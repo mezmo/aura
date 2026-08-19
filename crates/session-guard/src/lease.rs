@@ -1,12 +1,20 @@
 //! Liveness: the heartbeat lease and the write capability it gates.
-//! Revocation is structural and total: the shared flag is revoked on
-//! every end path — explicit stop, lease drop, actor exit (via the exit
-//! guard the actor task owns), and `Revocation`'s own Drop — so a closed
-//! channel always reads Lost, and the capability checks a held receiver,
-//! not a fresh subscription.
+//!
+//! Two roles are split by type so they cannot be confused:
+//!
+//! - [`Liveness`] is a clone-safe, drop-safe *observation* of the lease
+//!   state (an atomic flag). Capabilities hold clones; dropping or
+//!   cloning one never changes the state.
+//! - [`Revocation`] is the *authority* to end the lease. Exactly the
+//!   lease itself and the actor's [`ActorExitGuard`] hold one; dropping
+//!   either revokes. Misuse fails safe: an exit guard dropped outside
+//!   the actor task revokes immediately (lease reads Lost), never
+//!   Live-after-death.
 
 use crate::claim::Generation;
 use crate::identity::{SessionId, TurnId};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -33,39 +41,58 @@ pub struct LeaseLost {
     pub session: SessionId,
 }
 
-/// Shared revocation flag. Clones share state; dropping any clone
-/// revokes, so the channel can never read Live after every holder is
-/// gone. Liveness reads hit an atomic, not a fresh watch subscription.
+/// Clone-safe, drop-safe liveness observation. The atomic is the
+/// authoritative read; the watch channel exists for anyone who needs to
+/// await a change. Holding or dropping a `Liveness` never alters state.
+#[derive(Debug, Clone)]
+pub(crate) struct Liveness {
+    lost: Arc<AtomicBool>,
+    sender: Arc<watch::Sender<LeaseState>>,
+}
+
+impl Liveness {
+    /// A live flag pair: the observation handle and a receiver for
+    /// awaiting changes.
+    pub(crate) fn channel() -> (Self, watch::Receiver<LeaseState>) {
+        let (tx, rx) = watch::channel(LeaseState::Live);
+        (
+            Self {
+                lost: Arc::new(AtomicBool::new(false)),
+                sender: Arc::new(tx),
+            },
+            rx,
+        )
+    }
+
+    /// Whether the lease is Lost. Authoritative: every end path sets the
+    /// flag before anything else.
+    pub(crate) fn is_lost(&self) -> bool {
+        self.lost.load(Ordering::Acquire)
+    }
+}
+
+/// The authority to end a lease. Held only by [`HeartbeatLease`] and the
+/// actor's [`ActorExitGuard`]; dropping either revokes.
 #[derive(Debug, Clone)]
 pub(crate) struct Revocation {
-    sender: std::sync::Arc<watch::Sender<LeaseState>>,
-    lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    liveness: Liveness,
 }
 
 impl Revocation {
-    /// A live revocation (sender side).
+    /// A live revocation bound to a fresh liveness pair.
     pub(crate) fn new() -> Self {
-        let (tx, _rx) = watch::channel(LeaseState::Live);
-        Self {
-            sender: std::sync::Arc::new(tx),
-            lost: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        }
+        let (liveness, _rx) = Liveness::channel();
+        Self { liveness }
     }
 
     /// Mark lost. Idempotent.
     pub(crate) fn revoke(&self) {
-        self.lost.store(true, std::sync::atomic::Ordering::Release);
-        self.sender.send_if_modified(|state| {
+        self.liveness.lost.store(true, Ordering::Release);
+        self.liveness.sender.send_if_modified(|state| {
             let changed = *state == LeaseState::Live;
             *state = LeaseState::Lost;
             changed
         });
-    }
-
-    /// Whether the flag is Lost. Every end path (stop, drop, actor exit,
-    /// sender drop) revokes first, so this is authoritative.
-    pub(crate) fn is_lost(&self) -> bool {
-        self.lost.load(std::sync::atomic::Ordering::Acquire)
     }
 }
 
@@ -74,9 +101,11 @@ impl Drop for Revocation {
         self.revoke();
     }
 }
+
 /// Owned by the heartbeat actor task: revokes when the task exits for
 /// any reason (return, panic, abort), so actor death can never leave a
-/// lease Live.
+/// lease Live. Dropping it *outside* the task also revokes — misuse
+/// fails toward Lost, never toward a false Live.
 #[derive(Debug)]
 pub(crate) struct ActorExitGuard {
     revocation: Revocation,
@@ -96,8 +125,8 @@ impl Drop for ActorExitGuard {
 }
 
 /// The identity a lease (and everything derived from it) is bound to.
-/// Built by [`crate::state::AcquiredClaim::lease_source`], so lease,
-/// capability, and release all share one claim identity.
+/// Constructed only at [`crate::state::AcquiredClaim`]'s lease-building
+/// site, so lease, capability, and release all share one claim identity.
 #[derive(Debug, Clone)]
 pub(crate) struct ClaimLeaseSource {
     pub(crate) session: SessionId,
@@ -106,8 +135,8 @@ pub(crate) struct ClaimLeaseSource {
 }
 
 /// The heartbeat lease, carried by value through the turn state chain.
-/// Derived from one [`ClaimLeaseSource`] identity, so its session and
-/// incarnation can never disagree with the claim it defends.
+/// Owns the [`Revocation`], so the lease's end (stop, drop) is the
+/// lease's revocation.
 #[derive(Debug)]
 pub struct HeartbeatLease {
     session: SessionId,
@@ -119,8 +148,7 @@ pub struct HeartbeatLease {
 
 impl HeartbeatLease {
     /// A lease with no background actor (local admission): the
-    /// revocation flag alone decides liveness. Bindings come from
-    /// `source`.
+    /// revocation flag alone decides liveness.
     pub(crate) fn static_from(source: ClaimLeaseSource) -> Self {
         Self {
             session: source.session,
@@ -131,14 +159,16 @@ impl HeartbeatLease {
         }
     }
 
-    /// A lease around a running heartbeat actor. The actor MUST hold an
-    /// [`ActorExitGuard`] built from a clone of the same revocation, and
-    /// must exit when the flag turns Lost. Binding comes from `source`.
+    /// A lease around a heartbeat actor. The `spawn` closure receives
+    /// the matching [`ActorExitGuard`] and must move it into the task it
+    /// spawns; if it drops the guard instead, the guard's Drop revokes
+    /// immediately and the lease reads Lost (fail-safe).
     pub(crate) fn with_actor(
         source: ClaimLeaseSource,
-        revocation: Revocation,
-        actor: JoinHandle<()>,
+        spawn: impl FnOnce(ActorExitGuard) -> JoinHandle<()>,
     ) -> Self {
+        let revocation = Revocation::new();
+        let actor = spawn(ActorExitGuard::new(revocation.clone()));
         Self {
             session: source.session,
             turn: source.turn,
@@ -157,22 +187,22 @@ impl HeartbeatLease {
     /// Current liveness.
     #[must_use]
     pub fn state(&self) -> LeaseState {
-        if self.revocation.is_lost() {
+        if self.revocation.liveness.is_lost() {
             LeaseState::Lost
         } else {
             LeaseState::Live
         }
     }
 
-    /// A write capability bound to this lease's full identity.
-    /// Cheap to clone; liveness is read from the shared flag.
+    /// A write capability bound to this lease's full identity. Cheap to
+    /// clone and drop: capabilities observe liveness, they never revoke.
     #[must_use]
     pub fn capability(&self) -> WriteCapability {
         WriteCapability {
             session: self.session.clone(),
             turn: self.turn,
             generation: self.generation,
-            revocation: self.revocation.clone(),
+            liveness: self.revocation.liveness.clone(),
         }
     }
 
@@ -190,8 +220,7 @@ impl HeartbeatLease {
 impl Drop for HeartbeatLease {
     fn drop(&mut self) {
         // Abandonment path: revoke synchronously (also covered by
-        // Revocation's own Drop, but explicit is clearer); abort without
-        // joining.
+        // Revocation's own Drop); abort without joining.
         self.revocation.revoke();
         if let Some(actor) = self.actor.take() {
             actor.abort();
@@ -202,13 +231,14 @@ impl Drop for HeartbeatLease {
 /// Permission to write on behalf of one turn of one session, under one
 /// claim incarnation. Identity-complete: a capability can be checked
 /// against the exact write target, not just a bare generation. Fails
-/// closed once the backing lease revokes.
+/// closed once the backing lease revokes; cloning and dropping a
+/// capability never changes lease state.
 #[derive(Debug, Clone)]
 pub struct WriteCapability {
     session: SessionId,
     turn: TurnId,
     generation: Generation,
-    revocation: Revocation,
+    liveness: Liveness,
 }
 
 impl WriteCapability {
@@ -236,7 +266,7 @@ impl WriteCapability {
     /// [`LeaseLost`] naming this capability's identity when the lease is
     /// gone.
     pub fn assert_live(&self) -> Result<(), LeaseLost> {
-        if self.revocation.is_lost() {
+        if self.liveness.is_lost() {
             Err(LeaseLost {
                 generation: self.generation,
                 session: self.session.clone(),

@@ -50,7 +50,9 @@ impl fmt::Display for SessionId {
     }
 }
 
-/// One orchestration turn. UUIDv7: time-ordered, matches run-dir naming.
+/// One orchestration turn. Locally minted as UUIDv7 (time-ordered,
+/// matches run-dir naming); the wire form accepts any UUID so claims
+/// written by other writers keep parsing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TurnId(uuid::Uuid);
 

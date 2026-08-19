@@ -9,10 +9,12 @@
 use std::future::Future;
 use std::path::{Path, PathBuf};
 
-use crate::arbiter::ArbiterGuard;
+use crate::arbiter::HeldGuard;
 use crate::claim::Generation;
 use crate::identity::{InstanceId, SessionId, TurnId};
+use crate::lease::ActorExitGuard;
 use crate::lease::{HeartbeatLease, LeaseLost, WriteCapability};
+use tokio::task::JoinHandle;
 
 /// The complete output of a successful admission (adapter-side,
 /// crate-internal): the claim identity plus the release action bound to
@@ -48,13 +50,39 @@ impl AcquiredClaim {
         }
     }
 
-    /// The lease source every derived artifact must be built from.
-    pub(crate) fn lease_source(&self) -> crate::lease::ClaimLeaseSource {
-        crate::lease::ClaimLeaseSource {
+    /// Consume the claim into a held lock with a static (actor-free)
+    /// lease — local admission. The lease is built from this claim's own
+    /// identity inside this call, so identity, lease, and release cannot
+    /// disagree.
+    pub(crate) fn into_held_local(self, arbiter: HeldGuard) -> HeldLock {
+        let lease = HeartbeatLease::static_from(crate::lease::ClaimLeaseSource {
             session: self.session.clone(),
             turn: self.turn,
             generation: self.generation,
-        }
+        });
+        HeldLock::from_parts(self, arbiter, lease)
+    }
+
+    /// Consume the claim into a held lock with an actor-backed lease —
+    /// claim-file admission. `spawn` receives the matching
+    /// [`ActorExitGuard`] and must move it into the task it spawns (a
+    /// guard dropped outside the task revokes immediately: fail-safe).
+    /// The lease is built from this claim's own identity inside this
+    /// call.
+    pub(crate) fn into_held_with_actor(
+        self,
+        arbiter: HeldGuard,
+        spawn: impl FnOnce(ActorExitGuard) -> JoinHandle<()>,
+    ) -> HeldLock {
+        let lease = HeartbeatLease::with_actor(
+            crate::lease::ClaimLeaseSource {
+                session: self.session.clone(),
+                turn: self.turn,
+                generation: self.generation,
+            },
+            spawn,
+        );
+        HeldLock::from_parts(self, arbiter, lease)
     }
 }
 
@@ -112,8 +140,11 @@ pub struct HeldLock {
     turn: TurnId,
     holder: InstanceId,
     generation: Generation,
-    arbiter: ArbiterGuard,
+    // Drop order matters: the lease (first) revokes before the arbiter
+    // slot (second) frees, so no window exists where another local
+    // request acquires the slot while a capability still reads Live.
     lease: HeartbeatLease,
+    arbiter: HeldGuard,
     release: ReleaseAction,
 }
 
@@ -129,22 +160,17 @@ impl std::fmt::Debug for HeldLock {
 }
 
 impl HeldLock {
-    /// Assemble a held lock (adapter-side) from one acquired claim, its
-    /// arbiter slot, and a lease built from the claim's own
-    /// [`lease_source`](AcquiredClaim::lease_source). All three then
-    /// share one identity by construction.
-    pub(crate) fn new(
-        acquired: AcquiredClaim,
-        arbiter: ArbiterGuard,
-        lease: HeartbeatLease,
-    ) -> Self {
+    /// Assemble from parts (private: only the `into_held_*` constructors
+    /// on [`AcquiredClaim`] call this, which is what binds lease to
+    /// claim by construction).
+    fn from_parts(acquired: AcquiredClaim, arbiter: HeldGuard, lease: HeartbeatLease) -> Self {
         Self {
             session: acquired.session,
             turn: acquired.turn,
             holder: acquired.holder,
             generation: acquired.generation,
-            arbiter,
             lease,
+            arbiter,
             release: acquired.release,
         }
     }
@@ -179,6 +205,31 @@ impl HeldLock {
     /// releases the claim.
     pub async fn abort(self) -> Result<(), ReleaseError> {
         todo!("fill: lease stop + release; aura #421 follow-up")
+    }
+}
+
+/// A run directory whose creation was authorized by a live
+/// [`WriteCapability`]. The sole constructor performs the `create_dir`
+/// under the capability check, so the value itself is the proof; the
+/// path inside is not forgeable.
+#[derive(Debug)]
+#[must_use]
+pub struct RunDir(PathBuf);
+
+impl RunDir {
+    /// Create the run directory under claim authority: the capability
+    /// must be live at creation time. Non-recursive (`create_dir`
+    /// semantics: the parent — the session directory — must already
+    /// exist; an `AlreadyExists` collision is a hard error, not
+    /// retried).
+    ///
+    /// # Errors
+    /// [`FenceCause::LeaseLost`] when the capability is no longer live;
+    /// [`FenceCause::Io`] for the underlying filesystem error.
+    pub fn create_under(capability: &WriteCapability, path: PathBuf) -> Result<Self, FenceCause> {
+        capability.assert_live()?;
+        std::fs::create_dir(&path)?;
+        Ok(Self(path))
     }
 }
 
@@ -247,19 +298,47 @@ impl ActiveTurn {
 }
 
 /// Context handed to the injected commit step. Assembled by the barrier
-/// from the turn's own state; not constructible outside the crate.
+/// from the turn's own state; fields are private with read accessors, so
+/// a context is not constructible or forgeable outside the crate.
 #[derive(Debug, Clone)]
 pub struct CommitContext {
+    run_dir: PathBuf,
+    outcome: TurnOutcome,
+    session: SessionId,
+    turn: TurnId,
+    generation: Generation,
+}
+
+impl CommitContext {
     /// The fenced run directory (where manifests go).
-    pub run_dir: PathBuf,
+    #[must_use]
+    pub fn run_dir(&self) -> &Path {
+        &self.run_dir
+    }
+
     /// The terminal outcome.
-    pub outcome: TurnOutcome,
+    #[must_use]
+    pub const fn outcome(&self) -> TurnOutcome {
+        self.outcome
+    }
+
     /// The session.
-    pub session: SessionId,
+    #[must_use]
+    pub fn session(&self) -> &SessionId {
+        &self.session
+    }
+
     /// The turn.
-    pub turn: TurnId,
+    #[must_use]
+    pub const fn turn(&self) -> TurnId {
+        self.turn
+    }
+
     /// The claim incarnation that authorized the turn.
-    pub generation: Generation,
+    #[must_use]
+    pub const fn generation(&self) -> Generation {
+        self.generation
+    }
 }
 
 /// How the barrier's cleanup fared when the commit step failed.
@@ -371,13 +450,9 @@ pub struct CommittedResponse<T> {
 }
 
 impl<T> CommittedResponse<T> {
-    /// Build the authorization (barrier-internal).
-    pub(crate) fn new(
-        payload: T,
-        session: SessionId,
-        turn: TurnId,
-        generation: Generation,
-    ) -> Self {
+    /// Build the authorization (private to this module: only the barrier
+    /// body constructs it).
+    fn new(payload: T, session: SessionId, turn: TurnId, generation: Generation) -> Self {
         Self {
             payload,
             session,

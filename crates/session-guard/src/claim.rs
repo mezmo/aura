@@ -19,6 +19,8 @@ use crate::identity::{InstanceId, SessionId, TurnId};
 /// A claim incarnation. Minted fresh (UUIDv7) on every admission or
 /// steal: globally unique, time-ordered, never reused — tombstone names
 /// derived from it cannot collide across restarts or delayed operations.
+/// The wire form accepts any UUID (older writers must keep parsing), so
+/// the invariant is *uniqueness*, not version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Generation(uuid::Uuid);
 
@@ -136,12 +138,29 @@ impl ClaimWire {
 #[error("invalid claim wire: {0}")]
 pub struct WireError(String);
 
+/// Distinguishes distinct reads of a claim: every construction mints a
+/// new, monotonically increasing id; clones share their id. Steal
+/// revalidation requires an observation id strictly greater than the
+/// evidence's second sample, so a stale clone can never masquerade as a
+/// fresh read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct ObservationId(u64);
+
+impl ObservationId {
+    fn mint() -> Self {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        Self(COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
 /// One complete, validated observation of a session's claim, from a single
 /// uncached read. Everything downstream (holder views, staleness
 /// evidence, steal revalidation) starts from one of these; nothing pairs
-/// raw samples with remembered metadata.
+/// raw samples with remembered metadata. The observation id pins *which*
+/// read produced it.
 #[derive(Debug, Clone)]
 pub struct ObservedClaim {
+    observation: ObservationId,
     session: SessionId,
     holder: InstanceId,
     turn: TurnId,
@@ -161,7 +180,13 @@ impl ObservedClaim {
         reason = "todo!() body; filled by aura #421 follow-up"
     )]
     pub(crate) fn from_wire(session: SessionId, wire: ClaimWire) -> Result<Self, WireError> {
-        todo!("fill: validate + bind; aura #421 follow-up")
+        todo!("fill: validate + bind (mints observation id); aura #421 follow-up")
+    }
+
+    /// The read this observation came from (crate-internal; revalidation
+    /// orders observations by it).
+    pub(crate) const fn observation(&self) -> ObservationId {
+        self.observation
     }
 
     /// Serialize this observation's wire form (heartbeat renewal writes).
@@ -240,6 +265,10 @@ pub enum EvidenceError {
     /// steal on this evidence would race a live-but-slow renewal.
     #[error("observations not separated by the staleness window")]
     TooCloseTogether,
+    /// The "fresh" read at steal time was not a later read than the
+    /// evidence's second sample (stale clone or replay).
+    #[error("revalidation read is not fresher than the evidence")]
+    NotFresh,
 }
 
 /// Proof that one exact claim (same session, holder, turn, incarnation)
@@ -301,8 +330,10 @@ pub(crate) struct ValidatedSteal {
 /// Who holds a session, as an honest observation can report it. `Here`
 /// and `Remote` carry exactly the data each can prove: a local hold knows
 /// the holder without a disk read; a remote hold is always an
-/// observation, so it carries the heartbeat.
+/// observation, so it carries the heartbeat. Non-exhaustive: variants
+/// are constructed only inside this crate.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum HolderView {
     /// Held by this process.
     Here {

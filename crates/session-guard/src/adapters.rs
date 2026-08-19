@@ -54,7 +54,10 @@ impl TurnAdmission for LocalAdmission {
         reason = "todo!() body; filled by aura #421 follow-up"
     )]
     async fn admit(&self, req: IdleRequest) -> Result<HeldLock, AdmissionError> {
-        todo!("fill: arbiter hold + static lease + no-op release; aura #421 follow-up")
+        todo!(
+            "fill: arbiter PendingGuard → confirm() → AcquiredClaim \
+             into_held_local; aura #421 follow-up"
+        )
     }
 
     #[expect(
@@ -62,7 +65,7 @@ impl TurnAdmission for LocalAdmission {
         reason = "todo!() body; filled by aura #421 follow-up"
     )]
     async fn locate_holder(&self, session: &SessionId) -> std::io::Result<Option<HolderView>> {
-        todo!("fill: arbiter holds() → Here view; aura #421 follow-up")
+        todo!("fill: arbiter holds() (Held only) → Here view; aura #421 follow-up")
     }
 }
 
@@ -95,9 +98,11 @@ impl ClaimFileAdmission {
         }
     }
 
-    /// The claim root this backend manages.
+    /// The claim root this backend manages (crate-internal: backends are
+    /// reachable only through the factory's trait object, so a public
+    /// accessor would be dead surface).
     #[must_use]
-    pub fn root(&self) -> &Path {
+    pub(crate) fn root(&self) -> &Path {
         &self.root
     }
 
@@ -130,8 +135,9 @@ impl TurnAdmission for ClaimFileAdmission {
     )]
     async fn admit(&self, req: IdleRequest) -> Result<HeldLock, AdmissionError> {
         todo!(
-            "fill: arbiter → O_EXCL election or evidence steal (internal, \
-             revalidated) + lease actor; aura #421 follow-up"
+            "fill: arbiter PendingGuard → O_EXCL election or evidence \
+             steal (internal, revalidated) → confirm() → AcquiredClaim \
+             into_held_with_actor; aura #421 follow-up"
         )
     }
 

@@ -58,7 +58,7 @@ mod lease;
 mod state;
 
 pub use adapters::{ClaimFileAdmission, LocalAdmission};
-pub use arbiter::{ArbiterGuard, SessionArbiter};
+pub use arbiter::{HeldGuard, PendingGuard, SessionArbiter};
 pub use claim::{
     EvidenceError, Generation, HeartbeatExhausted, HeartbeatSeq, HolderView, ObservedClaim,
     WireError, claim_path, tombstone_path,
@@ -69,7 +69,8 @@ pub use identity::{
 pub use lease::{BeatInterval, LeaseLost, LeaseState, WriteCapability};
 pub use state::{
     ActiveTurn, AdmissionError, BarrierError, CleanupOutcome, CommitContext, CommittedResponse,
-    CommittingTurn, FenceCause, FencedRun, HeldLock, IdleRequest, ReleaseError, TurnOutcome,
+    CommittingTurn, FenceCause, FencedRun, HeldLock, IdleRequest, ReleaseError, RunDir,
+    TurnOutcome,
 };
 
 use std::fmt;
