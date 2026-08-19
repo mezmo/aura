@@ -28,6 +28,11 @@ authors = ["Mezmo <support@mezmo.com>"]
 license = "Apache-2.0"
 repository = "https://github.com/mezmo/aura"
 
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+
 [workspace.dependencies]
 rig-core = { git = "https://github.com/mezmo/rig.git", rev = "5b0238a1d74e1d7c68034384b69e17f62890d517", default-features = false, features = ["rmcp", "reqwest-rustls"] }
 # Pinned to exact versions compatible with our rig-core 0.28.x fork.
