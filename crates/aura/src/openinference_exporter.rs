@@ -2,7 +2,7 @@
 //!
 //! Wraps an OTLP `SpanExporter` to add [OpenInference] attributes before
 //! export. This ensures Phoenix correctly classifies spans (LLM, TOOL,
-//! AGENT, CHAIN) and displays token counts, model names, and
+//! RETRIEVER, CHAIN) and displays token counts, model names, and
 //! structured messages in its UI.
 //!
 //! ## Dual-source attribute design
@@ -20,9 +20,9 @@
 //! [OpenInference]: https://github.com/Arize-ai/openinference/tree/main/spec
 
 use crate::logging::{
-    ATTR_GEN_AI_SYSTEM_INSTRUCTIONS, ATTR_INPUT_VALUE, ATTR_LLM_MODEL_NAME, ATTR_LLM_SYSTEM,
-    ATTR_LLM_TOKEN_COMPLETION, ATTR_LLM_TOKEN_PROMPT, ATTR_OUTPUT_VALUE, ATTR_TOOL_NAME,
-    ATTR_TOOL_PARAMETERS,
+    ATTR_GEN_AI_SYSTEM_INSTRUCTIONS, ATTR_INPUT_VALUE, ATTR_LLM_MODEL_NAME, ATTR_LLM_PROVIDER,
+    ATTR_LLM_SYSTEM, ATTR_LLM_TOKEN_COMPLETION, ATTR_LLM_TOKEN_PROMPT, ATTR_OUTPUT_VALUE,
+    ATTR_TOOL_NAME, ATTR_TOOL_PARAMETERS,
 };
 use futures::future::BoxFuture;
 use opentelemetry::{KeyValue, StringValue, Value};
@@ -106,19 +106,37 @@ impl<E: SpanExporter + Send + Sync + 'static> SpanExporter for OpenInferenceExpo
 // ---------------------------------------------------------------------------
 
 /// Map a span name to an OpenInference span kind.
+///
+/// Phoenix computes cost only for LLM-kind spans with a non-empty
+/// `llm.model_name` (`should_calculate_span_cost` in the Phoenix server).
+/// The `agent.turn` spans are the cost anchors: the Rig fork records
+/// per-call model identifiers and token usage on them, and Phoenix rolls
+/// those descendants up per worker / per trace. Aura's agent-level spans
+/// also export as LLM so Phoenix renders their `llm.tools.*` and
+/// `llm.invocation_parameters` attributes in its LLM span view; they carry
+/// model identifiers but no token counts, so only the turns contribute
+/// cost.
 fn infer_span_kind(name: &str) -> &'static str {
     match name {
-        // Rig LLM-level spans (agent.turn is LLM so Phoenix renders Output Messages)
+        // Rig LLM-level spans (agent.turn carries per-call model + usage)
         "chat" | "chat_streaming" | "agent.turn" => "LLM",
         // Tool execution spans
         "execute_tool" | "mcp.tool_call" => "TOOL",
-        // Aura agent orchestration (worker is an autonomous agent with its own LLM + tools)
-        "agent.stream" | "agent.prompt" | "agent.chat" | "orchestration.worker" => "AGENT",
-        // Aura chain / entry-point spans + orchestration phases
+        // Vector store searches carry `retrieval.documents.*` attributes
+        "vector.search" => "RETRIEVER",
+        // Aura agent-level spans: the streaming root, the non-streaming
+        // entry points, and the orchestration coordinator/worker phases —
+        // each records the tools and invocation parameters it advertises
+        // to the model (see the doc comment above)
+        "agent.stream"
+        | "agent.prompt"
+        | "agent.chat"
+        | "orchestration.planning"
+        | "orchestration.worker" => "LLM",
+        // Aura chain / entry-point spans + orchestration lifecycle
         "chat_completions"
         | "streaming_completion"
         | "orchestration"
-        | "orchestration.planning"
         | "orchestration.iteration" => "CHAIN",
         // Safe default
         _ => "CHAIN",
@@ -153,6 +171,7 @@ fn transform_span(mut span: SpanData) -> SpanData {
         match key {
             "gen_ai.system" | "gen_ai.provider.name" => {
                 extra_attrs.push(KeyValue::new(ATTR_LLM_SYSTEM, kv.value.clone()));
+                extra_attrs.push(KeyValue::new(ATTR_LLM_PROVIDER, kv.value.clone()));
             }
             "gen_ai.request.model" => {
                 extra_attrs.push(KeyValue::new(ATTR_LLM_MODEL_NAME, kv.value.clone()));
@@ -181,8 +200,8 @@ fn transform_span(mut span: SpanData) -> SpanData {
             }
             // The system prompt has no OpenInference attribute of its own, so
             // it becomes leading `system` entries in `llm.input_messages`.
-            // Ungated by span kind: Aura records it on `agent.stream` (AGENT)
-            // and the `orchestration.*` (CHAIN/AGENT) spans, never on an LLM one.
+            // Ungated by span kind: any span that records a system prompt
+            // translates the same way.
             ATTR_GEN_AI_SYSTEM_INSTRUCTIONS => {
                 deferred_system_instructions = parse_system_instructions(&kv.value.to_string());
             }
@@ -558,13 +577,30 @@ mod tests {
         assert_eq!(infer_span_kind("chat_streaming"), "LLM");
         assert_eq!(infer_span_kind("execute_tool"), "TOOL");
         assert_eq!(infer_span_kind("mcp.tool_call"), "TOOL");
-        assert_eq!(infer_span_kind("agent.stream"), "AGENT");
-        assert_eq!(infer_span_kind("agent.prompt"), "AGENT");
-        assert_eq!(infer_span_kind("agent.chat"), "AGENT");
+        assert_eq!(infer_span_kind("vector.search"), "RETRIEVER");
+        assert_eq!(infer_span_kind("agent.stream"), "LLM");
+        assert_eq!(infer_span_kind("agent.prompt"), "LLM");
+        assert_eq!(infer_span_kind("agent.chat"), "LLM");
         assert_eq!(infer_span_kind("agent.turn"), "LLM");
+        assert_eq!(infer_span_kind("orchestration.planning"), "LLM");
+        assert_eq!(infer_span_kind("orchestration.worker"), "LLM");
         assert_eq!(infer_span_kind("chat_completions"), "CHAIN");
         assert_eq!(infer_span_kind("streaming_completion"), "CHAIN");
+        assert_eq!(infer_span_kind("orchestration"), "CHAIN");
+        assert_eq!(infer_span_kind("orchestration.iteration"), "CHAIN");
         assert_eq!(infer_span_kind("unknown_span"), "CHAIN");
+    }
+
+    /// `transform_span` stamps the kind attribute on the streaming root.
+    #[test]
+    fn test_agent_stream_kind_attribute() {
+        let without_tokens = transform_span(make_span("agent.stream", vec![]));
+        assert_eq!(
+            find_attr(&without_tokens, "openinference.span.kind")
+                .unwrap()
+                .to_string(),
+            "LLM"
+        );
     }
 
     /// Verify gen_ai.* LLM attributes are translated to OpenInference equivalents,
@@ -572,7 +608,8 @@ mod tests {
     #[test]
     fn test_translates_llm_attributes() {
         use crate::logging::{
-            ATTR_LLM_MODEL_NAME, ATTR_LLM_SYSTEM, ATTR_LLM_TOKEN_COMPLETION, ATTR_LLM_TOKEN_PROMPT,
+            ATTR_LLM_MODEL_NAME, ATTR_LLM_PROVIDER, ATTR_LLM_SYSTEM, ATTR_LLM_TOKEN_COMPLETION,
+            ATTR_LLM_TOKEN_PROMPT,
         };
 
         let span = make_span(
@@ -592,6 +629,10 @@ mod tests {
             "openai"
         );
         assert_eq!(
+            find_attr(&result, "llm.provider").unwrap().to_string(),
+            "openai"
+        );
+        assert_eq!(
             find_attr(&result, "llm.model_name").unwrap().to_string(),
             "gpt-4"
         );
@@ -600,6 +641,7 @@ mod tests {
 
         // Keys match logging.rs constants (drift guard)
         assert!(find_attr(&result, ATTR_LLM_SYSTEM).is_some());
+        assert!(find_attr(&result, ATTR_LLM_PROVIDER).is_some());
         assert!(find_attr(&result, ATTR_LLM_MODEL_NAME).is_some());
         assert!(find_attr(&result, ATTR_LLM_TOKEN_PROMPT).is_some());
         assert!(find_attr(&result, ATTR_LLM_TOKEN_COMPLETION).is_some());
@@ -949,11 +991,11 @@ mod tests {
 
     /// A single instruction part becomes a leading `system` message, and the
     /// raw GenAI key is stripped like every other translated `gen_ai.*` key.
-    /// AGENT kind matters: Aura records the prompt on non-LLM spans.
+    /// Uses a CHAIN span: the translation is ungated by span kind.
     #[test]
     fn test_system_instructions_translate_to_input_messages() {
         let span = make_span(
-            "agent.stream",
+            "orchestration",
             vec![
                 KeyValue::new("gen_ai.system", "openai"),
                 KeyValue::new(
@@ -1208,7 +1250,7 @@ mod tests {
         // input.messages only expanded on LLM spans
         let messages = r#"[{"role":"user","content":"hello"}]"#;
         let span = make_span(
-            "agent.stream",
+            "orchestration",
             vec![KeyValue::new("gen_ai.input.messages", messages)],
         );
         assert!(find_attr(&transform_span(span), "llm.input_messages.0.message.role").is_none());
@@ -1464,6 +1506,10 @@ mod pipeline_tests {
 
         // Translated LLM attributes
         assert_eq!(find_attr(chat, "llm.system").unwrap().to_string(), "openai");
+        assert_eq!(
+            find_attr(chat, "llm.provider").unwrap().to_string(),
+            "openai"
+        );
         assert_eq!(
             find_attr(chat, "llm.model_name").unwrap().to_string(),
             "gpt-4"

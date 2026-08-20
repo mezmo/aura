@@ -586,6 +586,13 @@ impl Orchestrator {
         let mut worker_config = self.agent_config.clone();
         let worker_cfg = worker_name.and_then(|name| self.config.workers.get(name));
 
+        // Named workers report their own agent name (Rig stamps it on turn
+        // spans as `gen_ai.agent.name`); the generic worker keeps the base
+        // agent's name.
+        if let Some(name) = worker_name {
+            worker_config.agent.name = name.to_string();
+        }
+
         // Resolve per-worker LLM override (falls back to [agent.llm] when absent)
         if let Some(override_llm) = worker_cfg.and_then(|w| w.llm.as_ref()) {
             worker_config.llm = override_llm.clone();
@@ -922,6 +929,7 @@ impl Orchestrator {
             client_tool_names: Default::default(),
             turn_nudge,
             system_prompt: preamble.clone(),
+            invocation_parameters: crate::logging::llm_invocation_parameters(&worker_config.llm),
         };
 
         Ok(AgentWithPreamble {
@@ -1469,6 +1477,12 @@ impl Orchestrator {
             &tracing::Span::current(),
             &coordinator_state.preamble,
         );
+        // The coordinator always runs on [agent.llm] (see `create_coordinator`).
+        let (provider, model) = self.agent_config.llm.model_info();
+        crate::logging::set_llm_identifiers(&tracing::Span::current(), provider, model);
+        if let Some(params) = crate::logging::llm_invocation_parameters(&self.agent_config.llm) {
+            crate::logging::set_llm_invocation_parameters(&tracing::Span::current(), &params);
+        }
 
         for attempt in 1..=max_correction_attempts {
             // Clear any stale routing decision
@@ -1524,16 +1538,7 @@ impl Orchestrator {
                 )
                 .await
             {
-                Ok(r) => {
-                    crate::logging::set_token_usage(
-                        &tracing::Span::current(),
-                        r.usage.input_tokens,
-                        r.usage.output_tokens,
-                        r.usage.total_tokens,
-                        0,
-                    );
-                    r
-                }
+                Ok(r) => r,
                 Err(e) if is_context_overflow_error(e.as_ref()) => {
                     let suggestion = context_overflow_suggestion("planning");
                     return Err(
@@ -2105,15 +2110,20 @@ Assign tasks to the worker whose tools best match the required operations."#,
     /// Build a Rig agent with the given completion model and coordinator tools.
     ///
     /// Shared helper that eliminates per-provider duplication in `create_coordinator`.
+    #[allow(clippy::too_many_arguments)]
     fn build_agent_with_tools<M: rig::completion::CompletionModel + Send + Sync>(
         completion_model: M,
         preamble: &str,
         temperature: Option<f64>,
         additional_params: Option<serde_json::Value>,
         max_tokens: Option<u64>,
+        provider_name: &str,
+        model_name: &str,
         tools: CoordinatorTools,
     ) -> rig::agent::Agent<M> {
         let mut builder = rig::agent::AgentBuilder::new(completion_model);
+        builder = builder.name("coordinator");
+        builder = builder.provider_name(provider_name).model_name(model_name);
         builder = builder.preamble(preamble);
         if let Some(temp) = temperature {
             builder = builder.temperature(temp);
@@ -2322,6 +2332,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 client_tool_names: Default::default(),
                 turn_nudge: None,
                 system_prompt: preamble.clone(),
+                invocation_parameters: crate::logging::llm_invocation_parameters(
+                    &self.agent_config.llm,
+                ),
             },
             preamble,
             escalation_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -2341,6 +2354,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         max_tokens: Option<u64>,
         tools: CoordinatorTools,
     ) -> Result<ProviderAgent, Box<dyn std::error::Error + Send + Sync>> {
+        let (llm_provider, llm_model) = self.agent_config.llm.model_info();
         match &self.agent_config.llm {
             LlmConfig::OpenAI {
                 api_key,
@@ -2376,6 +2390,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     temperature,
                     combined_params,
                     max_tokens,
+                    llm_provider,
+                    llm_model,
                     tools,
                 )))
             }
@@ -2400,6 +2416,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     temperature,
                     additional_params,
                     max_tokens,
+                    llm_provider,
+                    llm_model,
                     tools,
                 )))
             }
@@ -2432,6 +2450,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     temperature,
                     additional_params,
                     max_tokens,
+                    llm_provider,
+                    llm_model,
                     tools,
                 )))
             }
@@ -2456,6 +2476,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     temperature,
                     additional_params,
                     max_tokens,
+                    llm_provider,
+                    llm_model,
                     tools,
                 )))
             }
@@ -2475,6 +2497,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     temperature,
                     additional_params,
                     max_tokens,
+                    llm_provider,
+                    llm_model,
                     tools,
                 )))
             }
@@ -2499,6 +2523,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     temperature,
                     additional_params,
                     max_tokens,
+                    llm_provider,
+                    llm_model,
                     tools,
                 )))
             }
@@ -2517,6 +2543,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
     ) -> Result<(ProviderAgent, String), Box<dyn std::error::Error + Send + Sync>> {
         let preamble = worker_config.effective_preamble();
         let temperature = worker_config.llm.temperature();
+        let (llm_provider, llm_model) = worker_config.llm.model_info();
         let shared_mcp: Option<Arc<McpManager>> = self.mcp_manager.clone();
 
         // Box<dyn ToolDyn> is not Clone, so each provider arm constructs its own instance.
@@ -2552,6 +2579,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     .completions_api()
                     .completion_model(model);
                 let mut builder = rig::agent::AgentBuilder::new(cm);
+                builder = builder.name(&worker_config.agent.name);
+                builder = builder.provider_name(llm_provider).model_name(llm_model);
                 builder = builder.preamble(preamble);
                 if let Some(temp) = temperature {
                     builder = builder.temperature(temp);
@@ -2597,6 +2626,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     .map_err(|e| format!("Failed to build Anthropic worker: {}", e))?
                     .completion_model(model);
                 let mut builder = rig::agent::AgentBuilder::new(cm);
+                builder = builder.name(&worker_config.agent.name);
+                builder = builder.provider_name(llm_provider).model_name(llm_model);
                 builder = builder.preamble(preamble);
                 if let Some(temp) = temperature {
                     builder = builder.temperature(temp);
@@ -2638,6 +2669,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 ))
                 .completion_model(model);
                 let mut builder = rig::agent::AgentBuilder::new(cm);
+                builder = builder.name(&worker_config.agent.name);
+                builder = builder.provider_name(llm_provider).model_name(llm_model);
                 builder = builder.preamble(preamble);
                 if let Some(temp) = temperature {
                     builder = builder.temperature(temp);
@@ -2671,6 +2704,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     .map_err(|e| format!("Failed to build Gemini worker: {}", e))?
                     .completion_model(model);
                 let mut builder = rig::agent::AgentBuilder::new(cm);
+                builder = builder.name(&worker_config.agent.name);
+                builder = builder.provider_name(llm_provider).model_name(llm_model);
                 builder = builder.preamble(preamble);
                 if let Some(temp) = temperature {
                     builder = builder.temperature(temp);
@@ -2698,6 +2733,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     .map_err(|e| format!("Failed to build Ollama worker: {}", e))?
                     .completion_model(model);
                 let mut builder = rig::agent::AgentBuilder::new(cm);
+                builder = builder.name(&worker_config.agent.name);
+                builder = builder.provider_name(llm_provider).model_name(llm_model);
                 builder = builder.preamble(preamble);
                 if let Some(temp) = temperature {
                     builder = builder.temperature(temp);
@@ -2730,6 +2767,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     .map_err(|e| format!("Failed to build OpenRouter worker: {}", e))?
                     .completion_model(model);
                 let mut builder = rig::agent::AgentBuilder::new(cm);
+                builder = builder.name(&worker_config.agent.name);
+                builder = builder.provider_name(llm_provider).model_name(llm_model);
                 builder = builder.preamble(preamble);
                 if let Some(temp) = temperature {
                     builder = builder.temperature(temp);
@@ -3065,6 +3104,24 @@ Assign tasks to the worker whose tools best match the required operations."#,
             if let Some(name) = worker_name {
                 span.record("orchestration.worker", *name);
             }
+            // Same effective-LLM resolution as `create_worker`; recorded here
+            // (not there) so retries don't append duplicate attributes.
+            let worker_cfg = worker_name.and_then(|name| self.config.workers.get(name));
+            let effective_llm = worker_cfg
+                .and_then(|w| w.llm.as_ref())
+                .unwrap_or(&self.agent_config.llm);
+            let (provider, model) = effective_llm.model_info();
+            crate::logging::set_llm_identifiers(&span, provider, model);
+            if let Some(params) = crate::logging::llm_invocation_parameters(effective_llm) {
+                crate::logging::set_llm_invocation_parameters(&span, &params);
+            }
+            if let Some(mcp) = &self.mcp_manager {
+                let filter = worker_cfg.and_then(|w| w.mcp_filter.as_deref());
+                let tools = mcp.tool_schemas_json(filter);
+                if !tools.is_empty() {
+                    crate::logging::set_llm_tools(&span, &tools);
+                }
+            }
         }
 
         // Build the base worker prompt once — reused across retry attempts
@@ -3077,13 +3134,16 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 context: &context_str,
                 your_task: task_description,
             });
+        crate::logging::set_llm_prompt_template(
+            &tracing::Span::current(),
+            super::templates::WORKER_TASK_PROMPT_TEMPLATE,
+            &[
+                ("CONTEXT", context_str.as_str()),
+                ("YOUR_TASK", task_description),
+            ],
+        );
 
         let start_time = std::time::Instant::now();
-        let mut last_usage = rig::completion::Usage {
-            input_tokens: 0,
-            output_tokens: 0,
-            total_tokens: 0,
-        };
         let mut last_raw_response = String::new();
         let mut last_error: Option<Box<dyn std::error::Error + Send + Sync>> = None;
         let mut actual_attempts: usize = 0;
@@ -3177,13 +3237,6 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 }
             }
 
-            // Track per-attempt usage for span metrics.
-            // Cumulative usage_state is now updated eagerly per TurnUsage inside
-            // stream_and_forward, so failed attempts also contribute.
-            if let Ok(ref response) = stream_result {
-                last_usage = response.usage;
-            }
-
             // Detect context overflow and other errors — don't retry hard errors
             let result = match stream_result {
                 Ok(r) => Ok(r.content),
@@ -3216,11 +3269,6 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     match structured {
                         Some(output) => {
                             let duration_ms = start_time.elapsed().as_millis() as u64;
-                            self.set_worker_span_usage(
-                                last_usage.input_tokens,
-                                last_usage.output_tokens,
-                                last_usage.total_tokens,
-                            );
                             self.persist_worker_execution(
                                 task_id,
                                 task_description,
@@ -3249,11 +3297,6 @@ Assign tasks to the worker whose tools best match the required operations."#,
                                 attempt
                             );
                             let duration_ms = start_time.elapsed().as_millis() as u64;
-                            self.set_worker_span_usage(
-                                last_usage.input_tokens,
-                                last_usage.output_tokens,
-                                last_usage.total_tokens,
-                            );
                             self.persist_worker_execution(
                                 task_id,
                                 task_description,
@@ -3289,11 +3332,6 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
         // All attempts exhausted or hard error occurred
         let duration_ms = start_time.elapsed().as_millis() as u64;
-        self.set_worker_span_usage(
-            last_usage.input_tokens,
-            last_usage.output_tokens,
-            last_usage.total_tokens,
-        );
         if let Some(ref e) = last_error {
             self.persist_worker_execution(
                 task_id,
@@ -3327,13 +3365,6 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 structured_output: None,
             })
         }
-    }
-
-    /// Set token usage metrics on the current orchestration.worker span.
-    /// usage_state is already updated per-attempt in the retry loop.
-    fn set_worker_span_usage(&self, input: u64, output: u64, total: u64) {
-        let span = tracing::Span::current();
-        crate::logging::set_token_usage(&span, input, output, total, 0);
     }
 
     /// Persist a single worker execution attempt to the journal and persistence store.

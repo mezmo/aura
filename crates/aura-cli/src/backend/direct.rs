@@ -280,6 +280,7 @@ impl DirectBackend {
             max_tokens: None,
             stream: Some(true),
             metadata: None,
+            user: None,
             tools: web_tools,
         }
     }
@@ -358,6 +359,7 @@ impl DirectBackend {
             max_tokens: None,
             stream: Some(false),
             metadata: None,
+            user: None,
             tools: None,
         };
 

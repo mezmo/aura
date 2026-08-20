@@ -4,7 +4,7 @@ use rig::completion::ToolDefinition;
 use rig::tool::Tool as RigTool;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tracing::{debug, info};
+use tracing::{Instrument, debug, info};
 
 use crate::{error::BuilderError, vector_store::VectorStoreManager};
 
@@ -113,6 +113,9 @@ impl RigTool for DynamicVectorSearchTool {
         let store_name = self.store_name.clone();
         let vector_store = self.vector_store.clone();
 
+        let span = tracing::info_span!("vector.search", "vector.store" = %store_name);
+        crate::logging::set_input_attributes(&span, &args.query);
+
         info!(
             "🔍 Searching vector store '{}' (query: '{}', limit: {}, min_score: {}, filters: {})",
             store_name,
@@ -122,29 +125,43 @@ impl RigTool for DynamicVectorSearchTool {
             args.label_filters.len()
         );
 
-        let search_results = if !args.label_filters.is_empty() {
-            info!(
-                "   Applying {} label filter(s): {:?}",
-                args.label_filters.len(),
-                args.label_filters
-            );
-            let filter_map = args
-                .label_filters
-                .iter()
-                .map(|kv| (kv.key.clone(), parse_value_str(&kv.value)))
-                .collect();
-            vector_store
-                .search_with_filter(&args.query, args.limit, filter_map)
-                .await?
-        } else {
-            vector_store.search(&args.query, args.limit).await?
-        };
+        let search_results = async {
+            if !args.label_filters.is_empty() {
+                info!(
+                    "   Applying {} label filter(s): {:?}",
+                    args.label_filters.len(),
+                    args.label_filters
+                );
+                let filter_map = args
+                    .label_filters
+                    .iter()
+                    .map(|kv| (kv.key.clone(), parse_value_str(&kv.value)))
+                    .collect();
+                vector_store
+                    .search_with_filter(&args.query, args.limit, filter_map)
+                    .await
+            } else {
+                vector_store.search(&args.query, args.limit).await
+            }
+        }
+        .instrument(span.clone())
+        .await?;
 
         // Filter by minimum score if specified
         let filtered_results: Vec<_> = search_results
             .into_iter()
             .filter(|result| result.score >= args.min_score)
             .collect();
+
+        let documents: Vec<crate::logging::RetrievedDocument<'_>> = filtered_results
+            .iter()
+            .map(|r| crate::logging::RetrievedDocument {
+                content: &r.content,
+                score: r.score as f64,
+                metadata: r.metadata.as_ref(),
+            })
+            .collect();
+        crate::logging::set_retrieval_documents(&span, &documents);
 
         let results_count = filtered_results.len();
 

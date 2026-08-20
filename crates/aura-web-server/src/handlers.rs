@@ -231,6 +231,14 @@ pub struct RequestSetup {
     pub has_client_tools: bool,
     /// Request id (`req_…`) shared by the agent build and the completion stream.
     pub request_id: String,
+    /// OpenAI-compatible `user` field, for the `user.id` span attribute.
+    pub user_id: Option<String>,
+    /// Request `metadata` serialized as a JSON object string, for the
+    /// `metadata` span attribute.
+    pub metadata_json: Option<String>,
+    /// MCP tool schemas for the `llm.tools.{i}.tool.json_schema` span
+    /// attributes.
+    pub tools_json: Vec<String>,
 }
 
 /// Extract query, chat history, and build agent -- shared across both code paths.
@@ -288,47 +296,59 @@ pub async fn prepare_request(
         .map(|tools| tools.iter().map(aura::builder::ClientTool::from).collect());
 
     // Build the appropriate agent type based on orchestration config
-    let streaming_agent: Arc<dyn StreamingAgent> = if config.orchestration_enabled() {
-        // Orchestration path: build via streaming agent builder (returns Orchestrator).
-        // Client tools are filtered per-coordinator/per-worker inside the orchestrator.
-        let builder = RigBuilder::new(config.clone(), data.pending_approvals.clone())
-            .with_hitl_hmac(data.hitl_webhook_hmac.clone());
-        builder
-            .build_streaming_agent_with_headers(
-                Some(req_headers_map),
-                Some(chat_session_id.to_string()),
-                client_tools_vec.clone(),
-                Some(request_id.clone()),
-            )
-            .await
-            .map_err(|e| {
-                error!("Failed to build streaming agent: {}", e);
-                PrepareError::Internal(format!("Failed to build streaming agent: {e}"))
-            })?
-    } else {
-        // Standard path: build Agent with optional additional tools and client tools.
-        // Only attach client tools if the agent opted in via [agent].enable_client_tools.
-        let client_tools = if config.agent.enable_client_tools {
-            req.tools.as_deref()
+    let (streaming_agent, tools_json): (Arc<dyn StreamingAgent>, Vec<String>) =
+        if config.orchestration_enabled() {
+            // Orchestration path: build via streaming agent builder (returns Orchestrator).
+            // Client tools are filtered per-coordinator/per-worker inside the orchestrator.
+            let builder = RigBuilder::new(config.clone(), data.pending_approvals.clone())
+                .with_hitl_hmac(data.hitl_webhook_hmac.clone());
+            let agent = builder
+                .build_streaming_agent_with_headers(
+                    Some(req_headers_map),
+                    Some(chat_session_id.to_string()),
+                    client_tools_vec.clone(),
+                    Some(request_id.clone()),
+                )
+                .await
+                .map_err(|e| {
+                    error!("Failed to build streaming agent: {}", e);
+                    PrepareError::Internal(format!("Failed to build streaming agent: {e}"))
+                })?;
+            // Worker spans carry their own filtered tool lists.
+            (agent, Vec::new())
         } else {
-            None
+            // Standard path: build Agent with optional additional tools and client tools.
+            // Only attach client tools if the agent opted in via [agent].enable_client_tools.
+            let client_tools = if config.agent.enable_client_tools {
+                req.tools.as_deref()
+            } else {
+                None
+            };
+            let agent = build_agent_for_request(
+                &config,
+                req_headers_map,
+                additional_tools,
+                client_tools,
+                request_id.clone(),
+                chat_session_id.to_string(),
+                data,
+            )
+            .await?;
+            let tools_json = agent.otel_llm_tools();
+            (agent as Arc<dyn StreamingAgent>, tools_json)
         };
-        build_agent_for_request(
-            &config,
-            req_headers_map,
-            additional_tools,
-            client_tools,
-            request_id.clone(),
-            chat_session_id.to_string(),
-            data,
-        )
-        .await? as Arc<dyn StreamingAgent>
-    };
 
     let (provider, model) = streaming_agent.get_provider_info();
     let model_str = format!("{provider}/{model}");
     let completion_id = format!("chatcmpl-{}", Uuid::new_v4());
     let created_timestamp = Utc::now().timestamp() as u64;
+
+    let user_id = req.user.clone().filter(|u| !u.is_empty());
+    let metadata_json = req
+        .metadata
+        .as_ref()
+        .filter(|m| !m.is_empty())
+        .and_then(|m| serde_json::to_string(m).ok());
 
     Ok(RequestSetup {
         query,
@@ -341,6 +361,9 @@ pub async fn prepare_request(
         chat_session_id: chat_session_id.to_string(),
         has_client_tools,
         request_id,
+        user_id,
+        metadata_json,
+        tools_json,
     })
 }
 
@@ -501,6 +524,9 @@ pub async fn execute_completion(
     let _resource_guard =
         RequestResourceGuard::new(config.request_id.clone(), config.pending_approvals.clone());
 
+    let invocation_parameters = aura::logging::llm_invocation_parameters(&setup.config.agent.llm);
+    let orchestration_enabled = setup.config.orchestration_enabled();
+
     // Destructure to move chat_history instead of cloning
     let RequestSetup {
         query,
@@ -513,6 +539,9 @@ pub async fn execute_completion(
         chat_session_id,
         has_client_tools: _,
         request_id: _,
+        user_id,
+        metadata_json,
+        tools_json,
     } = setup;
 
     // Orchestration spawns inside `stream_with_timeout`, so SSE side-channel
@@ -549,12 +578,14 @@ pub async fn execute_completion(
         request_id: config.request_id.clone(),
         session_id: chat_session_id.clone(),
         query: config.query_for_otel,
-        identity_id: String::new(),
+        user_id,
+        metadata_json,
+        invocation_parameters,
+        tools_json,
         message_count: config.message_count,
-        usage_state: usage_state.clone(),
         response_content: config.response_content,
         system_prompt: streaming_agent.system_prompt().map(str::to_string),
-        is_orchestration: streaming_agent.is_orchestration(),
+        orchestration_enabled,
     };
     otel_ctx.record_input();
 
@@ -1279,6 +1310,7 @@ mod tests {
             max_tokens: None,
             stream,
             metadata: None,
+            user: None,
             tools: None,
         }
     }
@@ -1401,6 +1433,9 @@ mod tests {
             chat_session_id: "cs-test".to_string(),
             has_client_tools: false,
             request_id: request_id.clone(),
+            user_id: None,
+            metadata_json: None,
+            tools_json: vec![],
         };
         let config = CompletionConfig {
             request_id,

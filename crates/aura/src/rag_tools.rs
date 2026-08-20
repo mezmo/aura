@@ -4,7 +4,7 @@ use rig::tool::Tool;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
-use tracing::{debug, info, warn};
+use tracing::{Instrument, debug, info, warn};
 
 /// Macro to create unique vector search tool structs for each vector store
 macro_rules! create_vector_search_tool {
@@ -68,6 +68,9 @@ macro_rules! create_vector_search_tool {
             }
 
             async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+                let span = tracing::info_span!("vector.search", "vector.store" = Self::NAME);
+                crate::logging::set_input_attributes(&span, &args.query);
+
                 info!(
                     "🔍 Searching vector store: '{}' (limit: {}, min_score: {})",
                     args.query, args.limit, args.min_score
@@ -76,6 +79,7 @@ macro_rules! create_vector_search_tool {
                 let search_results = self
                     .vector_store
                     .search(&args.query, args.limit)
+                    .instrument(span.clone())
                     .await?;
 
                 // Filter by minimum score if specified
@@ -83,6 +87,16 @@ macro_rules! create_vector_search_tool {
                     .into_iter()
                     .filter(|result| result.score >= args.min_score)
                     .collect();
+
+                let documents: Vec<crate::logging::RetrievedDocument<'_>> = filtered_results
+                    .iter()
+                    .map(|r| crate::logging::RetrievedDocument {
+                        content: &r.content,
+                        score: r.score as f64,
+                        metadata: r.metadata.as_ref(),
+                    })
+                    .collect();
+                crate::logging::set_retrieval_documents(&span, &documents);
 
                 let results_count = filtered_results.len();
 
