@@ -20,18 +20,19 @@
 //! `agent.stream` is created as a **root span** (`parent: None`) so that
 //! Phoenix sees it as the trace root.  I/O attributes (`input.value`,
 //! `output.value`, `user.id`, `session.id`, `metadata`) always live on this
-//! span. Token counts live here in **single-agent mode only**; in
-//! **orchestration mode** they live on the per-phase child spans
-//! (`orchestration.planning`, `orchestration.worker`,
-//! `orchestration.synthesis`, `orchestration.evaluation`) so Phoenix's
-//! rollup shows the accurate aggregate without double-counting the parent.
+//! span. Token counts live on the `agent.turn` spans only: the Rig fork
+//! records per-call model identifiers and usage there, Phoenix prices those
+//! LLM-kind spans (`openinference_exporter::infer_span_kind`), and every
+//! aggregate — per worker, per phase, per trace — is Phoenix's rollup of
+//! the turns. No Aura-owned span records token counts, so nothing
+//! double-counts.
 //!
 //! ### Single-agent mode
 //!
 //! ```text
-//! agent.stream (AGENT, ROOT)        <- Phoenix root span, lives for full stream duration
-//!   ├── user.id, session.id, metadata, input.value, output.value, tokens
-//!   └── agent.turn (LLM)           <- from Rig fork (reuses agent.stream as parent)
+//! agent.stream (LLM, ROOT)          <- Phoenix root span, lives for full stream duration
+//!   ├── user.id, session.id, metadata, input.value, output.value
+//!   └── agent.turn (LLM)           <- from Rig fork; carries model + per-call tokens
 //!       ├── execute_tool (TOOL)     <- from Rig (no error status — see below)
 //!       │   └── mcp.tool_call (TOOL) <- from Aura, canonical tool span with error status
 //!       └── execute_tool (TOOL)
@@ -41,12 +42,12 @@
 //! ### Orchestration mode
 //!
 //! ```text
-//! agent.stream (AGENT, ROOT)
+//! agent.stream (LLM, ROOT)
 //!   └── orchestration (CHAIN)                   <- full orchestration lifecycle
-//!         ├── orchestration.planning (CHAIN)     <- coordinator routing/planning
+//!         ├── orchestration.planning (LLM)         <- coordinator routing/planning
 //!         │   └── agent.turn (LLM) → ...
 //!         └── orchestration.iteration (CHAIN)    <- per plan-execute-continue cycle
-//!             └── orchestration.worker (AGENT)   <- per worker task
+//!             └── orchestration.worker (LLM)       <- per worker task
 //!                 └── agent.turn (LLM) → execute_tool → mcp.tool_call
 //! ```
 //!
@@ -105,16 +106,30 @@ static TRACER_PROVIDER: OnceLock<TracerProvider> = OnceLock::new();
 
 /// LLM provider identifier (e.g. "openai", "anthropic").
 pub const ATTR_LLM_SYSTEM: &str = "llm.system";
+/// LLM hosting provider (e.g. "openai", "bedrock").
+pub const ATTR_LLM_PROVIDER: &str = "llm.provider";
 /// Model name (e.g. "gpt-4o").
 pub const ATTR_LLM_MODEL_NAME: &str = "llm.model_name";
 /// Prompt / input token count.
 pub const ATTR_LLM_TOKEN_PROMPT: &str = "llm.token_count.prompt";
 /// Completion / output token count.
 pub const ATTR_LLM_TOKEN_COMPLETION: &str = "llm.token_count.completion";
-/// Total token count (prompt + completion).
-pub const ATTR_LLM_TOKEN_TOTAL: &str = "llm.token_count.total";
-/// Completion tokens spent generating tool call JSON (subset of completion).
-pub const ATTR_LLM_TOKEN_TOOL_COMPLETION: &str = "llm.token_count.tool_completion";
+/// LLM call parameters (temperature, max_tokens, …) as a JSON object string.
+pub const ATTR_LLM_INVOCATION_PARAMETERS: &str = "llm.invocation_parameters";
+/// End-user identifier from the request.
+pub const ATTR_USER_ID: &str = "user.id";
+/// Caller-supplied request metadata as a JSON object string.
+pub const ATTR_METADATA: &str = "metadata";
+/// Aura release that produced the trace.
+pub const ATTR_AURA_VERSION: &str = "aura.version";
+/// Aura workspace version.
+pub const AURA_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Serving path: "orchestration" or "single-agent".
+pub const ATTR_AURA_MODE: &str = "aura.mode";
+/// Prompt template with placeholders, before variable substitution.
+pub const ATTR_LLM_PROMPT_TEMPLATE: &str = "llm.prompt_template.template";
+/// Prompt template variables as a JSON object string.
+pub const ATTR_LLM_PROMPT_TEMPLATE_VARIABLES: &str = "llm.prompt_template.variables";
 /// Assembled system prompt sent to the provider (preamble + skill catalog,
 /// etc.), as an OTel GenAI array of typed parts.
 pub const ATTR_GEN_AI_SYSTEM_INSTRUCTIONS: &str = "gen_ai.system_instructions";
@@ -284,11 +299,19 @@ pub fn init_otel_provider() -> Option<&'static TracerProvider> {
     let exporter = crate::openinference_exporter::OpenInferenceExporter::new(otlp_exporter);
 
     let service_name = std::env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| "aura".to_string());
+    // Phoenix routes traces to a project solely by the
+    // `openinference.project.name` resource attribute (its OTLP receiver
+    // ignores `service.name`); without it, traces land in Phoenix's
+    // default project.
+    let project_name =
+        std::env::var("PHOENIX_PROJECT_NAME").unwrap_or_else(|_| service_name.clone());
 
     let provider = TracerProvider::builder()
         .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
         .with_resource(opentelemetry_sdk::Resource::new(vec![
             opentelemetry::KeyValue::new("service.name", service_name),
+            opentelemetry::KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
+            opentelemetry::KeyValue::new("openinference.project.name", project_name),
         ]))
         .build();
 
@@ -440,11 +463,22 @@ pub fn set_span_ok(span: &tracing::Span) {
     let _ = span;
 }
 
-/// Mark the span status as error with a message. No-op when the `otel` feature is disabled.
+/// Mark the span status as error with a message, and attach an OTel
+/// `exception` span event carrying `exception.message` — the shape Phoenix
+/// renders on failed spans. No-op when the `otel` feature is disabled.
 #[cfg(feature = "otel")]
 pub fn set_span_error(span: &tracing::Span, msg: impl Into<String>) {
     use tracing_opentelemetry::OpenTelemetrySpanExt;
-    span.set_status(opentelemetry::trace::Status::error(msg.into()));
+    let msg = msg.into();
+    // The tracing-opentelemetry layer rewrites an `error`-only event (no
+    // message field) into a span event named `exception`. Fired before
+    // `set_status` so the clean message below overrides the Debug-formatted
+    // status the layer derives from the event.
+    {
+        let _guard = span.enter();
+        tracing::error!(error = msg.as_str());
+    }
+    span.set_status(opentelemetry::trace::Status::error(msg));
 }
 
 /// Mark the span status as error with a message. No-op when the `otel` feature is disabled.
@@ -458,10 +492,15 @@ pub fn set_span_error(span: &tracing::Span, _msg: impl Into<String>) {
 // ---------------------------------------------------------------------------
 
 /// Record LLM provider and model identifiers on a span.
+///
+/// Sets both `llm.system` and `llm.provider` to the same provider string:
+/// Phoenix cost tracking matches `llm.provider` + `llm.model_name` against
+/// its pricing table, while `llm.system` is what its UI displays.
 #[cfg(feature = "otel")]
 pub fn set_llm_identifiers(span: &tracing::Span, provider: &str, model: &str) {
     use tracing_opentelemetry::OpenTelemetrySpanExt;
     span.set_attribute(ATTR_LLM_SYSTEM, provider.to_string());
+    span.set_attribute(ATTR_LLM_PROVIDER, provider.to_string());
     span.set_attribute(ATTR_LLM_MODEL_NAME, model.to_string());
 }
 
@@ -470,35 +509,113 @@ pub fn set_llm_identifiers(span: &tracing::Span, _provider: &str, _model: &str) 
     let _ = span;
 }
 
-/// Record token usage counters on a span.
-///
-/// `tool_completion` is the subset of `completion` spent generating tool call JSON.
-/// Only recorded when non-zero to avoid noise on single-turn (no-tool) interactions.
+/// Build the `llm.invocation_parameters` JSON object string for an LLM config
+/// (temperature, max_tokens, and any additional params). Returns `None` when
+/// the config sets no call parameters.
+pub fn llm_invocation_parameters(llm: &aura_config::LlmConfig) -> Option<String> {
+    let mut map = serde_json::Map::new();
+    if let Some(t) = llm.temperature() {
+        map.insert("temperature".into(), t.into());
+    }
+    if let Some(m) = llm.max_tokens() {
+        map.insert("max_tokens".into(), m.into());
+    }
+    if let Some(serde_json::Value::Object(extra)) = llm.additional_params() {
+        map.extend(extra);
+    }
+    if map.is_empty() {
+        None
+    } else {
+        Some(serde_json::Value::Object(map).to_string())
+    }
+}
+
+/// Record LLM invocation parameters (a JSON object string) on a span.
 #[cfg(feature = "otel")]
-pub fn set_token_usage(
-    span: &tracing::Span,
-    prompt: u64,
-    completion: u64,
-    total: u64,
-    tool_completion: u64,
-) {
+pub fn set_llm_invocation_parameters(span: &tracing::Span, params_json: &str) {
     use tracing_opentelemetry::OpenTelemetrySpanExt;
-    span.set_attribute(ATTR_LLM_TOKEN_PROMPT, prompt as i64);
-    span.set_attribute(ATTR_LLM_TOKEN_COMPLETION, completion as i64);
-    span.set_attribute(ATTR_LLM_TOKEN_TOTAL, total as i64);
-    if tool_completion > 0 {
-        span.set_attribute(ATTR_LLM_TOKEN_TOOL_COMPLETION, tool_completion as i64);
+    span.set_attribute(ATTR_LLM_INVOCATION_PARAMETERS, params_json.to_string());
+}
+
+#[cfg(not(feature = "otel"))]
+pub fn set_llm_invocation_parameters(span: &tracing::Span, _params_json: &str) {
+    let _ = span;
+}
+
+/// Record the prompt template and its variables on a span.
+///
+/// The template (static text with `%%VAR%%` placeholders, no request
+/// content) is always recorded; the variables carry request content, so
+/// they follow the content-recording rules (`OTEL_RECORD_CONTENT` gate
+/// plus truncation), mirroring `input.value`.
+#[cfg(feature = "otel")]
+pub fn set_llm_prompt_template(span: &tracing::Span, template: &str, variables: &[(&str, &str)]) {
+    use tracing_opentelemetry::OpenTelemetrySpanExt;
+    span.set_attribute(ATTR_LLM_PROMPT_TEMPLATE, template.to_string());
+    if should_record_content() {
+        let map: serde_json::Map<String, serde_json::Value> = variables
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), truncate_for_otel(v).into()))
+            .collect();
+        span.set_attribute(
+            ATTR_LLM_PROMPT_TEMPLATE_VARIABLES,
+            serde_json::Value::Object(map).to_string(),
+        );
     }
 }
 
 #[cfg(not(feature = "otel"))]
-pub fn set_token_usage(
-    span: &tracing::Span,
-    _prompt: u64,
-    _completion: u64,
-    _total: u64,
-    _tool_completion: u64,
-) {
+pub fn set_llm_prompt_template(span: &tracing::Span, _template: &str, _variables: &[(&str, &str)]) {
+    let _ = span;
+}
+
+/// Record the tool schemas advertised to the model as OpenInference
+/// `llm.tools.{i}.tool.json_schema` attributes.
+#[cfg(feature = "otel")]
+pub fn set_llm_tools(span: &tracing::Span, schemas: &[String]) {
+    use tracing_opentelemetry::OpenTelemetrySpanExt;
+    for (i, schema) in schemas.iter().enumerate() {
+        span.set_attribute(format!("llm.tools.{i}.tool.json_schema"), schema.clone());
+    }
+}
+
+#[cfg(not(feature = "otel"))]
+pub fn set_llm_tools(span: &tracing::Span, _schemas: &[String]) {
+    let _ = span;
+}
+
+/// A retrieved document for [`set_retrieval_documents`].
+pub struct RetrievedDocument<'a> {
+    pub content: &'a str,
+    pub score: f64,
+    pub metadata: Option<&'a serde_json::Value>,
+}
+
+/// Record retrieved documents as OpenInference `retrieval.documents.{i}.*`
+/// attributes. Scores are always recorded; content and metadata only when
+/// content recording is enabled (`OTEL_RECORD_CONTENT`).
+#[cfg(feature = "otel")]
+pub fn set_retrieval_documents(span: &tracing::Span, docs: &[RetrievedDocument<'_>]) {
+    use tracing_opentelemetry::OpenTelemetrySpanExt;
+    for (i, doc) in docs.iter().enumerate() {
+        span.set_attribute(format!("retrieval.documents.{i}.document.score"), doc.score);
+        if should_record_content() {
+            span.set_attribute(
+                format!("retrieval.documents.{i}.document.content"),
+                truncate_for_otel(doc.content),
+            );
+            if let Some(meta) = doc.metadata {
+                span.set_attribute(
+                    format!("retrieval.documents.{i}.document.metadata"),
+                    meta.to_string(),
+                );
+            }
+        }
+    }
+}
+
+#[cfg(not(feature = "otel"))]
+pub fn set_retrieval_documents(span: &tracing::Span, _docs: &[RetrievedDocument<'_>]) {
     let _ = span;
 }
 
@@ -665,5 +782,32 @@ mod tests {
         let json = system_instructions_json("You are a helpful assistant.");
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed[0]["content"], "You are a helpful assistant.");
+    }
+
+    #[test]
+    fn llm_invocation_parameters_serializes_call_params() {
+        let llm: aura_config::LlmConfig = serde_json::from_value(serde_json::json!({
+            "provider": "openai",
+            "api_key": "k",
+            "model": "gpt-4o",
+            "temperature": 0.2,
+            "max_tokens": 512,
+        }))
+        .unwrap();
+        let params = llm_invocation_parameters(&llm).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&params).unwrap();
+        assert_eq!(parsed["temperature"], 0.2);
+        assert_eq!(parsed["max_tokens"], 512);
+    }
+
+    #[test]
+    fn llm_invocation_parameters_none_when_unset() {
+        let llm: aura_config::LlmConfig = serde_json::from_value(serde_json::json!({
+            "provider": "openai",
+            "api_key": "k",
+            "model": "gpt-4o",
+        }))
+        .unwrap();
+        assert!(llm_invocation_parameters(&llm).is_none());
     }
 }

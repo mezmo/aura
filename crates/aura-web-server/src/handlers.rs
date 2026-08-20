@@ -8,7 +8,7 @@ use aura::{
 use aura_events::{AgentInfo, ServerInfo};
 use axum::Json;
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
@@ -231,6 +231,14 @@ pub struct RequestSetup {
     pub has_client_tools: bool,
     /// Request id (`req_…`) shared by the agent build and the completion stream.
     pub request_id: String,
+    /// OpenAI-compatible `user` field, for the `user.id` span attribute.
+    pub user_id: Option<String>,
+    /// Request `metadata` serialized as a JSON object string, for the
+    /// `metadata` span attribute.
+    pub metadata_json: Option<String>,
+    /// MCP tool schemas for the `llm.tools.{i}.tool.json_schema` span
+    /// attributes.
+    pub tools_json: Vec<String>,
 }
 
 /// Extract query, chat history, and build agent -- shared across both code paths.
@@ -288,47 +296,59 @@ pub async fn prepare_request(
         .map(|tools| tools.iter().map(aura::builder::ClientTool::from).collect());
 
     // Build the appropriate agent type based on orchestration config
-    let streaming_agent: Arc<dyn StreamingAgent> = if config.orchestration_enabled() {
-        // Orchestration path: build via streaming agent builder (returns Orchestrator).
-        // Client tools are filtered per-coordinator/per-worker inside the orchestrator.
-        let builder = RigBuilder::new(config.clone(), data.pending_approvals.clone())
-            .with_hitl_hmac(data.hitl_webhook_hmac.clone());
-        builder
-            .build_streaming_agent_with_headers(
-                Some(req_headers_map),
-                Some(chat_session_id.to_string()),
-                client_tools_vec.clone(),
-                Some(request_id.clone()),
-            )
-            .await
-            .map_err(|e| {
-                error!("Failed to build streaming agent: {}", e);
-                PrepareError::Internal(format!("Failed to build streaming agent: {e}"))
-            })?
-    } else {
-        // Standard path: build Agent with optional additional tools and client tools.
-        // Only attach client tools if the agent opted in via [agent].enable_client_tools.
-        let client_tools = if config.agent.enable_client_tools {
-            req.tools.as_deref()
+    let (streaming_agent, tools_json): (Arc<dyn StreamingAgent>, Vec<String>) =
+        if config.orchestration_enabled() {
+            // Orchestration path: build via streaming agent builder (returns Orchestrator).
+            // Client tools are filtered per-coordinator/per-worker inside the orchestrator.
+            let builder = RigBuilder::new(config.clone(), data.pending_approvals.clone())
+                .with_hitl_hmac(data.hitl_webhook_hmac.clone());
+            let agent = builder
+                .build_streaming_agent_with_headers(
+                    Some(req_headers_map),
+                    Some(chat_session_id.to_string()),
+                    client_tools_vec.clone(),
+                    Some(request_id.clone()),
+                )
+                .await
+                .map_err(|e| {
+                    error!("Failed to build streaming agent: {}", e);
+                    PrepareError::Internal(format!("Failed to build streaming agent: {e}"))
+                })?;
+            // Worker spans carry their own filtered tool lists.
+            (agent, Vec::new())
         } else {
-            None
+            // Standard path: build Agent with optional additional tools and client tools.
+            // Only attach client tools if the agent opted in via [agent].enable_client_tools.
+            let client_tools = if config.agent.enable_client_tools {
+                req.tools.as_deref()
+            } else {
+                None
+            };
+            let agent = build_agent_for_request(
+                &config,
+                req_headers_map,
+                additional_tools,
+                client_tools,
+                request_id.clone(),
+                chat_session_id.to_string(),
+                data,
+            )
+            .await?;
+            let tools_json = agent.otel_llm_tools();
+            (agent as Arc<dyn StreamingAgent>, tools_json)
         };
-        build_agent_for_request(
-            &config,
-            req_headers_map,
-            additional_tools,
-            client_tools,
-            request_id.clone(),
-            chat_session_id.to_string(),
-            data,
-        )
-        .await? as Arc<dyn StreamingAgent>
-    };
 
     let (provider, model) = streaming_agent.get_provider_info();
     let model_str = format!("{provider}/{model}");
     let completion_id = format!("chatcmpl-{}", Uuid::new_v4());
     let created_timestamp = Utc::now().timestamp() as u64;
+
+    let user_id = req.user.clone().filter(|u| !u.is_empty());
+    let metadata_json = req
+        .metadata
+        .as_ref()
+        .filter(|m| !m.is_empty())
+        .and_then(|m| serde_json::to_string(m).ok());
 
     Ok(RequestSetup {
         query,
@@ -341,6 +361,9 @@ pub async fn prepare_request(
         chat_session_id: chat_session_id.to_string(),
         has_client_tools,
         request_id,
+        user_id,
+        metadata_json,
+        tools_json,
     })
 }
 
@@ -501,6 +524,9 @@ pub async fn execute_completion(
     let _resource_guard =
         RequestResourceGuard::new(config.request_id.clone(), config.pending_approvals.clone());
 
+    let invocation_parameters = aura::logging::llm_invocation_parameters(&setup.config.agent.llm);
+    let orchestration_enabled = setup.config.orchestration_enabled();
+
     // Destructure to move chat_history instead of cloning
     let RequestSetup {
         query,
@@ -513,6 +539,9 @@ pub async fn execute_completion(
         chat_session_id,
         has_client_tools: _,
         request_id: _,
+        user_id,
+        metadata_json,
+        tools_json,
     } = setup;
 
     // Orchestration spawns inside `stream_with_timeout`, so SSE side-channel
@@ -549,12 +578,14 @@ pub async fn execute_completion(
         request_id: config.request_id.clone(),
         session_id: chat_session_id.clone(),
         query: config.query_for_otel,
-        identity_id: String::new(),
+        user_id,
+        metadata_json,
+        invocation_parameters,
+        tools_json,
         message_count: config.message_count,
-        usage_state: usage_state.clone(),
         response_content: config.response_content,
         system_prompt: streaming_agent.system_prompt().map(str::to_string),
-        is_orchestration: streaming_agent.is_orchestration(),
+        orchestration_enabled,
     };
     otel_ctx.record_input();
 
@@ -990,14 +1021,96 @@ pub async fn health(State(state): State<Arc<AppState>>) -> Response {
     .into_response()
 }
 
+/// Ceiling on a single agent's MCP tool discovery, so one hung server can't
+/// hold an `/aura/info` request open indefinitely.
+const INFO_TOOL_DISCOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Query string for [`info`].
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct InfoQuery {
+    /// Comma-separated detail tokens; see [`ToolDetail::parse`].
+    #[serde(default)]
+    detail: Option<String>,
+}
+
+/// How much MCP tool information `GET /aura/info` should gather.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolDetail {
+    /// Config view only — no MCP server is contacted.
+    None,
+    /// Every field of the MCP `Tool` object, schemas included.
+    Full,
+    /// Tool names and descriptions.
+    Summary,
+}
+
+impl ToolDetail {
+    /// Read the `detail` query parameter.
+    ///
+    /// Tokens are comma-separated and trimmed; empty ones are ignored, so an
+    /// absent parameter and `detail=` both mean [`ToolDetail::None`].
+    /// `tools` outranks `tools:summary` when both appear, being a superset.
+    /// An unrecognized token is an error rather than a silent no-op — a
+    /// misspelled parameter should not look like a server with no tools.
+    fn parse(raw: Option<&str>) -> Result<Self, String> {
+        let mut detail = Self::None;
+        for token in raw.unwrap_or_default().split(',') {
+            match token.trim() {
+                "" => continue,
+                "tools" => detail = Self::Full,
+                "tools:summary" if detail != Self::Full => detail = Self::Summary,
+                "tools:summary" => {}
+                other => {
+                    return Err(format!(
+                        "unknown detail '{other}'; expected 'tools' or 'tools:summary'"
+                    ));
+                }
+            }
+        }
+        Ok(detail)
+    }
+}
+
 /// `GET /aura/info`: aura-native introspection. Off `/v1/` to keep the OpenAI surface clean.
-pub async fn info(State(state): State<Arc<AppState>>) -> Response {
-    let agents: Vec<AgentInfo> = state
-        .configs
-        .iter()
-        .filter(|config| !config.agent.hidden)
-        .map(aura::agent_info)
-        .collect();
+///
+/// `?detail=tools` (or `tools:summary`) additionally connects to every visible
+/// agent's MCP servers to list their tools, forwarding the caller's headers so
+/// the result reflects that caller's authorization. Agents are swept
+/// concurrently, but the response still costs a full round of MCP connections —
+/// callers that only need the config view should omit the parameter.
+pub async fn info(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<InfoQuery>,
+) -> Response {
+    let detail = match ToolDetail::parse(query.detail.as_deref()) {
+        Ok(detail) => detail,
+        Err(message) => {
+            return error_response(StatusCode::BAD_REQUEST, &message, "invalid_request_error");
+        }
+    };
+
+    let visible = state.configs.iter().filter(|config| !config.agent.hidden);
+
+    let agents: Vec<AgentInfo> = if detail == ToolDetail::None {
+        visible.map(aura::agent_info).collect()
+    } else {
+        // Convert HeaderMap to HashMap for framework-agnostic passing
+        let req_headers: HashMap<String, String> = headers
+            .iter()
+            .filter_map(|(k, v)| v.to_str().ok().map(|val| (k.to_string(), val.to_string())))
+            .collect();
+
+        let mut agents: Vec<AgentInfo> = futures_util::future::join_all(visible.map(|config| {
+            aura::agent_info_with_tools(config, Some(&req_headers), INFO_TOOL_DISCOVERY_TIMEOUT)
+        }))
+        .await;
+
+        if detail == ToolDetail::Summary {
+            agents.iter_mut().for_each(aura::summarize_tools);
+        }
+        agents
+    };
 
     Json(ServerInfo {
         default_agent: state.default_agent.clone(),
@@ -1279,6 +1392,7 @@ mod tests {
             max_tokens: None,
             stream,
             metadata: None,
+            user: None,
             tools: None,
         }
     }
@@ -1401,6 +1515,9 @@ mod tests {
             chat_session_id: "cs-test".to_string(),
             has_client_tools: false,
             request_id: request_id.clone(),
+            user_id: None,
+            metadata_json: None,
+            tools_json: vec![],
         };
         let config = CompletionConfig {
             request_id,
@@ -1866,7 +1983,7 @@ model = "gpt-4o-mini"
     #[tokio::test]
     async fn test_info_returns_agents_with_workers() {
         let state = make_info_state(vec![orch_info_config()], None);
-        let resp = info(State(state)).await;
+        let resp = info(State(state), HeaderMap::new(), Query(InfoQuery::default())).await;
         let info = parse_info_response(resp).await;
 
         assert_eq!(info.agents.len(), 1);
@@ -1892,7 +2009,10 @@ model = "gpt-4o-mini"
             )],
             None,
         );
-        let info = parse_info_response(info(State(state)).await).await;
+        let info = parse_info_response(
+            info(State(state), HeaderMap::new(), Query(InfoQuery::default())).await,
+        )
+        .await;
 
         assert_eq!(
             info.agents[0].description.as_deref(),
@@ -1925,7 +2045,10 @@ url = "http://127.0.0.1:9"
             ],
             None,
         );
-        let info = parse_info_response(info(State(state)).await).await;
+        let info = parse_info_response(
+            info(State(state), HeaderMap::new(), Query(InfoQuery::default())).await,
+        )
+        .await;
         let servers_of = |id: &str| {
             info.agents
                 .iter()
@@ -1967,12 +2090,123 @@ url = "http://127.0.0.1:9"
             ],
             Some("visible-agent"),
         );
-        let resp = info(State(state)).await;
+        let resp = info(State(state), HeaderMap::new(), Query(InfoQuery::default())).await;
         let info = parse_info_response(resp).await;
 
         let ids: Vec<_> = info.agents.iter().map(|agent| agent.id.as_str()).collect();
         assert_eq!(ids, ["visible-agent"]);
         assert_eq!(info.default_agent.as_deref(), Some("visible-agent"));
+    }
+
+    #[test]
+    fn tool_detail_parses_recognized_tokens() {
+        let parse = |raw: Option<&str>| ToolDetail::parse(raw);
+
+        // Absent and empty both mean "don't connect".
+        assert_eq!(parse(None), Ok(ToolDetail::None));
+        assert_eq!(parse(Some("")), Ok(ToolDetail::None));
+        assert_eq!(parse(Some(" , ")), Ok(ToolDetail::None));
+
+        assert_eq!(parse(Some("tools")), Ok(ToolDetail::Full));
+        assert_eq!(parse(Some(" tools ")), Ok(ToolDetail::Full));
+        assert_eq!(parse(Some("tools:summary")), Ok(ToolDetail::Summary));
+
+        // `tools` is a superset, so it wins in either order.
+        assert_eq!(parse(Some("tools,tools:summary")), Ok(ToolDetail::Full));
+        assert_eq!(parse(Some("tools:summary,tools")), Ok(ToolDetail::Full));
+
+        assert!(parse(Some("bogus")).is_err());
+        assert!(parse(Some("tools,bogus")).is_err());
+        // A near-miss is still rejected rather than silently ignored.
+        assert!(parse(Some("schemas")).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_info_rejects_unknown_detail_token() {
+        let state = make_info_state(vec![solo_info_config("solo")], None);
+        let resp = info(
+            State(state),
+            HeaderMap::new(),
+            Query(InfoQuery {
+                detail: Some("bogus".to_string()),
+            }),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let message = body["error"]["message"].as_str().unwrap_or_default();
+        assert!(message.contains("tools:summary"), "{body}");
+    }
+
+    /// Without `detail`, the response carries no `tools` key at all — the
+    /// wire shape is exactly what it was before the parameter existed.
+    #[tokio::test]
+    async fn test_info_omits_tools_without_detail() {
+        let state = make_info_state(
+            vec![info_config(
+                "dead-mcp",
+                "",
+                r#"
+[mcp.servers.dead]
+transport = "http_streamable"
+url = "http://127.0.0.1:9"
+"#,
+            )],
+            None,
+        );
+        let resp = info(State(state), HeaderMap::new(), Query(InfoQuery::default())).await;
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        let server = &body["agents"][0]["mcp_servers"]["dead"];
+        assert_eq!(server["transport"], "http_streamable");
+        assert!(server.get("tools").is_none(), "{body}");
+    }
+
+    /// An unreachable server reports no tools under either detail level, and
+    /// the config view survives intact.
+    #[tokio::test]
+    async fn test_info_detail_leaves_unreachable_server_without_tools() {
+        for detail in ["tools", "tools:summary"] {
+            let state = make_info_state(
+                vec![info_config(
+                    "dead-mcp",
+                    "",
+                    r#"
+[mcp.servers.dead]
+transport = "http_streamable"
+url = "http://127.0.0.1:9"
+"#,
+                )],
+                None,
+            );
+            let resp = info(
+                State(state),
+                HeaderMap::new(),
+                Query(InfoQuery {
+                    detail: Some(detail.to_string()),
+                }),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK, "{detail}");
+
+            let parsed = parse_info_response(resp).await;
+            assert_eq!(
+                parsed.agents[0].mcp_servers.as_ref().unwrap()["dead"],
+                aura_events::McpServerOverview::HttpStreamable {
+                    url: "http://127.0.0.1:9".to_string(),
+                    description: None,
+                    tools: None,
+                },
+                "{detail}"
+            );
+        }
     }
 
     // --- streaming / response builder tests ---

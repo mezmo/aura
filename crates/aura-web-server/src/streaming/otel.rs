@@ -7,7 +7,7 @@
 //! - [`StreamOtelContext::record_input`] — called at span start
 //! - [`StreamOtelContext::record_output`] — called after the stream ends
 
-use aura::{ResponseContent, UsageState};
+use aura::ResponseContent;
 
 use super::StreamTermination;
 
@@ -25,21 +25,20 @@ pub struct StreamOtelContext {
     pub request_id: String,
     pub session_id: String,
     pub query: String,
-    /// Identity from request headers (currently unused).
-    pub identity_id: String,
+    /// OpenAI-compatible `user` field from the request.
+    pub user_id: Option<String>,
+    /// Request `metadata` map serialized as a JSON object string.
+    pub metadata_json: Option<String>,
+    /// `llm.invocation_parameters` JSON for the effective LLM config.
+    pub invocation_parameters: Option<String>,
+    /// MCP tool schemas for `llm.tools.{i}.tool.json_schema`.
+    pub tools_json: Vec<String>,
     pub message_count: usize,
-    pub usage_state: UsageState,
     pub response_content: ResponseContent,
     /// Assembled system prompt sent to the provider.
     pub system_prompt: Option<String>,
-    /// True when the streaming agent is an orchestrator. Orchestration emits
-    /// per-phase LLM spans (`orchestration.planning`, `orchestration.worker`,
-    /// `orchestration.synthesis`, `orchestration.evaluation`) that each carry
-    /// their own `llm.token_count.*` attributes. Recording the aggregate on
-    /// the parent `agent.stream` span on top of that double-counts in
-    /// Phoenix's rollup, so `record_output` skips the token write here and
-    /// lets Phoenix sum the descendants.
-    pub is_orchestration: bool,
+    /// Whether the request is served by the multi-agent orchestrator.
+    pub orchestration_enabled: bool,
 }
 
 impl StreamOtelContext {
@@ -53,33 +52,47 @@ impl StreamOtelContext {
         }
         aura::logging::set_span_attribute(&span, "http.request_id", self.request_id.clone());
         aura::logging::set_span_attribute(&span, "session.id", self.session_id.clone());
-        if !self.identity_id.is_empty() {
-            aura::logging::set_span_attribute(&span, "identity.id", self.identity_id.clone());
+        aura::logging::set_span_attribute(
+            &span,
+            aura::logging::ATTR_AURA_VERSION,
+            aura::logging::AURA_VERSION,
+        );
+        aura::logging::set_span_attribute(
+            &span,
+            aura::logging::ATTR_AURA_MODE,
+            if self.orchestration_enabled {
+                "orchestration"
+            } else {
+                "single-agent"
+            },
+        );
+        if let Some(user_id) = &self.user_id {
+            aura::logging::set_span_attribute(&span, aura::logging::ATTR_USER_ID, user_id.clone());
+        }
+        if let Some(metadata) = &self.metadata_json {
+            aura::logging::set_span_attribute(
+                &span,
+                aura::logging::ATTR_METADATA,
+                metadata.clone(),
+            );
+        }
+        if let Some(params) = &self.invocation_parameters {
+            aura::logging::set_llm_invocation_parameters(&span, params);
+        }
+        if !self.tools_json.is_empty() {
+            aura::logging::set_llm_tools(&span, &self.tools_json);
         }
         aura::logging::set_span_attribute(&span, "message_count", self.message_count as i64);
     }
 
     /// Record output-side OTel attributes on the current span after the stream ends.
     ///
-    /// Captures token usage, response content (if available), and termination status.
+    /// Captures response content (if available) and termination status. Token
+    /// usage is not recorded here: each `agent.turn` child span carries its
+    /// own per-call usage (recorded by the Rig fork), and Phoenix's rollup
+    /// sums those descendants — an aggregate on this span would double-count.
     pub fn record_output(&self, termination: &StreamTermination) {
         let span = tracing::Span::current();
-        // In orchestration mode, per-phase spans already carry their own
-        // `llm.token_count.*` attributes; recording the aggregate on the parent
-        // `agent.stream` span would double-count under Phoenix's rollup.
-        if !self.is_orchestration {
-            let (prompt_tokens, completion_tokens, total_tokens) =
-                self.usage_state.get_final_usage();
-            let tool_completion_tokens = self.usage_state.get_tool_completion_tokens();
-            aura::logging::set_token_usage(
-                &span,
-                prompt_tokens,
-                completion_tokens,
-                total_tokens,
-                tool_completion_tokens,
-            );
-        }
-
         // Record response content for OpenInference/Phoenix visibility
         if let Some(content) = self.response_content.get() {
             aura::logging::set_output_attributes(&span, &content);

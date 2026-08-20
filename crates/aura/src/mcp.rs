@@ -1147,6 +1147,33 @@ impl McpManager {
             .chain(self.stdio_tools.values().flat_map(|tools| tools.iter()))
     }
 
+    /// Serialize tool definitions as OpenAI-style function schemas, for the
+    /// OpenInference `llm.tools.{i}.tool.json_schema` span attributes.
+    ///
+    /// `filter` narrows by glob patterns (worker `mcp_filter` semantics);
+    /// `None` includes every tool.
+    pub fn tool_schemas_json(&self, filter: Option<&[String]>) -> Vec<String> {
+        self.tool_definitions_iter()
+            .filter(|tool| match filter {
+                None => true,
+                Some(patterns) => patterns
+                    .iter()
+                    .any(|p| crate::config::glob_match(p, &tool.name)),
+            })
+            .map(|tool| {
+                serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": tool.input_schema,
+                    }
+                })
+                .to_string()
+            })
+            .collect()
+    }
+
     /// Returns a `server_name → tool_names` map for all transports.
     ///
     /// Used by the scratchpad layer to resolve per-server `min_tokens`

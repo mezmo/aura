@@ -151,6 +151,8 @@ pub struct Agent {
     /// Assembled system prompt handed to the provider builder
     /// (preamble + skill catalog, etc.).
     pub(crate) system_prompt: String,
+    /// `llm.invocation_parameters` JSON for OTel spans.
+    pub(crate) invocation_parameters: Option<String>,
 }
 
 impl Agent {
@@ -432,6 +434,7 @@ impl Agent {
 
         // Extract model name for logging
         let model_name = config.llm.model_name().to_string();
+        let (llm_provider, _) = config.llm.model_info();
 
         let mut system_prompt = config.effective_preamble().to_string();
         if let Some(catalog) = render_skill_catalog(&config.agent.skills) {
@@ -472,7 +475,12 @@ impl Agent {
 
                 // Create agent builder with system prompt and temperature
                 let mut agent_builder = rig::agent::AgentBuilder::new(completion_model);
-                agent_builder = agent_builder.preamble(&system_prompt);
+                agent_builder = agent_builder
+                    .name(&config.agent.name)
+                    .provider_name(llm_provider)
+                    .model_name(&model_name)
+                    .preamble(&system_prompt);
+
                 if let Some(temp) = temperature {
                     agent_builder = agent_builder.temperature(*temp);
                 }
@@ -538,7 +546,12 @@ impl Agent {
 
                 // Create agent builder with system prompt and temperature
                 let mut agent_builder = rig::agent::AgentBuilder::new(completion_model);
-                agent_builder = agent_builder.preamble(&system_prompt);
+                agent_builder = agent_builder
+                    .name(&config.agent.name)
+                    .provider_name(llm_provider)
+                    .model_name(&model_name)
+                    .preamble(&system_prompt);
+
                 if let Some(temp) = temperature {
                     agent_builder = agent_builder.temperature(*temp);
                 }
@@ -603,7 +616,12 @@ impl Agent {
 
                 // Create agent builder with system prompt and temperature
                 let mut agent_builder = rig::agent::AgentBuilder::new(completion_model);
-                agent_builder = agent_builder.preamble(&system_prompt);
+                agent_builder = agent_builder
+                    .name(&config.agent.name)
+                    .provider_name(llm_provider)
+                    .model_name(&model_name)
+                    .preamble(&system_prompt);
+
                 if let Some(temp) = temperature {
                     agent_builder = agent_builder.temperature(*temp);
                 }
@@ -652,7 +670,12 @@ impl Agent {
                 let completion_model = client.completion_model(model);
 
                 let mut agent_builder = rig::agent::AgentBuilder::new(completion_model);
-                agent_builder = agent_builder.preamble(&system_prompt);
+                agent_builder = agent_builder
+                    .name(&config.agent.name)
+                    .provider_name(llm_provider)
+                    .model_name(&model_name)
+                    .preamble(&system_prompt);
+
                 if let Some(temp) = temperature {
                     agent_builder = agent_builder.temperature(*temp);
                 }
@@ -696,7 +719,12 @@ impl Agent {
 
                 // Create agent builder with system prompt and temperature
                 let mut agent_builder = rig::agent::AgentBuilder::new(completion_model);
-                agent_builder = agent_builder.preamble(&system_prompt);
+                agent_builder = agent_builder
+                    .name(&config.agent.name)
+                    .provider_name(llm_provider)
+                    .model_name(&model_name)
+                    .preamble(&system_prompt);
+
                 if let Some(temp) = temperature {
                     agent_builder = agent_builder.temperature(*temp);
                 }
@@ -744,7 +772,12 @@ impl Agent {
                 let completion_model = client.completion_model(model);
 
                 let mut agent_builder = rig::agent::AgentBuilder::new(completion_model);
-                agent_builder = agent_builder.preamble(&system_prompt);
+                agent_builder = agent_builder
+                    .name(&config.agent.name)
+                    .provider_name(llm_provider)
+                    .model_name(&model_name)
+                    .preamble(&system_prompt);
+
                 if let Some(temp) = temperature {
                     agent_builder = agent_builder.temperature(*temp);
                 }
@@ -787,6 +820,7 @@ impl Agent {
             client_tool_names,
             turn_nudge,
             system_prompt,
+            invocation_parameters: crate::logging::llm_invocation_parameters(&config.llm),
         })
     }
 
@@ -1144,6 +1178,7 @@ impl Agent {
             query,
             &self.system_prompt,
         );
+        self.record_llm_call_attributes(&span);
 
         let stream = self.stream_prompt(query).await;
         let result = self.collect_stream_response(stream).await;
@@ -1169,11 +1204,23 @@ impl Agent {
             query,
             &self.system_prompt,
         );
+        self.record_llm_call_attributes(&span);
 
         let stream = self.stream_chat(query, chat_history).await;
         let result = self.collect_stream_response(stream).await;
         record_completion_result(&span, &result);
         result
+    }
+
+    /// Record invocation parameters and the advertised tool schemas on a span.
+    fn record_llm_call_attributes(&self, span: &tracing::Span) {
+        if let Some(params) = &self.invocation_parameters {
+            crate::logging::set_llm_invocation_parameters(span, params);
+        }
+        let tools = self.otel_llm_tools();
+        if !tools.is_empty() {
+            crate::logging::set_llm_tools(span, &tools);
+        }
     }
 
     /// Internal: Collect a stream into a CompletionResponse.
@@ -1526,6 +1573,20 @@ impl Agent {
     pub fn mcp_manager(&self) -> Option<&McpManager> {
         self.mcp_manager.as_deref()
     }
+
+    /// MCP tool schemas serialized for the `llm.tools.{i}.tool.json_schema`
+    /// span attributes. Empty when no MCP manager is configured.
+    pub fn otel_llm_tools(&self) -> Vec<String> {
+        self.mcp_manager
+            .as_ref()
+            .map(|m| m.tool_schemas_json(None))
+            .unwrap_or_default()
+    }
+
+    /// `llm.invocation_parameters` JSON for OTel spans.
+    pub fn otel_invocation_parameters(&self) -> Option<&str> {
+        self.invocation_parameters.as_deref()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1568,7 +1629,9 @@ fn record_input_attributes(
     crate::logging::set_system_prompt_attribute(span, system_prompt);
 }
 
-/// Record completion result fields (usage, content, status) on the span via OTel API.
+/// Record completion result fields (content, status) on the span via OTel API.
+/// Token usage lives on the nested `agent.turn` spans (recorded by the Rig
+/// fork), which Phoenix rolls up and prices.
 fn record_completion_result(
     span: &tracing::Span,
     result: &Result<
@@ -1578,13 +1641,6 @@ fn record_completion_result(
 ) {
     match result {
         Ok(response) => {
-            crate::logging::set_token_usage(
-                span,
-                response.usage.input_tokens,
-                response.usage.output_tokens,
-                response.usage.total_tokens,
-                0, // no per-tool breakdown in non-streaming path
-            );
             crate::logging::set_output_attributes(span, &response.content);
             crate::logging::set_span_ok(span);
         }

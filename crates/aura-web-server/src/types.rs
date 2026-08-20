@@ -227,6 +227,10 @@ pub struct ChatCompletionRequest {
     #[serde(default)]
     pub metadata: Option<HashMap<String, String>>,
 
+    /// OpenAI-compatible end-user identifier.
+    #[serde(default)]
+    pub user: Option<String>,
+
     /// Client-side tool definitions. Per-agent opt-in via
     /// `[agent].enable_client_tools` and `[orchestration.worker.<name>].enable_client_tools`
     /// in TOML; tools are filtered with the matching `client_tool_filter`.

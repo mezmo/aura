@@ -147,10 +147,6 @@ impl StreamingAgent for OrchestratorFactory {
         self.agent_config.llm.model_info()
     }
 
-    fn is_orchestration(&self) -> bool {
-        true
-    }
-
     async fn stream(
         &self,
         query: &str,
