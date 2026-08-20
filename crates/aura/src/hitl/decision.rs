@@ -113,7 +113,11 @@ pub enum ApprovalOrigin {
     /// glob that fired.
     ConfigGate { matched_pattern: String },
     /// The agent called `request_approval` itself.
-    AgentRequested { reason: String },
+    AgentRequested {
+        reason: String,
+        /// `[agent].name` of the config that built this agent.
+        agent_name: String,
+    },
 }
 
 /// Typestate for a parked call awaiting its decision.

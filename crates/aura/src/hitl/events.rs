@@ -131,9 +131,12 @@ fn origin_to_wire(origin: &ApprovalOrigin) -> ApprovalOriginWire {
         ApprovalOrigin::ConfigGate { matched_pattern } => ApprovalOriginWire::ConfigGate {
             matched_pattern: matched_pattern.clone(),
         },
-        ApprovalOrigin::AgentRequested { reason } => ApprovalOriginWire::AgentRequested {
-            reason: reason.clone(),
-        },
+        ApprovalOrigin::AgentRequested { reason, agent_name } => {
+            ApprovalOriginWire::AgentRequested {
+                reason: reason.clone(),
+                agent_name: agent_name.clone(),
+            }
+        }
     }
 }
 

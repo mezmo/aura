@@ -786,6 +786,7 @@ mod tests {
             },
             origin: ApprovalOrigin::AgentRequested {
                 reason: "deleting prod ns".to_string(),
+                agent_name: "sre-assistant".to_string(),
             },
             items: vec![],
         };
@@ -802,6 +803,7 @@ mod tests {
         // task is flattened to task_id/worker siblings, not a nested object.
         assert!(value["scope"].get("task").is_none());
         assert_eq!(value["origin"]["kind"], "agent_requested");
+        assert_eq!(value["origin"]["agent_name"], "sre-assistant");
         // regression guard: no externally-tagged domain variant keys.
         assert!(value["scope"].get("Worker").is_none());
         assert!(value["origin"].get("AgentRequested").is_none());
@@ -842,6 +844,7 @@ mod tests {
             scope: AgentScope::Single { session_id: None },
             origin: ApprovalOrigin::AgentRequested {
                 reason: "touches prod".to_string(),
+                agent_name: "test-agent".to_string(),
             },
             items: vec![ApprovalItem {
                 tool_name: "request_approval".to_string(),
@@ -868,6 +871,7 @@ mod tests {
             scope: AgentScope::Single { session_id: None },
             origin: ApprovalOrigin::AgentRequested {
                 reason: "touches prod".to_string(),
+                agent_name: "test-agent".to_string(),
             },
             items: vec![ApprovalItem {
                 tool_name: "request_approval".to_string(),
@@ -920,6 +924,7 @@ mod tests {
             "conv-req-1",
             ApprovalOrigin::AgentRequested {
                 reason: "test".into(),
+                agent_name: "test-agent".to_string(),
             },
         );
         let decision_id = request.decision_id;
@@ -1001,6 +1006,7 @@ mod tests {
             "conv-req-3",
             ApprovalOrigin::AgentRequested {
                 reason: "test".into(),
+                agent_name: "test-agent".to_string(),
             },
         );
         let decision_id = request.decision_id;
@@ -1065,6 +1071,7 @@ mod tests {
             "conv-req-backstop",
             ApprovalOrigin::AgentRequested {
                 reason: "test".into(),
+                agent_name: "test-agent".to_string(),
             },
         );
         let decision_id = request.decision_id;
@@ -1097,6 +1104,7 @@ mod tests {
             "conv-req-4",
             ApprovalOrigin::AgentRequested {
                 reason: "test".into(),
+                agent_name: "test-agent".to_string(),
             },
         );
         let cancel = crate::request_cancellation::RequestCancelToken::unbound();

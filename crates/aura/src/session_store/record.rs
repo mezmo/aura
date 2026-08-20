@@ -57,8 +57,14 @@ pub enum ScopeRecord {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum OriginRecord {
-    ConfigGate { matched_pattern: String },
-    AgentRequested { reason: String },
+    ConfigGate {
+        matched_pattern: String,
+    },
+    AgentRequested {
+        reason: String,
+        #[serde(default)]
+        agent_name: String,
+    },
 }
 
 /// Storage form of a recorded [`ApprovalDecision`].
@@ -192,8 +198,9 @@ impl From<&ApprovalOrigin> for OriginRecord {
             ApprovalOrigin::ConfigGate { matched_pattern } => OriginRecord::ConfigGate {
                 matched_pattern: matched_pattern.clone(),
             },
-            ApprovalOrigin::AgentRequested { reason } => OriginRecord::AgentRequested {
+            ApprovalOrigin::AgentRequested { reason, agent_name } => OriginRecord::AgentRequested {
                 reason: reason.clone(),
+                agent_name: agent_name.clone(),
             },
         }
     }
@@ -205,7 +212,9 @@ impl From<OriginRecord> for ApprovalOrigin {
             OriginRecord::ConfigGate { matched_pattern } => {
                 ApprovalOrigin::ConfigGate { matched_pattern }
             }
-            OriginRecord::AgentRequested { reason } => ApprovalOrigin::AgentRequested { reason },
+            OriginRecord::AgentRequested { reason, agent_name } => {
+                ApprovalOrigin::AgentRequested { reason, agent_name }
+            }
         }
     }
 }
@@ -274,6 +283,7 @@ mod tests {
             },
             ApprovalOrigin::AgentRequested {
                 reason: "risky".to_string(),
+                agent_name: "ops-agent".to_string(),
             },
         ));
     }
@@ -296,6 +306,7 @@ mod tests {
             AgentScope::Single { session_id: None },
             ApprovalOrigin::AgentRequested {
                 reason: "r".to_string(),
+                agent_name: "test-agent".to_string(),
             },
         ));
         let json = serde_json::to_value(&record).unwrap();

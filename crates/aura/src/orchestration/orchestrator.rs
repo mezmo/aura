@@ -791,6 +791,7 @@ impl Orchestrator {
                 hitl.route.clone(),
                 scope,
                 request_id,
+                self.agent_config.agent.name.clone(),
             ));
         }
 

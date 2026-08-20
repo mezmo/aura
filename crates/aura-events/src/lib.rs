@@ -1005,8 +1005,14 @@ mod tests {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ApprovalOriginWire {
-    ConfigGate { matched_pattern: String },
-    AgentRequested { reason: String },
+    ConfigGate {
+        matched_pattern: String,
+    },
+    AgentRequested {
+        reason: String,
+        #[serde(default)]
+        agent_name: String,
+    },
 }
 
 /// Which agent surface is asking for approval.

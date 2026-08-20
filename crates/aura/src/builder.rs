@@ -344,6 +344,7 @@ impl Agent {
                 hitl.route.clone(),
                 scope,
                 request_id,
+                config_owned.agent.name.clone(),
             ));
         }
 

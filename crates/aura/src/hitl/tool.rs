@@ -27,15 +27,22 @@ pub struct RequestApprovalTool {
     route: Arc<DecisionRoute>,
     scope: AgentScope,
     request_id: String,
+    agent_name: String,
 }
 
 impl RequestApprovalTool {
     #[must_use]
-    pub fn new(route: Arc<DecisionRoute>, scope: AgentScope, request_id: String) -> Self {
+    pub fn new(
+        route: Arc<DecisionRoute>,
+        scope: AgentScope,
+        request_id: String,
+        agent_name: String,
+    ) -> Self {
         Self {
             route,
             scope,
             request_id,
+            agent_name,
         }
     }
 }
@@ -142,6 +149,7 @@ impl Tool for RequestApprovalTool {
             scope: self.scope.clone(),
             origin: ApprovalOrigin::AgentRequested {
                 reason: args.risk_rationale.clone(),
+                agent_name: self.agent_name.clone(),
             },
             items: vec![ApprovalItem {
                 tool_name: Self::NAME.to_string(),
@@ -301,6 +309,7 @@ mod tests {
             route.clone(),
             AgentScope::Single { session_id: None },
             request_id.clone(),
+            "test-agent".to_string(),
         );
 
         // Subscribe before the call so the Requested event is captured.
