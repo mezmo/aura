@@ -1,5 +1,28 @@
 ## Changelog
 
+## [0.2.1](https://github.com/mezmo/aura/compare/v0.2.0...v0.2.1) (2026-08-20)
+
+
+### Code Refactoring
+
+* **mcp**: extract reusable mcp header resolution [4015522](https://github.com/mezmo/aura/commit/4015522249ddc8ad935e0a6fa73f9f9ad9f5651d) - Dan Hable
+
+
+
+### Continuous Integration
+
+* compute the release version against the remote [20c306d](https://github.com/mezmo/aura/commit/20c306d5aaae202aeab9dad3c5e6a678bef38a5d) - Jacob Hull
+
+
+
+### Features
+
+* **events**: add mcp tool overview wire types [51b08cd](https://github.com/mezmo/aura/commit/51b08cd12681b057bf62ad72e3b6dea25810ed5b) - Dan Hable
+
+* **mcp**: discover tool detail for agent info [30b9c27](https://github.com/mezmo/aura/commit/30b9c27a977a6e7febb7f5e0ff2f7fa55142c0f1) - Dan Hable
+
+* **otel**: fix empty assistant content 400, enrich phoenix spans [c3b8b99](https://github.com/mezmo/aura/commit/c3b8b99634924a4c01212cbcdb54fbe20316760e) - Justin Gross
+
 # [0.2.0](https://github.com/mezmo/aura/compare/v0.1.21...v0.2.0) (2026-08-19)
 
 
