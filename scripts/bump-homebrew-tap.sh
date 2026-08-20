@@ -55,8 +55,8 @@ cd "${WORKDIR}/tap"
 for f in Formula/*.rb; do
   awk -v ver="${VERSION}" -v ck="${CHECKSUMS}" -v have="${HAVE_CHECKSUMS}" -v dry="${DRY_RUN}" '
     BEGIN { if (have) while ((getline l < ck) > 0) { n = split(l, a, /  +/); sums[a[2]] = a[1] } }
-    /^[[:space:]]*version "/ { sub(/"[^"]+"/, "\"" ver "\""); print; next }
     /^[[:space:]]*url "/ {
+      sub(/\/v[0-9][^\/"]*\//, "/v" ver "/")
       m = split($0, p, "/"); asset = p[m]; sub(/".*/, "", asset); pend = asset; print; next
     }
     pend != "" && /sha256 "/ {

@@ -113,8 +113,8 @@ authenticates it, so it verifies the API key and the target repository.
 bump-homebrew-tap.sh [--dry-run] <version>
 ```
 
-Rewrites the `version` and `sha256` fields in each `Formula/*.rb` of
-`mezmo/homebrew-tap` and pushes to `main`.
+Rewrites the version tag in each `url` and the matching `sha256` in every
+`Formula/*.rb` of `mezmo/homebrew-tap`, and pushes to `main`.
 
 | Switch | Default | Effect |
 | --- | --- | --- |
