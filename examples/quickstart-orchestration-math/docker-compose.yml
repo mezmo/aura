@@ -28,7 +28,8 @@ services:
     image: mezmo/aura:latest
     container_name: aura
     command:
-      - ./aura-web-server
+      - ./aura
+      - webserver
       - --verbose
     ports:
       - "3000:3000"

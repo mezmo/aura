@@ -13,7 +13,7 @@
 # Usage (local, with mock MCP on port 9999):
 #   CONFIG_PATH=configs/example-math-orchestration.toml \
 #   AURA_CUSTOM_EVENTS=true \
-#   cargo run --bin aura-web-server
+#   cargo run --bin aura -- webserver
 #
 # Usage (Docker Compose):
 #   docker compose -f compose/base.yml -f compose/dev.yml up -d

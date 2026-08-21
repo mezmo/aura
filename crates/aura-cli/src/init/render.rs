@@ -112,7 +112,7 @@ pub(crate) fn next_steps(config_path: &Path, wrote_env: bool) -> String {
     format!(
         "\nNext steps:\n  \
            1. Add MCP servers to {config_for_run} to connect your observability stack\n  \
-           2. {run_prefix}CONFIG_PATH={config_for_run} aura-web-server\n  \
+           2. {run_prefix}CONFIG_PATH={config_for_run} aura webserver\n  \
            3. aura --api-url http://localhost:8080\n\
          {env_note}",
     )

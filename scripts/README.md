@@ -17,7 +17,8 @@ Release and install helpers.
 curl -fsSL https://raw.githubusercontent.com/mezmo/aura/main/scripts/install.sh | bash
 ```
 
-Installs `aura` (CLI) and `aura-web-server` for `linux`/`darwin` on `amd64`/`arm64`.
+Installs `aura` for `linux`/`darwin` on `amd64`/`arm64`. One binary: the
+interactive CLI, and the web server via `aura webserver`.
 
 The script takes no command-line arguments. Every switch is an environment
 variable, so it works unchanged when piped into `bash`:
@@ -33,15 +34,13 @@ curl -fsSL .../install.sh | AURA_COMPONENT=cli AURA_VERSION=0.1.3 bash
 | `AURA_VERSION` | `latest` | Version to install. A leading `v` is optional (`0.1.3` and `v0.1.3` both work). For `direct`, `latest` follows the `releases/latest` redirect; for `deb`/`rpm` it pins the package version, and `latest` lets the package manager pick. |
 | `AURA_INSTALL_METHOD` | `auto` | How to install: `auto`, `homebrew`, `direct`, `deb`, or `rpm`. See below. Any other value is an error. |
 | `AURA_INSTALL_PATH` | `~/.local/bin` | Install directory for the `direct` method. Created if missing. The `homebrew`, `deb`, and `rpm` methods install to their own prefixes and ignore it. |
-| `AURA_COMPONENT` | `all` | Which binaries to install: `all`, `server` (`aura-web-server` only), or `cli` (`aura` only). Any other value is an error. |
+| `AURA_COMPONENT` | `all` | Accepts `all`, `server`, or `cli`; all three install the `aura` binary. Any other value is an error. |
 | `AURA_REQUIRE_CHECKSUM` | `1` | `direct` only. `0` downgrades a missing `checksums.txt`, or a missing entry for an asset, to a warning instead of a fatal error. A checksum *mismatch* is always fatal. |
 | `AURA_CHECKSUMS` | unset | `direct` only. Path to a local `checksums.txt` to verify against, instead of downloading one from the release. |
 
 ### Install methods
 
-`AURA_INSTALL_METHOD` selects how AURA is installed. Each `AURA_COMPONENT` maps
-to its own tap formula and system package, so component-scoped installs work on
-every method.
+`AURA_INSTALL_METHOD` selects how AURA is installed.
 
 - `auto` (default) uses the first method whose requirements are met and whose
   options don't conflict, in order: a native `deb` then `rpm` package (Linux,

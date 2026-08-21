@@ -101,7 +101,7 @@ Through compatible [MCP](https://modelcontextprotocol.io) servers, AURA agents c
 ## Ways to Run AURA
 
 - **As a local chat assistant.** Run AURA interactively from your terminal.
-- **As a service.** Run the `aura-web-server` daemon and connect it to monitoring systems to trigger agent workflows.
+- **As a service.** Run `aura webserver` as a daemon and connect it to monitoring systems to trigger agent workflows.
 - **As a container.** Run the published [`mezmo/aura`](https://hub.docker.com/r/mezmo/aura) Docker image.
 - **As a Kubernetes workload.** Deploy AURA with the [included Helm chart](deployment/helm/aura).
 - **As a library.** Embed AURA's Rust core directly in your own application.

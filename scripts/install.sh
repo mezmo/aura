@@ -81,11 +81,10 @@ main() {
     esac
 }
 
+# Every component resolves to the one binary.
 targets() {
     case "${COMPONENT}" in
-        cli)    echo "aura" ;;
-        server) echo "aura-web-server" ;;
-        all)    echo "aura aura-web-server" ;;
+        cli|server|all) echo "aura" ;;
     esac
 }
 
