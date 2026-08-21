@@ -7,7 +7,7 @@
 //! request-extension side-channel).
 
 use aura_config::ToolHeaderMappings;
-use reqwest::header::HeaderMap;
+use reqwest::header::{HeaderMap, HeaderName};
 
 /// Validated approver identity headers captured from one approved webhook
 /// response.
@@ -19,48 +19,60 @@ use reqwest::header::HeaderMap;
 /// producer.
 #[derive(Clone)]
 pub struct ApproverHeaders {
-    /// The validated override pairs, keys lowercased so an override replaces
-    /// the frozen default header rather than coexisting with it. The keys
-    /// are also the audit surface (names only); no separate name list
-    /// exists to fall out of sync.
+    /// The validated override pairs, keys lowercased. The keys are also the
+    /// audit surface (names only); no separate name list exists to fall out
+    /// of sync.
     headers: HeaderMap,
 }
 
 impl ApproverHeaders {
     /// Capture and validate approver headers from an approval response.
     ///
-    /// Every outbound name in `mapping` must resolve to a present response
-    /// header or the whole capture fails closed; nothing is silently
-    /// dropped.
-    #[expect(
-        unused_variables,
-        reason = "todo!() body; filled when capture wiring lands"
-    )]
-    #[expect(
-        dead_code,
-        reason = "filled when the webhook client's gate path wires capture"
-    )]
+    /// Response lookup is case-insensitive and takes the first value of a
+    /// multi-valued header, matching how the route reads the signature
+    /// headers off the same response.
     pub(crate) fn from_captured(
         mapping: &ToolHeaderMappings,
         response_headers: &HeaderMap,
     ) -> Result<Self, CaptureError> {
-        todo!("resolve mapped response headers, fail closed on missing")
+        let mut headers = HeaderMap::new();
+        let mut missing = Vec::new();
+        for (outbound, response_name) in mapping.iter() {
+            match response_headers.get(response_name) {
+                Some(value) => {
+                    // The outbound name is a validated lowercase header name
+                    // by construction of `ToolHeaderMappings`.
+                    let name = HeaderName::from_bytes(outbound.as_bytes())
+                        .expect("outbound names validated at config parse");
+                    headers.insert(name, value.clone());
+                }
+                None => missing.push(outbound.to_owned()),
+            }
+        }
+        if !missing.is_empty() {
+            missing.sort_unstable();
+            return Err(CaptureError::MissingHeaders { names: missing });
+        }
+        Ok(Self { headers })
     }
 
     /// The captured outbound header names (never values), lowercased.
     pub fn captured_names(&self) -> impl Iterator<Item = &str> {
-        self.headers.keys().map(reqwest::header::HeaderName::as_str)
+        self.headers.keys().map(HeaderName::as_str)
     }
 
     /// Apply the overrides to an outbound request builder as per-request
     /// headers, which override the client's frozen `default_headers` for
     /// that one request only.
-    #[expect(
-        unused_variables,
-        reason = "todo!() body; filled when gate-to-wire wiring lands"
-    )]
+    ///
+    /// Whole-map application, not pair-by-pair: `RequestBuilder::header`
+    /// appends, so a name the builder already carries would end up sent
+    /// twice — the approver's identity beside the requester's. Passing the
+    /// map replaces per name, which is the discipline the lowercased keys
+    /// were established for. Default headers need no such care: `reqwest`
+    /// fills them in only where the request left the name vacant.
     pub(crate) fn apply_to(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        todo!("per-request .header(k, v) for each captured pair")
+        builder.headers(self.headers.clone())
     }
 }
 
@@ -127,16 +139,16 @@ pub enum McpTransportKind {
 }
 
 /// Fail closed when `kind` cannot deliver per-call header overrides.
-/// Called at the execution seam only when overrides exist.
-#[expect(
-    unused_variables,
-    reason = "todo!() body; filled when gate-to-wire wiring lands"
-)]
+/// Called at the execution seam only when overrides exist, so the check
+/// keys off the transport alone.
 pub(crate) fn ensure_transport_delivers_overrides(
     kind: McpTransportKind,
-    overrides: &ApproverHeaders,
 ) -> Result<(), OverrideApplicationError> {
-    todo!("stdio rejects overrides; http and sse accept")
+    match kind {
+        // Both HTTP send paths read the extension and apply the overrides.
+        McpTransportKind::StreamableHttp | McpTransportKind::Sse => Ok(()),
+        McpTransportKind::Stdio => Err(OverrideApplicationError::TransportUnsupported { kind }),
+    }
 }
 
 /// Extract approver overrides from an outbound client message, if the one
@@ -182,8 +194,233 @@ pub(crate) fn current_approver_overrides() -> Option<ApproverHeaders> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    use std::collections::HashMap;
+
+    use reqwest::header::HeaderValue;
+
     use super::*;
+
+    /// One captured override pair, for the seam tests that need a value of
+    /// this type without restating the capture plumbing. Construction goes
+    /// through the real capture path so a test can never hold overrides the
+    /// production path could not have produced.
+    pub(crate) fn captured_overrides(outbound: &str, value: &str) -> ApproverHeaders {
+        const RESPONSE_NAME: &str = "x-approver-source";
+        ApproverHeaders::from_captured(
+            &mappings(&[(outbound, RESPONSE_NAME)]),
+            &response(&[(RESPONSE_NAME, value)]),
+        )
+        .expect("the mapped header is present")
+    }
+
+    /// Captured overrides for several pairs at once, each mapped from its
+    /// own `x-response-<outbound>` response header, given in whatever order
+    /// the caller likes. Construction goes through the real capture path,
+    /// so a test can never hold overrides the production path could not
+    /// have produced.
+    #[cfg(feature = "otel")]
+    pub(crate) fn captured_overrides_multi(pairs: &[(&str, &str)]) -> ApproverHeaders {
+        let response_names: Vec<String> = pairs
+            .iter()
+            .map(|(outbound, _)| format!("x-response-{outbound}"))
+            .collect();
+        let mapping: Vec<(&str, &str)> = pairs
+            .iter()
+            .zip(&response_names)
+            .map(|((outbound, _), name)| (*outbound, name.as_str()))
+            .collect();
+        let response_pairs: Vec<(&str, &str)> = pairs
+            .iter()
+            .zip(&response_names)
+            .map(|((_, value), name)| (name.as_str(), *value))
+            .collect();
+        ApproverHeaders::from_captured(&mappings(&mapping), &response(&response_pairs))
+            .expect("every mapped header is present")
+    }
+
+    pub(crate) fn mappings(pairs: &[(&str, &str)]) -> ToolHeaderMappings {
+        let raw: HashMap<String, String> = pairs
+            .iter()
+            .map(|(outbound, response)| ((*outbound).to_owned(), (*response).to_owned()))
+            .collect();
+        ToolHeaderMappings::try_from(raw).expect("test mappings are valid config")
+    }
+
+    fn response(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for (name, value) in pairs {
+            headers.append(
+                HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        headers
+    }
+
+    /// Capture rekeys the response value under the configured outbound name,
+    /// carrying the value through unchanged.
+    #[test]
+    fn captures_response_value_under_outbound_name() {
+        let captured = ApproverHeaders::from_captured(
+            &mappings(&[("x-forwarded-user", "x-approver-id")]),
+            &response(&[("x-approver-id", "alice")]),
+        )
+        .expect("a present mapped header captures");
+
+        assert_eq!(
+            captured.captured_names().collect::<Vec<_>>(),
+            vec!["x-forwarded-user"]
+        );
+        assert_eq!(captured.headers.get("x-forwarded-user").unwrap(), "alice");
+        assert!(captured.headers.get("x-approver-id").is_none());
+    }
+
+    /// A webhook is free to spell its response header any way, and so is
+    /// the operator configuring the mapping; neither spelling has to match
+    /// the other's case.
+    #[test]
+    fn response_lookup_is_case_insensitive() {
+        let captured = ApproverHeaders::from_captured(
+            &mappings(&[("x-forwarded-user", "X-Approver-Id")]),
+            &response(&[("X-APPROVER-ID", "alice")]),
+        )
+        .expect("response header casing must not defeat capture");
+
+        assert_eq!(captured.headers.get("x-forwarded-user").unwrap(), "alice");
+    }
+
+    /// A response may repeat a header. Capture takes the first value, as the
+    /// route's own header reads do, and exactly one value lands under the
+    /// outbound name — a second approver identity cannot ride along.
+    #[test]
+    fn repeated_response_header_captures_only_the_first_value() {
+        let captured = ApproverHeaders::from_captured(
+            &mappings(&[("x-forwarded-user", "x-approver-id")]),
+            &response(&[("x-approver-id", "alice"), ("x-approver-id", "mallory")]),
+        )
+        .expect("a repeated mapped header still captures");
+
+        assert_eq!(captured.headers.get("x-forwarded-user").unwrap(), "alice");
+        assert_eq!(
+            captured.headers.get_all("x-forwarded-user").iter().count(),
+            1
+        );
+    }
+
+    /// Every missing name is reported at once, sorted, so one failing
+    /// response always produces the same audit string.
+    #[test]
+    fn missing_names_are_all_reported_and_sorted() {
+        let err = ApproverHeaders::from_captured(
+            &mappings(&[
+                ("x-forwarded-user", "x-approver-id"),
+                ("authorization", "x-approver-token"),
+                ("x-tenant", "x-approver-tenant"),
+            ]),
+            &response(&[("x-approver-tenant", "acme")]),
+        )
+        .expect_err("a partial capture must fail closed");
+
+        assert_eq!(
+            err,
+            CaptureError::MissingHeaders {
+                names: vec!["authorization".to_owned(), "x-forwarded-user".to_owned()],
+            }
+        );
+
+        // The event-level audit signal: the Display text names every missing
+        // header and carries no value, including the one response value that
+        // did arrive (for the header that was present).
+        let message = err.to_string();
+        assert_eq!(
+            message,
+            "approver identity capture failed: response missing mapped headers \
+             [\"authorization\", \"x-forwarded-user\"]"
+        );
+        assert!(!message.contains("acme"), "message was: {message}");
+    }
+
+    /// Every captured pair lands on the request the builder produces, under
+    /// the outbound name.
+    #[test]
+    fn apply_to_sets_every_captured_pair_on_the_request() {
+        let captured = ApproverHeaders::from_captured(
+            &mappings(&[
+                ("x-forwarded-user", "x-approver-id"),
+                ("x-tenant", "x-approver-tenant"),
+            ]),
+            &response(&[("x-approver-id", "alice"), ("x-approver-tenant", "acme")]),
+        )
+        .expect("both mapped headers capture");
+
+        let request = captured
+            .apply_to(reqwest::Client::new().post("http://127.0.0.1:9/"))
+            .build()
+            .expect("the override headers are valid");
+
+        assert_eq!(request.headers().get("x-forwarded-user").unwrap(), "alice");
+        assert_eq!(request.headers().get("x-tenant").unwrap(), "acme");
+    }
+
+    /// The override REPLACES a same-named header already on the builder rather
+    /// than coexisting with it. Two identities on one request is the failure
+    /// mode this guards: `reqwest`'s per-header setter appends, so applying
+    /// pair-by-pair would leave the original value in place beside the
+    /// approver's.
+    #[test]
+    fn apply_to_replaces_a_header_already_on_the_builder() {
+        let captured = ApproverHeaders::from_captured(
+            &mappings(&[("authorization", "x-approver-token")]),
+            &response(&[("x-approver-token", "Bearer approver")]),
+        )
+        .expect("the mapped header captures");
+
+        let request = captured
+            .apply_to(
+                reqwest::Client::new()
+                    .post("http://127.0.0.1:9/")
+                    .header("authorization", "Bearer requester"),
+            )
+            .build()
+            .expect("the override headers are valid");
+
+        assert_eq!(
+            request.headers().get_all("authorization").iter().count(),
+            1,
+            "the requester's identity must not ride along beside the approver's",
+        );
+        assert_eq!(
+            request.headers().get("authorization").unwrap(),
+            "Bearer approver",
+        );
+    }
+
+    /// Stdio has no per-call header channel, so a call that demands identity
+    /// cannot be delivered and must not proceed under the cached one.
+    #[test]
+    fn stdio_transport_refuses_overrides() {
+        assert_eq!(
+            ensure_transport_delivers_overrides(McpTransportKind::Stdio),
+            Err(OverrideApplicationError::TransportUnsupported {
+                kind: McpTransportKind::Stdio
+            }),
+        );
+    }
+
+    /// Both HTTP transports read the extension on their send path, so both
+    /// can deliver.
+    #[test]
+    fn http_transports_accept_overrides() {
+        assert_eq!(
+            ensure_transport_delivers_overrides(McpTransportKind::StreamableHttp),
+            Ok(()),
+        );
+        assert_eq!(
+            ensure_transport_delivers_overrides(McpTransportKind::Sse),
+            Ok(()),
+        );
+    }
 
     /// Every adaptor call outside a task-local scope (wrapper-less agents)
     /// must read `None`, never panic.

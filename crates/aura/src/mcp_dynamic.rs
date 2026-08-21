@@ -19,9 +19,7 @@ pub struct McpToolAdaptor {
     #[allow(dead_code)]
     server_name: String,
     client: Arc<McpClient>,
-    /// Which transport this adaptor fronts, tagged at construction. The
-    /// approver-override path fails closed on transports that cannot
-    /// deliver per-request headers.
+    /// Which transport this adaptor fronts, tagged at construction.
     transport_kind: McpTransportKind,
 }
 
@@ -96,15 +94,54 @@ impl RigTool for McpToolAdaptor {
             // captured any. Unscoped reads yield `None` (wrapper-less
             // agents).
             let approver_overrides = current_approver_overrides();
-            if let Some(overrides) = &approver_overrides {
+            if approver_overrides.is_some() {
                 // Fail closed before dispatch when the transport cannot
                 // deliver per-request headers.
-                ensure_transport_delivers_overrides(transport_kind, overrides)
+                ensure_transport_delivers_overrides(transport_kind)
                     .map_err(|e| ToolError::ToolCallError(Box::new(e)))?;
             }
 
             // Use shared execution function for consistent logging and error handling
             execute_mcp_tool(&client, &tool_name, args, approver_overrides).await
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+    use crate::mcp_streamable_http::tests::client_and_server;
+
+    /// An adaptor for `tool_name`, fronting `client`, tagged as `kind`.
+    /// The client is always a streamable-HTTP one: the tag, not the wire, is
+    /// what the override path consults, so a stdio-tagged adaptor over a
+    /// reachable server is exactly the case that must still refuse.
+    async fn adaptor_for(
+        client: McpClient,
+        tool_name: &str,
+        kind: McpTransportKind,
+    ) -> McpToolAdaptor {
+        let tool = rmcp::model::Tool::new(
+            tool_name.to_owned(),
+            "test tool".to_owned(),
+            std::sync::Arc::new(serde_json::Map::new()),
+        );
+        McpToolAdaptor::new(tool, "test-server".to_owned(), Arc::new(client), kind)
+    }
+
+    /// A stdio tool that no approval gated is untouched by any of this.
+    #[tokio::test]
+    async fn stdio_adaptor_runs_an_ungated_call() {
+        let (server, client) = client_and_server(&std::collections::HashMap::new()).await;
+        let adaptor = adaptor_for(client, "ungated", McpTransportKind::Stdio).await;
+
+        adaptor
+            .call(json!({}))
+            .await
+            .expect("an ungated stdio call proceeds");
+
+        assert_eq!(server.tool_calls().len(), 1);
     }
 }

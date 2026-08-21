@@ -191,6 +191,88 @@ fn resolve_message_endpoint(
 mod tests {
     use super::*;
 
+    mod approver_overrides {
+        use rmcp::model::{CallToolRequestParam, ClientJsonRpcMessage, RequestId};
+
+        use super::*;
+        use crate::approver_headers::{ApproverHeaders, tests::captured_overrides};
+        use crate::mcp_streamable_http::call_tool_request;
+        use crate::mcp_streamable_http::tests::RecordingMcpServer;
+
+        fn call_message(tool: &str, overrides: Option<ApproverHeaders>) -> ClientJsonRpcMessage {
+            ClientJsonRpcMessage::request(
+                call_tool_request(
+                    CallToolRequestParam {
+                        name: tool.to_owned().into(),
+                        arguments: None,
+                    },
+                    overrides,
+                ),
+                RequestId::Number(1),
+            )
+        }
+
+        /// The SSE send path reads the same extension the streamable-HTTP path
+        /// does: an override replaces the frozen identity on exactly that one
+        /// POST, arrives once, and never appears in the JSON body — and a
+        /// message with no extension leaves the client's identity in place.
+        #[tokio::test]
+        async fn send_applies_the_override_to_that_post_alone() {
+            let server = RecordingMcpServer::start().await;
+            // Built by hand because `connect` needs a live SSE stream and the
+            // send path is what is under test. The frozen header stands in
+            // for the identity a configured client would hold.
+            let mut frozen = HeaderMap::new();
+            frozen.insert(
+                "authorization",
+                HeaderValue::from_static("Bearer requester"),
+            );
+            let mut transport = SseTransport {
+                http_client: reqwest::Client::builder()
+                    .default_headers(frozen)
+                    .build()
+                    .unwrap(),
+                message_endpoint: url::Url::parse(&server.url).unwrap(),
+                stream: None,
+            };
+
+            transport
+                .send(call_message(
+                    "gated",
+                    Some(captured_overrides("authorization", "Bearer approver")),
+                ))
+                .await
+                .expect("the loopback server accepts the post");
+
+            let gated = &server.tool_calls()[0];
+            assert_eq!(
+                gated.header_values("authorization"),
+                vec!["Bearer approver"],
+                "the requester's identity must be replaced, not joined",
+            );
+            let body = gated.body_text();
+            assert!(!body.contains("authorization"), "body was: {body}");
+            assert!(!body.contains("approver"), "body was: {body}");
+
+            transport
+                .send(call_message("ungated", None))
+                .await
+                .expect("the loopback server accepts the second post");
+
+            assert_eq!(
+                server.tool_calls().len(),
+                2,
+                "exactly one POST per message, nothing duplicated"
+            );
+            let ungated = &server.tool_calls()[1];
+            assert_eq!(
+                ungated.header_values("authorization"),
+                vec!["Bearer requester"],
+                "the next ungated message keeps the frozen identity",
+            );
+        }
+    }
+
     #[test]
     fn test_resolve_message_endpoint_query_only() {
         let base = url::Url::parse("https://localhost/sse").unwrap();

@@ -43,6 +43,17 @@ fn record_tool_call_input(span: &tracing::Span, args: &Value) {
     }
 }
 
+/// Record the outbound header NAMES an approver override applies to this
+/// call, sorted and comma-joined, never the values.
+fn record_applied_headers(
+    span: &tracing::Span,
+    overrides: &crate::approver_headers::ApproverHeaders,
+) {
+    let mut names: Vec<&str> = overrides.captured_names().collect();
+    names.sort_unstable();
+    crate::logging::set_span_attribute(span, crate::logging::ATTR_APPLIED_HEADERS, names.join(","));
+}
+
 /// Record tool call result attributes on the current span.
 ///
 /// On success: result length, status OK, and (when content recording is
@@ -106,6 +117,9 @@ pub async fn execute_mcp_tool(
 
     // OTel: record input attributes
     record_tool_call_input(&span, &args);
+    if let Some(overrides) = approver_overrides.as_ref() {
+        record_applied_headers(&span, overrides);
+    }
 
     // Log tool call initiation
     info!(
@@ -269,5 +283,93 @@ mod tests {
         assert!(bounded.contains("[tool error truncated:"));
         // The leading context (where categorization keywords live) survives.
         assert!(bounded.starts_with("Tool execution failed:"));
+    }
+
+    /// Trace correlation: a gated call's `mcp.tool_call` span carries the
+    /// captured override's header NAMES, never their values, and an
+    /// ungated call's span carries neither.
+    ///
+    /// Gated on `otel`: without the feature there is no span data to
+    /// assert against.
+    #[cfg(feature = "otel")]
+    mod applied_headers_span {
+
+        use opentelemetry::trace::TracerProvider as _;
+
+        use opentelemetry_sdk::trace::TracerProvider;
+        use serde_json::json;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        use super::*;
+        use crate::logging::ATTR_APPLIED_HEADERS;
+        use crate::mcp_streamable_http::tests::client_and_server;
+        use crate::test_span_capture::CapturedSpans;
+
+        /// Run `execute_mcp_tool` under a subscriber that exports to memory,
+        /// returning the `applied_headers` attribute its `mcp.tool_call`
+        /// span carries. `#[tracing::instrument]` on `execute_mcp_tool`
+        /// opens the span itself, so no outer instrumentation is needed.
+        async fn applied_headers_on_call(
+            client: &McpClient,
+            overrides: Option<crate::approver_headers::ApproverHeaders>,
+        ) -> Option<String> {
+            let captured = CapturedSpans::default();
+            let provider = TracerProvider::builder()
+                .with_simple_exporter(captured.clone())
+                .build();
+            let _guard = tracing::subscriber::set_default(
+                tracing_subscriber::registry()
+                    .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("test"))),
+            );
+
+            execute_mcp_tool(client, "gated", json!({}), overrides)
+                .await
+                .expect("the call succeeds");
+
+            assert!(
+                captured.contains("mcp.tool_call"),
+                "the mcp.tool_call span was never exported",
+            );
+            captured.attribute("mcp.tool_call", ATTR_APPLIED_HEADERS)
+        }
+
+        /// A gated call carrying an override stamps its captured names,
+        /// sorted and comma-joined, on the execution span — never a value.
+        /// Configured out of alphabetical order (`x-tenant` before
+        /// `authorization`), so a joined-but-unsorted regression would
+        /// produce `"x-tenant,authorization"` and this test would catch it.
+        #[tokio::test]
+        async fn gated_call_stamps_the_applied_header_names_never_values() {
+            let (_server, client) = client_and_server(&HashMap::new()).await;
+
+            let overrides = crate::approver_headers::tests::captured_overrides_multi(&[
+                ("x-tenant", "acme"),
+                ("authorization", "Bearer approver-secret"),
+            ]);
+            let attribute = applied_headers_on_call(&client, Some(overrides)).await;
+
+            assert_eq!(
+                attribute.as_deref(),
+                Some("authorization,x-tenant"),
+                "the span must name every applied header, sorted",
+            );
+            for value in ["acme", "Bearer approver-secret", "approver-secret"] {
+                assert!(
+                    !attribute.as_deref().unwrap().contains(value),
+                    "the span must never carry a header value, got: {attribute:?}",
+                );
+            }
+        }
+
+        /// A call no approval gated carries no override, so its span records
+        /// no `applied_headers` attribute at all.
+        #[tokio::test]
+        async fn ungated_call_records_no_applied_headers() {
+            let (_server, client) = client_and_server(&HashMap::new()).await;
+
+            let attribute = applied_headers_on_call(&client, None).await;
+
+            assert_eq!(attribute, None);
+        }
     }
 }

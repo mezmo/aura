@@ -1226,6 +1226,59 @@ tool_headers_from_response = { "Authorization" = "x-approver-token" }
         }
     }
 
+    /// An explicitly empty map is the same feature-off state as an absent
+    /// one, and survives a serialize round trip as an absent key.
+    #[test]
+    fn hitl_webhook_tool_headers_empty_map_is_feature_off() {
+        let toml = r#"
+require_approval = ["kubectl_*"]
+
+[route]
+mode = "webhook"
+url = "https://approvals.example.com/decide"
+tool_headers_from_response = {}
+"#;
+        let hitl: HitlConfig = toml::from_str(toml).unwrap();
+        match &hitl.route {
+            DecisionRouteConfig::Webhook {
+                tool_headers_from_response,
+                ..
+            } => assert!(tool_headers_from_response.is_empty()),
+            other => panic!("expected Webhook route, got {:?}", other),
+        }
+        let round_tripped = toml::to_string(&hitl).unwrap();
+        assert!(
+            !round_tripped.contains("tool_headers_from_response"),
+            "an empty map must not be emitted: {round_tripped}"
+        );
+    }
+
+    /// Both sides of a mapping are lowercased through the real TOML
+    /// deserialization path, so a config spelled in header case resolves the
+    /// same as one spelled in wire case.
+    #[test]
+    fn hitl_webhook_tool_headers_response_name_lowercased() {
+        let toml = r#"
+require_approval = ["kubectl_*"]
+
+[route]
+mode = "webhook"
+url = "https://approvals.example.com/decide"
+tool_headers_from_response = { "X-Forwarded-User" = "X-Approver-Id" }
+"#;
+        let hitl: HitlConfig = toml::from_str(toml).unwrap();
+        match hitl.route {
+            DecisionRouteConfig::Webhook {
+                tool_headers_from_response,
+                ..
+            } => assert_eq!(
+                tool_headers_from_response.iter().collect::<Vec<_>>(),
+                vec![("x-forwarded-user", "x-approver-id")]
+            ),
+            other => panic!("expected Webhook route, got {:?}", other),
+        }
+    }
+
     /// Reserved transport-owned names are rejected at parse.
     #[test]
     fn hitl_webhook_tool_headers_reserved_name_rejected() {
@@ -1320,9 +1373,6 @@ pub enum DecisionRouteConfig {
         #[serde(default)]
         headers_from_request: HashMap<String, String>,
         /// Outbound MCP header name → webhook approval-response header name.
-        /// Non-empty opts gated calls into approver identity forwarding.
-        /// Validated at parse (see [`ToolHeaderMappings`]); the validated
-        /// map is carried but not consumed until capture wiring lands.
         #[serde(default, skip_serializing_if = "ToolHeaderMappings::is_empty")]
         tool_headers_from_response: ToolHeaderMappings,
     },
@@ -1340,8 +1390,7 @@ pub const RESERVED_TOOL_HEADER_NAMES: [&str; 6] = [
 ];
 
 /// Validated `tool_headers_from_response` mapping: outbound MCP header
-/// name → webhook approval-response header name, both sides lowercased
-/// at parse so an override always replaces the frozen default header.
+/// name → webhook approval-response header name, both sides lowercased.
 /// Syntactically invalid header names, duplicates after lowercasing, and
 /// reserved transport-owned names (see [`RESERVED_TOOL_HEADER_NAMES`])
 /// are rejected at construction, so downstream code never holds an
@@ -1350,7 +1399,7 @@ pub const RESERVED_TOOL_HEADER_NAMES: [&str; 6] = [
 pub struct ToolHeaderMappings(HashMap<String, String>);
 
 impl ToolHeaderMappings {
-    /// True when no mapping is configured (the legacy, feature-off state).
+    /// True when no mapping is configured.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()

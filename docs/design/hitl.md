@@ -418,11 +418,18 @@ telemetry.
 
 ## Trace correlation
 
-`DecisionRoute::decide` stamps the request's `decision_id` on the current span,
-which is the gated call's Rig `execute_tool` span: both surfaces await `decide`
-inline, and `WrappedTool` carries that span across the approval gate into the
-inner tool. One stamp, ahead of the route split, gives every approval-gated
-execution the id the payload and the lifecycle events carry:
+`DecisionRoute::decide_for_gate` and `DecisionRoute::decide` each stamp the
+request's `decision_id` on the current span, ahead of their own route split
+and of any outcome: the config gate awaits `decide_for_gate` inline from the
+gated call's Rig `execute_tool` span, and `WrappedTool` carries that span
+across the approval gate into the inner tool; the agent-callable
+`request_approval` tool awaits `decide` directly on its own `execute_tool`
+span instead of going through the gate. Neither entry point is reached
+through the other on every route — `decide_for_gate`'s webhook arm never
+calls `decide`, and `request_approval` never calls `decide_for_gate` — so
+each stamps independently rather than relying on the other to have done it.
+Stamping ahead of the split gives every approval-gated execution the id the
+payload and the lifecycle events carry:
 
 ```text
 execute_tool
@@ -431,9 +438,128 @@ execute_tool
         status = OK | ERROR
 ```
 
-A trace consumer joins the approval to the result of the action it released
-without a second reporting channel. Ungated calls never reach `decide`, so they
-carry no `decision_id`.
+On the config-gate surface, this is the gated action's own span — the approval
+joins the result of the action it released on one span, without a second
+reporting channel. On the agent-callable surface, the stamp lands on
+`request_approval`'s own execution span instead: it correlates the approval
+decision to that tool call, not to whatever separate tool call the agent goes
+on to make once the decision comes back approved. Ungated calls never reach
+`decide_for_gate` or `decide`, so they carry no `decision_id`.
+
+## Approver header forwarding
+
+Companion to the ADR [2026-08-13-approver-identity-forwarding](../adr/2026-08-13-approver-identity-forwarding.md).
+
+MCP client headers are resolved once, at agent-build time, before any
+approval exists — so a gated tool call executes under the original
+requester's identity even after a human approves it. `tool_headers_from_response`
+lets an operator substitute the approver's identity onto that one gated
+call instead.
+
+### Config shape
+
+```toml
+[hitl.route]
+mode = "webhook"
+url = "https://approvals.example.com/hook"
+headers_from_request = { "authorization" = "authorization" }   # PR #490, unrelated
+# outbound MCP header name -> webhook response header name
+tool_headers_from_response = { "authorization" = "x-approver-token" }
+```
+
+`#[serde(default)]`; absent or an empty map is the pre-existing behavior,
+unchanged. Every outbound name is lowercased at parse — the same discipline
+`resolve_mcp_headers` already applies to static headers — so a captured
+override replaces the frozen value on the wire rather than coexisting with
+it. Parse also rejects a duplicate outbound name after lowercasing and any
+name from the transport-owned reserved set (`content-type`, `accept`,
+`mcp-session-id`, `host`, `content-length`, `transfer-encoding`), so a
+mapping can never corrupt MCP framing or session routing.
+
+### Fail-closed contract
+
+Capture runs only for an approved webhook decision whose origin is the
+config gate (`ApprovalOrigin::ConfigGate`) — never for the `request_approval`
+agent-callable surface, which stays credential-free by construction
+([#306](https://github.com/mezmo/aura/issues/306)). When
+`tool_headers_from_response` is non-empty:
+
+- Every mapped outbound name must resolve to a present response header, read
+  case-insensitively and taking the first value on a repeat. One missing
+  name fails the whole capture.
+- A malformed value cannot reach capture: values are read from the parsed
+  response's header map, which admits only valid HTTP header values.
+- A capture failure resolves the approval to an error: the gated call fails
+  with a message naming every missing header, never a value.
+- A denied, timed-out, or cancelled decision captures nothing, because there
+  is no decision to capture from.
+
+An absent or empty map is the legacy path: an approved call proceeds under
+the requester's frozen identity, exactly as it did before this feature.
+
+### The https question
+
+Capture does not require `https://`. A webhook route with
+`tool_headers_from_response` configured over plain `http://` is usable and
+unsigned — a deployment that terminates TLS ahead of the process (a trusted
+gateway, service-to-service) is a legitimate topology this does not reject —
+but it is never silent: server startup logs one warning per `[hitl]` config
+naming the exposure, alongside the boot-time HMAC-signing check
+(`warn_on_cleartext_capture`, called next to `validate_webhook_signing_config`).
+The webhook client itself, rebuilt on every request that builds an agent,
+never logs this warning; only the boot-time call does, and the log line
+carries the webhook's scheme and host only, never its path, query, or
+userinfo. The one rule `https://` still enforces is unchanged and
+independent of capture: an HMAC secret configured over `http://` is a
+misconfiguration and fails closed at boot.
+
+### Transport support
+
+The override rides the outbound `rmcp::model::Request` as a typed extension;
+only the transports that read it back before serializing can deliver it:
+
+- **HTTP-streamable and SSE**: both send paths read the extension and apply
+  it as a per-request header, which replaces the client's frozen default
+  header for that one request only. The override never reaches the JSON
+  body — the hand-written wire serializer extracts only the `Meta`
+  extension, so anything else placed in `Extensions` never reaches the wire
+  as data.
+- **Stdio**: the tool adaptor is tagged with its transport kind at
+  construction. A gated stdio call that carries an override fails closed
+  before dispatch — identity was demanded and stdio has no per-call header
+  channel to deliver it.
+
+### One-call scoping
+
+The override rides the one request value the gate released, inserted into
+that request's `Extensions` map and read back by the transport before the
+outbound POST. There is no keyed map and nothing to clean up: every tool
+execution re-enters `pre_call` and the gate mints a fresh `DecisionId` per
+call, so an LLM- or orchestration-initiated retry re-gates, fires a fresh
+webhook approval, and captures fresh response headers rather than reusing a
+prior decision's identity.
+
+### Application-time audit
+
+`execute_mcp_tool` (`crates/aura/src/mcp_tool_execution.rs`) stamps the
+outbound header NAMES an override applied — sorted, comma-joined, never the
+values — on the `mcp.tool_call` span as `applied_headers`, present only when
+the call carried an override. Event-level audit is the capture failure's own
+error text: a missing header fails the approval with a message naming
+every affected header, which is what both a caller and the trace see.
+No `aura-events` wire type changes: under fail-closed semantics a capture
+success stamp would be degenerate (success always equals the configured key
+set), so the existing `Errored` outcome already carries the full audit
+signal.
+
+The names-only contract covers this feature's own audit fields — the span
+attribute and the capture-failure error text. It does not extend to a
+gated tool's own output: a tool whose result echoes the header it received
+(as `echo_headers` does, by design, for testing) puts the forwarded value
+into that tool's recorded result the same way any tool call's output is
+recorded, whether or not an override applied. Forwarding credentials to a
+tool that echoes them back makes the value visible wherever tool results
+are recorded.
 
 ## Orchestration behavior
 

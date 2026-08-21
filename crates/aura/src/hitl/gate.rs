@@ -189,6 +189,26 @@ mod tests {
         );
     }
 
+    /// The mapping is the only path from an approval's captured identity to
+    /// the call it released; a `Proceed` that dropped the overrides would
+    /// send the gated call under the requester's identity instead.
+    #[test]
+    fn approval_result_mapping_carries_captured_overrides_into_the_call() {
+        let captured = crate::approver_headers::tests::captured_overrides("authorization", "tok");
+
+        assert_eq!(
+            approval_result_to_pre_call(Ok(GateDecision::Approved {
+                overrides: Some(captured.clone()),
+            }))
+            .unwrap(),
+            PreCallOutcome::Proceed {
+                overrides: Some(captured)
+            },
+        );
+    }
+
+    /// A denial is feedback the model can act on, not a tool error: the
+    /// mapping short-circuits the call with the denial reason.
     #[test]
     fn approval_result_mapping_denial_is_feedback_not_error() {
         let outcome = approval_result_to_pre_call(Ok(GateDecision::Denied {
@@ -237,17 +257,16 @@ mod tests {
     /// Trace correlation: a gated call's `execute_tool` span carries the
     /// `decision_id` of the approval that gated it.
     ///
-    /// Gated on `otel` — without the feature `set_span_attribute` is a
-    /// documented no-op and there is no span data to assert against.
+    /// Gated on `otel`: without the feature there is no span data to
+    /// assert against.
     #[cfg(feature = "otel")]
     mod decision_id_span {
-        use std::future::Future;
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::sync::{Arc, Mutex, MutexGuard};
 
-        use futures::future::BoxFuture;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
         use opentelemetry::trace::TracerProvider as _;
-        use opentelemetry_sdk::export::trace::{ExportResult, SpanData, SpanExporter};
+
         use opentelemetry_sdk::trace::TracerProvider;
         use rig::completion::ToolDefinition;
         use rig::tool::Tool as RigTool;
@@ -261,67 +280,8 @@ mod tests {
         use super::*;
         use crate::approval_event_broker::{self, ApprovalLifecycleEvent};
         use crate::logging::ATTR_DECISION_ID;
+        use crate::test_span_capture::{CapturedSpans, traced_as_execute_tool};
         use crate::tool_wrapper::WrappedTool;
-
-        /// Spans the test subscriber has exported.
-        #[derive(Debug, Clone, Default)]
-        struct CapturedSpans(Arc<Mutex<Vec<SpanData>>>);
-
-        impl CapturedSpans {
-            fn spans(&self) -> MutexGuard<'_, Vec<SpanData>> {
-                self.0.lock().expect("captured spans mutex")
-            }
-
-            fn contains(&self, name: &str) -> bool {
-                self.spans().iter().any(|span| span.name == name)
-            }
-
-            fn attribute(&self, name: &str, key: &str) -> Option<String> {
-                self.spans()
-                    .iter()
-                    .find(|span| span.name == name)
-                    .and_then(|span| span.attributes.iter().find(|kv| kv.key.as_str() == key))
-                    .map(|kv| kv.value.to_string())
-            }
-        }
-
-        impl SpanExporter for CapturedSpans {
-            fn export(&mut self, batch: Vec<SpanData>) -> BoxFuture<'static, ExportResult> {
-                self.spans().extend(batch);
-                Box::pin(std::future::ready(Ok(())))
-            }
-        }
-
-        /// Run `body` inside an `execute_tool` span — the span Rig opens around
-        /// a tool call — under a subscriber that exports to memory, returning
-        /// the body's output and the `decision_id` the exported span carries.
-        async fn traced_as_execute_tool<T>(body: impl Future<Output = T>) -> (T, Option<String>) {
-            let captured = CapturedSpans::default();
-            let provider = TracerProvider::builder()
-                .with_simple_exporter(captured.clone())
-                .build();
-            let _guard = tracing::subscriber::set_default(
-                tracing_subscriber::registry()
-                    .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("test"))),
-            );
-
-            let output = body.instrument(tracing::info_span!("execute_tool")).await;
-
-            // The registry instruments a parked approval's wake task with the
-            // same span, so the export lands once that task has released it too.
-            for _ in 0..1_000 {
-                if captured.contains("execute_tool") {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-            assert!(
-                captured.contains("execute_tool"),
-                "the execute_tool span was never exported",
-            );
-
-            (output, captured.attribute("execute_tool", ATTR_DECISION_ID))
-        }
 
         /// What a trace backend actually receives, assembled the way the binary
         /// assembles it: the real OTel filter, the OpenInference exporter, and

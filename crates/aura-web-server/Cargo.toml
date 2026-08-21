@@ -81,6 +81,10 @@ integration-scratchpad = []  # scratchpad_test
 # `AURA_TEST_REDIS_URL` in tests/redis_session_store_test.rs)
 integration-session-store = ["session-store-redis"]  # redis_session_store_test
 
+# HITL approver header forwarding (separate per-case server; see
+# hitl_header_forwarding_tests.rs for why and the run recipe)
+integration-hitl-header-forwarding = []  # hitl_header_forwarding_tests
+
 [dev-dependencies]
 tokio-test = "0.4"
 reqwest = { workspace = true }
