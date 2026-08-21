@@ -7,6 +7,7 @@ use std::path::Path;
 #[cfg(feature = "standalone-cli")]
 use anyhow::Result;
 
+use super::Scope;
 use super::spec::ConfigSpec;
 
 fn toml_escape(s: &str) -> String {
@@ -50,19 +51,44 @@ pub(crate) fn render_env(env_var: &str, value: &str) -> String {
     )
 }
 
-/// Merge a new key into an existing `.env`: replace the line if the key
-/// already exists, otherwise append it.
+/// If `line` assigns `env_var`, return the raw right-hand side.
+///
+/// Recognises the same shapes the runtime loader does — a bare `KEY=value`,
+/// an `export KEY=value`, and whitespace around either — so that the line
+/// this file rewrites is the line the runtime would have read. A miss here
+/// against a hit at load time is what lets an old value stay in force after
+/// a new one is appended below it.
+fn env_assignment<'a>(line: &'a str, env_var: &str) -> Option<&'a str> {
+    let line = line.trim_start();
+    let line = line
+        .strip_prefix("export")
+        .filter(|rest| rest.starts_with([' ', '\t']))
+        .map_or(line, str::trim_start);
+    let rest = line.strip_prefix(env_var)?;
+    Some(rest.trim_start().strip_prefix('=')?.trim())
+}
+
+/// Value currently bound to `env_var` in a `.env`, as the runtime would read
+/// it: the first assignment wins.
+pub(crate) fn env_value<'a>(existing: &'a str, env_var: &str) -> Option<&'a str> {
+    existing
+        .lines()
+        .find_map(|line| env_assignment(line, env_var))
+}
+
+/// Merge a new key into an existing `.env`. Every assignment of `env_var` is
+/// replaced — the runtime applies the first one it meets, so leaving an
+/// earlier line in place would keep the old value effective. Appended when
+/// absent.
 pub(crate) fn merge_env(existing: &str, env_var: &str, value: &str) -> String {
     let mut found = false;
     let mut out = String::new();
     for line in existing.lines() {
-        let trimmed = line.trim_start();
-        if trimmed
-            .strip_prefix(env_var)
-            .is_some_and(|rest| rest.trim_start().starts_with('='))
-        {
-            out.push_str(&format!("{env_var}={value}\n"));
-            found = true;
+        if env_assignment(line, env_var).is_some() {
+            if !found {
+                out.push_str(&format!("{env_var}={value}\n"));
+                found = true;
+            }
         } else {
             out.push_str(line);
             out.push('\n');
@@ -89,32 +115,62 @@ pub(crate) fn validate_rendered(spec: &ConfigSpec, rendered: &str) -> Result<()>
     Ok(())
 }
 
+/// Render a path for pasting into a shell, quoting it when it holds anything
+/// that would otherwise split the argument or be reinterpreted.
+fn shell_quote(path: &Path) -> String {
+    let s = path.display().to_string();
+    let safe = !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/'));
+    if safe {
+        return s;
+    }
+    // Close the quote, emit an escaped literal quote, reopen — the only way to
+    // carry a single quote through single quoting in POSIX shells.
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
 /// Human-readable next-steps shown after writing the files.
-pub(crate) fn next_steps(config_path: &Path, wrote_env: bool) -> String {
-    let dir = config_path.parent().filter(|p| !p.as_os_str().is_empty());
-    let (run_prefix, config_for_run) = match dir {
-        Some(d) => {
-            let name = config_path.file_name().map_or_else(
-                || config_path.display().to_string(),
-                |n| n.to_string_lossy().into_owned(),
-            );
-            (format!("cd {} && ", d.display()), name)
-        }
-        None => (String::new(), config_path.display().to_string()),
-    };
+pub(crate) fn next_steps(config_path: &Path, wrote_env: bool, scope: Scope) -> String {
     let env_note = if wrote_env {
         "\nThe API key was written to .env (gitignored — do not commit it).\n\
-         The server reads it automatically; a shell export of the same \
-         variable takes precedence."
+         It is read automatically; a shell export of the same variable takes \
+         precedence."
     } else {
         ""
     };
+
+    // Only the well-known filename is discovered in a working directory; any
+    // other local name has to be passed on the command line, or the printed
+    // command would load something else or nothing at all.
+    let discoverable = config_path
+        .file_name()
+        .is_some_and(|n| n == std::ffi::OsStr::new(crate::agent_config::CWD_CONFIG_FILENAME));
+    let run = match scope {
+        // Discovery stops at the first hit, so a working directory holding its
+        // own `config.toml` never reaches the global set — promising it is
+        // found "from any directory" would be wrong in exactly that case.
+        Scope::Global => concat!(
+            "  2. Run `aura` from any directory that has no config.toml of its own\n",
+            "     (a local config.toml takes precedence)"
+        )
+        .to_string(),
+        Scope::Local if discoverable => config_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map_or_else(
+                || "  2. aura".to_string(),
+                |d| format!("  2. cd {} && aura", shell_quote(d)),
+            ),
+        Scope::Local => format!("  2. aura --config {}", shell_quote(config_path)),
+    };
+
     format!(
         "\nNext steps:\n  \
-           1. Add MCP servers to {config_for_run} to connect your observability stack\n  \
-           2. {run_prefix}CONFIG_PATH={config_for_run} aura-web-server\n  \
-           3. aura --api-url http://localhost:8080\n\
+           1. Add MCP servers to {} to connect your observability stack\n\
+         {run}\n\
          {env_note}",
+        config_path.display(),
     )
 }
 
@@ -198,6 +254,61 @@ mod tests {
     }
 
     #[test]
+    fn env_value_reads_the_line_merge_env_would_replace() {
+        let existing = "GITHUB_TOKEN=ghp_abc\n  OPENAI_API_KEY = sk-old \n";
+        assert_eq!(env_value(existing, "OPENAI_API_KEY"), Some("sk-old"));
+        assert_eq!(env_value(existing, "ANTHROPIC_API_KEY"), None);
+    }
+
+    #[test]
+    fn env_value_does_not_match_a_longer_variable_name() {
+        let existing = "OPENAI_API_KEY_STAGING=sk-staging\n";
+        assert_eq!(env_value(existing, "OPENAI_API_KEY"), None);
+    }
+
+    #[test]
+    fn env_value_sees_an_export_prefixed_assignment() {
+        // The runtime loader accepts this form; the helpers must too, or a
+        // value the runtime will use is invisible to the collision warning.
+        assert_eq!(
+            env_value("export OPENAI_API_KEY=sk-old\n", "OPENAI_API_KEY"),
+            Some("sk-old")
+        );
+        assert_eq!(
+            env_value("  export\tOPENAI_API_KEY = sk-old \n", "OPENAI_API_KEY"),
+            Some("sk-old")
+        );
+    }
+
+    #[test]
+    fn env_value_does_not_treat_exported_as_export() {
+        // `exportOPENAI_API_KEY=` and `exported_KEY=` are other variables.
+        assert_eq!(
+            env_value("exportOPENAI_API_KEY=x\n", "OPENAI_API_KEY"),
+            None
+        );
+    }
+
+    #[test]
+    fn env_value_returns_the_first_assignment_like_the_runtime() {
+        let existing = "OPENAI_API_KEY=first\nOPENAI_API_KEY=second\n";
+        assert_eq!(env_value(existing, "OPENAI_API_KEY"), Some("first"));
+    }
+
+    #[test]
+    fn merge_env_replaces_an_export_prefixed_line() {
+        let env = merge_env("export OPENAI_API_KEY=sk-old\n", "OPENAI_API_KEY", "sk-new");
+        assert_eq!(env, "OPENAI_API_KEY=sk-new\n");
+    }
+
+    #[test]
+    fn merge_env_collapses_every_duplicate_so_the_new_value_is_first() {
+        let existing = "A=1\nexport OPENAI_API_KEY=old1\nB=2\nOPENAI_API_KEY=old2\n";
+        let env = merge_env(existing, "OPENAI_API_KEY", "new");
+        assert_eq!(env, "A=1\nOPENAI_API_KEY=new\nB=2\n");
+    }
+
+    #[test]
     fn merge_env_idempotent() {
         let once = merge_env("", "OPENAI_API_KEY", "sk-test");
         assert_eq!(merge_env(&once, "OPENAI_API_KEY", "sk-test"), once);
@@ -205,21 +316,84 @@ mod tests {
 
     #[test]
     fn next_steps_mentions_config() {
-        let s = next_steps(Path::new("config.toml"), false);
+        let s = next_steps(Path::new("config.toml"), false, Scope::Local);
         assert!(s.contains("config.toml"), "got: {s}");
     }
 
     #[test]
     fn next_steps_mentions_env_when_written() {
-        let s = next_steps(Path::new("config.toml"), true);
+        let s = next_steps(Path::new("config.toml"), true, Scope::Local);
         assert!(s.contains(".env"), "got: {s}");
     }
 
     #[test]
     fn next_steps_cds_into_config_dir() {
-        let s = next_steps(Path::new("proj/config.toml"), false);
-        assert!(s.contains("cd proj"), "got: {s}");
-        assert!(s.contains("CONFIG_PATH=config.toml"), "got: {s}");
+        let s = next_steps(Path::new("proj/config.toml"), false, Scope::Local);
+        assert!(s.contains("cd proj && aura"), "got: {s}");
+    }
+
+    #[test]
+    fn next_steps_names_a_config_bare_aura_would_not_find() {
+        // Only `config.toml` is discovered in the working directory, so the
+        // printed command has to point at anything else explicitly.
+        for path in ["myagent.toml", "proj/myagent.toml"] {
+            let s = next_steps(Path::new(path), false, Scope::Local);
+            assert!(s.contains(&format!("aura --config {path}")), "got: {s}");
+        }
+    }
+
+    #[test]
+    fn next_steps_for_global_needs_no_cd() {
+        let s = next_steps(
+            Path::new("/home/u/.aura/agents/assistant.toml"),
+            false,
+            Scope::Global,
+        );
+        assert!(s.contains("from any directory"), "got: {s}");
+        assert!(!s.contains("cd "), "got: {s}");
+    }
+
+    #[test]
+    fn next_steps_for_global_does_not_promise_a_shadowed_directory() {
+        // A directory with its own config.toml never reaches the global set.
+        let s = next_steps(
+            Path::new("/home/u/.aura/agents/assistant.toml"),
+            false,
+            Scope::Global,
+        );
+        assert!(s.contains("no config.toml of its own"), "got: {s}");
+        assert!(s.contains("takes precedence"), "got: {s}");
+    }
+
+    #[test]
+    fn shell_quote_leaves_ordinary_paths_alone() {
+        assert_eq!(shell_quote(Path::new("config.toml")), "config.toml");
+        assert_eq!(
+            shell_quote(Path::new("proj/my-agent_2.toml")),
+            "proj/my-agent_2.toml"
+        );
+    }
+
+    #[test]
+    fn shell_quote_protects_paths_a_shell_would_mangle() {
+        assert_eq!(shell_quote(Path::new("my agent.toml")), "'my agent.toml'");
+        assert_eq!(
+            shell_quote(Path::new("a;rm -rf b.toml")),
+            "'a;rm -rf b.toml'"
+        );
+        assert_eq!(shell_quote(Path::new("it's.toml")), r"'it'\''s.toml'");
+    }
+
+    #[test]
+    fn next_steps_quotes_a_path_with_spaces() {
+        let s = next_steps(Path::new("my agent.toml"), false, Scope::Local);
+        assert!(s.contains("aura --config 'my agent.toml'"), "got: {s}");
+    }
+
+    #[test]
+    fn next_steps_quotes_a_cd_target_with_spaces() {
+        let s = next_steps(Path::new("my proj/config.toml"), false, Scope::Local);
+        assert!(s.contains("cd 'my proj' && aura"), "got: {s}");
     }
 
     #[cfg(feature = "standalone-cli")]

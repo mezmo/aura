@@ -58,37 +58,24 @@ pub struct DirectBackend {
 impl DirectBackend {
     /// Load configs and construct AppState, mirroring the web server's startup.
     pub async fn from_toml(
-        config_path: &str,
+        config_path: impl AsRef<Path>,
         extra_headers: Vec<(String, String)>,
     ) -> Result<Self> {
+        let config_path = config_path.as_ref();
+
         // Surface a friendly, actionable message when the config is simply
         // missing, instead of leaking a raw "No such file or directory" IO
-        // error. This is the common first-run case: `aura-cli` defaults to
-        // `config.toml` in the current directory when neither `--config` nor
-        // `--api-url` is given.
-        if !std::path::Path::new(config_path).exists() {
-            // Derive the program name from the running executable rather than
-            // hardcoding it, so the suggested command stays correct if the
-            // binary is renamed (e.g. `aura-cli` -> `aura`).
-            let prog = std::env::current_exe()
-                .ok()
-                .as_deref()
-                .and_then(std::path::Path::file_name)
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "aura".to_string());
-            anyhow::bail!(
-                "No agent config found at `{config_path}`.\n\n\
-                 Standalone mode needs a TOML agent config. To get started:\n  \
-                 • run `{prog} init` to generate one in the current directory\n  \
-                 • pass `--config <path>` to point at an existing config file or directory\n  \
-                 • set `--api-url <url>` (or AURA_API_URL) to connect to a running aura-web-server instead"
-            );
+        // error.
+        if !config_path.exists() {
+            anyhow::bail!(crate::agent_config::missing_config_message(
+                std::slice::from_ref(&config_path)
+            ));
         }
 
         let configs =
             aura_config::load_config(config_path).context("Failed to load agent config")?;
         if configs.is_empty() {
-            anyhow::bail!("No agent config found in {}", config_path);
+            anyhow::bail!("No agent config found in {}", config_path.display());
         }
 
         // Load the HITL webhook HMAC once at startup; a misconfiguration
@@ -128,13 +115,12 @@ impl DirectBackend {
         Ok(Self {
             app_state,
             extra_headers: headers_map,
-            config_path: PathBuf::from(config_path),
+            config_path: config_path.to_path_buf(),
         })
     }
 
-    /// Path the agent configs were loaded from, as given at startup. May
-    /// be a directory (`load_config` accepts both) — writers must check
-    /// `is_file()` first.
+    /// Path the agent configs were loaded from. May be a directory
+    /// (`load_config` accepts both) — writers must check `is_file()` first.
     pub fn config_path(&self) -> &Path {
         &self.config_path
     }
