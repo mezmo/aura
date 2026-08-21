@@ -29,7 +29,8 @@ license = "Apache-2.0"
 repository = "https://github.com/mezmo/aura"
 
 [profile.release]
-lto = "fat"
+# prefer thin lto until runtime performance warrants optimizations
+lto = "thin"
 codegen-units = 1
 strip = "symbols"
 

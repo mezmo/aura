@@ -34,7 +34,7 @@ pipeline {
   }
 
   options {
-    timeout time: 1, unit: 'HOURS'
+    timeout time: 90, unit: 'MINUTES'
     timestamps()
     ansiColor 'xterm'
     // On main, don't abort: a release build pushes a [skip ci] version commit
