@@ -37,6 +37,13 @@ pub struct WaitForArgs {
     pub poll_sec: Option<u64>,
     #[serde(default)]
     pub max_wait_sec: Option<u64>,
+    /// The persistence wrapper teaches worker models to attach
+    /// `_aura_reasoning` to every call, so it arrives here too even though
+    /// this tool sits outside the wrapper. Accepted and ignored — same
+    /// contract as `request_approval` — so the strict parse rejects only
+    /// genuinely unknown fields.
+    #[serde(default, rename = "_aura_reasoning")]
+    pub aura_reasoning: Option<String>,
 }
 
 /// Wire form of the probe.
@@ -1231,6 +1238,23 @@ mod tests {
             "poll_secs": 3,
         }));
         assert!(result.is_err());
+    }
+
+    /// Worker models attach the persistence wrapper's reasoning field to
+    /// every tool call; a wait_for call carrying it must parse rather than
+    /// bounce back to the model as an unknown-field error.
+    #[test]
+    fn aura_reasoning_is_accepted_and_ignored() {
+        let args = serde_json::from_value::<WaitForArgs>(serde_json::json!({
+            "probe": { "tool": "t", "args": {} },
+            "until": { "matches": "x" },
+            "_aura_reasoning": "watching the rollout settle",
+        }))
+        .expect("the reasoning field must not fail the call");
+        assert_eq!(
+            args.aura_reasoning.as_deref(),
+            Some("watching the rollout settle")
+        );
     }
 
     #[test]
