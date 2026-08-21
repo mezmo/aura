@@ -3,12 +3,13 @@ use crate::lenient_bool;
 use crate::lenient_int;
 use crate::orchestration::OrchestrationConfig;
 use crate::scratchpad::{ScratchpadConfig, ScratchpadToolEntry};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 
 /// Root configuration structure for our POC
-#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default, JsonSchema)]
 pub struct Config {
     /// Top-level persistence directory shared by scratchpad and orchestration
     /// artifacts. `[orchestration.artifacts].memory_dir` is honored as a
@@ -31,7 +32,7 @@ pub struct Config {
 }
 
 /// Reasoning effort level for GPT-5 models
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ReasoningEffort {
     #[serde(rename = "none")]
@@ -58,7 +59,7 @@ impl fmt::Display for ReasoningEffort {
 }
 
 /// LLM provider configuration with strong typing per provider
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "provider", rename_all = "lowercase")]
 #[serde(deny_unknown_fields)]
 pub enum LlmConfig {
@@ -552,7 +553,7 @@ fn validate_llm_api_key(llm: &LlmConfig, location: &str) -> Result<(), crate::Co
 }
 
 /// MCP servers configuration
-#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default, JsonSchema)]
 pub struct McpConfig {
     pub servers: HashMap<String, McpServerConfig>,
     /// Enable OpenAI-compatible tool schema sanitization (default: true)
@@ -565,7 +566,7 @@ fn default_sanitize_schemas() -> bool {
 }
 
 /// Individual MCP server configuration
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, JsonSchema)]
 #[serde(tag = "transport")]
 pub enum McpServerConfig {
     #[serde(rename = "stdio")]
@@ -630,7 +631,7 @@ impl McpServerConfig {
 }
 
 /// Vector store configuration (in-memory, Qdrant, and Bedrock KB)
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, JsonSchema)]
 pub struct VectorStoreConfig {
     /// Unique name to identify this vector store
     pub name: String,
@@ -643,7 +644,7 @@ pub struct VectorStoreConfig {
 }
 
 /// Type-specific vector store configuration, tagged by `type` field
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum VectorStoreType {
     InMemory {
@@ -678,7 +679,7 @@ impl Default for VectorStoreConfig {
 }
 
 /// Embedding model configuration with strong typing per provider
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, JsonSchema)]
 #[serde(tag = "provider", rename_all = "lowercase")]
 pub enum EmbeddingConfig {
     OpenAI {
@@ -725,7 +726,7 @@ impl EmbeddingConfig {
 }
 
 /// Tools configuration
-#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default, JsonSchema)]
 pub struct ToolsConfig {
     #[serde(default)]
     pub filesystem: bool,
@@ -734,7 +735,7 @@ pub struct ToolsConfig {
 }
 
 /// The `[agent.skills]` TOML table: where to discover skills from.
-#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default, JsonSchema)]
 pub struct SkillsConfig {
     /// Local skill sources (directories containing skill subdirectories)
     #[serde(default)]
@@ -742,7 +743,7 @@ pub struct SkillsConfig {
 }
 
 /// One `[[agent.skills.local]]` entry.
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, JsonSchema)]
 pub struct LocalSkillSource {
     /// Path to directory containing skill subdirectories (absolute or relative to the process CWD)
     pub source: std::path::PathBuf,
@@ -761,7 +762,7 @@ pub struct TodoToolsConfig {
 /// This is the TOML-facing view of the agent config. The runtime
 /// `AgentRuntimeConfig` in the `aura` crate extracts a subset (`AgentSettings`)
 /// for agent construction.
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AgentConfig {
     pub name: String,
@@ -814,6 +815,7 @@ pub struct AgentConfig {
     /// Useful when a model is not ready to be  or should only be invoked
     /// by known callers (default: false)
     #[serde(default, deserialize_with = "lenient_bool::deserialize_bool")]
+    #[schemars(schema_with = "lenient_bool::json_schema")]
     pub hidden: bool,
     /// Skill discovery sources. Workers inherit these unless they provide
     /// `[orchestration.worker.<name>.skills]`.
@@ -822,6 +824,7 @@ pub struct AgentConfig {
     /// Nudge the agent on its final turn to submit its results instead of
     /// calling more tools (default: false).
     #[serde(default, deserialize_with = "lenient_bool::deserialize_bool")]
+    #[schemars(schema_with = "lenient_bool::json_schema")]
     pub nudge_last_turn: bool,
     /// Nudge the agent to start wrapping up when this many turns remain
     /// before the turn-depth limit. `None` disables wrap-up nudging.
@@ -1288,7 +1291,7 @@ tool_headers_from_response = { "Content-Type" = "x-anything" }
 
 /// `[hitl]` config table. `Option<HitlConfig>` on [`Config`] is the enable bit;
 /// there is no `enabled` bool.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct HitlConfig {
     /// Glob patterns whose match gates a tool call. Compiled at TOML load.
     #[serde(default)]
@@ -1299,7 +1302,7 @@ pub struct HitlConfig {
 
 /// `[hitl.route]` table. The `Webhook` variant cannot parse without a valid
 /// URL, so the "url required, never empty" invariant holds structurally.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum DecisionRouteConfig {
     /// Attended: the approver is already at the client (default timeout 60s).
@@ -1415,6 +1418,20 @@ impl<'de> Deserialize<'de> for ToolHeaderMappings {
     }
 }
 
+impl JsonSchema for ToolHeaderMappings {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "ToolHeaderMappings".into()
+    }
+
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "description": "Outbound MCP header name → webhook approval-response header name.",
+            "type": "object",
+            "additionalProperties": { "type": "string" }
+        })
+    }
+}
+
 fn default_conversational_timeout_secs() -> u64 {
     60
 }
@@ -1468,6 +1485,20 @@ impl<'de> Deserialize<'de> for WebhookUrl {
     }
 }
 
+impl JsonSchema for WebhookUrl {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "WebhookUrl".into()
+    }
+
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "description": "A webhook URL with an http(s) scheme.",
+            "type": "string",
+            "pattern": "^https?://"
+        })
+    }
+}
+
 /// A tool-name glob pattern, compiled to a matcher at TOML load. Keeps its
 /// source text alongside the compiled matcher; the wire `matched_pattern` is the
 /// source string.
@@ -1508,5 +1539,18 @@ impl<'de> Deserialize<'de> for GlobPattern {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let source = String::deserialize(deserializer)?;
         Self::new(source).map_err(serde::de::Error::custom)
+    }
+}
+
+impl JsonSchema for GlobPattern {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "GlobPattern".into()
+    }
+
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "description": "A tool-name glob pattern.",
+            "type": "string"
+        })
     }
 }

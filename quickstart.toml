@@ -103,7 +103,6 @@ turn_depth_bonus = 6
 [orchestration]
 enabled = true
 max_planning_cycles = 2
-quality_threshold = 0.75
 allow_direct_answers = true
 allow_clarification = true
 tools_in_planning = "summary"

@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 /// and optionally overridden at `[orchestration.worker.<name>.scratchpad]`.
 /// A worker's effective config is the agent defaults merged with any overrides
 /// on the worker.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, schemars::JsonSchema)]
 pub struct ScratchpadConfig {
     /// Whether scratchpad is active for this agent/worker.
     #[serde(default)]
@@ -44,7 +44,7 @@ impl Default for ScratchpadConfig {
 ///
 /// Controls when a tool's output gets intercepted and diverted to scratchpad
 /// storage instead of being returned inline to the LLM.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, schemars::JsonSchema)]
 pub struct ScratchpadToolEntry {
     /// Minimum output size (in tokens) before interception kicks in.
     #[serde(default = "default_scratchpad_min_tokens")]

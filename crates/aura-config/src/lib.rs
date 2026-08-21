@@ -5,6 +5,7 @@ pub mod lenient_bool;
 pub mod lenient_int;
 pub mod loader;
 pub mod orchestration;
+pub mod schema;
 pub mod scratchpad;
 pub mod session_store;
 pub mod skills;
