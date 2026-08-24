@@ -21,6 +21,7 @@
 //! fabricated or misattributed manifest is unconstructible. Turn-transient
 //! scratchpad I/O has its own typed surface (see `scratchpad.rs`).
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -490,6 +491,7 @@ impl HeldLock {
             });
         }
         Ok(FencedRun {
+            issued: Mutex::new(BTreeSet::new()),
             delta: Mutex::new(Manifest::empty()),
             lock: self,
             run_dir: path,
@@ -610,6 +612,14 @@ pub enum ArtifactWriteError {
 #[derive(Debug)]
 #[must_use]
 pub struct FencedRun {
+    /// Paths reserved this turn (write-once, I1). A reservation is taken
+    /// *synchronously* — before any await or filesystem mutation — so two
+    /// concurrent `write_artifact` calls for one path cannot both pass:
+    /// the second is rejected before anything is written. A failed write
+    /// consumes its reservation (single-artifact retry is unsupported;
+    /// the turn aborts). Sync mutex: locked only to insert, never across
+    /// an await.
+    issued: Mutex<BTreeSet<ArtifactPath>>,
     /// The turn's private manifest delta: every successful
     /// `write_artifact` records itself here. The barrier commits exactly
     /// this — a fabricated or misattributed delta is unconstructible
@@ -715,17 +725,21 @@ impl ActiveTurn {
         self.run.read_artifact(path).await
     }
 
-    /// Write one manifest-bound artifact: capability asserted, one write
-    /// per path per turn (I1), own-epoch only, then temp write → fsync →
-    /// atomic rename (the vendor-affirmed atomic) → parent-dir fsync.
-    /// The digest is computed for the returned entry, and the write
-    /// records itself into the turn's private delta — the barrier
-    /// commits exactly the recorded set, nothing else.
+    /// Write one manifest-bound artifact: the path is *reserved*
+    /// synchronously (before any await or filesystem mutation, so
+    /// concurrent writers of one path cannot interleave), the capability
+    /// is asserted, the epoch prefix must match this claim's, then temp
+    /// write → fsync → atomic rename (the vendor-affirmed atomic) →
+    /// parent-dir fsync. The digest is computed for the returned entry,
+    /// and the write records itself into the turn's private delta — the
+    /// barrier commits exactly the recorded set, nothing else. A failed
+    /// write consumes the reservation: single-artifact retry is
+    /// unsupported, the turn aborts.
     ///
     /// # Errors
     /// [`ArtifactWriteError::Duplicate`] when the path was already
-    /// written this turn; [`ArtifactWriteError::WrongEpoch`] when the
-    /// path's prefix is not this claim's epoch;
+    /// reserved or written this turn; [`ArtifactWriteError::WrongEpoch`]
+    /// when the path's prefix is not this claim's epoch;
     /// [`ArtifactWriteError::LeaseLost`] when the capability fails;
     /// [`ArtifactWriteError::Io`] on filesystem failure.
     #[expect(
@@ -738,7 +752,7 @@ impl ActiveTurn {
         bytes: &[u8],
     ) -> Result<ManifestEntry, ArtifactWriteError> {
         todo!(
-            "fill: assert_live + dup/epoch checks + temp/fsync/rename/dir-fsync + sha256 + record into private delta; aura #421 follow-up"
+            "fill: reserve path in issued (sync, pre-await) → assert_live → epoch check → temp/fsync/rename/dir-fsync → sha256 → record into private delta; aura #421 follow-up"
         )
     }
 
@@ -884,8 +898,10 @@ impl CommitContext {
 
 /// How the barrier's cleanup fared when the commit step failed. Both
 /// fields carry their real results: no cleanup failure is silently
-/// dropped.
+/// dropped. `#[must_use]`: an ignored abort outcome is a compile-time
+/// warning, matching the rest of the state chain.
 #[derive(Debug)]
+#[must_use]
 pub struct CleanupOutcome {
     /// The quarantine result.
     pub quarantine: Result<(), std::io::Error>,
@@ -920,10 +936,10 @@ impl CommittingTurn {
     /// *definitely* (delta merge, fence loss, proven non-landing, or
     /// store error); quarantine was attempted.
     /// [`BarrierError::CommitIndeterminate`] — commit-unknown and the
-    /// reconcile read found the claim superseded: whether S3 landed is
-    /// unknowable, so the run is *never* quarantined (its bytes may be
-    /// manifest-referenced); the claim is released and the turn reported
-    /// lost.
+    /// outcome could not be reconciled (supersession *or* a failed
+    /// reconcile read): whether S3 landed is unknowable, so the run is
+    /// *never* quarantined (its bytes may be manifest-referenced); the
+    /// claim is released and the turn reported lost.
     /// [`BarrierError::Release`] — release failed after a durable
     /// commit; the authorized response travels with the error (data is
     /// durable) and the session is flagged wedged.
@@ -940,7 +956,7 @@ impl CommittingTurn {
         Fut: Future<Output = Result<T, E>>,
     {
         todo!(
-            "fill: mint OpId → payload(ctx) → take_delta → extend_from → S3 via store (latch from TurnEnd; commit-unknown → reconcile: Applied → proceed, NotApplied → CommitRejected(NotLanded), SupersededUnknown → CommitIndeterminate, never quarantine) → lease stop → release → response; aura #421 follow-up"
+            "fill: mint OpId → payload(ctx) → take_delta → extend_from → S3 via store (latch from TurnEnd; commit-unknown → reconcile: Applied → proceed, NotApplied → CommitRejected(NotLanded), SupersededUnknown or reconcile-failure → CommitIndeterminate with typed cause, never quarantine) → lease stop → release → response; aura #421 follow-up"
         )
     }
 }
@@ -963,9 +979,33 @@ pub enum CommitRejection {
     /// run.
     #[error("commit proved never landed")]
     NotLanded,
-    /// The claim authority errored before or without S3.
+    /// The claim authority errored *before S3 was dispatched* (nothing
+    /// could have landed). A store error after S3 dispatch is NOT here —
+    /// it is indeterminate and routes to `CommitIndeterminate`.
     #[error(transparent)]
     Store(#[from] StoreUnavailable),
+}
+
+/// Why a commit's outcome is unknowable (the commit may have landed, so
+/// the run's bytes may be manifest-referenced — quarantine is forbidden
+/// on every variant).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndeterminateCause {
+    /// Commit-unknown, and the reconcile read found the claim
+    /// superseded: the single op slot may have been overwritten.
+    SupersededUnknown,
+    /// Commit-unknown, and the reconcile read itself failed: no view of
+    /// the row exists at all.
+    ReconcileUnavailable,
+}
+
+impl std::fmt::Display for IndeterminateCause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            IndeterminateCause::SupersededUnknown => f.write_str("superseded before reconcile"),
+            IndeterminateCause::ReconcileUnavailable => f.write_str("reconcile read unavailable"),
+        }
+    }
 }
 
 /// Why the barrier failed.
@@ -993,13 +1033,16 @@ pub enum BarrierError<T, E> {
         /// Quarantine and release results.
         cleanup: CleanupOutcome,
     },
-    /// Commit-unknown, and the reconcile read found the claim
-    /// superseded: whether S3 landed is unknowable. The run is *not*
-    /// quarantined — its bytes may be manifest-referenced — so only the
-    /// release result travels. The turn is reported lost; the new holder
-    /// re-drives the session.
-    #[error("commit indeterminate after supersession; released={}, run left for manifest-aware GC", release.is_ok())]
+    /// Commit-indeterminate: the S3 response was lost *and* the outcome
+    /// could not be reconciled — either the reconcile read found the
+    /// claim superseded, or the reconcile read itself failed. Whether
+    /// S3 landed is unknowable, so the run is *never* quarantined (its
+    /// bytes may be manifest-referenced); the claim is released and the
+    /// turn reported lost.
+    #[error("commit indeterminate ({cause}); released={}, run left for manifest-aware GC", release.is_ok())]
     CommitIndeterminate {
+        /// Why the outcome is unknowable.
+        cause: IndeterminateCause,
         /// The claim release result.
         release: Result<(), ReleaseError>,
     },
@@ -1044,9 +1087,11 @@ impl<T, E> BarrierError<T, E> {
 /// Sole authorization to emit a terminal frame. Carries the committed
 /// payload bound to session + turn + epoch + holder. Not `Clone`; the
 /// payload is only reachable through authorization-preserving
-/// transforms, so the envelope cannot be discarded short of consuming
-/// the whole value.
+/// transforms. `#[must_use]`: dropping the envelope unconsumed is a
+/// compile-time warning, so the authorization cannot be silently
+/// discarded.
 #[derive(Debug)]
+#[must_use]
 pub struct CommittedResponse<T> {
     payload: T,
     session: SessionId,

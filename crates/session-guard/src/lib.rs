@@ -127,7 +127,8 @@ pub use scratchpad::{InvalidScratchpadName, ScratchpadError, ScratchpadName};
 pub use state::{
     ActiveTurn, AdmissionError, ArtifactWriteError, BarrierError, CleanupOutcome, CommitContext,
     CommitKind, CommitRejection, CommittedResponse, CommittingTurn, CreateRunError, FenceCause,
-    FencedRun, HeldLock, IdleRequest, ReadError, ReleaseError, TurnEnd, VerifiedRead,
+    FencedRun, HeldLock, IdleRequest, IndeterminateCause, ReadError, ReleaseError, TurnEnd,
+    VerifiedRead,
 };
 pub use store::StoreUnavailable;
 
