@@ -15,6 +15,8 @@
 /// [`extract_http_status`].
 use aura_events::HTTP_STATUS_MARKER;
 
+use crate::ui::text::strip_control_chars;
+
 /// A single user-facing notice derived from an `aura.mcp_status` event.
 ///
 /// The variant carries the severity; the payload is the human-readable message
@@ -117,6 +119,10 @@ fn failure_summary(transport_display: &str, name: &str, reason: &str) -> String 
 ///
 /// A failed server never also produces a "no tools" warning — the connection
 /// failure is the actionable problem and no tools are expected when it fails.
+///
+/// The server name, transport, and reason are all remote-controlled, so each
+/// message is stripped of terminal control characters here rather than at
+/// every place a notice is printed.
 pub fn notices_from_event(val: &serde_json::Value) -> Vec<McpNotice> {
     let Some(servers) = val.get("servers").and_then(|s| s.as_array()) else {
         return Vec::new();
@@ -142,11 +148,13 @@ pub fn notices_from_event(val: &serde_json::Value) -> Vec<McpNotice> {
 
             if status == "failed" {
                 let reason = s.get("reason").and_then(|v| v.as_str()).unwrap_or_default();
-                Some(McpNotice::Error(failure_summary(disp, name, reason)))
+                Some(McpNotice::Error(strip_control_chars(&failure_summary(
+                    disp, name, reason,
+                ))))
             } else if status == "connected" && tools == 0 {
-                Some(McpNotice::Warning(format!(
+                Some(McpNotice::Warning(strip_control_chars(&format!(
                     "{disp} MCP server '{name}' connected but reported no tools available"
-                )))
+                ))))
             } else {
                 None
             }
@@ -264,6 +272,34 @@ mod tests {
         assert_eq!(
             notices[0].message(),
             "HTTP MCP server 'mezmo' connected but reported no tools available"
+        );
+    }
+
+    #[test]
+    fn control_characters_are_stripped_from_notices() {
+        let notices = notices_from_event(&event(json!([
+            {
+                "server_name": "gh\x1b[31m",
+                "transport": "http_streamable",
+                "status": "failed",
+                "tools_count": 0,
+                "reason": "Connection failed: \x1b]0;pwned\x07transport closed"
+            },
+            {
+                "server_name": "kb\x07",
+                "transport": "sse",
+                "status": "connected",
+                "tools_count": 0
+            }
+        ])));
+        assert_eq!(notices.len(), 2);
+        assert_eq!(
+            notices[0].message(),
+            "HTTP MCP server 'gh[31m': ]0;pwnedtransport closed"
+        );
+        assert_eq!(
+            notices[1].message(),
+            "SSE MCP server 'kb' connected but reported no tools available"
         );
     }
 
