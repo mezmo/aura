@@ -997,7 +997,9 @@ impl IterateOverTool {
             description:
                 "Iterate over items in a JSON array and extract selected fields from each. \
                           Use dot-notation for the array path and comma-separated field names. \
-                          Fields can use dot-notation for nested access (e.g., 'metadata.score')."
+                          Fields can use dot-notation for nested access (e.g., 'metadata.score'). \
+                          Supports optional offset/limit to project a window of items instead \
+                          of the whole array."
                     .to_string(),
             parameters: json!({
                 "type": "object",
@@ -1013,6 +1015,16 @@ impl IterateOverTool {
                     "fields": {
                         "type": "string",
                         "description": "Comma-separated field names to extract (e.g., 'id,title,metadata.score')"
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "Optional: index of the first item to return (0-indexed, default 0)",
+                        "minimum": 0
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Optional: max items to return starting at offset (default: all remaining items)",
+                        "minimum": 1
                     }
                 },
                 "required": ["file", "path", "fields"],
@@ -1029,6 +1041,12 @@ pub struct IterateOverArgs {
     pub path: String,
     /// Comma-separated field names to extract from each item (e.g., "id,title,score").
     pub fields: String,
+    /// 0-indexed start position within the array.
+    #[serde(default)]
+    pub offset: Option<usize>,
+    /// Max items to return starting at `offset`.
+    #[serde(default)]
+    pub limit: Option<usize>,
 }
 
 impl Tool for IterateOverTool {
@@ -1044,11 +1062,18 @@ impl Tool for IterateOverTool {
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         tracing::debug!(
-            "scratchpad iterate_over: file={}, path={}, fields={}",
+            "scratchpad iterate_over: file={}, path={}, fields={}, offset={:?}, limit={:?}",
             args.file,
             args.path,
-            args.fields
+            args.fields,
+            args.offset,
+            args.limit
         );
+        if args.limit == Some(0) {
+            return Err(ScratchpadToolError::InvalidArg(
+                "limit must be >= 1".to_string(),
+            ));
+        }
         let content = read_scratchpad_file(&self.storage, &args.file).await?;
         let root: serde_json::Value =
             serde_json::from_str(&content).map_err(|_| ScratchpadToolError::NotJson)?;
@@ -1060,10 +1085,28 @@ impl Tool for IterateOverTool {
 
         let field_names: Vec<&str> = args.fields.split(',').map(|s| s.trim()).collect();
 
-        let mut rows: Vec<serde_json::Value> = Vec::with_capacity(items.len());
-        for (i, item) in items.iter().enumerate() {
+        // Offset past the end yields an empty window, not an error, so the
+        // LLM can correct course.
+        let total_items = items.len();
+        let offset = args.offset.unwrap_or(0);
+        let window_end = match args.limit {
+            Some(l) => offset.saturating_add(l).min(total_items),
+            None => total_items,
+        };
+        let windowed_items: &[serde_json::Value] = if offset >= total_items {
+            &[]
+        } else {
+            &items[offset..window_end]
+        };
+        let window_size = windowed_items.len();
+        let is_full_scan = offset == 0 && window_size == total_items;
+
+        let mut rows: Vec<serde_json::Value> = Vec::with_capacity(window_size);
+        for (i, item) in windowed_items.iter().enumerate() {
+            // Absolute array position — keeps get_in paths in rows and hints valid.
+            let index = offset + i;
             let mut row = serde_json::Map::new();
-            row.insert("_index".to_string(), json!(i));
+            row.insert("_index".to_string(), json!(index));
             for &field in &field_names {
                 let val = navigate_path(item, field)
                     .ok()
@@ -1072,7 +1115,7 @@ impl Tool for IterateOverTool {
                     val,
                     ITERATE_OVER_STRING_PREVIEW_LINES,
                     &args.path,
-                    i,
+                    index,
                     field,
                 );
                 row.insert(field.to_string(), val);
@@ -1083,28 +1126,46 @@ impl Tool for IterateOverTool {
         let result = serde_json::to_string_pretty(&rows).unwrap_or_else(|_| "[]".to_string());
 
         // Build the final formatted output FIRST, then budget-check on it.
+        let window_desc = if is_full_scan {
+            format!("{} items", total_items)
+        } else {
+            format!(
+                "items [{}..{}) of {} total",
+                offset,
+                offset + window_size,
+                total_items
+            )
+        };
         let meta = build_metadata(result.lines().count(), &result, &self.budget);
         let final_output = format!(
-            "{}\n\n--- scratchpad iterate_over: $.{} ({} items, fields: [{}]) | {} ---",
-            result,
-            args.path,
-            items.len(),
-            args.fields,
-            meta
+            "{}\n\n--- scratchpad iterate_over: $.{} ({}, fields: [{}]) | {} ---",
+            result, args.path, window_desc, args.fields, meta
         );
 
         if let Err(e) = check_and_record_budget(&self.budget, &final_output) {
+            let mut suggestions = Vec::new();
+            // A retry is only proposed when it strictly narrows the window;
+            // a single over-budget item needs fewer fields, not fewer items.
+            if window_size > 1 {
+                suggestions.push(format!(
+                    "Paginate with a smaller window: iterate_over file=\"{}\" path=\"{}\" fields=\"{}\" offset={} limit={}",
+                    args.file, args.path, args.fields, offset, window_size / 2
+                ));
+            }
+            suggestions.push("Request fewer fields".to_string());
+            suggestions.push(
+                "Use get_in to access specific items by index (e.g., 'results.0.title')"
+                    .to_string(),
+            );
+            suggestions.push("Use grep to find specific items first".to_string());
             return Ok(format_budget_error(
                 e,
                 "iterate_over_too_large",
                 json!({
-                    "item_count": items.len(),
+                    "item_count": total_items,
+                    "window_size": window_size,
                     "requested_fields": field_names,
-                    "suggestions": [
-                        "Request fewer fields",
-                        "Use get_in to access specific items by index (e.g., 'results.0.title')",
-                        "Use grep to find specific items first"
-                    ]
+                    "suggestions": suggestions,
                 }),
             ));
         }
@@ -2271,6 +2332,8 @@ mod tests {
                 file: "test.json".to_string(),
                 path: "results".to_string(),
                 fields: "id,title".to_string(),
+                offset: None,
+                limit: None,
             })
             .await
             .unwrap();
@@ -2291,6 +2354,8 @@ mod tests {
                 file: "test.json".to_string(),
                 path: "results".to_string(),
                 fields: "id,metadata.score".to_string(),
+                offset: None,
+                limit: None,
             })
             .await
             .unwrap();
@@ -2309,6 +2374,8 @@ mod tests {
                 file: "test.json".to_string(),
                 path: "total".to_string(),
                 fields: "id".to_string(),
+                offset: None,
+                limit: None,
             })
             .await;
         assert!(result.is_err());
@@ -2339,6 +2406,8 @@ mod tests {
                 file: "trunc.json".to_string(),
                 path: "items".to_string(),
                 fields: "id,content".to_string(),
+                offset: None,
+                limit: None,
             })
             .await
             .unwrap();
@@ -2351,6 +2420,217 @@ mod tests {
         assert!(result.contains("### Section 0"));
         // Item 1's short content should be intact
         assert!(result.contains("short value"));
+    }
+
+    #[tokio::test]
+    async fn test_iterate_over_paginated_window() {
+        let (_tmp, storage, budget) = setup().await;
+        let json = serde_json::json!({
+            "items": (0..10).map(|i| serde_json::json!({"id": i, "name": format!("item-{i}")})).collect::<Vec<_>>()
+        });
+        storage
+            .write_output("page", &json.to_string())
+            .await
+            .unwrap();
+
+        let tool = IterateOverTool::new(storage, budget);
+        let result = tool
+            .call(IterateOverArgs {
+                file: "page.json".to_string(),
+                path: "items".to_string(),
+                fields: "id,name".to_string(),
+                offset: Some(3),
+                limit: Some(4),
+            })
+            .await
+            .unwrap();
+        // Window is items [3..7): item-3 through item-6
+        assert!(result.contains("item-3"));
+        assert!(result.contains("item-6"));
+        assert!(!result.contains("item-2"));
+        assert!(!result.contains("item-7"));
+        // _index carries the absolute array position, not the window position
+        assert!(result.contains("\"_index\": 3"));
+        assert!(!result.contains("\"_index\": 0"));
+        assert!(result.contains("items [3..7) of 10 total"));
+    }
+
+    #[tokio::test]
+    async fn test_iterate_over_limit_only() {
+        let (_tmp, storage, budget) = setup().await;
+        storage.write_output("test", sample_json()).await.unwrap();
+
+        let tool = IterateOverTool::new(storage, budget);
+        let result = tool
+            .call(IterateOverArgs {
+                file: "test.json".to_string(),
+                path: "results".to_string(),
+                fields: "id,title".to_string(),
+                offset: None,
+                limit: Some(1),
+            })
+            .await
+            .unwrap();
+        assert!(result.contains("First Result"));
+        assert!(!result.contains("Second Result"));
+        assert!(result.contains("items [0..1) of 2 total"));
+    }
+
+    #[tokio::test]
+    async fn test_iterate_over_offset_past_end() {
+        let (_tmp, storage, budget) = setup().await;
+        storage.write_output("test", sample_json()).await.unwrap();
+
+        let tool = IterateOverTool::new(storage, budget);
+        let result = tool
+            .call(IterateOverArgs {
+                file: "test.json".to_string(),
+                path: "results".to_string(),
+                fields: "id".to_string(),
+                offset: Some(50),
+                limit: Some(10),
+            })
+            .await
+            .unwrap();
+        // Deterministic empty window, not an error
+        assert!(result.contains("[]"));
+        assert!(result.contains("items [50..50) of 2 total"));
+    }
+
+    #[tokio::test]
+    async fn test_iterate_over_limit_overflow_saturates() {
+        let (_tmp, storage, budget) = setup().await;
+        storage.write_output("test", sample_json()).await.unwrap();
+
+        let tool = IterateOverTool::new(storage, budget);
+        // offset + usize::MAX must not wrap; window clamps to total items.
+        let result = tool
+            .call(IterateOverArgs {
+                file: "test.json".to_string(),
+                path: "results".to_string(),
+                fields: "id,title".to_string(),
+                offset: Some(1),
+                limit: Some(usize::MAX),
+            })
+            .await
+            .unwrap();
+        assert!(!result.contains("First Result"));
+        assert!(result.contains("Second Result"));
+        assert!(result.contains("items [1..2) of 2 total"));
+    }
+
+    #[tokio::test]
+    async fn test_iterate_over_full_limit_reports_full_scan() {
+        let (_tmp, storage, budget) = setup().await;
+        storage.write_output("test", sample_json()).await.unwrap();
+
+        let tool = IterateOverTool::new(storage, budget);
+        // offset=0 + limit covering the whole array reads as a full scan.
+        let result = tool
+            .call(IterateOverArgs {
+                file: "test.json".to_string(),
+                path: "results".to_string(),
+                fields: "id".to_string(),
+                offset: Some(0),
+                limit: Some(2),
+            })
+            .await
+            .unwrap();
+        assert!(result.contains("2 items"));
+        assert!(!result.contains("of 2 total"));
+    }
+
+    #[tokio::test]
+    async fn test_iterate_over_zero_limit_rejected() {
+        let (_tmp, storage, budget) = setup().await;
+        storage.write_output("test", sample_json()).await.unwrap();
+
+        let tool = IterateOverTool::new(storage, budget);
+        // Schema advertises minimum 1, but providers don't enforce it.
+        let result = tool
+            .call(IterateOverArgs {
+                file: "test.json".to_string(),
+                path: "results".to_string(),
+                fields: "id".to_string(),
+                offset: None,
+                limit: Some(0),
+            })
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_iterate_over_budget_error_retry_narrows() {
+        let (_tmp, storage, _budget) = setup().await;
+        let counter = TiktokenCounter::default_counter();
+        let tiny_budget = ContextBudget::new(100, 0.20, 0, std::sync::Arc::new(counter));
+
+        let items: Vec<String> = (0..50)
+            .map(|i| format!(r#"{{"id":{i},"title":"result number {i}"}}"#))
+            .collect();
+        let json = format!(r#"{{"items":[{}]}}"#, items.join(","));
+        storage.write_output("big", &json).await.unwrap();
+
+        let tool = IterateOverTool::new(storage, tiny_budget);
+        let result = tool
+            .call(IterateOverArgs {
+                file: "big.json".to_string(),
+                path: "items".to_string(),
+                fields: "id,title".to_string(),
+                offset: None,
+                limit: None,
+            })
+            .await
+            .unwrap();
+
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["error"], "iterate_over_too_large");
+        assert_eq!(parsed["window_size"], 50);
+        let first = parsed["suggestions"][0].as_str().unwrap();
+        assert!(
+            first.contains("limit=25"),
+            "retry must halve the 50-item window, got: {first}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_iterate_over_budget_error_single_item_no_retry() {
+        let (_tmp, storage, _budget) = setup().await;
+        let counter = TiktokenCounter::default_counter();
+        let tiny_budget = ContextBudget::new(100, 0.20, 0, std::sync::Arc::new(counter));
+
+        // One item whose single-line field alone exceeds the budget — a
+        // narrower window cannot exist, so no paginated retry is offered.
+        let big = "x".repeat(2000);
+        let json = format!(r#"{{"items":[{{"id":1,"content":"{big}"}}]}}"#);
+        storage.write_output("one", &json).await.unwrap();
+
+        let tool = IterateOverTool::new(storage, tiny_budget);
+        let result = tool
+            .call(IterateOverArgs {
+                file: "one.json".to_string(),
+                path: "items".to_string(),
+                fields: "id,content".to_string(),
+                offset: None,
+                limit: None,
+            })
+            .await
+            .unwrap();
+
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["error"], "iterate_over_too_large");
+        let suggestions = parsed["suggestions"].as_array().unwrap();
+        assert!(
+            !suggestions
+                .iter()
+                .any(|s| s.as_str().unwrap().contains("limit=")),
+            "no paginated retry for a single-item window"
+        );
+        assert!(
+            suggestions
+                .iter()
+                .any(|s| s.as_str().unwrap().contains("fewer fields")),
+        );
     }
 
     #[tokio::test]

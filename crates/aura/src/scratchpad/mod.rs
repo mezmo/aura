@@ -192,7 +192,7 @@ When you see a `[scratchpad: ...]` message instead of direct output, use these t
 3. **head** — Preview the first N lines.
 4. **grep** — Search for specific content with regex.
 5. **get_in** — Extract a value at a nested JSON path (e.g., `results.0.title`). For large string values, use `offset` and `limit` to paginate by line.
-6. **iterate_over** — Extract selected fields from every item in a JSON array (e.g., `iterate_over(file, 'results', 'id,title')`).
+6. **iterate_over** — Extract selected fields from items in a JSON array (e.g., `iterate_over(file, 'results', 'id,title')`). For large arrays, use `offset` and `limit` to paginate by item.
 7. **slice** — Extract a specific line range.
 8. **read** — Read the entire file (WARNING: may be large, prefer targeted tools).
 
