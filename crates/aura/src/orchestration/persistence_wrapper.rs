@@ -1459,6 +1459,7 @@ mod tests {
             route,
             scope,
             request_id.clone(),
+            "test-agent".to_string(),
         ));
         let persistence: Arc<dyn ToolWrapper> = Arc::new(test_wrapper(Arc::new(Mutex::new(
             ExecutionPersistence::disabled(),

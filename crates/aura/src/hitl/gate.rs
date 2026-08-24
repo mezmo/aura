@@ -30,6 +30,8 @@ pub struct HitlApprovalWrapper {
     scope: AgentScope,
     /// Global request id, for SSE event routing.
     request_id: String,
+    /// `[agent].name` of the config that built this agent.
+    agent_name: String,
 }
 
 impl HitlApprovalWrapper {
@@ -39,12 +41,14 @@ impl HitlApprovalWrapper {
         route: Arc<DecisionRoute>,
         scope: AgentScope,
         request_id: String,
+        agent_name: String,
     ) -> Self {
         Self {
             patterns,
             route,
             scope,
             request_id,
+            agent_name,
         }
     }
 
@@ -80,6 +84,7 @@ impl ToolWrapper for HitlApprovalWrapper {
             scope: self.scope.clone(),
             origin: ApprovalOrigin::ConfigGate {
                 matched_pattern: matched.to_string(),
+                agent_name: self.agent_name.clone(),
             },
             items: vec![ApprovalItem {
                 tool_name: ctx.tool_name.clone(),
@@ -141,6 +146,7 @@ mod tests {
             }),
             AgentScope::Single { session_id: None },
             "t".into(),
+            "test-agent".to_string(),
         );
         assert_eq!(wrapper.matched_pattern("kubectl_apply"), Some("kubectl_*"));
         assert_eq!(wrapper.matched_pattern("request_approval"), None);
@@ -165,6 +171,7 @@ mod tests {
             }),
             AgentScope::Single { session_id: None },
             "req-test".into(),
+            "test-agent".to_string(),
         );
         let args = serde_json::json!({});
 
@@ -458,6 +465,7 @@ mod tests {
                 Arc::new(route),
                 AgentScope::Single { session_id: None },
                 request_id.to_string(),
+                "test-agent".to_string(),
             );
             (
                 WrappedTool::new(inner, Arc::new(gate) as Arc<dyn ToolWrapper>),

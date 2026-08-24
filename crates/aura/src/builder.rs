@@ -333,6 +333,7 @@ impl Agent {
                     hitl.route.clone(),
                     scope.clone(),
                     request_id.clone(),
+                    config_owned.agent.name.clone(),
                 ));
             config_owned.tool_wrapper = Some(match config_owned.tool_wrapper.take() {
                 Some(existing) => Arc::new(crate::tool_wrapper::ComposedWrapper::new(vec![

@@ -1007,6 +1007,8 @@ mod tests {
 pub enum ApprovalOriginWire {
     ConfigGate {
         matched_pattern: String,
+        #[serde(default)]
+        agent_name: String,
     },
     AgentRequested {
         reason: String,

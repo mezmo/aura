@@ -128,8 +128,12 @@ pub fn completed_error(
 
 fn origin_to_wire(origin: &ApprovalOrigin) -> ApprovalOriginWire {
     match origin {
-        ApprovalOrigin::ConfigGate { matched_pattern } => ApprovalOriginWire::ConfigGate {
+        ApprovalOrigin::ConfigGate {
+            matched_pattern,
+            agent_name,
+        } => ApprovalOriginWire::ConfigGate {
             matched_pattern: matched_pattern.clone(),
+            agent_name: agent_name.clone(),
         },
         ApprovalOrigin::AgentRequested { reason, agent_name } => {
             ApprovalOriginWire::AgentRequested {

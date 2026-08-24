@@ -740,6 +740,7 @@ mod tests {
             scope: AgentScope::Single { session_id: None },
             origin: ApprovalOrigin::ConfigGate {
                 matched_pattern: "shell*".to_string(),
+                agent_name: "sre-assistant".to_string(),
             },
             items: vec![ApprovalItem {
                 tool_name: "shell_exec".to_string(),
@@ -760,6 +761,7 @@ mod tests {
         assert!(value["scope"].get("session_id").is_none());
         assert_eq!(value["origin"]["kind"], "config_gate");
         assert_eq!(value["origin"]["matched_pattern"], "shell*");
+        assert_eq!(value["origin"]["agent_name"], "sre-assistant");
         // regression guard: the externally-tagged domain variant keys must not appear.
         assert!(value["scope"].get("Single").is_none());
         assert!(value["origin"].get("ConfigGate").is_none());
@@ -818,6 +820,7 @@ mod tests {
             scope: AgentScope::Single { session_id: None },
             origin: ApprovalOrigin::ConfigGate {
                 matched_pattern: "kubectl_*".to_string(),
+                agent_name: "test-agent".to_string(),
             },
             items: vec![ApprovalItem {
                 tool_name: "kubectl_delete".to_string(),
@@ -961,6 +964,7 @@ mod tests {
             "conv-req-2",
             ApprovalOrigin::ConfigGate {
                 matched_pattern: "rm_*".into(),
+                agent_name: "test-agent".to_string(),
             },
         );
         let decision_id = request.decision_id;
@@ -1135,6 +1139,7 @@ mod tests {
             &request_id,
             ApprovalOrigin::ConfigGate {
                 matched_pattern: "dangerous_*".into(),
+                agent_name: "test-agent".to_string(),
             },
         );
         let decision_id = request.decision_id;
@@ -1208,6 +1213,7 @@ mod tests {
                 scope: AgentScope::Single { session_id: None },
                 origin: ApprovalOrigin::ConfigGate {
                     matched_pattern: "dangerous_*".into(),
+                    agent_name: "test-agent".to_string(),
                 },
                 items: vec![],
             }
@@ -1563,6 +1569,7 @@ mod tests {
             scope: AgentScope::Single { session_id: None },
             origin: ApprovalOrigin::ConfigGate {
                 matched_pattern: "dangerous_*".into(),
+                agent_name: "test-agent".to_string(),
             },
             items: vec![ApprovalItem {
                 tool_name: "dangerous_apply".into(),
@@ -1912,6 +1919,7 @@ mod tests {
             scope: AgentScope::Single { session_id: None },
             origin: ApprovalOrigin::ConfigGate {
                 matched_pattern: "dangerous_*".into(),
+                agent_name: "test-agent".to_string(),
             },
             items: vec![ApprovalItem {
                 tool_name: "dangerous_apply".into(),

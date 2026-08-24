@@ -343,6 +343,7 @@ fn make_parked(request_id: &str, ttl: Duration) -> ParkedApproval {
             scope: AgentScope::Single { session_id: None },
             origin: ApprovalOrigin::ConfigGate {
                 matched_pattern: "kubectl_*".to_string(),
+                agent_name: "test-agent".to_string(),
             },
             items: vec![ApprovalItem {
                 tool_name: "kubectl_delete".to_string(),

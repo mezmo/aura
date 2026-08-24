@@ -1476,6 +1476,7 @@ mod tests {
                 tool_name: "dangerous_apply".to_string(),
                 origin: aura_events::ApprovalOriginWire::ConfigGate {
                     matched_pattern: "dangerous_*".to_string(),
+                    agent_name: "test-agent".to_string(),
                 },
                 scope: aura_events::AgentScopeWire::Single { session_id: None },
             });
@@ -2428,6 +2429,7 @@ url = "http://127.0.0.1:9"
                 scope: aura::hitl::AgentScope::Single { session_id: None },
                 origin: aura::hitl::ApprovalOrigin::ConfigGate {
                     matched_pattern: "test_*".into(),
+                    agent_name: "test-agent".to_string(),
                 },
                 items: vec![],
             };
@@ -2635,6 +2637,7 @@ url = "http://127.0.0.1:9"
                 scope: aura::hitl::AgentScope::Single { session_id: None },
                 origin: aura::hitl::ApprovalOrigin::ConfigGate {
                     matched_pattern: "test_*".into(),
+                    agent_name: "test-agent".to_string(),
                 },
                 items: vec![],
             };

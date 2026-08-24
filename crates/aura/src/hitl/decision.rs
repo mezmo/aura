@@ -111,7 +111,11 @@ pub enum AgentScope {
 pub enum ApprovalOrigin {
     /// A configured glob matched the tool call; carries the display form of the
     /// glob that fired.
-    ConfigGate { matched_pattern: String },
+    ConfigGate {
+        matched_pattern: String,
+        /// `[agent].name` of the config that built this agent.
+        agent_name: String,
+    },
     /// The agent called `request_approval` itself.
     AgentRequested {
         reason: String,

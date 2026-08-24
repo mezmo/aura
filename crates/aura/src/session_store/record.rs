@@ -59,6 +59,8 @@ pub enum ScopeRecord {
 pub enum OriginRecord {
     ConfigGate {
         matched_pattern: String,
+        #[serde(default)]
+        agent_name: String,
     },
     AgentRequested {
         reason: String,
@@ -195,8 +197,12 @@ impl TryFrom<ScopeRecord> for AgentScope {
 impl From<&ApprovalOrigin> for OriginRecord {
     fn from(origin: &ApprovalOrigin) -> Self {
         match origin {
-            ApprovalOrigin::ConfigGate { matched_pattern } => OriginRecord::ConfigGate {
+            ApprovalOrigin::ConfigGate {
+                matched_pattern,
+                agent_name,
+            } => OriginRecord::ConfigGate {
                 matched_pattern: matched_pattern.clone(),
+                agent_name: agent_name.clone(),
             },
             ApprovalOrigin::AgentRequested { reason, agent_name } => OriginRecord::AgentRequested {
                 reason: reason.clone(),
@@ -209,9 +215,13 @@ impl From<&ApprovalOrigin> for OriginRecord {
 impl From<OriginRecord> for ApprovalOrigin {
     fn from(record: OriginRecord) -> Self {
         match record {
-            OriginRecord::ConfigGate { matched_pattern } => {
-                ApprovalOrigin::ConfigGate { matched_pattern }
-            }
+            OriginRecord::ConfigGate {
+                matched_pattern,
+                agent_name,
+            } => ApprovalOrigin::ConfigGate {
+                matched_pattern,
+                agent_name,
+            },
             OriginRecord::AgentRequested { reason, agent_name } => {
                 ApprovalOrigin::AgentRequested { reason, agent_name }
             }
@@ -269,6 +279,7 @@ mod tests {
             },
             ApprovalOrigin::ConfigGate {
                 matched_pattern: "kubectl_*".to_string(),
+                agent_name: "test-agent".to_string(),
             },
         ));
     }
@@ -296,6 +307,7 @@ mod tests {
             },
             ApprovalOrigin::ConfigGate {
                 matched_pattern: "*".to_string(),
+                agent_name: "test-agent".to_string(),
             },
         ));
     }

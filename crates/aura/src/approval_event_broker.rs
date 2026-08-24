@@ -140,6 +140,7 @@ mod tests {
             tool_name: "dangerous_apply".to_owned(),
             origin: ApprovalOriginWire::ConfigGate {
                 matched_pattern: "dangerous_*".to_owned(),
+                agent_name: "test-agent".to_owned(),
             },
             scope: AgentScopeWire::Single { session_id: None },
         })

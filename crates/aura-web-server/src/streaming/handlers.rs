@@ -2219,6 +2219,7 @@ mod tests {
                                 arguments: serde_json::json!({}),
                                 origin: aura_events::ApprovalOriginWire::ConfigGate {
                                     matched_pattern: "dangerous_*".into(),
+                                    agent_name: "test-agent".into(),
                                 },
                                 scope: aura_events::AgentScopeWire::Single { session_id: None },
                                 expires_at: "2026-01-01T00:00:00Z".into(),

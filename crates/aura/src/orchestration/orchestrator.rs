@@ -785,13 +785,14 @@ impl Orchestrator {
                 hitl.route.clone(),
                 scope.clone(),
                 request_id.clone(),
+                worker_config.agent.name.clone(),
             ));
             wrappers.insert(0, gate);
             worker_config.hitl_request_approval_tool = Some(crate::hitl::RequestApprovalTool::new(
                 hitl.route.clone(),
                 scope,
                 request_id,
-                self.agent_config.agent.name.clone(),
+                worker_config.agent.name.clone(),
             ));
         }
 
