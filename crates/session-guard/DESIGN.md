@@ -168,12 +168,23 @@ compile-fail tests must pin that when the test layer lands.
 
 1. **PG failover epoch regression.** An async-replica failover can lose
    the latest epoch increment; two holders can then both be assigned the
-   same epoch (one pre-, one post-failover). *Survivable, lossy*:
-   `holder_id` freshness (I2) keeps every mutation predicate sound, so
-   Postgres still linearizes commits; the cost is double-written epoch
-   dirs (debris for GC), not corrupted committed state. Deployment rule:
-   single-primary fail-stop is the v1 posture; do not inherit an
-   async-failover managed default without revisiting this paragraph.
+   same epoch (one pre-, one post-failover). `holder_id` freshness (I2)
+   keeps every *Postgres* mutation predicate sound, so the store still
+   linearizes commits. But panel round 4 showed the filesystem side is
+   weaker than this paragraph originally claimed: with epoch-only run
+   dirs, the two same-epoch holders share a directory, so a stale holder
+   can overwrite the winner's artifact bytes at a path the winner's
+   manifest references (digest-detected on read — never silent), and a
+   stale holder's quarantine-after-LostFence can delete committed files
+   in the shared dir. **v1 is gated by deployment posture:**
+   single-primary fail-stop Postgres makes the scenario unreachable, and
+   that posture is the v1 rule. The recorded fix — `(epoch, holder)`
+   -namespaced run dirs (`e{k}/h-{holder}/`, enforced through
+   `ArtifactPath`, `write_artifact`, and GC) — is **deferred by Mike's
+   ruling (2026-08-23) and must land before the claims table ever sits on
+   an async-failover Postgres.** Greenfield means landing it later costs
+   no migration; deploying onto async-failover PG without it is a known
+   corruption window.
 2. **Release/renewal closure binding is unprovable by types.** The
    release closure's captured fence triple and the renewal closure's S2
    are adapter contracts (one construction site each); Layer-2 pins
@@ -290,7 +301,16 @@ tokens):
 | 34 | GLM | `CleanupOutcome` not `#[must_use]` — an ignored abort outcome would silently drop both results | Accepted | `#[must_use]` added (r12.3) |
 | 35 | GLM | `CommittedResponse` not `#[must_use]` — a dropped authorization would not warn | Accepted | `#[must_use]` added (r12.3) |
 
-## Hole inventory (rev 12.3 baseline, post-round-3 repairs; 36 holes, unchanged in count)
+Round 4 (rev-12.3 commits 1b4c7751 + de3d0ad9; seat 1 GLM-5.2: PASS
+with 1 MINOR; seat 2 codex gpt-5.6-sol: FAIL, 1 BLOCKING; costs: codex
+lane 121,357 tokens):
+
+| # | Seat | Finding | Disposition | Repair |
+|---|---|---|---|---|
+| 36 | GLM | `#[from]` on `CommitRejection::Store` makes the wrong routing the path of least resistance (a post-S3 store error could be `.into()`-ed into the quarantining variant) | Accepted | `#[from]` dropped; every construction site must name the variant (r12.4) |
+| 37 | codex | Epoch-only run namespacing breaks under PG failover regression: two same-epoch holders share a dir, so a stale holder can overwrite the winner's manifest-referenced bytes or quarantine the shared dir | **Deferred — Mike's ruling 2026-08-23.** Gated by the v1 single-primary fail-stop posture, under which the scenario is unreachable; greenfield means no migration cost to land it later | Recorded fix: `(epoch, holder)`-namespaced run dirs through `ArtifactPath`, `write_artifact`, manifest, and GC. **Trigger: must land before the claims table ever sits on an async-failover Postgres.** Residual risk 1 rewritten to state the exposure honestly |
+
+## Hole inventory (rev 12.4 baseline, post-round-4; 36 holes, unchanged in count)
 
 `grep -rEn '^\s+todo!\(' src/` returns 36 holes:
 

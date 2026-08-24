@@ -102,6 +102,12 @@ pub fn session_dir(root: &Path, session: &SessionId) -> PathBuf {
 /// The epoch's run directory within a session root:
 /// `{session_root}/e{k}`. Everything a claim writes lives under here;
 /// nothing outside it is the claim's to touch.
+///
+/// Layout note (panel round 4, deferred finding): epoch-only
+/// namespacing is safe under the v1 posture (single-primary fail-stop
+/// Postgres). Under an async-failover deployment, two holders can share
+/// one epoch — the recorded fix is `(epoch, holder)`-namespaced run
+/// dirs. See DESIGN.md residual risk 1 and the round-4 ledger.
 #[must_use]
 pub fn epoch_dir(session_root: &Path, epoch: Epoch) -> PathBuf {
     session_root.join(epoch.dir_name())

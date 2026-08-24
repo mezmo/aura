@@ -981,9 +981,11 @@ pub enum CommitRejection {
     NotLanded,
     /// The claim authority errored *before S3 was dispatched* (nothing
     /// could have landed). A store error after S3 dispatch is NOT here —
-    /// it is indeterminate and routes to `CommitIndeterminate`.
+    /// it is indeterminate and routes to `CommitIndeterminate`. No
+    /// `#[from]` on purpose: every construction site must name the
+    /// variant, so the pre-S3-only contract is confronted at each site.
     #[error(transparent)]
-    Store(#[from] StoreUnavailable),
+    Store(StoreUnavailable),
 }
 
 /// Why a commit's outcome is unknowable (the commit may have landed, so
