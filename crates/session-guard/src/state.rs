@@ -1115,7 +1115,6 @@ impl<T> CommittedResponse<T> {
 
     /// Transform the payload while preserving the authorization envelope.
     /// The only public way to reach the payload's value.
-    #[must_use]
     pub fn map<U>(self, f: impl FnOnce(T) -> U) -> CommittedResponse<U> {
         CommittedResponse {
             payload: f(self.payload),
