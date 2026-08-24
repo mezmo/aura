@@ -1,0 +1,280 @@
+//! The session manifest: the declared, committed artifact set.
+//!
+//! One cumulative manifest per session, stored as a JSONB column on the
+//! claims row (Q7 ruling: manifest-in-Postgres, so commit publication is
+//! one atomic statement — invariant I4). Entries are epoch-qualified
+//! paths with content digests; the map only ever grows across epochs.
+//!
+//! Two readers rely on it:
+//!
+//! - the claiming pod, to build the GC keep-set and the reify history
+//!   view, straight from the granted claim (no filesystem read);
+//! - the artifact read path (the aura seam), which verifies each file's
+//!   digest on first read. With write-once paths (I1) a digest mismatch
+//!   can only mean platform corruption — fail loud, never retry
+//!   ([`ReadMiss`]).
+
+use std::collections::{BTreeMap, btree_map};
+use std::fmt;
+
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+use crate::epoch::Epoch;
+use crate::identity::TurnId;
+
+/// An artifact's path relative to the session root, always
+/// epoch-qualified (`e{k}/...`).
+///
+/// Business rule (parse, don't validate — fill-phase): a single
+/// relative path, first component `e{digits}`, no `.`/`..` components,
+/// no separators beyond `/`. The write-once invariant (I1) is enforced
+/// at [`Manifest::declare`].
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ArtifactPath(String);
+
+/// Why a raw string is not an [`ArtifactPath`]. Diagnostic-only.
+#[derive(Debug, thiserror::Error)]
+#[error("invalid artifact path: {reason}")]
+pub struct InvalidArtifactPath {
+    /// The validation failure, for diagnostics only.
+    pub reason: String,
+}
+
+impl ArtifactPath {
+    /// Parse and constrain an artifact path. The sole constructor.
+    ///
+    /// # Errors
+    /// [`InvalidArtifactPath`] when the path is not epoch-qualified or
+    /// contains a forbidden component.
+    #[expect(
+        unused_variables,
+        reason = "todo!() body; filled by aura #421 follow-up"
+    )]
+    pub fn parse(raw: &str) -> Result<Self, InvalidArtifactPath> {
+        todo!("fill: epoch-qualified relative-path rules; aura #421 follow-up")
+    }
+}
+
+impl AsRef<str> for ArtifactPath {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl AsRef<std::path::Path> for ArtifactPath {
+    fn as_ref(&self) -> &std::path::Path {
+        std::path::Path::new(&self.0)
+    }
+}
+
+impl fmt::Display for ArtifactPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl Serialize for ArtifactPath {
+    /// The JSON form is the plain path string (including as a map key).
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_ref())
+    }
+}
+
+impl<'de> Deserialize<'de> for ArtifactPath {
+    /// Deserialization validates: a manifest carrying an unparseable
+    /// path fails to load rather than smuggling it through.
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct PathVisitor;
+        impl serde::de::Visitor<'_> for PathVisitor {
+            type Value = ArtifactPath;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("an epoch-qualified artifact path string")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                ArtifactPath::parse(v).map_err(serde::de::Error::custom)
+            }
+        }
+        d.deserialize_string(PathVisitor)
+    }
+}
+
+/// A content digest (sha256) over one committed artifact. The wire form
+/// is lowercase hex.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Digest([u8; 32]);
+
+/// Why a raw string is not a [`Digest`]. Diagnostic-only.
+#[derive(Debug, thiserror::Error)]
+#[error("invalid digest: {reason}")]
+pub struct InvalidDigest {
+    /// The validation failure, for diagnostics only.
+    pub reason: String,
+}
+
+impl Digest {
+    /// Wrap an already-computed digest.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// The raw digest bytes.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    /// Parse a lowercase hex digest. The sole string constructor.
+    ///
+    /// # Errors
+    /// [`InvalidDigest`] when the string is not 64 lowercase hex digits.
+    #[expect(
+        unused_variables,
+        reason = "todo!() body; filled by aura #421 follow-up"
+    )]
+    pub fn from_hex(raw: &str) -> Result<Self, InvalidDigest> {
+        todo!("fill: hex decode; aura #421 follow-up")
+    }
+}
+
+impl fmt::Display for Digest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+impl Serialize for Digest {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for Digest {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct DigestVisitor;
+        impl serde::de::Visitor<'_> for DigestVisitor {
+            type Value = Digest;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a 64-digit lowercase hex sha256")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                Digest::from_hex(v).map_err(serde::de::Error::custom)
+            }
+        }
+        d.deserialize_string(DigestVisitor)
+    }
+}
+
+/// One manifest entry: the committed artifact's digest and provenance.
+/// Public fields are all validated types; `bytes` is a plain metric (no
+/// domain rule branches on it).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManifestEntry {
+    /// The artifact's sha256.
+    pub digest: Digest,
+    /// The turn that committed it.
+    pub turn: TurnId,
+    /// The epoch whose dir holds it.
+    pub epoch: Epoch,
+    /// Byte length (diagnostics and drain sizing).
+    pub bytes: u64,
+}
+
+/// Why a declaration was rejected: the write-once rule (I1) made
+/// structural. Carries the already-declared path.
+#[derive(Debug, thiserror::Error)]
+#[error("artifact path already declared (write-once violation): {0}")]
+pub struct DeclareError(pub ArtifactPath);
+
+/// The cumulative declared artifact set for a session. Construction of
+/// new entries goes through [`declare`](Self::declare), which rejects
+/// duplicate paths: a manifest can grow but never mutate an entry.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Manifest {
+    entries: BTreeMap<ArtifactPath, ManifestEntry>,
+}
+
+impl Manifest {
+    /// The empty manifest of a fresh session.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    /// Number of declared artifacts.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether nothing is declared yet.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// The entry for a path, if declared.
+    #[must_use]
+    pub fn get(&self, path: &ArtifactPath) -> Option<&ManifestEntry> {
+        self.entries.get(path)
+    }
+
+    /// Every declared path — the GC keep-set's source.
+    pub fn paths(&self) -> impl Iterator<Item = &ArtifactPath> {
+        self.entries.keys()
+    }
+
+    /// Every (path, entry) pair.
+    pub fn entries(&self) -> impl Iterator<Item = (&ArtifactPath, &ManifestEntry)> {
+        self.entries.iter()
+    }
+
+    /// Declare a newly committed artifact. Write-once (I1): declaring a
+    /// path that already has an entry is an error, never an overwrite.
+    ///
+    /// # Errors
+    /// [`DeclareError`] carrying the already-declared path.
+    pub fn declare(
+        &mut self,
+        path: ArtifactPath,
+        entry: ManifestEntry,
+    ) -> Result<(), DeclareError> {
+        match self.entries.entry(path) {
+            btree_map::Entry::Vacant(vacant) => {
+                vacant.insert(entry);
+                Ok(())
+            }
+            btree_map::Entry::Occupied(occupied) => Err(DeclareError(occupied.key().clone())),
+        }
+    }
+}
+
+/// How a manifest-referenced read failed. The two variants are the two
+/// failure classes with opposite correct responses; collapsing them
+/// would make corruption retried or propagation failed loud.
+#[derive(Debug, thiserror::Error)]
+pub enum ReadMiss {
+    /// The file is not visible — propagation class. Retry inside the
+    /// propagation window, then escalate through the repair lane.
+    #[error("referenced artifact not yet visible: {0}")]
+    NotFound(ArtifactPath),
+    /// The file read but does not match the manifest digest —
+    /// corruption class (with write-once paths, mismatch can only be
+    /// platform corruption). Fail loud immediately; never retry.
+    #[error("referenced artifact digest mismatch at {path}: expected {expected}, read {actual}")]
+    Corrupt {
+        /// The referenced path.
+        path: ArtifactPath,
+        /// The manifest's digest.
+        expected: Digest,
+        /// The digest of the bytes actually read.
+        actual: Digest,
+    },
+}

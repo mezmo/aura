@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use crate::TurnAdmission;
 use crate::arbiter::SessionArbiter;
 use crate::claim::HolderView;
-use crate::identity::{InstanceId, SessionId};
+use crate::identity::{PodId, SessionId};
 use crate::state::{AdmissionError, HeldLock, IdleRequest};
 
 /// Proof that a claim is being assembled by the local backend. The
@@ -17,10 +17,10 @@ use crate::state::{AdmissionError, HeldLock, IdleRequest};
 pub(crate) struct LocalLeaseProof(());
 
 /// Same-instance requests still serialize; there is no cross-instance
-/// claim. Leases are static (nothing to renew).
+/// claim. Leases are static (nothing to renew, no self-fence).
 #[derive(Debug)]
 pub struct LocalAdmission {
-    instance: InstanceId,
+    pod: PodId,
     arbiter: SessionArbiter,
     retry_after: Duration,
     proof: LocalLeaseProof,
@@ -28,12 +28,12 @@ pub struct LocalAdmission {
 
 impl LocalAdmission {
     pub(crate) fn new(
-        instance: InstanceId,
+        pod: PodId,
         arbiter: SessionArbiter,
         env: crate::config::LocalAdmissionEnv<'_>,
     ) -> Self {
         Self {
-            instance,
+            pod,
             arbiter,
             retry_after: env.retry_after(),
             proof: LocalLeaseProof(()),
@@ -50,7 +50,7 @@ impl TurnAdmission for LocalAdmission {
     async fn admit(&self, req: IdleRequest) -> Result<HeldLock, AdmissionError> {
         todo!(
             "fill: arbiter PendingGuard → confirm() → \
-             AcquiredClaim::new_local(self.proof) → into_held; \
+             AcquiredClaim::new_local(self.proof, .., self.pod.clone(), release) → into_held; \
              aura #421 follow-up"
         )
     }

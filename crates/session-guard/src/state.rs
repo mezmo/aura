@@ -5,102 +5,140 @@
 //! identity and its bound release arrive together, and the lease derives
 //! from the same identity inside `into_held`, so
 //! identity, lease, and release cannot disagree.
+//!
+//! The claim identity is the fence triple `(session, epoch, holder)` —
+//! every Postgres mutation predicates on it (invariant I2), and every
+//! local capability names it.
 
-use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::arbiter::HeldGuard;
-use crate::claim::Generation;
-use crate::identity::{InstanceId, SessionId, TurnId};
-use crate::lease::{HeartbeatLease, LeaseLost, WriteCapability};
+use crate::epoch::Epoch;
+use crate::identity::{HolderId, OpId, PodId, SessionId, TurnId};
+use crate::lease::{
+    BeatInterval, HeartbeatLease, LeaseLost, LeaseTtl, SelfFenceMargin, WriteCapability,
+};
+use crate::repair::RepairLane;
+use crate::store::StoreUnavailable;
 
 /// The complete output of a successful admission (adapter-side,
 /// crate-internal): the claim identity plus the release action bound to
 /// that exact claim at construction. The lease is derived from the same
-/// identity inside `into_held`. (The closure's captured path
+/// identity inside `into_held`. (The closure's captured fence triple
 /// cannot be proven by types — closures are opaque; that binding is the
 /// adapter's contract, tested in Layer 2 and recorded as residual risk.)
 pub(crate) struct AcquiredClaim {
     session: SessionId,
     turn: TurnId,
-    holder: InstanceId,
-    generation: Generation,
+    epoch: Epoch,
+    holder: HolderId,
+    pod: PodId,
     release: ReleaseAction,
     lease_plan: LeasePlan,
+    repair: Option<Arc<dyn RepairLane>>,
 }
 
 /// How the lease for this claim renews. Chosen by the adapter at
-/// acquisition (local = static, claim-file = heartbeat), NOT by the
-/// caller at assembly — so the claim-file backend cannot silently take a
+/// acquisition (local = static, pg = heartbeat), NOT by the caller at
+/// assembly — so the Postgres backend cannot silently take a
 /// never-revoking static lease.
 pub(crate) enum LeasePlan {
     /// No renewal (local admission): revocation is the only end.
     Static,
-    /// Lease-owned heartbeat loop over an adapter renewal write.
+    /// Lease-owned heartbeat loop over an adapter S2 write.
     Heartbeat {
-        beat: crate::lease::BeatInterval,
+        /// Beat cadence (config).
+        beat: BeatInterval,
+        /// Server-side lease ttl (config).
+        ttl: LeaseTtl,
+        /// Self-fence margin (config).
+        margin: SelfFenceMargin,
+        /// One S2 renewal.
         write: Box<RenewalWrite>,
     },
 }
 
-/// Renewal inputs for a claim-file heartbeat lease.
+/// Renewal inputs for a Postgres heartbeat lease.
 pub(crate) struct HeartbeatRenewal {
-    pub(crate) beat: crate::lease::BeatInterval,
+    pub(crate) beat: BeatInterval,
+    pub(crate) ttl: LeaseTtl,
+    pub(crate) margin: SelfFenceMargin,
     pub(crate) write: Box<RenewalWrite>,
 }
 
-/// One adapter renewal write (the claim-body rewrite).
+/// One adapter renewal write (one S2). Renewal failure of any shape —
+/// Lost (zero rows) or store-unavailable — maps to an error here, so the
+/// lease fails closed either way (I5).
 pub(crate) type RenewalWriteFuture =
     std::pin::Pin<Box<dyn Future<Output = Result<(), std::io::Error>> + Send>>;
 pub(crate) type RenewalWrite = dyn FnMut() -> RenewalWriteFuture + Send;
 
 impl AcquiredClaim {
-    /// Assemble a local (static-lease) claim (adapter-side). The
-    /// `proof` token's constructor is private to
-    /// `adapters::local`, so no other backend can build a static-lease
-    /// claim. The release action must close over this claim's file; that
-    /// binding is the adapter's contract, tested in Layer 2.
+    /// Assemble a local (static-lease) claim (adapter-side). Epoch and
+    /// holder are nominal in local mode (no authority to fence against)
+    /// but are still minted, so every downstream identity is real. The
+    /// `proof` token's constructor is private to `adapters::local`, so
+    /// no other backend can build a static-lease claim. The release
+    /// action must close over this claim's identity; that binding is the
+    /// adapter's contract, tested in Layer 2.
     pub(crate) fn new_local(
         _proof: crate::adapters::local::LocalLeaseProof,
         session: SessionId,
         turn: TurnId,
-        holder: InstanceId,
-        generation: Generation,
+        pod: PodId,
         release: ReleaseAction,
     ) -> Self {
         Self {
             session,
             turn,
-            holder,
-            generation,
+            epoch: Epoch::initial(),
+            holder: HolderId::mint(),
+            pod,
             release,
             lease_plan: LeasePlan::Static,
+            repair: None,
         }
     }
 
-    /// Assemble a claim-file (heartbeat-lease) claim (adapter-side). The
-    /// `proof` token's constructor is private to `adapters::claim_file`,
-    /// so no other backend can build a heartbeat-lease claim. `write`
-    /// performs one renewal and must return only after the claim-body
-    /// write completes (the same class of crate-internal contract as the
+    /// Assemble a Postgres-fenced (heartbeat-lease) claim (adapter-side).
+    /// The `proof` token's constructor is private to `adapters::pg`, so
+    /// no other backend can build a heartbeat-lease claim. `write`
+    /// performs one S2 renewal and must return only after the statement
+    /// completes (the same class of crate-internal contract as the
     /// release closure; residual risk, Layer-2 tested).
-    pub(crate) fn new_with_heartbeat(
-        _proof: crate::adapters::claim_file::HeartbeatLeaseProof,
+    #[expect(clippy::too_many_arguments, reason = "one claim identity bundle")]
+    pub(crate) fn new_pg(
+        _proof: crate::adapters::pg::PgLeaseProof,
         session: SessionId,
         turn: TurnId,
-        holder: InstanceId,
-        generation: Generation,
+        epoch: Epoch,
+        holder: HolderId,
+        pod: PodId,
         release: ReleaseAction,
         renewal: HeartbeatRenewal,
+        repair: Arc<dyn RepairLane>,
     ) -> Self {
-        let HeartbeatRenewal { beat, write } = renewal;
+        let HeartbeatRenewal {
+            beat,
+            ttl,
+            margin,
+            write,
+        } = renewal;
         Self {
             session,
             turn,
+            epoch,
             holder,
-            generation,
+            pod,
             release,
-            lease_plan: LeasePlan::Heartbeat { beat, write },
+            lease_plan: LeasePlan::Heartbeat {
+                beat,
+                ttl,
+                margin,
+                write,
+            },
+            repair: Some(repair),
         }
     }
 
@@ -112,27 +150,35 @@ impl AcquiredClaim {
         let Self {
             session,
             turn,
+            epoch,
             holder,
-            generation,
+            pod,
             release,
             lease_plan,
+            repair,
         } = self;
         let source = crate::lease::ClaimLeaseSource {
             session: session.clone(),
             turn,
-            generation,
+            epoch,
+            holder,
         };
         let lease = match lease_plan {
             LeasePlan::Static => HeartbeatLease::static_from(source),
-            LeasePlan::Heartbeat { beat, write } => {
-                HeartbeatLease::with_heartbeat(source, beat, write)
-            }
+            LeasePlan::Heartbeat {
+                beat,
+                ttl,
+                margin,
+                write,
+            } => HeartbeatLease::with_heartbeat(source, beat, ttl, margin, write),
         };
-        HeldLock::from_parts(session, turn, holder, generation, release, arbiter, lease)
+        HeldLock::from_parts(
+            session, turn, epoch, holder, pod, release, arbiter, lease, repair,
+        )
     }
 }
 
-/// Zero-argument release bound to one claim at construction.
+/// Zero-argument release bound to one claim at construction (one S4).
 pub(crate) type ReleaseAction = Box<dyn FnOnce() -> ReleaseFuture + Send>;
 
 pub(crate) type ReleaseFuture =
@@ -140,41 +186,51 @@ pub(crate) type ReleaseFuture =
 
 /// Why admission failed. Only [`AdmissionError::Busy`] is contention: it
 /// maps to HTTP 503 + `Retry-After` and is the sole LB-retryable variant.
+/// [`AdmissionError::Parked`] is deliberately not retryable on a hint —
+/// the HITL wait is unbounded and routing must surface it honestly.
 #[derive(Debug, thiserror::Error)]
 pub enum AdmissionError {
     /// A live claim exists for the session.
-    #[error("session busy: held by {holder}")]
+    #[error("session busy: held by pod {holder}")]
     Busy {
-        /// Who holds the session, for routing and honest hints.
-        holder: InstanceId,
-        /// How long the caller should wait before retrying.
+        /// Which pod holds the session, for routing and honest hints.
+        holder: PodId,
+        /// How long the caller should wait before retrying (configured
+        /// fixed hint — a zero-row S1 carries no deadline; codex M7).
         retry_after: std::time::Duration,
     },
-    /// A steal raced a revival or another steal. Retryable, but distinct
-    /// from `Busy`.
-    #[error("contention lost during steal")]
-    ContentionLost,
-    /// The claim root is absent or not provisioned (cold-deploy wedge).
+    /// The session is parked on a different turn, awaiting an external
+    /// driver (HITL). Not contention; no retry hint.
+    #[error("session parked on turn {turn} (awaiting external resolution)")]
+    Parked {
+        /// The turn the session is parked on.
+        turn: TurnId,
+    },
+    /// The claim authority is unreachable. Fail-stop (I5): the claim
+    /// path fails loudly rather than degrading.
+    #[error(transparent)]
+    StoreUnavailable(#[from] StoreUnavailable),
+    /// The session root is absent or not provisioned (cold-deploy wedge).
     /// Operator-facing, not retryable by the LB. Diagnostic-only payload.
-    #[error("claim root not provisioned: {0}")]
+    #[error("session root not provisioned: {0}")]
     NotProvisioned(String),
-    /// Claim-store I/O failure (including invalid claim content, mapped
-    /// deliberately with its source preserved).
+    /// Claim-path I/O failure.
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
 
 /// A request awaiting admission, parsed and ready. Built by the ingress
 /// seam after `SessionId` validation, before any visible status. The
-/// acting instance is the backend's own configured identity, not caller
+/// acting pod is the backend's own configured identity, not caller
 /// input.
 #[derive(Debug)]
 #[must_use]
 pub struct IdleRequest {
     /// The session to claim.
     pub session: SessionId,
-    /// The turn this request will run, fixed here so claim bodies name
-    /// the turn even under client retries.
+    /// The turn this request will run, fixed here so the claim names the
+    /// turn even under client retries (and so reify presents the parked
+    /// turn id).
     pub turn: TurnId,
 }
 
@@ -184,14 +240,19 @@ pub struct IdleRequest {
 pub struct HeldLock {
     session: SessionId,
     turn: TurnId,
-    holder: InstanceId,
-    generation: Generation,
+    epoch: Epoch,
+    holder: HolderId,
+    pod: PodId,
     // Drop order matters: the lease (first) revokes before the arbiter
     // slot (second) frees, so no window exists where another local
     // request acquires the slot while a capability still reads Live.
     lease: HeartbeatLease,
     arbiter: HeldGuard,
     release: ReleaseAction,
+    /// The writability-wedge cure (H4) available to `create_run`'s fill:
+    /// `Some` under the Postgres backend, `None` in local mode (no
+    /// shared mount, no delegation to cure).
+    repair: Option<Arc<dyn RepairLane>>,
 }
 
 impl std::fmt::Debug for HeldLock {
@@ -199,8 +260,9 @@ impl std::fmt::Debug for HeldLock {
         f.debug_struct("HeldLock")
             .field("session", &self.session)
             .field("turn", &self.turn)
+            .field("epoch", &self.epoch)
             .field("holder", &self.holder)
-            .field("generation", &self.generation)
+            .field("pod", &self.pod)
             .finish_non_exhaustive()
     }
 }
@@ -208,30 +270,35 @@ impl std::fmt::Debug for HeldLock {
 impl HeldLock {
     /// Assemble from parts (private: only `into_held` calls this,
     /// which is what binds lease to claim by construction).
+    #[expect(clippy::too_many_arguments, reason = "one claim identity bundle")]
     fn from_parts(
         session: SessionId,
         turn: TurnId,
-        holder: InstanceId,
-        generation: Generation,
+        epoch: Epoch,
+        holder: HolderId,
+        pod: PodId,
         release: ReleaseAction,
         arbiter: HeldGuard,
         lease: HeartbeatLease,
+        repair: Option<Arc<dyn RepairLane>>,
     ) -> Self {
         Self {
             session,
             turn,
+            epoch,
             holder,
-            generation,
+            pod,
             lease,
             arbiter,
             release,
+            repair,
         }
     }
 
-    /// Who holds the session right now (this process, no disk read).
+    /// Who holds the session right now (this process, no store read).
     #[must_use]
     pub fn holder_view(&self) -> crate::claim::HolderView {
-        crate::claim::HolderView::here(self.holder.clone())
+        crate::claim::HolderView::here(self.pod.clone())
     }
 
     /// The write capability bound to this claim.
@@ -247,11 +314,17 @@ impl HeldLock {
     }
 
     /// Create and bind this claim's run directory in one step: the
-    /// capability is asserted, the directory created *by this lock*, and
-    /// liveness re-checked after creation — so the fenced run can never
-    /// carry a directory authorized by a different claim or an
+    /// capability is asserted, the epoch dir `e{k}/` derived *from this
+    /// claim's epoch* (the seam no longer chooses the layout — the
+    /// epoch-partition ruling makes it structural), created by this
+    /// lock, and liveness re-checked after creation — so the fenced run
+    /// can never carry a directory authorized by a different claim or an
     /// already-lost lease. Non-recursive (the session directory must
     /// already exist); `AlreadyExists` is a hard error, not retried.
+    ///
+    /// Fill note (H4): an `EROFS` from a wedged post-crash delegation
+    /// escalates through `self.repair` (`force_cure` on the session
+    /// dir, 518 ms measured) and retries once before failing.
     ///
     /// # Errors
     /// [`CreateRunError`] *returns the lock* in every variant so the
@@ -260,7 +333,7 @@ impl HeldLock {
     /// additionally carries the created directory's path so the caller
     /// can remove or quarantine it before aborting — otherwise a fixed
     /// turn id could retry into `AlreadyExists` forever.
-    pub async fn create_run(self, path: PathBuf) -> Result<FencedRun, CreateRunError> {
+    pub async fn create_run(self, session_root: &Path) -> Result<FencedRun, CreateRunError> {
         let capability = self.lease.capability();
         if let Err(cause) = capability.assert_live() {
             return Err(CreateRunError::NotLive {
@@ -268,6 +341,7 @@ impl HeldLock {
                 lock: self,
             });
         }
+        let path = crate::epoch::epoch_dir(session_root, self.epoch);
         if let Err(cause) = tokio::fs::create_dir(&path).await {
             return Err(CreateRunError::Create { cause, lock: self });
         }
@@ -331,7 +405,7 @@ pub struct FencedRun {
 }
 
 impl FencedRun {
-    /// The fenced run directory.
+    /// The fenced run directory (this claim's epoch dir).
     #[must_use]
     pub fn run_dir(&self) -> &Path {
         &self.run_dir
@@ -352,9 +426,12 @@ impl FencedRun {
     }
 }
 
-/// A live turn. Terminal outcomes — success, failure, clarification —
-/// all flow through [`complete`](Self::complete); nothing else may
-/// follow.
+/// A live turn. Terminal paths are exactly two:
+/// [`complete`](Self::complete) with a [`CommitKind`] (Success or
+/// Clarification — both commit), or [`abort`](Self::abort) (Failure and
+/// mid-turn cancellation — quarantine, no commit). "Success/Clarification
+/// commit, Failure aborts" is unrepresentable-to-violate: no failure
+/// value can reach the barrier.
 #[derive(Debug)]
 #[must_use]
 pub struct ActiveTurn {
@@ -370,32 +447,42 @@ impl ActiveTurn {
     }
 }
 
-/// The terminal outcome of a turn. Every path commits, including
-/// clarification (which today writes no manifest — this fixes that).
+/// The committable terminal outcome of a turn (codex B5: the trait
+/// speaks in commit kinds, and Failure is not one — it aborts).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TurnOutcome {
+pub enum CommitKind {
     /// The turn produced an answer.
     Success,
-    /// The turn failed.
-    Failure,
-    /// The turn ended in a clarification or direct response.
+    /// The turn ended in a clarification or direct response (commits
+    /// like success: the artifact set includes the clarification
+    /// record).
     Clarification,
+}
+
+impl std::fmt::Display for CommitKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CommitKind::Success => f.write_str("success"),
+            CommitKind::Clarification => f.write_str("clarification"),
+        }
+    }
 }
 
 impl ActiveTurn {
     /// End the turn and enter the completion barrier. After this call
     /// the response is not yet authorized — only the barrier's
     /// [`CommittedResponse`] is.
-    pub fn complete(self, outcome: TurnOutcome) -> CommittingTurn {
+    pub fn complete(self, kind: CommitKind) -> CommittingTurn {
         CommittingTurn {
             run: self.run,
-            outcome,
+            kind,
         }
     }
 
-    /// Abort mid-turn (client disconnect, cancellation): quarantine the
-    /// run, stop the lease, release the claim. Distinct from abandonment:
-    /// the process is alive to clean up.
+    /// Abort mid-turn (failure, client disconnect, cancellation):
+    /// quarantine the run, stop the lease, release the claim. Distinct
+    /// from abandonment: the process is alive to clean up. Nothing
+    /// commits — the turn's files stay unreferenced debris for GC.
     pub async fn abort(self) -> Result<(), ReleaseError> {
         todo!("fill: quarantine + lease stop + release; aura #421 follow-up")
     }
@@ -403,27 +490,31 @@ impl ActiveTurn {
 
 /// Context handed to the injected commit step. Assembled by the barrier
 /// from the turn's own state; fields are private with read accessors, so
-/// a context is not constructible or forgeable outside the crate.
+/// a context is not constructible or forgeable outside the crate. The
+/// barrier mints the [`OpId`] at assembly: one barrier run is one
+/// logical commit, and every retry of its S3 reuses this id (B3).
 #[derive(Debug, Clone)]
 pub struct CommitContext {
     run_dir: PathBuf,
-    outcome: TurnOutcome,
+    kind: CommitKind,
     session: SessionId,
     turn: TurnId,
-    generation: Generation,
+    epoch: Epoch,
+    holder: HolderId,
+    op: OpId,
 }
 
 impl CommitContext {
-    /// The fenced run directory (where manifests go).
+    /// The fenced run directory (where the turn's artifacts live).
     #[must_use]
     pub fn run_dir(&self) -> &Path {
         &self.run_dir
     }
 
-    /// The terminal outcome.
+    /// The committable outcome.
     #[must_use]
-    pub const fn outcome(&self) -> TurnOutcome {
-        self.outcome
+    pub const fn kind(&self) -> CommitKind {
+        self.kind
     }
 
     /// The session.
@@ -438,10 +529,22 @@ impl CommitContext {
         self.turn
     }
 
-    /// The claim incarnation that authorized the turn.
+    /// The claim epoch that authorized the turn.
     #[must_use]
-    pub const fn generation(&self) -> Generation {
-        self.generation
+    pub const fn epoch(&self) -> Epoch {
+        self.epoch
+    }
+
+    /// The acquire attempt that authorized the turn.
+    #[must_use]
+    pub const fn holder(&self) -> HolderId {
+        self.holder
+    }
+
+    /// The logical commit id (commit-unknown reconciliation key, B3).
+    #[must_use]
+    pub const fn op(&self) -> OpId {
+        self.op
     }
 }
 
@@ -462,7 +565,7 @@ pub struct CleanupOutcome {
 #[must_use]
 pub struct CommittingTurn {
     run: FencedRun,
-    outcome: TurnOutcome,
+    kind: CommitKind,
 }
 
 impl CommittingTurn {
@@ -488,7 +591,7 @@ impl CommittingTurn {
         F: FnOnce(CommitContext) -> Fut,
         Fut: Future<Output = Result<T, E>>,
     {
-        todo!("fill: commit(ctx) → lease stop → release → response; aura #421 follow-up")
+        todo!("fill: mint OpId, commit(ctx) → lease stop → release → response; aura #421 follow-up")
     }
 }
 
@@ -541,7 +644,7 @@ impl<T, E> BarrierError<T, E> {
 }
 
 /// Sole authorization to emit a terminal frame. Carries the committed
-/// payload bound to session + turn + incarnation. Not `Clone`; the
+/// payload bound to session + turn + epoch + holder. Not `Clone`; the
 /// payload is only reachable through authorization-preserving
 /// transforms, so the envelope cannot be discarded short of consuming
 /// the whole value.
@@ -550,18 +653,20 @@ pub struct CommittedResponse<T> {
     payload: T,
     session: SessionId,
     turn: TurnId,
-    generation: Generation,
+    epoch: Epoch,
+    holder: HolderId,
 }
 
 impl<T> CommittedResponse<T> {
     /// Build the authorization (private to this module: only the barrier
     /// body constructs it).
-    fn new(payload: T, session: SessionId, turn: TurnId, generation: Generation) -> Self {
+    fn new(payload: T, session: SessionId, turn: TurnId, epoch: Epoch, holder: HolderId) -> Self {
         Self {
             payload,
             session,
             turn,
-            generation,
+            epoch,
+            holder,
         }
     }
 
@@ -573,15 +678,22 @@ impl<T> CommittedResponse<T> {
             payload: f(self.payload),
             session: self.session,
             turn: self.turn,
-            generation: self.generation,
+            epoch: self.epoch,
+            holder: self.holder,
         }
     }
 
     /// Consume the authorization, yielding the payload and its identity
     /// to the terminal emitter that consumes this value.
     #[must_use]
-    pub fn into_parts(self) -> (T, SessionId, TurnId, Generation) {
-        (self.payload, self.session, self.turn, self.generation)
+    pub fn into_parts(self) -> (T, SessionId, TurnId, Epoch, HolderId) {
+        (
+            self.payload,
+            self.session,
+            self.turn,
+            self.epoch,
+            self.holder,
+        )
     }
 
     /// Turn identity for logging and metrics.
@@ -600,11 +712,19 @@ impl<T> CommittedResponse<T> {
 /// Why a claim release failed.
 #[derive(Debug, thiserror::Error)]
 pub enum ReleaseError {
-    /// The claim's incarnation no longer matches (stolen during
+    /// The claim's fence triple no longer matches (stolen during
     /// shutdown). Not fixable by force — the new owner's claim stands.
-    #[error("claim superseded (incarnation {0} retired)")]
-    Superseded(Generation),
-    /// Filesystem failure while releasing.
+    #[error("claim superseded (epoch {epoch}, holder {holder} retired)")]
+    Superseded {
+        /// The epoch that was retired.
+        epoch: Epoch,
+        /// The acquire attempt that was retired.
+        holder: HolderId,
+    },
+    /// The claim authority is unreachable (fail-stop, I5).
+    #[error(transparent)]
+    StoreUnavailable(#[from] StoreUnavailable),
+    /// Filesystem failure while releasing (quarantine path).
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
@@ -615,7 +735,8 @@ pub enum FenceCause {
     /// The backing claim lease was lost; writes were stopped.
     #[error(transparent)]
     LeaseLost(#[from] LeaseLost),
-    /// Filesystem rejection (e.g. EROFS on the shared mount).
+    /// Filesystem rejection (e.g. EROFS on the shared mount — the H4
+    /// wedge class).
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }

@@ -1,368 +1,233 @@
-# session-guard - design record (Layer 1 skeleton, rev 11)
+# session-guard - design record (Layer 1 skeleton, rev 12)
 
 Claim-based turn admission for multi-instance AURA: at most one service
 instance runs a turn for a session at a time, with session memory on a
 shared Archil disk. Skeleton = type surface only; every `todo!()` is a
-tracked hole (inventory at the bottom). Rev 11 folds the round-10 review findings
-(ledger below); the mutation-linearity question is settled by the
-Phase-1 litmus, not by assertion.
+tracked hole (inventory at the bottom).
+
+**Rev 12 is the Postgres pivot.** Mike ruled 2026-08-20/21: the
+claim-file protocol (rev 11 and earlier) is retired — Postgres is the
+sole claim authority, no claim-file adapter ships. The design survived a
+grill, two replicated rig probe runs, and a codex adversarial gate (6
+BLOCKING + 4 MINOR, all ten folded). Rulings from the 2026-08-23 review
+session are folded here too (manifest-in-PG, debris-only epoch-scoped
+GC, three-way miss handling, two-tier repair lane). The flow-chart
+companion is `DESIGN.html` (rendered review packet, untracked pending a
+commit decision). Revisions ≤ 11 and their panel ledger live in git
+history; the retired design's recorded weaknesses (mutation linearity
+across check-then-rename, the staleness-window steal, unfenced
+session-shared mutations) are exactly what the Postgres authority
+deletes.
 
 ## Admission protocol
 
-One well-known claim file per session (`{root}/{session}/CLAIM`) is the
-election: fresh admission is a single atomic `O_EXCL` create, so two
-instances can never both win a *fresh* admission. The body carries the
-holder, turn, claim incarnation, and a heartbeat sequence. Release
-renames the claim to an incarnation-unique tombstone
-(`{generation}.TOMBSTONE`) and unlinks it. A steal replaces the body
-only after `StalenessEvidence` (two validated observations of the same
-claim, unchanged heartbeat, staleness-window-separated) is
-*revalidated* against a fresh read, yielding a `ValidatedSteal` token.
+One row per session in `session_claims`, never deleted. The election is
+one statement (S1): `INSERT .. ON CONFLICT (session_id) DO UPDATE ..
+WHERE lease_expires_at < clock_timestamp() AND (parked_turn IS NULL OR
+parked_turn = $turn)`. Under READ COMMITTED (pinned, I7) a concurrent
+claimant blocks on the row lock, then re-evaluates the WHERE against the
+winner's updated row and matches zero rows — the first racer after lease
+expiry steals atomically, documented Postgres behavior. The lease
+deadline is computed inside the locked update via `clock_timestamp()`
+(codex B2; `now()` is transaction-start and would reintroduce the bug —
+verified against PG 18 docs 2026-08-23, invariant I6).
 
-**Mutation linearity is an open litmus question.** Rename is atomic;
-conditional rename is not. Steal, heartbeat renewal, and release are
-check-then-rename sequences with bounded races (residual risks below).
-The Phase-1 litmus suite decides whether the archil FUSE surface offers
-anything stronger than POSIX; if it does not, the fallback is
-fencing-token semantics, stated here with its holes named: (a) a steal
-requires 3 observed missed beats, but a *paused* holder (never
-scheduled) has experienced no failed renewal, so its local capability
-still reads Live until its actor next runs - the litmus must include a
-paused-holder-resumes-after-steal probe; (b) once the old holder's
-renewal does run and fails, the lease revokes within one beat; (c) turn
-*data* is turn-scoped (each turn writes its own run directory, so
-overlap damages at most the loser's own in-flight run), but two
-session-shared mutations are NOT fenced and must be handled at the aura
-seam: the best-effort `latest` symlink, and `prune_session_runs`
-(which also deletes sibling run dirs and is already slated to move out
-of request init into a GC protocol). Residual window: writes issued
-between a steal landing and the loser's next `assert_live` check. This
-chain is the *designed* boundary and is unverified until the litmus
-runs; the litmus gate treats it as a candidate, not a proof.
+Zero S1 rows is classified by one follow-up read (S1_CLASSIFY) into
+`Busy` (live lease — configured fixed retry hint; codex M7) or `Parked`
+(park latch set on a different turn — no retry hint; the HITL wait is
+unbounded). A successful claim clears the latch in the same statement.
+
+There is no storage-level fence (probe H5: a thawed zombie's write+fsync
+succeeds after a steal). Writes are contained, not intercepted: one
+claim = one epoch = one run dir (`{session}/e{k}/`); paths are
+write-once (I1); the manifest (JSONB on the row, cumulative) is the only
+authority on committed bytes (G2's handshake is the row read itself —
+Q7: manifest-in-Postgres, so commit is fsync-then-one-atomic-UPDATE with
+no pointer-flip window, I4). Commits are predicated on the fence triple
+and an unexpired lease (B1), so Postgres linearizes what can ever become
+committed state (G1-prime) even if a failover regresses the epoch (I2).
+
+Turn outcomes: Success/Clarification commit (S3 publishes the cumulative
+manifest + op id + park latch); Failure aborts (quarantine + release, no
+commit — unrepresentable at the type level: the barrier takes a
+`CommitKind`, and `Failure` has no `CommitKind`). Park =
+commit-then-release with `parked_turn` set; reify re-claims the same
+`TurnId`; the park *algorithm* belongs to HITL-271 — this crate carries
+only the latch, the `Parked` admission variant, and the same-TurnId
+reify path.
 
 ## Type-to-business-rule map (every public item)
 
 | Item | One business rule | Invalid state it forbids |
 |---|---|---|
-| `SessionId` | Exactly 1..=128 bytes of ASCII `[A-Za-z0-9._-]`, not `.`/`..`/`latest` | Empty id resolving to the claim root; traversal; symlink collision |
-| `TurnId` (+`parse`) | A turn id is a unique UUID fixed at ingress (locally minted v7; wire accepts any UUID) | Claim bodies that cannot name the claiming turn |
-| `InstanceId` (+`parse`, `from_env`) | The claim holder is a named service instance (1..=64 bytes, same charset); explicit `AURA_INSTANCE_ID` fails loud when invalid, fallback only when absent | Anonymous claims; k8s-only assumptions; silent bad config |
-| `Generation` | Each admission/steal mints a fresh unique incarnation (locally UUIDv7; the wire accepts any UUID, so the invariant is uniqueness) | Reused or wrapped ids; tombstone name collisions across restarts |
-| `HeartbeatSeq` | Liveness is a monotonic counter, never wall clock; construction is crate-internal (`initial`/`try_next`/`new`); exhaustion is a typed dead end | Clock-skew fakery; silent wraparound; forged heartbeats |
-| `claim_path` / `tombstone_path` | The election is one fixed name; releases target incarnation-unique tombstones | Two fresh admissions both winning; deleting another incarnation's claim |
-| `ObservedClaim` | Every claim judgment comes from one complete validated read (private wire, fallible `from_wire`) | Pairing raw samples with remembered metadata; unvalidated wire fields |
-| `StalenessEvidence` (internal) + `ValidatedSteal` | A steal needs two same-claim observations, unchanged heartbeat, window-separated, then revalidation against a strictly later observation (id-ordered, non-wrapping); the token (private fields, accessor-read) carries the session and the superseded incarnation | Steal on session-id alone; stale evidence about a moved claim; a cloned sample masquerading as fresh; a forged token |
-| `EvidenceError` / `WireError` / `HeartbeatExhausted` / `InvalidTurnId` / `InvalidSessionId` / `InvalidInstanceId` / `AdmissionConfigError` | Diagnostics only; nothing branches on their payloads | Domain logic on raw text |
-| `SessionArbiter` / `PendingGuard` / `HeldGuard` (crate-internal) | Same-instance same-session requests serialize before any disk access; a slot is Admitting until the election resolves, Held after confirm (confirm is crate-internal, so no external caller can manufacture a Held slot without an adapter-driven election); `holds()` reports Held only; the held guard lives inside `HeldLock` so it spans the turn | Two local tasks both reaching the claim store; an admission attempt mistaken for a holder; forged local holds |
-| `AcquiredClaim` (internal) | Admission output is one sealed bundle: `new_local` or `new_with_heartbeat` fixes the lease plan at acquisition (never caller-selected) and requires a backend-private proof token, and the single `into_held` builds the lease from the same identity internally | Claim/lease/release identity disagreement; a claim-file claim taking a never-revoking static lease |
-| `HeldLock` | A held claim carries identity, arbiter slot, lease, and bound release, assembled only via private `from_parts` from `AcquiredClaim::into_held` | Hand-assembled holds; missing liveness |
-| `HeartbeatLease` / `ClaimLeaseSource` / `Liveness` / `Revocation` | Liveness ends structurally (atomic + Notify, `Notified` created before the lost check so revoke-before-registration and revoke-after-registration are both covered; only the lease and the actor exit guard hold revocation authority); the lease OWNS the heartbeat loop (wake-and-join cooperative shutdown, so an in-flight renewal completes before release - abort would not guarantee this, as tokio fs writes ride unabortable `spawn_blocking`); the first failed renewal revokes; capabilities merely observe (clone/drop-safe) | Orphaned heartbeats; Live-after-death capabilities; a dropped capability killing a live lease; a renewal landing after release begins; stop() hanging on a wedged mount (named risk 7) |
-| `WriteCapability` | Writes are authorized for one session+turn+incarnation triple and fail closed after revocation (identity-complete, checkable against the write target) | Cross-session capability misuse; writes after a steal |
-| `Revocation` (internal) | The lost flag is an atomic; every end path sets it before anything else | Live reads from a dead lease; per-check subscription cost |
-| `BeatInterval` | The beat is non-zero by construction | `stale_after` degenerating to zero |
-| `AdmissionEnv` / `LocalAdmissionEnv` / `ClaimFileAdmissionEnv` | Config is validated once; fields live in the sibling `config` module and are private; zero intervals are errors; backend constructors require a mode proof narrowed from the config | Unvalidated public config; constructing a local backend from a lockfile config; forged mode proofs |
-| `AdmissionMode` / `build_admission` | The single factory uses `env` to choose the backend and the matching mode proof, then passes in one shared arbiter and one instance identity; backend constructors are config-proof-gated and not exported; the docs state the build-once-per-server requirement (a second call creates an independent arbiter, voiding `off`-mode same-process exclusion) | `LocalAdmission` for a `lockfile` config; per-backend arbiters; caller-supplied identities |
-| `TurnAdmission` | The port: admit + locate_holder; steals are internal | Orchestration coupling; hand-rolled steals |
-| `LocalAdmission` / `ClaimFileAdmission` | Backends are the factory's two products; they differ only in cross-instance mechanics; both require the matching config mode proof at construction and store the backend-owned instance identity plus a backend-private lease proof token (`LocalLeaseProof` or `HeartbeatLeaseProof`) | Caller-named holders; identity disagreement between backends; claim-file admission taking a local static lease |
-| `IdleRequest` | Admission input is a validated session plus the turn fixed at ingress; the acting instance is never caller input | Forged holder identities |
-| `FencedRun` / `CreateRunError` | A run directory enters the state only via `HeldLock::create_run`, which asserts the capability, creates the directory, and re-checks liveness; on failure the lock is returned (for `abort`), and post-create loss also returns the created path for removal or quarantine; downstream states expose `capability()` so persistence and commit cannot silently skip the next check | Run dirs outside admission; cross-claim directory swaps; loss between assert and create; fixed turn retries wedged by an orphaned run dir |
-| `TurnOutcome` | Every terminal path (success/failure/clarification) commits | Silent no-manifest exits |
-| `CommitContext` | The commit step learns outcome, run dir, and claim identity from the barrier; private fields, not constructible outside the crate | Forgeable commit context; out-of-order commit |
-| `CommittingTurn::barrier` | Ordering is commit(ctx), then lease stop, then release, then authorize; commit is lazy and context-fed | Eager commit; manifest-after-release; warn-and-continue |
-| `CleanupOutcome` / `BarrierError` | Commit failure carries the commit error plus the cleanup outcome; release failure after durable commit carries the authorized response; both variants display | Silently lost cleanup failures; lost payloads on wedges |
-| `CommittedResponse<T>` | Terminal-frame authorization bound to session+turn+incarnation; constructor private to the barrier module; payload reachable only through envelope-preserving `map` or consuming `into_parts` | Detached, reused, or forged authorization |
-| `AdmissionError` | Only `Busy` is LB-retryable contention; `ContentionLost` distinct; `NotProvisioned` operator-facing; `Io` covers invalid-wire (InvalidData, source preserved) | Retry storms on non-contention failures |
-| `ReleaseError` | `Superseded` is final (the new owner stands), never force-fixed | Force-unwedging by type accident |
+| `SessionId` | Exactly 1..=128 bytes of ASCII `[A-Za-z0-9._-]`, not `.`/`..`/`latest` | Empty id resolving to the session root; traversal; symlink collision |
+| `TurnId` (+`parse`) | A turn id is a unique UUID fixed at ingress (locally v7; wire accepts any UUID); reify reuses the parked turn's id | Claim rows that cannot name the claiming turn; reify under a fresh id |
+| `PodId` (+`parse`, `from_env`) | The holder's pod is a stable RFC-1123 name (1..=253 bytes): `AURA_POD_ID` (fail loud when invalid) → `POD_NAME` → `HOSTNAME` | Anonymous claim rows; a controller unable to map pod-Deleted → row |
+| `HolderId` (+`parse`) | Each acquire *attempt* mints a fresh UUIDv7 (I2) — the second fence every mutation predicates on | A stale holder linearizing a commit after a failover epoch regression |
+| `OpId` (+`parse`) | One logical commit = one id, minted by the barrier, reused by its retries (B3) | Commit-unknown resolved by blind re-UPDATE |
+| `Epoch` (+`initial`/`next`/`from_raw` crate-internal) | Per-session monotonic fencing token; dir name `e{k}`; construction only inside the crate | Caller-minted epochs; wrapped counters (u64 exhaustion is a typed dead end) |
+| `session_dir` / `epoch_dir` | The only path derivations: `{root}/{session}` and `{session}/e{k}` | Hand-assembled layout strings at the seam |
+| `LeaseDeadline` | A server-clock timestamp (`clock_timestamp()` product); never compared against pod clocks | Cross-clock lease comparisons on the safety path |
+| `LeaseTtl` / `SelfFenceMargin` / `BeatInterval` | Non-zero durations by construction; config additionally requires margin < ttl | Degenerate zero leases; a margin that swallows the ttl |
+| `SelfFenceDeadline` (internal) | Conservative local expiry re-anchored at each beat *transmission* (`transmit + ttl − margin`, codex M9); unfenced in local mode | A self-fence that waits on a response; Live-after-wedge capabilities |
+| `Liveness` / `Revocation` / `ActorExitGuard` (internal) | Unchanged from rev 11: capabilities observe (clone/drop-safe); only the lease and the exit guard hold revocation authority | Live-after-death capabilities; a dropped capability killing a live lease |
+| `HeartbeatLease` / `ClaimLeaseSource` | Unchanged machinery, adapted identity: the lease owns the S2 heartbeat loop (anchor-at-transmission + wake-and-join shutdown); the first failed renewal revokes (Lost and PG-down both fail closed, I5) | Orphaned heartbeats; a renewal landing after release begins |
+| `WriteCapability` | Writes authorized for one `(session, turn, epoch, holder)` quad, failing closed on revocation *or* self-fence expiry | Cross-claim capability misuse; writes after a steal |
+| `Manifest` | The cumulative committed artifact set; grows only through `declare`, which rejects duplicate paths (I1 made structural) | A manifest that can overwrite an entry |
+| `ArtifactPath` / `Digest` (+`Invalid*`) | Epoch-qualified relative path; 32-byte sha256 (hex wire); both parse-don't-validate, and serde deserialization validates too | Unvalidated strings in the committed set |
+| `ManifestEntry` | digest + turn + epoch + byte length, all validated types (`bytes` is a plain metric — no rule branches on it) | Provenance separated from content |
+| `DeclareError` | The write-once violation carries the already-declared path | Silent double-declare |
+| `ReadMiss` | The two read-failure classes stay distinct: `NotFound` (propagation — retry/escalate) vs `Corrupt` (fail loud, never retry) | Corruption retried as propagation |
+| `SessionArbiter` / guards (internal) | Unchanged: same-instance serialization before any store access; Admitting vs Held two-phase | Two local tasks both reaching the store |
+| `AcquiredClaim` (internal) | Admission output is one sealed bundle; `new_local`/`new_pg` fix the lease plan at acquisition and demand the backend's private proof token; `into_held` derives the lease from the same identity | Claim/lease/release identity disagreement; a pg claim taking a static lease |
+| `HeldLock` | Held claim = identity + arbiter slot + lease + bound release + optional repair lane; assembled only via `into_held`; `create_run` derives the epoch dir from the claim's own epoch (the seam no longer chooses layout) | Hand-assembled holds; run dirs outside the epoch partition |
+| `CommitKind` | The only two outcomes that may commit; `Failure` has no `CommitKind` and routes to `abort` | A failed turn reaching the barrier |
+| `CommitContext` | Barrier-assembled commit inputs incl. the minted `OpId`; private fields, not constructible outside the crate | Forgeable commit context; out-of-order commit |
+| `CommittingTurn::barrier` | Ordering: commit(ctx) → lease stop → release → authorize; commit is lazy and context-fed | Eager commit; manifest-after-release |
+| `CleanupOutcome` / `BarrierError` | Unchanged: commit failure carries cleanup results; release failure after durable commit carries the authorized response | Silently lost cleanup failures |
+| `CommittedResponse<T>` | Terminal-frame authorization bound to session+turn+epoch+holder; constructor private to the barrier module | Detached, reused, or forged authorization |
+| `AdmissionError` | `Busy` (retryable, fixed hint) vs `Parked` (no hint, honest HITL signal) vs `StoreUnavailable` (fail-stop, I5) vs `NotProvisioned` (operator) vs `Io`; `ContentionLost` deleted (a lost S1 race *is* Busy) | Retry storms on non-contention failures; HITL parks mistaken for contention |
+| `ReleaseError` | `Superseded` is final (the new owner stands), never force-fixed; `StoreUnavailable` distinct from `Io` | Force-unwedging by type accident |
 | `FenceCause` | Write-path failures are lease-loss or I/O, nothing else | Misclassified EROFS |
-| `LeaseState` / `LeaseLost` | Liveness is Live or Lost, and loss names the session and incarnation | Anonymous loss |
-| `STALE_FACTOR` / `stale_after` | A claim is stealable after 3 missed beats | Sub-revocation steals |
-| `HolderView` | Opaque: `here` (local hold, no disk read) or `remote(&ObservedClaim)` (both fields from ONE observation); accessors read, never construct | Forged locality/heartbeat pairings; pairings from different reads |
+| `LeaseState` / `LeaseLost` | Liveness is Live or Lost, and loss names session + epoch + holder | Anonymous loss |
+| `HolderView` / `Locality` | Opaque: `here(pod)` or `remote(pod, deadline)`; the remote pair arrives together at one construction site (crate-internal contract, Layer-2 pinned) | Forged locality/deadline pairings |
+| `StoreUnavailable` | PG-down is one typed failure, diagnostic payload only | Silent degradation of the claim path |
+| `AdmissionEnv` / mode proofs | Config validated once; `pg()` narrows only when mode=Pg *and* a URL is present, so `PgAdmissionEnv` is unforgeable for a half-configured pg mode | Local backend from a pg config; url-less pg backend |
+| `PgUrl` | Connection URL validated at config (scheme-checked) | Bare connection strings across the boundary |
+| `RepairLaneKind` | `auto`/`cli`/`s3api`, default auto | Unvalidated lane names |
+| `AdmissionMode` / `build_admission` | One factory: mode proof + shared arbiter + pod identity; build-once-per-server documented | Per-backend arbiters; caller-supplied identities |
+| `TurnAdmission` | The port: admit + locate_holder; steals are internal to S1 | Orchestration coupling; hand-rolled steals |
+| `LocalAdmission` / `PgAdmission` | The factory's two products; both require their mode proof at construction and store the pod identity plus a backend-private lease proof token | Caller-named holders; pg claims on static leases |
 
 ## Seam table
 
 | Reach | Visibility | Notes |
 |---|---|---|
 | `tokio` (task, time, sync Notify, fs) | pub dependency | heartbeat loop spawn/join; revocation is a shared atomic + Notify |
-| std fs/path, atomics | std | claim ops live in `ClaimFileAdmission` only |
+| `tokio-postgres` | pub dependency | the `PgStore` fill; `with-serde_json-1` for the manifest jsonb. Unconditional in rev 12 so the workspace gate (`--workspace --all-targets`) compiles the pg module; feature-gating is an integration-time decision |
+| serde / serde_json | pub dependency | manifest jsonb wire; `ArtifactPath`/`Digest` deserialize with validation |
+| uuid (v7, serde) | pub dependency | HolderId/OpId/TurnId minting and wire |
+| std fs/path, atomics, Mutex | std | GC sweep; `SelfFenceDeadline`'s Mutex never crosses an await |
 | no aura crates, no orchestration types | - | consumed via `TurnAdmission` |
 
 Visibility honesty: `pub(crate)` means any module *inside this crate*
-can call it. The internal assembly points are `AcquiredClaim::{new_local,
-new_with_heartbeat}`, `HeldLock::from_parts` (private), `Generation::mint`, `ObservedClaim::from_wire`,
-`StalenessEvidence::{from_observations, revalidate}`, `HeartbeatLease::
-{static_from, with_heartbeat}`, `Revocation::new`, and `release_for`
-(private).
-Backend proof-token constructors are stronger than `pub(crate)`:
-`LocalLeaseProof(())` is private to `adapters::local`, while
-`HeartbeatLeaseProof(())` is private to `adapters::claim_file`. Backend
-constructors are crate-internal so the factory can fill, but they require
-config proofs whose fields are private to the sibling `config` module:
-`LocalAdmissionEnv` for `LocalAdmission::new` and
-`ClaimFileAdmissionEnv` for `ClaimFileAdmission::new`. A backend module
-can call the other constructor, but it cannot produce the opposite mode
-proof from its own config. None are reachable outside the crate; Layer-2
+can call it. The internal assembly points are
+`AcquiredClaim::{new_local, new_pg}`, `HeldLock::from_parts` (private),
+`Epoch::{initial, next, from_raw}`, `HolderId::mint`, `OpId::mint`,
+`HeartbeatLease::{static_from, with_heartbeat}`, `Revocation::new`,
+`SelfFenceDeadline::{fenced, anchor_at}`, `HolderView::{here, remote}`,
+`KeepSet::from_manifest`, and the SQL constants in `store.rs`. Backend
+proof-token constructors are stronger than `pub(crate)`:
+`LocalLeaseProof(())` is private to `adapters::local`,
+`PgLeaseProof(())` to `adapters::pg`. Backend constructors are
+crate-internal and require the narrowed config proofs
+(`LocalAdmissionEnv` / `PgAdmissionEnv`) whose fields are private to the
+sibling `config` module. None are reachable outside the crate; Layer-2
 compile-fail tests must pin that when the test layer lands.
 
 ## Residual risks (named)
 
-1. **Mutation races (open litmus)**: steal, heartbeat renewal, and
-   release are check-then-rename; two concurrent steals can both
-   succeed locally. Boundary until the litmus rules: (a) `ValidatedSteal`
-   revalidation narrows the window to one rename; (b) identity-bound
-   `WriteCapability` fails the loser's writes closed; (c) incarnation
-   minting makes tombstones collision-free. Turn-scoped data limits a
-   race's blast radius to the loser's own run, but session-shared
-   mutations (the `latest` symlink, pruning) remain UNFENCED until the
-   aura seam moves them out of request handling - until then a resumed
-   loser can repoint `latest` or delete sibling runs, so
-   *session-visible corruption remains possible*; the no-corruption
-   claim is withdrawn pending both the litmus and the seam work.
-2. **Release-closure binding is unprovable by types**: the release
-   closure's captured path is the adapter's contract (one construction
-   site: `release_for`, which derives paths from the observation);
-   Layer-2 tests pin it.
-2a. **Run-dir layout is seam-chosen** (R4, accepted in part):
-   `HeldLock::create_run` proves authorization (capability asserted,
-   re-checked after creation) but the seam *chooses* the directory
-   (naming, parent); the guard proves authorization, not layout.
-3. **Check-then-write race on `assert_live`**: advisory at the call
-   site; the structural backstop is heartbeat-renewal failure after
-   revocation.
-4. **Uncached reads**: the archil adapter must bypass client cache
-   (invalidate-cache or readdir expiry 0); Phase-1 litmus, not proven.
-5. **Ordinary cancellation leaves a claim live-looking until
-   staleness** (drop revokes the lease but never runs the async
-   release): bounded availability cost, one staleness window;
-   documented rather than fixed (a detached cleanup task would trade a
-   wedge risk for it).
-6. **Abandonment** (`mem::forget`, task kill): claim leaks until
-   staleness; same bounded window. The drop path aborts the heartbeat
-   loop, and an in-flight renewal write (unabortable `spawn_blocking`)
-   may LAND after revocation - bounded in practice because a steal
-   needs the full staleness window of quiet beats, but it is risk 1's
-   check-then-rename class on a wedge-then-recover mount.
-7. **Unbounded join on a wedged mount**: `stop()` joins the heartbeat
-   loop; if the renewal write hangs on the shared mount (the failure
-   class this crate exists for), `stop()` - and the barrier with it -
-   hangs. Liveness-only and operator-visible, never corruption; the
-   Phase-1 litmus measures it and the rig's drain-timeout probe bounds
-   it. Same for the barrier that awaits it.
-8. **Renewal-callback contract**: `write` (like the release closure) is
-   adapter-supplied and opaque; it must be identity-bound and return
-   only after the claim-body write completes. One construction site;
-   Layer-2 tests pin both.
+1. **PG failover epoch regression.** An async-replica failover can lose
+   the latest epoch increment; two holders can then both be assigned the
+   same epoch (one pre-, one post-failover). *Survivable, lossy*:
+   `holder_id` freshness (I2) keeps every mutation predicate sound, so
+   Postgres still linearizes commits; the cost is double-written epoch
+   dirs (debris for GC), not corrupted committed state. Deployment rule:
+   single-primary fail-stop is the v1 posture; do not inherit an
+   async-failover managed default without revisiting this paragraph.
+2. **Release/renewal closure binding is unprovable by types.** The
+   release closure's captured fence triple and the renewal closure's S2
+   are adapter contracts (one construction site each); Layer-2 pins
+   them.
+3. **Check-then-write race on `assert_live`.** Advisory at the call
+   site; the structural backstop is server-side: S3's fence+lease
+   predicate rejects a lost claim's commit no matter what local
+   liveness said.
+4. **Minutes-scale post-crash propagation is unmeasured** (two rig runs,
+   healthy network). The propagation-window default (30 s) is a guess
+   until the vendor's cache-TTL/`invalidate-cache` latency answers land
+   or a soak test measures the tail. The protocol stalls, never lies.
+5. **`invalidate-cache` is unmeasured** (vendor info arrived after the
+   probe runs). It is the first repair tier precisely because its
+   failure is benign (falls through to `force_cure`). Do not make it
+   load-bearing before a rig measurement.
+6. **archil CLI presence inside CSI-mounted pods is unknown**; it picks
+   the default `RepairLane` impl (`Auto` discovery is the fill-phase
+   behavior).
+7. **Ordinary cancellation leaves the row live until lease expiry**
+   (bounded availability cost, one TTL); pod death is covered by the
+   controller's S4 pod-variant (M10).
+8. **Abandonment** (`mem::forget`, task kill): the row leaks until
+   lease expiry; the drop path aborts the heartbeat loop, and an
+   in-flight S2 (unabortable in flight) may land after revocation —
+   bounded by the lease predicate (B1): a late renewal on an expired
+   claim matches zero rows.
+9. **Unbounded join on a wedged store**: `stop()` joins the heartbeat
+   loop; a hung S2 (network wedge) hangs `stop()` and the barrier with
+   it. Liveness-only, operator-visible, never corruption.
+10. **Lazy PG connect**: `build_admission` stays sync; the first claim
+    pays connect latency, and connect failure surfaces as
+    `StoreUnavailable` (fail-stop applies there too).
+11. **Manifest growth**: cumulative per session in one jsonb column —
+    fine at hundreds of entries; compaction/summarization is a future
+    product card, not a rev-12 concern. The manifest's JSON envelope has
+    no version field yet; if the shape changes, add `v` at the first
+    change, not after two shapes exist.
 
-## Panel ledger
+## Panel ledger (rev 12)
 
-Model identities (for the author/reviewer invariant): the skeleton
-author is OpenCode session model opencode-go/glm-5.3. Seat-2 reviewer
-throughout: codex gpt-5.6-sol. Rounds 2 and 3 seat 1 was dispatched to
-the `rust-reviewer` pin, which reads `openai/gpt-5.6-sol` - the same
-family as the codex seat, a routing collision recorded here (the two seats still ran as independent contexts and converged
-on overlapping findings, but the different-family invariant was NOT
-satisfied in rounds 2-3). Round 4 seat 1 reroutes to the
-`frontier-reviewer` pin (kimi-for-coding/k3) to restore the invariant.
+Model identities (author/reviewer invariant): the rev-12 skeleton author
+is OpenCode session model `kimi-for-coding/k3`. Panel routing per
+`REVIEW-TOOLING.md` (OpenCode board-owner row): seat 1 (adversarial
+invalid-states) = `rust-reviewer` subagent (baseten/zai-org/GLM-5.2);
+seat 2 (logic + seams) = codex CLI (gpt-5.6-sol). Three distinct
+families; the invariant holds. The codex design-packet gate re-run (the
+handoff's continuation task) is a separate, later gate on the filled
+packet.
 
-Round 1 (codex gpt-5.6-sol, 14 findings; frontier seat kimi k3 returned
-empty, rerouted per failed-delegation rule):
-
-| # | Finding | Disposition | Repair |
-|---|---|---|---|
-| C1 | Unique claim names cannot arbitrate | Accepted | Fixed-name CLAIM, O_EXCL election (r1); steal/revalidate hardened (r2/r3) |
-| C2 | Claim/lease/release generations independently assemblable | Accepted | OwnedClaim (r1), then AcquiredClaim + ClaimLeaseSource (r3) |
-| C3 | Evidence neither validated nor producible | Accepted | ObservedClaim + from_observations (r1); revalidate -> ValidatedSteal (r3) |
-| C4 | Lease end does not revoke capabilities | Accepted | Revocation (r2); exit guard + atomic flag + Drop-revoke (r3) |
-| C5 | Error paths discard owned state | Accepted | HeldLock::abort + ActiveTurn::abort (r2) |
-| C6 | Barrier signature cannot uphold ordering | Accepted | lazy FnOnce(CommitContext) (r2); CleanupOutcome (r3) |
-| C7 | Terminal authorization detachable | Accepted | map/into_parts only (r2) |
-| C8 | Public wire type bypasses identities | Accepted | private ClaimWire + ObservedClaim (r2) |
-| C9 | Invalid configs constructible | Accepted | private fields + factory (r2) |
-| C10 | Empty SessionId allowed | Accepted | 1..=128 (r2) |
-| C11 | Arbiter per backend | Accepted | shared via factory (r2) |
-| C12 | DESIGN.md accountability incomplete | Accepted | rewritten (r2); per-finding ledger + full map (this rev) |
-| C13 | Immutability doc contradicts renewal | Accepted | protocol paragraph (r2) |
-| C14 | Prose lint (tricolon) | Accepted | fixed (r2) |
-
-Round 2 (rust-reviewer seat, 11 findings; codex seat, 14 findings):
+Rounds: pending (the panel reviews the rev-12 skeleton commit).
 
 | # | Seat | Finding | Disposition | Repair |
 |---|---|---|---|---|
-| R1 | rust | HeldLock::new accepts disagreeing parts | Accepted | AcquiredClaim + lease_source derivation (r3) |
-| R2 | rust | WriteCapability not bound to session/turn | Accepted | identity-complete capability (r3) |
-| R3 | rust | IdleRequest.instance can contradict backend | Accepted | field removed; backend-owned identity (r3) |
-| R4 | rust | open_run/activate/CommitContext forgeable | Accepted partially | CommitContext constructed by barrier only (r3); run-dir binding stays at the seam by design (abort is the cleanup path; recorded) |
-| R5 | rust | Superseded generation can produce CommittedResponse | Accepted | lease stop before authorize + identity-bound capability make post-commit steal fail the release; response still travels (durable data) - documented as residual |
-| R6 | rust | Generation/heartbeat overflow; gen zero | Accepted | UUIDv7 incarnations + try_next Option (r3) |
-| R7 | rust | TurnId has no parser (from_wire unfillable) | Accepted | TurnId::parse (r3) |
-| R8 | rust | HolderView contradictory states | Accepted | enum variants (r3) |
-| R9 | rust | Backends exported with no rule, root unreachable | Rejected | backends are the factory's named products (documentation value); rule added to map (r3) |
-| R10 | rust | NotProvisioned(String) unstructured | Rejected | diagnostic-only payload, same convention as WireError; rule documents it |
-| R11 | rust | Cancellation leaves bounded stale claim | Accepted | documented residual risk 5 |
-| K1 | codex | Mutation ops not linearizable | Accepted as open | litmus-first decision recorded above; fencing fallback designed in |
-| K2 | codex | Actor death leaves Live; per-check subscribe cost | Accepted | ActorExitGuard + atomic flag (r3) |
-| K3 | codex | C2 still assemblable | Accepted | as R1 (r3) |
-| K4 | codex | Revalidation not representable | Accepted | ValidatedSteal token (r3) |
-| K5 | codex | ClaimWire::initial / TurnId::parse seams missing | Accepted | crate-visible initial + parse (r3) |
-| K6 | codex | Generation persistence / tombstone reuse | Accepted | UUIDv7 incarnations (r3) |
-| K7 | codex | Commit-failure loses cleanup failure | Accepted | CleanupOutcome (r3) |
-| K8 | codex | BarrierError has no Display | Accepted | variant displays (r3) |
-| K9 | codex | Holder identity/locality dishonest | Accepted | as R3/R8 + arbiter holds() (r3) |
-| K10 | codex | InstanceId::from_env fail-soft | Accepted | Result + fallback-only-when-absent (r3) |
-| K11 | codex | observe erases invalid-wire | Accepted | ObserveError internal, mapped contract documented (r3) |
-| K12 | codex | Ledger not per-finding | Accepted | this table (r3) |
-| K13 | codex | Prose lint tricolon | Accepted | rewritten (r3) |
-| K14 | codex | Dependency features broader than needed | Deferred | workspace-level feature slimming touches all crates; queued behind the fill phase |
 
-Round 3 (rust-reviewer pin = gpt-5.6-sol, 10 findings; codex
-gpt-5.6-sol, 11 findings - same family on both seats, see the routing
-note above):
+## Hole inventory (rev 12 baseline)
 
-| # | Seat | Finding | Disposition | Repair |
-|---|---|---|---|---|
-| T1 | rust+codex | Dropping any capability clone revokes the lease (Revocation::Drop) | Accepted | Liveness/Revocation split: capabilities observe, only lease + exit guard hold authority (r4) |
-| T2 | rust+codex | Lease not type-linked to claim at HeldLock::new | Accepted | into_held_local / into_held_with_actor consuming constructors (r4) |
-| T3 | codex | with_actor exit-guard contract unenforceable | Accepted | with_actor spawns via closure receiving the guard; dropped-outside-task fails Lost (r4) |
-| T4 | rust | CommittedResponse::new forgeable in-crate | Accepted | private to state module (r4) |
-| T5 | rust | CommitContext publicly forgeable | Accepted | private fields + accessors (r4) |
-| T6 | rust | FencedRun accepts any PathBuf | Accepted | RunDir::create_under token (r4) |
-| T7 | rust | HolderView variant construction forgeable | Accepted | #[non_exhaustive] (r4) |
-| T8 | codex | release_for lacks session (cannot derive tombstone path) | Accepted | release_for(&ObservedClaim) (r4) |
-| T9 | codex | ValidatedSteal: clone can masquerade as fresh; token lacks session | Accepted | ObservationId ordering + EvidenceError::NotFresh + token carries session (r4) |
-| T10 | codex | holds() reports admission attempts as holders | Accepted | PendingGuard::confirm two-phase arbiter (r4) |
-| T11 | rust | HeldLock field drop order frees arbiter before lease revokes | Accepted | lease field ordered before arbiter (r4) |
-| T12 | codex | "errored turn, never corrupted session" unsupported | Accepted | fencing chain documented as candidate with residual window; litmus gate (r4) |
-| T13 | rust+codex | Hole inventory count wrong (19, adapters 6) | Accepted | corrected (r4) |
-| T14 | rust+codex | Generation/TurnId UUIDv7 doc vs permissive parse | Accepted | invariant restated as uniqueness; locally minted v7, wire accepts any UUID (r4) |
-| T15 | codex | Ledger lacks model identity columns | Accepted | model-identity paragraph added (r4) |
-| T16 | codex | root() unreachable dead surface | Accepted | pub(crate) (r4) |
-| T17 | rust | AdmissionConfigError missing from map | Accepted | added to diagnostics row (r4) |
-| T18 | codex | R4 seam contract absent from residual risks | Accepted | risk 2a added (r4) |
+`grep -rEn '^\s+todo!\(' src/` returns 30 holes:
 
-Round 4 (seat 1 frontier-reviewer pin = kimi k3, 7 findings; seat 2
-codex gpt-5.6-sol, 9 findings; different-family invariant restored):
-
-| # | Seat | Finding | Disposition | Repair |
-|---|---|---|---|---|
-| F1 | both | Recorded r4 repairs for open_run/release_for/ValidatedSteal had not landed in code (ledger said they had) | Accepted | landed with asserted patches in r5; process note below |
-| F2 | both | open_run still accepts raw PathBuf (RunDir bypassed) | Accepted | open_run(RunDir); FencedRun stores the token (r5) |
-| F3 | kimi | enum-level #[non_exhaustive] does not block variant construction | Accepted | HolderView is an opaque struct with crate-internal here/remote constructors (r5) |
-| F4 | both | release_for still lacks session | Accepted | release_for(&ObservedClaim) (r5) |
-| F5 | both | ValidatedSteal still lacks session | Accepted | token carries {session, superseded} (r5) |
-| F6 | codex | with_actor guard/handle association unenforced (dummy handle) | Accepted | lease spawns the wrapper task owning the guard; body receives a Liveness observation (r5) |
-| F7 | codex | HeldGuard constructible outside (public confirm) | Accepted | arbiter API crate-internal; exports removed (r5) |
-| F8 | codex | fencing chain: paused holder; session-shared mutations | Accepted | chain restated with holes named (latest symlink, prune); paused-holder litmus added (r5) |
-| F9 | both | watch channel dead surface | Accepted | channel deleted; atomic flag only (r5) |
-| F10 | codex | RunDir::create_under sync I/O on async path | Accepted | async tokio::fs::create_dir (r5) |
-| F11 | both | DESIGN.md stale (rev 3 title, HeldLock::new refs) | Accepted | r5 rewrite |
-| F12 | kimi | HeartbeatSeq::new public (forged heartbeats) | Accepted | pub(crate) (r5) |
-
-Process note (F1): the r4 fold script applied replacements without
-asserting they matched, so three repairs silently missed while the
-ledger recorded them as done - caught only by the panel reading code.
-Rule going forward: every fold patch asserts its replacements, and the
-ledger records repairs only after `grep` verification of the landed
-source.
-
-Round 5 (seat 1 frontier-reviewer pin = kimi k3: PASS with 8 minors;
-seat 2 codex gpt-5.6-sol: FAIL, 5 BLOCKING + 2 MINOR; different-family
-invariant held):
-
-| # | Seat | Finding | Disposition | Repair |
-|---|---|---|---|---|
-| V1 | codex | risk 1 still claims "errored turn, not corrupted session" while latest/prune are unfenced | Accepted | no-corruption claim withdrawn; corruption possibility stated until seam work lands (r6) |
-| V2 | codex+kimi | RunDir not bound to the authorizing lock (cross-claim swap) | Accepted | open_run+RunDir replaced by HeldLock::create_run (asserts this lock's capability, creates, binds in one step) (r6) |
-| V3 | codex | ValidatedSteal pub(crate) fields forgeable in-crate | Accepted | private fields + crate-internal accessors (r6) |
-| V4 | codex | HolderView::remote pairs holder+heartbeat from possibly different reads | Accepted | remote(&ObservedClaim) derives both from one observation (r6) |
-| V5 | codex | stop() aborts the wrapper; spawn_blocking fs writes are unabortable, so a renewal can land after release begins | Accepted | lease-owned heartbeat loop with wake-and-join cooperative shutdown (in-flight renewal completes before stop returns) (r6) |
-| V6 | codex+kimi | stale docs (seam table watch row, HeldLock::new refs, SessionArbiter link) | Accepted | r6 rewrite |
-| V7 | codex | ObservationId fetch_add wraps | Accepted | checked mint; typed exhaustion (r6) |
-| V8 | kimi | dead public exports (ObservedClaim/EvidenceError/HeartbeatExhausted without public producers) | Accepted | dropped from exports (r6) |
-| V9 | kimi | HeartbeatSeq::initial/try_next public (forged sequences) | Accepted | pub(crate) (r6) |
-| V10 | kimi | LeaseState public without public producer | Accepted | HeldLock::lease_state() added (r6) |
-| V11 | kimi | one-arbiter invariant is caller discipline | Accepted | build-once requirement documented on the factory and in the map row (r6) |
-| V12 | kimi | fill-phase gate invocation undocumented | Accepted | recorded (r6) |
-| V13 | kimi | ValidatedSteal map row overstated ("full superseded identity") | Accepted | reworded to session + superseded incarnation (r6) |
-
-Round 6 (seat 1 frontier-reviewer pin = kimi k3: PASS with 5 minors;
-seat 2 codex gpt-5.6-sol: FAIL, 4 BLOCKING + 3 MINOR):
-
-| # | Seat | Finding | Disposition | Repair |
-|---|---|---|---|---|
-| W1 | codex | create_run consumes the lock on error → no clean release path | Accepted | CreateRunError returns the lock for abort (r7) |
-| W2 | codex | create_run TOCTOU material (no structurally-required next assert) | Accepted | post-create liveness recheck + capability() on FencedRun/ActiveTurn (r7) |
-| W3 | codex | revoked() missed-wakeup interval (is_lost before notified()) | Accepted | Notified created before the lost check (r7) |
-| W4 | codex | into_held_local/into_held_with_heartbeat caller-selectable (claim-file could take static lease) | Accepted | LeasePlan fixed at acquisition (new_local/new_with_heartbeat); single into_held (r7) |
-| W5 | codex | renewal-callback contract unrecorded | Accepted | residual risk 8 + Layer-2 pin (r7) |
-| W6 | both | stale DESIGN.md identifiers (into_held_with_actor, with_actor, RunDir, open_run diagram) | Accepted | r7 sweep |
-| W7 | both | round-5 ledger counts off by one (kimi 7 vs 8 tagged rows) | Accepted | V13 was added during the fold without retagging the header; header corrected here: kimi round-5 = 8 folded rows, of which V2/V6 shared with codex |
-| W8 | kimi | stop() unbounded join not a named risk | Accepted | residual risk 7 (r7) |
-| W9 | kimi | drop-path renewal remnant not named | Accepted | residual risk 6 clause (r7) |
-
-Round 7 (seat 1 frontier-reviewer pin = kimi k3: EMPTY, failed
-delegation, not a pass; seat 2 codex gpt-5.6-sol: FAIL, 2 BLOCKING +
-2 MINOR):
-
-| # | Seat | Finding | Disposition | Repair |
-|---|---|---|---|---|
-| X1 | codex | `AcquiredClaim::new_local` still callable from the claim-file adapter because both constructors are `pub(crate)` | Accepted | adapters split into `local` and `claim_file` modules; each module owns a private-constructor proof token; the matching `AcquiredClaim` constructor requires that token (r8) |
-| X2 | codex | post-create lease loss discarded the just-created run directory path | Accepted | `CreateRunError` is now `NotLive`, `Create`, or `LostAfterCreate { lock, run_dir }`, so cleanup/quarantine can target the orphan before abort (r8) |
-| X3 | codex | round-5 header still said 7 minors after V13 made it 8 | Accepted | header corrected (r8) |
-| X4 | codex | `revoked()` comment misstated `notify_waiters` ordering semantics | Accepted | comment now states both cases: revoke after registration wakes, revoke before registration is caught by the lost check (r8) |
-
-Round 8 (seat 1 rust-reviewer pin = GLM-5.2 after kimi stall: PASS
-with 1 MINOR; seat 2 codex gpt-5.6-sol: FAIL, 1 BLOCKING + 1 MINOR):
-
-| # | Seat | Finding | Disposition | Repair |
-|---|---|---|---|---|
-| Y1 | GLM | fill-unit list accounted for 18 of 19 holes; `build_admission` was inventoried but not assigned | Accepted | unit 1 now covers config/factory, including mode dispatch and shared arbiter construction (r8/r9) |
-| Y2 | codex | `ClaimFileAdmission::admit` could still construct `LocalAdmission` through `LocalAdmission::new` and delegate to a static lease | Accepted | backend constructors were first made module-private (r9); that made the factory unfillable, then Z1 replaced it with config mode proofs (r10) |
-| Y3 | codex | adapter split used `adapters/mod.rs`, not the repo's sibling-module layout | Accepted | restored the `adapters.rs` facade with `adapters/local.rs` and `adapters/claim_file.rs` as submodules (r9) |
-
-Round 9 (seat 1 rust-reviewer pin = GLM-5.2: PASS with 1 MINOR; seat
-2 codex gpt-5.6-sol: FAIL, 1 BLOCKING):
-
-| # | Seat | Finding | Disposition | Repair |
-|---|---|---|---|---|
-| Z1 | GLM+codex | module-private backend constructors close the sibling-backend escape but leave `build_admission` unable to construct either backend | Accepted | `AdmissionEnv` moved to sibling `config` module; backend constructors are crate-internal again but require narrowed mode proofs (`LocalAdmissionEnv` / `ClaimFileAdmissionEnv`) whose fields are private to `config` (r10) |
-| Z2 | GLM | visibility paragraph listed `release_for` without noting it is private | Accepted | paragraph now marks `release_for` private (r10) |
-
-Round 10 (seat 1 rust-reviewer pin = GLM-5.2: PASS with 1 MINOR; seat
-2 codex gpt-5.6-sol: PASS with 2 MINOR):
-
-| # | Seat | Finding | Disposition | Repair |
-|---|---|---|---|---|
-| AA1 | GLM+codex | map row said backends store a config mode proof, but the proof is consumed at construction; only retry/env values and lease proof tokens are stored | Accepted | row now says backends require the config proof at construction and store identity plus backend-private lease proof token (r11) |
-| AA2 | codex | visibility paragraph said Layer-2 compile-fail tests pin the privacy claim, but no Layer-2 harness exists yet | Accepted | wording now says Layer-2 compile-fail tests must pin it when the test layer lands (r11) |
-
-## Hole inventory (rev 11 baseline)
-
-`grep -rEn '^\s+todo!\(' src/` returns 19 holes:
-
-- `identity.rs` (4): `SessionId::parse`, `TurnId::parse`,
-  `InstanceId::parse`, `InstanceId::from_env`
-- `claim.rs` (4): `Generation::parse`, `ObservedClaim::from_wire`,
-  `StalenessEvidence::from_observations`,
-  `StalenessEvidence::revalidate`
-- `config.rs` (1): `AdmissionEnv::from_env`
-- `lib.rs` (1): `build_admission`
+- `identity.rs` (6): `SessionId::parse`, `TurnId::parse`,
+  `PodId::parse`, `PodId::from_env`, `HolderId::parse`, `OpId::parse`
+- `config.rs` (2): `PgUrl::parse`, `AdmissionEnv::from_env`
+- `manifest.rs` (2): `ArtifactPath::parse`, `Digest::from_hex`
+- `gc.rs` (1): `DebrisSweep::sweep`
+- `repair.rs` (5): `CliRepairLane::{refresh_dir, force_cure}`,
+  `S3ApiRepairLane::{refresh_dir, force_cure}`, `build_repair_lane`
 - `state.rs` (3): `HeldLock::abort`, `ActiveTurn::abort`,
   `CommittingTurn::barrier`
+- `lib.rs` (1): `build_admission`
 - `adapters/local.rs` (2): `LocalAdmission::{admit, locate_holder}`
-- `adapters/claim_file.rs` (4): `ClaimFileAdmission::{observe,
-  release_for, admit, locate_holder}`
+- `adapters/pg.rs` (8): `PgAdmission::{admit, locate_holder}`,
+  `PgStore::{claim, heartbeat, commit, release, reconcile_commit,
+  locate}`
 
 Fill units, each with its exit criterion (markers swept, inventory
 accounted, its Layer-2 frames green):
 
-1. identities + config/factory (parse rules, env validation, mode
-   dispatch + shared arbiter construction)
-2. wire + observation (`from_wire`/`to_wire`/`Generation::parse`)
-3. evidence pair + revalidate (window/binding rules)
-4. `LocalAdmission` (arbiter + static lease + no-op release)
-5. `ClaimFileAdmission::observe` + `locate_holder`
-6. `release_for` + `HeldLock::abort` (tombstone protocol)
-7. `ClaimFileAdmission::admit` (election + steal path + actor)
-8. `ActiveTurn::abort` + `barrier` (ordering + cleanup algebra)
+1. identities + config/factory (parse rules, env chains, validation,
+   mode dispatch + shared arbiter + repair-lane build)
+2. manifest wire (`ArtifactPath::parse`, `Digest::from_hex`) + serde
+   round-trip goldens
+3. `PgStore` connection + statements S1–S6 (against a scripted
+   `ClaimStore` double for unit goldens; a live-PG integration test
+   separately)
+4. `PgAdmission::admit` + `locate_holder` (claim flow, GC hook,
+   lease/lock assembly, outcome mapping)
+5. `LocalAdmission` (arbiter + static lease + no-op release)
+6. `HeldLock::abort` + `ActiveTurn::abort` + `barrier` (ordering,
+   cleanup algebra, OpId mint)
+7. `DebrisSweep::sweep` + `RepairLane` impls (CLI first; S3-API may
+   wait on the vendor answer)
+8. `create_run` EROFS cure-retry (the H4 escalation — behavior change to
+   an already-real body; its golden pins the retry-once shape)
 
 `clippy.todo` stays `warn` through the fill phase; the completion gate
 flips it to `deny`. Fill-phase gate invocation (an auditor running the
