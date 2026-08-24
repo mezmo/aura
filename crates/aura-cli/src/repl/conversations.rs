@@ -124,6 +124,27 @@ impl ConversationStore {
         fs::read_to_string(&path).ok().filter(|s| !s.is_empty())
     }
 
+    /// Persist the model the latest turn was sent with; `None` for the
+    /// server default.
+    pub fn save_turn_model(&self, model: Option<&str>) {
+        let path = self.dir.join("turn_model");
+        let _ = match model {
+            Some(model) => fs::write(&path, model),
+            None => fs::remove_file(&path),
+        };
+    }
+
+    pub fn load_turn_model(&self) -> Option<String> {
+        let path = self.dir.join("turn_model");
+        fs::read_to_string(&path).ok().filter(|s| !s.is_empty())
+    }
+
+    /// Whether the selected model is still the one the latest turn was sent
+    /// with.
+    pub fn selected_model_matches_last_turn(&self) -> bool {
+        self.load_model() == self.load_turn_model()
+    }
+
     /// Save the resolved system prompt for this conversation.
     /// Stored separately from chat_history to enable comparison on resume.
     pub fn save_system_prompt(&self, prompt: &str) {
@@ -467,6 +488,23 @@ mod tests {
         assert!(store.load_model().is_none());
         store.save_model("gpt-4o");
         assert_eq!(store.load_model().as_deref(), Some("gpt-4o"));
+    }
+
+    #[test]
+    fn turn_model_tracks_whether_the_selection_changed() {
+        let tmp = TempDir::new().unwrap();
+        let store = make_store(&tmp);
+        assert!(store.load_turn_model().is_none());
+        assert!(store.selected_model_matches_last_turn());
+        store.save_model("gpt-4o");
+        assert!(!store.selected_model_matches_last_turn());
+        store.save_turn_model(Some("gpt-4o"));
+        assert_eq!(store.load_turn_model().as_deref(), Some("gpt-4o"));
+        assert!(store.selected_model_matches_last_turn());
+        store.save_model("claude");
+        assert!(!store.selected_model_matches_last_turn());
+        store.save_turn_model(None);
+        assert!(store.load_turn_model().is_none());
     }
 
     #[test]

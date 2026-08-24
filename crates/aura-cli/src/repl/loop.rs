@@ -991,6 +991,7 @@ pub fn run_repl(
                 let live_worker_reasoning: LiveWorkerReasoningMap =
                     Arc::new(Mutex::new(std::collections::HashMap::new()));
                 let worker_reasoning_seen = Arc::new(AtomicBool::new(false));
+                let session_info_seen = Arc::new(AtomicBool::new(false));
 
                 let (anim, stop_flag) = WaveAnimation::start(
                     "Thinking",
@@ -1144,6 +1145,7 @@ pub fn run_repl(
                             live_reasoning: live_reasoning.clone(),
                             live_worker_reasoning: live_worker_reasoning.clone(),
                             worker_reasoning_seen: worker_reasoning_seen.clone(),
+                            session_info_seen: session_info_seen.clone(),
                             stop_flag: stop_flag.clone(),
                             anim_cleared: anim_cleared.clone(),
                             cancel: cancel_flag.clone(),
@@ -1173,6 +1175,15 @@ pub fn run_repl(
                     // before the stream ended without a usage/tool event).
                     flush_live_reasoning(&live_reasoning);
                     flush_all_worker_reasoning(&live_worker_reasoning);
+
+                    // The window and MCP tally the status line now holds belong
+                    // to the selected model; remember which one so /resume can
+                    // tell whether they still apply.
+                    if session_info_seen.load(Ordering::Relaxed)
+                        && let Some(store) = &conv_store
+                    {
+                        store.save_turn_model(get_selected_model().as_deref());
+                    }
 
                     // Check for cancellation
                     if cancel_flag.load(Ordering::Relaxed) {
@@ -2201,6 +2212,8 @@ struct ReplStreamHandler {
     /// Set once the stream delivers an `aura.orchestrator.worker_reasoning`
     /// event; gates dropping the per-delta `aura.reasoning` worker mirror.
     worker_reasoning_seen: Arc<AtomicBool>,
+    /// Whether this request's stream has reported `aura.session_info`.
+    session_info_seen: Arc<AtomicBool>,
     stop_flag: Arc<AtomicBool>,
     anim_cleared: Arc<AtomicBool>,
     cancel: Arc<AtomicBool>,
@@ -2770,6 +2783,7 @@ impl StreamHandler for ReplStreamHandler {
     fn on_orchestrator_event(&mut self, event_name: &str, val: &serde_json::Value) {
         record_session_event(event_name, val);
         if event_name == event_names::SESSION_INFO {
+            self.session_info_seen.store(true, Ordering::Relaxed);
             update_status_bar();
             return;
         }

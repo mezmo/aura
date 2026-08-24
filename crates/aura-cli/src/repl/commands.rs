@@ -361,11 +361,19 @@ pub(crate) fn handle_resume(
             }
             // The display-event replay below carries no session metadata, so
             // seed the model, window, and MCP tally from the resumed
-            // conversation's own last report. This runs after the selected
-            // model is restored because that forgets the window on a change.
-            for name in [event_names::SESSION_INFO, event_names::MCP_STATUS] {
-                if let Some(val) = last_sse_event(name) {
-                    record_session_event(name, &val);
+            // conversation's own last report — unless the selected model has
+            // changed since that turn, in which case they describe another
+            // model and stay blank until the next turn reports, as after
+            // /model. This runs after the selected model is restored because
+            // that forgets the window on a change.
+            if conv_store
+                .as_ref()
+                .is_some_and(ConversationStore::selected_model_matches_last_turn)
+            {
+                for name in [event_names::SESSION_INFO, event_names::MCP_STATUS] {
+                    if let Some(val) = last_sse_event(name) {
+                        record_session_event(name, &val);
+                    }
                 }
             }
             // Load per-conversation input history for the resumed conversation
