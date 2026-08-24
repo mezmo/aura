@@ -48,7 +48,9 @@ pub(crate) enum ClaimOutcome {
 
 /// A granted claim: everything the lease and the lock are built from.
 /// The manifest rides the claim (Q7: manifest lives in the row), so the
-/// G2 handshake needs no filesystem read at claim time.
+/// G2 handshake needs no filesystem read at claim time. `granted_at` is
+/// the adapter's instant of S1 *transmission* — the self-fence's initial
+/// anchor (codex M9), so the pre-first-beat window is fenced too.
 #[derive(Debug)]
 pub(crate) struct GrantedClaim {
     pub(crate) session: SessionId,
@@ -58,6 +60,7 @@ pub(crate) struct GrantedClaim {
     pub(crate) pod: PodId,
     pub(crate) lease_expires_at: LeaseDeadline,
     pub(crate) manifest: Manifest,
+    pub(crate) granted_at: std::time::Instant,
 }
 
 /// A live-claim refusal.

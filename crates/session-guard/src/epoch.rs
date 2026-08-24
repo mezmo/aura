@@ -12,7 +12,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::identity::SessionId;
 
@@ -20,8 +20,30 @@ use crate::identity::SessionId;
 /// branch of S1); each steal bumps it inside the locked update.
 /// Construction is crate-internal: outside code receives epochs from a
 /// granted claim, never mints them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+///
+/// The SQL column is a signed `bigint`, so the database's domain
+/// ceilings at `i64::MAX`; the `u64` newtype's exhaustion dead-end holds
+/// within that domain (the store edge converts via `i64`).
+/// Deserialization validates: an epoch read from storage is never 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct Epoch(u64);
+
+impl<'de> Deserialize<'de> for Epoch {
+    /// Deserialization validates: 0 (or any value below
+    /// [`Epoch::initial`]) is not a valid epoch — a corrupted or
+    /// non-Rust-written row fails to load rather than smuggling epoch 0
+    /// into GC scope math and fence predicates.
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let raw = u64::deserialize(d)?;
+        if raw >= Epoch::initial().as_u64() {
+            Ok(Self(raw))
+        } else {
+            Err(serde::de::Error::custom(
+                "epoch below the initial epoch (1)",
+            ))
+        }
+    }
+}
 
 impl Epoch {
     /// The epoch of a session's first claim.

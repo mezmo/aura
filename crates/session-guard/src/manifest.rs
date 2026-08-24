@@ -27,10 +27,15 @@ use crate::identity::TurnId;
 ///
 /// Business rule (parse, don't validate — fill-phase): a single
 /// relative path, first component `e{digits}`, no `.`/`..` components,
-/// no separators beyond `/`. The write-once invariant (I1) is enforced
-/// at [`Manifest::declare`].
+/// no separators beyond `/`. The parsed epoch prefix is carried as a
+/// field so provenance can be *checked* against it ([`Manifest::declare`]
+/// rejects a path/entry epoch mismatch). The write-once invariant (I1)
+/// is enforced at `declare`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ArtifactPath(String);
+pub struct ArtifactPath {
+    raw: String,
+    epoch: Epoch,
+}
 
 /// Why a raw string is not an [`ArtifactPath`]. Diagnostic-only.
 #[derive(Debug, thiserror::Error)]
@@ -41,7 +46,8 @@ pub struct InvalidArtifactPath {
 }
 
 impl ArtifactPath {
-    /// Parse and constrain an artifact path. The sole constructor.
+    /// Parse and constrain an artifact path. The sole constructor;
+    /// fills both the raw form and the parsed epoch prefix.
     ///
     /// # Errors
     /// [`InvalidArtifactPath`] when the path is not epoch-qualified or
@@ -51,25 +57,31 @@ impl ArtifactPath {
         reason = "todo!() body; filled by aura #421 follow-up"
     )]
     pub fn parse(raw: &str) -> Result<Self, InvalidArtifactPath> {
-        todo!("fill: epoch-qualified relative-path rules; aura #421 follow-up")
+        todo!("fill: epoch-qualified relative-path rules + prefix parse; aura #421 follow-up")
+    }
+
+    /// The epoch prefix the path was parsed from (`e{k}/...` → `k`).
+    #[must_use]
+    pub const fn epoch(&self) -> Epoch {
+        self.epoch
     }
 }
 
 impl AsRef<str> for ArtifactPath {
     fn as_ref(&self) -> &str {
-        &self.0
+        &self.raw
     }
 }
 
 impl AsRef<std::path::Path> for ArtifactPath {
     fn as_ref(&self) -> &std::path::Path {
-        std::path::Path::new(&self.0)
+        std::path::Path::new(&self.raw)
     }
 }
 
 impl fmt::Display for ArtifactPath {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(&self.raw)
     }
 }
 
@@ -187,16 +199,34 @@ pub struct ManifestEntry {
     pub bytes: u64,
 }
 
-/// Why a declaration was rejected: the write-once rule (I1) made
-/// structural. Carries the already-declared path.
+/// Why a declaration was rejected. The two variants are the two rules a
+/// manifest enforces; nothing else can fail.
 #[derive(Debug, thiserror::Error)]
-#[error("artifact path already declared (write-once violation): {0}")]
-pub struct DeclareError(pub ArtifactPath);
+pub enum DeclareError {
+    /// The write-once rule (I1): the path already has an entry.
+    #[error("artifact path already declared (write-once violation): {0}")]
+    AlreadyDeclared(ArtifactPath),
+    /// The entry's provenance epoch disagrees with the path's epoch
+    /// prefix — a cross-field state production never reaches through
+    /// `ActiveTurn::write_artifact`, but a hand-built delta is rejected
+    /// here rather than stored.
+    #[error("entry epoch {declared} disagrees with path prefix: {path}")]
+    EpochMismatch {
+        /// The offending path.
+        path: ArtifactPath,
+        /// The epoch the entry claimed.
+        declared: Epoch,
+    },
+}
 
-/// The cumulative declared artifact set for a session. Construction of
-/// new entries goes through [`declare`](Self::declare), which rejects
-/// duplicate paths: a manifest can grow but never mutate an entry.
+/// The cumulative declared artifact set for a session. Serialized
+/// transparently as the entries map itself, so a fresh row's `'{}'`
+/// jsonb deserializes to the empty manifest. Construction of new entries
+/// goes through [`declare`](Self::declare), which rejects duplicate
+/// paths and epoch mismatches: a manifest can grow but never mutate or
+/// misattribute an entry.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct Manifest {
     entries: BTreeMap<ArtifactPath, ManifestEntry>,
 }
@@ -238,21 +268,49 @@ impl Manifest {
 
     /// Declare a newly committed artifact. Write-once (I1): declaring a
     /// path that already has an entry is an error, never an overwrite.
+    /// The entry's epoch must equal the path's prefix epoch, so
+    /// provenance cannot disagree with location.
     ///
     /// # Errors
-    /// [`DeclareError`] carrying the already-declared path.
+    /// [`DeclareError::AlreadyDeclared`] when the path has an entry;
+    /// [`DeclareError::EpochMismatch`] when entry and path epochs
+    /// disagree.
     pub fn declare(
         &mut self,
         path: ArtifactPath,
         entry: ManifestEntry,
     ) -> Result<(), DeclareError> {
+        if entry.epoch != path.epoch() {
+            return Err(DeclareError::EpochMismatch {
+                declared: entry.epoch,
+                path,
+            });
+        }
         match self.entries.entry(path) {
             btree_map::Entry::Vacant(vacant) => {
                 vacant.insert(entry);
                 Ok(())
             }
-            btree_map::Entry::Occupied(occupied) => Err(DeclareError(occupied.key().clone())),
+            btree_map::Entry::Occupied(occupied) => {
+                Err(DeclareError::AlreadyDeclared(occupied.key().clone()))
+            }
         }
+    }
+
+    /// Merge a turn's delta into the base manifest, entry by entry. The
+    /// barrier's commit path uses this, so a delta that collides with or
+    /// misattributes committed state fails the commit rather than
+    /// replacing it (cumulativeness is enforced, not asserted).
+    ///
+    /// # Errors
+    /// The first [`DeclareError`] encountered; entries declared before
+    /// the failure stay declared (callers treat any error as fatal to
+    /// the commit, so the partial state never reaches the store).
+    pub fn extend_from(&mut self, delta: Manifest) -> Result<(), DeclareError> {
+        for (path, entry) in delta.entries {
+            self.declare(path, entry)?;
+        }
+        Ok(())
     }
 }
 

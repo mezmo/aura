@@ -23,12 +23,14 @@ use crate::epoch::Epoch;
 use crate::identity::{HolderId, OpId, PodId, SessionId, TurnId};
 use crate::lease::{LeaseDeadline, LeaseTtl};
 use crate::manifest::Manifest;
-use crate::state::CommitKind;
 
-/// The fence identity every mutation predicates on (I2).
+/// The fence identity every mutation predicates on (I2). `turn` rides
+/// along so the park latch can be derived (`parked_turn` is always the
+/// *committing* turn's id — never a free parameter).
 #[derive(Debug, Clone)]
 pub(crate) struct ClaimRef {
     pub(crate) session: SessionId,
+    pub(crate) turn: crate::identity::TurnId,
     pub(crate) epoch: Epoch,
     pub(crate) holder: HolderId,
 }
@@ -93,14 +95,35 @@ pub(crate) enum ReleaseOutcome {
 }
 
 /// The commit-unknown reconciliation verdict (B3): a read-back on
-/// `last_commit_op`, never a blind re-UPDATE.
+/// `last_commit_op` *and* the fence triple, never a blind re-UPDATE.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CommitDisposition {
-    /// The row already carries this op id: the commit landed.
+    /// The row still shows our fence triple and carries this op id:
+    /// the commit landed.
     Applied,
-    /// No row or a different op id: the commit did not land; retrying
-    /// or aborting is safe.
+    /// The row still shows our fence triple but a different op id: our
+    /// commit definitively did not land; retrying or aborting is safe.
     NotApplied,
+    /// The row shows a *different* epoch/holder: we were superseded, and
+    /// whether our commit landed before the steal is unknowable from the
+    /// row (the single `last_commit_op` slot may have been overwritten
+    /// by the new holder). Honest indeterminacy, reported as such — the
+    /// turn's delivery is moot once stolen, so the caller treats this as
+    /// a lost turn, not a retryable one.
+    SupersededUnknown,
+}
+
+/// Whether one commit latches the session as parked. The latch value
+/// itself is never a parameter: `Parked` writes the *committing* turn's
+/// id, so a contradictory kind/latch combination is unrepresentable
+/// (codex B5's "nothing enforces same-TurnId reification" starts here).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ParkLatch {
+    /// A normal commit: `parked_turn` is written NULL.
+    NotParked,
+    /// A park commit (HITL-271's driver): `parked_turn` is written with
+    /// the committing turn's id.
+    Parked,
 }
 
 /// The claim-store port: one method per statement.
@@ -109,6 +132,9 @@ pub(crate) trait ClaimStore: Send + Sync {
     /// S1: fresh claim, steal-after-expiry, or reify — one statement.
     /// Zero updated rows is classified by a follow-up read into
     /// `Busy` (live lease) or `Parked` (parked on a different turn).
+    /// The classify read can race a release landing between S1 and it
+    /// (the row reads as claimable again); the implementation retries S1
+    /// once in that case rather than reporting a third refusal shape.
     async fn claim(&self, req: &ClaimRequest) -> Result<ClaimOutcome, StoreUnavailable>;
 
     /// S2: extend the lease. Predicated on the fence triple and an
@@ -120,27 +146,35 @@ pub(crate) trait ClaimStore: Send + Sync {
         ttl: LeaseTtl,
     ) -> Result<HeartbeatOutcome, StoreUnavailable>;
 
-    /// S3: publish the cumulative manifest, record the op id, and set
-    /// or clear the park latch — one atomic statement (I4). Predicated
-    /// on the fence triple and an unexpired lease (B1).
+    /// S3: publish the cumulative manifest, record the op id, and write
+    /// the park latch — one atomic statement (I4). Predicated on the
+    /// fence triple and an unexpired lease (B1). The latch value is
+    /// derived from the claim's own turn (never a free parameter).
     async fn commit(
         &self,
         claim: &ClaimRef,
-        kind: CommitKind,
+        latch: ParkLatch,
         op: OpId,
         manifest: &Manifest,
-        parked: Option<TurnId>,
     ) -> Result<CommitOutcome, StoreUnavailable>;
 
     /// S4: expire-now release, predicated on the fence triple. The row
     /// stays (never-DELETE, I7).
     async fn release(&self, claim: &ClaimRef) -> Result<ReleaseOutcome, StoreUnavailable>;
 
-    /// Commit-unknown reconciliation (B3): read back `last_commit_op`
-    /// after a connection error and compare.
+    /// S4 controller variant: expire every live row a pod holds (M10).
+    /// Returns the number of rows expired. Administrative; the caller is
+    /// the controller, not a turn path. Known residual: pod-name reuse
+    /// can expire a same-named replacement pod's claims — bounded to an
+    /// unnecessary bounce, never corruption (DESIGN.md risk list).
+    async fn release_pod(&self, pod: &PodId) -> Result<u64, StoreUnavailable>;
+
+    /// Commit-unknown reconciliation (B3): read back the fence triple
+    /// and `last_commit_op`, then compare both.
     async fn reconcile_commit(
         &self,
         session: &SessionId,
+        claim: &ClaimRef,
         op: OpId,
     ) -> Result<CommitDisposition, StoreUnavailable>;
 
@@ -215,18 +249,20 @@ RETURNING lease_expires_at";
 // $1 text · $2 bigint epoch · $3 uuid holder_id · $4 float8 ttl millis
 
 /// S3 — commit. One atomic statement publishes the manifest, records
-/// the logical op id, and sets/clears the park latch (I4). The lease
+/// the logical op id, and writes the park latch (I4). The lease
 /// predicate (B1) refuses commits from a holder whose lease already
 /// expired — the store-side fence that replaces any filesystem fence.
+/// Parameters are contiguous; $6 is `Some(claim.turn)` when parking,
+/// NULL otherwise (derived from [`ParkLatch`], never free).
 pub(crate) const S3_COMMIT: &str = "
 UPDATE session_claims
-SET manifest = $5,
-    last_commit_op = $6,
-    parked_turn = $7
+SET manifest = $4,
+    last_commit_op = $5,
+    parked_turn = $6
 WHERE session_id = $1 AND epoch = $2 AND holder_id = $3
   AND lease_expires_at > clock_timestamp()";
-// $1 text · $2 bigint · $3 uuid · $5 jsonb manifest · $6 uuid op ·
-// $7 uuid-or-null parked_turn
+// $1 text · $2 bigint epoch · $3 uuid holder_id · $4 jsonb manifest ·
+// $5 uuid op · $6 uuid-or-null parked_turn (the committing turn when parking)
 
 /// S4 — release (expire-now). Idempotent by predicate: supersession
 /// matches zero rows and is not an error. The controller variant for
@@ -242,9 +278,11 @@ UPDATE session_claims
 SET lease_expires_at = clock_timestamp()
 WHERE holder_pod = $1 AND lease_expires_at > clock_timestamp()";
 
-/// S5 — commit-unknown reconciliation read (B3).
+/// S5 — commit-unknown reconciliation read (B3). Reads the fence triple
+/// alongside the op slot so a supersession in between is reported as
+/// [`CommitDisposition::SupersededUnknown`], not a false `NotApplied`.
 pub(crate) const S5_RECONCILE: &str = "
-SELECT last_commit_op FROM session_claims
+SELECT epoch, holder_id, last_commit_op FROM session_claims
 WHERE session_id = $1";
 
 /// S6 — holder lookup for HITL routing: only a live lease reports a

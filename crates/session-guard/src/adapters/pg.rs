@@ -2,12 +2,14 @@
 //! table is the sole cross-instance authority.
 //!
 //! Claim flow (figure 1 in DESIGN.html): arbiter → S1 via
-//! [`ClaimStore`] → on `Granted`, the manifest rides the row (no
-//! filesystem read), a [`DebrisSweep`] runs at claim time (debris-only,
-//! epoch-scoped — I3), then the lease/lock assembly. The heartbeat lease
-//! renews over S2; the release action closes over S4 with this claim's
-//! fence triple.
+//! [`ClaimStore`] (capturing the S1 transmission instant as the
+//! self-fence's initial anchor) → on `Granted`, the manifest rides the
+//! row (no filesystem read), a [`DebrisSweep`] runs at claim time
+//! against this backend's bound session root (debris-only, epoch-scoped
+//! — I3), then the lease/lock assembly. The heartbeat lease renews over
+//! S2; the release action closes over S4 with this claim's fence triple.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,10 +20,10 @@ use crate::arbiter::SessionArbiter;
 use crate::claim::HolderView;
 use crate::config::PgAdmissionEnv;
 use crate::identity::{PodId, SessionId};
-use crate::lease::{LeaseTtl, SelfFenceMargin};
+use crate::lease::{BeatInterval, LeaseTtl, SelfFenceMargin};
 use crate::repair::RepairLane;
 use crate::state::{AdmissionError, HeldLock, IdleRequest};
-use crate::store::ClaimStore;
+use crate::store::{ClaimStore, ParkLatch};
 
 /// Proof that a claim is being assembled by the Postgres backend. The
 /// constructor is private to this module, so only [`PgAdmission`] can
@@ -36,10 +38,13 @@ pub(crate) struct PgLeaseProof(());
 pub struct PgAdmission {
     store: Arc<dyn ClaimStore>,
     pod: PodId,
+    root: PathBuf,
     arbiter: SessionArbiter,
     retry_after: Duration,
+    beat: BeatInterval,
     ttl: LeaseTtl,
     margin: SelfFenceMargin,
+    propagation_window: Duration,
     repair: Arc<dyn RepairLane>,
     proof: PgLeaseProof,
 }
@@ -48,7 +53,9 @@ impl std::fmt::Debug for PgAdmission {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PgAdmission")
             .field("pod", &self.pod)
+            .field("root", &self.root)
             .field("retry_after", &self.retry_after)
+            .field("beat", &self.beat)
             .field("ttl", &self.ttl)
             .field("margin", &self.margin)
             .finish_non_exhaustive()
@@ -59,6 +66,7 @@ impl PgAdmission {
     pub(crate) fn new(
         store: Arc<dyn ClaimStore>,
         pod: PodId,
+        root: PathBuf,
         arbiter: SessionArbiter,
         env: PgAdmissionEnv<'_>,
         repair: Arc<dyn RepairLane>,
@@ -66,10 +74,13 @@ impl PgAdmission {
         Self {
             store,
             pod,
+            root,
             arbiter,
             retry_after: env.retry_after(),
+            beat: env.beat(),
             ttl: env.lease_ttl(),
             margin: env.fence_margin(),
+            propagation_window: env.propagation_window(),
             repair,
             proof: PgLeaseProof(()),
         }
@@ -84,10 +95,13 @@ impl TurnAdmission for PgAdmission {
     )]
     async fn admit(&self, req: IdleRequest) -> Result<HeldLock, AdmissionError> {
         todo!(
-            "fill: arbiter PendingGuard → mint HolderId → store.claim(S1 + classify) → \
-             Granted: DebrisSweep::at_claim_time(&manifest, epoch).sweep(root) (failure ≠ claim failure), \
-             then AcquiredClaim::new_pg(self.proof, .., self.repair.clone()) → into_held → confirm(); \
-             Busy → AdmissionError::Busy; Parked → AdmissionError::Parked; \
+            "fill: arbiter PendingGuard → mint HolderId → note S1 transmission instant \
+             (granted_at) → store.claim(S1 + classify, one internal retry when classify \
+             observes a claimable row) → Granted: DebrisSweep::at_claim_time(&manifest, epoch)\
+             .sweep(&session_root under self.root) (failure ≠ claim failure), then \
+             AcquiredClaim::new_pg(self.proof, granted, root/session, self.store.clone(), \
+             self.propagation_window, release-closing-over-S4, renewal, self.repair.clone()) \
+             → into_held → confirm(); Busy → AdmissionError::Busy; Parked → AdmissionError::Parked; \
              aura #421 follow-up"
         )
     }
@@ -127,7 +141,9 @@ impl ClaimStore for PgStore {
         &self,
         req: &crate::store::ClaimRequest,
     ) -> Result<crate::claim::ClaimOutcome, crate::store::StoreUnavailable> {
-        todo!("fill: S1_CLAIM; 0 rows → S1_CLASSIFY → Busy/Parked; aura #421 follow-up")
+        todo!(
+            "fill: S1_CLAIM; 0 rows → S1_CLASSIFY → Busy/Parked (one S1 retry when claimable); aura #421 follow-up"
+        )
     }
 
     #[expect(
@@ -149,12 +165,13 @@ impl ClaimStore for PgStore {
     async fn commit(
         &self,
         claim: &crate::store::ClaimRef,
-        kind: crate::state::CommitKind,
+        latch: ParkLatch,
         op: crate::identity::OpId,
         manifest: &crate::manifest::Manifest,
-        parked: Option<crate::identity::TurnId>,
     ) -> Result<crate::store::CommitOutcome, crate::store::StoreUnavailable> {
-        todo!("fill: S3_COMMIT (manifest as jsonb); 0 rows → LostFence; aura #421 follow-up")
+        todo!(
+            "fill: S3_COMMIT (manifest as jsonb; $6 = claim.turn when Parked else NULL); 0 rows → LostFence; aura #421 follow-up"
+        )
     }
 
     #[expect(
@@ -172,12 +189,23 @@ impl ClaimStore for PgStore {
         unused_variables,
         reason = "todo!() body; filled by aura #421 follow-up"
     )]
+    async fn release_pod(&self, pod: &PodId) -> Result<u64, crate::store::StoreUnavailable> {
+        todo!("fill: S4_RELEASE_POD, rows-affected; aura #421 follow-up")
+    }
+
+    #[expect(
+        unused_variables,
+        reason = "todo!() body; filled by aura #421 follow-up"
+    )]
     async fn reconcile_commit(
         &self,
         session: &SessionId,
+        claim: &crate::store::ClaimRef,
         op: crate::identity::OpId,
     ) -> Result<crate::store::CommitDisposition, crate::store::StoreUnavailable> {
-        todo!("fill: S5_RECONCILE read-back on last_commit_op; aura #421 follow-up")
+        todo!(
+            "fill: S5_RECONCILE; compare op AND fence triple → Applied / NotApplied / SupersededUnknown; aura #421 follow-up"
+        )
     }
 
     #[expect(

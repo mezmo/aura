@@ -240,6 +240,13 @@ impl LocalAdmissionEnv<'_> {
     pub(crate) const fn retry_after(self) -> Duration {
         self.0.retry_after
     }
+
+    /// The read-miss propagation window (uniform read path in both
+    /// modes).
+    #[must_use]
+    pub(crate) const fn propagation_window(self) -> Duration {
+        self.0.propagation_window
+    }
 }
 
 impl PgAdmissionEnv<'_> {
@@ -250,6 +257,13 @@ impl PgAdmissionEnv<'_> {
             .pg_url
             .clone()
             .expect("PgAdmissionEnv: URL presence pinned by AdmissionEnv::pg")
+    }
+
+    /// The heartbeat interval (the heartbeat lease cannot be assembled
+    /// without it).
+    #[must_use]
+    pub(crate) const fn beat(self) -> BeatInterval {
+        self.0.beat
     }
 
     /// The server-side lease ttl.
@@ -268,6 +282,12 @@ impl PgAdmissionEnv<'_> {
     #[must_use]
     pub(crate) const fn retry_after(self) -> Duration {
         self.0.retry_after
+    }
+
+    /// The read-miss propagation window.
+    #[must_use]
+    pub(crate) const fn propagation_window(self) -> Duration {
+        self.0.propagation_window
     }
 
     /// The configured repair lane kind.

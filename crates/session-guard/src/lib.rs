@@ -22,9 +22,13 @@
 //! succeeds after a steal), so writes are *contained*, not intercepted:
 //! one claim = one epoch = one run dir (`{session}/e{k}/`), paths are
 //! write-once (I1), and the cumulative manifest in the claims row is the
-//! only authority on committed bytes. GC is debris-only and
-//! epoch-scoped (I3); a thawed zombie's writes land where nothing reads
-//! them and the next claim's sweep reclaims them.
+//! only authority on committed bytes. The artifact I/O surface is part
+//! of the claim: [`ActiveTurn::write_artifact`] is the only way
+//! manifest-bound bytes are written (temp + fsync + rename, one write
+//! per path — I1/I4 as structure), and [`FencedRun::read_artifact`] owns
+//! verify-on-first-read with the three-way miss handling. GC is
+//! debris-only and epoch-scoped (I3); a thawed zombie's writes land
+//! where nothing reads them and the next claim's sweep reclaims them.
 //!
 //! The consuming state machine (one instance's view of one request):
 //!
@@ -119,9 +123,9 @@ pub use manifest::{
     ManifestEntry, ReadMiss,
 };
 pub use state::{
-    ActiveTurn, AdmissionError, BarrierError, CleanupOutcome, CommitContext, CommitKind,
-    CommittedResponse, CommittingTurn, CreateRunError, FenceCause, FencedRun, HeldLock,
-    IdleRequest, ReleaseError,
+    ActiveTurn, AdmissionError, ArtifactWriteError, BarrierError, CleanupOutcome, CommitContext,
+    CommitKind, CommitRejection, CommittedResponse, CommittingTurn, CreateRunError, FenceCause,
+    FencedRun, HeldLock, IdleRequest, ReadError, ReleaseError, VerifiedRead,
 };
 pub use store::StoreUnavailable;
 
@@ -134,19 +138,22 @@ use crate::identity::PodId as FactoryPodId;
 /// shared arbiter, one backend, selected by mode. The single factory —
 /// backend constructors require a mode-proof narrowed from `env`, so a
 /// [`LocalAdmission`] can never be built from a `pg` config. `root` is
-/// the session-store root (session dirs live under it); `pod` is this
-/// pod's identity (the `holder_pod` column).
+/// the session-store root: every claim binds its session dir under it at
+/// admission, so a claim can never create or sweep beneath another
+/// session's root. `pod` is this pod's identity (the `holder_pod`
+/// column).
 ///
 /// # Errors
-/// [`AdmissionConfigError`] when `env` selects `pg` but `root` is empty
-/// or the URL is missing.
+/// [`AdmissionConfigError`] when the narrowed mode proof is unavailable
+/// for the configured mode (for `pg`: URL missing — though
+/// [`AdmissionEnv::from_env`] rejects that earlier).
 #[expect(
     unused_variables,
     reason = "todo!() body; filled by aura #421 follow-up"
 )]
 pub fn build_admission(
     env: &AdmissionEnv,
-    root: Option<PathBuf>,
+    root: PathBuf,
     pod: FactoryPodId,
 ) -> Result<Arc<dyn TurnAdmission>, AdmissionConfigError> {
     todo!("fill: mode dispatch + shared arbiter + repair lane; aura #421 follow-up")

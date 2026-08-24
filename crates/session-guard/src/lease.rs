@@ -132,14 +132,26 @@ impl SelfFenceMargin {
 
 /// The holder's conservative local deadline (codex M9): re-anchored at
 /// every heartbeat *transmission* to `transmit_instant + ttl − margin`,
-/// so the deadline never depends on a response arriving. A `None` value
-/// is an unfenced lease (local admission): never expires.
+/// so the deadline never depends on a response arriving. The initial
+/// anchor is set at claim-grant time (the S1 transmission), so the
+/// pre-first-beat window is fenced too.
 ///
 /// Sync `Mutex` on purpose: the critical section is one `Instant`
 /// store/load, never held across an await.
 #[derive(Debug, Clone)]
 pub(crate) struct SelfFenceDeadline {
-    shared: Arc<Mutex<Option<Instant>>>,
+    shared: Arc<Mutex<SelfFenceState>>,
+}
+
+/// Unfenced (local admission) and fenced (pg) are distinct states — a
+/// bare `Option<Instant>` cannot tell "unfenced" from "not yet
+/// anchored", and a fence that cannot anchor is worse than none.
+#[derive(Debug)]
+enum SelfFenceState {
+    /// Local admission: `is_expired` is always false, anchoring no-ops.
+    Unfenced,
+    /// Postgres-fenced. The initial anchor lands with the lease.
+    Fenced { deadline: Option<Instant> },
 }
 
 impl SelfFenceDeadline {
@@ -147,25 +159,34 @@ impl SelfFenceDeadline {
     /// false; anchoring is a no-op.
     pub(crate) fn unfenced() -> Self {
         Self {
-            shared: Arc::new(Mutex::new(None)),
+            shared: Arc::new(Mutex::new(SelfFenceState::Unfenced)),
         }
     }
 
-    /// A fenced deadline; it starts unanchored (already expired would be
-    /// wrong — the first beat anchors it), so reads before the first
-    /// beat do not fail a lease that was just granted. The claim flow
-    /// anchors at acquisition before any capability escapes.
-    pub(crate) fn fenced() -> Self {
+    /// A fenced deadline, initially anchored at the claim's grant: the
+    /// server processed S1 no earlier than it was transmitted, so
+    /// `granted_at + (ttl − margin)` conservatively bounds the first
+    /// lease.
+    pub(crate) fn fenced(granted_at: Instant, ttl: LeaseTtl, margin: SelfFenceMargin) -> Self {
         Self {
-            shared: Arc::new(Mutex::new(None)),
+            shared: Arc::new(Mutex::new(SelfFenceState::Fenced {
+                deadline: Some(Self::anchor(granted_at, ttl, margin)),
+            })),
         }
+    }
+
+    /// The anchor math: transmission instant plus the ttl minus the
+    /// margin. A saturating window and a checked add keep overflow
+    /// conservative (an earlier deadline is the safe direction).
+    fn anchor(transmitted_at: Instant, ttl: LeaseTtl, margin: SelfFenceMargin) -> Instant {
+        let window = ttl.get().saturating_sub(margin.get());
+        transmitted_at.checked_add(window).unwrap_or(transmitted_at)
     }
 
     /// Re-anchor at a beat transmission: the server cannot have
     /// processed the beat before it was sent, so
     /// `transmitted_at + (ttl − margin)` is a conservative expiry no
-    /// matter what the response says. A `None` shared value (unfenced)
-    /// stays `None`.
+    /// matter what the response says. No-op on an unfenced deadline.
     pub(crate) fn anchor_at(
         &self,
         transmitted_at: Instant,
@@ -173,19 +194,18 @@ impl SelfFenceDeadline {
         margin: SelfFenceMargin,
     ) {
         let mut guard = self.shared.lock().expect("self-fence mutex poisoned");
-        if guard.is_some() {
-            let window = ttl.get().saturating_sub(margin.get());
-            *guard = Some(transmitted_at.checked_add(window).unwrap_or(transmitted_at));
+        if let SelfFenceState::Fenced { deadline } = &mut *guard {
+            *deadline = Some(Self::anchor(transmitted_at, ttl, margin));
         }
     }
 
     /// Whether the anchored deadline has passed. An unfenced deadline
     /// never expires.
     pub(crate) fn is_expired(&self) -> bool {
-        self.shared
-            .lock()
-            .expect("self-fence mutex poisoned")
-            .is_some_and(|deadline| Instant::now() >= deadline)
+        match &*self.shared.lock().expect("self-fence mutex poisoned") {
+            SelfFenceState::Unfenced => false,
+            SelfFenceState::Fenced { deadline } => deadline.is_some_and(|d| Instant::now() >= d),
+        }
     }
 }
 
@@ -321,9 +341,11 @@ impl HeartbeatLease {
     /// A lease whose heartbeat loop the lease itself owns and drives.
     /// `write` performs one S2 renewal; the loop anchors the self-fence
     /// deadline at every beat *transmission* (before the write is
-    /// awaited), then calls it every `beat` while live. Any write
-    /// failure revokes and ends the loop (renewal failure fails closed:
-    /// Lost and PG-down are indistinguishable by design — I5).
+    /// awaited), then calls it every `beat` while live. `granted_at` is
+    /// the claim's S1 transmission instant — the initial anchor, so the
+    /// pre-first-beat window is fenced too. Any write failure revokes
+    /// and ends the loop (renewal failure fails closed: Lost and PG-down
+    /// are indistinguishable by design — I5).
     ///
     /// Shutdown is cooperative so release ordering holds:
     /// [`stop`](Self::stop) revokes, wakes the loop, and *joins* it — an
@@ -335,6 +357,7 @@ impl HeartbeatLease {
         beat: BeatInterval,
         ttl: LeaseTtl,
         margin: SelfFenceMargin,
+        granted_at: Instant,
         write: F,
     ) -> Self
     where
@@ -344,7 +367,7 @@ impl HeartbeatLease {
         let revocation = Revocation::new();
         let guard = ActorExitGuard::new(revocation.clone());
         let shutdown = revocation.clone();
-        let deadline = SelfFenceDeadline::fenced();
+        let deadline = SelfFenceDeadline::fenced(granted_at, ttl, margin);
         let loop_deadline = deadline.clone();
         let mut write = write;
         let actor = tokio::spawn(async move {

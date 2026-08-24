@@ -68,10 +68,12 @@ impl fmt::Display for SessionId {
     }
 }
 
-/// One orchestration turn. Locally minted as UUIDv7 (time-ordered,
-/// matches run-dir naming); the wire form accepts any UUID so rows
-/// written by other writers keep parsing. A parked turn is reified with
-/// the *same* `TurnId` (the S1 parked predicate compares it).
+/// One orchestration turn. Two wire forms, deliberately: the serde form
+/// (compact UUID, manifest JSONB — Rust-to-Rust) and [`parse`](Self::parse)
+/// (UUID string — HTTP headers, PG uuid text). Locally minted as UUIDv7
+/// (time-ordered, matches run-dir naming); both wire forms accept any
+/// UUID so rows written by other writers keep parsing. A parked turn is
+/// reified with the *same* `TurnId` (the S1 parked predicate compares it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct TurnId(#[serde(with = "uuid::serde::compact")] uuid::Uuid);
 
