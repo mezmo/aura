@@ -199,12 +199,11 @@ impl ClaimStore for PgStore {
     )]
     async fn reconcile_commit(
         &self,
-        session: &SessionId,
         claim: &crate::store::ClaimRef,
         op: crate::identity::OpId,
     ) -> Result<crate::store::CommitDisposition, crate::store::StoreUnavailable> {
         todo!(
-            "fill: S5_RECONCILE; compare op AND fence triple → Applied / NotApplied / SupersededUnknown; aura #421 follow-up"
+            "fill: S5_RECONCILE on claim.session; compare op AND fence triple → Applied / NotApplied / SupersededUnknown; aura #421 follow-up"
         )
     }
 

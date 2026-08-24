@@ -35,14 +35,14 @@
 //! ```text
 //! Idle ──admit──────────► HeldLock ──create_run──► FencedRun ──activate──► ActiveTurn
 //!  │                        │         (asserts capability, derives e{k}/    │
-//!  ├─busy──► 503           │          from the claim's epoch, creates,      │
-//!  └─parked──► parked      │          rechecks; error returns the lock)     │
-//!      (no retry hint)     └─create_run Err: abort returned lock            ├─complete(CommitKind)──► CommittingTurn
-//!                                      abandonment ────┘                    │      (Success|Clarification)
-//!                                      (drop revokes)                       └─Failure──► abort (no commit)
-//!                                                                           barrier(commit(ctx))
-//!                                                                                │
-//!                                                                           CommittedResponse
+//!  ├─busy──► 503           │          from the claim's epoch under the      │
+//!  └─parked──► parked      │          bound session root, creates,          │
+//!      (no retry hint)     │          rechecks; error returns the lock)     ├─complete(CommitKind)─┐
+//!                          └─create_run Err: abort returned lock            ├─park()───────────────┼─► CommittingTurn
+//!                              abandonment (drop revokes)                   └─Failure──► abort     │      barrier(payload(ctx))
+//!                                                                           (no commit)           │         │
+//!                                                                                               ▼
+//!                                                                                        CommittedResponse
 //! ```
 //!
 //! Only a [`CommittedResponse`] authorizes emitting the terminal frame of
@@ -104,6 +104,7 @@ mod identity;
 mod lease;
 mod manifest;
 mod repair;
+mod scratchpad;
 mod state;
 mod store;
 
@@ -122,10 +123,11 @@ pub use manifest::{
     ArtifactPath, DeclareError, Digest, InvalidArtifactPath, InvalidDigest, Manifest,
     ManifestEntry, ReadMiss,
 };
+pub use scratchpad::{InvalidScratchpadName, ScratchpadError, ScratchpadName};
 pub use state::{
     ActiveTurn, AdmissionError, ArtifactWriteError, BarrierError, CleanupOutcome, CommitContext,
     CommitKind, CommitRejection, CommittedResponse, CommittingTurn, CreateRunError, FenceCause,
-    FencedRun, HeldLock, IdleRequest, ReadError, ReleaseError, VerifiedRead,
+    FencedRun, HeldLock, IdleRequest, ReadError, ReleaseError, TurnEnd, VerifiedRead,
 };
 pub use store::StoreUnavailable;
 

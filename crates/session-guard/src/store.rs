@@ -170,10 +170,11 @@ pub(crate) trait ClaimStore: Send + Sync {
     async fn release_pod(&self, pod: &PodId) -> Result<u64, StoreUnavailable>;
 
     /// Commit-unknown reconciliation (B3): read back the fence triple
-    /// and `last_commit_op`, then compare both.
+    /// and `last_commit_op` for the claim's own session, then compare
+    /// both. The session is taken from `claim` — there is no way to
+    /// reconcile one session against another claim's fence.
     async fn reconcile_commit(
         &self,
-        session: &SessionId,
         claim: &ClaimRef,
         op: OpId,
     ) -> Result<CommitDisposition, StoreUnavailable>;
@@ -231,9 +232,11 @@ RETURNING c.epoch, c.lease_expires_at, c.manifest";
 /// S1 classify — run only when S1 updates zero rows, to tell the two
 /// refusal shapes apart honestly: `Parked` (parked on a different turn;
 /// unbounded wait, no retry hint) vs `Busy` (live lease; hint from
-/// config — codex M7).
+/// config — codex M7). `expired` is computed server-side, so the
+/// classify-then-retry decision never compares pod clocks.
 pub(crate) const S1_CLASSIFY: &str = "
-SELECT holder_pod, lease_expires_at, parked_turn
+SELECT holder_pod, lease_expires_at, parked_turn,
+       (lease_expires_at < clock_timestamp()) AS expired
 FROM session_claims
 WHERE session_id = $1";
 

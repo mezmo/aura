@@ -146,12 +146,15 @@ pub(crate) struct SelfFenceDeadline {
 /// Unfenced (local admission) and fenced (pg) are distinct states — a
 /// bare `Option<Instant>` cannot tell "unfenced" from "not yet
 /// anchored", and a fence that cannot anchor is worse than none.
+/// `Fenced` always holds a concrete anchor: the initial one lands at
+/// construction (the S1 transmission instant), so "fenced but never
+/// anchored" is unrepresentable.
 #[derive(Debug)]
 enum SelfFenceState {
     /// Local admission: `is_expired` is always false, anchoring no-ops.
     Unfenced,
-    /// Postgres-fenced. The initial anchor lands with the lease.
-    Fenced { deadline: Option<Instant> },
+    /// Postgres-fenced, always anchored.
+    Fenced { deadline: Instant },
 }
 
 impl SelfFenceDeadline {
@@ -170,7 +173,7 @@ impl SelfFenceDeadline {
     pub(crate) fn fenced(granted_at: Instant, ttl: LeaseTtl, margin: SelfFenceMargin) -> Self {
         Self {
             shared: Arc::new(Mutex::new(SelfFenceState::Fenced {
-                deadline: Some(Self::anchor(granted_at, ttl, margin)),
+                deadline: Self::anchor(granted_at, ttl, margin),
             })),
         }
     }
@@ -195,7 +198,7 @@ impl SelfFenceDeadline {
     ) {
         let mut guard = self.shared.lock().expect("self-fence mutex poisoned");
         if let SelfFenceState::Fenced { deadline } = &mut *guard {
-            *deadline = Some(Self::anchor(transmitted_at, ttl, margin));
+            *deadline = Self::anchor(transmitted_at, ttl, margin);
         }
     }
 
@@ -204,7 +207,7 @@ impl SelfFenceDeadline {
     pub(crate) fn is_expired(&self) -> bool {
         match &*self.shared.lock().expect("self-fence mutex poisoned") {
             SelfFenceState::Unfenced => false,
-            SelfFenceState::Fenced { deadline } => deadline.is_some_and(|d| Instant::now() >= d),
+            SelfFenceState::Fenced { deadline } => Instant::now() >= *deadline,
         }
     }
 }

@@ -61,10 +61,17 @@ impl Epoch {
         }
     }
 
-    /// Wrap the epoch read from a claims row (crate-internal: the only
-    /// producer besides a granted claim).
-    pub(crate) const fn from_raw(n: u64) -> Self {
-        Self(n)
+    /// Wrap the epoch read from a claims row (crate-internal). `None`
+    /// for 0: a corrupted or foreign-written row fails at the store edge
+    /// rather than smuggling epoch 0 into GC scope math and fence
+    /// predicates (the manifest path validates identically via
+    /// `Deserialize`).
+    pub(crate) const fn from_raw(n: u64) -> Option<Self> {
+        if n >= Self::initial().0 {
+            Some(Self(n))
+        } else {
+            None
+        }
     }
 
     /// The raw token.

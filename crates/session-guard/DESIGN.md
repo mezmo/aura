@@ -55,23 +55,27 @@ The artifact I/O surface is part of the claim, so I1 and I4 are
 structural rather than conventional: `ActiveTurn::write_artifact` is the
 only way manifest-bound bytes are written (temp + fsync + vendor-atomic
 rename + parent-dir fsync, one write per path per turn, only into the
-claiming epoch's dir), and `FencedRun::read_artifact` owns
-verify-on-first-read with the three-way miss handling inside (propagation
-window → `refresh_dir` → `force_cure` → fail loud). Scratchpad bytes are
-exempt: turn-transient, never manifest-bound, and collected as debris
-once the epoch passes.
+claiming epoch's dir), and every successful write records itself into
+the turn's *private* delta — the raw run-directory path never leaves the
+crate, so a fabricated or misattributed manifest is unconstructible.
+`FencedRun::read_artifact` owns verify-on-first-read with the three-way
+miss handling inside (propagation window → `refresh_dir` → `force_cure`
+→ fail loud). Scratchpad bytes have their own typed surface
+(`scratchpad.rs`): turn-transient, capability-gated, never
+manifest-bound, and collected as debris once the epoch passes.
 
-Turn outcomes: Success/Clarification commit (the barrier merges the
-turn's delta into the granted base manifest via `extend_from`, then S3
-publishes manifest + op id + park latch); Failure aborts (quarantine +
-release, no commit — unrepresentable at the type level: the barrier
-takes a `CommitKind`, and `Failure` has no `CommitKind`). Park =
-commit-then-release with the latch written; reify re-claims the same
-`TurnId`; the park *algorithm* belongs to HITL-271 — this crate carries
-only the latch, the `Parked` admission variant, and the same-TurnId
-reify path. The latch value is derived from the committing turn
-(`ParkLatch`), never passed as a free parameter, so a contradictory
-latch/turn combination is unrepresentable.
+Turn outcomes: the barrier's terminal shape is one `TurnEnd` —
+`Commit(CommitKind)` (Success/Clarification) or `Park` (HITL-271's
+commit-then-release with the latch set) — and `abort` covers Failure and
+cancellation, so no failure value can reach a commit. At the barrier the
+injected step produces only the response payload; the barrier consumes
+the recorded delta, merges it into the granted base manifest
+(`extend_from`), and issues S3 with the latch derived from the `TurnEnd`
+(never a free parameter). Commit-unknown reconciles by read-back on the
+fence triple plus the op slot: `Applied` proceeds, `NotApplied` rejects
+with quarantine (safe — nothing references the run), and
+`SupersededUnknown` is *indeterminate*: the run is never quarantined
+(its bytes may be manifest-referenced) and the turn is reported lost.
 
 ## Type-to-business-rule map (every public item, plus the crate-internal
 assembly types)
@@ -83,11 +87,11 @@ assembly types)
 | `PodId` (+`parse`, `from_env`) | The holder's pod is a stable RFC-1123 name (1..=253 bytes): `AURA_POD_ID` (fail loud when invalid) → `POD_NAME` → `HOSTNAME` | Anonymous claim rows; a controller unable to map pod-Deleted → row |
 | `HolderId` (+`parse`) | Each acquire *attempt* mints a fresh UUIDv7 (I2) — the second fence every mutation predicates on | A stale holder linearizing a commit after a failover epoch regression |
 | `OpId` (+`parse`) | One logical commit = one id, minted by the barrier, reused by its retries (B3) | Commit-unknown resolved by blind re-UPDATE |
-| `Epoch` | Per-session monotonic fencing token starting at 1; construction crate-internal (`initial`/`next`/`from_raw`); deserialization validates (0 rejected); SQL `bigint` domain noted (`i64::MAX` ceiling, unreachable in practice) | Caller-minted epochs; epoch 0 smuggled in through a corrupted or foreign-written row |
+| `Epoch` | Per-session monotonic fencing token starting at 1; construction crate-internal (`initial`/`next`); both ingress paths validate — `from_raw` returns `None` for 0 (store edge), `Deserialize` rejects 0 (manifest) — so epoch 0 is unreachable; SQL `bigint` domain noted (`i64::MAX` ceiling, unreachable in practice) | Caller-minted epochs; epoch 0 smuggled in through a corrupted or foreign-written row |
 | `session_dir` / `epoch_dir` | The only path derivations: `{root}/{session}` and `{session}/e{k}` | Hand-assembled layout strings at the seam |
 | `LeaseDeadline` | A server-clock timestamp (`clock_timestamp()` product); never compared against pod clocks | Cross-clock lease comparisons on the safety path |
 | `LeaseTtl` / `SelfFenceMargin` / `BeatInterval` | Non-zero durations by construction; config requires margin < ttl | Degenerate zero leases; a margin that swallows the ttl |
-| `SelfFenceDeadline` (internal) | Conservative local expiry: `Unfenced` and `Fenced` are distinct states (a fence that cannot anchor is worse than none); anchored at the S1 transmission instant (`granted_at`) and re-anchored at each beat transmission (`transmit + ttl − margin`, codex M9) | A self-fence that never fires; an unfenced pre-first-beat window; a self-fence that waits on a response |
+| `SelfFenceDeadline` (internal) | Conservative local expiry: `Unfenced` and `Fenced` are distinct states and `Fenced` always holds a concrete anchor (no Option — "fenced but never anchored" is unrepresentable); anchored at the S1 transmission instant (`granted_at`, single-sourced from the granted claim record) and re-anchored at each beat transmission (`transmit + ttl − margin`, codex M9) | A self-fence that never fires; an unfenced pre-first-beat window; a self-fence that waits on a response |
 | `Liveness` / `Revocation` / `ActorExitGuard` (internal) | Unchanged from rev 11: capabilities observe (clone/drop-safe); only the lease and the exit guard hold revocation authority | Live-after-death capabilities; a dropped capability killing a live lease |
 | `HeartbeatLease` / `ClaimLeaseSource` | Unchanged machinery, adapted identity: the lease owns the S2 heartbeat loop (anchor-at-transmission + wake-and-join shutdown); the first failed renewal revokes (Lost and PG-down both fail closed, I5) | Orphaned heartbeats; a renewal landing after release begins |
 | `WriteCapability` | Writes authorized for one `(session, turn, epoch, holder)` quad, failing closed on revocation *or* self-fence expiry | Cross-claim capability misuse; writes after a steal |
@@ -100,16 +104,19 @@ assembly types)
 | `VerifiedRead` / `ReadError` | Verified bytes plus the entry they verified against; constructed only by the read path after the digest check; the error escapes only after window + repair are exhausted | Unverified bytes reaching the seam; retry decisions leaking to callers |
 | `ArtifactWriteError` | The write path's four rejections as four variants: `Duplicate`, `WrongEpoch`, `LeaseLost`, `Io` | A duplicate write and a wrong-epoch write collapsing into one undiagnosable error |
 | `SessionArbiter` / guards (internal) | Unchanged: same-instance serialization before any store access; Admitting vs Held two-phase | Two local tasks both reaching the store |
-| `AcquiredClaim` (internal) | Admission output is one sealed bundle: identity + bound session root + base manifest + store handle + release; `new_local`/`new_pg` fix the lease plan at acquisition and demand the backend's private proof token; `into_held` derives the lease from the same identity | Claim/lease/release identity disagreement; a pg claim taking a static lease; a claim unbound from its session root |
-| `GrantedClaim` (internal) | The granted row as one bundle, including `granted_at` (the S1 transmission instant) so the self-fence's initial anchor travels with the claim | A lease built without its M9 anchor |
-| `HeldLock` | Held claim = identity + bound session root + base manifest + store + lease + arbiter slot + release + repair lane; `create_run` is argument-free — it derives the epoch dir under the claim's own bound root (no caller-selected layout, no session-A-dir-under-session-B) | Hand-assembled holds; run dirs outside the epoch partition; cross-session root confusion |
-| `FencedRun` / `read_artifact` | The G2 base view (`manifest()`) and the verified read path ride the run; the read path owns the three-way miss handling internally | The seam hand-rolling digest checks or repair escalation |
-| `ActiveTurn` / `write_artifact` | The only manifest-bound write path: capability asserted, one write per path per turn, own-epoch only, temp+fsync+rename+dir-fsync, digest computed for the returned entry (I1/I4 as structure) | A second write to one path; a write outside the claiming epoch; an unfsynced file entering the manifest |
-| `CommitKind` | The only two outcomes that may commit; `Failure` has no `CommitKind` and routes to `abort` | A failed turn reaching the barrier |
-| `CommitContext` | Barrier-assembled commit inputs incl. the minted `OpId`; private fields, not constructible outside the crate | Forgeable commit context; out-of-order commit |
-| `CommittingTurn::barrier` | The crate owns the full ordering: injected write-and-declare step (returns payload + delta) → `extend_from` merge → S3 via the bound store (commit-unknown → reconcile) → lease stop → release → authorize | Eager commit; a commit step that returns Ok without publishing; manifest-after-release |
-| `CommitRejection` | The crate-side commit failures as distinct causes: delta merge (`Declare`), fence loss, store error, unknowable-after-supersession | An indeterminate commit reported as retryable |
-| `CleanupOutcome` / `BarrierError` | Both cleanup results carried as real `Result`s; the injected step's failure (`CommitFailed`) and the authority's rejection (`CommitRejected`) are distinct variants | Silently lost cleanup failures; a wedged-session report on a steal |
+| `AcquiredClaim` (internal) | Admission output is one sealed bundle: identity + bound session root + base manifest + paired backend services + release; `new_local`/`new_pg` fix the lease plan at acquisition and demand the backend's private proof token; `into_held` derives the lease from the same identity and the claim record's `granted_at` | Claim/lease/release identity disagreement; a pg claim taking a static lease; a claim unbound from its session root |
+| `Backend` (internal) | Backend services are paired by construction: `Local` (neither) or `Pg { store, repair }` (both) | A store-without-repair claim (a commit path with no cure, or a cure with no store) |
+| `GrantedClaim` (internal) | The granted row as one bundle, including `granted_at` (the S1 transmission instant) — the lease's initial self-fence anchor comes from this record and nowhere else | A lease built without its M9 anchor; a self-fence anchored at assembly time |
+| `HeldLock` | Held claim = identity + bound session root + base manifest + backend + lease + arbiter slot + release; `create_run` is argument-free — it derives the epoch dir under the claim's own bound root (no caller-selected layout, no session-A-dir-under-session-B); `abort` reports a full `CleanupOutcome` | Hand-assembled holds; run dirs outside the epoch partition; cross-session root confusion; a silently lost abort cleanup failure |
+| `FencedRun` / `read_artifact` | The G2 base view (`manifest()`) and the verified read path ride the run; the read path owns the three-way miss handling internally; the raw run-dir path never leaves the crate | The seam hand-rolling digest checks or repair escalation; an unguarded write path around the typed surfaces |
+| `ActiveTurn` / `write_artifact` | The only manifest-bound write path: capability asserted, one write per path per turn, own-epoch only, temp+fsync+rename+dir-fsync, digest computed, and each write *recorded into the turn's private delta* — the barrier commits exactly the recorded set | A second write to one path; a write outside the claiming epoch; an unfsynced file entering the manifest; a fabricated or foreign-epoch delta |
+| `ScratchpadName` / `ScratchpadError` | Turn-transient I/O with its own typed surface: single-component names, capability-gated, same-turn reads fail loud on stale pointers (`NotFound` names turn + entry) | Raw path math at the seam; silent empty reads on stale scratchpad pointers |
+| `CommitKind` | The only two *committing* outcomes; `Failure` has no `CommitKind` and routes to `abort` | A failed turn reaching the barrier |
+| `TurnEnd` | The barrier's terminal shape in one type: `Commit(CommitKind)` or `Park`; the S3 latch is derived from it (`latch()`), so park intent has a representable route and the latch value stays the committing turn's id | A latch supplied without park intent; a park that cannot reach the barrier |
+| `CommitContext` | Barrier-assembled inputs incl. the minted `OpId` and the `TurnEnd`; private fields, not constructible outside the crate; carries no run-dir path (the payload step needs identities, not layout) | Forgeable commit context; out-of-order commit; a raw path bypass |
+| `CommittingTurn::barrier` | The crate owns the full ordering: injected payload step (`Result<T, E>` only) → consume the recorded private delta → `extend_from` merge → S3 via the bound store (commit-unknown → reconcile) → lease stop → release → authorize | Eager commit; a commit step that returns Ok without publishing; a callback-fabricated manifest |
+| `CommitRejection` | The *definite* crate-side commit failures as distinct causes: delta merge (`Declare`), fence loss, proven non-landing (`NotLanded` — quarantine-safe), store error. Indeterminacy is not here | Quarantining bytes a committed manifest may reference |
+| `CleanupOutcome` / `BarrierError` | Both cleanup results carried as real `Result`s; aborts return `CleanupOutcome` too; `CommitIndeterminate` carries *no* quarantine field — an indeterminate commit is never quarantined, only released and reported lost | Silently lost cleanup failures; a wedged-session report on a steal; deletion of maybe-committed bytes |
 | `CommittedResponse<T>` | Terminal-frame authorization bound to session+turn+epoch+holder; constructor private to the barrier module | Detached, reused, or forged authorization |
 | `AdmissionError` | `Busy` (retryable, fixed hint) vs `Parked` (no hint, honest HITL signal) vs `StoreUnavailable` (fail-stop, I5) vs `NotProvisioned` (operator) vs `Io`; `ContentionLost` deleted (a lost S1 race *is* Busy) | Retry storms on non-contention failures; HITL parks mistaken for contention |
 | `ReleaseError` | Only genuine failures: `StoreUnavailable`, `Io`. Supersession is a clean idempotent store outcome (`ReleaseOutcome::Superseded`), not an error | A steal misreported as a wedge |
@@ -252,9 +259,28 @@ MINOR; costs: codex lane 103,127 tokens):
 | 18 | codex | `CleanupOutcome.quarantined: bool` discards the quarantine failure | Accepted | `quarantine: Result<(), std::io::Error>` (r12.1) |
 | 19 | codex | `Epoch` u64 vs PG signed `bigint` | Accepted | `i64` domain documented on the type; store-edge conversion at the driver boundary (r12.1) |
 
-## Hole inventory (rev 12.1 baseline, post-round-1 repairs)
+Round 2 (rev-12.1 commit c02251ba; seat 1 GLM-5.2: PASS with 5 MINOR;
+seat 2 codex gpt-5.6-sol: FAIL, 8 BLOCKING + 1 MINOR; costs: codex lane
+132,719 tokens):
 
-`grep -rEn '^\s+todo!\(' src/` returns 33 holes:
+| # | Seat | Finding | Disposition | Repair |
+|---|---|---|---|---|
+| 20 | codex+GLM | `granted_at` duplicated: `GrantedClaim.granted_at` discarded while `HeartbeatRenewal.granted_at` was used — two sources for the M9 anchor | Accepted | `HeartbeatRenewal` drops the field; the lease's plan takes the claim record's `granted_at` — one source of truth (r12.2) |
+| 21 | codex | The barrier callback returned the manifest delta, so a fabricated manifest (unwritten or foreign-epoch entries) was constructible | Accepted | the callback returns only the payload; every `write_artifact` records itself into the turn's *private* delta, and the barrier commits exactly that set (`take_delta`) (r12.2) |
+| 22 | codex | `run_dir()` accessors on `FencedRun`/`CommitContext` exposed a raw write path around the typed surface | Accepted | public path accessors removed; scratchpad I/O gained its own typed surface (`scratchpad.rs`); the only raw path crossing the boundary is the `LostAfterCreate` cleanup payload (r12.2) |
+| 23 | codex | Park intent had no representable route to the barrier (store took `ParkLatch` but no turn-outcome mapped to it) | Accepted | `TurnEnd::{Commit(CommitKind), Park}`; `ActiveTurn::{complete, park}`; the latch derives from the end via `latch()` (r12.2) |
+| 24 | codex | An indeterminate commit (reconcile = superseded-unknown) was routed through a variant whose cleanup quarantines the run — potentially deleting manifest-referenced bytes | Accepted | `BarrierError::CommitIndeterminate` carries no quarantine field: stop, release, report lost, leave the epoch for manifest-aware GC; `CommitRejection::NotLanded` covers the proven-never-landed case (r12.2) |
+| 25 | codex | `ActiveTurn::abort`/`HeldLock::abort` returned a single `ReleaseError`, discarding the quarantine result | Accepted | both aborts return `CleanupOutcome` (both results reported) (r12.2) |
+| 26 | codex | The classify-then-retry decision needed a server-derived claimable fact (pod clocks cannot evaluate `lease_expires_at`) | Accepted | `S1_CLASSIFY` computes `(lease_expires_at < clock_timestamp()) AS expired` server-side (r12.2) |
+| 27 | codex | `reconcile_commit` took `session` independently of the `ClaimRef`, so one session could be read against another claim's fence | Accepted | session derives from the claim ref; the separate parameter is gone (r12.2) |
+| 28 | GLM | `Fenced { deadline: Option<Instant> }` still permitted fenced-never-anchored | Accepted | `Fenced { deadline: Instant }` — the Option is gone (r12.2) |
+| 29 | GLM | `Epoch::from_raw` accepted 0, bypassing the `Deserialize` validation | Accepted | `from_raw` returns `Option<Epoch>` (`None` at 0); the store edge fails loud on it (r12.2) |
+| 30 | GLM | A hand-built delta with self-consistent but foreign-epoch entries passed `declare` | Accepted | closed structurally by #21: the delta is recorded only by `write_artifact` (own-epoch enforced); `declare`'s tie check remains the second line (r12.2) |
+| 31 | GLM | `HeldParts` carried store and repair as independent `Option`s | Accepted | paired into the `Backend::{Local, Pg{store, repair}}` enum (r12.2) |
+
+## Hole inventory (rev 12.2 baseline, post-round-2 repairs)
+
+`grep -rEn '^\s+todo!\(' src/` returns 36 holes:
 
 - `identity.rs` (6): `SessionId::parse`, `TurnId::parse`,
   `PodId::parse`, `PodId::from_env`, `HolderId::parse`, `OpId::parse`
@@ -263,6 +289,8 @@ MINOR; costs: codex lane 103,127 tokens):
 - `gc.rs` (1): `DebrisSweep::sweep`
 - `repair.rs` (5): `CliRepairLane::{refresh_dir, force_cure}`,
   `S3ApiRepairLane::{refresh_dir, force_cure}`, `build_repair_lane`
+- `scratchpad.rs` (3): `ScratchpadName::parse`,
+  `ActiveTurn::{write_scratchpad, read_scratchpad}`
 - `state.rs` (5): `HeldLock::abort`, `ActiveTurn::abort`,
   `CommittingTurn::barrier`, `FencedRun::read_artifact`,
   `ActiveTurn::write_artifact`
@@ -279,16 +307,19 @@ accounted, its Layer-2 frames green):
    mode dispatch + shared arbiter + repair-lane build)
 2. manifest wire (`ArtifactPath::parse`, `Digest::from_hex`) + serde
    round-trip goldens (including the `'{}'` fresh-row case and the
-   epoch-0 rejection)
+   epoch-0 rejection, both directions)
 3. `PgStore` connection + statements S1–S6 (scripted `ClaimStore`
    double for unit goldens; a live-PG integration test separately)
-4. `PgAdmission::admit` + `locate_holder` (claim flow, classify retry,
-   GC hook, lease/lock assembly, outcome mapping)
+4. `PgAdmission::admit` + `locate_holder` (claim flow, classify retry on
+   the server-computed `expired`, GC hook, lease/lock assembly, outcome
+   mapping)
 5. `LocalAdmission` (arbiter + static lease + no-op release)
 6. artifact I/O (`write_artifact` publication sequence + dup/epoch
-   enforcement; `read_artifact` verify + window + two-tier escalation)
-7. `HeldLock::abort` + `ActiveTurn::abort` + `barrier` (ordering,
-   merge, reconcile, cleanup algebra, OpId mint)
+   enforcement + private-delta recording; `read_artifact` verify +
+   window + two-tier escalation; scratchpad write/read)
+7. `HeldLock::abort` + `ActiveTurn::abort` + `barrier` (ordering, delta
+   merge, reconcile algebra incl. indeterminate-never-quarantine, cleanup
+   reporting, OpId mint)
 8. `DebrisSweep::sweep` + `RepairLane` impls (CLI first; S3-API may
    wait on the vendor answer)
 9. `create_run` EROFS cure-retry (the H4 escalation — behavior change to
