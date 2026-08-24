@@ -26,7 +26,7 @@ pub(crate) use super::status_bar::update_status_bar_unlocked;
 pub use super::status_bar::{
     add_scratchpad_usage, add_turn_notice, begin_turn_context_tracking, clear_turn_notices,
     context_fill_ratio, fresh_context_fill_ratio, get_context_tokens, get_cumulative_tokens,
-    handle_ctrlc, mark_orchestrated, reset_ctrlc_state, reset_session_status,
+    handle_ctrlc, mark_orchestrated, record_session_event, reset_ctrlc_state, reset_session_status,
     reset_status_bar_tokens, seed_status_bar_tokens, set_context_used, set_context_window_usage,
     set_mcp_counts, set_session_info, set_status_bar_tokens, set_status_segments,
     update_status_bar,
@@ -49,9 +49,10 @@ pub use super::animation::{
 pub(crate) use super::stream_panel::clear_stream_panel_in_place;
 pub use super::stream_panel::{
     RawSseEvent, at_stream_top, clear_stream_events, enter_stream_focus, exit_stream_focus,
-    is_stream_panel_focused, is_stream_panel_visible, load_and_restore_sse_events, push_sse_event,
-    scroll_stream_down, scroll_stream_page_down, scroll_stream_page_up, scroll_stream_up,
-    set_stream_conv_dir, set_stream_show_all, toggle_stream_expand, toggle_stream_panel,
+    is_stream_panel_focused, is_stream_panel_visible, last_sse_event, load_and_restore_sse_events,
+    push_sse_event, scroll_stream_down, scroll_stream_page_down, scroll_stream_page_up,
+    scroll_stream_up, set_stream_conv_dir, set_stream_show_all, toggle_stream_expand,
+    toggle_stream_panel,
 };
 
 // Re-export from event_replay.rs

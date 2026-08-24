@@ -14,7 +14,8 @@ use crossterm::cursor;
 use crossterm::execute;
 use crossterm::terminal;
 
-use crate::api::mcp_status::McpCounts;
+use crate::api::mcp_status::{McpCounts, counts_from_event};
+use crate::event_names;
 use crate::theme::{AuraStyle, Themed};
 
 use super::animation::render_queued_wave;
@@ -56,6 +57,24 @@ pub fn set_context_used(tokens: u64) {
 pub fn set_mcp_counts(counts: McpCounts) {
     if let Ok(mut g) = MCP_COUNTS.lock() {
         *g = Some(counts);
+    }
+}
+
+/// Record what the status line learns from a stream event: the model and
+/// context window from `aura.session_info`, the server tally from
+/// `aura.mcp_status`. Other events are ignored.
+pub fn record_session_event(event_name: &str, val: &serde_json::Value) {
+    if event_name == event_names::SESSION_INFO {
+        if let Some(model) = val.get("model").and_then(|m| m.as_str()) {
+            set_session_info(
+                model.to_owned(),
+                val.get("model_context_limit").and_then(|l| l.as_u64()),
+            );
+        }
+    } else if event_name == event_names::MCP_STATUS
+        && let Some(counts) = counts_from_event(val)
+    {
+        set_mcp_counts(counts);
     }
 }
 
@@ -455,6 +474,41 @@ pub fn reset_ctrlc_state() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    fn session_model() -> Option<String> {
+        SESSION_MODEL.lock().unwrap().clone()
+    }
+
+    #[test]
+    fn record_session_event_seeds_and_reset_clears() {
+        record_session_event(
+            event_names::SESSION_INFO,
+            &json!({ "model": "gpt-4o", "model_context_limit": 128000 }),
+        );
+        record_session_event(
+            event_names::MCP_STATUS,
+            &json!({ "servers": [
+                { "server_name": "a", "status": "connected" },
+                { "server_name": "b", "status": "failed" }
+            ] }),
+        );
+        record_session_event("aura.progress", &json!({ "model": "other" }));
+        assert_eq!(session_model().as_deref(), Some("gpt-4o"));
+        assert_eq!(MODEL_CONTEXT_LIMIT.load(Ordering::Relaxed), 128000);
+        assert_eq!(
+            *MCP_COUNTS.lock().unwrap(),
+            Some(McpCounts {
+                connected: 1,
+                total: 2
+            })
+        );
+
+        reset_session_status();
+        assert_eq!(session_model(), None);
+        assert_eq!(MODEL_CONTEXT_LIMIT.load(Ordering::Relaxed), 0);
+        assert_eq!(*MCP_COUNTS.lock().unwrap(), None);
+    }
 
     #[test]
     fn a_previous_turns_reading_still_displays_but_stops_driving_decisions() {

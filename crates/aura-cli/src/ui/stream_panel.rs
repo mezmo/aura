@@ -624,6 +624,17 @@ pub fn push_sse_event(event_name: &str, data: &str) {
     STREAM_PANEL_DIRTY.store(true, Ordering::Relaxed);
 }
 
+/// The parsed payload of the most recent stream event named `event_name`.
+pub fn last_sse_event(event_name: &str) -> Option<serde_json::Value> {
+    let state = STREAM_PANEL.lock().ok()?;
+    let event = state
+        .events
+        .iter()
+        .rev()
+        .find(|e| e.event_name == event_name)?;
+    serde_json::from_str(&event.data).ok()
+}
+
 /// Toggle the stream panel visibility.
 pub fn toggle_stream_panel() {
     if let Ok(mut state) = STREAM_PANEL.lock() {
@@ -874,4 +885,21 @@ pub fn toggle_stream_expand() {
         }
     }
     render_stream_panel_in_place();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{last_sse_event, push_sse_event};
+    use serde_json::json;
+
+    #[test]
+    fn last_sse_event_returns_the_newest_payload_for_the_name() {
+        // A name no other test pushes, so the shared panel state is not a race.
+        let name = "test.last_sse_event";
+        assert_eq!(last_sse_event(name), None);
+        push_sse_event(name, r#"{"seq":1}"#);
+        push_sse_event("test.other", r#"{"seq":2}"#);
+        push_sse_event(name, r#"{"seq":3}"#);
+        assert_eq!(last_sse_event(name), Some(json!({"seq": 3})));
+    }
 }

@@ -33,11 +33,11 @@ use crate::ui::prompt::{
     last_mid_stream_history_entry, load_and_restore_sse_events, lock_term,
     overwrite_orch_task_header_unlocked, prepare_input_line, print_fields_tree,
     print_tool_call_expanded, print_user_echo, print_welcome_state_animated, push_display_event,
-    push_mid_stream_history, push_sse_event, random_bullet_color, redraw_input_frame,
-    replay_event_log_global, reset_ctrlc_state, reset_input_geometry, restore_terminal_mode,
-    seed_model_cache, seed_status_bar_tokens, set_context_used, set_context_window_usage,
-    set_expanded_output, set_mcp_counts, set_mid_stream_history, set_noncanonical_noecho,
-    set_processing, set_readline_active, set_selected_model, set_session_info, set_startup_status,
+    push_mid_stream_history, push_sse_event, random_bullet_color, record_session_event,
+    redraw_input_frame, replay_event_log_global, reset_ctrlc_state, reset_input_geometry,
+    restore_terminal_mode, seed_model_cache, seed_status_bar_tokens, set_context_used,
+    set_context_window_usage, set_expanded_output, set_mid_stream_history, set_noncanonical_noecho,
+    set_processing, set_readline_active, set_selected_model, set_startup_status,
     set_status_bar_tokens, set_stream_conv_dir, set_welcome_state, setup_terminal,
     stop_and_clear_animation, styled_prompt, take_pending_command, take_queued_input,
     task_color_for, text_lines, update_status_bar, update_status_bar_unlocked, with_event_log,
@@ -2768,14 +2768,9 @@ impl StreamHandler for ReplStreamHandler {
     }
 
     fn on_orchestrator_event(&mut self, event_name: &str, val: &serde_json::Value) {
+        record_session_event(event_name, val);
         if event_name == event_names::SESSION_INFO {
-            if let Some(model) = val.get("model").and_then(|m| m.as_str()) {
-                set_session_info(
-                    model.to_owned(),
-                    val.get("model_context_limit").and_then(|l| l.as_u64()),
-                );
-                update_status_bar();
-            }
+            update_status_bar();
             return;
         }
 
@@ -2786,9 +2781,6 @@ impl StreamHandler for ReplStreamHandler {
         //  3. Immediately in the scrollback, so the user can react — e.g. stop
         //     a doomed run — without waiting for the turn to finish.
         if event_name == event_names::MCP_STATUS {
-            if let Some(counts) = crate::api::mcp_status::counts_from_event(val) {
-                set_mcp_counts(counts);
-            }
             let notices = crate::api::mcp_status::notices_from_event(val);
             if notices.is_empty() {
                 return;
