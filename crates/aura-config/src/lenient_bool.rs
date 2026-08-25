@@ -23,6 +23,16 @@ pub fn deserialize_bool<'de, D: Deserializer<'de>>(deserializer: D) -> Result<bo
     }
 }
 
+/// Schema for fields deserialized with [`deserialize_bool`].
+pub fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "anyOf": [
+            { "type": "boolean" },
+            { "type": "string", "enum": ["true", "false"] }
+        ]
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
