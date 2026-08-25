@@ -99,6 +99,13 @@ impl DirectBackend {
             if let Some(hitl) = &config.hitl {
                 aura::hitl::validate_webhook_signing_config(hitl, hitl_webhook_hmac.as_ref())
                     .context("Invalid HITL webhook configuration")?;
+                aura::hitl::warn_on_cleartext_capture(hitl);
+                // The CLI's tracing subscriber is a no-op unless `log_file`
+                // is set, so the warning rides stderr as well — silent by
+                // default here would contradict the posture the ADR records.
+                if let Some(warning) = aura::hitl::cleartext_capture_warning(hitl) {
+                    eprintln!("warning: {warning}");
+                }
             }
         }
 

@@ -503,9 +503,11 @@ Capture does not require `https://`. A webhook route with
 `tool_headers_from_response` configured over plain `http://` is usable and
 unsigned — a deployment that terminates TLS ahead of the process (a trusted
 gateway, service-to-service) is a legitimate topology this does not reject —
-but it is never silent: server startup logs one warning per `[hitl]` config
-naming the exposure, alongside the boot-time HMAC-signing check
-(`warn_on_cleartext_capture`, called next to `validate_webhook_signing_config`).
+but it is never silent: each binary's startup logs one warning per `[hitl]`
+config naming the exposure, alongside the boot-time HMAC-signing check
+(`warn_on_cleartext_capture`, called next to `validate_webhook_signing_config`;
+the standalone CLI additionally prints the warning to stderr, because its
+default tracing subscriber is a no-op without `log_file`).
 The webhook client itself, rebuilt on every request that builds an agent,
 never logs this warning; only the boot-time call does, and the log line
 carries the webhook's scheme and host only, never its path, query, or

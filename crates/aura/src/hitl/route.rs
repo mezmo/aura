@@ -846,23 +846,34 @@ pub fn validate_webhook_signing_config(
 /// `HitlRuntime::from_config` and would turn one misconfiguration into a
 /// warning per chat request.
 pub fn warn_on_cleartext_capture(config: &HitlConfig) {
+    if let Some(warning) = cleartext_capture_warning(config) {
+        tracing::warn!("{warning}");
+    }
+}
+
+/// The cleartext-capture warning for `config`, rendered as a message so a
+/// binary whose default tracing subscriber is silent (aura-cli without
+/// `log_file`) can print it on a channel it actually owns, such as stderr.
+/// `None` for every configuration [`warn_on_cleartext_capture`] stays quiet
+/// for; the message carries the redacted origin, never the full URL.
+pub fn cleartext_capture_warning(config: &HitlConfig) -> Option<String> {
     let DecisionRouteConfig::Webhook {
         url,
         tool_headers_from_response,
         ..
     } = &config.route
     else {
-        return;
+        return None;
     };
     if tool_headers_from_response.is_empty() || url.as_str().starts_with("https://") {
-        return;
+        return None;
     }
-    tracing::warn!(
-        origin = %redact_to_origin(url.as_str()),
-        "HITL webhook route captures approver response headers over cleartext http, so \
+    Some(format!(
+        "HITL webhook route {} captures approver response headers over cleartext http, so \
          this route's tool_headers_from_response values are readable by any network \
-         observer; intended for trusted-gateway or service-to-service deployments"
-    );
+         observer; intended for trusted-gateway or service-to-service deployments",
+        redact_to_origin(url.as_str())
+    ))
 }
 
 /// `scheme://host[:port]` of `url`, dropping userinfo, path, query, and
@@ -1958,6 +1969,54 @@ mod tests {
             assert!(
                 !log.contains("https://approvals.example.com"),
                 "an https route must not warn, got log: {log}"
+            );
+        }
+
+        /// The rendered warning carries the redacted origin so a binary can
+        /// print it on a channel tracing does not reach, and it keeps the
+        /// same redaction the traced event holds: userinfo, path, and query
+        /// never appear.
+        #[test]
+        fn cleartext_capture_warning_redacts_the_url() {
+            let warning = super::super::cleartext_capture_warning(&webhook_config(
+                "http://token:secret@approvals.example.com:8443/aura/hook?key=shh",
+                user_mapping(),
+            ))
+            .expect("a mapped cleartext route must warn");
+
+            assert!(
+                warning.contains("http://approvals.example.com:8443"),
+                "the warning must name the origin, got: {warning}"
+            );
+            for secret in ["token", "secret", "aura/hook", "key=shh"] {
+                assert!(
+                    !warning.contains(secret),
+                    "the warning must never carry userinfo, path, or query, got: {warning}"
+                );
+            }
+        }
+
+        /// The quiet cases match [`warn_on_cleartext_capture`]: an https
+        /// route and an empty (legacy) mapping both return `None`, so the
+        /// stderr channel a binary opens stays silent exactly when the
+        /// traced one does.
+        #[test]
+        fn cleartext_capture_warning_is_none_when_quiet() {
+            assert!(
+                super::super::cleartext_capture_warning(&webhook_config(
+                    "https://approvals.example.com/aura",
+                    user_mapping(),
+                ))
+                .is_none(),
+                "an https route must not warn"
+            );
+            assert!(
+                super::super::cleartext_capture_warning(&webhook_config(
+                    "http://approvals.example.com/aura",
+                    aura_config::ToolHeaderMappings::default(),
+                ))
+                .is_none(),
+                "an empty mapping is the legacy path and must not warn"
             );
         }
 
