@@ -267,12 +267,16 @@ where
     }
 }
 
-/// Ensure aura_config warnings are always visible regardless of RUST_LOG setting.
+/// Keep operational warnings visible regardless of RUST_LOG setting.
 ///
-/// This is important for operational warnings like duplicate skill detection
-/// that should never be silently filtered.
-fn ensure_aura_config_warnings(filter: EnvFilter) -> EnvFilter {
-    filter.add_directive("aura_config=warn".parse().unwrap())
+/// This is important for warnings that must never be silently filtered:
+/// `aura_config` (duplicate skill detection) and `aura::hitl` (the
+/// cleartext-capture exposure warning), both of which the default
+/// per-binary `info` filter would otherwise drop.
+fn ensure_operational_warnings(filter: EnvFilter) -> EnvFilter {
+    filter
+        .add_directive("aura_config=warn".parse().unwrap())
+        .add_directive("aura::hitl=warn".parse().unwrap())
 }
 
 // ---------------------------------------------------------------------------
@@ -523,7 +527,7 @@ pub fn init_logging(debug: bool, verbose: bool, binary_name: &str) {
         // Default: Only binary-specific info level logging on console
         let console_filter = EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| format!("{binary_name}=info").into());
-        let console_filter = ensure_aura_config_warnings(console_filter);
+        let console_filter = ensure_operational_warnings(console_filter);
 
         let registry =
             tracing_subscriber::registry().with(fmt::layer().with_filter(console_filter));
@@ -857,6 +861,60 @@ pub async fn shutdown_tracer() {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Minimal tracing-capture facility (same shape as the one in
+    /// `hitl::route` tests): a shared buffer that implements `io::Write` by
+    /// reference, so `Arc<CapturedLog>` satisfies `tracing_subscriber`'s
+    /// `MakeWriter`, and a filter's real select/not-select behavior is
+    /// observable without touching the global subscriber.
+    struct CapturedLog(std::sync::Mutex<Vec<u8>>);
+
+    impl std::io::Write for &CapturedLog {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The default console filter is `{binary}=info` plus the operational
+    /// directives; under EnvFilter semantics an unmatched target is silent,
+    /// so without the `aura::hitl=warn` directive the cleartext-capture
+    /// warning would never reach a default-mode console. Warn-level events
+    /// from that subtree must pass while its info-level noise stays dropped.
+    #[test]
+    fn default_console_filter_still_shows_hitl_warnings() {
+        use std::sync::Arc;
+
+        let buf = Arc::new(CapturedLog(std::sync::Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_env_filter(ensure_operational_warnings(EnvFilter::new(
+                "aura-web-server=info",
+            )))
+            .with_ansi(false)
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!(
+                target: "aura::hitl::route",
+                "cleartext capture warning under a default filter"
+            );
+            tracing::info!(target: "aura::hitl::route", "info noise stays filtered");
+        });
+
+        let log = String::from_utf8_lossy(&buf.0.lock().unwrap()).to_string();
+        assert!(
+            log.contains("cleartext capture warning under a default filter"),
+            "the hitl warning must survive the default filter, got log: {log}"
+        );
+        assert!(
+            !log.contains("info noise stays filtered"),
+            "the directive is warn-level, not a blanket enable, got log: {log}"
+        );
+    }
 
     /// A prompt longer than `OTEL_CONTENT_MAX_LENGTH` must still serialize to
     /// valid JSON — truncating the finished JSON instead of the content would
