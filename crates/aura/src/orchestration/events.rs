@@ -161,12 +161,31 @@ pub enum OrchestratorEvent {
         /// Arguments passed to the tool
         arguments: serde_json::Value,
     },
+    /// A tool call has cleared every pre-call gate and is running.
+    ///
+    /// `ToolCallStarted` is emitted when the call is requested, before a
+    /// HITL gate can hold or deny it; this is the first event that means
+    /// the tool is actually executing.
+    ToolCallExecuting {
+        /// Task ID the tool call belongs to (None if ID couldn't be parsed)
+        task_id: Option<usize>,
+        /// Unique identifier for this tool call
+        tool_call_id: String,
+        /// Name of the tool being called
+        tool_name: String,
+        /// ID of the worker or orchestrator that called the tool
+        worker_id: String,
+    },
     /// A tool call has completed within a worker task.
     ToolCallCompleted {
         /// Task ID the tool call belongs to (None if ID couldn't be parsed)
         task_id: Option<usize>,
         /// The tool call ID this result corresponds to
         tool_call_id: String,
+        /// Name of the tool that was called
+        tool_name: String,
+        /// ID of the worker or orchestrator that called the tool
+        worker_id: String,
         /// Whether the tool call succeeded
         success: bool,
         /// How long the call took in milliseconds

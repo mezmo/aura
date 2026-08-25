@@ -10,7 +10,8 @@
 //! - `aura.orchestrator.task_completed` - Worker finished task (success/failure)
 //! - `aura.orchestrator.iteration_complete` - Plan-execute-continue cycle done
 //! - `aura.orchestrator.synthesizing` - Consolidating task results for coordinator decision
-//! - `aura.orchestrator.tool_call_started` - Worker tool execution began
+//! - `aura.orchestrator.tool_call_started` - Worker requested a tool call (before any gate)
+//! - `aura.orchestrator.tool_call_executing` - Tool call cleared every gate and is running
 //! - `aura.orchestrator.tool_call_completed` - Worker tool execution finished
 //!
 //! # Separation from Base Events
@@ -74,6 +75,7 @@ pub mod event_names {
     pub const SYNTHESIZING: &str = "aura.orchestrator.synthesizing";
     pub const WORKER_REASONING: &str = "aura.orchestrator.worker_reasoning";
     pub const TOOL_CALL_STARTED: &str = "aura.orchestrator.tool_call_started";
+    pub const TOOL_CALL_EXECUTING: &str = "aura.orchestrator.tool_call_executing";
     pub const TOOL_CALL_COMPLETED: &str = "aura.orchestrator.tool_call_completed";
 }
 
@@ -174,11 +176,24 @@ pub enum OrchestrationStreamEvent {
         #[serde(flatten)]
         context: EventContext,
     },
+    /// Emitted once a tool call has cleared every pre-call gate (e.g. HITL
+    /// approval) and is running. `ToolCallStarted` precedes any gate.
+    ToolCallExecuting {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        task_id: Option<usize>,
+        tool_call_id: String,
+        tool_name: String,
+        worker_id: String,
+        #[serde(flatten)]
+        context: EventContext,
+    },
     /// Emitted when a tool call completes within a worker task.
     ToolCallCompleted {
         #[serde(skip_serializing_if = "Option::is_none")]
         task_id: Option<usize>,
         tool_call_id: String,
+        tool_name: String,
+        worker_id: String,
         #[serde(flatten)]
         outcome: CompletionOutcome,
         #[serde(flatten)]
@@ -200,6 +215,7 @@ impl OrchestrationStreamEvent {
             Self::Synthesizing { .. } => event_names::SYNTHESIZING,
             Self::WorkerReasoning { .. } => event_names::WORKER_REASONING,
             Self::ToolCallStarted { .. } => event_names::TOOL_CALL_STARTED,
+            Self::ToolCallExecuting { .. } => event_names::TOOL_CALL_EXECUTING,
             Self::ToolCallCompleted { .. } => event_names::TOOL_CALL_COMPLETED,
         }
     }
@@ -375,10 +391,30 @@ impl OrchestrationStreamEvent {
         }
     }
 
+    /// Create a ToolCallExecuting event.
+    pub fn tool_call_executing(
+        task_id: Option<usize>,
+        tool_call_id: impl Into<String>,
+        tool_name: impl Into<String>,
+        worker_id: impl Into<String>,
+        context: EventContext,
+    ) -> Self {
+        Self::ToolCallExecuting {
+            task_id,
+            tool_call_id: tool_call_id.into(),
+            tool_name: tool_name.into(),
+            worker_id: worker_id.into(),
+            context,
+        }
+    }
+
     /// Create a ToolCallCompleted event.
+    #[allow(clippy::too_many_arguments)]
     pub fn tool_call_completed(
         task_id: Option<usize>,
         tool_call_id: impl Into<String>,
+        tool_name: impl Into<String>,
+        worker_id: impl Into<String>,
         success: bool,
         duration_ms: u64,
         result: Option<String>,
@@ -387,6 +423,8 @@ impl OrchestrationStreamEvent {
         Self::ToolCallCompleted {
             task_id,
             tool_call_id: tool_call_id.into(),
+            tool_name: tool_name.into(),
+            worker_id: worker_id.into(),
             outcome: CompletionOutcome {
                 success,
                 duration_ms,
@@ -572,10 +610,29 @@ mod tests {
     }
 
     #[test]
+    fn test_format_sse_tool_call_executing() {
+        let event = OrchestrationStreamEvent::tool_call_executing(
+            Some(0),
+            "call_1",
+            "mean",
+            "statistics",
+            test_ctx(),
+        );
+        let sse = event.format_sse();
+
+        assert!(sse.starts_with(&format!("event: {}\n", event_names::TOOL_CALL_EXECUTING)));
+        assert!(sse.contains("\"tool_call_id\":\"call_1\""));
+        assert!(sse.contains("\"tool_name\":\"mean\""));
+        assert!(sse.contains("\"worker_id\":\"statistics\""));
+    }
+
+    #[test]
     fn test_format_sse_tool_call_completed_with_result() {
         let event = OrchestrationStreamEvent::tool_call_completed(
             Some(0),
             "call_1",
+            "mean",
+            "statistics",
             true,
             42,
             Some("30.0".to_string()),
@@ -584,6 +641,8 @@ mod tests {
         let sse = event.format_sse();
 
         assert!(sse.starts_with(&format!("event: {}\n", event_names::TOOL_CALL_COMPLETED)));
+        assert!(sse.contains("\"tool_name\":\"mean\""));
+        assert!(sse.contains("\"worker_id\":\"statistics\""));
         assert!(sse.contains("\"result\":\"30.0\""));
         assert!(sse.contains("\"success\":true"));
     }

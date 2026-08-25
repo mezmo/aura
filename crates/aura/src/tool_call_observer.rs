@@ -62,10 +62,28 @@ pub enum ToolEvent {
         timestamp: Instant,
     },
 
+    /// A tool call has passed every pre-call gate and is about to run.
+    ///
+    /// `CallStarted` fires when the model asks for the call; a gated call
+    /// can still be held or denied after that. This is the first event
+    /// that means the tool is executing.
+    CallExecuting {
+        /// The tool call ID being executed
+        tool_call_id: String,
+        /// Name of the tool being called
+        tool_name: String,
+        /// The ID of the orchestrator or worker that initiated the tool call
+        tool_initiator_id: String,
+    },
+
     /// A tool call has completed (success or failure).
     CallCompleted {
         /// The tool call ID this result corresponds to
         tool_call_id: String,
+        /// Name of the tool that was called
+        tool_name: String,
+        /// The ID of the orchestrator or worker that initiated the tool call
+        tool_initiator_id: String,
         /// The outcome of the tool call
         result: ToolOutcome,
         /// How long the call took in milliseconds
@@ -90,14 +108,31 @@ impl ToolEvent {
         }
     }
 
+    /// Create a new CallExecuting event.
+    pub fn call_executing(
+        tool_call_id: impl Into<String>,
+        tool_name: impl Into<String>,
+        tool_initiator_id: impl Into<String>,
+    ) -> Self {
+        Self::CallExecuting {
+            tool_call_id: tool_call_id.into(),
+            tool_name: tool_name.into(),
+            tool_initiator_id: tool_initiator_id.into(),
+        }
+    }
+
     /// Create a successful CallCompleted event.
     pub fn call_completed_success(
         tool_call_id: impl Into<String>,
+        tool_name: impl Into<String>,
+        tool_initiator_id: impl Into<String>,
         result: impl Into<String>,
         duration_ms: u64,
     ) -> Self {
         Self::CallCompleted {
             tool_call_id: tool_call_id.into(),
+            tool_name: tool_name.into(),
+            tool_initiator_id: tool_initiator_id.into(),
             result: ToolOutcome::Success(result.into()),
             duration_ms,
         }
@@ -106,12 +141,16 @@ impl ToolEvent {
     /// Create a failed CallCompleted event.
     pub fn call_completed_error(
         tool_call_id: impl Into<String>,
+        tool_name: impl Into<String>,
+        tool_initiator_id: impl Into<String>,
         message: impl Into<String>,
         retry_hint: Option<RetryHint>,
         duration_ms: u64,
     ) -> Self {
         Self::CallCompleted {
             tool_call_id: tool_call_id.into(),
+            tool_name: tool_name.into(),
+            tool_initiator_id: tool_initiator_id.into(),
             result: ToolOutcome::Error {
                 message: message.into(),
                 retry_hint,
@@ -366,7 +405,9 @@ mod tests {
 
         assert_eq!(observer.subscriber_count(), 2);
 
-        observer.emit(ToolEvent::call_completed_success("call_1", "result", 100));
+        observer.emit(ToolEvent::call_completed_success(
+            "call_1", "search", "worker", "result", 100,
+        ));
 
         let event1 = rx1.recv().await.unwrap();
         let event2 = rx2.recv().await.unwrap();
@@ -375,13 +416,16 @@ mod tests {
         match (event1, event2) {
             (
                 ToolEvent::CallCompleted {
-                    tool_call_id: id1, ..
+                    tool_call_id: id1,
+                    tool_name: name1,
+                    ..
                 },
                 ToolEvent::CallCompleted {
                     tool_call_id: id2, ..
                 },
             ) => {
                 assert_eq!(id1, "call_1");
+                assert_eq!(name1, "search");
                 assert_eq!(id2, "call_1");
             }
             _ => panic!("Expected CallCompleted events"),
