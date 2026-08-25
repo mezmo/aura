@@ -114,10 +114,7 @@ mod tests {
     use super::*;
     use crate::mcp_streamable_http::tests::client_and_server;
 
-    /// An adaptor for `tool_name`, fronting `client`, tagged as `kind`.
-    /// The client is always a streamable-HTTP one: the tag, not the wire, is
-    /// what the override path consults, so a stdio-tagged adaptor over a
-    /// reachable server is exactly the case that must still refuse.
+    /// An adaptor for `tool_name`, fronting `client`, tagged as `kind`. The client is always streamable-HTTP: the tag, not the wire, is what the override path consults.
     async fn adaptor_for(
         client: McpClient,
         tool_name: &str,
@@ -131,7 +128,6 @@ mod tests {
         McpToolAdaptor::new(tool, "test-server".to_owned(), Arc::new(client), kind)
     }
 
-    /// A stdio tool that no approval gated is untouched by any of this.
     #[tokio::test]
     async fn stdio_adaptor_runs_an_ungated_call() {
         let (server, client) = client_and_server(&std::collections::HashMap::new()).await;

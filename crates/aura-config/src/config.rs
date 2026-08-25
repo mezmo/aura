@@ -1285,9 +1285,7 @@ tool_headers_from_response = {}
         );
     }
 
-    /// Both sides of a mapping are lowercased through the real TOML
-    /// deserialization path, so a config spelled in header case resolves the
-    /// same as one spelled in wire case.
+    /// Both sides of a mapping are lowercased through the real TOML deserialization path, so a config spelled in header case resolves like one spelled in wire case.
     #[test]
     fn hitl_webhook_tool_headers_response_name_lowercased() {
         let toml = r#"

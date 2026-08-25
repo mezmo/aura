@@ -1970,10 +1970,7 @@ mod tests {
         scratchpad::ContextBudget::new(128_000, 0.20, 0, counter)
     }
 
-    /// Tool composition is where each MCP adaptor learns which transport it
-    /// fronts. Both the single-agent path and the orchestration worker path
-    /// reach it through `add_all_tools`, so what that function tags decides
-    /// whether a gated call can deliver approver identity or must refuse.
+    /// Tool composition is where each MCP adaptor learns which transport it fronts. Both the single-agent path and the orchestration worker path reach it through `add_all_tools`, so what that function tags decides whether a gated call can deliver approver identity or must refuse.
     mod transport_tagging {
         use std::collections::HashMap;
 
@@ -2045,9 +2042,7 @@ mod tests {
             )
         }
 
-        /// A manager offering the same tool name on each of the three
-        /// transports, all backed by `server` — so the only thing that can
-        /// distinguish them downstream is the tag composition gives them.
+        /// A manager offering the same tool name on each of the three transports, all backed by `server`, so the tag composition distinguishes them downstream.
         async fn manager_serving_all_transports(server: &RecordingMcpServer) -> McpManager {
             let connect = async || {
                 McpClient::new(server.url.clone(), &HashMap::new())

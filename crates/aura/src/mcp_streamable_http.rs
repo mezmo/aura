@@ -666,9 +666,7 @@ pub(crate) mod tests {
     }
 
     impl RecordedRequest {
-        /// Every value sent under `name`, in arrival order. A test that asks
-        /// for the count is asking whether an override replaced a header or
-        /// merely joined it.
+        /// Every value sent under `name`, in arrival order. A test counting values asks whether an override replaced a header or merely joined it.
         pub(crate) fn header_values(&self, name: &str) -> Vec<&str> {
             self.headers
                 .iter()
@@ -681,8 +679,7 @@ pub(crate) mod tests {
             String::from_utf8_lossy(&self.body).into_owned()
         }
 
-        /// The JSON-RPC method this request carried, or `None` for a body
-        /// that is not a JSON-RPC message.
+        /// The JSON-RPC method this request carried.
         fn rpc_method(&self) -> Option<String> {
             serde_json::from_slice::<Value>(&self.body)
                 .ok()?
@@ -703,14 +700,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// A loopback MCP server over streamable HTTP that answers the handshake
-    /// and every tool call, and keeps each request it received.
-    ///
-    /// It exists so a test can watch what actually reaches the wire: the
-    /// approver override is applied deep inside the transport, after rmcp's
-    /// worker has taken the request value, so nothing short of the received
-    /// request proves it arrived — or, for the calls that must not carry it,
-    /// that it did not.
+    /// A loopback MCP server over streamable HTTP that answers the handshake and every tool call, keeping each request it receives. It exists so a test can watch what actually reaches the wire: the approver override is applied deep inside the transport, after rmcp's worker has taken the request value.
     pub(crate) struct RecordingMcpServer {
         pub(crate) url: String,
         received: Arc<Mutex<Vec<RecordedRequest>>>,
@@ -759,9 +749,7 @@ pub(crate) mod tests {
     /// later request.
     const SESSION_ID: &str = "recording-session";
 
-    /// Read one HTTP request off `socket`, record it, answer it, and close.
-    /// Answering `connection: close` keeps the framing to one request per
-    /// connection, so the reader never has to unpick a keep-alive stream.
+    /// Read one HTTP request off `socket`, record it, answer it, and close. Answering `connection: close` keeps the framing to one request per connection.
     async fn serve_one_request(mut socket: TcpStream, sink: Arc<Mutex<Vec<RecordedRequest>>>) {
         let mut buf = Vec::new();
         let head_end = loop {
@@ -803,9 +791,7 @@ pub(crate) mod tests {
 
         let http_method = request_line.split_whitespace().next().unwrap_or_default();
         let (status, extra_headers, payload) = match http_method {
-            // rmcp opens a server-to-client stream once it has a session; 405
-            // is the documented "this server has none", which the worker
-            // absorbs instead of failing the connection.
+            // rmcp opens a server-to-client stream once it has a session; 405 is the documented "this server has none", which the worker absorbs instead of failing the connection.
             "GET" => ("405 Method Not Allowed", Vec::new(), String::new()),
             "DELETE" => ("202 Accepted", Vec::new(), String::new()),
             _ => reply_to_rpc(&body),
@@ -888,9 +874,7 @@ pub(crate) mod tests {
         HashMap::new()
     }
 
-    /// The override rides exactly the call it was captured for: the gated
-    /// call carries it, and the very next call on the same client — the one
-    /// no approval unblocked — is back to the client's own identity.
+    /// The override rides exactly the call it was captured for: the gated call carries it, and the very next call on the same client (the one no approval unblocked) reverts to the client's own identity.
     #[tokio::test]
     async fn override_rides_one_call_and_no_later_one() {
         let (server, client) = client_and_server(&requester_headers()).await;
@@ -973,9 +957,7 @@ pub(crate) mod tests {
         );
     }
 
-    /// Two gated calls in flight on one client keep their own identities.
-    /// Scoping is structural — each override rides its own request value —
-    /// and this is the test that would catch a regression to shared state.
+    /// Two gated calls in flight on one client keep their own identities. Scoping is structural; each override rides its own request value. This test catches a regression to shared state.
     #[tokio::test]
     async fn concurrent_gated_calls_keep_their_own_identity() {
         let (server, client) = client_and_server(&requester_headers()).await;
@@ -1007,9 +989,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// `set_current_request` selects the tracked branch, so this is the same
-    /// entry point a gated call takes in the server and the branch choice must
-    /// not decide whether identity is delivered.
+    /// `set_current_request` selects the tracked branch, so this is the same entry point a gated call takes in the server and the branch choice must not decide whether identity is delivered.
     #[tokio::test]
     async fn call_tool_delivers_the_override_on_either_branch() {
         let (server, client) = client_and_server(&requester_headers()).await;

@@ -1,9 +1,8 @@
 //! The approval decision route: how a gated call gets its decision.
 //!
-//! A closed two-variant enum chosen by the `[hitl.route]` config table. Replaces
-//! the spike's `ApprovalDispatch` trait: the variant set is known, and
-//! [`DecisionRoute::decide`] holds the shared semantics (deadline, fail-closed
-//! mapping, event emission) in one place instead of per-impl.
+//! A closed two-variant enum chosen by the `[hitl.route]` config table;
+//! [`DecisionRoute::decide`] holds the shared semantics (deadline,
+//! fail-closed mapping, event emission) in one place.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -200,10 +199,7 @@ pub enum DecisionRoute {
 
 /// Stamp `decision_id` on the current tracing span.
 ///
-/// `set_span_attribute` appends rather than overwrites by key, so one span
-/// stamped twice would carry a duplicate attribute entry. The entry points
-/// stamp once each and delegate through the unstamped
-/// [`DecisionRoute::decide_inner`].
+/// `set_span_attribute` appends rather than overwrites, so a span stamped twice would carry duplicate attribute entries. Entry points stamp once each, delegating through the unstamped [`DecisionRoute::decide_inner`].
 fn stamp_decision_id(decision_id: DecisionId) {
     crate::logging::set_span_attribute(
         &tracing::Span::current(),
@@ -212,15 +208,9 @@ fn stamp_decision_id(decision_id: DecisionId) {
     );
 }
 
-/// Run one webhook approval round trip behind the choreography both webhook
-/// arms share: publish `Requested`, race the round trip against the cancel
-/// token, then publish `Completed`.
+/// Run one webhook approval round trip behind the choreography both arms share: publish `Requested`, race against cancellation, then publish `Completed`.
 ///
-/// Two phases, both failing closed: the race is `biased` so a pending
-/// cancellation wins, and the result is rechecked against the token before
-/// it becomes the decision, so a disconnect landing just as the decision
-/// arrives is caught too. The arms differ only in the round trip itself and
-/// in how their decision shape projects into the completed event.
+/// Two phases, both failing closed: the race is `biased` so pending cancellation wins, and the result is rechecked against the token before becoming the decision. The arms differ only in the round trip itself and how their decision shape projects into the completed event.
 async fn webhook_round_trip<T>(
     request: &ApprovalRequest,
     cancel: &crate::request_cancellation::RequestCancelToken,
@@ -309,10 +299,7 @@ impl DecisionRoute {
         self.decide_inner(request, cancel).await
     }
 
-    /// Obtain a decision for `request`, applying the shared semantics
-    /// (deadline, fail-closed mapping, event emission) in one place.
-    ///
-    /// Does not stamp: both callers stamp on their own entry.
+    /// Obtain a decision for `request`, applying the shared semantics (deadline, fail-closed mapping, event emission) in one place. Does not stamp: both callers stamp on their own entry.
     async fn decide_inner(
         &self,
         request: ApprovalRequest,
@@ -548,8 +535,6 @@ impl WebhookClient {
                  will fail closed"
             );
         }
-        // The cleartext-capture warning lives at the boot-time seam, not
-        // here: see [`warn_on_cleartext_capture`].
         Self {
             client,
             url,
@@ -773,23 +758,14 @@ pub fn validate_webhook_signing_config(
     }
 }
 
-/// Boot-time warning for a webhook route that captures approver response
-/// headers over plain `http://`. Call this once per `[hitl]` config at
-/// startup, alongside `validate_webhook_signing_config`. Do not call from
-/// [`WebhookClient`] construction: that runs fresh per request via
-/// `HitlRuntime::from_config` and would turn one misconfiguration into a
-/// warning per chat request.
+/// Boot-time warning for a webhook route capturing approver response headers over `http://`. Call once per `[hitl]` config at startup, alongside `validate_webhook_signing_config`. Do not call from [`WebhookClient`] construction: that would turn one misconfiguration into a warning per chat request.
 pub fn warn_on_cleartext_capture(config: &HitlConfig) {
     if let Some(warning) = cleartext_capture_warning(config) {
         tracing::warn!("{warning}");
     }
 }
 
-/// The cleartext-capture warning for `config`, rendered as a message so a
-/// binary whose default tracing subscriber is silent (aura-cli without
-/// `log_file`) can print it on a channel it actually owns, such as stderr.
-/// `None` for every configuration [`warn_on_cleartext_capture`] stays quiet
-/// for; the message carries the redacted origin, never the full URL.
+/// The cleartext-capture warning for `config`, rendered as a message so a binary with silent default tracing (aura-cli without `log_file`) can print it on a channel it owns, such as stderr. `None` for every configuration [`warn_on_cleartext_capture`] stays quiet for; the message carries the redacted origin, never the full URL.
 pub fn cleartext_capture_warning(config: &HitlConfig) -> Option<String> {
     let DecisionRouteConfig::Webhook {
         url,
@@ -810,9 +786,7 @@ pub fn cleartext_capture_warning(config: &HitlConfig) -> Option<String> {
     ))
 }
 
-/// `scheme://host[:port]` of `url`, dropping userinfo, path, query, and
-/// fragment — the parts of a webhook URL a log line must never carry,
-/// since a webhook URL may embed a token in any of them.
+/// `scheme://host[:port]` of `url`, dropping userinfo, path, query, and fragment. These are parts a log line must never carry, since a webhook URL may embed a token in any of them.
 fn redact_to_origin(url: &str) -> String {
     let (scheme, rest) = url.split_once("://").unwrap_or(("", url));
     let authority = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
@@ -1394,10 +1368,7 @@ mod tests {
                 .await
         }
 
-        /// [`one_shot_receiver`] that fires `cancel_after_read` once it has
-        /// the whole request and before it writes a byte of the response, so
-        /// the caller meets a cancelled token and an arriving approval at the
-        /// same time.
+        /// [`one_shot_receiver`] that fires `cancel_after_read` once it has the whole request and before writing any response, so the caller meets cancellation and an arriving approval simultaneously.
         async fn cancelling_receiver(
             cancel: crate::request_cancellation::RequestCancelToken,
             response_headers: Vec<(String, String)>,
@@ -1467,9 +1438,7 @@ mod tests {
                 }
                 response.push_str("\r\n");
                 response.push_str(&response_body);
-                // A cancelling caller may already have dropped the connection,
-                // so a failed reply is not a test failure; every test that
-                // cares asserts on what the client resolved to.
+                // A cancelling caller may already have dropped the connection, so a failed reply is not a test failure; every test that cares asserts on what the client resolved to.
                 socket.write_all(response.as_bytes()).await.ok();
                 socket.shutdown().await.ok();
                 tx.send(ReceivedRequest { headers, body }).ok();
@@ -1477,12 +1446,7 @@ mod tests {
             (url, rx)
         }
 
-        /// A receiver that accepts one connection, signals over the returned
-        /// channel that it has, and then never answers — so the caller's own
-        /// timeout or cancellation is what resolves the round trip. Awaiting
-        /// the signal before acting proves the round trip is in flight. The
-        /// spawned task holds the accepted socket open for the life of the
-        /// test; closing it would surface as a transport error instead.
+        /// A receiver that accepts one connection, signals over the returned channel, and never answers, so the caller's own timeout or cancellation resolves the round trip. Awaiting the signal before acting proves the round trip is in flight. The spawned task holds the accepted socket open for the life of the test.
         async fn stalled_receiver() -> (String, tokio::sync::oneshot::Receiver<()>) {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let url = format!("http://{}", listener.local_addr().unwrap());
@@ -1495,9 +1459,7 @@ mod tests {
             (url, accepted_rx)
         }
 
-        /// Builds a client directly against a loopback `http://` receiver.
-        /// Bypasses the https-only policy deliberately: the policy is
-        /// exercised by `http_url_with_secret_fails_closed`.
+        /// Builds a client directly against a loopback `http://` receiver, bypassing the https-only policy deliberately. The policy is exercised by `http_url_with_secret_fails_closed`.
         fn loopback_client(
             url: &str,
             signing: EgressSigning,
@@ -1757,10 +1719,7 @@ mod tests {
             );
         }
 
-        /// Capture does not require https: TLS may be terminated ahead of the
-        /// process (trusted gateway, service-to-service), so a cleartext url
-        /// with mappings builds a usable unsigned route. Only the HMAC-secret
-        /// rule rejects plaintext, and it is unchanged by capture.
+        /// Capture does not require https: TLS may be terminated ahead of the process (trusted gateway, service-to-service), so a cleartext url with mappings builds a usable unsigned route. Only the HMAC-secret rule rejects plaintext, unchanged by capture.
         #[test]
         fn from_config_allows_capture_over_plaintext_url() {
             use super::super::HitlRuntime;
@@ -1832,11 +1791,7 @@ mod tests {
             String::from_utf8_lossy(&buf.0.lock().unwrap()).to_string()
         }
 
-        /// Construction (`HitlRuntime::from_config`, and so `WebhookClient`
-        /// construction) runs once per chat request, not once at startup —
-        /// so it must never warn on cleartext capture itself, or every
-        /// request on the route would repeat the warning.
-        /// [`warn_on_cleartext_capture`] is the boot-time seam for it.
+        /// Construction (`HitlRuntime::from_config`, and so `WebhookClient` construction) runs once per chat request, not once at startup, so it must never warn on cleartext capture itself, or every request on the route would repeat the warning. [`warn_on_cleartext_capture`] is the boot-time seam for it.
         #[test]
         fn capture_over_plaintext_url_stays_silent_at_construction() {
             let pending = crate::hitl::PendingApprovals::new();
@@ -1851,11 +1806,7 @@ mod tests {
             assert!(log.is_empty(), "construction must not log, got: {log}");
         }
 
-        /// The boot-time warning names the risk and the webhook's origin,
-        /// but never the userinfo, path, or query a webhook URL may carry —
-        /// any of which can hold a secret. An https route with the same
-        /// mappings stays quiet, so the warning is attributable to the
-        /// cleartext scheme alone.
+        /// The boot-time warning names the risk and the webhook's origin, but never the userinfo, path, or query. The warning is attributable to the cleartext scheme alone.
         #[test]
         fn warn_on_cleartext_capture_warns_once_and_redacts_the_url() {
             let log = captured_warn_log(|| {
@@ -1888,10 +1839,7 @@ mod tests {
             );
         }
 
-        /// The rendered warning carries the redacted origin so a binary can
-        /// print it on a channel tracing does not reach, and it keeps the
-        /// same redaction the traced event holds: userinfo, path, and query
-        /// never appear.
+        /// The rendered warning carries the redacted origin so a binary can print it on a channel tracing does not reach, keeping the same redaction the traced event holds.
         #[test]
         fn cleartext_capture_warning_redacts_the_url() {
             let warning = super::super::cleartext_capture_warning(&webhook_config(
@@ -1912,10 +1860,7 @@ mod tests {
             }
         }
 
-        /// The quiet cases match [`warn_on_cleartext_capture`]: an https
-        /// route and an empty (legacy) mapping both return `None`, so the
-        /// stderr channel a binary opens stays silent exactly when the
-        /// traced one does.
+        /// The quiet cases match [`warn_on_cleartext_capture`]: an https route and an empty (legacy) mapping both return `None`.
         #[test]
         fn cleartext_capture_warning_is_none_when_quiet() {
             assert!(
@@ -1936,9 +1881,7 @@ mod tests {
             );
         }
 
-        /// An absent or empty `tool_headers_from_response` map captures
-        /// nothing, so there is no exposure to warn about, over either
-        /// scheme.
+        /// An absent or empty `tool_headers_from_response` map captures nothing, so there is no exposure to warn about over either scheme.
         #[test]
         fn warn_on_cleartext_capture_is_quiet_with_no_map() {
             let log = captured_warn_log(|| {
@@ -2018,11 +1961,7 @@ mod tests {
             );
         }
 
-        /// The route-wide `request_approval` surface — what the
-        /// agent-callable tool uses — never captures identity, whatever the
-        /// mapping says: an approved, identity-bearing response resolves to
-        /// a plain decision, and the outcome type has no override channel
-        /// that could carry the headers anywhere.
+        /// The route-wide `request_approval` surface (what the agent-callable tool uses) never captures identity, whatever the mapping says. An approved, identity-bearing response resolves to a plain decision, and the outcome type has no override channel to carry headers anywhere.
         #[tokio::test]
         async fn route_wide_approval_discards_identity_headers() {
             let (url, _received) = one_shot_receiver(
@@ -2047,12 +1986,7 @@ mod tests {
             );
         }
 
-        /// The gate path's response matrix, one loopback receiver per row:
-        /// identity exists only on an approved response whose mapped headers
-        /// are all present. Every other row — a denial, a missing mapped
-        /// header, an empty mapping, a non-2xx status, a malformed body, an
-        /// unverified response, a timeout — yields no override object, each
-        /// asserted at its own shape rather than by omission.
+        /// The gate path's response matrix: identity exists only on an approved response whose mapped headers are all present. Every other row (denial, missing header, empty mapping, non-2xx status, malformed body, unverified response, timeout) yields no override, each asserted at its own shape.
         #[tokio::test]
         async fn gate_response_matrix_yields_overrides_only_on_a_complete_approval() {
             enum Reply {
@@ -2234,10 +2168,7 @@ mod tests {
             }
         }
 
-        /// Cancelling a round trip the receiver has already accepted — so it
-        /// is provably in flight — resolves the cancelled decision without
-        /// waiting out the timeout. Both entrypoints honour the same token:
-        /// `decide_for_gate` and the route-wide `decide`.
+        /// Cancelling a round trip the receiver has already accepted resolves the cancelled decision without waiting out the timeout. Both entrypoints honour the same token: `decide_for_gate` and the route-wide `decide`.
         #[tokio::test]
         async fn webhook_cancellation_short_circuits_the_round_trip_on_both_paths() {
             for route_wide in [false, true] {
@@ -2275,11 +2206,7 @@ mod tests {
             }
         }
 
-        /// Cancellation beats an approval that is already on the wire: the
-        /// receiver cancels the token before writing an approved,
-        /// identity-bearing response, so the decision and the disconnect are
-        /// both live. Whichever the race sees first, the recheck makes
-        /// `Cancelled` the answer and no override object is produced.
+        /// Cancellation beats an approval already on the wire: the receiver cancels before writing an approved response, so whichever the race sees first, the recheck makes `Cancelled` the answer and no override object is produced.
         #[tokio::test]
         async fn webhook_gate_cancellation_beats_a_ready_approval() {
             let cancel = crate::request_cancellation::RequestCancelToken::unbound();

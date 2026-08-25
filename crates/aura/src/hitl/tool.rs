@@ -450,13 +450,7 @@ mod tests {
         );
     }
 
-    /// Trace correlation for the agent-callable surface: the decision id
-    /// must land on the tool's own execution span. Mirrors the equivalent
-    /// coverage for the config-gate surface in `gate.rs`'s `decision_id_span`
-    /// tests.
-    ///
-    /// Gated on `otel`: without the feature there is no span data to
-    /// assert against.
+    /// Trace correlation for the agent-callable surface: the decision id must land on the tool's own execution span. Mirrors the equivalent coverage in `gate.rs`'s `decision_id_span` tests. Gated on `otel`: without the feature there is no span data to assert against.
     #[cfg(feature = "otel")]
     mod decision_id_span {
 

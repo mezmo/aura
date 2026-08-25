@@ -196,9 +196,7 @@ mod tests {
         );
     }
 
-    /// The mapping is the only path from an approval's captured identity to
-    /// the call it released; a `Proceed` that dropped the overrides would
-    /// send the gated call under the requester's identity instead.
+    /// The mapping is the only path from an approval's captured identity to the call it released; a `Proceed` that dropped the overrides would send the gated call under the requester's identity instead.
     #[test]
     fn approval_result_mapping_carries_captured_overrides_into_the_call() {
         let captured = crate::approver_headers::tests::captured_overrides("authorization", "tok");
@@ -556,8 +554,6 @@ mod tests {
             approval_event_broker::unsubscribe(&request_id).await;
         }
 
-        /// A call no glob matches allocates no decision, so its span must not
-        /// claim one.
         #[tokio::test]
         async fn ungated_call_records_no_decision_id() {
             let (tool, ran) = gated_tool(

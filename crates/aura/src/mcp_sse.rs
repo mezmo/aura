@@ -212,10 +212,7 @@ mod tests {
             )
         }
 
-        /// The SSE send path reads the same extension the streamable-HTTP path
-        /// does: an override replaces the frozen identity on exactly that one
-        /// POST, arrives once, and never appears in the JSON body — and a
-        /// message with no extension leaves the client's identity in place.
+        /// The SSE send path reads the same extension the streamable-HTTP path does: an override replaces the frozen identity on exactly that one POST, arrives once, and never appears in the JSON body.
         #[tokio::test]
         async fn send_applies_the_override_to_that_post_alone() {
             let server = RecordingMcpServer::start().await;

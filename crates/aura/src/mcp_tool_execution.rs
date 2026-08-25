@@ -285,12 +285,7 @@ mod tests {
         assert!(bounded.starts_with("Tool execution failed:"));
     }
 
-    /// Trace correlation: a gated call's `mcp.tool_call` span carries the
-    /// captured override's header NAMES, never their values, and an
-    /// ungated call's span carries neither.
-    ///
-    /// Gated on `otel`: without the feature there is no span data to
-    /// assert against.
+    /// Trace correlation: a gated call's `mcp.tool_call` span carries the captured override's header NAMES, never their values, and an ungated call's span carries neither. Gated on `otel`: without the feature there is no span data to assert against.
     #[cfg(feature = "otel")]
     mod applied_headers_span {
 
@@ -305,10 +300,7 @@ mod tests {
         use crate::mcp_streamable_http::tests::client_and_server;
         use crate::test_span_capture::CapturedSpans;
 
-        /// Run `execute_mcp_tool` under a subscriber that exports to memory,
-        /// returning the `applied_headers` attribute its `mcp.tool_call`
-        /// span carries. `#[tracing::instrument]` on `execute_mcp_tool`
-        /// opens the span itself, so no outer instrumentation is needed.
+        /// Run `execute_mcp_tool` under a subscriber that exports to memory, returning the `applied_headers` attribute its `mcp.tool_call` span carries.
         async fn applied_headers_on_call(
             client: &McpClient,
             overrides: Option<crate::approver_headers::ApproverHeaders>,
@@ -333,11 +325,7 @@ mod tests {
             captured.attribute("mcp.tool_call", ATTR_APPLIED_HEADERS)
         }
 
-        /// A gated call carrying an override stamps its captured names,
-        /// sorted and comma-joined, on the execution span — never a value.
-        /// Configured out of alphabetical order (`x-tenant` before
-        /// `authorization`), so a joined-but-unsorted regression would
-        /// produce `"x-tenant,authorization"` and this test would catch it.
+        /// A gated call carrying an override stamps its captured names, sorted and comma-joined, on the execution span, never a value. Configured out of order (`x-tenant` before `authorization`) to catch a regression to `"x-tenant,authorization"`.
         #[tokio::test]
         async fn gated_call_stamps_the_applied_header_names_never_values() {
             let (_server, client) = client_and_server(&HashMap::new()).await;
@@ -361,8 +349,6 @@ mod tests {
             }
         }
 
-        /// A call no approval gated carries no override, so its span records
-        /// no `applied_headers` attribute at all.
         #[tokio::test]
         async fn ungated_call_records_no_applied_headers() {
             let (_server, client) = client_and_server(&HashMap::new()).await;

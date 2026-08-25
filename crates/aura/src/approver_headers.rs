@@ -19,9 +19,7 @@ use reqwest::header::{HeaderMap, HeaderName};
 /// producer.
 #[derive(Clone)]
 pub struct ApproverHeaders {
-    /// The validated override pairs, keys lowercased. The keys are also the
-    /// audit surface (names only); no separate name list exists to fall out
-    /// of sync.
+    /// Validated override pairs, keys lowercased. Keys serve as the audit surface (names only); no separate name list exists.
     headers: HeaderMap,
 }
 
@@ -172,9 +170,7 @@ pub(crate) fn extract_from_client_message(
 }
 
 tokio::task_local! {
-    /// Approver header overrides for the current gated tool call. Scoped
-    /// by `WrappedTool::call` inside the inner-call spawn; read by
-    /// `McpToolAdaptor::call` via [`current_approver_overrides`].
+    /// Approver header overrides for the current gated tool call.
     /// Crate-private so nothing outside the wrapper path can inject
     /// overrides.
     pub(crate) static APPROVER_OVERRIDES: Option<ApproverHeaders>;
@@ -201,10 +197,7 @@ pub(crate) mod tests {
 
     use super::*;
 
-    /// One captured override pair, for the seam tests that need a value of
-    /// this type without restating the capture plumbing. Construction goes
-    /// through the real capture path so a test can never hold overrides the
-    /// production path could not have produced.
+    /// One captured override pair for seam tests. Construction uses the real capture path, so a test cannot hold overrides that production could not produce.
     pub(crate) fn captured_overrides(outbound: &str, value: &str) -> ApproverHeaders {
         const RESPONSE_NAME: &str = "x-approver-source";
         ApproverHeaders::from_captured(
@@ -214,11 +207,7 @@ pub(crate) mod tests {
         .expect("the mapped header is present")
     }
 
-    /// Captured overrides for several pairs at once, each mapped from its
-    /// own `x-response-<outbound>` response header, given in whatever order
-    /// the caller likes. Construction goes through the real capture path,
-    /// so a test can never hold overrides the production path could not
-    /// have produced.
+    /// Captured overrides for several pairs. Construction uses the real capture path, so a test cannot hold overrides that production could not produce.
     #[cfg(feature = "otel")]
     pub(crate) fn captured_overrides_multi(pairs: &[(&str, &str)]) -> ApproverHeaders {
         let response_names: Vec<String> = pairs
@@ -258,8 +247,6 @@ pub(crate) mod tests {
         headers
     }
 
-    /// Capture rekeys the response value under the configured outbound name,
-    /// carrying the value through unchanged.
     #[test]
     fn captures_response_value_under_outbound_name() {
         let captured = ApproverHeaders::from_captured(
@@ -276,9 +263,7 @@ pub(crate) mod tests {
         assert!(captured.headers.get("x-approver-id").is_none());
     }
 
-    /// A webhook is free to spell its response header any way, and so is
-    /// the operator configuring the mapping; neither spelling has to match
-    /// the other's case.
+    /// A webhook may spell its response header however it likes, as may the operator configuring the mapping.
     #[test]
     fn response_lookup_is_case_insensitive() {
         let captured = ApproverHeaders::from_captured(
@@ -290,9 +275,7 @@ pub(crate) mod tests {
         assert_eq!(captured.headers.get("x-forwarded-user").unwrap(), "alice");
     }
 
-    /// A response may repeat a header. Capture takes the first value, as the
-    /// route's own header reads do, and exactly one value lands under the
-    /// outbound name — a second approver identity cannot ride along.
+    /// A response may repeat a header. Capture takes the first value, as the route does. Exactly one value lands under the outbound name; a second identity cannot ride along.
     #[test]
     fn repeated_response_header_captures_only_the_first_value() {
         let captured = ApproverHeaders::from_captured(
@@ -329,9 +312,7 @@ pub(crate) mod tests {
             }
         );
 
-        // The event-level audit signal: the Display text names every missing
-        // header and carries no value, including the one response value that
-        // did arrive (for the header that was present).
+        // Event-level audit signal: the Display text names every missing header and carries no value.
         let message = err.to_string();
         assert_eq!(
             message,
@@ -341,8 +322,6 @@ pub(crate) mod tests {
         assert!(!message.contains("acme"), "message was: {message}");
     }
 
-    /// Every captured pair lands on the request the builder produces, under
-    /// the outbound name.
     #[test]
     fn apply_to_sets_every_captured_pair_on_the_request() {
         let captured = ApproverHeaders::from_captured(
@@ -363,11 +342,6 @@ pub(crate) mod tests {
         assert_eq!(request.headers().get("x-tenant").unwrap(), "acme");
     }
 
-    /// The override REPLACES a same-named header already on the builder rather
-    /// than coexisting with it. Two identities on one request is the failure
-    /// mode this guards: `reqwest`'s per-header setter appends, so applying
-    /// pair-by-pair would leave the original value in place beside the
-    /// approver's.
     #[test]
     fn apply_to_replaces_a_header_already_on_the_builder() {
         let captured = ApproverHeaders::from_captured(
@@ -429,8 +403,6 @@ pub(crate) mod tests {
         assert_eq!(current_approver_overrides(), None);
     }
 
-    /// And the scoped read hands the value through unchanged shape-wise
-    /// (a `None` payload scoped explicitly is still `None`).
     #[tokio::test]
     async fn scoped_none_reads_none() {
         APPROVER_OVERRIDES

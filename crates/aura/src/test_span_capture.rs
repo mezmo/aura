@@ -31,9 +31,8 @@ impl CapturedSpans {
         self.spans().iter().any(|span| span.name == name)
     }
 
-    /// The single `key` attribute on the span named `name`, or `None`
-    /// if the span carries no such attribute. Panics if the span
-    /// carries more than one — a double-stamp regression would
+    /// The single `key` attribute on the span named `name`. Panics if
+    /// the span carries more than one — a double-stamp regression would
     /// otherwise pass with only the first entry.
     pub(crate) fn attribute(&self, name: &str, key: &str) -> Option<String> {
         let spans = self.spans();
@@ -60,9 +59,7 @@ impl SpanExporter for CapturedSpans {
     }
 }
 
-/// Run `body` inside an `execute_tool` span — the span Rig opens around
-/// a tool call — under a subscriber that exports to memory, returning
-/// the body's output and the `decision_id` the exported span carries.
+/// Run `body` inside an `execute_tool` span (the span Rig opens around a tool call) under a subscriber that exports to memory, returning the body's output and the `decision_id` the exported span carries.
 pub(crate) async fn traced_as_execute_tool<T>(
     body: impl Future<Output = T>,
 ) -> (T, Option<String>) {

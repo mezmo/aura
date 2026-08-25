@@ -14,15 +14,10 @@
 //!
 //! # Run recipe
 //!
-//! 1. Start the shared MCP fixture: `docker compose -f compose/base.yml -f
-//!    compose/dev.yml up -d mock-mcp` (FastMCP at
-//!    `${MCP_MOCK_HOST:-127.0.0.1}:9999`).
-//! 2. Export `OPENAI_API_KEY` (each generated config resolves
-//!    `{{ env.OPENAI_API_KEY }}`, exactly like `test-config.toml`).
-//! 3. `cargo test -p aura-web-server --features integration-hitl-header-forwarding`.
-//!    Cargo builds `aura-web-server` as a side effect (via
-//!    `CARGO_BIN_EXE_aura-web-server`); each test spawns it fresh, waits on
-//!    `/health`, drives one chat completion, and kills it on drop.
+//! `make test-integration-hitl-local` (`.makefiles/aura.mk`) starts the
+//! shared `mock-mcp` fixture, needs no env beyond `OPENAI_API_KEY`, and runs
+//! this suite. Each test spawns its server fresh, waits on `/health`, drives
+//! one chat completion, and kills it on drop.
 
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -45,9 +40,7 @@ const ECHO_PROMPT: &str = "Call the echo_headers tool now and reply with only it
 // A dedicated aura-web-server, spawned fresh per test case
 // ---------------------------------------------------------------------------
 
-/// A freshly spawned `aura-web-server`, bound to its own port and reading a
-/// config generated for exactly one test case. Killed and its config file
-/// removed on drop.
+/// A freshly spawned `aura-web-server`, bound to its own port and reading a config generated for exactly one test case. Killed and its config file removed on drop.
 struct AuraServer {
     port: u16,
     child: Child,
@@ -62,12 +55,7 @@ impl AuraServer {
         format!("http://127.0.0.1:{}", self.port)
     }
 
-    /// Spawn `aura-web-server` (built as a side effect of this test binary,
-    /// via `CARGO_BIN_EXE_aura-web-server`) against `config_toml`, and wait
-    /// until it answers `/health`. `free_port`'s bind-then-drop leaves a
-    /// window for something else to grab the port before the child binds it;
-    /// one retry on a fresh port covers that without masking a genuine
-    /// startup failure, which still panics on the second attempt.
+    /// Spawn `aura-web-server` against `config_toml`, wait until it answers `/health`. `free_port`'s bind-then-drop leaves a window for another process to grab the port; one retry on a fresh port covers that.
     async fn start(config_toml: &str) -> Self {
         match Self::try_start(config_toml).await {
             Ok(server) => server,
@@ -158,11 +146,7 @@ impl AuraServer {
         }
     }
 
-    /// Kill the child and await its exit, reaping the process, then remove
-    /// its generated config file. Call this explicitly at the end of a
-    /// test; `Drop`'s `start_kill` is only the fallback for a test that
-    /// panics before reaching it, since a non-blocking kill on drop cannot
-    /// await the reap.
+    /// Kill the child and await its exit, reaping the process, then remove its generated config file. Call this explicitly at test end; `Drop`'s `start_kill` is only the fallback for a test that panics.
     async fn stop(mut self) {
         let _ = self.child.kill().await;
         let _ = std::fs::remove_file(&self.config_path);
@@ -205,11 +189,7 @@ enum ApproverReply {
     Deny,
 }
 
-/// An in-process webhook approver bound to a loopback port, answering every
-/// POST it receives the same way for the life of the test. Mirrors the
-/// one-shot receiver idiom in `hitl::route`'s `webhook_signing` tests, minus
-/// the one-shot restriction: a chat turn may retry or the harness may want
-/// more than one decision, so this loops `accept`.
+/// An in-process webhook approver bound to a loopback port, answering every POST it receives the same way for the life of the test. Mirrors the one-shot receiver idiom in `hitl::route`'s `webhook_signing` tests, minus the one-shot restriction.
 struct MockApprover {
     url: String,
     hits: Arc<AtomicUsize>,
@@ -236,17 +216,13 @@ impl MockApprover {
         Self { url, hits }
     }
 
-    /// How many decision requests this approver has accepted so far. The
-    /// direct proof that a call did, or did not, consult the route at all —
-    /// stronger than inferring it from the reply's shape.
+    /// How many decision requests this approver has accepted so far: direct proof that a call did, or did not, consult the route.
     fn hits(&self) -> usize {
         self.hits.load(Ordering::SeqCst)
     }
 }
 
-/// Read one HTTP request off `socket` and answer it per `reply`. Ignores the
-/// request body: which decision to hand back is fixed per test, not derived
-/// from the payload.
+/// Read one HTTP request off `socket` and answer it per `reply`. Ignores the request body: which decision to hand back is fixed per test.
 async fn serve_one_decision(mut socket: tokio::net::TcpStream, reply: ApproverReply) {
     let mut buf = Vec::new();
     let head_end = loop {
@@ -309,18 +285,13 @@ async fn serve_one_decision(mut socket: tokio::net::TcpStream, reply: ApproverRe
 // Generated config
 // ---------------------------------------------------------------------------
 
-/// The shared mock-mcp fixture's URL — the same server
-/// `header_forwarding_tests.rs` depends on, honoring the same `MCP_MOCK_HOST`
-/// override for container-network runs.
+/// The shared mock-mcp fixture's URL, the same server `header_forwarding_tests.rs` depends on, honoring the same `MCP_MOCK_HOST` override.
 fn mcp_url() -> String {
     let host = std::env::var("MCP_MOCK_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
     format!("http://{host}:9999/mcp")
 }
 
-/// A minimal single-agent config: one MCP server with a frozen static
-/// `Authorization` header (standing in for the pre-approval requester
-/// identity, as `test-config.toml` does for the base suite), plus whatever
-/// `[hitl]` table the caller supplies.
+/// A minimal single-agent config: one MCP server with a frozen static `Authorization` header (standing in for pre-approval requester identity), plus whatever `[hitl]` table the caller supplies.
 fn config_toml(mcp_url: &str, frozen_authorization: &str, hitl_toml: &str) -> String {
     format!(
         r#"
@@ -363,9 +334,7 @@ temperature = 0.0
     )
 }
 
-/// `[hitl]` gating `echo_headers`, routed to `approver_url`, with
-/// `tool_headers_from_response` mapping the approver token onto
-/// `authorization`.
+/// `[hitl]` gating `echo_headers`, routed to `approver_url`, with `tool_headers_from_response` mapping the approver token onto `authorization`.
 fn gated_hitl_toml(approver_url: &str) -> String {
     let mapping = r#"tool_headers_from_response = { "authorization" = "x-approver-token" }"#;
     format!(
@@ -381,9 +350,7 @@ url = "{approver_url}"
     )
 }
 
-/// `[hitl]` present and pointed at a real (denying) approver, but its glob
-/// matches no tool this suite calls — proves an unmatched call never
-/// consults the route at all.
+/// `[hitl]` present and pointed at a real (denying) approver, but its glob matches no tool this suite calls, proving an unmatched call never consults the route.
 fn ungated_hitl_toml(approver_url: &str) -> String {
     format!(
         r#"
@@ -434,17 +401,13 @@ fn assistant_text(response_json: &Value) -> &str {
         .expect("response carries assistant message content")
 }
 
-/// The `echo_headers` JSON blob out of a chat response's assistant prose,
-/// with `context` naming what the calling test expected, so a miss names
-/// both the expectation and what the assistant actually said.
+/// Extract the `echo_headers` JSON blob from a chat response's assistant prose, with `context` naming what the test expected, so a miss identifies both expectation and actual assistant output.
 fn headers_from_response(response_json: &Value, context: &str) -> Value {
     let text = assistant_text(response_json);
     extract_json_object(text).unwrap_or_else(|| panic!("{context}; got: {text:?}"))
 }
 
-/// The first `{...}` JSON object embedded in `text`, if any — mirrors
-/// `header_forwarding_tests.rs`'s extraction of the `echo_headers` JSON blob
-/// out of the model's prose.
+/// The first `{...}` JSON object embedded in `text`, if any, mirrors `header_forwarding_tests.rs`'s extraction of the `echo_headers` JSON blob from the model's prose.
 fn extract_json_object(text: &str) -> Option<Value> {
     // The assistant relays the tool output in whatever quoting it fancies:
     // bare, wrapped as a JSON string literal, or with the headers JSON
