@@ -340,37 +340,14 @@ pub static NORMAL: Theme = Theme {
     key_label: Style::fg(Color::Reset),
     stream_aura: Style::fg(Color::Yellow),
     stream_message: Style::fg(Color::Cyan),
-    // Status line hues are lifted from the `.welcome` logo gradient.
-    status_model: Style::fg(Color::Rgb {
-        r: 243,
-        g: 116,
-        b: 195,
-    }), // Logo pink
-    status_path: Style::fg(Color::Rgb {
-        r: 93,
-        g: 147,
-        b: 215,
-    }), // Logo blue
-    status_git: Style::fg(Color::Rgb {
-        r: 236,
-        g: 172,
-        b: 149,
-    }), // Logo peach
-    status_tokens: Style::fg(Color::Rgb {
-        r: 147,
-        g: 112,
-        b: 219,
-    }), // Lavender
-    status_scratch: Style::fg(Color::Rgb {
-        r: 64,
-        g: 224,
-        b: 208,
-    }), // Turquoise
-    status_mcp: Style::fg(Color::Rgb {
-        r: 232,
-        g: 224,
-        b: 168,
-    }), // Logo yellow
+    // Named ANSI colors so the status line follows the terminal's own
+    // palette; hues approximate the `.welcome` logo gradient.
+    status_model: Style::fg(Color::Magenta),
+    status_path: Style::fg(Color::Blue),
+    status_git: Style::fg(Color::DarkYellow),
+    status_tokens: Style::fg(Color::Cyan),
+    status_scratch: Style::fg(Color::DarkCyan),
+    status_mcp: Style::fg(Color::Yellow),
     default_output_bg: Color::Reset,
     markdown_bg: Color::Reset,
     diff_bg: Color::Reset,
