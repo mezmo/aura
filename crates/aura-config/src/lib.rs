@@ -37,8 +37,11 @@ fn load_single_config<P: AsRef<Path>>(path: P) -> Result<Config, ConfigError> {
     let contents = fs::read_to_string(path)?;
     let resolved = resolve_env_vars(&contents)?;
     check_legacy_top_level_llm(&resolved)?;
+
     let config: Config = toml::from_str(&resolved)?;
     config.validate()?;
+    config.validate_memory_dir_writable()?;
+
     Ok(config)
 }
 
@@ -136,4 +139,92 @@ pub fn load_config_from_str(contents: &str) -> Result<Config, ConfigError> {
     let config: Config = toml::from_str(&resolved)?;
     config.validate()?;
     Ok(config)
+}
+
+#[cfg(test)]
+mod load_config_tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::TempDir;
+
+    fn write_config(dir: &TempDir, name: &str, contents: &str) -> std::path::PathBuf {
+        let path = dir.path().join(name);
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(contents.as_bytes()).unwrap();
+        path
+    }
+
+    fn minimal_toml(extra: &str) -> String {
+        format!(
+            r#"
+{extra}
+[agent]
+name = "Test"
+system_prompt = "p"
+[agent.llm]
+provider = "openai"
+api_key = "test-key"
+model = "gpt-4o"
+"#
+        )
+    }
+
+    #[test]
+    fn load_config_no_memory_dir_passes() {
+        let dir = TempDir::new().unwrap();
+        let path = write_config(&dir, "agent.toml", &minimal_toml(""));
+        load_config(path).expect("config without memory_dir should load");
+    }
+
+    #[test]
+    fn load_config_writable_memory_dir_passes() {
+        let dir = TempDir::new().unwrap();
+        let memory_dir = dir.path().join("memory");
+        let toml = minimal_toml(&format!(
+            r#"memory_dir = "{}"
+"#,
+            memory_dir.display()
+        ));
+        let path = write_config(&dir, "agent.toml", &toml);
+        load_config(&path).expect("config with writable memory_dir should load");
+        assert!(
+            memory_dir.exists(),
+            "memory_dir should have been created by load_config"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn load_config_unwritable_memory_dir_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let memory_dir = dir.path().join("locked");
+        std::fs::create_dir_all(&memory_dir).unwrap();
+        std::fs::set_permissions(&memory_dir, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        // Root ignores permission bits — skip rather than fail the assertion.
+        let probe = memory_dir.join(".aura-startup-probe");
+        if std::fs::write(&probe, b"probe").is_ok() {
+            let _ = std::fs::remove_file(&probe);
+            std::fs::set_permissions(&memory_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+
+        let toml = minimal_toml(&format!(
+            r#"memory_dir = "{}"
+"#,
+            memory_dir.display()
+        ));
+        let path = write_config(&dir, "agent.toml", &toml);
+        let err = load_config(&path).expect_err("unwritable memory_dir should fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not writable") || msg.contains("Permission denied"),
+            "error should describe the write failure: {msg}"
+        );
+
+        // Restore permissions so TempDir cleanup succeeds.
+        std::fs::set_permissions(&memory_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
 }

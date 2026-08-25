@@ -336,6 +336,16 @@ impl Config {
         self.agent.alias.as_deref().unwrap_or(&self.agent.name)
     }
 
+    /// Resolve the effective persistence directory: top-level `memory_dir`,
+    /// or `[orchestration.artifacts].memory_dir` as a legacy fallback.
+    pub fn effective_memory_dir(&self) -> Option<&str> {
+        self.memory_dir.as_deref().or_else(|| {
+            self.orchestration
+                .as_ref()
+                .and_then(|o| o.artifacts.memory_dir.as_deref())
+        })
+    }
+
     /// Validate the configuration
     pub fn validate(&self) -> Result<(), crate::ConfigError> {
         validate_llm_api_key(&self.agent.llm, "agent.llm")?;
@@ -418,6 +428,32 @@ impl Config {
         Ok(())
     }
 
+    /// Validate that the effective `memory_dir` (if set) is writable.
+    ///
+    /// Creates the directory if it doesn't exist, then probes writability with
+    /// a temporary file. The probe file is removed afterward on a best-effort
+    /// basis.
+    ///
+    /// This is not part of the validate() method because it is not side effect
+    /// free.
+    pub fn validate_memory_dir_writable(&self) -> Result<(), crate::ConfigError> {
+        let Some(dir) = self.effective_memory_dir() else {
+            return Ok(());
+        };
+
+        let path = std::path::Path::new(dir);
+
+        std::fs::create_dir_all(path).map_err(|e| {
+            crate::ConfigError::Validation(format!("Cannot create memory_dir '{dir}': {e}"))
+        })?;
+
+        tempfile::NamedTempFile::new_in(path).map_err(|e| {
+            crate::ConfigError::Validation(format!("memory_dir '{dir}' is not writable: {e}"))
+        })?;
+
+        Ok(())
+    }
+
     /// When scratchpad is enabled on the agent or any worker, require a
     /// `memory_dir` (top-level, with legacy fallback to
     /// `[orchestration.artifacts].memory_dir`) and a `context_window` on each
@@ -440,11 +476,7 @@ impl Config {
             return Ok(());
         }
 
-        let effective_memory_dir = self.memory_dir.as_deref().or_else(|| {
-            self.orchestration
-                .as_ref()
-                .and_then(|o| o.artifacts.memory_dir.as_deref())
-        });
+        let effective_memory_dir = self.effective_memory_dir();
         if effective_memory_dir.is_none() {
             return Err(crate::ConfigError::Validation(
                 "Scratchpad enabled but top-level `memory_dir` is not set".to_string(),
