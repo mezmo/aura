@@ -8,6 +8,7 @@ use aura_cli::oneshot::run_oneshot;
 use aura_cli::permissions::PermissionChecker;
 use aura_cli::repl::r#loop::run_repl;
 use aura_cli::ui::pre_launch;
+use aura_cli::ui::prompt::AgentHost;
 
 fn main() -> Result<()> {
     // Catch --config/--standalone before clap parses when standalone-cli is not enabled.
@@ -103,6 +104,14 @@ fn main() -> Result<()> {
     if let Some(segments) = config.status_line_segments.clone() {
         aura_cli::ui::prompt::set_status_segments(segments);
     }
+    aura_cli::ui::prompt::set_agent_host(if is_standalone {
+        AgentHost::Local
+    } else {
+        AgentHost::Remote {
+            server: aura_cli::ui::status_line::server_display(&config.api_url),
+            client_tools: config.enable_client_tools,
+        }
+    });
     let permissions = PermissionChecker::load(&std::env::current_dir()?)?;
     let mut backend = Backend::from_config(&rt, &config, &args, is_standalone)?;
 

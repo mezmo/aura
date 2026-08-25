@@ -18,6 +18,7 @@ use crate::ui::text::strip_control_chars;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Segment {
     Model,
+    Server,
     Cwd,
     Git,
     Context,
@@ -27,8 +28,9 @@ pub enum Segment {
 }
 
 impl Segment {
-    pub const ALL: [Segment; 7] = [
+    pub const ALL: [Segment; 8] = [
         Segment::Model,
+        Segment::Server,
         Segment::Cwd,
         Segment::Git,
         Segment::Context,
@@ -41,6 +43,7 @@ impl Segment {
     pub fn name(self) -> &'static str {
         match self {
             Segment::Model => "model",
+            Segment::Server => "server",
             Segment::Cwd => "cwd",
             Segment::Git => "git",
             Segment::Context => "context",
@@ -92,6 +95,9 @@ pub struct ContextUsage {
 #[derive(Clone, Debug, Default)]
 pub struct Snapshot {
     pub model: Option<String>,
+    /// Address of the aura-web-server the agent runs on, already in display
+    /// form (see [`server_display`]).
+    pub server: Option<String>,
     /// Working directory, already home-abbreviated for display.
     pub cwd: Option<String>,
     pub git_branch: Option<String>,
@@ -156,12 +162,17 @@ pub fn render(snapshot: &Snapshot, segments: &[Segment], width: usize, right: &s
 }
 
 fn piece(segment: Segment, snapshot: &Snapshot) -> Option<Piece> {
-    // Model, cwd, and branch come from a server or the filesystem: strip
-    // control characters so they cannot carry escape sequences to the terminal.
+    // Model, server, cwd, and branch come from a server, the environment, or
+    // the filesystem: strip control characters so they cannot carry escape
+    // sequences to the terminal.
     let (text, style) = match segment {
         Segment::Model => (
             strip_control_chars(snapshot.model.as_deref()?),
             AuraStyle::StatusModel,
+        ),
+        Segment::Server => (
+            format!("⇄ {}", strip_control_chars(snapshot.server.as_deref()?)),
+            AuraStyle::StatusPath,
         ),
         Segment::Cwd => (
             strip_control_chars(snapshot.cwd.as_deref()?),
@@ -344,6 +355,25 @@ fn scaled(n: u64, unit: u64, suffix: char) -> String {
     }
 }
 
+/// `api_url` as the status line shows it: the scheme and any credentials
+/// dropped and trailing slashes trimmed, so `https://user:pw@host:8443/aura/`
+/// becomes `host:8443/aura`. A base path is kept because it distinguishes
+/// servers sharing one host.
+pub fn server_display(api_url: &str) -> String {
+    let url = api_url.trim();
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    let path = path.trim_end_matches('/');
+    if path.is_empty() {
+        host.to_owned()
+    } else {
+        format!("{host}/{path}")
+    }
+}
+
 /// `path` with a leading `home` replaced by `~`.
 pub fn abbreviate_home(path: &Path, home: Option<&Path>) -> String {
     match home.and_then(|h| path.strip_prefix(h).ok()) {
@@ -421,6 +451,7 @@ mod tests {
     fn snapshot() -> Snapshot {
         Snapshot {
             model: Some("claude-sonnet-4-5".to_owned()),
+            server: None,
             cwd: Some("~/src/aura".to_owned()),
             git_branch: Some("main".to_owned()),
             context: Some(ContextUsage {
@@ -445,7 +476,7 @@ mod tests {
         }
         let err = "nope".parse::<Segment>().unwrap_err();
         assert!(err.to_string().contains("`nope`"));
-        assert!(err.to_string().contains("model, cwd, git"));
+        assert!(err.to_string().contains("model, server, cwd, git"));
     }
 
     #[test]
@@ -481,25 +512,57 @@ mod tests {
     }
 
     #[test]
+    fn remote_snapshot_shows_server_in_place_of_cwd_and_git() {
+        let snapshot = Snapshot {
+            server: Some("aura.example.com".to_owned()),
+            cwd: None,
+            git_branch: None,
+            ..snapshot()
+        };
+        let line = strip_ansi(&render(&snapshot, DEFAULT_SEGMENTS, 200, ""));
+        assert_eq!(
+            line,
+            "claude-sonnet-4-5 │ ⇄ aura.example.com │ ctx ███░░░░░ 38% 76k/200k │ in 182k / out 41k │ mcp 3/3"
+        );
+    }
+
+    #[test]
+    fn server_display_strips_scheme_credentials_and_trailing_slash() {
+        assert_eq!(server_display("http://localhost:8080"), "localhost:8080");
+        assert_eq!(
+            server_display("https://aura.prod.example.com/"),
+            "aura.prod.example.com"
+        );
+        assert_eq!(
+            server_display("https://user:p@ss@host:8443/aura/v2//"),
+            "host:8443/aura/v2"
+        );
+        assert_eq!(server_display("localhost:8080"), "localhost:8080");
+        assert_eq!(server_display("http://[::1]:8080/"), "[::1]:8080");
+    }
+
+    #[test]
     fn control_characters_in_external_text_are_neutralised() {
         let snapshot = Snapshot {
             model: Some("gpt\x1b[2J-4o".to_owned()),
+            server: Some("host\x07".to_owned()),
             cwd: Some("~/a\tb".to_owned()),
             git_branch: Some("main\u{9b}31m".to_owned()),
             ..Snapshot::default()
         };
         let line = render(
             &snapshot,
-            &[Segment::Model, Segment::Cwd, Segment::Git],
+            &[Segment::Model, Segment::Server, Segment::Cwd, Segment::Git],
             200,
             "",
         );
         // The raw output carries only our own SGR styling: the injected
-        // clear-screen, tab, and C1 CSI never reach the terminal.
+        // clear-screen, bell, tab, and C1 CSI never reach the terminal.
         assert!(!line.contains("\x1b[2J"));
+        assert!(!line.contains('\x07'));
         assert!(!line.contains('\t'));
         assert!(!line.contains('\u{9b}'));
-        assert_eq!(strip_ansi(&line), "gpt[2J-4o │ ~/ab │ ⎇ main31m");
+        assert_eq!(strip_ansi(&line), "gpt[2J-4o │ ⇄ host │ ~/ab │ ⎇ main31m");
     }
 
     #[test]

@@ -20,11 +20,12 @@ use crate::theme::{AuraStyle, Themed};
 
 use super::animation::render_queued_wave;
 use super::state::{
-    CONTEXT_USED, CONTEXT_USED_FRESH, CTRLC_HINT_VISIBLE, CTRLC_RESET_SKIP, CUMULATIVE_COMPLETION,
-    CUMULATIVE_PROMPT, CUMULATIVE_SCRATCHPAD_EXTRACTED, CUMULATIVE_SCRATCHPAD_INTERCEPTED,
-    CURSOR_ROW, CWD, FRAME_LINES, LAST_CTRLC, MCP_COUNTS, MODEL_CONTEXT_LIMIT, ORCHESTRATED,
-    PROCESSING, QUEUED_INPUT, QUEUED_WAVE_POS, SESSION_MODEL, STATUS_HINT, STATUS_ROWS,
-    STATUS_SEGMENTS, TURN_NOTICES, get_selected_model, lock_term, status_rows, term_size,
+    AGENT_HOST, CONTEXT_USED, CONTEXT_USED_FRESH, CTRLC_HINT_VISIBLE, CTRLC_RESET_SKIP,
+    CUMULATIVE_COMPLETION, CUMULATIVE_PROMPT, CUMULATIVE_SCRATCHPAD_EXTRACTED,
+    CUMULATIVE_SCRATCHPAD_INTERCEPTED, CURSOR_ROW, CWD, FRAME_LINES, LAST_CTRLC, MCP_COUNTS,
+    MODEL_CONTEXT_LIMIT, ORCHESTRATED, PROCESSING, QUEUED_INPUT, QUEUED_WAVE_POS, SESSION_MODEL,
+    STATUS_HINT, STATUS_ROWS, STATUS_SEGMENTS, TURN_NOTICES, get_selected_model, lock_term,
+    status_rows, term_size,
 };
 use super::status_line::{self, ContextUsage, DEFAULT_SEGMENTS, Segment, Snapshot};
 use super::text::strip_control_chars;
@@ -34,10 +35,29 @@ const IDLE_RIGHT_TEXT: &str = "AURA, by Mezmo!";
 /// Right-aligned on the status line while a request is in flight.
 const BUSY_RIGHT_TEXT: &str = "esc to stop";
 
+/// Where the agent the status line describes is running.
+#[derive(Debug)]
+pub enum AgentHost {
+    /// In this process.
+    Local,
+    /// On an aura-web-server reached over HTTP.
+    Remote {
+        /// Server address in display form (see `status_line::server_display`).
+        server: String,
+        /// Whether this process runs local tools on the server's behalf.
+        client_tools: bool,
+    },
+}
+
 /// Install the segments the status line shows; only the first call takes
 /// effect.
 pub fn set_status_segments(segments: Vec<Segment>) {
     let _ = STATUS_SEGMENTS.set(segments);
+}
+
+/// Record where the agent runs; only the first call takes effect.
+pub fn set_agent_host(host: AgentHost) {
+    let _ = AGENT_HOST.set(host);
 }
 
 /// Record the model and context window reported by `aura.session_info`.
@@ -102,7 +122,21 @@ pub fn reset_session_status() {
 }
 
 fn capture_snapshot() -> Snapshot {
-    let cwd = CWD.get_or_init(|| std::env::current_dir().ok()).as_deref();
+    // A remote agent's working tree is the server's, so the local directory
+    // and branch say nothing about it — except that client tools still run
+    // against the local directory, which keeps the cwd relevant.
+    let (server, show_cwd, show_git) = match AGENT_HOST.get() {
+        None | Some(AgentHost::Local) => (None, true, true),
+        Some(AgentHost::Remote {
+            server,
+            client_tools,
+        }) => (Some(server.clone()), *client_tools, false),
+    };
+    let cwd = if show_cwd {
+        CWD.get_or_init(|| std::env::current_dir().ok()).as_deref()
+    } else {
+        None
+    };
     // In an orchestrated conversation aura.usage is the sum of every
     // planning, worker, and synthesis call, not any one context, so there is
     // no single figure to show. Otherwise show the count once something has
@@ -116,8 +150,9 @@ fn capture_snapshot() -> Snapshot {
     };
     Snapshot {
         model: get_selected_model().or_else(|| SESSION_MODEL.lock().ok().and_then(|g| g.clone())),
+        server,
         cwd: cwd.map(|p| status_line::abbreviate_home(p, dirs::home_dir().as_deref())),
-        git_branch: cwd.and_then(status_line::git_branch),
+        git_branch: cwd.filter(|_| show_git).and_then(status_line::git_branch),
         context,
         prompt_tokens: CUMULATIVE_PROMPT.lock().map(|g| *g).unwrap_or(0),
         completion_tokens: CUMULATIVE_COMPLETION.lock().map(|g| *g).unwrap_or(0),

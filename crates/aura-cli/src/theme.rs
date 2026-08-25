@@ -98,7 +98,7 @@ pub enum AuraStyle {
     StreamAura,    // stream panel: aura.* event lines
     StreamMessage, // stream panel: 'message' event lines
     StatusModel,   // status line: model name
-    StatusPath,    // status line: working directory
+    StatusPath,    // status line: working directory or connected server
     StatusGit,     // status line: git branch
     StatusTokens,  // status line: cumulative in/out tokens
     StatusScratch, // status line: scratchpad savings

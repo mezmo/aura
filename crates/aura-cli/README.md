@@ -220,12 +220,13 @@ log_file = "/tmp/aura.log"  # append-only; see Logging section below
 [status_line]
 # Segments shown under the input box, in display order. Omit the block for
 # the default set; use an empty list to hide the line's segments entirely.
-segments = ["model", "cwd", "git", "context", "tokens", "scratchpad", "mcp"]
+segments = ["model", "server", "cwd", "git", "context", "tokens", "scratchpad", "mcp"]
 ```
 
 The status line is rendered locally from state the CLI already holds — no
 extra requests or tokens. Segments: `model` (selected model, or the one the
-server reports), `cwd` (`~`-abbreviated working directory), `git` (branch
+server reports), `server` (the `--api-url` host in HTTP mode, without scheme
+or credentials), `cwd` (`~`-abbreviated working directory), `git` (branch
 from `.git/HEAD`, no `git` subprocess), `context` (tokens currently in the
 model's context; becomes a meter with a percentage when the agent's
 `[agent.llm]` config sets `context_window`, e.g. `context_window = 200000`;
@@ -233,7 +234,11 @@ hidden in orchestrated conversations, which span many agent contexts), `tokens` 
 (`in` = tokens diverted into the scratchpad, `out` = tokens read back into
 context; shown once any were intercepted), and `mcp` (connected/configured MCP servers). Segments with
 nothing to show are omitted; on narrow terminals the cwd is shortened
-first, then trailing segments are dropped.
+first, then trailing segments are dropped. Which of `server`, `cwd`, and
+`git` appear depends on the mode: standalone mode shows `cwd` and `git`;
+HTTP mode shows `server` instead, since the agent's working tree is the
+server's, keeping `cwd` only when `--enable-client-tools` runs local tools
+against it.
 
 > **Note on system prompts:** In **HTTP mode**, `--system-prompt` is intended for
 > OpenAI-compatible backends that support system messages. **AURA's server ignores system

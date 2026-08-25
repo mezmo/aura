@@ -17,6 +17,7 @@ use crossterm::style::Color;
 use crate::api::mcp_status::McpCounts;
 use crate::api::types::{DisplayEvent, ModelEntry};
 use crate::repl::registry::PendingCommand;
+use crate::ui::status_bar::AgentHost;
 use crate::ui::status_line::Segment;
 use crate::ui::welcome::WelcomeState;
 
@@ -74,6 +75,8 @@ pub(crate) static QUEUED_WAVE_DIR: Mutex<f32> = Mutex::new(0.5);
 
 /// Segments the status line shows; unset means `status_line::DEFAULT_SEGMENTS`.
 pub(crate) static STATUS_SEGMENTS: OnceLock<Vec<Segment>> = OnceLock::new();
+/// Where the agent runs.
+pub(crate) static AGENT_HOST: OnceLock<AgentHost> = OnceLock::new();
 /// Process working directory, resolved once.
 pub(crate) static CWD: OnceLock<Option<PathBuf>> = OnceLock::new();
 /// Model name reported by the server for the current session.
