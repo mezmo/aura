@@ -1453,6 +1453,7 @@ impl Orchestrator {
         chat_history: &[rig::completion::Message],
         coordinator_state: &mut CoordinatorState,
         previous: Option<&IterationContext>,
+        phase_index: usize,
         event_tx: Option<&tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>>,
     ) -> Result<(PlanningResponse, String, String), StreamError> {
         let max_correction_attempts = self.config.max_plan_parse_retries;
@@ -1596,7 +1597,7 @@ impl Orchestrator {
                 {
                     let persistence = self.persistence.lock().await;
                     if let Err(e) = persistence
-                        .write_planning_phase(&prompt, &response_text)
+                        .write_planning_phase(phase_index, &prompt, &response_text)
                         .await
                     {
                         tracing::warn!("Failed to persist planning phase: {}", e);
@@ -1639,7 +1640,7 @@ impl Orchestrator {
             {
                 let persistence = self.persistence.lock().await;
                 if let Err(e) = persistence
-                    .write_planning_phase(&prompt, &response_text)
+                    .write_planning_phase(phase_index, &prompt, &response_text)
                     .await
                 {
                     tracing::warn!("Failed to persist planning phase: {}", e);
@@ -3666,6 +3667,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 &chat_history,
                 &mut coordinator_state,
                 None,
+                0,
                 Some(&event_tx),
             )
             .await?;
@@ -4029,6 +4031,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 chat_history,
                 coordinator_state,
                 Some(&post_execute_ctx),
+                1,
                 Some(event_tx),
             )
             .await;

@@ -519,7 +519,16 @@ impl ExecutionPersistence {
     }
 
     /// Write planning phase artifacts (coordinator prompt/response).
-    pub async fn write_planning_phase(&self, prompt: &str, response: &str) -> io::Result<PathBuf> {
+    ///
+    /// `phase_index` distinguishes multiple coordinator calls within one
+    /// iteration (e.g. `0` for initial planning, `1` for the post-execution
+    /// continuation decision) so successive calls don't overwrite one another.
+    pub async fn write_planning_phase(
+        &self,
+        phase_index: usize,
+        prompt: &str,
+        response: &str,
+    ) -> io::Result<PathBuf> {
         if !self.enabled {
             return Ok(PathBuf::new());
         }
@@ -527,8 +536,16 @@ impl ExecutionPersistence {
         let iter_path = self.iteration_path();
         fs::create_dir_all(&iter_path).await?;
 
-        fs::write(iter_path.join("planning.prompt.txt"), prompt).await?;
-        fs::write(iter_path.join("planning.response.txt"), response).await?;
+        fs::write(
+            iter_path.join(format!("planning.{phase_index}.prompt.txt")),
+            prompt,
+        )
+        .await?;
+        fs::write(
+            iter_path.join(format!("planning.{phase_index}.response.txt")),
+            response,
+        )
+        .await?;
 
         Ok(iter_path)
     }
@@ -1217,6 +1234,79 @@ mod tests {
         assert_eq!(persistence.current_iteration(), 1);
         assert_eq!(persistence.start_new_iteration(), 2);
         assert_eq!(persistence.current_iteration(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_write_planning_phase_indexed_files() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut persistence = ExecutionPersistence::new(temp_dir.path().join("memory"), None)
+            .await
+            .unwrap();
+
+        // Two coordinator phases in the same iteration must not overwrite
+        // one another.
+        persistence
+            .write_planning_phase(0, "initial-prompt", "initial-response")
+            .await
+            .unwrap();
+        persistence
+            .write_planning_phase(1, "continuation-prompt", "continuation-response")
+            .await
+            .unwrap();
+
+        let iter1 = persistence.iteration_path();
+        assert_eq!(
+            tokio::fs::read_to_string(iter1.join("planning.0.prompt.txt"))
+                .await
+                .unwrap(),
+            "initial-prompt",
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(iter1.join("planning.0.response.txt"))
+                .await
+                .unwrap(),
+            "initial-response",
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(iter1.join("planning.1.prompt.txt"))
+                .await
+                .unwrap(),
+            "continuation-prompt",
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(iter1.join("planning.1.response.txt"))
+                .await
+                .unwrap(),
+            "continuation-response",
+        );
+
+        // The legacy unindexed filenames must not appear.
+        assert!(!iter1.join("planning.prompt.txt").exists());
+        assert!(!iter1.join("planning.response.txt").exists());
+
+        // A new iteration gets its own directory, so `phase_index = 0` starts
+        // fresh without colliding with the previous iteration's files.
+        persistence.start_new_iteration();
+        persistence
+            .write_planning_phase(0, "iter2-prompt", "iter2-response")
+            .await
+            .unwrap();
+
+        let iter2 = persistence.iteration_path();
+        assert_ne!(iter1, iter2);
+        assert_eq!(
+            tokio::fs::read_to_string(iter2.join("planning.0.prompt.txt"))
+                .await
+                .unwrap(),
+            "iter2-prompt",
+        );
+        // Previous iteration's artifacts remain intact.
+        assert_eq!(
+            tokio::fs::read_to_string(iter1.join("planning.0.prompt.txt"))
+                .await
+                .unwrap(),
+            "initial-prompt",
+        );
     }
 
     #[tokio::test]
