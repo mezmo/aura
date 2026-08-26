@@ -486,7 +486,13 @@ impl HeldLock {
             });
         }
         let path = crate::epoch::epoch_dir(&self.session_root, self.epoch);
-        if let Err(cause) = tokio::fs::create_dir(&path).await {
+        if let Err(cause) = create_epoch_dir_with_cure(
+            || tokio::fs::create_dir(&path),
+            self.repair_lane(),
+            self.session_root(),
+        )
+        .await
+        {
             return Err(CreateRunError::Create { cause, lock: self });
         }
         if capability.assert_live().is_err() {
@@ -521,6 +527,36 @@ impl HeldLock {
             quarantine: Ok(()),
             release,
         }
+    }
+}
+
+/// Try `create`; on `EROFS`, escalate through `repair` (`force_cure` on
+/// `session_root`) and retry `create` once. A missing repair lane (local
+/// mode), any non-`EROFS` error, or any error on the retry (including a
+/// second `EROFS`) propagates without a further cure or retry — the cure
+/// runs at most once per call, regardless of whether it itself succeeds.
+async fn create_epoch_dir_with_cure<C, Fut>(
+    mut create: C,
+    repair: Option<&Arc<dyn RepairLane>>,
+    session_root: &Path,
+) -> Result<(), std::io::Error>
+where
+    C: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(), std::io::Error>>,
+{
+    match create().await {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::ReadOnlyFilesystem => {
+            let Some(repair) = repair else {
+                return Err(err);
+            };
+            // A failed cure is not distinguished from a successful one:
+            // the retry runs either way, and its own outcome is what
+            // propagates.
+            let _ = repair.force_cure(session_root).await;
+            create().await
+        }
+        Err(err) => Err(err),
     }
 }
 
@@ -1673,5 +1709,146 @@ mod tests {
             run_dir.exists(),
             "an indeterminate commit never quarantines the maybe-referenced run"
         );
+    }
+
+    use async_trait::async_trait;
+    use std::io::{Error as IoError, ErrorKind};
+
+    /// A [`RepairLane`] double that only ever fields `force_cure` calls;
+    /// `create_epoch_dir_with_cure` never calls `refresh_dir`, so reaching
+    /// it here is a test bug, not a real code path. The call count lives
+    /// behind a shared `Arc` so the test retains a handle after the lane
+    /// is erased to `Arc<dyn RepairLane>`.
+    struct RecordingRepairLane {
+        force_cure_calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl RepairLane for RecordingRepairLane {
+        async fn refresh_dir(&self, _dir: &Path) -> Result<(), crate::repair::RepairError> {
+            unreachable!("create_run's cure path escalates only through force_cure")
+        }
+
+        async fn force_cure(&self, _dir: &Path) -> Result<(), crate::repair::RepairError> {
+            self.force_cure_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// Replays a fixed script of outcomes for `create_epoch_dir_with_cure`'s
+    /// injected `create` op: `Some(kind)` errors with that kind, `None`
+    /// succeeds. Exhausting the script panics — no golden here drives
+    /// `create` more times than it scripts.
+    struct ScriptedCreate {
+        script: std::sync::Mutex<std::collections::VecDeque<Option<ErrorKind>>>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ScriptedCreate {
+        fn new(script: impl IntoIterator<Item = Option<ErrorKind>>) -> Self {
+            Self {
+                script: std::sync::Mutex::new(script.into_iter().collect()),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        async fn call(&self) -> Result<(), IoError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match self
+                .script
+                .lock()
+                .expect("script mutex poisoned")
+                .pop_front()
+                .expect("create called more times than scripted")
+            {
+                Some(kind) => Err(IoError::from(kind)),
+                None => Ok(()),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn create_run_erofs_cures_once_then_succeeds() {
+        let force_cure_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let repair: Arc<dyn RepairLane> = Arc::new(RecordingRepairLane {
+            force_cure_calls: force_cure_calls.clone(),
+        });
+        let create = ScriptedCreate::new([Some(ErrorKind::ReadOnlyFilesystem), None]);
+        let root = tempfile::tempdir().expect("temp root");
+
+        let result = create_epoch_dir_with_cure(|| create.call(), Some(&repair), root.path()).await;
+
+        assert!(result.is_ok(), "the cured retry succeeds");
+        assert_eq!(
+            force_cure_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "force_cure runs exactly once"
+        );
+        assert_eq!(create.call_count(), 2, "create runs exactly twice");
+    }
+
+    #[tokio::test]
+    async fn create_run_erofs_twice_fails_loud() {
+        let force_cure_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let repair: Arc<dyn RepairLane> = Arc::new(RecordingRepairLane {
+            force_cure_calls: force_cure_calls.clone(),
+        });
+        let create = ScriptedCreate::new([
+            Some(ErrorKind::ReadOnlyFilesystem),
+            Some(ErrorKind::ReadOnlyFilesystem),
+        ]);
+        let root = tempfile::tempdir().expect("temp root");
+
+        let err = create_epoch_dir_with_cure(|| create.call(), Some(&repair), root.path())
+            .await
+            .expect_err("a second EROFS on the retry fails loud");
+
+        assert_eq!(err.kind(), ErrorKind::ReadOnlyFilesystem);
+        assert_eq!(
+            force_cure_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the cure never runs a second time"
+        );
+        assert_eq!(create.call_count(), 2, "no third create past the one retry");
+    }
+
+    #[tokio::test]
+    async fn create_run_erofs_local_no_cure_fails_loud() {
+        let create = ScriptedCreate::new([Some(ErrorKind::ReadOnlyFilesystem)]);
+        let root = tempfile::tempdir().expect("temp root");
+
+        let err = create_epoch_dir_with_cure(|| create.call(), None, root.path())
+            .await
+            .expect_err("local mode has no lane to cure with");
+
+        assert_eq!(err.kind(), ErrorKind::ReadOnlyFilesystem);
+        assert_eq!(create.call_count(), 1, "no retry without a repair lane");
+    }
+
+    #[tokio::test]
+    async fn create_run_non_erofs_no_cure() {
+        let force_cure_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let repair: Arc<dyn RepairLane> = Arc::new(RecordingRepairLane {
+            force_cure_calls: force_cure_calls.clone(),
+        });
+        let create = ScriptedCreate::new([Some(ErrorKind::PermissionDenied)]);
+        let root = tempfile::tempdir().expect("temp root");
+
+        let err = create_epoch_dir_with_cure(|| create.call(), Some(&repair), root.path())
+            .await
+            .expect_err("a non-EROFS error is never cured");
+
+        assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+        assert_eq!(
+            force_cure_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the cure never runs for a non-EROFS error"
+        );
+        assert_eq!(create.call_count(), 1, "no retry for a non-EROFS error");
     }
 }
