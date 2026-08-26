@@ -3,13 +3,11 @@
 // - active_turn_abort_reports_cleanup: Type-to-business-rule map: ActiveTurn::abort
 // - barrier_payload_step_first_then_authorizes: Type-to-business-rule map: CommittingTurn::barrier
 // - barrier_failed_payload_quarantines: Type-to-business-rule map: BarrierError::CommitFailed
-// - barrier_park_derives_latch: Type-to-business-rule map: TurnEnd / ParkLatch
+// - barrier_park_authorizes: Type-to-business-rule map: CommittingTurn::barrier
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use session_guard::{
-    CommitKind, IdleRequest, PodId, SessionId, TurnId, build_admission,
-};
+use session_guard::{CommitKind, IdleRequest, PodId, SessionId, TurnId, build_admission};
 
 fn assert_clean_admission_env() {
     for var in [
@@ -37,13 +35,15 @@ fn expect_todo_panic_with_domino(
     if result.is_ok() {
         return;
     }
-    let upstream = result
-        .unwrap_err()
-        .downcast_ref::<&str>()
-        .map(|s| (*s).to_string())
+    let payload = result.unwrap_err();
+    let upstream = payload
+        .downcast_ref::<String>()
+        .map(|s| s.as_str().to_string())
+        .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
         .unwrap_or_default();
     panic!(
-        "frame {frame}: waits todo!(): {target} (fill {fill}); upstream domino: {upstream}"
+        "frame {}: waits todo!(): {} (fill {}); upstream domino: {}",
+        frame, target, fill, upstream
     );
 }
 
@@ -196,7 +196,7 @@ fn barrier_failed_payload_quarantines() {
 }
 
 #[test]
-fn barrier_park_derives_latch() {
+fn barrier_park_authorizes() {
     assert_clean_admission_env();
     let result = catch_unwind(AssertUnwindSafe(|| {
         let rt = tokio::runtime::Runtime::new().expect("runtime");
@@ -228,7 +228,7 @@ fn barrier_park_derives_latch() {
     }));
     expect_todo_panic_with_domino(
         result,
-        "barrier_park_derives_latch",
+        "barrier_park_authorizes",
         "CommittingTurn::barrier",
         "u7",
     );

@@ -1,23 +1,24 @@
-error[E0433]: cannot find `SelfFenceDeadline` in `session_guard`
- --> tests/compilefail/self_fence_deadline.rs:4:28
+error[E0603]: module `lease` is private
+ --> tests/compilefail/self_fence_deadline.rs:6:28
   |
-4 |     let _ = session_guard::SelfFenceDeadline::fenced;
-  |                            ^^^^^^^^^^^^^^^^^ could not find `SelfFenceDeadline` in `session_guard`
+6 |     let _ = session_guard::lease::SelfFenceDeadline::fenced;
+  |                            ^^^^^  ----------------- struct `SelfFenceDeadline` is not publicly re-exported
+  |                            |
+  |                            private module
   |
-help: a struct with a similar name exists
+note: the module `lease` is defined here
+ --> src/lib.rs
   |
-4 -     let _ = session_guard::SelfFenceDeadline::fenced;
-4 +     let _ = session_guard::SelfFenceMargin::fenced;
-  |
+  | mod lease;
+  | ^^^^^^^^^
 
-error[E0433]: cannot find `SelfFenceDeadline` in `session_guard`
- --> tests/compilefail/self_fence_deadline.rs:5:28
+error[E0624]: associated function `fenced` is private
+ --> tests/compilefail/self_fence_deadline.rs:6:54
   |
-5 |     let _ = session_guard::SelfFenceDeadline::anchor_at;
-  |                            ^^^^^^^^^^^^^^^^^ could not find `SelfFenceDeadline` in `session_guard`
+6 |     let _ = session_guard::lease::SelfFenceDeadline::fenced;
+  |                                                      ^^^^^^ private associated function
   |
-help: a struct with a similar name exists
+ ::: src/lease.rs
   |
-5 -     let _ = session_guard::SelfFenceDeadline::anchor_at;
-5 +     let _ = session_guard::SelfFenceMargin::anchor_at;
-  |
+  |     pub(crate) fn fenced(granted_at: Instant, ttl: LeaseTtl, margin: SelfFenceMargin) -> Self {
+  |     ----------------------------------------------------------------------------------------- private associated function defined here

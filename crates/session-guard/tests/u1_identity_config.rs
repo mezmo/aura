@@ -13,7 +13,7 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use session_guard::{
-    AdmissionEnv, AdmissionMode, HolderId, OpId, PodId, PgUrl, SessionId, TurnId, build_admission,
+    AdmissionEnv, AdmissionMode, HolderId, OpId, PgUrl, PodId, SessionId, TurnId, build_admission,
 };
 
 fn assert_clean_admission_env() {
@@ -54,13 +54,15 @@ fn expect_todo_panic_with_domino(
     if result.is_ok() {
         return;
     }
-    let upstream = result
-        .unwrap_err()
-        .downcast_ref::<&str>()
-        .map(|s| (*s).to_string())
+    let payload = result.unwrap_err();
+    let upstream = payload
+        .downcast_ref::<String>()
+        .map(|s| s.as_str().to_string())
+        .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
         .unwrap_or_default();
     panic!(
-        "frame {frame}: waits todo!(): {target} (fill {fill}); upstream domino: {upstream}"
+        "frame {}: waits todo!(): {} (fill {}); upstream domino: {}",
+        frame, target, fill, upstream
     );
 }
 
@@ -149,5 +151,10 @@ fn build_admission_off_dispatch() {
         let _admission = build_admission(&env, root.path().to_path_buf(), pod)
             .expect("factory dispatches off mode to a LocalAdmission");
     }));
-    expect_todo_panic_with_domino(result, "build_admission_off_dispatch", "build_admission", "u1");
+    expect_todo_panic_with_domino(
+        result,
+        "build_admission_off_dispatch",
+        "build_admission",
+        "u1",
+    );
 }

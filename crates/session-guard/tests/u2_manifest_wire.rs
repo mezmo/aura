@@ -9,9 +9,17 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use session_guard::{ArtifactPath, Digest, Epoch, Manifest};
 
+fn todo_message(payload: &dyn std::any::Any) -> String {
+    payload
+        .downcast_ref::<String>()
+        .map(|s| s.clone())
+        .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
+        .unwrap_or_default()
+}
+
 fn expect_todo_panic(result: Result<(), Box<dyn std::any::Any + Send>>) {
     if let Err(payload) = result {
-        let msg = payload.downcast_ref::<&str>().unwrap_or(&"");
+        let msg = todo_message(&*payload);
         assert!(msg.contains("fill:"), "unexpected panic: {msg:?}");
         panic!("waits todo!(): {msg}");
     }
@@ -52,8 +60,8 @@ fn digest_from_hex_rules() {
 #[test]
 fn manifest_serde_empty_fresh_row() {
     // wire-pin: green by design (existing derive), not a frame
-    let manifest: Manifest = serde_json::from_str("{}")
-        .expect("fresh-row '{}' jsonb deserializes to empty manifest");
+    let manifest: Manifest =
+        serde_json::from_str("{}").expect("fresh-row '{}' jsonb deserializes to empty manifest");
     assert!(manifest.is_empty());
     assert_eq!(serde_json::to_string(&manifest).unwrap(), "{}");
 }

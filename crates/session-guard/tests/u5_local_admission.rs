@@ -34,13 +34,15 @@ fn expect_todo_panic_with_domino(
     if result.is_ok() {
         return;
     }
-    let upstream = result
-        .unwrap_err()
-        .downcast_ref::<&str>()
-        .map(|s| (*s).to_string())
+    let payload = result.unwrap_err();
+    let upstream = payload
+        .downcast_ref::<String>()
+        .map(|s| s.as_str().to_string())
+        .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
         .unwrap_or_default();
     panic!(
-        "frame {frame}: waits todo!(): {target} (fill {fill}); upstream domino: {upstream}"
+        "frame {}: waits todo!(): {} (fill {}); upstream domino: {}",
+        frame, target, fill, upstream
     );
 }
 
@@ -59,7 +61,10 @@ fn local_admission_admit_and_locate() {
                 session: SessionId::parse("s1").expect("session id parses"),
                 turn: TurnId::new(),
             };
-            let lock = admission.admit(req).await.expect("local admission grants the claim");
+            let lock = admission
+                .admit(req)
+                .await
+                .expect("local admission grants the claim");
             assert_eq!(lock.holder_view().locality(), Locality::Here);
             assert_eq!(lock.lease_state(), LeaseState::Live);
 

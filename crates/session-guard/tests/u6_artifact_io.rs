@@ -1,5 +1,5 @@
 // Frames for DESIGN.md sections:
-// - write_artifact_publishes_and_records_delta: Type-to-business-rule map: ActiveTurn::write_artifact
+// - write_artifact_publishes: Type-to-business-rule map: ActiveTurn::write_artifact
 // - write_artifact_rejects_duplicate: Type-to-business-rule map: ArtifactWriteError::Duplicate
 // - write_artifact_rejects_wrong_epoch: Type-to-business-rule map: ArtifactWriteError::WrongEpoch
 // - read_artifact_not_found_after_exhaustion: Type-to-business-rule map: FencedRun::read_artifact
@@ -37,18 +37,20 @@ fn expect_todo_panic_with_domino(
     if result.is_ok() {
         return;
     }
-    let upstream = result
-        .unwrap_err()
-        .downcast_ref::<&str>()
-        .map(|s| (*s).to_string())
+    let payload = result.unwrap_err();
+    let upstream = payload
+        .downcast_ref::<String>()
+        .map(|s| s.as_str().to_string())
+        .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
         .unwrap_or_default();
     panic!(
-        "frame {frame}: waits todo!(): {target} (fill {fill}); upstream domino: {upstream}"
+        "frame {}: waits todo!(): {} (fill {}); upstream domino: {}",
+        frame, target, fill, upstream
     );
 }
 
 #[test]
-fn write_artifact_publishes_and_records_delta() {
+fn write_artifact_publishes() {
     assert_clean_admission_env();
     let result = catch_unwind(AssertUnwindSafe(|| {
         let rt = tokio::runtime::Runtime::new().expect("runtime");
@@ -85,7 +87,7 @@ fn write_artifact_publishes_and_records_delta() {
     }));
     expect_todo_panic_with_domino(
         result,
-        "write_artifact_publishes_and_records_delta",
+        "write_artifact_publishes",
         "ActiveTurn::write_artifact",
         "u6",
     );
