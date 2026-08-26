@@ -306,21 +306,20 @@ impl DecisionRoute {
                 .await;
 
                 let mut outcome = handle.outcome(cancel).await;
-                if matches!(
-                    outcome,
-                    ApprovalOutcome::TimedOut { .. } | ApprovalOutcome::Cancelled(_)
-                ) {
-                    registry.remove(&decision_id).await;
-                }
+                let timed_out = matches!(outcome, ApprovalOutcome::TimedOut { .. });
                 // The deadline backstop consults the store before failing
                 // closed: a decision durably recorded but whose wake was lost
-                // (down to the final poll gap) still takes effect.
-                // Cancellation deliberately does not — a disconnected request
-                // must not execute a buffered approval.
-                if matches!(outcome, ApprovalOutcome::TimedOut { .. })
-                    && let Some(decision) = registry.recorded_decision(&decision_id).await
+                // (down to the final poll gap) still takes effect. The read
+                // precedes the removal because removing a parked record also
+                // drops its recorded decision. Cancellation deliberately does
+                // not consult the store — a disconnected request must not
+                // execute a buffered approval.
+                if timed_out && let Some(decision) = registry.recorded_decision(&decision_id).await
                 {
                     outcome = ApprovalOutcome::Decided(decision);
+                }
+                if timed_out || matches!(outcome, ApprovalOutcome::Cancelled(_)) {
+                    registry.remove(&decision_id).await;
                 }
 
                 let completed_event =
