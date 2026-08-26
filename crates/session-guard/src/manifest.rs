@@ -52,12 +52,49 @@ impl ArtifactPath {
     /// # Errors
     /// [`InvalidArtifactPath`] when the path is not epoch-qualified or
     /// contains a forbidden component.
-    #[expect(
-        unused_variables,
-        reason = "todo!() body; filled by aura #421 follow-up"
-    )]
     pub fn parse(raw: &str) -> Result<Self, InvalidArtifactPath> {
-        todo!("fill: epoch-qualified relative-path rules + prefix parse; aura #421 follow-up")
+        if raw.is_empty() {
+            return Err(InvalidArtifactPath {
+                reason: "empty path".into(),
+            });
+        }
+        if raw.contains('\\') {
+            return Err(InvalidArtifactPath {
+                reason: "backslash separator".into(),
+            });
+        }
+        let mut segments = raw.split('/');
+        let first = segments.next().unwrap_or_default();
+        let digits = first.strip_prefix('e').ok_or_else(|| InvalidArtifactPath {
+            reason: "path must be epoch-qualified (e{k}/...)".into(),
+        })?;
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(InvalidArtifactPath {
+                reason: "epoch prefix must be e{digits}".into(),
+            });
+        }
+        let k = digits.parse::<u64>().map_err(|_| InvalidArtifactPath {
+            reason: "epoch prefix out of range".into(),
+        })?;
+        let epoch = Epoch::from_raw(k).ok_or_else(|| InvalidArtifactPath {
+            reason: "epoch 0 is unreachable".into(),
+        })?;
+        for segment in segments {
+            if segment.is_empty() {
+                return Err(InvalidArtifactPath {
+                    reason: "empty path segment".into(),
+                });
+            }
+            if segment == "." || segment == ".." {
+                return Err(InvalidArtifactPath {
+                    reason: "dot component".into(),
+                });
+            }
+        }
+        Ok(Self {
+            raw: raw.to_string(),
+            epoch,
+        })
     }
 
     /// The epoch prefix the path was parsed from (`e{k}/...` → `k`).
@@ -125,6 +162,16 @@ pub struct InvalidDigest {
     pub reason: String,
 }
 
+/// The value of a single hex digit, either case.
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
 impl Digest {
     /// Wrap an already-computed digest.
     #[must_use]
@@ -142,12 +189,23 @@ impl Digest {
     ///
     /// # Errors
     /// [`InvalidDigest`] when the string is not 64 lowercase hex digits.
-    #[expect(
-        unused_variables,
-        reason = "todo!() body; filled by aura #421 follow-up"
-    )]
     pub fn from_hex(raw: &str) -> Result<Self, InvalidDigest> {
-        todo!("fill: hex decode; aura #421 follow-up")
+        if raw.len() != 64 {
+            return Err(InvalidDigest {
+                reason: "digest must be exactly 64 hex chars".into(),
+            });
+        }
+        let mut bytes = [0u8; 32];
+        for (i, chunk) in raw.as_bytes().chunks(2).enumerate() {
+            let hi = hex_val(chunk[0]).ok_or_else(|| InvalidDigest {
+                reason: "non-hex character".into(),
+            })?;
+            let lo = hex_val(chunk[1]).ok_or_else(|| InvalidDigest {
+                reason: "non-hex character".into(),
+            })?;
+            bytes[i] = (hi << 4) | lo;
+        }
+        Ok(Self(bytes))
     }
 }
 
