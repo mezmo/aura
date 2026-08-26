@@ -293,3 +293,228 @@ WHERE session_id = $1";
 pub(crate) const S6_LOCATE: &str = "
 SELECT holder_pod, lease_expires_at FROM session_claims
 WHERE session_id = $1 AND lease_expires_at > clock_timestamp()";
+
+#[cfg(test)]
+pub(crate) mod scripted {
+    //! A scripted [`ClaimStore`] double for the turn-lifecycle tests: one
+    //! outcome queue per method, replayed in call order. P28/P31 drive the
+    //! turn chain against it without a database.
+
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    use async_trait::async_trait;
+
+    use super::{
+        ClaimRef, ClaimRequest, ClaimStore, CommitDisposition, CommitOutcome, HeartbeatOutcome,
+        LeaseTtl, OpId, ParkLatch, PodId, ReleaseOutcome, SessionId, StoreUnavailable,
+    };
+    use crate::claim::{ClaimOutcome, HolderView};
+    use crate::manifest::Manifest;
+
+    /// A [`ClaimStore`] whose every method pops its own pre-scripted
+    /// outcome queue. Interior-mutable so the `&self` trait methods can
+    /// advance their queues.
+    #[derive(Default)]
+    pub(crate) struct ScriptedStore {
+        claims: Mutex<VecDeque<Result<ClaimOutcome, StoreUnavailable>>>,
+        heartbeats: Mutex<VecDeque<Result<HeartbeatOutcome, StoreUnavailable>>>,
+        commits: Mutex<VecDeque<Result<CommitOutcome, StoreUnavailable>>>,
+        releases: Mutex<VecDeque<Result<ReleaseOutcome, StoreUnavailable>>>,
+        pod_releases: Mutex<VecDeque<Result<u64, StoreUnavailable>>>,
+        reconciles: Mutex<VecDeque<Result<CommitDisposition, StoreUnavailable>>>,
+        locates: Mutex<VecDeque<Result<Option<HolderView>, StoreUnavailable>>>,
+    }
+
+    impl ScriptedStore {
+        pub(crate) fn script_claim(&self, outcome: Result<ClaimOutcome, StoreUnavailable>) {
+            self.claims.lock().expect("claims").push_back(outcome);
+        }
+
+        pub(crate) fn script_heartbeat(&self, outcome: Result<HeartbeatOutcome, StoreUnavailable>) {
+            self.heartbeats
+                .lock()
+                .expect("heartbeats")
+                .push_back(outcome);
+        }
+
+        pub(crate) fn script_commit(&self, outcome: Result<CommitOutcome, StoreUnavailable>) {
+            self.commits.lock().expect("commits").push_back(outcome);
+        }
+
+        pub(crate) fn script_release(&self, outcome: Result<ReleaseOutcome, StoreUnavailable>) {
+            self.releases.lock().expect("releases").push_back(outcome);
+        }
+
+        pub(crate) fn script_release_pod(&self, outcome: Result<u64, StoreUnavailable>) {
+            self.pod_releases
+                .lock()
+                .expect("pod releases")
+                .push_back(outcome);
+        }
+
+        pub(crate) fn script_reconcile(
+            &self,
+            outcome: Result<CommitDisposition, StoreUnavailable>,
+        ) {
+            self.reconciles
+                .lock()
+                .expect("reconciles")
+                .push_back(outcome);
+        }
+
+        pub(crate) fn script_locate(&self, outcome: Result<Option<HolderView>, StoreUnavailable>) {
+            self.locates.lock().expect("locates").push_back(outcome);
+        }
+    }
+
+    fn next<T>(queue: &Mutex<VecDeque<T>>, method: &str) -> T {
+        queue
+            .lock()
+            .expect("scripted queue mutex")
+            .pop_front()
+            .unwrap_or_else(|| panic!("scripted store: {method} queue exhausted"))
+    }
+
+    #[async_trait]
+    impl ClaimStore for ScriptedStore {
+        async fn claim(&self, _req: &ClaimRequest) -> Result<ClaimOutcome, StoreUnavailable> {
+            next(&self.claims, "claim")
+        }
+
+        async fn heartbeat(
+            &self,
+            _claim: &ClaimRef,
+            _ttl: LeaseTtl,
+        ) -> Result<HeartbeatOutcome, StoreUnavailable> {
+            next(&self.heartbeats, "heartbeat")
+        }
+
+        async fn commit(
+            &self,
+            _claim: &ClaimRef,
+            _latch: ParkLatch,
+            _op: OpId,
+            _manifest: &Manifest,
+        ) -> Result<CommitOutcome, StoreUnavailable> {
+            next(&self.commits, "commit")
+        }
+
+        async fn release(&self, _claim: &ClaimRef) -> Result<ReleaseOutcome, StoreUnavailable> {
+            next(&self.releases, "release")
+        }
+
+        async fn release_pod(&self, _pod: &PodId) -> Result<u64, StoreUnavailable> {
+            next(&self.pod_releases, "release_pod")
+        }
+
+        async fn reconcile_commit(
+            &self,
+            _claim: &ClaimRef,
+            _op: OpId,
+        ) -> Result<CommitDisposition, StoreUnavailable> {
+            next(&self.reconciles, "reconcile_commit")
+        }
+
+        async fn locate(
+            &self,
+            _session: &SessionId,
+        ) -> Result<Option<HolderView>, StoreUnavailable> {
+            next(&self.locates, "locate")
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::time::Duration;
+
+        use super::*;
+        use crate::claim::{BusyClaim, ParkedClaim};
+        use crate::epoch::Epoch;
+        use crate::identity::{HolderId, TurnId};
+
+        fn session() -> SessionId {
+            SessionId::parse("scripted-session").expect("valid session id")
+        }
+
+        fn pod() -> PodId {
+            PodId::parse("scripted-pod").expect("valid pod id")
+        }
+
+        fn ttl() -> LeaseTtl {
+            LeaseTtl::new(Duration::from_secs(15)).expect("non-zero ttl")
+        }
+
+        fn request() -> ClaimRequest {
+            ClaimRequest {
+                session: session(),
+                turn: TurnId::new(),
+                holder: HolderId::mint(),
+                pod: pod(),
+                ttl: ttl(),
+            }
+        }
+
+        fn claim_ref() -> ClaimRef {
+            ClaimRef {
+                session: session(),
+                turn: TurnId::new(),
+                epoch: Epoch::initial(),
+                holder: HolderId::mint(),
+            }
+        }
+
+        #[tokio::test]
+        async fn replays_each_method_queue_in_order() {
+            let store = ScriptedStore::default();
+            store.script_claim(Ok(ClaimOutcome::Busy(BusyClaim {
+                holder: HolderView::here(pod()),
+                retry_after: Duration::from_millis(1),
+            })));
+            store.script_claim(Ok(ClaimOutcome::Parked(ParkedClaim {
+                turn: TurnId::new(),
+            })));
+            store.script_heartbeat(Ok(HeartbeatOutcome::Lost));
+            store.script_commit(Ok(CommitOutcome::Committed));
+            store.script_release(Ok(ReleaseOutcome::Released));
+            store.script_release_pod(Ok(3));
+            store.script_reconcile(Ok(CommitDisposition::Applied));
+            store.script_locate(Ok(None));
+
+            let req = request();
+            let claim = claim_ref();
+
+            // The claim queue's two outcomes replay in the scripted order.
+            assert!(matches!(store.claim(&req).await, Ok(ClaimOutcome::Busy(_))));
+            assert!(matches!(
+                store.claim(&req).await,
+                Ok(ClaimOutcome::Parked(_))
+            ));
+            assert!(matches!(
+                store.heartbeat(&claim, ttl()).await,
+                Ok(HeartbeatOutcome::Lost)
+            ));
+            assert!(matches!(
+                store
+                    .commit(
+                        &claim,
+                        ParkLatch::NotParked,
+                        OpId::mint(),
+                        &Manifest::empty()
+                    )
+                    .await,
+                Ok(CommitOutcome::Committed)
+            ));
+            assert!(matches!(
+                store.release(&claim).await,
+                Ok(ReleaseOutcome::Released)
+            ));
+            assert!(matches!(store.release_pod(&pod()).await, Ok(3)));
+            assert!(matches!(
+                store.reconcile_commit(&claim, OpId::mint()).await,
+                Ok(CommitDisposition::Applied)
+            ));
+            assert!(matches!(store.locate(&session()).await, Ok(None)));
+        }
+    }
+}
