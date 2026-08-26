@@ -100,9 +100,10 @@ impl PgUrl {
             ));
         }
         if !(raw.starts_with("postgres://") || raw.starts_with("postgresql://")) {
-            return Err(AdmissionConfigError(format!(
+            return Err(AdmissionConfigError(
                 "AURA_SESSION_ADMISSION_PG_URL must use the postgres:// or postgresql:// scheme"
-            )));
+                    .to_string(),
+            ));
         }
         Ok(Self(raw.to_string()))
     }
@@ -467,6 +468,10 @@ fn parse_millis(name: &str, raw: Option<&str>, default: u64) -> Result<u64, Admi
 mod tests {
     use super::*;
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "test helper mirrors the eight env vars"
+    )]
     fn values(
         mode: Option<&'static str>,
         pg_url: Option<&'static str>,
