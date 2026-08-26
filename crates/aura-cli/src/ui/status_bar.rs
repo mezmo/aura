@@ -137,10 +137,11 @@ fn capture_snapshot() -> Snapshot {
     } else {
         None
     };
-    // In an orchestrated conversation aura.usage is the sum of every
-    // planning, worker, and synthesis call, not any one context, so there is
-    // no single figure to show. Otherwise show the count once something has
-    // been reported, with the meter when the model's window is known.
+    // In an orchestrated conversation the mid-turn aura.tool_usage readings
+    // come from every worker as well as the coordinator (the event carries no
+    // agent id), so there is no single context to show. Otherwise show the
+    // count once something has been reported, with the meter when the
+    // model's window is known.
     let used = CONTEXT_USED.load(Ordering::Relaxed);
     let limit = NonZeroU64::new(MODEL_CONTEXT_LIMIT.load(Ordering::Relaxed));
     let context = if ORCHESTRATED.load(Ordering::Relaxed) || (used == 0 && limit.is_none()) {
