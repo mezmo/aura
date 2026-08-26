@@ -94,11 +94,23 @@ impl ApprovalStore for InMemoryApprovalStore {
     async fn resolve_durable(
         &self,
         id: &DecisionId,
-        _decision: ApprovalDecision,
+        decision: ApprovalDecision,
     ) -> Result<WakeReason, ResolveError> {
-        if !self.lock().contains_key(id) {
-            return Err(ResolveError::NotFound);
-        }
+        // The parked record stays for park-restart replay (P7's contract),
+        // and the decision lands in the decided map so main's `decision()`
+        // read-back and the registry's store-poll wake both observe it
+        // (ab6c4e6b's contract).
+        let expires_at = match self.lock().get(id) {
+            Some(parked) => parked.expires_at,
+            None => return Err(ResolveError::NotFound),
+        };
+        self.lock_decided().insert(
+            *id,
+            DecidedEntry {
+                decision,
+                keep_until: expires_at + chrono::Duration::seconds(DECISION_RETENTION_MARGIN_SECS),
+            },
+        );
         Ok(WakeReason::DecisionResolved {
             decision_id: *id,
             resolved_at: chrono::Utc::now(),
