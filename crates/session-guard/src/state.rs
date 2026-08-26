@@ -38,7 +38,9 @@ use crate::lease::{
 };
 use crate::manifest::{ArtifactPath, DeclareError, Digest, Manifest, ManifestEntry, ReadMiss};
 use crate::repair::RepairLane;
-use crate::store::{ClaimStore, ParkLatch, StoreUnavailable};
+use crate::store::{
+    ClaimRef, ClaimStore, CommitDisposition, CommitOutcome, ParkLatch, StoreUnavailable,
+};
 
 /// The claim's backend services, paired by construction: the pg backend
 /// always brings both its store and its repair lane; local brings
@@ -506,7 +508,19 @@ impl HeldLock {
     /// releases the claim. Both cleanup results are reported; an abort
     /// has no single "failure" to return.
     pub async fn abort(self) -> CleanupOutcome {
-        todo!("fill: lease stop + release, both outcomes reported; aura #421 follow-up")
+        let HeldLock {
+            lease,
+            release,
+            arbiter,
+            ..
+        } = self;
+        // This type retained no run dir, so there is nothing to quarantine;
+        // the claim teardown is the whole of the cleanup.
+        let release = teardown_claim(lease, release, arbiter).await;
+        CleanupOutcome {
+            quarantine: Ok(()),
+            release,
+        }
     }
 }
 
@@ -885,9 +899,23 @@ impl ActiveTurn {
     /// cleanup results are reported; an abort has no single "failure" to
     /// return.
     pub async fn abort(self) -> CleanupOutcome {
-        todo!(
-            "fill: quarantine + lease stop + release, both outcomes reported; aura #421 follow-up"
-        )
+        let FencedRun { lock, run_dir, .. } = self.run;
+        // Nothing committed, so the run's files are unreferenced: remove
+        // them best-effort before tearing the claim down. A removal failure
+        // is reported, not fatal — the files stay debris the next sweep
+        // collects.
+        let quarantine = quarantine_run(&run_dir).await;
+        let HeldLock {
+            lease,
+            release,
+            arbiter,
+            ..
+        } = lock;
+        let release = teardown_claim(lease, release, arbiter).await;
+        CleanupOutcome {
+            quarantine,
+            release,
+        }
     }
 }
 
@@ -1044,10 +1072,6 @@ impl CommittingTurn {
     /// [`BarrierError::Release`] — release failed after a durable
     /// commit; the authorized response travels with the error (data is
     /// durable) and the session is flagged wedged.
-    #[expect(
-        unused_variables,
-        reason = "todo!() body; filled by aura #421 follow-up"
-    )]
     pub async fn barrier<T, E, F, Fut>(
         self,
         payload: F,
@@ -1056,10 +1080,165 @@ impl CommittingTurn {
         F: FnOnce(CommitContext) -> Fut,
         Fut: Future<Output = Result<T, E>>,
     {
-        todo!(
-            "fill: mint OpId → payload(ctx) → take_delta → extend_from → S3 via store (latch from TurnEnd; commit-unknown → reconcile: Applied → proceed, NotApplied → CommitRejected(NotLanded), SupersededUnknown or reconcile-failure → CommitIndeterminate with typed cause, never quarantine) → lease stop → release → response; aura #421 follow-up"
-        )
+        let CommittingTurn { run, end } = self;
+        let delta = run.take_delta();
+        let FencedRun { lock, run_dir, .. } = run;
+        let HeldLock {
+            session,
+            turn,
+            epoch,
+            holder,
+            manifest: base,
+            backend,
+            lease,
+            arbiter,
+            release,
+            ..
+        } = lock;
+
+        // One barrier run is one logical commit; every retry of its S3
+        // reuses this id (B3).
+        let op = OpId::mint();
+        let ctx = CommitContext {
+            end,
+            session: session.clone(),
+            turn,
+            epoch,
+            holder,
+            op,
+        };
+
+        // The injected step runs first and produces only the response
+        // payload; its failure aborts before any S3.
+        let payload = match payload(ctx).await {
+            Ok(payload) => payload,
+            Err(error) => {
+                let quarantine = quarantine_run(&run_dir).await;
+                let release = teardown_claim(lease, release, arbiter).await;
+                return Err(BarrierError::CommitFailed {
+                    error,
+                    cleanup: CleanupOutcome {
+                        quarantine,
+                        release,
+                    },
+                });
+            }
+        };
+
+        // Merge the turn's recorded delta into the granted base; a
+        // colliding or misattributed entry fails the commit rather than
+        // replacing committed history.
+        let mut merged = base;
+        if let Err(err) = merged.extend_from(delta) {
+            let quarantine = quarantine_run(&run_dir).await;
+            let release = teardown_claim(lease, release, arbiter).await;
+            return Err(BarrierError::CommitRejected {
+                cause: CommitRejection::Declare(err),
+                cleanup: CleanupOutcome {
+                    quarantine,
+                    release,
+                },
+            });
+        }
+
+        // Commit. Local mode has no cross-instance authority, so the merged
+        // manifest is the commit and S3/reconcile are skipped. Pg mode
+        // issues S3 and, on a lost response, reconciles by read-back.
+        if let Backend::Pg { store, .. } = &backend {
+            let claim_ref = ClaimRef {
+                session: session.clone(),
+                turn,
+                epoch,
+                holder,
+            };
+            match store.commit(&claim_ref, end.latch(), op, &merged).await {
+                Ok(CommitOutcome::Committed) => {}
+                Ok(CommitOutcome::LostFence) => {
+                    let quarantine = quarantine_run(&run_dir).await;
+                    let release = teardown_claim(lease, release, arbiter).await;
+                    return Err(BarrierError::CommitRejected {
+                        cause: CommitRejection::LostFence,
+                        cleanup: CleanupOutcome {
+                            quarantine,
+                            release,
+                        },
+                    });
+                }
+                Err(_unavailable) => {
+                    // Commit-unknown: the S3 response was lost. Reconcile by
+                    // read-back before deciding — never a blind re-commit.
+                    match store.reconcile_commit(&claim_ref, op).await {
+                        Ok(CommitDisposition::Applied) => {}
+                        Ok(CommitDisposition::NotApplied) => {
+                            // Proven never landed: quarantine is safe, nothing
+                            // references the run.
+                            let quarantine = quarantine_run(&run_dir).await;
+                            let release = teardown_claim(lease, release, arbiter).await;
+                            return Err(BarrierError::CommitRejected {
+                                cause: CommitRejection::NotLanded,
+                                cleanup: CleanupOutcome {
+                                    quarantine,
+                                    release,
+                                },
+                            });
+                        }
+                        Ok(CommitDisposition::SupersededUnknown) => {
+                            // Whether S3 landed is unknowable, so the run is
+                            // never quarantined (its bytes may be
+                            // manifest-referenced); release and report lost.
+                            let release = teardown_claim(lease, release, arbiter).await;
+                            return Err(BarrierError::CommitIndeterminate {
+                                cause: IndeterminateCause::SupersededUnknown,
+                                release,
+                            });
+                        }
+                        Err(_reconcile_unavailable) => {
+                            // No view of the row at all; same indeterminate
+                            // rule — never quarantine.
+                            let release = teardown_claim(lease, release, arbiter).await;
+                            return Err(BarrierError::CommitIndeterminate {
+                                cause: IndeterminateCause::ReconcileUnavailable,
+                                release,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // Durable commit: stop the lease, release the claim, then authorize.
+        // A release failure after a durable commit travels with the
+        // authorized response — the data is durable; delivery is the
+        // caller's call.
+        let release = teardown_claim(lease, release, arbiter).await;
+        let response = CommittedResponse::new(payload, session, turn, epoch, holder);
+        match release {
+            Ok(()) => Ok(response),
+            Err(error) => Err(BarrierError::Release { response, error }),
+        }
     }
+}
+
+/// Best-effort removal of a turn's run directory. A failure is reported,
+/// not fatal: the uncommitted files are unreferenced debris the next sweep
+/// collects.
+async fn quarantine_run(run_dir: &Path) -> Result<(), std::io::Error> {
+    tokio::fs::remove_dir_all(run_dir).await
+}
+
+/// Ordered claim teardown: revoke and join the lease first (so every
+/// capability fails closed), then run the release action, then free the
+/// arbiter slot last — the drop-order invariant that keeps another local
+/// request from taking the slot while a capability still reads Live.
+async fn teardown_claim(
+    lease: HeartbeatLease,
+    release: ReleaseAction,
+    arbiter: HeldGuard,
+) -> Result<(), ReleaseError> {
+    lease.stop().await;
+    let released = (release)().await;
+    drop(arbiter);
+    released
 }
 
 /// Why the crate-side commit was rejected *definitely* (the injected
@@ -1284,7 +1463,11 @@ pub enum FenceCause {
 mod tests {
     use super::*;
 
+    use crate::arbiter::SessionArbiter;
     use crate::config::AdmissionEnv;
+    use crate::lease::ClaimLeaseSource;
+    use crate::repair::build_repair_lane;
+    use crate::store::scripted::ScriptedStore;
 
     /// A wrong `write_artifact` that skips the private-delta record still
     /// passes the public publish frame (bytes land on disk); this pins
@@ -1324,5 +1507,171 @@ mod tests {
                 "the recorded delta entry is the returned entry"
             );
         });
+    }
+
+    /// The park latch is derived from the turn end, never supplied. `latch()`
+    /// is what the barrier issues at S3, so pin it against drift.
+    #[test]
+    fn barrier_park_derives_latch() {
+        assert_eq!(TurnEnd::Park.latch(), ParkLatch::Parked);
+        assert_eq!(
+            TurnEnd::Commit(CommitKind::Success).latch(),
+            ParkLatch::NotParked
+        );
+        assert_eq!(
+            TurnEnd::Commit(CommitKind::Clarification).latch(),
+            ParkLatch::NotParked
+        );
+    }
+
+    /// Assemble a Postgres-backed [`CommittingTurn`] over a scripted store,
+    /// so the barrier's S3-and-reconcile branch is exercised without a
+    /// database. The repair lane is never touched on the commit path, so a
+    /// CLI lane over a nonexistent binary is an inert placeholder.
+    fn pg_committing_turn(store: Arc<ScriptedStore>, run_dir: PathBuf) -> CommittingTurn {
+        let session = SessionId::parse("pg-session").expect("session id parses");
+        let turn = TurnId::new();
+        let epoch = Epoch::initial();
+        let holder = HolderId::mint();
+        let pod = PodId::parse("pod-0").expect("pod id parses");
+        let arbiter = SessionArbiter::new()
+            .try_acquire(&session)
+            .expect("fresh arbiter admits")
+            .confirm();
+        let lease = HeartbeatLease::static_from(ClaimLeaseSource {
+            session: session.clone(),
+            turn,
+            epoch,
+            holder,
+        });
+        let session_root = run_dir
+            .parent()
+            .expect("run dir has a session-root parent")
+            .to_path_buf();
+        let store: Arc<dyn ClaimStore> = store;
+        let release: ReleaseAction = Box::new(|| Box::pin(async { Ok(()) }));
+        let lock = HeldLock::from_parts(HeldParts {
+            session,
+            turn,
+            epoch,
+            holder,
+            pod,
+            session_root,
+            manifest: Manifest::empty(),
+            backend: Backend::Pg {
+                store,
+                repair: build_repair_lane(),
+            },
+            propagation_window: Duration::from_millis(0),
+            release,
+            arbiter,
+            lease,
+        });
+        let run = FencedRun {
+            issued: Mutex::new(BTreeSet::new()),
+            delta: Mutex::new(Manifest::empty()),
+            lock,
+            run_dir,
+        };
+        CommittingTurn {
+            run,
+            end: TurnEnd::Commit(CommitKind::Success),
+        }
+    }
+
+    async fn pg_run_dir(root: &std::path::Path) -> PathBuf {
+        let run_dir = root.join("pg-session").join("e1");
+        tokio::fs::create_dir_all(&run_dir)
+            .await
+            .expect("run dir exists");
+        run_dir
+    }
+
+    #[tokio::test]
+    async fn pg_barrier_lost_fence_rejects_and_quarantines() {
+        let root = tempfile::tempdir().expect("temp root");
+        let run_dir = pg_run_dir(root.path()).await;
+        let store = Arc::new(ScriptedStore::default());
+        store.script_commit(Ok(CommitOutcome::LostFence));
+        let committing = pg_committing_turn(store, run_dir.clone());
+        let err = committing
+            .barrier(|_ctx| async move { Ok::<_, &str>("payload") })
+            .await
+            .expect_err("a lost fence rejects the commit");
+        assert!(matches!(
+            err,
+            BarrierError::CommitRejected {
+                cause: CommitRejection::LostFence,
+                ..
+            }
+        ));
+        assert!(!run_dir.exists(), "LostFence quarantines the run dir");
+    }
+
+    #[tokio::test]
+    async fn pg_barrier_commit_unknown_then_applied_authorizes() {
+        let root = tempfile::tempdir().expect("temp root");
+        let run_dir = pg_run_dir(root.path()).await;
+        let store = Arc::new(ScriptedStore::default());
+        store.script_commit(Err(StoreUnavailable::msg("s3 response lost")));
+        store.script_reconcile(Ok(CommitDisposition::Applied));
+        let committing = pg_committing_turn(store, run_dir.clone());
+        let response = committing
+            .barrier(|_ctx| async move { Ok::<_, &str>("payload") })
+            .await
+            .expect("a reconciled-Applied commit-unknown authorizes");
+        let (payload, ..) = response.into_parts();
+        assert_eq!(payload, "payload");
+        assert!(run_dir.exists(), "an applied commit never quarantines");
+    }
+
+    #[tokio::test]
+    async fn pg_barrier_commit_unknown_superseded_is_indeterminate() {
+        let root = tempfile::tempdir().expect("temp root");
+        let run_dir = pg_run_dir(root.path()).await;
+        let store = Arc::new(ScriptedStore::default());
+        store.script_commit(Err(StoreUnavailable::msg("s3 response lost")));
+        store.script_reconcile(Ok(CommitDisposition::SupersededUnknown));
+        let committing = pg_committing_turn(store, run_dir.clone());
+        let err = committing
+            .barrier(|_ctx| async move { Ok::<_, &str>("payload") })
+            .await
+            .expect_err("a superseded-unknown commit is indeterminate");
+        assert!(matches!(
+            err,
+            BarrierError::CommitIndeterminate {
+                cause: IndeterminateCause::SupersededUnknown,
+                ..
+            }
+        ));
+        assert!(
+            run_dir.exists(),
+            "an indeterminate commit never quarantines the maybe-referenced run"
+        );
+    }
+
+    #[tokio::test]
+    async fn pg_barrier_reconcile_unavailable_is_indeterminate() {
+        let root = tempfile::tempdir().expect("temp root");
+        let run_dir = pg_run_dir(root.path()).await;
+        let store = Arc::new(ScriptedStore::default());
+        store.script_commit(Err(StoreUnavailable::msg("s3 response lost")));
+        store.script_reconcile(Err(StoreUnavailable::msg("reconcile read down")));
+        let committing = pg_committing_turn(store, run_dir.clone());
+        let err = committing
+            .barrier(|_ctx| async move { Ok::<_, &str>("payload") })
+            .await
+            .expect_err("a failed reconcile read is indeterminate");
+        assert!(matches!(
+            err,
+            BarrierError::CommitIndeterminate {
+                cause: IndeterminateCause::ReconcileUnavailable,
+                ..
+            }
+        ));
+        assert!(
+            run_dir.exists(),
+            "an indeterminate commit never quarantines the maybe-referenced run"
+        );
     }
 }
