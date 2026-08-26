@@ -36,11 +36,10 @@
 //! Idle ──admit──────────► HeldLock ──create_run──► FencedRun ──activate──► ActiveTurn
 //!  │                        │         (asserts capability, derives e{k}/    │
 //!  ├─busy──► 503           │          from the claim's epoch under the      │
-//!  └─parked──► parked      │          bound session root, creates,          │
-//!      (no retry hint)     │          rechecks; error returns the lock)     ├─complete(CommitKind)─┐
-//!                          └─create_run Err: abort returned lock            ├─park()───────────────┼─► CommittingTurn
-//!                              abandonment (drop revokes)                   └─Failure──► abort     │      barrier(payload(ctx))
-//!                                                                           (no commit)           │         │
+//!  └─parked──► parked      │          bound session root, creates,          ├─complete(CommitKind)─┐
+//!      (no retry hint)     │          rechecks; error returns the lock)     ├─park()───────────────┼─► CommittingTurn
+//!                          └─create_run Err: abort returned lock            └─Failure──► abort     │      barrier(payload(ctx))
+//!                              abandonment (drop revokes)                   (no commit)           │         │
 //!                                                                                               ▼
 //!                                                                                        CommittedResponse
 //! ```
@@ -150,16 +149,31 @@ use crate::identity::PodId as FactoryPodId;
 /// [`AdmissionConfigError`] when the narrowed mode proof is unavailable
 /// for the configured mode (for `pg`: URL missing — though
 /// [`AdmissionEnv::from_env`] rejects that earlier).
-#[expect(
-    unused_variables,
-    reason = "todo!() body; filled by aura #421 follow-up"
-)]
 pub fn build_admission(
     env: &AdmissionEnv,
     root: PathBuf,
     pod: FactoryPodId,
 ) -> Result<Arc<dyn TurnAdmission>, AdmissionConfigError> {
-    todo!("fill: mode dispatch + shared arbiter + repair lane; aura #421 follow-up")
+    let arbiter = crate::arbiter::SessionArbiter::new();
+    match env.mode() {
+        AdmissionMode::Off => {
+            let local = env.local().ok_or_else(|| {
+                AdmissionConfigError("build_admission: local config unavailable".to_string())
+            })?;
+            Ok(Arc::new(LocalAdmission::new(pod, root, arbiter, local)))
+        }
+        AdmissionMode::Pg => {
+            let pg = env.pg().ok_or_else(|| {
+                AdmissionConfigError("build_admission: pg config unavailable".to_string())
+            })?;
+            let store: Arc<dyn crate::store::ClaimStore> =
+                Arc::new(crate::adapters::pg::PgStore::new(pg.pg_url()));
+            let repair = crate::repair::build_repair_lane(pg.repair_lane());
+            Ok(Arc::new(PgAdmission::new(
+                store, pod, root, arbiter, pg, repair,
+            )))
+        }
+    }
 }
 
 /// The port: everything the web server and HITL routing consume. Steals

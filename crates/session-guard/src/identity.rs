@@ -47,12 +47,31 @@ impl SessionId {
     /// # Errors
     /// [`InvalidSessionId`] when the charset, length, or reserved-name
     /// rule fails.
-    #[expect(
-        unused_variables,
-        reason = "todo!() body; filled by aura #421 follow-up"
-    )]
     pub fn parse(raw: &str) -> Result<Self, InvalidSessionId> {
-        todo!("fill: charset/length/reserved rules; aura #421 follow-up")
+        if raw.is_empty() {
+            return Err(InvalidSessionId {
+                reason: "empty session id".to_string(),
+            });
+        }
+        if raw.len() > SESSION_ID_MAX_BYTES {
+            return Err(InvalidSessionId {
+                reason: format!("session id exceeds {SESSION_ID_MAX_BYTES} bytes"),
+            });
+        }
+        if RESERVED_SESSION_IDS.contains(&raw) {
+            return Err(InvalidSessionId {
+                reason: format!("reserved session id {raw:?}"),
+            });
+        }
+        if !raw
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-')
+        {
+            return Err(InvalidSessionId {
+                reason: "session id contains characters outside [A-Za-z0-9._-]".to_string(),
+            });
+        }
+        Ok(Self(raw.to_string()))
     }
 }
 
@@ -89,12 +108,11 @@ impl TurnId {
     ///
     /// # Errors
     /// [`InvalidTurnId`] when the string is not a UUID.
-    #[expect(
-        unused_variables,
-        reason = "todo!() body; filled by aura #421 follow-up"
-    )]
     pub fn parse(raw: &str) -> Result<Self, InvalidTurnId> {
-        todo!("fill: uuid parse; aura #421 follow-up")
+        let uuid = uuid::Uuid::parse_str(raw).map_err(|e| InvalidTurnId {
+            reason: e.to_string(),
+        })?;
+        Ok(Self(uuid))
     }
 }
 
@@ -141,12 +159,35 @@ impl PodId {
     ///
     /// # Errors
     /// [`InvalidPodId`] when the charset or length rule fails.
-    #[expect(
-        unused_variables,
-        reason = "todo!() body; filled by aura #421 follow-up"
-    )]
     pub fn parse(raw: &str) -> Result<Self, InvalidPodId> {
-        todo!("fill: charset/length rules; aura #421 follow-up")
+        if raw.is_empty() {
+            return Err(InvalidPodId {
+                reason: "empty pod id".to_string(),
+            });
+        }
+        if raw.len() > POD_ID_MAX_BYTES {
+            return Err(InvalidPodId {
+                reason: format!("pod id exceeds {POD_ID_MAX_BYTES} bytes"),
+            });
+        }
+        for seg in raw.split('.') {
+            if seg.is_empty() {
+                return Err(InvalidPodId {
+                    reason: "pod id has an empty segment".to_string(),
+                });
+            }
+            if seg.len() > 63 {
+                return Err(InvalidPodId {
+                    reason: "pod id segment exceeds 63 characters".to_string(),
+                });
+            }
+            if !seg.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+                return Err(InvalidPodId {
+                    reason: "pod id contains characters outside [A-Za-z0-9.-]".to_string(),
+                });
+            }
+        }
+        Ok(Self(raw.to_string()))
     }
 
     /// Derive this pod's identity: `AURA_POD_ID` (explicit, fail loud
@@ -156,7 +197,35 @@ impl PodId {
     /// [`InvalidPodId`] when `AURA_POD_ID` is set but invalid, or no
     /// source yields a valid id.
     pub fn from_env() -> Result<Self, InvalidPodId> {
-        todo!("fill: env chain AURA_POD_ID/POD_NAME/HOSTNAME; aura #421 follow-up")
+        Self::from_env_chain(
+            std::env::var("AURA_POD_ID").ok().as_deref(),
+            std::env::var("POD_NAME").ok().as_deref(),
+            std::env::var("HOSTNAME").ok().as_deref(),
+        )
+    }
+
+    /// Resolve a pod id from the three env sources. The first present
+    /// source wins; if it is invalid the error is returned (fail loud,
+    /// no fall-through to a later source). No source present is an error:
+    /// a pod must not be anonymous.
+    pub(crate) fn from_env_chain(
+        aura: Option<&str>,
+        pod_name: Option<&str>,
+        hostname: Option<&str>,
+    ) -> Result<Self, InvalidPodId> {
+        if let Some(v) = aura {
+            return Self::parse(v);
+        }
+        if let Some(v) = pod_name {
+            return Self::parse(v);
+        }
+        if let Some(v) = hostname {
+            return Self::parse(v);
+        }
+        Err(InvalidPodId {
+            reason: "no pod id source: AURA_POD_ID, POD_NAME, and HOSTNAME are all unset"
+                .to_string(),
+        })
     }
 }
 
@@ -191,12 +260,11 @@ impl HolderId {
     ///
     /// # Errors
     /// [`InvalidHolderId`] when the string is not a UUID.
-    #[expect(
-        unused_variables,
-        reason = "todo!() body; filled by aura #421 follow-up"
-    )]
     pub fn parse(raw: &str) -> Result<Self, InvalidHolderId> {
-        todo!("fill: uuid parse; aura #421 follow-up")
+        let uuid = uuid::Uuid::parse_str(raw).map_err(|e| InvalidHolderId {
+            reason: e.to_string(),
+        })?;
+        Ok(Self(uuid))
     }
 }
 
@@ -231,12 +299,11 @@ impl OpId {
     ///
     /// # Errors
     /// [`InvalidOpId`] when the string is not a UUID.
-    #[expect(
-        unused_variables,
-        reason = "todo!() body; filled by aura #421 follow-up"
-    )]
     pub fn parse(raw: &str) -> Result<Self, InvalidOpId> {
-        todo!("fill: uuid parse; aura #421 follow-up")
+        let uuid = uuid::Uuid::parse_str(raw).map_err(|e| InvalidOpId {
+            reason: e.to_string(),
+        })?;
+        Ok(Self(uuid))
     }
 }
 
@@ -251,5 +318,43 @@ pub struct InvalidOpId {
 impl fmt::Display for OpId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn first_present_wins_aura() {
+        let pod = PodId::from_env_chain(Some("aura-1"), Some("pod-1"), Some("host-1"))
+            .expect("aura source wins");
+        assert_eq!(pod.as_ref(), "aura-1");
+    }
+
+    #[test]
+    fn first_present_wins_pod_name() {
+        let pod = PodId::from_env_chain(None, Some("pod-1"), Some("host-1"))
+            .expect("pod name source wins");
+        assert_eq!(pod.as_ref(), "pod-1");
+    }
+
+    #[test]
+    fn first_present_wins_hostname() {
+        let pod = PodId::from_env_chain(None, None, Some("host-1")).expect("hostname source wins");
+        assert_eq!(pod.as_ref(), "host-1");
+    }
+
+    #[test]
+    fn invalid_first_present_fails_loud() {
+        let err = PodId::from_env_chain(Some("bad/name"), Some("pod-1"), Some("host-1"))
+            .expect_err("invalid aura source fails loud, no fall-through");
+        assert!(!err.reason.is_empty());
+    }
+
+    #[test]
+    fn none_present_errors() {
+        let err = PodId::from_env_chain(None, None, None).expect_err("no source is an error");
+        assert!(!err.reason.is_empty());
     }
 }

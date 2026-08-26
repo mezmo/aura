@@ -93,12 +93,18 @@ impl PgUrl {
     /// # Errors
     /// [`AdmissionConfigError`] when the scheme is not a Postgres scheme
     /// or the URL is empty.
-    #[expect(
-        unused_variables,
-        reason = "todo!() body; filled by aura #421 follow-up"
-    )]
     pub fn parse(raw: &str) -> Result<Self, AdmissionConfigError> {
-        todo!("fill: scheme/empty validation; aura #421 follow-up")
+        if raw.is_empty() {
+            return Err(AdmissionConfigError(
+                "AURA_SESSION_ADMISSION_PG_URL must not be empty".to_string(),
+            ));
+        }
+        if !(raw.starts_with("postgres://") || raw.starts_with("postgresql://")) {
+            return Err(AdmissionConfigError(format!(
+                "AURA_SESSION_ADMISSION_PG_URL must use the postgres:// or postgresql:// scheme"
+            )));
+        }
+        Ok(Self(raw.to_string()))
     }
 }
 
@@ -124,6 +130,21 @@ const DEFAULT_RETRY_AFTER_MILLIS: u64 = 1_000;
 const DEFAULT_LEASE_TTL_MILLIS: u64 = 15_000;
 const DEFAULT_FENCE_MARGIN_MILLIS: u64 = 250;
 const DEFAULT_PROPAGATION_WINDOW_MILLIS: u64 = 30_000;
+
+/// Raw string values read from the environment, before validation. Kept
+/// separate from [`AdmissionEnv`] so every validation rule is reachable
+/// without touching the process environment (which is forbidden
+/// crate-wide by `forbid(unsafe_code)`).
+pub(crate) struct AdmissionEnvValues<'a> {
+    pub(crate) mode: Option<&'a str>,
+    pub(crate) pg_url: Option<&'a str>,
+    pub(crate) beat_interval_ms: Option<&'a str>,
+    pub(crate) lease_ttl_ms: Option<&'a str>,
+    pub(crate) fence_margin_ms: Option<&'a str>,
+    pub(crate) retry_after_ms: Option<&'a str>,
+    pub(crate) propagation_window_ms: Option<&'a str>,
+    pub(crate) repair_lane: Option<&'a str>,
+}
 
 /// Effective admission configuration. Private fields: the beat interval
 /// and lease ttl are non-zero by construction, and the PG-only fields
@@ -169,7 +190,138 @@ impl AdmissionEnv {
     /// lease_ttl`; `pg` mode requires the URL. Defaults to `off` when
     /// unset.
     pub fn from_env() -> Result<Self, AdmissionConfigError> {
-        todo!("fill: env parsing with validation; aura #421 follow-up")
+        Self::from_values(AdmissionEnvValues {
+            mode: std::env::var("AURA_SESSION_ADMISSION").ok().as_deref(),
+            pg_url: std::env::var("AURA_SESSION_ADMISSION_PG_URL")
+                .ok()
+                .as_deref(),
+            beat_interval_ms: std::env::var("AURA_SESSION_ADMISSION_BEAT_INTERVAL_MS")
+                .ok()
+                .as_deref(),
+            lease_ttl_ms: std::env::var("AURA_SESSION_ADMISSION_LEASE_TTL_MS")
+                .ok()
+                .as_deref(),
+            fence_margin_ms: std::env::var("AURA_SESSION_ADMISSION_FENCE_MARGIN_MS")
+                .ok()
+                .as_deref(),
+            retry_after_ms: std::env::var("AURA_SESSION_ADMISSION_RETRY_AFTER_MS")
+                .ok()
+                .as_deref(),
+            propagation_window_ms: std::env::var("AURA_SESSION_ADMISSION_PROPAGATION_WINDOW_MS")
+                .ok()
+                .as_deref(),
+            repair_lane: std::env::var("AURA_SESSION_REPAIR_LANE").ok().as_deref(),
+        })
+    }
+
+    /// Validate the raw environment values and assemble the effective
+    /// config. All validation lives here so it is reachable without
+    /// mutating the process environment (forbidden crate-wide).
+    pub(crate) fn from_values(vals: AdmissionEnvValues<'_>) -> Result<Self, AdmissionConfigError> {
+        let mode = match vals.mode {
+            Some(s) => AdmissionMode::from_str(s)?,
+            None => AdmissionMode::Off,
+        };
+
+        let pg_url = match mode {
+            AdmissionMode::Pg => {
+                let raw = vals.pg_url.ok_or_else(|| {
+                    AdmissionConfigError(
+                        "AURA_SESSION_ADMISSION_PG_URL is required in pg mode".to_string(),
+                    )
+                })?;
+                Some(PgUrl::parse(raw)?)
+            }
+            // Absent-or-ignored cleanly in off mode: a stray URL never
+            // fails a local deployment.
+            AdmissionMode::Off => None,
+        };
+
+        let beat_millis = parse_millis(
+            "AURA_SESSION_ADMISSION_BEAT_INTERVAL_MS",
+            vals.beat_interval_ms,
+            DEFAULT_BEAT_INTERVAL_MILLIS,
+        )?;
+        let beat = BeatInterval::new(Duration::from_millis(beat_millis)).map_err(|_| {
+            AdmissionConfigError(
+                "AURA_SESSION_ADMISSION_BEAT_INTERVAL_MS must be a positive number of milliseconds"
+                    .to_string(),
+            )
+        })?;
+
+        let lease_millis = parse_millis(
+            "AURA_SESSION_ADMISSION_LEASE_TTL_MS",
+            vals.lease_ttl_ms,
+            DEFAULT_LEASE_TTL_MILLIS,
+        )?;
+        let lease_ttl = LeaseTtl::new(Duration::from_millis(lease_millis)).map_err(|_| {
+            AdmissionConfigError(
+                "AURA_SESSION_ADMISSION_LEASE_TTL_MS must be a positive number of milliseconds"
+                    .to_string(),
+            )
+        })?;
+
+        let margin_millis = parse_millis(
+            "AURA_SESSION_ADMISSION_FENCE_MARGIN_MS",
+            vals.fence_margin_ms,
+            DEFAULT_FENCE_MARGIN_MILLIS,
+        )?;
+        let fence_margin = SelfFenceMargin::new(Duration::from_millis(margin_millis)).map_err(
+            |_| {
+                AdmissionConfigError(
+                    "AURA_SESSION_ADMISSION_FENCE_MARGIN_MS must be a positive number of milliseconds"
+                    .to_string(),
+                )
+            },
+        )?;
+
+        if fence_margin.get() >= lease_ttl.get() {
+            return Err(AdmissionConfigError(format!(
+                "AURA_SESSION_ADMISSION_FENCE_MARGIN_MS ({margin_millis}) must be less than AURA_SESSION_ADMISSION_LEASE_TTL_MS ({lease_millis})"
+            )));
+        }
+
+        let retry_millis = parse_millis(
+            "AURA_SESSION_ADMISSION_RETRY_AFTER_MS",
+            vals.retry_after_ms,
+            DEFAULT_RETRY_AFTER_MILLIS,
+        )?;
+        if retry_millis == 0 {
+            return Err(AdmissionConfigError(
+                "AURA_SESSION_ADMISSION_RETRY_AFTER_MS must be a positive number of milliseconds"
+                    .to_string(),
+            ));
+        }
+        let retry_after = Duration::from_millis(retry_millis);
+
+        let window_millis = parse_millis(
+            "AURA_SESSION_ADMISSION_PROPAGATION_WINDOW_MS",
+            vals.propagation_window_ms,
+            DEFAULT_PROPAGATION_WINDOW_MILLIS,
+        )?;
+        if window_millis == 0 {
+            return Err(AdmissionConfigError(
+                "AURA_SESSION_ADMISSION_PROPAGATION_WINDOW_MS must be a positive number of milliseconds"
+                    .to_string(),
+            ));
+        }
+        let propagation_window = Duration::from_millis(window_millis);
+
+        let repair = match vals.repair_lane {
+            Some(s) => RepairLaneKind::from_str(s)?,
+            None => RepairLaneKind::Auto,
+        };
+
+        Ok(Self {
+            mode,
+            beat,
+            retry_after,
+            lease_ttl,
+            fence_margin,
+            propagation_window,
+            pg_url,
+            repair,
+        })
     }
 
     /// The configured backend mode.
@@ -294,5 +446,186 @@ impl PgAdmissionEnv<'_> {
     #[must_use]
     pub(crate) const fn repair_lane(self) -> RepairLaneKind {
         self.0.repair
+    }
+}
+
+/// Parse a millisecond knob: absent uses `default`, present must be a
+/// `u64` (zero is rejected downstream by the non-zero constructors or
+/// the positivity checks).
+fn parse_millis(name: &str, raw: Option<&str>, default: u64) -> Result<u64, AdmissionConfigError> {
+    match raw {
+        None => Ok(default),
+        Some(s) => s.parse::<u64>().map_err(|_| {
+            AdmissionConfigError(format!(
+                "{name} must be a positive integer number of milliseconds, got '{s}'"
+            ))
+        }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn values(
+        mode: Option<&'static str>,
+        pg_url: Option<&'static str>,
+        beat: Option<&'static str>,
+        lease: Option<&'static str>,
+        margin: Option<&'static str>,
+        retry: Option<&'static str>,
+        window: Option<&'static str>,
+        repair: Option<&'static str>,
+    ) -> AdmissionEnvValues<'static> {
+        AdmissionEnvValues {
+            mode,
+            pg_url,
+            beat_interval_ms: beat,
+            lease_ttl_ms: lease,
+            fence_margin_ms: margin,
+            retry_after_ms: retry,
+            propagation_window_ms: window,
+            repair_lane: repair,
+        }
+    }
+
+    fn defaults() -> AdmissionEnvValues<'static> {
+        values(None, None, None, None, None, None, None, None)
+    }
+
+    #[test]
+    fn off_defaults() {
+        let env = AdmissionEnv::from_values(defaults()).expect("off defaults are valid");
+        assert_eq!(env.mode(), AdmissionMode::Off);
+        assert_eq!(env.beat().get(), Duration::from_millis(5_000));
+        assert_eq!(env.retry_after(), Duration::from_millis(1_000));
+        assert_eq!(env.lease_ttl().get(), Duration::from_millis(15_000));
+        assert_eq!(env.fence_margin().get(), Duration::from_millis(250));
+        assert_eq!(env.propagation_window(), Duration::from_millis(30_000));
+        assert_eq!(env.repair_lane(), RepairLaneKind::Auto);
+        assert!(env.local().is_some());
+        assert!(env.pg().is_none());
+    }
+
+    #[test]
+    fn pg_without_url_fails() {
+        let err =
+            AdmissionEnv::from_values(values(Some("pg"), None, None, None, None, None, None, None))
+                .expect_err("pg mode without a URL fails loud");
+        assert!(!err.0.is_empty());
+    }
+
+    #[test]
+    fn pg_with_bad_scheme_fails() {
+        let err = AdmissionEnv::from_values(values(
+            Some("pg"),
+            Some("redis://://x"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ))
+        .expect_err("pg mode with a non-postgres scheme fails");
+        assert!(!err.0.is_empty());
+    }
+
+    #[test]
+    fn margin_gte_tt_fails() {
+        let err = AdmissionEnv::from_values(values(
+            Some("pg"),
+            Some("postgres://x"),
+            None,
+            Some("100"),
+            Some("100"),
+            None,
+            None,
+            None,
+        ))
+        .expect_err("margin equal to ttl fails");
+        assert!(!err.0.is_empty());
+    }
+
+    #[test]
+    fn zero_duration_fails() {
+        let err =
+            AdmissionEnv::from_values(values(None, None, Some("0"), None, None, None, None, None))
+                .expect_err("zero beat interval fails");
+        assert!(!err.0.is_empty());
+    }
+
+    #[test]
+    fn non_numeric_millis_fails() {
+        let err = AdmissionEnv::from_values(values(
+            None,
+            None,
+            Some("abc"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ))
+        .expect_err("non-numeric millis fails");
+        assert!(!err.0.is_empty());
+    }
+
+    #[test]
+    fn unknown_mode_fails() {
+        let err = AdmissionEnv::from_values(values(
+            Some("bogus"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ))
+        .expect_err("unknown mode fails");
+        assert!(!err.0.is_empty());
+    }
+
+    #[test]
+    fn repair_lane_parsing() {
+        let cli = AdmissionEnv::from_values(values(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("cli"),
+        ))
+        .expect("cli lane parses");
+        assert_eq!(cli.repair_lane(), RepairLaneKind::Cli);
+
+        let s3 = AdmissionEnv::from_values(values(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("s3api"),
+        ))
+        .expect("s3api lane parses");
+        assert_eq!(s3.repair_lane(), RepairLaneKind::S3Api);
+
+        let err = AdmissionEnv::from_values(values(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("nope"),
+        ))
+        .expect_err("unknown lane fails");
+        assert!(!err.0.is_empty());
     }
 }
