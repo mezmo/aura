@@ -179,12 +179,12 @@ impl CheckpointEnvelope {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) const TEST_RUN_ID: &str = "018f9d2e-7c3a-7000-8000-000000000271";
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) const TEST_SESSION_ID: &str = "018f9d2e-7c3a-7000-8000-0000000000aa";
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl RunCheckpoint {
     /// Minimal fixture matching `testdata/checkpoint-v1.json`.
     pub(crate) fn test_minimal() -> Self {

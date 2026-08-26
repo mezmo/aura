@@ -1,5 +1,6 @@
 ---
 source: crates/aura-web-server/tests/durability_harness_test.rs
+assertion_line: 766
 expression: snapshot
 ---
 {
@@ -12,7 +13,7 @@ expression: snapshot
           "a2a_server": {
             "version": "1.0"
           },
-          "aura_version": "0.1.14",
+          "aura_version": "0.2.6",
           "session_store": {
             "backend": "redis",
             "ping": {
@@ -81,6 +82,7 @@ expression: snapshot
         {
           "decision_id": "<id>",
           "origin": {
+            "agent_name": "gated",
             "kind": "config_gate",
             "matched_pattern": "mock_tool"
           },
@@ -100,6 +102,7 @@ expression: snapshot
           "decision_id": "<id>",
           "expires_at": "<timestamp>",
           "origin": {
+            "agent_name": "gated",
             "kind": "config_gate",
             "matched_pattern": "mock_tool"
           },
@@ -148,6 +151,7 @@ expression: snapshot
         {
           "decision_id": "<id>",
           "origin": {
+            "agent_name": "gated",
             "kind": "config_gate",
             "matched_pattern": "mock_tool"
           },
@@ -167,6 +171,7 @@ expression: snapshot
           "decision_id": "<id>",
           "expires_at": "<timestamp>",
           "origin": {
+            "agent_name": "gated",
             "kind": "config_gate",
             "matched_pattern": "mock_tool"
           },
@@ -191,7 +196,7 @@ expression: snapshot
           "a2a_server": {
             "version": "1.0"
           },
-          "aura_version": "0.1.14",
+          "aura_version": "0.2.6",
           "session_store": {
             "backend": "redis",
             "ping": {
