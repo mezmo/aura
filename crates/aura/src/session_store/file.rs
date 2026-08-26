@@ -206,19 +206,6 @@ impl ApprovalStore for FileApprovalStore {
             .await
     }
 
-    async fn resolve(
-        &self,
-        id: &DecisionId,
-        _decision: ApprovalDecision,
-    ) -> Result<(), ResolveError> {
-        let id = *id;
-        match self.blocking(move |dir| take_record(&dir, &id)).await {
-            Ok(true) => Ok(()),
-            Ok(false) => Err(ResolveError::NotFound),
-            Err(err) => Err(ResolveError::Store(err)),
-        }
-    }
-
     async fn decision(
         &self,
         id: &DecisionId,

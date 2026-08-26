@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use tokio::sync::broadcast;
 
-use crate::hitl::{ApprovalDecision, DecisionId, ParkedApproval, ResolveError, Timestamp};
+use crate::hitl::{ApprovalDecision, DecisionId, ParkedApproval, ResolveError};
 use crate::orchestration::park::{
     AgentInstanceId, CasError, FencingGeneration, Lease, LeaseTtl, ParkCommit, RunEvent, RunState,
     SessionId, SessionRecord, WakeReason,
@@ -19,15 +19,10 @@ use super::{ApprovalStore, EventBus, RunStore, RunStoreError, SessionStoreError,
 /// Buffered payloads per topic before slow subscribers start lagging.
 const TOPIC_CAPACITY: usize = 64;
 
-/// Decision retention margin.
-const DECISION_RETENTION_MARGIN_SECS: i64 = 60;
-
-/// A recorded decision, the wake reason carrying it, and the deadline past
-/// which it may be pruned.
+/// A recorded decision and the wake reason carrying it.
 struct DecidedEntry {
     decision: ApprovalDecision,
     wake: WakeReason,
-    keep_until: Option<Timestamp>,
 }
 
 /// The parked-approval registry as a plain map.
@@ -48,17 +43,14 @@ impl InMemoryApprovalStore {
         self.entries.lock().expect("approval store lock poisoned")
     }
 
-    /// Lock the decided map, dropping entries past their retention deadline.
-    /// An entry with no deadline of its own is left to whoever removes the
-    /// approval it belongs to.
+    /// Lock the decided map. A recorded decision has no expiry of its own:
+    /// it lives exactly as long as the approval it belongs to, and the calls
+    /// that end the approval end it too.
     ///
     /// Callers holding [`Self::lock`] may take this lock; the reverse order
     /// is never used.
     fn lock_decided(&self) -> std::sync::MutexGuard<'_, BTreeMap<DecisionId, DecidedEntry>> {
-        let mut decided = self.decided.lock().expect("approval store lock poisoned");
-        let now = chrono::Utc::now();
-        decided.retain(|_, entry| entry.keep_until.is_none_or(|deadline| deadline > now));
-        decided
+        self.decided.lock().expect("approval store lock poisoned")
     }
 }
 
@@ -71,34 +63,6 @@ impl ApprovalStore for InMemoryApprovalStore {
 
     async fn get(&self, id: &DecisionId) -> Result<Option<ParkedApproval>, SessionStoreError> {
         Ok(self.lock().get(id).cloned())
-    }
-
-    async fn resolve(
-        &self,
-        id: &DecisionId,
-        decision: ApprovalDecision,
-    ) -> Result<(), ResolveError> {
-        // Removal under the lock is the at-most-once guarantee, and the
-        // decision is written under the same guard so no reader observes the
-        // approval gone before its decision is readable.
-        let mut entries = self.lock();
-        let parked = entries.remove(id).ok_or(ResolveError::NotFound)?;
-        // This path consumes the approval, so nothing is left to GC the
-        // decision: it carries a deadline of its own instead.
-        self.lock_decided().insert(
-            *id,
-            DecidedEntry {
-                decision,
-                wake: WakeReason::DecisionResolved {
-                    decision_id: *id,
-                    resolved_at: chrono::Utc::now(),
-                },
-                keep_until: Some(
-                    parked.expires_at + chrono::Duration::seconds(DECISION_RETENTION_MARGIN_SECS),
-                ),
-            },
-        );
-        Ok(())
     }
 
     async fn decision(
@@ -123,9 +87,7 @@ impl ApprovalStore for InMemoryApprovalStore {
             return Err(ResolveError::NotFound);
         }
         // Insert-if-absent is the first-write-wins guarantee: a repeat or a
-        // contradiction reads back the stored resolution. The entry gets no
-        // deadline — it lives exactly as long as the approval does, and
-        // `remove`/`cancel_request` end both together.
+        // contradiction reads back the stored resolution.
         let wake = self
             .lock_decided()
             .entry(*id)
@@ -135,7 +97,6 @@ impl ApprovalStore for InMemoryApprovalStore {
                     decision_id: *id,
                     resolved_at: chrono::Utc::now(),
                 },
-                keep_until: None,
             })
             .wake
             .clone();
@@ -503,7 +464,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn approval_store_register_get_resolve() {
+    async fn approval_store_register_get_consume() {
         let store = InMemoryApprovalStore::new();
         let entry = parked("req-1");
         let id = entry.request.decision_id;
@@ -512,18 +473,19 @@ mod tests {
         assert!(store.get(&id).await.unwrap().is_some());
 
         store
-            .resolve(&id, ApprovalDecision::Approved)
+            .resolve_durable(&id, ApprovalDecision::Approved)
             .await
             .unwrap();
+        store.remove(&id).await.unwrap();
         assert!(store.get(&id).await.unwrap().is_none());
-        assert_eq!(
-            store.resolve(&id, ApprovalDecision::Approved).await,
+        assert!(matches!(
+            store.resolve_durable(&id, ApprovalDecision::Approved).await,
             Err(ResolveError::NotFound),
-        );
+        ));
     }
 
     #[tokio::test]
-    async fn approval_store_resolve_records_readable_decision() {
+    async fn approval_store_resolution_records_readable_decision() {
         let store = InMemoryApprovalStore::new();
         let entry = parked("req-durable");
         let id = entry.request.decision_id;
@@ -532,33 +494,16 @@ mod tests {
         let denied = ApprovalDecision::Denied {
             reason: Some("not safe".into()),
         };
-        store.resolve(&id, denied.clone()).await.unwrap();
+        store.resolve_durable(&id, denied.clone()).await.unwrap();
 
         assert_eq!(store.decision(&id).await.unwrap(), Some(denied.clone()));
-        // Recorded decision survives rejected second resolve.
-        assert_eq!(
-            store.resolve(&id, ApprovalDecision::Approved).await,
-            Err(ResolveError::NotFound)
-        );
-        assert_eq!(store.decision(&id).await.unwrap(), Some(denied));
-        assert_eq!(store.decision(&DecisionId::generate()).await.unwrap(), None);
-    }
-
-    #[tokio::test]
-    async fn recorded_decision_is_pruned_after_retention_window() {
-        let store = InMemoryApprovalStore::new();
-        let mut entry = parked("req-prune");
-        // Retention margin is already past.
-        entry.expires_at =
-            chrono::Utc::now() - chrono::Duration::seconds(2 * DECISION_RETENTION_MARGIN_SECS);
-        let id = entry.request.decision_id;
-        store.register(entry).await.unwrap();
+        // The recorded decision survives a contradicting second resolution.
         store
-            .resolve(&id, ApprovalDecision::Approved)
+            .resolve_durable(&id, ApprovalDecision::Approved)
             .await
             .unwrap();
-
-        assert_eq!(store.decision(&id).await.unwrap(), None);
+        assert_eq!(store.decision(&id).await.unwrap(), Some(denied));
+        assert_eq!(store.decision(&DecisionId::generate()).await.unwrap(), None);
     }
 
     /// A decision may never outlive the approval that justified it, however

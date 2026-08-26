@@ -14,7 +14,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow, bail, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
 use bytes::Bytes;
 use futures::StreamExt;
 use uuid::Uuid;
@@ -63,18 +63,8 @@ pub async fn assert_approval_store_conformance(store: Arc<dyn ApprovalStore>) {
     );
     record(
         &mut failures,
-        "resolve_removes_the_entry",
-        resolve_removes_the_entry(store.as_ref()).await,
-    );
-    record(
-        &mut failures,
-        "resolve_of_an_unknown_id_is_not_found",
-        resolve_of_an_unknown_id_is_not_found(store.as_ref()).await,
-    );
-    record(
-        &mut failures,
-        "concurrent_resolve_has_exactly_one_winner",
-        concurrent_resolve_has_exactly_one_winner(&store).await,
+        "resolve_durable_of_an_unknown_id_is_not_found",
+        resolve_durable_of_an_unknown_id_is_not_found(store.as_ref()).await,
     );
     record(
         &mut failures,
@@ -317,72 +307,14 @@ async fn every_scope_survives_storage(store: &dyn ApprovalStore) -> Result<()> {
     Ok(())
 }
 
-async fn resolve_removes_the_entry(store: &dyn ApprovalStore) -> Result<()> {
-    let entry = parked_single(&unique("resolve"));
-    let id = entry.request.decision_id;
-    store.register(entry).await?;
-
-    resolve(store, &id).await?;
-    ensure!(
-        store.get(&id).await?.is_none(),
-        "a resolved approval must no longer be readable",
-    );
-    Ok(())
-}
-
-async fn resolve_of_an_unknown_id_is_not_found(store: &dyn ApprovalStore) -> Result<()> {
+async fn resolve_durable_of_an_unknown_id_is_not_found(store: &dyn ApprovalStore) -> Result<()> {
     let outcome = store
-        .resolve(&DecisionId::generate(), ApprovalDecision::Approved)
+        .resolve_durable(&DecisionId::generate(), ApprovalDecision::Approved)
         .await;
     ensure!(
-        outcome == Err(ResolveError::NotFound),
+        matches!(outcome, Err(ResolveError::NotFound)),
         "resolving an unknown id must report NotFound, got {outcome:?}",
     );
-    Ok(())
-}
-
-/// At-most-once consumption is the store's job: whichever caller wins, no
-/// second caller may also see success and run the gated call twice.
-///
-/// A non-atomic take only misbehaves when the calls overlap in time, and how
-/// wide that window gets depends on the caller's runtime, so the race is
-/// released from a barrier and rerun enough times that a broken backend cannot
-/// pass by luck.
-async fn concurrent_resolve_has_exactly_one_winner(store: &Arc<dyn ApprovalStore>) -> Result<()> {
-    for round in 0..RACE_ROUNDS {
-        let entry = parked_single(&unique("one-winner"));
-        let id = entry.request.decision_id;
-        store.register(entry).await?;
-
-        let start = Arc::new(tokio::sync::Barrier::new(RESOLVER_COUNT));
-        let resolvers: Vec<_> = (0..RESOLVER_COUNT)
-            .map(|_| {
-                let store = Arc::clone(store);
-                let start = Arc::clone(&start);
-                tokio::spawn(async move {
-                    start.wait().await;
-                    store.resolve(&id, ApprovalDecision::Approved).await
-                })
-            })
-            .collect();
-
-        let mut winners = 0;
-        for resolver in resolvers {
-            match resolver
-                .await
-                .map_err(|e| anyhow!("a resolver task did not complete: {e}"))?
-            {
-                Ok(()) => winners += 1,
-                Err(ResolveError::NotFound) => {}
-                Err(err) => bail!("a losing resolve must report NotFound, got {err:?}"),
-            }
-        }
-        ensure!(
-            winners == 1,
-            "round {round}: exactly one of {RESOLVER_COUNT} concurrent resolves must succeed, \
-             {winners} did",
-        );
-    }
     Ok(())
 }
 
@@ -520,6 +452,10 @@ async fn remove_discards_the_recorded_decision(store: &dyn ApprovalStore) -> Res
 
     store.remove(&id).await?;
     ensure!(
+        store.get(&id).await?.is_none(),
+        "a consumed approval must no longer be readable",
+    );
+    ensure!(
         store.decision(&id).await?.is_none(),
         "removing an approval must discard the decision recorded for it",
     );
@@ -590,7 +526,7 @@ async fn cancel_request_removes_only_its_own(store: &dyn ApprovalStore) -> Resul
         store.get(&kept_id).await?.is_some(),
         "cancelling a request must leave other requests' approvals alone",
     );
-    resolve(store, &kept_id)
+    resolve_durable(store, &kept_id, ApprovalDecision::Approved)
         .await
         .context("an approval left by cancel_request must still be resolvable")?;
     Ok(())
@@ -1121,13 +1057,6 @@ fn parked(request_id: &str, scope: AgentScope) -> ParkedApproval {
 }
 
 /// [`ResolveError`] carries no `Display`, so rows surface it through `Debug`.
-async fn resolve(store: &dyn ApprovalStore, id: &DecisionId) -> Result<()> {
-    store
-        .resolve(id, ApprovalDecision::Approved)
-        .await
-        .map_err(|err| anyhow!("resolve failed: {err:?}"))
-}
-
 async fn resolve_durable(
     store: &dyn ApprovalStore,
     id: &DecisionId,

@@ -391,48 +391,6 @@ async fn approval_register_get_roundtrip_preserves_record() {
     assert_eq!(ParkedApprovalRecord::from(&restored), expected);
 }
 
-#[tokio::test]
-async fn approval_resolve_is_at_most_once_across_instances() {
-    let config = test_config(60);
-    let instance_a = connect(&config).await.approvals();
-    let instance_b = connect(&config).await.approvals();
-
-    let parked = make_parked("req-2", Duration::from_secs(60));
-    let id = parked.request.decision_id;
-    instance_a.register(parked).await.unwrap();
-
-    instance_b
-        .resolve(&id, ApprovalDecision::Approved)
-        .await
-        .expect("first resolve wins");
-    assert_eq!(
-        instance_a.resolve(&id, ApprovalDecision::Approved).await,
-        Err(ResolveError::NotFound)
-    );
-    assert!(instance_a.get(&id).await.unwrap().is_none());
-}
-
-#[tokio::test]
-async fn approval_concurrent_resolves_have_exactly_one_winner() {
-    let config = test_config(60);
-    let instance_a = connect(&config).await.approvals();
-    let instance_b = connect(&config).await.approvals();
-
-    let parked = make_parked("req-3", Duration::from_secs(60));
-    let id = parked.request.decision_id;
-    instance_a.register(parked).await.unwrap();
-
-    let (a, b) = tokio::join!(
-        instance_a.resolve(&id, ApprovalDecision::Approved),
-        instance_b.resolve(&id, ApprovalDecision::Approved),
-    );
-    assert_eq!(
-        [a.is_ok(), b.is_ok()].iter().filter(|ok| **ok).count(),
-        1,
-        "exactly one resolver must win: {a:?} / {b:?}"
-    );
-}
-
 /// A resolution leaves a durable decision record readable from any instance (issue #474).
 #[tokio::test]
 async fn approval_resolve_records_decision_readable_cross_instance() {
@@ -447,16 +405,20 @@ async fn approval_resolve_records_decision_readable_cross_instance() {
     let denied = ApprovalDecision::Denied {
         reason: Some("not now".to_string()),
     };
-    instance_b.resolve(&id, denied.clone()).await.unwrap();
+    instance_b
+        .resolve_durable(&id, denied.clone())
+        .await
+        .unwrap();
 
     assert_eq!(
         instance_a.decision(&id).await.unwrap(),
         Some(denied.clone())
     );
-    assert_eq!(
-        instance_a.resolve(&id, ApprovalDecision::Approved).await,
-        Err(ResolveError::NotFound)
-    );
+    // A contradicting resolution from the other instance does not displace it.
+    instance_a
+        .resolve_durable(&id, ApprovalDecision::Approved)
+        .await
+        .unwrap();
     assert_eq!(instance_a.decision(&id).await.unwrap(), Some(denied));
     assert_eq!(
         instance_a.decision(&DecisionId::generate()).await.unwrap(),
@@ -472,7 +434,7 @@ async fn decision_record_outlives_parked_record_ttl() {
     let id = parked.request.decision_id;
     approvals.register(parked).await.unwrap();
     approvals
-        .resolve(&id, ApprovalDecision::Approved)
+        .resolve_durable(&id, ApprovalDecision::Approved)
         .await
         .unwrap();
 
@@ -485,7 +447,7 @@ async fn decision_record_outlives_parked_record_ttl() {
 }
 
 #[tokio::test]
-async fn approval_remove_makes_resolve_not_found() {
+async fn approval_remove_makes_resolution_not_found() {
     let approvals = connect(&test_config(60)).await.approvals();
     let parked = make_parked("req-4", Duration::from_secs(60));
     let id = parked.request.decision_id;
@@ -493,10 +455,12 @@ async fn approval_remove_makes_resolve_not_found() {
 
     approvals.remove(&id).await.unwrap();
 
-    assert_eq!(
-        approvals.resolve(&id, ApprovalDecision::Approved).await,
+    assert!(matches!(
+        approvals
+            .resolve_durable(&id, ApprovalDecision::Approved)
+            .await,
         Err(ResolveError::NotFound)
-    );
+    ));
 }
 
 #[tokio::test]
@@ -525,10 +489,12 @@ async fn approval_expires_with_its_record_ttl() {
     tokio::time::sleep(Duration::from_millis(1600)).await;
 
     assert!(approvals.get(&id).await.unwrap().is_none());
-    assert_eq!(
-        approvals.resolve(&id, ApprovalDecision::Approved).await,
+    assert!(matches!(
+        approvals
+            .resolve_durable(&id, ApprovalDecision::Approved)
+            .await,
         Err(ResolveError::NotFound)
-    );
+    ));
 }
 
 // ---------------------------------------------------------------------------
@@ -686,7 +652,7 @@ async fn store_only_resolve_wakes_parking_instance_via_poll() {
     // Resolve against the store alone — no registry, no publish.
     store_b
         .approvals()
-        .resolve(&id, ApprovalDecision::Approved)
+        .resolve_durable(&id, ApprovalDecision::Approved)
         .await
         .expect("store resolve succeeds");
 
