@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use aura_config::{DecisionRouteConfig, GlobPattern, HitlConfig, ToolHeaderMappings, WebhookUrl};
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+use reqwest::header::HeaderMap;
 
 use super::decision::{ApprovalDecision, ApprovalOutcome, DecisionId};
 use super::events;
@@ -71,7 +71,11 @@ impl HitlRuntime {
                     client: WebhookClient::with_headers_and_signing(
                         build_webhook_client(),
                         url.clone(),
-                        resolve_webhook_headers(headers, headers_from_request, req_headers),
+                        crate::webhook_utils::resolve_headers(
+                            headers,
+                            headers_from_request,
+                            req_headers,
+                        ),
                         signing,
                         tool_headers_from_response.clone(),
                     ),
@@ -385,55 +389,6 @@ pub(crate) fn build_webhook_client() -> reqwest::Client {
         .connect_timeout(WEBHOOK_CONNECT_TIMEOUT)
         .build()
         .expect("reqwest client builder only fails on TLS backend init")
-}
-
-/// Resolve operator-configured webhook headers into a validated [`HeaderMap`]:
-/// static `headers` overlaid with `headers_from_request` values from the
-/// inbound client request. Invalid header names or values are skipped with
-/// a warning (matching `mcp_streamable_http.rs`).
-///
-/// Opt-in only: nothing is forwarded unless the operator configures it.
-/// Classification is deliberately absent from this surface — see
-/// [`apply_request_header_mappings`](crate::rig_builder::apply_request_header_mappings).
-fn resolve_webhook_headers(
-    static_headers: &HashMap<String, String>,
-    headers_from_request: &HashMap<String, String>,
-    req_headers: Option<&HashMap<String, String>>,
-) -> HeaderMap {
-    let empty = HashMap::new();
-    let req_headers = req_headers.unwrap_or(&empty);
-
-    let mut resolved: HashMap<String, String> = static_headers
-        .iter()
-        .map(|(k, v)| (k.to_lowercase(), v.clone()))
-        .collect();
-    let resolved_count = crate::rig_builder::apply_request_header_mappings(
-        &mut resolved,
-        headers_from_request,
-        req_headers,
-    );
-    if resolved_count > 0 {
-        tracing::info!("Webhook route: resolved {resolved_count} header(s) from request");
-    }
-
-    let mut header_map = HeaderMap::new();
-    for (key, value) in &resolved {
-        match (
-            HeaderName::from_bytes(key.as_bytes()),
-            HeaderValue::from_str(value),
-        ) {
-            (Ok(name), Ok(val)) => {
-                header_map.insert(name, val);
-            }
-            _ => {
-                tracing::warn!(
-                    "Skipping invalid webhook header '{}' (failed to convert)",
-                    key
-                );
-            }
-        }
-    }
-    header_map
 }
 
 /// HMAC signing state for the webhook route.
@@ -2294,7 +2249,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // resolve_webhook_headers unit tests
+    // webhook header resolution unit tests
     // -----------------------------------------------------------------
 
     fn make_req_headers(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
@@ -2309,7 +2264,7 @@ mod tests {
         let static_headers = make_req_headers(&[("x-tenant", "sre-prod")]);
         let headers_from_request = std::collections::HashMap::new();
         let header_map =
-            super::resolve_webhook_headers(&static_headers, &headers_from_request, None);
+            crate::webhook_utils::resolve_headers(&static_headers, &headers_from_request, None);
         assert_eq!(header_map.get("x-tenant").unwrap(), "sre-prod");
         assert_eq!(header_map.len(), 1);
     }
@@ -2320,7 +2275,7 @@ mod tests {
         let headers_from_request = make_req_headers(&[("x-tenant", "x-incoming-tenant")]);
         let req_headers = make_req_headers(&[("x-incoming-tenant", "forwarded-value")]);
 
-        let header_map = super::resolve_webhook_headers(
+        let header_map = crate::webhook_utils::resolve_headers(
             &static_headers,
             &headers_from_request,
             Some(&req_headers),
@@ -2336,7 +2291,7 @@ mod tests {
         let headers_from_request = make_req_headers(&[("authorization", "x-incoming-auth")]);
         let req_headers = make_req_headers(&[("x-incoming-auth", "dynamic-token")]);
 
-        let header_map = super::resolve_webhook_headers(
+        let header_map = crate::webhook_utils::resolve_headers(
             &static_headers,
             &headers_from_request,
             Some(&req_headers),
@@ -2349,7 +2304,7 @@ mod tests {
 
         // When the mapped request header is ABSENT, the static value is the fallback.
         let req_headers_empty = std::collections::HashMap::new();
-        let header_map_fallback = super::resolve_webhook_headers(
+        let header_map_fallback = crate::webhook_utils::resolve_headers(
             &static_headers,
             &headers_from_request,
             Some(&req_headers_empty),
@@ -2369,7 +2324,7 @@ mod tests {
         let headers_from_request = make_req_headers(&[("Authorization", "Authorization")]);
         let req_headers = make_req_headers(&[("authorization", "Token my-token")]);
 
-        let header_map = super::resolve_webhook_headers(
+        let header_map = crate::webhook_utils::resolve_headers(
             &static_headers,
             &headers_from_request,
             Some(&req_headers),
@@ -2392,7 +2347,7 @@ mod tests {
         let headers_from_request = make_req_headers(&[("authorization", "x-incoming-auth")]);
         let req_headers = make_req_headers(&[("x-incoming-auth", "dynamic-token")]);
 
-        let header_map = super::resolve_webhook_headers(
+        let header_map = crate::webhook_utils::resolve_headers(
             &static_headers,
             &headers_from_request,
             Some(&req_headers),
@@ -2412,7 +2367,7 @@ mod tests {
         let headers_from_request = std::collections::HashMap::new();
 
         let header_map =
-            super::resolve_webhook_headers(&static_headers, &headers_from_request, None);
+            crate::webhook_utils::resolve_headers(&static_headers, &headers_from_request, None);
         assert_eq!(header_map.get("x-valid").unwrap(), "ok");
         assert_eq!(
             header_map.len(),
@@ -2461,7 +2416,7 @@ mod tests {
         let headers_from_request = std::collections::HashMap::new();
 
         let header_map = tracing::subscriber::with_default(subscriber, || {
-            super::resolve_webhook_headers(&static_headers, &headers_from_request, None)
+            crate::webhook_utils::resolve_headers(&static_headers, &headers_from_request, None)
         });
         let log = String::from_utf8_lossy(&buf.0.lock().unwrap()).to_string();
 
@@ -2475,7 +2430,7 @@ mod tests {
 
         // (b) the warning is emitted and names the offending header.
         assert!(
-            log.contains("Skipping invalid webhook header"),
+            log.contains("Skipping invalid header"),
             "warning must be emitted, got log: {log}"
         );
         assert!(
@@ -2506,7 +2461,7 @@ mod tests {
         let headers_from_request = std::collections::HashMap::new();
 
         let header_map =
-            super::resolve_webhook_headers(&static_headers, &headers_from_request, None);
+            crate::webhook_utils::resolve_headers(&static_headers, &headers_from_request, None);
         assert!(
             header_map.is_empty(),
             "empty config must produce no headers (bare POST)"

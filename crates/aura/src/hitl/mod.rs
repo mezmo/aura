@@ -49,7 +49,7 @@ pub use route::{
     cleartext_capture_warning, validate_webhook_signing_config, warn_on_cleartext_capture,
 };
 pub use signing::{
-    SIGNATURE_HEADER, SignedHeaders, SigningContext, TIMESTAMP_HEADER, VerificationError,
-    VerifiedBody, WebhookHmac, authorize_ingress,
+    ConfigError, PrimarySecret, SIGNATURE_HEADER, SignedHeaders, SigningContext, TIMESTAMP_HEADER,
+    Tolerance, VerificationError, VerifiedBody, WebhookHmac, authorize_ingress,
 };
 pub use tool::{RequestApprovalArgs, RequestApprovalTool};

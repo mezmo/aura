@@ -28,6 +28,9 @@ pub struct Config {
     /// it; presence of the table is the enable bit.
     #[serde(default)]
     pub hitl: Option<HitlConfig>,
+    /// Governance integration for catalog sync and policy endpoints.
+    #[serde(default)]
+    pub governance: Option<GovernanceConfig>,
 }
 
 /// Reasoning effort level for GPT-5 models
@@ -1588,4 +1591,45 @@ impl<'de> Deserialize<'de> for GlobPattern {
         let source = String::deserialize(deserializer)?;
         Self::new(source).map_err(serde::de::Error::custom)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Governance configuration
+// ---------------------------------------------------------------------------
+
+/// `[governance]` config table for catalog sync and policy integration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GovernanceConfig {
+    /// Catalog webhook configuration for MCP tool discovery sync.
+    pub catalog: Option<CatalogWebhookConfig>,
+}
+
+/// `[governance.catalog]` webhook configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CatalogWebhookConfig {
+    /// Webhook endpoint URL (must start with http:// or https://).
+    pub url: WebhookUrl,
+    /// Request timeout in seconds (default: 30).
+    #[serde(default = "default_catalog_timeout_secs")]
+    pub timeout_secs: u64,
+    /// Static headers with environment variable interpolation.
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+    /// Outbound header name → inbound request header name mapping.
+    #[serde(default)]
+    pub headers_from_request: HashMap<String, String>,
+    /// Optional HMAC signing configuration.
+    #[serde(default)]
+    pub hmac: Option<CatalogHmacConfig>,
+}
+
+fn default_catalog_timeout_secs() -> u64 {
+    30
+}
+
+/// `[governance.catalog.hmac]` HMAC signing configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CatalogHmacConfig {
+    /// Primary HMAC secret (minimum 32 bytes). Supports env var interpolation.
+    pub secret: String,
 }

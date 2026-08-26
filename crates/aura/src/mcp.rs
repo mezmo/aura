@@ -1200,6 +1200,18 @@ impl McpManager {
         map
     }
 
+    pub fn get_tool_definition_by_server(&self, name: &str) -> Vec<rmcp::model::Tool> {
+        if let Some(tools) = self.streamable_tools.get(name) {
+            tools.clone()
+        } else if let Some(tools) = self.sse_tools.get(name) {
+            tools.clone()
+        } else if let Some(tools) = self.stdio_tools.get(name) {
+            tools.clone()
+        } else {
+            vec![]
+        }
+    }
+
     /// Execute a tool by name (used by Ollama text-to-tool fallback).
     ///
     /// Called by `FallbackToolExecutor` when it detects tool calls in streamed text.
