@@ -518,13 +518,33 @@ async fn drive_to_approval(
     let (fail_tx, mut fail_rx) = mpsc::unbounded_channel();
     let mut events = Vec::new();
     let mut setup_failure: Option<String> = None;
+    // The crash is timed at the park window: after the approval record is
+    // durable, wait for the run to park (or the stream to end, or the park
+    // grace to lapse) before killing, so a backend that parks is cut down
+    // after its CAS and one that refuses is cut down all the same.
+    let mut record_ready = false;
+    let mut parked_seen = false;
+    let mut park_deadline: Option<Instant> = None;
 
     loop {
         tokio::select! {
             _ = tokio::time::sleep_until(overall_deadline) => break,
-            _ = kill_rx.recv() => {
+            _ = async {
+                match park_deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
                 let _ = server.stop().await;
                 break;
+            }
+            _ = kill_rx.recv() => {
+                record_ready = true;
+                if parked_seen {
+                    let _ = server.stop().await;
+                    break;
+                }
+                park_deadline = Some(Instant::now() + Duration::from_secs(10));
             }
             maybe_fail = fail_rx.recv() => {
                 if let Some(err) = maybe_fail {
@@ -559,9 +579,23 @@ async fn drive_to_approval(
                                 }
                             });
                         }
+                        let parked = evt.event_type.as_deref()
+                            == Some("aura.orchestrator.run_parked");
                         events.push(evt);
+                        if parked {
+                            parked_seen = true;
+                            if record_ready {
+                                let _ = server.stop().await;
+                                break;
+                            }
+                        }
                     }
-                    None => break,
+                    None => {
+                        if parked_seen {
+                            let _ = server.stop().await;
+                        }
+                        break;
+                    }
                 }
             }
         }
