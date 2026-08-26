@@ -1,0 +1,125 @@
+error[E0603]: module `store` is private
+ --> tests/compilefail/store_sql_constants.rs:4:28
+  |
+4 |     let _ = session_guard::store::SCHEMA;
+  |                            ^^^^^  ------ constant `SCHEMA` is not publicly re-exported
+  |                            |
+  |                            private module
+  |
+note: the module `store` is defined here
+ --> src/lib.rs
+  |
+  | mod store;
+  | ^^^^^^^^^
+
+error[E0603]: module `store` is private
+ --> tests/compilefail/store_sql_constants.rs:5:28
+  |
+5 |     let _ = session_guard::store::S1_CLAIM;
+  |                            ^^^^^  -------- constant `S1_CLAIM` is not publicly re-exported
+  |                            |
+  |                            private module
+  |
+note: the module `store` is defined here
+ --> src/lib.rs
+  |
+  | mod store;
+  | ^^^^^^^^^
+
+error[E0603]: module `store` is private
+ --> tests/compilefail/store_sql_constants.rs:6:28
+  |
+6 |     let _ = session_guard::store::S1_CLASSIFY;
+  |                            ^^^^^  ----------- constant `S1_CLASSIFY` is not publicly re-exported
+  |                            |
+  |                            private module
+  |
+note: the module `store` is defined here
+ --> src/lib.rs
+  |
+  | mod store;
+  | ^^^^^^^^^
+
+error[E0603]: module `store` is private
+ --> tests/compilefail/store_sql_constants.rs:7:28
+  |
+7 |     let _ = session_guard::store::S2_HEARTBEAT;
+  |                            ^^^^^  ------------ constant `S2_HEARTBEAT` is not publicly re-exported
+  |                            |
+  |                            private module
+  |
+note: the module `store` is defined here
+ --> src/lib.rs
+  |
+  | mod store;
+  | ^^^^^^^^^
+
+error[E0603]: module `store` is private
+ --> tests/compilefail/store_sql_constants.rs:8:28
+  |
+8 |     let _ = session_guard::store::S3_COMMIT;
+  |                            ^^^^^  --------- constant `S3_COMMIT` is not publicly re-exported
+  |                            |
+  |                            private module
+  |
+note: the module `store` is defined here
+ --> src/lib.rs
+  |
+  | mod store;
+  | ^^^^^^^^^
+
+error[E0603]: module `store` is private
+ --> tests/compilefail/store_sql_constants.rs:9:28
+  |
+9 |     let _ = session_guard::store::S4_RELEASE;
+  |                            ^^^^^  ---------- constant `S4_RELEASE` is not publicly re-exported
+  |                            |
+  |                            private module
+  |
+note: the module `store` is defined here
+ --> src/lib.rs
+  |
+  | mod store;
+  | ^^^^^^^^^
+
+error[E0603]: module `store` is private
+  --> tests/compilefail/store_sql_constants.rs:10:28
+   |
+10 |     let _ = session_guard::store::S4_RELEASE_POD;
+   |                            ^^^^^  -------------- constant `S4_RELEASE_POD` is not publicly re-exported
+   |                            |
+   |                            private module
+   |
+note: the module `store` is defined here
+  --> src/lib.rs
+   |
+   | mod store;
+   | ^^^^^^^^^
+
+error[E0603]: module `store` is private
+  --> tests/compilefail/store_sql_constants.rs:11:28
+   |
+11 |     let _ = session_guard::store::S5_RECONCILE;
+   |                            ^^^^^  ------------ constant `S5_RECONCILE` is not publicly re-exported
+   |                            |
+   |                            private module
+   |
+note: the module `store` is defined here
+  --> src/lib.rs
+   |
+   | mod store;
+   | ^^^^^^^^^
+
+error[E0603]: module `store` is private
+  --> tests/compilefail/store_sql_constants.rs:12:28
+   |
+12 |     let _ = session_guard::store::S6_LOCATE;
+   |                            ^^^^^  --------- constant `S6_LOCATE` is not publicly re-exported
+   |                            |
+   |                            private module
+   |
+note: the module `store` is defined here
+  --> src/lib.rs
+   |
+   | mod store;
+   | ^^^^^^^^^

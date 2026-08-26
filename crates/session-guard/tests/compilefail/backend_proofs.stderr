@@ -1,0 +1,27 @@
+error[E0603]: module `adapters` is private
+ --> tests/compilefail/backend_proofs.rs:3:20
+  |
+3 | use session_guard::adapters::local::LocalLeaseProof;
+  |                    ^^^^^^^^  ----- module `local` is not publicly re-exported
+  |                    |
+  |                    private module
+  |
+note: the module `adapters` is defined here
+ --> src/lib.rs
+  |
+  | mod adapters;
+  | ^^^^^^^^^^^^
+
+error[E0603]: module `adapters` is private
+ --> tests/compilefail/backend_proofs.rs:4:20
+  |
+4 | use session_guard::adapters::pg::PgLeaseProof;
+  |                    ^^^^^^^^  -- module `pg` is not publicly re-exported
+  |                    |
+  |                    private module
+  |
+note: the module `adapters` is defined here
+ --> src/lib.rs
+  |
+  | mod adapters;
+  | ^^^^^^^^^^^^

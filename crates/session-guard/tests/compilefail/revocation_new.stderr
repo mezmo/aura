@@ -1,0 +1,5 @@
+error[E0433]: cannot find `Revocation` in `session_guard`
+ --> tests/compilefail/revocation_new.rs:4:28
+  |
+4 |     let _ = session_guard::Revocation::new;
+  |                            ^^^^^^^^^^ could not find `Revocation` in `session_guard`

@@ -1,0 +1,32 @@
+error[E0624]: associated function `initial` is private
+ --> tests/compilefail/epoch_constructors.rs:4:35
+  |
+4 |     let _ = session_guard::Epoch::initial;
+  |                                   ^^^^^^^ private associated function
+  |
+ ::: src/epoch.rs
+  |
+  |     pub(crate) const fn initial() -> Self {
+  |     ------------------------------------- private associated function defined here
+
+error[E0624]: method `next` is private
+ --> tests/compilefail/epoch_constructors.rs:5:35
+  |
+5 |     let _ = session_guard::Epoch::next;
+  |                                   ^^^^ private method
+  |
+ ::: src/epoch.rs
+  |
+  |     pub(crate) const fn next(self) -> Option<Self> {
+  |     ---------------------------------------------- private method defined here
+
+error[E0624]: associated function `from_raw` is private
+ --> tests/compilefail/epoch_constructors.rs:6:35
+  |
+6 |     let _ = session_guard::Epoch::from_raw;
+  |                                   ^^^^^^^^ private associated function
+  |
+ ::: src/epoch.rs
+  |
+  |     pub(crate) const fn from_raw(n: u64) -> Option<Self> {
+  |     ---------------------------------------------------- private associated function defined here

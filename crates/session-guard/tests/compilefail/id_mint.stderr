@@ -1,0 +1,21 @@
+error[E0624]: associated function `mint` is private
+ --> tests/compilefail/id_mint.rs:4:38
+  |
+4 |     let _ = session_guard::HolderId::mint;
+  |                                      ^^^^ private associated function
+  |
+ ::: src/identity.rs
+  |
+  |     pub(crate) fn mint() -> Self {
+  |     ---------------------------- private associated function defined here
+
+error[E0624]: associated function `mint` is private
+ --> tests/compilefail/id_mint.rs:5:34
+  |
+5 |     let _ = session_guard::OpId::mint;
+  |                                  ^^^^ private associated function
+  |
+ ::: src/identity.rs
+  |
+  |     pub(crate) fn mint() -> Self {
+  |     ---------------------------- private associated function defined here

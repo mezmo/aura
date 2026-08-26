@@ -1,0 +1,5 @@
+error[E0432]: unresolved import `session_guard::HeldParts`
+ --> tests/compilefail/held_parts.rs:3:5
+  |
+3 | use session_guard::HeldParts;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^ no `HeldParts` in the root

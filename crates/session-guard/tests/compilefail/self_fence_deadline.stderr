@@ -1,0 +1,23 @@
+error[E0433]: cannot find `SelfFenceDeadline` in `session_guard`
+ --> tests/compilefail/self_fence_deadline.rs:4:28
+  |
+4 |     let _ = session_guard::SelfFenceDeadline::fenced;
+  |                            ^^^^^^^^^^^^^^^^^ could not find `SelfFenceDeadline` in `session_guard`
+  |
+help: a struct with a similar name exists
+  |
+4 -     let _ = session_guard::SelfFenceDeadline::fenced;
+4 +     let _ = session_guard::SelfFenceMargin::fenced;
+  |
+
+error[E0433]: cannot find `SelfFenceDeadline` in `session_guard`
+ --> tests/compilefail/self_fence_deadline.rs:5:28
+  |
+5 |     let _ = session_guard::SelfFenceDeadline::anchor_at;
+  |                            ^^^^^^^^^^^^^^^^^ could not find `SelfFenceDeadline` in `session_guard`
+  |
+help: a struct with a similar name exists
+  |
+5 -     let _ = session_guard::SelfFenceDeadline::anchor_at;
+5 +     let _ = session_guard::SelfFenceMargin::anchor_at;
+  |

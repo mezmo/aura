@@ -19,3 +19,8 @@ tokio-postgres = { workspace = true }
 # Hole inventory: warn through the fill phase; flip to deny at completion.
 rust.unsafe_code = "forbid"
 clippy.todo = "warn"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }
+tempfile = "3"
+trybuild = "1"

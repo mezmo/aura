@@ -1,0 +1,21 @@
+error[E0624]: associated function `here` is private
+ --> tests/compilefail/holder_view_constructors.rs:4:40
+  |
+4 |     let _ = session_guard::HolderView::here;
+  |                                        ^^^^ private associated function
+  |
+ ::: src/claim.rs
+  |
+  |     pub(crate) fn here(pod: PodId) -> Self {
+  |     -------------------------------------- private associated function defined here
+
+error[E0624]: associated function `remote` is private
+ --> tests/compilefail/holder_view_constructors.rs:5:40
+  |
+5 |     let _ = session_guard::HolderView::remote;
+  |                                        ^^^^^^ private associated function
+  |
+ ::: src/claim.rs
+  |
+  |     pub(crate) fn remote(pod: PodId, lease_expires_at: LeaseDeadline) -> Self {
+  |     ------------------------------------------------------------------------- private associated function defined here

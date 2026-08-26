@@ -1,0 +1,10 @@
+error[E0624]: associated function `new` is private
+ --> tests/compilefail/verified_read_new.rs:4:42
+  |
+4 |     let _ = session_guard::VerifiedRead::new;
+  |                                          ^^^ private associated function
+  |
+ ::: src/state.rs
+  |
+  |     fn new(bytes: Vec<u8>, entry: ManifestEntry) -> Self {
+  |     ---------------------------------------------------- private associated function defined here

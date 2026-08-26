@@ -1,0 +1,5 @@
+error[E0433]: cannot find `KeepSet` in `session_guard`
+ --> tests/compilefail/keep_set.rs:4:28
+  |
+4 |     let _ = session_guard::KeepSet::from_manifest;
+  |                            ^^^^^^^ could not find `KeepSet` in `session_guard`

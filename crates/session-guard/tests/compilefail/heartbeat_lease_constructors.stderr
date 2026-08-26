@@ -1,0 +1,11 @@
+error[E0433]: cannot find `HeartbeatLease` in `session_guard`
+ --> tests/compilefail/heartbeat_lease_constructors.rs:4:28
+  |
+4 |     let _ = session_guard::HeartbeatLease::static_from;
+  |                            ^^^^^^^^^^^^^^ could not find `HeartbeatLease` in `session_guard`
+
+error[E0433]: cannot find `HeartbeatLease` in `session_guard`
+ --> tests/compilefail/heartbeat_lease_constructors.rs:5:28
+  |
+5 |     let _ = session_guard::HeartbeatLease::with_heartbeat;
+  |                            ^^^^^^^^^^^^^^ could not find `HeartbeatLease` in `session_guard`
