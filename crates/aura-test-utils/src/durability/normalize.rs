@@ -91,7 +91,16 @@ fn is_id_key(key: &str) -> bool {
 fn is_timestamp_key(key: &str) -> bool {
     matches!(
         key,
-        "created_at" | "timestamp" | "started_at" | "finished_at" | "created" | "expires_at"
+        "created_at"
+            | "timestamp"
+            | "started_at"
+            | "finished_at"
+            | "created"
+            | "expires_at"
+            | "parked_at"
+            | "registered_at"
+            | "resolved_at"
+            | "decided_at"
     )
 }
 

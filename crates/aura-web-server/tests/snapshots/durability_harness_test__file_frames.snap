@@ -120,6 +120,69 @@ expression: snapshot
             "worker": "gated"
           },
           "tool_name": "mock_tool"
+        },
+        {
+          "agent_id": "coordinator",
+          "duration_ms": "<duration>",
+          "result": "tool call parked for approval <run>: the run is parking pending a human decision",
+          "session_id": "<id>",
+          "success": false,
+          "task_id": 0,
+          "tool_call_id": "<id>",
+          "trace_id": "<id>"
+        },
+        {
+          "agent_id": "gated",
+          "context_tokens": 10,
+          "response_tokens": 5,
+          "session_id": "<id>",
+          "trace_id": "<id>"
+        },
+        {
+          "agent_id": "coordinator",
+          "duration_ms": "<duration>",
+          "orchestrator_id": "<id>",
+          "result": "blocked — waiting for approval <run>",
+          "session_id": "<id>",
+          "success": false,
+          "task_id": 0,
+          "trace_id": "<id>",
+          "worker_id": "<id>"
+        },
+        {
+          "agent_id": "coordinator",
+          "approvals": [
+            "<run>"
+          ],
+          "expires_at": "<timestamp>",
+          "parked_at": "<timestamp>",
+          "session_id": "<id>",
+          "trace_id": "<id>"
+        },
+        {
+          "completion_tokens": 15,
+          "prompt_tokens": 30,
+          "session_id": "<id>",
+          "total_tokens": 45,
+          "trace_id": "<id>"
+        },
+        {
+          "choices": [
+            {
+              "delta": {},
+              "finish_reason": "stop",
+              "index": 0
+            }
+          ],
+          "created": "<timestamp>",
+          "id": "<id>",
+          "model": "ollama/aura-stub",
+          "object": "chat.completion.chunk",
+          "usage": {
+            "completion_tokens": 0,
+            "prompt_tokens": 0,
+            "total_tokens": 0
+          }
         }
       ],
       "name": "planning",
@@ -199,11 +262,15 @@ expression: snapshot
       "name": "checkpoint_commit_crash",
       "store_state": {
         "approval_file_count": 1,
-        "artifact_count": 2,
+        "artifact_count": 4,
         "memory_dir": "<memory_dir>",
-        "run_record_count": 0,
-        "run_record_paths": [],
-        "run_record_states": []
+        "run_record_count": 1,
+        "run_record_paths": [
+          "<memory_dir>/runs/<run>.json"
+        ],
+        "run_record_states": [
+          "parked"
+        ]
       }
     },
     {
