@@ -27,6 +27,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use aura::orchestration::park::RunState;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
@@ -61,9 +62,11 @@ async fn durability_harness_file_frames() {
     let decision_id = extract_decision_id(&events);
 
     // Frame: checkpoint_commit_crash — kill the server at the park window,
-    // restart, and assert that no decodable run record exists. Orchestration
-    // artifacts (plan.json, etc.) do not count; only files that decode as a
-    // SessionRecord via decode_run_record are run records.
+    // restart, and assert that at least one decodable run record is Parked
+    // with its checkpoint. Orchestration artifacts (plan.json, etc.) do not
+    // count; only files that decode as a SessionRecord via decode_run_record
+    // are run records, and a Created/Running/Completed/Failed/Cancelled
+    // record does not satisfy the crash-recovery guarantee this frame checks.
     let mut checkpoint_frame = Frame::new("checkpoint_commit_crash");
     let memory_dir = server.memory_dir().to_path_buf();
     let (run_records, artifact_count) = find_run_records(&memory_dir).await;
@@ -81,11 +84,23 @@ async fn durability_harness_file_frames() {
         json!(
             run_records
                 .iter()
-                .map(|p| p.display().to_string())
+                .map(|(p, _)| p.display().to_string())
                 .collect::<Vec<_>>()
         ),
     );
-    if run_records.is_empty() {
+    checkpoint_frame.record_state(
+        "run_record_states",
+        json!(
+            run_records
+                .iter()
+                .map(|(_, state)| run_state_name(state))
+                .collect::<Vec<_>>()
+        ),
+    );
+    let has_parked_checkpoint = run_records
+        .iter()
+        .any(|(_, state)| matches!(state, RunState::Parked { .. }));
+    if !has_parked_checkpoint {
         red.push("checkpoint_commit_crash");
     }
     transcript.push(checkpoint_frame);
@@ -722,7 +737,10 @@ async fn publish_decision_to_redis(
     Ok(subscribers)
 }
 
-async fn find_run_records(memory_dir: &std::path::Path) -> (Vec<PathBuf>, usize) {
+/// Candidate files under `memory_dir` that decode as a v1 [`RunState`]
+/// record, paired with their decoded state, plus a count of candidates that
+/// did not decode (orchestration artifacts such as `plan.json`).
+async fn find_run_records(memory_dir: &std::path::Path) -> (Vec<(PathBuf, RunState)>, usize) {
     let pattern = format!("{}/**/*.json", memory_dir.display());
     let candidates: Vec<PathBuf> = glob::glob(&pattern)
         .expect("glob pattern is valid")
@@ -733,22 +751,28 @@ async fn find_run_records(memory_dir: &std::path::Path) -> (Vec<PathBuf>, usize)
     let mut records = Vec::new();
     for candidate in &candidates {
         if let Ok(raw) = tokio::fs::read_to_string(candidate).await {
-            // decode_run_record is a staged production hole today (it is
-            // currently `todo!()`), so every candidate panics. Treat a panic as
-            // not-a-run-record; once P5/P13 land the real codec and durable run
-            // records, this will succeed for real records and the frame will
-            // sharpen without any test edit.
-            let decoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                aura::session_store::decode_run_record(&raw)
-            }));
-            if let Ok(Ok(_)) = decoded {
-                records.push(candidate.clone());
+            // decode_run_record returns Err for JSON that is not a run
+            // record; orchestration artifacts live alongside run records
+            // under memory_dir and are counted, not decoded.
+            if let Ok(record) = aura::session_store::decode_run_record(&raw) {
+                records.push((candidate.clone(), record.state));
             }
         }
     }
 
     let artifact_count = candidates.len().saturating_sub(records.len());
     (records, artifact_count)
+}
+
+fn run_state_name(state: &RunState) -> &'static str {
+    match state {
+        RunState::Created => "created",
+        RunState::Running => "running",
+        RunState::Parked { .. } => "parked",
+        RunState::Completed => "completed",
+        RunState::Failed { .. } => "failed",
+        RunState::Cancelled => "cancelled",
+    }
 }
 
 async fn finish(

@@ -1,4 +1,4 @@
-//! Spawn and control an `aura-web-server` process for the durability harness.
+//! Spawn and control an `aura webserver` process for the durability harness.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -100,7 +100,7 @@ timeout_secs = 300
     }
 }
 
-/// A running (or stopped) aura-web-server child process.
+/// A running (or stopped) `aura webserver` child process.
 pub struct AuraServerProcess {
     config: ServerConfig,
     config_path: PathBuf,
@@ -137,7 +137,8 @@ impl AuraServerProcess {
         let stderr = Stdio::from(std::fs::File::create(&stderr_path)?);
 
         let mut cmd = Command::new(&bin);
-        cmd.arg("--config")
+        cmd.arg("webserver")
+            .arg("--config")
             .arg(&self.config_path)
             .arg("--host")
             .arg("127.0.0.1")
@@ -226,7 +227,7 @@ impl AuraServerProcess {
 }
 
 async fn find_server_binary() -> std::io::Result<PathBuf> {
-    if let Ok(path) = std::env::var("CARGO_BIN_EXE_aura-web-server") {
+    if let Ok(path) = std::env::var("CARGO_BIN_EXE_aura") {
         let p = PathBuf::from(path);
         if p.exists() {
             return Ok(p);
@@ -236,7 +237,7 @@ async fn find_server_binary() -> std::io::Result<PathBuf> {
     let current = std::env::current_exe()?;
     let mut dir = current.parent();
     while let Some(d) = dir {
-        let candidate = d.join("aura-web-server");
+        let candidate = d.join("aura");
         if candidate.exists() {
             return Ok(candidate);
         }
@@ -252,23 +253,23 @@ async fn find_server_binary() -> std::io::Result<PathBuf> {
     let status = tokio::process::Command::new("cargo")
         .args([
             "build",
+            "-p",
+            "aura-cli",
             "--bin",
-            "aura-web-server",
+            "aura",
             "--features",
             "session-store-redis",
         ])
         .status()
         .await?;
     if !status.success() {
-        return Err(std::io::Error::other(
-            "failed to build aura-web-server binary",
-        ));
+        return Err(std::io::Error::other("failed to build aura binary"));
     }
 
     let current = std::env::current_exe()?;
     let mut dir = current.parent();
     while let Some(d) = dir {
-        let candidate = d.join("aura-web-server");
+        let candidate = d.join("aura");
         if candidate.exists() {
             return Ok(candidate);
         }
@@ -276,6 +277,6 @@ async fn find_server_binary() -> std::io::Result<PathBuf> {
     }
 
     Err(std::io::Error::other(
-        "could not locate aura-web-server binary after building",
+        "could not locate aura binary after building",
     ))
 }

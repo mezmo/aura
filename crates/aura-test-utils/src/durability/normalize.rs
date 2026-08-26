@@ -6,7 +6,8 @@ use regex::Regex;
 use serde_json::Value;
 
 /// Replace run/session/approval IDs, timestamps, durations, host/port addresses,
-/// and filesystem paths with stable placeholders.
+/// filesystem paths, and the `aura_version` release string with stable
+/// placeholders.
 pub fn scrub_nondeterminism(value: &mut Value, memory_dir: &Path) {
     let memory_dir_str = memory_dir.to_string_lossy().to_string();
     let cs_re = Regex::new(r"cs_[0-9a-fA-F]{16,}").expect("cs regex compiles");
@@ -31,6 +32,8 @@ fn scrub_value(value: &mut Value, memory_dir: &str, cs_re: &Regex, uuid_re: &Reg
                     }
                 } else if key == "duration_ms" || key == "elapsed_ms" {
                     *val = Value::String("<duration>".to_string());
+                } else if key == "aura_version" {
+                    *val = Value::String("<version>".to_string());
                 } else if key == "base_url" || key == "url" {
                     if let Value::String(s) = val {
                         *s = scrub_url(s);
