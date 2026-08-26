@@ -34,6 +34,8 @@ fn scrub_value(value: &mut Value, memory_dir: &str, cs_re: &Regex, uuid_re: &Reg
                     *val = Value::String("<duration>".to_string());
                 } else if key == "aura_version" {
                     *val = Value::String("<version>".to_string());
+                } else if key == "latency_ms" {
+                    *val = Value::String("<ms>".to_string());
                 } else if key == "base_url" || key == "url" {
                     if let Value::String(s) = val {
                         *s = scrub_url(s);

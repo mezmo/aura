@@ -1,6 +1,5 @@
 ---
 source: crates/aura-web-server/tests/durability_harness_test.rs
-assertion_line: 766
 expression: snapshot
 ---
 {
@@ -13,11 +12,11 @@ expression: snapshot
           "a2a_server": {
             "version": "1.0"
           },
-          "aura_version": "0.2.6",
+          "aura_version": "<version>",
           "session_store": {
             "backend": "redis",
             "ping": {
-              "latency_ms": 0,
+              "latency_ms": "<ms>",
               "ok": true
             }
           },
@@ -43,6 +42,13 @@ expression: snapshot
               "transport": "http_streamable"
             }
           ],
+          "session_id": "<id>",
+          "trace_id": "<id>"
+        },
+        {
+          "agent_id": "main",
+          "context_tokens": 10,
+          "response_tokens": 5,
           "session_id": "<id>",
           "trace_id": "<id>"
         },
@@ -196,11 +202,11 @@ expression: snapshot
           "a2a_server": {
             "version": "1.0"
           },
-          "aura_version": "0.2.6",
+          "aura_version": "<version>",
           "session_store": {
             "backend": "redis",
             "ping": {
-              "latency_ms": 0,
+              "latency_ms": "<ms>",
               "ok": true
             }
           },
