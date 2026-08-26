@@ -4,6 +4,7 @@ pub mod backend;
 pub mod cli;
 pub mod config;
 pub mod event_names;
+pub mod governance;
 pub mod init;
 pub mod logging;
 pub mod oneshot;

@@ -21,6 +21,24 @@ pub enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<std::ffi::OsString>,
     },
+
+    /// Governance operations for MCP tool catalog management.
+    Governance {
+        #[command(subcommand)]
+        action: GovernanceAction,
+    },
+}
+
+/// Governance subcommand actions.
+#[derive(clap::Subcommand, Debug)]
+pub enum GovernanceAction {
+    /// Discover all MCP tools and POST a catalog snapshot to the configured
+    /// governance webhook. This command is standalone-mode only.
+    Sync {
+        /// Path to TOML agent config file (defaults to config.toml).
+        #[arg(long = "config")]
+        config_path: Option<String>,
+    },
 }
 
 /// Aura CLI — interactive chat completions REPL
@@ -141,7 +159,7 @@ pub fn check_standalone_flag() {
     let pass_through = std::env::args().any(|a| {
         matches!(
             a.as_str(),
-            "--help" | "-h" | "--version" | "-V" | "init" | "webserver"
+            "--help" | "-h" | "--version" | "-V" | "init" | "webserver" | "governance"
         )
     });
     if pass_through {

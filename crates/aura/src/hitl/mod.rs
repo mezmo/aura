@@ -49,7 +49,7 @@ pub use route::{
     validate_webhook_signing_config,
 };
 pub use signing::{
-    SIGNATURE_HEADER, SignedHeaders, SigningContext, TIMESTAMP_HEADER, VerificationError,
-    VerifiedBody, WebhookHmac, authorize_ingress,
+    PrimarySecret, SIGNATURE_HEADER, SignedHeaders, SigningContext, TIMESTAMP_HEADER, Tolerance,
+    VerificationError, VerifiedBody, WebhookHmac, authorize_ingress,
 };
 pub use tool::{RequestApprovalArgs, RequestApprovalTool};

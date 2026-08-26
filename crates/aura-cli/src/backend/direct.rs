@@ -139,6 +139,11 @@ impl DirectBackend {
         &self.config_path
     }
 
+    /// Access to the loaded configs.
+    pub fn configs(&self) -> &[aura_config::Config] {
+        &self.app_state.configs
+    }
+
     /// Return `true` if any loaded config enables client-side tools.
     ///
     /// A config qualifies when it is single-agent (orchestration disabled)

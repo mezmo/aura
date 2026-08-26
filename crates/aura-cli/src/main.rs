@@ -24,6 +24,9 @@ fn main() -> Result<()> {
         }
         #[cfg(feature = "webserver")]
         Some(aura_cli::cli::Command::Webserver { args }) => return aura_cli::webserver::run(args),
+        Some(aura_cli::cli::Command::Governance { action }) => {
+            return aura_cli::governance::run(action);
+        }
         None => {}
     }
 

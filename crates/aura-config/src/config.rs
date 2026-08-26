@@ -28,6 +28,9 @@ pub struct Config {
     /// it; presence of the table is the enable bit.
     #[serde(default)]
     pub hitl: Option<HitlConfig>,
+    /// Governance subsystem configuration.
+    #[serde(default)]
+    pub governance: Option<GovernanceConfig>,
 }
 
 /// Reasoning effort level for GPT-5 models
@@ -1541,4 +1544,50 @@ impl<'de> Deserialize<'de> for GlobPattern {
         let source = String::deserialize(deserializer)?;
         Self::new(source).map_err(serde::de::Error::custom)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Governance configuration
+// ---------------------------------------------------------------------------
+//
+// The `[governance]` table configures catalog-sync webhooks for MCP tool
+// discovery snapshots. These are declarative DTOs — the runtime domain
+// lives in `aura::governance`.
+
+/// `[governance]` config table.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GovernanceConfig {
+    /// Catalog-sync webhook configuration.
+    #[serde(default)]
+    pub catalog: Option<CatalogWebhookConfig>,
+}
+
+/// `[governance.catalog]` webhook configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CatalogWebhookConfig {
+    /// The webhook URL to POST catalog snapshots to.
+    pub url: WebhookUrl,
+    /// Request timeout in seconds (default 30s).
+    #[serde(default = "default_catalog_timeout_secs")]
+    pub timeout_secs: u64,
+    /// Static headers to include with every request.
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+    /// Outbound header name → inbound request header name mapping.
+    #[serde(default)]
+    pub headers_from_request: HashMap<String, String>,
+    /// HMAC signing configuration.
+    #[serde(default)]
+    pub hmac: Option<CatalogHmacConfig>,
+}
+
+/// `[governance.catalog.hmac]` HMAC signing configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CatalogHmacConfig {
+    /// The primary HMAC secret for signing requests.
+    pub secret: String,
+}
+
+fn default_catalog_timeout_secs() -> u64 {
+    30
 }

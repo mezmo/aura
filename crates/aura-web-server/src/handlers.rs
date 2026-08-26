@@ -1366,6 +1366,7 @@ mod tests {
             tools: None,
             orchestration: None,
             hitl: None,
+            governance: None,
             agent: aura_config::AgentConfig {
                 name: "test-agent".to_string(),
                 ..aura_config::AgentConfig::default()

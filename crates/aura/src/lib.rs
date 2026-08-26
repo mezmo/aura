@@ -14,6 +14,7 @@ pub mod env_flags;
 pub mod error;
 pub mod fallback_tool_parser;
 pub mod fallback_tool_stream;
+pub mod governance;
 pub mod hitl;
 pub mod inactivity;
 pub mod logging;
@@ -56,9 +57,9 @@ pub use config::{AgentRuntimeConfig, SessionId, ToolContextFactory};
 // Pure config types are owned by `aura-config` and re-exported here for
 // ergonomic consumption (`aura::LlmConfig`, etc.).
 pub use aura_config::{
-    AgentConfig, AgentSettings, EmbeddingConfig, LlmConfig, McpConfig, McpServerConfig,
-    ReasoningEffort, SkillConfig, TodoToolsConfig, ToolsConfig, VectorStoreConfig, VectorStoreType,
-    glob_match, lenient_int,
+    AgentConfig, AgentSettings, CatalogHmacConfig, CatalogWebhookConfig, EmbeddingConfig,
+    GovernanceConfig, LlmConfig, McpConfig, McpServerConfig, ReasoningEffort, SkillConfig,
+    TodoToolsConfig, ToolsConfig, VectorStoreConfig, VectorStoreType, glob_match, lenient_int,
 };
 pub use error::{BuilderError, BuilderResult};
 pub use orchestration::tools::{

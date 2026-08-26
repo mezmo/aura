@@ -67,6 +67,9 @@ regex = "1"
 async-stream = "0.3"
 strum = { workspace = true }
 
+# Event ID generation for governance catalog sync
+ulid = "1"
+
 # Tokenization for scratchpad context budget
 tiktoken-rs = "0.9.1"
 # Exact local Gemini tokenizer (embeds the Gemma 3 SentencePiece model)
