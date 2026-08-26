@@ -998,3 +998,513 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::Other);
     }
 }
+
+// ---- P29: live-Postgres frames for S1–S6 against a real database ----
+
+/// Live-Postgres integration frames (card P29). Each frame drives a real
+/// [`PgStore`] against the database named by `AURA_SESSION_ADMISSION_PG_URL`
+/// and exercises one S1–S6 round-trip end to end. The seam under test
+/// (`PgStore::new`, the `ClaimStore` methods, `ClaimRequest`/`ClaimRef`) is
+/// `pub(crate)`, so these frames live in `src` rather than an external
+/// `tests/` file — the U3/U4 `tests/` placeholders are stubs for exactly
+/// this reason.
+///
+/// With the URL unset every frame logs a loud SKIP and returns, so the
+/// suite is green whether or not a database is provisioned (a silent green
+/// would hide the whole surface). The `session_claims` table persists and
+/// frames run concurrently, so every frame allocates a fresh session id
+/// (and, where it matters, a fresh pod id) — nothing here assumes an empty
+/// table.
+#[cfg(test)]
+mod livepg {
+    use super::*;
+    use crate::claim::Locality;
+    use crate::config::PgUrl;
+
+    /// A short server lease, crossed deterministically by [`EXPIRY_WAIT_MS`].
+    const LEASE_TTL_MS: u64 = 400;
+    /// Wait comfortably past [`LEASE_TTL_MS`] so a slow CI box still sees the
+    /// server lease clock cross `clock_timestamp()` before the next probe.
+    const EXPIRY_WAIT_MS: u64 = 900;
+    /// The claim-to-renewal gap in the heartbeat frame: shorter than
+    /// [`LEASE_TTL_MS`] so the renewal still finds the lease live, yet long
+    /// enough that the renewed deadline is visibly later than the original.
+    const PRE_RENEW_GAP_MS: u64 = 80;
+    /// A lease long enough that no frame races its own expiry.
+    const GENEROUS_TTL_MS: u64 = 10_000;
+
+    /// The connection URL, or a loud skip. Reading the environment is safe
+    /// (the crate forbids only `unsafe`, which the 2024 `set_var`/`remove_var`
+    /// are — not `var`), which is why these frames need no env mutation.
+    fn pg_url_or_skip(test: &str) -> Option<PgUrl> {
+        match std::env::var("AURA_SESSION_ADMISSION_PG_URL") {
+            Ok(raw) => {
+                Some(PgUrl::parse(&raw).expect("AURA_SESSION_ADMISSION_PG_URL is a valid pg url"))
+            }
+            Err(_) => {
+                eprintln!("SKIP livepg {test}: AURA_SESSION_ADMISSION_PG_URL not set");
+                None
+            }
+        }
+    }
+
+    /// Applied exactly once per test binary before any frame's own connect.
+    static SCHEMA_READY: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+
+    /// Force one serialized connect (which applies `SCHEMA`) before any
+    /// concurrent frame connects, so every later `CREATE TABLE IF NOT EXISTS`
+    /// finds the table already present and cannot race the catalog insert.
+    async fn ensure_schema(url: &PgUrl) {
+        SCHEMA_READY
+            .get_or_init(|| async {
+                let store = PgStore::new(url.clone());
+                let probe = SessionId::parse("p29-schema-probe").expect("valid session id");
+                store
+                    .locate(&probe)
+                    .await
+                    .expect("schema bootstrap connect succeeds");
+            })
+            .await;
+    }
+
+    fn ttl_ms(ms: u64) -> LeaseTtl {
+        LeaseTtl::new(Duration::from_millis(ms)).expect("non-zero ttl")
+    }
+
+    fn unique_session(tag: &str) -> SessionId {
+        SessionId::parse(&format!("p29-{tag}-{}", TurnId::new())).expect("valid session id")
+    }
+
+    fn unique_pod(tag: &str) -> PodId {
+        PodId::parse(&format!("p29-{tag}-{}", TurnId::new())).expect("valid pod id")
+    }
+
+    /// A claim request under a fresh throwaway pod (pod identity is
+    /// irrelevant to every frame but the `release_pod` one).
+    fn claim_request(session: &SessionId, ttl: LeaseTtl) -> ClaimRequest {
+        claim_request_on(session, &unique_pod("holder"), ttl)
+    }
+
+    /// A claim request under a caller-chosen pod, with a fresh holder minted
+    /// per attempt (as the admission path does).
+    fn claim_request_on(session: &SessionId, pod: &PodId, ttl: LeaseTtl) -> ClaimRequest {
+        ClaimRequest {
+            session: session.clone(),
+            turn: TurnId::new(),
+            holder: HolderId::mint(),
+            pod: pod.clone(),
+            ttl,
+        }
+    }
+
+    fn claim_ref(granted: &GrantedClaim) -> ClaimRef {
+        ClaimRef {
+            session: granted.session.clone(),
+            turn: granted.turn,
+            epoch: granted.epoch,
+            holder: granted.holder,
+        }
+    }
+
+    fn expect_granted(outcome: ClaimOutcome) -> GrantedClaim {
+        match outcome {
+            ClaimOutcome::Granted(granted) => granted,
+            other => panic!("expected Granted, got {other:?}"),
+        }
+    }
+
+    /// S1 headline: two holders race one fresh session; the row lock lets
+    /// exactly one win (Granted) and the loser re-evaluates the WHERE against
+    /// the winner's live lease and matches zero rows (Busy) — READ COMMITTED
+    /// serialization (I7).
+    #[tokio::test]
+    async fn livepg_upsert_race_one_winner() {
+        let Some(url) = pg_url_or_skip("livepg_upsert_race_one_winner") else {
+            return;
+        };
+        ensure_schema(&url).await;
+
+        let session = unique_session("race");
+        // Two independent connections so the two S1 upserts genuinely race at
+        // the row lock, not on one pipelined client.
+        let store_a = PgStore::new(url.clone());
+        let store_b = PgStore::new(url.clone());
+        // Force both connects up front so `join!` races only the S1 statements.
+        store_a.locate(&session).await.expect("store A connects");
+        store_b.locate(&session).await.expect("store B connects");
+
+        let req_a = claim_request(&session, ttl_ms(GENEROUS_TTL_MS));
+        let req_b = claim_request(&session, ttl_ms(GENEROUS_TTL_MS));
+        let (out_a, out_b) = tokio::join!(store_a.claim(&req_a), store_b.claim(&req_b));
+        let out_a = out_a.expect("store A claim reaches the db");
+        let out_b = out_b.expect("store B claim reaches the db");
+
+        let outcomes = [out_a, out_b];
+        let granted = outcomes
+            .iter()
+            .filter(|o| matches!(o, ClaimOutcome::Granted(_)))
+            .count();
+        let busy = outcomes
+            .iter()
+            .filter(|o| matches!(o, ClaimOutcome::Busy(_)))
+            .count();
+        assert_eq!(
+            (granted, busy),
+            (1, 1),
+            "exactly one racer wins the row lock (Granted); the loser re-evaluates \
+             the WHERE against the winner's live lease and is Busy; got {:?} / {:?}",
+            outcomes[0],
+            outcomes[1],
+        );
+    }
+
+    /// S1 steal: a short lease lapses server-side, and the next claim by a
+    /// new holder steals with an incremented epoch, leaving the first holder
+    /// stale.
+    #[tokio::test]
+    async fn livepg_steal_at_expiry() {
+        let Some(url) = pg_url_or_skip("livepg_steal_at_expiry") else {
+            return;
+        };
+        ensure_schema(&url).await;
+        let store = PgStore::new(url.clone());
+        let session = unique_session("steal");
+
+        let first = expect_granted(
+            store
+                .claim(&claim_request(&session, ttl_ms(LEASE_TTL_MS)))
+                .await
+                .expect("first claim reaches the db"),
+        );
+        assert_eq!(
+            first.epoch,
+            Epoch::initial(),
+            "a fresh session starts at the initial epoch"
+        );
+
+        tokio::time::sleep(Duration::from_millis(EXPIRY_WAIT_MS)).await;
+        let second = expect_granted(
+            store
+                .claim(&claim_request(&session, ttl_ms(GENEROUS_TTL_MS)))
+                .await
+                .expect("steal claim reaches the db"),
+        );
+        assert!(
+            second.epoch > first.epoch,
+            "the steal bumps the epoch inside the locked update ({} then {})",
+            first.epoch,
+            second.epoch
+        );
+        assert_ne!(
+            second.holder, first.holder,
+            "the steal installs a new holder"
+        );
+
+        let stale = store
+            .heartbeat(&claim_ref(&first), ttl_ms(GENEROUS_TTL_MS))
+            .await
+            .expect("heartbeat reaches the db");
+        assert!(
+            matches!(stale, HeartbeatOutcome::Lost),
+            "the stolen-from holder cannot renew (got {stale:?})"
+        );
+    }
+
+    /// S2: a live lease renews (deadline advances); once the renewed lease
+    /// lapses, the next heartbeat is Lost.
+    #[tokio::test]
+    async fn livepg_heartbeat_renew_and_expire() {
+        let Some(url) = pg_url_or_skip("livepg_heartbeat_renew_and_expire") else {
+            return;
+        };
+        ensure_schema(&url).await;
+        let store = PgStore::new(url.clone());
+        let session = unique_session("beat");
+
+        let granted = expect_granted(
+            store
+                .claim(&claim_request(&session, ttl_ms(LEASE_TTL_MS)))
+                .await
+                .expect("claim reaches the db"),
+        );
+        let claim = claim_ref(&granted);
+        let first_deadline = granted.lease_expires_at;
+
+        // Renew while the lease is still live; the new deadline is later.
+        tokio::time::sleep(Duration::from_millis(PRE_RENEW_GAP_MS)).await;
+        let renewed = store
+            .heartbeat(&claim, ttl_ms(LEASE_TTL_MS))
+            .await
+            .expect("heartbeat reaches the db");
+        let new_deadline = match renewed {
+            HeartbeatOutcome::Renewed { deadline } => deadline,
+            HeartbeatOutcome::Lost => panic!("a live lease renews, got Lost"),
+        };
+        assert!(
+            new_deadline > first_deadline,
+            "renewal moves the server deadline forward"
+        );
+
+        // Let the renewed lease lapse; the next heartbeat is Lost.
+        tokio::time::sleep(Duration::from_millis(EXPIRY_WAIT_MS)).await;
+        let lost = store
+            .heartbeat(&claim, ttl_ms(LEASE_TTL_MS))
+            .await
+            .expect("heartbeat reaches the db");
+        assert!(
+            matches!(lost, HeartbeatOutcome::Lost),
+            "an expired lease cannot renew (got {lost:?})"
+        );
+    }
+
+    /// S3 fence: a stolen-from holder's commit matches zero rows
+    /// (LostFence), while the current holder's commit lands (Committed).
+    #[tokio::test]
+    async fn livepg_commit_fence_rejected_after_steal() {
+        let Some(url) = pg_url_or_skip("livepg_commit_fence_rejected_after_steal") else {
+            return;
+        };
+        ensure_schema(&url).await;
+        let store = PgStore::new(url.clone());
+        let session = unique_session("fence");
+
+        let a = expect_granted(
+            store
+                .claim(&claim_request(&session, ttl_ms(LEASE_TTL_MS)))
+                .await
+                .expect("A claim reaches the db"),
+        );
+        let a_ref = claim_ref(&a);
+
+        tokio::time::sleep(Duration::from_millis(EXPIRY_WAIT_MS)).await;
+        let b = expect_granted(
+            store
+                .claim(&claim_request(&session, ttl_ms(GENEROUS_TTL_MS)))
+                .await
+                .expect("B steal reaches the db"),
+        );
+        let b_ref = claim_ref(&b);
+
+        let a_commit = store
+            .commit(
+                &a_ref,
+                ParkLatch::NotParked,
+                OpId::mint(),
+                &Manifest::empty(),
+            )
+            .await
+            .expect("A commit reaches the db");
+        assert!(
+            matches!(a_commit, CommitOutcome::LostFence),
+            "a stolen-from holder cannot commit (got {a_commit:?})"
+        );
+
+        let b_commit = store
+            .commit(
+                &b_ref,
+                ParkLatch::NotParked,
+                OpId::mint(),
+                &Manifest::empty(),
+            )
+            .await
+            .expect("B commit reaches the db");
+        assert!(
+            matches!(b_commit, CommitOutcome::Committed),
+            "the current holder commits (got {b_commit:?})"
+        );
+    }
+
+    /// S5 reconcile: `Applied` (fence + op match a real commit),
+    /// `NotApplied` (fence matches, op differs), and `SupersededUnknown`
+    /// (a steal changed the fence).
+    #[tokio::test]
+    async fn livepg_reconcile_three_outcomes() {
+        let Some(url) = pg_url_or_skip("livepg_reconcile_three_outcomes") else {
+            return;
+        };
+        ensure_schema(&url).await;
+        let store = PgStore::new(url.clone());
+        let session = unique_session("recon");
+
+        let a = expect_granted(
+            store
+                .claim(&claim_request(&session, ttl_ms(GENEROUS_TTL_MS)))
+                .await
+                .expect("claim reaches the db"),
+        );
+        let a_ref = claim_ref(&a);
+        let op = OpId::mint();
+
+        let committed = store
+            .commit(&a_ref, ParkLatch::NotParked, op, &Manifest::empty())
+            .await
+            .expect("commit reaches the db");
+        assert!(
+            matches!(committed, CommitOutcome::Committed),
+            "the commit lands (got {committed:?})"
+        );
+        assert_eq!(
+            store
+                .reconcile_commit(&a_ref, op)
+                .await
+                .expect("reconcile reaches the db"),
+            CommitDisposition::Applied,
+            "the same fence and op read back Applied"
+        );
+
+        assert_eq!(
+            store
+                .reconcile_commit(&a_ref, OpId::mint())
+                .await
+                .expect("reconcile reaches the db"),
+            CommitDisposition::NotApplied,
+            "the same fence with a different op is a definite non-landing"
+        );
+
+        // Release makes the row stealable now; the steal bumps epoch/holder,
+        // so the original fence reads back as superseded.
+        let released = store.release(&a_ref).await.expect("release reaches the db");
+        assert!(
+            matches!(released, ReleaseOutcome::Released),
+            "the held claim releases (got {released:?})"
+        );
+        let _b = expect_granted(
+            store
+                .claim(&claim_request(&session, ttl_ms(GENEROUS_TTL_MS)))
+                .await
+                .expect("steal reaches the db"),
+        );
+        assert_eq!(
+            store
+                .reconcile_commit(&a_ref, op)
+                .await
+                .expect("reconcile reaches the db"),
+            CommitDisposition::SupersededUnknown,
+            "a changed epoch/holder makes the original commit's fate unknowable"
+        );
+    }
+
+    /// S6 locate: a live lease reports its remote holder; an expired lease
+    /// reports none.
+    #[tokio::test]
+    async fn livepg_locate_live_then_expired() {
+        let Some(url) = pg_url_or_skip("livepg_locate_live_then_expired") else {
+            return;
+        };
+        ensure_schema(&url).await;
+        let store = PgStore::new(url.clone());
+        let session = unique_session("locate");
+
+        let req = claim_request(&session, ttl_ms(LEASE_TTL_MS));
+        let pod = req.pod.clone();
+        let _granted = expect_granted(store.claim(&req).await.expect("claim reaches the db"));
+
+        let holder = store
+            .locate(&session)
+            .await
+            .expect("locate reaches the db")
+            .expect("a live lease reports a holder");
+        assert_eq!(holder.pod(), &pod, "locate names the holding pod");
+        assert_eq!(
+            holder.locality(),
+            Locality::Remote,
+            "a row read is always a remote observation"
+        );
+
+        tokio::time::sleep(Duration::from_millis(EXPIRY_WAIT_MS)).await;
+        assert!(
+            store
+                .locate(&session)
+                .await
+                .expect("locate reaches the db")
+                .is_none(),
+            "an expired lease locates no holder"
+        );
+    }
+
+    /// S4: `release` expires a held row (Released, then reads expired); a
+    /// stale-fence release is Superseded; `release_pod` expires every live
+    /// row a pod holds and returns the count.
+    #[tokio::test]
+    async fn livepg_release_and_release_pod() {
+        let Some(url) = pg_url_or_skip("livepg_release_and_release_pod") else {
+            return;
+        };
+        ensure_schema(&url).await;
+        let store = PgStore::new(url.clone());
+        let pod = unique_pod("rel");
+
+        // A held claim releases cleanly and then reads expired.
+        let session = unique_session("rel-a");
+        let a = expect_granted(
+            store
+                .claim(&claim_request_on(&session, &pod, ttl_ms(GENEROUS_TTL_MS)))
+                .await
+                .expect("A claim reaches the db"),
+        );
+        let a_ref = claim_ref(&a);
+        let released = store.release(&a_ref).await.expect("release reaches the db");
+        assert!(
+            matches!(released, ReleaseOutcome::Released),
+            "the held claim releases (got {released:?})"
+        );
+        assert!(
+            store
+                .locate(&session)
+                .await
+                .expect("locate reaches the db")
+                .is_none(),
+            "a released row reads expired"
+        );
+
+        // Superseded needs a stale fence: `S4_RELEASE` predicates only on the
+        // fence triple (no live check), so a re-release under the SAME fence
+        // would still match and read Released. A steal by a new holder bumps
+        // the epoch, so the original fence now matches zero rows.
+        let _b = expect_granted(
+            store
+                .claim(&claim_request_on(&session, &pod, ttl_ms(GENEROUS_TTL_MS)))
+                .await
+                .expect("B steal reaches the db"),
+        );
+        let superseded = store.release(&a_ref).await.expect("release reaches the db");
+        assert!(
+            matches!(superseded, ReleaseOutcome::Superseded),
+            "a stale fence releases Superseded (got {superseded:?})"
+        );
+
+        // release_pod expires every live row under the pod: the stolen
+        // session (still held live by B) plus a second live session.
+        let session2 = unique_session("rel-b");
+        let _c = expect_granted(
+            store
+                .claim(&claim_request_on(&session2, &pod, ttl_ms(GENEROUS_TTL_MS)))
+                .await
+                .expect("C claim reaches the db"),
+        );
+        let expired = store
+            .release_pod(&pod)
+            .await
+            .expect("release_pod reaches the db");
+        assert_eq!(
+            expired, 2,
+            "the pod's two live rows are expired-now and counted"
+        );
+        assert!(
+            store
+                .locate(&session)
+                .await
+                .expect("locate reaches the db")
+                .is_none(),
+            "the stolen session reads expired after release_pod"
+        );
+        assert!(
+            store
+                .locate(&session2)
+                .await
+                .expect("locate reaches the db")
+                .is_none(),
+            "the second session reads expired after release_pod"
+        );
+    }
+}
