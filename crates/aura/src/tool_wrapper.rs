@@ -547,14 +547,33 @@ where
                 // demanded override silently degrading to None would
                 // proceed under cached identity, which is fail-open.
                 Ok(PreCallOutcome::Proceed { overrides }) => overrides,
-                #[expect(
-                    unused_variables,
-                    reason = "staged for #271: blocked attempt termination"
-                )]
+                // The gate parked this call durably. The tool must not run,
+                // and rig's `Tool` interface types every non-output as an
+                // error, so the attempt ends here as one; the block itself
+                // travels to the run loop on the gate's blocked signal.
                 Ok(PreCallOutcome::Blocked(approval)) => {
-                    todo!(
-                        "staged for #271: blocked gate outcome ends the attempt as ToolAttemptOutcome::Blocked without executing"
-                    )
+                    let duration_ms = start.elapsed().as_millis() as u64;
+                    let error_msg = format!(
+                        "tool call parked for approval {}: the run is parking pending a human decision",
+                        approval.decision_id
+                    );
+
+                    let wrapper_clone = wrapper.clone();
+                    let ctx_clone = ctx.clone();
+                    let extracted_clone = extracted.clone();
+                    let completion_msg = error_msg.clone();
+                    tokio::spawn(async move {
+                        wrapper_clone
+                            .on_complete(
+                                &ctx_clone,
+                                extracted_clone.as_ref(),
+                                Err(&completion_msg),
+                                duration_ms,
+                            )
+                            .await;
+                    });
+
+                    return Err(ToolError::ToolCallError(error_msg.into()));
                 }
                 Ok(PreCallOutcome::ShortCircuit { output }) => {
                     let duration_ms = start.elapsed().as_millis() as u64;

@@ -5,6 +5,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
+use aura::session_store::RunStore;
+
 use crate::session_store::SessionStore;
 use crate::streaming::ToolResultMode;
 
@@ -110,6 +112,12 @@ pub struct AppState {
     pub hitl_webhook_hmac: Option<aura::hitl::WebhookHmac>,
     /// The session-state backend.
     pub session_store: Arc<dyn SessionStore>,
+    /// The deployment's opt-in to durable parking.
+    ///
+    /// Only the web server's entry point sets it: every other host of this
+    /// state — the CLI standalone backend, tests — shares the request path
+    /// but not the durable-park guarantee, and leaves it `None`.
+    pub run_store: Option<Arc<dyn RunStore>>,
 }
 
 /// OpenAI-compatible message role

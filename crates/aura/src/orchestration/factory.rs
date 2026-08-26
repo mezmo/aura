@@ -20,8 +20,13 @@ use crate::provider_agent::{StreamError, StreamItem};
 use crate::session_store::RunStore;
 use crate::streaming::StreamingAgent;
 
+use super::RunId;
 use super::orchestrator::{
     Orchestrator, STREAM_CHUNK_SIZE, spawn_cancellation_watcher, spawn_tool_event_forwarder,
+};
+use super::park::{
+    AgentInstanceId, FencingGeneration, LeaseTtl, RunEvent, RunState, Session, SessionId,
+    SessionRecord,
 };
 
 /// Zero-state wrapper that implements `StreamingAgent` for orchestration mode.
@@ -72,6 +77,10 @@ impl OrchestratorFactory {
     ) -> BoxStream<'static, Result<StreamItem, StreamError>> {
         let agent_config = self.agent_config.clone();
         let run_store = self.run_store.clone();
+        let park_window = agent_config
+            .hitl
+            .as_ref()
+            .and_then(crate::hitl::HitlRuntime::parkable_timeout);
 
         // Create channel for orchestrator events
         let (event_tx, event_rx) =
@@ -96,41 +105,21 @@ impl OrchestratorFactory {
                 orchestrator.run_store = run_store;
                 orchestrator.request_id = request_id.clone();
 
-                // Wire the durable session id and fencing generation so commit_quiescent_park
-                // can perform the park CAS. Failures here are non-fatal: park will refuse
-                // fail-closed at call time rather than aborting the entire run.
-                if let Some(ref store) = orchestrator.run_store {
-                    let sid = crate::orchestration::park::SessionId::generate();
-                    let instance_id = crate::orchestration::park::AgentInstanceId::generate();
-                    let ttl = crate::orchestration::park::LeaseTtl::new(
-                        std::time::Duration::from_secs(3600),
-                    )
-                    .expect("3600 s is nonzero");
-                    let record = crate::orchestration::park::SessionRecord {
-                        session: crate::orchestration::park::Session {
-                            id: sid,
-                            chat_session_id: None,
-                            created_at: Utc::now(),
-                        },
-                        run_id: None,
-                        state: crate::orchestration::park::RunState::Created,
-                        lease: None,
-                        generation: crate::orchestration::park::FencingGeneration::INITIAL,
-                    };
-                    match store.create(record).await {
-                        Ok(()) => match store.acquire_lease(sid, instance_id, ttl).await {
-                            Ok(lease) => {
-                                orchestrator.session_id = Some(sid);
-                                orchestrator.fencing_generation = Some(lease.generation);
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    "failed to acquire run-store lease at run start: {e}"
-                                );
-                            }
-                        },
+                // Wire the durable session id and fencing generation so
+                // commit_quiescent_park can perform the park CAS. Failures here
+                // are non-fatal: park refuses fail-closed at call time rather
+                // than aborting the entire run.
+                if let (Some(store), Some(park_window)) =
+                    (orchestrator.run_store.as_ref().map(Arc::clone), park_window)
+                {
+                    let run_id = orchestrator.persistence.lock().await.run_id().to_string();
+                    match begin_run(store.as_ref(), &run_id, park_window).await {
+                        Ok((session_id, generation)) => {
+                            orchestrator.session_id = Some(session_id);
+                            orchestrator.fencing_generation = Some(generation);
+                        }
                         Err(e) => {
-                            tracing::warn!("failed to create run-store session at run start: {e}");
+                            tracing::warn!("durable parking unarmed: run start failed: {e}");
                         }
                     }
                 }
@@ -200,6 +189,44 @@ impl OrchestratorFactory {
 
         Box::pin(stream)
     }
+}
+
+/// Mint the run's durable session, claim its lease, and move the record
+/// `Created -> Running` before the first wave.
+///
+/// The park CAS presents the generation this returns, not the lease's: the
+/// `Start` write advances the record, so the lease's own generation is
+/// stale the moment it succeeds. The lease is held for the park window, so
+/// a run that parks keeps its claim for as long as the approval is
+/// claimable.
+pub(super) async fn begin_run(
+    store: &dyn RunStore,
+    run_id: &str,
+    park_window: Duration,
+) -> Result<(SessionId, FencingGeneration), Box<dyn std::error::Error + Send + Sync>> {
+    let run_id: RunId = run_id.parse()?;
+    let session_id = SessionId::generate();
+    let ttl = LeaseTtl::new(park_window)?;
+    store
+        .create(SessionRecord {
+            session: Session {
+                id: session_id,
+                chat_session_id: None,
+                created_at: Utc::now(),
+            },
+            run_id: None,
+            state: RunState::Created,
+            lease: None,
+            generation: FencingGeneration::INITIAL,
+        })
+        .await?;
+    let lease = store
+        .acquire_lease(session_id, AgentInstanceId::generate(), ttl)
+        .await?;
+    let started = store
+        .apply(session_id, lease.generation, RunEvent::Start { run_id })
+        .await?;
+    Ok((session_id, started.generation))
 }
 
 #[async_trait]

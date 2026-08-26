@@ -122,26 +122,72 @@ impl PendingApprovals {
     ///
     /// Store or bus faults do not fail registration: the call parks anyway.
     /// An unpersisted park cannot be resolved and fails closed at its
-    /// timeout; a park whose subscription failed still resolves through the
-    /// wake task's store poll.
+    /// timeout.
+    ///
+    /// The wake is wired before the store insert: once `store.register`
+    /// returns, any process may resolve and publish, and the wake must
+    /// already be listening for the decision.
     #[must_use]
     pub async fn register(&self, request: ApprovalRequest, timeout: Duration) -> AwaitingDecision {
+        let (parked, id, request_id) = Self::parked_record(request, timeout);
+        let handle = self.wire_wake(id, request_id, timeout).await;
+        if let Err(err) = self.0.store.register(parked).await {
+            warn!(
+                decision_id = %id, error = %err,
+                "parked approval not persisted; it cannot be resolved and will fail closed",
+            );
+        }
+        handle
+    }
+
+    /// Park an approval durably, failing closed on a store fault: the
+    /// record is written first, so an `Err` leaves no wake wired and the
+    /// caller can refuse the gated call rather than park a run whose
+    /// approval does not exist (ADR 2026-07-21, decisions 1 and 10).
+    ///
+    /// That ordering inverts [`Self::register`]'s: a decision resolved
+    /// between the insert and the subscription reaches the waiter through
+    /// the wake task's store poll rather than the bus publish.
+    pub async fn register_durable(
+        &self,
+        request: ApprovalRequest,
+        timeout: Duration,
+    ) -> Result<AwaitingDecision, SessionStoreError> {
+        let (parked, id, request_id) = Self::parked_record(request, timeout);
+        self.0.store.register(parked).await?;
+        Ok(self.wire_wake(id, request_id, timeout).await)
+    }
+
+    /// Build the durable record for `request` alongside the two keys the
+    /// process-local wake is filed under.
+    fn parked_record(
+        request: ApprovalRequest,
+        timeout: Duration,
+    ) -> (ParkedApproval, DecisionId, String) {
         let id = request.decision_id;
         let request_id = request.request_id.clone();
         let now = chrono::Utc::now();
-        let (tx, rx) = oneshot::channel();
         let parked = ParkedApproval {
             request,
             registered_at: now,
             expires_at: now
                 + chrono::Duration::from_std(timeout).expect("approval timeout fits in chrono"),
         };
+        (parked, id, request_id)
+    }
 
-        // Subscribe before the store insert: once `store.register` returns,
-        // any process may resolve and publish, and the wake must already be
-        // listening for the decision. A failed subscription still parks a
-        // wakeable approval — the wake task's store poll remains as the
-        // (slower) carrier.
+    /// Subscribe to the approval's decision topic, spawn the task that fires
+    /// its wake, and file the process-local entry.
+    ///
+    /// A failed subscription still parks a wakeable approval — the wake
+    /// task's store poll remains as the (slower) carrier.
+    async fn wire_wake(
+        &self,
+        id: DecisionId,
+        request_id: String,
+        timeout: Duration,
+    ) -> AwaitingDecision {
+        let (tx, rx) = oneshot::channel();
         let subscription = match self.0.bus.subscribe(&approval_topic(&id)).await {
             Ok(decisions) => Some(decisions),
             Err(err) => {
@@ -167,12 +213,6 @@ impl PendingApprovals {
                 wake_task,
             },
         );
-        if let Err(err) = self.0.store.register(parked).await {
-            warn!(
-                decision_id = %id, error = %err,
-                "parked approval not persisted; it cannot be resolved and will fail closed",
-            );
-        }
         AwaitingDecision::new(id, rx, Instant::now() + timeout)
     }
 

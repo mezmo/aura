@@ -97,6 +97,19 @@ impl ApprovalOwnership {
         }
     }
 
+    /// Give the request's approvals back after a park commit failed, so
+    /// teardown deletes them instead of leaking records no session owns.
+    ///
+    /// A half that already began deleting keeps its claim: the approvals
+    /// may be gone, and re-arming would let the other half delete twice.
+    pub fn abort_transfer(&self) {
+        let mut phase = self.0.lock().expect("approval ownership lock poisoned");
+        match *phase {
+            OwnershipPhase::SessionOwned => *phase = OwnershipPhase::RequestOwned,
+            OwnershipPhase::RequestOwned | OwnershipPhase::TearingDown => {}
+        }
+    }
+
     /// A teardown half asks whether it may delete the request's approvals.
     /// Each half calls this at the moment it would delete — the async half
     /// from inside its spawned task, so a transfer that lands between guard

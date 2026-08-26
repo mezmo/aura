@@ -472,6 +472,13 @@ impl Task {
     pub fn blocked(&mut self, approval: ApprovalRef) {
         self.state = TaskState::Blocked { approval };
     }
+
+    /// Release the task back to Pending once its approval has a decision,
+    /// so the scheduler re-dispatches it and the attempt re-runs with the
+    /// decision available (ADR 2026-07-21, decisions 2 and 8).
+    pub fn pending(&mut self) {
+        self.state = TaskState::Pending;
+    }
 }
 
 /// Status of a task in the execution plan.

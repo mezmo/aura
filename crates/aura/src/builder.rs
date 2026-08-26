@@ -1741,9 +1741,15 @@ impl StreamingAgent for Agent {
 /// `orchestration.enabled = true`, any supplied `client_tools` are dropped
 /// with a warning. In single-agent mode, they are attached to the agent only
 /// when `[agent].enable_client_tools = true` (filtered by `client_tool_filter`).
+///
+/// `run_store` is the deployment's durable-parking capability. `None`
+/// leaves the orchestrator unable to park, so a quiescent-blocked run
+/// refuses fail-closed; it is also what keeps a gate hit on an unarmed
+/// deployment holding its in-request await as before.
 pub async fn build_streaming_agent(
     config: &crate::config::AgentRuntimeConfig,
     client_tools: Option<Vec<ClientTool>>,
+    run_store: Option<Arc<dyn crate::session_store::RunStore>>,
 ) -> Result<Arc<dyn StreamingAgent>, Box<dyn std::error::Error + Send + Sync>> {
     use crate::orchestration::OrchestratorFactory;
 
@@ -1756,7 +1762,10 @@ pub async fn build_streaming_agent(
                  will be ignored. Use a non-orchestrated agent config to enable them."
             );
         }
-        let factory = OrchestratorFactory::new(config.clone());
+        let mut factory = OrchestratorFactory::new(config.clone());
+        if let Some(run_store) = run_store {
+            factory = factory.with_run_store(run_store);
+        }
         Ok(Arc::new(factory))
     } else {
         // Standard single-agent mode: gate client tools on the agent's TOML opt-in

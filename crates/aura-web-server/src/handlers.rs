@@ -321,7 +321,8 @@ pub async fn prepare_request(
             // Orchestration path: build via streaming agent builder (returns Orchestrator).
             // Client tools are filtered per-coordinator/per-worker inside the orchestrator.
             let builder = RigBuilder::new(config.clone(), data.pending_approvals.clone())
-                .with_hitl_hmac(data.hitl_webhook_hmac.clone());
+                .with_hitl_hmac(data.hitl_webhook_hmac.clone())
+                .with_run_store(data.run_store.clone());
             let agent = builder
                 .build_streaming_agent_with_headers(
                     Some(req_headers_map),
@@ -1397,6 +1398,7 @@ mod tests {
         aura_config::Config {
             hitl: Some(aura_config::HitlConfig {
                 require_approval: vec![],
+                park_timeout_secs: 3600,
                 route,
             }),
             ..make_test_config()
@@ -1793,6 +1795,7 @@ mod tests {
             pending_approvals: aura::hitl::PendingApprovals::new(),
             hitl_webhook_hmac: None,
             session_store: Arc::new(crate::session_store::InMemorySessionStore::new()),
+            run_store: None,
         })
     }
 
@@ -1901,6 +1904,7 @@ model = "gpt-4o"
             pending_approvals: aura::hitl::PendingApprovals::new(),
             hitl_webhook_hmac: None,
             session_store: Arc::new(crate::session_store::InMemorySessionStore::new()),
+            run_store: None,
         })
     }
 
@@ -2373,6 +2377,7 @@ url = "http://127.0.0.1:9"
                 pending_approvals: aura::hitl::PendingApprovals::new(),
                 hitl_webhook_hmac: None,
                 session_store: Arc::new(crate::session_store::InMemorySessionStore::new()),
+                run_store: None,
             })
         }
 

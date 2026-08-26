@@ -21,6 +21,7 @@ pub struct RigBuilder {
     config: Config,
     pending_approvals: PendingApprovals,
     hitl_hmac: Option<crate::hitl::WebhookHmac>,
+    run_store: Option<Arc<dyn crate::session_store::RunStore>>,
 }
 
 impl RigBuilder {
@@ -29,6 +30,7 @@ impl RigBuilder {
             config,
             pending_approvals,
             hitl_hmac: None,
+            run_store: None,
         }
     }
 
@@ -36,6 +38,20 @@ impl RigBuilder {
     #[must_use]
     pub fn with_hitl_hmac(mut self, hmac: Option<crate::hitl::WebhookHmac>) -> Self {
         self.hitl_hmac = hmac;
+        self
+    }
+
+    /// Arm durable parking with the session store's run-store capability.
+    ///
+    /// Callers pass the capability straight through from their session
+    /// store, so a backend that hands out none leaves the built agent
+    /// parking-incapable rather than silently falling back.
+    #[must_use]
+    pub fn with_run_store(
+        mut self,
+        run_store: Option<Arc<dyn crate::session_store::RunStore>>,
+    ) -> Self {
+        self.run_store = run_store;
         self
     }
 
@@ -173,7 +189,7 @@ impl RigBuilder {
         agent_config.session_id = session_id;
         agent_config.request_id = request_id;
 
-        build_streaming_agent(&agent_config, client_tools)
+        build_streaming_agent(&agent_config, client_tools, self.run_store.clone())
             .await
             .map_err(|e| BuilderError::AgentError(format!("Failed to build streaming agent: {e}")))
     }

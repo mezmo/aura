@@ -46,7 +46,7 @@ pub use gate::{BlockedSignal, HitlApprovalWrapper};
 pub use protocol::{ApprovalDecisionWire, ApprovalItem, ApprovalRequest, PROTOCOL_VERSION};
 pub use registry::{ParkedApproval, PendingApprovals, ResolveError};
 pub use route::{
-    ApprovalError, DecisionRoute, HitlRuntime, PlaintextWebhookUrlError, WebhookClient,
+    ApprovalError, DecisionRoute, HitlRuntime, ParkError, PlaintextWebhookUrlError, WebhookClient,
     validate_webhook_signing_config,
 };
 pub use signing::{

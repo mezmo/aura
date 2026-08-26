@@ -390,7 +390,7 @@ pub struct Orchestrator {
     pub(super) mcp_manager: Option<Arc<McpManager>>,
 
     /// Execution persistence for debugging and retry intelligence
-    persistence: Arc<Mutex<ExecutionPersistence>>,
+    pub(super) persistence: Arc<Mutex<ExecutionPersistence>>,
 
     /// Optional prompt journal for dev diagnostics (gated by AURA_PROMPT_JOURNAL=1)
     prompt_journal: Option<PromptJournal>,
@@ -593,6 +593,17 @@ impl Orchestrator {
             orchestration_config.max_plan_parse_retries,
         );
 
+        // The conversational registry is the park's approval carrier: the
+        // park commit reconciles drain-time decisions out of its store and
+        // drops the request's wake handles through it. A webhook route
+        // resolves in-request and parks nothing, so neither applies.
+        let (approval_store, hitl_registry) = match agent_config.hitl.as_ref().map(|h| &*h.route) {
+            Some(crate::hitl::DecisionRoute::Conversational { registry, .. }) => {
+                (Some(registry.store()), Some(registry.clone()))
+            }
+            Some(crate::hitl::DecisionRoute::Webhook { .. }) | None => (None, None),
+        };
+
         Ok(Self {
             orchestrator_id,
             config: orchestration_config,
@@ -607,9 +618,9 @@ impl Orchestrator {
             run_store: None,
             session_id: None,
             fencing_generation: None,
-            approval_store: None,
+            approval_store,
             request_id: String::new(),
-            hitl_registry: None,
+            hitl_registry,
         })
     }
 
@@ -679,12 +690,21 @@ impl Orchestrator {
             block,
             escalation_flag.clone(),
         ));
-        // Durable parking arms the gate's blocked path per worker attempt;
-        // without the capability the gate keeps its held-await behavior.
-        let blocked_signal = self
+        // Durable parking arms the gate's blocked path per worker attempt.
+        // It takes both halves — the run store to park into and a route with
+        // a record to claim later — so without either the gate keeps its
+        // held-await behavior.
+        let park_window = self
+            .agent_config
+            .hitl
+            .as_ref()
+            .and_then(crate::hitl::HitlRuntime::parkable_timeout);
+        let durable_park = self
             .run_store
             .as_ref()
-            .map(|_| crate::hitl::BlockedSignal::new());
+            .and(park_window)
+            .map(|window| (crate::hitl::BlockedSignal::new(), window));
+        let blocked_signal = durable_park.as_ref().map(|(signal, _)| signal.clone());
 
         // Create a modified config for workers with extension fields
         let mut worker_config = self.agent_config.clone();
@@ -891,8 +911,8 @@ impl Orchestrator {
                 request_id.clone(),
                 worker_config.agent.name.clone(),
             );
-            if let Some(signal) = &blocked_signal {
-                gate = gate.with_blocked_signal(signal.clone());
+            if let Some((signal, window)) = &durable_park {
+                gate = gate.with_blocked_signal(signal.clone(), *window);
             }
             wrappers.insert(0, Arc::new(gate));
             worker_config.hitl_request_approval_tool = Some(crate::hitl::RequestApprovalTool::new(
@@ -3319,17 +3339,84 @@ Assign tasks to the worker whose tools best match the required operations."#,
             }
         };
 
-        // B. Reconcile drain-time decisions (ADR decision 8).
-        // TODO(P7): ApprovalStore exposes no `is_resolved`/`decision` accessor;
-        // add drain-time reconciliation once `resolve_durable` wake reasons are
-        // queryable.
+        // The conversational route is what makes a park claimable later: its
+        // store holds the approval records and its configured window bounds
+        // them. Both come off that one route, so one guard covers both.
+        let (approval_store, park_timeout) = self
+            .approval_store
+            .as_ref()
+            .zip(
+                self.agent_config
+                    .hitl
+                    .as_ref()
+                    .and_then(crate::hitl::HitlRuntime::parkable_timeout),
+            )
+            .ok_or_else(|| {
+                StreamError::from(
+                    "durable park requires the conversational decision route; \
+                     set `[hitl.route] mode = \"conversational\"`",
+                )
+            })?;
+
+        // B. Reconcile drain-time decisions (ADR decision 8). A decision that
+        // landed while the wave drained releases its task back to `Pending`;
+        // the dispatch FSM consumes the decision when the task re-executes.
+        // Approvals still undecided are snapshotted so the checkpoint carries
+        // the tool name, arguments, and digest that FSM binds on reify.
+        let mut reconciled = plan.clone();
+        let mut still_blocked: Vec<ApprovalRef> = Vec::new();
+        let mut approvals: Vec<ParkedApprovalSnapshot> = Vec::new();
+        for approval in blocked_on.iter() {
+            let decided = approval_store
+                .decision(&approval.decision_id)
+                .await
+                .map_err(|e| {
+                    StreamError::from(format!("approval decision lookup failed during park: {e}"))
+                })?;
+            if decided.is_some() {
+                if let Some(task) = reconciled.get_task_mut(approval.task.task_id) {
+                    task.pending();
+                }
+                continue;
+            }
+            match approval_store.get(&approval.decision_id).await {
+                Ok(Some(parked)) => {
+                    approvals.push(Self::parked_approval_snapshot(approval, &parked));
+                    still_blocked.push(approval.clone());
+                }
+                // Undecided and absent: the record the checkpoint would name
+                // is gone, so a reified run could never resolve it. Fail
+                // closed rather than park an unclaimable approval.
+                Ok(None) => {
+                    return Err(StreamError::from(format!(
+                        "approval record vanished during park: {}",
+                        approval.decision_id
+                    )));
+                }
+                Err(e) => {
+                    return Err(StreamError::from(format!(
+                        "approval store lookup failed during park: {e}"
+                    )));
+                }
+            }
+        }
+
+        let Ok(blocked_on) = NonEmpty::new(still_blocked) else {
+            // Every block was decided while the wave drained: there is
+            // nothing left to park on, so the run continues with the
+            // released tasks (ADR decision 8).
+            return Ok(IterationOutcome::Continue {
+                new_plan: reconciled,
+                previous_context: None,
+                planning_ms: 0,
+            });
+        };
 
         // C. Build the checkpoint.
         let now = chrono::Utc::now();
-        // TODO(P7): replace with `self.config.park_timeout_secs()` once the
-        // orchestration config surface adds it.
-        let park_timeout_secs: i64 = 3600;
-        let expires_at = now + chrono::Duration::seconds(park_timeout_secs);
+        let expires_at = now
+            + chrono::Duration::from_std(park_timeout)
+                .map_err(|e| StreamError::from(format!("park timeout out of range: {e}")))?;
 
         let blocked_bindings: Vec<BlockedTaskBinding> = blocked_on
             .iter()
@@ -3338,36 +3425,6 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 decision_id: a.decision_id,
             })
             .collect();
-
-        // Approval snapshots are built from the durable approval record so the
-        // checkpoint carries the tool name, arguments, and digest the dispatch
-        // FSM will bind on reify.
-        let mut approvals: Vec<ParkedApprovalSnapshot> = Vec::new();
-        // TODO(P7): wire approval_store from factory so snapshots are populated.
-        if let Some(store) = &self.approval_store {
-            for approval in blocked_on.iter() {
-                match store.get(&approval.decision_id).await {
-                    Ok(Some(parked)) => {
-                        approvals.push(Self::parked_approval_snapshot(approval, &parked));
-                    }
-                    Ok(None) => {
-                        // The approval was resolved/removed while we drained.
-                        // Decision 8 says we should continue instead of parking;
-                        // this is the best-effort signal available today.
-                        return Ok(IterationOutcome::Continue {
-                            new_plan: plan.clone(),
-                            previous_context: None,
-                            planning_ms: 0,
-                        });
-                    }
-                    Err(e) => {
-                        return Err(StreamError::from(format!(
-                            "approval store lookup failed during park: {e}"
-                        )));
-                    }
-                }
-            }
-        }
 
         let run_id = self
             .persistence
@@ -3399,7 +3456,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             query.to_owned(),
             chat_history.to_owned(),
             coordinator_conversation.to_owned(),
-            plan.clone(),
+            reconciled,
             blocked_bindings,
             approvals,
             Vec::new(),
@@ -3424,18 +3481,51 @@ Assign tasks to the worker whose tools best match the required operations."#,
             expires_at,
         };
 
-        // D. CAS `Running -> Parked` through the run store.
-        run_store
-            .park(session_id, generation, park_commit)
-            .await
-            .map_err(|e| StreamError::from(format!("run store park failed: {e}")))?;
+        // D. Take approval ownership BEFORE the CAS (ADR decision 10): the
+        // request's teardown must be disarmed while the approvals still
+        // exist, or the checkpoint names records a closing stream deletes.
+        // A missing marker means teardown is already under way, since the
+        // web guard unregisters before it begins deleting.
+        let ownership =
+            crate::hitl::ApprovalOwnership::for_request(&self.request_id).ok_or_else(|| {
+                StreamError::from(
+                    "durable park refused: the request's approvals are already being torn down",
+                )
+            })?;
+        ownership
+            .transfer_to_session()
+            .map_err(|e| StreamError::from(format!("durable park refused: {e}")))?;
 
-        // E. Transfer approval ownership from request scope to session scope
-        // (ADR decision 10). The CAS committed the park; drop process-local
-        // wake handles before the stream closes.
-        // TODO(P7): wire hitl_registry from factory so ownership transfer fires.
-        if let Some(registry) = &self.hitl_registry {
-            registry.cancel_request_local(&self.request_id);
+        // E. Commit the park. From here the transfer is live, so an
+        // abandoned commit would strand approvals under a session that
+        // never parked — run it in its own task, which the request's cancel
+        // token cannot drop, and treat a lost task like a failed CAS.
+        let registry = self.hitl_registry.clone();
+        let request_id = self.request_id.clone();
+        let rollback = ownership.clone();
+        let commit = tokio::spawn(async move {
+            match run_store.park(session_id, generation, park_commit).await {
+                Ok(_) => {
+                    // The park owns the approvals now; drop the process-local
+                    // wake handles without touching the records themselves.
+                    if let Some(registry) = registry {
+                        registry.cancel_request_local(&request_id);
+                    }
+                    Ok(())
+                }
+                Err(e) => {
+                    rollback.abort_transfer();
+                    Err(format!("run store park failed: {e}"))
+                }
+            }
+        });
+        match commit.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(StreamError::from(e)),
+            Err(e) => {
+                ownership.abort_transfer();
+                return Err(StreamError::from(format!("park commit task failed: {e}")));
+            }
         }
 
         // F. Emit the `Parked` frame post-CAS (ADR decision 15).
@@ -6825,5 +6915,440 @@ mod tests {
             }
             _ => panic!("Expected ToolOutput"),
         }
+    }
+}
+
+/// The production park path end to end: a gate hit under a memory run
+/// store parks the run, drain-time decisions release their tasks, and a
+/// failed commit hands the approvals back to request teardown.
+#[cfg(test)]
+mod durable_park_tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use aura_config::GlobPattern;
+    use rig::completion::ToolDefinition;
+    use rig::tool::{Tool as RigTool, ToolError};
+    use serde_json::{Value, json};
+
+    use std::collections::HashMap;
+
+    use super::*;
+    use crate::config::AgentRuntimeConfig;
+    use crate::hitl::{
+        AgentScope, ApprovalDecision, ApprovalOwnership, BlockedSignal, DecisionRoute,
+        HitlApprovalWrapper, HitlRuntime, PendingApprovals,
+    };
+    use crate::orchestration::park::{RunState, WaveOutcome};
+    use crate::orchestration::types::{Task, TaskIdentity};
+    use crate::session_store::{
+        ApprovalStore, InMemoryApprovalStore, InMemoryEventBus, InMemoryRunStore, RunStore,
+    };
+    use crate::tool_wrapper::{ToolWrapper, WrappedTool};
+
+    const PARK_WINDOW: Duration = Duration::from_secs(3600);
+    const GATED_TOOL: &str = "kubectl_apply";
+
+    /// A tool the gate always stops, so reaching it at all is the failure
+    /// this suite is written to catch.
+    #[derive(Clone)]
+    struct NeverRuns;
+
+    impl RigTool for NeverRuns {
+        const NAME: &'static str = GATED_TOOL;
+        type Error = ToolError;
+        type Args = Value;
+        type Output = String;
+
+        fn name(&self) -> String {
+            GATED_TOOL.to_string()
+        }
+
+        async fn definition(&self, _prompt: String) -> ToolDefinition {
+            ToolDefinition {
+                name: GATED_TOOL.to_string(),
+                description: String::new(),
+                parameters: json!({ "type": "object" }),
+            }
+        }
+
+        async fn call(&self, _args: Value) -> Result<String, ToolError> {
+            panic!("a gated tool must never execute")
+        }
+    }
+
+    fn unique_request_id() -> String {
+        format!("req_park_{}", uuid::Uuid::new_v4().simple())
+    }
+
+    fn conversational_runtime(registry: &PendingApprovals) -> HitlRuntime {
+        HitlRuntime {
+            patterns: Arc::from([GlobPattern::new("kubectl_*").unwrap()]),
+            route: Arc::new(DecisionRoute::Conversational {
+                registry: registry.clone(),
+                timeout: Duration::from_secs(60),
+            }),
+            park_timeout: PARK_WINDOW,
+        }
+    }
+
+    fn park_config(registry: &PendingApprovals, request_id: &str) -> AgentRuntimeConfig {
+        AgentRuntimeConfig {
+            hitl: Some(conversational_runtime(registry)),
+            request_id: Some(request_id.to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// An orchestrator wired the way the production factory wires one: the
+    /// run store armed and the durable session started, so the park CAS
+    /// meets a `Running` record at the generation `Start` returned.
+    async fn armed_orchestrator(
+        registry: &PendingApprovals,
+        run_store: Arc<InMemoryRunStore>,
+        request_id: &str,
+    ) -> Orchestrator {
+        let mut orchestrator = Orchestrator::new(park_config(registry, request_id))
+            .await
+            .expect("orchestrator builds without mcp or persistence");
+        orchestrator.request_id = request_id.to_string();
+        let run_id = orchestrator.persistence.lock().await.run_id().to_string();
+        let (session_id, generation) =
+            super::super::factory::begin_run(run_store.as_ref(), &run_id, PARK_WINDOW)
+                .await
+                .expect("run start claims the session and moves it to Running");
+        orchestrator.run_store = Some(run_store);
+        orchestrator.session_id = Some(session_id);
+        orchestrator.fencing_generation = Some(generation);
+        orchestrator
+    }
+
+    /// Drive one gated tool call through the real wrapper chain and return
+    /// the block it deposits, exactly as a worker attempt would.
+    async fn gate_hit(
+        orchestrator: &Orchestrator,
+        registry: &PendingApprovals,
+        request_id: &str,
+        task_id: usize,
+    ) -> ApprovalRef {
+        let signal = BlockedSignal::new();
+        let gate = HitlApprovalWrapper::new(
+            Arc::from([GlobPattern::new("kubectl_*").unwrap()]),
+            Arc::new(DecisionRoute::Conversational {
+                registry: registry.clone(),
+                timeout: Duration::from_secs(60),
+            }),
+            AgentScope::Worker {
+                run_id: orchestrator
+                    .persistence
+                    .lock()
+                    .await
+                    .run_id()
+                    .parse()
+                    .expect("run id is a uuid"),
+                task: TaskIdentity::new(task_id, None),
+                session_id: None,
+            },
+            request_id.to_string(),
+            "test-agent".to_string(),
+        )
+        .with_blocked_signal(signal.clone(), PARK_WINDOW);
+        let tool = WrappedTool::new(NeverRuns, Arc::new(gate) as Arc<dyn ToolWrapper>);
+
+        tool.call(json!({ "namespace": "prod" }))
+            .await
+            .expect_err("a parked call ends the attempt as an error");
+
+        match orchestrator
+            .attempt_blocked(signal.take_blocked().expect("the gate deposited a block"))
+            .expect("a durably parked gate hit is a blocked attempt")
+        {
+            TaskExecutionOutcome::Blocked(approval) => approval,
+            other => panic!("expected a blocked attempt, got {other:?}"),
+        }
+    }
+
+    /// A one-task plan whose only task is blocked on `approval`.
+    fn blocked_plan(approval: &ApprovalRef) -> Plan {
+        let mut plan = Plan::new("park me");
+        let mut task = Task::new(approval.task.task_id, "gated work", "needs approval");
+        task.blocked(approval.clone());
+        plan.add_task(task);
+        plan
+    }
+
+    /// Commit the park for `plan` and return its outcome alongside the
+    /// events the sink saw, in emission order.
+    async fn commit(
+        orchestrator: &Orchestrator,
+        plan: &Plan,
+    ) -> (
+        Result<IterationOutcome, StreamError>,
+        Vec<OrchestratorEvent>,
+    ) {
+        let WaveOutcome::Blocked { on } = Orchestrator::classify_blocked_drain(plan) else {
+            panic!("a plan holding a blocked task drains blocked");
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let outcome = orchestrator
+            .commit_quiescent_park(
+                on,
+                &ChannelEventSink::new(tx),
+                plan,
+                &[],
+                "park me",
+                &[],
+                1,
+                IterationTimings::default(),
+            )
+            .await;
+
+        let mut frames = Vec::new();
+        while let Ok(Ok(StreamItem::OrchestratorEvent(event))) = rx.try_recv() {
+            frames.push(event);
+        }
+        (outcome, frames)
+    }
+
+    /// The keystone: a gated call under a run store parks the run, and the
+    /// request's teardown leaves the approval the checkpoint names alone.
+    #[tokio::test]
+    async fn gated_call_parks_the_run_and_the_approval_survives_teardown() {
+        let approvals = Arc::new(InMemoryApprovalStore::new());
+        let registry =
+            PendingApprovals::with_backend(approvals.clone(), Arc::new(InMemoryEventBus::new()));
+        let run_store = Arc::new(InMemoryRunStore::new());
+        let request_id = unique_request_id();
+        let ownership = ApprovalOwnership::register(&request_id);
+
+        let orchestrator = armed_orchestrator(&registry, run_store.clone(), &request_id).await;
+        let approval = gate_hit(&orchestrator, &registry, &request_id, 0).await;
+        let plan = blocked_plan(&approval);
+
+        let (outcome, frames) = commit(&orchestrator, &plan).await;
+        assert!(matches!(
+            outcome.expect("park commits"),
+            IterationOutcome::Parked
+        ));
+        // The parked frame is the run's only orchestration frame here, and
+        // the CAS above is what let it be emitted (ADR decision 15).
+        assert!(
+            matches!(frames.as_slice(), [OrchestratorEvent::Parked { .. }]),
+            "expected exactly one parked frame, got {frames:?}",
+        );
+
+        // The request's teardown, both halves: the guard's synchronous
+        // cancel and the spawned store cleanup that follows it.
+        ApprovalOwnership::unregister(&request_id);
+        assert!(
+            !ownership.begin_teardown(),
+            "a parked run's approvals belong to the session, not the request",
+        );
+        registry.cancel_request_local(&request_id);
+
+        assert!(
+            approvals
+                .get(&approval.decision_id)
+                .await
+                .expect("store readable")
+                .is_some(),
+            "the approval the checkpoint names must outlive the request",
+        );
+        let record = run_store
+            .load(orchestrator.session_id.unwrap())
+            .await
+            .expect("record readable")
+            .expect("the run was created at start");
+        assert!(matches!(record.state, RunState::Parked { .. }));
+    }
+
+    /// A decision that lands while the wave drains releases its task
+    /// instead of parking on it (ADR decision 8).
+    #[tokio::test]
+    async fn a_decision_that_lands_during_drain_continues_and_redispatches() {
+        let approvals = Arc::new(InMemoryApprovalStore::new());
+        let registry =
+            PendingApprovals::with_backend(approvals.clone(), Arc::new(InMemoryEventBus::new()));
+        let run_store = Arc::new(InMemoryRunStore::new());
+        let request_id = unique_request_id();
+        let _ownership = ApprovalOwnership::register(&request_id);
+
+        let orchestrator = armed_orchestrator(&registry, run_store.clone(), &request_id).await;
+        let approval = gate_hit(&orchestrator, &registry, &request_id, 0).await;
+        let plan = blocked_plan(&approval);
+
+        registry
+            .resolve(&approval.decision_id, ApprovalDecision::Approved)
+            .await
+            .expect("the parked approval resolves durably");
+
+        let (outcome, frames) = commit(&orchestrator, &plan).await;
+        let IterationOutcome::Continue { new_plan, .. } = outcome.expect("drain reconciles") else {
+            panic!("a fully decided drain continues, it does not park");
+        };
+        assert!(frames.is_empty(), "a continued run emits no parked frame");
+
+        let task = new_plan
+            .tasks
+            .iter()
+            .find(|t| t.id == approval.task.task_id)
+            .expect("task kept");
+        assert_eq!(task.state, TaskState::Pending, "the task left Blocked");
+        assert_eq!(
+            new_plan.ready_tasks().len(),
+            1,
+            "the released task is dispatchable again",
+        );
+
+        // The continuation prompt renders a Pending task, so the staged
+        // Blocked arm is out of reach on this path.
+        let prompt = IterationContext::new(1, new_plan, None, vec![], HashMap::new())
+            .build_continuation_prompt(3, false, 2000);
+        assert!(prompt.contains("gated work"));
+
+        assert!(
+            run_store
+                .load(orchestrator.session_id.unwrap())
+                .await
+                .expect("record readable")
+                .is_some_and(|r| matches!(r.state, RunState::Running)),
+            "a continued run never parked",
+        );
+    }
+
+    /// A failed CAS must hand the approvals back: the park did not happen,
+    /// so the request still owns them and teardown must delete them.
+    #[tokio::test]
+    async fn a_failed_park_cas_rolls_the_ownership_transfer_back() {
+        let approvals = Arc::new(InMemoryApprovalStore::new());
+        let registry =
+            PendingApprovals::with_backend(approvals.clone(), Arc::new(InMemoryEventBus::new()));
+        let run_store = Arc::new(InMemoryRunStore::new());
+        let request_id = unique_request_id();
+        let ownership = ApprovalOwnership::register(&request_id);
+
+        let mut orchestrator = Orchestrator::new(park_config(&registry, &request_id))
+            .await
+            .expect("orchestrator builds");
+        orchestrator.request_id = request_id.clone();
+        // The session record stays `Created`: never started, so the park's
+        // `Running -> Parked` CAS is a state mismatch.
+        let session_id = crate::orchestration::park::SessionId::generate();
+        run_store
+            .create(crate::orchestration::park::SessionRecord {
+                session: crate::orchestration::park::Session {
+                    id: session_id,
+                    chat_session_id: None,
+                    created_at: chrono::Utc::now(),
+                },
+                run_id: None,
+                state: RunState::Created,
+                lease: None,
+                generation: crate::orchestration::park::FencingGeneration::INITIAL,
+            })
+            .await
+            .expect("session mints");
+        orchestrator.run_store = Some(run_store);
+        orchestrator.session_id = Some(session_id);
+        orchestrator.fencing_generation =
+            Some(crate::orchestration::park::FencingGeneration::INITIAL);
+
+        let approval = gate_hit(&orchestrator, &registry, &request_id, 0).await;
+        let plan = blocked_plan(&approval);
+
+        let (outcome, frames) = commit(&orchestrator, &plan).await;
+        let Err(err) = outcome else {
+            panic!("a Created record cannot park");
+        };
+        assert!(frames.is_empty(), "a refused park announces nothing");
+        assert!(err.to_string().contains("run store park failed"), "{err}");
+
+        assert!(
+            ownership.begin_teardown(),
+            "a park that did not commit leaves the approvals with the request",
+        );
+        registry.cancel_request(&request_id).await;
+        assert!(
+            approvals
+                .get(&approval.decision_id)
+                .await
+                .expect("store readable")
+                .is_none(),
+            "teardown must reclaim an approval no session owns",
+        );
+    }
+
+    /// Dropping the orchestration future after the transfer must not strand
+    /// approvals under a session that never parked.
+    #[tokio::test]
+    async fn a_cancelled_commit_leaves_a_consistent_end_state() {
+        let approvals = Arc::new(InMemoryApprovalStore::new());
+        let registry =
+            PendingApprovals::with_backend(approvals.clone(), Arc::new(InMemoryEventBus::new()));
+        let run_store = Arc::new(InMemoryRunStore::new());
+        let request_id = unique_request_id();
+        let ownership = ApprovalOwnership::register(&request_id);
+
+        let orchestrator = armed_orchestrator(&registry, run_store.clone(), &request_id).await;
+        let approval = gate_hit(&orchestrator, &registry, &request_id, 0).await;
+        let plan = blocked_plan(&approval);
+        let session_id = orchestrator.session_id.unwrap();
+
+        let commit_task = tokio::spawn(async move { commit(&orchestrator, &plan).await.0.is_ok() });
+        tokio::task::yield_now().await;
+        commit_task.abort();
+        let _ = commit_task.await;
+
+        // Whichever side of the window the abort landed on, the store and
+        // the ownership marker must agree.
+        for _ in 0..1_000 {
+            let parked = run_store
+                .load(session_id)
+                .await
+                .expect("record readable")
+                .is_some_and(|r| matches!(r.state, RunState::Parked { .. }));
+            if parked {
+                assert!(
+                    approvals
+                        .get(&approval.decision_id)
+                        .await
+                        .expect("store readable")
+                        .is_some(),
+                    "a parked run keeps the approval its checkpoint names",
+                );
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            ownership.begin_teardown(),
+            "a run that did not park must leave its approvals to teardown",
+        );
+    }
+
+    /// The generation the park presents is the one `Start` returned, not
+    /// the lease's: `apply` advances the record.
+    #[tokio::test]
+    async fn run_start_moves_the_record_to_running_before_the_first_wave() {
+        let registry = PendingApprovals::new();
+        let run_store = Arc::new(InMemoryRunStore::new());
+        let request_id = unique_request_id();
+        let _ownership = ApprovalOwnership::register(&request_id);
+
+        let orchestrator = armed_orchestrator(&registry, run_store.clone(), &request_id).await;
+        let session_id = orchestrator.session_id.unwrap();
+        let record = run_store
+            .load(session_id)
+            .await
+            .expect("record readable")
+            .expect("run start created the session");
+
+        assert!(matches!(record.state, RunState::Running));
+        assert_eq!(
+            Some(record.generation),
+            orchestrator.fencing_generation,
+            "the park presents the post-Start generation",
+        );
+        assert!(record.run_id.is_some(), "Start bound the run id");
     }
 }

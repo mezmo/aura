@@ -440,6 +440,7 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
             session_store.bus(),
         ),
         hitl_webhook_hmac: ingress_hmac.clone(),
+        run_store: session_store.runs(),
         session_store: session_store.clone(),
     });
 

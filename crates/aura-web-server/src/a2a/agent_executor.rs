@@ -744,6 +744,7 @@ mod tests {
             pending_approvals: aura::hitl::PendingApprovals::new(),
             hitl_webhook_hmac: None,
             session_store: Arc::new(crate::session_store::InMemorySessionStore::new()),
+            run_store: None,
         });
         AuraAgentExecutor::new(app_state, SharedTaskStore::default())
     }

@@ -400,6 +400,17 @@ impl Config {
         // Scratchpad validation
         self.validate_scratchpad()?;
 
+        // A zero park window expires the run the instant it parks, which the
+        // reaper reads as a non-human exit and denies — fail closed at parse
+        // instead.
+        if let Some(hitl) = &self.hitl
+            && hitl.park_timeout_secs == 0
+        {
+            return Err(crate::ConfigError::Validation(
+                "hitl.park_timeout_secs must be greater than 0".to_string(),
+            ));
+        }
+
         if let (Some(hitl), Some(orch)) = (
             &self.hitl,
             self.orchestration.as_ref().filter(|o| o.enabled),
@@ -1083,10 +1094,51 @@ mod tests {
         assert_eq!(config.agent.nudge_turns_remaining, None);
     }
 
+    /// The park window has a default because most deployments never set
+    /// one, and a zero window is rejected because it expires a run the
+    /// instant it parks.
+    #[test]
+    fn hitl_park_timeout_defaults_and_rejects_zero() {
+        let parsed: HitlConfig = toml::from_str(
+            r#"
+            require_approval = ["kubectl_*"]
+            [route]
+            mode = "conversational"
+            "#,
+        )
+        .expect("a [hitl] table without a park timeout parses");
+        assert_eq!(parsed.park_timeout_secs, 3600);
+
+        let mut config = Config {
+            hitl: Some(parsed),
+            ..Default::default()
+        };
+        config.agent.llm = LlmConfig::Ollama {
+            model: "test".to_string(),
+            base_url: None,
+            max_tokens: None,
+            context_window: None,
+            temperature: None,
+            fallback_tool_parsing: false,
+            additional_params: None,
+        };
+        config
+            .validate()
+            .expect("the default park window validates");
+
+        config.hitl.as_mut().unwrap().park_timeout_secs = 0;
+        let err = config
+            .validate()
+            .expect_err("a zero park window is rejected")
+            .to_string();
+        assert!(err.contains("park_timeout_secs"), "unexpected error: {err}");
+    }
+
     #[test]
     fn test_hitl_timeout_conflict_disabled_per_call_timeout() {
         let hitl = HitlConfig {
             require_approval: vec![],
+            park_timeout_secs: 3600,
             route: DecisionRouteConfig::Webhook {
                 url: WebhookUrl::new("http://localhost:9999").unwrap(),
                 timeout_secs: 300,
@@ -1119,6 +1171,7 @@ mod tests {
     fn test_hitl_timeout_conflict_route_timeout_less_than_per_call() {
         let hitl = HitlConfig {
             require_approval: vec![],
+            park_timeout_secs: 3600,
             route: DecisionRouteConfig::Webhook {
                 url: WebhookUrl::new("http://localhost:9999").unwrap(),
                 timeout_secs: 30,
@@ -1134,6 +1187,7 @@ mod tests {
     fn test_hitl_timeout_conflict_route_timeout_equals_per_call() {
         let hitl = HitlConfig {
             require_approval: vec![],
+            park_timeout_secs: 3600,
             route: DecisionRouteConfig::Webhook {
                 url: WebhookUrl::new("http://localhost:9999").unwrap(),
                 timeout_secs: 60,
@@ -1151,6 +1205,7 @@ mod tests {
     fn test_hitl_timeout_conflict_route_timeout_greater_than_per_call() {
         let hitl = HitlConfig {
             require_approval: vec![],
+            park_timeout_secs: 3600,
             route: DecisionRouteConfig::Webhook {
                 url: WebhookUrl::new("http://localhost:9999").unwrap(),
                 timeout_secs: 120,
@@ -1169,6 +1224,7 @@ mod tests {
     fn test_hitl_timeout_conflict_conversational_variant() {
         let hitl = HitlConfig {
             require_approval: vec![],
+            park_timeout_secs: 3600,
             route: DecisionRouteConfig::Conversational { timeout_secs: 120 },
         };
         let msg = hitl_timeout_conflict_warning(&hitl, 60).unwrap();
@@ -1327,6 +1383,9 @@ pub struct HitlConfig {
     pub require_approval: Vec<GlobPattern>,
     /// The decision route; required when `[hitl]` is present.
     pub route: DecisionRouteConfig,
+    /// How long a durably parked run stays claimable, in seconds.
+    #[serde(default = "default_park_timeout_secs")]
+    pub park_timeout_secs: u64,
 }
 
 /// `[hitl.route]` table. The `Webhook` variant cannot parse without a valid
@@ -1453,6 +1512,10 @@ fn default_conversational_timeout_secs() -> u64 {
 
 fn default_webhook_timeout_secs() -> u64 {
     300
+}
+
+fn default_park_timeout_secs() -> u64 {
+    3600
 }
 
 /// A validated webhook URL.

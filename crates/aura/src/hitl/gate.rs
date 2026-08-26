@@ -49,6 +49,28 @@ impl BlockedSignal {
     pub fn take_blocked(&self) -> Option<ToolAttemptOutcome> {
         self.0.lock().expect("blocked signal lock poisoned").take()
     }
+
+    /// Whether a block is already deposited for the current attempt.
+    #[must_use]
+    pub fn is_blocked(&self) -> bool {
+        self.0
+            .lock()
+            .expect("blocked signal lock poisoned")
+            .is_some()
+    }
+}
+
+/// What the gate tells the model once the run is already parking: the
+/// attempt is over, and a second gated call would register an approval
+/// nothing will ever claim.
+const ALREADY_PARKING: &str = "the run is parking pending approval; no further gated calls";
+
+/// The durable-park arming of one gate: the channel a block leaves on and
+/// the window the approval is registered for.
+#[derive(Clone)]
+struct DurablePark {
+    signal: BlockedSignal,
+    timeout: std::time::Duration,
 }
 
 /// Gates matching tool calls behind an approval decision.
@@ -69,7 +91,7 @@ pub struct HitlApprovalWrapper {
     /// Present only when the deployment supports durable parking: a gate hit
     /// then parks the approval and ends the attempt as `Blocked` instead of
     /// holding the await for the length of the request.
-    blocked_signal: Option<BlockedSignal>,
+    durable_park: Option<DurablePark>,
 }
 
 impl HitlApprovalWrapper {
@@ -87,41 +109,54 @@ impl HitlApprovalWrapper {
             scope,
             request_id,
             agent_name,
-            blocked_signal: None,
+            durable_park: None,
         }
     }
 
-    /// Arm the durable-park path: a gate hit parks the approval and reports
-    /// the block through `signal` instead of awaiting the decision in-request.
+    /// Arm the durable-park path: a gate hit registers the approval for
+    /// `park_timeout` and reports the block through `signal` instead of
+    /// awaiting the decision in-request.
     #[must_use]
-    pub fn with_blocked_signal(mut self, signal: BlockedSignal) -> Self {
-        self.blocked_signal = Some(signal);
+    pub fn with_blocked_signal(
+        mut self,
+        signal: BlockedSignal,
+        park_timeout: std::time::Duration,
+    ) -> Self {
+        self.durable_park = Some(DurablePark {
+            signal,
+            timeout: park_timeout,
+        });
         self
     }
 
-    /// Park the gated call durably and end the attempt blocked (ADR
-    /// 2026-07-21, decisions 1 and 11). The fill builds one
-    /// [`PreCallOutcome::Blocked`] and returns it THROUGH
+    /// Register the gated call durably and end the attempt blocked (ADR
+    /// 2026-07-21, decisions 1 and 11).
+    ///
+    /// Registration precedes the block: a store fault fails the call closed
+    /// as a tool error with nothing published, so the run never parks on an
+    /// approval that was not written. On success the one
+    /// [`PreCallOutcome::Blocked`] built here returns THROUGH
     /// [`BlockedSignal::deposit`], which stores its projection and hands the
     /// outcome back — the side channel and the wrapper-chain value are one.
-    fn park_instead_of_awaiting(
+    async fn park_instead_of_awaiting(
         &self,
         request: ApprovalRequest,
-        signal: &BlockedSignal,
+        park: &DurablePark,
     ) -> Result<PreCallOutcome, ToolError> {
-        let task = match request.scope {
-            AgentScope::Worker { task, .. } => task,
-            _ => {
-                return Err(ToolError::ToolCallError(
-                    "durable park requires worker scope".to_string().into(),
-                ));
-            }
+        let AgentScope::Worker { task, .. } = request.scope.clone() else {
+            return Err(ToolError::ToolCallError(
+                "durable park requires worker scope".to_string().into(),
+            ));
         };
         let approval_ref = ApprovalRef {
             decision_id: request.decision_id,
             task,
         };
-        Ok(signal.deposit(PreCallOutcome::Blocked(approval_ref)))
+        self.route
+            .park(request, park.timeout)
+            .await
+            .map_err(|e| ToolError::ToolCallError(format!("tool call blocked: {e}").into()))?;
+        Ok(park.signal.deposit(PreCallOutcome::Blocked(approval_ref)))
     }
 
     /// First configured glob that matches `tool_name`, never gating the
@@ -149,6 +184,16 @@ impl ToolWrapper for HitlApprovalWrapper {
         let Some(matched) = self.matched_pattern(&ctx.tool_name) else {
             return Ok(PreCallOutcome::Proceed { overrides: None });
         };
+        // The block is sticky for the rest of the attempt: the run is
+        // already draining toward its park, so a further gated call
+        // registers nothing and tells the model to stop.
+        if let Some(park) = &self.durable_park
+            && park.signal.is_blocked()
+        {
+            return Ok(PreCallOutcome::ShortCircuit {
+                output: ALREADY_PARKING.to_string(),
+            });
+        }
         let request = ApprovalRequest {
             version: PROTOCOL_VERSION,
             decision_id: DecisionId::generate(),
@@ -164,8 +209,8 @@ impl ToolWrapper for HitlApprovalWrapper {
                 tool_call_intent: ctx.tool_call_intent.clone(),
             }],
         };
-        if let Some(signal) = &self.blocked_signal {
-            return self.park_instead_of_awaiting(request, signal);
+        if let Some(park) = &self.durable_park {
+            return self.park_instead_of_awaiting(request, park).await;
         }
         let cancel =
             crate::request_cancellation::RequestCancellation::token_for_id(&self.request_id)
@@ -314,6 +359,216 @@ mod tests {
                 .unwrap_err()
                 .to_string();
         assert!(channel_fault.contains("approval channel error"));
+    }
+
+    /// The durable-park arm of the gate: what it writes before it blocks,
+    /// and what it refuses to write once the run is already parking.
+    mod durable_park {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use rig::completion::ToolDefinition;
+        use rig::tool::Tool as RigTool;
+        use serde_json::json;
+
+        use super::super::super::decision::ApprovalDecision;
+        use super::super::super::registry::{ParkedApproval, PendingApprovals, ResolveError};
+        use super::*;
+        use crate::approval_event_broker;
+        use crate::orchestration::park::WakeReason;
+        use crate::orchestration::{RunId, TaskIdentity};
+        use crate::session_store::{
+            ApprovalStore, InMemoryApprovalStore, InMemoryEventBus, SessionStoreError,
+        };
+        use crate::tool_wrapper::WrappedTool;
+
+        /// An approval store that counts registrations and can refuse them,
+        /// standing in for a store outage at the park's one durable write.
+        struct CountingApprovalStore {
+            inner: InMemoryApprovalStore,
+            registers: AtomicUsize,
+            refuse: bool,
+        }
+
+        impl CountingApprovalStore {
+            fn new(refuse: bool) -> Self {
+                Self {
+                    inner: InMemoryApprovalStore::new(),
+                    registers: AtomicUsize::new(0),
+                    refuse,
+                }
+            }
+
+            fn registers(&self) -> usize {
+                self.registers.load(Ordering::SeqCst)
+            }
+        }
+
+        #[async_trait]
+        impl ApprovalStore for CountingApprovalStore {
+            async fn register(&self, parked: ParkedApproval) -> Result<(), SessionStoreError> {
+                self.registers.fetch_add(1, Ordering::SeqCst);
+                if self.refuse {
+                    return Err(SessionStoreError::Request {
+                        reason: "approval store offline".to_string(),
+                    });
+                }
+                self.inner.register(parked).await
+            }
+
+            async fn get(
+                &self,
+                id: &DecisionId,
+            ) -> Result<Option<ParkedApproval>, SessionStoreError> {
+                self.inner.get(id).await
+            }
+
+            async fn resolve(
+                &self,
+                id: &DecisionId,
+                decision: ApprovalDecision,
+            ) -> Result<(), ResolveError> {
+                self.inner.resolve(id, decision).await
+            }
+
+            async fn decision(
+                &self,
+                id: &DecisionId,
+            ) -> Result<Option<ApprovalDecision>, SessionStoreError> {
+                self.inner.decision(id).await
+            }
+
+            async fn resolve_durable(
+                &self,
+                id: &DecisionId,
+                decision: ApprovalDecision,
+            ) -> Result<WakeReason, ResolveError> {
+                self.inner.resolve_durable(id, decision).await
+            }
+
+            async fn remove(&self, id: &DecisionId) -> Result<(), SessionStoreError> {
+                self.inner.remove(id).await
+            }
+
+            async fn cancel_request(&self, request_id: &str) -> Result<(), SessionStoreError> {
+                self.inner.cancel_request(request_id).await
+            }
+        }
+
+        #[derive(Clone)]
+        struct StubTool;
+
+        impl RigTool for StubTool {
+            const NAME: &'static str = "kubectl_apply";
+            type Error = ToolError;
+            type Args = Value;
+            type Output = String;
+
+            fn name(&self) -> String {
+                "kubectl_apply".to_string()
+            }
+
+            async fn definition(&self, _prompt: String) -> ToolDefinition {
+                ToolDefinition {
+                    name: "kubectl_apply".to_string(),
+                    description: String::new(),
+                    parameters: json!({ "type": "object" }),
+                }
+            }
+
+            async fn call(&self, _args: Value) -> Result<String, ToolError> {
+                panic!("a gated tool must never execute")
+            }
+        }
+
+        fn armed_gate(registry: &PendingApprovals, request_id: &str) -> HitlApprovalWrapper {
+            HitlApprovalWrapper::new(
+                Arc::from([GlobPattern::new("kubectl_*").unwrap()]),
+                Arc::new(DecisionRoute::Conversational {
+                    registry: registry.clone(),
+                    timeout: Duration::from_secs(60),
+                }),
+                AgentScope::Worker {
+                    run_id: uuid::Uuid::new_v4()
+                        .to_string()
+                        .parse::<RunId>()
+                        .expect("a v4 uuid is a run id"),
+                    task: TaskIdentity::new(0, None),
+                    session_id: None,
+                },
+                request_id.to_string(),
+                "test-agent".to_string(),
+            )
+            .with_blocked_signal(BlockedSignal::new(), Duration::from_secs(3600))
+        }
+
+        fn unique_request_id() -> String {
+            format!("req_gate_{}", uuid::Uuid::new_v4().simple())
+        }
+
+        /// A store outage at registration fails the call closed with nothing
+        /// announced: no approver may see a decision id whose record the run
+        /// could never resolve.
+        #[tokio::test]
+        async fn a_store_fault_at_registration_publishes_nothing() {
+            let store = Arc::new(CountingApprovalStore::new(true));
+            let registry =
+                PendingApprovals::with_backend(store.clone(), Arc::new(InMemoryEventBus::new()));
+            let request_id = unique_request_id();
+            let mut events = approval_event_broker::subscribe(&request_id).await;
+
+            let tool = WrappedTool::new(
+                StubTool,
+                Arc::new(armed_gate(&registry, &request_id)) as Arc<dyn ToolWrapper>,
+            );
+            let err = tool
+                .call(json!({}))
+                .await
+                .expect_err("a store fault must block the call");
+
+            assert!(
+                err.to_string().contains("approval store offline"),
+                "the tool error must name the store fault, got: {err}",
+            );
+            assert_eq!(store.registers(), 1, "the store was asked exactly once");
+            assert!(
+                events.try_recv().is_err(),
+                "a refused registration announces nothing",
+            );
+
+            approval_event_broker::unsubscribe(&request_id).await;
+        }
+
+        /// Once the run is parking, a further gated call in the same attempt
+        /// registers nothing: a second approval would have no task waiting on
+        /// it and nothing would ever claim it.
+        #[tokio::test]
+        async fn a_second_gated_hit_in_one_attempt_registers_nothing() {
+            let store = Arc::new(CountingApprovalStore::new(false));
+            let registry =
+                PendingApprovals::with_backend(store.clone(), Arc::new(InMemoryEventBus::new()));
+            let request_id = unique_request_id();
+            let gate = armed_gate(&registry, &request_id);
+            let args = json!({});
+            let ctx = ToolCallContext::new("kubectl_apply");
+
+            let first = gate.pre_call(&args, &ctx).await.expect("the gate parks");
+            assert!(matches!(first, PreCallOutcome::Blocked(_)));
+            assert_eq!(store.registers(), 1);
+
+            let second = gate
+                .pre_call(&args, &ctx)
+                .await
+                .expect("a parking run short-circuits rather than erroring");
+            assert_eq!(
+                second,
+                PreCallOutcome::ShortCircuit {
+                    output: ALREADY_PARKING.to_string()
+                },
+            );
+            assert_eq!(store.registers(), 1, "the second hit registered nothing");
+
+            registry.cancel_request(&request_id).await;
+        }
     }
 
     /// Trace correlation: a gated call's `execute_tool` span carries the

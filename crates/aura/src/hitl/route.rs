@@ -35,6 +35,8 @@ const WEBHOOK_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 pub struct HitlRuntime {
     pub patterns: Arc<[GlobPattern]>,
     pub route: Arc<DecisionRoute>,
+    /// How long a durably parked run stays claimable.
+    pub park_timeout: Duration,
 }
 
 impl HitlRuntime {
@@ -86,6 +88,20 @@ impl HitlRuntime {
         Self {
             patterns: Arc::from(config.require_approval.clone()),
             route: Arc::new(route),
+            park_timeout: Duration::from_secs(config.park_timeout_secs),
+        }
+    }
+
+    /// The park window, for a deployment whose route can durably park.
+    ///
+    /// A webhook route resolves its decision in one round trip and leaves
+    /// no record for a later request to claim, so it never parks — the run
+    /// store stays unused and the gate keeps its in-request await.
+    #[must_use]
+    pub fn parkable_timeout(&self) -> Option<Duration> {
+        match &*self.route {
+            DecisionRoute::Conversational { .. } => Some(self.park_timeout),
+            DecisionRoute::Webhook { .. } => None,
         }
     }
 }
@@ -177,6 +193,48 @@ impl GateDecision {
     }
 }
 
+/// Why a durable park could not be registered.
+#[derive(Debug, thiserror::Error)]
+pub enum ParkError {
+    /// The gate's durable-park path was armed on a route that parks nothing
+    /// in a store, so there would be no record for a later request to claim.
+    #[error("durable park requires the conversational decision route")]
+    WrongRoute,
+    #[error("durable park could not persist the approval: {0}")]
+    Store(#[from] crate::session_store::SessionStoreError),
+}
+
+/// The `Requested` and `Pending` events one conversational registration
+/// owes its subscribers, prepared before the request moves into the store.
+struct ConversationalAnnouncement {
+    request_id: String,
+    requested: ApprovalLifecycleEvent,
+    pending: ApprovalLifecycleEvent,
+}
+
+impl ConversationalAnnouncement {
+    /// Build the pair for `request` parked with `timeout`.
+    fn prepare(request: &ApprovalRequest, timeout: Duration) -> Self {
+        let expires_at = chrono::Utc::now()
+            + chrono::Duration::from_std(timeout).expect("approval timeout fits in chrono");
+        Self {
+            request_id: request.request_id.clone(),
+            requested: ApprovalLifecycleEvent::Requested(request.into()),
+            pending: ApprovalLifecycleEvent::Pending(events::pending(request, &expires_at)),
+        }
+    }
+
+    /// Publish `Requested` then `Pending`.
+    ///
+    /// Every caller registers first: both events carry the decision id
+    /// off-process (SSE), and an approver reacting to either must find the
+    /// parked record already resolvable.
+    async fn publish(self) {
+        approval_event_broker::publish(&self.request_id, self.requested).await;
+        approval_event_broker::publish(&self.request_id, self.pending).await;
+    }
+}
+
 /// Where an approval decision comes from. Fixed per deployment by config.
 #[expect(
     clippy::large_enum_variant,
@@ -198,6 +256,28 @@ pub enum DecisionRoute {
 }
 
 impl DecisionRoute {
+    /// Park `request` durably for `park_timeout`, ending the caller's tool
+    /// attempt instead of awaiting the decision in-request (ADR 2026-07-21,
+    /// decisions 1 and 11).
+    ///
+    /// A store fault aborts before anything is published, so no approver
+    /// ever sees a decision id whose record does not exist. The await handle
+    /// is dropped on purpose: the decision reaches the run when it reifies,
+    /// through the store, not through this request.
+    pub async fn park(
+        &self,
+        request: ApprovalRequest,
+        park_timeout: Duration,
+    ) -> Result<(), ParkError> {
+        let Self::Conversational { registry, .. } = self else {
+            return Err(ParkError::WrongRoute);
+        };
+        let announcement = ConversationalAnnouncement::prepare(&request, park_timeout);
+        registry.register_durable(request, park_timeout).await?;
+        announcement.publish().await;
+        Ok(())
+    }
+
     /// Obtain a decision for a config-gated call, carrying any captured
     /// approver header overrides on the approved arm.
     ///
@@ -287,23 +367,9 @@ impl DecisionRoute {
 
         match self {
             Self::Conversational { registry, timeout } => {
-                let requested_event = ApprovalLifecycleEvent::Requested((&request).into());
-                let expires_at = chrono::Utc::now()
-                    + chrono::Duration::from_std(*timeout)
-                        .expect("approval timeout fits in chrono");
-                let pending_event = events::pending(&request, &expires_at);
-
-                // Register before publishing anything: both events carry the
-                // decision id off-process (SSE), and an approver reacting to
-                // either must find the parked record already resolvable.
+                let announcement = ConversationalAnnouncement::prepare(&request, *timeout);
                 let handle = registry.register(request, *timeout).await;
-
-                approval_event_broker::publish(&request_id, requested_event).await;
-                approval_event_broker::publish(
-                    &request_id,
-                    ApprovalLifecycleEvent::Pending(pending_event),
-                )
-                .await;
+                announcement.publish().await;
 
                 let mut outcome = handle.outcome(cancel).await;
                 let timed_out = matches!(outcome, ApprovalOutcome::TimedOut { .. });
@@ -1424,6 +1490,7 @@ mod tests {
 
             let webhook = |url: &str| aura_config::HitlConfig {
                 require_approval: vec![],
+                park_timeout_secs: 3600,
                 route: aura_config::DecisionRouteConfig::Webhook {
                     url: aura_config::WebhookUrl::new(url).unwrap(),
                     timeout_secs: 300,
@@ -1456,9 +1523,54 @@ mod tests {
             // Conversational route has no URL to validate.
             let conversational = aura_config::HitlConfig {
                 require_approval: vec![],
+                park_timeout_secs: 3600,
                 route: aura_config::DecisionRouteConfig::Conversational { timeout_secs: 60 },
             };
             validate_webhook_signing_config(&conversational, Some(&hmac)).unwrap();
+        }
+
+        /// The configured park window reaches the runtime carrier, and only
+        /// the route that can durably park hands it out.
+        #[test]
+        fn from_config_carries_the_park_window_for_the_parkable_route_only() {
+            use super::super::HitlRuntime;
+
+            let pending = crate::hitl::PendingApprovals::new();
+
+            let conversational = HitlRuntime::from_config(
+                &aura_config::HitlConfig {
+                    require_approval: vec![],
+                    park_timeout_secs: 900,
+                    route: aura_config::DecisionRouteConfig::Conversational { timeout_secs: 60 },
+                },
+                &pending,
+                None,
+                None,
+            );
+            assert_eq!(conversational.park_timeout, Duration::from_secs(900));
+            assert_eq!(
+                conversational.parkable_timeout(),
+                Some(Duration::from_secs(900)),
+            );
+
+            let webhook = HitlRuntime::from_config(
+                &aura_config::HitlConfig {
+                    require_approval: vec![],
+                    park_timeout_secs: 900,
+                    route: aura_config::DecisionRouteConfig::Webhook {
+                        url: aura_config::WebhookUrl::new("https://approvals.example.com/aura")
+                            .unwrap(),
+                        timeout_secs: 300,
+                        headers: HashMap::new(),
+                        headers_from_request: HashMap::new(),
+                        tool_headers_from_response: aura_config::ToolHeaderMappings::default(),
+                    },
+                },
+                &pending,
+                None,
+                None,
+            );
+            assert_eq!(webhook.parkable_timeout(), None);
         }
 
         #[test]
@@ -1467,6 +1579,7 @@ mod tests {
 
             let config = |url: &str| aura_config::HitlConfig {
                 require_approval: vec![],
+                park_timeout_secs: 3600,
                 route: aura_config::DecisionRouteConfig::Webhook {
                     url: aura_config::WebhookUrl::new(url).unwrap(),
                     timeout_secs: 300,

@@ -139,6 +139,7 @@ impl DirectBackend {
             additional_tools: additional_tools_factory(),
             pending_approvals,
             hitl_webhook_hmac,
+            run_store: None,
             session_store,
         });
 
@@ -276,6 +277,7 @@ impl DirectBackend {
             pending_approvals: old.pending_approvals.clone(),
             hitl_webhook_hmac: old.hitl_webhook_hmac.clone(),
             session_store: old.session_store.clone(),
+            run_store: None,
         });
     }
 
@@ -526,6 +528,7 @@ mod tests {
             pending_approvals: aura::hitl::PendingApprovals::new(),
             hitl_webhook_hmac: None,
             session_store: Arc::new(InMemorySessionStore::new()),
+            run_store: None,
         });
         DirectBackend {
             app_state,
