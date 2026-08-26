@@ -73,12 +73,36 @@ impl ArtifactPath {
                 reason: "epoch prefix must be e{digits}".into(),
             });
         }
+        // Reject non-canonical digit strings: `epoch_dir` derives the
+        // directory as `e{k}`, so a leading-zero prefix like `e01` would
+        // parse to epoch 1 while preserving `e01/...` — a permanent
+        // read-miss. Parse-don't-validate: reject, never normalize.
+        if digits.len() > 1 && digits.starts_with('0') {
+            return Err(InvalidArtifactPath {
+                reason: "epoch prefix must be canonical (no leading zeros)".into(),
+            });
+        }
         let k = digits.parse::<u64>().map_err(|_| InvalidArtifactPath {
             reason: "epoch prefix out of range".into(),
         })?;
         let epoch = Epoch::from_raw(k).ok_or_else(|| InvalidArtifactPath {
             reason: "epoch 0 is unreachable".into(),
         })?;
+        // The epoch prefix must be followed by a path body; a bare `e1`
+        // would collide with the epoch directory itself.
+        let body = segments.next().ok_or_else(|| InvalidArtifactPath {
+            reason: "epoch prefix requires a path body".into(),
+        })?;
+        if body.is_empty() {
+            return Err(InvalidArtifactPath {
+                reason: "empty path segment".into(),
+            });
+        }
+        if body == "." || body == ".." {
+            return Err(InvalidArtifactPath {
+                reason: "dot component".into(),
+            });
+        }
         for segment in segments {
             if segment.is_empty() {
                 return Err(InvalidArtifactPath {

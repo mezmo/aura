@@ -37,6 +37,8 @@ fn artifact_path_parse_rules() {
         assert!(ArtifactPath::parse("e1/../x").is_err());
         assert!(ArtifactPath::parse("e1/./x").is_err());
         assert!(ArtifactPath::parse("/e1/foo").is_err());
+        assert!(ArtifactPath::parse("e01/foo.txt").is_err());
+        assert!(ArtifactPath::parse("e1").is_err());
     }));
     expect_todo_panic(result);
 }
