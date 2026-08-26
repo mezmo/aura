@@ -79,7 +79,6 @@
 //! | `AURA_SESSION_ADMISSION_FENCE_MARGIN_MS` | self-fence margin (default 250) |
 //! | `AURA_SESSION_ADMISSION_RETRY_AFTER_MS` | `Busy` retry hint (default 1000) |
 //! | `AURA_SESSION_ADMISSION_PROPAGATION_WINDOW_MS` | read-miss retry window (default 30000) |
-//! | `AURA_SESSION_REPAIR_LANE` | `auto` (default), `cli`, or `s3api` |
 //!
 //! Build the backend with [`build_admission`] — `off` yields a
 //! [`LocalAdmission`] (arbiter-only), `pg` a [`PgAdmission`] against the
@@ -109,7 +108,7 @@ mod store;
 
 pub use adapters::{LocalAdmission, PgAdmission};
 pub use claim::{HolderView, Locality};
-pub use config::{AdmissionConfigError, AdmissionEnv, AdmissionMode, PgUrl, RepairLaneKind};
+pub use config::{AdmissionConfigError, AdmissionEnv, AdmissionMode, PgUrl};
 pub use epoch::{Epoch, epoch_dir, session_dir};
 pub use identity::{
     HolderId, InvalidHolderId, InvalidOpId, InvalidPodId, InvalidSessionId, InvalidTurnId, OpId,
@@ -168,7 +167,7 @@ pub fn build_admission(
             })?;
             let store: Arc<dyn crate::store::ClaimStore> =
                 Arc::new(crate::adapters::pg::PgStore::new(pg.pg_url()));
-            let repair = crate::repair::build_repair_lane(pg.repair_lane());
+            let repair = crate::repair::build_repair_lane();
             Ok(Arc::new(PgAdmission::new(
                 store, pod, root, arbiter, pg, repair,
             )))

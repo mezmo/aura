@@ -43,45 +43,6 @@ impl FromStr for AdmissionMode {
     }
 }
 
-/// Which repair-lane implementation serves Archil cures.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[non_exhaustive]
-pub enum RepairLaneKind {
-    /// Prefer the archil CLI when the binary is discoverable, else the
-    /// S3-API lane.
-    #[default]
-    Auto,
-    /// The archil CLI (`invalidate-cache`, `checkout -f` + checkin).
-    Cli,
-    /// The S3-compatible API lane (CSI pods without the CLI).
-    S3Api,
-}
-
-impl fmt::Display for RepairLaneKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            RepairLaneKind::Auto => "auto",
-            RepairLaneKind::Cli => "cli",
-            RepairLaneKind::S3Api => "s3api",
-        })
-    }
-}
-
-impl FromStr for RepairLaneKind {
-    type Err = AdmissionConfigError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_ascii_lowercase().as_str() {
-            "auto" => Ok(RepairLaneKind::Auto),
-            "cli" => Ok(RepairLaneKind::Cli),
-            "s3api" | "s3-api" | "s3" => Ok(RepairLaneKind::S3Api),
-            other => Err(AdmissionConfigError(format!(
-                "unknown repair lane '{other}' (expected 'auto', 'cli', or 's3api')"
-            ))),
-        }
-    }
-}
-
 /// A Postgres connection URL. Validated at config time (scheme must be
 /// `postgres://` or `postgresql://`); never a bare string past the
 /// config boundary.
@@ -145,7 +106,6 @@ struct AdmissionEnvValues<'a> {
     fence_margin_ms: Option<&'a OsStr>,
     retry_after_ms: Option<&'a OsStr>,
     propagation_window_ms: Option<&'a OsStr>,
-    repair_lane: Option<&'a OsStr>,
 }
 
 /// Effective admission configuration. Private fields: the beat interval
@@ -161,7 +121,6 @@ pub struct AdmissionEnv {
     fence_margin: SelfFenceMargin,
     propagation_window: Duration,
     pg_url: Option<PgUrl>,
-    repair: RepairLaneKind,
 }
 
 /// Proof that an [`AdmissionEnv`] selected the local backend.
@@ -186,7 +145,6 @@ impl AdmissionEnv {
     /// | `AURA_SESSION_ADMISSION_FENCE_MARGIN_MS` | self-fence margin (default 250) |
     /// | `AURA_SESSION_ADMISSION_RETRY_AFTER_MS` | `Busy` retry hint (default 1000) |
     /// | `AURA_SESSION_ADMISSION_PROPAGATION_WINDOW_MS` | read-miss retry window (default 30000; uncalibrated — soak test) |
-    /// | `AURA_SESSION_REPAIR_LANE` | `auto` (default), `cli`, or `s3api` |
     ///
     /// Validation rules: every duration non-zero; `fence_margin <
     /// lease_ttl`; `pg` mode requires the URL. Defaults to `off` when
@@ -202,7 +160,6 @@ impl AdmissionEnv {
             retry_after_ms: std::env::var_os("AURA_SESSION_ADMISSION_RETRY_AFTER_MS").as_deref(),
             propagation_window_ms: std::env::var_os("AURA_SESSION_ADMISSION_PROPAGATION_WINDOW_MS")
                 .as_deref(),
-            repair_lane: std::env::var_os("AURA_SESSION_REPAIR_LANE").as_deref(),
         })
     }
 
@@ -306,13 +263,6 @@ impl AdmissionEnv {
         }
         let propagation_window = Duration::from_millis(window_millis);
 
-        let repair = match vals.repair_lane {
-            None => RepairLaneKind::Auto,
-            Some(os) => RepairLaneKind::from_str(os.to_str().ok_or_else(|| {
-                AdmissionConfigError("AURA_SESSION_REPAIR_LANE is not valid UTF-8".to_string())
-            })?)?,
-        };
-
         Ok(Self {
             mode,
             beat,
@@ -321,7 +271,6 @@ impl AdmissionEnv {
             fence_margin,
             propagation_window,
             pg_url,
-            repair,
         })
     }
 
@@ -360,12 +309,6 @@ impl AdmissionEnv {
     #[must_use]
     pub const fn propagation_window(&self) -> Duration {
         self.propagation_window
-    }
-
-    /// The configured repair lane kind.
-    #[must_use]
-    pub const fn repair_lane(&self) -> RepairLaneKind {
-        self.repair
     }
 
     /// Narrow this config to the local backend.
@@ -442,12 +385,6 @@ impl PgAdmissionEnv<'_> {
     pub(crate) const fn propagation_window(self) -> Duration {
         self.0.propagation_window
     }
-
-    /// The configured repair lane kind.
-    #[must_use]
-    pub(crate) const fn repair_lane(self) -> RepairLaneKind {
-        self.0.repair
-    }
 }
 
 /// Parse a millisecond knob: absent uses `default`, present must be a
@@ -479,10 +416,6 @@ mod tests {
 
     use super::*;
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "test helper mirrors the eight env vars"
-    )]
     fn values(
         mode: Option<&'static str>,
         pg_url: Option<&'static str>,
@@ -491,7 +424,6 @@ mod tests {
         margin: Option<&'static str>,
         retry: Option<&'static str>,
         window: Option<&'static str>,
-        repair: Option<&'static str>,
     ) -> AdmissionEnvValues<'static> {
         AdmissionEnvValues {
             mode: mode.map(OsStr::new),
@@ -501,12 +433,11 @@ mod tests {
             fence_margin_ms: margin.map(OsStr::new),
             retry_after_ms: retry.map(OsStr::new),
             propagation_window_ms: window.map(OsStr::new),
-            repair_lane: repair.map(OsStr::new),
         }
     }
 
     fn defaults() -> AdmissionEnvValues<'static> {
-        values(None, None, None, None, None, None, None, None)
+        values(None, None, None, None, None, None, None)
     }
 
     #[test]
@@ -518,16 +449,14 @@ mod tests {
         assert_eq!(env.lease_ttl().get(), Duration::from_millis(15_000));
         assert_eq!(env.fence_margin().get(), Duration::from_millis(250));
         assert_eq!(env.propagation_window(), Duration::from_millis(30_000));
-        assert_eq!(env.repair_lane(), RepairLaneKind::Auto);
         assert!(env.local().is_some());
         assert!(env.pg().is_none());
     }
 
     #[test]
     fn pg_without_url_fails() {
-        let err =
-            AdmissionEnv::from_values(values(Some("pg"), None, None, None, None, None, None, None))
-                .expect_err("pg mode without a URL fails loud");
+        let err = AdmissionEnv::from_values(values(Some("pg"), None, None, None, None, None, None))
+            .expect_err("pg mode without a URL fails loud");
         assert!(!err.0.is_empty());
     }
 
@@ -536,7 +465,6 @@ mod tests {
         let err = AdmissionEnv::from_values(values(
             Some("pg"),
             Some("redis://://x"),
-            None,
             None,
             None,
             None,
@@ -557,7 +485,6 @@ mod tests {
             Some("100"),
             None,
             None,
-            None,
         ))
         .expect_err("margin equal to ttl fails");
         assert!(!err.0.is_empty());
@@ -565,83 +492,24 @@ mod tests {
 
     #[test]
     fn zero_duration_fails() {
-        let err =
-            AdmissionEnv::from_values(values(None, None, Some("0"), None, None, None, None, None))
-                .expect_err("zero beat interval fails");
+        let err = AdmissionEnv::from_values(values(None, None, Some("0"), None, None, None, None))
+            .expect_err("zero beat interval fails");
         assert!(!err.0.is_empty());
     }
 
     #[test]
     fn non_numeric_millis_fails() {
-        let err = AdmissionEnv::from_values(values(
-            None,
-            None,
-            Some("abc"),
-            None,
-            None,
-            None,
-            None,
-            None,
-        ))
-        .expect_err("non-numeric millis fails");
+        let err =
+            AdmissionEnv::from_values(values(None, None, Some("abc"), None, None, None, None))
+                .expect_err("non-numeric millis fails");
         assert!(!err.0.is_empty());
     }
 
     #[test]
     fn unknown_mode_fails() {
-        let err = AdmissionEnv::from_values(values(
-            Some("bogus"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        ))
-        .expect_err("unknown mode fails");
-        assert!(!err.0.is_empty());
-    }
-
-    #[test]
-    fn repair_lane_parsing() {
-        let cli = AdmissionEnv::from_values(values(
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some("cli"),
-        ))
-        .expect("cli lane parses");
-        assert_eq!(cli.repair_lane(), RepairLaneKind::Cli);
-
-        let s3 = AdmissionEnv::from_values(values(
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some("s3api"),
-        ))
-        .expect("s3api lane parses");
-        assert_eq!(s3.repair_lane(), RepairLaneKind::S3Api);
-
-        let err = AdmissionEnv::from_values(values(
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some("nope"),
-        ))
-        .expect_err("unknown lane fails");
+        let err =
+            AdmissionEnv::from_values(values(Some("bogus"), None, None, None, None, None, None))
+                .expect_err("unknown mode fails");
         assert!(!err.0.is_empty());
     }
 
@@ -656,7 +524,6 @@ mod tests {
             fence_margin_ms: None,
             retry_after_ms: None,
             propagation_window_ms: None,
-            repair_lane: None,
         })
         .expect_err("non-UTF-8 mode fails loud");
         assert!(err.0.contains("AURA_SESSION_ADMISSION"));
