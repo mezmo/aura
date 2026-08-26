@@ -2,6 +2,7 @@
 //! environment at startup; invalid values are config errors, never
 //! silent clamps. Every timing knob is configurable (ruling 2026-08-23).
 
+use std::ffi::OsStr;
 use std::fmt;
 use std::str::FromStr;
 use std::time::Duration;
@@ -136,15 +137,15 @@ const DEFAULT_PROPAGATION_WINDOW_MILLIS: u64 = 30_000;
 /// separate from [`AdmissionEnv`] so every validation rule is reachable
 /// without touching the process environment (which is forbidden
 /// crate-wide by `forbid(unsafe_code)`).
-pub(crate) struct AdmissionEnvValues<'a> {
-    pub(crate) mode: Option<&'a str>,
-    pub(crate) pg_url: Option<&'a str>,
-    pub(crate) beat_interval_ms: Option<&'a str>,
-    pub(crate) lease_ttl_ms: Option<&'a str>,
-    pub(crate) fence_margin_ms: Option<&'a str>,
-    pub(crate) retry_after_ms: Option<&'a str>,
-    pub(crate) propagation_window_ms: Option<&'a str>,
-    pub(crate) repair_lane: Option<&'a str>,
+struct AdmissionEnvValues<'a> {
+    mode: Option<&'a OsStr>,
+    pg_url: Option<&'a OsStr>,
+    beat_interval_ms: Option<&'a OsStr>,
+    lease_ttl_ms: Option<&'a OsStr>,
+    fence_margin_ms: Option<&'a OsStr>,
+    retry_after_ms: Option<&'a OsStr>,
+    propagation_window_ms: Option<&'a OsStr>,
+    repair_lane: Option<&'a OsStr>,
 }
 
 /// Effective admission configuration. Private fields: the beat interval
@@ -192,36 +193,28 @@ impl AdmissionEnv {
     /// unset.
     pub fn from_env() -> Result<Self, AdmissionConfigError> {
         Self::from_values(AdmissionEnvValues {
-            mode: std::env::var("AURA_SESSION_ADMISSION").ok().as_deref(),
-            pg_url: std::env::var("AURA_SESSION_ADMISSION_PG_URL")
-                .ok()
+            mode: std::env::var_os("AURA_SESSION_ADMISSION").as_deref(),
+            pg_url: std::env::var_os("AURA_SESSION_ADMISSION_PG_URL").as_deref(),
+            beat_interval_ms: std::env::var_os("AURA_SESSION_ADMISSION_BEAT_INTERVAL_MS")
                 .as_deref(),
-            beat_interval_ms: std::env::var("AURA_SESSION_ADMISSION_BEAT_INTERVAL_MS")
-                .ok()
+            lease_ttl_ms: std::env::var_os("AURA_SESSION_ADMISSION_LEASE_TTL_MS").as_deref(),
+            fence_margin_ms: std::env::var_os("AURA_SESSION_ADMISSION_FENCE_MARGIN_MS").as_deref(),
+            retry_after_ms: std::env::var_os("AURA_SESSION_ADMISSION_RETRY_AFTER_MS").as_deref(),
+            propagation_window_ms: std::env::var_os("AURA_SESSION_ADMISSION_PROPAGATION_WINDOW_MS")
                 .as_deref(),
-            lease_ttl_ms: std::env::var("AURA_SESSION_ADMISSION_LEASE_TTL_MS")
-                .ok()
-                .as_deref(),
-            fence_margin_ms: std::env::var("AURA_SESSION_ADMISSION_FENCE_MARGIN_MS")
-                .ok()
-                .as_deref(),
-            retry_after_ms: std::env::var("AURA_SESSION_ADMISSION_RETRY_AFTER_MS")
-                .ok()
-                .as_deref(),
-            propagation_window_ms: std::env::var("AURA_SESSION_ADMISSION_PROPAGATION_WINDOW_MS")
-                .ok()
-                .as_deref(),
-            repair_lane: std::env::var("AURA_SESSION_REPAIR_LANE").ok().as_deref(),
+            repair_lane: std::env::var_os("AURA_SESSION_REPAIR_LANE").as_deref(),
         })
     }
 
     /// Validate the raw environment values and assemble the effective
     /// config. All validation lives here so it is reachable without
     /// mutating the process environment (forbidden crate-wide).
-    pub(crate) fn from_values(vals: AdmissionEnvValues<'_>) -> Result<Self, AdmissionConfigError> {
+    fn from_values(vals: AdmissionEnvValues<'_>) -> Result<Self, AdmissionConfigError> {
         let mode = match vals.mode {
-            Some(s) => AdmissionMode::from_str(s)?,
             None => AdmissionMode::Off,
+            Some(os) => AdmissionMode::from_str(os.to_str().ok_or_else(|| {
+                AdmissionConfigError("AURA_SESSION_ADMISSION is not valid UTF-8".to_string())
+            })?)?,
         };
 
         let pg_url = match mode {
@@ -229,6 +222,11 @@ impl AdmissionEnv {
                 let raw = vals.pg_url.ok_or_else(|| {
                     AdmissionConfigError(
                         "AURA_SESSION_ADMISSION_PG_URL is required in pg mode".to_string(),
+                    )
+                })?;
+                let raw = raw.to_str().ok_or_else(|| {
+                    AdmissionConfigError(
+                        "AURA_SESSION_ADMISSION_PG_URL is not valid UTF-8".to_string(),
                     )
                 })?;
                 Some(PgUrl::parse(raw)?)
@@ -309,8 +307,10 @@ impl AdmissionEnv {
         let propagation_window = Duration::from_millis(window_millis);
 
         let repair = match vals.repair_lane {
-            Some(s) => RepairLaneKind::from_str(s)?,
             None => RepairLaneKind::Auto,
+            Some(os) => RepairLaneKind::from_str(os.to_str().ok_or_else(|| {
+                AdmissionConfigError("AURA_SESSION_REPAIR_LANE is not valid UTF-8".to_string())
+            })?)?,
         };
 
         Ok(Self {
@@ -453,19 +453,30 @@ impl PgAdmissionEnv<'_> {
 /// Parse a millisecond knob: absent uses `default`, present must be a
 /// `u64` (zero is rejected downstream by the non-zero constructors or
 /// the positivity checks).
-fn parse_millis(name: &str, raw: Option<&str>, default: u64) -> Result<u64, AdmissionConfigError> {
+fn parse_millis(
+    name: &str,
+    raw: Option<&OsStr>,
+    default: u64,
+) -> Result<u64, AdmissionConfigError> {
     match raw {
         None => Ok(default),
-        Some(s) => s.parse::<u64>().map_err(|_| {
-            AdmissionConfigError(format!(
-                "{name} must be a positive integer number of milliseconds, got '{s}'"
-            ))
-        }),
+        Some(os) => {
+            let s = os
+                .to_str()
+                .ok_or_else(|| AdmissionConfigError(format!("{name} is not valid UTF-8")))?;
+            s.parse::<u64>().map_err(|_| {
+                AdmissionConfigError(format!(
+                    "{name} must be a positive integer number of milliseconds, got '{s}'"
+                ))
+            })
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::ffi::OsStrExt;
+
     use super::*;
 
     #[expect(
@@ -483,14 +494,14 @@ mod tests {
         repair: Option<&'static str>,
     ) -> AdmissionEnvValues<'static> {
         AdmissionEnvValues {
-            mode,
-            pg_url,
-            beat_interval_ms: beat,
-            lease_ttl_ms: lease,
-            fence_margin_ms: margin,
-            retry_after_ms: retry,
-            propagation_window_ms: window,
-            repair_lane: repair,
+            mode: mode.map(OsStr::new),
+            pg_url: pg_url.map(OsStr::new),
+            beat_interval_ms: beat.map(OsStr::new),
+            lease_ttl_ms: lease.map(OsStr::new),
+            fence_margin_ms: margin.map(OsStr::new),
+            retry_after_ms: retry.map(OsStr::new),
+            propagation_window_ms: window.map(OsStr::new),
+            repair_lane: repair.map(OsStr::new),
         }
     }
 
@@ -632,5 +643,23 @@ mod tests {
         ))
         .expect_err("unknown lane fails");
         assert!(!err.0.is_empty());
+    }
+
+    #[test]
+    fn non_utf8_mode_fails_loud() {
+        let bad = OsStr::from_bytes(&[0xc0, 0x80]);
+        let err = AdmissionEnv::from_values(AdmissionEnvValues {
+            mode: Some(bad),
+            pg_url: None,
+            beat_interval_ms: None,
+            lease_ttl_ms: None,
+            fence_margin_ms: None,
+            retry_after_ms: None,
+            propagation_window_ms: None,
+            repair_lane: None,
+        })
+        .expect_err("non-UTF-8 mode fails loud");
+        assert!(err.0.contains("AURA_SESSION_ADMISSION"));
+        assert!(err.0.contains("not valid UTF-8"));
     }
 }

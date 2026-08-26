@@ -15,6 +15,7 @@
 //!   reconciliation key (retries reuse it; the read-back distinguishes
 //!   Applied from NotApplied).
 
+use std::ffi::OsStr;
 use std::fmt;
 
 /// Maximum session id length in bytes.
@@ -141,8 +142,10 @@ impl fmt::Display for TurnId {
 /// pod-Deleted/Failed event to the claim row to release (S4's
 /// controller variant predicates on it).
 ///
-/// Business rule: 1..=253 bytes of ASCII `[A-Za-z0-9.-]` (RFC 1123
-/// subdomain, so a k8s pod name always parses).
+/// Business rule: 1..=253 bytes total, dot-separated segments of
+/// 1..=63 chars, each segment starts and ends with `[a-z0-9]` and its
+/// interior may be `[a-z0-9-]` (RFC 1123 label, so a k8s pod name
+/// always parses).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PodId(String);
 
@@ -152,6 +155,19 @@ pub struct PodId(String);
 pub struct InvalidPodId {
     /// The validation failure, for diagnostics only.
     pub reason: String,
+}
+
+fn is_rfc1123_terminal(b: u8) -> bool {
+    b.is_ascii_lowercase() || b.is_ascii_digit()
+}
+
+/// Why [`PodId::from_env_chain`] could not resolve a pod id. The
+/// `index` names which env source failed so the public caller can
+/// include the variable name in its diagnostic.
+#[derive(Debug)]
+enum FromEnvChainError {
+    Invalid { index: usize, reason: InvalidPodId },
+    Missing,
 }
 
 impl PodId {
@@ -171,19 +187,24 @@ impl PodId {
             });
         }
         for seg in raw.split('.') {
-            if seg.is_empty() {
+            if seg.is_empty() || seg.len() > 63 {
                 return Err(InvalidPodId {
-                    reason: "pod id has an empty segment".to_string(),
+                    reason: "pod id has an invalid segment length".to_string(),
                 });
             }
-            if seg.len() > 63 {
+            let mut bytes = seg.bytes();
+            let first = bytes.next().expect("non-empty segment");
+            let last = bytes.next_back().unwrap_or(first);
+            if !is_rfc1123_terminal(first) || !is_rfc1123_terminal(last) {
                 return Err(InvalidPodId {
-                    reason: "pod id segment exceeds 63 characters".to_string(),
+                    reason:
+                        "pod id segment must start and end with a lowercase alphanumeric character"
+                            .to_string(),
                 });
             }
-            if !seg.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+            if !bytes.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-') {
                 return Err(InvalidPodId {
-                    reason: "pod id contains characters outside [A-Za-z0-9.-]".to_string(),
+                    reason: "pod id contains characters outside [a-z0-9.-]".to_string(),
                 });
             }
         }
@@ -198,34 +219,52 @@ impl PodId {
     /// source yields a valid id.
     pub fn from_env() -> Result<Self, InvalidPodId> {
         Self::from_env_chain(
-            std::env::var("AURA_POD_ID").ok().as_deref(),
-            std::env::var("POD_NAME").ok().as_deref(),
-            std::env::var("HOSTNAME").ok().as_deref(),
+            std::env::var_os("AURA_POD_ID").as_deref(),
+            std::env::var_os("POD_NAME").as_deref(),
+            std::env::var_os("HOSTNAME").as_deref(),
         )
+        .map_err(|e| match e {
+            FromEnvChainError::Invalid { index, reason } => {
+                let var = match index {
+                    0 => "AURA_POD_ID",
+                    1 => "POD_NAME",
+                    2 => "HOSTNAME",
+                    _ => unreachable!(),
+                };
+                InvalidPodId {
+                    reason: format!("{var}: {}", reason.reason),
+                }
+            }
+            FromEnvChainError::Missing => InvalidPodId {
+                reason: "no pod id source: AURA_POD_ID, POD_NAME, and HOSTNAME are all unset"
+                    .to_string(),
+            },
+        })
     }
 
     /// Resolve a pod id from the three env sources. The first present
     /// source wins; if it is invalid the error is returned (fail loud,
     /// no fall-through to a later source). No source present is an error:
     /// a pod must not be anonymous.
-    pub(crate) fn from_env_chain(
-        aura: Option<&str>,
-        pod_name: Option<&str>,
-        hostname: Option<&str>,
-    ) -> Result<Self, InvalidPodId> {
-        if let Some(v) = aura {
-            return Self::parse(v);
+    fn from_env_chain(
+        aura: Option<&OsStr>,
+        pod_name: Option<&OsStr>,
+        hostname: Option<&OsStr>,
+    ) -> Result<Self, FromEnvChainError> {
+        let sources = [aura, pod_name, hostname];
+        for (index, source) in sources.iter().enumerate() {
+            if let Some(os) = source {
+                let value = os.to_str().ok_or_else(|| FromEnvChainError::Invalid {
+                    index,
+                    reason: InvalidPodId {
+                        reason: "value is not valid UTF-8".to_string(),
+                    },
+                })?;
+                return Self::parse(value)
+                    .map_err(|reason| FromEnvChainError::Invalid { index, reason });
+            }
         }
-        if let Some(v) = pod_name {
-            return Self::parse(v);
-        }
-        if let Some(v) = hostname {
-            return Self::parse(v);
-        }
-        Err(InvalidPodId {
-            reason: "no pod id source: AURA_POD_ID, POD_NAME, and HOSTNAME are all unset"
-                .to_string(),
-        })
+        Err(FromEnvChainError::Missing)
     }
 }
 
@@ -323,38 +362,99 @@ impl fmt::Display for OpId {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::ffi::OsStrExt;
+
     use super::*;
 
     #[test]
     fn first_present_wins_aura() {
-        let pod = PodId::from_env_chain(Some("aura-1"), Some("pod-1"), Some("host-1"))
-            .expect("aura source wins");
+        let pod = PodId::from_env_chain(
+            Some(OsStr::new("aura-1")),
+            Some(OsStr::new("pod-1")),
+            Some(OsStr::new("host-1")),
+        )
+        .expect("aura source wins");
         assert_eq!(pod.as_ref(), "aura-1");
     }
 
     #[test]
     fn first_present_wins_pod_name() {
-        let pod = PodId::from_env_chain(None, Some("pod-1"), Some("host-1"))
-            .expect("pod name source wins");
+        let pod =
+            PodId::from_env_chain(None, Some(OsStr::new("pod-1")), Some(OsStr::new("host-1")))
+                .expect("pod name source wins");
         assert_eq!(pod.as_ref(), "pod-1");
     }
 
     #[test]
     fn first_present_wins_hostname() {
-        let pod = PodId::from_env_chain(None, None, Some("host-1")).expect("hostname source wins");
+        let pod = PodId::from_env_chain(None, None, Some(OsStr::new("host-1")))
+            .expect("hostname source wins");
         assert_eq!(pod.as_ref(), "host-1");
     }
 
     #[test]
     fn invalid_first_present_fails_loud() {
-        let err = PodId::from_env_chain(Some("bad/name"), Some("pod-1"), Some("host-1"))
-            .expect_err("invalid aura source fails loud, no fall-through");
-        assert!(!err.reason.is_empty());
+        let err = PodId::from_env_chain(
+            Some(OsStr::new("bad/name")),
+            Some(OsStr::new("pod-1")),
+            Some(OsStr::new("host-1")),
+        )
+        .expect_err("invalid aura source fails loud, no fall-through");
+        assert!(matches!(
+            err,
+            FromEnvChainError::Invalid {
+                index: 0,
+                reason: InvalidPodId { .. }
+            }
+        ));
     }
 
     #[test]
     fn none_present_errors() {
         let err = PodId::from_env_chain(None, None, None).expect_err("no source is an error");
-        assert!(!err.reason.is_empty());
+        assert!(matches!(err, FromEnvChainError::Missing));
+    }
+
+    #[test]
+    fn rfc1123_rejects_leading_hyphen() {
+        assert!(PodId::parse("-pod").is_err());
+    }
+
+    #[test]
+    fn rfc1123_rejects_trailing_hyphen() {
+        assert!(PodId::parse("pod-").is_err());
+    }
+
+    #[test]
+    fn rfc1123_rejects_dot_adjacent_non_terminal() {
+        assert!(PodId::parse("a.-b").is_err());
+    }
+
+    #[test]
+    fn rfc1123_allows_interior_double_hyphen() {
+        assert!(PodId::parse("pod--name").is_ok());
+    }
+
+    #[test]
+    fn rfc1123_rejects_uppercase() {
+        assert!(PodId::parse("Pod-1").is_err());
+    }
+
+    #[test]
+    fn non_utf8_aura_pod_id_fails_loud_no_fallthrough() {
+        let bad = OsStr::from_bytes(&[0xc0, 0x80]);
+        let err = PodId::from_env_chain(
+            Some(bad),
+            Some(OsStr::new("pod-1")),
+            Some(OsStr::new("host-1")),
+        )
+        .expect_err("non-UTF-8 AURA_POD_ID fails loud");
+        assert!(matches!(
+            err,
+            FromEnvChainError::Invalid {
+                index: 0,
+                reason: InvalidPodId { .. }
+            }
+        ));
     }
 }

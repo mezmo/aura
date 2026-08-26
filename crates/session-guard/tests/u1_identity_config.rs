@@ -97,10 +97,11 @@ fn turn_id_parse_wire() {
 fn pod_id_parse_rules() {
     let result = catch_unwind(AssertUnwindSafe(|| {
         assert!(PodId::parse("pod-1").is_ok());
-        assert!(PodId::parse("Pod.Name-2").is_ok());
+        assert!(PodId::parse("pod.name-2").is_ok());
         assert!(PodId::parse("").is_err());
         assert!(PodId::parse("pod/name").is_err());
         assert!(PodId::parse("pod_name").is_err());
+        assert!(PodId::parse("Pod.Name-2").is_err());
         let long = "p".repeat(254);
         assert!(PodId::parse(&long).is_err());
     }));
