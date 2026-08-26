@@ -75,7 +75,7 @@ pub mod event_names {
     pub const WORKER_REASONING: &str = "aura.orchestrator.worker_reasoning";
     pub const TOOL_CALL_STARTED: &str = "aura.orchestrator.tool_call_started";
     pub const TOOL_CALL_COMPLETED: &str = "aura.orchestrator.tool_call_completed";
-    pub const PARKED: &str = "aura.orchestrator.parked";
+    pub const PARKED: &str = "aura.orchestrator.run_parked";
 }
 
 /// SSE events specific to orchestration mode.

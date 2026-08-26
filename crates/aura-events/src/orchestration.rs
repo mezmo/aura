@@ -80,7 +80,7 @@ pub mod event_names {
     pub const TOOL_CALL_COMPLETED: &str = "aura.orchestrator.tool_call_completed";
     pub const PHASE_STARTED: &str = "aura.orchestrator.phase_started";
     pub const PHASE_COMPLETED: &str = "aura.orchestrator.phase_completed";
-    pub const PARKED: &str = "aura.orchestrator.parked";
+    pub const PARKED: &str = "aura.orchestrator.run_parked";
 }
 
 /// SSE events specific to orchestration mode.
