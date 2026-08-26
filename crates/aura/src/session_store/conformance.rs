@@ -513,6 +513,10 @@ async fn remove_discards_the_recorded_decision(store: &dyn ApprovalStore) -> Res
     let id = entry.request.decision_id;
     store.register(entry).await?;
     resolve_durable(store, &id, ApprovalDecision::Approved).await?;
+    ensure!(
+        store.decision(&id).await?.is_some(),
+        "the decision must be readable before the removal, or this row proves nothing",
+    );
 
     store.remove(&id).await?;
     ensure!(
@@ -528,6 +532,10 @@ async fn cancel_request_discards_the_recorded_decision(store: &dyn ApprovalStore
     let id = entry.request.decision_id;
     store.register(entry).await?;
     resolve_durable(store, &id, ApprovalDecision::Approved).await?;
+    ensure!(
+        store.decision(&id).await?.is_some(),
+        "the decision must be readable before the cancellation, or this row proves nothing",
+    );
 
     store.cancel_request(&request_id).await?;
     ensure!(

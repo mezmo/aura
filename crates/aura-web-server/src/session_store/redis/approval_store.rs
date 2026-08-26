@@ -73,6 +73,20 @@ static RESOLVE_DURABLE_SCRIPT: LazyLock<redis::Script> = LazyLock::new(|| {
     )
 });
 
+/// Atomic removal of an approval together with the decision recorded for it,
+/// returning the approval payload so the request index can be pruned. Two
+/// commands would leave a window — and a crash between them a permanent
+/// state — where a decision is readable for an approval that is gone.
+static REMOVE_SCRIPT: LazyLock<redis::Script> = LazyLock::new(|| {
+    redis::Script::new(
+        r#"
+        local record = redis.call('GET', KEYS[1])
+        redis.call('DEL', KEYS[1], KEYS[2])
+        return record
+        "#,
+    )
+});
+
 pub struct RedisApprovalStore {
     conn: ConnectionManager,
     key_prefix: String,
@@ -96,22 +110,6 @@ impl RedisApprovalStore {
 
     fn req_key(&self, request_id: &str) -> String {
         format!("{}:approval:req:{request_id}", self.key_prefix)
-    }
-
-    /// Atomically take the record (`GETDEL`), pruning the request index
-    /// best-effort. `None` means no live entry existed.
-    async fn take(&self, id: &DecisionId) -> Result<Option<()>, SessionStoreError> {
-        let mut conn = self.conn.clone();
-        let payload: Option<String> = redis::cmd("GETDEL")
-            .arg(self.approval_key(&id.to_string()))
-            .query_async(&mut conn)
-            .await
-            .map_err(request_err)?;
-        let Some(json) = payload else {
-            return Ok(None);
-        };
-        self.prune_req_index(id, &json).await;
-        Ok(Some(()))
     }
 
     /// Drop a taken record's id from its request index, best-effort.
@@ -236,11 +234,17 @@ impl ApprovalStore for RedisApprovalStore {
     }
 
     async fn remove(&self, id: &DecisionId) -> Result<(), SessionStoreError> {
-        self.take(id).await?;
         let mut conn = self.conn.clone();
-        conn.del::<_, ()>(self.decision_key(&id.to_string()))
+        let payload: Option<String> = REMOVE_SCRIPT
+            .key(self.approval_key(&id.to_string()))
+            .key(self.decision_key(&id.to_string()))
+            .invoke_async(&mut conn)
             .await
-            .map_err(request_err)
+            .map_err(request_err)?;
+        if let Some(json) = payload {
+            self.prune_req_index(id, &json).await;
+        }
+        Ok(())
     }
 
     async fn cancel_request(&self, request_id: &str) -> Result<(), SessionStoreError> {
@@ -248,7 +252,11 @@ impl ApprovalStore for RedisApprovalStore {
         let mut conn = self.conn.clone();
         let ids: Vec<String> = conn.smembers(&req_key).await.map_err(request_err)?;
 
+        // MULTI/EXEC, so each approval and its decision go in the same
+        // transaction: nothing observes, and no crash strands, a decision
+        // whose approval the same cancellation already deleted.
         let mut pipe = redis::pipe();
+        pipe.atomic();
         for id in &ids {
             pipe.del(self.approval_key(id)).ignore();
             pipe.del(self.decision_key(id)).ignore();

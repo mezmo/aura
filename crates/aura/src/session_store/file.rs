@@ -241,13 +241,10 @@ impl ApprovalStore for FileApprovalStore {
             .blocking(move |dir| {
                 // Check the record exists without consuming it: the parked
                 // entry outlives its decision until a claim takes it.
-                let path = record_path(&dir, &id);
-                match fs::metadata(&path) {
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-                    Err(e) => return Err(io_err("metadata", &path, &e)),
-                    Ok(_) => {}
+                if !record_exists(&dir, &id)? {
+                    return Ok(None);
                 }
-                commit_decided(&dir, &id, record).map(Some)
+                commit_decided(&dir, &id, record)
             })
             .await
         {
@@ -704,8 +701,9 @@ fn decided_path(dir: &Path, id: &DecisionId) -> PathBuf {
     dir.join(format!("{id}.{DECIDED_EXTENSION}"))
 }
 
-/// Record the decision under a name only the first caller creates, returning
-/// whichever record the sidecar ends up holding. `link` is the create-new
+/// Record the decision under a name only the first caller creates, reporting
+/// whichever record the sidecar ends up holding, or `None` if the approval
+/// went away while this call was writing. `link` is the create-new
 /// primitive: of any number of concurrent callers exactly one makes the name
 /// and the rest read back what it wrote, so a contradicting second decision
 /// cannot displace the first.
@@ -714,11 +712,17 @@ fn decided_path(dir: &Path, id: &DecisionId) -> PathBuf {
 /// keeps the two apart: no reader can open the sidecar and find a payload
 /// that is not yet all there, and the bytes are durable before the name that
 /// promises them exists.
+///
+/// The caller's existence check and this link are separate filesystem
+/// operations, so a take can slip between them and carry off the record this
+/// decision belongs to. The record is checked again once the name is
+/// committed, and a decision left behind by that race is unlinked here rather
+/// than left readable for a run to wake on.
 fn commit_decided(
     dir: &Path,
     id: &DecisionId,
     record: DecidedRecord,
-) -> Result<DecidedRecord, SessionStoreError> {
+) -> Result<Option<DecidedRecord>, SessionStoreError> {
     let sidecar = decided_path(dir, id);
     let staged = dir.join(format!("{id}.{}.tmp", Uuid::now_v7()));
     write_synced(&staged, &encode_decided_record(&record)).inspect_err(|_| {
@@ -727,14 +731,34 @@ fn commit_decided(
 
     let linked = fs::hard_link(&staged, &sidecar);
     let _ = fs::remove_file(&staged);
-    match linked {
-        Ok(()) => sync_dir(dir).map(|()| record),
+    let committed = match linked {
+        Ok(()) => {
+            sync_dir(dir)?;
+            record
+        }
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
             read_decided(&sidecar)?.ok_or_else(|| SessionStoreError::Request {
                 reason: format!("{} was discarded mid-resolution", sidecar.display()),
-            })
+            })?
         }
-        Err(e) => Err(io_err("commit", &sidecar, &e)),
+        Err(e) => return Err(io_err("commit", &sidecar, &e)),
+    };
+
+    if !record_exists(dir, id)? {
+        if discard_decided(dir, id)? {
+            sync_dir(dir)?;
+        }
+        return Ok(None);
+    }
+    Ok(Some(committed))
+}
+
+fn record_exists(dir: &Path, id: &DecisionId) -> Result<bool, SessionStoreError> {
+    let path = record_path(dir, id);
+    match fs::metadata(&path) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(io_err("metadata", &path, &e)),
     }
 }
 
@@ -747,10 +771,16 @@ fn read_decided(path: &Path) -> Result<Option<DecidedRecord>, SessionStoreError>
 }
 
 /// Drop the decision recorded for an approval that is going away, reporting
-/// whether a sidecar was there to drop. Best effort: a sidecar that outlives
-/// a failed unlink is inert once no record names it.
-fn discard_decided(dir: &Path, id: &DecisionId) -> bool {
-    fs::remove_file(decided_path(dir, id)).is_ok()
+/// whether a sidecar was there to drop. A sidecar that survives is readable
+/// by `decision()`, so only its absence is an acceptable outcome: any other
+/// failure is reported rather than passed off as inert debris.
+fn discard_decided(dir: &Path, id: &DecisionId) -> Result<bool, SessionStoreError> {
+    let path = decided_path(dir, id);
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(io_err("discard", &path, &e)),
+    }
 }
 
 /// Take the record by renaming it to a name only this call knows, reporting
@@ -767,7 +797,8 @@ fn discard_decided(dir: &Path, id: &DecisionId) -> bool {
 ///
 /// The approval's recorded decision goes with the record, whichever call
 /// finds it: an approval that has been consumed or cancelled must not leave a
-/// decision behind for a later reader to wake a run on.
+/// decision behind for a later reader to wake a run on. A decision that
+/// cannot be unlinked fails the call, because it stays readable.
 ///
 /// Discarding the claimed file afterwards is best effort: the take has already
 /// succeeded, so a failure there must not be reported as a lost race. What it
@@ -777,13 +808,13 @@ fn take_record(dir: &Path, id: &DecisionId) -> Result<bool, SessionStoreError> {
     let claimed = dir.join(format!("{id}.{}.{TAKEN_EXTENSION}", Uuid::now_v7()));
     match fs::rename(&path, &claimed) {
         Ok(()) => {
-            discard_decided(dir, id);
+            discard_decided(dir, id)?;
             sync_dir(dir)?;
             let _ = fs::remove_file(&claimed);
             Ok(true)
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            if discard_decided(dir, id) {
+            if discard_decided(dir, id)? {
                 sync_dir(dir)?;
             }
             Ok(false)
@@ -1229,6 +1260,31 @@ mod tests {
             store.decision(&id).await,
             Err(SessionStoreError::Decode { .. })
         ));
+    }
+
+    /// The window the post-link re-check closes: a take carries off the
+    /// approval between the resolver's existence check and its link. Driving
+    /// the commit directly with no record present stands in for losing that
+    /// race, since the two calls cannot be interleaved on demand.
+    #[tokio::test]
+    async fn a_decision_written_after_its_approval_vanished_is_discarded() {
+        let root = tempfile::tempdir().unwrap();
+        let store = FileApprovalStore::open(root.path()).await.unwrap();
+        let id = DecisionId::generate();
+
+        let committed = commit_decided(
+            &store.dir,
+            &id,
+            DecidedRecord::new(&id, &ApprovalDecision::Approved),
+        )
+        .unwrap();
+
+        assert!(
+            committed.is_none(),
+            "a decision whose approval is gone must not commit"
+        );
+        assert!(!decided_path(&store.dir, &id).exists());
+        assert_eq!(store.decision(&id).await.unwrap(), None);
     }
 
     /// The wake reason has to outlive the process that recorded it: that is

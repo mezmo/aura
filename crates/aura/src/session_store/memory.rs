@@ -22,12 +22,12 @@ const TOPIC_CAPACITY: usize = 64;
 /// Decision retention margin.
 const DECISION_RETENTION_MARGIN_SECS: i64 = 60;
 
-/// A recorded decision, the wake reason carrying it, and their shared
-/// retention deadline.
+/// A recorded decision, the wake reason carrying it, and the deadline past
+/// which it may be pruned.
 struct DecidedEntry {
     decision: ApprovalDecision,
     wake: WakeReason,
-    keep_until: Timestamp,
+    keep_until: Option<Timestamp>,
 }
 
 /// The parked-approval registry as a plain map.
@@ -48,11 +48,16 @@ impl InMemoryApprovalStore {
         self.entries.lock().expect("approval store lock poisoned")
     }
 
-    /// Lock the decided map, dropping entries past their retention window.
+    /// Lock the decided map, dropping entries past their retention deadline.
+    /// An entry with no deadline of its own is left to whoever removes the
+    /// approval it belongs to.
+    ///
+    /// Callers holding [`Self::lock`] may take this lock; the reverse order
+    /// is never used.
     fn lock_decided(&self) -> std::sync::MutexGuard<'_, BTreeMap<DecisionId, DecidedEntry>> {
         let mut decided = self.decided.lock().expect("approval store lock poisoned");
         let now = chrono::Utc::now();
-        decided.retain(|_, entry| entry.keep_until > now);
+        decided.retain(|_, entry| entry.keep_until.is_none_or(|deadline| deadline > now));
         decided
     }
 }
@@ -73,8 +78,13 @@ impl ApprovalStore for InMemoryApprovalStore {
         id: &DecisionId,
         decision: ApprovalDecision,
     ) -> Result<(), ResolveError> {
-        // Removal under the lock is the at-most-once guarantee.
-        let parked = self.lock().remove(id).ok_or(ResolveError::NotFound)?;
+        // Removal under the lock is the at-most-once guarantee, and the
+        // decision is written under the same guard so no reader observes the
+        // approval gone before its decision is readable.
+        let mut entries = self.lock();
+        let parked = entries.remove(id).ok_or(ResolveError::NotFound)?;
+        // This path consumes the approval, so nothing is left to GC the
+        // decision: it carries a deadline of its own instead.
         self.lock_decided().insert(
             *id,
             DecidedEntry {
@@ -83,8 +93,9 @@ impl ApprovalStore for InMemoryApprovalStore {
                     decision_id: *id,
                     resolved_at: chrono::Utc::now(),
                 },
-                keep_until: parked.expires_at
-                    + chrono::Duration::seconds(DECISION_RETENTION_MARGIN_SECS),
+                keep_until: Some(
+                    parked.expires_at + chrono::Duration::seconds(DECISION_RETENTION_MARGIN_SECS),
+                ),
             },
         );
         Ok(())
@@ -103,13 +114,18 @@ impl ApprovalStore for InMemoryApprovalStore {
         decision: ApprovalDecision,
     ) -> Result<WakeReason, ResolveError> {
         // The parked record stays for park-restart replay, and the decision
-        // lands in the decided map that `decision()` reads back.
-        let expires_at = match self.lock().get(id) {
-            Some(parked) => parked.expires_at,
-            None => return Err(ResolveError::NotFound),
-        };
-        // Insert-if-absent under the lock is the first-write-wins guarantee:
-        // a repeat or a contradiction reads back the stored resolution.
+        // lands in the decided map that `decision()` reads back. Both maps
+        // move under one hold of the entries lock, so a removal cannot land
+        // between the check and the write and leave a decision behind with
+        // no approval to belong to.
+        let entries = self.lock();
+        if !entries.contains_key(id) {
+            return Err(ResolveError::NotFound);
+        }
+        // Insert-if-absent is the first-write-wins guarantee: a repeat or a
+        // contradiction reads back the stored resolution. The entry gets no
+        // deadline — it lives exactly as long as the approval does, and
+        // `remove`/`cancel_request` end both together.
         let wake = self
             .lock_decided()
             .entry(*id)
@@ -119,7 +135,7 @@ impl ApprovalStore for InMemoryApprovalStore {
                     decision_id: *id,
                     resolved_at: chrono::Utc::now(),
                 },
-                keep_until: expires_at + chrono::Duration::seconds(DECISION_RETENTION_MARGIN_SECS),
+                keep_until: None,
             })
             .wake
             .clone();
@@ -127,24 +143,24 @@ impl ApprovalStore for InMemoryApprovalStore {
     }
 
     async fn remove(&self, id: &DecisionId) -> Result<(), SessionStoreError> {
-        self.lock().remove(id);
+        let mut entries = self.lock();
+        entries.remove(id);
         self.lock_decided().remove(id);
         Ok(())
     }
 
     async fn cancel_request(&self, request_id: &str) -> Result<(), SessionStoreError> {
         // A decided entry carries no request id, so the ids to discard are
-        // read off the parked records before those records go.
-        let cancelled: Vec<DecisionId> = {
-            let mut entries = self.lock();
-            let ids = entries
-                .iter()
-                .filter(|(_, parked)| parked.request.request_id == request_id)
-                .map(|(id, _)| *id)
-                .collect();
-            entries.retain(|_, parked| parked.request.request_id != request_id);
-            ids
-        };
+        // read off the parked records before those records go. The entries
+        // lock is held across both removals so a decision cannot outlive the
+        // approval it belongs to.
+        let mut entries = self.lock();
+        let cancelled: Vec<DecisionId> = entries
+            .iter()
+            .filter(|(_, parked)| parked.request.request_id == request_id)
+            .map(|(id, _)| *id)
+            .collect();
+        entries.retain(|_, parked| parked.request.request_id != request_id);
         let mut decided = self.lock_decided();
         for id in cancelled {
             decided.remove(&id);
@@ -459,6 +475,10 @@ mod tests {
         conformance::assert_run_store_conformance(Arc::new(InMemoryRunStore::new())).await;
     }
 
+    /// Milliseconds the lock-order probe waits for the resolver to reach
+    /// the decided map before calling the hold missing.
+    const LOCK_PROBE_ATTEMPTS: usize = 2000;
+
     fn parked(request_id: &str) -> ParkedApproval {
         let now = chrono::Utc::now();
         ParkedApproval {
@@ -539,6 +559,105 @@ mod tests {
             .unwrap();
 
         assert_eq!(store.decision(&id).await.unwrap(), None);
+    }
+
+    /// A decision may never outlive the approval that justified it, however
+    /// heavily resolution and removal contend. Two OS threads walk the same
+    /// ids flat out rather than pairing a task per id, since spawned tasks
+    /// this short are scheduled one after the other rather than together.
+    ///
+    /// This samples the end state; it does not police the window that lets a
+    /// decision outlive its approval, which is a few instructions wide and
+    /// survives a run of this row. The row below is the guard for that.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resolve_durable_racing_remove_never_orphans_a_decision() {
+        const IDS: usize = 4000;
+
+        let store = Arc::new(InMemoryApprovalStore::new());
+        let mut ids = Vec::with_capacity(IDS);
+        for _ in 0..IDS {
+            let entry = parked("req-race");
+            ids.push(entry.request.decision_id);
+            store.register(entry).await.unwrap();
+        }
+
+        let start = Arc::new(std::sync::Barrier::new(2));
+        let resolver = std::thread::spawn({
+            let store = Arc::clone(&store);
+            let ids = ids.clone();
+            let start = Arc::clone(&start);
+            let handle = tokio::runtime::Handle::current();
+            move || {
+                start.wait();
+                for id in &ids {
+                    let _ = handle.block_on(store.resolve_durable(id, ApprovalDecision::Approved));
+                }
+            }
+        });
+        let remover = std::thread::spawn({
+            let store = Arc::clone(&store);
+            let ids = ids.clone();
+            let start = Arc::clone(&start);
+            let handle = tokio::runtime::Handle::current();
+            move || {
+                start.wait();
+                for id in &ids {
+                    handle.block_on(store.remove(id)).unwrap();
+                }
+            }
+        });
+        resolver.join().unwrap();
+        remover.join().unwrap();
+
+        for (nth, id) in ids.iter().enumerate() {
+            let approval = store.get(id).await.unwrap().is_some();
+            let decision = store.decision(id).await.unwrap().is_some();
+            assert_eq!(
+                approval, decision,
+                "approval {nth}: it and its decision must end together, got \
+                 approval={approval} decision={decision}",
+            );
+        }
+    }
+
+    /// The mutual exclusion the row above can only sample: pinning the
+    /// decided map stalls a resolver between its two steps, and the entries
+    /// lock must still be held at that moment. A resolver that released it
+    /// would be leaving exactly the gap a removal slips through.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resolve_durable_holds_the_entries_lock_while_writing_the_decision() {
+        let store = Arc::new(InMemoryApprovalStore::new());
+        let entry = parked("req-lock-order");
+        let id = entry.request.decision_id;
+        store.register(entry).await.unwrap();
+
+        let pinned = store.decided.lock().unwrap();
+        let resolver = tokio::task::spawn_blocking({
+            let store = Arc::clone(&store);
+            let handle = tokio::runtime::Handle::current();
+            move || handle.block_on(store.resolve_durable(&id, ApprovalDecision::Approved))
+        });
+
+        let mut held = false;
+        for _ in 0..LOCK_PROBE_ATTEMPTS {
+            if store.entries.try_lock().is_err() {
+                held = true;
+                break;
+            }
+            // Blocking, not `tokio::time::sleep`: the pin is a std guard, and
+            // holding one across an await is the hazard this row is about.
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(
+            held,
+            "resolve_durable must hold the entries lock while it writes the decision",
+        );
+
+        drop(pinned);
+        resolver
+            .await
+            .unwrap()
+            .expect("the resolution completes once the decided map frees");
     }
 
     #[tokio::test]
