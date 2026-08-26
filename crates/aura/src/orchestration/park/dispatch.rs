@@ -9,7 +9,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::hitl::Timestamp;
+use crate::hitl::{ApprovalRef, Timestamp};
 
 use super::lease::FencingGeneration;
 
@@ -55,6 +55,17 @@ impl ArgsDigest {
     pub(crate) fn test_value(raw: &str) -> Self {
         Self(raw.to_string())
     }
+}
+
+/// What a task carries from the approval it blocked on into the attempt
+/// that consumes the decision: which decision, the arguments the human
+/// approved (as the digest the dispatch claim revalidates against), and the
+/// fencing generation the claiming dispatcher holds.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ApprovalBinding {
+    pub approval: ApprovalRef,
+    pub args_digest: ArgsDigest,
+    pub generation: FencingGeneration,
 }
 
 /// Where one parked approval's decision stands. [`DispatchState`] - the

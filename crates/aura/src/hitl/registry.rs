@@ -271,6 +271,19 @@ impl PendingApprovals {
         }
     }
 
+    /// Poison the wake map's lock so the next local operation on this
+    /// registry panics — the stand-in for a panic inside a park commit's
+    /// local cleanup, which has no other reachable trigger.
+    #[cfg(test)]
+    pub fn poison_wakes_for_test(&self) {
+        let inner = Arc::clone(&self.0);
+        let poisoner = std::thread::spawn(move || {
+            let _guard = inner.wakes.lock().expect("registry lock poisoned");
+            panic!("poisoning the wake map");
+        });
+        assert!(poisoner.join().is_err(), "the poisoning thread must panic");
+    }
+
     /// Synchronously drop the wake handles parked under a request id; their
     /// awaits resolve to `Cancelled`. Leaves store entries in place — use
     /// [`Self::cancel_request`] to also clean the store.

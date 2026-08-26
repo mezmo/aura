@@ -223,9 +223,21 @@ pub(super) async fn begin_run(
     let lease = store
         .acquire_lease(session_id, AgentInstanceId::generate(), ttl)
         .await?;
-    let started = store
+    let started = match store
         .apply(session_id, lease.generation, RunEvent::Start { run_id })
-        .await?;
+        .await
+    {
+        Ok(record) => record,
+        Err(e) => {
+            // Hand the lease back so a later claim is not fenced out by a
+            // holder that never ran. The `Created` record it leaves behind is
+            // inert - no run points at it - and P8's reaper collects it.
+            if let Err(release) = store.release_lease(session_id, lease.generation).await {
+                tracing::warn!("run start failed and its lease could not be released: {release}");
+            }
+            return Err(e.into());
+        }
+    };
     Ok((session_id, started.generation))
 }
 

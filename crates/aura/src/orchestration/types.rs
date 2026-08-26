@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::hitl::ApprovalRef;
+use crate::orchestration::park::ApprovalBinding;
 
 /// Maximum nesting depth for step structures.
 /// Depth 0 = top-level steps list, depth 1 = inside a parallel group,
@@ -333,6 +334,9 @@ pub struct Task {
     /// Top-level because it's orthogonal to pass/fail — workers can submit
     /// structured output regardless of task outcome.
     pub structured_output: Option<StructuredTaskOutput>,
+    /// The approval decision this task's next attempt consumes instead of
+    /// raising a new request.
+    pub approval_binding: Option<ApprovalBinding>,
 }
 
 impl Serialize for Task {
@@ -404,6 +408,10 @@ impl<'de> Deserialize<'de> for Task {
             worker: h.worker,
             rationale: h.rationale,
             structured_output: h.structured_output,
+            // Runtime-only, like `TaskState::Blocked`: a plan crossing the
+            // wire carries no dispatch binding, and the checkpoint rebuilds
+            // one from its own approval snapshots.
+            approval_binding: None,
         })
     }
 }
@@ -427,6 +435,7 @@ impl Task {
             worker: None,
             rationale: rationale.into(),
             structured_output: None,
+            approval_binding: None,
         }
     }
 
@@ -473,11 +482,14 @@ impl Task {
         self.state = TaskState::Blocked { approval };
     }
 
-    /// Release the task back to Pending once its approval has a decision,
-    /// so the scheduler re-dispatches it and the attempt re-runs with the
-    /// decision available (ADR 2026-07-21, decisions 2 and 8).
-    pub fn pending(&mut self) {
+    /// Release the task back to Pending once its approval has a decision.
+    ///
+    /// The binding rides along so the re-dispatched attempt consumes that
+    /// decision rather than raising a second approval for the same call
+    /// (ADR 2026-07-21, decisions 2, 8, and 9).
+    pub fn released(&mut self, binding: ApprovalBinding) {
         self.state = TaskState::Pending;
+        self.approval_binding = Some(binding);
     }
 }
 

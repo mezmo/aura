@@ -62,10 +62,10 @@ use super::tools::{InspectToolParamsTool, ListToolsTool, ReadArtifactTool};
 use super::config::OrchestrationConfig;
 use super::events::OrchestratorEvent;
 use super::park::{
-    ApprovalOriginSnapshot, ArgsDigest, BlockedTaskBinding, ChatSessionId, CheckpointEnvelope,
-    ConfigFingerprint, DecisionConsumption, FencingGeneration, NonEmpty, ParkCommit, ParkReason,
-    ParkedApprovalSnapshot, ResumePoint, RunCheckpoint, SessionId, TaskExecutionOutcome,
-    WaveOutcome,
+    ApprovalBinding, ApprovalOriginSnapshot, ArgsDigest, BlockedTaskBinding, ChatSessionId,
+    CheckpointEnvelope, ConfigFingerprint, DecisionConsumption, FencingGeneration, NonEmpty,
+    ParkCommit, ParkReason, ParkedApprovalSnapshot, ResumePoint, RunCheckpoint, SessionId,
+    TaskExecutionOutcome, WaveOutcome,
 };
 use super::persistence::ExecutionPersistence;
 use super::prompt_journal::{JournalPhase, PromptJournal};
@@ -102,6 +102,8 @@ struct TaskExecutionParams<'a> {
     task_description: &'a str,
     task_context: &'a Option<String>,
     worker_name: Option<&'a str>,
+    /// The decision this attempt dispatches instead of raising a new one.
+    approval_binding: &'a Option<ApprovalBinding>,
 }
 
 /// Named return type for `create_*` coordinator/worker methods.
@@ -650,6 +652,7 @@ impl Orchestrator {
         task_id: usize,
         attempt: usize,
         worker_name: Option<&str>,
+        approval_binding: &Option<ApprovalBinding>,
     ) -> Result<AgentWithPreamble, Box<dyn std::error::Error + Send + Sync>> {
         use super::duplicate_call_guard::DuplicateCallGuard;
         use super::observer_wrapper::ObserverWrapper;
@@ -912,7 +915,7 @@ impl Orchestrator {
                 worker_config.agent.name.clone(),
             );
             if let Some((signal, window)) = &durable_park {
-                gate = gate.with_blocked_signal(signal.clone(), *window);
+                gate = gate.with_blocked_signal(signal.clone(), *window, approval_binding.clone());
             }
             wrappers.insert(0, Arc::new(gate));
             worker_config.hitl_request_approval_tool = Some(crate::hitl::RequestApprovalTool::new(
@@ -3102,14 +3105,28 @@ Assign tasks to the worker whose tools best match the required operations."#,
             if plan.is_finished() {
                 break WaveOutcome::Finished;
             }
-            // Collect ready tasks with their context and worker assignment
-            // Tuple: (task_id, description, context, worker_name)
-            let ready_tasks: Vec<(usize, String, Option<String>, Option<String>)> = plan
+            // Collect ready tasks with their context, worker assignment, and
+            // the approval decision (if any) their attempt consumes.
+            // Tuple: (task_id, description, context, worker_name, binding)
+            type ReadyTask = (
+                usize,
+                String,
+                Option<String>,
+                Option<String>,
+                Option<ApprovalBinding>,
+            );
+            let ready_tasks: Vec<ReadyTask> = plan
                 .ready_tasks()
                 .iter()
                 .map(|t| {
                     let context = self.build_task_context(plan, t.id);
-                    (t.id, t.description.clone(), context, t.worker.clone())
+                    (
+                        t.id,
+                        t.description.clone(),
+                        context,
+                        t.worker.clone(),
+                        t.approval_binding.clone(),
+                    )
                 })
                 .collect();
 
@@ -3142,7 +3159,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             );
 
             // Mark all ready tasks as running and emit TaskStarted events
-            for (task_id, task_desc, _context, worker_name) in &ready_tasks {
+            for (task_id, task_desc, _context, worker_name, _binding) in &ready_tasks {
                 if let Some(task) = plan.get_task_mut(*task_id) {
                     task.start();
                 }
@@ -3159,12 +3176,13 @@ Assign tasks to the worker whose tools best match the required operations."#,
             let mut futures: FuturesUnordered<_> = ready_tasks
                 .into_iter()
                 .map(
-                    |(task_id, task_desc, task_context, worker_name)| async move {
+                    |(task_id, task_desc, task_context, worker_name, approval_binding)| async move {
                         let start_time = Instant::now();
                         let params = TaskExecutionParams {
                             task_description: &task_desc,
                             task_context: &task_context,
                             worker_name: worker_name.as_deref(),
+                            approval_binding: &approval_binding,
                         };
                         let result = self.execute_task(task_id, &params, stream_tx).await;
                         let duration_ms = start_time.elapsed().as_millis() as u64;
@@ -3358,11 +3376,25 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 )
             })?;
 
+        // The run's fenced identity is resolved before anything is
+        // reconciled: a released task carries the generation its dispatch
+        // claims under, so a run that never armed must fail closed here
+        // rather than continue and re-request every approval it holds.
+        let session_id = self.session_id.ok_or_else(|| {
+            StreamError::from("durable park requires a session id; arm the run store at run start")
+        })?;
+        let generation = self.fencing_generation.ok_or_else(|| {
+            StreamError::from(
+                "durable park requires a fencing generation; acquire a lease at run start",
+            )
+        })?;
+
         // B. Reconcile drain-time decisions (ADR decision 8). A decision that
-        // landed while the wave drained releases its task back to `Pending`;
-        // the dispatch FSM consumes the decision when the task re-executes.
-        // Approvals still undecided are snapshotted so the checkpoint carries
-        // the tool name, arguments, and digest that FSM binds on reify.
+        // landed while the wave drained releases its task, which carries the
+        // binding its next attempt dispatches against; approvals still
+        // undecided are snapshotted into the checkpoint the reify path binds.
+        // Either way the record must exist: without it the digest that makes
+        // consumption exactly-once cannot be recovered.
         let mut reconciled = plan.clone();
         let mut still_blocked: Vec<ApprovalRef> = Vec::new();
         let mut approvals: Vec<ParkedApprovalSnapshot> = Vec::new();
@@ -3373,32 +3405,31 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 .map_err(|e| {
                     StreamError::from(format!("approval decision lookup failed during park: {e}"))
                 })?;
+            let parked = approval_store
+                .get(&approval.decision_id)
+                .await
+                .map_err(|e| {
+                    StreamError::from(format!("approval store lookup failed during park: {e}"))
+                })?
+                .ok_or_else(|| {
+                    StreamError::from(format!(
+                        "approval record vanished during park: {}",
+                        approval.decision_id
+                    ))
+                })?;
+            let snapshot = Self::parked_approval_snapshot(approval, &parked);
             if decided.is_some() {
                 if let Some(task) = reconciled.get_task_mut(approval.task.task_id) {
-                    task.pending();
+                    task.released(ApprovalBinding {
+                        approval: approval.clone(),
+                        args_digest: snapshot.args_digest,
+                        generation,
+                    });
                 }
                 continue;
             }
-            match approval_store.get(&approval.decision_id).await {
-                Ok(Some(parked)) => {
-                    approvals.push(Self::parked_approval_snapshot(approval, &parked));
-                    still_blocked.push(approval.clone());
-                }
-                // Undecided and absent: the record the checkpoint would name
-                // is gone, so a reified run could never resolve it. Fail
-                // closed rather than park an unclaimable approval.
-                Ok(None) => {
-                    return Err(StreamError::from(format!(
-                        "approval record vanished during park: {}",
-                        approval.decision_id
-                    )));
-                }
-                Err(e) => {
-                    return Err(StreamError::from(format!(
-                        "approval store lookup failed during park: {e}"
-                    )));
-                }
-            }
+            approvals.push(snapshot);
+            still_blocked.push(approval.clone());
         }
 
         let Ok(blocked_on) = NonEmpty::new(still_blocked) else {
@@ -3434,14 +3465,6 @@ Assign tasks to the worker whose tools best match the required operations."#,
             .parse::<RunId>()
             .map_err(|e| StreamError::from(format!("invalid run id: {e}")))?;
 
-        let session_id = self.session_id.ok_or_else(|| {
-            StreamError::from("durable park requires a session id; arm the run store at run start")
-        })?;
-        let generation = self.fencing_generation.ok_or_else(|| {
-            StreamError::from(
-                "durable park requires a fencing generation; acquire a lease at run start",
-            )
-        })?;
         let chat_session_id = self
             .agent_config
             .session_id
@@ -3497,35 +3520,46 @@ Assign tasks to the worker whose tools best match the required operations."#,
             .map_err(|e| StreamError::from(format!("durable park refused: {e}")))?;
 
         // E. Commit the park. From here the transfer is live, so an
-        // abandoned commit would strand approvals under a session that
-        // never parked — run it in its own task, which the request's cancel
-        // token cannot drop, and treat a lost task like a failed CAS.
+        // abandoned commit would strand approvals under a session that never
+        // parked — run it in its own task, which the request's cancel token
+        // cannot drop. The task reports the CAS the instant it returns and
+        // only then cleans up locally, so nothing that happens after the
+        // record is parked can be mistaken for a park that did not happen.
         let registry = self.hitl_registry.clone();
         let request_id = self.request_id.clone();
-        let rollback = ownership.clone();
+        let (cas_tx, cas_rx) = tokio::sync::oneshot::channel();
         let commit = tokio::spawn(async move {
-            match run_store.park(session_id, generation, park_commit).await {
-                Ok(_) => {
-                    // The park owns the approvals now; drop the process-local
-                    // wake handles without touching the records themselves.
-                    if let Some(registry) = registry {
-                        registry.cancel_request_local(&request_id);
-                    }
-                    Ok(())
-                }
-                Err(e) => {
-                    rollback.abort_transfer();
-                    Err(format!("run store park failed: {e}"))
-                }
+            let cas = run_store
+                .park(session_id, generation, park_commit)
+                .await
+                .map(|_| ())
+                .map_err(|e| format!("run store park failed: {e}"));
+            let committed = cas.is_ok();
+            let _ = cas_tx.send(cas);
+            if committed && let Some(registry) = registry {
+                // The park owns the approvals now; drop the process-local
+                // wake handles without touching the records themselves.
+                registry.cancel_request_local(&request_id);
             }
         });
-        match commit.await {
+        match cas_rx.await {
             Ok(Ok(())) => {}
-            Ok(Err(e)) => return Err(StreamError::from(e)),
-            Err(e) => {
+            Ok(Err(e)) => {
                 ownership.abort_transfer();
-                return Err(StreamError::from(format!("park commit task failed: {e}")));
+                return Err(StreamError::from(e));
             }
+            // The task died before the CAS returned, so nothing is parked.
+            Err(_) => {
+                ownership.abort_transfer();
+                return Err(StreamError::from(
+                    "park commit task ended without reporting the CAS",
+                ));
+            }
+        }
+        // The record is parked; the approvals belong to the session whatever
+        // became of the cleanup that follows.
+        if let Err(e) = commit.await {
+            tracing::warn!("park committed but its local cleanup did not finish: {e}");
         }
 
         // F. Emit the `Parked` frame post-CAS (ADR decision 15).
@@ -3719,6 +3753,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             task_description,
             task_context,
             worker_name,
+            approval_binding,
         } = params;
 
         {
@@ -3782,7 +3817,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 escalation_flag,
                 submit_result_decision,
                 blocked_signal,
-            } = self.create_worker(task_id, attempt, *worker_name).await?;
+            } = self
+                .create_worker(task_id, attempt, *worker_name, approval_binding)
+                .await?;
 
             // Retries rebuild the same preamble, and `set_attribute` appends
             // rather than replaces, so record it once per worker span.
@@ -6932,6 +6969,7 @@ mod durable_park_tests {
     use serde_json::{Value, json};
 
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
     use crate::config::AgentRuntimeConfig;
@@ -6949,12 +6987,13 @@ mod durable_park_tests {
     const PARK_WINDOW: Duration = Duration::from_secs(3600);
     const GATED_TOOL: &str = "kubectl_apply";
 
-    /// A tool the gate always stops, so reaching it at all is the failure
-    /// this suite is written to catch.
+    /// The gated tool, counting the times the gate let it through: a park
+    /// must leave the count at zero, and a consumed decision must raise it
+    /// exactly once.
     #[derive(Clone)]
-    struct NeverRuns;
+    struct GatedTool(Arc<AtomicUsize>);
 
-    impl RigTool for NeverRuns {
+    impl RigTool for GatedTool {
         const NAME: &'static str = GATED_TOOL;
         type Error = ToolError;
         type Args = Value;
@@ -6973,8 +7012,15 @@ mod durable_park_tests {
         }
 
         async fn call(&self, _args: Value) -> Result<String, ToolError> {
-            panic!("a gated tool must never execute")
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok("applied".to_string())
         }
+    }
+
+    /// The arguments every attempt in this suite presents; the digest bound
+    /// at approval is computed over exactly these.
+    fn gated_args() -> Value {
+        json!({ "namespace": "prod" })
     }
 
     fn unique_request_id() -> String {
@@ -7023,15 +7069,18 @@ mod durable_park_tests {
         orchestrator
     }
 
-    /// Drive one gated tool call through the real wrapper chain and return
-    /// the block it deposits, exactly as a worker attempt would.
-    async fn gate_hit(
+    /// One worker attempt's gated tool, wrapped as `create_worker` wraps it:
+    /// the block channel, the park window, and the decision the task already
+    /// holds. Returns the tool, its block channel, and its run counter.
+    async fn worker_attempt(
         orchestrator: &Orchestrator,
         registry: &PendingApprovals,
         request_id: &str,
         task_id: usize,
-    ) -> ApprovalRef {
+        binding: Option<ApprovalBinding>,
+    ) -> (WrappedTool<GatedTool>, BlockedSignal, Arc<AtomicUsize>) {
         let signal = BlockedSignal::new();
+        let runs = Arc::new(AtomicUsize::new(0));
         let gate = HitlApprovalWrapper::new(
             Arc::from([GlobPattern::new("kubectl_*").unwrap()]),
             Arc::new(DecisionRoute::Conversational {
@@ -7052,12 +7101,32 @@ mod durable_park_tests {
             request_id.to_string(),
             "test-agent".to_string(),
         )
-        .with_blocked_signal(signal.clone(), PARK_WINDOW);
-        let tool = WrappedTool::new(NeverRuns, Arc::new(gate) as Arc<dyn ToolWrapper>);
+        .with_blocked_signal(signal.clone(), PARK_WINDOW, binding);
+        (
+            WrappedTool::new(
+                GatedTool(runs.clone()),
+                Arc::new(gate) as Arc<dyn ToolWrapper>,
+            ),
+            signal,
+            runs,
+        )
+    }
 
-        tool.call(json!({ "namespace": "prod" }))
+    /// Drive one gated tool call through the real wrapper chain and return
+    /// the block it deposits, exactly as a first worker attempt would.
+    async fn gate_hit(
+        orchestrator: &Orchestrator,
+        registry: &PendingApprovals,
+        request_id: &str,
+        task_id: usize,
+    ) -> ApprovalRef {
+        let (tool, signal, runs) =
+            worker_attempt(orchestrator, registry, request_id, task_id, None).await;
+
+        tool.call(gated_args())
             .await
             .expect_err("a parked call ends the attempt as an error");
+        assert_eq!(runs.load(Ordering::SeqCst), 0, "a parked call never ran");
 
         match orchestrator
             .attempt_blocked(signal.take_blocked().expect("the gate deposited a block"))
@@ -7200,6 +7269,49 @@ mod durable_park_tests {
             "the released task is dispatchable again",
         );
 
+        // The next attempt dispatches the decision the task already holds
+        // instead of asking a second time.
+        let binding = task
+            .approval_binding
+            .clone()
+            .expect("the released task kept its binding");
+        assert_eq!(binding.approval.decision_id, approval.decision_id);
+        let (tool, signal, runs) = worker_attempt(
+            &orchestrator,
+            &registry,
+            &request_id,
+            approval.task.task_id,
+            Some(binding),
+        )
+        .await;
+        assert_eq!(
+            tool.call(gated_args())
+                .await
+                .expect("the approval releases the call"),
+            "applied",
+        );
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "the approved call ran once");
+        assert!(
+            signal.take_blocked().is_none(),
+            "a dispatched call never blocks"
+        );
+        assert!(
+            approvals
+                .get(&approval.decision_id)
+                .await
+                .expect("store readable")
+                .is_none(),
+            "the consumed approval is gone, and no second one took its place",
+        );
+        assert!(
+            approvals
+                .decision(&approval.decision_id)
+                .await
+                .expect("store readable")
+                .is_none(),
+            "a dispatched decision cannot be claimed again",
+        );
+
         // The continuation prompt renders a Pending task, so the staged
         // Blocked arm is out of reach on this path.
         let prompt = IterationContext::new(1, new_plan, None, vec![], HashMap::new())
@@ -7323,6 +7435,50 @@ mod durable_park_tests {
         assert!(
             ownership.begin_teardown(),
             "a run that did not park must leave its approvals to teardown",
+        );
+    }
+
+    /// The park is committed once the CAS returns. Whatever happens to the
+    /// commit task afterwards, the approvals belong to the session: handing
+    /// them back would let teardown delete a parked run's approvals.
+    #[tokio::test]
+    async fn a_panic_after_the_cas_leaves_the_transfer_standing() {
+        let approvals = Arc::new(InMemoryApprovalStore::new());
+        let registry =
+            PendingApprovals::with_backend(approvals.clone(), Arc::new(InMemoryEventBus::new()));
+        let run_store = Arc::new(InMemoryRunStore::new());
+        let request_id = unique_request_id();
+        let ownership = ApprovalOwnership::register(&request_id);
+
+        let orchestrator = armed_orchestrator(&registry, run_store.clone(), &request_id).await;
+        let approval = gate_hit(&orchestrator, &registry, &request_id, 0).await;
+        let plan = blocked_plan(&approval);
+
+        // The commit task's local cleanup panics after the CAS has landed.
+        registry.poison_wakes_for_test();
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let (outcome, _frames) = commit(&orchestrator, &plan).await;
+        std::panic::set_hook(previous_hook);
+
+        assert!(
+            matches!(
+                outcome.expect("the CAS succeeded"),
+                IterationOutcome::Parked
+            ),
+            "a park whose cleanup died is still a park",
+        );
+        assert!(
+            !ownership.begin_teardown(),
+            "the transfer must stand once the record is parked",
+        );
+        assert!(
+            approvals
+                .get(&approval.decision_id)
+                .await
+                .expect("store readable")
+                .is_some(),
+            "the parked run keeps the approval its checkpoint names",
         );
     }
 

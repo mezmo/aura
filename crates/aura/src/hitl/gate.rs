@@ -12,10 +12,12 @@ use aura_config::GlobPattern;
 use rig::tool::ToolError;
 use serde_json::Value;
 
-use super::decision::{AgentScope, ApprovalOrigin, ApprovalRef, DecisionId};
+use super::decision::{AgentScope, ApprovalDecision, ApprovalOrigin, ApprovalRef, DecisionId};
 use super::protocol::{ApprovalItem, ApprovalRequest, PROTOCOL_VERSION};
 use super::route::{ApprovalError, DecisionRoute, GateDecision};
-use crate::orchestration::park::ToolAttemptOutcome;
+use crate::orchestration::park::{
+    ApprovalBinding, ArgsDigest, DispatchError, DispatchEvent, DispatchState, ToolAttemptOutcome,
+};
 use crate::tool_wrapper::{PreCallOutcome, ToolCallContext, ToolWrapper};
 
 /// Typed side-channel carrying [`ToolAttemptOutcome::Blocked`] across the
@@ -65,12 +67,26 @@ impl BlockedSignal {
 /// nothing will ever claim.
 const ALREADY_PARKING: &str = "the run is parking pending approval; no further gated calls";
 
-/// The durable-park arming of one gate: the channel a block leaves on and
-/// the window the approval is registered for.
+/// The durable-park arming of one gate: the channel a block leaves on, the
+/// window an approval is registered for, and the decision this attempt was
+/// re-dispatched to consume.
 #[derive(Clone)]
 struct DurablePark {
     signal: BlockedSignal,
     timeout: std::time::Duration,
+    binding: Arc<std::sync::Mutex<Option<ApprovalBinding>>>,
+}
+
+impl DurablePark {
+    /// Take the pending binding, leaving none behind: one binding dispatches
+    /// at most once, so a second gated call in the same attempt raises its
+    /// own approval rather than reusing a spent decision.
+    fn take_binding(&self) -> Option<ApprovalBinding> {
+        self.binding
+            .lock()
+            .expect("approval binding lock poisoned")
+            .take()
+    }
 }
 
 /// Gates matching tool calls behind an approval decision.
@@ -116,15 +132,19 @@ impl HitlApprovalWrapper {
     /// Arm the durable-park path: a gate hit registers the approval for
     /// `park_timeout` and reports the block through `signal` instead of
     /// awaiting the decision in-request.
+    /// `binding` is the decision a re-dispatched attempt consumes; `None`
+    /// raises a fresh approval on the first gated call.
     #[must_use]
     pub fn with_blocked_signal(
         mut self,
         signal: BlockedSignal,
         park_timeout: std::time::Duration,
+        binding: Option<ApprovalBinding>,
     ) -> Self {
         self.durable_park = Some(DurablePark {
             signal,
             timeout: park_timeout,
+            binding: Arc::new(std::sync::Mutex::new(binding)),
         });
         self
     }
@@ -141,6 +161,7 @@ impl HitlApprovalWrapper {
     async fn park_instead_of_awaiting(
         &self,
         request: ApprovalRequest,
+        args: &Value,
         park: &DurablePark,
     ) -> Result<PreCallOutcome, ToolError> {
         let AgentScope::Worker { task, .. } = request.scope.clone() else {
@@ -148,6 +169,18 @@ impl HitlApprovalWrapper {
                 "durable park requires worker scope".to_string().into(),
             ));
         };
+        // A task re-dispatched after its approval was decided consumes that
+        // decision here; only an undecided or absent binding registers.
+        if let Some(binding) = park.take_binding() {
+            if let Some(consumed) = self.consume_binding(&binding, args).await {
+                return consumed;
+            }
+            // Still undecided: the run blocks on the approval it already has,
+            // never on a second one for the same call.
+            return Ok(park
+                .signal
+                .deposit(PreCallOutcome::Blocked(binding.approval)));
+        }
         let approval_ref = ApprovalRef {
             decision_id: request.decision_id,
             task,
@@ -157,6 +190,65 @@ impl HitlApprovalWrapper {
             .await
             .map_err(|e| ToolError::ToolCallError(format!("tool call blocked: {e}").into()))?;
         Ok(park.signal.deposit(PreCallOutcome::Blocked(approval_ref)))
+    }
+
+    /// Dispatch the decision `binding` names, or report that it has not
+    /// arrived (`None`) so the caller blocks on it again.
+    ///
+    /// The claim revalidates this call's arguments against the digest
+    /// recorded when the human decided: only the call they actually saw may
+    /// run, and a mismatch leaves the decision unconsumed for the arguments
+    /// it does cover (ADR 2026-07-21, decision 9). A dispatched decision is
+    /// removed with its record, so it cannot be claimed twice.
+    async fn consume_binding(
+        &self,
+        binding: &ApprovalBinding,
+        args: &Value,
+    ) -> Option<Result<PreCallOutcome, ToolError>> {
+        let registry = self.route.registry()?;
+        let id = binding.approval.decision_id;
+        let decision = match registry.store().decision(&id).await {
+            Ok(Some(decision)) => decision,
+            Ok(None) => return None,
+            Err(e) => {
+                return Some(Err(ToolError::ToolCallError(
+                    format!("tool call blocked: approval decision unreadable: {e}").into(),
+                )));
+            }
+        };
+
+        let outcome = match decision {
+            ApprovalDecision::Denied { reason } => denial_short_circuit(reason),
+            ApprovalDecision::Approved => {
+                let claim = DispatchEvent::Claim {
+                    generation: binding.generation,
+                    presented: ArgsDigest::compute(args),
+                    at: chrono::Utc::now(),
+                };
+                match DispatchState::Unclaimed.apply(claim, &binding.args_digest) {
+                    Ok(_) => PreCallOutcome::Proceed { overrides: None },
+                    Err(DispatchError::DigestMismatch { bound, presented }) => {
+                        return Some(Err(ToolError::ToolCallError(
+                            format!(
+                                "tool call denied: arguments differ from the approved call \
+                                 (approved digest {}, presented {})",
+                                bound.as_str(),
+                                presented.as_str(),
+                            )
+                            .into(),
+                        )));
+                    }
+                    Err(DispatchError::Illegal { from, event }) => {
+                        return Some(Err(ToolError::ToolCallError(
+                            format!("tool call denied: dispatch rejected {event:?} from {from:?}")
+                                .into(),
+                        )));
+                    }
+                }
+            }
+        };
+        registry.remove(&id).await;
+        Some(Ok(outcome))
     }
 
     /// First configured glob that matches `tool_name`, never gating the
@@ -210,12 +302,23 @@ impl ToolWrapper for HitlApprovalWrapper {
             }],
         };
         if let Some(park) = &self.durable_park {
-            return self.park_instead_of_awaiting(request, park).await;
+            return self.park_instead_of_awaiting(request, args, park).await;
         }
         let cancel =
             crate::request_cancellation::RequestCancellation::token_for_id(&self.request_id)
                 .unwrap_or_else(crate::request_cancellation::RequestCancelToken::unbound);
         approval_result_to_pre_call(self.route.decide_for_gate(request, &cancel).await)
+    }
+}
+
+/// Report a denial to the model as tool output rather than an error: a
+/// refusal is an answer the agent must reason about, not a fault.
+fn denial_short_circuit(reason: Option<String>) -> PreCallOutcome {
+    PreCallOutcome::ShortCircuit {
+        output: format!(
+            "Tool call blocked by human approval denial: {}. Do not execute this action.",
+            reason.unwrap_or_else(|| "no reason provided".to_string())
+        ),
     }
 }
 
@@ -225,12 +328,7 @@ fn approval_result_to_pre_call(
 ) -> Result<PreCallOutcome, ToolError> {
     match result {
         Ok(GateDecision::Approved { overrides }) => Ok(PreCallOutcome::Proceed { overrides }),
-        Ok(GateDecision::Denied { reason }) => Ok(PreCallOutcome::ShortCircuit {
-            output: format!(
-                "Tool call blocked by human approval denial: {}. Do not execute this action.",
-                reason.unwrap_or_else(|| "no reason provided".to_string())
-            ),
-        }),
+        Ok(GateDecision::Denied { reason }) => Ok(denial_short_circuit(reason)),
         Ok(GateDecision::TimedOut { .. }) => Err(ToolError::ToolCallError(
             "tool call denied: approval timed out".to_string().into(),
         )),
@@ -372,21 +470,25 @@ mod tests {
 
         use super::super::super::decision::ApprovalDecision;
         use super::super::super::registry::{ParkedApproval, PendingApprovals, ResolveError};
+        use super::super::super::teardown::ApprovalOwnership;
         use super::*;
         use crate::approval_event_broker;
-        use crate::orchestration::park::WakeReason;
+        use crate::orchestration::park::{FencingGeneration, WakeReason};
         use crate::orchestration::{RunId, TaskIdentity};
         use crate::session_store::{
             ApprovalStore, InMemoryApprovalStore, InMemoryEventBus, SessionStoreError,
         };
         use crate::tool_wrapper::WrappedTool;
 
-        /// An approval store that counts registrations and can refuse them,
-        /// standing in for a store outage at the park's one durable write.
+        /// An approval store that counts registrations, and can stage what
+        /// the park's one durable write runs into: a store outage, or a
+        /// request that tears down while the write is in flight.
         struct CountingApprovalStore {
             inner: InMemoryApprovalStore,
             registers: AtomicUsize,
             refuse: bool,
+            /// Request whose ownership marker is dropped mid-`register`.
+            teardown_during_register: Option<String>,
         }
 
         impl CountingApprovalStore {
@@ -395,6 +497,16 @@ mod tests {
                     inner: InMemoryApprovalStore::new(),
                     registers: AtomicUsize::new(0),
                     refuse,
+                    teardown_during_register: None,
+                }
+            }
+
+            /// Tear `request_id` down from inside the write, landing the race
+            /// the bracketing lookups in `DecisionRoute::park` exist for.
+            fn tearing_down(request_id: &str) -> Self {
+                Self {
+                    teardown_during_register: Some(request_id.to_string()),
+                    ..Self::new(false)
                 }
             }
 
@@ -411,6 +523,9 @@ mod tests {
                     return Err(SessionStoreError::Request {
                         reason: "approval store offline".to_string(),
                     });
+                }
+                if let Some(request_id) = &self.teardown_during_register {
+                    ApprovalOwnership::unregister(request_id);
                 }
                 self.inner.register(parked).await
             }
@@ -481,6 +596,16 @@ mod tests {
         }
 
         fn armed_gate(registry: &PendingApprovals, request_id: &str) -> HitlApprovalWrapper {
+            bound_gate(registry, request_id, None)
+        }
+
+        /// The gate as `create_worker` arms it, optionally re-dispatching a
+        /// task that already holds `binding`.
+        fn bound_gate(
+            registry: &PendingApprovals,
+            request_id: &str,
+            binding: Option<ApprovalBinding>,
+        ) -> HitlApprovalWrapper {
             HitlApprovalWrapper::new(
                 Arc::from([GlobPattern::new("kubectl_*").unwrap()]),
                 Arc::new(DecisionRoute::Conversational {
@@ -498,11 +623,67 @@ mod tests {
                 request_id.to_string(),
                 "test-agent".to_string(),
             )
-            .with_blocked_signal(BlockedSignal::new(), Duration::from_secs(3600))
+            .with_blocked_signal(
+                BlockedSignal::new(),
+                Duration::from_secs(3600),
+                binding,
+            )
         }
 
         fn unique_request_id() -> String {
             format!("req_gate_{}", uuid::Uuid::new_v4().simple())
+        }
+
+        /// Park an approval over `args`, settle it with `decision`, and hand
+        /// back the binding the released task carries into its next attempt.
+        async fn settled_binding(
+            registry: &PendingApprovals,
+            request_id: &str,
+            args: &Value,
+            decision: ApprovalDecision,
+        ) -> ApprovalBinding {
+            let gate = armed_gate(registry, request_id);
+            let outcome = gate
+                .pre_call(args, &ToolCallContext::new("kubectl_apply"))
+                .await
+                .expect("the first attempt parks");
+            let PreCallOutcome::Blocked(approval) = outcome else {
+                panic!("expected a parked call, got {outcome:?}");
+            };
+            registry
+                .resolve(&approval.decision_id, decision)
+                .await
+                .expect("the parked approval resolves durably");
+            ApprovalBinding {
+                approval,
+                args_digest: ArgsDigest::compute(args),
+                generation: FencingGeneration::INITIAL,
+            }
+        }
+
+        async fn approved_binding(
+            registry: &PendingApprovals,
+            request_id: &str,
+            args: &Value,
+        ) -> ApprovalBinding {
+            settled_binding(registry, request_id, args, ApprovalDecision::Approved).await
+        }
+
+        async fn denied_binding(
+            registry: &PendingApprovals,
+            request_id: &str,
+            args: &Value,
+            reason: &str,
+        ) -> ApprovalBinding {
+            settled_binding(
+                registry,
+                request_id,
+                args,
+                ApprovalDecision::Denied {
+                    reason: Some(reason.to_string()),
+                },
+            )
+            .await
         }
 
         /// A store outage at registration fails the call closed with nothing
@@ -515,6 +696,7 @@ mod tests {
                 PendingApprovals::with_backend(store.clone(), Arc::new(InMemoryEventBus::new()));
             let request_id = unique_request_id();
             let mut events = approval_event_broker::subscribe(&request_id).await;
+            let _ownership = ApprovalOwnership::register(&request_id);
 
             let tool = WrappedTool::new(
                 StubTool,
@@ -538,6 +720,129 @@ mod tests {
             approval_event_broker::unsubscribe(&request_id).await;
         }
 
+        /// The park's write and the request's teardown race: whichever side
+        /// lands first, no approval may outlive the request without a run
+        /// checkpoint naming it.
+        #[tokio::test]
+        async fn teardown_during_the_write_leaves_no_orphan_approval() {
+            let request_id = unique_request_id();
+            let store = Arc::new(CountingApprovalStore::tearing_down(&request_id));
+            let registry =
+                PendingApprovals::with_backend(store.clone(), Arc::new(InMemoryEventBus::new()));
+            let mut events = approval_event_broker::subscribe(&request_id).await;
+            let _ownership = ApprovalOwnership::register(&request_id);
+
+            let tool = WrappedTool::new(
+                StubTool,
+                Arc::new(armed_gate(&registry, &request_id)) as Arc<dyn ToolWrapper>,
+            );
+            let err = tool
+                .call(json!({}))
+                .await
+                .expect_err("a torn-down request must not park");
+
+            assert!(
+                err.to_string().contains("teardown already began"),
+                "the tool error must name the race, got: {err}",
+            );
+            assert_eq!(store.registers(), 1, "the write happened, then was undone");
+            assert!(
+                events.try_recv().is_err(),
+                "an undone registration announces nothing",
+            );
+
+            approval_event_broker::unsubscribe(&request_id).await;
+        }
+
+        /// A request already torn down never reaches the store at all.
+        #[tokio::test]
+        async fn a_torn_down_request_registers_nothing() {
+            let store = Arc::new(CountingApprovalStore::new(false));
+            let registry =
+                PendingApprovals::with_backend(store.clone(), Arc::new(InMemoryEventBus::new()));
+            let request_id = unique_request_id();
+
+            // No `ApprovalOwnership::register`: the marker teardown drops is
+            // already gone by the time the detached pre_call runs.
+            let tool = WrappedTool::new(
+                StubTool,
+                Arc::new(armed_gate(&registry, &request_id)) as Arc<dyn ToolWrapper>,
+            );
+            let err = tool
+                .call(json!({}))
+                .await
+                .expect_err("a torn-down request must not park");
+
+            assert!(err.to_string().contains("teardown already began"), "{err}");
+            assert_eq!(store.registers(), 0, "nothing was written");
+        }
+
+        /// A re-dispatched attempt whose arguments differ from the ones the
+        /// human saw is denied, and the decision stays claimable for the
+        /// call it does cover (ADR decision 9).
+        #[tokio::test]
+        async fn a_digest_mismatch_is_denied_and_consumes_nothing() {
+            let store = Arc::new(CountingApprovalStore::new(false));
+            let registry =
+                PendingApprovals::with_backend(store.clone(), Arc::new(InMemoryEventBus::new()));
+            let request_id = unique_request_id();
+            let _ownership = ApprovalOwnership::register(&request_id);
+            let approved = json!({ "namespace": "prod" });
+            let binding = approved_binding(&registry, &request_id, &approved).await;
+
+            let gate = bound_gate(&registry, &request_id, Some(binding.clone()));
+            let err = gate
+                .pre_call(
+                    &json!({ "namespace": "staging" }),
+                    &ToolCallContext::new("kubectl_apply"),
+                )
+                .await
+                .expect_err("tampered arguments are denied");
+
+            assert!(
+                err.to_string().contains("differ from the approved call"),
+                "{err}"
+            );
+            assert!(
+                store
+                    .decision(&binding.approval.decision_id)
+                    .await
+                    .expect("store readable")
+                    .is_some(),
+                "a rejected claim leaves the decision unconsumed",
+            );
+        }
+
+        /// A denial reaches the model as tool output, and the decision it
+        /// settles is dropped with its record.
+        #[tokio::test]
+        async fn a_denied_binding_short_circuits_and_is_consumed() {
+            let store = Arc::new(CountingApprovalStore::new(false));
+            let registry =
+                PendingApprovals::with_backend(store.clone(), Arc::new(InMemoryEventBus::new()));
+            let request_id = unique_request_id();
+            let _ownership = ApprovalOwnership::register(&request_id);
+            let args = json!({ "namespace": "prod" });
+            let binding = denied_binding(&registry, &request_id, &args, "too risky").await;
+
+            let gate = bound_gate(&registry, &request_id, Some(binding.clone()));
+            let outcome = gate
+                .pre_call(&args, &ToolCallContext::new("kubectl_apply"))
+                .await
+                .expect("a denial is feedback, not a fault");
+
+            assert_eq!(outcome, denial_short_circuit(Some("too risky".to_string())));
+            assert_eq!(store.registers(), 1, "a denial raises no new approval");
+            assert!(
+                store
+                    .get(&binding.approval.decision_id)
+                    .await
+                    .expect("store readable")
+                    .is_none(),
+                "a settled denial is dropped with its record",
+            );
+        }
+
         /// Once the run is parking, a further gated call in the same attempt
         /// registers nothing: a second approval would have no task waiting on
         /// it and nothing would ever claim it.
@@ -547,6 +852,7 @@ mod tests {
             let registry =
                 PendingApprovals::with_backend(store.clone(), Arc::new(InMemoryEventBus::new()));
             let request_id = unique_request_id();
+            let _ownership = ApprovalOwnership::register(&request_id);
             let gate = armed_gate(&registry, &request_id);
             let args = json!({});
             let ctx = ToolCallContext::new("kubectl_apply");

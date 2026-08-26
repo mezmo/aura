@@ -17,6 +17,7 @@ use super::events;
 use super::protocol::{ApprovalDecisionWire, ApprovalRequest, ApprovalRequestWire};
 use super::registry::PendingApprovals;
 use super::signing::{SigningContext, WebhookHmac, authorize_ingress};
+use super::teardown::ApprovalOwnership;
 use crate::approval_event_broker::{self, ApprovalLifecycleEvent};
 
 /// Maximum time to wait for a TCP connection to the approval webhook before
@@ -200,6 +201,10 @@ pub enum ParkError {
     /// in a store, so there would be no record for a later request to claim.
     #[error("durable park requires the conversational decision route")]
     WrongRoute,
+    /// The request's approvals are being deleted, so a record written now
+    /// would be torn down with no run checkpoint naming it.
+    #[error("durable park refused: request teardown already began")]
+    TeardownUnderway,
     #[error("durable park could not persist the approval: {0}")]
     Store(#[from] crate::session_store::SessionStoreError),
 }
@@ -269,13 +274,35 @@ impl DecisionRoute {
         request: ApprovalRequest,
         park_timeout: Duration,
     ) -> Result<(), ParkError> {
-        let Self::Conversational { registry, .. } = self else {
+        let Some(registry) = self.registry() else {
             return Err(ParkError::WrongRoute);
         };
+        // The gate's pre_call runs in a detached task, so teardown can begin
+        // on either side of this write. Bracketing it: refusing up front
+        // keeps a doomed record from ever existing, and re-checking after
+        // reclaims one that teardown had already walked past.
+        let request_id = request.request_id.clone();
+        let decision_id = request.decision_id;
+        if ApprovalOwnership::for_request(&request_id).is_none() {
+            return Err(ParkError::TeardownUnderway);
+        }
         let announcement = ConversationalAnnouncement::prepare(&request, park_timeout);
         registry.register_durable(request, park_timeout).await?;
+        if ApprovalOwnership::for_request(&request_id).is_none() {
+            registry.remove(&decision_id).await;
+            return Err(ParkError::TeardownUnderway);
+        }
         announcement.publish().await;
         Ok(())
+    }
+
+    /// The registry a conversational route parks into. A webhook route
+    /// resolves in one round trip and keeps no parked records.
+    pub(crate) fn registry(&self) -> Option<&PendingApprovals> {
+        match self {
+            Self::Conversational { registry, .. } => Some(registry),
+            Self::Webhook { .. } => None,
+        }
     }
 
     /// Obtain a decision for a config-gated call, carrying any captured
@@ -384,9 +411,11 @@ impl DecisionRoute {
                 {
                     outcome = ApprovalOutcome::Decided(decision);
                 }
-                if timed_out || matches!(outcome, ApprovalOutcome::Cancelled(_)) {
-                    registry.remove(&decision_id).await;
-                }
+                // Resolution keeps the record so a parked run can claim it,
+                // which leaves the in-request waiter as the only party that
+                // can drop one it has finished with — on every outcome, or
+                // memory and file retain it for good.
+                registry.remove(&decision_id).await;
 
                 let completed_event =
                     events::completed(decision_id, &outcome, &scope, started.elapsed());
@@ -774,6 +803,7 @@ mod tests {
     };
     use super::super::registry::PendingApprovals;
     use super::DecisionRoute;
+    use crate::session_store::ApprovalStore;
     use std::time::Duration;
 
     fn conv_route(timeout: Duration) -> (PendingApprovals, DecisionRoute) {
@@ -794,6 +824,72 @@ mod tests {
             origin,
             items: vec![],
         }
+    }
+
+    /// Resolution keeps the record so a parked run can claim it, which
+    /// leaves an in-request park as the only party that can drop the one it
+    /// waited on. Nothing else ever will.
+    #[tokio::test]
+    async fn an_answered_held_await_leaves_no_record_behind() {
+        let store = std::sync::Arc::new(crate::session_store::InMemoryApprovalStore::new());
+        let registry = PendingApprovals::with_backend(
+            store.clone(),
+            std::sync::Arc::new(crate::session_store::InMemoryEventBus::new()),
+        );
+        let route = DecisionRoute::Conversational {
+            registry: registry.clone(),
+            timeout: Duration::from_secs(60),
+        };
+        let request = single_request(
+            "req-held-await",
+            ApprovalOrigin::ConfigGate {
+                matched_pattern: "kubectl_*".to_string(),
+                agent_name: "test-agent".to_string(),
+            },
+        );
+        let decision_id = request.decision_id;
+
+        let cancel = crate::request_cancellation::RequestCancelToken::unbound();
+        let decide = tokio::spawn(async move { route.decide(request, &cancel).await });
+        // Resolve once the wake is wired; the registry's store is the seam
+        // that says so.
+        for _ in 0..1_000 {
+            if store
+                .get(&decision_id)
+                .await
+                .expect("store readable")
+                .is_some()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        registry
+            .resolve(&decision_id, ApprovalDecision::Approved)
+            .await
+            .expect("the parked approval resolves");
+
+        let outcome = decide.await.expect("no panic").expect("no channel fault");
+        assert!(matches!(
+            outcome,
+            ApprovalOutcome::Decided(ApprovalDecision::Approved)
+        ));
+        assert!(
+            store
+                .get(&decision_id)
+                .await
+                .expect("store readable")
+                .is_none(),
+            "the answered park left its record behind",
+        );
+        assert!(
+            store
+                .decision(&decision_id)
+                .await
+                .expect("store readable")
+                .is_none(),
+            "the answered park left its decision behind",
+        );
     }
 
     #[test]
