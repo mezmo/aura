@@ -1555,6 +1555,51 @@ mod tests {
         );
     }
 
+    /// An MCP server's error reaches `handle_tool_result` with the prefix
+    /// `aura::mcp_response` applies, and must be reported as a failure rather
+    /// than a successful result carrying the error text.
+    #[test]
+    fn test_handle_tool_result_reports_mcp_error_as_failure() {
+        let config = StreamConfig::new(true, false, ToolResultMode::Aura, 0);
+        let ctx = TurnContext {
+            completion_id: "test-123".to_string(),
+            model_str: "gpt-4".to_string(),
+            created_timestamp: 1234567890,
+            max_tokens: None,
+            agent_context: AgentContext::single_agent(),
+            correlation: CorrelationContext::new("test-session", None),
+        };
+
+        let mut state = TurnState::new();
+        state
+            .tool_call_map
+            .insert("call_abc123".to_string(), ("list_files".to_string(), 0));
+
+        let tool_result = ToolResult {
+            id: "call_abc123".to_string(),
+            call_id: None,
+            result: "Tool returned an error: 401 Unauthorized".to_string(),
+        };
+
+        let output: String = handle_tool_result(&config, &ctx, &mut state, &tool_result)
+            .iter()
+            .filter_map(|b| std::str::from_utf8(b).ok())
+            .collect();
+
+        assert!(
+            output.contains(event_names::TOOL_COMPLETE),
+            "expected an aura.tool_complete event, got: {output}"
+        );
+        assert!(
+            output.contains(r#""success":false"#),
+            "MCP error must report success:false, got: {output}"
+        );
+        assert!(
+            output.contains("401 Unauthorized"),
+            "error message must survive into the event, got: {output}"
+        );
+    }
+
     #[test]
     fn test_is_context_overflow_error_openai_style() {
         assert!(is_context_overflow_error("context_length_exceeded"));

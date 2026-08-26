@@ -260,9 +260,11 @@ pub use openai::{
     MessageRole, ToolCallChunk,
 };
 
-/// Error prefix patterns from Rig's tool error handling.
+/// Error prefix patterns from Rig's tool error handling. The first is also
+/// `MCP_ERROR_PREFIX` in `aura::mcp_response`; both must stay in step with
+/// `McpToolError` in rig's `tool/mod.rs`.
 const ERROR_PREFIXES: &[(&str, &str)] = &[
-    ("Tool returned error: ", "ToolError"),
+    ("Tool returned an error: ", "ToolError"),
     ("Tool execution failed: ", "ExecutionError"),
     ("Tool not found: ", "NotFoundError"),
     ("Invalid tool arguments: ", "ArgumentError"),
@@ -403,7 +405,7 @@ mod tests {
 
     #[test]
     fn test_detect_tool_error_failure() {
-        let status = detect_tool_error("Tool returned error: Connection refused");
+        let status = detect_tool_error("Tool returned an error: Connection refused");
         match status {
             ToolResultStatus::Error(err) => {
                 assert_eq!(err.error_type(), "ToolError");
