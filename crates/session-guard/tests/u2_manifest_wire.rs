@@ -12,7 +12,7 @@ use session_guard::{ArtifactPath, Digest, Epoch, Manifest};
 fn todo_message(payload: &dyn std::any::Any) -> String {
     payload
         .downcast_ref::<String>()
-        .map(|s| s.clone())
+        .cloned()
         .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
         .unwrap_or_default()
 }
