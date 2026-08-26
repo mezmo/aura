@@ -1831,56 +1831,9 @@ mod tests {
 
     mod inactivity {
         use super::*;
-        use async_trait::async_trait;
-        use aura::streaming::StreamingAgent;
-        use futures_util::stream::BoxStream;
+        use aura_test_utils::mock_agent::MockAgent;
         use std::sync::Arc;
         use tokio_util::sync::CancellationToken;
-
-        struct NoopAgent;
-
-        #[async_trait]
-        impl StreamingAgent for NoopAgent {
-            fn get_provider_info(&self) -> (&str, &str) {
-                ("test", "fake")
-            }
-
-            async fn stream(
-                &self,
-                _query: &str,
-                _chat_history: Vec<aura::Message>,
-                _cancel_token: CancellationToken,
-                _request_id: &str,
-            ) -> Result<
-                BoxStream<'static, Result<aura::StreamItem, aura::StreamError>>,
-                aura::StreamError,
-            > {
-                Ok(Box::pin(futures_util::stream::pending()))
-            }
-
-            async fn stream_with_timeout(
-                &self,
-                _query: &str,
-                _chat_history: Vec<aura::Message>,
-                _timeout: Duration,
-                _request_id: &str,
-            ) -> (
-                BoxStream<'static, Result<aura::StreamItem, aura::StreamError>>,
-                watch::Sender<bool>,
-                aura::UsageState,
-            ) {
-                let (cancel_tx, _) = watch::channel(false);
-                (
-                    Box::pin(futures_util::stream::pending()),
-                    cancel_tx,
-                    aura::UsageState::new(),
-                )
-            }
-
-            async fn cancel_and_close_mcp(&self, _request_id: &str, _reason: &str) -> usize {
-                0
-            }
-        }
 
         /// Event senders must outlive the loop: a closed channel's `recv()`
         /// arm is permanently ready with `None`, which starves paused time.
@@ -1900,7 +1853,7 @@ mod tests {
             (
                 StreamingCallbacks {
                     request_id: "req_inactivity_test".to_string(),
-                    agent: Arc::new(NoopAgent),
+                    agent: Arc::new(MockAgent::pending()),
                     tool_event_rx,
                     progress_rx,
                     tool_usage_rx,

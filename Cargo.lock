@@ -359,10 +359,14 @@ dependencies = [
 name = "aura-test-utils"
 version = "0.2.5"
 dependencies = [
+ "async-trait",
+ "aura",
+ "futures",
  "reqwest",
  "serde",
  "serde_json",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

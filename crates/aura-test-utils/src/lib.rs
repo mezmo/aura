@@ -1,5 +1,6 @@
 //! Shared test utilities for aura integration tests.
 
+pub mod mock_agent;
 pub mod sse;
 
 use std::future::Future;

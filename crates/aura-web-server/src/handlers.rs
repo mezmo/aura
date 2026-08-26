@@ -1342,12 +1342,10 @@ fn error_response(
 mod tests {
     use super::*;
     use crate::types::{ChatMessage, ChatMessageFunctionCall, ChatMessageToolCall, Role};
-    use async_trait::async_trait;
-    use futures::stream::{self, BoxStream};
+    use aura_test_utils::mock_agent::MockAgent;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
-    use tokio::sync::watch;
     use tokio_util::sync::CancellationToken;
 
     fn msg(role: Role, content: &str) -> ChatMessage {
@@ -1437,74 +1435,32 @@ mod tests {
         validate_hitl_delivery_mode(&config, &req).unwrap();
     }
 
-    struct StartupApprovalPublisher {
-        published: Arc<AtomicBool>,
-    }
-
-    #[async_trait]
-    impl StreamingAgent for StartupApprovalPublisher {
-        fn get_provider_info(&self) -> (&str, &str) {
-            ("test", "fake")
-        }
-
-        async fn stream(
-            &self,
-            _query: &str,
-            _chat_history: Vec<aura::Message>,
-            _cancel_token: CancellationToken,
-            _request_id: &str,
-        ) -> Result<
-            BoxStream<'static, Result<aura::StreamItem, aura::StreamError>>,
-            aura::StreamError,
-        > {
-            Ok(Box::pin(stream::pending()))
-        }
-
-        async fn stream_with_timeout(
-            &self,
-            _query: &str,
-            _chat_history: Vec<aura::Message>,
-            _timeout: Duration,
-            request_id: &str,
-        ) -> (
-            BoxStream<'static, Result<aura::StreamItem, aura::StreamError>>,
-            watch::Sender<bool>,
-            aura::UsageState,
-        ) {
-            let event = aura::ApprovalLifecycleEvent::Requested(aura_events::ApprovalRequested {
-                decision_id: aura::hitl::DecisionId::generate().to_string(),
-                tool_name: "dangerous_apply".to_string(),
-                origin: aura_events::ApprovalOriginWire::ConfigGate {
-                    matched_pattern: "dangerous_*".to_string(),
-                    agent_name: "test-agent".to_string(),
-                },
-                scope: aura_events::AgentScopeWire::Single { session_id: None },
-            });
-            self.published.store(
-                aura::approval_event_broker::publish(request_id, event).await,
-                Ordering::SeqCst,
-            );
-
-            let (cancel_tx, _cancel_rx) = watch::channel(false);
-            (
-                Box::pin(stream::pending()),
-                cancel_tx,
-                aura::UsageState::new(),
-            )
-        }
-
-        async fn cancel_and_close_mcp(&self, _request_id: &str, _reason: &str) -> usize {
-            0
-        }
-    }
-
     #[tokio::test]
     async fn sse_approval_subscription_exists_before_stream_startup() {
         let request_id = format!("req_test_{}", Uuid::new_v4().simple());
         let published = Arc::new(AtomicBool::new(false));
-        let agent: Arc<dyn StreamingAgent> = Arc::new(StartupApprovalPublisher {
-            published: Arc::clone(&published),
-        });
+        let agent: Arc<dyn StreamingAgent> = Arc::new(MockAgent::pending().on_stream_start({
+            let published = Arc::clone(&published);
+            move |request_id| {
+                let published = Arc::clone(&published);
+                async move {
+                    let event =
+                        aura::ApprovalLifecycleEvent::Requested(aura_events::ApprovalRequested {
+                            decision_id: aura::hitl::DecisionId::generate().to_string(),
+                            tool_name: "dangerous_apply".to_string(),
+                            origin: aura_events::ApprovalOriginWire::ConfigGate {
+                                matched_pattern: "dangerous_*".to_string(),
+                                agent_name: "test-agent".to_string(),
+                            },
+                            scope: aura_events::AgentScopeWire::Single { session_id: None },
+                        });
+                    published.store(
+                        aura::approval_event_broker::publish(&request_id, event).await,
+                        Ordering::SeqCst,
+                    );
+                }
+            }
+        }));
         let setup = RequestSetup {
             query: "trigger approval".to_string(),
             chat_history: vec![],

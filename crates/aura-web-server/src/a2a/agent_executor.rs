@@ -716,6 +716,7 @@ mod tests {
     use crate::a2a::SharedTaskStore;
     use crate::streaming::ToolResultMode;
     use crate::types::{ActiveRequestTracker, AppState};
+    use aura_test_utils::mock_agent::MockAgent;
 
     fn make_executor(
         configs: Vec<aura_config::Config>,
@@ -840,52 +841,6 @@ mod tests {
         assert_eq!(result.map(|c| c.agent.name), Some("B".to_owned()));
     }
 
-    /// Stand-in for a built agent, only ever parked in the cancel map.
-    struct IdleAgent;
-
-    #[async_trait::async_trait]
-    impl StreamingAgent for IdleAgent {
-        fn get_provider_info(&self) -> (&str, &str) {
-            ("test", "idle")
-        }
-
-        async fn stream(
-            &self,
-            _query: &str,
-            _chat_history: Vec<aura::Message>,
-            _cancel_token: CancellationToken,
-            _request_id: &str,
-        ) -> Result<
-            futures_util::stream::BoxStream<'static, Result<aura::StreamItem, aura::StreamError>>,
-            aura::StreamError,
-        > {
-            Ok(Box::pin(futures_util::stream::pending()))
-        }
-
-        async fn stream_with_timeout(
-            &self,
-            _query: &str,
-            _chat_history: Vec<aura::Message>,
-            _timeout: std::time::Duration,
-            _request_id: &str,
-        ) -> (
-            futures_util::stream::BoxStream<'static, Result<aura::StreamItem, aura::StreamError>>,
-            tokio::sync::watch::Sender<bool>,
-            aura::UsageState,
-        ) {
-            let (cancel_tx, _cancel_rx) = tokio::sync::watch::channel(false);
-            (
-                Box::pin(futures_util::stream::pending()),
-                cancel_tx,
-                aura::UsageState::new(),
-            )
-        }
-
-        async fn cancel_and_close_mcp(&self, _request_id: &str, _reason: &str) -> usize {
-            0
-        }
-    }
-
     /// A consumer that stops polling after a terminal event drops the
     /// execution generator mid-body, so the entry and the registry
     /// registration have to be released by the guard rather than by cleanup
@@ -906,7 +861,7 @@ mod tests {
             task_id.clone(),
             TaskCancelEntry {
                 token: CancellationToken::new(),
-                agent: Arc::new(IdleAgent),
+                agent: Arc::new(MockAgent::pending()),
                 request_id: request_id.clone(),
             },
         );
