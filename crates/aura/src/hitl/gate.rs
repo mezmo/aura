@@ -80,23 +80,17 @@ impl PendingBinding {
         Self(Arc::new(std::sync::Mutex::new(binding)))
     }
 
-    /// Read the binding without spending it. A call that inspects the
-    /// binding and then refuses must leave it claimable for the call it
-    /// does cover, so only [`Self::take`] empties the cell.
-    #[must_use]
-    pub fn peek(&self) -> Option<ApprovalBinding> {
-        self.0
-            .lock()
-            .expect("approval binding lock poisoned")
-            .clone()
-    }
-
-    /// Spend the binding, leaving the cell empty.
+    /// Take the binding out of the cell, leaving it empty.
     pub fn take(&self) -> Option<ApprovalBinding> {
         self.0
             .lock()
             .expect("approval binding lock poisoned")
             .take()
+    }
+
+    /// Put a binding back, for a claim that ended without settling it.
+    fn restore(&self, binding: ApprovalBinding) {
+        *self.0.lock().expect("approval binding lock poisoned") = Some(binding);
     }
 
     /// Whether a binding is still waiting to be dispatched.
@@ -106,6 +100,47 @@ impl PendingBinding {
             .lock()
             .expect("approval binding lock poisoned")
             .is_some()
+    }
+}
+
+/// One caller's exclusive hold on a task's binding.
+///
+/// Taking the binding out of the cell is the claim: a concurrent caller
+/// finds the cell empty and cannot validate the same decision. Dropping the
+/// hold returns the binding, so every path that does not settle the
+/// decision leaves it claimable without having to say so; only
+/// [`Self::commit`] keeps the cell empty.
+struct BindingClaim<'a> {
+    cell: &'a PendingBinding,
+    binding: Option<ApprovalBinding>,
+}
+
+impl<'a> BindingClaim<'a> {
+    /// Claim the cell's binding, if it holds one.
+    fn take(cell: &'a PendingBinding) -> Option<Self> {
+        cell.take().map(|binding| Self {
+            cell,
+            binding: Some(binding),
+        })
+    }
+
+    fn binding(&self) -> &ApprovalBinding {
+        self.binding
+            .as_ref()
+            .expect("a claim holds its binding until it commits")
+    }
+
+    /// Settle the decision: the binding is spent and the cell stays empty.
+    fn commit(mut self) {
+        self.binding = None;
+    }
+}
+
+impl Drop for BindingClaim<'_> {
+    fn drop(&mut self) {
+        if let Some(binding) = self.binding.take() {
+            self.cell.restore(binding);
+        }
     }
 }
 
@@ -201,19 +236,9 @@ impl HitlApprovalWrapper {
             ));
         };
         // A task re-dispatched after its approval was decided consumes that
-        // decision here; only an undecided or absent binding registers.
-        if let Some(binding) = park.binding.peek() {
-            if let Some(consumed) = self
-                .consume_binding(&binding, args, tool_name, &park.binding)
-                .await
-            {
-                return consumed;
-            }
-            // Still undecided: the run blocks on the approval it already has,
-            // never on a second one for the same call.
-            return Ok(park
-                .signal
-                .deposit(PreCallOutcome::Blocked(binding.approval)));
+        // decision here; only an unclaimed or absent binding registers.
+        if let Some(dispatched) = self.consume_binding(args, tool_name, park).await {
+            return dispatched;
         }
         let approval_ref = ApprovalRef {
             decision_id: request.decision_id,
@@ -226,22 +251,27 @@ impl HitlApprovalWrapper {
         Ok(park.signal.deposit(PreCallOutcome::Blocked(approval_ref)))
     }
 
-    /// Dispatch the decision `binding` names, or report that it has not
-    /// arrived (`None`) so the caller blocks on it again.
+    /// Dispatch the decision this task already holds, or `None` when it
+    /// holds none and the caller must raise a fresh approval.
     ///
     /// Revalidation pins the whole call the human saw, not half of it: the
     /// tool name here, because the digest covers only arguments, and the
     /// arguments through the dispatch claim. Either mismatch denies and
-    /// leaves the decision unconsumed for the call it does cover (ADR
+    /// leaves the decision claimable for the call it does cover (ADR
     /// 2026-07-21, decision 9). A dispatched decision is removed with its
     /// record, so it cannot be claimed twice.
     async fn consume_binding(
         &self,
-        binding: &ApprovalBinding,
         args: &Value,
         tool_name: &str,
-        cell: &PendingBinding,
+        park: &DurablePark,
     ) -> Option<Result<PreCallOutcome, ToolError>> {
+        // The claim IS taking the binding out of the cell: a concurrent
+        // caller then finds it empty and cannot validate the same decision.
+        // Every early return below drops the claim, which puts the binding
+        // back, so refusals stay claimable without saying so one by one.
+        let claim = BindingClaim::take(&park.binding)?;
+        let binding = claim.binding();
         let registry = self.route.registry()?;
         let id = binding.approval.decision_id;
         if tool_name != binding.tool_name {
@@ -255,7 +285,13 @@ impl HitlApprovalWrapper {
         }
         let decision = match registry.store().decision(&id).await {
             Ok(Some(decision)) => decision,
-            Ok(None) => return None,
+            // Undecided: the run blocks on the approval it already has,
+            // never on a second one for the same call.
+            Ok(None) => {
+                return Some(Ok(park
+                    .signal
+                    .deposit(PreCallOutcome::Blocked(binding.approval.clone()))));
+            }
             Err(e) => {
                 return Some(Err(ToolError::ToolCallError(
                     format!("tool call blocked: approval decision unreadable: {e}").into(),
@@ -266,12 +302,12 @@ impl HitlApprovalWrapper {
         let outcome = match decision {
             ApprovalDecision::Denied { reason } => denial_short_circuit(reason),
             ApprovalDecision::Approved => {
-                let claim = DispatchEvent::Claim {
+                let dispatch = DispatchEvent::Claim {
                     generation: binding.generation,
                     presented: ArgsDigest::compute(args),
                     at: chrono::Utc::now(),
                 };
-                match DispatchState::Unclaimed.apply(claim, &binding.args_digest) {
+                match DispatchState::Unclaimed.apply(dispatch, &binding.args_digest) {
                     Ok(_) => PreCallOutcome::Proceed { overrides: None },
                     Err(DispatchError::DigestMismatch { bound, presented }) => {
                         return Some(Err(ToolError::ToolCallError(
@@ -293,10 +329,9 @@ impl HitlApprovalWrapper {
                 }
             }
         };
-        // Spent only here, on the two outcomes that settle the decision:
-        // every refusal above returns with the cell untouched, so the call
-        // the human did approve can still claim it.
-        cell.take();
+        // The decision is settled, so the binding is spent: the cell stays
+        // empty and a retry raises its own approval.
+        claim.commit();
         registry.remove(&id).await;
         Some(Ok(outcome))
     }
@@ -998,6 +1033,74 @@ mod tests {
                     .expect("store readable")
                     .is_some(),
                 "the retry's own approval is registered and claimable",
+            );
+        }
+
+        /// Two gated calls in flight at once over one binding: the claim is
+        /// taking it out of the cell, so exactly one can validate the
+        /// decision and the other never reaches the tool. Rig runs a
+        /// worker's tools sequentially today, so this is a property of the
+        /// claim, not of the caller.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn concurrent_callers_dispatch_one_binding_once() {
+            let store = Arc::new(CountingApprovalStore::new(false));
+            let registry =
+                PendingApprovals::with_backend(store.clone(), Arc::new(InMemoryEventBus::new()));
+            let request_id = unique_request_id();
+            let _ownership = ApprovalOwnership::register(&request_id);
+            let args = json!({ "namespace": "prod" });
+            let binding = approved_binding(&registry, &request_id, &args).await;
+            let registered_before = store.registers();
+
+            // One gate, as `create_worker` builds it, called twice at once —
+            // the shape two parallel tool calls in one attempt would take.
+            let pending = PendingBinding::new(Some(binding.clone()));
+            let gate = Arc::new(gate_over(&registry, &request_id, pending.clone()));
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
+
+            let callers: Vec<_> = (0..2)
+                .map(|_| {
+                    let gate = Arc::clone(&gate);
+                    let barrier = Arc::clone(&barrier);
+                    let args = args.clone();
+                    tokio::spawn(async move {
+                        barrier.wait().await;
+                        gate.pre_call(&args, &ToolCallContext::new("kubectl_apply"))
+                            .await
+                    })
+                })
+                .collect();
+
+            let mut proceeded = 0;
+            let mut blocked_on = Vec::new();
+            for caller in callers {
+                match caller.await.expect("neither caller panics") {
+                    Ok(PreCallOutcome::Proceed { .. }) => proceeded += 1,
+                    Ok(PreCallOutcome::Blocked(approval)) => blocked_on.push(approval.decision_id),
+                    other => panic!("unexpected outcome {other:?}"),
+                }
+            }
+
+            assert_eq!(proceeded, 1, "one binding dispatches exactly once");
+            assert!(!pending.is_pending(), "the dispatch spent the binding");
+            assert!(
+                store
+                    .decision(&binding.approval.decision_id)
+                    .await
+                    .expect("store readable")
+                    .is_none(),
+                "the decision was consumed once and cannot be claimed again",
+            );
+            // The loser never validated the spent decision. It is an
+            // ordinary first gated call, so it parks under its own id — a
+            // second execution is a second approval, never a free ride on
+            // one the human already spent.
+            assert_eq!(blocked_on.len(), 1);
+            assert_ne!(blocked_on[0], binding.approval.decision_id);
+            assert_eq!(
+                store.registers() - registered_before,
+                1,
+                "the loser raised its own approval, not a duplicate of the spent one",
             );
         }
 

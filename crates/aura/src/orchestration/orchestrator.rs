@@ -3607,11 +3607,13 @@ Assign tasks to the worker whose tools best match the required operations."#,
         let Err(e) = run_store.park(session_id, generation, commit).await else {
             return Ok(());
         };
-        // Only this run's own commit counts. A park advances the record by
-        // exactly one generation, and another owner must acquire the lease
-        // before it can park, which advances it again — so anything past the
-        // successor is someone else's park, carrying a checkpoint that does
-        // not name our approvals.
+        // Only this run's own commit counts. The generation is what separates
+        // it from a newer owner's: a park advances the record by exactly one,
+        // and another owner must acquire the lease before parking, which
+        // advances it again — so anything past the successor is someone
+        // else's park, carrying a checkpoint that does not name our
+        // approvals. The run id catches the other way this can be the wrong
+        // record: a session that was never ours.
         let ours = matches!(
             run_store.load(session_id).await,
             Ok(Some(record))
@@ -7856,8 +7858,9 @@ mod durable_park_tests {
                 .expect("our run starts");
 
         // A newer owner takes the lease (+1) and parks (+2) while we were
-        // away, under its own run id. Our claim has to end first, which is
-        // exactly what a lease expiry or a clean handoff does.
+        // away. The record's run id rides along unchanged through both, so
+        // the generation step is what separates this from our own commit:
+        // ours would have landed at exactly +1.
         run_store
             .release_lease(session_id, our_generation)
             .await
