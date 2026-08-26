@@ -10,33 +10,21 @@ use aura_cli::repl::r#loop::run_repl;
 use aura_cli::ui::pre_launch;
 use aura_cli::ui::prompt::AgentHost;
 
-fn main() -> Result<()> {
-    // Catch --config/--standalone before clap parses when standalone-cli is not enabled.
-    #[cfg(not(feature = "standalone-cli"))]
-    aura_cli::cli::check_standalone_flag();
-
-    let args = Args::parse();
-
-    // Subcommands run before any backend/REPL setup (and before the tokio
-    // runtime exists — init uses blocking HTTP for model discovery).
-    match &args.command {
-        Some(aura_cli::cli::Command::Init(init_args)) => {
-            return aura_cli::init::run_init(init_args);
-        }
-        #[cfg(feature = "webserver")]
-        Some(aura_cli::cli::Command::Webserver { args }) => return aura_cli::webserver::run(args),
-        None => {}
-    }
-
-    // Load .env so a config's {{ env.* }} references resolve without manual
-    // exporting. dotenvy never overwrites — shell exports and earlier .env
-    // entries win.
+/// Resolves loading the .env files into the current environment so config
+/// template resolution has overrides.
+///
+/// Returns whether the process is running standalone or not.
+fn resolve_env_config(args: &Args) -> bool {
+    // Loads .env so a config's {{ env.* }} references resolve without manual
+    // exporting. CWD first, then the config file's directory (init writes
+    // .env next to the config). dotenvy never overwrites — shell exports and
+    // earlier .env entries win.
     dotenvy::dotenv().ok();
 
     // `resolve_standalone` reads AURA_API_URL from the process environment, so
     // it must run after the CWD `.env` is loaded.
     #[cfg(feature = "standalone-cli")]
-    let is_standalone = aura_cli::cli::resolve_standalone(&args);
+    let is_standalone = aura_cli::cli::resolve_standalone(args);
     #[cfg(not(feature = "standalone-cli"))]
     let is_standalone = false;
 
@@ -49,6 +37,36 @@ fn main() -> Result<()> {
         && let Some(dir) = aura_cli::agent_config::env_dir(&path)
     {
         dotenvy::from_path(dir.join(".env")).ok();
+    }
+
+    is_standalone
+}
+
+fn main() -> Result<()> {
+    // Catch --config/--standalone before clap parses when standalone-cli is not enabled.
+    #[cfg(not(feature = "standalone-cli"))]
+    aura_cli::cli::check_standalone_flag();
+
+    let args = Args::parse();
+
+    // Do this first since subcommands may depend on env var values
+    let is_standalone = resolve_env_config(&args);
+
+    // Subcommands run before any backend/REPL setup (and before the tokio
+    // runtime exists — init and governance uses blocking HTTP for model discovery).
+    match &args.command {
+        Some(aura_cli::cli::Command::Init(init_args)) => {
+            return aura_cli::init::run_init(init_args);
+        }
+        #[cfg(feature = "webserver")]
+        Some(aura_cli::cli::Command::Webserver { args }) => return aura_cli::webserver::run(args),
+        #[cfg(feature = "standalone-cli")]
+        Some(aura_cli::cli::Command::Governance { command }) => {
+            let conf_path = aura_cli::agent_config::resolve(args.agent_config.as_deref())?;
+            let confs = aura_config::load_config(conf_path)?;
+            return aura_cli::governance::run(&confs, command);
+        }
+        None => {}
     }
 
     let mut config = AppConfig::load(&args)?;

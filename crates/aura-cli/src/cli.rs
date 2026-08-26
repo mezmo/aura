@@ -21,6 +21,13 @@ pub enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<std::ffi::OsString>,
     },
+
+    /// Governance commands for policy integration and catalog sync.
+    #[cfg(feature = "standalone-cli")]
+    Governance {
+        #[command(subcommand)]
+        command: crate::governance::GovernanceCommands,
+    },
 }
 
 /// Aura CLI — interactive chat completions REPL

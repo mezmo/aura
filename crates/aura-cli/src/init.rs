@@ -110,7 +110,6 @@ pub struct InitArgs {
 }
 
 pub fn run_init(args: &InitArgs) -> Result<()> {
-    dotenvy::dotenv().ok();
     let is_tty = std::io::stdin().is_terminal();
     let interactive = !args.non_interactive && is_tty;
     let mut prompter = Prompter {

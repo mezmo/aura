@@ -153,6 +153,11 @@ impl DirectBackend {
         self.app_state.pending_approvals.clone()
     }
 
+    /// Access the loaded agent configs for governance operations.
+    pub fn configs(&self) -> &[aura_config::Config] {
+        &self.app_state.configs
+    }
+
     /// Return the effective model ID for each loaded config.
     pub(crate) fn model_ids(&self) -> Vec<String> {
         self.model_choices().into_iter().map(|m| m.id).collect()

@@ -5,6 +5,8 @@ pub mod backend;
 pub mod cli;
 pub mod config;
 pub mod event_names;
+#[cfg(feature = "standalone-cli")]
+pub mod governance;
 pub mod init;
 pub mod logging;
 pub mod oneshot;
