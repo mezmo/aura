@@ -918,6 +918,7 @@ fn parked(request_id: &str, scope: AgentScope) -> ParkedApproval {
             scope,
             origin: ApprovalOrigin::ConfigGate {
                 matched_pattern: "conformance_*".to_string(),
+                agent_name: "test-agent".to_string(),
             },
             items: vec![ApprovalItem {
                 tool_name: "conformance_tool".to_string(),

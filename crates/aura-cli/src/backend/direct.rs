@@ -954,6 +954,7 @@ api_key = "sk-standalone-test"
                     scope: aura::hitl::AgentScope::Single { session_id: None },
                     origin: aura::hitl::ApprovalOrigin::ConfigGate {
                         matched_pattern: "test_*".to_string(),
+                        agent_name: "test-agent".to_string(),
                     },
                     items: vec![aura::hitl::ApprovalItem {
                         tool_name: "test_tool".to_string(),

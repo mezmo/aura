@@ -234,6 +234,7 @@ mod tests {
                 scope: AgentScope::Single { session_id: None },
                 origin: ApprovalOrigin::ConfigGate {
                     matched_pattern: "test_*".to_string(),
+                    agent_name: "test-agent".to_string(),
                 },
                 items: vec![ApprovalItem {
                     tool_name: "test_tool".to_string(),
