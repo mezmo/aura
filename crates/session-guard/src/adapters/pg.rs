@@ -22,16 +22,20 @@ use crate::TurnAdmission;
 use crate::arbiter::SessionArbiter;
 use crate::claim::{BusyClaim, ClaimOutcome, GrantedClaim, HolderView, ParkedClaim};
 use crate::config::PgAdmissionEnv;
-use crate::epoch::Epoch;
+use crate::epoch::{Epoch, session_dir};
+use crate::gc::DebrisSweep;
 use crate::identity::{HolderId, OpId, PodId, SessionId, TurnId};
 use crate::lease::{BeatInterval, LeaseDeadline, LeaseTtl, SelfFenceMargin};
 use crate::manifest::Manifest;
 use crate::repair::RepairLane;
-use crate::state::{AdmissionError, HeldLock, IdleRequest};
+use crate::state::{
+    AcquiredClaim, AdmissionError, HeartbeatRenewal, HeldLock, IdleRequest, ReleaseAction,
+    RenewalWrite,
+};
 use crate::store::{
-    ClaimRequest, ClaimStore, CommitDisposition, CommitOutcome, HeartbeatOutcome, ParkLatch,
-    ReleaseOutcome, S1_CLAIM, S1_CLASSIFY, S2_HEARTBEAT, S3_COMMIT, S4_RELEASE, S4_RELEASE_POD,
-    S5_RECONCILE, S6_LOCATE, SCHEMA, StoreUnavailable,
+    ClaimRef, ClaimRequest, ClaimStore, CommitDisposition, CommitOutcome, HeartbeatOutcome,
+    ParkLatch, ReleaseOutcome, S1_CLAIM, S1_CLASSIFY, S2_HEARTBEAT, S3_COMMIT, S4_RELEASE,
+    S4_RELEASE_POD, S5_RECONCILE, S6_LOCATE, SCHEMA, StoreUnavailable,
 };
 
 /// Proof that a claim is being assembled by the Postgres backend. The
@@ -94,33 +98,118 @@ impl PgAdmission {
             proof: PgLeaseProof(()),
         }
     }
+
+    /// One S4 release bound to this claim's fence triple. Release is
+    /// idempotent, so both [`ReleaseOutcome::Released`] and
+    /// [`ReleaseOutcome::Superseded`] are success; a store failure surfaces
+    /// as a [`crate::state::ReleaseError`]. The returned action owns a
+    /// cloned store handle and the claim ref, so it is `Send + 'static`.
+    fn release_action(&self, claim: ClaimRef) -> ReleaseAction {
+        let store = self.store.clone();
+        Box::new(move || {
+            Box::pin(async move {
+                store.release(&claim).await?;
+                Ok(())
+            })
+        })
+    }
+
+    /// One S2 renewal bound to this claim's fence triple. Fails closed (I5):
+    /// a lost lease and an unreachable store both revoke, mapped to an
+    /// `io::Error`. The `FnMut` owns a cloned store handle, the ttl, and the
+    /// claim ref, re-cloning them into each beat's future so every future is
+    /// `Send + 'static`.
+    fn renewal_write(&self, claim: ClaimRef) -> Box<RenewalWrite> {
+        let store = self.store.clone();
+        let ttl = self.ttl;
+        Box::new(move || {
+            let store = store.clone();
+            let claim = claim.clone();
+            Box::pin(async move {
+                match store.heartbeat(&claim, ttl).await {
+                    Ok(HeartbeatOutcome::Renewed { .. }) => Ok(()),
+                    Ok(HeartbeatOutcome::Lost) => {
+                        Err(std::io::Error::other("session claim lease lost"))
+                    }
+                    Err(unavailable) => Err(std::io::Error::other(unavailable)),
+                }
+            })
+        })
+    }
 }
 
 #[async_trait]
 impl TurnAdmission for PgAdmission {
-    #[expect(
-        unused_variables,
-        reason = "todo!() body; filled by aura #421 follow-up"
-    )]
     async fn admit(&self, req: IdleRequest) -> Result<HeldLock, AdmissionError> {
-        todo!(
-            "fill: arbiter PendingGuard → mint HolderId → note S1 transmission instant \
-             (granted_at) → store.claim(S1 + classify, one internal retry when classify \
-             observes a claimable row) → Granted: DebrisSweep::at_claim_time(&manifest, epoch)\
-             .sweep(&session_root under self.root) (failure ≠ claim failure), then \
-             AcquiredClaim::new_pg(self.proof, granted, root/session, self.store.clone(), \
-             self.propagation_window, release-closing-over-S4, renewal, self.repair.clone()) \
-             → into_held → confirm(); Busy → AdmissionError::Busy; Parked → AdmissionError::Parked; \
-             aura #421 follow-up"
-        )
+        // The in-process arbiter is the first serialization layer: a lost
+        // local race names this pod as the busy holder and never reaches S1.
+        let Some(pending) = self.arbiter.try_acquire(&req.session) else {
+            return Err(AdmissionError::Busy {
+                holder: self.pod.clone(),
+                retry_after: self.retry_after,
+            });
+        };
+        // `pending` frees the arbiter slot on drop; it is consumed by
+        // `confirm()` only on the granted path, so every error return below
+        // (including the `?` on `claim`) drops it and releases the slot.
+        let claim_request = ClaimRequest {
+            session: req.session.clone(),
+            turn: req.turn,
+            holder: HolderId::mint(),
+            pod: self.pod.clone(),
+            ttl: self.ttl,
+        };
+        match self.store.claim(&claim_request).await? {
+            ClaimOutcome::Granted(granted) => {
+                let session_root = session_dir(&self.root, &granted.session);
+                // Debris GC at claim time against this claim's bound root; a
+                // sweep failure is not a claim failure (I3), so its outcome
+                // is discarded rather than propagated.
+                let _ = DebrisSweep::at_claim_time(&granted.manifest, granted.epoch)
+                    .sweep(&session_root)
+                    .await;
+                let claim_ref = ClaimRef {
+                    session: granted.session.clone(),
+                    turn: granted.turn,
+                    epoch: granted.epoch,
+                    holder: granted.holder,
+                };
+                let renewal = HeartbeatRenewal {
+                    beat: self.beat,
+                    ttl: self.ttl,
+                    margin: self.margin,
+                    write: self.renewal_write(claim_ref.clone()),
+                };
+                let acquired = AcquiredClaim::new_pg(
+                    self.proof,
+                    granted,
+                    session_root,
+                    self.store.clone(),
+                    self.repair.clone(),
+                    self.propagation_window,
+                    self.release_action(claim_ref),
+                    renewal,
+                );
+                Ok(acquired.into_held(pending.confirm()))
+            }
+            // The store fills a zero placeholder for a live-lease refusal, so
+            // the honest retry hint is this backend's configured one, never
+            // `busy.retry_after` (codex M7).
+            ClaimOutcome::Busy(busy) => Err(AdmissionError::Busy {
+                holder: busy.holder.pod().clone(),
+                retry_after: self.retry_after,
+            }),
+            ClaimOutcome::Parked(parked) => Err(AdmissionError::Parked { turn: parked.turn }),
+        }
     }
 
-    #[expect(
-        unused_variables,
-        reason = "todo!() body; filled by aura #421 follow-up"
-    )]
     async fn locate_holder(&self, session: &SessionId) -> std::io::Result<Option<HolderView>> {
-        todo!("fill: store.locate (S6, live leases only) → Remote view; aura #421 follow-up")
+        // S6 reports only a live lease; an unreachable store fails loud (I5)
+        // rather than masquerading as "no holder".
+        self.store
+            .locate(session)
+            .await
+            .map_err(std::io::Error::other)
     }
 }
 
@@ -661,5 +750,251 @@ mod tests {
             ),
             CommitDisposition::SupersededUnknown
         );
+    }
+
+    // ---- U4: the PgAdmission claim flow, DB-free against a scripted store ----
+
+    use crate::store::scripted::ScriptedStore;
+
+    /// A distinct, non-zero retry hint, so a forwarded `busy.retry_after`
+    /// (the store's zero placeholder) is a visibly wrong value.
+    const TEST_RETRY_AFTER: Duration = Duration::from_millis(1_234);
+
+    /// A repair lane that is never exercised on the admission path (repair
+    /// rides the read path only); both cures are inert here.
+    struct InertRepair;
+
+    #[async_trait]
+    impl RepairLane for InertRepair {
+        async fn refresh_dir(
+            &self,
+            _dir: &std::path::Path,
+        ) -> Result<(), crate::repair::RepairError> {
+            Ok(())
+        }
+
+        async fn force_cure(
+            &self,
+            _dir: &std::path::Path,
+        ) -> Result<(), crate::repair::RepairError> {
+            Ok(())
+        }
+    }
+
+    fn session() -> SessionId {
+        SessionId::parse("s1").expect("valid session id")
+    }
+
+    fn pod() -> PodId {
+        PodId::parse("pod-0").expect("valid pod id")
+    }
+
+    fn remote_pod() -> PodId {
+        PodId::parse("remote-pod").expect("valid pod id")
+    }
+
+    fn idle_request() -> IdleRequest {
+        IdleRequest {
+            session: session(),
+            turn: TurnId::new(),
+        }
+    }
+
+    fn granted_claim() -> GrantedClaim {
+        GrantedClaim {
+            session: session(),
+            turn: TurnId::new(),
+            epoch: Epoch::initial(),
+            holder: HolderId::mint(),
+            pod: pod(),
+            lease_expires_at: LeaseDeadline::new(SystemTime::now() + Duration::from_secs(15)),
+            manifest: Manifest::empty(),
+            granted_at: Instant::now(),
+        }
+    }
+
+    /// A [`PgAdmission`] over a scripted store, assembled by struct literal:
+    /// the `PgAdmissionEnv`/`AdmissionEnv` constructor path is confined to
+    /// the `config` module tree and is unreachable here, but this test
+    /// module is a descendant of `adapters::pg`, so it may name the private
+    /// fields and the [`PgLeaseProof`] token directly. The beat is far
+    /// larger than any test's lifetime, so the heartbeat actor never fires a
+    /// scripted renewal before the [`HeldLock`] drops.
+    fn admission(store: Arc<dyn ClaimStore>, arbiter: SessionArbiter) -> PgAdmission {
+        PgAdmission {
+            store,
+            pod: pod(),
+            root: PathBuf::from("/nonexistent-sg-test-root"),
+            arbiter,
+            retry_after: TEST_RETRY_AFTER,
+            beat: BeatInterval::new(Duration::from_secs(3_600)).expect("non-zero beat"),
+            ttl: LeaseTtl::new(Duration::from_secs(15)).expect("non-zero ttl"),
+            margin: SelfFenceMargin::new(Duration::from_millis(250)).expect("non-zero margin"),
+            propagation_window: Duration::from_secs(30),
+            repair: Arc::new(InertRepair),
+            proof: PgLeaseProof(()),
+        }
+    }
+
+    #[tokio::test]
+    async fn pg_admit_granted_returns_held_lock_and_records_hold() {
+        let store = Arc::new(ScriptedStore::default());
+        store.script_claim(Ok(ClaimOutcome::Granted(granted_claim())));
+        let arbiter = SessionArbiter::new();
+        let admission = admission(store, arbiter.clone());
+
+        let held = admission
+            .admit(idle_request())
+            .await
+            .expect("a scripted grant yields a held lock");
+
+        assert_eq!(held.holder_view().pod(), &pod());
+        assert!(
+            arbiter.holds(&session()),
+            "a granted admission promotes the arbiter slot to Held"
+        );
+    }
+
+    #[tokio::test]
+    async fn pg_admit_busy_reports_configured_retry_after_not_store_zero() {
+        let store = Arc::new(ScriptedStore::default());
+        store.script_claim(Ok(ClaimOutcome::Busy(BusyClaim {
+            holder: HolderView::remote(
+                remote_pod(),
+                LeaseDeadline::new(SystemTime::now() + Duration::from_secs(5)),
+            ),
+            // The store returns a zero placeholder; the adapter must replace
+            // it with the configured hint.
+            retry_after: Duration::ZERO,
+        })));
+        let admission = admission(store, SessionArbiter::new());
+
+        let err = admission
+            .admit(idle_request())
+            .await
+            .expect_err("a live lease refuses admission");
+
+        match err {
+            AdmissionError::Busy {
+                holder,
+                retry_after,
+            } => {
+                assert_eq!(holder, remote_pod(), "the refusal names the store's holder");
+                assert_eq!(
+                    retry_after, TEST_RETRY_AFTER,
+                    "the retry hint is the configured one, never the store's zero"
+                );
+                assert_ne!(retry_after, Duration::ZERO);
+            }
+            other => panic!("expected Busy, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn pg_admit_parked_reports_parked_turn() {
+        let parked_turn = TurnId::new();
+        let store = Arc::new(ScriptedStore::default());
+        store.script_claim(Ok(ClaimOutcome::Parked(ParkedClaim { turn: parked_turn })));
+        let admission = admission(store, SessionArbiter::new());
+
+        let err = admission
+            .admit(idle_request())
+            .await
+            .expect_err("a parked session refuses admission");
+
+        match err {
+            AdmissionError::Parked { turn } => assert_eq!(turn, parked_turn),
+            other => panic!("expected Parked, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn pg_admit_store_unavailable_maps_and_frees_the_slot() {
+        let store = Arc::new(ScriptedStore::default());
+        store.script_claim(Err(StoreUnavailable::msg("connection refused")));
+        let arbiter = SessionArbiter::new();
+        let admission = admission(store, arbiter.clone());
+
+        let err = admission
+            .admit(idle_request())
+            .await
+            .expect_err("an unreachable store fails the claim path");
+        assert!(matches!(err, AdmissionError::StoreUnavailable(_)));
+        // The dropped PendingGuard released the slot, so a fresh attempt can
+        // re-enter admission.
+        assert!(
+            arbiter.try_acquire(&session()).is_some(),
+            "a failed admit frees the arbiter slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn pg_admit_second_same_session_is_busy_via_arbiter() {
+        let store = Arc::new(ScriptedStore::default());
+        // Only one S1 is scripted: the arbiter must refuse the second admit
+        // before it can reach the store (a second claim would panic the
+        // exhausted queue).
+        store.script_claim(Ok(ClaimOutcome::Granted(granted_claim())));
+        let admission = admission(store, SessionArbiter::new());
+
+        let _held = admission
+            .admit(idle_request())
+            .await
+            .expect("the first admit grants");
+        let err = admission
+            .admit(idle_request())
+            .await
+            .expect_err("a second same-session admit is refused locally");
+
+        match err {
+            AdmissionError::Busy {
+                holder,
+                retry_after,
+            } => {
+                assert_eq!(holder, pod(), "the local refusal names this pod");
+                assert_eq!(retry_after, TEST_RETRY_AFTER);
+            }
+            other => panic!("expected Busy, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn pg_locate_holder_maps_remote_and_absent() {
+        let store = Arc::new(ScriptedStore::default());
+        let remote = HolderView::remote(
+            remote_pod(),
+            LeaseDeadline::new(SystemTime::now() + Duration::from_secs(5)),
+        );
+        store.script_locate(Ok(Some(remote.clone())));
+        store.script_locate(Ok(None));
+        let admission = admission(store, SessionArbiter::new());
+
+        assert_eq!(
+            admission
+                .locate_holder(&session())
+                .await
+                .expect("a live lease reports its holder"),
+            Some(remote)
+        );
+        assert_eq!(
+            admission
+                .locate_holder(&session())
+                .await
+                .expect("no live lease reports no holder"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn pg_locate_holder_store_unavailable_is_io_error() {
+        let store = Arc::new(ScriptedStore::default());
+        store.script_locate(Err(StoreUnavailable::msg("connection refused")));
+        let admission = admission(store, SessionArbiter::new());
+
+        let err = admission
+            .locate_holder(&session())
+            .await
+            .expect_err("an unreachable store fails loud");
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
     }
 }
