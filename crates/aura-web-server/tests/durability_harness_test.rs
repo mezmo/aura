@@ -490,15 +490,12 @@ async fn drive_post_park_frames(
     transcript.push(retrieval_frame);
 }
 
-/// Open a streaming chat request, collect events until the first
-/// `aura.approval_requested`, then wait for the approval record to be persisted
-/// in the backend before SIGKILL-ing the server. The response is held open
-/// until the process dies, so the request teardown never runs and the approval
-/// record survives.
-///
-/// Returns the collected events and an optional harness-setup failure message.
-/// A setup failure means the crash window was never reached, which is
-/// distinguishable from a product-red frame in the output.
+/// Open a streaming chat request and collect its events. Once the approval
+/// record is durable in the backend, keep collecting until the stream ends
+/// (a parking backend closes it after `run_parked`; a grace bounds one that
+/// never parks), then SIGKILL the server. The kill lands after the park, so
+/// the crash frames read a committed record; the request teardown never runs
+/// in-process, so the approval must survive on ownership transfer alone.
 async fn drive_to_approval(
     client: &reqwest::Client,
     server: &mut AuraServerProcess,
