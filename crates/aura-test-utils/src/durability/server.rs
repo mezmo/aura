@@ -234,22 +234,9 @@ async fn find_server_binary() -> std::io::Result<PathBuf> {
         }
     }
 
-    let current = std::env::current_exe()?;
-    let mut dir = current.parent();
-    while let Some(d) = dir {
-        let candidate = d.join("aura");
-        if candidate.exists() {
-            return Ok(candidate);
-        }
-        if d.ends_with("target") {
-            // We have walked up to target/ without finding it; build it.
-            break;
-        }
-        dir = d.parent();
-    }
-
-    // Fallback: build the binary so the harness can be run with a plain
-    // `cargo test` invocation.
+    // Build before looking: a binary already sitting in target/ may lack
+    // the redis feature the harness needs, and cargo is a no-op when it is
+    // current.
     let status = tokio::process::Command::new("cargo")
         .args([
             "build",
