@@ -193,6 +193,15 @@ pub(crate) const COMMANDS: &[Command] = &[
         validate: None,
         mid_stream: MidStream::Defer,
     },
+    #[cfg(feature = "standalone-cli")]
+    Command {
+        name: "/governance",
+        description: "Governance commands (standalone mode only)",
+        usage_hint: Some("sync"),
+        handler: cmd_governance,
+        validate: None,
+        mid_stream: MidStream::Defer,
+    },
 ];
 
 /// Look up a command by its exact, fully-resolved name.
@@ -311,6 +320,11 @@ fn cmd_mcp(ctx: &mut CommandContext, args: &str) -> CommandOutcome {
 fn cmd_telemetry(ctx: &mut CommandContext, args: &str) -> CommandOutcome {
     commands::handle_telemetry(args, ctx.telemetry);
     CommandOutcome::Handled
+}
+
+#[cfg(feature = "standalone-cli")]
+fn cmd_governance(ctx: &mut CommandContext, args: &str) -> CommandOutcome {
+    super::governance::handle_governance(ctx, args)
 }
 
 /// Block Enter while a command's argument is still ambiguous against the live
