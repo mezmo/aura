@@ -517,10 +517,11 @@ async fn drive_to_approval(
     let (fail_tx, mut fail_rx) = mpsc::unbounded_channel();
     let mut events = Vec::new();
     let mut setup_failure: Option<String> = None;
-    // The crash is timed at the park window: after the approval record is
-    // durable, wait for the run to park (or the stream to end, or the park
-    // grace to lapse) before killing, so a backend that parks is cut down
-    // after its CAS and one that refuses is cut down all the same.
+    // The crash is timed after the park: once the approval record is
+    // durable, the stream is drained to its end (or a grace lapses for a
+    // backend that never parks) and then the server is killed, so a backend
+    // that parks is cut down after its CAS with its frames on record, and
+    // one that refuses is cut down all the same.
     let mut record_ready = false;
     let mut parked_seen = false;
     let mut park_deadline: Option<Instant> = None;
@@ -539,10 +540,11 @@ async fn drive_to_approval(
             }
             _ = kill_rx.recv() => {
                 record_ready = true;
-                if parked_seen {
-                    let _ = server.stop().await;
-                    break;
-                }
+                // Killing the moment the record lands would cut the stream
+                // before the park; killing the moment the parked frame lands
+                // would race the frames behind it. The crash follows the
+                // stream end, bounded by a grace for a backend that never
+                // parks.
                 park_deadline = Some(Instant::now() + Duration::from_secs(10));
             }
             maybe_fail = fail_rx.recv() => {
@@ -578,19 +580,13 @@ async fn drive_to_approval(
                                 }
                             });
                         }
-                        let parked = evt.event_type.as_deref()
-                            == Some("aura.orchestrator.run_parked");
-                        events.push(evt);
-                        if parked {
+                        if evt.event_type.as_deref() == Some("aura.orchestrator.run_parked") {
                             parked_seen = true;
-                            if record_ready {
-                                let _ = server.stop().await;
-                                break;
-                            }
                         }
+                        events.push(evt);
                     }
                     None => {
-                        if parked_seen {
+                        if parked_seen || record_ready {
                             let _ = server.stop().await;
                         }
                         break;
