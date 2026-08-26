@@ -8,8 +8,9 @@ use async_trait::async_trait;
 use crate::TurnAdmission;
 use crate::arbiter::SessionArbiter;
 use crate::claim::HolderView;
+use crate::epoch::session_dir;
 use crate::identity::{PodId, SessionId};
-use crate::state::{AdmissionError, HeldLock, IdleRequest};
+use crate::state::{AcquiredClaim, AdmissionError, HeldLock, IdleRequest, ReleaseAction};
 
 /// Proof that a claim is being assembled by the local backend. The
 /// constructor is private to this module, so only [`LocalAdmission`] can
@@ -50,24 +51,34 @@ impl LocalAdmission {
 
 #[async_trait]
 impl TurnAdmission for LocalAdmission {
-    #[expect(
-        unused_variables,
-        reason = "todo!() body; filled by aura #421 follow-up"
-    )]
     async fn admit(&self, req: IdleRequest) -> Result<HeldLock, AdmissionError> {
-        todo!(
-            "fill: arbiter PendingGuard → confirm() → \
-             AcquiredClaim::new_local(self.proof, session, turn, self.pod.clone(), \
-             self.root/session, self.propagation_window, release) → into_held; \
-             aura #421 follow-up"
-        )
+        // The arbiter is the whole election in `off` mode, so it runs
+        // first and a lost race names this pod as the holder.
+        let Some(pending) = self.arbiter.try_acquire(&req.session) else {
+            return Err(AdmissionError::Busy {
+                holder: self.pod.clone(),
+                retry_after: self.retry_after,
+            });
+        };
+        let session_root = session_dir(&self.root, &req.session);
+        // No authority to release against; the arbiter slot frees on drop.
+        let release: ReleaseAction = Box::new(|| Box::pin(async { Ok(()) }));
+        let claim = AcquiredClaim::new_local(
+            self.proof,
+            req.session,
+            req.turn,
+            self.pod.clone(),
+            session_root,
+            self.propagation_window,
+            release,
+        );
+        Ok(claim.into_held(pending.confirm()))
     }
 
-    #[expect(
-        unused_variables,
-        reason = "todo!() body; filled by aura #421 follow-up"
-    )]
     async fn locate_holder(&self, session: &SessionId) -> std::io::Result<Option<HolderView>> {
-        todo!("fill: arbiter holds() (Held only) → Here view; aura #421 follow-up")
+        Ok(self
+            .arbiter
+            .holds(session)
+            .then(|| HolderView::here(self.pod.clone())))
     }
 }
