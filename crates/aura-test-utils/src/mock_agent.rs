@@ -13,14 +13,31 @@ use tokio_util::sync::CancellationToken;
 
 type StartHook = Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
+#[derive(Clone)]
+enum Script {
+    Pending,
+    Items(Vec<StreamItem>),
+}
+
 pub struct MockAgent {
+    script: Script,
     on_stream_start: Option<StartHook>,
 }
 
 impl MockAgent {
     /// Yields nothing and never ends.
     pub fn pending() -> Self {
+        Self::with_script(Script::Pending)
+    }
+
+    /// Yields `items` in order, then ends.
+    pub fn scripted(items: impl IntoIterator<Item = StreamItem>) -> Self {
+        Self::with_script(Script::Items(items.into_iter().collect()))
+    }
+
+    fn with_script(script: Script) -> Self {
         Self {
+            script,
             on_stream_start: None,
         }
     }
@@ -40,7 +57,13 @@ impl MockAgent {
         if let Some(hook) = &self.on_stream_start {
             hook(request_id.to_string()).await;
         }
-        Box::pin(stream::pending())
+
+        match &self.script {
+            Script::Pending => Box::pin(stream::pending()) as BoxStream<'_, _>,
+            Script::Items(items) => Box::pin(stream::iter(
+                items.clone().into_iter().map(Ok::<_, StreamError>),
+            )),
+        }
     }
 }
 
@@ -84,8 +107,44 @@ impl StreamingAgent for MockAgent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aura::StreamedAssistantContent;
     use futures::StreamExt;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn text(s: &str) -> StreamItem {
+        StreamItem::StreamAssistantItem(StreamedAssistantContent::Text(s.to_string()))
+    }
+
+    async fn collect_text(agent: &MockAgent) -> Vec<String> {
+        let stream = agent
+            .stream("q", vec![], CancellationToken::new(), "req_1")
+            .await
+            .expect("mock stream should start");
+        stream
+            .filter_map(|item| async move {
+                match item {
+                    Ok(StreamItem::StreamAssistantItem(StreamedAssistantContent::Text(t))) => {
+                        Some(t)
+                    }
+                    _ => None,
+                }
+            })
+            .collect()
+            .await
+    }
+
+    #[tokio::test]
+    async fn scripted_items_replay_in_order_then_end() {
+        let agent = MockAgent::scripted([text("a"), text("b")]);
+        assert_eq!(collect_text(&agent).await, vec!["a", "b"]);
+    }
+
+    #[tokio::test]
+    async fn the_script_replays_on_every_stream() {
+        let agent = MockAgent::scripted([text("a")]);
+        assert_eq!(collect_text(&agent).await, vec!["a"]);
+        assert_eq!(collect_text(&agent).await, vec!["a"]);
+    }
 
     #[tokio::test]
     async fn a_pending_agent_never_yields() {

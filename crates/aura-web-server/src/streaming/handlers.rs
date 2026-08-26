@@ -1492,6 +1492,64 @@ mod tests {
     use super::*;
     use aura::stream_events::{AgentContext, CorrelationContext};
     use aura_events::event_names;
+    use aura_test_utils::mock_agent::MockAgent;
+    use std::sync::Arc;
+    use tokio_util::sync::CancellationToken;
+
+    /// Event senders must outlive the loop: a closed channel's `recv()`
+    /// arm is permanently ready with `None`, which starves paused time.
+    #[derive(Clone)]
+    struct EventSenders {
+        tool_event_tx: mpsc::Sender<ToolLifecycleEvent>,
+        progress_tx: mpsc::Sender<ProgressNotification>,
+        tool_usage_tx: mpsc::Sender<ToolUsageEvent>,
+        approval_tx: mpsc::Sender<ApprovalLifecycleEvent>,
+    }
+
+    fn callbacks() -> (StreamingCallbacks, EventSenders) {
+        let (tool_event_tx, tool_event_rx) = mpsc::channel(8);
+        let (progress_tx, progress_rx) = mpsc::channel(8);
+        let (tool_usage_tx, tool_usage_rx) = mpsc::channel(8);
+        let (approval_tx, approval_event_rx) = mpsc::channel(8);
+        (
+            StreamingCallbacks {
+                request_id: "req_test".to_string(),
+                agent: Arc::new(MockAgent::pending()),
+                tool_event_rx,
+                progress_rx,
+                tool_usage_rx,
+                approval_event_rx,
+                usage_state: aura::UsageState::new(),
+                response_content: ResponseContent::new(),
+                model_name: "test/fake".to_string(),
+                stream_shutdown_token: CancellationToken::new(),
+            },
+            EventSenders {
+                tool_event_tx,
+                progress_tx,
+                tool_usage_tx,
+                approval_tx,
+            },
+        )
+    }
+
+    fn turn_context() -> TurnContext {
+        TurnContext::new(
+            "test-id".to_string(),
+            "test/fake".to_string(),
+            0,
+            None,
+            "test-session",
+        )
+    }
+
+    const HB_QUIET: Duration = Duration::from_secs(86_400);
+
+    fn text_item(s: &str) -> Result<StreamItem, StreamError> {
+        Ok(StreamItem::StreamAssistantItem(
+            StreamedAssistantContent::Text(s.to_string()),
+        ))
+    }
 
     /// Verify handle_tool_call does NOT emit aura.tool_requested events directly.
     /// The aura.tool_requested event is emitted via StreamingRequestHook → tool_event_rx channel
@@ -1965,52 +2023,6 @@ mod tests {
 
     mod inactivity {
         use super::*;
-        use aura_test_utils::mock_agent::MockAgent;
-        use std::sync::Arc;
-        use tokio_util::sync::CancellationToken;
-
-        /// Event senders must outlive the loop: a closed channel's `recv()`
-        /// arm is permanently ready with `None`, which starves paused time.
-        #[derive(Clone)]
-        struct EventSenders {
-            _tool_event_tx: mpsc::Sender<ToolLifecycleEvent>,
-            _progress_tx: mpsc::Sender<ProgressNotification>,
-            _tool_usage_tx: mpsc::Sender<ToolUsageEvent>,
-            _approval_tx: mpsc::Sender<ApprovalLifecycleEvent>,
-        }
-
-        fn callbacks() -> (StreamingCallbacks, EventSenders) {
-            let (tool_event_tx, tool_event_rx) = mpsc::channel(8);
-            let (progress_tx, progress_rx) = mpsc::channel(8);
-            let (tool_usage_tx, tool_usage_rx) = mpsc::channel(8);
-            let (approval_tx, approval_event_rx) = mpsc::channel(8);
-            (
-                StreamingCallbacks {
-                    request_id: "req_inactivity_test".to_string(),
-                    agent: Arc::new(MockAgent::pending()),
-                    tool_event_rx,
-                    progress_rx,
-                    tool_usage_rx,
-                    approval_event_rx,
-                    usage_state: aura::UsageState::new(),
-                    response_content: ResponseContent::new(),
-                    model_name: "test/fake".to_string(),
-                    stream_shutdown_token: CancellationToken::new(),
-                },
-                EventSenders {
-                    _tool_event_tx: tool_event_tx,
-                    _progress_tx: progress_tx,
-                    _tool_usage_tx: tool_usage_tx,
-                    _approval_tx: approval_tx,
-                },
-            )
-        }
-
-        fn text_item(s: &str) -> Result<StreamItem, StreamError> {
-            Ok(StreamItem::StreamAssistantItem(
-                StreamedAssistantContent::Text(s.to_string()),
-            ))
-        }
 
         /// Returns the termination and elapsed (virtual) seconds.
         async fn run_loop<S>(
@@ -2023,13 +2035,7 @@ mod tests {
             S: futures_util::Stream<Item = Result<StreamItem, StreamError>> + Unpin,
         {
             let config = StreamConfig::new(false, false, ToolResultMode::None, 0);
-            let ctx = TurnContext::new(
-                "test-id".to_string(),
-                "test-model".to_string(),
-                0,
-                None,
-                "test-session",
-            );
+            let ctx = turn_context();
             let (chunk_tx, mut chunk_rx) = mpsc::channel(8);
             // Drain so sends (including heartbeats) never block the loop.
             tokio::spawn(async move { while chunk_rx.recv().await.is_some() {} });
@@ -2051,8 +2057,6 @@ mod tests {
             .await;
             (termination, start.elapsed().as_secs())
         }
-
-        const HB_QUIET: Duration = Duration::from_secs(86_400);
 
         #[tokio::test(start_paused = true)]
         async fn mid_stream_hang_fails_at_window() {
@@ -2227,13 +2231,7 @@ mod tests {
             F: std::future::Future<Output = ()> + Send + 'static,
         {
             let config = StreamConfig::new(true, false, ToolResultMode::None, 0);
-            let ctx = TurnContext::new(
-                "test-id".to_string(),
-                "test-model".to_string(),
-                0,
-                None,
-                "test-session",
-            );
+            let ctx = turn_context();
             let (chunk_tx, mut chunk_rx) = mpsc::channel(64);
             tokio::spawn(async move { while chunk_rx.recv().await.is_some() {} });
             let (cancel_tx, _cancel_rx) = watch::channel(false);
@@ -2270,7 +2268,7 @@ mod tests {
                     for n in 0..3i64 {
                         tokio::time::sleep(Duration::from_secs(20)).await;
                         let _ = s
-                            ._progress_tx
+                            .progress_tx
                             .send(aura::ProgressNotification {
                                 progress_token: aura::ProgressToken(aura::NumberOrString::Number(
                                     n,
@@ -2298,7 +2296,7 @@ mod tests {
                 |s| async move {
                     tokio::time::sleep(Duration::from_secs(25)).await;
                     let _ = s
-                        ._approval_tx
+                        .approval_tx
                         .send(ApprovalLifecycleEvent::Pending(
                             aura_events::ApprovalPending {
                                 decision_id: "d1".into(),
@@ -2333,6 +2331,403 @@ mod tests {
             .await;
             assert_eq!(termination, StreamTermination::Timeout);
             assert_eq!(elapsed, 30);
+        }
+    }
+
+    /// The exact SSE each event produces, as `(event type, payload)` pairs.
+    ///
+    /// Asserting whole payloads means the event-plumbing refactors behind #575 —
+    /// de-globalising the brokers, then unifying the single-agent and worker
+    /// streaming paths — cannot change what reaches a client without changing
+    /// these expectations.
+    mod wire_format {
+        use super::*;
+        use aura_test_utils::sse::parse_sse_stream;
+
+        /// A case may drive the agent stream or the brokers, never both: the
+        /// loop selects over them without bias, so an interleaving asserted
+        /// here would be an ordering the code does not guarantee.
+        async fn render(
+            items: Vec<StreamItem>,
+            emit_custom_events: bool,
+            preload: impl FnOnce(&EventSenders),
+        ) -> Vec<(Option<String>, String)> {
+            let (cb, senders) = callbacks();
+            preload(&senders);
+
+            let config = StreamConfig::new(emit_custom_events, true, ToolResultMode::Aura, 0);
+            let (chunk_tx, mut chunk_rx) = mpsc::channel(64);
+            let (cancel_tx, _cancel_rx) = watch::channel(false);
+            let stream = futures_util::stream::iter(items.into_iter().map(Ok));
+
+            let handle = tokio::spawn(async move {
+                process_sse_stream_full(
+                    &config,
+                    &turn_context(),
+                    Box::pin(stream),
+                    chunk_tx,
+                    cancel_tx,
+                    Duration::from_secs(900),
+                    HB_QUIET,
+                    None,
+                    None,
+                    cb,
+                )
+                .await
+            });
+
+            let mut body = String::new();
+            while let Some(chunk) = chunk_rx.recv().await {
+                body.push_str(std::str::from_utf8(&chunk.expect("chunk")).expect("utf8"));
+            }
+            handle.await.expect("handler finishes");
+            drop(senders);
+
+            let (events, _done) = parse_sse_stream(&body);
+            events.into_iter().map(|e| (e.event_type, e.data)).collect()
+        }
+
+        /// Reads `expect` events off a stream that never ends, so the loop has
+        /// no ready branch but the brokers and cannot break first.
+        async fn render_broker(
+            emit_custom_events: bool,
+            expect: usize,
+            preload: impl FnOnce(&EventSenders),
+        ) -> Vec<(Option<String>, String)> {
+            let (cb, senders) = callbacks();
+            preload(&senders);
+
+            let config = StreamConfig::new(emit_custom_events, true, ToolResultMode::Aura, 0);
+            let (chunk_tx, mut chunk_rx) = mpsc::channel(64);
+            let (cancel_tx, _cancel_rx) = watch::channel(false);
+
+            let handle = tokio::spawn(async move {
+                process_sse_stream_full(
+                    &config,
+                    &turn_context(),
+                    Box::pin(futures_util::stream::pending()),
+                    chunk_tx,
+                    cancel_tx,
+                    Duration::from_secs(900),
+                    HB_QUIET,
+                    None,
+                    None,
+                    cb,
+                )
+                .await
+            });
+
+            let mut body = String::new();
+            for _ in 0..expect {
+                let chunk = tokio::time::timeout(Duration::from_secs(5), chunk_rx.recv())
+                    .await
+                    .expect("event arrives")
+                    .expect("channel open")
+                    .expect("chunk");
+                body.push_str(std::str::from_utf8(&chunk).expect("utf8"));
+            }
+            handle.abort();
+            drop(senders);
+
+            let (events, _done) = parse_sse_stream(&body);
+            events.into_iter().map(|e| (e.event_type, e.data)).collect()
+        }
+
+        fn named(event: &str, data: &str) -> (Option<String>, String) {
+            (Some(event.to_string()), data.to_string())
+        }
+
+        fn chunk(data: &str) -> (Option<String>, String) {
+            (None, data.to_string())
+        }
+
+        const SESSION_INFO_DATA: &str = r#"{"model":"test/fake","session_id":"test-session"}"#;
+        const STOP_CHUNK: &str = r#"{"id":"test-id","object":"chat.completion.chunk","created":0,"model":"test/fake","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#;
+
+        #[tokio::test]
+        async fn text_without_custom_events_is_openai_chunks_only() {
+            let out = render(vec![text_item("Hi").unwrap()], false, |_| {}).await;
+            assert_eq!(
+                out,
+                vec![
+                    chunk(
+                        r#"{"id":"test-id","object":"chat.completion.chunk","created":0,"model":"test/fake","choices":[{"index":0,"delta":{"role":"assistant","content":"Hi"}}]}"#
+                    ),
+                    chunk(STOP_CHUNK),
+                ]
+            );
+        }
+
+        #[tokio::test]
+        async fn custom_events_open_the_stream_with_session_info() {
+            let out = render(vec![text_item("Hi").unwrap()], true, |_| {}).await;
+            assert_eq!(out[0], named(event_names::SESSION_INFO, SESSION_INFO_DATA));
+        }
+
+        /// `Reasoning` renders nothing; the payload reaches the wire through
+        /// `ReasoningDelta`. The A2A executor reads the opposite variant, so a
+        /// unified event path must pick one, and this records which side moves.
+        #[tokio::test]
+        async fn only_the_reasoning_delta_variant_reaches_the_wire() {
+            let complete = render(
+                vec![StreamItem::StreamAssistantItem(
+                    StreamedAssistantContent::Reasoning("Thinking".to_string()),
+                )],
+                true,
+                |_| {},
+            )
+            .await;
+            assert_eq!(
+                complete,
+                vec![
+                    named(event_names::SESSION_INFO, SESSION_INFO_DATA),
+                    chunk(STOP_CHUNK),
+                ]
+            );
+
+            let delta = render(
+                vec![StreamItem::StreamAssistantItem(
+                    StreamedAssistantContent::ReasoningDelta {
+                        id: None,
+                        delta: "Thinking".to_string(),
+                    },
+                )],
+                true,
+                |_| {},
+            )
+            .await;
+            assert_eq!(
+                delta[1],
+                named(
+                    event_names::REASONING,
+                    r#"{"content":"Thinking","agent_id":"main","session_id":"test-session"}"#
+                )
+            );
+        }
+
+        #[tokio::test]
+        async fn a_tool_call_and_its_result_render_as_a_chunk_then_tool_complete() {
+            let out = render(
+                vec![
+                    StreamItem::StreamAssistantItem(StreamedAssistantContent::ToolCall(
+                        aura::ToolCall {
+                            id: "call_1".to_string(),
+                            name: "list_pipelines".to_string(),
+                            arguments: r#"{"filter":"error"}"#.to_string(),
+                        },
+                    )),
+                    StreamItem::StreamUserItem(aura::StreamedUserContent::ToolResult(
+                        aura::ToolResult {
+                            id: "call_1".to_string(),
+                            call_id: Some("call_1".to_string()),
+                            result: "3 pipelines".to_string(),
+                        },
+                    )),
+                ],
+                true,
+                |_| {},
+            )
+            .await;
+            assert_eq!(
+                out,
+                vec![
+                    named(event_names::SESSION_INFO, SESSION_INFO_DATA),
+                    chunk(
+                        r#"{"id":"test-id","object":"chat.completion.chunk","created":0,"model":"test/fake","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"list_pipelines","arguments":"{\"filter\":\"error\"}"}}]}}]}"#
+                    ),
+                    named(
+                        event_names::TOOL_COMPLETE,
+                        r#"{"tool_id":"call_1","tool_name":"list_pipelines","duration_ms":0,"success":true,"result":"3 pipelines","agent_id":"main","session_id":"test-session"}"#
+                    ),
+                    chunk(STOP_CHUNK),
+                ]
+            );
+        }
+
+        #[tokio::test]
+        async fn mcp_status_renders_the_server_snapshot() {
+            let out = render(
+                vec![StreamItem::McpStatus(vec![aura_events::McpServerStatus {
+                    server_name: "mezmo".to_string(),
+                    transport: "http_streamable".to_string(),
+                    status: "connected".to_string(),
+                    tools_count: 4,
+                    reason: None,
+                }])],
+                true,
+                |_| {},
+            )
+            .await;
+            assert_eq!(
+                out[1],
+                named(
+                    event_names::MCP_STATUS,
+                    r#"{"servers":[{"server_name":"mezmo","transport":"http_streamable","status":"connected","tools_count":4}],"session_id":"test-session"}"#
+                )
+            );
+        }
+
+        #[tokio::test]
+        async fn orchestrator_events_render_under_their_own_namespace() {
+            let out = render(
+                vec![StreamItem::OrchestratorEvent(
+                    aura::OrchestratorEvent::TaskStarted {
+                        task_id: 1,
+                        description: "scan logs".to_string(),
+                        orchestrator_id: "coordinator".to_string(),
+                        worker_id: "log_worker".to_string(),
+                    },
+                )],
+                true,
+                |_| {},
+            )
+            .await;
+            assert_eq!(
+                out[1],
+                named(
+                    "aura.orchestrator.task_started",
+                    r#"{"description":"scan logs","task_id":1,"orchestrator_id":"coordinator","worker_id":"log_worker","agent_id":"main","session_id":"test-session"}"#
+                )
+            );
+        }
+
+        #[tokio::test]
+        async fn scratchpad_usage_renders_its_token_counts() {
+            let out = render(
+                vec![StreamItem::ScratchpadUsage {
+                    agent_id: "main".to_string(),
+                    tokens_intercepted: 1200,
+                    tokens_extracted: 300,
+                }],
+                true,
+                |_| {},
+            )
+            .await;
+            assert_eq!(
+                out[1],
+                named(
+                    event_names::SCRATCHPAD_USAGE,
+                    r#"{"tokens_intercepted":1200,"tokens_extracted":300,"agent_id":"main","session_id":"test-session"}"#
+                )
+            );
+        }
+
+        #[tokio::test]
+        async fn a_requested_tool_event_renders_its_arguments() {
+            let out = render_broker(true, 2, |s| {
+                s.tool_event_tx
+                    .try_send(ToolLifecycleEvent::Requested {
+                        tool_id: "call_1".to_string(),
+                        tool_name: "list_pipelines".to_string(),
+                        arguments: serde_json::json!({"filter": "error"}),
+                    })
+                    .expect("broker send");
+            })
+            .await;
+            assert_eq!(
+                out[1],
+                named(
+                    event_names::TOOL_REQUESTED,
+                    r#"{"tool_id":"call_1","tool_name":"list_pipelines","arguments":{"filter":"error"},"agent_id":"main","session_id":"test-session"}"#
+                )
+            );
+        }
+
+        #[tokio::test]
+        async fn a_started_tool_event_renders_without_arguments() {
+            let out = render_broker(true, 2, |s| {
+                s.tool_event_tx
+                    .try_send(ToolLifecycleEvent::Start {
+                        tool_id: "call_1".to_string(),
+                        tool_name: "list_pipelines".to_string(),
+                        progress_token: None,
+                    })
+                    .expect("broker send");
+            })
+            .await;
+            assert_eq!(
+                out[1],
+                named(
+                    event_names::TOOL_START,
+                    r#"{"tool_id":"call_1","tool_name":"list_pipelines","agent_id":"main","session_id":"test-session"}"#
+                )
+            );
+        }
+
+        #[tokio::test]
+        async fn progress_renders_a_percentage_from_progress_over_total() {
+            let out = render_broker(true, 2, |s| {
+                s.progress_tx
+                    .try_send(ProgressNotification {
+                        progress_token: aura::ProgressToken(aura::NumberOrString::String(
+                            "tok_1".to_string().into(),
+                        )),
+                        progress: 3.0,
+                        total: Some(10.0),
+                        message: Some("scanning".to_string()),
+                    })
+                    .expect("broker send");
+            })
+            .await;
+            assert_eq!(
+                out[1],
+                named(
+                    event_names::PROGRESS,
+                    r#"{"message":"scanning","phase":"mcp_progress","percent":30,"progress_token":"tok_1","agent_id":"main","session_id":"test-session"}"#
+                )
+            );
+        }
+
+        #[tokio::test]
+        async fn tool_usage_renders_its_token_split() {
+            let out = render_broker(true, 2, |s| {
+                s.tool_usage_tx
+                    .try_send(ToolUsageEvent {
+                        tool_ids: vec!["call_1".to_string()],
+                        prompt_tokens: 1200,
+                        completion_tokens: 80,
+                        total_tokens: 1280,
+                    })
+                    .expect("broker send");
+            })
+            .await;
+            assert_eq!(
+                out[1],
+                named(
+                    event_names::TOOL_USAGE,
+                    r#"{"tool_ids":["call_1"],"prompt_tokens":1200,"completion_tokens":80,"total_tokens":1280,"session_id":"test-session"}"#
+                )
+            );
+        }
+
+        /// Approval is the one broker whose select arm carries no
+        /// `emit_custom_events` guard, so it renders on a stream that emits no
+        /// other aura event.
+        #[tokio::test]
+        async fn approvals_render_even_with_custom_events_off() {
+            let out = render_broker(false, 1, |s| {
+                s.approval_tx
+                    .try_send(ApprovalLifecycleEvent::Requested(
+                        aura_events::ApprovalRequested {
+                            decision_id: "dec_1".to_string(),
+                            tool_name: "dangerous_apply".to_string(),
+                            origin: aura_events::ApprovalOriginWire::ConfigGate {
+                                matched_pattern: "dangerous_*".to_string(),
+                                agent_name: "test-agent".to_string(),
+                            },
+                            scope: aura_events::AgentScopeWire::Single { session_id: None },
+                        },
+                    ))
+                    .expect("broker send");
+            })
+            .await;
+            assert_eq!(
+                out[0],
+                named(
+                    event_names::APPROVAL_REQUESTED,
+                    r#"{"decision_id":"dec_1","tool_name":"dangerous_apply","origin":{"kind":"config_gate","matched_pattern":"dangerous_*","agent_name":"test-agent"},"scope":{"kind":"single"}}"#
+                )
+            );
         }
     }
 }
