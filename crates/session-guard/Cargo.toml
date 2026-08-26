@@ -14,6 +14,7 @@ thiserror = { workspace = true }
 uuid = { workspace = true }
 async-trait = { workspace = true }
 tokio-postgres = { workspace = true, features = ["with-uuid-1"] }
+sha2 = { workspace = true }
 
 [lints]
 # Hole inventory: warn through the fill phase; flip to deny at completion.
