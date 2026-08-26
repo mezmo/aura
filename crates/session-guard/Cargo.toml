@@ -13,7 +13,7 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
 async-trait = { workspace = true }
-tokio-postgres = { workspace = true }
+tokio-postgres = { workspace = true, features = ["with-uuid-1"] }
 
 [lints]
 # Hole inventory: warn through the fill phase; flip to deny at completion.
