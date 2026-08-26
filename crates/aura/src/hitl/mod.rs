@@ -42,7 +42,7 @@ pub use decision::{
     AgentScope, ApprovalDecision, ApprovalOrigin, ApprovalOutcome, ApprovalRef, AwaitingDecision,
     CancelReason, DecisionId, Timestamp,
 };
-pub use gate::{BlockedSignal, HitlApprovalWrapper};
+pub use gate::{BlockedSignal, HitlApprovalWrapper, PendingBinding};
 pub use protocol::{ApprovalDecisionWire, ApprovalItem, ApprovalRequest, PROTOCOL_VERSION};
 pub use registry::{ParkedApproval, PendingApprovals, ResolveError};
 pub use route::{

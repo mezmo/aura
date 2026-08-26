@@ -266,10 +266,10 @@ async fn durability_harness_redis_frames() {
     finish("redis_frames", transcript, red, &mut server).await;
 }
 
-/// Drive a run up to the first HITL approval request, kill the server at the
-/// park window, and return the captured events. The approval record is left
-/// in the backend because the crash prevents the request teardown from
-/// cancelling it.
+/// Drive a run until it reports `aura.orchestrator.run_parked`, kill the
+/// server, and return the captured events. The park has already committed
+/// its CAS and transferred the approval to the session by then, so the
+/// record in the backend is one the run owns, not one teardown missed.
 async fn drive_to_park(
     backend: SessionStoreBackend,
     mcp_url: String,
@@ -346,8 +346,7 @@ async fn drive_to_park(
     transcript.push(worker_frame);
 
     // Frame: park_at_quiescence — after the approval is requested, the run
-    // must durably park (emit an orchestrator.run_parked event). Production
-    // does not wire run_store_for_parking, so this frame is red.
+    // must durably park and say so with an orchestrator.run_parked event.
     let mut park_frame = Frame::new("park_at_quiescence");
     for evt in &events {
         if (evt.event_type.as_deref() == Some("aura.approval_requested")

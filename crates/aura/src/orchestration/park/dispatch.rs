@@ -13,14 +13,16 @@ use crate::hitl::{ApprovalRef, Timestamp};
 
 use super::lease::FencingGeneration;
 
-/// SHA-256 hex digest over the RFC 8785 (JCS) canonical form of a tool
-/// call's arguments.
+/// SHA-256 hex digest over a tool call's arguments, canonicalized by
+/// recursively sorting object keys by their Rust `str` order and
+/// serializing with `serde_json`. This is not RFC 8785: JCS orders keys by
+/// UTF-16 code unit and prescribes its own number formatting.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct ArgsDigest(String);
 
 impl ArgsDigest {
-    /// Canonicalize (RFC 8785) and hash the arguments.
+    /// Canonicalize and hash the arguments.
     pub fn compute(args: &serde_json::Value) -> Self {
         fn sort_keys(v: &serde_json::Value) -> serde_json::Value {
             match v {
@@ -58,12 +60,13 @@ impl ArgsDigest {
 }
 
 /// What a task carries from the approval it blocked on into the attempt
-/// that consumes the decision: which decision, the arguments the human
-/// approved (as the digest the dispatch claim revalidates against), and the
+/// that consumes the decision: which decision, which call the human
+/// approved (its tool name and the digest of its arguments), and the
 /// fencing generation the claiming dispatcher holds.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ApprovalBinding {
     pub approval: ApprovalRef,
+    pub tool_name: String,
     pub args_digest: ArgsDigest,
     pub generation: FencingGeneration,
 }
@@ -144,7 +147,9 @@ impl DispatchState {
     /// Apply one event, returning the next state and leaving `self`
     /// untouched - a rejected event provably consumes nothing, which is
     /// what "a digest mismatch leaves the decision unconsumed" means at the
-    /// type level. `bound` is the digest recorded when the approval parked.
+    /// type level. `bound` is the digest recorded when the approval parked;
+    /// it covers the arguments alone, so a caller that must also pin the
+    /// tool the human approved checks that name itself.
     ///
     /// Legality: `Unclaimed` is claimed by exactly one dispatcher, and only
     /// with a digest equal to `bound`; `Claimed` confirms `Executed` or

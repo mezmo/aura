@@ -205,6 +205,17 @@ pub enum ParkError {
     /// would be torn down with no run checkpoint naming it.
     #[error("durable park refused: request teardown already began")]
     TeardownUnderway,
+    /// Teardown began during the write AND the compensating removal failed,
+    /// so the record survives with no owner. The id is the handle the
+    /// expiry reaper needs to sweep it.
+    #[error(
+        "durable park refused: request teardown already began and approval {decision_id} \
+         could not be removed ({reason}); it is orphaned until the reaper expires it"
+    )]
+    OrphanedOnTeardown {
+        decision_id: super::decision::DecisionId,
+        reason: String,
+    },
     #[error("durable park could not persist the approval: {0}")]
     Store(#[from] crate::session_store::SessionStoreError),
 }
@@ -289,8 +300,13 @@ impl DecisionRoute {
         let announcement = ConversationalAnnouncement::prepare(&request, park_timeout);
         registry.register_durable(request, park_timeout).await?;
         if ApprovalOwnership::for_request(&request_id).is_none() {
-            registry.remove(&decision_id).await;
-            return Err(ParkError::TeardownUnderway);
+            return Err(match registry.remove_reporting(&decision_id).await {
+                Ok(()) => ParkError::TeardownUnderway,
+                Err(e) => ParkError::OrphanedOnTeardown {
+                    decision_id,
+                    reason: e.to_string(),
+                },
+            });
         }
         announcement.publish().await;
         Ok(())

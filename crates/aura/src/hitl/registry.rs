@@ -145,9 +145,9 @@ impl PendingApprovals {
     /// caller can refuse the gated call rather than park a run whose
     /// approval does not exist (ADR 2026-07-21, decisions 1 and 10).
     ///
-    /// That ordering inverts [`Self::register`]'s: a decision resolved
-    /// between the insert and the subscription reaches the waiter through
-    /// the wake task's store poll rather than the bus publish.
+    /// The insert precedes the subscription, so a decision resolved in that
+    /// window reaches the waiter through the wake task's store poll rather
+    /// than the bus publish.
     pub async fn register_durable(
         &self,
         request: ApprovalRequest,
@@ -255,8 +255,10 @@ impl PendingApprovals {
     }
 
     /// Expire a parked approval after timeout/cancellation so later ingress
-    /// returns [`ResolveError::NotFound`].
-    pub async fn remove(&self, id: &DecisionId) {
+    /// returns [`ResolveError::NotFound`], reporting whether the store
+    /// entry actually went. A caller compensating for a failed park needs
+    /// to know: a record it cannot remove is orphaned, not cleaned up.
+    pub async fn remove_reporting(&self, id: &DecisionId) -> Result<(), SessionStoreError> {
         if let Some(entry) = self
             .0
             .wakes
@@ -266,7 +268,13 @@ impl PendingApprovals {
         {
             entry.abort_wake_task();
         }
-        if let Err(err) = self.0.store.remove(id).await {
+        self.0.store.remove(id).await
+    }
+
+    /// Expire a parked approval after timeout/cancellation so later ingress
+    /// returns [`ResolveError::NotFound`].
+    pub async fn remove(&self, id: &DecisionId) {
+        if let Err(err) = self.remove_reporting(id).await {
             warn!(decision_id = %id, error = %err, "parked approval removal failed");
         }
     }

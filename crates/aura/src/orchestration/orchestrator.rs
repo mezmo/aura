@@ -64,8 +64,8 @@ use super::events::OrchestratorEvent;
 use super::park::{
     ApprovalBinding, ApprovalOriginSnapshot, ArgsDigest, BlockedTaskBinding, ChatSessionId,
     CheckpointEnvelope, ConfigFingerprint, DecisionConsumption, FencingGeneration, NonEmpty,
-    ParkCommit, ParkReason, ParkedApprovalSnapshot, ResumePoint, RunCheckpoint, SessionId,
-    TaskExecutionOutcome, WaveOutcome,
+    ParkCommit, ParkReason, ParkedApprovalSnapshot, ResumePoint, RunCheckpoint, RunState,
+    SessionId, TaskExecutionOutcome, UnparkableCredential, WaveOutcome,
 };
 use super::persistence::ExecutionPersistence;
 use super::prompt_journal::{JournalPhase, PromptJournal};
@@ -652,7 +652,7 @@ impl Orchestrator {
         task_id: usize,
         attempt: usize,
         worker_name: Option<&str>,
-        approval_binding: &Option<ApprovalBinding>,
+        approval_binding: &crate::hitl::PendingBinding,
     ) -> Result<AgentWithPreamble, Box<dyn std::error::Error + Send + Sync>> {
         use super::duplicate_call_guard::DuplicateCallGuard;
         use super::observer_wrapper::ObserverWrapper;
@@ -3422,6 +3422,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 if let Some(task) = reconciled.get_task_mut(approval.task.task_id) {
                     task.released(ApprovalBinding {
                         approval: approval.clone(),
+                        tool_name: snapshot.tool_name.clone(),
                         args_digest: snapshot.args_digest,
                         generation,
                     });
@@ -3504,7 +3505,15 @@ Assign tasks to the worker whose tools best match the required operations."#,
             expires_at,
         };
 
-        // D. Take approval ownership BEFORE the CAS (ADR decision 10): the
+        // D. Refuse while the run holds request-forwarded credentials (ADR
+        // decision 13). A checkpoint stores no secrets, so a run whose MCP
+        // connections were built from this request's headers cannot be
+        // resumed later without them and must fail closed instead.
+        if let Some(unparkable) = Self::forwarded_mcp_credential(&self.agent_config) {
+            return Err(unparkable);
+        }
+
+        // E. Take approval ownership BEFORE the CAS (ADR decision 10): the
         // request's teardown must be disarmed while the approvals still
         // exist, or the checkpoint names records a closing stream deletes.
         // A missing marker means teardown is already under way, since the
@@ -3519,7 +3528,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             .transfer_to_session()
             .map_err(|e| StreamError::from(format!("durable park refused: {e}")))?;
 
-        // E. Commit the park. From here the transfer is live, so an
+        // F. Commit the park. From here the transfer is live, so an
         // abandoned commit would strand approvals under a session that never
         // parked — run it in its own task, which the request's cancel token
         // cannot drop. The task reports the CAS the instant it returns and
@@ -3527,14 +3536,17 @@ Assign tasks to the worker whose tools best match the required operations."#,
         // record is parked can be mistaken for a park that did not happen.
         let registry = self.hitl_registry.clone();
         let request_id = self.request_id.clone();
+        let rollback = ownership.clone();
         let (cas_tx, cas_rx) = tokio::sync::oneshot::channel();
         let commit = tokio::spawn(async move {
-            let cas = run_store
-                .park(session_id, generation, park_commit)
-                .await
-                .map(|_| ())
-                .map_err(|e| format!("run store park failed: {e}"));
+            let cas = Self::park_cas(&*run_store, session_id, generation, park_commit).await;
             let committed = cas.is_ok();
+            // Compensation lives here, not at the caller: a disconnect can
+            // drop the receiving half, and the approvals must still go back
+            // to the request that owns them.
+            if !committed {
+                rollback.abort_transfer();
+            }
             let _ = cas_tx.send(cas);
             if committed && let Some(registry) = registry {
                 // The park owns the approvals now; drop the process-local
@@ -3544,11 +3556,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
         });
         match cas_rx.await {
             Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                ownership.abort_transfer();
-                return Err(StreamError::from(e));
-            }
-            // The task died before the CAS returned, so nothing is parked.
+            Ok(Err(e)) => return Err(StreamError::from(e)),
+            // The task died before reporting: nothing is parked, and no
+            // compensation ran, so the caller performs it.
             Err(_) => {
                 ownership.abort_transfer();
                 return Err(StreamError::from(
@@ -3562,7 +3572,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             tracing::warn!("park committed but its local cleanup did not finish: {e}");
         }
 
-        // F. Emit the `Parked` frame post-CAS (ADR decision 15).
+        // G. Emit the `Parked` frame post-CAS (ADR decision 15).
         sink.emit(OrchestratorEvent::Parked {
             session_id: session_id.to_string(),
             approvals: blocked_on
@@ -3575,6 +3585,73 @@ Assign tasks to the worker whose tools best match the required operations."#,
         .await;
 
         Ok(IterationOutcome::Parked)
+    }
+
+    /// Run the `Running -> Parked` CAS, resolving an ambiguous failure
+    /// against the record itself.
+    ///
+    /// A backend can commit the transition and still return an error — the
+    /// file store renames the parked record into place before syncing its
+    /// directory. Reading the record back distinguishes the two: parked at
+    /// the generation this call presented means the park happened, and
+    /// treating it as a failure would hand the approvals to a teardown that
+    /// deletes them out from under a visibly parked run.
+    async fn park_cas(
+        run_store: &dyn RunStore,
+        session_id: SessionId,
+        generation: FencingGeneration,
+        commit: ParkCommit,
+    ) -> Result<(), String> {
+        let Err(e) = run_store.park(session_id, generation, commit).await else {
+            return Ok(());
+        };
+        let parked_anyway = matches!(
+            run_store.load(session_id).await,
+            Ok(Some(record))
+                if matches!(record.state, RunState::Parked { .. })
+                    && record.generation > generation
+        );
+        if parked_anyway {
+            tracing::warn!("run store park reported `{e}` but the record is parked; continuing");
+            return Ok(());
+        }
+        Err(format!("run store park failed: {e}"))
+    }
+
+    /// The first MCP server whose connection headers were resolved from the
+    /// inbound request, as the park refusal it forces.
+    ///
+    /// Classification is not on this surface yet, so every forwarded header
+    /// is treated as a credential — the fail-closed default of ADR decision
+    /// 13. A deployment that forwards only reified identity headers is
+    /// refused too, which is the safe direction of the error.
+    fn forwarded_mcp_credential(config: &AgentRuntimeConfig) -> Option<StreamError> {
+        let servers = &config.mcp.as_ref()?.servers;
+        // Sorted so the named server does not vary run to run.
+        let mut named: Vec<(&String, &aura_config::McpServerConfig)> = servers.iter().collect();
+        named.sort_by_key(|(name, _)| name.as_str());
+        named.into_iter().find_map(|(server, cfg)| {
+            let forwarded = match cfg {
+                aura_config::McpServerConfig::HttpStreamable {
+                    headers_from_request,
+                    ..
+                }
+                | aura_config::McpServerConfig::Sse {
+                    headers_from_request,
+                    ..
+                } => headers_from_request,
+                aura_config::McpServerConfig::Stdio { .. } => return None,
+            };
+            let mut headers: Vec<&String> = forwarded.keys().collect();
+            headers.sort_by_key(|h| h.as_str());
+            let header = headers.first()?;
+            Some(StreamError::from(format!(
+                "{} (mcp server '{server}' forwards it from the request)",
+                UnparkableCredential {
+                    header: (*header).clone(),
+                },
+            )))
+        })
     }
 
     /// Build a [`ParkedApprovalSnapshot`] from an in-process [`ApprovalRef`]
@@ -3802,6 +3879,12 @@ Assign tasks to the worker whose tools best match the required operations."#,
             ],
         );
 
+        // One cell for the task, not one per attempt: the attempt that
+        // dispatches the decision empties it, so a retry after an approved
+        // call raises its own approval instead of blocking on a record that
+        // consumption already removed.
+        let pending_binding = crate::hitl::PendingBinding::new((*approval_binding).clone());
+
         let start_time = std::time::Instant::now();
         let mut last_raw_response = String::new();
         let mut last_error: Option<Box<dyn std::error::Error + Send + Sync>> = None;
@@ -3818,7 +3901,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 submit_result_decision,
                 blocked_signal,
             } = self
-                .create_worker(task_id, attempt, *worker_name, approval_binding)
+                .create_worker(task_id, attempt, *worker_name, &pending_binding)
                 .await?;
 
             // Retries rebuild the same preamble, and `set_attribute` appends
@@ -7077,7 +7160,7 @@ mod durable_park_tests {
         registry: &PendingApprovals,
         request_id: &str,
         task_id: usize,
-        binding: Option<ApprovalBinding>,
+        binding: crate::hitl::PendingBinding,
     ) -> (WrappedTool<GatedTool>, BlockedSignal, Arc<AtomicUsize>) {
         let signal = BlockedSignal::new();
         let runs = Arc::new(AtomicUsize::new(0));
@@ -7120,8 +7203,14 @@ mod durable_park_tests {
         request_id: &str,
         task_id: usize,
     ) -> ApprovalRef {
-        let (tool, signal, runs) =
-            worker_attempt(orchestrator, registry, request_id, task_id, None).await;
+        let (tool, signal, runs) = worker_attempt(
+            orchestrator,
+            registry,
+            request_id,
+            task_id,
+            crate::hitl::PendingBinding::default(),
+        )
+        .await;
 
         tool.call(gated_args())
             .await
@@ -7134,6 +7223,42 @@ mod durable_park_tests {
         {
             TaskExecutionOutcome::Blocked(approval) => approval,
             other => panic!("expected a blocked attempt, got {other:?}"),
+        }
+    }
+
+    /// The smallest well-formed park commit: enough for a CAS to accept,
+    /// with no bearing on what this suite asserts.
+    fn park_commit_for(session_id: crate::orchestration::park::SessionId) -> ParkCommit {
+        let now = chrono::Utc::now();
+        let decision_id = crate::hitl::DecisionId::generate();
+        let checkpoint = RunCheckpoint::new(
+            uuid::Uuid::new_v4()
+                .to_string()
+                .parse()
+                .expect("a v4 uuid is a run id"),
+            session_id,
+            None,
+            ConfigFingerprint::new(""),
+            "park me".to_string(),
+            Vec::new(),
+            Vec::new(),
+            Plan::new("park me"),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            ResumePoint::WaveBoundary { iteration: 1 },
+            Vec::new(),
+            Vec::new(),
+            1,
+            IterationTimings::default(),
+        );
+        ParkCommit {
+            checkpoint: CheckpointEnvelope::new(checkpoint),
+            reason: ParkReason::ApprovalsBlocked {
+                decisions: NonEmpty::new(vec![decision_id]).expect("one decision"),
+            },
+            parked_at: now,
+            expires_at: now + chrono::Duration::seconds(3600),
         }
     }
 
@@ -7281,7 +7406,7 @@ mod durable_park_tests {
             &registry,
             &request_id,
             approval.task.task_id,
-            Some(binding),
+            crate::hitl::PendingBinding::new(Some(binding)),
         )
         .await;
         assert_eq!(
@@ -7455,9 +7580,11 @@ mod durable_park_tests {
         let plan = blocked_plan(&approval);
 
         // The commit task's local cleanup panics after the CAS has landed.
-        registry.poison_wakes_for_test();
+        // Both this poisoning and that cleanup panic are the test's subject,
+        // so neither should print.
         let previous_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
+        registry.poison_wakes_for_test();
         let (outcome, _frames) = commit(&orchestrator, &plan).await;
         std::panic::set_hook(previous_hook);
 
@@ -7479,6 +7606,215 @@ mod durable_park_tests {
                 .expect("store readable")
                 .is_some(),
             "the parked run keeps the approval its checkpoint names",
+        );
+    }
+
+    /// A run whose MCP connections were built from this request's headers
+    /// cannot be resumed without them, and a checkpoint stores no secrets:
+    /// it must refuse to park (ADR decision 13).
+    #[tokio::test]
+    async fn a_run_forwarding_mcp_headers_refuses_to_park() {
+        let approvals = Arc::new(InMemoryApprovalStore::new());
+        let registry =
+            PendingApprovals::with_backend(approvals.clone(), Arc::new(InMemoryEventBus::new()));
+        let run_store = Arc::new(InMemoryRunStore::new());
+        let request_id = unique_request_id();
+        let ownership = ApprovalOwnership::register(&request_id);
+
+        let mut config = park_config(&registry, &request_id);
+        config.mcp = Some(aura_config::McpConfig {
+            sanitize_schemas: true,
+            servers: HashMap::from([(
+                "mezmo".to_string(),
+                aura_config::McpServerConfig::HttpStreamable {
+                    url: "http://127.0.0.1:9/mcp".to_string(),
+                    headers: HashMap::new(),
+                    description: None,
+                    headers_from_request: HashMap::from([(
+                        "Authorization".to_string(),
+                        "authorization".to_string(),
+                    )]),
+                    scratchpad: HashMap::new(),
+                },
+            )]),
+        });
+        let mut orchestrator = Orchestrator::new(config)
+            .await
+            .expect("orchestrator builds without live mcp");
+        orchestrator.request_id = request_id.clone();
+        let run_id = orchestrator.persistence.lock().await.run_id().to_string();
+        let (session_id, generation) =
+            super::super::factory::begin_run(run_store.as_ref(), &run_id, PARK_WINDOW)
+                .await
+                .expect("run start claims the session");
+        orchestrator.run_store = Some(run_store.clone());
+        orchestrator.session_id = Some(session_id);
+        orchestrator.fencing_generation = Some(generation);
+
+        let approval = gate_hit(&orchestrator, &registry, &request_id, 0).await;
+        let plan = blocked_plan(&approval);
+        let (outcome, frames) = commit(&orchestrator, &plan).await;
+
+        let Err(err) = outcome else {
+            panic!("a credential-holding run must not park");
+        };
+        let err = err.to_string();
+        assert!(
+            err.contains("Authorization"),
+            "the header must be named: {err}"
+        );
+        assert!(err.contains("mezmo"), "the server must be named: {err}");
+        assert!(frames.is_empty(), "a refused park announces nothing");
+        assert!(
+            ownership.begin_teardown(),
+            "a refusal before the transfer leaves the approvals with the request",
+        );
+        assert!(
+            run_store
+                .load(session_id)
+                .await
+                .expect("record readable")
+                .is_some_and(|r| matches!(r.state, RunState::Running)),
+            "the refusal happens before any CAS",
+        );
+    }
+
+    /// The retry loop's cell is built once per task and handed to every
+    /// attempt, so what one attempt consumes the next cannot re-dispatch.
+    #[tokio::test]
+    async fn create_worker_shares_one_binding_cell_across_attempts() {
+        let approvals = Arc::new(InMemoryApprovalStore::new());
+        let registry =
+            PendingApprovals::with_backend(approvals.clone(), Arc::new(InMemoryEventBus::new()));
+        let run_store = Arc::new(InMemoryRunStore::new());
+        let request_id = unique_request_id();
+        let _ownership = ApprovalOwnership::register(&request_id);
+        let orchestrator = armed_orchestrator(&registry, run_store, &request_id).await;
+
+        let approval = gate_hit(&orchestrator, &registry, &request_id, 0).await;
+        let pending = crate::hitl::PendingBinding::new(Some(ApprovalBinding {
+            approval,
+            tool_name: GATED_TOOL.to_string(),
+            args_digest: ArgsDigest::compute(&gated_args()),
+            generation: orchestrator.fencing_generation.expect("armed"),
+        }));
+
+        // Two attempts of one task, built the way execute_task builds them.
+        let first = orchestrator
+            .create_worker(0, 1, None, &pending)
+            .await
+            .expect("the first attempt builds");
+        let second = orchestrator
+            .create_worker(0, 2, None, &pending)
+            .await
+            .expect("the retry builds");
+
+        assert!(
+            first.blocked_signal.is_some() && second.blocked_signal.is_some(),
+            "both attempts are armed for durable parking",
+        );
+        assert!(
+            pending.is_pending(),
+            "building an attempt must not consume the task's binding",
+        );
+        pending.take();
+        assert!(
+            !pending.is_pending(),
+            "the cell every attempt holds is the same one",
+        );
+    }
+
+    /// A disconnect between the transfer and the CAS result must still hand
+    /// the approvals back when the CAS then fails: compensation belongs to
+    /// the commit task, which nothing can drop.
+    #[tokio::test]
+    async fn a_cas_failure_compensates_even_with_the_caller_gone() {
+        let approvals = Arc::new(InMemoryApprovalStore::new());
+        let registry =
+            PendingApprovals::with_backend(approvals.clone(), Arc::new(InMemoryEventBus::new()));
+        let run_store = Arc::new(InMemoryRunStore::new());
+        let request_id = unique_request_id();
+        let ownership = ApprovalOwnership::register(&request_id);
+
+        let mut orchestrator = Orchestrator::new(park_config(&registry, &request_id))
+            .await
+            .expect("orchestrator builds");
+        orchestrator.request_id = request_id.clone();
+        // A session that was never created: every CAS against it fails.
+        orchestrator.run_store = Some(run_store);
+        orchestrator.session_id = Some(crate::orchestration::park::SessionId::generate());
+        orchestrator.fencing_generation =
+            Some(crate::orchestration::park::FencingGeneration::INITIAL);
+
+        let approval = gate_hit(&orchestrator, &registry, &request_id, 0).await;
+        let plan = blocked_plan(&approval);
+
+        // Drop the caller the moment the transfer is live, so the oneshot
+        // receiver is gone before the CAS reports.
+        let commit_task = tokio::spawn(async move { commit(&orchestrator, &plan).await.0.is_ok() });
+        commit_task.abort();
+        let _ = commit_task.await;
+
+        for _ in 0..1_000 {
+            if ownership.begin_teardown() {
+                registry.cancel_request(&request_id).await;
+                assert!(
+                    approvals
+                        .get(&approval.decision_id)
+                        .await
+                        .expect("store readable")
+                        .is_none(),
+                    "teardown reclaims an approval no session owns",
+                );
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("a failed CAS must return the approvals to the request");
+    }
+
+    /// A backend that commits the transition and then reports an error (the
+    /// file store syncing its directory after the rename) must not be read
+    /// as a failed park: the record is visibly parked.
+    #[tokio::test]
+    async fn a_post_commit_error_is_resolved_against_the_record() {
+        let run_store = Arc::new(InMemoryRunStore::new());
+        let (session_id, generation) = super::super::factory::begin_run(
+            run_store.as_ref(),
+            &uuid::Uuid::new_v4().to_string(),
+            PARK_WINDOW,
+        )
+        .await
+        .expect("the run starts");
+
+        // The park lands, so a second CAS at the same generation fails while
+        // the record is already parked — the shape a post-rename sync fault
+        // presents to the caller.
+        let commit = park_commit_for(session_id);
+        assert!(
+            Orchestrator::park_cas(run_store.as_ref(), session_id, generation, commit.clone())
+                .await
+                .is_ok(),
+        );
+        assert!(
+            Orchestrator::park_cas(run_store.as_ref(), session_id, generation, commit.clone())
+                .await
+                .is_ok(),
+            "a stale-generation error over a parked record is not a failed park",
+        );
+
+        // A record that never parked stays a failure.
+        let other = crate::orchestration::park::SessionId::generate();
+        assert!(
+            Orchestrator::park_cas(
+                run_store.as_ref(),
+                other,
+                crate::orchestration::park::FencingGeneration::INITIAL,
+                commit
+            )
+            .await
+            .is_err(),
+            "an unknown session is a real park failure",
         );
     }
 

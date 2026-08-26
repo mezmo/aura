@@ -28,8 +28,8 @@ pub struct RunCheckpoint {
     pub external_history: Vec<Message>,
     /// The coordinator's own conversation across planning iterations.
     pub coordinator_conversation: Vec<Message>,
-    /// Plan snapshot at the drained boundary; blocked tasks appear
-    /// `Pending`, with their bindings in [`Self::blocked`].
+    /// Plan snapshot at the drained boundary. A blocked task's decision
+    /// binding is carried separately, in [`Self::blocked`].
     pub plan: Plan,
     pub blocked: Vec<BlockedTaskBinding>,
     pub approvals: Vec<ParkedApprovalSnapshot>,

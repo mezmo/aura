@@ -67,26 +67,44 @@ impl BlockedSignal {
 /// nothing will ever claim.
 const ALREADY_PARKING: &str = "the run is parking pending approval; no further gated calls";
 
-/// The durable-park arming of one gate: the channel a block leaves on, the
-/// window an approval is registered for, and the decision this attempt was
-/// re-dispatched to consume.
-#[derive(Clone)]
-struct DurablePark {
-    signal: BlockedSignal,
-    timeout: std::time::Duration,
-    binding: Arc<std::sync::Mutex<Option<ApprovalBinding>>>,
-}
+/// The decision a task was re-dispatched to consume, shared by every
+/// attempt of that task. One binding dispatches at most once: the attempt
+/// that takes it leaves the cell empty, so a retry after a consumed
+/// approval raises its own rather than blocking on a spent decision.
+#[derive(Clone, Default)]
+pub struct PendingBinding(Arc<std::sync::Mutex<Option<ApprovalBinding>>>);
 
-impl DurablePark {
-    /// Take the pending binding, leaving none behind: one binding dispatches
-    /// at most once, so a second gated call in the same attempt raises its
-    /// own approval rather than reusing a spent decision.
-    fn take_binding(&self) -> Option<ApprovalBinding> {
-        self.binding
+impl PendingBinding {
+    #[must_use]
+    pub fn new(binding: Option<ApprovalBinding>) -> Self {
+        Self(Arc::new(std::sync::Mutex::new(binding)))
+    }
+
+    /// Take the binding, leaving the cell empty.
+    pub fn take(&self) -> Option<ApprovalBinding> {
+        self.0
             .lock()
             .expect("approval binding lock poisoned")
             .take()
     }
+
+    /// Whether a binding is still waiting to be dispatched.
+    #[must_use]
+    pub fn is_pending(&self) -> bool {
+        self.0
+            .lock()
+            .expect("approval binding lock poisoned")
+            .is_some()
+    }
+}
+
+/// The durable-park arming of one gate: the channel a block leaves on, the
+/// window an approval is registered for, and the task's pending decision.
+#[derive(Clone)]
+struct DurablePark {
+    signal: BlockedSignal,
+    timeout: std::time::Duration,
+    binding: PendingBinding,
 }
 
 /// Gates matching tool calls behind an approval decision.
@@ -132,19 +150,20 @@ impl HitlApprovalWrapper {
     /// Arm the durable-park path: a gate hit registers the approval for
     /// `park_timeout` and reports the block through `signal` instead of
     /// awaiting the decision in-request.
-    /// `binding` is the decision a re-dispatched attempt consumes; `None`
-    /// raises a fresh approval on the first gated call.
+    /// `binding` is the task's pending decision, shared across its attempts
+    /// so that consuming it here empties it for every later attempt; an
+    /// empty cell raises a fresh approval on the first gated call.
     #[must_use]
     pub fn with_blocked_signal(
         mut self,
         signal: BlockedSignal,
         park_timeout: std::time::Duration,
-        binding: Option<ApprovalBinding>,
+        binding: PendingBinding,
     ) -> Self {
         self.durable_park = Some(DurablePark {
             signal,
             timeout: park_timeout,
-            binding: Arc::new(std::sync::Mutex::new(binding)),
+            binding,
         });
         self
     }
@@ -162,6 +181,7 @@ impl HitlApprovalWrapper {
         &self,
         request: ApprovalRequest,
         args: &Value,
+        tool_name: &str,
         park: &DurablePark,
     ) -> Result<PreCallOutcome, ToolError> {
         let AgentScope::Worker { task, .. } = request.scope.clone() else {
@@ -171,8 +191,8 @@ impl HitlApprovalWrapper {
         };
         // A task re-dispatched after its approval was decided consumes that
         // decision here; only an undecided or absent binding registers.
-        if let Some(binding) = park.take_binding() {
-            if let Some(consumed) = self.consume_binding(&binding, args).await {
+        if let Some(binding) = park.binding.take() {
+            if let Some(consumed) = self.consume_binding(&binding, args, tool_name).await {
                 return consumed;
             }
             // Still undecided: the run blocks on the approval it already has,
@@ -195,18 +215,29 @@ impl HitlApprovalWrapper {
     /// Dispatch the decision `binding` names, or report that it has not
     /// arrived (`None`) so the caller blocks on it again.
     ///
-    /// The claim revalidates this call's arguments against the digest
-    /// recorded when the human decided: only the call they actually saw may
-    /// run, and a mismatch leaves the decision unconsumed for the arguments
-    /// it does cover (ADR 2026-07-21, decision 9). A dispatched decision is
-    /// removed with its record, so it cannot be claimed twice.
+    /// Revalidation pins the whole call the human saw, not half of it: the
+    /// tool name here, because the digest covers only arguments, and the
+    /// arguments through the dispatch claim. Either mismatch denies and
+    /// leaves the decision unconsumed for the call it does cover (ADR
+    /// 2026-07-21, decision 9). A dispatched decision is removed with its
+    /// record, so it cannot be claimed twice.
     async fn consume_binding(
         &self,
         binding: &ApprovalBinding,
         args: &Value,
+        tool_name: &str,
     ) -> Option<Result<PreCallOutcome, ToolError>> {
         let registry = self.route.registry()?;
         let id = binding.approval.decision_id;
+        if tool_name != binding.tool_name {
+            return Some(Err(ToolError::ToolCallError(
+                format!(
+                    "tool call denied: approval {id} covers '{}', not '{tool_name}'",
+                    binding.tool_name,
+                )
+                .into(),
+            )));
+        }
         let decision = match registry.store().decision(&id).await {
             Ok(Some(decision)) => decision,
             Ok(None) => return None,
@@ -302,7 +333,9 @@ impl ToolWrapper for HitlApprovalWrapper {
             }],
         };
         if let Some(park) = &self.durable_park {
-            return self.park_instead_of_awaiting(request, args, park).await;
+            return self
+                .park_instead_of_awaiting(request, args, &ctx.tool_name, park)
+                .await;
         }
         let cancel =
             crate::request_cancellation::RequestCancellation::token_for_id(&self.request_id)
@@ -471,6 +504,7 @@ mod tests {
         use super::super::super::decision::ApprovalDecision;
         use super::super::super::registry::{ParkedApproval, PendingApprovals, ResolveError};
         use super::super::super::teardown::ApprovalOwnership;
+        use super::PendingBinding;
         use super::*;
         use crate::approval_event_broker;
         use crate::orchestration::park::{FencingGeneration, WakeReason};
@@ -489,6 +523,11 @@ mod tests {
             refuse: bool,
             /// Request whose ownership marker is dropped mid-`register`.
             teardown_during_register: Option<String>,
+            /// Whether `remove` reports a fault instead of deleting.
+            refuse_remove: bool,
+            /// Id of the most recent registration, for assertions about a
+            /// record whose id the caller never sees.
+            last_registered: std::sync::Mutex<Option<DecisionId>>,
         }
 
         impl CountingApprovalStore {
@@ -498,6 +537,8 @@ mod tests {
                     registers: AtomicUsize::new(0),
                     refuse,
                     teardown_during_register: None,
+                    refuse_remove: false,
+                    last_registered: std::sync::Mutex::new(None),
                 }
             }
 
@@ -510,6 +551,22 @@ mod tests {
                 }
             }
 
+            /// Tear down mid-write and then refuse the compensating removal,
+            /// leaving the record with no owner.
+            fn tearing_down_undeletably(request_id: &str) -> Self {
+                Self {
+                    refuse_remove: true,
+                    ..Self::tearing_down(request_id)
+                }
+            }
+
+            fn last_registered(&self) -> DecisionId {
+                self.last_registered
+                    .lock()
+                    .expect("last registered lock")
+                    .expect("a registration happened")
+            }
+
             fn registers(&self) -> usize {
                 self.registers.load(Ordering::SeqCst)
             }
@@ -519,6 +576,8 @@ mod tests {
         impl ApprovalStore for CountingApprovalStore {
             async fn register(&self, parked: ParkedApproval) -> Result<(), SessionStoreError> {
                 self.registers.fetch_add(1, Ordering::SeqCst);
+                *self.last_registered.lock().expect("last registered lock") =
+                    Some(parked.request.decision_id);
                 if self.refuse {
                     return Err(SessionStoreError::Request {
                         reason: "approval store offline".to_string(),
@@ -537,14 +596,6 @@ mod tests {
                 self.inner.get(id).await
             }
 
-            async fn resolve(
-                &self,
-                id: &DecisionId,
-                decision: ApprovalDecision,
-            ) -> Result<(), ResolveError> {
-                self.inner.resolve(id, decision).await
-            }
-
             async fn decision(
                 &self,
                 id: &DecisionId,
@@ -561,6 +612,11 @@ mod tests {
             }
 
             async fn remove(&self, id: &DecisionId) -> Result<(), SessionStoreError> {
+                if self.refuse_remove {
+                    return Err(SessionStoreError::Request {
+                        reason: "approval store offline".to_string(),
+                    });
+                }
                 self.inner.remove(id).await
             }
 
@@ -605,6 +661,16 @@ mod tests {
             registry: &PendingApprovals,
             request_id: &str,
             binding: Option<ApprovalBinding>,
+        ) -> HitlApprovalWrapper {
+            gate_over(registry, request_id, PendingBinding::new(binding))
+        }
+
+        /// The gate armed over a binding cell the caller keeps, the way
+        /// `execute_task` shares one cell across a task's attempts.
+        fn gate_over(
+            registry: &PendingApprovals,
+            request_id: &str,
+            binding: PendingBinding,
         ) -> HitlApprovalWrapper {
             HitlApprovalWrapper::new(
                 Arc::from([GlobPattern::new("kubectl_*").unwrap()]),
@@ -656,6 +722,7 @@ mod tests {
                 .expect("the parked approval resolves durably");
             ApprovalBinding {
                 approval,
+                tool_name: "kubectl_apply".to_string(),
                 args_digest: ArgsDigest::compute(args),
                 generation: FencingGeneration::INITIAL,
             }
@@ -775,6 +842,129 @@ mod tests {
 
             assert!(err.to_string().contains("teardown already began"), "{err}");
             assert_eq!(store.registers(), 0, "nothing was written");
+        }
+
+        /// A record the compensation cannot delete is orphaned, and the
+        /// refusal has to name it: the reaper needs the id to sweep it.
+        #[tokio::test]
+        async fn an_undeletable_record_is_reported_by_id() {
+            let request_id = unique_request_id();
+            let store = Arc::new(CountingApprovalStore::tearing_down_undeletably(&request_id));
+            let registry =
+                PendingApprovals::with_backend(store.clone(), Arc::new(InMemoryEventBus::new()));
+            let _ownership = ApprovalOwnership::register(&request_id);
+
+            let tool = WrappedTool::new(
+                StubTool,
+                Arc::new(armed_gate(&registry, &request_id)) as Arc<dyn ToolWrapper>,
+            );
+            let err = tool
+                .call(json!({}))
+                .await
+                .expect_err("a torn-down request must not park")
+                .to_string();
+
+            assert!(err.contains("orphaned"), "{err}");
+            // The id is the reaper's handle, so it must be in the message.
+            let orphan = store.last_registered();
+            assert!(err.contains(&orphan.to_string()), "{err}");
+            assert!(
+                store
+                    .inner
+                    .get(&orphan)
+                    .await
+                    .expect("store readable")
+                    .is_some(),
+                "the record the refusal names really is still there",
+            );
+        }
+
+        /// An approval covers one call, not one argument list: a different
+        /// gated tool with the same arguments must not ride it.
+        #[tokio::test]
+        async fn a_binding_for_another_tool_is_refused() {
+            let store = Arc::new(CountingApprovalStore::new(false));
+            let registry =
+                PendingApprovals::with_backend(store.clone(), Arc::new(InMemoryEventBus::new()));
+            let request_id = unique_request_id();
+            let _ownership = ApprovalOwnership::register(&request_id);
+            let args = json!({ "namespace": "prod" });
+            let mut binding = approved_binding(&registry, &request_id, &args).await;
+            binding.tool_name = "kubectl_delete".to_string();
+
+            let gate = bound_gate(&registry, &request_id, Some(binding.clone()));
+            let err = gate
+                .pre_call(&args, &ToolCallContext::new("kubectl_apply"))
+                .await
+                .expect_err("an approval for another tool is refused")
+                .to_string();
+
+            assert!(err.contains("kubectl_delete"), "{err}");
+            assert!(err.contains("kubectl_apply"), "{err}");
+            assert!(
+                store
+                    .decision(&binding.approval.decision_id)
+                    .await
+                    .expect("store readable")
+                    .is_some(),
+                "a refused claim consumes nothing",
+            );
+        }
+
+        /// The binding belongs to the task, not to one attempt: once an
+        /// attempt dispatches it, a retry cannot block on the record that
+        /// dispatch removed.
+        #[tokio::test]
+        async fn a_retry_after_consumption_starts_from_an_empty_binding() {
+            let store = Arc::new(CountingApprovalStore::new(false));
+            let registry =
+                PendingApprovals::with_backend(store.clone(), Arc::new(InMemoryEventBus::new()));
+            let request_id = unique_request_id();
+            let _ownership = ApprovalOwnership::register(&request_id);
+            let args = json!({ "namespace": "prod" });
+            let consumed = approved_binding(&registry, &request_id, &args).await;
+
+            // The cell `execute_task` holds for the whole task.
+            let pending = PendingBinding::new(Some(consumed.clone()));
+            let first = gate_over(&registry, &request_id, pending.clone());
+            assert_eq!(
+                first
+                    .pre_call(&args, &ToolCallContext::new("kubectl_apply"))
+                    .await
+                    .expect("the approval releases the call"),
+                PreCallOutcome::Proceed { overrides: None },
+            );
+            assert!(!pending.is_pending(), "consumption emptied the task's cell");
+
+            // The retry builds its gate from the same cell.
+            let retry = gate_over(&registry, &request_id, pending);
+            let outcome = retry
+                .pre_call(&args, &ToolCallContext::new("kubectl_apply"))
+                .await
+                .expect("the retry parks rather than erroring");
+            let PreCallOutcome::Blocked(fresh) = outcome else {
+                panic!("expected a fresh park, got {outcome:?}");
+            };
+            assert_ne!(
+                fresh.decision_id, consumed.approval.decision_id,
+                "the retry must not block on the consumed approval",
+            );
+            assert!(
+                store
+                    .get(&consumed.approval.decision_id)
+                    .await
+                    .expect("store readable")
+                    .is_none(),
+                "the consumed record stays gone",
+            );
+            assert!(
+                store
+                    .get(&fresh.decision_id)
+                    .await
+                    .expect("store readable")
+                    .is_some(),
+                "the retry's own approval is registered and claimable",
+            );
         }
 
         /// A re-dispatched attempt whose arguments differ from the ones the
