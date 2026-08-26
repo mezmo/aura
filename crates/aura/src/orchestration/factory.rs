@@ -220,9 +220,10 @@ pub(super) async fn begin_run(
             generation: FencingGeneration::INITIAL,
         })
         .await?;
-    // A lease this claim cannot take leaves the record just minted above
-    // unreachable: no run points at it and no later claim finds it. It is
-    // inert `Created` debris, and P8's reaper owns collecting it.
+    // A lease this claim cannot take strands the record just minted above.
+    // `RunStore` has no delete, so there is nothing to undo it with here;
+    // the record stays inert `Created` debris that no run points at, and
+    // P8's reaper collects it.
     let lease = store
         .acquire_lease(session_id, AgentInstanceId::generate(), ttl)
         .await?;

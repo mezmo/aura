@@ -3539,7 +3539,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
         let rollback = ownership.clone();
         let (cas_tx, cas_rx) = tokio::sync::oneshot::channel();
         let commit = tokio::spawn(async move {
-            let cas = Self::park_cas(&*run_store, session_id, generation, park_commit).await;
+            let cas =
+                Self::park_cas(&*run_store, session_id, generation, run_id, park_commit).await;
             let committed = cas.is_ok();
             // Compensation lives here, not at the caller: a disconnect can
             // drop the receiving half, and the approvals must still go back
@@ -3600,18 +3601,25 @@ Assign tasks to the worker whose tools best match the required operations."#,
         run_store: &dyn RunStore,
         session_id: SessionId,
         generation: FencingGeneration,
+        run_id: RunId,
         commit: ParkCommit,
     ) -> Result<(), String> {
         let Err(e) = run_store.park(session_id, generation, commit).await else {
             return Ok(());
         };
-        let parked_anyway = matches!(
+        // Only this run's own commit counts. A park advances the record by
+        // exactly one generation, and another owner must acquire the lease
+        // before it can park, which advances it again — so anything past the
+        // successor is someone else's park, carrying a checkpoint that does
+        // not name our approvals.
+        let ours = matches!(
             run_store.load(session_id).await,
             Ok(Some(record))
                 if matches!(record.state, RunState::Parked { .. })
-                    && record.generation > generation
+                    && record.generation == generation.next()
+                    && record.run_id == Some(run_id)
         );
-        if parked_anyway {
+        if ours {
             tracing::warn!("run store park reported `{e}` but the record is parked; continuing");
             return Ok(());
         }
@@ -7775,32 +7783,45 @@ mod durable_park_tests {
 
     /// A backend that commits the transition and then reports an error (the
     /// file store syncing its directory after the rename) must not be read
-    /// as a failed park: the record is visibly parked.
+    /// as a failed park: the record is visibly parked, by this run.
     #[tokio::test]
     async fn a_post_commit_error_is_resolved_against_the_record() {
         let run_store = Arc::new(InMemoryRunStore::new());
-        let (session_id, generation) = super::super::factory::begin_run(
-            run_store.as_ref(),
-            &uuid::Uuid::new_v4().to_string(),
-            PARK_WINDOW,
-        )
-        .await
-        .expect("the run starts");
+        let run_id: RunId = uuid::Uuid::new_v4()
+            .to_string()
+            .parse()
+            .expect("a v4 uuid is a run id");
+        let (session_id, generation) =
+            super::super::factory::begin_run(run_store.as_ref(), &run_id.to_string(), PARK_WINDOW)
+                .await
+                .expect("the run starts");
 
         // The park lands, so a second CAS at the same generation fails while
         // the record is already parked — the shape a post-rename sync fault
         // presents to the caller.
         let commit = park_commit_for(session_id);
         assert!(
-            Orchestrator::park_cas(run_store.as_ref(), session_id, generation, commit.clone())
-                .await
-                .is_ok(),
+            Orchestrator::park_cas(
+                run_store.as_ref(),
+                session_id,
+                generation,
+                run_id,
+                commit.clone()
+            )
+            .await
+            .is_ok(),
         );
         assert!(
-            Orchestrator::park_cas(run_store.as_ref(), session_id, generation, commit.clone())
-                .await
-                .is_ok(),
-            "a stale-generation error over a parked record is not a failed park",
+            Orchestrator::park_cas(
+                run_store.as_ref(),
+                session_id,
+                generation,
+                run_id,
+                commit.clone()
+            )
+            .await
+            .is_ok(),
+            "a stale-generation error over our own parked record is not a failed park",
         );
 
         // A record that never parked stays a failure.
@@ -7810,12 +7831,60 @@ mod durable_park_tests {
                 run_store.as_ref(),
                 other,
                 crate::orchestration::park::FencingGeneration::INITIAL,
+                run_id,
                 commit
             )
             .await
             .is_err(),
             "an unknown session is a real park failure",
         );
+    }
+
+    /// A newer owner's park is not ours to claim: its checkpoint names its
+    /// approvals, not the ones this run transferred, and reading it as our
+    /// own commit would keep those and announce a park that never happened.
+    #[tokio::test]
+    async fn a_newer_owners_park_is_not_read_as_our_commit() {
+        let run_store = Arc::new(InMemoryRunStore::new());
+        let our_run: RunId = uuid::Uuid::new_v4()
+            .to_string()
+            .parse()
+            .expect("a v4 uuid is a run id");
+        let (session_id, our_generation) =
+            super::super::factory::begin_run(run_store.as_ref(), &our_run.to_string(), PARK_WINDOW)
+                .await
+                .expect("our run starts");
+
+        // A newer owner takes the lease (+1) and parks (+2) while we were
+        // away, under its own run id. Our claim has to end first, which is
+        // exactly what a lease expiry or a clean handoff does.
+        run_store
+            .release_lease(session_id, our_generation)
+            .await
+            .expect("our lease ends");
+        let newer = run_store
+            .acquire_lease(
+                session_id,
+                crate::orchestration::park::AgentInstanceId::generate(),
+                crate::orchestration::park::LeaseTtl::new(PARK_WINDOW).expect("nonzero"),
+            )
+            .await
+            .expect("the lease transfers");
+        run_store
+            .park(session_id, newer.generation, park_commit_for(session_id))
+            .await
+            .expect("the newer owner parks");
+
+        let err = Orchestrator::park_cas(
+            run_store.as_ref(),
+            session_id,
+            our_generation,
+            our_run,
+            park_commit_for(session_id),
+        )
+        .await
+        .expect_err("a stale owner must not adopt someone else's park");
+        assert!(err.contains("run store park failed"), "{err}");
     }
 
     /// The generation the park presents is the one `Start` returned, not

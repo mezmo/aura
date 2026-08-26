@@ -80,7 +80,18 @@ impl PendingBinding {
         Self(Arc::new(std::sync::Mutex::new(binding)))
     }
 
-    /// Take the binding, leaving the cell empty.
+    /// Read the binding without spending it. A call that inspects the
+    /// binding and then refuses must leave it claimable for the call it
+    /// does cover, so only [`Self::take`] empties the cell.
+    #[must_use]
+    pub fn peek(&self) -> Option<ApprovalBinding> {
+        self.0
+            .lock()
+            .expect("approval binding lock poisoned")
+            .clone()
+    }
+
+    /// Spend the binding, leaving the cell empty.
     pub fn take(&self) -> Option<ApprovalBinding> {
         self.0
             .lock()
@@ -191,8 +202,11 @@ impl HitlApprovalWrapper {
         };
         // A task re-dispatched after its approval was decided consumes that
         // decision here; only an undecided or absent binding registers.
-        if let Some(binding) = park.binding.take() {
-            if let Some(consumed) = self.consume_binding(&binding, args, tool_name).await {
+        if let Some(binding) = park.binding.peek() {
+            if let Some(consumed) = self
+                .consume_binding(&binding, args, tool_name, &park.binding)
+                .await
+            {
                 return consumed;
             }
             // Still undecided: the run blocks on the approval it already has,
@@ -226,6 +240,7 @@ impl HitlApprovalWrapper {
         binding: &ApprovalBinding,
         args: &Value,
         tool_name: &str,
+        cell: &PendingBinding,
     ) -> Option<Result<PreCallOutcome, ToolError>> {
         let registry = self.route.registry()?;
         let id = binding.approval.decision_id;
@@ -278,6 +293,10 @@ impl HitlApprovalWrapper {
                 }
             }
         };
+        // Spent only here, on the two outcomes that settle the decision:
+        // every refusal above returns with the cell untouched, so the call
+        // the human did approve can still claim it.
+        cell.take();
         registry.remove(&id).await;
         Some(Ok(outcome))
     }
@@ -892,8 +911,8 @@ mod tests {
             let mut binding = approved_binding(&registry, &request_id, &args).await;
             binding.tool_name = "kubectl_delete".to_string();
 
-            let gate = bound_gate(&registry, &request_id, Some(binding.clone()));
-            let err = gate
+            let pending = PendingBinding::new(Some(binding.clone()));
+            let err = gate_over(&registry, &request_id, pending.clone())
                 .pre_call(&args, &ToolCallContext::new("kubectl_apply"))
                 .await
                 .expect_err("an approval for another tool is refused")
@@ -909,6 +928,21 @@ mod tests {
                     .is_some(),
                 "a refused claim consumes nothing",
             );
+            assert!(
+                pending.is_pending(),
+                "a refusal must not strand the binding",
+            );
+
+            // The tool the human did approve still claims it.
+            assert_eq!(
+                gate_over(&registry, &request_id, pending.clone())
+                    .pre_call(&args, &ToolCallContext::new("kubectl_delete"))
+                    .await
+                    .expect("the approved tool proceeds"),
+                PreCallOutcome::Proceed { overrides: None },
+            );
+            assert!(!pending.is_pending(), "the approved call spent the binding");
+            assert_eq!(store.registers(), 1, "no second approval was raised");
         }
 
         /// The binding belongs to the task, not to one attempt: once an
@@ -980,8 +1014,8 @@ mod tests {
             let approved = json!({ "namespace": "prod" });
             let binding = approved_binding(&registry, &request_id, &approved).await;
 
-            let gate = bound_gate(&registry, &request_id, Some(binding.clone()));
-            let err = gate
+            let pending = PendingBinding::new(Some(binding.clone()));
+            let err = gate_over(&registry, &request_id, pending.clone())
                 .pre_call(
                     &json!({ "namespace": "staging" }),
                     &ToolCallContext::new("kubectl_apply"),
@@ -1001,6 +1035,21 @@ mod tests {
                     .is_some(),
                 "a rejected claim leaves the decision unconsumed",
             );
+            assert!(
+                pending.is_pending(),
+                "a refusal must not strand the binding",
+            );
+
+            // The call the human did approve still claims it.
+            assert_eq!(
+                gate_over(&registry, &request_id, pending.clone())
+                    .pre_call(&approved, &ToolCallContext::new("kubectl_apply"))
+                    .await
+                    .expect("the approved arguments proceed"),
+                PreCallOutcome::Proceed { overrides: None },
+            );
+            assert!(!pending.is_pending(), "the approved call spent the binding");
+            assert_eq!(store.registers(), 1, "no second approval was raised");
         }
 
         /// A denial reaches the model as tool output, and the decision it
