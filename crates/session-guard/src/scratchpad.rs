@@ -10,6 +10,8 @@
 //! own-epoch just like manifest artifacts, but they do not enter the
 //! delta and never reach S3.
 
+use tokio::io::AsyncWriteExt;
+
 use crate::identity::TurnId;
 use crate::lease::LeaseLost;
 use crate::state::ActiveTurn;
@@ -34,12 +36,33 @@ impl ScratchpadName {
     /// # Errors
     /// [`InvalidScratchpadName`] when the name is empty, too long, or
     /// contains a separator or dotfile component.
-    #[expect(
-        unused_variables,
-        reason = "todo!() body; filled by aura #421 follow-up"
-    )]
     pub fn parse(raw: &str) -> Result<Self, InvalidScratchpadName> {
-        todo!("fill: single-component name rules; aura #421 follow-up")
+        if raw.is_empty() {
+            return Err(InvalidScratchpadName {
+                reason: "empty name".into(),
+            });
+        }
+        if raw.len() > 255 {
+            return Err(InvalidScratchpadName {
+                reason: "name exceeds 255 bytes".into(),
+            });
+        }
+        if raw == "." || raw == ".." {
+            return Err(InvalidScratchpadName {
+                reason: "dot component".into(),
+            });
+        }
+        if raw.contains('/') {
+            return Err(InvalidScratchpadName {
+                reason: "path separator".into(),
+            });
+        }
+        if raw.contains('\0') {
+            return Err(InvalidScratchpadName {
+                reason: "interior NUL".into(),
+            });
+        }
+        Ok(Self(raw.to_string()))
     }
 }
 
@@ -83,18 +106,25 @@ impl ActiveTurn {
     /// # Errors
     /// [`ScratchpadError::LeaseLost`] when the capability fails;
     /// [`ScratchpadError::Io`] on filesystem failure.
-    #[expect(
-        unused_variables,
-        reason = "todo!() body; filled by aura #421 follow-up"
-    )]
     pub async fn write_scratchpad(
         &self,
         name: &ScratchpadName,
         bytes: &[u8],
     ) -> Result<(), ScratchpadError> {
-        todo!(
-            "fill: assert_live + temp/rename under epoch dir, no delta record; aura #421 follow-up"
-        )
+        self.capability().assert_live()?;
+        let dir = self.scratch_dir();
+        let target = dir.join(name.as_ref());
+        // A per-write nonce keeps two concurrent scratch writes from
+        // colliding on the temp path before either renames.
+        let tmp = dir.join(format!(".sg-scratch-tmp-{}", uuid::Uuid::now_v7()));
+        let mut file = tokio::fs::File::create(&tmp).await?;
+        file.write_all(bytes).await?;
+        file.sync_all().await?;
+        drop(file);
+        tokio::fs::rename(&tmp, &target).await?;
+        let dir_handle = tokio::fs::File::open(dir).await?;
+        dir_handle.sync_all().await?;
+        Ok(())
     }
 
     /// Read one scratchpad entry written by this same turn. A missing
@@ -106,13 +136,20 @@ impl ActiveTurn {
     /// [`ScratchpadError::NotFound`] when the entry does not exist;
     /// [`ScratchpadError::LeaseLost`] when the capability fails;
     /// [`ScratchpadError::Io`] on filesystem failure.
-    #[expect(
-        unused_variables,
-        reason = "todo!() body; filled by aura #421 follow-up"
-    )]
     pub async fn read_scratchpad(&self, name: &ScratchpadName) -> Result<Vec<u8>, ScratchpadError> {
-        todo!(
-            "fill: assert_live + read under epoch dir; missing → NotFound(turn, name); aura #421 follow-up"
-        )
+        self.capability().assert_live()?;
+        let target = self.scratch_dir().join(name.as_ref());
+        match tokio::fs::read(&target).await {
+            Ok(bytes) => Ok(bytes),
+            // A stale pointer into a prior (or never-written) turn's
+            // scratch reads as ENOENT; surface it loud, never as empty.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                Err(ScratchpadError::NotFound {
+                    turn: self.capability().turn(),
+                    name: name.clone(),
+                })
+            }
+            Err(err) => Err(err.into()),
+        }
     }
 }

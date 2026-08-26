@@ -26,6 +26,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use sha2::{Digest as _, Sha256};
+use tokio::io::AsyncWriteExt;
+
 use crate::arbiter::HeldGuard;
 use crate::claim::GrantedClaim;
 use crate::epoch::Epoch;
@@ -33,7 +36,7 @@ use crate::identity::{HolderId, OpId, PodId, SessionId, TurnId};
 use crate::lease::{
     BeatInterval, HeartbeatLease, LeaseLost, LeaseTtl, SelfFenceMargin, WriteCapability,
 };
-use crate::manifest::{ArtifactPath, DeclareError, Manifest, ManifestEntry, ReadMiss};
+use crate::manifest::{ArtifactPath, DeclareError, Digest, Manifest, ManifestEntry, ReadMiss};
 use crate::repair::RepairLane;
 use crate::store::{ClaimStore, ParkLatch, StoreUnavailable};
 
@@ -663,14 +666,59 @@ impl FencedRun {
     /// # Errors
     /// [`ReadError`] after the window and the repair lane are exhausted,
     /// or immediately on corruption.
-    #[expect(
-        unused_variables,
-        reason = "todo!() body; filled by aura #421 follow-up"
-    )]
     pub async fn read_artifact(&self, path: &ArtifactPath) -> Result<VerifiedRead, ReadError> {
-        todo!(
-            "fill: read + digest verify; NotFound → window retry → refresh_dir → force_cure → fail loud; aura #421 follow-up"
-        )
+        // No committed entry is a terminal miss: the manifest is fixed at
+        // claim grant, so retrying or curing it would change nothing.
+        let Some(entry) = self.lock.manifest.get(path) else {
+            return Err(ReadMiss::NotFound(path.clone()).into());
+        };
+        let target = self.lock.session_root().join(path);
+        let deadline = Instant::now() + self.lock.propagation_window();
+        let mut escalation = 0u8;
+        loop {
+            match tokio::fs::read(&target).await {
+                Ok(bytes) => {
+                    let mut hash = [0u8; 32];
+                    hash.copy_from_slice(&Sha256::digest(&bytes)[..]);
+                    let actual = Digest::from_bytes(hash);
+                    // Write-once ⇒ a mismatch can only be corruption; fail
+                    // loud on first read, never retry it as propagation.
+                    if actual == entry.digest {
+                        return Ok(VerifiedRead::new(bytes, entry.clone()));
+                    }
+                    return Err(ReadMiss::Corrupt {
+                        path: path.clone(),
+                        expected: entry.digest,
+                        actual,
+                    }
+                    .into());
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    if Instant::now() >= deadline {
+                        return Err(ReadMiss::NotFound(path.clone()).into());
+                    }
+                    // Escalate the repair lane once per tier between
+                    // retries (Pg only); a cure's own failure is benign —
+                    // the window keeps retrying, then fails loud. Local
+                    // mode has no lane and simply window-retries.
+                    if let Some(repair) = self.lock.repair_lane() {
+                        match escalation {
+                            0 => {
+                                let _ = repair.refresh_dir(self.run_dir()).await;
+                                escalation = 1;
+                            }
+                            1 => {
+                                let _ = repair.force_cure(self.run_dir()).await;
+                                escalation = 2;
+                            }
+                            _ => {}
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
     }
 
     /// Drain the recorded delta (crate-internal: the barrier consumes it
@@ -715,6 +763,13 @@ impl ActiveTurn {
         self.run.manifest()
     }
 
+    /// The turn's run directory (the epoch dir), crate-internal (the
+    /// scratchpad I/O surface derives its paths from it).
+    #[must_use]
+    pub(crate) fn scratch_dir(&self) -> &Path {
+        self.run.run_dir()
+    }
+
     /// Read a manifest-referenced artifact (delegates to the fenced
     /// run's verified read path).
     ///
@@ -742,18 +797,64 @@ impl ActiveTurn {
     /// when the path's prefix is not this claim's epoch;
     /// [`ArtifactWriteError::LeaseLost`] when the capability fails;
     /// [`ArtifactWriteError::Io`] on filesystem failure.
-    #[expect(
-        unused_variables,
-        reason = "todo!() body; filled by aura #421 follow-up"
-    )]
     pub async fn write_artifact(
         &self,
         path: ArtifactPath,
         bytes: &[u8],
     ) -> Result<ManifestEntry, ArtifactWriteError> {
-        todo!(
-            "fill: reserve path in issued (sync, pre-await) → assert_live → epoch check → temp/fsync/rename/dir-fsync → sha256 → record into private delta; aura #421 follow-up"
-        )
+        // Reserve synchronously before any await or filesystem mutation:
+        // a second concurrent writer of this path (or an already-committed
+        // path) is rejected here, before anything is written. The lock is
+        // dropped before the first await, never held across it.
+        {
+            let mut issued = self.run.issued.lock().expect("issued mutex poisoned");
+            if self.run.lock.manifest.get(&path).is_some() || !issued.insert(path.clone()) {
+                return Err(ArtifactWriteError::Duplicate(path));
+            }
+        }
+        let capability = self.run.capability();
+        capability.assert_live()?;
+        let epoch = self.run.lock.epoch;
+        if path.epoch() != epoch {
+            return Err(ArtifactWriteError::WrongEpoch {
+                path,
+                expected: epoch,
+            });
+        }
+        // The path is epoch-qualified relative to the session root, and
+        // the epoch check above pins it to this claim's epoch dir, so the
+        // join lands under `run_dir` (never `run_dir.join` — that would
+        // double the epoch prefix).
+        let target = self.run.lock.session_root().join(&path);
+        let tmp = self
+            .run
+            .run_dir()
+            .join(format!(".sg-artifact-tmp-{}", uuid::Uuid::now_v7()));
+        let mut file = tokio::fs::File::create(&tmp).await?;
+        file.write_all(bytes).await?;
+        file.sync_all().await?;
+        drop(file);
+        tokio::fs::rename(&tmp, &target).await?;
+        let dir_handle = tokio::fs::File::open(self.run.run_dir()).await?;
+        dir_handle.sync_all().await?;
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&Sha256::digest(bytes)[..]);
+        let entry = ManifestEntry {
+            digest: Digest::from_bytes(hash),
+            turn: capability.turn(),
+            epoch,
+            bytes: bytes.len() as u64,
+        };
+        // Record into the turn's private delta: the barrier commits
+        // exactly this set. The reservation and epoch check above make a
+        // duplicate or foreign-epoch declare unreachable.
+        self.run
+            .delta
+            .lock()
+            .expect("delta mutex poisoned")
+            .declare(path, entry.clone())
+            .expect("reserved own-epoch path declares into the private delta");
+        Ok(entry)
     }
 
     /// End the turn and enter the completion barrier as a commit
@@ -1177,4 +1278,51 @@ pub enum FenceCause {
     /// wedge class).
     #[error(transparent)]
     Io(#[from] std::io::Error),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::config::AdmissionEnv;
+
+    /// A wrong `write_artifact` that skips the private-delta record still
+    /// passes the public publish frame (bytes land on disk); this pins
+    /// the recording itself, so `take_delta` sees exactly the one entry.
+    #[test]
+    fn write_artifact_records_delta() {
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        rt.block_on(async {
+            let pod = PodId::parse("pod-0").expect("pod id parses");
+            let env = AdmissionEnv::from_env().expect("off config parses");
+            let root = tempfile::tempdir().expect("temp root");
+            let admission = crate::build_admission(&env, root.path().to_path_buf(), pod)
+                .expect("factory dispatches off mode");
+            let session = SessionId::parse("s1").expect("session id parses");
+            tokio::fs::create_dir_all(root.path().join(session.as_ref()))
+                .await
+                .expect("session root exists for create_run");
+            let req = IdleRequest {
+                session: session.clone(),
+                turn: TurnId::new(),
+            };
+            let lock = admission.admit(req).await.expect("local admission grants");
+            let run = lock.create_run().await.expect("run dir created");
+            let active = run.activate();
+
+            let path = ArtifactPath::parse("e1/recorded.txt").expect("path parses");
+            let entry = active
+                .write_artifact(path.clone(), b"delta")
+                .await
+                .expect("write succeeds");
+
+            let delta = active.run.take_delta();
+            assert_eq!(delta.len(), 1, "exactly one entry recorded in the delta");
+            assert_eq!(
+                delta.get(&path),
+                Some(&entry),
+                "the recorded delta entry is the returned entry"
+            );
+        });
+    }
 }
