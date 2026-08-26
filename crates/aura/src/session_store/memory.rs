@@ -22,9 +22,11 @@ const TOPIC_CAPACITY: usize = 64;
 /// Decision retention margin.
 const DECISION_RETENTION_MARGIN_SECS: i64 = 60;
 
-/// A recorded decision and its retention deadline.
+/// A recorded decision, the wake reason carrying it, and their shared
+/// retention deadline.
 struct DecidedEntry {
     decision: ApprovalDecision,
+    wake: WakeReason,
     keep_until: Timestamp,
 }
 
@@ -77,6 +79,10 @@ impl ApprovalStore for InMemoryApprovalStore {
             *id,
             DecidedEntry {
                 decision,
+                wake: WakeReason::DecisionResolved {
+                    decision_id: *id,
+                    resolved_at: chrono::Utc::now(),
+                },
                 keep_until: parked.expires_at
                     + chrono::Duration::seconds(DECISION_RETENTION_MARGIN_SECS),
             },
@@ -96,35 +102,53 @@ impl ApprovalStore for InMemoryApprovalStore {
         id: &DecisionId,
         decision: ApprovalDecision,
     ) -> Result<WakeReason, ResolveError> {
-        // The parked record stays for park-restart replay (P7's contract),
-        // and the decision lands in the decided map so main's `decision()`
-        // read-back and the registry's store-poll wake both observe it
-        // (ab6c4e6b's contract).
+        // The parked record stays for park-restart replay, and the decision
+        // lands in the decided map that `decision()` reads back.
         let expires_at = match self.lock().get(id) {
             Some(parked) => parked.expires_at,
             None => return Err(ResolveError::NotFound),
         };
-        self.lock_decided().insert(
-            *id,
-            DecidedEntry {
+        // Insert-if-absent under the lock is the first-write-wins guarantee:
+        // a repeat or a contradiction reads back the stored resolution.
+        let wake = self
+            .lock_decided()
+            .entry(*id)
+            .or_insert_with(|| DecidedEntry {
                 decision,
+                wake: WakeReason::DecisionResolved {
+                    decision_id: *id,
+                    resolved_at: chrono::Utc::now(),
+                },
                 keep_until: expires_at + chrono::Duration::seconds(DECISION_RETENTION_MARGIN_SECS),
-            },
-        );
-        Ok(WakeReason::DecisionResolved {
-            decision_id: *id,
-            resolved_at: chrono::Utc::now(),
-        })
+            })
+            .wake
+            .clone();
+        Ok(wake)
     }
 
     async fn remove(&self, id: &DecisionId) -> Result<(), SessionStoreError> {
         self.lock().remove(id);
+        self.lock_decided().remove(id);
         Ok(())
     }
 
     async fn cancel_request(&self, request_id: &str) -> Result<(), SessionStoreError> {
-        self.lock()
-            .retain(|_, parked| parked.request.request_id != request_id);
+        // A decided entry carries no request id, so the ids to discard are
+        // read off the parked records before those records go.
+        let cancelled: Vec<DecisionId> = {
+            let mut entries = self.lock();
+            let ids = entries
+                .iter()
+                .filter(|(_, parked)| parked.request.request_id == request_id)
+                .map(|(id, _)| *id)
+                .collect();
+            entries.retain(|_, parked| parked.request.request_id != request_id);
+            ids
+        };
+        let mut decided = self.lock_decided();
+        for id in cancelled {
+            decided.remove(&id);
+        }
         Ok(())
     }
 }

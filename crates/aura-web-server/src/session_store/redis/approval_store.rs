@@ -8,7 +8,6 @@
 //! | -------------------------------------- | -------------------- | ------------------------------ |
 //! | `{p}:approval:{decision_id}`           | string (record JSON) | parked approval record         |
 //! | `{p}:approval:decision:{decision_id}`  | string (record JSON) | recorded decision              |
-//! | `{p}:approval:decided:{decision_id}`   | string (JSON)        | durable wake reason (24 h TTL) |
 //! | `{p}:approval:req:{request_id}`        | set of decision ids  | `cancel_request` fan-out       |
 //!
 //! Approval records carry a TTL derived from the approval's `expires_at`, so
@@ -56,10 +55,23 @@ static RESOLVE_SCRIPT: LazyLock<redis::Script> = LazyLock::new(|| {
     )
 });
 
-/// TTL for durable decision sidecars (`decided` keys). Generous enough to
-/// outlast any practical approval window; these are replay aids, not primary
-/// state.
-const DECIDED_KEY_TTL_SECS: u64 = 86_400;
+/// Atomic script for the durable resolution: first-write-wins on the decision
+/// key, with the parked approval left in place.
+static RESOLVE_DURABLE_SCRIPT: LazyLock<redis::Script> = LazyLock::new(|| {
+    redis::Script::new(
+        r#"
+        if redis.call('EXISTS', KEYS[1]) == 0 then
+            return nil
+        end
+        local ttl_ms = redis.call('PTTL', KEYS[1])
+        if ttl_ms < 0 then
+            ttl_ms = 0
+        end
+        redis.call('SET', KEYS[2], ARGV[1], 'NX', 'PX', ttl_ms + tonumber(ARGV[2]))
+        return redis.call('GET', KEYS[2])
+        "#,
+    )
+});
 
 pub struct RedisApprovalStore {
     conn: ConnectionManager,
@@ -84,10 +96,6 @@ impl RedisApprovalStore {
 
     fn req_key(&self, request_id: &str) -> String {
         format!("{}:approval:req:{request_id}", self.key_prefix)
-    }
-
-    fn decided_key(&self, decision_id: &str) -> String {
-        format!("{}:approval:decided:{decision_id}", self.key_prefix)
     }
 
     /// Atomically take the record (`GETDEL`), pruning the request index
@@ -194,41 +202,45 @@ impl ApprovalStore for RedisApprovalStore {
     async fn resolve_durable(
         &self,
         id: &DecisionId,
-        _decision: ApprovalDecision,
+        decision: ApprovalDecision,
     ) -> Result<aura::orchestration::park::WakeReason, ResolveError> {
         use aura::orchestration::park::WakeReason;
 
+        let payload = serde_json::to_string(&DecisionRecord::from(&decision))
+            .expect("decision record serializes to JSON");
         let mut conn = self.conn.clone();
-        let approval_key = self.approval_key(&id.to_string());
-
-        // Check the record exists without consuming it.
-        let exists: bool = conn
-            .exists(&approval_key)
+        let stored: Option<String> = RESOLVE_DURABLE_SCRIPT
+            .key(self.approval_key(&id.to_string()))
+            .key(self.decision_key(&id.to_string()))
+            .arg(payload)
+            .arg(DECISION_TTL_MARGIN_MS)
+            .invoke_async(&mut conn)
             .await
             .map_err(|e| ResolveError::Store(request_err(e)))?;
-        if !exists {
+        let Some(json) = stored else {
             return Err(ResolveError::NotFound);
-        }
-
-        let resolved_at = chrono::Utc::now();
-        let wake = WakeReason::DecisionResolved {
-            decision_id: *id,
-            resolved_at,
         };
-        let payload = serde_json::to_string(&wake).expect("wake reason serializes to JSON");
 
-        // Persist the decision so a restarted process can replay the wake.
-        let decided_key = self.decided_key(&id.to_string());
-        let _: () = conn
-            .set_ex(&decided_key, payload, DECIDED_KEY_TTL_SECS)
-            .await
-            .map_err(|e| ResolveError::Store(request_err(e)))?;
-
-        Ok(wake)
+        // The payload is whatever the key holds after the script's `NX`
+        // write, so deriving the wake from it — rather than from this call's
+        // own clock — is what makes a later caller agree with the first.
+        let record: DecisionRecord = serde_json::from_str(&json).map_err(|e| {
+            ResolveError::Store(SessionStoreError::Decode {
+                reason: e.to_string(),
+            })
+        })?;
+        Ok(WakeReason::DecisionResolved {
+            decision_id: *id,
+            resolved_at: record.decided_at,
+        })
     }
 
     async fn remove(&self, id: &DecisionId) -> Result<(), SessionStoreError> {
-        self.take(id).await.map(|_| ())
+        self.take(id).await?;
+        let mut conn = self.conn.clone();
+        conn.del::<_, ()>(self.decision_key(&id.to_string()))
+            .await
+            .map_err(request_err)
     }
 
     async fn cancel_request(&self, request_id: &str) -> Result<(), SessionStoreError> {
@@ -239,6 +251,7 @@ impl ApprovalStore for RedisApprovalStore {
         let mut pipe = redis::pipe();
         for id in &ids {
             pipe.del(self.approval_key(id)).ignore();
+            pipe.del(self.decision_key(id)).ignore();
         }
         pipe.del(&req_key).ignore();
         pipe.query_async::<()>(&mut conn).await.map_err(request_err)

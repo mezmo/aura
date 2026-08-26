@@ -7,7 +7,7 @@
 //! | Path                                  | Contents                            |
 //! | ------------------------------------- | ----------------------------------- |
 //! | `{root}/approvals/{decision_id}.json`    | one [`ParkedApprovalRecord`]        |
-//! | `{root}/approvals/{decision_id}.decided` | durable [`WakeReason`] sidecar      |
+//! | `{root}/approvals/{decision_id}.decided` | one [`DecidedRecord`]               |
 //! | `{root}/approvals/*.tmp`                 | an interrupted write, ignored       |
 //! | `{root}/approvals/*.taken`               | an interrupted take, ignored        |
 //! | `{root}/approvals/*.probe`               | an interrupted open check, ignored  |
@@ -79,8 +79,8 @@ use crate::orchestration::park::{
 };
 
 use super::{
-    ApprovalStore, ParkedApprovalRecord, RunStore, RunStoreError, SessionStoreError,
-    decode_run_record, encode_run_record,
+    ApprovalStore, DecidedRecord, ParkedApprovalRecord, RunStore, RunStoreError, SessionStoreError,
+    decode_decided_record, decode_run_record, encode_decided_record, encode_run_record,
 };
 
 #[cfg(not(windows))]
@@ -223,39 +223,35 @@ impl ApprovalStore for FileApprovalStore {
         &self,
         id: &DecisionId,
     ) -> Result<Option<ApprovalDecision>, SessionStoreError> {
-        todo!("staged for #271: read back the decision recorded for {id} (P7-completion)")
+        let id = *id;
+        let decided = self
+            .blocking(move |dir| read_decided(&decided_path(&dir, &id)))
+            .await?;
+        Ok(decided.map(|record| ApprovalDecision::from(record.decision)))
     }
 
     async fn resolve_durable(
         &self,
         id: &DecisionId,
-        _decision: ApprovalDecision,
+        decision: ApprovalDecision,
     ) -> Result<WakeReason, ResolveError> {
         let id = *id;
-        let resolved_at = chrono::Utc::now();
+        let record = DecidedRecord::new(&id, &decision);
         match self
             .blocking(move |dir| {
-                // Check the record exists without consuming it.
+                // Check the record exists without consuming it: the parked
+                // entry outlives its decision until a claim takes it.
                 let path = record_path(&dir, &id);
                 match fs::metadata(&path) {
                     Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
                     Err(e) => return Err(io_err("metadata", &path, &e)),
                     Ok(_) => {}
                 }
-                // Write the wake reason durably so a restarted process can replay it.
-                let wake = WakeReason::DecisionResolved {
-                    decision_id: id,
-                    resolved_at,
-                };
-                let sidecar = dir.join(format!("{id}.{DECIDED_EXTENSION}"));
-                let payload = serde_json::to_vec(&wake).expect("wake reason serializes to JSON");
-                write_synced(&sidecar, &payload)?;
-                sync_dir(&dir)?;
-                Ok(Some(wake))
+                commit_decided(&dir, &id, record).map(Some)
             })
             .await
         {
-            Ok(Some(wake)) => Ok(wake),
+            Ok(Some(record)) => Ok(record.wake),
             Ok(None) => Err(ResolveError::NotFound),
             Err(err) => Err(ResolveError::Store(err)),
         }
@@ -704,6 +700,59 @@ fn read_record(path: &Path) -> Result<Option<ParkedApproval>, SessionStoreError>
     }
 }
 
+fn decided_path(dir: &Path, id: &DecisionId) -> PathBuf {
+    dir.join(format!("{id}.{DECIDED_EXTENSION}"))
+}
+
+/// Record the decision under a name only the first caller creates, returning
+/// whichever record the sidecar ends up holding. `link` is the create-new
+/// primitive: of any number of concurrent callers exactly one makes the name
+/// and the rest read back what it wrote, so a contradicting second decision
+/// cannot displace the first.
+///
+/// Linking a fully written, synced file rather than creating an empty one
+/// keeps the two apart: no reader can open the sidecar and find a payload
+/// that is not yet all there, and the bytes are durable before the name that
+/// promises them exists.
+fn commit_decided(
+    dir: &Path,
+    id: &DecisionId,
+    record: DecidedRecord,
+) -> Result<DecidedRecord, SessionStoreError> {
+    let sidecar = decided_path(dir, id);
+    let staged = dir.join(format!("{id}.{}.tmp", Uuid::now_v7()));
+    write_synced(&staged, &encode_decided_record(&record)).inspect_err(|_| {
+        let _ = fs::remove_file(&staged);
+    })?;
+
+    let linked = fs::hard_link(&staged, &sidecar);
+    let _ = fs::remove_file(&staged);
+    match linked {
+        Ok(()) => sync_dir(dir).map(|()| record),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            read_decided(&sidecar)?.ok_or_else(|| SessionStoreError::Request {
+                reason: format!("{} was discarded mid-resolution", sidecar.display()),
+            })
+        }
+        Err(e) => Err(io_err("commit", &sidecar, &e)),
+    }
+}
+
+fn read_decided(path: &Path) -> Result<Option<DecidedRecord>, SessionStoreError> {
+    match fs::read(path) {
+        Ok(bytes) => decode_decided_record(&bytes).map(Some),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(io_err("read", path, &e)),
+    }
+}
+
+/// Drop the decision recorded for an approval that is going away, reporting
+/// whether a sidecar was there to drop. Best effort: a sidecar that outlives
+/// a failed unlink is inert once no record names it.
+fn discard_decided(dir: &Path, id: &DecisionId) -> bool {
+    fs::remove_file(decided_path(dir, id)).is_ok()
+}
+
 /// Take the record by renaming it to a name only this call knows, reporting
 /// whether this call is the one that got it. Rename is the at-most-once
 /// primitive: of any number of concurrent callers exactly one moves the file
@@ -716,6 +765,10 @@ fn read_record(path: &Path) -> Result<Option<ParkedApproval>, SessionStoreError>
 /// second consumer after the first already ran the gated call. A sync failure
 /// is reported as a lost take rather than a won one.
 ///
+/// The approval's recorded decision goes with the record, whichever call
+/// finds it: an approval that has been consumed or cancelled must not leave a
+/// decision behind for a later reader to wake a run on.
+///
 /// Discarding the claimed file afterwards is best effort: the take has already
 /// succeeded, so a failure there must not be reported as a lost race. What it
 /// can leave behind is an inert file no read path considers.
@@ -724,11 +777,17 @@ fn take_record(dir: &Path, id: &DecisionId) -> Result<bool, SessionStoreError> {
     let claimed = dir.join(format!("{id}.{}.{TAKEN_EXTENSION}", Uuid::now_v7()));
     match fs::rename(&path, &claimed) {
         Ok(()) => {
+            discard_decided(dir, id);
             sync_dir(dir)?;
             let _ = fs::remove_file(&claimed);
             Ok(true)
         }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            if discard_decided(dir, id) {
+                sync_dir(dir)?;
+            }
+            Ok(false)
+        }
         Err(e) => Err(io_err("take", &path, &e)),
     }
 }
@@ -964,7 +1023,16 @@ mod tests {
     }
 
     fn create_flag(root: &Path, name: &str) {
-        std::fs::write(flag_path(root, name), b"").unwrap();
+        write_flag(root, name, b"");
+    }
+
+    /// Publish a flag's contents together with its name. Readers poll for
+    /// existence, so a flag carrying a value must not appear empty first.
+    fn write_flag(root: &Path, name: &str, contents: &[u8]) {
+        let path = flag_path(root, name);
+        let staged = path.with_extension("flag-staged");
+        std::fs::write(&staged, contents).unwrap();
+        std::fs::rename(&staged, &path).unwrap();
     }
 
     fn wait_for_flag(root: &Path, name: &str) {
@@ -1139,6 +1207,55 @@ mod tests {
             store.get(&id).await,
             Err(SessionStoreError::Decode { .. })
         ));
+    }
+
+    /// A record written by a newer binary is refused rather than read as v1:
+    /// an old node must never wake a run on a decision it cannot interpret.
+    #[tokio::test]
+    async fn an_unknown_sidecar_version_is_a_decode_error() {
+        let root = tempfile::tempdir().unwrap();
+        let store = FileApprovalStore::open(root.path()).await.unwrap();
+        let id = DecisionId::generate();
+        let mut sidecar =
+            serde_json::to_value(DecidedRecord::new(&id, &ApprovalDecision::Approved)).unwrap();
+        sidecar["version"] = serde_json::json!(crate::session_store::DECIDED_RECORD_VERSION + 1);
+        std::fs::write(
+            decided_path(&store.dir, &id),
+            serde_json::to_vec(&sidecar).unwrap(),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            store.decision(&id).await,
+            Err(SessionStoreError::Decode { .. })
+        ));
+    }
+
+    /// The wake reason has to outlive the process that recorded it: that is
+    /// the whole point of writing it to disk rather than only publishing it.
+    #[tokio::test]
+    async fn a_reopened_store_sees_the_recorded_decision() {
+        let root = tempfile::tempdir().unwrap();
+        let entry = parked("req-decision-reopen");
+        let id = entry.request.decision_id;
+        let denied = ApprovalDecision::Denied {
+            reason: Some("unsafe".to_string()),
+        };
+
+        let first = FileApprovalStore::open(root.path()).await.unwrap();
+        first.register(entry).await.unwrap();
+        let wake = first.resolve_durable(&id, denied.clone()).await.unwrap();
+        drop(first);
+
+        let second = FileApprovalStore::open(root.path()).await.unwrap();
+        assert_eq!(second.decision(&id).await.unwrap(), Some(denied));
+        assert_eq!(
+            second
+                .resolve_durable(&id, ApprovalDecision::Approved)
+                .await
+                .unwrap(),
+            wake,
+        );
     }
 
     #[tokio::test]
@@ -1430,11 +1547,11 @@ mod tests {
             .await
             .expect("acquire succeeds after the parent released");
 
-        std::fs::write(
-            flag_path(Path::new(&root), CHILD_ACQUIRED_FLAG),
-            u64::from(lease.generation).to_string(),
-        )
-        .expect("write acquired generation flag");
+        write_flag(
+            Path::new(&root),
+            CHILD_ACQUIRED_FLAG,
+            u64::from(lease.generation).to_string().as_bytes(),
+        );
 
         wait_for_flag(Path::new(&root), "stale-attempted.flag");
 

@@ -28,7 +28,7 @@ use crate::orchestration::TaskIdentity;
 use crate::orchestration::park::{
     AgentInstanceId, CasError, ChatSessionId, CheckpointEnvelope, FencingGeneration, LeaseTtl,
     NonEmpty, ParkCommit, ParkReason, RunCheckpoint, RunEvent, RunState, Session,
-    SessionId as ParkSessionId, SessionRecord,
+    SessionId as ParkSessionId, SessionRecord, WakeReason,
 };
 
 use super::{ApprovalStore, EventBus, ParkedApprovalRecord, RunStore, RunStoreError, Subscription};
@@ -75,6 +75,36 @@ pub async fn assert_approval_store_conformance(store: Arc<dyn ApprovalStore>) {
         &mut failures,
         "concurrent_resolve_has_exactly_one_winner",
         concurrent_resolve_has_exactly_one_winner(&store).await,
+    );
+    record(
+        &mut failures,
+        "resolve_durable_records_a_readable_decision",
+        resolve_durable_records_a_readable_decision(store.as_ref()).await,
+    );
+    record(
+        &mut failures,
+        "resolve_durable_keeps_the_parked_entry",
+        resolve_durable_keeps_the_parked_entry(store.as_ref()).await,
+    );
+    record(
+        &mut failures,
+        "concurrent_resolve_durable_agree_on_one_record",
+        concurrent_resolve_durable_agree_on_one_record(&store).await,
+    );
+    record(
+        &mut failures,
+        "conflicting_resolve_durable_keeps_the_first",
+        conflicting_resolve_durable_keeps_the_first(store.as_ref()).await,
+    );
+    record(
+        &mut failures,
+        "remove_discards_the_recorded_decision",
+        remove_discards_the_recorded_decision(store.as_ref()).await,
+    );
+    record(
+        &mut failures,
+        "cancel_request_discards_the_recorded_decision",
+        cancel_request_discards_the_recorded_decision(store.as_ref()).await,
     );
     record(
         &mut failures,
@@ -353,6 +383,157 @@ async fn concurrent_resolve_has_exactly_one_winner(store: &Arc<dyn ApprovalStore
              {winners} did",
         );
     }
+    Ok(())
+}
+
+/// The decision has to outlive the resolver's own return value: a parking
+/// instance that never saw the bus wake recovers the resolution from here.
+async fn resolve_durable_records_a_readable_decision(store: &dyn ApprovalStore) -> Result<()> {
+    let entry = parked_single(&unique("durable-readback"));
+    let id = entry.request.decision_id;
+    store.register(entry).await?;
+
+    let denied = ApprovalDecision::Denied {
+        reason: Some("unsafe".to_string()),
+    };
+    resolve_durable(store, &id, denied.clone()).await?;
+
+    ensure!(
+        store.decision(&id).await? == Some(denied),
+        "a durably resolved approval must read back the decision it was resolved with",
+    );
+    Ok(())
+}
+
+/// Durable resolution is not consumption: the parked entry survives it, so a
+/// digest-bound claim is what takes the approval, not whoever decided it.
+async fn resolve_durable_keeps_the_parked_entry(store: &dyn ApprovalStore) -> Result<()> {
+    let entry = parked_single(&unique("durable-repeat"));
+    let id = entry.request.decision_id;
+    store.register(entry).await?;
+
+    let first = resolve_durable(store, &id, ApprovalDecision::Approved).await?;
+    ensure!(
+        store.get(&id).await?.is_some(),
+        "a durably resolved approval must still be readable",
+    );
+
+    let second = resolve_durable(store, &id, ApprovalDecision::Approved).await?;
+    ensure!(
+        second == first,
+        "a repeated resolution must return the recorded wake reason, got {second:?} after {first:?}",
+    );
+    ensure!(
+        store.get(&id).await?.is_some(),
+        "a repeated durable resolution must leave the parked entry in place",
+    );
+    Ok(())
+}
+
+/// Concurrent resolvers all win, but on one record: unlike the destructive
+/// path there is nothing to hand out exactly once, and a store that let the
+/// last writer through would hand different wake reasons to callers reading
+/// the same approval.
+async fn concurrent_resolve_durable_agree_on_one_record(
+    store: &Arc<dyn ApprovalStore>,
+) -> Result<()> {
+    for round in 0..RACE_ROUNDS {
+        let entry = parked_single(&unique("durable-race"));
+        let id = entry.request.decision_id;
+        store.register(entry).await?;
+
+        let start = Arc::new(tokio::sync::Barrier::new(RESOLVER_COUNT));
+        let resolvers: Vec<_> = (0..RESOLVER_COUNT)
+            .map(|_| {
+                let store = Arc::clone(store);
+                let start = Arc::clone(&start);
+                tokio::spawn(async move {
+                    start.wait().await;
+                    store.resolve_durable(&id, ApprovalDecision::Approved).await
+                })
+            })
+            .collect();
+
+        let mut wakes = Vec::with_capacity(RESOLVER_COUNT);
+        for resolver in resolvers {
+            let outcome = resolver
+                .await
+                .map_err(|e| anyhow!("a resolver task did not complete: {e}"))?;
+            wakes.push(outcome.map_err(|err| {
+                anyhow!(
+                    "round {round}: every concurrent durable resolve must succeed, one got {err:?}"
+                )
+            })?);
+        }
+        ensure!(
+            wakes.windows(2).all(|pair| pair[0] == pair[1]),
+            "round {round}: {RESOLVER_COUNT} concurrent durable resolves must agree on one \
+             recorded wake reason, got {wakes:?}",
+        );
+        ensure!(
+            store.get(&id).await?.is_some(),
+            "round {round}: concurrent durable resolves must leave the parked entry in place",
+        );
+    }
+    Ok(())
+}
+
+/// Two resolvers can disagree — a webhook approval racing an operator's
+/// denial. Letting the later one through would wake a run on a decision no
+/// gate ever released.
+async fn conflicting_resolve_durable_keeps_the_first(store: &dyn ApprovalStore) -> Result<()> {
+    let entry = parked_single(&unique("durable-conflict"));
+    let id = entry.request.decision_id;
+    store.register(entry).await?;
+
+    let first = resolve_durable(store, &id, ApprovalDecision::Approved).await?;
+    let second = resolve_durable(
+        store,
+        &id,
+        ApprovalDecision::Denied {
+            reason: Some("too late".to_string()),
+        },
+    )
+    .await?;
+
+    ensure!(
+        second == first,
+        "the first decision recorded wins: a conflicting resolution must return the stored \
+         wake reason, got {second:?} after {first:?}",
+    );
+    ensure!(
+        store.decision(&id).await? == Some(ApprovalDecision::Approved),
+        "the first decision recorded wins: the approval must survive a later denial",
+    );
+    Ok(())
+}
+
+async fn remove_discards_the_recorded_decision(store: &dyn ApprovalStore) -> Result<()> {
+    let entry = parked_single(&unique("durable-remove"));
+    let id = entry.request.decision_id;
+    store.register(entry).await?;
+    resolve_durable(store, &id, ApprovalDecision::Approved).await?;
+
+    store.remove(&id).await?;
+    ensure!(
+        store.decision(&id).await?.is_none(),
+        "removing an approval must discard the decision recorded for it",
+    );
+    Ok(())
+}
+
+async fn cancel_request_discards_the_recorded_decision(store: &dyn ApprovalStore) -> Result<()> {
+    let request_id = unique("durable-cancel");
+    let entry = parked_single(&request_id);
+    let id = entry.request.decision_id;
+    store.register(entry).await?;
+    resolve_durable(store, &id, ApprovalDecision::Approved).await?;
+
+    store.cancel_request(&request_id).await?;
+    ensure!(
+        store.decision(&id).await?.is_none(),
+        "cancelling a request must discard the decisions recorded for its approvals",
+    );
     Ok(())
 }
 
@@ -937,6 +1118,17 @@ async fn resolve(store: &dyn ApprovalStore, id: &DecisionId) -> Result<()> {
         .resolve(id, ApprovalDecision::Approved)
         .await
         .map_err(|err| anyhow!("resolve failed: {err:?}"))
+}
+
+async fn resolve_durable(
+    store: &dyn ApprovalStore,
+    id: &DecisionId,
+    decision: ApprovalDecision,
+) -> Result<WakeReason> {
+    store
+        .resolve_durable(id, decision)
+        .await
+        .map_err(|err| anyhow!("resolve_durable failed: {err:?}"))
 }
 
 async fn next_payload(subscriber: &mut Subscription) -> Result<Bytes> {

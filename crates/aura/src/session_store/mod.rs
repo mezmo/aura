@@ -37,8 +37,9 @@ use crate::orchestration::park::{
 pub use file::{FileApprovalStore, FileRunStore};
 pub use memory::{InMemoryApprovalStore, InMemoryEventBus, InMemoryRunStore};
 pub use record::{
-    DecisionRecord, InvalidRecord, OriginRecord, ParkedApprovalRecord, RUN_RECORD_VERSION,
-    RunRecordError, ScopeRecord, decode_run_record, encode_run_record,
+    DECIDED_RECORD_VERSION, DecidedRecord, DecisionRecord, InvalidRecord, OriginRecord,
+    ParkedApprovalRecord, RUN_RECORD_VERSION, RunRecordError, ScopeRecord, decode_decided_record,
+    decode_run_record, encode_decided_record, encode_run_record,
 };
 
 /// A fault in the backing session-store/bus backend.
@@ -87,7 +88,8 @@ pub trait ApprovalStore: Send + Sync {
         decision: ApprovalDecision,
     ) -> Result<(), ResolveError>;
 
-    /// Look up the decision recorded for an already-resolved approval.
+    /// Look up the decision [`Self::resolve_durable`] recorded for an
+    /// approval.
     async fn decision(
         &self,
         id: &DecisionId,
@@ -97,19 +99,26 @@ pub trait ApprovalStore: Send + Sync {
     /// destroying the parked entry (ADR 2026-07-21, decision 8): the entry
     /// and the returned wake reason survive until a claim consumes them.
     /// At-most-once consumption moves out of resolution and into the
-    /// dispatch FSM's digest-bound claim. Resolution is idempotent: a second
-    /// call on an already-resolved id returns `Ok` (the entry is still
-    /// present). An unknown or removed id returns [`ResolveError::NotFound`].
+    /// dispatch FSM's digest-bound claim.
+    ///
+    /// The first decision recorded for an id wins. A later call — repeating
+    /// that decision or contradicting it — records nothing and returns `Ok`
+    /// carrying the stored wake reason, so every caller reads the same
+    /// resolution. An unknown or removed id returns
+    /// [`ResolveError::NotFound`].
     async fn resolve_durable(
         &self,
         id: &DecisionId,
         decision: ApprovalDecision,
     ) -> Result<WakeReason, ResolveError>;
 
-    /// Remove a parked entry.
+    /// Remove a parked entry and the decision recorded for it: an approval
+    /// that is gone reads as undecided, never as a decision no run will
+    /// claim.
     async fn remove(&self, id: &DecisionId) -> Result<(), SessionStoreError>;
 
-    /// Remove every approval parked under a request id.
+    /// Remove every approval parked under a request id, and their recorded
+    /// decisions, on the same rule as [`Self::remove`].
     async fn cancel_request(&self, request_id: &str) -> Result<(), SessionStoreError>;
 }
 

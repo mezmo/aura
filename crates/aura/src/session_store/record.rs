@@ -18,8 +18,10 @@ use crate::hitl::{
     AgentScope, ApprovalDecision, ApprovalItem, ApprovalOrigin, ApprovalRequest, DecisionId,
     ParkedApproval, Timestamp,
 };
-use crate::orchestration::park::{self, SessionRecord};
+use crate::orchestration::park::{self, SessionRecord, WakeReason};
 use crate::orchestration::{RunId, TaskIdentity};
+
+use super::SessionStoreError;
 
 /// Round-trippable storage form of a [`ParkedApproval`]. Field and tag names
 /// are a persisted contract shared by every instance reading the store — rename
@@ -102,6 +104,75 @@ impl From<DecisionRecord> for ApprovalDecision {
                 reason: record.reason,
             }
         }
+    }
+}
+
+/// Version every decided record is written at today. A breaking shape change
+/// bumps this and adds a decoder for the new version; decoders for old
+/// versions are kept for as long as records of that version can exist.
+pub const DECIDED_RECORD_VERSION: u32 = 1;
+
+/// Round-trippable storage form of a resolved approval: the decision and the
+/// wake reason that carries it back to a parked run, in one record. Field and
+/// tag names are a persisted contract shared by every instance reading the
+/// store — rename only with a migration. The version tag is inlined in the
+/// record object — no wrapper envelope.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DecidedRecord {
+    pub version: u32,
+    pub decision: DecisionRecord,
+    pub wake: WakeReason,
+}
+
+impl DecidedRecord {
+    /// Stamp both halves from one instant, so the decision and its wake
+    /// reason cannot disagree about when the approval was resolved.
+    #[must_use]
+    pub fn new(decision_id: &DecisionId, decision: &ApprovalDecision) -> Self {
+        let decision = DecisionRecord::from(decision);
+        let wake = WakeReason::DecisionResolved {
+            decision_id: *decision_id,
+            resolved_at: decision.decided_at,
+        };
+        Self {
+            version: DECIDED_RECORD_VERSION,
+            decision,
+            wake,
+        }
+    }
+}
+
+/// Encode a decided record for storage at [`DECIDED_RECORD_VERSION`].
+#[must_use]
+pub fn encode_decided_record(record: &DecidedRecord) -> Vec<u8> {
+    serde_json::to_vec(record).expect("decided record serializes to JSON")
+}
+
+/// Decode a stored decided record, dispatching on its inline version tag
+/// before any body field is interpreted; an unknown version is refused, never
+/// guessed at or defaulted.
+pub fn decode_decided_record(raw: &[u8]) -> Result<DecidedRecord, SessionStoreError> {
+    let value: serde_json::Value = serde_json::from_slice(raw).map_err(decided_decode_err)?;
+    let version = value
+        .get("version")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| SessionStoreError::Decode {
+            reason: "decided record: missing or non-numeric version".to_string(),
+        })?;
+    if version != u64::from(DECIDED_RECORD_VERSION) {
+        return Err(SessionStoreError::Decode {
+            reason: format!(
+                "decided record version {version} has no decoder in this binary \
+                 (latest known: {DECIDED_RECORD_VERSION})"
+            ),
+        });
+    }
+    serde_json::from_value(value).map_err(decided_decode_err)
+}
+
+fn decided_decode_err(err: serde_json::Error) -> SessionStoreError {
+    SessionStoreError::Decode {
+        reason: format!("decided record: {err}"),
     }
 }
 
@@ -784,5 +855,57 @@ mod tests {
 
             assert_eq!(wire, domain, "wire copy drifted from the domain shape");
         }
+    }
+
+    #[test]
+    fn decided_record_carries_one_resolution_instant() {
+        let id = DecisionId::generate();
+        let record = DecidedRecord::new(&id, &ApprovalDecision::Approved);
+        let WakeReason::DecisionResolved {
+            decision_id,
+            resolved_at,
+        } = record.wake;
+        assert_eq!(decision_id, id);
+        assert_eq!(resolved_at, record.decision.decided_at);
+    }
+
+    #[test]
+    fn decided_record_round_trips() {
+        let record = DecidedRecord::new(
+            &DecisionId::generate(),
+            &ApprovalDecision::Denied {
+                reason: Some("not safe".to_string()),
+            },
+        );
+        let decoded = decode_decided_record(&encode_decided_record(&record)).expect("decodes");
+        assert_eq!(decoded, record);
+    }
+
+    /// A version with no decoder here is refused rather than read as v1: an
+    /// old node must never interpret a shape it does not know.
+    #[test]
+    fn unknown_decided_record_version_is_refused() {
+        let mut value = serde_json::to_value(DecidedRecord::new(
+            &DecisionId::generate(),
+            &ApprovalDecision::Approved,
+        ))
+        .expect("record serializes");
+        value["version"] = serde_json::json!(DECIDED_RECORD_VERSION + 1);
+        let raw = serde_json::to_vec(&value).expect("value serializes");
+
+        let err = decode_decided_record(&raw).unwrap_err();
+        assert!(
+            matches!(err, SessionStoreError::Decode { ref reason } if reason.contains("no decoder")),
+            "expected a decode refusal, got {err:?}",
+        );
+    }
+
+    #[test]
+    fn decided_record_without_a_version_is_refused() {
+        let err = decode_decided_record(br#"{"decision":{"approved":true}}"#).unwrap_err();
+        assert!(
+            matches!(err, SessionStoreError::Decode { ref reason } if reason.contains("version")),
+            "expected a decode refusal, got {err:?}",
+        );
     }
 }
