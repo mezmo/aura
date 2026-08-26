@@ -12,6 +12,20 @@ note: the module `lease` is defined here
   | mod lease;
   | ^^^^^^^^^
 
+error[E0603]: module `lease` is private
+ --> tests/compilefail/self_fence_deadline.rs:7:28
+  |
+7 |     let _ = session_guard::lease::SelfFenceDeadline::anchor_at;
+  |                            ^^^^^  ----------------- struct `SelfFenceDeadline` is not publicly re-exported
+  |                            |
+  |                            private module
+  |
+note: the module `lease` is defined here
+ --> src/lib.rs
+  |
+  | mod lease;
+  | ^^^^^^^^^
+
 error[E0624]: associated function `fenced` is private
  --> tests/compilefail/self_fence_deadline.rs:6:54
   |
@@ -22,3 +36,19 @@ error[E0624]: associated function `fenced` is private
   |
   |     pub(crate) fn fenced(granted_at: Instant, ttl: LeaseTtl, margin: SelfFenceMargin) -> Self {
   |     ----------------------------------------------------------------------------------------- private associated function defined here
+
+error[E0624]: method `anchor_at` is private
+ --> tests/compilefail/self_fence_deadline.rs:7:54
+  |
+7 |       let _ = session_guard::lease::SelfFenceDeadline::anchor_at;
+  |                                                        ^^^^^^^^^ private method
+  |
+ ::: src/lease.rs
+  |
+  | /     pub(crate) fn anchor_at(
+  | |         &self,
+  | |         transmitted_at: Instant,
+  | |         ttl: LeaseTtl,
+  | |         margin: SelfFenceMargin,
+  | |     ) {
+  | |_____- private method defined here

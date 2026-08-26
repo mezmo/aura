@@ -4,4 +4,5 @@
 
 fn main() {
     let _ = session_guard::lease::SelfFenceDeadline::fenced;
+    let _ = session_guard::lease::SelfFenceDeadline::anchor_at;
 }
