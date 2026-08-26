@@ -112,6 +112,12 @@ impl PendingApprovals {
         }))
     }
 
+    /// The approval store this registry parks into.
+    #[must_use]
+    pub fn store(&self) -> Arc<dyn ApprovalStore> {
+        Arc::clone(&self.0.store)
+    }
+
     /// Park an approval, returning the await handle.
     ///
     /// Store or bus faults do not fail registration: the call parks anyway.
