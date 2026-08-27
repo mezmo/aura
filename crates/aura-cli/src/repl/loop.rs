@@ -490,6 +490,23 @@ fn flush_live_reasoning(state: &Arc<Mutex<Option<LiveReasoning>>>) -> bool {
     was_top_level
 }
 
+/// Scrollback line for an `approval_requested` event. Route-neutral: the
+/// event carries no route, and a conversational `approval_pending` prompt
+/// appends below this line rather than replacing it, so the wording must
+/// not claim a route.
+fn approval_requested_line(requested: &aura_events::ApprovalRequested) -> String {
+    use aura_events::ApprovalOriginWire;
+    let origin = match &requested.origin {
+        ApprovalOriginWire::ConfigGate {
+            matched_pattern, ..
+        } => {
+            format!("config gate · {matched_pattern}")
+        }
+        ApprovalOriginWire::AgentRequested { .. } => "agent requested".to_string(),
+    };
+    format!("⏸ Approval requested — {} ({origin})", requested.tool_name)
+}
+
 /// Live worker reasoning blocks, one per concurrently-executing task.
 /// Keyed by `task_id` so interleaved deltas from same-wave workers each
 /// update their own tree row instead of contending for a single block.
@@ -3394,20 +3411,7 @@ impl StreamHandler for ReplStreamHandler {
             let _term = lock_term();
             erase_input_frame();
 
-            use aura_events::ApprovalOriginWire;
-            let origin = match &requested.origin {
-                ApprovalOriginWire::ConfigGate { matched_pattern, .. } => {
-                    format!("config gate · {matched_pattern}")
-                }
-                ApprovalOriginWire::AgentRequested { .. } => "agent requested".to_string(),
-            };
-            // Webhook route: no approval_pending follows (conversational
-            // replaces this line with the interactive prompt within
-            // milliseconds), so a line that lingers is routed to a webhook.
-            let line = format!(
-                "⏸ Approval requested — {} ({origin}) · awaiting webhook decision",
-                requested.tool_name
-            );
+            let line = approval_requested_line(requested);
             println!("{}", line.themed(AuraStyle::Warning));
             crate::ui::prompt::increment_orch_scrollback();
             println!();
@@ -3699,8 +3703,8 @@ impl StreamHandler for ReplStreamHandler {
 #[cfg(test)]
 mod tests {
     use super::{
-        COMMAND_ALIASES, COMPACT_NUDGE_FILL, ReplTelemetryLifecycle, command_hint,
-        should_nudge_at_fill,
+        COMMAND_ALIASES, COMPACT_NUDGE_FILL, ReplTelemetryLifecycle, approval_requested_line,
+        command_hint, should_nudge_at_fill,
     };
     use crate::repl::registry;
 
@@ -3896,6 +3900,65 @@ mod tests {
             assert!(
                 registry::lookup(target).is_some(),
                 "alias {bare:?} targets unknown command {target:?}",
+            );
+        }
+    }
+
+    fn approval_requested(
+        origin: aura_events::ApprovalOriginWire,
+    ) -> aura_events::ApprovalRequested {
+        aura_events::ApprovalRequested {
+            decision_id: "d-1".to_string(),
+            tool_name: "mock_tool".to_string(),
+            origin,
+            scope: aura_events::AgentScopeWire::Single { session_id: None },
+        }
+    }
+
+    #[test]
+    fn approval_requested_line_names_tool_and_config_gate_origin() {
+        let requested = approval_requested(aura_events::ApprovalOriginWire::ConfigGate {
+            matched_pattern: "mock_*".to_string(),
+            agent_name: "hitl-fast".to_string(),
+        });
+        assert_eq!(
+            approval_requested_line(&requested),
+            "⏸ Approval requested — mock_tool (config gate · mock_*)",
+        );
+    }
+
+    #[test]
+    fn approval_requested_line_names_agent_requested_origin() {
+        let requested = approval_requested(aura_events::ApprovalOriginWire::AgentRequested {
+            reason: "destructive".to_string(),
+            agent_name: "hitl-fast".to_string(),
+        });
+        assert_eq!(
+            approval_requested_line(&requested),
+            "⏸ Approval requested — mock_tool (agent requested)",
+        );
+    }
+
+    #[test]
+    fn approval_requested_line_makes_no_route_claim() {
+        // The event is route-agnostic and the conversational prompt appends
+        // below this line rather than replacing it, so route-specific
+        // wording (the Greptile finding on PR #616) contradicts scrollback
+        // on the other route.
+        for origin in [
+            aura_events::ApprovalOriginWire::ConfigGate {
+                matched_pattern: "mock_*".to_string(),
+                agent_name: String::new(),
+            },
+            aura_events::ApprovalOriginWire::AgentRequested {
+                reason: "destructive".to_string(),
+                agent_name: String::new(),
+            },
+        ] {
+            let line = approval_requested_line(&approval_requested(origin));
+            assert!(
+                !line.to_lowercase().contains("webhook"),
+                "line makes a route claim: {line}",
             );
         }
     }
