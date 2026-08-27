@@ -27,8 +27,10 @@
 # Docs: https://docs.mezmo.com/aura/configuration-reference#orchestration
 
 # Shared by orchestration persistence ({memory_dir}/{run_id}/...) and worker
-# scratchpads. Required because scratchpad is enabled below.
-memory_dir = "/tmp/aura-worker-overrides"
+# scratchpads. Required because scratchpad is enabled below. Tool output is
+# stored here in plaintext with default permissions, so keep it under a
+# directory only your user can read rather than a shared path like /tmp.
+memory_dir = "{{ env.HOME }}/.aura/worker-overrides"
 
 [mcp]
 sanitize_schemas = true

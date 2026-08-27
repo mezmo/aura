@@ -91,7 +91,7 @@ description = "Example STDIO MCP server"
 
 # Static headers sent with every request.
 [mcp.servers.example_http.headers]
-Authorization = "Bearer {{ env.MCP_TOKEN }}"
+Authorization = "Bearer {{ env.MCP_TOKEN | default: '' }}"
 
 # ── Header forwarding ───────────────────────────────────────────────
 # Forward headers from the incoming HTTP request to an MCP server.

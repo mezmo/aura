@@ -1578,8 +1578,14 @@ context_window = 200000
     fn test_all_shipped_configs_parse() {
         let _env_lock = crate::test_env_lock::lock();
 
+        // Examples that persist data place memory_dir under $HOME/.aura/;
+        // point HOME at a scratch directory so loading them (which creates
+        // and write-probes memory_dir) leaves nothing in the real home.
+        let fake_home = tempfile::TempDir::new().unwrap();
+
         // Set env vars every shipped config expects so env resolution succeeds.
         unsafe {
+            std::env::set_var("HOME", fake_home.path());
             std::env::set_var("OPENAI_API_KEY", "test-openai");
             std::env::set_var("ANTHROPIC_API_KEY", "test-anthropic");
             std::env::set_var("GOOGLE_API_KEY", "test-google");

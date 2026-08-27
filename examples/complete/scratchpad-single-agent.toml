@@ -24,9 +24,15 @@
 #
 # Docs: https://docs.mezmo.com/aura/scratchpad
 
-# Created if missing and checked for writability at startup.
-# Single-agent files land in {memory_dir}/scratchpad/.
-memory_dir = "/tmp/aura-scratchpad"
+# Created if missing and checked for writability at startup. Single-agent
+# files land in {memory_dir}/scratchpad/.
+#
+# Intercepted tool output (pod logs, events, resource dumps) is written here
+# in plaintext, and AURA does not tighten permissions on what it creates.
+# Keep it under a directory only your user can read; avoid shared locations
+# such as /tmp, where another local user could read the files or pre-create
+# the path.
+memory_dir = "{{ env.HOME }}/.aura/scratchpad"
 
 [mcp]
 sanitize_schemas = true
@@ -40,10 +46,11 @@ description = "Kubernetes cluster operations: pods, deployments, services, logs,
 
 # Per-tool interception thresholds for this server, in tokens. Keys are glob
 # patterns (`*` and `?`) matched against tool names; the longest matching
-# pattern wins. Omit this table entirely to use the default of 5120 for
-# every tool.
+# pattern wins. A server with no entries here is never intercepted, so a
+# catch-all `"*"` entry is what turns scratchpad on for the whole server.
+# `min_tokens` defaults to 5120 when omitted (`"*" = {}`).
 [mcp.servers.kubernetes.scratchpad]
-"*" = { min_tokens = 5_120 }          # default for everything on this server
+"*" = { min_tokens = 5_120 }          # everything on this server
 "pods_log" = { min_tokens = 1_500 }   # logs are big and rarely needed in full
 "events_list" = { min_tokens = 1_500 }
 "resources_list" = { min_tokens = 2_500 }
@@ -55,8 +62,9 @@ system_prompt = """
 You are a Kubernetes troubleshooting assistant.
 
 Large tool outputs are saved to a scratchpad instead of being returned
-inline; you will see a pointer like [scratchpad: file_id=...]. When that
-happens, do not re-run the tool. Use the scratchpad tools to inspect the
+inline; you will see a pointer like
+[scratchpad: output saved to '<file>' (~N tokens, N lines, format=json)].
+When that happens, do not re-run the tool. Use the scratchpad tools to inspect the
 saved output: `head` or `schema` first to learn its shape, then `grep`,
 `slice`, `get_in`, or `iterate_over` to extract exactly what you need.
 
