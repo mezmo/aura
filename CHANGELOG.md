@@ -1,5 +1,64 @@
 ## Changelog
 
+## [0.2.10](https://github.com/mezmo/aura/compare/v0.2.9...v0.2.10) (2026-08-27)
+
+
+### Bug Fixes
+
+* **cli**: forget the context window when the selected model changes [0ee5171](https://github.com/mezmo/aura/commit/0ee517154dbc95afba60c72607a3151c9b5838ba) - Eric Lake
+
+* **cli**: keep the per-turn context peak for the status meter [56802c0](https://github.com/mezmo/aura/commit/56802c0035dd6eb35b6a05c6d7fddfab370a1bd2) - Eric Lake
+
+* **cli**: neutralise control characters in status line text [59705b1](https://github.com/mezmo/aura/commit/59705b14bcf63242f9a6a15640733ee7084efa76) - Eric Lake
+
+* **cli**: reset session status on /clear and /resume [60791d1](https://github.com/mezmo/aura/commit/60791d1c831fa67f0bb0cded8fd9d6cefdcbe6ef) - Eric Lake
+
+* **cli**: restore session status when resuming a conversation [86b643d](https://github.com/mezmo/aura/commit/86b643db7b5fe10ab8941493ee29602c04494835) - Eric Lake
+
+* **cli**: show the context count for single agents again [0be1fc8](https://github.com/mezmo/aura/commit/0be1fc8d9b61878aa957a9c27346cc6545d0753d) - Eric Lake
+
+* **cli**: show the context meter only against a known window [22cc9e6](https://github.com/mezmo/aura/commit/22cc9e6c3b28c0f0f4c95e093476fbf78376a3ba) - Eric Lake
+
+* **cli**: skip stale session status on resume after a model switch [f418fd2](https://github.com/mezmo/aura/commit/f418fd244ccf090b0f8275b3d415127e158274d4) - Eric Lake
+
+* **cli**: strip control characters from mcp status notices [18bef91](https://github.com/mezmo/aura/commit/18bef919062833ab346b1cda22a8d486fa9a851e) - Eric Lake
+
+* **cli**: use named ansi colors for the status line [8f5bf14](https://github.com/mezmo/aura/commit/8f5bf143b56063f7caff52b90a38860f40cea533) - Eric Lake
+
+
+
+### Chores
+
+* **cli**: tidy status line module notes and imports [2b216b0](https://github.com/mezmo/aura/commit/2b216b0111060ff99d25ef3f57b88486aa765c62) - Eric Lake
+
+
+
+### Code Refactoring
+
+* **cli**: reuse strip_control_chars for status line text [a22a841](https://github.com/mezmo/aura/commit/a22a841f3d75bdaa7eb774ca292ae311d89ef0e1) - Eric Lake
+
+
+
+### Documentation
+
+* **cli**: explain why the context segment hides in orchestration [566b064](https://github.com/mezmo/aura/commit/566b06454bea7220a43ba260ef130fe36a4e4d84) - Eric Lake
+
+
+
+### Features
+
+* **cli**: add status line segment renderer [30d50ba](https://github.com/mezmo/aura/commit/30d50ba5953bfc19d4afc2a497653cd2a8e78c49) - Eric Lake
+
+* **cli**: colour status line segments and label token counts [5018865](https://github.com/mezmo/aura/commit/50188650ac4b4798dd779c85fc05bf50367984c6) - Eric Lake [hi#contrast](https://github.com/hi/issues/contrast)
+
+* **cli**: configure status line segments in cli.toml [033885c](https://github.com/mezmo/aura/commit/033885c6379f58b0dd2d716427916dd18f43a033) - Eric Lake
+
+* **cli**: label scratchpad savings as in/out tokens [ad30de2](https://github.com/mezmo/aura/commit/ad30de23b5e7e6b0022bf87db4953b0a8f46b70e) - Eric Lake
+
+* **cli**: render the status line from live session state [fc6802f](https://github.com/mezmo/aura/commit/fc6802fd4b733f0cb98d8b83da38da415d85e7e4) - Eric Lake
+
+* **cli**: show the connected server in the status line in http mode [74d8318](https://github.com/mezmo/aura/commit/74d8318f1946a7af202c057ab3a61e10ab836968) - Eric Lake
+
 ## [0.2.9](https://github.com/mezmo/aura/compare/v0.2.8...v0.2.9) (2026-08-27)
 
 
