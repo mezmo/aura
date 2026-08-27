@@ -1,0 +1,82 @@
+# Scratchpad (context-window management) — a single agent that inspects a
+# Kubernetes cluster without letting large tool outputs (pod logs, event
+# lists, resource dumps) flood the context window.
+#
+# When an MCP tool returns more than its `min_tokens` threshold, the output is
+# written to disk under `memory_dir` and the model receives a short pointer
+# instead. The agent then uses the scratchpad exploration tools (head, slice,
+# grep, schema, get_in, iterate_over, item_schema, read) to pull out only what
+# it needs.
+#
+# Three settings must be present together or the config fails to load:
+#   1. top-level `memory_dir`               (where intercepted outputs are written)
+#   2. `[agent.llm].context_window`         (budget math needs the real window size)
+#   3. `[agent.scratchpad].enabled = true`
+#
+# Prerequisites:
+#   export OPENAI_API_KEY="sk-..."
+#   Kubernetes context configured (kubectl access)
+#   Start the K8s MCP server:
+#     npx -y kubernetes-mcp-server@latest --port 8081 --read-only
+#
+# Usage:
+#   CONFIG_PATH=examples/complete/scratchpad-single-agent.toml cargo run --bin aura -- webserver
+#
+# Docs: https://docs.mezmo.com/aura/scratchpad
+
+# Created if missing and checked for writability at startup.
+# Single-agent files land in {memory_dir}/scratchpad/.
+memory_dir = "/tmp/aura-scratchpad"
+
+[mcp]
+sanitize_schemas = true
+
+# Kubernetes — cluster inspection
+# https://github.com/containers/kubernetes-mcp-server
+[mcp.servers.kubernetes]
+transport = "http_streamable"
+url = "http://localhost:8081/mcp"
+description = "Kubernetes cluster operations: pods, deployments, services, logs, events"
+
+# Per-tool interception thresholds for this server, in tokens. Keys are glob
+# patterns (`*` and `?`) matched against tool names; the longest matching
+# pattern wins. Omit this table entirely to use the default of 5120 for
+# every tool.
+[mcp.servers.kubernetes.scratchpad]
+"*" = { min_tokens = 5_120 }          # default for everything on this server
+"pods_log" = { min_tokens = 1_500 }   # logs are big and rarely needed in full
+"events_list" = { min_tokens = 1_500 }
+"resources_list" = { min_tokens = 2_500 }
+
+[agent]
+name = "Kubernetes Investigator"
+model_owner = "mezmo"
+system_prompt = """
+You are a Kubernetes troubleshooting assistant.
+
+Large tool outputs are saved to a scratchpad instead of being returned
+inline; you will see a pointer like [scratchpad: file_id=...]. When that
+happens, do not re-run the tool. Use the scratchpad tools to inspect the
+saved output: `head` or `schema` first to learn its shape, then `grep`,
+`slice`, `get_in`, or `iterate_over` to extract exactly what you need.
+
+Report concrete resource names, namespaces, timestamps, and counts. Never
+invent values you did not read from the data.
+"""
+turn_depth = 12
+
+[agent.llm]
+provider = "openai"
+api_key = "{{ env.OPENAI_API_KEY }}"
+model = "gpt-5.2"
+# Required when scratchpad is enabled. Use the real window for your model.
+context_window = 400_000
+
+[agent.scratchpad]
+enabled = true
+# Fraction of context_window held back for reasoning and the final answer.
+context_safety_margin = 0.20
+# Cap on tokens a single exploration tool call may return.
+max_extraction_tokens = 10_000
+# Extra ReAct turns granted so exploration calls don't eat the turn budget.
+turn_depth_bonus = 6

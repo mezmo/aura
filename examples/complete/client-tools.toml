@@ -1,0 +1,48 @@
+# Client-side tools — let the model read files on the machine running the
+# `aura` CLI, not on the server.
+#
+# USE AT YOUR OWN RISK. This hands the model tools that execute on the
+# client. Both sides must opt in: the CLI must be started with
+# `--enable-client-tools`, and this config must set
+# `enable_client_tools = true`. `client_tool_filter` then narrows which of
+# the advertised tools the server will attach.
+#
+# Client tools advertised by the CLI:
+#   Shell, Read, ListFiles, Update, SearchFiles, FindFiles, FileInfo
+# This example allows only the read-only ones. Remove the filter (or list
+# "Shell"/"Update") to allow command execution and file edits.
+#
+# Single-agent mode only: orchestration coordinators and workers never
+# receive client tools, even when the request offers them.
+#
+# Prerequisites:
+#   export OPENAI_API_KEY="sk-..."
+#
+# Usage:
+#   CONFIG_PATH=examples/complete/client-tools.toml cargo run --bin aura -- webserver
+#   # in the directory you want the model to see:
+#   aura --api-url http://localhost:8080 --enable-client-tools
+#
+# Docs: https://docs.mezmo.com/aura/client-side-tools
+
+[agent]
+name = "Code Reader"
+model_owner = "mezmo"
+system_prompt = """
+You help developers understand the project in their current directory.
+Use the client tools to list, find, search, and read files; never assume
+a file's contents. Give file paths and line numbers with every claim.
+You cannot modify files or run commands in this configuration.
+"""
+turn_depth = 15
+
+# Attach client tools offered on the request (default: false).
+enable_client_tools = true
+# Glob patterns (`*`, `?`) against client tool names. Omitted or empty
+# means every advertised tool is attached.
+client_tool_filter = ["Read", "ListFiles", "SearchFiles", "FindFiles", "FileInfo"]
+
+[agent.llm]
+provider = "openai"
+api_key = "{{ env.OPENAI_API_KEY }}"
+model = "gpt-5.2"

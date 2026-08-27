@@ -1,0 +1,205 @@
+# Orchestration — every per-worker override, and every [orchestration.*]
+# knob, in one place. Same K8s + Prometheus setup as kubernetes-sre.toml.
+#
+# Inheritance rules shown by the three workers below:
+#   k8s-discovery       inherits everything from [agent.*] (llm, scratchpad, skills)
+#   prometheus-analyst  overrides llm, scratchpad, and skills
+#   summarizer          no MCP tools; scratchpad explicitly off
+#
+# Per-worker `.scratchpad` REPLACES the agent's table — it is not merged.
+# An override table therefore has to repeat `enabled = true`, or the worker
+# silently runs without scratchpad.
+#
+# Prerequisites:
+#   export OPENAI_API_KEY="sk-..."
+#   Kubernetes context configured (kubectl access)
+#   Start the K8s MCP server:
+#     npx -y kubernetes-mcp-server@latest --port 8081 --read-only
+#   export PROMETHEUS_URL="http://localhost:9090"
+#   Start the Prometheus MCP server:
+#     docker run -i --rm -e PROMETHEUS_URL -e PROMETHEUS_MCP_SERVER_TRANSPORT=http \
+#       -e PROMETHEUS_MCP_BIND_PORT=8082 -p 8082:8082 ghcr.io/pab1it0/prometheus-mcp-server:latest
+#
+# Usage (from the repo root, so the skills path resolves):
+#   AURA_CUSTOM_EVENTS=true CONFIG_PATH=examples/complete/orchestrated-worker-overrides.toml \
+#     cargo run --bin aura -- webserver
+#
+# Docs: https://docs.mezmo.com/aura/configuration-reference#orchestration
+
+# Shared by orchestration persistence ({memory_dir}/{run_id}/...) and worker
+# scratchpads. Required because scratchpad is enabled below.
+memory_dir = "/tmp/aura-worker-overrides"
+
+[mcp]
+sanitize_schemas = true
+
+[mcp.servers.kubernetes]
+transport = "http_streamable"
+url = "http://localhost:8081/mcp"
+description = "Kubernetes cluster operations: pods, deployments, services, logs, events"
+
+[mcp.servers.prometheus]
+transport = "http_streamable"
+url = "http://localhost:8082/mcp"
+description = "Prometheus metrics queries and alert status"
+
+# ── Agent defaults (the coordinator, and what workers inherit) ────────
+
+[agent]
+name = "SRE Coordinator"
+model_owner = "mezmo"
+# In orchestration mode this is the coordinator's prompt.
+system_prompt = """
+You coordinate Kubernetes investigations.
+
+ROUTING
+- Workload state, events, logs → k8s-discovery
+- Metrics, targets, PromQL → prometheus-analyst
+- Turning findings into a report → summarizer
+Dispatch independent tasks in parallel. Answer trivial questions directly.
+"""
+# Default tool-call budget per worker task; workers may override.
+turn_depth = 10
+
+[agent.llm]
+provider = "openai"
+api_key = "{{ env.OPENAI_API_KEY }}"
+model = "gpt-5.2"
+# Required on every LLM that a scratchpad-enabled worker resolves to.
+context_window = 400_000
+
+# Default scratchpad for workers that don't override it.
+[agent.scratchpad]
+enabled = true
+context_safety_margin = 0.20
+max_extraction_tokens = 10_000
+turn_depth_bonus = 6
+
+# Default skill sources for workers that don't override them.
+[[agent.skills.local]]
+source = "examples/complete/skills"
+
+# ── Orchestration ─────────────────────────────────────────────────────
+
+[orchestration]
+enabled = true
+# Plan → execute → re-plan cycles before the coordinator must answer.
+max_planning_cycles = 3
+# Malformed-plan retries before falling back to a single generic task.
+max_plan_parse_retries = 3
+# Let the coordinator skip orchestration for simple questions.
+allow_direct_answers = true
+# Let the coordinator ask the user a question instead of planning.
+allow_clarification = true
+# What the coordinator sees about tools while planning (display only):
+# "none" | "summary" (names per worker) | "full" (names + descriptions).
+tools_in_planning = "summary"
+# Truncate each worker's tool list in the planning prompt after N names.
+max_tools_per_worker = 10
+# Consecutive identical tool calls before the worker is nudged / blocked.
+duplicate_call_nudge_threshold = 3
+duplicate_call_block_threshold = 5
+# Extra instructions injected into the GENERIC worker preamble (used for
+# tasks not assigned to a named worker). Named workers use `preamble`.
+worker_system_prompt = "Report exact resource names and namespaces."
+
+[orchestration.timeouts]
+# Wall-clock budget for one coordinator phase or one worker task; 0 disables.
+per_call_timeout_secs = 180
+# Max silence between stream items before a call is treated as stalled;
+# 0 disables. Must be below per_call_timeout_secs to have any effect.
+# Tool execution time does not count as silence.
+stream_inactivity_timeout_secs = 60
+
+# Backoff for transient failures (provider 5xx, 408, connection errors)
+# on coordinator planning calls. Retry 1 waits base_delay_ms; each later
+# retry doubles the wait, capped at max_delay_ms.
+[orchestration.retry]
+base_delay_ms = 500
+max_delay_ms = 5000
+# Retries after the initial planning call.
+max_retries = 3
+
+[orchestration.artifacts]
+# Worker results longer than this (chars) are written to disk and
+# replaced inline by a summary of at most result_summary_length chars.
+result_artifact_threshold = 4000
+result_summary_length = 2000
+# Tool outputs larger than this (chars) or slower than this (ms) are
+# promoted to artifact files with an inline pointer. 0 = always / never.
+tool_output_artifact_threshold = 500
+tool_output_duration_threshold_ms = 5000
+# Prior run manifests injected into the coordinator prompt as session
+# context; 0 disables.
+session_history_turns = 3
+# Run directories kept per session before the oldest are pruned; 0 = keep all.
+max_session_runs = 20
+# Include condensed tool-call reasoning in the re-planning prompt.
+show_tool_reasoning_in_continuation = false
+
+# ── Workers ───────────────────────────────────────────────────────────
+
+# Inherits [agent.llm], [agent.scratchpad], and [agent.skills] unchanged.
+[orchestration.worker.k8s-discovery]
+description = "Kubernetes workload state: namespaces, pods, events, logs"
+preamble = """
+You are a Kubernetes discovery specialist. Use tools for every fact;
+never guess cluster state. Report names, kinds, replicas, and conditions.
+"""
+# Overrides [agent].turn_depth for this worker.
+turn_depth = 8
+# Glob patterns (`*`, `?`) against MCP tool names. Omit for all tools.
+mcp_filter = [
+  "namespaces_list",
+  "pods_list", "pods_list_in_namespace", "pods_get", "pods_log", "pods_top",
+  "events_list",
+  "resources_get", "resources_list",
+]
+# Names from [[vector_stores]] this worker may search (none defined here;
+# see rag-knowledge-base.toml). Default: no retrieval access.
+vector_stores = []
+
+# Overrides llm, scratchpad, and skills.
+[orchestration.worker.prometheus-analyst]
+description = "Prometheus metrics: PromQL queries, targets, metric metadata"
+preamble = """
+You are a Prometheus analyst. Run the query, then report metric names,
+labels, and values exactly as returned. Do not fabricate numbers.
+"""
+turn_depth = 8
+mcp_filter = ["health_check", "execute_query", "execute_range_query",
+              "list_metrics", "get_metric_metadata", "get_targets"]
+
+# A complete LLM config — provider tag and credentials included — not a
+# partial patch of [agent.llm].
+[orchestration.worker.prometheus-analyst.llm]
+provider = "openai"
+api_key = "{{ env.OPENAI_API_KEY }}"
+model = "gpt-4o"
+context_window = 128_000
+temperature = 0.1
+
+# Replaces [agent.scratchpad] wholesale: `enabled` must be repeated.
+[orchestration.worker.prometheus-analyst.scratchpad]
+enabled = true
+max_extraction_tokens = 4_000
+turn_depth_bonus = 4
+
+# `local = []` disables skills for this worker. A non-empty list would
+# replace (not extend) the agent's sources.
+[orchestration.worker.prometheus-analyst.skills]
+local = []
+
+# No tools, no scratchpad; just synthesizes what the others found.
+[orchestration.worker.summarizer]
+description = "Writes the final incident summary from other workers' findings"
+preamble = """
+You are a technical writer. Using only the material in your task, produce:
+Impact / Since / Cause / Evidence / Next step. Quote evidence verbatim.
+"""
+turn_depth = 2
+# Empty list = no MCP tools at all (omitting the key would mean ALL tools).
+mcp_filter = []
+
+[orchestration.worker.summarizer.scratchpad]
+enabled = false

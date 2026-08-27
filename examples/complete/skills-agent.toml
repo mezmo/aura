@@ -1,0 +1,53 @@
+# Skills — an agent that loads procedural knowledge on demand from local
+# SKILL.md files (Agent Skills spec: https://agentskills.io/specification).
+#
+# Each subdirectory of a `source` path that contains a SKILL.md becomes one
+# skill. At startup the catalog (name + description) is put in the agent's
+# context; the full body is only read when the model calls `load_skill`, so
+# you can ship many skills without paying for them on every request.
+#
+# The skill shipped with this example lives in ./skills/incident-triage/.
+#
+# Prerequisites:
+#   export OPENAI_API_KEY="sk-..."
+#   Kubernetes context configured (kubectl access)
+#   Start the K8s MCP server:
+#     npx -y kubernetes-mcp-server@latest --port 8081 --read-only
+#
+# Usage (run from the repo root — `source` paths resolve against the process
+# working directory):
+#   CONFIG_PATH=examples/complete/skills-agent.toml cargo run --bin aura -- webserver
+#
+# Docs: https://docs.mezmo.com/aura/skills
+
+[mcp]
+sanitize_schemas = true
+
+# Kubernetes — cluster inspection
+# https://github.com/containers/kubernetes-mcp-server
+[mcp.servers.kubernetes]
+transport = "http_streamable"
+url = "http://localhost:8081/mcp"
+description = "Kubernetes cluster operations: pods, deployments, services, logs, events"
+
+[agent]
+name = "SRE Assistant"
+model_owner = "mezmo"
+system_prompt = """
+You are an SRE assistant with access to a Kubernetes cluster and a library
+of skills. When a request matches a skill's description, call `load_skill`
+first and follow the procedure it gives you before using cluster tools.
+Cite which skill you followed in your answer.
+"""
+turn_depth = 15
+
+[agent.llm]
+provider = "openai"
+api_key = "{{ env.OPENAI_API_KEY }}"
+model = "gpt-5.2"
+
+# One entry per directory of skills. Add more [[agent.skills.local]] tables to
+# combine sources; when two sources define the same skill name, the first
+# listed wins and a warning is logged.
+[[agent.skills.local]]
+source = "examples/complete/skills"

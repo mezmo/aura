@@ -1,0 +1,61 @@
+# Fully local agent — Ollama for the model, a stdio MCP server for tools.
+# No API keys, no network egress.
+#
+# The stdio transport spawns the MCP server as a child process per request
+# and talks JSON-RPC over its stdin/stdout. `cmd[0]` is the executable,
+# `cmd[1..]` and `args` are its arguments, `env` is added to its environment.
+#
+# Prerequisites:
+#   1. Install Ollama: https://ollama.com
+#   2. Pull a tool-capable model: ollama pull qwen3:30b-a3b
+#   3. Node.js 18+ for the filesystem MCP server (fetched on first run by npx)
+#   4. A directory the agent may read:
+#        mkdir -p /tmp/aura-sandbox && cp README.md /tmp/aura-sandbox/
+#
+# Usage:
+#   CONFIG_PATH=examples/complete/local-ollama-stdio.toml cargo run --bin aura -- webserver
+#
+# Docs: https://docs.mezmo.com/aura/ollama-guide
+
+[mcp]
+sanitize_schemas = true
+
+# Filesystem — read/search files under an allow-listed root.
+# https://github.com/modelcontextprotocol/servers/tree/main/src/filesystem
+[mcp.servers.filesystem]
+transport = "stdio"
+cmd = ["npx", "-y", "@modelcontextprotocol/server-filesystem"]
+# Trailing arguments; here, the only directory the server may expose.
+args = ["/tmp/aura-sandbox"]
+# Extra environment for the child process (inherits the server's env too).
+env = { NODE_NO_WARNINGS = "1" }
+description = "Read, search, and list files under /tmp/aura-sandbox"
+
+[agent]
+name = "Local File Assistant"
+model_owner = "local"
+system_prompt = """
+You answer questions about the files in /tmp/aura-sandbox. Use the
+filesystem tools to read them; never guess file contents. Quote the
+relevant lines and name the file they came from.
+"""
+turn_depth = 8
+
+[agent.llm]
+provider = "ollama"
+model = "qwen3:30b-a3b"
+# Ollama's default; set this when Ollama runs on another host or in Docker
+# (e.g. http://host.docker.internal:11434).
+base_url = "http://localhost:11434"
+temperature = 0.2
+# Some local models emit tool calls as text instead of native tool_call
+# structures. This parses those from the stream and executes them via MCP.
+# Applies to single-agent mode only (see mezmo/aura#193 for orchestration).
+fallback_tool_parsing = true
+
+# Passed straight through to Ollama's API.
+# https://github.com/ollama/ollama/blob/main/docs/modelfile.md
+[agent.llm.additional_params]
+# Ollama's default context is small; raise it so tool schemas + file
+# contents fit. Costs VRAM.
+num_ctx = 32000

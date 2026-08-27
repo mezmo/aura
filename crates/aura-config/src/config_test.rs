@@ -1607,6 +1607,7 @@ context_window = 200000
             repo_root.join("configs"),
             repo_root.join("examples/minimal"),
             repo_root.join("examples/complete"),
+            repo_root.join("examples/multi-agent"),
         ];
         let single_files = [
             repo_root.join("quickstart.toml"),

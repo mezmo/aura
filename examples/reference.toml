@@ -16,7 +16,26 @@
 #   examples/complete/incident-response-mezmo.toml    - PagerDuty + Mezmo
 #   examples/complete/incident-response-datadog.toml  - PagerDuty + Datadog
 #   examples/complete/kubernetes-sre.toml             - K8s MCP + Prometheus
+#   examples/complete/kubernetes-sre-orchestrated-multi-model.toml
+#                                                     - orchestration, per-worker LLM
 #   examples/complete/devops-assistant.toml           - GitHub MCP
+#   examples/complete/hidden-agent.toml               - alias + hidden from /v1/models
+#
+# Feature-focused configs:
+#   examples/complete/hitl-webhook.toml               - approval gate, webhook route
+#   examples/complete/hitl-conversational.toml        - approval gate, in-chat route
+#   examples/complete/scratchpad-single-agent.toml    - large tool outputs → scratchpad
+#   examples/complete/skills-agent.toml               - on-demand SKILL.md loading
+#   examples/complete/rag-knowledge-base.toml         - Qdrant + Bedrock KB retrieval
+#   examples/complete/local-ollama-stdio.toml         - Ollama + stdio MCP, no API keys
+#   examples/complete/orchestrated-worker-overrides.toml
+#                                                     - every per-worker override + [orchestration.*] knob
+#   examples/complete/reasoning-models.toml           - reasoning_effort / thinking params per provider
+#   examples/complete/client-tools.toml               - CLI-side file tools, read-only filter
+#
+# Several agents from one server: examples/multi-agent/ (CONFIG_PATH=<dir>)
+#
+# Runnable quickstarts (compose / Helm): examples/quickstart-*/
 
 # ── MCP Tool Servers ────────────────────────────────────────────────
 [mcp]
