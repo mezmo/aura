@@ -953,11 +953,7 @@ fn handle_tool_result(
         tracing::debug!(
             "Tool '{}' result_text (first 200 chars): {}",
             tool_name,
-            if result_text.len() > 200 {
-                format!("{}...", &result_text[..200])
-            } else {
-                result_text.clone()
-            }
+            truncate_result(&result_text, 200)
         );
 
         let status = detect_tool_error(&result_text);

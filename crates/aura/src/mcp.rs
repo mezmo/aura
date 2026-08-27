@@ -1346,11 +1346,8 @@ macro_rules! create_mcp_tool_struct {
                 {
                     Ok(response) => {
                         debug!("  Response: {}", response);
-                        let response_summary = if response.len() > 200 {
-                            format!("{}... ({} chars)", &response[..200], response.len())
-                        } else {
-                            response.clone()
-                        };
+                        let response_summary =
+                            crate::mcp_tool_execution::preview_response(&response, 200);
                         info!("Tool '{}' completed: {}", self.tool_name, response_summary);
                         Ok(response)
                     }
@@ -1451,11 +1448,7 @@ impl RigTool for StreamableHttpMcpTool {
         {
             Ok(result) => {
                 debug!("  Tool execution successful");
-                let response_summary = if result.len() > 200 {
-                    format!("{}... ({} chars)", &result[..200], result.len())
-                } else {
-                    result.clone()
-                };
+                let response_summary = crate::mcp_tool_execution::preview_response(&result, 200);
                 info!(
                     "HTTP streamable tool '{}' completed: {}",
                     self.tool_name, response_summary
@@ -1611,11 +1604,7 @@ impl RigTool for FallbackHttpMcpTool {
         {
             Ok(result) => {
                 debug!("  Fallback tool execution successful");
-                let response_summary = if result.len() > 200 {
-                    format!("{}... ({} chars)", &result[..200], result.len())
-                } else {
-                    result.clone()
-                };
+                let response_summary = crate::mcp_tool_execution::preview_response(&result, 200);
                 info!(
                     "Fallback HTTP tool '{}' completed: {}",
                     self.unique_name, response_summary

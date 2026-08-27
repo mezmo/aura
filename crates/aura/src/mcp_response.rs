@@ -180,6 +180,21 @@ pub fn extract_resource_contents(resource: &rmcp::model::ResourceContents) -> St
     }
 }
 
+/// Char-boundary-safe preview for debug logging of tool outputs.
+///
+/// `debug!` arguments are evaluated even when the DEBUG target is
+/// disabled, so preview construction must stay panic-free at any log
+/// level. A fixed byte slice can split a multi-byte character (the `─`
+/// separators common in container logs) and take down the worker.
+fn debug_preview(s: &str) -> String {
+    let (head, truncated) = crate::string_utils::truncate_for_log(s, 200);
+    if truncated {
+        format!("{head}...")
+    } else {
+        head.to_string()
+    }
+}
+
 /// Extract the result from an MCP tool call response
 ///
 /// This function handles two types of MCP tool responses:
@@ -244,11 +259,7 @@ pub fn extract_tool_result(result: CallToolResult, tool_name: &str) -> Result<Ca
         );
         debug!(
             "   Structured content preview: {}",
-            if json_str.len() > 200 {
-                format!("{}...", &json_str[..200])
-            } else {
-                json_str.clone()
-            }
+            debug_preview(&json_str)
         );
 
         return if is_error {
@@ -288,14 +299,7 @@ pub fn extract_tool_result(result: CallToolResult, tool_name: &str) -> Result<Ca
         tool_name,
         content.len()
     );
-    debug!(
-        "   Content preview: {}",
-        if content.len() > 200 {
-            format!("{}...", &content[..200])
-        } else {
-            content.clone()
-        }
-    );
+    debug!("   Content preview: {}", debug_preview(&content));
 
     if is_error {
         Ok(CallOutcome::GeneralToolError {
@@ -887,6 +891,60 @@ mod tests {
             "jsonrpc error message must be bounded; got {} bytes",
             outcome.content().len()
         );
+    }
+
+    // --- UTF-8 boundary regression tests ---
+    //
+    // `debug!` arguments are evaluated even with debug logging off, so
+    // extract_tool_result must stay panic-free for any multibyte layout
+    // whose byte 200 falls inside a character.
+
+    #[test]
+    fn test_debug_preview_stops_at_char_boundary() {
+        // '─' spans bytes 198..201: byte 200 sits mid-character here.
+        let content = format!("{}{}", "a".repeat(198), "─".repeat(50));
+        assert!(content.len() > 200);
+        let preview = debug_preview(&content);
+        assert!(std::str::from_utf8(preview.as_bytes()).is_ok());
+        assert!(preview.starts_with(&"a".repeat(198)));
+        assert!(preview.ends_with("..."));
+        assert!(preview.len() < content.len());
+    }
+
+    #[test]
+    fn test_text_content_multibyte_does_not_panic() {
+        // Sweep alignments so at least one prefix lands byte 200 mid-char
+        // regardless of serde's exact pretty-print layout.
+        for prefix in 0..10 {
+            let text = format!("{}{}", "a".repeat(180 + prefix), "─".repeat(60));
+            let result = CallToolResult {
+                content: vec![Content {
+                    raw: RawContent::Text(RawTextContent { text, meta: None }),
+                    annotations: None,
+                }],
+                structured_content: None,
+                is_error: None,
+                meta: None,
+            };
+            let outcome = extract_tool_result(result, "fetch_container_logs").unwrap();
+            assert!(!outcome.is_error());
+        }
+    }
+
+    #[test]
+    fn test_structured_content_multibyte_does_not_panic() {
+        for prefix in 0..10 {
+            let result = CallToolResult {
+                content: vec![],
+                structured_content: Some(json!({
+                    "logs": format!("{}{}", "a".repeat(180 + prefix), "─".repeat(60)),
+                })),
+                is_error: None,
+                meta: None,
+            };
+            let outcome = extract_tool_result(result, "fetch_container_logs").unwrap();
+            assert!(!outcome.is_error());
+        }
     }
 
     #[test]

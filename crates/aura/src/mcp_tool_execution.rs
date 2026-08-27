@@ -190,7 +190,7 @@ fn bound_transport_error(err_str: &str) -> Option<String> {
 ///
 /// # Returns
 /// Preview string suitable for logging
-fn preview_response(response: &str, max_len: usize) -> String {
+pub(crate) fn preview_response(response: &str, max_len: usize) -> String {
     if response.len() > max_len {
         let truncate_at = response.floor_char_boundary(max_len);
         format!("{}... ({} chars)", &response[..truncate_at], response.len())

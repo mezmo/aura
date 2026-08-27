@@ -97,7 +97,7 @@ pub(crate) fn render_queued_wave(text: &str, wave_pos: f32) -> String {
     let (width, _) = term_size();
     let max_len = (width as usize).saturating_sub(2);
     let display = if text.len() > max_len {
-        &text[..max_len]
+        &text[..text.floor_char_boundary(max_len)]
     } else {
         text
     };
@@ -721,7 +721,7 @@ pub fn print_tool_call_line(
     let (width, _) = term_size();
     let args_display = if display.len() > width as usize {
         let budget = (width as usize).saturating_sub(4);
-        format!("{}...", &display[..budget])
+        format!("{}...", &display[..display.floor_char_boundary(budget)])
     } else {
         display
     };
