@@ -18,11 +18,6 @@ pub struct BlockedAttempt {
 
 impl BlockedAttempt {
     #[must_use]
-    pub fn approval(&self) -> &ApprovalRef {
-        &self.approval
-    }
-
-    #[must_use]
     pub fn into_approval(self) -> ApprovalRef {
         self.approval
     }

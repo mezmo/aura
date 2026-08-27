@@ -74,7 +74,7 @@ use super::types::{
     FailedTaskRecord, FailureCategory, FailureSummary, IterationContext, IterationOutcome,
     IterationTimings, Plan, PlanningResponse, RunId, TaskState, TaskStatus,
 };
-use crate::hitl::{ApprovalItem, ApprovalOrigin, ApprovalRef, ParkedApproval};
+use crate::hitl::{ApprovalOrigin, ApprovalRef, ParkedApproval};
 use crate::session_store::RunStore;
 
 // ============================================================================
@@ -3417,7 +3417,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         approval.decision_id
                     ))
                 })?;
-            let snapshot = Self::parked_approval_snapshot(approval, &parked);
+            let snapshot = Self::parked_approval_snapshot(approval, &parked)?;
             if decided.is_some() {
                 if let Some(task) = reconciled.get_task_mut(approval.task.task_id) {
                     task.released(ApprovalBinding {
@@ -3665,21 +3665,20 @@ Assign tasks to the worker whose tools best match the required operations."#,
     }
 
     /// Build a [`ParkedApprovalSnapshot`] from an in-process [`ApprovalRef`]
-    /// and its durable [`ParkedApproval`] record.
+    /// and its durable [`ParkedApproval`] record. A record with no items is
+    /// fail-closed: snapshotting it would bind the digest of a call the gate
+    /// never saw.
     fn parked_approval_snapshot(
         approval: &ApprovalRef,
         parked: &ParkedApproval,
-    ) -> ParkedApprovalSnapshot {
+    ) -> Result<ParkedApprovalSnapshot, StreamError> {
         let request = &parked.request;
-        let item = request
-            .items
-            .first()
-            .cloned()
-            .unwrap_or_else(|| ApprovalItem {
-                tool_name: String::new(),
-                arguments: serde_json::Value::Null,
-                tool_call_intent: None,
-            });
+        let item = request.items.first().cloned().ok_or_else(|| {
+            StreamError::from(format!(
+                "approval record {} carries no items to snapshot",
+                approval.decision_id
+            ))
+        })?;
         let arguments = item.arguments;
         let args_digest = ArgsDigest::compute(&arguments);
         let origin = match &request.origin {
@@ -3694,7 +3693,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 }
             }
         };
-        ParkedApprovalSnapshot {
+        Ok(ParkedApprovalSnapshot {
             decision_id: approval.decision_id,
             task: approval.task.clone(),
             tool_name: item.tool_name,
@@ -3704,7 +3703,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             registered_at: parked.registered_at,
             expires_at: parked.expires_at,
             decision: DecisionConsumption::Pending,
-        }
+        })
     }
 
     /// Collect failed tasks from this iteration into failure records.

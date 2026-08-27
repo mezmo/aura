@@ -30,20 +30,8 @@ impl<T: Clone> NonEmpty<T> {
         }
     }
 
-    pub fn first(&self) -> &T {
-        &self.0[0]
-    }
-
     pub fn iter(&self) -> std::slice::Iter<'_, T> {
         self.0.iter()
-    }
-
-    pub fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        false
     }
 
     pub fn contains(&self, item: &T) -> bool
