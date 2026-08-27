@@ -3375,6 +3375,61 @@ impl StreamHandler for ReplStreamHandler {
         prepare_input_line(&self.input_buf, Some(&self.cancel));
     }
 
+    fn on_approval_requested(&mut self, requested: &aura_events::ApprovalRequested) {
+        flush_live_reasoning(&self.live_reasoning);
+        flush_all_worker_reasoning(&self.live_worker_reasoning);
+
+        // Stop animation — same dance as on_approval_pending / on_approval_completed.
+        let had_ptw = if let Ok(mut guard) = self.post_tool_wave.lock() {
+            guard.take().map(|(a, _)| a.finish()).is_some()
+        } else {
+            false
+        };
+        if !had_ptw && !self.anim_cleared.load(Ordering::Relaxed) {
+            stop_and_clear_animation(&self.stop_flag);
+            self.anim_cleared.store(true, Ordering::Relaxed);
+        }
+
+        {
+            let _term = lock_term();
+            erase_input_frame();
+
+            use aura_events::ApprovalOriginWire;
+            let origin = match &requested.origin {
+                ApprovalOriginWire::ConfigGate { matched_pattern, .. } => {
+                    format!("config gate · {matched_pattern}")
+                }
+                ApprovalOriginWire::AgentRequested { .. } => "agent requested".to_string(),
+            };
+            // Webhook route: no approval_pending follows (conversational
+            // replaces this line with the interactive prompt within
+            // milliseconds), so a line that lingers is routed to a webhook.
+            let line = format!(
+                "⏸ Approval requested — {} ({origin}) · awaiting webhook decision",
+                requested.tool_name
+            );
+            println!("{}", line.themed(AuraStyle::Warning));
+            crate::ui::prompt::increment_orch_scrollback();
+            println!();
+            crate::ui::prompt::increment_orch_scrollback();
+        }
+
+        // Park with an "Awaiting approval" animation until the decision lands.
+        let (wave_anim, wave_stop) = {
+            let _term = lock_term();
+            WaveAnimation::start(
+                "Awaiting approval",
+                vec![],
+                self.input_buf.clone(),
+                Some(self.cancel.clone()),
+            )
+        };
+        if let Ok(mut guard) = self.post_tool_wave.lock() {
+            *guard = Some((wave_anim, wave_stop));
+        }
+        prepare_input_line(&self.input_buf, Some(&self.cancel));
+    }
+
     fn on_approval_pending(&mut self, pending: &aura_events::ApprovalPending) {
         flush_live_reasoning(&self.live_reasoning);
         flush_all_worker_reasoning(&self.live_worker_reasoning);
