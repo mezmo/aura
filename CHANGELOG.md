@@ -1,5 +1,37 @@
 ## Changelog
 
+## [0.2.9](https://github.com/mezmo/aura/compare/v0.2.8...v0.2.9) (2026-08-27)
+
+
+### Bug Fixes
+
+* **mcp**: truncate tool-result previews on char boundaries [a5aec84](https://github.com/mezmo/aura/commit/a5aec84dc7bf75a8672c698f8a390adbabda63cf) - Mike Shearer [#609](https://github.com/mezmo/aura/issues/609)
+
+## [0.2.8](https://github.com/mezmo/aura/compare/v0.2.7...v0.2.8) (2026-08-26)
+
+
+### Bug Fixes
+
+* **orchestration**: anchor the 500 match to rig's status prefixes [1a38925](https://github.com/mezmo/aura/commit/1a3892590f06e0a5bde450d40fc2c0341876950e) - Mike Shearer [#454](https://github.com/mezmo/aura/issues/454)
+
+* **orchestration**: classify 408 as provider-overloaded [cb66a23](https://github.com/mezmo/aura/commit/cb66a23ec5565f1c0572897387b83ce4a6bf495d) - Mike Shearer [#454](https://github.com/mezmo/aura/issues/454)
+
+* **orchestration**: classify provider 5xx and connection failures [48cad92](https://github.com/mezmo/aura/commit/48cad920c1e3ae315a22416cad21baed6b2ba9d2) - Mike Shearer [#454](https://github.com/mezmo/aura/issues/454)
+
+
+
+### Documentation
+
+* **orchestration**: move retry behavior notes to implementing sites [b80a5bc](https://github.com/mezmo/aura/commit/b80a5bcc0901d9b4d6c29acb1041364c241fde0f) - Mike Shearer [#454](https://github.com/mezmo/aura/issues/454)
+
+* **orchestration**: name the rig rev the workspace pins [8a3391f](https://github.com/mezmo/aura/commit/8a3391fc8e291de27a614a3ea26111a0239047c2) - Mike Shearer [#454](https://github.com/mezmo/aura/issues/454)
+
+
+
+### Features
+
+* **orchestration**: back off transient planning retries [5cb2cd5](https://github.com/mezmo/aura/commit/5cb2cd5c8353e594e9deab3475b2379f63884d6e) - Mike Shearer [#454](https://github.com/mezmo/aura/issues/454)
+
 ## [0.2.7](https://github.com/mezmo/aura/compare/v0.2.6...v0.2.7) (2026-08-26)
 
 

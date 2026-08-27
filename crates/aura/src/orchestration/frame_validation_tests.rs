@@ -1679,5 +1679,9 @@ fn test_session_history_multi_artifact_listing() {
 // ========================================================================
 
 fn prompt_excerpt(s: &str) -> &str {
-    if s.len() > 200 { &s[..200] } else { s }
+    if s.len() > 200 {
+        &s[..s.floor_char_boundary(200)]
+    } else {
+        s
+    }
 }

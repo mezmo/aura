@@ -423,7 +423,7 @@ async fn test_aura_tool_complete_includes_result() {
                 .as_str()
                 .map(|s| {
                     if s.len() > 100 {
-                        format!("{}...", &s[..100])
+                        format!("{}...", &s[..s.floor_char_boundary(100)])
                     } else {
                         s.to_string()
                     }
