@@ -115,19 +115,43 @@ pub(crate) fn validate_rendered(spec: &ConfigSpec, rendered: &str) -> Result<()>
     Ok(())
 }
 
-/// Render a path for pasting into a shell, quoting it when it holds anything
-/// that would otherwise split the argument or be reinterpreted.
+/// Render a path for pasting into the shell this build runs under, quoting
+/// it when it holds anything that would otherwise split the argument or be
+/// reinterpreted.
 fn shell_quote(path: &Path) -> String {
     let s = path.display().to_string();
+    if cfg!(windows) {
+        windows_quote(&s)
+    } else {
+        posix_quote(&s)
+    }
+}
+
+fn posix_quote(s: &str) -> String {
     let safe = !s.is_empty()
         && s.chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/'));
     if safe {
-        return s;
+        return s.to_owned();
     }
     // Close the quote, emit an escaped literal quote, reopen — the only way to
     // carry a single quote through single quoting in POSIX shells.
     format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// cmd.exe and PowerShell both take double quotes; a single quote is an
+/// ordinary character to cmd.exe. Backslash separators and the drive colon
+/// are plain path characters here, not metacharacters.
+fn windows_quote(s: &str) -> String {
+    let safe = !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/' | '\\' | ':'));
+    if safe {
+        return s.to_owned();
+    }
+    // A double quote is not a legal filename character on Windows, so the
+    // quoted body never needs escaping.
+    format!("\"{s}\"")
 }
 
 /// Human-readable next-steps shown after writing the files.
@@ -366,34 +390,73 @@ mod tests {
     }
 
     #[test]
-    fn shell_quote_leaves_ordinary_paths_alone() {
-        assert_eq!(shell_quote(Path::new("config.toml")), "config.toml");
+    fn posix_quote_leaves_ordinary_paths_alone() {
+        assert_eq!(posix_quote("config.toml"), "config.toml");
+        assert_eq!(posix_quote("proj/my-agent_2.toml"), "proj/my-agent_2.toml");
+    }
+
+    #[test]
+    fn posix_quote_protects_paths_a_shell_would_mangle() {
+        assert_eq!(posix_quote("my agent.toml"), "'my agent.toml'");
+        assert_eq!(posix_quote("a;rm -rf b.toml"), "'a;rm -rf b.toml'");
+        assert_eq!(posix_quote("it's.toml"), r"'it'\''s.toml'");
+    }
+
+    #[test]
+    fn windows_quote_leaves_ordinary_paths_alone() {
+        // Separators and the drive colon are not quoting triggers.
         assert_eq!(
-            shell_quote(Path::new("proj/my-agent_2.toml")),
+            windows_quote(r"C:\Users\me\proj\config.toml"),
+            r"C:\Users\me\proj\config.toml"
+        );
+        assert_eq!(
+            windows_quote("proj/my-agent_2.toml"),
             "proj/my-agent_2.toml"
         );
     }
 
     #[test]
-    fn shell_quote_protects_paths_a_shell_would_mangle() {
-        assert_eq!(shell_quote(Path::new("my agent.toml")), "'my agent.toml'");
+    fn windows_quote_uses_double_quotes_cmd_and_powershell_both_honour() {
         assert_eq!(
-            shell_quote(Path::new("a;rm -rf b.toml")),
-            "'a;rm -rf b.toml'"
+            windows_quote(r"C:\My Agents\config.toml"),
+            r#""C:\My Agents\config.toml""#
         );
-        assert_eq!(shell_quote(Path::new("it's.toml")), r"'it'\''s.toml'");
+        assert_eq!(windows_quote("a&b.toml"), r#""a&b.toml""#);
+        // A single quote is literal to cmd.exe, so it must not be the wrapper.
+        assert_eq!(windows_quote("it's.toml"), r#""it's.toml""#);
+    }
+
+    /// The quoted form the running host's shell needs, so the `next_steps`
+    /// assertions hold on every platform the tests run on.
+    fn host_quoted(s: &str) -> String {
+        if cfg!(windows) {
+            format!("\"{s}\"")
+        } else {
+            format!("'{s}'")
+        }
+    }
+
+    #[test]
+    fn shell_quote_follows_the_host_platform() {
+        assert_eq!(shell_quote(Path::new("config.toml")), "config.toml");
+        assert_eq!(
+            shell_quote(Path::new("my agent.toml")),
+            host_quoted("my agent.toml")
+        );
     }
 
     #[test]
     fn next_steps_quotes_a_path_with_spaces() {
         let s = next_steps(Path::new("my agent.toml"), false, Scope::Local);
-        assert!(s.contains("aura --config 'my agent.toml'"), "got: {s}");
+        let want = format!("aura --config {}", host_quoted("my agent.toml"));
+        assert!(s.contains(&want), "got: {s}");
     }
 
     #[test]
     fn next_steps_quotes_a_cd_target_with_spaces() {
         let s = next_steps(Path::new("my proj/config.toml"), false, Scope::Local);
-        assert!(s.contains("cd 'my proj' && aura"), "got: {s}");
+        let want = format!("cd {} && aura", host_quoted("my proj"));
+        assert!(s.contains(&want), "got: {s}");
     }
 
     #[cfg(feature = "standalone-cli")]
