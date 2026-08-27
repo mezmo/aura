@@ -7688,6 +7688,43 @@ mod durable_park_tests {
         );
     }
 
+    /// A durable record whose items are gone cannot be snapshot: the park
+    /// fails closed rather than bind the digest of a call the gate never
+    /// saw. Only a store write can produce this - the gate always registers
+    /// one item.
+    #[tokio::test]
+    async fn a_zero_item_approval_record_fails_the_park_closed() {
+        let approvals = Arc::new(InMemoryApprovalStore::new());
+        let registry =
+            PendingApprovals::with_backend(approvals.clone(), Arc::new(InMemoryEventBus::new()));
+        let run_store = Arc::new(InMemoryRunStore::new());
+        let request_id = unique_request_id();
+        let ownership = ApprovalOwnership::register(&request_id);
+
+        let orchestrator = armed_orchestrator(&registry, run_store.clone(), &request_id).await;
+        let approval = gate_hit(&orchestrator, &registry, &request_id, 0).await;
+        let plan = blocked_plan(&approval);
+
+        let mut record = approvals
+            .get(&approval.decision_id)
+            .await
+            .expect("store readable")
+            .expect("the gate registered it");
+        record.request.items.clear();
+        approvals.register(record).await.expect("re-register");
+
+        let (outcome, frames) = commit(&orchestrator, &plan).await;
+        let Err(err) = outcome else {
+            panic!("a record with no items must not park");
+        };
+        assert!(err.to_string().contains("carries no items"), "{err}");
+        assert!(frames.is_empty(), "a refused park announces nothing");
+        assert!(
+            ownership.begin_teardown(),
+            "a refusal before the transfer leaves the approvals with the request",
+        );
+    }
+
     /// The retry loop's cell is built once per task and handed to every
     /// attempt, so what one attempt consumes the next cannot re-dispatch.
     #[tokio::test]
