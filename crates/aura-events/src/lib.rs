@@ -14,6 +14,7 @@
 //! Both enums derive `Serialize + Deserialize` so they can be used for
 //! producing SSE (server) and parsing SSE (client) with the same types.
 
+pub mod agent;
 pub mod event_names;
 pub mod orchestration;
 
@@ -61,6 +62,176 @@ pub fn format_named_sse(event_name: &str, data: &impl Serialize) -> String {
     format!("event: {event_name}\ndata: {json}\n\n")
 }
 
+// --- Domain value types -----------------------------------------------------
+//
+// The building blocks shared by the agent schema ([`agent::AgentEventPayload`])
+// and the wire schema below. Opaque newtypes reached through canonical
+// conversion traits; each serializes as its inner value.
+
+/// Generates the shared surface of a string newtype: construction, borrowing,
+/// display, and comparison against the string types.
+macro_rules! string_newtype {
+    ($(#[$meta:meta])* $name:ident) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+        #[serde(transparent)]
+        pub struct $name(String);
+
+        impl $name {
+            pub fn new(value: impl Into<String>) -> Self {
+                Self(value.into())
+            }
+
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+
+            pub fn into_string(self) -> String {
+                self.0
+            }
+        }
+
+        impl From<String> for $name {
+            fn from(value: String) -> Self {
+                Self(value)
+            }
+        }
+
+        impl From<&str> for $name {
+            fn from(value: &str) -> Self {
+                Self(value.to_owned())
+            }
+        }
+
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(&self.0)
+            }
+        }
+
+        impl AsRef<str> for $name {
+            fn as_ref(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl PartialEq<str> for $name {
+            fn eq(&self, other: &str) -> bool {
+                self.0 == other
+            }
+        }
+
+        impl PartialEq<&str> for $name {
+            fn eq(&self, other: &&str) -> bool {
+                self.0 == *other
+            }
+        }
+
+        impl PartialEq<String> for $name {
+            fn eq(&self, other: &String) -> bool {
+                &self.0 == other
+            }
+        }
+    };
+}
+
+string_newtype! {
+    /// The id a model assigns to one tool call.
+    ToolCallId
+}
+
+string_newtype! {
+    ToolName
+}
+
+/// Tokens as reported by a model provider, never counted locally.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
+)]
+#[serde(transparent)]
+pub struct TokenCount(u64);
+
+impl TokenCount {
+    pub fn new(tokens: u64) -> Self {
+        Self(tokens)
+    }
+
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl From<u64> for TokenCount {
+    fn from(tokens: u64) -> Self {
+        Self(tokens)
+    }
+}
+
+impl From<TokenCount> for u64 {
+    fn from(count: TokenCount) -> Self {
+        count.0
+    }
+}
+
+impl std::fmt::Display for TokenCount {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// One provider-billed token measurement.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenUsage {
+    pub prompt_tokens: TokenCount,
+    pub completion_tokens: TokenCount,
+    /// Total as the provider reported it, not a sum of the other two fields.
+    pub total_tokens: TokenCount,
+}
+
+/// How far along an operation is, in whatever unit the reporter chose.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Progress {
+    pub current: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total: Option<f64>,
+}
+
+impl Progress {
+    pub fn ratio(current: f64, total: f64) -> Self {
+        Self {
+            current,
+            total: Some(total),
+        }
+    }
+
+    pub fn indeterminate(current: f64) -> Self {
+        Self {
+            current,
+            total: None,
+        }
+    }
+
+    /// A zero total counts as complete.
+    pub fn percent(&self) -> Option<u8> {
+        self.total.map(|total| {
+            if total == 0.0 {
+                100
+            } else {
+                ((self.current / total) * 100.0).min(100.0) as u8
+            }
+        })
+    }
+}
+
+impl std::fmt::Display for Progress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.total {
+            Some(total) => write!(f, "{}/{total}", self.current),
+            None => write!(f, "{}", self.current),
+        }
+    }
+}
+
 /// Context identifying which agent emitted an event.
 ///
 /// For single-agent deployments, use `AgentContext::single_agent()` which sets
@@ -69,7 +240,7 @@ pub fn format_named_sse(event_name: &str, data: &impl Serialize) -> String {
 ///
 /// Note: `AgentContext::default()` gives an empty `agent_id` - use `single_agent()`
 /// for the standard single-agent context.
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct AgentContext {
     /// Unique identifier for this agent (e.g., "main", "log_worker", "rca_worker")
     pub agent_id: String,
@@ -414,6 +585,8 @@ pub enum AuraStreamEvent {
         /// Total tokens used
         total_tokens: u64,
         #[serde(flatten)]
+        agent: AgentContext,
+        #[serde(flatten)]
         correlation: CorrelationContext,
     },
     /// Emitted at stream end with final usage information.
@@ -638,6 +811,7 @@ impl AuraStreamEvent {
         prompt_tokens: u64,
         completion_tokens: u64,
         total_tokens: u64,
+        agent: AgentContext,
         correlation: CorrelationContext,
     ) -> Self {
         Self::ToolUsage {
@@ -645,6 +819,7 @@ impl AuraStreamEvent {
             prompt_tokens,
             completion_tokens,
             total_tokens,
+            agent,
             correlation,
         }
     }
@@ -713,6 +888,63 @@ impl AuraStreamEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn percent_needs_a_total() {
+        assert_eq!(Progress::ratio(50.0, 100.0).percent(), Some(50));
+        assert_eq!(Progress::indeterminate(50.0).percent(), None);
+    }
+
+    /// A server reporting `0/0` has nothing left to do, so it reads as done
+    /// rather than as a division by zero.
+    #[test]
+    fn a_zero_total_is_complete() {
+        assert_eq!(Progress::ratio(0.0, 0.0).percent(), Some(100));
+    }
+
+    #[test]
+    fn percent_is_capped_at_a_hundred() {
+        assert_eq!(Progress::ratio(150.0, 100.0).percent(), Some(100));
+    }
+
+    #[test]
+    fn a_string_newtype_serializes_as_its_bare_string() {
+        let json = serde_json::to_value(ToolCallId::new("call_abc")).unwrap();
+        assert_eq!(json, serde_json::json!("call_abc"));
+        assert_eq!(
+            serde_json::from_value::<ToolCallId>(json).unwrap(),
+            "call_abc"
+        );
+    }
+
+    /// `TokenUsage` flattens into the event variants that carry it, so the
+    /// grouping stays invisible on the wire.
+    #[test]
+    fn token_usage_flattens_to_bare_counts() {
+        #[derive(Serialize)]
+        struct Carrier {
+            #[serde(flatten)]
+            usage: TokenUsage,
+        }
+
+        let json = serde_json::to_value(Carrier {
+            usage: TokenUsage {
+                prompt_tokens: TokenCount::new(10),
+                completion_tokens: TokenCount::new(5),
+                total_tokens: TokenCount::new(15),
+            },
+        })
+        .unwrap();
+
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "total_tokens": 15
+            })
+        );
+    }
 
     #[test]
     fn agent_info_mcp_servers_backward_compatible() {

@@ -28,7 +28,7 @@ use tracing::{debug, error, info, warn};
 use crate::approver_headers::ApproverHeaders;
 use crate::mcp::progress::ProgressEnabledHandler;
 use crate::mcp::response::extract_tool_result;
-use crate::tool_event_broker::{peek_tool_call_id, publish_tool_start};
+use crate::tool_event_broker::{ToolName, peek_tool_call_id, publish_tool_start};
 
 /// Custom HTTP client that captures the underlying HTTP status when a request
 /// fails.
@@ -776,7 +776,7 @@ impl McpClient {
             publish_tool_start(
                 http_request_id,
                 tool_call_id.clone(),
-                tool_name.to_string(),
+                ToolName::new(tool_name),
                 progress_token.clone(),
             )
             .await;
