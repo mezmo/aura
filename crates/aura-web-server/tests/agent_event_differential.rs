@@ -12,7 +12,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use aura::agent_events::{Routed, publish_to_brokers};
+use aura::agent_events::Routed;
 use aura::tool_event_broker::publish_tool_requested;
 use aura::{
     ApprovalLifecycleEvent, NumberOrString, ProgressNotification, ProgressToken, ResponseContent,
@@ -152,20 +152,16 @@ async fn assert_paths_agree(
     );
 }
 
-/// Publishing through the adapter must reach a subscriber; a silent
-/// `NoSubscriber` would make both paths agree on emptiness.
+/// The `Delivered` assert matters because a silent drop would make both paths
+/// agree on emptiness.
 fn emit(
     event: AgentEvent,
 ) -> impl Fn(String) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>> {
     move |request_id: String| {
         let event = event.clone();
         Box::pin(async move {
-            let routed = publish_to_brokers(&request_id, &event).await;
-            assert_eq!(
-                routed,
-                Routed::Delivered,
-                "adapter should reach a subscriber"
-            );
+            let routed = aura::agent_events::emit(&request_id, event).await;
+            assert_eq!(routed, Routed::Delivered, "event should reach a consumer");
         })
     }
 }
