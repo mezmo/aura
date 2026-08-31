@@ -79,7 +79,9 @@ impl OrchestratorFactory {
                 // MCP servers are visible in orchestration mode too (workers
                 // share this one manager).
                 if let Some(ref mcp_manager) = orchestrator.mcp_manager {
-                    mcp_manager.set_current_request(&request_id).await;
+                    mcp_manager
+                        .set_current_call(&request_id, aura_events::AgentContext::coordinator())
+                        .await;
                     let snapshot = mcp_manager.server_status_snapshot();
                     if !snapshot.is_empty() {
                         let _ = event_tx.send(Ok(StreamItem::McpStatus(snapshot))).await;

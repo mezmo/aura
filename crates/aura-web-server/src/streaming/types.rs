@@ -210,11 +210,7 @@ pub mod context {
 
         /// Set agent_context to "coordinator" for orchestration mode.
         pub fn with_orchestration(mut self) -> Self {
-            self.agent_context = AgentContext {
-                agent_id: "coordinator".to_string(),
-                agent_name: None,
-                parent_agent_id: None,
-            };
+            self.agent_context = AgentContext::coordinator();
             self
         }
     }
