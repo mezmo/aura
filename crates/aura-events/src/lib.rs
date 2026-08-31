@@ -14,6 +14,7 @@
 //! Both enums derive `Serialize + Deserialize` so they can be used for
 //! producing SSE (server) and parsing SSE (client) with the same types.
 
+pub mod agent;
 pub mod event_names;
 pub mod orchestration;
 
