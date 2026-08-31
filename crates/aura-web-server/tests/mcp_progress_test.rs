@@ -155,7 +155,7 @@ async fn test_request_progress_broker_accessible() {
 /// Verifies progress notifications only go to the correct request (no cross-request leakage).
 #[tokio::test]
 async fn test_request_progress_isolation() {
-    use aura::{NumberOrString, ProgressNotification, ProgressToken};
+    use aura::{NumberOrString, Progress, ProgressNotification, ProgressToken};
     use std::sync::Arc;
 
     let mut rx1 = request_progress_subscribe("req_1").await;
@@ -163,9 +163,9 @@ async fn test_request_progress_isolation() {
 
     let notification = ProgressNotification {
         progress_token: ProgressToken(NumberOrString::String(Arc::from("token_1"))),
-        progress: 50.0,
-        total: Some(100.0),
+        progress: Progress::ratio(50.0, 100.0),
         message: Some("Progress for request 1".to_string()),
+        agent: None,
     };
 
     let broker = request_progress_global();
@@ -191,7 +191,7 @@ async fn test_request_progress_isolation() {
 
 #[tokio::test]
 async fn test_unsubscribe_stops_progress() {
-    use aura::{NumberOrString, ProgressNotification, ProgressToken};
+    use aura::{NumberOrString, Progress, ProgressNotification, ProgressToken};
 
     let request_id = "req_cancel_test";
     let mut rx = request_progress_subscribe(request_id).await;
@@ -199,9 +199,9 @@ async fn test_unsubscribe_stops_progress() {
     let broker = request_progress_global();
     let notification = ProgressNotification {
         progress_token: ProgressToken(NumberOrString::Number(1)),
-        progress: 10.0,
-        total: Some(100.0),
+        progress: Progress::ratio(10.0, 100.0),
         message: Some("Step 1".to_string()),
+        agent: None,
     };
     broker.publish(request_id, notification).await;
 
@@ -212,9 +212,9 @@ async fn test_unsubscribe_stops_progress() {
 
     let notification2 = ProgressNotification {
         progress_token: ProgressToken(NumberOrString::Number(1)),
-        progress: 20.0,
-        total: Some(100.0),
+        progress: Progress::ratio(20.0, 100.0),
         message: Some("Step 2 - should not be received".to_string()),
+        agent: None,
     };
     let sent = broker.publish(request_id, notification2).await;
 

@@ -9,6 +9,8 @@ use std::sync::OnceLock;
 use tokio::sync::{RwLock, mpsc};
 use tracing::debug;
 
+pub use aura_events::{AgentContext, Progress};
+
 /// Channel capacity for progress notifications per request
 const PROGRESS_CHANNEL_CAPACITY: usize = 1024;
 
@@ -17,24 +19,15 @@ const PROGRESS_CHANNEL_CAPACITY: usize = 1024;
 pub struct ProgressNotification {
     /// The progress token (correlates to tool call)
     pub progress_token: ProgressToken,
-    /// Current progress value (rmcp uses f64 for JSON-RPC compatibility)
-    pub progress: f64,
-    /// Total progress value (if known)
-    pub total: Option<f64>,
+    pub progress: Progress,
     /// Optional message describing current step
     pub message: Option<String>,
+    pub agent: Option<AgentContext>,
 }
 
 impl ProgressNotification {
-    /// Calculate percent completion (0-100) if total is known
     pub fn percent(&self) -> Option<u8> {
-        self.total.map(|total| {
-            if total == 0.0 {
-                100
-            } else {
-                ((self.progress / total) * 100.0).min(100.0) as u8
-            }
-        })
+        self.progress.percent()
     }
 }
 
@@ -191,16 +184,16 @@ mod tests {
 
         let notification = ProgressNotification {
             progress_token: numeric_token(1),
-            progress: 50.0,
-            total: Some(100.0),
+            progress: Progress::ratio(50.0, 100.0),
             message: Some("Halfway there".to_string()),
+            agent: None,
         };
 
         let sent = broker.publish("req_123", notification).await;
         assert!(sent);
 
         let received = rx.recv().await.unwrap();
-        assert_eq!(received.progress, 50.0);
+        assert_eq!(received.progress.current, 50.0);
         assert_eq!(received.message, Some("Halfway there".to_string()));
     }
 
@@ -210,9 +203,9 @@ mod tests {
 
         let notification = ProgressNotification {
             progress_token: numeric_token(1),
-            progress: 50.0,
-            total: Some(100.0),
+            progress: Progress::ratio(50.0, 100.0),
             message: None,
+            agent: None,
         };
 
         // No subscriber - should return false
@@ -229,9 +222,9 @@ mod tests {
         // Send to req_1 only
         let notification = ProgressNotification {
             progress_token: string_token("token_1"),
-            progress: 25.0,
-            total: Some(100.0),
+            progress: Progress::ratio(25.0, 100.0),
             message: Some("Request 1 progress".to_string()),
+            agent: None,
         };
         broker.publish("req_1", notification).await;
 
@@ -244,33 +237,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_percent_calculation() {
-        let notification = ProgressNotification {
-            progress_token: numeric_token(1),
-            progress: 50.0,
-            total: Some(100.0),
-            message: None,
-        };
-        assert_eq!(notification.percent(), Some(50));
-
-        let notification_no_total = ProgressNotification {
-            progress_token: numeric_token(2),
-            progress: 50.0,
-            total: None,
-            message: None,
-        };
-        assert_eq!(notification_no_total.percent(), None);
-
-        let notification_zero_total = ProgressNotification {
-            progress_token: numeric_token(3),
-            progress: 0.0,
-            total: Some(0.0),
-            message: None,
-        };
-        assert_eq!(notification_zero_total.percent(), Some(100));
-    }
-
-    #[tokio::test]
     async fn test_multiple_notifications_same_request() {
         let broker = RequestProgressBroker::new();
         let mut rx = broker.subscribe("req_123").await;
@@ -279,9 +245,9 @@ mod tests {
         for i in 1..=5 {
             let notification = ProgressNotification {
                 progress_token: numeric_token(1),
-                progress: i as f64 * 20.0,
-                total: Some(100.0),
+                progress: Progress::ratio(i as f64 * 20.0, 100.0),
                 message: Some(format!("Step {}", i)),
+                agent: None,
             };
             broker.publish("req_123", notification).await;
         }
@@ -289,7 +255,7 @@ mod tests {
         // Should receive all 5
         for i in 1..=5 {
             let received = rx.recv().await.unwrap();
-            assert_eq!(received.progress, i as f64 * 20.0);
+            assert_eq!(received.progress.current, i as f64 * 20.0);
             assert_eq!(received.message, Some(format!("Step {}", i)));
         }
     }
@@ -308,9 +274,9 @@ mod tests {
         // Publish should fail because receiver is gone, triggering cleanup
         let notification = ProgressNotification {
             progress_token: numeric_token(1),
-            progress: 50.0,
-            total: Some(100.0),
+            progress: Progress::ratio(50.0, 100.0),
             message: Some("Should fail".to_string()),
+            agent: None,
         };
         let sent = broker.publish("req_cleanup", notification).await;
 
@@ -332,9 +298,9 @@ mod tests {
         // Publish should succeed
         let notification = ProgressNotification {
             progress_token: numeric_token(1),
-            progress: 75.0,
-            total: Some(100.0),
+            progress: Progress::ratio(75.0, 100.0),
             message: Some("Should succeed".to_string()),
+            agent: None,
         };
         let sent = broker.publish("req_active", notification).await;
         assert!(sent);
@@ -343,7 +309,7 @@ mod tests {
         let received = rx.recv().await;
         assert!(received.is_some());
         let msg = received.unwrap();
-        assert_eq!(msg.progress, 75.0);
+        assert_eq!(msg.progress.current, 75.0);
         assert_eq!(msg.message, Some("Should succeed".to_string()));
 
         // Subscription still active
@@ -369,9 +335,9 @@ mod tests {
             for i in 0..send_count {
                 let notification = ProgressNotification {
                     progress_token: numeric_token(i as i64),
-                    progress: i as f64,
-                    total: Some(send_count as f64),
+                    progress: Progress::ratio(i as f64, send_count as f64),
                     message: Some(format!("msg {}", i)),
+                    agent: None,
                 };
                 broker.publish("req_backpressure", notification).await;
             }
@@ -395,9 +361,9 @@ mod tests {
         for i in 0..PROGRESS_CHANNEL_CAPACITY {
             let notification = ProgressNotification {
                 progress_token: numeric_token(i as i64),
-                progress: i as f64,
-                total: Some(PROGRESS_CHANNEL_CAPACITY as f64),
+                progress: Progress::ratio(i as f64, PROGRESS_CHANNEL_CAPACITY as f64),
                 message: None,
+                agent: None,
             };
             assert!(broker.publish("req_drain", notification).await);
         }
@@ -427,9 +393,9 @@ mod tests {
                     for i in 0..10 {
                         let notification = ProgressNotification {
                             progress_token: numeric_token((publisher_id * 10 + i) as i64),
-                            progress: i as f64,
-                            total: Some(10.0),
+                            progress: Progress::ratio(i as f64, 10.0),
                             message: Some(format!("pub {} msg {}", publisher_id, i)),
+                            agent: None,
                         };
                         broker.publish("req_concurrent", notification).await;
                     }

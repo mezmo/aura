@@ -26,12 +26,12 @@ use super::types::{
     FunctionCallChunk, MessageRole, StreamConfig, ToolCallChunk, ToolResultMode, ToolResultStatus,
     TurnContext, TurnState, detect_tool_error, format_sse_chunk, truncate_result,
 };
-use aura::stream_events::AuraStreamEvent;
+use aura::stream_events::{AuraStreamEvent, CorrelationContext};
 use aura::{
     ApprovalLifecycleEvent, EventContext, OrchestrationStreamEvent, OrchestratorEvent,
     PASSTHROUGH_MARKER, ProgressNotification, RequestCancellation, ResponseContent, StreamError,
     StreamItem, StreamedAssistantContent, StreamedUserContent, StreamingAgent, ToolCall,
-    ToolLifecycleEvent, ToolResult, ToolUsageEvent, UsageState,
+    ToolCallId, ToolLifecycleEvent, ToolResult, ToolUsageEvent, UsageState,
 };
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
@@ -240,19 +240,18 @@ where
                     inactivity.touch();
                     let event = AuraStreamEvent::progress(
                         notification.message.clone().unwrap_or_else(|| {
-                            format!("Progress: {}/{:?}", notification.progress, notification.total)
+                            format!("Progress: {}", notification.progress)
                         }),
                         "mcp_progress",
                         notification.percent(),
                         Some(notification.progress_token.clone()),
-                        ctx.agent_context.clone(),
+                        notification.agent.clone().unwrap_or_else(|| ctx.agent_context.clone()),
                         ctx.correlation.clone(),
                     );
                     tracing::debug!(
-                        "Emitting aura.progress event: token={:?}, progress={}/{:?}",
+                        "Emitting aura.progress event: token={:?}, progress={}",
                         notification.progress_token,
-                        notification.progress,
-                        notification.total
+                        notification.progress
                     );
                     if tx.send(Ok(Bytes::from(event.format_sse()))).await.is_err() {
                         tracing::info!("Client disconnected during progress notification");
@@ -266,29 +265,29 @@ where
                 if let Some(tool_event) = tool_event {
                     inactivity.touch();
                     let sse_event = match tool_event {
-                        ToolLifecycleEvent::Requested { tool_id, tool_name, arguments } => {
+                        ToolLifecycleEvent::Requested { tool_id, tool_name, arguments, agent } => {
                             tracing::debug!(
                                 "Emitting aura.tool_requested event: tool_id={}, tool_name={}",
                                 tool_id, tool_name
                             );
                             AuraStreamEvent::tool_requested(
-                                &tool_id,
-                                &tool_name,
+                                tool_id.as_str(),
+                                tool_name.as_str(),
                                 arguments,
-                                ctx.agent_context.clone(),
+                                agent.unwrap_or_else(|| ctx.agent_context.clone()),
                                 ctx.correlation.clone(),
                             )
                         }
-                        ToolLifecycleEvent::Start { tool_id, tool_name, progress_token } => {
+                        ToolLifecycleEvent::Start { tool_id, tool_name, progress_token, agent } => {
                             tracing::debug!(
                                 "Emitting aura.tool_start event: tool_id={}, tool_name={}, progress_token={:?}",
                                 tool_id, tool_name, progress_token
                             );
                             AuraStreamEvent::tool_start(
-                                &tool_id,
-                                &tool_name,
+                                tool_id.as_str(),
+                                tool_name.as_str(),
                                 progress_token,
-                                ctx.agent_context.clone(),
+                                agent.unwrap_or_else(|| ctx.agent_context.clone()),
                                 ctx.correlation.clone(),
                             )
                         }
@@ -328,15 +327,9 @@ where
                     inactivity.touch();
                     tracing::debug!(
                         "Emitting aura.tool_usage event: tool_ids={:?}, prompt_tokens={}",
-                        usage_event.tool_ids, usage_event.prompt_tokens
+                        usage_event.tool_ids, usage_event.usage.prompt_tokens
                     );
-                    let sse_event = AuraStreamEvent::tool_usage(
-                        usage_event.tool_ids,
-                        usage_event.prompt_tokens,
-                        usage_event.completion_tokens,
-                        usage_event.total_tokens,
-                        ctx.correlation.clone(),
-                    );
+                    let sse_event = tool_usage_sse(usage_event, ctx.correlation.clone());
                     if tx.send(Ok(Bytes::from(sse_event.format_sse()))).await.is_err() {
                         tracing::info!("Client disconnected during tool_usage event");
                         break StreamTermination::Disconnected;
@@ -478,6 +471,20 @@ fn resolve_billed_usage(
     }
 }
 
+fn tool_usage_sse(event: ToolUsageEvent, correlation: CorrelationContext) -> AuraStreamEvent {
+    AuraStreamEvent::tool_usage(
+        event
+            .tool_ids
+            .into_iter()
+            .map(ToolCallId::into_string)
+            .collect(),
+        event.usage.prompt_tokens.get(),
+        event.usage.completion_tokens.get(),
+        event.usage.total_tokens.get(),
+        correlation,
+    )
+}
+
 /// Send final usage events, finish chunk, and [DONE] marker to the client.
 async fn send_final_events(
     emit_custom_events: bool,
@@ -489,13 +496,7 @@ async fn send_final_events(
     // Drain any pending tool_usage events before emitting final aura.usage
     if emit_custom_events {
         while let Ok(usage_event) = callbacks.tool_usage_rx.try_recv() {
-            let sse_event = AuraStreamEvent::tool_usage(
-                usage_event.tool_ids,
-                usage_event.prompt_tokens,
-                usage_event.completion_tokens,
-                usage_event.total_tokens,
-                ctx.correlation.clone(),
-            );
+            let sse_event = tool_usage_sse(usage_event, ctx.correlation.clone());
             if tx
                 .send(Ok(Bytes::from(sse_event.format_sse())))
                 .await
@@ -1555,6 +1556,7 @@ fn build_final_chunk(ctx: &TurnContext, state: &TurnState) -> Vec<Bytes> {
 mod tests {
     use super::*;
     use aura::stream_events::{AgentContext, CorrelationContext};
+    use aura::{Progress, ToolName};
     use aura_events::event_names;
 
     /// Verify handle_tool_call does NOT emit aura.tool_requested events directly.
@@ -2415,9 +2417,9 @@ mod tests {
                                 progress_token: aura::ProgressToken(aura::NumberOrString::Number(
                                     n,
                                 )),
-                                progress: n as f64,
-                                total: Some(3.0),
+                                progress: Progress::ratio(n as f64, 3.0),
                                 message: Some("working".into()),
+                                agent: None,
                             })
                             .await;
                     }
@@ -2625,9 +2627,10 @@ mod tests {
                 let tx = tx.clone();
                 async move {
                     tx.send(ToolLifecycleEvent::Requested {
-                        tool_id: TOOL_ID.to_string(),
-                        tool_name: TOOL_NAME.to_string(),
+                        tool_id: ToolCallId::new(TOOL_ID),
+                        tool_name: ToolName::new(TOOL_NAME),
                         arguments: json!({ "path": "/mock" }),
+                        agent: None,
                     })
                     .await
                     .expect("tool event channel open");
@@ -2641,9 +2644,10 @@ mod tests {
                 let tx = tx.clone();
                 async move {
                     tx.send(ToolLifecycleEvent::Start {
-                        tool_id: TOOL_ID.to_string(),
-                        tool_name: TOOL_NAME.to_string(),
+                        tool_id: ToolCallId::new(TOOL_ID),
+                        tool_name: ToolName::new(TOOL_NAME),
                         progress_token: Some(ProgressToken(NumberOrString::Number(7))),
+                        agent: None,
                     })
                     .await
                     .expect("tool event channel open");
@@ -2658,9 +2662,9 @@ mod tests {
                 async move {
                     tx.send(ProgressNotification {
                         progress_token: ProgressToken(NumberOrString::Number(7)),
-                        progress: 50.0,
-                        total: Some(100.0),
+                        progress: Progress::ratio(50.0, 100.0),
                         message: Some("halfway".to_string()),
+                        agent: None,
                     })
                     .await
                     .expect("progress channel open");
