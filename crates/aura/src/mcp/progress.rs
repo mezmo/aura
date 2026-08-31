@@ -29,7 +29,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
-use crate::request_progress::{self, ProgressNotification};
+use aura_events::agent::{AgentEvent, AgentEventPayload};
 
 /// A custom ClientHandler that routes progress notifications to request-scoped channels.
 ///
@@ -119,18 +119,18 @@ impl ClientHandler for ProgressEnabledHandler {
             // Get current request ID (if any)
             let request_id = self.current_request_id.read().await.clone();
 
-            // Build notification for request-scoped broker
-            let notification = ProgressNotification {
-                progress_token: params.progress_token.clone(),
-                progress: params.progress,
-                total: params.total,
-                message: params.message.clone(),
-            };
-
             if let Some(ref req_id) = request_id {
-                // Route to request-specific channel
-                let sent = request_progress::publish(req_id, notification).await;
-                if sent {
+                let routed = crate::agent_events::emit(
+                    req_id,
+                    AgentEvent::single_agent(AgentEventPayload::ToolProgress {
+                        progress_token: params.progress_token.clone(),
+                        progress: params.progress,
+                        total: params.total,
+                        message: params.message.clone(),
+                    }),
+                )
+                .await;
+                if routed == crate::agent_events::Routed::Delivered {
                     debug!(
                         "Progress notification routed to request '{}': progress={}, message={:?}",
                         req_id, params.progress, params.message

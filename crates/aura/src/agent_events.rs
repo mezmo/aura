@@ -1,9 +1,9 @@
-//! Projection of [`AgentEvent`]s back onto the request-scoped brokers.
+//! Projection of [`AgentEvent`]s onto the request-scoped brokers.
 //!
 //! Producers move onto the [`aura_events::agent`] schema one at a time. This
 //! adapter lets them do that without any consumer changing: it republishes an
 //! agent's events into the same brokers the SSE handler, A2A executor, and CLI
-//! already subscribe to, so both paths converge on identical output.
+//! already subscribe to.
 //!
 //! Scope: the side channels only — tool lifecycle, MCP progress, tool usage,
 //! and HITL approvals. Content-bearing events ([`AgentEventPayload::TextDelta`]
@@ -13,15 +13,13 @@
 use aura_events::agent::{AgentEvent, AgentEventPayload};
 
 use crate::approval_event_broker::{self, ApprovalLifecycleEvent};
-use crate::env_flags::bool_env;
 use crate::request_progress::{self, ProgressNotification};
 use crate::tool_event_broker::{publish_tool_requested, publish_tool_start, publish_tool_usage};
 
-pub const ENV_AGENT_EVENTS: &str = "AURA_AGENT_EVENTS";
-
-/// Defaults off until the schema reaches parity with the broker path.
-pub fn agent_events_enabled() -> bool {
-    bool_env(ENV_AGENT_EVENTS, false)
+/// The seam producers call, so a real event stream can attach here later
+/// without touching the emission sites.
+pub async fn emit(request_id: &str, event: AgentEvent) -> Routed {
+    publish_to_brokers(request_id, &event).await
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -291,10 +289,5 @@ mod tests {
         .await;
 
         assert_eq!(routed, Routed::NoSubscriber);
-    }
-
-    #[tokio::test]
-    async fn the_flag_is_off_unless_set() {
-        assert!(!agent_events_enabled());
     }
 }
