@@ -26,7 +26,8 @@ use tracing::{debug, error, info, warn};
 use crate::approver_headers::ApproverHeaders;
 use crate::mcp_progress::ProgressEnabledHandler;
 use crate::mcp_response::extract_tool_result;
-use crate::tool_event_broker::{peek_tool_call_id, publish_tool_start};
+use crate::tool_event_broker::peek_tool_call_id;
+use aura_events::agent::{AgentEvent, AgentEventPayload};
 
 /// Build the CallTool request, attaching approver header overrides as a
 /// request extension when present. The extension rides on this one
@@ -503,11 +504,13 @@ impl McpClient {
         let progress_token = Some(handle.progress_token.clone());
         let request_id_string = http_request_id.to_string();
         if let Some(tool_call_id) = peek_tool_call_id(&request_id_string).await {
-            publish_tool_start(
+            crate::agent_events::emit(
                 http_request_id,
-                tool_call_id.clone(),
-                tool_name.to_string(),
-                progress_token.clone(),
+                AgentEvent::single_agent(AgentEventPayload::ToolStart {
+                    tool_id: tool_call_id.clone(),
+                    tool_name: tool_name.to_string(),
+                    progress_token: progress_token.clone(),
+                }),
             )
             .await;
             debug!(

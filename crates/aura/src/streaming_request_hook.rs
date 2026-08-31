@@ -32,9 +32,8 @@
 //! ```
 
 use crate::scratchpad::{self, ContextBudget};
-use crate::tool_event_broker::{
-    pop_tool_call_id, publish_tool_requested, publish_tool_usage, push_tool_call_id,
-};
+use crate::tool_event_broker::{pop_tool_call_id, push_tool_call_id};
+use aura_events::agent::{AgentEvent, AgentEventPayload};
 use rig::agent::{CancelSignal, StreamingPromptHook};
 use rig::completion::{CompletionModel, GetTokenUsage, Message};
 use std::collections::HashSet;
@@ -480,8 +479,15 @@ where
                 // Rig 0.28+ passes correct tool_call_id; register for event correlation
                 if let Some(id) = &tool_call_id {
                     push_tool_call_id(&request_id, id.clone()).await;
-                    publish_tool_requested(&request_id, id.clone(), tool_name.clone(), arguments)
-                        .await;
+                    crate::agent_events::emit(
+                        &request_id,
+                        AgentEvent::single_agent(AgentEventPayload::ToolRequested {
+                            tool_id: id.clone(),
+                            tool_name: tool_name.clone(),
+                            arguments,
+                        }),
+                    )
+                    .await;
                 } else {
                     tracing::warn!(
                         "Tool '{}' called without tool_call_id for request '{}' - event correlation unavailable",
@@ -610,12 +616,14 @@ where
                         tool_ids.len(),
                         tool_ids
                     );
-                    publish_tool_usage(
+                    crate::agent_events::emit(
                         &request_id,
-                        tool_ids,
-                        usage.input_tokens,
-                        usage.output_tokens,
-                        usage.total_tokens,
+                        AgentEvent::single_agent(AgentEventPayload::ToolUsage {
+                            tool_ids,
+                            prompt_tokens: usage.input_tokens,
+                            completion_tokens: usage.output_tokens,
+                            total_tokens: usage.total_tokens,
+                        }),
                     )
                     .await;
                 }
