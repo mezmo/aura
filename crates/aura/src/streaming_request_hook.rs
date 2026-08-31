@@ -44,6 +44,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use aura_events::agent::{AgentEvent, AgentEventPayload};
 use rig::agent::{CancelSignal, StreamingPromptHook};
 use rig::completion::{CompletionModel, GetTokenUsage, Message};
 use tokio::sync::watch;
@@ -51,8 +52,7 @@ use tokio::sync::watch;
 use crate::orchestration::BlockedCell;
 use crate::scratchpad::{self, ContextBudget};
 use crate::tool_event_broker::{
-    TokenUsage, ToolCallId, ToolName, pop_tool_call_id, publish_tool_requested, publish_tool_usage,
-    push_tool_call_id,
+    TokenUsage, ToolCallId, ToolName, pop_tool_call_id, push_tool_call_id,
 };
 
 /// Maximum pending tool IDs before warning. Prevents unbounded growth if
@@ -595,8 +595,15 @@ where
                 if let Some(id) = &tool_call_id {
                     let id = ToolCallId::new(id);
                     push_tool_call_id(&request_id, id.clone()).await;
-                    publish_tool_requested(&request_id, id, ToolName::new(&tool_name), arguments)
-                        .await;
+                    let _ = crate::agent_events::emit(
+                        &request_id,
+                        AgentEvent::single_agent(AgentEventPayload::ToolRequested {
+                            tool_call_id: id,
+                            tool_name: ToolName::new(&tool_name),
+                            arguments,
+                        }),
+                    )
+                    .await;
                 } else {
                     tracing::warn!(
                         "Tool '{}' called without tool_call_id for request '{}' - event correlation unavailable",
@@ -732,14 +739,16 @@ where
                         tool_ids.len(),
                         tool_ids
                     );
-                    publish_tool_usage(
+                    let _ = crate::agent_events::emit(
                         &request_id,
-                        tool_ids,
-                        TokenUsage {
-                            prompt_tokens: usage.input_tokens.into(),
-                            completion_tokens: usage.output_tokens.into(),
-                            total_tokens: usage.total_tokens.into(),
-                        },
+                        AgentEvent::single_agent(AgentEventPayload::ToolUsage {
+                            tool_call_ids: tool_ids,
+                            usage: TokenUsage {
+                                prompt_tokens: usage.input_tokens.into(),
+                                completion_tokens: usage.output_tokens.into(),
+                                total_tokens: usage.total_tokens.into(),
+                            },
+                        }),
                     )
                     .await;
                 }

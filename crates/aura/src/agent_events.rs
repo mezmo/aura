@@ -1,9 +1,8 @@
-//! Projection of [`AgentEvent`]s back onto the request-scoped brokers.
+//! Projection of [`AgentEvent`]s onto the request-scoped brokers.
 //!
-//! Producers move onto the [`aura_events::agent`] schema one at a time. This
-//! adapter lets them do that without any consumer changing, because it
-//! republishes an agent's events into the same brokers the SSE handler already
-//! subscribes to, so both paths converge on identical output.
+//! Producers build [`AgentEvent`]s; this adapter republishes each one onto the
+//! request-scoped broker its payload belongs to, which is what the SSE handler
+//! subscribes to.
 //!
 //! Scope: the side channels only — tool lifecycle, MCP progress, tool usage,
 //! and HITL approvals. Content-bearing events ([`AgentEventPayload::TextDelta`]
@@ -13,17 +12,26 @@
 use aura_events::agent::{AgentEvent, AgentEventPayload};
 
 use crate::approval_event_broker::{self, ApprovalLifecycleEvent};
-use crate::env_flags::bool_env;
 use crate::request_progress::{self, ProgressNotification};
 use crate::tool_event_broker::{self, ToolLifecycleEvent, ToolUsageEvent};
 
-pub const ENV_AGENT_EVENTS: &str = "AURA_AGENT_EVENTS";
+/// The seam producers call, so a real event stream can attach here later
+/// without touching the emission sites.
+///
+/// A payload that finds no subscriber is reported here, so producers that only
+/// wanted it logged have nothing to branch on.
+pub async fn emit(request_id: &str, event: AgentEvent) -> Routed {
+    let payload = std::mem::discriminant(&event.payload);
+    let routed = publish_to_brokers(request_id, event).await;
 
-/// Defaults off until the schema reaches parity with the broker path.
-pub fn agent_events_enabled() -> bool {
-    bool_env(ENV_AGENT_EVENTS, false)
+    if routed == Routed::NoSubscriber {
+        tracing::debug!(request_id, ?payload, "agent event reached no consumer");
+    }
+
+    routed
 }
 
+#[must_use]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Routed {
     Delivered,
@@ -40,8 +48,9 @@ pub enum Routed {
 /// The event's [`AgentContext`] rides along on every broker event that carries
 /// one, so a worker's tool call stays attributed to the worker rather than to
 /// the stream's own agent.
-pub async fn publish_to_brokers(request_id: &str, event: AgentEvent) -> Routed {
+pub(crate) async fn publish_to_brokers(request_id: &str, event: AgentEvent) -> Routed {
     let AgentEvent { agent, payload } = event;
+    let payload_kind = std::mem::discriminant(&payload);
     let delivered = match payload {
         AgentEventPayload::ToolRequested {
             tool_call_id,
@@ -136,7 +145,14 @@ pub async fn publish_to_brokers(request_id: &str, event: AgentEvent) -> Routed {
         | AgentEventPayload::WorkerPhase { .. }
         | AgentEventPayload::Usage { .. }
         | AgentEventPayload::ContextUsage { .. }
-        | AgentEventPayload::ScratchpadUsage { .. } => return Routed::NotSideChannel,
+        | AgentEventPayload::ScratchpadUsage { .. } => {
+            tracing::trace!(
+                request_id,
+                payload = ?payload_kind,
+                "content payload reached no broker; it travels on the StreamItem stream"
+            );
+            return Routed::NotSideChannel;
+        }
 
         unknown => {
             tracing::warn!(
@@ -209,7 +225,7 @@ mod tests {
         let request_id = "req_adapter_start";
         let mut rx = tool_event_subscribe(request_id).await;
 
-        publish_to_brokers(
+        let _ = publish_to_brokers(
             request_id,
             AgentEvent::single_agent(AgentEventPayload::ToolStart {
                 tool_call_id: ToolCallId::new("call_1"),
@@ -232,7 +248,7 @@ mod tests {
         let request_id = "req_adapter_progress";
         let mut rx = progress_subscribe(request_id).await;
 
-        publish_to_brokers(
+        let _ = publish_to_brokers(
             request_id,
             AgentEvent::single_agent(AgentEventPayload::ToolProgress {
                 progress_token: token(7),
@@ -257,7 +273,7 @@ mod tests {
         let mut rx = tool_usage_subscribe(request_id).await;
         let worker = AgentContext::worker("log_worker", None, "coordinator");
 
-        publish_to_brokers(
+        let _ = publish_to_brokers(
             request_id,
             AgentEvent::new(
                 worker.clone(),
@@ -282,7 +298,7 @@ mod tests {
         let request_id = "req_adapter_usage";
         let mut rx = tool_usage_subscribe(request_id).await;
 
-        publish_to_brokers(
+        let _ = publish_to_brokers(
             request_id,
             AgentEvent::single_agent(AgentEventPayload::ToolUsage {
                 tool_call_ids: vec![ToolCallId::new("call_1")],
@@ -355,7 +371,7 @@ mod tests {
         let mut rx = tool_event_subscribe(request_id).await;
         let worker = AgentContext::worker("log_worker", None, "orchestrator");
 
-        publish_to_brokers(
+        let _ = publish_to_brokers(
             request_id,
             AgentEvent::new(
                 worker.clone(),
@@ -374,14 +390,5 @@ mod tests {
             panic!("expected Requested");
         };
         assert_eq!(agent, Some(worker));
-    }
-
-    /// Probes an unset name rather than [`ENV_AGENT_EVENTS`] itself, because
-    /// reading the real var asserts on the ambient environment and fails for
-    /// anyone who has the flag exported.
-    #[test]
-    fn the_flag_is_off_unless_set() {
-        assert_eq!(ENV_AGENT_EVENTS, "AURA_AGENT_EVENTS");
-        assert!(!bool_env("AURA_AGENT_EVENTS_UNSET_PROBE", false));
     }
 }

@@ -263,6 +263,15 @@ impl AgentContext {
         }
     }
 
+    /// Create an orchestration run's context with agent_id = "coordinator"
+    pub fn coordinator() -> Self {
+        Self {
+            agent_id: "coordinator".to_string(),
+            agent_name: None,
+            parent_agent_id: None,
+        }
+    }
+
     /// Create a single-agent context with a custom name
     pub fn single_agent_with_name(name: impl Into<String>) -> Self {
         Self {
