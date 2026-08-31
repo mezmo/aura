@@ -5,6 +5,7 @@
 //! in web services or other applications that need to build agents
 //! programmatically.
 
+pub mod agent_events;
 pub mod approval_event_broker;
 pub mod approver_headers;
 pub mod bedrock_embedding;
