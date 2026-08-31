@@ -1631,7 +1631,9 @@ mod tests {
                 tool: "search_logs".to_string(),
                 reasoning: String::new(),
                 duration_ms: 1200,
-                outcome: ToolOutcome::Success { output_bytes: 27171 },
+                outcome: ToolOutcome::Success {
+                    output_bytes: 27171,
+                },
                 artifact_filename: Some("task-0-sre-iter-1-tool-1.txt".to_string()),
             }],
         );
