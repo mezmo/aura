@@ -19,6 +19,9 @@ default-members = [
     "crates/aura-test-utils",
     "crates/aura-cli",
 ]
+# Keep a local rig checkout's crates out of this workspace (used when
+# temporarily path-pinning rig-core/rig-bedrock at ./rig for fork work).
+exclude = ["rig"]
 resolver = "3"
 
 [workspace.package]
@@ -35,10 +38,11 @@ codegen-units = 1
 strip = "symbols"
 
 [workspace.dependencies]
-rig-core = { git = "https://github.com/mezmo/rig.git", rev = "5b0238a1d74e1d7c68034384b69e17f62890d517", default-features = false, features = ["rmcp", "reqwest-rustls"] }
-# Pinned to exact versions compatible with our rig-core 0.28.x fork.
-# Newer versions pull in rig-core 0.31+ which is semver-incompatible with the fork.
-rig-bedrock = "=0.3.10"
+rig-core = { git = "https://github.com/mezmo/rig.git", rev = "8fbc59c4772566629d353459617505191e415ed2", default-features = false, features = ["rmcp", "reqwest-rustls"] }
+# The fork's vendored copy (0.3.10 + prompt-caching support), building against
+# the same rig-core. crates.io 0.3.11+ pulls rig-core 0.31, which is
+# semver-incompatible with the 0.28 fork.
+rig-bedrock = { git = "https://github.com/mezmo/rig.git", rev = "8fbc59c4772566629d353459617505191e415ed2" }
 
 # MCP support
 rmcp = { version = "0.12.0", features = ["transport-child-process", "client", "transport-streamable-http-client", "transport-streamable-http-client-reqwest"] }
@@ -106,5 +110,5 @@ http = "1.0"
 
 # Patch rig-core to use the fork with streaming hook + span propagation fix
 [patch.crates-io]
-rig-core = { git = "https://github.com/mezmo/rig.git", rev = "5b0238a1d74e1d7c68034384b69e17f62890d517" }
+rig-core = { git = "https://github.com/mezmo/rig.git", rev = "8fbc59c4772566629d353459617505191e415ed2" }
 
