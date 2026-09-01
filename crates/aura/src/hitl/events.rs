@@ -1,15 +1,19 @@
-//! The single conversion boundary between the HITL domain and the `aura-events`
-//! SSE DTO layer. The only file in this module that imports both worlds: domain
-//! types from `super::*` and wire DTOs from `aura_events`.
+//! Where HITL domain types become the wire DTOs that describe an approval.
 //!
-//! The domain never imports its core types from `aura-events`; conversions only
-//! flow one way, domain -> wire, and only here.
+//! The domain owns its core types and never takes them from `aura-events`.
+//! Conversion runs one way, domain -> wire, and lives here so a serialization
+//! shape cannot reach back into the domain.
+//!
+//! The agent event schema is a separate concern from those DTOs. The
+//! constructors below return a finished event, so an approval's payload and its
+//! envelope come from one scope.
 
 use std::time::Duration;
 
+use aura_events::agent::{AgentEvent, AgentEventPayload};
 use aura_events::{
-    AgentScopeWire, ApprovalCompleted, ApprovalOriginWire, ApprovalOutcomeWire, ApprovalPending,
-    ApprovalRequested, CancelReasonWire,
+    AgentContext, AgentScopeWire, ApprovalCompleted, ApprovalOriginWire, ApprovalOutcomeWire,
+    ApprovalPending, ApprovalRequested, COORDINATOR_AGENT_ID, CancelReasonWire,
 };
 
 use super::decision::{
@@ -17,6 +21,86 @@ use super::decision::{
 };
 use super::protocol::{ApprovalRequest, ApprovalRequestWire};
 use super::registry::ParkedApproval;
+
+/// The agent whose gated call an approval belongs to.
+///
+/// A named worker is attributed to itself. An unnamed worker has no name in the
+/// scope, so it is attributed to the coordinator that runs it.
+fn agent_of(scope: &AgentScope) -> AgentContext {
+    match scope {
+        AgentScope::Single { .. } => AgentContext::single_agent(),
+        AgentScope::Worker { task, .. } => match &task.worker {
+            Some(worker) => AgentContext::worker(worker, None, COORDINATOR_AGENT_ID),
+            None => AgentContext::coordinator(),
+        },
+        AgentScope::Coordinator { .. } => AgentContext::coordinator(),
+    }
+}
+
+/// The events an approval's producers publish. Each derives its agent from the
+/// same scope that builds its payload, so the envelope cannot disagree with the
+/// body it wraps.
+#[must_use]
+pub fn requested_event(request: &ApprovalRequest) -> AgentEvent {
+    AgentEvent::new(
+        agent_of(&request.scope),
+        AgentEventPayload::ApprovalRequested(request.into()),
+    )
+}
+
+#[must_use]
+pub fn pending_event(
+    request: &ApprovalRequest,
+    expires_at: &super::decision::Timestamp,
+) -> AgentEvent {
+    AgentEvent::new(
+        agent_of(&request.scope),
+        AgentEventPayload::ApprovalPending(pending(request, expires_at)),
+    )
+}
+
+#[must_use]
+pub fn completed_event(
+    decision_id: DecisionId,
+    outcome: &ApprovalOutcome,
+    scope: &AgentScope,
+    duration: Duration,
+) -> AgentEvent {
+    AgentEvent::new(
+        agent_of(scope),
+        AgentEventPayload::ApprovalCompleted(completed(decision_id, outcome, scope, duration)),
+    )
+}
+
+#[must_use]
+pub fn completed_error_event(
+    decision_id: DecisionId,
+    message: String,
+    scope: &AgentScope,
+    duration: Duration,
+) -> AgentEvent {
+    AgentEvent::new(
+        agent_of(scope),
+        AgentEventPayload::ApprovalCompleted(completed_error(
+            decision_id,
+            message,
+            scope,
+            duration,
+        )),
+    )
+}
+
+#[must_use]
+pub fn completed_cancelled_event(
+    decision_id: DecisionId,
+    scope: &AgentScope,
+    duration: Duration,
+) -> AgentEvent {
+    AgentEvent::new(
+        agent_of(scope),
+        AgentEventPayload::ApprovalCompleted(completed_cancelled(decision_id, scope, duration)),
+    )
+}
 
 /// `approval_requested`: emitted for both routes when an approval is raised.
 impl From<&ApprovalRequest> for ApprovalRequested {

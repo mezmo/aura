@@ -330,6 +330,65 @@ mod tests {
         assert_eq!(usage.usage.total_tokens.get(), 15);
     }
 
+    /// The three approval arms publish to one broker and differ only by
+    /// lifecycle variant, so an arm wired to the wrong variant is invisible
+    /// without driving all three.
+    #[tokio::test]
+    async fn each_approval_arm_keeps_its_lifecycle_variant() {
+        let request_id = "req_adapter_approvals";
+        let mut rx = crate::approval_event_broker::subscribe(request_id).await;
+
+        let origin = || aura_events::ApprovalOriginWire::ConfigGate {
+            matched_pattern: "kubectl_*".to_string(),
+            agent_name: "ops".to_string(),
+        };
+        let scope = || aura_events::AgentScopeWire::Single { session_id: None };
+
+        let payloads = [
+            AgentEventPayload::ApprovalRequested(aura_events::ApprovalRequested {
+                decision_id: "d-1".to_string(),
+                tool_name: "kubectl_apply".to_string(),
+                origin: origin(),
+                scope: scope(),
+            }),
+            AgentEventPayload::ApprovalPending(aura_events::ApprovalPending {
+                decision_id: "d-1".to_string(),
+                tool_name: "kubectl_apply".to_string(),
+                arguments: json!({ "ns": "prod" }),
+                origin: origin(),
+                scope: scope(),
+                expires_at: "2026-09-02T15:03:11+00:00".to_string(),
+            }),
+            AgentEventPayload::ApprovalCompleted(aura_events::ApprovalCompleted {
+                decision_id: "d-1".to_string(),
+                outcome: aura_events::ApprovalOutcomeWire::Errored {
+                    message: "boom".to_string(),
+                },
+                duration_ms: 7,
+                scope: scope(),
+            }),
+        ];
+
+        for payload in payloads {
+            let routed = publish_to_brokers(request_id, AgentEvent::single_agent(payload)).await;
+            assert_eq!(routed, Routed::Delivered);
+        }
+
+        let arrived: Vec<_> = (0..3)
+            .map(|_| rx.try_recv().expect("approval should arrive"))
+            .collect();
+        crate::approval_event_broker::unsubscribe(request_id).await;
+
+        assert!(matches!(arrived[0], ApprovalLifecycleEvent::Requested(_)));
+        assert!(matches!(arrived[1], ApprovalLifecycleEvent::Pending(_)));
+        assert!(matches!(arrived[2], ApprovalLifecycleEvent::Completed(_)));
+
+        let ApprovalLifecycleEvent::Pending(ref pending) = arrived[1] else {
+            unreachable!()
+        };
+        assert_eq!(pending.expires_at, "2026-09-02T15:03:11+00:00");
+    }
+
     #[tokio::test]
     async fn content_events_are_not_routed_to_a_broker() {
         let routed = publish_to_brokers(

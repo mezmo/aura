@@ -223,14 +223,12 @@ pub(crate) fn cancel_run_approvals(
     let request_id = request_id.to_string();
     tokio::task::spawn(async move {
         for parked in registry.cancel_request(&run_owner_id(&run_id)).await {
-            crate::approval_event_broker::publish(
+            let _ = crate::agent_events::emit(
                 &request_id,
-                crate::approval_event_broker::ApprovalLifecycleEvent::Completed(
-                    crate::hitl::completed_cancelled(
-                        parked.request.decision_id,
-                        &parked.request.scope,
-                        std::time::Duration::ZERO,
-                    ),
+                crate::hitl::completed_cancelled_event(
+                    parked.request.decision_id,
+                    &parked.request.scope,
+                    std::time::Duration::ZERO,
                 ),
             )
             .await;

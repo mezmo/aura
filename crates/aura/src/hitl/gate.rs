@@ -213,20 +213,15 @@ impl HitlApprovalWrapper {
         // task returns still sweeps this ticket.
         park.guard.record(std::slice::from_ref(&call));
 
-        // The lifecycle pair goes to the live request's broker, not the owner id.
-        crate::approval_event_broker::publish(
+        // The lifecycle pair goes to the live request, not the owner id.
+        let _ = crate::agent_events::emit(
             &self.request_id,
-            crate::approval_event_broker::ApprovalLifecycleEvent::Requested(
-                (&parked.request).into(),
-            ),
+            super::events::requested_event(&parked.request),
         )
         .await;
-        crate::approval_event_broker::publish(
+        let _ = crate::agent_events::emit(
             &self.request_id,
-            crate::approval_event_broker::ApprovalLifecycleEvent::Pending(super::events::pending(
-                &parked.request,
-                &parked.expires_at,
-            )),
+            super::events::pending_event(&parked.request, &parked.expires_at),
         )
         .await;
 
