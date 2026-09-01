@@ -23,10 +23,11 @@ use super::orchestrator::{
     TREE_END_BULLET, TREE_END_DURATION, TREE_MID_BULLET, TREE_MID_DURATION, format_orch_duration_ms,
 };
 use super::state::{
-    EVENT_LOG, EXPANDED_OUTPUT, WELCOME_STATE, random_bullet_color, task_color_for,
+    EVENT_LOG, EXPANDED_OUTPUT, STREAM_CONV_DIR, WELCOME_STATE, random_bullet_color, task_color_for,
 };
 use super::status_bar::{
-    mark_orchestrated, reset_status_bar_tokens, set_context_window_usage, set_status_bar_tokens,
+    mark_orchestrated, reset_status_bar_tokens, seed_status_bar_tokens, set_context_window_usage,
+    set_status_bar_tokens,
 };
 
 /// Clear the terminal and replay all recorded events.
@@ -711,6 +712,17 @@ pub fn replay_event_log_global() {
                 println!();
                 i += 1;
             }
+        }
+    }
+
+    // The counters rebuilt above come from the display-event log, which may
+    // be truncated; the conversation's usage ledger is authoritative, so it
+    // gets the last word on every replay (resume, /expand, style repaints).
+    // An empty ledger keeps the replay-derived values.
+    if let Some(dir) = STREAM_CONV_DIR.lock().ok().and_then(|g| g.clone()) {
+        let (prompt, completion, cache_read) = crate::repl::conversations::usage_totals_at(&dir);
+        if prompt > 0 {
+            seed_status_bar_tokens(prompt, completion, cache_read);
         }
     }
 }

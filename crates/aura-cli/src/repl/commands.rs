@@ -15,9 +15,9 @@ use crate::ui::prompt::{
     get_model_cache, get_model_matches, is_expanded_output, last_sse_event, list_conversations,
     load_and_restore_sse_events, print_help, print_welcome_state, record_session_event,
     redraw_input_frame, replay_event_log_global, reset_session_status, reset_status_bar_tokens,
-    seed_model_cache, seed_status_bar_tokens, set_expanded_output, set_mid_stream_history,
-    set_selected_model, set_stream_conv_dir, set_stream_show_all, set_welcome_state,
-    toggle_stream_panel, with_event_log,
+    seed_model_cache, set_expanded_output, set_mid_stream_history, set_selected_model,
+    set_stream_conv_dir, set_stream_show_all, set_welcome_state, toggle_stream_panel,
+    with_event_log,
 };
 use crate::ui::state::{RESUME_MATCHES, get_tab_select_index, set_tab_select_index};
 use crate::ui::welcome::WelcomeState;
@@ -394,12 +394,8 @@ pub(crate) fn handle_resume(
             set_welcome_state(WelcomeState::pick());
             // Replay the event log so the user sees the conversation
             crate::ui::prompt::erase_input_frame();
+            // Replay seeds the token counters from the usage ledger.
             replay_event_log_global();
-            // Seed token counters from authoritative usage JSONL after replay
-            if let Some(store) = conv_store {
-                let (p, c, cache_read) = store.load_usage_totals();
-                seed_status_bar_tokens(p, c, cache_read);
-            }
             println!(
                 "{}",
                 "Resumed conversation. Continue below.".themed(AuraStyle::Success),
