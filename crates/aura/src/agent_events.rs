@@ -56,6 +56,7 @@ pub(crate) async fn publish_to_brokers(request_id: &str, event: AgentEvent) -> R
             tool_call_id,
             tool_name,
             arguments,
+            ..
         } => {
             tool_event_broker::publish(
                 request_id,
@@ -73,6 +74,7 @@ pub(crate) async fn publish_to_brokers(request_id: &str, event: AgentEvent) -> R
             tool_call_id,
             tool_name,
             progress_token,
+            ..
         } => {
             tool_event_broker::publish(
                 request_id,
@@ -145,7 +147,17 @@ pub(crate) async fn publish_to_brokers(request_id: &str, event: AgentEvent) -> R
         | AgentEventPayload::WorkerPhase { .. }
         | AgentEventPayload::Usage { .. }
         | AgentEventPayload::ContextUsage { .. }
-        | AgentEventPayload::ScratchpadUsage { .. } => {
+        | AgentEventPayload::ScratchpadUsage { .. }
+        | AgentEventPayload::PlanCreated { .. }
+        | AgentEventPayload::DirectAnswer { .. }
+        | AgentEventPayload::ClarificationNeeded { .. }
+        | AgentEventPayload::TaskStarted { .. }
+        | AgentEventPayload::TaskCompleted { .. }
+        | AgentEventPayload::TaskBlocked { .. }
+        | AgentEventPayload::RunParked { .. }
+        | AgentEventPayload::IterationComplete { .. }
+        | AgentEventPayload::ReplanStarted { .. }
+        | AgentEventPayload::Synthesizing { .. } => {
             tracing::trace!(
                 request_id,
                 payload = ?payload_kind,
@@ -228,6 +240,8 @@ mod tests {
         let _ = publish_to_brokers(
             request_id,
             AgentEvent::single_agent(AgentEventPayload::ToolStart {
+                arguments: None,
+                task_id: None,
                 tool_call_id: ToolCallId::new("call_1"),
                 tool_name: ToolName::new("list_files"),
                 progress_token: Some(token(7)),
@@ -334,6 +348,7 @@ mod tests {
         let routed = publish_to_brokers(
             "req_adapter_complete",
             AgentEvent::single_agent(AgentEventPayload::ToolComplete {
+                task_id: None,
                 tool_call_id: ToolCallId::new("call_1"),
                 tool_name: ToolName::new("list_files"),
                 duration_ms: 3,

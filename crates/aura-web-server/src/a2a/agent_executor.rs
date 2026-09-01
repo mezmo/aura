@@ -404,7 +404,7 @@ impl AgentExecutor for AuraAgentExecutor {
                     Ok(StreamItem::ContextUsage { .. }) => {
                         event!(Level::DEBUG, request_id, "context usage");
                     }
-                    Ok(StreamItem::OrchestratorEvent(_)) => {
+                    Ok(StreamItem::AgentEvent(_)) => {
                         event!(Level::DEBUG, request_id, "orchestration event");
                     }
                     Ok(StreamItem::McpStatus(_)) => {

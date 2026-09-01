@@ -15,12 +15,6 @@
 //! - Error classification with retry hints
 //! - Duration tracking for performance analysis
 //!
-//! # Current Status
-//!
-//! **Phase 1.5**: Observer is instantiated but not yet wired to SSE event streaming.
-//! **Phase 2**: Will be connected to `OrchestratorEvent` for real-time tool call
-//! visibility during parallel worker execution.
-//!
 //! # Usage
 //!
 //! ```ignore
@@ -66,6 +60,8 @@ pub enum ToolEvent {
     CallCompleted {
         /// The tool call ID this result corresponds to
         tool_call_id: String,
+        /// Name of the tool that ran
+        tool_name: String,
         /// The outcome of the tool call
         result: ToolOutcome,
         /// How long the call took in milliseconds
@@ -93,11 +89,13 @@ impl ToolEvent {
     /// Create a successful CallCompleted event.
     pub fn call_completed_success(
         tool_call_id: impl Into<String>,
+        tool_name: impl Into<String>,
         result: impl Into<String>,
         duration_ms: u64,
     ) -> Self {
         Self::CallCompleted {
             tool_call_id: tool_call_id.into(),
+            tool_name: tool_name.into(),
             result: ToolOutcome::Success(result.into()),
             duration_ms,
         }
@@ -106,12 +104,14 @@ impl ToolEvent {
     /// Create a failed CallCompleted event.
     pub fn call_completed_error(
         tool_call_id: impl Into<String>,
+        tool_name: impl Into<String>,
         message: impl Into<String>,
         retry_hint: Option<RetryHint>,
         duration_ms: u64,
     ) -> Self {
         Self::CallCompleted {
             tool_call_id: tool_call_id.into(),
+            tool_name: tool_name.into(),
             result: ToolOutcome::Error {
                 message: message.into(),
                 retry_hint,
@@ -224,12 +224,6 @@ impl RetryHint {
 /// The observer allows coordinators to observe tool execution events
 /// without modifying the core execution flow. Multiple subscribers
 /// can receive events concurrently.
-///
-/// # Phase 2 Integration
-///
-/// This will be wired to emit `OrchestratorEvent::ToolCallStarted` and
-/// `OrchestratorEvent::ToolCallCompleted` events for real-time SSE streaming
-/// during parallel worker execution.
 pub struct ToolCallObserver {
     /// Sender side of the broadcast channel.
     event_tx: broadcast::Sender<ToolEvent>,
@@ -366,7 +360,9 @@ mod tests {
 
         assert_eq!(observer.subscriber_count(), 2);
 
-        observer.emit(ToolEvent::call_completed_success("call_1", "result", 100));
+        observer.emit(ToolEvent::call_completed_success(
+            "call_1", "search", "result", 100,
+        ));
 
         let event1 = rx1.recv().await.unwrap();
         let event2 = rx2.recv().await.unwrap();

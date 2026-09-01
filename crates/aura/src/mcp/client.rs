@@ -814,6 +814,8 @@ impl McpClient {
                 AgentEvent::new(
                     agent,
                     AgentEventPayload::ToolStart {
+                        arguments: None,
+                        task_id: None,
                         tool_call_id: tool_call_id.clone(),
                         tool_name: ToolName::new(tool_name),
                         progress_token: progress_token.clone(),
