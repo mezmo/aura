@@ -1066,43 +1066,6 @@ impl McpManager {
         total_cancelled
     }
 
-    /// Set the current HTTP request ID for cancellation tracking.
-    pub async fn set_current_request(&self, http_request_id: &str) {
-        for client in self.streamable_clients.values() {
-            client.set_current_request(http_request_id).await;
-        }
-        for client in self.sse_clients.values() {
-            client.set_current_request(http_request_id).await;
-        }
-        for client in self.stdio_clients.values() {
-            client.set_current_request(http_request_id).await;
-        }
-        let total_clients =
-            self.streamable_clients.len() + self.sse_clients.len() + self.stdio_clients.len();
-        debug!(
-            "Set current HTTP request ID on {} MCP client(s): {}",
-            total_clients, http_request_id
-        );
-    }
-
-    pub async fn clear_current_request(&self) {
-        for client in self.streamable_clients.values() {
-            client.clear_current_request().await;
-        }
-        for client in self.sse_clients.values() {
-            client.clear_current_request().await;
-        }
-        for client in self.stdio_clients.values() {
-            client.clear_current_request().await;
-        }
-        let total_clients =
-            self.streamable_clients.len() + self.sse_clients.len() + self.stdio_clients.len();
-        debug!(
-            "Cleared current HTTP request ID on {} MCP client(s)",
-            total_clients
-        );
-    }
-
     /// Get all available tool names across all transports.
     ///
     /// Returns a list of tool names that can be used for fallback tool execution.

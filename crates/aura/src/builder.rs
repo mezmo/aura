@@ -1672,10 +1672,6 @@ impl StreamingAgent for Agent {
         // The hook enforces the bound, so an unbounded run gets one it never reaches.
         let timeout = timeout.unwrap_or(Duration::MAX);
 
-        if let Some(mcp_manager) = &self.mcp_manager {
-            mcp_manager.set_current_request(request_id).await;
-        }
-
         let (stream, cancel, usage_state) = if chat_history.is_empty() {
             self.stream_prompt_with_timeout(query, timeout, request_id)
                 .await
@@ -1684,7 +1680,14 @@ impl StreamingAgent for Agent {
                 .await
         };
 
-        crate::streaming::AgentRun::new(Box::pin(stream), cancel, usage_state)
+        crate::streaming::AgentRun::new(
+            Box::pin(crate::run_context::scope_stream(
+                request_id.to_string(),
+                stream,
+            )),
+            cancel,
+            usage_state,
+        )
     }
 
     async fn cancel_and_close_mcp(&self, request_id: &str, reason: &str) -> usize {

@@ -21,9 +21,10 @@
 use rmcp::{
     ClientHandler,
     handler::client::progress::ProgressDispatcher,
-    model::ProgressNotificationParam,
+    model::{ProgressNotificationParam, ProgressToken},
     service::{NotificationContext, RoleClient},
 };
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::RwLock;
@@ -35,27 +36,15 @@ use aura_events::agent::{AgentEvent, AgentEventPayload};
 ///
 /// This handler is used instead of `()` when creating MCP clients to enable
 /// progress notification support. Progress notifications received from the
-/// server are routed to the specific HTTP request that initiated the tool call,
-/// ensuring no cross-request or cross-customer data leakage.
-///
-/// # Example
-/// ```ignore
-/// // Create handler with shared request ID reference
-/// let current_request_id = Arc::new(RwLock::new(None));
-/// let handler = ProgressEnabledHandler::new(current_request_id.clone());
-/// let client = serve_client(handler.clone(), transport).await?;
-///
-/// // Set request ID before tool execution
-/// *current_request_id.write().await = Some("req_123".to_string());
-///
-/// // Progress notifications will now be routed to req_123's channel
-/// ```
+/// server are routed to the run that initiated the tool call, by the progress
+/// token that call minted, so concurrent runs cannot see each other's progress.
 #[derive(Clone)]
 pub struct ProgressEnabledHandler {
     progress_dispatcher: ProgressDispatcher,
-    /// Shared reference to the current HTTP request ID
-    /// This is set by the MCP client before each tool execution
-    current_request_id: Arc<RwLock<Option<String>>>,
+    /// Which run each in-flight progress token belongs to. Notifications arrive
+    /// on the transport's task, which cannot read the run's task-local, so the
+    /// token is the only thing tying one back to its run.
+    token_owners: Arc<RwLock<HashMap<ProgressToken, String>>>,
     /// Flag to log orphaned progress only once (prevents log flood from servers ignoring cancellation)
     logged_orphaned_warning: Arc<AtomicBool>,
     /// Counter for orphaned progress notifications (for diagnostics)
@@ -66,16 +55,21 @@ impl std::fmt::Debug for ProgressEnabledHandler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ProgressEnabledHandler")
             .field("progress_dispatcher", &self.progress_dispatcher)
-            .field("current_request_id", &"Arc<RwLock<Option<String>>>")
+            .field("token_owners", &"Arc<RwLock<HashMap<..>>>")
             .finish()
     }
 }
 
 impl ProgressEnabledHandler {
-    pub fn new(current_request_id: Arc<RwLock<Option<String>>>) -> Self {
+    /// The run a progress token belongs to, or `None` once its call has ended.
+    pub async fn owner_of(&self, token: &ProgressToken) -> Option<String> {
+        self.token_owners.read().await.get(token).cloned()
+    }
+
+    pub fn new(token_owners: Arc<RwLock<HashMap<ProgressToken, String>>>) -> Self {
         Self {
             progress_dispatcher: ProgressDispatcher::new(),
-            current_request_id,
+            token_owners,
             logged_orphaned_warning: Arc::new(AtomicBool::new(false)),
             orphaned_count: Arc::new(AtomicU64::new(0)),
         }
@@ -116,10 +110,9 @@ impl ClientHandler for ProgressEnabledHandler {
         _context: NotificationContext<RoleClient>,
     ) -> impl std::future::Future<Output = ()> + Send + '_ {
         async move {
-            // Get current request ID (if any)
-            let request_id = self.current_request_id.read().await.clone();
+            let request_id = self.owner_of(&params.progress_token).await;
 
-            if let Some(ref req_id) = request_id {
+            if let Some(req_id) = request_id.as_deref() {
                 let routed = crate::agent_events::emit(
                     req_id,
                     AgentEvent::single_agent(AgentEventPayload::ToolProgress {
@@ -171,82 +164,56 @@ impl ClientHandler for ProgressEnabledHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rmcp::model::NumberOrString;
 
-    fn create_test_handler() -> ProgressEnabledHandler {
-        let current_request_id = Arc::new(RwLock::new(None));
-        ProgressEnabledHandler::new(current_request_id)
+    fn token(n: i64) -> ProgressToken {
+        ProgressToken(NumberOrString::Number(n))
+    }
+
+    fn handler_owning(pairs: &[(i64, &str)]) -> ProgressEnabledHandler {
+        let owners = pairs
+            .iter()
+            .map(|(t, run)| (token(*t), (*run).to_string()))
+            .collect::<HashMap<_, _>>();
+        ProgressEnabledHandler::new(Arc::new(RwLock::new(owners)))
     }
 
     #[test]
     fn test_handler_creation() {
-        let handler = create_test_handler();
-        // Just verify it can be created and progress_dispatcher is accessible
+        let handler = handler_owning(&[]);
         let _ = handler.progress_dispatcher();
     }
 
     #[test]
     fn test_handler_clone() {
-        let handler = create_test_handler();
+        let handler = handler_owning(&[]);
         let cloned = handler.clone();
-        // Both should have accessible progress dispatchers
         let _ = cloned.progress_dispatcher();
     }
 
     #[tokio::test]
-    async fn test_handler_with_request_id() {
-        let current_request_id = Arc::new(RwLock::new(Some("req_test_123".to_string())));
-        let handler = ProgressEnabledHandler::new(current_request_id.clone());
+    async fn an_unowned_token_has_no_run() {
+        assert_eq!(handler_owning(&[]).owner_of(&token(1)).await, None);
+    }
 
-        // Verify request ID is accessible
-        let req_id = handler.current_request_id.read().await;
-        assert_eq!(*req_id, Some("req_test_123".to_string()));
+    /// The ambient "current request" this replaced was last-writer-wins, so a
+    /// worker's progress could be attributed to whichever run set it last.
+    #[tokio::test]
+    async fn concurrent_runs_route_by_their_own_token() {
+        let handler = handler_owning(&[(1, "run_a"), (2, "run_b")]);
+
+        assert_eq!(handler.owner_of(&token(1)).await.as_deref(), Some("run_a"));
+        assert_eq!(handler.owner_of(&token(2)).await.as_deref(), Some("run_b"));
     }
 
     #[tokio::test]
-    async fn test_handler_request_id_changes() {
-        let current_request_id = Arc::new(RwLock::new(None));
-        let handler = ProgressEnabledHandler::new(current_request_id.clone());
+    async fn a_released_token_stops_routing() {
+        let owners = Arc::new(RwLock::new(HashMap::new()));
+        let handler = ProgressEnabledHandler::new(owners.clone());
+        owners.write().await.insert(token(7), "run_a".to_string());
+        assert_eq!(handler.owner_of(&token(7)).await.as_deref(), Some("run_a"));
 
-        // Initially no request ID
-        {
-            let req_id = handler.current_request_id.read().await;
-            assert_eq!(*req_id, None);
-        }
-
-        // Set request ID
-        {
-            let mut req_id = current_request_id.write().await;
-            *req_id = Some("req_456".to_string());
-        }
-
-        // Handler should see the new value
-        {
-            let req_id = handler.current_request_id.read().await;
-            assert_eq!(*req_id, Some("req_456".to_string()));
-        }
-    }
-
-    #[test]
-    fn test_orphaned_tracking() {
-        let handler = create_test_handler();
-
-        // Initially false and zero
-        assert!(!handler.logged_orphaned_warning.load(Ordering::SeqCst));
-        assert_eq!(handler.orphaned_count(), 0);
-
-        // Simulate orphaned notifications
-        handler.orphaned_count.fetch_add(1, Ordering::SeqCst);
-        handler.orphaned_count.fetch_add(1, Ordering::SeqCst);
-        assert_eq!(handler.orphaned_count(), 2);
-
-        // Warning flag
-        let was_logged = handler.logged_orphaned_warning.swap(true, Ordering::SeqCst);
-        assert!(!was_logged);
-        assert!(handler.logged_orphaned_warning.load(Ordering::SeqCst));
-
-        // Reset works for both
-        handler.reset_orphaned_tracking();
-        assert!(!handler.logged_orphaned_warning.load(Ordering::SeqCst));
-        assert_eq!(handler.orphaned_count(), 0);
+        owners.write().await.remove(&token(7));
+        assert_eq!(handler.owner_of(&token(7)).await, None);
     }
 }

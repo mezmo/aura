@@ -8,7 +8,7 @@ use rmcp::{
     RoleClient,
     model::{
         CallToolRequestParam, CancelledNotificationParam, ClientRequest, ProgressNotificationParam,
-        Request, RequestId, Tool,
+        ProgressToken, Request, RequestId, Tool,
     },
     serve_client,
     service::{PeerRequestOptions, RunningService},
@@ -99,8 +99,9 @@ pub struct McpClient {
     server_url: String,
     /// Tracks in-flight MCP requests for cancellation support
     in_flight: Arc<InFlightRequests>,
-    /// Current HTTP request ID for automatic cancellation tracking.
-    current_http_request_id: Arc<RwLock<Option<String>>>,
+    /// Which run each in-flight progress token belongs to, shared with the
+    /// progress handler.
+    token_owners: Arc<RwLock<HashMap<ProgressToken, String>>>,
 }
 
 impl Clone for McpClient {
@@ -109,7 +110,7 @@ impl Clone for McpClient {
             client: self.client.clone(),
             server_url: self.server_url.clone(),
             in_flight: self.in_flight.clone(),
-            current_http_request_id: self.current_http_request_id.clone(),
+            token_owners: self.token_owners.clone(),
         }
     }
 }
@@ -124,8 +125,8 @@ impl McpClient {
         T: rmcp::transport::Transport<RoleClient> + Send + 'static,
         T::Error: std::error::Error + Send + Sync + 'static,
     {
-        let current_http_request_id = Arc::new(RwLock::new(None));
-        let handler = ProgressEnabledHandler::new(Arc::clone(&current_http_request_id));
+        let token_owners = Arc::new(RwLock::new(HashMap::new()));
+        let handler = ProgressEnabledHandler::new(Arc::clone(&token_owners));
 
         let client = serve_client(handler, transport)
             .await
@@ -135,7 +136,7 @@ impl McpClient {
             client: Arc::new(client),
             server_url,
             in_flight: Arc::new(InFlightRequests::new()),
-            current_http_request_id,
+            token_owners,
         })
     }
 
@@ -202,27 +203,17 @@ impl McpClient {
         Ok(client)
     }
 
-    /// Set the current HTTP request ID for cancellation tracking.
-    pub async fn set_current_request(&self, http_request_id: &str) {
-        let mut guard = self.current_http_request_id.write().await;
-        *guard = Some(http_request_id.to_string());
-        debug!(
-            "Set current HTTP request ID for MCP client: {}",
-            http_request_id
-        );
+    /// Ties a progress token to the run that minted it, so notifications
+    /// arriving on the transport task can be routed back.
+    async fn own_progress_token(&self, token: ProgressToken, run_id: &str) {
+        self.token_owners
+            .write()
+            .await
+            .insert(token, run_id.to_string());
     }
 
-    /// Clear the current HTTP request ID.
-    pub async fn clear_current_request(&self) {
-        let mut guard = self.current_http_request_id.write().await;
-        if let Some(ref id) = *guard {
-            debug!("Cleared current HTTP request ID: {}", id);
-        }
-        *guard = None;
-    }
-
-    pub async fn get_current_request(&self) -> Option<String> {
-        self.current_http_request_id.read().await.clone()
+    async fn release_progress_token(&self, token: &ProgressToken) {
+        self.token_owners.write().await.remove(token);
     }
 
     pub async fn discover_tools(&self) -> Result<Vec<Tool>> {
@@ -254,14 +245,14 @@ impl McpClient {
         Ok(tools_response.tools)
     }
 
-    /// Execute a tool. Auto-tracks for cancellation if `set_current_request` was called.
+    /// Execute a tool, tracking it for cancellation when called inside a run.
     pub async fn call_tool(
         &self,
         tool_name: &str,
         arguments: HashMap<String, Value>,
         approver_overrides: Option<ApproverHeaders>,
     ) -> Result<String> {
-        if let Some(http_request_id) = self.get_current_request().await {
+        if let Some(http_request_id) = crate::run_context::current_run_id() {
             info!(
                 "Tool '{}' executing WITH automatic tracking (http_request_id={})",
                 tool_name, http_request_id
@@ -337,6 +328,12 @@ impl McpClient {
             .context("Failed to send tool call request")?;
 
         let progress_token = handle.progress_token.clone();
+        // The transport task cannot read the run's task-local, so tie the token
+        // to the run here, while still inside it.
+        if let Some(run_id) = crate::run_context::current_run_id() {
+            self.own_progress_token(progress_token.clone(), &run_id)
+                .await;
+        }
         info!(
             "Tool '{}' started with progress token: {:?}",
             tool_name, progress_token
@@ -369,10 +366,9 @@ impl McpClient {
             debug!("Progress stream ended for '{}'", tool_name_for_task);
         });
 
-        let response = handle
-            .await_response()
-            .await
-            .context(format!("Tool '{}' execution failed", tool_name))?;
+        let response = handle.await_response().await;
+        self.release_progress_token(&progress_token).await;
+        let response = response.context(format!("Tool '{}' execution failed", tool_name))?;
 
         match response {
             rmcp::model::ServerResult::CallToolResult(result) => {
@@ -622,8 +618,11 @@ impl McpClient {
     pub async fn cancel_and_close(&self, http_request_id: &str, reason: &str) -> usize {
         let count = self.cancel_all_for_request(http_request_id, reason).await;
 
-        // Also clear the request ID to stop routing any straggler progress notifications
-        self.clear_current_request().await;
+        // Drop this run's token ownership so straggler notifications stop routing.
+        self.token_owners
+            .write()
+            .await
+            .retain(|_, owner| owner != http_request_id);
 
         // Forcefully close connection - server is ignoring cancellation anyway
         self.close_connection();
@@ -992,7 +991,9 @@ pub(crate) mod tests {
         }
     }
 
-    /// `set_current_request` selects the tracked branch, so this is the same entry point a gated call takes in the server and the branch choice must not decide whether identity is delivered.
+    /// Being inside a run selects the tracked branch, so this is the same entry
+    /// point a gated call takes in the server and the branch choice must not
+    /// decide whether identity is delivered.
     #[tokio::test]
     async fn call_tool_delivers_the_override_on_either_branch() {
         let (server, client) = client_and_server(&requester_headers()).await;
@@ -1006,15 +1007,17 @@ pub(crate) mod tests {
             .await
             .expect("the untracked call succeeds");
 
-        client.set_current_request("http-req-1").await;
-        client
-            .call_tool(
-                "tracked",
-                no_args(),
-                Some(captured_overrides("x-forwarded-user", "bob")),
-            )
-            .await
-            .expect("the tracked call succeeds");
+        crate::run_context::with_run_id("http-req-1".to_string(), async {
+            client
+                .call_tool(
+                    "tracked",
+                    no_args(),
+                    Some(captured_overrides("x-forwarded-user", "bob")),
+                )
+                .await
+                .expect("the tracked call succeeds");
+        })
+        .await;
 
         let calls = server.tool_calls();
         assert_eq!(calls[0].header_values("x-forwarded-user"), vec!["alice"]);

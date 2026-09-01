@@ -36,6 +36,7 @@ pub mod rag_tools;
 pub mod request_cancellation;
 pub mod request_progress;
 pub mod rig_builder;
+pub mod run_context;
 mod schema_sanitize; // Private - MCP schema sanitization for OpenAI compatibility
 pub mod scratchpad;
 pub mod session_store;
