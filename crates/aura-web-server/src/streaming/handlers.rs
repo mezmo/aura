@@ -20,6 +20,7 @@
 
 use crate::streaming::types::openai::UsageInfo;
 use aura_events::agent::{AgentEvent, AgentEventPayload};
+use tokio_util::sync::CancellationToken;
 
 use super::types::{
     CHUNK_OBJECT, ChatCompletionChunk, ChatCompletionChunkChoice, ChatCompletionChunkDelta,
@@ -38,7 +39,7 @@ use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
 
 /// Context for cancellation and cleanup callbacks.
 pub struct StreamingCallbacks {
@@ -103,8 +104,8 @@ pub async fn process_sse_stream_full<S>(
     ctx: &TurnContext,
     mut stream: S,
     tx: mpsc::Sender<Result<Bytes, String>>,
-    cancel_tx: watch::Sender<bool>,
-    timeout_duration: Duration,
+    cancel_tx: CancellationToken,
+    timeout_duration: Option<Duration>,
     heartbeat_interval: Duration,
     first_chunk_timeout: Option<Duration>,
     inactivity_timeout: Option<Duration>,
@@ -158,8 +159,14 @@ where
         }
     }
 
-    // Safety net timeout
-    let timeout = tokio::time::sleep(timeout_duration);
+    // Safety net timeout. An unbounded run waits on a future that never
+    // resolves rather than a zero sleep that fires on the first poll.
+    let timeout = async move {
+        match timeout_duration {
+            Some(duration) => tokio::time::sleep(duration).await,
+            None => std::future::pending().await,
+        }
+    };
     tokio::pin!(timeout);
 
     // Heartbeat for proactive disconnect detection during silent tool execution
@@ -360,7 +367,7 @@ where
             _ = &mut timeout => {
                 tracing::warn!(
                     "Streaming safety net timeout ({:?}) - signaling cancellation",
-                    timeout_duration
+                    timeout_duration.unwrap_or_default()
                 );
                 break StreamTermination::Timeout;
             }
@@ -411,13 +418,13 @@ where
         }
 
         StreamTermination::Disconnected => {
-            let _ = cancel_tx.send(true);
+            cancel_tx.cancel();
             RequestCancellation::cancel(&callbacks.request_id, "client disconnected");
             cancel_mcp(&callbacks, "client disconnected").await;
         }
 
         StreamTermination::Timeout => {
-            let _ = cancel_tx.send(true);
+            cancel_tx.cancel();
             RequestCancellation::cancel(&callbacks.request_id, "timeout");
             cancel_mcp(&callbacks, "timeout").await;
             send_final_events(emit_custom_events, &mut callbacks, ctx, &state, &tx).await;
@@ -425,7 +432,7 @@ where
 
         StreamTermination::Shutdown => {
             // [DONE] before MCP cleanup so client gets clean termination regardless of MCP latency
-            let _ = cancel_tx.send(true);
+            cancel_tx.cancel();
             RequestCancellation::cancel(&callbacks.request_id, "server shutdown");
             send_final_events(emit_custom_events, &mut callbacks, ctx, &state, &tx).await;
             cancel_mcp(&callbacks, "server shutdown").await;
@@ -2205,7 +2212,7 @@ mod tests {
             let (chunk_tx, mut chunk_rx) = mpsc::channel(8);
             // Drain so sends (including heartbeats) never block the loop.
             tokio::spawn(async move { while chunk_rx.recv().await.is_some() {} });
-            let (cancel_tx, _cancel_rx) = watch::channel(false);
+            let cancel_tx = CancellationToken::new();
             let (cb, _senders) = callbacks();
             let start = tokio::time::Instant::now();
             let termination = process_sse_stream_full(
@@ -2214,7 +2221,7 @@ mod tests {
                 stream,
                 chunk_tx,
                 cancel_tx,
-                Duration::from_secs(900),
+                Some(Duration::from_secs(900)),
                 heartbeat,
                 first_chunk,
                 inactivity,
@@ -2408,7 +2415,7 @@ mod tests {
             );
             let (chunk_tx, mut chunk_rx) = mpsc::channel(64);
             tokio::spawn(async move { while chunk_rx.recv().await.is_some() {} });
-            let (cancel_tx, _cancel_rx) = watch::channel(false);
+            let cancel_tx = CancellationToken::new();
             let (cb, senders) = callbacks();
             // The driver gets a clone; the originals stay alive past the loop.
             tokio::spawn(drive(senders.clone()));
@@ -2419,7 +2426,7 @@ mod tests {
                 stream,
                 chunk_tx,
                 cancel_tx,
-                Duration::from_secs(900),
+                Some(Duration::from_secs(900)),
                 HB_QUIET,
                 None,
                 inactivity,
@@ -2598,9 +2605,14 @@ mod tests {
             );
 
             let stream = MockAgent::scripted(steps)
-                .stream("q", vec![], CancellationToken::new(), "req_tool_events")
+                .stream(
+                    "q",
+                    vec![],
+                    aura::streaming::RunOptions::default(),
+                    "req_tool_events",
+                )
                 .await
-                .expect("mock stream should start");
+                .into_events();
 
             let (chunk_tx, mut chunk_rx) = mpsc::channel::<Result<Bytes, String>>(64);
             let collector = tokio::spawn(async move {
@@ -2610,7 +2622,7 @@ mod tests {
                 }
                 body
             });
-            let (cancel_tx, _cancel_rx) = watch::channel(false);
+            let cancel_tx = CancellationToken::new();
 
             let termination = process_sse_stream_full(
                 &config,
@@ -2618,7 +2630,7 @@ mod tests {
                 stream,
                 chunk_tx,
                 cancel_tx,
-                Duration::from_secs(900),
+                Some(Duration::from_secs(900)),
                 // Far enough out that heartbeats never interleave with the script.
                 Duration::from_secs(86_400),
                 None,

@@ -20,8 +20,6 @@ use rig::completion::Usage;
 use std::collections::HashSet;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::watch;
 
 /// A client-side tool definition supplied with a request.
 ///
@@ -1425,16 +1423,12 @@ impl Agent {
 
     /// Stream a query with timeout and cancellation support.
     ///
-    /// Returns the stream and a sender to trigger external cancellation.
+    /// Returns the run: its stream, the token that cancels it, and its usage.
     ///
     /// # Arguments
     /// * `query` - The user query
-    /// * `timeout` - Timeout duration for the request
+    /// * `options` - How the run is bounded and cancelled
     /// * `request_id` - Unique request ID for MCP tool cancellation context
-    ///
-    /// # Returns
-    /// * Stream of multi-turn items
-    /// * Sender to trigger external cancellation (e.g., on client disconnect)
     ///
     /// # Cancellation
     /// The StreamingRequestHook checks for cancellation at key points during streaming:
@@ -1444,39 +1438,29 @@ impl Agent {
     /// - After each tool result (clears active request context, adds to pending_tool_ids)
     /// - After each streaming completion (captures usage, emits aura.tool_usage)
     ///
-    /// To cancel externally (e.g., on client disconnect), call `cancel_tx.send(true)`.
-    ///
-    /// # Returns
-    /// * Stream of multi-turn items
-    /// * Sender to trigger external cancellation
-    /// * UsageState for reading final usage at stream end (shared with hook)
+    /// To cancel externally (e.g., on client disconnect), cancel the run's token.
     pub async fn stream_prompt_with_timeout(
         &self,
         query: &str,
-        timeout: Duration,
+        options: crate::streaming::RunOptions,
         request_id: &str,
-    ) -> (
-        Pin<Box<dyn futures::stream::Stream<Item = Result<StreamItem, StreamError>> + Send>>,
-        watch::Sender<bool>,
-        crate::streaming_request_hook::UsageState,
-    ) {
+    ) -> crate::streaming::AgentRun {
         self.seed_scratchpad_request_input(query, &[]);
-        let (stream, cancel_tx, usage_state) = self
-            .inner
+        self.inner
             .stream_prompt_with_timeout(
                 query,
                 self.max_depth,
-                timeout,
+                options,
                 request_id,
                 self.scratchpad_budget.clone(),
                 self.client_tool_names.clone(),
             )
-            .await;
-        (
-            self.append_scratchpad_usage(self.maybe_wrap_with_fallback(self.count_turns(stream))),
-            cancel_tx,
-            usage_state,
-        )
+            .await
+            .map_stream(|stream| {
+                self.append_scratchpad_usage(
+                    self.maybe_wrap_with_fallback(self.count_turns(stream)),
+                )
+            })
     }
 
     /// Stream a chat query with timeout and cancellation support.
@@ -1484,13 +1468,9 @@ impl Agent {
     /// # Arguments
     /// * `query` - The user query
     /// * `chat_history` - Previous conversation messages
-    /// * `timeout` - Timeout duration for the request
+    /// * `options` - How the run is bounded and cancelled
     /// * `request_id` - Unique request ID for MCP tool cancellation context
     ///
-    /// # Returns
-    /// * Stream of multi-turn items
-    /// * Sender to trigger external cancellation (e.g., on client disconnect)
-    /// * UsageState for reading final usage at stream end (shared with hook)
     ///
     /// # Cancellation
     /// See `stream_prompt_with_timeout` for cancellation details.
@@ -1498,31 +1478,26 @@ impl Agent {
         &self,
         query: &str,
         chat_history: Vec<rig::completion::Message>,
-        timeout: Duration,
+        options: crate::streaming::RunOptions,
         request_id: &str,
-    ) -> (
-        Pin<Box<dyn futures::stream::Stream<Item = Result<StreamItem, StreamError>> + Send>>,
-        watch::Sender<bool>,
-        crate::streaming_request_hook::UsageState,
-    ) {
+    ) -> crate::streaming::AgentRun {
         self.seed_scratchpad_request_input(query, &chat_history);
-        let (stream, cancel_tx, usage_state) = self
-            .inner
+        self.inner
             .stream_chat_with_timeout(
                 query,
                 chat_history,
                 self.max_depth,
-                timeout,
+                options,
                 request_id,
                 self.scratchpad_budget.clone(),
                 self.client_tool_names.clone(),
             )
-            .await;
-        (
-            self.append_scratchpad_usage(self.maybe_wrap_with_fallback(self.count_turns(stream))),
-            cancel_tx,
-            usage_state,
-        )
+            .await
+            .map_stream(|stream| {
+                self.append_scratchpad_usage(
+                    self.maybe_wrap_with_fallback(self.count_turns(stream)),
+                )
+            })
     }
 
     /// Seed the scratchpad budget's running estimate with the user query +
@@ -1695,8 +1670,6 @@ fn record_completion_result(
 // Implement StreamingAgent trait for Agent
 use crate::streaming::StreamingAgent;
 use async_trait::async_trait;
-use futures::stream::BoxStream;
-use tokio_util::sync::CancellationToken;
 
 #[async_trait]
 impl StreamingAgent for Agent {
@@ -1708,51 +1681,22 @@ impl StreamingAgent for Agent {
         &self,
         query: &str,
         chat_history: Vec<rig::completion::Message>,
-        _cancel_token: CancellationToken,
+        options: crate::streaming::RunOptions,
         request_id: &str,
-    ) -> Result<BoxStream<'static, Result<StreamItem, StreamError>>, StreamError> {
+    ) -> crate::streaming::AgentRun {
         if let Some(mcp_manager) = &self.mcp_manager {
             mcp_manager
                 .set_current_call(request_id, aura_events::AgentContext::single_agent())
                 .await;
         }
 
-        let stream = if chat_history.is_empty() {
-            self.stream_prompt(query).await
+        if chat_history.is_empty() {
+            self.stream_prompt_with_timeout(query, options, request_id)
+                .await
         } else {
-            self.stream_chat(query, chat_history).await
-        };
-
-        Ok(Box::pin(stream))
-    }
-
-    async fn stream_with_timeout(
-        &self,
-        query: &str,
-        chat_history: Vec<rig::completion::Message>,
-        timeout: Duration,
-        request_id: &str,
-    ) -> (
-        BoxStream<'static, Result<StreamItem, StreamError>>,
-        watch::Sender<bool>,
-        crate::UsageState,
-    ) {
-        // Production entry point — set MCP request ID before delegating
-        if let Some(mcp_manager) = &self.mcp_manager {
-            mcp_manager
-                .set_current_call(request_id, aura_events::AgentContext::single_agent())
-                .await;
+            self.stream_chat_with_timeout(query, chat_history, options, request_id)
+                .await
         }
-
-        let (stream, cancel_tx, usage_state) = if chat_history.is_empty() {
-            self.stream_prompt_with_timeout(query, timeout, request_id)
-                .await
-        } else {
-            self.stream_chat_with_timeout(query, chat_history, timeout, request_id)
-                .await
-        };
-
-        (Box::pin(stream), cancel_tx, usage_state)
     }
 
     async fn cancel_and_close_mcp(&self, request_id: &str, reason: &str) -> usize {
