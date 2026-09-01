@@ -247,7 +247,6 @@ impl AgentExecutor for AuraAgentExecutor {
             // build any history for this context that can be used in further aura reasoning
             let history = get_history_for_context(task_store.clone(), &request_id, &context_id, &task_id).await?;
 
-            let cancel_token = stream_shutdown_token.child_token();
             // Register with the global cancellation registry for parity with the OpenAI handler
             // and to let any future code address this request by id.
             RequestCancellation::register(request_id.clone());
@@ -256,19 +255,27 @@ impl AgentExecutor for AuraAgentExecutor {
                 task_id: task_id.clone(),
                 request_id: request_id.clone(),
             };
+
+            // A2A tasks have their own lifetime, so the run is unbounded here and
+            // ends on cancelTask or shutdown.
+            let run = agent.stream(&text, history, None, &request_id).await;
+            let cancel_token = run.cancel_token();
+            let mut stream = run.into_events();
+
+            // The run owns its token, so server shutdown has to be forwarded to it
+            // rather than inherited through a child token.
+            let shutdown = stream_shutdown_token.child_token();
+            let on_shutdown = cancel_token.clone();
+            tokio::spawn(async move {
+                shutdown.cancelled().await;
+                on_shutdown.cancel();
+            });
+
             lock_cancel_state(&task_cancel_state).insert(task_id.clone(), TaskCancelEntry {
                 token: cancel_token.clone(),
                 agent: agent.clone(),
                 request_id: request_id.clone(),
             });
-
-            let mut stream = match agent.stream(&text, history, cancel_token.clone(), &request_id).await {
-                Ok(s) => s,
-                Err(e) => {
-                    yield Ok(fail_status(&task_id, &context_id, &e.to_string()));
-                    return;
-                }
-            };
 
             // RAII guard: drop on any generator exit (loop break, early return, panic,
             // consumer drop) produces exactly one decrement. Replaces the manual

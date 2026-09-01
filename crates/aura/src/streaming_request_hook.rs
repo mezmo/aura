@@ -19,13 +19,13 @@
 //! # Usage
 //!
 //! ```ignore
-//! let (hook, cancel_sender, usage_state) = StreamingRequestHook::new(Duration::from_secs(60), "req_123");
+//! let (hook, cancel, usage_state) = StreamingRequestHook::new(Duration::from_secs(60), "req_123");
 //!
 //! // Pass hook to streaming request
 //! agent.stream_prompt(query).with_hook(hook).multi_turn(depth).await;
 //!
 //! // To cancel externally (e.g., on client disconnect):
-//! let _ = cancel_sender.send(true);
+//! cancel.cancel();
 //!
 //! // At stream end, read final usage from usage_state
 //! let (prompt, completion, total) = usage_state.get_final_usage();
@@ -41,7 +41,7 @@ use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
 
 /// Maximum pending tool IDs before warning. Prevents unbounded growth if
 /// usage events never fire (e.g., provider doesn't return token counts).
@@ -271,7 +271,7 @@ pub struct StreamingRequestHook {
     start_time: Instant,
     timeout: Duration,
     /// External cancellation signal (e.g., from client disconnect)
-    cancelled: watch::Receiver<bool>,
+    cancelled: CancellationToken,
     /// Request ID for event correlation
     request_id: String,
     /// Shared usage state (returned separately for handler access)
@@ -292,14 +292,10 @@ pub struct StreamingRequestHook {
 impl StreamingRequestHook {
     /// Create a new streaming request hook with the given timeout duration and request ID.
     ///
-    /// Returns a tuple of (hook, cancel_sender, usage_state).
-    /// - `hook`: The hook to pass to stream_prompt().with_hook()
-    /// - `cancel_sender`: Send `true` to trigger cancellation
-    /// - `usage_state`: Shared state - handler keeps clone to read final usage at stream end
     pub fn new(
         timeout: Duration,
         request_id: impl Into<String>,
-    ) -> (Self, watch::Sender<bool>, UsageState) {
+    ) -> (Self, CancellationToken, UsageState) {
         Self::with_scratchpad_budget(timeout, request_id, None)
     }
 
@@ -311,20 +307,20 @@ impl StreamingRequestHook {
         timeout: Duration,
         request_id: impl Into<String>,
         scratchpad_budget: Option<ContextBudget>,
-    ) -> (Self, watch::Sender<bool>, UsageState) {
-        let (tx, rx) = watch::channel(false);
+    ) -> (Self, CancellationToken, UsageState) {
+        let cancel = CancellationToken::new();
         let usage_state = UsageState::new();
         let hook = Self {
             start_time: Instant::now(),
             timeout,
-            cancelled: rx,
+            cancelled: cancel.clone(),
             request_id: request_id.into(),
             usage_state: usage_state.clone(),
             scratchpad_budget,
             client_tool_names: HashSet::new(),
             client_tool_called: Arc::new(AtomicBool::new(false)),
         };
-        (hook, tx, usage_state)
+        (hook, cancel, usage_state)
     }
 
     /// Register the names of client-side (passthrough) tools for this request.
@@ -338,7 +334,7 @@ impl StreamingRequestHook {
 
     /// Check if the request should be cancelled (timeout or external signal).
     fn should_cancel(&self) -> bool {
-        if *self.cancelled.borrow() {
+        if self.cancelled.is_cancelled() {
             return true;
         }
         self.start_time.elapsed() > self.timeout
@@ -368,7 +364,7 @@ impl StreamingRequestHook {
 
     /// Check and cancel if needed, logging the reason.
     fn check_and_cancel(&self, cancel_sig: CancelSignal, context: &str) {
-        if *self.cancelled.borrow() {
+        if self.cancelled.is_cancelled() {
             tracing::info!("Request cancelled externally during {}", context);
             cancel_sig.cancel();
         } else if self.start_time.elapsed() > self.timeout {
@@ -654,12 +650,11 @@ mod tests {
 
     #[test]
     fn test_external_cancellation() {
-        let (hook, tx, _usage_state) =
+        let (hook, cancel, _usage_state) =
             StreamingRequestHook::new(Duration::from_secs(60), "test_req_2");
         assert!(!hook.should_cancel());
 
-        // Signal cancellation
-        tx.send(true).unwrap();
+        cancel.cancel();
         assert!(hook.should_cancel());
     }
 

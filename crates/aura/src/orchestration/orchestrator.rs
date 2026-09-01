@@ -46,7 +46,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use rig::client::CompletionClient;
-use tokio::sync::{Mutex, watch};
+use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::Agent;
@@ -175,29 +175,15 @@ fn apply_worker_skills_override(
 /// returns `Err`, the `select!` resolves, and the sleep future is dropped
 /// (cancelling the timer via tokio's standard drop semantics).
 #[must_use = "task runs independently; bind with `let _handle =` to document fire-and-forget intent"]
-pub(super) fn spawn_cancellation_watcher(
-    cancel_rx: watch::Receiver<bool>,
+pub(super) fn spawn_timeout_watcher(
     timeout: Duration,
     cancel_token: CancellationToken,
     request_id: String,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         tokio::select! {
-            was_cancelled = async {
-                let mut rx = cancel_rx;
-                loop {
-                    if rx.changed().await.is_err() {
-                        return false; // Sender dropped — stream finished normally
-                    }
-                    if *rx.borrow_and_update() {
-                        return true; // External cancellation requested
-                    }
-                }
-            } => {
-                if was_cancelled {
-                    tracing::info!("External cancellation triggered for {}", request_id);
-                    cancel_token.cancel();
-                }
+            () = cancel_token.cancelled() => {
+                tracing::info!("Run cancelled for {}", request_id);
             }
             _ = tokio::time::sleep(timeout) => {
                 tracing::warn!("Timeout reached, cancelling orchestration");
@@ -5695,115 +5681,38 @@ mod tests {
     // ========================================================================
 
     #[tokio::test(start_paused = true)]
-    async fn test_watcher_normal_completion_does_not_cancel() {
-        let (cancel_tx, cancel_rx) = watch::channel(false);
+    async fn watcher_stops_when_the_run_ends() {
         let cancel_token = CancellationToken::new();
-        let handle = spawn_cancellation_watcher(
-            cancel_rx,
+        let handle = spawn_timeout_watcher(
             Duration::from_secs(300),
             cancel_token.clone(),
             "test-normal".to_string(),
         );
 
-        drop(cancel_tx);
-        tokio::task::yield_now().await;
-        handle.await.unwrap();
-        assert!(!cancel_token.is_cancelled());
-    }
+        // The run's drop guard cancels on completion; the watcher must notice
+        // rather than sleeping out its timeout.
+        cancel_token.cancel();
 
-    #[tokio::test(start_paused = true)]
-    async fn test_watcher_external_cancel_triggers_token() {
-        let (cancel_tx, cancel_rx) = watch::channel(false);
-        let cancel_token = CancellationToken::new();
-        let handle = spawn_cancellation_watcher(
-            cancel_rx,
-            Duration::from_secs(300),
-            cancel_token.clone(),
-            "test-cancel".to_string(),
+        let start = tokio::time::Instant::now();
+        handle.await.unwrap();
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "watcher should exit on cancellation, not wait out its timeout"
         );
-
-        cancel_tx.send(true).unwrap();
-        tokio::task::yield_now().await;
-        handle.await.unwrap();
-        assert!(cancel_token.is_cancelled());
     }
 
     #[tokio::test(start_paused = true)]
-    async fn test_watcher_timeout_triggers_cancellation() {
-        // Keep sender alive so only the timeout path can fire
-        let (_cancel_tx, cancel_rx) = watch::channel(false);
+    async fn watcher_cancels_on_timeout() {
         let cancel_token = CancellationToken::new();
-        let handle = spawn_cancellation_watcher(
-            cancel_rx,
+        let handle = spawn_timeout_watcher(
             Duration::from_secs(60),
             cancel_token.clone(),
             "test-timeout".to_string(),
         );
 
         tokio::time::advance(Duration::from_secs(61)).await;
-        tokio::task::yield_now().await;
         handle.await.unwrap();
         assert!(cancel_token.is_cancelled());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn test_watcher_drop_before_timeout_prevents_spurious_cancel() {
-        let (cancel_tx, cancel_rx) = watch::channel(false);
-        let cancel_token = CancellationToken::new();
-        let handle = spawn_cancellation_watcher(
-            cancel_rx,
-            Duration::from_secs(60),
-            cancel_token.clone(),
-            "test-no-spurious".to_string(),
-        );
-
-        // Advance to T=30s, then drop sender (simulating stream completing mid-timeout)
-        tokio::time::advance(Duration::from_secs(30)).await;
-        tokio::task::yield_now().await;
-        drop(cancel_tx);
-        tokio::task::yield_now().await;
-
-        let start = tokio::time::Instant::now();
-        handle.await.unwrap();
-        let elapsed = start.elapsed();
-
-        assert!(
-            !cancel_token.is_cancelled(),
-            "token should not be cancelled when sender is dropped before timeout"
-        );
-        // Task should exit promptly on sender drop, not wait for remaining 30s timeout
-        assert!(
-            elapsed < Duration::from_secs(1),
-            "task should exit promptly after sender drop, not wait for timeout; elapsed: {:?}",
-            elapsed
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn test_watcher_false_signal_does_not_cancel() {
-        let (cancel_tx, cancel_rx) = watch::channel(false);
-        let cancel_token = CancellationToken::new();
-        let handle = spawn_cancellation_watcher(
-            cancel_rx,
-            Duration::from_secs(300),
-            cancel_token.clone(),
-            "test-false-signal".to_string(),
-        );
-
-        // Send false — triggers rx.changed() but borrow_and_update() sees false,
-        // so the loop continues waiting
-        cancel_tx.send(false).unwrap();
-        tokio::task::yield_now().await;
-        assert!(
-            !cancel_token.is_cancelled(),
-            "false signal should not cancel"
-        );
-
-        // Clean exit via sender drop
-        drop(cancel_tx);
-        tokio::task::yield_now().await;
-        handle.await.unwrap();
-        assert!(!cancel_token.is_cancelled());
     }
 
     // ========================================================================

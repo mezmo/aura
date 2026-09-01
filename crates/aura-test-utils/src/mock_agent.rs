@@ -6,10 +6,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use aura::streaming::AgentRun;
 use aura::{Message, StreamError, StreamItem, StreamingAgent, UsageState};
 use aura::{StreamedAssistantContent, StreamedUserContent, ToolCall, ToolResult};
 use futures::stream::{self, BoxStream, StreamExt};
-use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 type StartHook = Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
@@ -175,26 +175,11 @@ impl StreamingAgent for MockAgent {
         &self,
         _query: &str,
         _chat_history: Vec<Message>,
-        _cancel_token: CancellationToken,
+        _timeout: Option<Duration>,
         request_id: &str,
-    ) -> Result<BoxStream<'static, Result<StreamItem, StreamError>>, StreamError> {
-        Ok(self.start(request_id).await)
-    }
-
-    async fn stream_with_timeout(
-        &self,
-        _query: &str,
-        _chat_history: Vec<Message>,
-        _timeout: Duration,
-        request_id: &str,
-    ) -> (
-        BoxStream<'static, Result<StreamItem, StreamError>>,
-        watch::Sender<bool>,
-        UsageState,
-    ) {
+    ) -> AgentRun {
         let stream = self.start(request_id).await;
-        let (cancel_tx, _cancel_rx) = watch::channel(false);
-        (stream, cancel_tx, UsageState::new())
+        AgentRun::new(stream, CancellationToken::new(), UsageState::new())
     }
 
     async fn cancel_and_close_mcp(&self, _request_id: &str, _reason: &str) -> usize {
@@ -210,10 +195,7 @@ mod tests {
     #[tokio::test]
     async fn a_pending_agent_never_yields() {
         let agent = MockAgent::pending();
-        let mut stream = agent
-            .stream("q", vec![], CancellationToken::new(), "req_1")
-            .await
-            .expect("mock stream should start");
+        let mut stream = agent.stream("q", vec![], None, "req_1").await.into_events();
         assert!(
             tokio::time::timeout(Duration::from_millis(50), stream.next())
                 .await
@@ -222,57 +204,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_start_hook_runs_before_both_entry_points_stream() {
-        for entry_point in ["stream", "stream_with_timeout"] {
-            let ran = Arc::new(AtomicBool::new(false));
-            let flag = Arc::clone(&ran);
-            let agent = MockAgent::pending().on_stream_start(move |request_id| {
-                let flag = Arc::clone(&flag);
-                async move {
-                    assert_eq!(request_id, "req_1");
-                    flag.store(true, Ordering::SeqCst);
-                }
-            });
-
-            if entry_point == "stream" {
-                let _ = agent
-                    .stream("q", vec![], CancellationToken::new(), "req_1")
-                    .await
-                    .expect("mock stream should start");
-            } else {
-                let _ = agent
-                    .stream_with_timeout("q", vec![], Duration::from_secs(1), "req_1")
-                    .await;
+    async fn the_start_hook_runs_before_the_stream() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&ran);
+        let agent = MockAgent::pending().on_stream_start(move |request_id| {
+            let flag = Arc::clone(&flag);
+            async move {
+                assert_eq!(request_id, "req_1");
+                flag.store(true, Ordering::SeqCst);
             }
+        });
 
-            assert!(
-                ran.load(Ordering::SeqCst),
-                "hook should run for {entry_point}"
-            );
-        }
-    }
+        let _ = agent.stream("q", vec![], None, "req_1").await.into_events();
 
-    #[tokio::test(start_paused = true)]
-    async fn a_yielding_agent_produces_its_items_then_ends() {
-        let agent = MockAgent::yielding([items::text("hello "), items::text("world")]);
-        let stream = agent
-            .stream("q", vec![], CancellationToken::new(), "req_1")
-            .await
-            .expect("mock stream should start");
-
-        let texts: Vec<String> = stream
-            .filter_map(|item| async move {
-                match item {
-                    Ok(StreamItem::StreamAssistantItem(StreamedAssistantContent::Text(t))) => {
-                        Some(t)
-                    }
-                    _ => None,
-                }
-            })
-            .collect()
-            .await;
-
-        assert_eq!(texts, vec!["hello ", "world"]);
+        assert!(ran.load(Ordering::SeqCst), "hook should run");
     }
 
     #[tokio::test(start_paused = true)]
@@ -290,9 +235,9 @@ mod tests {
         ]);
 
         let stream = agent
-            .stream("q", vec![], CancellationToken::new(), "req_42")
+            .stream("q", vec![], None, "req_42")
             .await
-            .expect("mock stream should start");
+            .into_events();
         let items: Vec<_> = stream.collect().await;
 
         assert_eq!(order.lock().expect("order lock").as_slice(), ["req_42"]);
@@ -304,15 +249,15 @@ mod tests {
         let agent = MockAgent::yielding([items::text("once")]);
 
         let first: Vec<_> = agent
-            .stream("q", vec![], CancellationToken::new(), "req_1")
+            .stream("q", vec![], None, "req_1")
             .await
-            .expect("mock stream should start")
+            .into_events()
             .collect()
             .await;
         let second: Vec<_> = agent
-            .stream("q", vec![], CancellationToken::new(), "req_1")
+            .stream("q", vec![], None, "req_1")
             .await
-            .expect("mock stream should start")
+            .into_events()
             .collect()
             .await;
 
@@ -336,10 +281,7 @@ mod tests {
             Step::item(items::text("b")),
         ]);
 
-        let mut stream = agent
-            .stream("q", vec![], CancellationToken::new(), "req_1")
-            .await
-            .expect("mock stream should start");
+        let mut stream = agent.stream("q", vec![], None, "req_1").await.into_events();
         while stream.next().await.is_some() {
             seen.fetch_add(1, Ordering::SeqCst);
         }

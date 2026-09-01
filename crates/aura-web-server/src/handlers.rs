@@ -562,14 +562,17 @@ pub async fn execute_completion(
     };
 
     // Create stream with timeout — single path for both Agent and Orchestrator
-    let (stream, cancel_tx, usage_state) = streaming_agent
-        .stream_with_timeout(
+    let run = streaming_agent
+        .stream(
             &query,
             chat_history,
-            config.timeout_duration,
+            (!config.timeout_duration.is_zero()).then_some(config.timeout_duration),
             &config.request_id,
         )
         .await;
+    let cancel_tx = run.cancel_token();
+    let usage_state = run.usage().clone();
+    let stream = run.into_events();
 
     let response_content = config.response_content.clone();
     let otel_ctx = StreamOtelContext {

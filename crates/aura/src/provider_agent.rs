@@ -17,7 +17,7 @@ use rig::streaming::{StreamingChat, StreamingPrompt};
 use std::collections::HashSet;
 use std::pin::Pin;
 use std::time::Duration;
-use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
 
 use crate::scratchpad::ContextBudget;
 use crate::streaming_request_hook::StreamingRequestHook;
@@ -175,7 +175,7 @@ impl ProviderAgent {
         client_tool_names: HashSet<String>,
     ) -> (
         Pin<Box<dyn futures::Stream<Item = Result<StreamItem, StreamError>> + Send>>,
-        watch::Sender<bool>,
+        CancellationToken,
         crate::streaming_request_hook::UsageState,
     ) {
         let (hook, cancel_tx, usage_state) =
@@ -276,7 +276,7 @@ impl ProviderAgent {
         client_tool_names: HashSet<String>,
     ) -> (
         Pin<Box<dyn futures::Stream<Item = Result<StreamItem, StreamError>> + Send>>,
-        watch::Sender<bool>,
+        CancellationToken,
         crate::streaming_request_hook::UsageState,
     ) {
         let (hook, cancel_tx, usage_state) =

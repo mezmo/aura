@@ -21,7 +21,6 @@ use std::collections::HashSet;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::watch;
 
 /// A client-side tool definition supplied with a request.
 ///
@@ -1417,7 +1416,7 @@ impl Agent {
         request_id: &str,
     ) -> (
         Pin<Box<dyn futures::stream::Stream<Item = Result<StreamItem, StreamError>> + Send>>,
-        watch::Sender<bool>,
+        CancellationToken,
         crate::streaming_request_hook::UsageState,
     ) {
         self.seed_scratchpad_request_input(query, &[]);
@@ -1462,7 +1461,7 @@ impl Agent {
         request_id: &str,
     ) -> (
         Pin<Box<dyn futures::stream::Stream<Item = Result<StreamItem, StreamError>> + Send>>,
-        watch::Sender<bool>,
+        CancellationToken,
         crate::streaming_request_hook::UsageState,
     ) {
         self.seed_scratchpad_request_input(query, &chat_history);
@@ -1655,7 +1654,6 @@ fn record_completion_result(
 // Implement StreamingAgent trait for Agent
 use crate::streaming::StreamingAgent;
 use async_trait::async_trait;
-use futures::stream::BoxStream;
 use tokio_util::sync::CancellationToken;
 
 #[async_trait]
@@ -1668,39 +1666,17 @@ impl StreamingAgent for Agent {
         &self,
         query: &str,
         chat_history: Vec<rig::completion::Message>,
-        _cancel_token: CancellationToken,
+        timeout: Option<Duration>,
         request_id: &str,
-    ) -> Result<BoxStream<'static, Result<StreamItem, StreamError>>, StreamError> {
+    ) -> crate::streaming::AgentRun {
+        // The hook enforces the bound, so an unbounded run gets one it never reaches.
+        let timeout = timeout.unwrap_or(Duration::MAX);
+
         if let Some(mcp_manager) = &self.mcp_manager {
             mcp_manager.set_current_request(request_id).await;
         }
 
-        let stream = if chat_history.is_empty() {
-            self.stream_prompt(query).await
-        } else {
-            self.stream_chat(query, chat_history).await
-        };
-
-        Ok(Box::pin(stream))
-    }
-
-    async fn stream_with_timeout(
-        &self,
-        query: &str,
-        chat_history: Vec<rig::completion::Message>,
-        timeout: Duration,
-        request_id: &str,
-    ) -> (
-        BoxStream<'static, Result<StreamItem, StreamError>>,
-        watch::Sender<bool>,
-        crate::UsageState,
-    ) {
-        // Production entry point — set MCP request ID before delegating
-        if let Some(mcp_manager) = &self.mcp_manager {
-            mcp_manager.set_current_request(request_id).await;
-        }
-
-        let (stream, cancel_tx, usage_state) = if chat_history.is_empty() {
+        let (stream, cancel, usage_state) = if chat_history.is_empty() {
             self.stream_prompt_with_timeout(query, timeout, request_id)
                 .await
         } else {
@@ -1708,7 +1684,7 @@ impl StreamingAgent for Agent {
                 .await
         };
 
-        (Box::pin(stream), cancel_tx, usage_state)
+        crate::streaming::AgentRun::new(Box::pin(stream), cancel, usage_state)
     }
 
     async fn cancel_and_close_mcp(&self, request_id: &str, reason: &str) -> usize {
