@@ -1672,9 +1672,11 @@ impl StreamingAgent for Agent {
         timeout: Option<Duration>,
         request_id: &str,
     ) -> crate::streaming::AgentRun {
+        // Rig runs tools on its own server task, so bind the run where a tool
+        // call can still find it.
         if let Some(mcp_manager) = &self.mcp_manager {
             mcp_manager
-                .set_current_call(request_id, aura_events::AgentContext::single_agent())
+                .bind_call(request_id, aura_events::AgentContext::single_agent())
                 .await;
         }
 
@@ -1685,6 +1687,12 @@ impl StreamingAgent for Agent {
             self.stream_chat_with_timeout(query, chat_history, timeout, request_id)
                 .await
         }
+        .map_stream(|stream| {
+            Box::pin(crate::run_context::scope_stream(
+                request_id.to_string(),
+                stream,
+            ))
+        })
     }
 
     async fn cancel_and_close_mcp(&self, request_id: &str, reason: &str) -> usize {

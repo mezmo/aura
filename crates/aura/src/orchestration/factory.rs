@@ -69,7 +69,7 @@ impl OrchestratorFactory {
         // Capture parent span so child spans nest correctly in tracing.
         let parent_span = tracing::Span::current();
         tokio::spawn(tracing::Instrument::instrument(
-            async move {
+            crate::run_context::with_run_id(request_id.clone(), async move {
                 let _done_guard = done_guard;
                 let mut orchestrator = match Orchestrator::new(agent_config).await {
                     Ok(o) => o,
@@ -83,13 +83,14 @@ impl OrchestratorFactory {
                 orchestrator.usage_state = usage_state;
                 orchestrator.outer_budget = outer_budget;
 
-                // Set MCP request ID for progress notification routing, and
-                // surface per-server connection status so degraded/unavailable
+                // Surface per-server connection status so degraded/unavailable
                 // MCP servers are visible in orchestration mode too (workers
                 // share this one manager).
                 if let Some(ref mcp_manager) = orchestrator.mcp_manager {
+                    // Workers share this manager, and their tool calls run on
+                    // rig's server task where the run's scope does not reach.
                     mcp_manager
-                        .set_current_call(&request_id, aura_events::AgentContext::coordinator())
+                        .bind_call(&request_id, aura_events::AgentContext::coordinator())
                         .await;
                     let snapshot = mcp_manager.server_status_snapshot();
                     if !snapshot.is_empty() {
@@ -140,7 +141,7 @@ impl OrchestratorFactory {
                         }
                     }
                 }
-            },
+            }),
             parent_span,
         ));
 
