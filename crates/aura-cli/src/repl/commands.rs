@@ -473,7 +473,8 @@ pub(crate) fn handle_model(
     redraw_input_frame();
 }
 
-/// Returned tuple: (store, history, events, expanded, (prompt_tokens, completion_tokens))
+/// Returned tuple: (store, history, events, expanded,
+/// (prompt_tokens, completion_tokens, cache_read_tokens))
 #[allow(clippy::type_complexity)]
 pub(crate) fn resume_conversation(
     id_prefix: &str,

@@ -39,9 +39,11 @@ strip = "symbols"
 
 [workspace.dependencies]
 rig-core = { git = "https://github.com/mezmo/rig.git", rev = "8fbc59c4772566629d353459617505191e415ed2", default-features = false, features = ["rmcp", "reqwest-rustls"] }
-# The fork's vendored copy (0.3.10 + prompt-caching support), building against
-# the same rig-core. crates.io 0.3.11+ pulls rig-core 0.31, which is
-# semver-incompatible with the 0.28 fork.
+# The fork's vendored copy (versioned "0.3.10" but carrying prompt-caching
+# support beyond the crates.io release of that number), building against the
+# same rig-core. crates.io 0.3.11+ pulls rig-core 0.31, which is
+# semver-incompatible with the 0.28 fork. This also resolves rig-derive to the
+# fork's 0.1.10 rather than the newer crates.io release.
 rig-bedrock = { git = "https://github.com/mezmo/rig.git", rev = "8fbc59c4772566629d353459617505191e415ed2" }
 
 # MCP support
