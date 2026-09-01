@@ -620,6 +620,8 @@ impl Agent {
 
                 tracing::info!("Creating Bedrock completion model: {}", model);
                 let mut completion_model = bedrock_client.completion_model(model);
+                // Opt-in per agent: Bedrock rejects cachePoint blocks on
+                // models without prompt-caching support.
                 if *prompt_caching {
                     tracing::info!("  Prompt caching enabled");
                     completion_model = completion_model.with_prompt_caching();

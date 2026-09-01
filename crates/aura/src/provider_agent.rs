@@ -380,11 +380,10 @@ pub enum StreamItem {
     Final(FinalResponseInfo),
     /// Internal marker for final response (filtered out before returning to caller)
     FinalMarker,
-    /// Per-turn token usage from intermediate turns (not end-of-stream).
+    /// Per-turn token usage from intermediate turns (not end-of-stream),
+    /// with the turn's provider-reported prompt-cache split.
     /// Emitted on every Rig `Final` chunk so callers can capture usage
     /// even when they short-circuit before the terminal `FinalResponse`.
-    /// The second field carries the turn's prompt-cache counts when the
-    /// provider reported any.
     TurnUsage(Usage, Option<rig::completion::CacheUsage>),
     /// Orchestrator status event (plan progress, task status, etc.)
     OrchestratorEvent(OrchestratorEvent),

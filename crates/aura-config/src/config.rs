@@ -96,7 +96,7 @@ pub enum LlmConfig {
         /// Context window size in tokens.
         #[serde(default, deserialize_with = "lenient_int::deserialize_option_u64")]
         context_window: Option<u64>,
-        /// Anthropic prompt caching (`cache_control` breakpoints). Off by default.
+        /// Anthropic prompt caching (`cache_control` breakpoints).
         #[serde(default)]
         prompt_caching: bool,
         /// Controls the randomness and creativity of the llm
@@ -119,9 +119,7 @@ pub enum LlmConfig {
         /// Context window size in tokens.
         #[serde(default, deserialize_with = "lenient_int::deserialize_option_u64")]
         context_window: Option<u64>,
-        /// Bedrock prompt caching (`cachePoint` breakpoints). Off by default;
-        /// enable only for models that support prompt caching — Bedrock
-        /// rejects requests otherwise.
+        /// Bedrock prompt caching (`cachePoint` breakpoints).
         #[serde(default)]
         prompt_caching: bool,
         #[serde(default)]
