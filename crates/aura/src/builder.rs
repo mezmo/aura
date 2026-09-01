@@ -525,6 +525,7 @@ impl Agent {
                 api_key,
                 model,
                 base_url,
+                prompt_caching,
                 temperature,
                 additional_params,
                 ..
@@ -544,7 +545,11 @@ impl Agent {
                 let client = client_builder.build()?;
                 tracing::info!("Anthropic client initialized successfully");
 
-                let completion_model = client.completion_model(model);
+                let mut completion_model = client.completion_model(model);
+                if *prompt_caching {
+                    tracing::info!("  Prompt caching enabled");
+                    completion_model = completion_model.with_prompt_caching();
+                }
 
                 // Create agent builder with system prompt and temperature
                 let mut agent_builder = rig::agent::AgentBuilder::new(completion_model);
@@ -581,6 +586,7 @@ impl Agent {
                 model,
                 region,
                 profile,
+                prompt_caching,
                 temperature,
                 additional_params,
                 ..
@@ -613,7 +619,11 @@ impl Agent {
                 tracing::info!("AWS Bedrock client initialized successfully");
 
                 tracing::info!("Creating Bedrock completion model: {}", model);
-                let completion_model = bedrock_client.completion_model(model);
+                let mut completion_model = bedrock_client.completion_model(model);
+                if *prompt_caching {
+                    tracing::info!("  Prompt caching enabled");
+                    completion_model = completion_model.with_prompt_caching();
+                }
                 tracing::info!("Bedrock completion model created successfully");
 
                 // Create agent builder with system prompt and temperature
@@ -1254,7 +1264,7 @@ impl Agent {
                     usage = response.usage;
                     break;
                 }
-                Ok(StreamItem::FinalMarker) | Ok(StreamItem::TurnUsage(_)) => {
+                Ok(StreamItem::FinalMarker) | Ok(StreamItem::TurnUsage(..)) => {
                     // Per-turn marker — not end-of-stream. Continue collecting.
                 }
                 Ok(_) => {
@@ -1325,7 +1335,7 @@ impl Agent {
         };
         state.reset();
         Box::pin(stream.map(move |item| {
-            if matches!(item, Ok(StreamItem::TurnUsage(_))) {
+            if matches!(item, Ok(StreamItem::TurnUsage(..))) {
                 state.record_turn_completed();
             }
             item

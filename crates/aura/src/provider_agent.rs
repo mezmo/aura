@@ -383,7 +383,9 @@ pub enum StreamItem {
     /// Per-turn token usage from intermediate turns (not end-of-stream).
     /// Emitted on every Rig `Final` chunk so callers can capture usage
     /// even when they short-circuit before the terminal `FinalResponse`.
-    TurnUsage(Usage),
+    /// The second field carries the turn's prompt-cache counts when the
+    /// provider reported any.
+    TurnUsage(Usage, Option<rig::completion::CacheUsage>),
     /// Orchestrator status event (plan progress, task status, etc.)
     OrchestratorEvent(OrchestratorEvent),
     /// Per-agent scratchpad usage report.
@@ -529,7 +531,7 @@ fn map_stream_item<R: rig::completion::GetTokenUsage>(
                         output_tokens: 0,
                         total_tokens: 0,
                     });
-                    return Ok(StreamItem::TurnUsage(usage));
+                    return Ok(StreamItem::TurnUsage(usage, resp.cache_token_usage()));
                 }
             };
             Ok(StreamItem::StreamAssistantItem(mapped))

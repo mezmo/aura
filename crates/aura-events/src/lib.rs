@@ -421,6 +421,14 @@ pub enum AuraStreamEvent {
         completion_tokens: u64,
         /// Total tokens used
         total_tokens: u64,
+        /// Prompt tokens served from the provider's prompt cache
+        /// (a subset of `prompt_tokens`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_read_input_tokens: Option<u64>,
+        /// Prompt tokens written to the provider's prompt cache
+        /// (a subset of `prompt_tokens`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_creation_input_tokens: Option<u64>,
         #[serde(flatten)]
         correlation: CorrelationContext,
     },
@@ -636,17 +644,22 @@ impl AuraStreamEvent {
         }
     }
 
-    /// Create a Usage event (emitted at stream end).
+    /// Create a Usage event (emitted at stream end). `cache_usage` is the
+    /// provider-reported prompt-cache split as `(read, creation)` tokens, if
+    /// any.
     pub fn usage(
         prompt_tokens: u64,
         completion_tokens: u64,
         total_tokens: u64,
+        cache_usage: Option<(u64, u64)>,
         correlation: CorrelationContext,
     ) -> Self {
         Self::Usage {
             prompt_tokens,
             completion_tokens,
             total_tokens,
+            cache_read_input_tokens: cache_usage.map(|(read, _)| read),
+            cache_creation_input_tokens: cache_usage.map(|(_, creation)| creation),
             correlation,
         }
     }
@@ -910,17 +923,49 @@ mod tests {
 
     #[test]
     fn usage_roundtrip() {
-        let event = AuraStreamEvent::usage(100, 50, 150, CorrelationContext::new("s1", None));
+        let event = AuraStreamEvent::usage(100, 50, 150, None, CorrelationContext::new("s1", None));
         let json = serde_json::to_string(&event).unwrap();
+        assert!(
+            !json.contains("cache_read_input_tokens"),
+            "absent cache usage must not serialize"
+        );
         let parsed: AuraStreamEvent = serde_json::from_str(&json).unwrap();
         match parsed {
             AuraStreamEvent::Usage {
                 prompt_tokens,
                 completion_tokens,
+                cache_read_input_tokens,
                 ..
             } => {
                 assert_eq!(prompt_tokens, 100);
                 assert_eq!(completion_tokens, 50);
+                assert_eq!(cache_read_input_tokens, None);
+            }
+            other => panic!("expected Usage, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn usage_roundtrip_with_cache() {
+        let event = AuraStreamEvent::usage(
+            100,
+            50,
+            150,
+            Some((80, 20)),
+            CorrelationContext::new("s1", None),
+        );
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: AuraStreamEvent = serde_json::from_str(&json).unwrap();
+        match parsed {
+            AuraStreamEvent::Usage {
+                prompt_tokens,
+                cache_read_input_tokens,
+                cache_creation_input_tokens,
+                ..
+            } => {
+                assert_eq!(prompt_tokens, 100);
+                assert_eq!(cache_read_input_tokens, Some(80));
+                assert_eq!(cache_creation_input_tokens, Some(20));
             }
             other => panic!("expected Usage, got {:?}", other),
         }

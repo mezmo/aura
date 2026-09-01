@@ -64,6 +64,12 @@ pub struct UsageState {
     accumulated_completion_tokens: Arc<AtomicU64>,
     /// Completion tokens spent on tool-call turns.
     tool_completion_tokens: Arc<AtomicU64>,
+    /// Whether any turn reported prompt-cache usage.
+    cache_seen: Arc<AtomicBool>,
+    /// Cumulative input tokens served from the provider's prompt cache.
+    cache_read_tokens: Arc<AtomicU64>,
+    /// Cumulative input tokens written to the provider's prompt cache.
+    cache_creation_tokens: Arc<AtomicU64>,
     /// Input tokens of the most recent turn.
     last_input_tokens: Arc<AtomicU64>,
     /// Output tokens of the most recent turn.
@@ -105,6 +111,30 @@ impl UsageState {
     /// The response completion tokens can be derived as `completion - tool_completion`.
     pub fn get_tool_completion_tokens(&self) -> u64 {
         self.tool_completion_tokens.load(Ordering::Acquire)
+    }
+
+    /// Cumulative prompt-cache usage as `(cache_read, cache_creation)`, summed
+    /// across every LLM turn. `None` until a provider reports cache counts, so
+    /// providers without prompt caching (or with it disabled) stay silent. Both
+    /// counts are subsets of the billed prompt tokens in `get_final_usage`.
+    pub fn get_cache_usage(&self) -> Option<(u64, u64)> {
+        if !self.cache_seen.load(Ordering::Acquire) {
+            return None;
+        }
+        Some((
+            self.cache_read_tokens.load(Ordering::Acquire),
+            self.cache_creation_tokens.load(Ordering::Acquire),
+        ))
+    }
+
+    /// Accumulate one turn's prompt-cache counts (both the single-agent and
+    /// orchestration paths).
+    pub fn store_cache_usage(&self, cache_read: u64, cache_creation: u64) {
+        self.cache_seen.store(true, Ordering::Release);
+        self.cache_read_tokens
+            .fetch_add(cache_read, Ordering::AcqRel);
+        self.cache_creation_tokens
+            .fetch_add(cache_creation, Ordering::AcqRel);
     }
 
     /// Record one completion turn (single-agent path): accumulate billed
@@ -580,6 +610,7 @@ where
         // Extract usage if the response type supports it
         // StreamingResponse implements GetTokenUsage which has token_usage()
         let usage = response.token_usage();
+        let cache_usage = response.cache_token_usage();
 
         async move {
             if let Some(usage) = usage {
@@ -596,6 +627,12 @@ where
                     usage.total_tokens,
                     is_tool_turn,
                 );
+                if let Some(cache) = cache_usage {
+                    usage_state.store_cache_usage(
+                        cache.cache_read_input_tokens,
+                        cache.cache_creation_input_tokens,
+                    );
+                }
 
                 // Feed LLM ground-truth into the scratchpad budget so its
                 // remaining-budget hints reflect real context pressure (the
@@ -625,6 +662,9 @@ where
                     prompt_tokens = usage.input_tokens,
                     completion_tokens = usage.output_tokens,
                     total_tokens = usage.total_tokens,
+                    cache_read_input_tokens = cache_usage.map(|c| c.cache_read_input_tokens),
+                    cache_creation_input_tokens =
+                        cache_usage.map(|c| c.cache_creation_input_tokens),
                     "Token usage captured"
                 );
             }
@@ -760,6 +800,22 @@ mod tests {
             prompt > 0,
             "handler uses prompt > 0 to gate aura.usage emission"
         );
+    }
+
+    #[test]
+    fn test_cache_usage_accumulates_and_is_none_until_reported() {
+        let usage_state = UsageState::new();
+        assert_eq!(
+            usage_state.get_cache_usage(),
+            None,
+            "no cache usage reported yet — event must omit the fields"
+        );
+
+        // Turn 1: cold cache — everything written. Turn 2: full read-back.
+        usage_state.store_cache_usage(0, 18_000);
+        usage_state.store_cache_usage(18_000, 500);
+
+        assert_eq!(usage_state.get_cache_usage(), Some((18_000, 18_500)));
     }
 
     #[test]

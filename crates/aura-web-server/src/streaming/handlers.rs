@@ -509,8 +509,13 @@ async fn send_final_events(
                 completion,
                 total
             );
-            let usage_event =
-                AuraStreamEvent::usage(prompt, completion, total, ctx.correlation.clone());
+            let usage_event = AuraStreamEvent::usage(
+                prompt,
+                completion,
+                total,
+                callbacks.usage_state.get_cache_usage(),
+                ctx.correlation.clone(),
+            );
             let _ = tx.send(Ok(Bytes::from(usage_event.format_sse()))).await;
         }
 
@@ -717,7 +722,7 @@ fn handle_stream_item(
 
             vec![]
         }
-        StreamItem::FinalMarker | StreamItem::TurnUsage(_) => {
+        StreamItem::FinalMarker | StreamItem::TurnUsage(..) => {
             // Internal markers - filtered out
             tracing::debug!("Received final/turn-usage marker");
             vec![]

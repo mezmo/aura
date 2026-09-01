@@ -443,7 +443,12 @@ struct TurnTally {
 }
 
 impl TurnTally {
-    fn record(&mut self, turn: &rig::completion::Usage, usage_state: &crate::UsageState) {
+    fn record(
+        &mut self,
+        turn: &rig::completion::Usage,
+        cache: Option<rig::completion::CacheUsage>,
+        usage_state: &crate::UsageState,
+    ) {
         self.total.input_tokens += turn.input_tokens;
         self.total.output_tokens += turn.output_tokens;
         self.total.total_tokens += turn.total_tokens;
@@ -453,6 +458,12 @@ impl TurnTally {
             total_tokens: turn.total_tokens,
         };
         usage_state.accumulate_usage(turn.input_tokens, turn.output_tokens);
+        if let Some(cache) = cache {
+            usage_state.store_cache_usage(
+                cache.cache_read_input_tokens,
+                cache.cache_creation_input_tokens,
+            );
+        }
     }
 
     /// Reconcile against a loop total the provider reported separately.
@@ -1156,8 +1167,8 @@ impl Orchestrator {
                     Ok(StreamItem::FinalMarker) => {
                         // Per-turn marker — not end-of-stream. Continue collecting.
                     }
-                    Ok(StreamItem::TurnUsage(turn)) => {
-                        tally.record(&turn, usage_state);
+                    Ok(StreamItem::TurnUsage(turn, cache)) => {
+                        tally.record(&turn, cache, usage_state);
                         if let Some(budget) = scratchpad_budget {
                             budget.set_estimated_used(turn.input_tokens, turn.output_tokens);
                         }
@@ -1183,8 +1194,10 @@ impl Orchestrator {
                         );
                         if decision_ready().await {
                             tracing::debug!("{}: decision captured, reading turn usage", phase);
-                            if let Some(Ok(StreamItem::TurnUsage(turn))) = stream.next().await {
-                                tally.record(&turn, usage_state);
+                            if let Some(Ok(StreamItem::TurnUsage(turn, cache))) =
+                                stream.next().await
+                            {
+                                tally.record(&turn, cache, usage_state);
                             }
                             return Ok(LoopStep::End);
                         }
@@ -1413,8 +1426,10 @@ impl Orchestrator {
                             );
                             if decision_ready().await {
                                 tracing::debug!("{}: decision captured, reading turn usage", phase);
-                                if let Some(Ok(StreamItem::TurnUsage(turn))) = stream.next().await {
-                                    tally.record(&turn, &self.usage_state);
+                                if let Some(Ok(StreamItem::TurnUsage(turn, cache))) =
+                                    stream.next().await
+                                {
+                                    tally.record(&turn, cache, &self.usage_state);
                                 }
                                 return Ok(LoopStep::End);
                             }
@@ -1439,8 +1454,8 @@ impl Orchestrator {
                             final_total = Some(info.usage);
                             return Ok(LoopStep::End);
                         }
-                        Ok(StreamItem::TurnUsage(turn)) => {
-                            tally.record(&turn, &self.usage_state);
+                        Ok(StreamItem::TurnUsage(turn, cache)) => {
+                            tally.record(&turn, cache, &self.usage_state);
                         }
                         Ok(StreamItem::FinalMarker) => return Ok(LoopStep::End),
                         // MaxDepthError: success if decision was captured, error otherwise
@@ -2615,6 +2630,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 api_key,
                 model,
                 base_url,
+                prompt_caching,
                 ..
             } => {
                 let mut cb = rig::providers::anthropic::Client::<reqwest::Client>::builder()
@@ -2622,10 +2638,13 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 if let Some(url) = base_url {
                     cb = cb.base_url(url);
                 }
-                let cm = cb
+                let mut cm = cb
                     .build()
                     .map_err(|e| format!("Failed to build Anthropic coordinator: {}", e))?
                     .completion_model(model);
+                if *prompt_caching {
+                    cm = cm.with_prompt_caching();
+                }
                 Ok(ProviderAgent::Anthropic(Self::build_agent_with_tools(
                     cm,
                     preamble,
@@ -2641,6 +2660,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 model,
                 region,
                 profile,
+                prompt_caching,
                 ..
             } => {
                 use aws_config::{BehaviorVersion, Region};
@@ -2656,10 +2676,13 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         .load()
                         .await
                 };
-                let cm = rig_bedrock::client::Client::from(aws_sdk_bedrockruntime::Client::new(
-                    &sdk_config,
-                ))
+                let mut cm = rig_bedrock::client::Client::from(
+                    aws_sdk_bedrockruntime::Client::new(&sdk_config),
+                )
                 .completion_model(model);
+                if *prompt_caching {
+                    cm = cm.with_prompt_caching();
+                }
                 Ok(ProviderAgent::Bedrock(Self::build_agent_with_tools(
                     cm,
                     preamble,
@@ -2829,6 +2852,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 api_key,
                 model,
                 base_url,
+                prompt_caching,
                 additional_params,
                 ..
             } => {
@@ -2837,10 +2861,13 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 if let Some(url) = base_url {
                     cb = cb.base_url(url);
                 }
-                let cm = cb
+                let mut cm = cb
                     .build()
                     .map_err(|e| format!("Failed to build Anthropic worker: {}", e))?
                     .completion_model(model);
+                if *prompt_caching {
+                    cm = cm.with_prompt_caching();
+                }
                 let mut builder = rig::agent::AgentBuilder::new(cm);
                 builder = builder.name(&worker_config.agent.name);
                 builder = builder.provider_name(llm_provider).model_name(llm_model);
@@ -2864,6 +2891,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 model,
                 region,
                 profile,
+                prompt_caching,
                 additional_params,
                 ..
             } => {
@@ -2880,10 +2908,13 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         .load()
                         .await
                 };
-                let cm = rig_bedrock::client::Client::from(aws_sdk_bedrockruntime::Client::new(
-                    &sdk_config,
-                ))
+                let mut cm = rig_bedrock::client::Client::from(
+                    aws_sdk_bedrockruntime::Client::new(&sdk_config),
+                )
                 .completion_model(model);
+                if *prompt_caching {
+                    cm = cm.with_prompt_caching();
+                }
                 let mut builder = rig::agent::AgentBuilder::new(cm);
                 builder = builder.name(&worker_config.agent.name);
                 builder = builder.provider_name(llm_provider).model_name(llm_model);
@@ -4895,8 +4926,8 @@ mod tests {
         let usage_state = crate::UsageState::new();
         let mut tally = TurnTally::default();
 
-        tally.record(&usage(2012, 115), &usage_state);
-        tally.record(&usage(2152, 124), &usage_state);
+        tally.record(&usage(2012, 115), None, &usage_state);
+        tally.record(&usage(2152, 124), None, &usage_state);
 
         // Billed usage is the whole loop.
         assert_eq!(usage_state.get_final_usage(), (4164, 239, 4403));
@@ -4910,8 +4941,8 @@ mod tests {
     fn test_tally_reconciles_to_zero_when_every_turn_was_recorded() {
         let usage_state = crate::UsageState::new();
         let mut tally = TurnTally::default();
-        tally.record(&usage(2012, 115), &usage_state);
-        tally.record(&usage(2152, 124), &usage_state);
+        tally.record(&usage(2012, 115), None, &usage_state);
+        tally.record(&usage(2152, 124), None, &usage_state);
 
         // The provider's loop total for these turns — nothing bypassed record().
         let unrecorded = tally.reconcile(&usage(4164, 239));
@@ -4924,7 +4955,7 @@ mod tests {
     fn test_tally_reconcile_surfaces_turns_that_bypassed_record() {
         let usage_state = crate::UsageState::new();
         let mut tally = TurnTally::default();
-        tally.record(&usage(2012, 115), &usage_state);
+        tally.record(&usage(2012, 115), None, &usage_state);
 
         let unrecorded = tally.reconcile(&usage(4164, 239));
 
@@ -4936,7 +4967,7 @@ mod tests {
     fn test_tally_reconcile_saturates_when_total_trails_recorded() {
         let usage_state = crate::UsageState::new();
         let mut tally = TurnTally::default();
-        tally.record(&usage(4164, 239), &usage_state);
+        tally.record(&usage(4164, 239), None, &usage_state);
 
         let unrecorded = tally.reconcile(&usage(100, 10));
 
@@ -4960,7 +4991,7 @@ mod tests {
         ] {
             let mut tally = TurnTally::default();
             for turn in &turns {
-                tally.record(turn, &usage_state);
+                tally.record(turn, None, &usage_state);
             }
         }
 
@@ -4988,7 +5019,10 @@ mod tests {
     }
 
     fn turn(input_tokens: u64, output_tokens: u64) -> Result<StreamItem, StreamError> {
-        Ok(StreamItem::TurnUsage(usage(input_tokens, output_tokens)))
+        Ok(StreamItem::TurnUsage(
+            usage(input_tokens, output_tokens),
+            None,
+        ))
     }
 
     fn tool_result(id: &str) -> Result<StreamItem, StreamError> {
