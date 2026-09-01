@@ -252,7 +252,7 @@ fn extract_task_id(tool_call_id: &str) -> Option<usize> {
 /// attribution the envelope already holds.
 fn by_worker(worker_id: &str, payload: AgentEventPayload) -> AgentEvent {
     AgentEvent::new(
-        aura_events::AgentContext::worker(worker_id, None, "coordinator"),
+        aura_events::AgentContext::worker(worker_id, None, aura_events::COORDINATOR_AGENT_ID),
         payload,
     )
 }
@@ -1181,11 +1181,9 @@ impl Orchestrator {
         for call in pending {
             registry.remove(&call.decision_id).await;
             if let Some(ref scope) = scope {
-                crate::approval_event_broker::publish(
+                let _ = crate::agent_events::emit(
                     &request_id,
-                    crate::approval_event_broker::ApprovalLifecycleEvent::Completed(
-                        crate::hitl::completed_cancelled(call.decision_id, scope, Duration::ZERO),
-                    ),
+                    crate::hitl::completed_cancelled_event(call.decision_id, scope, Duration::ZERO),
                 )
                 .await;
             }

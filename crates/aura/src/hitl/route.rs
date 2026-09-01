@@ -17,7 +17,7 @@ use super::events;
 use super::protocol::{ApprovalDecisionWire, ApprovalRequest, ApprovalRequestWire};
 use super::registry::PendingApprovals;
 use super::signing::{SigningContext, WebhookHmac, authorize_ingress};
-use crate::approval_event_broker::{self, ApprovalLifecycleEvent};
+use crate::agent_events::emit;
 
 /// Maximum time to wait for a TCP connection to the approval webhook before
 /// failing closed. Without this, an unreachable host can hang the connect
@@ -230,11 +230,7 @@ async fn webhook_round_trip<T>(
     let decision_id = request.decision_id;
     let scope = request.scope.clone();
 
-    approval_event_broker::publish(
-        &request_id,
-        ApprovalLifecycleEvent::Requested(request.into()),
-    )
-    .await;
+    let _ = emit(&request_id, events::requested_event(request)).await;
 
     let raced = tokio::select! {
         biased;
@@ -251,13 +247,13 @@ async fn webhook_round_trip<T>(
     let completed = match &result {
         Ok(decision) => {
             let elapsed = started.elapsed();
-            events::completed(decision_id, &event_outcome(decision), &scope, elapsed)
+            events::completed_event(decision_id, &event_outcome(decision), &scope, elapsed)
         }
         Err(err) => {
-            events::completed_error(decision_id, err.to_string(), &scope, started.elapsed())
+            events::completed_error_event(decision_id, err.to_string(), &scope, started.elapsed())
         }
     };
-    approval_event_broker::publish(&request_id, ApprovalLifecycleEvent::Completed(completed)).await;
+    let _ = emit(&request_id, completed).await;
     result
 }
 
@@ -319,23 +315,19 @@ impl DecisionRoute {
 
         match self {
             Self::Conversational { registry, timeout } => {
-                let requested_event = ApprovalLifecycleEvent::Requested((&request).into());
+                let requested = events::requested_event(&request);
                 let expires_at = chrono::Utc::now()
                     + chrono::Duration::from_std(*timeout)
                         .expect("approval timeout fits in chrono");
-                let pending_event = events::pending(&request, &expires_at);
+                let pending = events::pending_event(&request, &expires_at);
 
                 // Register before publishing anything: both events carry the
                 // decision id off-process (SSE), and an approver reacting to
                 // either must find the parked record already resolvable.
                 let handle = registry.register(request, *timeout).await;
 
-                approval_event_broker::publish(&request_id, requested_event).await;
-                approval_event_broker::publish(
-                    &request_id,
-                    ApprovalLifecycleEvent::Pending(pending_event),
-                )
-                .await;
+                let _ = emit(&request_id, requested).await;
+                let _ = emit(&request_id, pending).await;
 
                 let mut outcome = handle.outcome(cancel).await;
                 if matches!(
@@ -355,13 +347,9 @@ impl DecisionRoute {
                     outcome = ApprovalOutcome::Decided(decision);
                 }
 
-                let completed_event =
-                    events::completed(decision_id, &outcome, &scope, started.elapsed());
-                approval_event_broker::publish(
-                    &request_id,
-                    ApprovalLifecycleEvent::Completed(completed_event),
-                )
-                .await;
+                let completed =
+                    events::completed_event(decision_id, &outcome, &scope, started.elapsed());
+                let _ = emit(&request_id, completed).await;
 
                 Ok(outcome)
             }
