@@ -261,6 +261,8 @@ async fn a_full_tool_turn_matches() {
                 Step::item(items::tool_call(TOOL_ID, TOOL_NAME, TOOL_ARGS)),
                 Step::effect(emit(AgentEvent::single_agent(
                     AgentEventPayload::ToolStart {
+                        arguments: None,
+                        task_id: None,
                         tool_call_id: TOOL_ID.to_string(),
                         tool_name: TOOL_NAME.to_string(),
                         progress_token: Some(token()),
