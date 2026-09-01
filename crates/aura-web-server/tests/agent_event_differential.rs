@@ -33,7 +33,7 @@ use aura_web_server::streaming::{
     process_sse_stream_full,
 };
 use bytes::Bytes;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 const TOOL_ID: &str = "call_abc123";
@@ -106,9 +106,14 @@ async fn run_as(request_id: &str, steps: Vec<Step>, orchestration: bool) -> Vec<
     };
 
     let stream = MockAgent::scripted(steps)
-        .stream("q", vec![], CancellationToken::new(), request_id)
+        .stream(
+            "q",
+            vec![],
+            aura::streaming::RunOptions::default(),
+            request_id,
+        )
         .await
-        .expect("mock stream should start");
+        .into_events();
 
     let (chunk_tx, mut chunk_rx) = mpsc::channel::<Result<Bytes, String>>(64);
     let collector = tokio::spawn(async move {
@@ -118,7 +123,7 @@ async fn run_as(request_id: &str, steps: Vec<Step>, orchestration: bool) -> Vec<
         }
         body
     });
-    let (cancel_tx, _cancel_rx) = watch::channel(false);
+    let cancel_tx = CancellationToken::new();
 
     let termination = process_sse_stream_full(
         &config,
@@ -126,7 +131,7 @@ async fn run_as(request_id: &str, steps: Vec<Step>, orchestration: bool) -> Vec<
         stream,
         chunk_tx,
         cancel_tx,
-        Duration::from_secs(900),
+        Some(Duration::from_secs(900)),
         // Far enough out that heartbeats never interleave with the script.
         Duration::from_secs(86_400),
         None,
