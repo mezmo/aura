@@ -19,6 +19,7 @@
 //! 3. Cancel MCP requests and close connections via `agent.cancel_and_close_mcp()`
 
 use crate::streaming::types::openai::UsageInfo;
+use aura_events::agent::AgentEventPayload;
 
 use super::types::{
     CHUNK_OBJECT, ChatCompletionChunk, ChatCompletionChunkChoice, ChatCompletionChunkDelta,
@@ -28,10 +29,10 @@ use super::types::{
 };
 use aura::stream_events::AuraStreamEvent;
 use aura::{
-    ApprovalLifecycleEvent, EventContext, OrchestrationStreamEvent, OrchestratorEvent,
-    PASSTHROUGH_MARKER, ProgressNotification, RequestCancellation, ResponseContent, StreamError,
-    StreamItem, StreamedAssistantContent, StreamedUserContent, StreamingAgent, ToolCall,
-    ToolLifecycleEvent, ToolResult, ToolUsageEvent, UsageState,
+    ApprovalLifecycleEvent, EventContext, OrchestrationStreamEvent, PASSTHROUGH_MARKER,
+    ProgressNotification, RequestCancellation, ResponseContent, StreamError, StreamItem,
+    StreamedAssistantContent, StreamedUserContent, StreamingAgent, ToolCall, ToolLifecycleEvent,
+    ToolResult, ToolUsageEvent, UsageState,
 };
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
@@ -1148,7 +1149,7 @@ fn maybe_truncate(s: &str, max_len: usize) -> Option<String> {
 fn handle_orchestrator_event(
     config: &StreamConfig,
     ctx: &TurnContext,
-    event: &OrchestratorEvent,
+    event: &AgentEventPayload,
 ) -> Vec<Bytes> {
     if !config.emit_custom_events {
         tracing::debug!(
@@ -1161,7 +1162,7 @@ fn handle_orchestrator_event(
     let event_context = EventContext::new(ctx.agent_context.clone(), ctx.correlation.clone());
 
     let sse_event: OrchestrationStreamEvent = match event {
-        OrchestratorEvent::PlanCreated {
+        AgentEventPayload::PlanCreated {
             goal,
             tasks,
             routing_mode,
@@ -1188,7 +1189,7 @@ fn handle_orchestrator_event(
                 event_context,
             )
         }
-        OrchestratorEvent::DirectAnswer {
+        AgentEventPayload::DirectAnswer {
             response,
             routing_rationale,
         } => {
@@ -1198,7 +1199,7 @@ fn handle_orchestrator_event(
             );
             OrchestrationStreamEvent::direct_answer(response, routing_rationale, event_context)
         }
-        OrchestratorEvent::ClarificationNeeded {
+        AgentEventPayload::ClarificationNeeded {
             question,
             options,
             routing_rationale,
@@ -1215,7 +1216,7 @@ fn handle_orchestrator_event(
                 event_context,
             )
         }
-        OrchestratorEvent::TaskStarted {
+        AgentEventPayload::TaskStarted {
             task_id,
             description,
             orchestrator_id,
@@ -1230,7 +1231,7 @@ fn handle_orchestrator_event(
                 event_context,
             )
         }
-        OrchestratorEvent::TaskCompleted {
+        AgentEventPayload::TaskCompleted {
             task_id,
             success,
             duration_ms,
@@ -1254,7 +1255,7 @@ fn handle_orchestrator_event(
                 event_context,
             )
         }
-        OrchestratorEvent::IterationComplete {
+        AgentEventPayload::IterationComplete {
             iteration,
             will_replan,
             reasoning,
@@ -1282,7 +1283,7 @@ fn handle_orchestrator_event(
                 event_context,
             )
         }
-        OrchestratorEvent::ReplanStarted { iteration, trigger } => {
+        AgentEventPayload::ReplanStarted { iteration, trigger } => {
             tracing::debug!(
                 "Orchestrator: replan started (iteration={}, trigger={})",
                 iteration,
@@ -1290,14 +1291,14 @@ fn handle_orchestrator_event(
             );
             OrchestrationStreamEvent::replan_started(*iteration, trigger, event_context)
         }
-        OrchestratorEvent::Synthesizing { iteration } => {
+        AgentEventPayload::Synthesizing { iteration } => {
             tracing::debug!(
                 "Orchestrator: consolidating results for coordinator (iteration={})",
                 iteration
             );
             OrchestrationStreamEvent::synthesizing(*iteration, event_context)
         }
-        OrchestratorEvent::WorkerReasoning {
+        AgentEventPayload::WorkerReasoning {
             task_id,
             worker_id,
             content,
@@ -1327,7 +1328,7 @@ fn handle_orchestrator_event(
             bytes.push(Bytes::from(reasoning_event.format_sse()));
             return bytes;
         }
-        OrchestratorEvent::ToolCallStarted {
+        AgentEventPayload::ToolCallStarted {
             task_id,
             tool_call_id,
             tool_name,
@@ -1349,7 +1350,7 @@ fn handle_orchestrator_event(
                 event_context,
             )
         }
-        OrchestratorEvent::ToolCallCompleted {
+        AgentEventPayload::ToolCallCompleted {
             task_id,
             tool_call_id,
             success,
@@ -1372,6 +1373,9 @@ fn handle_orchestrator_event(
                 event_context,
             )
         }
+        // Only orchestration payloads reach here; StreamItem::OrchestratorEvent
+        // carries nothing else.
+        _ => return vec![],
     };
 
     vec![Bytes::from(sse_event.format_sse())]

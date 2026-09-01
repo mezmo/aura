@@ -17,6 +17,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::orchestration::{IterationTimings, RoutingMode};
 use crate::{
     AgentContext, ApprovalCompleted, ApprovalPending, ApprovalRequested, McpServerStatus,
     ProgressToken, WorkerPhase,
@@ -46,10 +47,6 @@ pub enum ToolOutcome {
     Failure { error: String },
 }
 
-/// What an agent has to say about its own execution.
-///
-/// `#[non_exhaustive]` because the vocabulary grows as producers move onto this
-/// schema — orchestration events in particular are not yet modelled here.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[non_exhaustive]
@@ -142,6 +139,84 @@ pub enum AgentEventPayload {
     ApprovalPending(ApprovalPending),
 
     ApprovalCompleted(ApprovalCompleted),
+
+    PlanCreated {
+        goal: String,
+        tasks: Vec<String>,
+        routing_mode: RoutingMode,
+        routing_rationale: String,
+        planning_response: String,
+    },
+
+    DirectAnswer {
+        response: String,
+        routing_rationale: String,
+    },
+
+    ClarificationNeeded {
+        question: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        options: Option<Vec<String>>,
+        routing_rationale: String,
+    },
+
+    TaskStarted {
+        task_id: usize,
+        description: String,
+        orchestrator_id: String,
+        worker_id: String,
+    },
+
+    TaskCompleted {
+        task_id: usize,
+        success: bool,
+        duration_ms: u64,
+        orchestrator_id: String,
+        worker_id: String,
+        result: String,
+    },
+
+    IterationComplete {
+        iteration: usize,
+        will_replan: bool,
+        reasoning: String,
+        gaps: Vec<String>,
+        timings: IterationTimings,
+    },
+
+    ReplanStarted {
+        iteration: usize,
+        /// `"coordinator"` or `"failure"`.
+        trigger: String,
+    },
+
+    Synthesizing {
+        iteration: usize,
+    },
+
+    WorkerReasoning {
+        task_id: usize,
+        worker_id: String,
+        content: String,
+    },
+
+    ToolCallStarted {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_id: Option<usize>,
+        tool_call_id: String,
+        tool_name: String,
+        worker_id: String,
+        arguments: serde_json::Value,
+    },
+
+    ToolCallCompleted {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_id: Option<usize>,
+        tool_call_id: String,
+        success: bool,
+        duration_ms: u64,
+        result: String,
+    },
 }
 
 #[cfg(test)]

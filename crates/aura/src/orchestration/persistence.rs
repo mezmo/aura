@@ -38,8 +38,8 @@ use std::time::Duration;
 use tokio::fs;
 use tokio::sync::Notify;
 
-use super::events::RoutingMode;
 use super::types::{Plan, TaskStatus};
+use aura_events::orchestration::RoutingMode;
 
 // ============================================================================
 // Filename Helpers
