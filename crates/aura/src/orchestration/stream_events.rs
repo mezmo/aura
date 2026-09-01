@@ -119,6 +119,49 @@ mod tests {
         assert!(!sse.contains("planning_response"));
     }
 
+    /// The blocked-task wire event carries the gated call's `tool_call_id`.
+    #[test]
+    fn test_format_sse_task_blocked() {
+        let event = OrchestrationStreamEvent::task_blocked(
+            2,
+            "call_42",
+            "0191e8c0-1111-7000-8000-00000000000a",
+            "kubectl_apply",
+            "orch-1",
+            "operations",
+            test_ctx(),
+        );
+        let sse = event.format_sse();
+
+        assert!(sse.starts_with(&format!("event: {}\n", event_names::TASK_BLOCKED)));
+        assert!(sse.contains("\"task_id\":2"));
+        assert!(sse.contains("\"tool_call_id\":\"call_42\""));
+        assert!(sse.contains("\"tool_name\":\"kubectl_apply\""));
+        assert!(sse.contains("\"decision_id\":\"0191e8c0-1111-7000-8000-00000000000a\""));
+        assert!(sse.contains("\"worker_id\":\"operations\""));
+    }
+
+    #[test]
+    fn test_format_sse_run_parked() {
+        let event = OrchestrationStreamEvent::run_parked(
+            "0191e8c0-1111-7000-8000-0000000000ff",
+            vec![
+                "0191e8c0-1111-7000-8000-00000000000a".to_string(),
+                "0191e8c0-1111-7000-8000-00000000000b".to_string(),
+            ],
+            "2026-09-02T15:03:11+00:00",
+            2,
+            test_ctx(),
+        );
+        let sse = event.format_sse();
+
+        assert!(sse.starts_with(&format!("event: {}\n", event_names::RUN_PARKED)));
+        assert!(sse.contains("\"run_id\":\"0191e8c0-1111-7000-8000-0000000000ff\""));
+        assert!(sse.contains("\"decision_ids\":["));
+        assert!(sse.contains("\"expires_at\":\"2026-09-02T15:03:11+00:00\""));
+        assert!(sse.contains("\"iteration\":2"));
+    }
+
     #[test]
     fn test_format_sse_iteration_complete() {
         let event = OrchestrationStreamEvent::iteration_complete(

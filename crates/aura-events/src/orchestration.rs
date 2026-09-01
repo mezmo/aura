@@ -32,12 +32,16 @@ impl RoutingMode {
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct IterationTimings {
     /// Prompt → plan created.
+    #[serde(default)]
     pub planning_ms: u64,
     /// Plan ready → continuation-prompt entrypoint.
+    #[serde(default)]
     pub execution_ms: u64,
     /// Sum of per-task wall durations across the iteration.
+    #[serde(default)]
     pub task_compute_ms: u64,
     /// Sum of tool-call durations recorded for the iteration's tasks.
+    #[serde(default)]
     pub tool_ms: u64,
 }
 
@@ -170,7 +174,7 @@ pub enum OrchestrationStreamEvent {
         will_replan: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         reasoning: Option<String>,
-        #[serde(skip_serializing_if = "Vec::is_empty")]
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
         gaps: Vec<String>,
         #[serde(flatten)]
         timings: IterationTimings,
@@ -472,5 +476,58 @@ impl OrchestrationStreamEvent {
             },
             context,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{AgentContext, CorrelationContext};
+
+    fn ctx() -> EventContext {
+        EventContext::new(
+            AgentContext::coordinator(),
+            CorrelationContext::new("test-session", None),
+        )
+    }
+
+    /// The enum is untagged, so a field omitted on the wire must still
+    /// deserialize. Without a default, an absent `gaps` drops the variant and
+    /// the frame binds to whichever later variant its remaining fields fit.
+    #[test]
+    fn iteration_complete_survives_a_roundtrip_with_no_gaps() {
+        let event = OrchestrationStreamEvent::iteration_complete(
+            1,
+            false,
+            Some("done".to_string()),
+            vec![],
+            IterationTimings::default(),
+            ctx(),
+        );
+
+        let json = serde_json::to_string(&event).expect("should serialize");
+        assert!(!json.contains("gaps"));
+
+        let parsed: OrchestrationStreamEvent =
+            serde_json::from_str(&json).expect("should deserialize");
+        assert!(matches!(
+            parsed,
+            OrchestrationStreamEvent::IterationComplete { .. }
+        ));
+    }
+
+    /// Each timing carries its own default for the same reason.
+    #[test]
+    fn iteration_complete_survives_a_roundtrip_with_missing_timings() {
+        let json = r#"{"iteration":2,"will_replan":true,"planning_ms":5,"agent_id":"coordinator","session_id":"s"}"#;
+
+        let parsed: OrchestrationStreamEvent =
+            serde_json::from_str(json).expect("should deserialize");
+
+        let OrchestrationStreamEvent::IterationComplete { timings, .. } = parsed else {
+            panic!("expected IterationComplete, got {parsed:?}");
+        };
+        assert_eq!(timings.planning_ms, 5);
+        assert_eq!(timings.tool_ms, 0);
     }
 }
