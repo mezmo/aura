@@ -119,6 +119,12 @@ pub const ATTR_LLM_MODEL_NAME: &str = "llm.model_name";
 pub const ATTR_LLM_TOKEN_PROMPT: &str = "llm.token_count.prompt";
 /// Completion / output token count.
 pub const ATTR_LLM_TOKEN_COMPLETION: &str = "llm.token_count.completion";
+/// Prompt tokens served from the provider's prompt cache
+/// (a sub-count of `llm.token_count.prompt`).
+pub const ATTR_LLM_TOKEN_PROMPT_CACHE_READ: &str = "llm.token_count.prompt_details.cache_read";
+/// Prompt tokens written to the provider's prompt cache
+/// (a sub-count of `llm.token_count.prompt`).
+pub const ATTR_LLM_TOKEN_PROMPT_CACHE_WRITE: &str = "llm.token_count.prompt_details.cache_write";
 /// LLM call parameters (temperature, max_tokens, …) as a JSON object string.
 pub const ATTR_LLM_INVOCATION_PARAMETERS: &str = "llm.invocation_parameters";
 /// End-user identifier from the request.
