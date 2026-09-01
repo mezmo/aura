@@ -9,7 +9,6 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::stream::{self, BoxStream};
-use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::AgentRuntimeConfig;
@@ -17,7 +16,7 @@ use crate::provider_agent::{StreamError, StreamItem};
 use crate::streaming::StreamingAgent;
 
 use super::orchestrator::{
-    Orchestrator, STREAM_CHUNK_SIZE, spawn_cancellation_watcher, spawn_tool_event_forwarder,
+    Orchestrator, STREAM_CHUNK_SIZE, spawn_timeout_watcher, spawn_tool_event_forwarder,
 };
 
 /// Zero-state wrapper that implements `StreamingAgent` for orchestration mode.
@@ -28,6 +27,13 @@ pub struct OrchestratorFactory {
     agent_config: AgentRuntimeConfig,
 }
 
+/// A run's two signals. `cancel` stops the run and is what the caller holds;
+/// `finished` says the run's task ended, which is not the same thing.
+struct RunTokens {
+    cancel: CancellationToken,
+    finished: CancellationToken,
+}
+
 impl OrchestratorFactory {
     pub fn new(agent_config: AgentRuntimeConfig) -> Self {
         Self { agent_config }
@@ -35,18 +41,15 @@ impl OrchestratorFactory {
 
     /// Spawn the background orchestration task and return its event stream.
     ///
-    /// Shared by [`stream`](Self::stream) and
-    /// [`stream_with_timeout`](Self::stream_with_timeout). The `usage_state`
-    /// handle is assigned to the inner `Orchestrator` so planning, worker,
-    /// synthesis, and evaluation turns can accumulate into it; the caller
-    /// (`stream_with_timeout`) retains a clone and hands it to the streaming
-    /// handler for the final `aura.usage` event. `stream()` passes a detached
-    /// state since its trait-visible callers don't observe usage.
+    /// The `usage_state` handle is assigned to the inner `Orchestrator` so
+    /// planning, worker, synthesis, and evaluation turns can accumulate into it.
+    /// [`stream`](Self::stream) keeps a clone on the run it returns, so the
+    /// streaming handler can read the totals for the final `aura.usage` event.
     fn spawn_orchestration_stream(
         &self,
         query: String,
         chat_history: Vec<rig::completion::Message>,
-        cancel_token: CancellationToken,
+        tokens: RunTokens,
         request_id: String,
         usage_state: crate::UsageState,
         outer_budget: Option<Duration>,
@@ -57,11 +60,17 @@ impl OrchestratorFactory {
         let (event_tx, event_rx) =
             tokio::sync::mpsc::channel::<Result<StreamItem, StreamError>>(100);
 
-        let cancel_token_clone = cancel_token.clone();
+        let RunTokens { cancel, finished } = tokens;
+        let cancel_token_clone = cancel.clone();
+        // Marks the run finished on every exit path, which is what lets the
+        // timeout watcher stop rather than sleeping out its full duration. It is
+        // not the run's cancel token: a run that finished was not cancelled.
+        let done_guard = finished.drop_guard();
         // Capture parent span so child spans nest correctly in tracing.
         let parent_span = tracing::Span::current();
         tokio::spawn(tracing::Instrument::instrument(
             async move {
+                let _done_guard = done_guard;
                 let mut orchestrator = match Orchestrator::new(agent_config).await {
                     Ok(o) => o,
                     Err(e) => {
@@ -160,40 +169,21 @@ impl StreamingAgent for OrchestratorFactory {
         &self,
         query: &str,
         chat_history: Vec<rig::completion::Message>,
-        cancel_token: CancellationToken,
+        timeout: Option<Duration>,
         request_id: &str,
-    ) -> Result<BoxStream<'static, Result<StreamItem, StreamError>>, StreamError> {
-        // Raw-stream callers don't observe usage; hand the spawn a detached
-        // UsageState so the field is populated but nobody reads it.
-        Ok(self.spawn_orchestration_stream(
-            query.to_string(),
-            chat_history,
-            cancel_token,
-            request_id.to_string(),
-            crate::UsageState::new(),
-            None,
-        ))
-    }
-
-    async fn stream_with_timeout(
-        &self,
-        query: &str,
-        chat_history: Vec<rig::completion::Message>,
-        timeout: Duration,
-        request_id: &str,
-    ) -> (
-        BoxStream<'static, Result<StreamItem, StreamError>>,
-        watch::Sender<bool>,
-        crate::UsageState,
-    ) {
-        let (cancel_tx, cancel_rx) = watch::channel(false);
+    ) -> crate::streaming::AgentRun {
         let cancel_token = CancellationToken::new();
-        let watcher_cancel_token = cancel_token.clone();
-        let request_id_owned = request_id.to_string();
+        let finished = CancellationToken::new();
 
-        // Fire-and-forget: task self-terminates when cancel_tx is dropped or timeout fires.
-        let _watcher_handle =
-            spawn_cancellation_watcher(cancel_rx, timeout, watcher_cancel_token, request_id_owned);
+        if let Some(timeout) = timeout {
+            // Fire-and-forget: self-terminates when the run ends or the timeout fires.
+            let _watcher_handle = spawn_timeout_watcher(
+                timeout,
+                cancel_token.clone(),
+                finished.clone(),
+                request_id.to_string(),
+            );
+        }
 
         // Share one UsageState between the inner orchestrator (writer) and the
         // streaming handler (reader) so aura.usage reflects the aggregate of
@@ -202,13 +192,16 @@ impl StreamingAgent for OrchestratorFactory {
         let stream = self.spawn_orchestration_stream(
             query.to_string(),
             chat_history,
-            cancel_token,
+            RunTokens {
+                cancel: cancel_token.clone(),
+                finished,
+            },
             request_id.to_string(),
             usage_state.clone(),
-            (!timeout.is_zero()).then_some(timeout),
+            timeout,
         );
 
-        (stream, cancel_tx, usage_state)
+        crate::streaming::AgentRun::new(stream, cancel_token, usage_state)
     }
 
     async fn cancel_and_close_mcp(&self, _request_id: &str, _reason: &str) -> usize {

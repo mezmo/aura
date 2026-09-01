@@ -544,7 +544,7 @@ pub async fn execute_completion(
         tools_json,
     } = setup;
 
-    // Orchestration spawns inside `stream_with_timeout`, so SSE side-channel
+    // Orchestration spawns inside `stream`, so SSE side-channel
     // receivers must be subscribed before stream startup.
     let delivery_channels = match delivery {
         DeliveryMode::Collect { result_tx } => DeliveryChannels::Collect { result_tx },
@@ -562,14 +562,17 @@ pub async fn execute_completion(
     };
 
     // Create stream with timeout — single path for both Agent and Orchestrator
-    let (stream, cancel_tx, usage_state) = streaming_agent
-        .stream_with_timeout(
+    let run = streaming_agent
+        .stream(
             &query,
             chat_history,
-            config.timeout_duration,
+            (!config.timeout_duration.is_zero()).then_some(config.timeout_duration),
             &config.request_id,
         )
         .await;
+    let cancel_tx = run.cancel_token();
+    let usage_state = run.usage().clone();
+    let stream = run.into_events();
 
     let response_content = config.response_content.clone();
     let otel_ctx = StreamOtelContext {

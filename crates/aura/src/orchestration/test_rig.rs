@@ -49,7 +49,8 @@ use rig::streaming::{
     StreamingCompletionResponse,
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Notify, watch};
+use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
 
 use crate::streaming_request_hook::{StreamingRequestHook, UsageState};
 
@@ -592,10 +593,9 @@ pub(crate) struct StreamRun {
     /// The loop's aggregated usage (`FinalResponse.usage`).
     pub(crate) usage: Usage,
     pub(crate) tool_results: Vec<ToolResultRecord>,
-    /// External cancellation handle (the hook's watch channel), for the
-    /// commit-3 race tests.
-    #[allow(dead_code)] // commit 3: race tests cancel mid-stream
-    pub(crate) cancel_tx: watch::Sender<bool>,
+    /// External cancellation handle, for the race tests.
+    #[allow(dead_code)] // race tests cancel mid-stream
+    pub(crate) cancel: CancellationToken,
     /// The park-aware hook's usage state, asserting hook compatibility.
     pub(crate) usage_state: UsageState,
 }
@@ -621,8 +621,11 @@ pub(crate) async fn drive_worker(
     max_depth: usize,
 ) -> Result<StreamRun, Box<dyn std::error::Error + Send + Sync>> {
     let request_id = format!("rig_{}", uuid::Uuid::new_v4().simple());
-    let (hook, cancel_tx, usage_state) =
-        StreamingRequestHook::with_scratchpad_budget(Duration::from_secs(60), request_id, None);
+    let (hook, cancel, usage_state) = StreamingRequestHook::with_scratchpad_budget(
+        Some(Duration::from_secs(60)),
+        request_id,
+        None,
+    );
 
     let mut stream = rig
         .agent
@@ -635,7 +638,7 @@ pub(crate) async fn drive_worker(
         final_text: None,
         usage: Usage::new(),
         tool_results: Vec::new(),
-        cancel_tx,
+        cancel,
         usage_state,
     };
 

@@ -47,7 +47,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rig::client::CompletionClient;
-use tokio::sync::{Mutex, watch};
+use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::Agent;
@@ -194,40 +194,22 @@ fn apply_worker_skills_override(
 /// Returns a `JoinHandle` for the watcher task. The handle is intentionally
 /// fire-and-forget in production (the task self-terminates via `select!`),
 /// but callers in tests should `.await` it to assert post-conditions.
-///
-/// Cleanup: when the caller drops the sender side of `cancel_rx` after an
-/// explicit signal, `rx.changed()` returns `Err`, the `select!` resolves,
-/// and the sleep future is dropped (cancelling the timer via tokio's
-/// standard drop semantics). A drop with no explicit signal is treated as
-/// an unexplained abort — see the loop body below.
 #[must_use = "task runs independently; bind with `let _handle =` to document fire-and-forget intent"]
-pub(super) fn spawn_cancellation_watcher(
-    cancel_rx: watch::Receiver<bool>,
+/// `finished` resolves when the run's task ends, so the watcher stops rather
+/// than sleeping out its full duration. It is separate from `cancel_token`
+/// because a finished run has not been cancelled, and anything reading the
+/// run's token must be able to tell those apart.
+pub(super) fn spawn_timeout_watcher(
     timeout: Duration,
     cancel_token: CancellationToken,
+    finished: CancellationToken,
     request_id: String,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         tokio::select! {
-            was_cancelled = async {
-                let mut rx = cancel_rx;
-                loop {
-                    // A closed channel means the outer stream can no longer
-                    // signal cancellation. Fail safe by cancelling the
-                    // orchestration token (#305) — cancelling an
-                    // already-finished inner task is a no-op.
-                    if rx.changed().await.is_err() {
-                        return true;
-                    }
-                    if *rx.borrow_and_update() {
-                        return true; // External cancellation requested
-                    }
-                }
-            } => {
-                if was_cancelled {
-                    tracing::info!("External cancellation triggered for {}", request_id);
-                    cancel_token.cancel();
-                }
+            () = finished.cancelled() => {}
+            () = cancel_token.cancelled() => {
+                tracing::info!("Run cancelled for {}", request_id);
             }
             _ = tokio::time::sleep(timeout) => {
                 tracing::warn!("Timeout reached, cancelling orchestration");
@@ -460,8 +442,8 @@ pub struct Orchestrator {
     /// Accumulated token usage across all LLM calls in this orchestration run
     /// (planning, workers, continuation routing).
     ///
-    /// Cloned from a handle owned by `OrchestratorFactory::stream_with_timeout`
-    /// so the streaming handler can read the final totals and emit `aura.usage`.
+    /// Cloned from the handle `OrchestratorFactory::stream` puts on the run, so
+    /// the streaming handler can read the final totals and emit `aura.usage`.
     /// In orchestration mode we aggregate additively via
     /// [`crate::UsageState::accumulate_usage`] so the reported prompt/completion
     /// totals reflect *billed* tokens across every internal LLM turn, not just
@@ -1445,12 +1427,10 @@ impl Orchestrator {
         let timeout_secs = self.config.per_call_timeout_secs();
         let stream_future = async {
             let stream = match park_key {
-                Some(key) => {
-                    agent
-                        .stream_chat_with_timeout(prompt, history, Duration::MAX, key)
-                        .await
-                        .0
-                }
+                Some(key) => agent
+                    .stream_chat_with_timeout(prompt, history, None, key)
+                    .await
+                    .into_events(),
                 None => agent.stream_chat(prompt, history).await,
             };
             Self::drive_forward_loop(
@@ -4074,18 +4054,19 @@ Assign tasks to the worker whose tools best match the required operations."#,
         let srd = submit_result_decision.clone();
         let park_registration =
             crate::streaming_request_hook::ParkCellRegistration::new(&park.key, park.cell.clone());
-        let (stream, _cancel_tx, _usage_state) = worker
+        let stream = worker
             .inner
             .stream_chat_message_with_timeout(
                 current_prompt,
                 continuation.history.clone(),
                 worker.max_depth,
-                Duration::MAX,
+                None,
                 &park.key,
                 worker.scratchpad_budget.clone(),
                 worker.client_tool_names.clone(),
             )
-            .await;
+            .await
+            .into_events();
         let stream_result = Self::drive_forward_loop(
             stream,
             &self.usage_state,
@@ -6545,120 +6526,44 @@ mod tests {
     // Cancellation watcher tests
     // ========================================================================
 
+    /// A finished run is not a cancelled one, so the watcher has to stop on a
+    /// signal that leaves the run's own token untouched.
     #[tokio::test(start_paused = true)]
-    async fn test_watcher_unexplained_drop_triggers_failsafe_cancel() {
-        let (cancel_tx, cancel_rx) = watch::channel(false);
+    async fn watcher_stops_when_the_run_ends() {
         let cancel_token = CancellationToken::new();
-        let handle = spawn_cancellation_watcher(
-            cancel_rx,
+        let finished = CancellationToken::new();
+        let handle = spawn_timeout_watcher(
             Duration::from_secs(300),
             cancel_token.clone(),
+            finished.clone(),
             "test-normal".to_string(),
         );
 
-        // A bare drop with no explicit `false` first means the outer task
-        // ended without going through its normal completion path (e.g.
-        // aborted during shutdown) — the watcher must fail safe and cancel.
-        drop(cancel_tx);
-        tokio::task::yield_now().await;
-        handle.await.unwrap();
-        assert!(cancel_token.is_cancelled());
-    }
+        finished.cancel();
 
-    #[tokio::test(start_paused = true)]
-    async fn test_watcher_external_cancel_triggers_token() {
-        let (cancel_tx, cancel_rx) = watch::channel(false);
-        let cancel_token = CancellationToken::new();
-        let handle = spawn_cancellation_watcher(
-            cancel_rx,
-            Duration::from_secs(300),
-            cancel_token.clone(),
-            "test-cancel".to_string(),
+        let start = tokio::time::Instant::now();
+        handle.await.unwrap();
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "watcher should exit when the run ends, not wait out its timeout"
         );
-
-        cancel_tx.send(true).unwrap();
-        tokio::task::yield_now().await;
-        handle.await.unwrap();
-        assert!(cancel_token.is_cancelled());
+        assert!(
+            !cancel_token.is_cancelled(),
+            "a run that finished was never cancelled"
+        );
     }
 
     #[tokio::test(start_paused = true)]
-    async fn test_watcher_timeout_triggers_cancellation() {
-        // Keep sender alive so only the timeout path can fire
-        let (_cancel_tx, cancel_rx) = watch::channel(false);
+    async fn watcher_cancels_on_timeout() {
         let cancel_token = CancellationToken::new();
-        let handle = spawn_cancellation_watcher(
-            cancel_rx,
+        let handle = spawn_timeout_watcher(
             Duration::from_secs(60),
             cancel_token.clone(),
+            CancellationToken::new(),
             "test-timeout".to_string(),
         );
 
         tokio::time::advance(Duration::from_secs(61)).await;
-        tokio::task::yield_now().await;
-        handle.await.unwrap();
-        assert!(cancel_token.is_cancelled());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn test_watcher_unexplained_drop_before_timeout_cancels_promptly() {
-        let (cancel_tx, cancel_rx) = watch::channel(false);
-        let cancel_token = CancellationToken::new();
-        let handle = spawn_cancellation_watcher(
-            cancel_rx,
-            Duration::from_secs(60),
-            cancel_token.clone(),
-            "test-abort-mid-stream".to_string(),
-        );
-
-        // Advance to T=30s, then drop the sender with no prior explicit
-        // signal — the production scenario of an outer task aborted mid-
-        // stream (e.g. during shutdown). The watcher must fail safe and
-        // cancel promptly rather than assume normal completion.
-        tokio::time::advance(Duration::from_secs(30)).await;
-        tokio::task::yield_now().await;
-        drop(cancel_tx);
-        tokio::task::yield_now().await;
-
-        let start = tokio::time::Instant::now();
-        handle.await.unwrap();
-        let elapsed = start.elapsed();
-
-        assert!(
-            cancel_token.is_cancelled(),
-            "an unexplained sender drop must fail safe and cancel"
-        );
-        // Task should exit promptly on sender drop, not wait for remaining 30s timeout
-        assert!(
-            elapsed < Duration::from_secs(1),
-            "task should exit promptly after sender drop, not wait for timeout; elapsed: {:?}",
-            elapsed
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn test_watcher_false_signal_does_not_cancel() {
-        let (cancel_tx, cancel_rx) = watch::channel(false);
-        let cancel_token = CancellationToken::new();
-        let handle = spawn_cancellation_watcher(
-            cancel_rx,
-            Duration::from_secs(300),
-            cancel_token.clone(),
-            "test-false-signal".to_string(),
-        );
-
-        // Send false — triggers rx.changed() but borrow_and_update() sees false,
-        // so the loop continues waiting
-        cancel_tx.send(false).unwrap();
-        tokio::task::yield_now().await;
-        assert!(
-            !cancel_token.is_cancelled(),
-            "false signal should not cancel"
-        );
-
-        // Bare drop with no final explicit signal — fail safe and cancel.
-        drop(cancel_tx);
-        tokio::task::yield_now().await;
         handle.await.unwrap();
         assert!(cancel_token.is_cancelled());
     }
