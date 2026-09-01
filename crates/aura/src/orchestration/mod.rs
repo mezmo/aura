@@ -37,7 +37,8 @@
 //!     .build_streaming_agent_with_headers(None, None, None)
 //!     .await?;
 //!
-//! let stream = agent.stream(query, history, cancel_token, "req_123").await?;
+//! let run = agent.stream(query, history, RunOptions::default(), "req_123").await;
+//! let stream = run.into_events();
 //! ```
 
 mod config;
