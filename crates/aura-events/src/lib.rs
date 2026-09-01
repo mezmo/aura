@@ -232,6 +232,11 @@ impl std::fmt::Display for Progress {
     }
 }
 
+/// The agent id of an orchestrated run's coordinator. Workers name it as their
+/// parent, so it defines the agent hierarchy and every producer spells it the
+/// same way.
+pub const COORDINATOR_AGENT_ID: &str = "coordinator";
+
 /// Context identifying which agent emitted an event.
 ///
 /// For single-agent deployments, use `AgentContext::single_agent()` which sets
@@ -267,7 +272,7 @@ impl AgentContext {
     /// Workers name it as their parent.
     pub fn coordinator() -> Self {
         Self {
-            agent_id: "coordinator".to_string(),
+            agent_id: COORDINATOR_AGENT_ID.to_string(),
             agent_name: None,
             parent_agent_id: None,
         }

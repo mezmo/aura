@@ -41,7 +41,7 @@ pub use decision::{
     AgentScope, ApprovalDecision, ApprovalOrigin, ApprovalOutcome, AwaitingDecision, CancelReason,
     DecisionId, Timestamp,
 };
-pub(crate) use events::completed_cancelled;
+pub(crate) use events::completed_cancelled_event;
 pub use gate::HitlApprovalWrapper;
 pub use protocol::{ApprovalDecisionWire, ApprovalItem, ApprovalRequest, PROTOCOL_VERSION};
 pub use registry::{ParkedApproval, PendingApprovals, ResolveError};
