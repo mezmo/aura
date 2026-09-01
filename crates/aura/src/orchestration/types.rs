@@ -1082,19 +1082,7 @@ fn truncate_reasoning(s: &str, max_chars: usize) -> String {
     }
 }
 
-/// Phase-level wall-clock timings for one orchestration iteration, in
-/// milliseconds.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
-pub struct IterationTimings {
-    /// Prompt → plan created.
-    pub planning_ms: u64,
-    /// Plan ready → continuation-prompt entrypoint.
-    pub execution_ms: u64,
-    /// Sum of per-task wall durations across the iteration.
-    pub task_compute_ms: u64,
-    /// Sum of tool-call durations recorded for the iteration's tasks.
-    pub tool_ms: u64,
-}
+pub use aura_events::orchestration::IterationTimings;
 
 /// Outcome returned by `run_iteration` to drive the orchestration loop.
 ///

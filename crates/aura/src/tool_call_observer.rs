@@ -18,7 +18,7 @@
 //! # Current Status
 //!
 //! **Phase 1.5**: Observer is instantiated but not yet wired to SSE event streaming.
-//! **Phase 2**: Will be connected to `OrchestratorEvent` for real-time tool call
+//! **Phase 2**: Will be connected to `AgentEventPayload` for real-time tool call
 //! visibility during parallel worker execution.
 //!
 //! # Usage
@@ -227,8 +227,8 @@ impl RetryHint {
 ///
 /// # Phase 2 Integration
 ///
-/// This will be wired to emit `OrchestratorEvent::ToolCallStarted` and
-/// `OrchestratorEvent::ToolCallCompleted` events for real-time SSE streaming
+/// This will be wired to emit `AgentEventPayload::ToolCallStarted` and
+/// `AgentEventPayload::ToolCallCompleted` events for real-time SSE streaming
 /// during parallel worker execution.
 pub struct ToolCallObserver {
     /// Sender side of the broadcast channel.
