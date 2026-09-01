@@ -432,6 +432,8 @@ pub enum StreamItem {
 pub struct FinalResponseInfo {
     pub content: String,
     pub usage: Usage,
+    /// Prompt-cache split matching `usage`'s turn population.
+    pub cache_usage: Option<rig::completion::CacheUsage>,
 }
 
 /// Streamed assistant content (provider-agnostic).
@@ -550,6 +552,7 @@ fn map_stream_item<R: rig::completion::GetTokenUsage>(
             Ok(StreamItem::Final(FinalResponseInfo {
                 content: final_resp.response().to_string(),
                 usage,
+                cache_usage: final_resp.cache_usage(),
             }))
         }
         // Handle any future variants added to the non-exhaustive enum

@@ -5080,6 +5080,7 @@ mod tests {
                     crate::provider_agent::FinalResponseInfo {
                         content: "done".to_string(),
                         usage: usage(4164, 239),
+                        cache_usage: None,
                     },
                 )),
             ],
@@ -5133,6 +5134,7 @@ mod tests {
                     crate::provider_agent::FinalResponseInfo {
                         content: "done".to_string(),
                         usage: usage(4164, 239),
+                        cache_usage: None,
                     },
                 )),
             ],

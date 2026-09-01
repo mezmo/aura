@@ -442,8 +442,8 @@ where
     termination
 }
 
-/// Resolve the cumulative billed usage `(prompt, completion, total)` for the
-/// final `aura.usage` event.
+/// Resolve the cumulative billed usage `(prompt, completion, total,
+/// cache_usage)` for the final `aura.usage` event.
 ///
 /// The single-agent path carries rig's turn-aggregated usage on
 /// `StreamItem::Final` (`usage_stats`), which sums every LLM turn — including
@@ -451,22 +451,30 @@ where
 /// rig invokes `on_stream_completion_response_finish` only for turns that
 /// produced assistant text, so the hook total (`UsageState::get_final_usage`)
 /// under-reports whenever a tool turn had no text preamble (common on
-/// Bedrock-Claude). Prefer the aggregated `Final` usage when present.
+/// Bedrock-Claude). Prefer the aggregated `Final` usage when present — and
+/// take the cache split from the same source (`final_cache_usage`), so the
+/// event's cache counts stay a subset of the prompt total next to them.
 ///
-/// Orchestration leaves `Final.usage` zero and accumulates billed tokens through
-/// `UsageState::accumulate_usage`, so fall back to the hook total when no
-/// aggregated `Final` usage is available.
+/// Orchestration leaves `Final.usage` zero and accumulates billed tokens
+/// through `UsageState::accumulate_usage` (which sees every turn via
+/// `TurnUsage`), so fall back to the hook totals — billed and cache alike —
+/// when no aggregated `Final` usage is available.
 fn resolve_billed_usage(
     usage_stats: &Option<UsageInfo>,
+    final_cache_usage: Option<(u64, u64)>,
     usage_state: &UsageState,
-) -> (u64, u64, u64) {
+) -> (u64, u64, u64, Option<(u64, u64)>) {
     match usage_stats {
         Some(u) if u.prompt_tokens > 0 => (
             u.prompt_tokens,
             u.completion_tokens,
             u.prompt_tokens + u.completion_tokens,
+            final_cache_usage,
         ),
-        _ => usage_state.get_final_usage(),
+        _ => {
+            let (prompt, completion, total) = usage_state.get_final_usage();
+            (prompt, completion, total, usage_state.get_cache_usage())
+        }
     }
 }
 
@@ -500,8 +508,11 @@ async fn send_final_events(
 
     // Emit aura.usage (cumulative billed) and aura.context_usage at stream end.
     if emit_custom_events {
-        let (prompt, completion, total) =
-            resolve_billed_usage(&state.usage_stats, &callbacks.usage_state);
+        let (prompt, completion, total, cache_usage) = resolve_billed_usage(
+            &state.usage_stats,
+            state.final_cache_usage,
+            &callbacks.usage_state,
+        );
         if prompt > 0 {
             tracing::debug!(
                 "Emitting aura.usage event: prompt={}, completion={}, total={}",
@@ -513,7 +524,7 @@ async fn send_final_events(
                 prompt,
                 completion,
                 total,
-                callbacks.usage_state.get_cache_usage(),
+                cache_usage,
                 ctx.correlation.clone(),
             );
             let _ = tx.send(Ok(Bytes::from(usage_event.format_sse()))).await;
@@ -711,6 +722,12 @@ fn handle_stream_item(
                 prompt_tokens: final_info.usage.input_tokens,
                 completion_tokens: final_info.usage.output_tokens,
                 total_tokens: final_info.usage.total_tokens,
+            });
+            state.final_cache_usage = final_info.cache_usage.map(|cache| {
+                (
+                    cache.cache_read_input_tokens,
+                    cache.cache_creation_input_tokens,
+                )
             });
 
             tracing::debug!(
@@ -1665,10 +1682,11 @@ mod tests {
             total_tokens: 12_250,
         });
 
-        // The fix: aura.usage reflects the aggregated total, not the undercount.
+        // The fix: aura.usage reflects the aggregated total, not the undercount,
+        // and the cache split comes from the same aggregated population.
         assert_eq!(
-            resolve_billed_usage(&usage_stats, &usage_state),
-            (12_000, 250, 12_250),
+            resolve_billed_usage(&usage_stats, Some((9_000, 2_000)), &usage_state),
+            (12_000, 250, 12_250, Some((9_000, 2_000))),
             "aura.usage must include every turn, including tool-only turns"
         );
     }
@@ -1688,9 +1706,10 @@ mod tests {
             total_tokens: 0,
         });
 
+        usage_state.store_cache_usage(4_000, 1_000);
         assert_eq!(
-            resolve_billed_usage(&usage_stats, &usage_state),
-            (13_000, 600, 13_600),
+            resolve_billed_usage(&usage_stats, None, &usage_state),
+            (13_000, 600, 13_600, Some((4_000, 1_000))),
             "orchestration billed usage comes from accumulate_usage"
         );
     }
@@ -1701,7 +1720,35 @@ mod tests {
         // usage, so fall back to whatever the hook recorded.
         let usage_state = UsageState::new();
         usage_state.store_usage(1500, 100, 1600, false);
-        assert_eq!(resolve_billed_usage(&None, &usage_state), (1500, 100, 1600));
+        assert_eq!(
+            resolve_billed_usage(&None, None, &usage_state),
+            (1500, 100, 1600, None)
+        );
+    }
+
+    #[test]
+    fn test_resolve_billed_usage_cache_split_matches_population() {
+        // A Bedrock-style tool loop: the hook missed the tool-only turn
+        // (it fires only on text turns), so its counters — billed and cache —
+        // under-report. The aggregated Final carries the full-run cache
+        // split; using the hook's split next to the aggregated totals would
+        // break the "cache is a subset of prompt_tokens" contract.
+        let usage_state = UsageState::new();
+        usage_state.store_usage(4_000, 150, 4_150, false); // text turn only
+        usage_state.store_cache_usage(3_000, 500); // text turn's split only
+
+        let usage_stats = Some(UsageInfo {
+            prompt_tokens: 12_000,
+            completion_tokens: 250,
+            total_tokens: 12_250,
+        });
+        let (_, _, _, cache) =
+            resolve_billed_usage(&usage_stats, Some((9_000, 2_000)), &usage_state);
+        assert_eq!(
+            cache,
+            Some((9_000, 2_000)),
+            "cache split must come from the same turn population as the totals"
+        );
     }
 
     #[tokio::test]
@@ -1756,6 +1803,7 @@ mod tests {
                     output_tokens: 5,
                     total_tokens: 15,
                 },
+                cache_usage: None,
             })),
         ];
         let stream = futures_util::stream::iter(items);
