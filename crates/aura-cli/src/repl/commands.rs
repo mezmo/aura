@@ -397,8 +397,8 @@ pub(crate) fn handle_resume(
             replay_event_log_global();
             // Seed token counters from authoritative usage JSONL after replay
             if let Some(store) = conv_store {
-                let (p, c) = store.load_usage_totals();
-                seed_status_bar_tokens(p, c);
+                let (p, c, cache_read) = store.load_usage_totals();
+                seed_status_bar_tokens(p, c, cache_read);
             }
             println!(
                 "{}",
@@ -487,7 +487,7 @@ pub(crate) fn resume_conversation(
     ConversationHistory,
     Vec<DisplayEvent>,
     bool,
-    (u64, u64),
+    (u64, u64, u64),
 )> {
     match ConversationStore::find_by_prefix(id_prefix) {
         Ok(full_uuid) => {

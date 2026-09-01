@@ -158,11 +158,21 @@ impl ConversationStore {
         fs::read_to_string(&path).ok().filter(|s| !s.is_empty())
     }
 
-    pub fn append_usage(&self, prompt_tokens: u64, completion_tokens: u64, model: Option<&str>) {
+    pub fn append_usage(
+        &self,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        cache_usage: Option<(u64, u64)>,
+        model: Option<&str>,
+    ) {
         let path = self.dir.join("usage");
         if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&path) {
             let mut line =
                 serde_json::json!({ "prompt": prompt_tokens, "completion": completion_tokens });
+            if let Some((cache_read, cache_creation)) = cache_usage {
+                line["cache_read"] = serde_json::Value::from(cache_read);
+                line["cache_creation"] = serde_json::Value::from(cache_creation);
+            }
             if let Some(m) = model {
                 line["model"] = serde_json::Value::String(m.to_string());
             }
@@ -170,22 +180,26 @@ impl ConversationStore {
         }
     }
 
-    /// Sum all usage entries and return (total_prompt, total_completion).
-    pub fn load_usage_totals(&self) -> (u64, u64) {
+    /// Sum all usage entries and return (total_prompt, total_completion,
+    /// total_cache_read). Entries written before cache tracking count zero
+    /// cache-read tokens.
+    pub fn load_usage_totals(&self) -> (u64, u64, u64) {
         let path = self.dir.join("usage");
         let data = match fs::read_to_string(&path) {
             Ok(d) => d,
-            Err(_) => return (0, 0),
+            Err(_) => return (0, 0, 0),
         };
         let mut prompt_total: u64 = 0;
         let mut completion_total: u64 = 0;
+        let mut cache_read_total: u64 = 0;
         for line in data.lines() {
             if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
                 prompt_total += val["prompt"].as_u64().unwrap_or(0);
                 completion_total += val["completion"].as_u64().unwrap_or(0);
+                cache_read_total += val["cache_read"].as_u64().unwrap_or(0);
             }
         }
-        (prompt_total, completion_total)
+        (prompt_total, completion_total, cache_read_total)
     }
 
     pub fn save_view_expanded(&self, expanded: bool) {
@@ -465,20 +479,22 @@ mod tests {
     fn usage_accumulation() {
         let tmp = TempDir::new().unwrap();
         let store = make_store(&tmp);
-        store.append_usage(100, 50, Some("gpt-4"));
-        store.append_usage(200, 75, None);
-        let (prompt, completion) = store.load_usage_totals();
+        store.append_usage(100, 50, Some((80, 10)), Some("gpt-4"));
+        store.append_usage(200, 75, None, None);
+        let (prompt, completion, cache_read) = store.load_usage_totals();
         assert_eq!(prompt, 300);
         assert_eq!(completion, 125);
+        assert_eq!(cache_read, 80, "entries without cache fields count zero");
     }
 
     #[test]
     fn usage_empty() {
         let tmp = TempDir::new().unwrap();
         let store = make_store(&tmp);
-        let (prompt, completion) = store.load_usage_totals();
+        let (prompt, completion, cache_read) = store.load_usage_totals();
         assert_eq!(prompt, 0);
         assert_eq!(completion, 0);
+        assert_eq!(cache_read, 0);
     }
 
     #[test]

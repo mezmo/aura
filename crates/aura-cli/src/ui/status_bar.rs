@@ -425,12 +425,15 @@ pub fn set_context_window_usage(
 }
 
 /// Seed cumulative token counters (used when resuming).
-pub fn seed_status_bar_tokens(prompt_tokens: u64, completion_tokens: u64) {
+pub fn seed_status_bar_tokens(prompt_tokens: u64, completion_tokens: u64, cache_read_tokens: u64) {
     if let Ok(mut g) = CUMULATIVE_PROMPT.lock() {
         *g = prompt_tokens;
     }
     if let Ok(mut g) = CUMULATIVE_COMPLETION.lock() {
         *g = completion_tokens;
+    }
+    if let Ok(mut g) = CUMULATIVE_CACHE_READ.lock() {
+        *g = cache_read_tokens;
     }
 }
 

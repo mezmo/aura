@@ -769,8 +769,8 @@ pub fn run_repl(
         // (replay resets + re-accumulates from view events; this ensures the
         // JSONL totals are the final source of truth).
         if let Some(ref store) = conv_store {
-            let (p, c) = store.load_usage_totals();
-            seed_status_bar_tokens(p, c);
+            let (p, c, cache_read) = store.load_usage_totals();
+            seed_status_bar_tokens(p, c, cache_read);
         }
         println!(
             "{}",
@@ -2004,12 +2004,21 @@ pub fn run_repl(
                             if let DisplayEvent::Usage {
                                 prompt_tokens,
                                 completion_tokens,
-                                ..
+                                cache_read_input_tokens,
+                                cache_creation_input_tokens,
                             } = event
                             {
+                                let cache_usage =
+                                    match (cache_read_input_tokens, cache_creation_input_tokens) {
+                                        (None, None) => None,
+                                        (read, creation) => {
+                                            Some((read.unwrap_or(0), creation.unwrap_or(0)))
+                                        }
+                                    };
                                 store.append_usage(
                                     *prompt_tokens,
                                     *completion_tokens,
+                                    cache_usage,
                                     get_selected_model().as_deref(),
                                 );
                             }
