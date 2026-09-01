@@ -17,7 +17,8 @@ use super::events;
 use super::protocol::{ApprovalDecisionWire, ApprovalRequest, ApprovalRequestWire};
 use super::registry::PendingApprovals;
 use super::signing::{SigningContext, WebhookHmac, authorize_ingress};
-use crate::approval_event_broker::{self, ApprovalLifecycleEvent};
+use crate::agent_events::emit;
+use aura_events::agent::{AgentEvent, AgentEventPayload};
 
 /// Maximum time to wait for a TCP connection to the approval webhook before
 /// failing closed. Without this, an unreachable host can hang the connect
@@ -230,9 +231,9 @@ async fn webhook_round_trip<T>(
     let decision_id = request.decision_id;
     let scope = request.scope.clone();
 
-    approval_event_broker::publish(
+    emit(
         &request_id,
-        ApprovalLifecycleEvent::Requested(request.into()),
+        AgentEvent::single_agent(AgentEventPayload::ApprovalRequested(request.into())),
     )
     .await;
 
@@ -257,7 +258,11 @@ async fn webhook_round_trip<T>(
             events::completed_error(decision_id, err.to_string(), &scope, started.elapsed())
         }
     };
-    approval_event_broker::publish(&request_id, ApprovalLifecycleEvent::Completed(completed)).await;
+    emit(
+        &request_id,
+        AgentEvent::single_agent(AgentEventPayload::ApprovalCompleted(completed)),
+    )
+    .await;
     result
 }
 
@@ -319,7 +324,7 @@ impl DecisionRoute {
 
         match self {
             Self::Conversational { registry, timeout } => {
-                let requested_event = ApprovalLifecycleEvent::Requested((&request).into());
+                let requested_event = AgentEventPayload::ApprovalRequested((&request).into());
                 let expires_at = chrono::Utc::now()
                     + chrono::Duration::from_std(*timeout)
                         .expect("approval timeout fits in chrono");
@@ -330,10 +335,10 @@ impl DecisionRoute {
                 // either must find the parked record already resolvable.
                 let handle = registry.register(request, *timeout).await;
 
-                approval_event_broker::publish(&request_id, requested_event).await;
-                approval_event_broker::publish(
+                emit(&request_id, AgentEvent::single_agent(requested_event)).await;
+                emit(
                     &request_id,
-                    ApprovalLifecycleEvent::Pending(pending_event),
+                    AgentEvent::single_agent(AgentEventPayload::ApprovalPending(pending_event)),
                 )
                 .await;
 
@@ -357,9 +362,9 @@ impl DecisionRoute {
 
                 let completed_event =
                     events::completed(decision_id, &outcome, &scope, started.elapsed());
-                approval_event_broker::publish(
+                emit(
                     &request_id,
-                    ApprovalLifecycleEvent::Completed(completed_event),
+                    AgentEvent::single_agent(AgentEventPayload::ApprovalCompleted(completed_event)),
                 )
                 .await;
 
