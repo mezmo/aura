@@ -21,11 +21,11 @@ use crate::theme::{AuraStyle, Themed};
 use super::animation::render_queued_wave;
 use super::state::{
     AGENT_HOST, CONTEXT_USED, CONTEXT_USED_FRESH, CTRLC_HINT_VISIBLE, CTRLC_RESET_SKIP,
-    CUMULATIVE_COMPLETION, CUMULATIVE_PROMPT, CUMULATIVE_SCRATCHPAD_EXTRACTED,
-    CUMULATIVE_SCRATCHPAD_INTERCEPTED, CURSOR_ROW, CWD, FRAME_LINES, LAST_CTRLC, MCP_COUNTS,
-    MODEL_CONTEXT_LIMIT, ORCHESTRATED, PROCESSING, QUEUED_INPUT, QUEUED_WAVE_POS, SESSION_MODEL,
-    STATUS_HINT, STATUS_ROWS, STATUS_SEGMENTS, TURN_NOTICES, get_selected_model, lock_term,
-    status_rows, term_size,
+    CUMULATIVE_CACHE_READ, CUMULATIVE_COMPLETION, CUMULATIVE_PROMPT,
+    CUMULATIVE_SCRATCHPAD_EXTRACTED, CUMULATIVE_SCRATCHPAD_INTERCEPTED, CURSOR_ROW, CWD,
+    FRAME_LINES, LAST_CTRLC, MCP_COUNTS, MODEL_CONTEXT_LIMIT, ORCHESTRATED, PROCESSING,
+    QUEUED_INPUT, QUEUED_WAVE_POS, SESSION_MODEL, STATUS_HINT, STATUS_ROWS, STATUS_SEGMENTS,
+    TURN_NOTICES, get_selected_model, lock_term, status_rows, term_size,
 };
 use super::status_line::{self, ContextUsage, DEFAULT_SEGMENTS, Segment, Snapshot};
 use super::text::strip_control_chars;
@@ -157,6 +157,7 @@ fn capture_snapshot() -> Snapshot {
         context,
         prompt_tokens: CUMULATIVE_PROMPT.lock().map(|g| *g).unwrap_or(0),
         completion_tokens: CUMULATIVE_COMPLETION.lock().map(|g| *g).unwrap_or(0),
+        cached_prompt_tokens: CUMULATIVE_CACHE_READ.lock().map(|g| *g).unwrap_or(0),
         scratchpad_intercepted: CUMULATIVE_SCRATCHPAD_INTERCEPTED
             .lock()
             .map(|g| *g)
@@ -328,6 +329,14 @@ pub fn set_status_bar_tokens(prompt_tokens: u64, completion_tokens: u64) {
     }
 }
 
+/// Accumulate prompt tokens the provider served from its prompt cache
+/// (a subset of the prompt tokens counted by `set_status_bar_tokens`).
+pub fn add_status_bar_cached_tokens(cache_read_tokens: u64) {
+    if let Ok(mut g) = CUMULATIVE_CACHE_READ.lock() {
+        *g += cache_read_tokens;
+    }
+}
+
 /// Accumulate scratchpad savings.
 pub fn add_scratchpad_usage(tokens_intercepted: u64, tokens_extracted: u64) {
     if let Ok(mut g) = CUMULATIVE_SCRATCHPAD_INTERCEPTED.lock() {
@@ -433,6 +442,9 @@ pub fn reset_status_bar_tokens() {
         *g = 0;
     }
     if let Ok(mut g) = CUMULATIVE_COMPLETION.lock() {
+        *g = 0;
+    }
+    if let Ok(mut g) = CUMULATIVE_CACHE_READ.lock() {
         *g = 0;
     }
     if let Ok(mut g) = CUMULATIVE_SCRATCHPAD_INTERCEPTED.lock() {

@@ -1953,6 +1953,8 @@ pub fn run_repl(
                             push_display_event(DisplayEvent::Usage {
                                 prompt_tokens,
                                 completion_tokens,
+                                cache_read_input_tokens: None,
+                                cache_creation_input_tokens: None,
                             });
                         }
 
@@ -2002,6 +2004,7 @@ pub fn run_repl(
                             if let DisplayEvent::Usage {
                                 prompt_tokens,
                                 completion_tokens,
+                                ..
                             } = event
                             {
                                 store.append_usage(
@@ -2488,13 +2491,23 @@ impl StreamHandler for ReplStreamHandler {
         update_status_bar();
     }
 
-    fn on_usage(&mut self, prompt_tokens: u64, completion_tokens: u64) {
+    fn on_usage(
+        &mut self,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        cache_usage: Option<(u64, u64)>,
+    ) {
         set_status_bar_tokens(prompt_tokens, completion_tokens);
+        if let Some((cache_read, _)) = cache_usage {
+            crate::ui::status_bar::add_status_bar_cached_tokens(cache_read);
+        }
         update_status_bar();
         if let Ok(mut events) = self.turn_events.lock() {
             events.push(DisplayEvent::Usage {
                 prompt_tokens,
                 completion_tokens,
+                cache_read_input_tokens: cache_usage.map(|(read, _)| read),
+                cache_creation_input_tokens: cache_usage.map(|(_, creation)| creation),
             });
         }
     }

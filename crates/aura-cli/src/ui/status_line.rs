@@ -106,6 +106,9 @@ pub struct Snapshot {
     pub prompt_tokens: u64,
     /// Cumulative completion tokens across the conversation.
     pub completion_tokens: u64,
+    /// Cumulative prompt tokens served from the provider's prompt cache
+    /// (a subset of `prompt_tokens`).
+    pub cached_prompt_tokens: u64,
     /// Tokens of tool output diverted to the scratchpad.
     pub scratchpad_intercepted: u64,
     /// Tokens read back into context from the scratchpad.
@@ -187,14 +190,21 @@ fn piece(segment: Segment, snapshot: &Snapshot) -> Option<Piece> {
             if snapshot.prompt_tokens == 0 && snapshot.completion_tokens == 0 {
                 return None;
             }
-            (
+            let text = if snapshot.cached_prompt_tokens > 0 {
+                format!(
+                    "in {} ({} cached) / out {}",
+                    compact(snapshot.prompt_tokens),
+                    compact(snapshot.cached_prompt_tokens),
+                    compact(snapshot.completion_tokens)
+                )
+            } else {
                 format!(
                     "in {} / out {}",
                     compact(snapshot.prompt_tokens),
                     compact(snapshot.completion_tokens)
-                ),
-                AuraStyle::StatusTokens,
-            )
+                )
+            };
+            (text, AuraStyle::StatusTokens)
         }
         Segment::Scratchpad => {
             if snapshot.scratchpad_intercepted == 0 {
@@ -460,6 +470,7 @@ mod tests {
             }),
             prompt_tokens: 182_000,
             completion_tokens: 41_000,
+            cached_prompt_tokens: 0,
             scratchpad_intercepted: 0,
             scratchpad_extracted: 0,
             mcp: Some(McpCounts {
@@ -625,6 +636,18 @@ mod tests {
         };
         let line = strip_ansi(&render(&snapshot, &[Segment::Tokens], 80, ""));
         assert_eq!(line, "in 182k / out 41k");
+    }
+
+    #[test]
+    fn tokens_show_cached_share_when_reported() {
+        let snapshot = Snapshot {
+            prompt_tokens: 182_000,
+            completion_tokens: 41_000,
+            cached_prompt_tokens: 150_000,
+            ..Snapshot::default()
+        };
+        let line = strip_ansi(&render(&snapshot, &[Segment::Tokens], 80, ""));
+        assert_eq!(line, "in 182k (150k cached) / out 41k");
     }
 
     #[test]

@@ -62,6 +62,7 @@ pub(crate) static STATUS_HINT: Mutex<Vec<String>> = Mutex::new(Vec::new());
 pub(crate) static TURN_NOTICES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 pub(crate) static CUMULATIVE_PROMPT: Mutex<u64> = Mutex::new(0);
 pub(crate) static CUMULATIVE_COMPLETION: Mutex<u64> = Mutex::new(0);
+pub(crate) static CUMULATIVE_CACHE_READ: Mutex<u64> = Mutex::new(0);
 pub(crate) static CUMULATIVE_SCRATCHPAD_INTERCEPTED: Mutex<u64> = Mutex::new(0);
 pub(crate) static CUMULATIVE_SCRATCHPAD_EXTRACTED: Mutex<u64> = Mutex::new(0);
 pub(crate) static PROCESSING: AtomicBool = AtomicBool::new(false);

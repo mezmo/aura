@@ -195,8 +195,13 @@ pub fn replay_event_log_global() {
             DisplayEvent::Usage {
                 prompt_tokens,
                 completion_tokens,
+                cache_read_input_tokens,
+                ..
             } => {
                 set_status_bar_tokens(*prompt_tokens, *completion_tokens);
+                if let Some(cache_read) = cache_read_input_tokens {
+                    super::status_bar::add_status_bar_cached_tokens(*cache_read);
+                }
                 i += 1;
             }
             DisplayEvent::ContextUsage {
