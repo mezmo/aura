@@ -16,8 +16,6 @@ use rig::message::ToolResultContent;
 use rig::streaming::{StreamingChat, StreamingPrompt};
 use std::collections::HashSet;
 use std::pin::Pin;
-use std::time::Duration;
-use tokio::sync::watch;
 
 use crate::scratchpad::ContextBudget;
 use crate::streaming_request_hook::StreamingRequestHook;
@@ -109,17 +107,13 @@ impl ProviderAgent {
         prompt: rig::completion::Message,
         chat_history: Vec<rig::completion::Message>,
         max_depth: usize,
-        timeout: Duration,
+        options: crate::streaming::RunOptions,
         request_id: &str,
         scratchpad_budget: Option<ContextBudget>,
         client_tool_names: HashSet<String>,
-    ) -> (
-        Pin<Box<dyn futures::Stream<Item = Result<StreamItem, StreamError>> + Send>>,
-        watch::Sender<bool>,
-        crate::streaming_request_hook::UsageState,
-    ) {
+    ) -> crate::streaming::AgentRun {
         let (hook, cancel_tx, usage_state) =
-            StreamingRequestHook::with_scratchpad_budget(timeout, request_id, scratchpad_budget);
+            StreamingRequestHook::with_scratchpad_budget(options, request_id, scratchpad_budget);
         let hook = hook.with_client_tool_names(client_tool_names);
 
         match self {
@@ -129,7 +123,7 @@ impl ProviderAgent {
                     .with_hook(hook)
                     .multi_turn(max_depth)
                     .await;
-                (
+                crate::streaming::AgentRun::new(
                     Box::pin(stream.map::<Result<StreamItem, StreamError>, _>(map_stream_item)),
                     cancel_tx,
                     usage_state,
@@ -141,7 +135,7 @@ impl ProviderAgent {
                     .with_hook(hook)
                     .multi_turn(max_depth)
                     .await;
-                (
+                crate::streaming::AgentRun::new(
                     Box::pin(stream.map::<Result<StreamItem, StreamError>, _>(map_stream_item)),
                     cancel_tx,
                     usage_state,
@@ -153,7 +147,7 @@ impl ProviderAgent {
                     .with_hook(hook)
                     .multi_turn(max_depth)
                     .await;
-                (
+                crate::streaming::AgentRun::new(
                     Box::pin(stream.map::<Result<StreamItem, StreamError>, _>(map_stream_item)),
                     cancel_tx,
                     usage_state,
@@ -165,7 +159,7 @@ impl ProviderAgent {
                     .with_hook(hook)
                     .multi_turn(max_depth)
                     .await;
-                (
+                crate::streaming::AgentRun::new(
                     Box::pin(stream.map::<Result<StreamItem, StreamError>, _>(map_stream_item)),
                     cancel_tx,
                     usage_state,
@@ -177,7 +171,7 @@ impl ProviderAgent {
                     .with_hook(hook)
                     .multi_turn(max_depth)
                     .await;
-                (
+                crate::streaming::AgentRun::new(
                     Box::pin(stream.map::<Result<StreamItem, StreamError>, _>(map_stream_item)),
                     cancel_tx,
                     usage_state,
@@ -189,7 +183,7 @@ impl ProviderAgent {
                     .with_hook(hook)
                     .multi_turn(max_depth)
                     .await;
-                (
+                crate::streaming::AgentRun::new(
                     Box::pin(stream.map::<Result<StreamItem, StreamError>, _>(map_stream_item)),
                     cancel_tx,
                     usage_state,
@@ -202,7 +196,7 @@ impl ProviderAgent {
                     .with_hook(hook)
                     .multi_turn(max_depth)
                     .await;
-                (
+                crate::streaming::AgentRun::new(
                     Box::pin(stream.map::<Result<StreamItem, StreamError>, _>(map_stream_item)),
                     cancel_tx,
                     usage_state,
@@ -316,25 +310,18 @@ impl ProviderAgent {
 
     /// Stream a prompt with timeout and cancellation support.
     ///
-    /// Returns (stream, cancel_sender, usage_state):
-    /// - stream: The actual stream of completion items
-    /// - cancel_sender: Send `true` to cancel the stream
-    /// - usage_state: Shared state for reading final usage at stream end
+    /// Returns the run: its stream, the token that cancels it, and its usage.
     pub async fn stream_prompt_with_timeout(
         &self,
         query: &str,
         max_depth: usize,
-        timeout: Duration,
+        options: crate::streaming::RunOptions,
         request_id: &str,
         scratchpad_budget: Option<ContextBudget>,
         client_tool_names: HashSet<String>,
-    ) -> (
-        Pin<Box<dyn futures::Stream<Item = Result<StreamItem, StreamError>> + Send>>,
-        watch::Sender<bool>,
-        crate::streaming_request_hook::UsageState,
-    ) {
+    ) -> crate::streaming::AgentRun {
         let (hook, cancel_tx, usage_state) =
-            StreamingRequestHook::with_scratchpad_budget(timeout, request_id, scratchpad_budget);
+            StreamingRequestHook::with_scratchpad_budget(options, request_id, scratchpad_budget);
         let hook = hook.with_client_tool_names(client_tool_names);
 
         match self {
@@ -344,7 +331,7 @@ impl ProviderAgent {
                     .with_hook(hook)
                     .multi_turn(max_depth)
                     .await;
-                (
+                crate::streaming::AgentRun::new(
                     Box::pin(stream.map::<Result<StreamItem, StreamError>, _>(map_stream_item)),
                     cancel_tx,
                     usage_state,
@@ -356,7 +343,7 @@ impl ProviderAgent {
                     .with_hook(hook)
                     .multi_turn(max_depth)
                     .await;
-                (
+                crate::streaming::AgentRun::new(
                     Box::pin(stream.map::<Result<StreamItem, StreamError>, _>(map_stream_item)),
                     cancel_tx,
                     usage_state,
@@ -368,7 +355,7 @@ impl ProviderAgent {
                     .with_hook(hook)
                     .multi_turn(max_depth)
                     .await;
-                (
+                crate::streaming::AgentRun::new(
                     Box::pin(stream.map::<Result<StreamItem, StreamError>, _>(map_stream_item)),
                     cancel_tx,
                     usage_state,
@@ -380,7 +367,7 @@ impl ProviderAgent {
                     .with_hook(hook)
                     .multi_turn(max_depth)
                     .await;
-                (
+                crate::streaming::AgentRun::new(
                     Box::pin(stream.map::<Result<StreamItem, StreamError>, _>(map_stream_item)),
                     cancel_tx,
                     usage_state,
@@ -392,7 +379,7 @@ impl ProviderAgent {
                     .with_hook(hook)
                     .multi_turn(max_depth)
                     .await;
-                (
+                crate::streaming::AgentRun::new(
                     Box::pin(stream.map::<Result<StreamItem, StreamError>, _>(map_stream_item)),
                     cancel_tx,
                     usage_state,
@@ -404,7 +391,7 @@ impl ProviderAgent {
                     .with_hook(hook)
                     .multi_turn(max_depth)
                     .await;
-                (
+                crate::streaming::AgentRun::new(
                     Box::pin(stream.map::<Result<StreamItem, StreamError>, _>(map_stream_item)),
                     cancel_tx,
                     usage_state,
@@ -417,7 +404,7 @@ impl ProviderAgent {
                     .with_hook(hook)
                     .multi_turn(max_depth)
                     .await;
-                (
+                crate::streaming::AgentRun::new(
                     Box::pin(stream.map::<Result<StreamItem, StreamError>, _>(map_stream_item)),
                     cancel_tx,
                     usage_state,
@@ -428,27 +415,20 @@ impl ProviderAgent {
 
     /// Stream a chat with timeout and cancellation support.
     ///
-    /// Returns (stream, cancel_sender, usage_state):
-    /// - stream: The actual stream of completion items
-    /// - cancel_sender: Send `true` to cancel the stream
-    /// - usage_state: Shared state for reading final usage at stream end
+    /// Returns the run: its stream, the token that cancels it, and its usage.
     #[allow(clippy::too_many_arguments)]
     pub async fn stream_chat_with_timeout(
         &self,
         query: &str,
         chat_history: Vec<rig::completion::Message>,
         max_depth: usize,
-        timeout: Duration,
+        options: crate::streaming::RunOptions,
         request_id: &str,
         scratchpad_budget: Option<ContextBudget>,
         client_tool_names: HashSet<String>,
-    ) -> (
-        Pin<Box<dyn futures::Stream<Item = Result<StreamItem, StreamError>> + Send>>,
-        watch::Sender<bool>,
-        crate::streaming_request_hook::UsageState,
-    ) {
+    ) -> crate::streaming::AgentRun {
         let (hook, cancel_tx, usage_state) =
-            StreamingRequestHook::with_scratchpad_budget(timeout, request_id, scratchpad_budget);
+            StreamingRequestHook::with_scratchpad_budget(options, request_id, scratchpad_budget);
         let hook = hook.with_client_tool_names(client_tool_names);
 
         match self {
@@ -458,7 +438,7 @@ impl ProviderAgent {
                     .with_hook(hook)
                     .multi_turn(max_depth)
                     .await;
-                (
+                crate::streaming::AgentRun::new(
                     Box::pin(stream.map::<Result<StreamItem, StreamError>, _>(map_stream_item)),
                     cancel_tx,
                     usage_state,
@@ -470,7 +450,7 @@ impl ProviderAgent {
                     .with_hook(hook)
                     .multi_turn(max_depth)
                     .await;
-                (
+                crate::streaming::AgentRun::new(
                     Box::pin(stream.map::<Result<StreamItem, StreamError>, _>(map_stream_item)),
                     cancel_tx,
                     usage_state,
@@ -482,7 +462,7 @@ impl ProviderAgent {
                     .with_hook(hook)
                     .multi_turn(max_depth)
                     .await;
-                (
+                crate::streaming::AgentRun::new(
                     Box::pin(stream.map::<Result<StreamItem, StreamError>, _>(map_stream_item)),
                     cancel_tx,
                     usage_state,
@@ -494,7 +474,7 @@ impl ProviderAgent {
                     .with_hook(hook)
                     .multi_turn(max_depth)
                     .await;
-                (
+                crate::streaming::AgentRun::new(
                     Box::pin(stream.map::<Result<StreamItem, StreamError>, _>(map_stream_item)),
                     cancel_tx,
                     usage_state,
@@ -506,7 +486,7 @@ impl ProviderAgent {
                     .with_hook(hook)
                     .multi_turn(max_depth)
                     .await;
-                (
+                crate::streaming::AgentRun::new(
                     Box::pin(stream.map::<Result<StreamItem, StreamError>, _>(map_stream_item)),
                     cancel_tx,
                     usage_state,
@@ -518,7 +498,7 @@ impl ProviderAgent {
                     .with_hook(hook)
                     .multi_turn(max_depth)
                     .await;
-                (
+                crate::streaming::AgentRun::new(
                     Box::pin(stream.map::<Result<StreamItem, StreamError>, _>(map_stream_item)),
                     cancel_tx,
                     usage_state,
@@ -531,7 +511,7 @@ impl ProviderAgent {
                     .with_hook(hook)
                     .multi_turn(max_depth)
                     .await;
-                (
+                crate::streaming::AgentRun::new(
                     Box::pin(stream.map::<Result<StreamItem, StreamError>, _>(map_stream_item)),
                     cancel_tx,
                     usage_state,
