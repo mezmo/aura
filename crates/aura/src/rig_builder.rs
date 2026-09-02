@@ -91,6 +91,7 @@ impl RigBuilder {
                     req_headers,
                 )
             }),
+            instance_id: crate::instance_id::instance_id(&self.config.agent).to_string(),
             ..Default::default()
         }
     }

@@ -28,6 +28,8 @@ pub struct RequestApprovalTool {
     scope: AgentScope,
     request_id: String,
     agent_name: String,
+    /// Instance ID of the AURA process that built this tool.
+    instance_id: String,
 }
 
 impl RequestApprovalTool {
@@ -37,12 +39,14 @@ impl RequestApprovalTool {
         scope: AgentScope,
         request_id: String,
         agent_name: String,
+        instance_id: String,
     ) -> Self {
         Self {
             route,
             scope,
             request_id,
             agent_name,
+            instance_id,
         }
     }
 }
@@ -144,6 +148,7 @@ impl Tool for RequestApprovalTool {
         let tool_call_intent = normalize_tool_call_intent(args.tool_call_intent.as_deref());
         let request = ApprovalRequest {
             version: PROTOCOL_VERSION,
+            instance_id: self.instance_id.clone(),
             decision_id: DecisionId::generate(),
             request_id: self.request_id.clone(),
             scope: self.scope.clone(),
@@ -310,6 +315,7 @@ mod tests {
             AgentScope::Single { session_id: None },
             request_id.clone(),
             "test-agent".to_string(),
+            "test-instance-id".to_string(),
         );
 
         // Subscribe before the call so the Requested event is captured.
@@ -477,6 +483,7 @@ mod tests {
                 AgentScope::Single { session_id: None },
                 request_id.clone(),
                 "test-agent".to_string(),
+                "test-instance-id".to_string(),
             );
             let args = RequestApprovalArgs {
                 action_description: "delete namespace".to_string(),

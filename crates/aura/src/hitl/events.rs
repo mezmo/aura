@@ -41,6 +41,7 @@ impl<'a> From<&'a ApprovalRequest> for ApprovalRequestWire<'a> {
     fn from(request: &'a ApprovalRequest) -> Self {
         Self {
             version: request.version,
+            instance_id: request.instance_id.as_str(),
             decision_id: request.decision_id,
             request_id: request.request_id.as_str(),
             scope: scope_to_wire(&request.scope),
