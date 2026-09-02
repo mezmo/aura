@@ -67,8 +67,21 @@ impl ApprovalStore for InMemoryApprovalStore {
         id: &DecisionId,
         decision: ApprovalDecision,
     ) -> Result<(), ResolveError> {
-        // Removal under the lock is the at-most-once guarantee.
-        let parked = self.lock().remove(id).ok_or(ResolveError::NotFound)?;
+        // Removal under the lock is the at-most-once guarantee. The expiry
+        // check in front of it refuses a ticket past its `expires_at`
+        // uniformly with an unknown id (park/reify §2.5); the ticket itself
+        // stays readable through `get` until `remove`.
+        let parked = {
+            let mut entries = self.lock();
+            if entries
+                .get(id)
+                .is_some_and(|parked| chrono::Utc::now() > parked.expires_at)
+            {
+                return Err(ResolveError::NotFound);
+            }
+            entries.remove(id)
+        };
+        let parked = parked.ok_or(ResolveError::NotFound)?;
         self.lock_decided().insert(
             *id,
             DecidedEntry {
@@ -251,21 +264,55 @@ mod tests {
         assert_eq!(store.decision(&DecisionId::generate()).await.unwrap(), None);
     }
 
+    /// Retention pruning still drops an entry past its window. The §2.5
+    /// contract makes an expired ticket unresolvable, so the past-window
+    /// state is constructed directly rather than reached through `resolve`.
     #[tokio::test]
     async fn recorded_decision_is_pruned_after_retention_window() {
         let store = InMemoryApprovalStore::new();
-        let mut entry = parked("req-prune");
-        // Retention margin is already past.
-        entry.expires_at =
-            chrono::Utc::now() - chrono::Duration::seconds(2 * DECISION_RETENTION_MARGIN_SECS);
-        let id = entry.request.decision_id;
-        store.register(entry).await.unwrap();
-        store
-            .resolve(&id, ApprovalDecision::Approved)
-            .await
-            .unwrap();
+        let id = parked("req-prune").request.decision_id;
+        store.lock_decided().insert(
+            id,
+            DecidedEntry {
+                decision: ApprovalDecision::Approved,
+                keep_until: chrono::Utc::now() - chrono::Duration::seconds(1),
+            },
+        );
 
         assert_eq!(store.decision(&id).await.unwrap(), None);
+    }
+
+    /// §2.5: `resolve` refuses a ticket past its `expires_at`, uniformly with
+    /// an unknown id; nothing is decided and the ticket stays for `get`.
+    #[tokio::test]
+    async fn expired_ticket_refuses_resolve() {
+        let store = InMemoryApprovalStore::new();
+        let mut entry = parked("req-expired");
+        entry.expires_at = chrono::Utc::now() - chrono::Duration::seconds(1);
+        let id = entry.request.decision_id;
+        store.register(entry).await.unwrap();
+
+        assert_eq!(
+            store.resolve(&id, ApprovalDecision::Approved).await,
+            Err(ResolveError::NotFound)
+        );
+        assert_eq!(store.decision(&id).await.unwrap(), None);
+        assert!(store.get(&id).await.unwrap().is_some());
+    }
+
+    /// §2.5: expiry is enforced only by `resolve`; `get` returns the expired
+    /// ticket until `remove`.
+    #[tokio::test]
+    async fn expired_ticket_is_returned_by_get_until_remove() {
+        let store = InMemoryApprovalStore::new();
+        let mut entry = parked("req-expired-get");
+        entry.expires_at = chrono::Utc::now() - chrono::Duration::seconds(1);
+        let id = entry.request.decision_id;
+        store.register(entry).await.unwrap();
+
+        assert!(store.get(&id).await.unwrap().is_some());
+        store.remove(&id).await.unwrap();
+        assert!(store.get(&id).await.unwrap().is_none());
     }
 
     #[tokio::test]

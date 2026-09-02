@@ -1,13 +1,15 @@
 //! Pluggable cross-instance session-state capabilities: a durable store for parked
 //! HITL approvals and a pub/sub event bus.
 //!
-//! The in-memory implementations are the default; a networked backend (e.g.
-//! Redis/Valkey) implements the same traits to make a load-balanced multi-instance
-//! deployment behave like one process.
+//! The in-memory implementations are the default; a file-backed approval
+//! store survives a process restart on a single host, and a networked backend
+//! (e.g. Redis/Valkey) implements the same traits to make a load-balanced
+//! multi-instance deployment behave like one process.
 //!
 //! See `docs/design/session-storage.md` and
 //! `docs/adr/2026-07-08-session-storage.md`.
 
+mod file;
 mod memory;
 mod record;
 
@@ -20,6 +22,7 @@ use futures::Stream;
 
 use crate::hitl::{ApprovalDecision, DecisionId, ParkedApproval, ResolveError};
 
+pub use file::FileApprovalStore;
 pub use memory::{InMemoryApprovalStore, InMemoryEventBus};
 pub use record::{DecisionRecord, InvalidRecord, OriginRecord, ParkedApprovalRecord, ScopeRecord};
 
@@ -53,7 +56,9 @@ pub enum SessionStoreError {
 pub trait ApprovalStore: Send + Sync {
     /// Persist a parked approval, keyed by its `DecisionId`. Backends with
     /// native expiry should TTL the entry from `expires_at` so abandoned
-    /// approvals self-clean.
+    /// approvals self-clean; backends without it (the file store) retain
+    /// the entry until the consumer removes it, and expiry is enforced
+    /// only by `resolve`.
     async fn register(&self, parked: ParkedApproval) -> Result<(), SessionStoreError>;
 
     /// Look up a parked approval.
