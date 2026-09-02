@@ -205,6 +205,14 @@ impl PendingApprovals {
         Ok(())
     }
 
+    /// The parked approval record for an id, propagating a store fault.
+    pub async fn try_parked(
+        &self,
+        id: &DecisionId,
+    ) -> Result<Option<ParkedApproval>, SessionStoreError> {
+        self.0.store.get(id).await
+    }
+
     /// The durably recorded decision for an already-resolved approval, if
     /// any. A store fault reads as "no recorded decision" (logged), so
     /// callers keep their fail-closed shape.

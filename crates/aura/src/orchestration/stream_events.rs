@@ -9,6 +9,7 @@
 //! - `aura.orchestrator.task_started` - Worker began task execution
 //! - `aura.orchestrator.task_completed` - Worker finished task (success/failure)
 //! - `aura.orchestrator.task_blocked` - Worker parked gated calls (park mode)
+//! - `aura.orchestrator.run_parked` - Run parked with a published checkpoint (park mode)
 //! - `aura.orchestrator.iteration_complete` - Plan-execute-continue cycle done
 //! - `aura.orchestrator.synthesizing` - Consolidating task results for coordinator decision
 //! - `aura.orchestrator.tool_call_started` - Worker tool execution began
@@ -71,6 +72,7 @@ pub mod event_names {
     pub const TASK_STARTED: &str = "aura.orchestrator.task_started";
     pub const TASK_COMPLETED: &str = "aura.orchestrator.task_completed";
     pub const TASK_BLOCKED: &str = "aura.orchestrator.task_blocked";
+    pub const RUN_PARKED: &str = "aura.orchestrator.run_parked";
     pub const ITERATION_COMPLETE: &str = "aura.orchestrator.iteration_complete";
     pub const REPLAN_STARTED: &str = "aura.orchestrator.replan_started";
     pub const SYNTHESIZING: &str = "aura.orchestrator.synthesizing";
@@ -143,6 +145,19 @@ pub enum OrchestrationStreamEvent {
         #[serde(flatten)]
         context: EventContext,
     },
+    /// The run parked with a published checkpoint (park mode); terminal.
+    RunParked {
+        /// The parked run's id.
+        run_id: String,
+        /// The decision ids still awaiting a human decision.
+        decision_ids: Vec<String>,
+        /// RFC 3339 timestamp after which the decisions expire.
+        expires_at: String,
+        /// Which iteration the run parked in (1-indexed).
+        iteration: usize,
+        #[serde(flatten)]
+        context: EventContext,
+    },
     /// Emitted when orchestrator completes an iteration.
     IterationComplete {
         iteration: usize,
@@ -211,6 +226,7 @@ impl OrchestrationStreamEvent {
             Self::TaskStarted { .. } => event_names::TASK_STARTED,
             Self::TaskCompleted { .. } => event_names::TASK_COMPLETED,
             Self::TaskBlocked { .. } => event_names::TASK_BLOCKED,
+            Self::RunParked { .. } => event_names::RUN_PARKED,
             Self::IterationComplete { .. } => event_names::ITERATION_COMPLETE,
             Self::ReplanStarted { .. } => event_names::REPLAN_STARTED,
             Self::Synthesizing { .. } => event_names::SYNTHESIZING,
@@ -339,6 +355,23 @@ impl OrchestrationStreamEvent {
                 orchestrator_id: orchestrator_id.into(),
                 worker_id: worker_id.into(),
             },
+            context,
+        }
+    }
+
+    /// Create a RunParked event (terminal, one per parked run).
+    pub fn run_parked(
+        run_id: impl Into<String>,
+        decision_ids: Vec<String>,
+        expires_at: impl Into<String>,
+        iteration: usize,
+        context: EventContext,
+    ) -> Self {
+        Self::RunParked {
+            run_id: run_id.into(),
+            decision_ids,
+            expires_at: expires_at.into(),
+            iteration,
             context,
         }
     }
@@ -617,6 +650,33 @@ mod tests {
         assert!(sse.contains("\"tool_name\":\"kubectl_apply\""));
         assert!(sse.contains("\"decision_id\":\"0191e8c0-1111-7000-8000-00000000000a\""));
         assert!(sse.contains("\"worker_id\":\"operations\""));
+    }
+
+    #[test]
+    fn test_format_sse_run_parked() {
+        let event = OrchestrationStreamEvent::run_parked(
+            "0191e8c0-1111-7000-8000-0000000000ff",
+            vec![
+                "0191e8c0-1111-7000-8000-00000000000a".to_string(),
+                "0191e8c0-1111-7000-8000-00000000000b".to_string(),
+            ],
+            "2026-09-02T15:03:11+00:00",
+            2,
+            test_ctx(),
+        );
+        let sse = event.format_sse();
+
+        assert!(sse.starts_with("event: aura.orchestrator.run_parked\n"));
+        assert_eq!(
+            event_names::RUN_PARKED,
+            aura_events::orchestration::event_names::RUN_PARKED
+        );
+        assert!(sse.contains("\"run_id\":\"0191e8c0-1111-7000-8000-0000000000ff\""));
+        assert!(sse.contains("\"decision_ids\":["));
+        assert!(sse.contains("\"0191e8c0-1111-7000-8000-00000000000a\""));
+        assert!(sse.contains("\"0191e8c0-1111-7000-8000-00000000000b\""));
+        assert!(sse.contains("\"expires_at\":\"2026-09-02T15:03:11+00:00\""));
+        assert!(sse.contains("\"iteration\":2"));
     }
 
     #[test]
