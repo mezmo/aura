@@ -229,22 +229,25 @@ pub(crate) fn build_document(
 }
 
 /// Load a checkpoint document from `path`, rejecting unknown schema
-/// versions.
+/// versions. The read runs on the blocking pool.
 #[allow(dead_code)]
-pub(crate) fn load_parked_run(path: &Path) -> io::Result<ParkedRun> {
-    let bytes = std::fs::read(path)?;
+pub(crate) async fn load_parked_run(path: &Path) -> io::Result<ParkedRun> {
+    let display = path.display().to_string();
+    let path = path.to_path_buf();
+    let bytes = tokio::task::spawn_blocking(move || std::fs::read(&path))
+        .await
+        .map_err(io::Error::other)??;
     let document: ParkedRun = serde_json::from_slice(&bytes).map_err(|e| {
         io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("parked run at {} failed to decode: {e}", path.display()),
+            format!("parked run at {display} failed to decode: {e}"),
         )
     })?;
     if document.schema_version != SCHEMA_VERSION {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "parked run at {} has schema version {} (expected {SCHEMA_VERSION})",
-                path.display(),
+                "parked run at {display} has schema version {} (expected {SCHEMA_VERSION})",
                 document.schema_version
             ),
         ));
@@ -446,19 +449,21 @@ mod tests {
 
     /// The load path reads a checkpoint from disk and rejects unknown
     /// schema versions.
-    #[test]
-    fn load_reads_from_disk_and_rejects_foreign_schema_version() {
+    #[tokio::test]
+    async fn load_reads_from_disk_and_rejects_foreign_schema_version() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("parked.json");
         std::fs::write(&path, GOLDEN).unwrap();
 
-        let doc = load_parked_run(&path).expect("golden loads from disk");
+        let doc = load_parked_run(&path)
+            .await
+            .expect("golden loads from disk");
         assert_eq!(doc.awaiting_decision_ids().len(), 1);
 
         let mut foreign: serde_json::Value = serde_json::from_str(GOLDEN).unwrap();
         foreign["schema_version"] = serde_json::json!(99);
         std::fs::write(&path, serde_json::to_string(&foreign).unwrap()).unwrap();
-        let err = load_parked_run(&path).unwrap_err();
+        let err = load_parked_run(&path).await.unwrap_err();
         assert!(
             err.to_string().contains("schema version 99"),
             "error names the version: {err}"

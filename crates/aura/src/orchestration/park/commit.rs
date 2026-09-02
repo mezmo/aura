@@ -12,7 +12,6 @@ use std::path::{Path, PathBuf};
 
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use tokio::fs;
 
 use crate::config::AgentRuntimeConfig;
 use crate::hitl::{AgentScope, DecisionId, PendingApprovals};
@@ -166,28 +165,36 @@ pub(crate) async fn publish(
             format!("invalid run id for parked document: {run_id:?}"),
         ));
     }
-    fs::create_dir_all(parked_dir).await?;
     let bytes = serde_json::to_vec_pretty(document)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-    let tmp = parked_dir.join(format!(".{run_id}.tmp"));
-    fs::write(&tmp, &bytes).await?;
-    let dest = parked_dir.join(format!("{run_id}{PARKED_DOCUMENT_SUFFIX}"));
-    fs::rename(&tmp, &dest).await?;
+    // The whole write-rename-unlink sequence runs as one blocking task:
+    // the fail-safe order stays a single unit, and no executor thread
+    // performs file I/O.
+    let parked_dir = parked_dir.to_path_buf();
+    let run_id = run_id.to_string();
+    tokio::task::spawn_blocking(move || {
+        std::fs::create_dir_all(&parked_dir)?;
 
-    let resuming = parked_dir.join(format!("{run_id}{RESUMING_DOCUMENT_SUFFIX}"));
-    match fs::remove_file(&resuming).await {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => {
+        let tmp = parked_dir.join(format!(".{run_id}.tmp"));
+        std::fs::write(&tmp, &bytes)?;
+        let dest = parked_dir.join(format!("{run_id}{PARKED_DOCUMENT_SUFFIX}"));
+        std::fs::rename(&tmp, &dest)?;
+
+        let resuming = parked_dir.join(format!("{run_id}{RESUMING_DOCUMENT_SUFFIX}"));
+        if let Err(e) = std::fs::remove_file(&resuming)
+            && e.kind() != io::ErrorKind::NotFound
+        {
             tracing::warn!(
                 path = %resuming.display(),
                 error = %e,
                 "failed to unlink stale resuming document after publish",
             );
         }
-    }
-    Ok(dest)
+        Ok(dest)
+    })
+    .await
+    .map_err(io::Error::other)?
 }
 
 /// Cancel every approval the run parked, so no decidable approval outlives
@@ -385,7 +392,7 @@ mod tests {
             "stale resuming document unlinked"
         );
 
-        let reloaded = load_parked_run(&dest).unwrap();
+        let reloaded = load_parked_run(&dest).await.unwrap();
         assert_eq!(reloaded.run_id, run_id);
     }
 

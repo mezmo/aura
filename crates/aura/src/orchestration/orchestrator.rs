@@ -7475,7 +7475,9 @@ mod tests {
             "the document lands at {{session_id}}/parked/{{run_id}}.json"
         );
 
-        let document = crate::orchestration::park::load_parked_run(&document_path).unwrap();
+        let document = crate::orchestration::park::load_parked_run(&document_path)
+            .await
+            .unwrap();
         assert_eq!(document.run_id, run_id);
         assert_eq!(document.iteration, 1);
         assert!(document.executed.is_empty());
