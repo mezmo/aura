@@ -17,6 +17,7 @@ pub mod fallback_tool_parser;
 pub mod fallback_tool_stream;
 pub mod governance;
 pub mod hitl;
+pub mod hooks;
 pub mod inactivity;
 pub mod logging;
 pub mod mcp;

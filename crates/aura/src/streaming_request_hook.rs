@@ -31,6 +31,7 @@
 //! let (prompt, completion, total) = usage_state.get_final_usage();
 //! ```
 
+use crate::hooks::{AgentHook, ClientTools, Deadline, Hooks};
 use crate::scratchpad::{self, ContextBudget};
 use crate::tool_event_broker::{pop_tool_call_id, push_tool_call_id};
 use aura_events::agent::{AgentEvent, AgentEventPayload};
@@ -40,7 +41,7 @@ use std::collections::HashSet;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 /// Maximum pending tool IDs before warning. Prevents unbounded growth if
@@ -268,10 +269,12 @@ impl ResponseContent {
 /// MCP cancellation is handled separately via client-level tracking (Arc-based).
 #[derive(Clone)]
 pub struct StreamingRequestHook {
-    start_time: Instant,
-    timeout: Duration,
-    /// External cancellation signal (e.g., from client disconnect)
-    cancelled: CancellationToken,
+    /// Everything watching this run. Cancellation and client-tool passthrough
+    /// live here; tool events and usage stay below because they share
+    /// `UsageState`'s pending tool ids.
+    hooks: Hooks,
+    deadline: Arc<Deadline>,
+    client_tools: Arc<ClientTools>,
     /// Request ID for event correlation
     request_id: String,
     /// Shared usage state (returned separately for handler access)
@@ -280,13 +283,6 @@ pub struct StreamingRequestHook {
     /// LLM-reported per-turn input/output tokens into the budget as ground
     /// truth so `remaining()` reflects actual context pressure.
     scratchpad_budget: Option<ContextBudget>,
-    /// Names of client-side (passthrough) tools registered for this request.
-    /// When the LLM calls one, the stream is terminated before the next LLM
-    /// turn so the client can execute the tool locally and submit results back.
-    client_tool_names: HashSet<String>,
-    /// Set when a client-side tool has been called in this request. Read by
-    /// `on_completion_call` to bail out before the next LLM turn.
-    client_tool_called: Arc<AtomicBool>,
 }
 
 impl StreamingRequestHook {
@@ -310,15 +306,17 @@ impl StreamingRequestHook {
     ) -> (Self, CancellationToken, UsageState) {
         let cancel = CancellationToken::new();
         let usage_state = UsageState::new();
+        let deadline = Arc::new(Deadline::new(timeout, cancel.clone()));
+        let client_tools = Arc::new(ClientTools::new(HashSet::new()));
         let hook = Self {
-            start_time: Instant::now(),
-            timeout,
-            cancelled: cancel.clone(),
+            hooks: Hooks::new()
+                .with(deadline.clone())
+                .with(client_tools.clone()),
+            deadline,
+            client_tools,
             request_id: request_id.into(),
             usage_state: usage_state.clone(),
             scratchpad_budget,
-            client_tool_names: HashSet::new(),
-            client_tool_called: Arc::new(AtomicBool::new(false)),
         };
         (hook, cancel, usage_state)
     }
@@ -328,16 +326,16 @@ impl StreamingRequestHook {
     /// When any of these tools are called, the hook ends the stream before the
     /// next LLM turn so the client can execute the tool and submit results.
     pub fn with_client_tool_names(mut self, names: HashSet<String>) -> Self {
-        self.client_tool_names = names;
+        let client_tools = Arc::new(ClientTools::new(names));
+        self.hooks = Hooks::new()
+            .with(self.deadline.clone())
+            .with(client_tools.clone());
+        self.client_tools = client_tools;
         self
     }
 
-    /// Check if the request should be cancelled (timeout or external signal).
     fn should_cancel(&self) -> bool {
-        if self.cancelled.is_cancelled() {
-            return true;
-        }
-        self.start_time.elapsed() > self.timeout
+        AgentHook::should_cancel(&self.hooks)
     }
 
     /// Should the SSE event surface (`aura.tool_requested` / `aura.tool_complete`
@@ -364,15 +362,8 @@ impl StreamingRequestHook {
 
     /// Check and cancel if needed, logging the reason.
     fn check_and_cancel(&self, cancel_sig: CancelSignal, context: &str) {
-        if self.cancelled.is_cancelled() {
-            tracing::info!("Request cancelled externally during {}", context);
-            cancel_sig.cancel();
-        } else if self.start_time.elapsed() > self.timeout {
-            tracing::warn!(
-                "Request timeout ({:?}) exceeded during {} - cancelling",
-                self.timeout,
-                context
-            );
+        if self.should_cancel() {
+            tracing::info!("Run cancelled during {}", context);
             cancel_sig.cancel();
         }
     }
@@ -390,18 +381,11 @@ where
         _history: &[Message],
         cancel_sig: CancelSignal,
     ) -> impl Future<Output = ()> + Send {
-        let has_client_tools = !self.client_tool_names.is_empty();
-        let client_tool_called = self.client_tool_called.clone();
         async move {
-            // If a passthrough tool was called this turn, do not initiate
-            // another LLM completion. Cancel here so the stream terminates
-            // and the streaming layer can emit `finish_reason: "tool_calls"`
-            // — the client will execute the tool and resume in a follow-up
-            // request.
-            if has_client_tools && client_tool_called.load(Ordering::Acquire) {
-                tracing::info!(
-                    "Client tool was called — cancelling before next LLM completion call"
-                );
+            // A hook declining ends the stream here so the streaming layer can
+            // emit `finish_reason: "tool_calls"` and the caller resume.
+            if !self.hooks.before_turn().await {
+                tracing::info!("A hook ended the run before the next LLM completion call");
                 cancel_sig.cancel();
                 return;
             }
@@ -455,17 +439,14 @@ where
         // makes the matching skip so push/pop stay symmetric. Cancellation
         // is still checked.
         let publish_event = Self::should_publish_tool_event(&tool_name);
-        let is_client_tool = self.client_tool_names.contains(&tool_name);
-        let client_tool_called = self.client_tool_called.clone();
         async move {
-            if is_client_tool {
-                tracing::info!(
-                    "Client tool '{}' called for request '{}' — marking for passthrough",
-                    tool_name,
-                    request_id
-                );
-                client_tool_called.store(true, Ordering::Release);
-            }
+            self.hooks
+                .on_tool_call(&crate::hooks::ToolCall {
+                    id: tool_call_id.as_deref(),
+                    name: &tool_name,
+                    args: &args_str,
+                })
+                .await;
 
             if publish_event {
                 // Parse args as JSON (fallback to empty object if invalid)
