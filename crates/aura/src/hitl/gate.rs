@@ -14,8 +14,22 @@ use serde_json::Value;
 
 use super::decision::{AgentScope, ApprovalOrigin, DecisionId};
 use super::protocol::{ApprovalItem, ApprovalRequest, PROTOCOL_VERSION};
+use super::registry::{ParkedApproval, PendingApprovals};
 use super::route::{ApprovalError, DecisionRoute, GateDecision};
+use crate::orchestration::{BlockedCell, PendingCall};
 use crate::tool_wrapper::{PreCallOutcome, ToolCallContext, ToolWrapper};
+
+/// The placeholder tool result a parked call returns.
+const PARK_SENTINEL: &str =
+    "This tool call is parked pending human approval. It has not run. Do not retry.";
+
+/// Park-arm state.
+struct ParkContext {
+    /// Registry over the approval store.
+    registry: PendingApprovals,
+    /// The worker's blocked cell.
+    cell: Arc<BlockedCell>,
+}
 
 /// Gates matching tool calls behind an approval decision.
 pub struct HitlApprovalWrapper {
@@ -34,6 +48,8 @@ pub struct HitlApprovalWrapper {
     agent_name: String,
     /// Instance ID of the AURA process that built this wrapper.
     instance_id: String,
+    /// Park arm state.
+    park: Option<ParkContext>,
 }
 
 impl HitlApprovalWrapper {
@@ -53,7 +69,15 @@ impl HitlApprovalWrapper {
             request_id,
             agent_name,
             instance_id,
+            park: None,
         }
+    }
+
+    /// Arm the park arm: glob-matched calls park as durable approvals.
+    #[must_use]
+    pub fn with_park(mut self, registry: PendingApprovals, cell: Arc<BlockedCell>) -> Self {
+        self.park = Some(ParkContext { registry, cell });
+        self
     }
 
     /// First configured glob that matches `tool_name`, never gating the
@@ -69,6 +93,120 @@ impl HitlApprovalWrapper {
             .find(|p| p.matches(tool_name))
             .map(|p| p.as_str())
     }
+
+    /// The park arm: register durably, publish, append to the blocked cell,
+    /// and short-circuit with the inert sentinel. Ordering is load-bearing —
+    /// a register error must fail the call closed before anything is
+    /// published or recorded, so no checkpoint can reference a decision id
+    /// the store does not hold.
+    async fn park_pre_call(
+        &self,
+        park: &ParkContext,
+        matched: &str,
+        args: &Value,
+        ctx: &ToolCallContext,
+    ) -> Result<PreCallOutcome, ToolError> {
+        // Park is worker-only: the scope carries the run and task identity.
+        let AgentScope::Worker { run_id, .. } = &self.scope else {
+            return Err(ToolError::ToolCallError(
+                "tool call blocked: park mode requires an orchestration worker scope"
+                    .to_string()
+                    .into(),
+            ));
+        };
+        // The route timeout bounds the decision window until a park TTL exists.
+        let DecisionRoute::Conversational { timeout, .. } = &*self.route else {
+            return Err(ToolError::ToolCallError(
+                "tool call blocked: park mode requires the conversational route"
+                    .to_string()
+                    .into(),
+            ));
+        };
+
+        let now = chrono::Utc::now();
+        let expires_at =
+            now + chrono::Duration::from_std(*timeout).expect("approval timeout fits in chrono");
+        let decision_id = DecisionId::generate();
+        let request = ApprovalRequest {
+            version: PROTOCOL_VERSION,
+            instance_id: self.instance_id.clone(),
+            decision_id,
+            // Owner-id convention: every backend sweeps `cancel_request` by
+            // this field, and request teardown passes the live request id, so
+            // the run-scoped value keeps a parked ticket out of that sweep.
+            // The run's own sweep passes the same value.
+            request_id: format!("run:{run_id}"),
+            scope: self.scope.clone(),
+            origin: ApprovalOrigin::ConfigGate {
+                matched_pattern: matched.to_string(),
+                agent_name: self.agent_name.clone(),
+            },
+            items: vec![ApprovalItem {
+                tool_name: ctx.tool_name.clone(),
+                arguments: args.clone(),
+                tool_call_intent: ctx.tool_call_intent.clone(),
+            }],
+        };
+
+        // The store's own register, not the registry's park-anyway one: a
+        // fault fails the call closed.
+        let parked = ParkedApproval {
+            request,
+            registered_at: now,
+            expires_at,
+        };
+        if let Err(err) = park.registry.register_durable(parked.clone()).await {
+            tracing::warn!(
+                decision_id = %decision_id,
+                error = %err,
+                "park-mode approval register failed; failing the gated call closed",
+            );
+            return Err(ToolError::ToolCallError(
+                format!("tool call blocked: approval store register failed: {err}").into(),
+            ));
+        }
+
+        // The lifecycle pair goes to the live request's broker, not the owner id.
+        crate::approval_event_broker::publish(
+            &self.request_id,
+            crate::approval_event_broker::ApprovalLifecycleEvent::Requested(
+                (&parked.request).into(),
+            ),
+        )
+        .await;
+        crate::approval_event_broker::publish(
+            &self.request_id,
+            crate::approval_event_broker::ApprovalLifecycleEvent::Pending(super::events::pending(
+                &parked.request,
+                &parked.expires_at,
+            )),
+        )
+        .await;
+
+        let call_id = park.cell.take_current_call_id().unwrap_or_else(|| {
+            tracing::warn!(
+                decision_id = %decision_id,
+                tool_name = %ctx.tool_name,
+                "parked call has no tool-call id; recording an empty call_id",
+            );
+            String::new()
+        });
+        park.cell.push(PendingCall {
+            decision_id,
+            tool_name: ctx.tool_name.clone(),
+            arguments: args.clone(),
+            call_id,
+        });
+        tracing::info!(
+            decision_id = %decision_id,
+            tool_name = %ctx.tool_name,
+            "parked gated call awaiting human decision",
+        );
+
+        Ok(PreCallOutcome::ShortCircuit {
+            output: PARK_SENTINEL.to_string(),
+        })
+    }
 }
 
 #[async_trait]
@@ -81,6 +219,9 @@ impl ToolWrapper for HitlApprovalWrapper {
         let Some(matched) = self.matched_pattern(&ctx.tool_name) else {
             return Ok(PreCallOutcome::Proceed { overrides: None });
         };
+        if let Some(park) = &self.park {
+            return self.park_pre_call(park, matched, args, ctx).await;
+        }
         let request = ApprovalRequest {
             version: PROTOCOL_VERSION,
             instance_id: self.instance_id.clone(),
@@ -234,7 +375,228 @@ mod tests {
                 output: "Tool call blocked by human approval denial: too risky. Do not execute this action."
                     .to_string()
             }
-        );
+        )
+    }
+
+    // ====================================================================
+    // Park arm
+    // ====================================================================
+
+    mod park {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use super::*;
+
+        fn worker_scope() -> AgentScope {
+            AgentScope::Worker {
+                run_id: "0191e8c0-1111-7000-8000-000000000042".parse().unwrap(),
+                task: crate::orchestration::TaskIdentity::new(1, Some("operations".to_string())),
+                session_id: None,
+            }
+        }
+
+        fn conv_route(timeout: Duration) -> (PendingApprovals, Arc<DecisionRoute>) {
+            let registry = PendingApprovals::new();
+            let route = Arc::new(DecisionRoute::Conversational {
+                registry: registry.clone(),
+                timeout,
+            });
+            (registry, route)
+        }
+
+        /// Route over an explicit registry, for tests that need the store.
+        fn conv_route_over(registry: PendingApprovals, timeout: Duration) -> Arc<DecisionRoute> {
+            Arc::new(DecisionRoute::Conversational { registry, timeout })
+        }
+
+        fn parked_gate(
+            registry: &PendingApprovals,
+            route: &Arc<DecisionRoute>,
+            request_id: &str,
+            cell: &Arc<crate::orchestration::BlockedCell>,
+        ) -> HitlApprovalWrapper {
+            HitlApprovalWrapper::new(
+                Arc::from([GlobPattern::new("kubectl_*").unwrap()]),
+                route.clone(),
+                worker_scope(),
+                request_id.to_string(),
+                "test-agent".to_string(),
+                "test-instance".to_string(),
+            )
+            .with_park(registry.clone(), cell.clone())
+        }
+
+        #[tokio::test]
+        async fn register_error_fails_closed_with_no_cell_entry_and_no_event() {
+            let request_id = format!("req_park_fail_{}", uuid::Uuid::new_v4().simple());
+            let mut events = crate::approval_event_broker::subscribe(&request_id).await;
+            let store: Arc<dyn crate::session_store::ApprovalStore> =
+                Arc::new(crate::session_store::FaultInjectingStore::failing_register());
+            let registry = PendingApprovals::with_backend(
+                store,
+                Arc::new(crate::session_store::InMemoryEventBus::new()),
+            );
+            let route = conv_route_over(registry.clone(), Duration::from_secs(60));
+            let cell = Arc::new(crate::orchestration::BlockedCell::default());
+            let gate = parked_gate(&registry, &route, &request_id, &cell);
+
+            let args = serde_json::json!({ "namespace": "prod" });
+            let ctx = ToolCallContext::new("kubectl_apply");
+            let result = gate.pre_call(&args, &ctx).await;
+
+            let err = result.expect_err("a register fault must fail the call closed");
+            assert!(
+                err.to_string().contains("approval store register failed"),
+                "error must name the register fault, got: {err}"
+            );
+            assert!(
+                err.to_string().contains("disk on fire"),
+                "error must carry the store's reason, got: {err}"
+            );
+            assert!(
+                cell.is_empty(),
+                "no cell entry may exist after a register fault"
+            );
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), events.recv())
+                    .await
+                    .is_err(),
+                "no approval event may be published after a register fault"
+            );
+
+            crate::approval_event_broker::unsubscribe(&request_id).await;
+        }
+
+        #[tokio::test]
+        async fn happy_path_registers_publishes_appends_and_short_circuits() {
+            let request_id = format!("req_park_ok_{}", uuid::Uuid::new_v4().simple());
+            let mut events = crate::approval_event_broker::subscribe(&request_id).await;
+            let store: Arc<dyn crate::session_store::ApprovalStore> =
+                Arc::new(crate::session_store::InMemoryApprovalStore::new());
+            let registry = PendingApprovals::with_backend(
+                store.clone(),
+                Arc::new(crate::session_store::InMemoryEventBus::new()),
+            );
+            let route = conv_route_over(registry.clone(), Duration::from_secs(120));
+            let cell = Arc::new(crate::orchestration::BlockedCell::default());
+            cell.set_current_call_id(Some("call_7".to_string()));
+            let gate = parked_gate(&registry, &route, &request_id, &cell);
+
+            let args = serde_json::json!({ "namespace": "prod" });
+            let ctx = ToolCallContext::new("kubectl_apply");
+            let outcome = gate.pre_call(&args, &ctx).await.unwrap();
+
+            assert_eq!(
+                outcome,
+                PreCallOutcome::ShortCircuit {
+                    output: super::PARK_SENTINEL.to_string()
+                },
+                "a parked call short-circuits with the inert sentinel"
+            );
+
+            // Mirror the hook's snapshot so the cell reports Blocked.
+            cell.snapshot_if_pending(
+                &[rig::completion::Message::user("do the thing")],
+                &rig::completion::Message::user("tool results"),
+            );
+            match cell.outcome() {
+                crate::orchestration::CellOutcome::Blocked { pending } => {
+                    assert_eq!(pending.len(), 1);
+                    assert_eq!(pending[0].tool_name, "kubectl_apply");
+                    assert_eq!(pending[0].call_id, "call_7");
+                    assert_eq!(pending[0].arguments, args);
+
+                    // Store: the ticket is parked under the run-scoped owner.
+                    let parked = store
+                        .get(&pending[0].decision_id)
+                        .await
+                        .unwrap()
+                        .expect("ticket parked in the store");
+                    assert_eq!(
+                        parked.request.request_id,
+                        "run:0191e8c0-1111-7000-8000-000000000042"
+                    );
+                    assert_eq!(parked.request.items[0].tool_name, "kubectl_apply");
+                    assert_eq!(parked.request.items[0].arguments, args);
+                }
+                other => panic!("expected Blocked, got {other:?}"),
+            }
+
+            // SSE: requested then pending, on the live request id.
+            match tokio::time::timeout(Duration::from_secs(1), events.recv()).await {
+                Ok(Some(crate::approval_event_broker::ApprovalLifecycleEvent::Requested(
+                    requested,
+                ))) => {
+                    assert_eq!(requested.tool_name, "kubectl_apply");
+                }
+                other => panic!("expected Requested event, got {other:?}"),
+            }
+            match tokio::time::timeout(Duration::from_secs(1), events.recv()).await {
+                Ok(Some(crate::approval_event_broker::ApprovalLifecycleEvent::Pending(
+                    pending,
+                ))) => {
+                    assert_eq!(pending.tool_name, "kubectl_apply");
+                    assert_eq!(pending.arguments, args);
+                    let scope = serde_json::to_value(&pending.scope).unwrap();
+                    assert_eq!(scope["kind"], "worker");
+                    assert_eq!(scope["run_id"], "0191e8c0-1111-7000-8000-000000000042");
+                }
+                other => panic!("expected Pending event, got {other:?}"),
+            }
+
+            crate::approval_event_broker::unsubscribe(&request_id).await;
+        }
+
+        #[tokio::test]
+        async fn two_gated_calls_append_two_cell_entries() {
+            let (registry, route) = conv_route(Duration::from_secs(60));
+            let cell = Arc::new(crate::orchestration::BlockedCell::default());
+            let gate = parked_gate(&registry, &route, "req-two-calls", &cell);
+
+            let first = gate
+                .pre_call(
+                    &serde_json::json!({ "namespace": "prod" }),
+                    &ToolCallContext::new("kubectl_apply"),
+                )
+                .await
+                .unwrap();
+            let second = gate
+                .pre_call(
+                    &serde_json::json!({ "namespace": "stage" }),
+                    &ToolCallContext::new("kubectl_delete"),
+                )
+                .await
+                .unwrap();
+            assert!(matches!(first, PreCallOutcome::ShortCircuit { .. }));
+            assert!(matches!(second, PreCallOutcome::ShortCircuit { .. }));
+
+            // Inspect without consuming: mirror the cell contents.
+            cell.snapshot_if_pending(&[], &rig::completion::Message::user("results"));
+            match cell.outcome() {
+                crate::orchestration::CellOutcome::Blocked { pending } => {
+                    assert_eq!(pending.len(), 2, "both gated calls are recorded");
+                    assert_eq!(pending[0].tool_name, "kubectl_apply");
+                    assert_eq!(pending[1].tool_name, "kubectl_delete");
+                    assert_ne!(pending[0].decision_id, pending[1].decision_id);
+                }
+                other => panic!("expected Blocked, got {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn ungated_tool_proceeds_without_parking() {
+            let (registry, route) = conv_route(Duration::from_secs(60));
+            let cell = Arc::new(crate::orchestration::BlockedCell::default());
+            let gate = parked_gate(&registry, &route, "req-ungated", &cell);
+
+            let outcome = gate
+                .pre_call(&serde_json::json!({}), &ToolCallContext::new("ls"))
+                .await
+                .unwrap();
+            assert_eq!(outcome, PreCallOutcome::Proceed { overrides: None });
+            assert!(cell.is_empty());
+        }
     }
 
     #[test]

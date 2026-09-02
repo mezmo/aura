@@ -9,6 +9,8 @@
 //! See `docs/design/session-storage.md` and
 //! `docs/adr/2026-07-08-session-storage.md`.
 
+#[cfg(test)]
+pub(crate) mod fault_store;
 mod file;
 mod memory;
 mod record;
@@ -22,6 +24,8 @@ use futures::Stream;
 
 use crate::hitl::{ApprovalDecision, DecisionId, ParkedApproval, ResolveError};
 
+#[cfg(test)]
+pub(crate) use fault_store::FaultInjectingStore;
 pub use file::FileApprovalStore;
 pub use memory::{InMemoryApprovalStore, InMemoryEventBus};
 pub use record::{DecisionRecord, InvalidRecord, OriginRecord, ParkedApprovalRecord, ScopeRecord};
