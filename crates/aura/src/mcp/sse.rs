@@ -196,8 +196,8 @@ mod tests {
 
         use super::*;
         use crate::approver_headers::{ApproverHeaders, tests::captured_overrides};
-        use crate::mcp_streamable_http::call_tool_request;
-        use crate::mcp_streamable_http::tests::RecordingMcpServer;
+        use crate::mcp::client::call_tool_request;
+        use crate::mcp::client::tests::RecordingMcpServer;
 
         fn call_message(tool: &str, overrides: Option<ApproverHeaders>) -> ClientJsonRpcMessage {
             ClientJsonRpcMessage::request(

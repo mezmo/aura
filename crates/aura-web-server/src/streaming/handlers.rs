@@ -1574,7 +1574,7 @@ mod tests {
     }
 
     /// An MCP server's error reaches `handle_tool_result` with the prefix
-    /// `aura::mcp_response` applies, and must be reported as a failure rather
+    /// `aura::mcp::response` applies, and must be reported as a failure rather
     /// than a successful result carrying the error text.
     #[test]
     fn test_handle_tool_result_reports_mcp_error_as_failure() {

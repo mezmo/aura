@@ -79,7 +79,7 @@
 //! child spans nest correctly under the trace root.
 //!
 //! Tool errors are only recorded on the `mcp.tool_call` child span (by
-//! `mcp_tool_execution.rs`), not on Rig's `execute_tool` parent.  This is
+//! `mcp/execution.rs`), not on Rig's `execute_tool` parent.  This is
 //! intentional: `mcp.tool_call` is the canonical TOOL span for Phoenix.
 //!
 //! ## Content recording
@@ -152,7 +152,7 @@ pub const ATTR_OUTPUT_MIME_TYPE: &str = "output.mime_type";
 pub const ATTR_OUTPUT_LENGTH: &str = "output.length";
 pub const ATTR_OUTPUT_VALUE: &str = "output.value";
 
-// Tool-level attributes (used by `mcp_tool_execution.rs` and `openinference_exporter.rs`)
+// Tool-level attributes (used by `mcp/execution.rs` and `openinference_exporter.rs`)
 pub const ATTR_TOOL_NAME: &str = "tool.name";
 pub const ATTR_TOOL_PARAMETERS: &str = "tool.parameters";
 pub const ATTR_TOOL_PARAMETERS_COUNT: &str = "tool.parameters.count";
@@ -160,7 +160,7 @@ pub const ATTR_TOOL_RESULT: &str = "tool.result";
 pub const ATTR_TOOL_RESULT_LENGTH: &str = "tool.result.length";
 pub const ATTR_TOOL_CANCELLED: &str = "tool.cancelled";
 
-// HITL attributes (used by `hitl::route` and `mcp_tool_execution`)
+// HITL attributes (used by `hitl::route` and `mcp::execution`)
 
 /// Handle of the human approval decision gating a tool call — the same
 /// `decision_id` the approval payload and lifecycle events carry.
@@ -507,12 +507,12 @@ pub fn init_logging(debug: bool, verbose: bool, binary_name: &str) {
 
         // Create a custom formatting layer that truncates very long lines (e.g., API payloads)
         // Block execute_tool spans (and their events) from rig to avoid duplication
-        // Our aura::mcp_dynamic logs provide better tool execution visibility with truncation
+        // Our aura::mcp::dynamic logs provide better tool execution visibility with truncation
         let fmt_layer = fmt::layer()
             .event_format(TruncatingFormatter { max_length: 500 })
             .with_filter(tracing_subscriber::filter::filter_fn(|metadata| {
                 // Block execute_tool spans from rig::agent::prompt_request to prevent duplicate logs
-                // Our aura::mcp_dynamic provides tool execution logs with proper truncation
+                // Our aura::mcp::dynamic provides tool execution logs with proper truncation
                 // This also blocks events within the execute_tool span (like "executed tool X with args Y")
                 if metadata.target().starts_with("rig::agent::prompt_request")
                     && metadata.is_span()
