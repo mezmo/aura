@@ -2381,6 +2381,7 @@ url = "http://127.0.0.1:9"
 
             let req = aura::hitl::ApprovalRequest {
                 version: aura::hitl::PROTOCOL_VERSION,
+                instance_id: "test-instance".to_string(),
                 decision_id: aura::hitl::DecisionId::generate(),
                 request_id: "req-smoke".into(),
                 scope: aura::hitl::AgentScope::Single { session_id: None },
@@ -2589,6 +2590,7 @@ url = "http://127.0.0.1:9"
         ) -> (aura::hitl::DecisionId, aura::hitl::AwaitingDecision) {
             let req = aura::hitl::ApprovalRequest {
                 version: aura::hitl::PROTOCOL_VERSION,
+                instance_id: "test-instance".to_string(),
                 decision_id: aura::hitl::DecisionId::generate(),
                 request_id: "req-hmac".into(),
                 scope: aura::hitl::AgentScope::Single { session_id: None },

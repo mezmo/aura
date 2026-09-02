@@ -10,12 +10,27 @@ use aura::governance::build_catalog;
 pub enum GovernanceCommands {
     /// Discover all MCP tools and send a catalog snapshot to the governance webhook.
     Sync,
+    /// Display the computed instance ID for each loaded agent config.
+    Info,
 }
 
 pub fn run(confs: &[aura_config::Config], command: &GovernanceCommands) -> Result<()> {
-    let rt = tokio::runtime::Runtime::new()?;
     match command {
-        GovernanceCommands::Sync => rt.block_on(sync_all(confs)),
+        GovernanceCommands::Sync => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(sync_all(confs))
+        }
+        GovernanceCommands::Info => {
+            info_all(confs);
+            Ok(())
+        }
+    }
+}
+
+fn info_all(confs: &[aura_config::Config]) {
+    for conf in confs {
+        let id = aura::instance_id::instance_id(&conf.agent);
+        println!("agent \"{}\"  instance_id: {id}", conf.agent.name);
     }
 }
 
