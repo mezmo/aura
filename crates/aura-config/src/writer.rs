@@ -90,19 +90,21 @@ pub fn append_worker_mcp_filter_in_str(
 
 /// Apply a text transformation to `path` and write the result atomically
 /// (temp + rename), preserving the file's permissions (configs holding
-/// credentials may be chmod 600). On error the original is untouched and
-/// the temp file removed.
+/// credentials may be chmod 600). Symlinks are followed first, so the
+/// rename replaces the file the link points at rather than the link
+/// itself. On error the original is untouched and the temp file removed.
 fn rewrite_file(
     path: &Path,
     transform: impl FnOnce(&str) -> Result<String, ConfigError>,
 ) -> Result<(), ConfigError> {
-    let existing = fs::read_to_string(path)?;
+    let path = path.canonicalize()?;
+    let existing = fs::read_to_string(&path)?;
     let updated = transform(&existing)?;
-    let permissions = fs::metadata(path)?.permissions();
+    let permissions = fs::metadata(&path)?.permissions();
     let tmp = path.with_extension(format!("toml.tmp.{}", std::process::id()));
     let written = fs::write(&tmp, updated)
         .and_then(|()| fs::set_permissions(&tmp, permissions))
-        .and_then(|()| fs::rename(&tmp, path));
+        .and_then(|()| fs::rename(&tmp, &path));
     if written.is_err() {
         let _ = fs::remove_file(&tmp);
     }
@@ -620,6 +622,32 @@ preamble = "You write"
 
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "permissions must survive the rewrite");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_upsert_through_symlink_edits_the_target_and_keeps_the_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("dotfiles").join("agent.toml");
+        std::fs::create_dir(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, BASE_CONFIG).unwrap();
+        let link = dir.path().join("agent.toml");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        upsert_mcp_server(&link, "k8s", &stdio_server()).unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the link must survive the rewrite"
+        );
+        assert!(
+            std::fs::read_to_string(&target)
+                .unwrap()
+                .contains("[mcp.servers.k8s]")
+        );
     }
 
     #[test]
