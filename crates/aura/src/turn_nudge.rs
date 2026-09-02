@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use async_trait::async_trait;
 use serde_json::Value;
 
-use crate::mcp::CallOutcome;
+use crate::mcp_response::CallOutcome;
 use crate::tool_wrapper::{ToolCallContext, ToolWrapper, TransformOutputResult};
 
 /// Shared turn-limit tracking for one agent stream.

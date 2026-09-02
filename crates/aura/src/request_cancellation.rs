@@ -11,7 +11,7 @@ use std::sync::{OnceLock, RwLock};
 use tokio_util::sync::{CancellationToken, WaitForCancellationFuture};
 use tracing::{debug, info};
 
-use crate::mcp::McpClient;
+use crate::mcp_streamable_http::McpClient;
 
 pub type RequestId = String;
 
