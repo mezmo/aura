@@ -53,6 +53,8 @@ pub struct DirectBackend {
     extra_headers: HashMap<String, String>,
     /// Filesystem source of the loaded configs (file or directory).
     config_path: PathBuf,
+    /// Effective agent id and source file of each loaded config.
+    config_files: Vec<(String, PathBuf)>,
 }
 
 impl DirectBackend {
@@ -72,11 +74,15 @@ impl DirectBackend {
             ));
         }
 
-        let configs =
-            aura_config::load_config(config_path).context("Failed to load agent config")?;
-        if configs.is_empty() {
+        let loaded =
+            aura_config::load_config_files(config_path).context("Failed to load agent config")?;
+        if loaded.is_empty() {
             anyhow::bail!("No agent config found in {}", config_path.display());
         }
+        let (config_files, configs): (Vec<(String, PathBuf)>, Vec<aura_config::Config>) = loaded
+            .into_iter()
+            .map(|(file, config)| ((config.agent_id().to_owned(), file), config))
+            .unzip();
 
         // Load the HITL webhook HMAC once at startup; a misconfiguration
         // fails the CLI boot rather than the first approval request.
@@ -123,13 +129,34 @@ impl DirectBackend {
             app_state,
             extra_headers: headers_map,
             config_path: config_path.to_path_buf(),
+            config_files,
         })
     }
 
-    /// Path the agent configs were loaded from. May be a directory
-    /// (`load_config` accepts both) — writers must check `is_file()` first.
+    /// Path the agent configs were loaded from — a file or a directory.
+    /// Writers edit one agent's file: see [`Self::config_file_for`].
     pub fn config_path(&self) -> &Path {
         &self.config_path
+    }
+
+    /// Effective agent id and source file of every loaded config.
+    pub fn agent_config_files(&self) -> &[(String, PathBuf)] {
+        &self.config_files
+    }
+
+    /// The file a writer should edit: the only loaded agent's file, or the
+    /// file of the agent `selected` names (any spelling
+    /// [`Self::find_matching_model`] accepts). `None` when several agents
+    /// are loaded and `selected` picks none of them.
+    pub fn config_file_for(&self, selected: Option<&str>) -> Option<&Path> {
+        if let [(_, only)] = self.config_files.as_slice() {
+            return Some(only);
+        }
+        let id = self.find_matching_model(selected?)?;
+        self.config_files
+            .iter()
+            .find(|(agent, _)| *agent == id)
+            .map(|(_, file)| file.as_path())
     }
 
     /// Return `true` if any loaded config enables client-side tools.
@@ -493,12 +520,23 @@ mod tests {
             hitl_webhook_hmac: None,
             session_store: Arc::new(InMemorySessionStore::new()),
         });
+        // Synthetic: these configs were built in memory, not loaded from
+        // disk, so point at paths that cannot exist.
+        let config_files = app_state
+            .configs
+            .iter()
+            .map(|c| {
+                (
+                    c.agent_id().to_owned(),
+                    PathBuf::from(format!("/nonexistent/{}.toml", c.agent_id())),
+                )
+            })
+            .collect();
         DirectBackend {
             app_state,
             extra_headers: HashMap::new(),
-            // Synthetic: these configs were built in memory, not loaded
-            // from disk, so point at a path that cannot exist.
             config_path: PathBuf::from("/nonexistent/in-memory-test-config.toml"),
+            config_files,
         }
     }
 
@@ -630,6 +668,40 @@ preamble = "p"
     // -----------------------------------------------------------------------
     // model_ids
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn config_file_for_single_config_ignores_selection() {
+        let backend = make_backend(vec![make_config("Only", None, "p")]);
+        let expected = Path::new("/nonexistent/Only.toml");
+        assert_eq!(backend.config_file_for(None), Some(expected));
+        assert_eq!(
+            backend.config_file_for(Some("something-else")),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn config_file_for_multiple_configs_needs_a_matching_selection() {
+        let backend = make_backend(vec![
+            make_config("Alpha", Some("a"), "p"),
+            make_config("Beta", None, "p"),
+        ]);
+        assert_eq!(backend.config_file_for(None), None);
+        assert_eq!(backend.config_file_for(Some("gamma")), None);
+        assert_eq!(
+            backend.config_file_for(Some("a")),
+            Some(Path::new("/nonexistent/a.toml"))
+        );
+        // Name and alias both resolve, case-insensitively, to the alias-keyed file.
+        assert_eq!(
+            backend.config_file_for(Some("ALPHA")),
+            Some(Path::new("/nonexistent/a.toml"))
+        );
+        assert_eq!(
+            backend.config_file_for(Some("beta")),
+            Some(Path::new("/nonexistent/Beta.toml"))
+        );
+    }
 
     #[test]
     fn model_ids_uses_alias_when_present() {

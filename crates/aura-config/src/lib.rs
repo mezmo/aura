@@ -30,7 +30,7 @@ pub use writer::upsert_mcp_server;
 
 use std::collections::HashSet;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Load a single TOML file into a Config.
 fn load_single_config<P: AsRef<Path>>(path: P) -> Result<Config, ConfigError> {
@@ -77,31 +77,42 @@ fn check_legacy_top_level_llm(toml_str: &str) -> Result<(), ConfigError> {
 /// - Each config can be serialized and deserialized correctly.
 /// - Each config is uniquely identifiable by alias or name.
 pub fn load_config<P: AsRef<Path>>(path: P) -> Result<Vec<Config>, ConfigError> {
+    Ok(load_config_files(path)?
+        .into_iter()
+        .map(|(_, config)| config)
+        .collect())
+}
+
+/// [`load_config`], with each config paired with the file it was parsed
+/// from. A directory's files come back in path order.
+pub fn load_config_files<P: AsRef<Path>>(path: P) -> Result<Vec<(PathBuf, Config)>, ConfigError> {
     let path = path.as_ref();
 
-    let configs = if path.is_dir() {
-        let mut entries: Vec<_> = fs::read_dir(path)?
+    let files: Vec<PathBuf> = if path.is_dir() {
+        let mut files: Vec<PathBuf> = fs::read_dir(path)?
             .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().is_some_and(|ext| ext == "toml"))
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|ext| ext == "toml"))
             .collect();
-        entries.sort_by_key(|e| e.path());
-
-        let mut configs = Vec::new();
-        for entry in entries {
-            configs.push(load_single_config(entry.path())?);
-        }
-        if configs.is_empty() {
+        if files.is_empty() {
             return Err(ConfigError::Validation(
                 "No .toml configuration files found in directory".to_string(),
             ));
         }
-        configs
+        files.sort();
+        files
     } else {
-        vec![load_single_config(path)?]
+        vec![path.to_path_buf()]
     };
 
-    validate_unique_identifiers(&configs)?;
-    Ok(configs)
+    let mut loaded = Vec::with_capacity(files.len());
+    for file in files {
+        let config = load_single_config(&file)?;
+        loaded.push((file, config));
+    }
+
+    validate_unique_identifiers(loaded.iter().map(|(_, config)| config))?;
+    Ok(loaded)
 }
 
 /// Validate that each config is uniquely identifiable by alias or name.
@@ -109,7 +120,9 @@ pub fn load_config<P: AsRef<Path>>(path: P) -> Result<Vec<Config>, ConfigError> 
 /// Each config's effective identifier is its alias (if set) or its name.
 /// All effective identifiers must be unique. Additionally, duplicate aliases
 /// get a distinct error message to help the user fix the right thing.
-pub fn validate_unique_identifiers(configs: &[Config]) -> Result<(), ConfigError> {
+pub fn validate_unique_identifiers<'a>(
+    configs: impl IntoIterator<Item = &'a Config>,
+) -> Result<(), ConfigError> {
     let mut seen_aliases = HashSet::new();
     let mut seen_ids = HashSet::new();
 
@@ -167,6 +180,34 @@ api_key = "test-key"
 model = "gpt-4o"
 "#
         )
+    }
+
+    #[test]
+    fn load_config_files_pairs_each_config_with_its_file() {
+        let dir = TempDir::new().unwrap();
+        let b = write_config(
+            &dir,
+            "b.toml",
+            &minimal_toml("").replace("name = \"Test\"", "name = \"B\""),
+        );
+        let a = write_config(
+            &dir,
+            "a.toml",
+            &minimal_toml("").replace("name = \"Test\"", "name = \"A\""),
+        );
+        write_config(&dir, "notes.md", "not a config");
+
+        let loaded = load_config_files(dir.path()).expect("directory should load");
+        let pairs: Vec<(&Path, &str)> = loaded
+            .iter()
+            .map(|(path, config)| (path.as_path(), config.agent.name.as_str()))
+            .collect();
+        assert_eq!(pairs, vec![(a.as_path(), "A"), (b.as_path(), "B")]);
+
+        let single = load_config_files(&a).expect("file should load");
+        assert_eq!(single.len(), 1);
+        assert_eq!(single[0].0, a);
+        assert_eq!(single[0].1.agent.name, "A");
     }
 
     #[test]
