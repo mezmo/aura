@@ -869,6 +869,14 @@ pub struct AgentConfig {
     #[serde(default)]
     #[serde(deserialize_with = "lenient_int::deserialize_option_usize")]
     pub nudge_turns_remaining: Option<usize>,
+    /// Stable seed for instance ID derivation.
+    ///
+    /// When set, this value is hashed with the agent name and the env seed
+    /// instead of the default `sha256(name, alias)`. Supports
+    /// `{{ env.* }}` templating so the value can come from an environment
+    /// variable without being committed to the config file.
+    #[serde(default)]
+    pub instance_seed: Option<String>,
 }
 
 fn default_turn_depth() -> Option<usize> {
@@ -902,6 +910,7 @@ impl Default for AgentConfig {
             skills: SkillsConfig::default(),
             nudge_last_turn: false,
             nudge_turns_remaining: None,
+            instance_seed: None,
         }
     }
 }
