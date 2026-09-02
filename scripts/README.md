@@ -10,6 +10,7 @@ Release and install helpers.
 | [`bump-homebrew-tap.sh`](bump-homebrew-tap.sh) | Bump `mezmo/homebrew-tap` formulae to a released version |
 | [`set-version.sh`](set-version.sh) | Set the workspace and crate versions in `Cargo.toml` |
 | [`next-version.mjs`](next-version.mjs) | Print the version semantic-release would release next |
+| [`sync-release-downloads.sh`](sync-release-downloads.sh) | Snapshot cumulative release-asset download totals into PostHog |
 
 `BRANCH_NAME` selects the release channel; see
 [the release channels design note](../docs/design/release-channels.md).
@@ -108,6 +109,54 @@ authenticates it, so it verifies the API key and the target repository.
 | `PACKAGERS` | `deb rpm` | Space-separated formats to publish. |
 | `CLOUDSMITH` | `cloudsmith` | `cloudsmith` executable to use. |
 
+
+## `sync-release-downloads.sh`
+
+```
+sync-release-downloads.sh [--dry-run] [--date YYYY-MM-DD] [--selftest]
+```
+
+Sends one PostHog event per GitHub release asset, carrying that asset's
+cumulative download count as of a snapshot date. Run daily at 01:17 UTC by
+[the `Release download metrics` workflow](../.github/workflows/release-download-metrics.yml),
+which snapshots the previous UTC day.
+
+Retries are safe. The event UUID is derived from `(repository, asset ID,
+snapshot date)` and the timestamp is pinned to `23:59:59Z` on the snapshot
+date, so re-running a date re-sends byte-identical events that PostHog
+deduplicates. Deduplication is eventual, so reporting should aggregate with
+`max(download_count)` per asset and snapshot date — cumulative counts only
+rise, which makes `max` correct while duplicates are still visible.
+
+After sending, the script reads the snapshot back and fails if PostHog cannot
+account for every event. This is not belt-and-braces: PostHog answers
+`200 {"status":"Ok"}` to a batch sent with an invalid project token, so an
+unverified send cannot tell success from silent discard. The read-back counts
+distinct event UUIDs rather than rows, because a re-run's rows stay visible
+until PostHog's background merges collapse them.
+
+A run also reports when the previous day holds no snapshot. That is advisory:
+GitHub only exposes current cumulative counts, so a missed day cannot be
+reconstructed by retrying.
+
+Draft releases are skipped; their assets are not publicly downloadable.
+GitHub-generated source archives are not release assets and never appear.
+
+| Switch | Default | Effect |
+| --- | --- | --- |
+| `--date` / `SNAPSHOT_DATE` | yesterday, UTC | Date to snapshot. Re-running a past date re-sends that date's events. |
+| `--dry-run` / `DRY_RUN=1` | off | Collect from GitHub and build the payload, print the first event, send nothing. Needs no PostHog token. |
+| `--selftest` | off | Run the built-in assertions (UUID vectors, payload shape) and exit. Reaches no network. |
+| `POSTHOG_PROJECT_API_KEY` | unset | PostHog project write token. Required unless `--dry-run`. |
+| `POSTHOG_API_READ_KEY` | unset | Personal API key used to read the snapshot back. Required unless `--dry-run` or `SKIP_VERIFY=1`. |
+| `POSTHOG_PROJECT_ID` | `443794` | Numeric project id the read-back queries. Must be the project the write token belongs to. |
+| `POSTHOG_API_HOST` | `https://us.posthog.com` | PostHog query host. Distinct from the ingest host. |
+| `VERIFY_TIMEOUT` | `300` | Seconds to wait for ingestion before failing the read-back. |
+| `SKIP_VERIFY` | `0` | `1` sends without reading the snapshot back. |
+| `POSTHOG_HOST` | `https://us.i.posthog.com` | PostHog ingest host. |
+| `GITHUB_REPOS` | `mezmo/aura` | Space-separated `owner/repo` list to snapshot. |
+| `BATCH_SIZE` | `1000` | Events per PostHog `/batch` request. |
+| `GH_TOKEN` / `GITHUB_TOKEN` | unset | Token `gh` authenticates with. |
 
 ## `bump-homebrew-tap.sh`
 

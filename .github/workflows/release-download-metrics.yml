@@ -1,0 +1,75 @@
+name: "Release download metrics"
+
+on:
+  schedule:
+    # 01:17 UTC daily, snapshotting the previous UTC day. Running early leaves
+    # the rest of the day to notice a failure and re-run it by hand. The odd
+    # minute is deliberate: GitHub drops queued scheduled jobs under load, and
+    # load peaks at the top of every hour.
+    - cron: "17 1 * * *"
+  workflow_dispatch:
+    inputs:
+      date:
+        description: "Snapshot date (YYYY-MM-DD, UTC). Defaults to yesterday."
+        required: false
+        type: string
+      dry_run:
+        description: "Build the payload without sending it"
+        required: false
+        default: false
+        type: boolean
+  pull_request:
+    paths:
+      - "scripts/sync-release-downloads.sh"
+      - ".github/workflows/release-download-metrics.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-download-metrics
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Self-test
+        run: scripts/sync-release-downloads.sh --selftest
+
+      - name: Snapshot release download totals
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          POSTHOG_PROJECT_API_KEY: ${{ secrets.POSTHOG_PROJECT_API_KEY }}
+          POSTHOG_API_READ_KEY: ${{ secrets.POSTHOG_API_READ_KEY }}
+          POSTHOG_PROJECT_ID: ${{ vars.POSTHOG_PROJECT_ID }}
+          # Inputs arrive as environment variables the script already reads, so
+          # nothing user-supplied is interpolated into a shell command.
+          SNAPSHOT_DATE: ${{ inputs.date }}
+          DRY_RUN: ${{ (github.event_name == 'pull_request' || inputs.dry_run) && '1' || '0' }}
+        run: scripts/sync-release-downloads.sh
+
+      - name: Report failure
+        if: failure() && github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_URL: "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        run: |
+          set -euo pipefail
+          title="Release download metrics sync failed"
+          body=$(printf '%s\n\n%s\n' \
+              "The scheduled snapshot failed: ${RUN_URL}" \
+              "Re-run it from the Actions tab with workflow_dispatch, passing the snapshot date it was covering. Events are keyed by that date, so a retry re-sends the same events and PostHog deduplicates them.")
+          existing=$(gh issue list --state open --search "${title} in:title" \
+              --json number --jq '.[0].number // empty')
+          if [ -n "${existing}" ]; then
+              gh issue comment "${existing}" --body "${body}"
+          else
+              gh issue create --title "${title}" --body "${body}"
+          fi
