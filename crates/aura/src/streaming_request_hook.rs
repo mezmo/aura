@@ -1,10 +1,11 @@
 //! Streaming request hook for request lifecycle management.
 //!
 //! This hook manages the full lifecycle of streaming requests:
-//! 1. Timeout/cancellation - External cancellation signal (e.g., client disconnect)
-//! 2. Tool event emission - `aura.tool_requested`, `aura.tool_usage` events
-//! 3. Usage state tracking - Token counts for billing/metrics
-//! 4. Tool ID FIFO correlation - Associates tool calls with results
+//! 1. Parked approvals (park mode) - snapshot + cancel when the blocked cell is set
+//! 2. Timeout/cancellation - External cancellation signal (e.g., client disconnect)
+//! 3. Tool event emission - `aura.tool_requested`, `aura.tool_usage` events
+//! 4. Usage state tracking - Token counts for billing/metrics
+//! 5. Tool ID FIFO correlation - Associates tool calls with results
 //!
 //! # Tool Event Flow
 //!
@@ -15,6 +16,11 @@
 //!
 //! This relies on Rig's streaming mode executing tools sequentially.
 //! See `docs/rig-fork-changes.md` for analysis.
+//!
+//! # Park mode
+//!
+//! A worker stream in park mode has a [`BlockedCell`] registered under its
+//! request id; `on_completion_call` checks it before every other check.
 //!
 //! # Usage
 //!
@@ -31,22 +37,81 @@
 //! let (prompt, completion, total) = usage_state.get_final_usage();
 //! ```
 
+use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use rig::agent::{CancelSignal, StreamingPromptHook};
+use rig::completion::{CompletionModel, GetTokenUsage, Message};
+use tokio::sync::watch;
+
+use crate::orchestration::BlockedCell;
 use crate::scratchpad::{self, ContextBudget};
 use crate::tool_event_broker::{
     pop_tool_call_id, publish_tool_requested, publish_tool_usage, push_tool_call_id,
 };
-use rig::agent::{CancelSignal, StreamingPromptHook};
-use rig::completion::{CompletionModel, GetTokenUsage, Message};
-use std::collections::HashSet;
-use std::future::Future;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
-use tokio::sync::watch;
 
 /// Maximum pending tool IDs before warning. Prevents unbounded growth if
 /// usage events never fire (e.g., provider doesn't return token counts).
 const MAX_PENDING_TOOL_IDS: usize = 256;
+
+// ============================================================================
+// Park cells (park mode)
+// ============================================================================
+
+/// Cancel reason the hook stamps when a parked call ends the worker stream.
+pub(crate) const PARK_CANCEL_REASON: &str = "parked";
+
+/// Blocked cells of the worker streams in park mode, keyed by the per-stream
+/// id the orchestrator passes as the hook's `request_id`. The hook is built
+/// inside the streaming layer and cannot take the cell as a parameter, so it
+/// travels through this request-keyed global like the tool-event broker.
+static PARK_CELLS: OnceLock<std::sync::RwLock<HashMap<String, Arc<BlockedCell>>>> = OnceLock::new();
+
+fn park_cells() -> &'static std::sync::RwLock<HashMap<String, Arc<BlockedCell>>> {
+    PARK_CELLS.get_or_init(|| std::sync::RwLock::new(HashMap::new()))
+}
+
+/// A worker stream's park-cell registration; dropping it removes the cell
+/// and the stream's tool-event subscription.
+pub(crate) struct ParkCellRegistration(String);
+
+impl ParkCellRegistration {
+    pub(crate) fn new(key: &str, cell: Arc<BlockedCell>) -> Self {
+        park_cells()
+            .write()
+            .expect("park cell registry poisoned")
+            .insert(key.to_string(), cell);
+        Self(key.to_string())
+    }
+}
+
+impl Drop for ParkCellRegistration {
+    fn drop(&mut self) {
+        park_cells()
+            .write()
+            .expect("park cell registry poisoned")
+            .remove(&self.0);
+        // The hook keyed its tool-event FIFO under the same id; the broker is
+        // async, so that cleanup runs as its own task when a runtime exists.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let key = std::mem::take(&mut self.0);
+            handle.spawn(async move { crate::tool_event_broker::unsubscribe(&key).await });
+        }
+    }
+}
+
+/// The blocked cell for `key`, if this stream is in park mode.
+pub(crate) fn park_cell_for(key: &str) -> Option<Arc<BlockedCell>> {
+    park_cells()
+        .read()
+        .expect("park cell registry poisoned")
+        .get(key)
+        .cloned()
+}
 
 /// Shared usage state that survives hook cloning.
 ///
@@ -421,13 +486,26 @@ where
 {
     fn on_completion_call(
         &self,
-        _prompt: &Message,
-        _history: &[Message],
+        prompt: &Message,
+        history: &[Message],
         cancel_sig: CancelSignal,
     ) -> impl Future<Output = ()> + Send {
         let has_client_tools = !self.client_tool_names.is_empty();
         let client_tool_called = self.client_tool_called.clone();
         async move {
+            // Checked before the client-tool, cancel, and timeout checks: a
+            // waiting parked call must get its snapshot whatever else is true.
+            if let Some(cell) = park_cell_for(&self.request_id)
+                && cell.snapshot_if_pending(history, prompt)
+            {
+                tracing::info!(
+                    request_id = %self.request_id,
+                    "Parked approval pending — cancelling stream (reason: {})",
+                    PARK_CANCEL_REASON
+                );
+                cancel_sig.cancel_with_reason(PARK_CANCEL_REASON);
+                return;
+            }
             // If a passthrough tool was called this turn, do not initiate
             // another LLM completion. Cancel here so the stream terminates
             // and the streaming layer can emit `finish_reason: "tool_calls"`
@@ -493,6 +571,11 @@ where
         let is_client_tool = self.client_tool_names.contains(&tool_name);
         let client_tool_called = self.client_tool_called.clone();
         async move {
+            // Stash the call id so the park arm can record it on the cell entry.
+            if let Some(cell) = park_cell_for(&request_id) {
+                cell.set_current_call_id(tool_call_id.clone());
+            }
+
             if is_client_tool {
                 tracing::info!(
                     "Client tool '{}' called for request '{}' — marking for passthrough",
@@ -682,6 +765,40 @@ mod tests {
             StreamingRequestHook::new(Duration::from_secs(60), "test_req_1");
         assert!(!hook.should_cancel());
         assert_eq!(hook.request_id, "test_req_1");
+    }
+
+    // ---------------------------------------------------------------------
+    // Park-cell registry
+    // ---------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn park_cell_registration_isolates_keys_and_removes_on_drop() {
+        let cell_a = Arc::new(BlockedCell::default());
+        let cell_b = Arc::new(BlockedCell::default());
+        let key_a = format!("park_reg_{}", uuid::Uuid::new_v4().simple());
+        let key_b = format!("park_reg_{}", uuid::Uuid::new_v4().simple());
+
+        assert!(park_cell_for(&key_a).is_none());
+        let reg_a = ParkCellRegistration::new(&key_a, cell_a.clone());
+        let reg_b = ParkCellRegistration::new(&key_b, cell_b.clone());
+
+        park_cell_for(&key_a)
+            .expect("registered cell")
+            .push(crate::orchestration::PendingCall {
+                decision_id: crate::hitl::DecisionId::generate(),
+                tool_name: "kubectl_apply".to_string(),
+                arguments: serde_json::json!({}),
+                call_id: "call_1".to_string(),
+            });
+        assert!(cell_b.is_empty(), "keys are isolated");
+
+        drop(reg_a);
+        assert!(
+            park_cell_for(&key_a).is_none(),
+            "a dropped registration is gone"
+        );
+        assert!(park_cell_for(&key_b).is_some(), "the sibling survives");
+        drop(reg_b);
     }
 
     #[test]

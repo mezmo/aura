@@ -1096,6 +1096,7 @@ mod tests {
     fn test_hitl_timeout_conflict_disabled_per_call_timeout() {
         let hitl = HitlConfig {
             require_approval: vec![],
+            park: ParkConfig::default(),
             route: DecisionRouteConfig::Webhook {
                 url: WebhookUrl::new("http://localhost:9999").unwrap(),
                 timeout_secs: 300,
@@ -1128,6 +1129,7 @@ mod tests {
     fn test_hitl_timeout_conflict_route_timeout_less_than_per_call() {
         let hitl = HitlConfig {
             require_approval: vec![],
+            park: ParkConfig::default(),
             route: DecisionRouteConfig::Webhook {
                 url: WebhookUrl::new("http://localhost:9999").unwrap(),
                 timeout_secs: 30,
@@ -1143,6 +1145,7 @@ mod tests {
     fn test_hitl_timeout_conflict_route_timeout_equals_per_call() {
         let hitl = HitlConfig {
             require_approval: vec![],
+            park: ParkConfig::default(),
             route: DecisionRouteConfig::Webhook {
                 url: WebhookUrl::new("http://localhost:9999").unwrap(),
                 timeout_secs: 60,
@@ -1160,6 +1163,7 @@ mod tests {
     fn test_hitl_timeout_conflict_route_timeout_greater_than_per_call() {
         let hitl = HitlConfig {
             require_approval: vec![],
+            park: ParkConfig::default(),
             route: DecisionRouteConfig::Webhook {
                 url: WebhookUrl::new("http://localhost:9999").unwrap(),
                 timeout_secs: 120,
@@ -1178,10 +1182,57 @@ mod tests {
     fn test_hitl_timeout_conflict_conversational_variant() {
         let hitl = HitlConfig {
             require_approval: vec![],
+            park: ParkConfig::default(),
             route: DecisionRouteConfig::Conversational { timeout_secs: 120 },
         };
         let msg = hitl_timeout_conflict_warning(&hitl, 60).unwrap();
         assert!(msg.contains("120s"));
+    }
+
+    // -------------------------------------------------------------------
+    // [hitl.park]
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn hitl_park_defaults_to_disabled_when_table_absent() {
+        let toml = r#"
+require_approval = ["kubectl_*"]
+
+[route]
+mode = "conversational"
+timeout_secs = 60
+"#;
+        let hitl: HitlConfig = toml::from_str(toml).unwrap();
+        assert!(!hitl.park.enabled);
+    }
+
+    #[test]
+    fn hitl_park_parses_enabled_true() {
+        let toml = r#"
+require_approval = ["kubectl_*"]
+
+[route]
+mode = "conversational"
+
+[park]
+enabled = true
+"#;
+        let hitl: HitlConfig = toml::from_str(toml).unwrap();
+        assert!(hitl.park.enabled);
+    }
+
+    #[test]
+    fn hitl_park_table_present_but_enabled_omitted_is_disabled() {
+        let toml = r#"
+require_approval = []
+
+[route]
+mode = "conversational"
+
+[park]
+"#;
+        let hitl: HitlConfig = toml::from_str(toml).unwrap();
+        assert!(!hitl.park.enabled);
     }
 
     #[test]
@@ -1387,6 +1438,17 @@ pub struct HitlConfig {
     pub require_approval: Vec<GlobPattern>,
     /// The decision route; required when `[hitl]` is present.
     pub route: DecisionRouteConfig,
+    /// `[hitl.park]` settings.
+    #[serde(default)]
+    pub park: ParkConfig,
+}
+
+/// `[hitl.park]` config table.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ParkConfig {
+    /// Park mode on or off (default off).
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 /// `[hitl.route]` table. The `Webhook` variant cannot parse without a valid

@@ -36,6 +36,7 @@
 //! - `PlanCreated` - when the coordinator produces a plan
 //! - `TaskStarted` - when a worker begins a task
 //! - `TaskCompleted` - when a worker finishes a task
+//! - `TaskBlocked` - when a worker parks gated calls (park mode)
 //! - `IterationComplete` - when the post-execute coordinator decision completes
 //! - `Synthesizing` - when task results are being consolidated for the coordinator
 
@@ -62,8 +63,8 @@ use super::config::OrchestrationConfig;
 use super::events::OrchestratorEvent;
 use super::persistence::ExecutionPersistence;
 use super::types::{
-    FailedTaskRecord, FailureCategory, FailureSummary, IterationContext, IterationOutcome,
-    IterationTimings, Plan, PlanningResponse, TaskState, TaskStatus,
+    BlockedCell, CellOutcome, FailedTaskRecord, FailureCategory, FailureSummary, IterationContext,
+    IterationOutcome, IterationTimings, PendingCall, Plan, PlanningResponse, TaskState, TaskStatus,
 };
 
 // ============================================================================
@@ -97,6 +98,20 @@ struct TaskExecutionParams<'a> {
 struct TaskExecutionResult {
     result: String,
     structured_output: Option<super::types::StructuredTaskOutput>,
+}
+
+/// The outcome of one worker task.
+enum TaskOutcome {
+    Completed(TaskExecutionResult),
+    /// The worker parked gated calls and its snapshot was captured.
+    Blocked(Vec<PendingCall>),
+}
+
+/// Park-mode state for one worker stream: its blocked cell and the stream key
+/// the hook looks the cell up by.
+struct WorkerPark {
+    cell: Arc<BlockedCell>,
+    key: String,
 }
 
 /// Named return type for `create_*` coordinator/worker methods.
@@ -575,11 +590,14 @@ impl Orchestrator {
     ///
     /// If a specialized worker is assigned via `worker_name`, it uses that worker's
     /// custom preamble and MCP filter. Otherwise uses generic worker with all tools.
+    ///
+    /// `park_cell` arms the gate's park arm for this worker.
     async fn create_worker(
         &self,
         task_id: usize,
         attempt: usize,
         worker_name: Option<&str>,
+        park_cell: Option<&Arc<BlockedCell>>,
     ) -> Result<AgentWithPreamble, Box<dyn std::error::Error + Send + Sync>> {
         use super::duplicate_call_guard::DuplicateCallGuard;
         use super::observer_wrapper::ObserverWrapper;
@@ -819,14 +837,21 @@ impl Orchestrator {
                 session_id: session_id_owned.map(crate::config::SessionId::new),
             };
             let request_id = worker_config.request_id.clone().unwrap_or_default();
-            let gate = Arc::new(crate::hitl::HitlApprovalWrapper::new(
+            let mut gate = crate::hitl::HitlApprovalWrapper::new(
                 hitl.patterns.clone(),
                 hitl.route.clone(),
                 scope.clone(),
                 request_id.clone(),
                 worker_config.agent.name.clone(),
-            ));
-            wrappers.insert(0, gate);
+            );
+            // The park arm needs the store-bearing route; webhook deployments
+            // keep the live decision path.
+            if let (Some(cell), crate::hitl::DecisionRoute::Conversational { registry, .. }) =
+                (park_cell, &*hitl.route)
+            {
+                gate = gate.with_park(registry.clone(), cell.clone());
+            }
+            wrappers.insert(0, Arc::new(gate));
             worker_config.hitl_request_approval_tool = Some(crate::hitl::RequestApprovalTool::new(
                 hitl.route.clone(),
                 scope,
@@ -979,6 +1004,82 @@ impl Orchestrator {
             escalation_flag,
             submit_result_decision,
         })
+    }
+
+    /// Park-mode wiring for one worker attempt: `Some` only when this run
+    /// parks gated calls (see [`Self::park_enabled`]).
+    fn worker_park(&self, task_id: usize, attempt: usize) -> Option<WorkerPark> {
+        if !self.park_enabled() {
+            return None;
+        }
+        Some(WorkerPark {
+            cell: Arc::new(BlockedCell::default()),
+            // A per-stream synthetic id, not the live request id, so the hook's
+            // tool-event publishes dead-letter instead of reaching the SSE stream.
+            key: format!("{}:task:{task_id}:attempt:{attempt}", self.orchestrator_id),
+        })
+    }
+
+    /// `[hitl.park].enabled` on the conversational route.
+    fn park_enabled(&self) -> bool {
+        self.agent_config.hitl.as_ref().is_some_and(|hitl| {
+            hitl.park_enabled
+                && matches!(
+                    &*hitl.route,
+                    crate::hitl::DecisionRoute::Conversational { .. }
+                )
+        })
+    }
+
+    /// Orphan cleanup for a parked worker whose stream ended before the hook
+    /// captured its conversation: every pending decision id is removed from
+    /// the store with an `approval_completed(cancelled)` event, so the human
+    /// is not left with a decidable approval nothing will consume.
+    async fn cancel_parked_approvals(
+        &self,
+        task_id: usize,
+        worker_name: Option<&str>,
+        pending: &[PendingCall],
+    ) {
+        let Some(hitl) = self.agent_config.hitl.clone() else {
+            return;
+        };
+        let crate::hitl::DecisionRoute::Conversational { registry, .. } = &*hitl.route else {
+            return;
+        };
+        let (run_id, session_id) = {
+            let p = self.persistence.lock().await;
+            (p.run_id().to_string(), p.session_id().map(String::from))
+        };
+        // Same scope shape `create_worker` stamps on the worker's approvals.
+        let scope =
+            run_id
+                .parse::<super::RunId>()
+                .ok()
+                .map(|run_id| crate::hitl::AgentScope::Worker {
+                    run_id,
+                    task: super::TaskIdentity::new(task_id, worker_name.map(String::from)),
+                    session_id: session_id.map(crate::config::SessionId::new),
+                });
+        let request_id = self.agent_config.request_id.clone().unwrap_or_default();
+        for call in pending {
+            registry.remove(&call.decision_id).await;
+            if let Some(ref scope) = scope {
+                crate::approval_event_broker::publish(
+                    &request_id,
+                    crate::approval_event_broker::ApprovalLifecycleEvent::Completed(
+                        crate::hitl::completed_cancelled(call.decision_id, scope, Duration::ZERO),
+                    ),
+                )
+                .await;
+            }
+            tracing::warn!(
+                decision_id = %call.decision_id,
+                tool = %call.tool_name,
+                task_id,
+                "orphaned park approval cancelled (stream ended before snapshot)",
+            );
+        }
     }
 
     /// Drive one agent loop's stream, forwarding events and tallying usage.
@@ -1206,12 +1307,17 @@ impl Orchestrator {
     /// - Forwards `ReasoningDelta`/`Reasoning` items through `event_tx`
     /// - No early-exit — runs the complete ReAct loop
     /// - Timeout wrapping via `per_call_timeout_secs`
+    ///
+    /// `park_key` routes a park-mode worker through the hook-carrying stream
+    /// so the park-aware hook runs; the hook's own deadline is disabled because
+    /// the per-call wrap below is the single wall-clock authority.
     async fn stream_and_forward(
         &self,
         agent: &Agent,
         params: StreamCallParams<'_>,
         stream_context: Option<StreamContext<'_>>,
         decision_ready: impl Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>,
+        park_key: Option<&str>,
     ) -> Result<ForwardedRun, Box<dyn std::error::Error + Send + Sync>> {
         let StreamCallParams {
             prompt,
@@ -1221,7 +1327,15 @@ impl Orchestrator {
         } = params;
         let timeout_secs = self.config.per_call_timeout_secs();
         let stream_future = async {
-            let stream = agent.stream_chat(prompt, history).await;
+            let stream = match park_key {
+                Some(key) => {
+                    agent
+                        .stream_chat_with_timeout(prompt, history, Duration::MAX, key)
+                        .await
+                        .0
+                }
+                None => agent.stream_chat(prompt, history).await,
+            };
             Self::drive_forward_loop(
                 stream,
                 &self.usage_state,
@@ -3024,10 +3138,19 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 .collect();
 
             if ready_tasks.is_empty() {
-                // No ready tasks but not finished - this shouldn't happen with valid plans
-                tracing::warn!(
-                    "No ready tasks but plan not finished — blocked tasks remaining after failure (dependency chain broken)"
-                );
+                // Quiescence: park outranks the replan path while a decision
+                // is outstanding.
+                if has_awaiting_task(plan) {
+                    for line in park_verdict_lines(plan) {
+                        tracing::warn!("{line}");
+                    }
+                } else {
+                    // No ready tasks but not finished - this shouldn't happen
+                    // with valid plans
+                    tracing::warn!(
+                        "No ready tasks but plan not finished — blocked tasks remaining after failure (dependency chain broken)"
+                    );
+                }
                 break;
             }
 
@@ -3085,7 +3208,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             {
                 task_compute_ms += duration_ms;
                 match result {
-                    Ok(exec_result) => {
+                    Ok(TaskOutcome::Completed(exec_result)) => {
                         let final_result = self
                             .maybe_create_artifact(
                                 task_id,
@@ -3126,6 +3249,34 @@ Assign tasks to the worker whose tools best match the required operations."#,
                                 duration_ms
                             );
                         }
+                    }
+                    Ok(TaskOutcome::Blocked(pending)) => {
+                        // The task awaits human decisions: no artifact, no
+                        // completion event; one blocked event per parked call.
+                        let worker_id = worker_name.clone().unwrap_or(self.orchestrator_id.clone());
+                        for call in &pending {
+                            let _ = event_tx
+                                .send(Ok(StreamItem::OrchestratorEvent(
+                                    OrchestratorEvent::TaskBlocked {
+                                        task_id,
+                                        orchestrator_id: self.orchestrator_id.clone(),
+                                        worker_id: worker_id.clone(),
+                                        tool_call_id: call.call_id.clone(),
+                                        decision_id: call.decision_id.to_string(),
+                                        tool_name: call.tool_name.clone(),
+                                    },
+                                )))
+                                .await;
+                        }
+                        if let Some(t) = plan.get_task_mut(task_id) {
+                            t.state = TaskState::AwaitingApproval { pending };
+                        }
+                        tracing::warn!(
+                            "Task {} ('{}') blocked awaiting approval after {}ms",
+                            task_id,
+                            task_desc,
+                            duration_ms
+                        );
                     }
                     Err(e) => {
                         let err_str = e.to_string();
@@ -3294,7 +3445,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         task_id: usize,
         params: &TaskExecutionParams<'_>,
         event_tx: Option<&tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>>,
-    ) -> Result<TaskExecutionResult, StreamError> {
+    ) -> Result<TaskOutcome, StreamError> {
         let TaskExecutionParams {
             task_description,
             task_context,
@@ -3356,12 +3507,23 @@ Assign tasks to the worker whose tools best match the required operations."#,
             actual_attempts = attempt;
             let is_final_attempt = attempt == MAX_WORKER_ATTEMPTS;
 
+            // A fresh cell per attempt: a failed attempt's entries must not
+            // leak into its retry.
+            let park = self.worker_park(task_id, attempt);
+
             let AgentWithPreamble {
                 agent: worker,
                 preamble: worker_preamble,
                 escalation_flag,
                 submit_result_decision,
-            } = self.create_worker(task_id, attempt, *worker_name).await?;
+            } = self
+                .create_worker(
+                    task_id,
+                    attempt,
+                    *worker_name,
+                    park.as_ref().map(|p| &p.cell),
+                )
+                .await?;
 
             // Retries rebuild the same preamble, and `set_attribute` appends
             // rather than replaces, so record it once per worker span.
@@ -3387,8 +3549,12 @@ Assign tasks to the worker whose tools best match the required operations."#,
             };
 
             // initial_used only counts templates + tool schemas, so bill the
-            // per-task prompt here.
-            if let Some(ref budget) = worker.scratchpad_budget {
+            // per-task prompt here. Park-mode workers skip the manual seed:
+            // their hook-carrying stream (`stream_chat_with_timeout`) seeds
+            // the budget itself, from the prompt *and* the retry history.
+            if park.is_none()
+                && let Some(ref budget) = worker.scratchpad_budget
+            {
                 let task_prompt_tokens = budget.count_tokens(&prompt);
                 budget.record_usage(task_prompt_tokens);
                 tracing::debug!(
@@ -3400,7 +3566,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
             // Execute the task
             let srd = submit_result_decision.clone();
-            let stream_result = self
+            let park_registration = park.as_ref().map(|p| {
+                crate::streaming_request_hook::ParkCellRegistration::new(&p.key, p.cell.clone())
+            });
+            let mut stream_result = self
                 .stream_and_forward(
                     &worker,
                     StreamCallParams {
@@ -3417,8 +3586,45 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         let srd = srd.clone();
                         Box::pin(async move { srd.lock().await.is_some() })
                     },
+                    park.as_ref().map(|p| p.key.as_str()),
                 )
                 .await;
+            drop(park_registration);
+
+            // The cell is read before the normal result handling: it is the
+            // source of truth after any stream end, the park cancel's Err included.
+            if let Some(ref park) = park {
+                match park.cell.outcome() {
+                    CellOutcome::Blocked { pending } => {
+                        tracing::info!(
+                            "Task {} blocked awaiting approval ({} pending call(s))",
+                            task_id,
+                            pending.len()
+                        );
+                        return Ok(TaskOutcome::Blocked(pending));
+                    }
+                    CellOutcome::Orphaned { pending } => {
+                        // The stream ended before the hook could snapshot: the
+                        // gated action never ran and cannot resume from a
+                        // conversation nobody captured, so cancel the decisions
+                        // and fail the task.
+                        self.cancel_parked_approvals(task_id, *worker_name, &pending)
+                            .await;
+                        let underlying = match stream_result.as_ref() {
+                            Err(e) => format!(" Underlying error: {e}"),
+                            Ok(_) => String::new(),
+                        };
+                        stream_result = Err(format!(
+                            "Worker stream ended before the parked approval snapshot \
+                             was captured for task {task_id}; {} pending approval(s) \
+                             cancelled.{underlying}",
+                            pending.len()
+                        )
+                        .into());
+                    }
+                    CellOutcome::Normal => {}
+                }
+            }
 
             // Emit per-agent ScratchpadUsage event if this worker used scratchpad.
             if let (Some(budget), Some(tx)) = (worker.scratchpad_budget.as_ref(), event_tx) {
@@ -3491,13 +3697,13 @@ Assign tasks to the worker whose tools best match the required operations."#,
                                 &prompt,
                             )
                             .await;
-                            return Ok(TaskExecutionResult {
+                            return Ok(TaskOutcome::Completed(TaskExecutionResult {
                                 result: output.result,
                                 structured_output: Some(super::types::StructuredTaskOutput {
                                     summary: output.summary,
                                     confidence: output.confidence,
                                 }),
-                            });
+                            }));
                         }
                         None if is_final_attempt => {
                             tracing::warn!(
@@ -3516,10 +3722,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
                                 &prompt,
                             )
                             .await;
-                            return Ok(TaskExecutionResult {
+                            return Ok(TaskOutcome::Completed(TaskExecutionResult {
                                 result: raw_response,
                                 structured_output: None,
-                            });
+                            }));
                         }
                         None => {
                             tracing::info!(
@@ -3569,10 +3775,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 &base_worker_prompt,
             )
             .await;
-            Ok(TaskExecutionResult {
+            Ok(TaskOutcome::Completed(TaskExecutionResult {
                 result: last_raw_response,
                 structured_output: None,
-            })
+            }))
         }
     }
 
@@ -3665,6 +3871,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         }
                     }
                     TaskState::Running => "▶ running".to_string(),
+                    TaskState::AwaitingApproval { pending } => {
+                        format!("⏸ awaiting approval ({} call(s))", pending.len())
+                    }
                 };
                 format!("Task {}: {} [{}]", t.id, t.description, status_detail)
             })
@@ -4142,6 +4351,30 @@ Assign tasks to the worker whose tools best match the required operations."#,
         }
 
         // ----------------------------------------------------------------
+        // PARK PATH (park mode): an awaiting task at quiescence ends the
+        // iteration here, with no post-execute coordinator call: the
+        // coordinator must not replan a task the human is deciding on.
+        // ----------------------------------------------------------------
+        if has_awaiting_task(&plan) {
+            let lines = park_verdict_lines(&plan);
+            let run_id = self.persistence.lock().await.run_id().to_string();
+            let mut message = format!("Run {} parked: task(s) awaiting human approval.\n", run_id);
+            for line in &lines {
+                message.push_str(&format!("- {line}\n"));
+            }
+            message.push_str(
+                "The run has stopped and no further tasks will execute until the \
+                 outstanding decisions are recorded.",
+            );
+            tracing::info!(
+                "Iteration {} parked at quiescence; skipping post-execute coordinator call",
+                iteration
+            );
+            self.write_run_manifest(&plan, iteration, None).await;
+            return Ok(IterationOutcome::FinalResult(message));
+        }
+
+        // ----------------------------------------------------------------
         // SUMMARIZE FAILURES (if any): builds the optional failure_summary
         // for the continuation prompt; no control-flow branching yet.
         // ----------------------------------------------------------------
@@ -4539,7 +4772,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         t.id, t.description, error
                     ));
                 }
-                TaskState::Pending | TaskState::Running => {
+                TaskState::Pending | TaskState::Running | TaskState::AwaitingApproval { .. } => {
                     out.push_str(&format!(
                         "## Task {}: {}\n\n(not executed)\n\n",
                         t.id, t.description
@@ -4794,6 +5027,47 @@ fn truncate_query(query: &str, max_len: usize) -> String {
     } else {
         truncated.to_string()
     }
+}
+
+// ============================================================================
+// Park quiescence (park mode)
+// ============================================================================
+
+/// Whether any task carries non-empty parked calls.
+fn has_awaiting_task(plan: &Plan) -> bool {
+    plan.tasks
+        .iter()
+        .any(|t| matches!(&t.state, TaskState::AwaitingApproval { pending } if !pending.is_empty()))
+}
+
+/// The warm-log verdict lines for the awaiting tasks: one line per task,
+/// naming its decision ids and gated tools.
+fn park_verdict_lines(plan: &Plan) -> Vec<String> {
+    plan.tasks
+        .iter()
+        .filter_map(|t| match &t.state {
+            TaskState::AwaitingApproval { pending } if !pending.is_empty() => {
+                let decisions = pending
+                    .iter()
+                    .map(|c| c.decision_id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let tools = pending
+                    .iter()
+                    .map(|c| c.tool_name.clone())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                Some(format!(
+                    "Park verdict: task {} (\"{}\") awaiting approval — decision(s) [{}] on tool(s) [{}]",
+                    t.id,
+                    truncate_query(&t.description, 80),
+                    decisions,
+                    tools,
+                ))
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 /// Check if an error indicates a MaxDepthError from rig's ReAct loop.
@@ -6453,5 +6727,296 @@ mod tests {
             }
             _ => panic!("Expected ToolOutput"),
         }
+    }
+
+    // ====================================================================
+    // Park quiescence (park mode)
+    // ====================================================================
+
+    use crate::hitl::DecisionId as TestDecisionId;
+    use crate::orchestration::PendingCall as TestPendingCall;
+    use crate::orchestration::Task;
+
+    fn parked_call(tool: &str) -> TestPendingCall {
+        TestPendingCall {
+            decision_id: TestDecisionId::generate(),
+            tool_name: tool.to_string(),
+            arguments: serde_json::json!({ "namespace": "prod" }),
+            call_id: "call_1".to_string(),
+        }
+    }
+
+    fn mark_awaiting(plan: &mut Plan, task_id: usize, pending: Vec<TestPendingCall>) {
+        plan.get_task_mut(task_id).unwrap().state = TaskState::AwaitingApproval { pending };
+    }
+
+    /// Single blocker mid-DAG: the gated task awaits, its dependent is not
+    /// ready, and the quiescence verdict is park.
+    #[test]
+    fn quiescence_single_blocker_mid_dag_parks() {
+        let mut plan = Plan::new("Deploy");
+        plan.add_task(Task::new(0, "Collect facts", "r"));
+        plan.add_task(Task::new(1, "Gated apply", "r").with_dependency(0));
+        plan.add_task(Task::new(2, "Verify", "r").with_dependency(1));
+        plan.get_task_mut(0).unwrap().complete("facts");
+        mark_awaiting(&mut plan, 1, vec![parked_call("kubectl_apply")]);
+
+        assert!(!plan.is_finished());
+        assert!(plan.ready_tasks().is_empty(), "the dependent is not ready");
+        assert!(has_awaiting_task(&plan));
+
+        let lines = park_verdict_lines(&plan);
+        assert_eq!(lines.len(), 1, "one verdict line per awaiting task");
+        assert!(
+            lines[0].contains("task 1"),
+            "line names the task: {}",
+            lines[0]
+        );
+        assert!(
+            lines[0].contains("kubectl_apply"),
+            "line names the tool: {}",
+            lines[0]
+        );
+    }
+
+    /// Two parallel blockers: both verdict lines appear, each naming its own
+    /// decision id.
+    #[test]
+    fn quiescence_two_parallel_blockers_park() {
+        let mut plan = Plan::new("Migrate");
+        plan.add_task(Task::new(0, "Gated apply A", "r"));
+        plan.add_task(Task::new(1, "Gated delete B", "r"));
+        mark_awaiting(&mut plan, 0, vec![parked_call("kubectl_apply")]);
+        mark_awaiting(&mut plan, 1, vec![parked_call("kubectl_delete")]);
+
+        assert!(has_awaiting_task(&plan));
+        let lines = park_verdict_lines(&plan);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("task 0") && lines[0].contains("kubectl_apply"));
+        assert!(lines[1].contains("task 1") && lines[1].contains("kubectl_delete"));
+    }
+
+    /// A blocker does not stop dispatching while independent work remains:
+    /// a ready task keeps the run away from the quiescence point.
+    #[test]
+    fn quiescence_not_reached_while_ready_work_remains() {
+        let mut plan = Plan::new("Mix");
+        plan.add_task(Task::new(0, "Gated apply", "r"));
+        plan.add_task(Task::new(1, "Independent research", "r"));
+        mark_awaiting(&mut plan, 0, vec![parked_call("kubectl_apply")]);
+
+        let ready = plan.ready_tasks();
+        assert_eq!(ready.len(), 1, "the independent task is still dispatched");
+        assert_eq!(ready[0].id, 1);
+    }
+
+    /// Poisoned sibling: a failed task would route the existing replan path,
+    /// but an outstanding decision takes precedence — park, not replan.
+    #[test]
+    fn quiescence_park_takes_precedence_over_replan() {
+        let mut plan = Plan::new("Risky");
+        plan.add_task(Task::new(0, "Exploding sibling", "r"));
+        plan.add_task(Task::new(1, "Gated apply", "r"));
+        plan.add_task(Task::new(2, "Downstream of sibling", "r").with_dependency(0));
+        plan.get_task_mut(0)
+            .unwrap()
+            .fail("boom", FailureCategory::AgentError);
+        mark_awaiting(&mut plan, 1, vec![parked_call("kubectl_apply")]);
+
+        assert!(plan.ready_tasks().is_empty(), "dependency chain broken");
+        assert!(
+            has_awaiting_task(&plan),
+            "an outstanding decision outranks the failure-replan path"
+        );
+    }
+
+    /// No awaiting task, broken chain: the existing replan verdict.
+    #[test]
+    fn quiescence_without_awaiting_task_is_the_replan_path() {
+        let mut plan = Plan::new("Plain");
+        plan.add_task(Task::new(0, "Exploding", "r"));
+        plan.add_task(Task::new(1, "Downstream", "r").with_dependency(0));
+        plan.get_task_mut(0)
+            .unwrap()
+            .fail("boom", FailureCategory::AgentError);
+
+        assert!(!has_awaiting_task(&plan));
+        assert!(park_verdict_lines(&plan).is_empty());
+    }
+
+    /// The real `execute()` loop parks at quiescence: no worker is dispatched
+    /// for the awaiting task or its dependent, the run does not spin, and the
+    /// awaiting state survives untouched.
+    #[tokio::test]
+    async fn execute_parks_at_quiescence_without_dispatching() {
+        let orchestrator = Orchestrator::new(crate::config::AgentRuntimeConfig::default())
+            .await
+            .unwrap();
+        let mut plan = Plan::new("Park smoke");
+        plan.add_task(Task::new(0, "Done task", "r"));
+        plan.add_task(Task::new(1, "Gated task", "r"));
+        plan.add_task(Task::new(2, "Dependent", "r").with_dependency(1));
+        plan.get_task_mut(0).unwrap().complete("ok");
+        mark_awaiting(&mut plan, 1, vec![parked_call("kubectl_apply")]);
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(32);
+        let compute_ms = orchestrator.execute(&mut plan, &event_tx).await.unwrap();
+
+        assert_eq!(compute_ms, 0, "no worker ran");
+        assert!(matches!(
+            plan.tasks[1].state,
+            TaskState::AwaitingApproval { .. }
+        ));
+        assert!(
+            matches!(plan.tasks[2].state, TaskState::Pending),
+            "the dependent must not be dispatched while a decision is outstanding"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), event_rx.recv())
+                .await
+                .is_err(),
+            "no task events fire at the park verdict"
+        );
+    }
+
+    /// `park_enabled` requires the flag AND the conversational route — the
+    /// webhook arm of park mode is out of V1 scope.
+    #[tokio::test]
+    async fn park_enabled_requires_flag_and_conversational_route() {
+        use aura_config::GlobPattern;
+
+        fn config(park_enabled: bool, conversational: bool) -> AgentRuntimeConfig {
+            let mut config = AgentRuntimeConfig::default();
+            let route = if conversational {
+                crate::hitl::DecisionRoute::Conversational {
+                    registry: crate::hitl::PendingApprovals::new(),
+                    timeout: Duration::from_secs(60),
+                }
+            } else {
+                crate::hitl::DecisionRoute::Webhook {
+                    client: crate::hitl::WebhookClient::new(
+                        reqwest::Client::new(),
+                        aura_config::WebhookUrl::new("https://approvals.example.com/").unwrap(),
+                    ),
+                    timeout: Duration::from_secs(5),
+                }
+            };
+            config.hitl = Some(crate::hitl::HitlRuntime {
+                patterns: Arc::from([GlobPattern::new("kubectl_*").unwrap()]),
+                route: Arc::new(route),
+                park_enabled,
+            });
+            config
+        }
+
+        let no_hitl = Orchestrator::new(AgentRuntimeConfig::default())
+            .await
+            .unwrap();
+        assert!(!no_hitl.park_enabled(), "no [hitl] table: park off");
+
+        let off = Orchestrator::new(config(false, true)).await.unwrap();
+        assert!(!off.park_enabled(), "flag off: park off");
+
+        let on = Orchestrator::new(config(true, true)).await.unwrap();
+        assert!(on.park_enabled(), "flag on + conversational: park on");
+
+        let webhook = Orchestrator::new(config(true, false)).await.unwrap();
+        assert!(!webhook.park_enabled(), "webhook route: park off");
+    }
+
+    /// The orphan cleanup: every pending decision id is removed from the
+    /// store with an `approval_completed(cancelled)` event, so no decidable
+    /// approval outlives a worker whose conversation was never captured.
+    #[tokio::test]
+    async fn cancel_parked_approvals_removes_tickets_and_publishes_cancelled() {
+        use crate::hitl::{
+            AgentScope, ApprovalOrigin, ApprovalRequest, PROTOCOL_VERSION, ParkedApproval,
+            PendingApprovals,
+        };
+        use crate::session_store::{InMemoryApprovalStore, InMemoryEventBus};
+
+        let request_id = format!("req_cancel_{}", uuid::Uuid::new_v4().simple());
+        let mut events = crate::approval_event_broker::subscribe(&request_id).await;
+
+        let store: Arc<dyn crate::session_store::ApprovalStore> =
+            Arc::new(InMemoryApprovalStore::new());
+        let registry =
+            PendingApprovals::with_backend(store.clone(), Arc::new(InMemoryEventBus::new()));
+        let config = AgentRuntimeConfig {
+            hitl: Some(crate::hitl::HitlRuntime {
+                patterns: Arc::from([aura_config::GlobPattern::new("kubectl_*").unwrap()]),
+                route: Arc::new(crate::hitl::DecisionRoute::Conversational {
+                    registry: registry.clone(),
+                    timeout: Duration::from_secs(60),
+                }),
+                park_enabled: true,
+            }),
+            request_id: Some(request_id.clone()),
+            ..AgentRuntimeConfig::default()
+        };
+        let orchestrator = Orchestrator::new(config).await.unwrap();
+
+        // Two durable registrations, as the park arm would make them.
+        let now = chrono::Utc::now();
+        let mut pending = Vec::new();
+        for tool in ["kubectl_apply", "kubectl_delete"] {
+            let decision_id = TestDecisionId::generate();
+            registry
+                .register_durable(ParkedApproval {
+                    request: ApprovalRequest {
+                        version: PROTOCOL_VERSION,
+                        decision_id,
+                        request_id: "run:test".to_string(),
+                        scope: AgentScope::Single { session_id: None },
+                        origin: ApprovalOrigin::ConfigGate {
+                            matched_pattern: "kubectl_*".to_string(),
+                            agent_name: "test-agent".to_string(),
+                        },
+                        items: vec![],
+                    },
+                    registered_at: now,
+                    expires_at: now + chrono::Duration::seconds(60),
+                })
+                .await
+                .expect("durable register succeeds");
+            assert!(
+                store.get(&decision_id).await.unwrap().is_some(),
+                "ticket parked before cleanup"
+            );
+            pending.push(TestPendingCall {
+                decision_id,
+                tool_name: tool.to_string(),
+                arguments: serde_json::json!({}),
+                call_id: "call_1".to_string(),
+            });
+        }
+
+        orchestrator
+            .cancel_parked_approvals(3, Some("operations"), &pending)
+            .await;
+
+        for call in &pending {
+            assert!(
+                store.get(&call.decision_id).await.unwrap().is_none(),
+                "orphaned decision {} removed from the store",
+                call.decision_id
+            );
+        }
+        for expected in &pending {
+            match tokio::time::timeout(Duration::from_secs(1), events.recv()).await {
+                Ok(Some(crate::approval_event_broker::ApprovalLifecycleEvent::Completed(
+                    completed,
+                ))) => {
+                    assert_eq!(completed.decision_id, expected.decision_id.to_string());
+                    assert!(matches!(
+                        completed.outcome,
+                        aura_events::ApprovalOutcomeWire::Cancelled { .. }
+                    ));
+                }
+                other => panic!("expected Completed(cancelled) event, got {other:?}"),
+            }
+        }
+
+        crate::approval_event_broker::unsubscribe(&request_id).await;
     }
 }

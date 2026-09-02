@@ -126,6 +126,21 @@ pub fn completed_error(
     }
 }
 
+/// `approval_completed(cancelled)` for a parked approval nothing will consume.
+#[must_use]
+pub fn completed_cancelled(
+    decision_id: DecisionId,
+    scope: &AgentScope,
+    duration: Duration,
+) -> ApprovalCompleted {
+    completed(
+        decision_id,
+        &ApprovalOutcome::Cancelled(CancelReason::Shutdown),
+        scope,
+        duration,
+    )
+}
+
 fn origin_to_wire(origin: &ApprovalOrigin) -> ApprovalOriginWire {
     match origin {
         ApprovalOrigin::ConfigGate {
