@@ -2861,6 +2861,7 @@ mod tests {
                     output_tokens: output,
                     total_tokens: input + output,
                 },
+                cache_usage: None,
             }))
         }
 
