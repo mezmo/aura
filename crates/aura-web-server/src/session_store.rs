@@ -49,7 +49,11 @@ pub async fn build_session_store(
 ) -> Result<Arc<dyn SessionStore>, SessionStoreError> {
     match config {
         SessionStoreConfig::Memory => Ok(Arc::new(InMemorySessionStore::new())),
-        SessionStoreConfig::File(file_config) => Ok(Arc::new(FileSessionStore::new(file_config)?)),
+        SessionStoreConfig::File(file_config) => {
+            // File-backed approvals; the task store and bus stay in memory,
+            // the single-pod deployment model.
+            Ok(Arc::new(FileSessionStore::new(file_config)?))
+        }
         #[cfg(feature = "session-store-redis")]
         SessionStoreConfig::Redis(redis_config) => {
             Ok(Arc::new(RedisSessionStore::connect(redis_config).await?))
@@ -62,8 +66,7 @@ pub async fn build_session_store(
     }
 }
 
-/// The default backend: every capability is process-local, so state is scoped
-/// to one process.
+/// The default backend.
 pub struct InMemorySessionStore {
     approvals: Arc<InMemoryApprovalStore>,
     tasks: Arc<InMemoryTaskStore>,
@@ -110,10 +113,7 @@ impl SessionStore for InMemorySessionStore {
     }
 }
 
-/// The file-backed backend: approvals persist as per-decision files under the
-/// configured path, surviving a process restart (the park/reify V1
-/// durability boundary). The A2A task store and the event bus stay in
-/// memory, per the single-pod deployment model.
+/// The file-backed backend.
 pub struct FileSessionStore {
     approvals: Arc<FileApprovalStore>,
     tasks: Arc<InMemoryTaskStore>,
@@ -121,8 +121,8 @@ pub struct FileSessionStore {
 }
 
 impl FileSessionStore {
-    /// Open the approval store at the configured path (creating its
-    /// directory tree when missing), failing fast when it cannot.
+    /// Open the approval store at the configured path, failing fast when it
+    /// cannot.
     pub fn new(config: &FileSessionStoreConfig) -> Result<Self, SessionStoreError> {
         Ok(Self {
             approvals: Arc::new(FileApprovalStore::open(&config.path)?),

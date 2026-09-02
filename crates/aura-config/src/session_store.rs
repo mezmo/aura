@@ -26,13 +26,12 @@ use std::time::Duration;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum SessionStoreBackend {
-    /// Process-local state (single-instance behavior).
+    /// Process-local state.
     #[default]
     Memory,
     /// Redis/Valkey-backed shared state.
     Redis,
-    /// File-backed approvals under a root directory; tasks and bus stay
-    /// in memory (single-pod, restart-durable).
+    /// File-backed approvals under a root directory.
     File,
 }
 
@@ -65,13 +64,12 @@ impl std::str::FromStr for SessionStoreBackend {
 /// The effective session-store configuration for one server deployment.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum SessionStoreConfig {
-    /// Process-local state (single-instance behavior).
+    /// Process-local state.
     #[default]
     Memory,
     /// Redis/Valkey-backed shared state.
     Redis(RedisSessionStoreConfig),
-    /// Restart-durable approvals under a root directory; tasks and bus stay
-    /// in memory.
+    /// Restart-durable approvals under a root directory.
     File(FileSessionStoreConfig),
 }
 
@@ -92,7 +90,6 @@ pub struct RedisSessionStoreConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileSessionStoreConfig {
     /// Root directory holding the per-decision ticket and decision files.
-    /// Created by the store when missing.
     pub path: String,
 }
 
@@ -154,7 +151,7 @@ impl RedisSessionStoreConfig {
 
 impl FileSessionStoreConfig {
     /// Read the file store's root directory from the environment. The path
-    /// is required; the store creates the directory tree when missing.
+    /// is required.
     fn from_env() -> Result<Self, ConfigError> {
         let path = env_var("AURA_SESSION_STORE_PATH").ok_or_else(|| {
             ConfigError::Validation(

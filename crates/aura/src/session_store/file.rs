@@ -86,7 +86,6 @@ pub struct FileApprovalStore {
 /// The shared store state every blocking-pool operation runs against.
 struct Inner {
     root: PathBuf,
-    /// Serializes compound operations for the single writing process.
     lock: Mutex<()>,
 }
 
@@ -145,8 +144,6 @@ impl Inner {
             Err(err) if err.kind() == io::ErrorKind::NotFound => {}
             Err(err) => return Err(request_err(err)),
         }
-        // §2.5 retention: a decided ticket moved into the decision file is
-        // still readable through `get` until `remove`.
         match fs::read(self.decision_path(&id)) {
             Ok(bytes) => {
                 let entry: ResolvedEntry = serde_json::from_slice(&bytes).map_err(decode_err)?;
@@ -177,9 +174,6 @@ impl Inner {
             }
             Err(err) => return Err(ResolveError::Store(request_err(err))),
         };
-        // Expiry is enforced only by `resolve` (§2.5): past `expires_at` the
-        // id is as good as unknown, and the ticket stays for `get` until
-        // `remove`.
         if chrono::Utc::now() > record.expires_at {
             return Err(ResolveError::NotFound);
         }
@@ -189,10 +183,6 @@ impl Inner {
         })
         .expect("resolved entry serializes to JSON");
 
-        // `File::create_new` is the at-most-once claim: exactly one `resolve`
-        // ever creates the decision file; every other attempt (a repeat, or a
-        // racer the lock would have serialized) sees `AlreadyExists` and
-        // reads as `NotFound`.
         let decision_path = self.decision_path(&id);
         let mut file = match fs::File::create_new(&decision_path) {
             Ok(file) => file,
@@ -282,8 +272,6 @@ impl Inner {
                 Err(err) => return Err(request_err(err)),
             };
             match serde_json::from_slice::<ParkedApprovalRecord>(&bytes) {
-                // Only undecided tickets are cancelled; a decided entry is
-                // retained until its consumer removes it (§2.5).
                 Ok(record) if record.request_id == request_id => {
                     fs::remove_file(&path).map_err(request_err)?;
                 }
