@@ -30,6 +30,16 @@
 //! never leaves a partial file under a final name. A `std::sync::Mutex`
 //! serializes operations for the single writing process; no operation awaits
 //! while holding it.
+//!
+//! Crash window in `resolve`: the decision file is claimed with
+//! `create_new` and then written and synced, so a process death between
+//! the two can leave an empty `decisions/{id}.json`. The aftermath fails
+//! closed - `resolve` keeps refusing (the claim exists), `decision`
+//! reports a decode fault, and `get` still returns the live ticket - and
+//! operator recovery is deleting that one empty file, after which the
+//! still-present ticket makes the id resolvable again. Consumers of the
+//! decision read (`decision()`) must therefore treat `Err(Decode)` on a
+//! known id as this recoverable state, not as an unknown id.
 
 use std::fs;
 use std::io::{self, Write};
@@ -176,6 +186,11 @@ impl ApprovalStore for FileApprovalStore {
             }
             Err(err) => return Err(ResolveError::Store(request_err(err))),
         };
+        // Best-effort beyond the stated durability boundary (a process
+        // restart): the page cache already carries the write across
+        // restart, and no other write path fsyncs, so this sync only
+        // narrows the empty-file crash window documented atop the module
+        // rather than promising host-crash durability.
         if let Err(err) = file.write_all(&payload).and_then(|()| file.sync_all()) {
             // Undo the claim: the decision was never fully written, and a
             // retry must be able to take the claim again.

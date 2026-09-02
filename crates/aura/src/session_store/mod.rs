@@ -64,7 +64,11 @@ pub trait ApprovalStore: Send + Sync {
     /// Look up a parked approval.
     async fn get(&self, id: &DecisionId) -> Result<Option<ParkedApproval>, SessionStoreError>;
 
-    /// Record a terminal decision and remove the parked entry atomically.
+    /// Record a terminal decision at most once per id: exactly one
+    /// resolve wins the claim and later attempts read as `NotFound`.
+    /// Backends remove the parked entry; the file backend instead moves
+    /// the ticket into its decision record, so `get` keeps returning the
+    /// ticket until `remove` (the retention contract park mode keys on).
     async fn resolve(
         &self,
         id: &DecisionId,
