@@ -53,8 +53,17 @@ pub struct DirectBackend {
     extra_headers: HashMap<String, String>,
     /// Filesystem source of the loaded configs (file or directory).
     config_path: PathBuf,
-    /// Effective agent id and source file of each loaded config.
-    config_files: Vec<(String, PathBuf)>,
+    agent_files: Vec<AgentFile>,
+}
+
+/// A loaded agent and the file that defines it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentFile {
+    /// Effective agent id (alias, else name).
+    pub id: String,
+    pub path: PathBuf,
+    /// `[agent].hidden`.
+    pub hidden: bool,
 }
 
 impl DirectBackend {
@@ -79,9 +88,16 @@ impl DirectBackend {
         if loaded.is_empty() {
             anyhow::bail!("No agent config found in {}", config_path.display());
         }
-        let (config_files, configs): (Vec<(String, PathBuf)>, Vec<aura_config::Config>) = loaded
+        let (agent_files, configs): (Vec<AgentFile>, Vec<aura_config::Config>) = loaded
             .into_iter()
-            .map(|(file, config)| ((config.agent_id().to_owned(), file), config))
+            .map(|(path, config)| {
+                let agent = AgentFile {
+                    id: config.agent_id().to_owned(),
+                    path,
+                    hidden: config.agent.hidden,
+                };
+                (agent, config)
+            })
             .unzip();
 
         // Load the HITL webhook HMAC once at startup; a misconfiguration
@@ -129,7 +145,7 @@ impl DirectBackend {
             app_state,
             extra_headers: headers_map,
             config_path: config_path.to_path_buf(),
-            config_files,
+            agent_files,
         })
     }
 
@@ -139,9 +155,9 @@ impl DirectBackend {
         &self.config_path
     }
 
-    /// Effective agent id and source file of every loaded config.
-    pub fn agent_config_files(&self) -> &[(String, PathBuf)] {
-        &self.config_files
+    /// Every loaded agent with the file that defines it, in load order.
+    pub fn agent_files(&self) -> &[AgentFile] {
+        &self.agent_files
     }
 
     /// The file a writer should edit: the only loaded agent's file, or the
@@ -149,14 +165,14 @@ impl DirectBackend {
     /// [`Self::find_matching_model`] accepts). `None` when several agents
     /// are loaded and `selected` picks none of them.
     pub fn config_file_for(&self, selected: Option<&str>) -> Option<&Path> {
-        if let [(_, only)] = self.config_files.as_slice() {
-            return Some(only);
+        if let [only] = self.agent_files.as_slice() {
+            return Some(&only.path);
         }
         let id = self.find_matching_model(selected?)?;
-        self.config_files
+        self.agent_files
             .iter()
-            .find(|(agent, _)| *agent == id)
-            .map(|(_, file)| file.as_path())
+            .find(|agent| agent.id == id)
+            .map(|agent| agent.path.as_path())
     }
 
     /// Return `true` if any loaded config enables client-side tools.
@@ -522,21 +538,20 @@ mod tests {
         });
         // Synthetic: these configs were built in memory, not loaded from
         // disk, so point at paths that cannot exist.
-        let config_files = app_state
+        let agent_files = app_state
             .configs
             .iter()
-            .map(|c| {
-                (
-                    c.agent_id().to_owned(),
-                    PathBuf::from(format!("/nonexistent/{}.toml", c.agent_id())),
-                )
+            .map(|c| AgentFile {
+                id: c.agent_id().to_owned(),
+                path: PathBuf::from(format!("/nonexistent/{}.toml", c.agent_id())),
+                hidden: c.agent.hidden,
             })
             .collect();
         DirectBackend {
             app_state,
             extra_headers: HashMap::new(),
             config_path: PathBuf::from("/nonexistent/in-memory-test-config.toml"),
-            config_files,
+            agent_files,
         }
     }
 
@@ -677,6 +692,24 @@ preamble = "p"
         assert_eq!(
             backend.config_file_for(Some("something-else")),
             Some(expected)
+        );
+    }
+
+    #[test]
+    fn agent_files_keep_hidden_agents_and_flag_them() {
+        let mut ghost = make_config("Ghost", None, "p");
+        ghost.agent.hidden = true;
+        let backend = make_backend(vec![make_config("Seen", None, "p"), ghost]);
+        let flags: Vec<(&str, bool)> = backend
+            .agent_files()
+            .iter()
+            .map(|agent| (agent.id.as_str(), agent.hidden))
+            .collect();
+        assert_eq!(flags, vec![("Seen", false), ("Ghost", true)]);
+        // Hidden agents stay reachable by explicit selection.
+        assert_eq!(
+            backend.config_file_for(Some("ghost")),
+            Some(Path::new("/nonexistent/Ghost.toml"))
         );
     }
 
