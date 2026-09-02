@@ -3344,16 +3344,14 @@ Assign tasks to the worker whose tools best match the required operations."#,
                                 )))
                                 .await;
                         }
-                        if let Some(t) = plan.get_task_mut(task_id) {
-                            t.state = TaskState::AwaitingApproval {
-                                pending: pending.clone(),
-                            };
-                        }
                         if let Some(ref guard) = self.park_guard
                             && let Some(scope) =
                                 self.worker_scope(task_id, worker_name.as_deref()).await
                         {
                             guard.record(&scope, &pending);
+                        }
+                        if let Some(t) = plan.get_task_mut(task_id) {
+                            t.state = TaskState::AwaitingApproval { pending };
                         }
                         park_records.insert(task_id, ParkedTaskRecord { attempt, snapshot });
                         tracing::warn!(
@@ -4994,24 +4992,21 @@ Assign tasks to the worker whose tools best match the required operations."#,
         };
 
         match super::park::commit_from_run_state(&inputs).await {
-            Ok((_path, refreshed)) => {
+            Ok(commit) => {
                 if let Some(ref guard) = self.park_guard {
                     guard.mark_published();
                 }
-                let expires_at = refreshed
-                    .expires_at
-                    .map(|t| t.to_rfc3339())
-                    .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
                 Self::emit_event(
                     event_tx,
                     OrchestratorEvent::RunParked {
                         run_id: run_id.clone(),
-                        decision_ids: refreshed
+                        decision_ids: commit
+                            .refreshed
                             .decision_ids
                             .iter()
                             .map(ToString::to_string)
                             .collect(),
-                        expires_at,
+                        expires_at: commit.expires_at,
                         iteration,
                     },
                 )
@@ -7345,14 +7340,22 @@ mod tests {
         crate::hitl::PendingApprovals,
         String,
     ) {
-        use crate::hitl::PendingApprovals;
-        use crate::session_store::{InMemoryApprovalStore, InMemoryEventBus};
+        let store = Arc::new(crate::session_store::InMemoryApprovalStore::new());
+        let (orchestrator, registry, run_id) =
+            park_orchestrator_over(store.clone(), memory_dir).await;
+        (orchestrator, store, registry, run_id)
+    }
 
-        let store = Arc::new(InMemoryApprovalStore::new());
-        let registry = PendingApprovals::with_backend(
-            store.clone() as Arc<dyn crate::session_store::ApprovalStore>,
-            Arc::new(InMemoryEventBus::new()),
-        );
+    /// An orchestrator wired for park mode over an explicit approval-store
+    /// backend, plus its registry and run id.
+    async fn park_orchestrator_over(
+        store: Arc<dyn crate::session_store::ApprovalStore>,
+        memory_dir: &std::path::Path,
+    ) -> (Orchestrator, crate::hitl::PendingApprovals, String) {
+        use crate::hitl::PendingApprovals;
+        use crate::session_store::InMemoryEventBus;
+
+        let registry = PendingApprovals::with_backend(store, Arc::new(InMemoryEventBus::new()));
         let config = AgentRuntimeConfig {
             hitl: Some(crate::hitl::HitlRuntime {
                 patterns: Arc::from([aura_config::GlobPattern::new("kubectl_*").unwrap()]),
@@ -7369,7 +7372,7 @@ mod tests {
         };
         let orchestrator = Orchestrator::new(config).await.unwrap();
         let run_id = orchestrator.persistence.lock().await.run_id().to_string();
-        (orchestrator, store, registry, run_id)
+        (orchestrator, registry, run_id)
     }
 
     /// An awaiting plan plus its park record, with every pending call
@@ -7738,6 +7741,174 @@ mod tests {
         assert!(
             registry.recorded_decision(&decided).await.is_some(),
             "the recorded decision survives the guard's drop"
+        );
+
+        crate::approval_event_broker::unsubscribe(&request_id).await;
+    }
+
+    /// Store double over an in-memory backend whose first `get` faults and
+    /// every later one succeeds: a transient backend outage the refresh
+    /// hits, recovered before the failed commit's cancellation sweep runs.
+    struct TransientGetFaultStore {
+        inner: crate::session_store::InMemoryApprovalStore,
+        faulted: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::session_store::ApprovalStore for TransientGetFaultStore {
+        async fn register(
+            &self,
+            parked: ParkedApproval,
+        ) -> Result<(), crate::session_store::SessionStoreError> {
+            self.inner.register(parked).await
+        }
+
+        async fn get(
+            &self,
+            id: &TestDecisionId,
+        ) -> Result<Option<ParkedApproval>, crate::session_store::SessionStoreError> {
+            if !self.faulted.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                return Err(crate::session_store::SessionStoreError::Request {
+                    reason: "transient parked-approval lookup fault".to_string(),
+                });
+            }
+            self.inner.get(id).await
+        }
+
+        async fn resolve(
+            &self,
+            id: &TestDecisionId,
+            decision: crate::hitl::ApprovalDecision,
+        ) -> Result<(), crate::hitl::ResolveError> {
+            self.inner.resolve(id, decision).await
+        }
+
+        async fn decision(
+            &self,
+            id: &TestDecisionId,
+        ) -> Result<Option<crate::hitl::ApprovalDecision>, crate::session_store::SessionStoreError>
+        {
+            self.inner.decision(id).await
+        }
+
+        async fn remove(
+            &self,
+            id: &TestDecisionId,
+        ) -> Result<(), crate::session_store::SessionStoreError> {
+            self.inner.remove(id).await
+        }
+
+        async fn cancel_request(
+            &self,
+            request_id: &str,
+        ) -> Result<(), crate::session_store::SessionStoreError> {
+            self.inner.cancel_request(request_id).await
+        }
+    }
+
+    /// A store fault during the refresh fails the commit before any
+    /// document is written: no `run_parked` event fires, and once the
+    /// store recovers, the failed-commit sweep cancels the still-undecided
+    /// approvals.
+    #[tokio::test]
+    async fn park_run_store_fault_during_refresh_fails_commit_and_sweeps() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(TransientGetFaultStore {
+            inner: crate::session_store::InMemoryApprovalStore::new(),
+            faulted: std::sync::atomic::AtomicBool::new(false),
+        });
+        let (orchestrator, registry, run_id) =
+            park_orchestrator_over(store.clone(), dir.path()).await;
+        let (plan, records, pending) = awaiting_plan_with_parked_calls(&registry, &run_id).await;
+        let request_id = orchestrator
+            .agent_config
+            .request_id
+            .clone()
+            .unwrap_or_default();
+        let mut events = crate::approval_event_broker::subscribe(&request_id).await;
+        // Arm the run guard as `execute` would have before the commit.
+        if let Some(ref guard) = orchestrator.park_guard {
+            let scope = orchestrator
+                .worker_scope(1, plan.tasks[1].worker.as_deref())
+                .await
+                .expect("worker scope builds");
+            guard.record(
+                &scope,
+                &match &plan.tasks[1].state {
+                    TaskState::AwaitingApproval { pending } => pending.clone(),
+                    _ => unreachable!("the fixture task is awaiting"),
+                },
+            );
+        }
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(32);
+        let chat_history = vec![rig::completion::Message::user("deploy the service")];
+        let result = orchestrator
+            .park_run(
+                "deploy the service",
+                &chat_history,
+                &[],
+                None,
+                1,
+                2_500,
+                &[],
+                &plan,
+                &records,
+                &event_tx,
+            )
+            .await;
+
+        let err = result.expect_err("the store fault must fail the commit");
+        assert!(
+            err.to_string().contains("Park commit failed"),
+            "error names the failed commit: {err}"
+        );
+
+        assert!(
+            !dir.path()
+                .join("park-sess")
+                .join("parked")
+                .join(format!("{run_id}.json"))
+                .try_exists()
+                .unwrap(),
+            "no document is published when the refresh faults"
+        );
+        for call in &pending {
+            assert!(
+                store.get(&call.decision_id).await.unwrap().is_none(),
+                "approval {} cancelled by the failed-commit sweep",
+                call.decision_id
+            );
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), event_rx.recv())
+                .await
+                .is_err(),
+            "no run_parked event fires on a faulted refresh"
+        );
+
+        // One completed(cancelled) per decision from the immediate sweep…
+        for _ in &pending {
+            match tokio::time::timeout(Duration::from_secs(1), events.recv()).await {
+                Ok(Some(crate::approval_event_broker::ApprovalLifecycleEvent::Completed(
+                    completed,
+                ))) => {
+                    assert!(matches!(
+                        completed.outcome,
+                        aura_events::ApprovalOutcomeWire::Cancelled { .. }
+                    ));
+                }
+                other => panic!("expected one Completed(cancelled) per decision, got {other:?}"),
+            }
+        }
+        // …and the guard's drop sweep adds nothing.
+        drop(orchestrator);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), events.recv())
+                .await
+                .is_err(),
+            "the drop sweep does not double-report cancelled approvals"
         );
 
         crate::approval_event_broker::unsubscribe(&request_id).await;

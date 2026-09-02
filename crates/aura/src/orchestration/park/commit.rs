@@ -42,6 +42,14 @@ pub(crate) struct RefreshedAwaiting {
     pub decision_ids: Vec<DecisionId>,
 }
 
+/// A completed park commit: the resolved expiry stamp and the refreshed
+/// awaiting set.
+pub(crate) struct ParkCommitOutcome {
+    /// RFC 3339 expiry timestamp.
+    pub expires_at: String,
+    pub refreshed: RefreshedAwaiting,
+}
+
 /// The run-scoped owner id every approval parked by `run_id` is registered
 /// under.
 pub(crate) fn run_owner_id(run_id: &str) -> String {
@@ -53,11 +61,14 @@ pub(crate) fn run_owner_id(run_id: &str) -> String {
 /// A decision can land between the task's blocked verdict and the commit;
 /// such a call is not awaiting a decision now and drops out of the
 /// checkpoint. The expiry is the earliest `expires_at` the approval store
-/// still holds for the surviving calls.
+/// still holds for the surviving calls. A store fault fails the refresh —
+/// and with it the commit: reading a fault as "not parked" would silently
+/// drop a still-decidable approval from the checkpoint, while the failed
+/// commit's sweep cancels it instead.
 pub(crate) async fn refresh_awaiting(
     plan: &Plan,
     registry: &PendingApprovals,
-) -> RefreshedAwaiting {
+) -> io::Result<RefreshedAwaiting> {
     let mut pending_by_task = HashMap::new();
     let mut expires_at = None;
     let mut decision_ids = Vec::new();
@@ -68,7 +79,11 @@ pub(crate) async fn refresh_awaiting(
         };
         let mut surviving = Vec::with_capacity(pending.len());
         for call in pending {
-            let Some(parked) = registry.parked(&call.decision_id).await else {
+            let Some(parked) = registry
+                .try_parked(&call.decision_id)
+                .await
+                .map_err(io::Error::other)?
+            else {
                 tracing::info!(
                     decision_id = %call.decision_id,
                     task_id = task.id,
@@ -100,15 +115,17 @@ pub(crate) async fn refresh_awaiting(
         }
     }
 
-    RefreshedAwaiting {
+    Ok(RefreshedAwaiting {
         pending_by_task,
         expires_at,
         decision_ids,
-    }
+    })
 }
 
 /// Build and publish the checkpoint from the run's current state, returning
-/// the published path and the refreshed awaiting set.
+/// the resolved `expires_at` stamp and the refreshed awaiting set. The
+/// stamp is resolved here once, so the document and the caller's terminal
+/// event carry the same deadline.
 ///
 /// This is the whole commit: refresh the awaiting set against the store,
 /// serialize, temp write, rename, unlink a stale resuming document. The
@@ -116,7 +133,7 @@ pub(crate) async fn refresh_awaiting(
 /// after this returns.
 pub(crate) async fn commit_from_run_state(
     inputs: &ParkCommitInputs<'_>,
-) -> io::Result<(PathBuf, RefreshedAwaiting)> {
+) -> io::Result<ParkCommitOutcome> {
     let ParkCommitInputs {
         state,
         plan,
@@ -126,7 +143,7 @@ pub(crate) async fn commit_from_run_state(
         config,
     } = inputs;
 
-    let refreshed = refresh_awaiting(plan, registry).await;
+    let refreshed = refresh_awaiting(plan, registry).await?;
     let expires_at = refreshed
         .expires_at
         .map(|t| t.to_rfc3339())
@@ -136,14 +153,16 @@ pub(crate) async fn commit_from_run_state(
         plan,
         records,
         &refreshed.pending_by_task,
-        expires_at,
+        expires_at.clone(),
         config_fingerprint(config),
-        identity_hash_from(None),
+        identity_hash_from(None), // P46: None until the server identity header config lands.
     );
     let parked_dir = parked_document_dir(memory_dir, state.session_id);
-    publish(&document, &parked_dir, state.run_id)
-        .await
-        .map(|path| (path, refreshed))
+    publish(&document, &parked_dir, state.run_id).await?;
+    Ok(ParkCommitOutcome {
+        expires_at,
+        refreshed,
+    })
 }
 
 /// Publish a checkpoint by temp write and same-directory rename.
@@ -536,7 +555,7 @@ mod tests {
         ];
         plan.tasks[0].state = crate::orchestration::TaskState::AwaitingApproval { pending };
 
-        let refreshed = refresh_awaiting(&plan, &registry).await;
+        let refreshed = refresh_awaiting(&plan, &registry).await.unwrap();
 
         let surviving = &refreshed.pending_by_task[&0];
         assert_eq!(surviving.len(), 2, "decided and removed drop out");

@@ -881,20 +881,6 @@ impl ExecutionPersistence {
         self.session_id.as_deref()
     }
 
-    /// The session directory owning this run (`{memory_dir}/{session_id}`),
-    /// or `None` for the un-sessioned layout.
-    pub fn session_root(&self) -> Option<&Path> {
-        self.base_path
-            .parent()
-            .filter(|_| self.session_id.is_some())
-    }
-
-    /// The directory this session's parked-run checkpoints live in
-    /// (`{session_root}/parked`).
-    pub fn parked_dir(&self) -> Option<PathBuf> {
-        self.session_root().map(|root| root.join("parked"))
-    }
-
     /// Write a typed run manifest to `{run_path}/manifest.json`.
     ///
     /// Called at the end of `run_orchestration_loop()` on both success and
@@ -2634,39 +2620,6 @@ mod tests {
                 std::io::ErrorKind::InvalidInput
             );
         }
-    }
-
-    #[tokio::test]
-    async fn test_session_root_and_parked_dir_helpers() {
-        let temp_dir = TempDir::new().unwrap();
-        let session_id = "cs_parked".to_string();
-        let persistence =
-            ExecutionPersistence::new(temp_dir.path().join("memory"), Some(session_id))
-                .await
-                .unwrap();
-        assert_eq!(
-            persistence.session_root(),
-            Some(temp_dir.path().join("memory").join("cs_parked").as_path())
-        );
-        assert_eq!(
-            persistence.parked_dir(),
-            Some(
-                temp_dir
-                    .path()
-                    .join("memory")
-                    .join("cs_parked")
-                    .join("parked")
-            )
-        );
-
-        let flat = ExecutionPersistence::new(temp_dir.path().join("memory"), None)
-            .await
-            .unwrap();
-        assert!(
-            flat.session_root().is_none(),
-            "the flat layout has no session root"
-        );
-        assert!(flat.parked_dir().is_none());
     }
 
     /// Pruning skips the `parked` checkpoint directory itself and any run

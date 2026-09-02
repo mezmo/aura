@@ -218,6 +218,19 @@ impl PendingApprovals {
         }
     }
 
+    /// The parked approval record for an id, propagating a store fault.
+    ///
+    /// Unlike [`Self::parked`], a store fault is returned to the caller
+    /// instead of reading as "not parked": the park commit's refresh must
+    /// fail its commit rather than silently drop a still-decidable
+    /// approval from the checkpoint.
+    pub async fn try_parked(
+        &self,
+        id: &DecisionId,
+    ) -> Result<Option<ParkedApproval>, SessionStoreError> {
+        self.0.store.get(id).await
+    }
+
     /// The durably recorded decision for an already-resolved approval, if
     /// any. A store fault reads as "no recorded decision" (logged), so
     /// callers keep their fail-closed shape.
