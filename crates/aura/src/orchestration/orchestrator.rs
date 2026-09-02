@@ -4607,25 +4607,20 @@ Assign tasks to the worker whose tools best match the required operations."#,
         out
     }
 
-    /// Write a typed `RunManifest` summarizing this orchestration run.
-    ///
-    /// Pre-load tool call records for all tasks in a plan, converting to
-    /// condensed `ToolTraceEntry` for continuation prompt rendering.
+    /// Collect the condensed tool traces for all tasks in a plan, for
+    /// continuation prompt rendering.
     async fn load_tool_traces_for_plan(
         &self,
         plan: &Plan,
     ) -> std::collections::HashMap<usize, Vec<super::persistence::ToolTraceEntry>> {
-        use super::persistence::ToolTraceEntry;
-
         let persistence = self.persistence.lock().await;
         let mut traces = std::collections::HashMap::new();
 
         for t in &plan.tasks {
-            let records = persistence.load_tool_records_for_task(t.id).await;
-            if records.is_empty() {
+            let entries = persistence.tool_traces_for_task(t.id);
+            if entries.is_empty() {
                 continue;
             }
-            let entries: Vec<ToolTraceEntry> = records.iter().map(ToolTraceEntry::from).collect();
             traces.insert(t.id, entries);
         }
 
@@ -4654,9 +4649,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         response_summary: Option<String>,
         timings: Option<IterationTimings>,
     ) {
-        use super::persistence::{
-            ArtifactEntry, ErrorContext, RunManifest, RunStatus, TaskSummary, ToolTraceEntry,
-        };
+        use super::persistence::{ArtifactEntry, ErrorContext, RunManifest, RunStatus, TaskSummary};
         use crate::string_utils::safe_truncate;
 
         let persistence = self.persistence.lock().await;
@@ -4692,9 +4685,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 })
                 .collect();
 
-            let tool_records = persistence.load_tool_records_for_task(t.id).await;
-            let tool_trace: Vec<ToolTraceEntry> =
-                tool_records.iter().map(ToolTraceEntry::from).collect();
+            let tool_trace = persistence.tool_traces_for_task(t.id);
 
             let (error, error_context) = match &t.state {
                 TaskState::Failed { error, category } => {

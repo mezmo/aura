@@ -30,9 +30,11 @@
 //! ```
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::fs;
@@ -210,46 +212,6 @@ pub enum RunStatus {
     Failed,
 }
 
-/// A single tool call made during task execution.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolCallRecord {
-    /// Tool name
-    pub tool: String,
-    /// Arguments passed to the tool
-    pub arguments: serde_json::Value,
-    /// Why this tool was called
-    pub reasoning: String,
-    /// Tool output (may be truncated for large outputs)
-    pub output: Option<String>,
-    /// Error if tool call failed
-    pub error: Option<String>,
-    /// Duration in milliseconds
-    pub duration_ms: u64,
-    /// Artifact filename if tool output was promoted to an artifact file.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub artifact_filename: Option<String>,
-}
-
-impl From<&ToolCallRecord> for ToolTraceEntry {
-    fn from(r: &ToolCallRecord) -> Self {
-        Self {
-            tool: r.tool.clone(),
-            reasoning: r.reasoning.clone(),
-            duration_ms: r.duration_ms,
-            outcome: if let Some(ref err) = r.error {
-                ToolOutcome::Error {
-                    message: err.clone(),
-                }
-            } else {
-                ToolOutcome::Success {
-                    output_bytes: r.output.as_ref().map(|o| o.len() as u64).unwrap_or(0),
-                }
-            },
-            artifact_filename: r.artifact_filename.clone(),
-        }
-    }
-}
-
 /// Summary of a worker's execution for a task.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskExecutionRecord {
@@ -293,6 +255,8 @@ pub struct ExecutionPersistence {
     enabled: bool,
     in_flight: Arc<AtomicUsize>,
     drain_notify: Arc<Notify>,
+    /// Condensed tool-call trace per task id.
+    tool_traces: Arc<StdMutex<HashMap<usize, Vec<ToolTraceEntry>>>>,
 }
 
 impl ExecutionPersistence {
@@ -357,6 +321,7 @@ impl ExecutionPersistence {
             enabled: true,
             in_flight: Arc::new(AtomicUsize::new(0)),
             drain_notify: Arc::new(Notify::new()),
+            tool_traces: Arc::new(StdMutex::new(HashMap::new())),
         })
     }
 
@@ -421,6 +386,7 @@ impl ExecutionPersistence {
             enabled: false,
             in_flight: Arc::new(AtomicUsize::new(0)),
             drain_notify: Arc::new(Notify::new()),
+            tool_traces: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
 
@@ -567,8 +533,8 @@ impl ExecutionPersistence {
         fs::create_dir_all(&iter_path).await?;
 
         // Write prompt and response with namespaced filenames.
-        // Tool calls are persisted incrementally via `append_tool_call()` to
-        // separate `*.tool-calls.json` files; nothing to write here.
+        // Tool calls are tracked in memory via `record_tool_trace()`;
+        // nothing to write for them here.
         let prompt_file = self.task_attempt_filename(task_id, attempt, "prompt.txt");
         let response_file = self.task_attempt_filename(task_id, attempt, "response.txt");
         fs::write(iter_path.join(&prompt_file), prompt).await?;
@@ -636,7 +602,7 @@ impl ExecutionPersistence {
 
     /// Write a tool output to an artifact file.
     ///
-    /// Returns the artifact filename for reference in footers and ToolCallRecord.
+    /// Returns the artifact filename for reference in footers and tool traces.
     /// Filename: `task-{id}-{worker}-iter-{n}-{tool_name}-{call_idx}-output.txt`
     pub async fn write_tool_output_artifact(
         &self,
@@ -818,41 +784,18 @@ impl ExecutionPersistence {
         Ok(results)
     }
 
-    /// Load all tool call records for a given task across all iterations.
-    ///
-    /// Scans `iteration-*/task-{task_id}.attempt-*.tool-calls.json` under the
-    /// run directory. Returns an empty vec on file-not-found (graceful for old runs).
-    pub async fn load_tool_records_for_task(&self, task_id: usize) -> Vec<ToolCallRecord> {
+    /// All tool traces recorded for a task so far, in call-completion order
+    /// across every iteration and attempt.
+    pub fn tool_traces_for_task(&self, task_id: usize) -> Vec<ToolTraceEntry> {
         if !self.enabled {
             return Vec::new();
         }
-
-        let mut all_records = Vec::new();
-        let prefix = format!("task-{task_id}.attempt-");
-
-        for iter_num in 1..=self.current_iteration {
-            let iter_dir = self.base_path.join(format!("iteration-{iter_num}"));
-            let Ok(mut entries) = fs::read_dir(&iter_dir).await else {
-                continue;
-            };
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                let name = entry.file_name();
-                let Some(name_str) = name.to_str() else {
-                    continue;
-                };
-                if !name_str.starts_with(&prefix) || !name_str.ends_with(".tool-calls.json") {
-                    continue;
-                }
-                let Ok(content) = fs::read_to_string(entry.path()).await else {
-                    continue;
-                };
-                if let Ok(records) = serde_json::from_str::<Vec<ToolCallRecord>>(&content) {
-                    all_records.extend(records);
-                }
-            }
-        }
-
-        all_records
+        self.tool_traces
+            .lock()
+            .unwrap()
+            .get(&task_id)
+            .cloned()
+            .unwrap_or_default()
     }
 
     // ========================================================================
@@ -883,48 +826,22 @@ impl ExecutionPersistence {
         Ok(manifest_path)
     }
 
-    /// Append a tool call record to the current task's execution.
+    /// Record a condensed tool trace entry for a task.
     ///
-    /// This is called by PersistenceWrapper during tool execution.
-    /// Tool calls are appended to a running list, not overwritten.
-    pub async fn append_tool_call(
-        &self,
-        task_id: usize,
-        attempt: usize,
-        record: &ToolCallRecord,
-    ) -> io::Result<()> {
+    /// Called by PersistenceWrapper as each tool call completes. Traces are
+    /// held in memory for continuation-prompt rendering and reach disk only
+    /// via the run manifest (`TaskSummary.tool_trace`); full tool outputs are
+    /// captured by artifact promotion and OTel, not here.
+    pub fn record_tool_trace(&self, task_id: usize, entry: ToolTraceEntry) {
         if !self.enabled {
-            return Ok(());
+            return;
         }
-
-        let iter_path = self.iteration_path();
-        fs::create_dir_all(&iter_path).await?;
-
-        let tool_file = self.task_attempt_filename(task_id, attempt, "tool-calls.json");
-        let tool_calls_path = iter_path.join(&tool_file);
-
-        // Read existing tool calls or start fresh
-        let mut tool_calls: Vec<ToolCallRecord> = match fs::read_to_string(&tool_calls_path).await {
-            Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
-            Err(e) => return Err(e),
-        };
-
-        // Append new record
-        tool_calls.push(record.clone());
-
-        // Write back
-        let json = serde_json::to_string_pretty(&tool_calls)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        fs::write(&tool_calls_path, json).await?;
-
-        tracing::debug!(
-            "Appended tool call to: {} (total: {})",
-            tool_calls_path.display(),
-            tool_calls.len()
-        );
-
-        Ok(())
+        self.tool_traces
+            .lock()
+            .unwrap()
+            .entry(task_id)
+            .or_default()
+            .push(entry);
     }
 }
 
@@ -2485,57 +2402,56 @@ mod tests {
         );
     }
 
+    fn trace_entry(tool: &str, duration_ms: u64) -> ToolTraceEntry {
+        ToolTraceEntry {
+            tool: tool.to_string(),
+            reasoning: "Searching for errors".to_string(),
+            duration_ms,
+            outcome: ToolOutcome::Success { output_bytes: 8 },
+            artifact_filename: None,
+        }
+    }
+
     #[tokio::test]
-    async fn test_load_tool_records_for_task() {
+    async fn test_tool_traces_for_task() {
         let temp_dir = TempDir::new().unwrap();
         let persistence = ExecutionPersistence::new(temp_dir.path().join("memory"), None)
             .await
             .unwrap();
 
-        let record = ToolCallRecord {
-            tool: "log_search".to_string(),
-            arguments: serde_json::json!({"query": "errors"}),
-            reasoning: "Searching for errors".to_string(),
-            output: Some("found 47".to_string()),
-            error: None,
-            duration_ms: 1500,
-            artifact_filename: None,
-        };
+        persistence.record_tool_trace(0, trace_entry("log_search", 1500));
 
-        persistence.append_tool_call(0, 1, &record).await.unwrap();
+        let traces = persistence.tool_traces_for_task(0);
+        assert_eq!(traces.len(), 1);
+        assert_eq!(traces[0].tool, "log_search");
+        assert_eq!(traces[0].duration_ms, 1500);
 
-        let records = persistence.load_tool_records_for_task(0).await;
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].tool, "log_search");
-        assert_eq!(records[0].duration_ms, 1500);
-
-        let empty = persistence.load_tool_records_for_task(99).await;
+        let empty = persistence.tool_traces_for_task(99);
         assert!(empty.is_empty());
     }
 
     #[tokio::test]
-    async fn test_append_tool_call_accumulates() {
+    async fn test_record_tool_trace_accumulates_across_clones() {
         let temp_dir = TempDir::new().unwrap();
         let persistence = ExecutionPersistence::new(temp_dir.path().join("memory"), None)
             .await
             .unwrap();
 
-        let record = ToolCallRecord {
-            tool: "log_search".to_string(),
-            arguments: serde_json::json!({"query": "errors"}),
-            reasoning: "Searching".to_string(),
-            output: Some("found".to_string()),
-            error: None,
-            duration_ms: 10,
-            artifact_filename: None,
-        };
+        // Traces recorded through a clone (as PersistenceWrapper holds one)
+        // must be visible to the original.
+        let clone = persistence.clone();
+        persistence.record_tool_trace(0, trace_entry("log_search", 10));
+        clone.record_tool_trace(0, trace_entry("log_search", 20));
 
-        // First append lands on a missing file (fresh vec), second reads it back.
-        persistence.append_tool_call(0, 1, &record).await.unwrap();
-        persistence.append_tool_call(0, 1, &record).await.unwrap();
+        let traces = persistence.tool_traces_for_task(0);
+        assert_eq!(traces.len(), 2);
+    }
 
-        let records = persistence.load_tool_records_for_task(0).await;
-        assert_eq!(records.len(), 2);
+    #[tokio::test]
+    async fn test_record_tool_trace_noop_when_disabled() {
+        let persistence = ExecutionPersistence::disabled();
+        persistence.record_tool_trace(0, trace_entry("log_search", 10));
+        assert!(persistence.tool_traces_for_task(0).is_empty());
     }
 
     #[tokio::test]

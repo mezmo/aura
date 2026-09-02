@@ -1,8 +1,9 @@
 //! Persistence tool wrapper for orchestration.
 //!
-//! Wraps MCP tools to capture reasoning and persist execution details.
+//! Wraps MCP tools to capture reasoning and record tool traces.
 //! The wrapper adds an optional `_aura_reasoning` field to tool schemas,
-//! extracts it during execution, and writes records to ExecutionPersistence.
+//! extracts it during execution, and records a condensed trace entry on
+//! ExecutionPersistence as each call completes.
 //! The field is intentionally not in the schema's `required` array so
 //! quantized/smaller models that omit it don't break their ReAct loop.
 //!
@@ -23,7 +24,7 @@ use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::{Mutex, Notify};
 
-use super::persistence::{ExecutionPersistence, ToolCallRecord};
+use super::persistence::{ExecutionPersistence, ToolOutcome, ToolTraceEntry};
 use crate::mcp_response::CallOutcome;
 use crate::tool_wrapper::{
     ToolCallContext, ToolWrapper, TransformArgsResult, TransformOutputResult, non_blank,
@@ -70,8 +71,8 @@ impl Drop for DrainGuard {
 /// 2. Extracts reasoning from args before calling the inner tool
 /// 3. Captures RAW tool output in `transform_output` (runs before any wrapper
 ///    that rewrites the output, e.g. `ScratchpadWrapper`)
-/// 4. Writes the record in `on_complete` using the captured raw output plus
-///    the `duration_ms` that only the completion hook receives
+/// 4. Records a condensed `ToolTraceEntry` in `on_complete` using the captured
+///    raw output plus the `duration_ms` that only the completion hook receives
 /// 5. Promotes qualifying tool outputs to artifact files (size/duration threshold)
 ///
 /// Only used in orchestration mode for worker agents.
@@ -255,8 +256,8 @@ impl ToolWrapper for PersistenceWrapper {
             notify: self.drain_notify.clone(),
         };
 
-        let (task_id, attempt) = match (ctx.task_id, ctx.attempt) {
-            (Some(tid), Some(att)) => (tid, att),
+        let task_id = match (ctx.task_id, ctx.attempt) {
+            (Some(tid), Some(_)) => tid,
             _ => {
                 tracing::debug!(
                     "Skipping persistence for {} - no task context",
@@ -326,25 +327,24 @@ impl ToolWrapper for PersistenceWrapper {
             None
         };
 
-        // Build tool call record (store clean output without footer)
-        let record = ToolCallRecord {
-            tool: ctx.tool_name.clone(),
-            arguments: ctx
-                .metadata
-                .clone()
-                .unwrap_or_else(|| serde_json::json!({})),
-            reasoning,
-            output: output.map(|o| strip_artifact_footer(&o).to_string()),
-            error,
-            duration_ms,
-            artifact_filename,
+        // Record the condensed trace (continuation prompts + run manifest).
+        // Full outputs live in promoted artifacts and OTel spans, not here.
+        let outcome = match error {
+            Some(message) => ToolOutcome::Error { message },
+            None => ToolOutcome::Success {
+                output_bytes: output_clean.len() as u64,
+            },
         };
-        if let Err(e) = persistence_guard
-            .append_tool_call(task_id, attempt, &record)
-            .await
-        {
-            tracing::warn!("Failed to persist tool call for {}: {}", ctx.tool_name, e);
-        }
+        persistence_guard.record_tool_trace(
+            task_id,
+            ToolTraceEntry {
+                tool: ctx.tool_name.clone(),
+                reasoning,
+                duration_ms,
+                outcome,
+                artifact_filename,
+            },
+        );
     }
 }
 
@@ -1299,12 +1299,9 @@ mod tests {
             .await;
 
         let p = persistence.lock().await;
-        let iter_path = p.run_path().join("iteration-1");
-        let tool_calls_path = iter_path.join("task-0.attempt-1.tool-calls.json");
-        let content = tokio::fs::read_to_string(&tool_calls_path).await.unwrap();
-        let records: Vec<ToolCallRecord> = serde_json::from_str(&content).unwrap();
-        assert_eq!(records.len(), 1);
-        assert!(records[0].artifact_filename.is_none());
+        let traces = p.tool_traces_for_task(0);
+        assert_eq!(traces.len(), 1);
+        assert!(traces[0].artifact_filename.is_none());
     }
 
     #[tokio::test]
@@ -1326,15 +1323,16 @@ mod tests {
             .await;
 
         let p = persistence.lock().await;
-        let iter_path = p.run_path().join("iteration-1");
-        let tool_calls_path = iter_path.join("task-0.attempt-1.tool-calls.json");
-        let content = tokio::fs::read_to_string(&tool_calls_path).await.unwrap();
-        let records: Vec<ToolCallRecord> = serde_json::from_str(&content).unwrap();
-        assert_eq!(records.len(), 1);
+        let traces = p.tool_traces_for_task(0);
+        assert_eq!(traces.len(), 1);
         assert_eq!(
-            records[0].artifact_filename.as_deref(),
+            traces[0].artifact_filename.as_deref(),
             Some("task-0-sre-iter-1-log-search-0-output.txt")
         );
+        assert!(matches!(
+            traces[0].outcome,
+            ToolOutcome::Success { output_bytes: 50 }
+        ));
     }
 
     // --------------------------------------------------------------------

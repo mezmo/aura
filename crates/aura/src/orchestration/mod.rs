@@ -68,7 +68,7 @@ pub use observer_wrapper::ObserverWrapper;
 pub use orchestrator::Orchestrator;
 pub use overview::{agent_info, agent_info_with_tools, summarize_tools, worker_overview};
 pub use persistence::{
-    ExecutionPersistence, RunManifest, RunStatus, TaskExecutionRecord, TaskSummary, ToolCallRecord,
+    ExecutionPersistence, RunManifest, RunStatus, TaskExecutionRecord, TaskSummary,
     build_session_context, load_session_manifests,
 };
 pub use persistence_wrapper::PersistenceWrapper;
