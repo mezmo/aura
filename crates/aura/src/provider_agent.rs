@@ -112,9 +112,12 @@ impl ProviderAgent {
         scratchpad_budget: Option<ContextBudget>,
         client_tool_names: HashSet<String>,
     ) -> crate::streaming::AgentRun {
-        let (hook, cancel_tx, usage_state) =
-            StreamingRequestHook::with_scratchpad_budget(options, request_id, scratchpad_budget);
-        let hook = hook.with_client_tool_names(client_tool_names);
+        let (hook, cancel_tx, usage_state) = StreamingRequestHook::with_scratchpad_budget(
+            options,
+            request_id,
+            scratchpad_budget,
+            client_tool_names,
+        );
 
         match self {
             Self::OpenAI(agent) => {
@@ -320,9 +323,12 @@ impl ProviderAgent {
         scratchpad_budget: Option<ContextBudget>,
         client_tool_names: HashSet<String>,
     ) -> crate::streaming::AgentRun {
-        let (hook, cancel_tx, usage_state) =
-            StreamingRequestHook::with_scratchpad_budget(options, request_id, scratchpad_budget);
-        let hook = hook.with_client_tool_names(client_tool_names);
+        let (hook, cancel_tx, usage_state) = StreamingRequestHook::with_scratchpad_budget(
+            options,
+            request_id,
+            scratchpad_budget,
+            client_tool_names,
+        );
 
         match self {
             Self::OpenAI(agent) => {
@@ -427,9 +433,12 @@ impl ProviderAgent {
         scratchpad_budget: Option<ContextBudget>,
         client_tool_names: HashSet<String>,
     ) -> crate::streaming::AgentRun {
-        let (hook, cancel_tx, usage_state) =
-            StreamingRequestHook::with_scratchpad_budget(options, request_id, scratchpad_budget);
-        let hook = hook.with_client_tool_names(client_tool_names);
+        let (hook, cancel_tx, usage_state) = StreamingRequestHook::with_scratchpad_budget(
+            options,
+            request_id,
+            scratchpad_budget,
+            client_tool_names,
+        );
 
         match self {
             Self::OpenAI(agent) => {
