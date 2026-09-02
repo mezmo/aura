@@ -38,16 +38,15 @@
 //! let (prompt, completion, total) = usage_state.get_final_usage();
 //! ```
 
+use crate::hooks::{AgentHook, ClientTools, Deadline, Hooks, RunCancelReason};
+use aura_events::agent::{AgentEvent, AgentEventPayload};
+use rig::agent::{CancelSignal, StreamingPromptHook};
+use rig::completion::{CompletionModel, GetTokenUsage, Message};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
-
-use aura_events::agent::{AgentEvent, AgentEventPayload};
-use rig::agent::{CancelSignal, StreamingPromptHook};
-use rig::completion::{CompletionModel, GetTokenUsage, Message};
 use tokio_util::sync::CancellationToken;
 
 use crate::orchestration::BlockedCell;
@@ -366,11 +365,8 @@ impl ResponseContent {
 /// MCP cancellation is handled separately via client-level tracking (Arc-based).
 #[derive(Clone)]
 pub struct StreamingRequestHook {
-    start_time: Instant,
-    /// Absent for a run the caller left unbounded.
-    timeout: Option<Duration>,
-    /// External cancellation signal (e.g., from client disconnect)
-    cancelled: CancellationToken,
+    /// Everything watching this run.
+    hooks: Hooks,
     /// Request ID for event correlation
     request_id: String,
     /// Shared usage state (returned separately for handler access)
@@ -379,13 +375,6 @@ pub struct StreamingRequestHook {
     /// LLM-reported per-turn input/output tokens into the budget as ground
     /// truth so `remaining()` reflects actual context pressure.
     scratchpad_budget: Option<ContextBudget>,
-    /// Names of client-side (passthrough) tools registered for this request.
-    /// When the LLM calls one, the stream is terminated before the next LLM
-    /// turn so the client can execute the tool locally and submit results back.
-    client_tool_names: HashSet<String>,
-    /// Set when a client-side tool has been called in this request. Read by
-    /// `on_completion_call` to bail out before the next LLM turn.
-    client_tool_called: Arc<AtomicBool>,
 }
 
 impl StreamingRequestHook {
@@ -394,7 +383,7 @@ impl StreamingRequestHook {
         options: crate::streaming::RunOptions,
         request_id: impl Into<String>,
     ) -> (Self, CancellationToken, UsageState) {
-        Self::with_scratchpad_budget(options, request_id, None)
+        Self::with_scratchpad_budget(options, request_id, None, HashSet::new())
     }
 
     /// Like `new`, but additionally wires a scratchpad `ContextBudget` so the
@@ -405,42 +394,33 @@ impl StreamingRequestHook {
         options: crate::streaming::RunOptions,
         request_id: impl Into<String>,
         scratchpad_budget: Option<ContextBudget>,
+        client_tool_names: HashSet<String>,
     ) -> (Self, CancellationToken, UsageState) {
         let (timeout, cancel) = options.into_parts();
         // A caller that supplied one can cancel before the run exists.
         let cancel = cancel.unwrap_or_default();
         let usage_state = UsageState::new();
         let hook = Self {
-            start_time: Instant::now(),
-            timeout,
-            cancelled: cancel.clone(),
+            hooks: Hooks::new()
+                .with(Arc::new(Deadline::new(timeout, cancel.clone())))
+                .with(Arc::new(ClientTools::new(client_tool_names))),
             request_id: request_id.into(),
             usage_state: usage_state.clone(),
             scratchpad_budget,
-            client_tool_names: HashSet::new(),
-            client_tool_called: Arc::new(AtomicBool::new(false)),
         };
         (hook, cancel, usage_state)
     }
 
-    /// Register the names of client-side (passthrough) tools for this request.
-    ///
-    /// When any of these tools are called, the hook ends the stream before the
-    /// next LLM turn so the client can execute the tool and submit results.
-    pub fn with_client_tool_names(mut self, names: HashSet<String>) -> Self {
-        self.client_tool_names = names;
+    /// Registers another observer for this run, alongside the deadline and
+    /// client-tool concerns the hook starts with.
+    #[must_use]
+    pub fn with_hook(mut self, hook: Arc<dyn AgentHook>) -> Self {
+        self.hooks = self.hooks.with(hook);
         self
     }
 
-    /// Check if the request should be cancelled (timeout or external signal).
-    fn should_cancel(&self) -> bool {
-        self.cancelled.is_cancelled() || self.deadline_passed()
-    }
-
-    /// An unbounded run has no deadline to pass.
-    fn deadline_passed(&self) -> bool {
-        self.timeout
-            .is_some_and(|timeout| self.start_time.elapsed() > timeout)
+    fn should_cancel(&self) -> Option<RunCancelReason> {
+        AgentHook::should_cancel(&self.hooks)
     }
 
     /// Should the SSE event surface (`aura.tool_requested` / `aura.tool_complete`
@@ -467,17 +447,26 @@ impl StreamingRequestHook {
 
     /// Check and cancel if needed, logging the reason.
     fn check_and_cancel(&self, cancel_sig: CancelSignal, context: &str) {
-        if self.cancelled.is_cancelled() {
-            tracing::info!("Request cancelled externally during {}", context);
-            cancel_sig.cancel();
-        } else if self.deadline_passed() {
-            tracing::warn!(
+        let Some(reason) = self.should_cancel() else {
+            return;
+        };
+        // A blown deadline is an operator's problem; the rest are routine.
+        match reason {
+            RunCancelReason::Deadline { after } => tracing::warn!(
                 "Request timeout ({:?}) exceeded during {} - cancelling",
-                self.timeout,
+                after,
                 context
-            );
-            cancel_sig.cancel();
+            ),
+            RunCancelReason::External => {
+                tracing::info!("Request cancelled externally during {}", context)
+            }
+            // Raised by `before_turn`, which logs it and ends the run itself, so
+            // reaching the cancel path means a hook also reports it here.
+            RunCancelReason::ClientTool => {
+                tracing::info!("Run yielding to a client tool during {}", context)
+            }
         }
+        cancel_sig.cancel();
     }
 }
 
@@ -493,11 +482,9 @@ where
         history: &[Message],
         cancel_sig: CancelSignal,
     ) -> impl Future<Output = ()> + Send {
-        let has_client_tools = !self.client_tool_names.is_empty();
-        let client_tool_called = self.client_tool_called.clone();
         async move {
-            // Checked before the client-tool, cancel, and timeout checks: a
-            // waiting parked call must get its snapshot whatever else is true.
+            // Checked before the hooks: a waiting parked call must get its
+            // snapshot whatever else is true.
             if let Some(cell) = park_cell_for(&self.request_id)
                 && cell.snapshot_if_pending(history, prompt)
             {
@@ -509,15 +496,14 @@ where
                 cancel_sig.cancel_with_reason(PARK_CANCEL_REASON);
                 return;
             }
-            // If a passthrough tool was called this turn, do not initiate
-            // another LLM completion. Cancel here so the stream terminates
-            // and the streaming layer can emit `finish_reason: "tool_calls"`
-            // — the client will execute the tool and resume in a follow-up
-            // request.
-            if has_client_tools && client_tool_called.load(Ordering::Acquire) {
-                tracing::info!(
-                    "Client tool was called — cancelling before next LLM completion call"
-                );
+
+            // A hook ending the run says why, so the log names it. Only a
+            // passthrough tool call leaves the marker the streaming layer reads
+            // for `finish_reason: "tool_calls"`; another reason ends the run
+            // without one.
+            if let Some(reason) = self.hooks.before_turn().await {
+                tracing::info!("Run ended before the next LLM completion call ({reason:?})");
+
                 cancel_sig.cancel();
                 return;
             }
@@ -532,10 +518,7 @@ where
         cancel_sig: CancelSignal,
     ) -> impl Future<Output = ()> + Send {
         async move {
-            // Only check periodically for text deltas (they're frequent)
-            if self.should_cancel() {
-                self.check_and_cancel(cancel_sig, "text streaming");
-            }
+            self.check_and_cancel(cancel_sig, "text streaming");
         }
     }
 
@@ -547,9 +530,7 @@ where
         cancel_sig: CancelSignal,
     ) -> impl Future<Output = ()> + Send {
         async move {
-            if self.should_cancel() {
-                self.check_and_cancel(cancel_sig, "tool call delta");
-            }
+            self.check_and_cancel(cancel_sig, "tool call delta");
         }
     }
 
@@ -571,22 +552,13 @@ where
         // makes the matching skip so push/pop stay symmetric. Cancellation
         // is still checked.
         let publish_event = Self::should_publish_tool_event(&tool_name);
-        let is_client_tool = self.client_tool_names.contains(&tool_name);
-        let client_tool_called = self.client_tool_called.clone();
         async move {
             // Stash the call id so the park arm can record it on the cell entry.
             if let Some(cell) = park_cell_for(&request_id) {
                 cell.set_current_call_id(tool_call_id.clone());
             }
 
-            if is_client_tool {
-                tracing::info!(
-                    "Client tool '{}' called for request '{}' — marking for passthrough",
-                    tool_name,
-                    request_id
-                );
-                client_tool_called.store(true, Ordering::Release);
-            }
+            self.hooks.on_tool_call(&tool_name).await;
 
             if publish_event {
                 // Parse args as JSON (fallback to empty object if invalid)
@@ -622,10 +594,7 @@ where
                 tool_call_id
             );
 
-            if self.should_cancel() {
-                tracing::info!("Cancelling before tool '{}' execution", tool_name);
-                self.check_and_cancel(cancel_sig, &format!("tool call ({})", tool_name));
-            }
+            self.check_and_cancel(cancel_sig, &format!("tool call ({})", tool_name));
         }
     }
 
@@ -681,10 +650,7 @@ where
                 );
             }
 
-            if self.should_cancel() {
-                tracing::info!("Cancelling after tool '{}' result", tool_name);
-                self.check_and_cancel(cancel_sig, &format!("tool result ({})", tool_name));
-            }
+            self.check_and_cancel(cancel_sig, &format!("tool result ({})", tool_name));
         }
     }
 
@@ -773,6 +739,33 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    /// A hook a caller registers has to be asked alongside the ones the hook
+    /// starts with, or the registration is decorative.
+    #[test]
+    fn a_registered_hook_is_asked() {
+        struct AlwaysCancel;
+
+        #[async_trait::async_trait]
+        impl AgentHook for AlwaysCancel {
+            fn should_cancel(&self) -> Option<RunCancelReason> {
+                Some(RunCancelReason::External)
+            }
+        }
+
+        let (hook, _cancel, _usage) = StreamingRequestHook::new(
+            crate::streaming::RunOptions::bounded(Some(Duration::from_secs(300))),
+            "req_registered",
+        );
+        assert!(
+            hook.should_cancel().is_none(),
+            "nothing has asked for cancellation yet"
+        );
+
+        let hook = hook.with_hook(Arc::new(AlwaysCancel));
+        assert!(hook.should_cancel().is_some());
+    }
 
     #[test]
     fn test_streaming_request_hook_creation() {
@@ -780,7 +773,7 @@ mod tests {
             crate::streaming::RunOptions::bounded(Some(Duration::from_secs(60))),
             "test_req_1",
         );
-        assert!(!hook.should_cancel());
+        assert!(hook.should_cancel().is_none());
         assert_eq!(hook.request_id, "test_req_1");
     }
 
@@ -824,10 +817,10 @@ mod tests {
             crate::streaming::RunOptions::bounded(Some(Duration::from_secs(60))),
             "test_req_2",
         );
-        assert!(!hook.should_cancel());
+        assert!(hook.should_cancel().is_none());
 
         cancel.cancel();
-        assert!(hook.should_cancel());
+        assert!(hook.should_cancel().is_some());
     }
 
     #[test]
@@ -840,7 +833,7 @@ mod tests {
 
         // Wait for timeout
         std::thread::sleep(Duration::from_millis(5));
-        assert!(hook.should_cancel());
+        assert!(hook.should_cancel().is_some());
     }
 
     #[test]
@@ -1045,6 +1038,7 @@ mod tests {
             crate::streaming::RunOptions::bounded(Some(Duration::from_secs(60))),
             "req_b",
             None,
+            HashSet::new(),
         );
         // Both hooks should report no scratchpad budget.
         assert!(hook_a.scratchpad_budget.is_none());
@@ -1060,6 +1054,7 @@ mod tests {
             crate::streaming::RunOptions::bounded(Some(Duration::from_secs(60))),
             "req_with_budget",
             Some(budget.clone()),
+            HashSet::new(),
         );
         let stored = hook
             .scratchpad_budget

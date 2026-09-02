@@ -214,7 +214,7 @@ mod tests {
 
     /// `into_events` wraps the stream, so the order is asserted rather than the
     /// count — a wrapper that buffered or reordered would keep the count.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_yielding_agent_produces_its_items_then_ends() {
         let agent = MockAgent::yielding(vec![items::text("hello "), items::text("world")]);
         let mut stream = agent
