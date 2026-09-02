@@ -73,6 +73,7 @@ pub mod event_names {
     pub const TASK_STARTED: &str = "aura.orchestrator.task_started";
     pub const TASK_COMPLETED: &str = "aura.orchestrator.task_completed";
     pub const TASK_BLOCKED: &str = "aura.orchestrator.task_blocked";
+    pub const RUN_PARKED: &str = "aura.orchestrator.run_parked";
     pub const ITERATION_COMPLETE: &str = "aura.orchestrator.iteration_complete";
     pub const REPLAN_STARTED: &str = "aura.orchestrator.replan_started";
     pub const SYNTHESIZING: &str = "aura.orchestrator.synthesizing";
@@ -147,6 +148,16 @@ pub enum OrchestrationStreamEvent {
         tool_name: String,
         orchestrator_id: String,
         worker_id: String,
+        #[serde(flatten)]
+        context: EventContext,
+    },
+    /// Emitted when a run parks at the quiescence verdict and its checkpoint
+    /// is published (park mode); terminal for the run.
+    RunParked {
+        run_id: String,
+        decision_ids: Vec<String>,
+        expires_at: String,
+        iteration: usize,
         #[serde(flatten)]
         context: EventContext,
     },
@@ -250,6 +261,7 @@ impl OrchestrationStreamEvent {
             Self::TaskStarted { .. } => event_names::TASK_STARTED,
             Self::TaskCompleted { .. } => event_names::TASK_COMPLETED,
             Self::TaskBlocked { .. } => event_names::TASK_BLOCKED,
+            Self::RunParked { .. } => event_names::RUN_PARKED,
             Self::IterationComplete { .. } => event_names::ITERATION_COMPLETE,
             Self::ReplanStarted { .. } => event_names::REPLAN_STARTED,
             Self::Synthesizing { .. } => event_names::SYNTHESIZING,
@@ -364,6 +376,23 @@ impl OrchestrationStreamEvent {
             tool_name: tool_name.into(),
             orchestrator_id: orchestrator_id.into(),
             worker_id: worker_id.into(),
+            context,
+        }
+    }
+
+    /// Create a RunParked event (terminal, one per parked run).
+    pub fn run_parked(
+        run_id: impl Into<String>,
+        decision_ids: Vec<String>,
+        expires_at: impl Into<String>,
+        iteration: usize,
+        context: EventContext,
+    ) -> Self {
+        Self::RunParked {
+            run_id: run_id.into(),
+            decision_ids,
+            expires_at: expires_at.into(),
+            iteration,
             context,
         }
     }
@@ -532,5 +561,29 @@ mod tests {
         assert!(sse.contains("\"decision_id\":\"0191e8c0-1111-7000-8000-00000000000a\""));
         assert!(sse.contains("\"orchestrator_id\":\"orch-1\""));
         assert!(sse.contains("\"worker_id\":\"operations\""));
+    }
+
+    /// The parked-run event is named `aura.orchestrator.run_parked` and
+    /// carries the run id, the awaiting decision ids, the expiry, and the
+    /// iteration.
+    #[test]
+    fn run_parked_event_name_and_payload() {
+        let event = OrchestrationStreamEvent::run_parked(
+            "0191e8c0-1111-7000-8000-0000000000ff",
+            vec!["0191e8c0-1111-7000-8000-00000000000a".to_string()],
+            "2026-09-02T15:03:11+00:00",
+            1,
+            test_ctx(),
+        );
+
+        assert_eq!(event.event_name(), event_names::RUN_PARKED);
+        assert_eq!(event_names::RUN_PARKED, "aura.orchestrator.run_parked");
+
+        let sse = event.format_sse();
+        assert!(sse.starts_with("event: aura.orchestrator.run_parked\n"));
+        assert!(sse.contains("\"run_id\":\"0191e8c0-1111-7000-8000-0000000000ff\""));
+        assert!(sse.contains("\"decision_ids\":[\"0191e8c0-1111-7000-8000-00000000000a\"]"));
+        assert!(sse.contains("\"expires_at\":\"2026-09-02T15:03:11+00:00\""));
+        assert!(sse.contains("\"iteration\":1"));
     }
 }

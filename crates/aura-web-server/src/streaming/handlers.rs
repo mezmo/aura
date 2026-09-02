@@ -1419,6 +1419,27 @@ fn handle_orchestrator_event(
                 event_context,
             )
         }
+        OrchestratorEvent::RunParked {
+            run_id,
+            decision_ids,
+            expires_at,
+            iteration,
+        } => {
+            tracing::debug!(
+                "Orchestrator: run {} parked at iteration {} ({} decision(s), expires {})",
+                run_id,
+                iteration,
+                decision_ids.len(),
+                expires_at
+            );
+            OrchestrationStreamEvent::run_parked(
+                run_id,
+                decision_ids.clone(),
+                expires_at,
+                *iteration,
+                event_context,
+            )
+        }
     };
 
     vec![Bytes::from(sse_event.format_sse())]

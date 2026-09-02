@@ -1,0 +1,153 @@
+{
+  "schema_version": 1,
+  "session_id": "sess-golden-0001",
+  "run_id": "0191e8c0-aaaa-7000-8000-00000000c0de",
+  "parked_at": "2026-09-02T14:03:11.000000+00:00",
+  "expires_at": "2026-09-02T15:03:11.000000+00:00",
+  "query": "Deploy the billing service to production",
+  "chat_history": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "Deploy the billing service to production"
+        }
+      ]
+    }
+  ],
+  "coordinator_conversation": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "Route this query."
+        }
+      ]
+    },
+    {
+      "role": "assistant",
+      "id": null,
+      "content": [
+        {
+          "text": "Two tasks: collect facts, then the gated apply."
+        }
+      ]
+    }
+  ],
+  "routing_decision": {
+    "response_type": "steps_plan",
+    "goal": "Deploy the billing service to production",
+    "steps": [
+      {
+        "type": "task",
+        "task": "Collect deployment facts",
+        "worker": null
+      },
+      {
+        "type": "task",
+        "task": "Apply the deployment",
+        "worker": "operations"
+      }
+    ],
+    "routing_rationale": "The apply step is gated and needs orchestration.",
+    "planning_summary": "Two-step plan with a gated apply."
+  },
+  "iteration": 1,
+  "planning_ms": 2140,
+  "failure_history": [],
+  "plan": {
+    "goal": "Deploy the billing service to production",
+    "steps": [
+      {
+        "type": "task",
+        "task": "Collect deployment facts",
+        "worker": null
+      },
+      {
+        "type": "task",
+        "task": "Apply the deployment",
+        "worker": "operations"
+      }
+    ],
+    "tasks": [
+      {
+        "task_id": 0,
+        "description": "Collect deployment facts",
+        "dependencies": [],
+        "rationale": "The apply step needs the current deployment state.",
+        "status": "complete",
+        "result": "3 replicas, image billing:2.14.0, no pending migrations."
+      },
+      {
+        "task_id": 1,
+        "description": "Apply the deployment",
+        "dependencies": [
+          0
+        ],
+        "worker": "operations",
+        "rationale": "The gated production apply.",
+        "status": "awaiting_approval",
+        "attempt": 1,
+        "pending": [
+          {
+            "decision_id": "0191e8c0-bbbb-7000-8000-000000000042",
+            "tool_name": "kubectl_apply",
+            "arguments": {
+              "namespace": "prod"
+            },
+            "call_id": "call_apply_1"
+          }
+        ],
+        "history": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "Apply the deployment."
+              }
+            ]
+          },
+          {
+            "role": "assistant",
+            "id": null,
+            "content": [
+              {
+                "id": "tc_1",
+                "call_id": "call_apply_1",
+                "function": {
+                  "name": "kubectl_apply",
+                  "arguments": {
+                    "namespace": "prod"
+                  }
+                },
+                "signature": null,
+                "additional_params": null
+              }
+            ]
+          }
+        ],
+        "current_prompt": {
+          "role": "user",
+          "content": [
+            {
+              "type": "toolresult",
+              "id": "tr_1",
+              "call_id": "call_apply_1",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "This tool call is parked pending human approval. It has not run. Do not retry."
+                }
+              ]
+            }
+          ]
+        }
+      }
+    ]
+  },
+  "executed": [],
+  "config_fingerprint": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+}

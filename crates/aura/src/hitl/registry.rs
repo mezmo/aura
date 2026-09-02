@@ -205,6 +205,19 @@ impl PendingApprovals {
         Ok(())
     }
 
+    /// The parked approval record for an id, if the store still holds one.
+    /// A store fault reads as "not parked" (logged), so callers keep their
+    /// fail-closed shape.
+    pub async fn parked(&self, id: &DecisionId) -> Option<ParkedApproval> {
+        match self.0.store.get(id).await {
+            Ok(parked) => parked,
+            Err(err) => {
+                warn!(decision_id = %id, error = %err, "parked approval lookup failed");
+                None
+            }
+        }
+    }
+
     /// The durably recorded decision for an already-resolved approval, if
     /// any. A store fault reads as "no recorded decision" (logged), so
     /// callers keep their fail-closed shape.

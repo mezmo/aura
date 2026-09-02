@@ -74,8 +74,23 @@ pub fn sanitize_filename_component(s: &str) -> String {
 /// separators, no parent references. Artifact filenames and run IDs come from
 /// untrusted tool/LLM input and are validated with this before being joined
 /// into a persistence path.
-fn is_safe_path_component(s: &str) -> bool {
+pub(crate) fn is_safe_path_component(s: &str) -> bool {
     !s.is_empty() && !s.contains('/') && !s.contains('\\') && !s.contains("..")
+}
+
+/// Whether `run_id` has a parked checkpoint document under `parked_dir`,
+/// under either the published or the resuming filename.
+async fn run_has_parked_document(parked_dir: &Path, run_id: &str) -> bool {
+    for suffix in [".json", ".resuming.json"] {
+        if parked_dir
+            .join(format!("{run_id}{suffix}"))
+            .try_exists()
+            .is_ok_and(|e| e)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 // ============================================================================
@@ -210,6 +225,9 @@ pub enum RunStatus {
     PartialSuccess,
     /// Run failed entirely.
     Failed,
+    /// Run stopped at the park verdict awaiting human decisions; the parked
+    /// checkpoint document is the record.
+    Parked,
 }
 
 /// Summary of a worker's execution for a task.
@@ -325,12 +343,62 @@ impl ExecutionPersistence {
         })
     }
 
+    /// Rebind persistence to a run directory recorded by an earlier
+    /// execution, binding a later resume to that run's artifacts.
+    ///
+    /// Uses the recorded `run_id` (not a fresh one), validates it against
+    /// path traversal, and re-creates the directory if it has been removed.
+    /// Iterations restart at 1; the resume's iterations write alongside the
+    /// original ones.
+    pub async fn reopen<P: AsRef<Path>>(
+        base_path: P,
+        session_id: Option<String>,
+        run_id: &str,
+    ) -> io::Result<Self> {
+        if let Some(ref sid) = session_id
+            && (sid.is_empty() || sid.contains('/') || sid.contains('\\') || sid.contains(".."))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Invalid session_id for persistence path: {:?}", sid),
+            ));
+        }
+        if !is_safe_path_component(run_id) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Invalid run_id for persistence reopen: {:?}", run_id),
+            ));
+        }
+
+        let effective_base = match session_id.as_deref() {
+            Some(sid) => base_path.as_ref().join(sid),
+            None => base_path.as_ref().to_path_buf(),
+        };
+        let run_path = effective_base.join(run_id);
+        fs::create_dir_all(&run_path).await?;
+
+        tracing::info!("🗂️ Execution persistence reopened: {}", run_path.display());
+
+        Ok(Self {
+            base_path: run_path,
+            run_id: run_id.to_string(),
+            session_id,
+            current_iteration: 1,
+            enabled: true,
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            drain_notify: Arc::new(Notify::new()),
+            tool_traces: Arc::new(StdMutex::new(HashMap::new())),
+        })
+    }
+
     /// Prune oldest run directories if the session exceeds `max_runs`.
     ///
-    /// Skips the current run and the `latest` symlink. Directories are sorted
-    /// lexicographically (UUID v7 = chronological order) and the oldest are
-    /// removed first. Best-effort: errors on individual deletions are logged
-    /// but don't fail the operation.
+    /// Skips the current run, the `latest` symlink, the `parked` checkpoint
+    /// directory, and any run holding a parked document (either filename) —
+    /// a parked run's artifacts must survive pruning for its resume to read.
+    /// Directories are sorted lexicographically (UUID v7 = chronological
+    /// order) and the oldest are removed first. Best-effort: errors on
+    /// individual deletions are logged but don't fail the operation.
     pub async fn prune_session_runs(&self, max_runs: usize) {
         if !self.enabled || max_runs == 0 || self.session_id.is_none() {
             return;
@@ -340,6 +408,7 @@ impl ExecutionPersistence {
             Some(p) => p.to_path_buf(),
             None => return,
         };
+        let parked_dir = session_dir.join("parked");
 
         let mut run_dirs: Vec<String> = Vec::new();
         let mut entries = match fs::read_dir(&session_dir).await {
@@ -354,7 +423,11 @@ impl ExecutionPersistence {
                 _ => continue,
             }
             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if name == "latest" || name == self.run_id {
+                if name == "latest" || name == "parked" || name == self.run_id {
+                    continue;
+                }
+                if run_has_parked_document(&parked_dir, name).await {
+                    tracing::info!("Skipping prune of run {} with a parked document", name);
                     continue;
                 }
                 run_dirs.push(name.to_string());
@@ -805,6 +878,20 @@ impl ExecutionPersistence {
     /// Get the session ID (if set).
     pub fn session_id(&self) -> Option<&str> {
         self.session_id.as_deref()
+    }
+
+    /// The session directory owning this run (`{memory_dir}/{session_id}`),
+    /// or `None` for the un-sessioned layout.
+    pub fn session_root(&self) -> Option<&Path> {
+        self.base_path
+            .parent()
+            .filter(|_| self.session_id.is_some())
+    }
+
+    /// The directory this session's parked-run checkpoints live in
+    /// (`{session_root}/parked`).
+    pub fn parked_dir(&self) -> Option<PathBuf> {
+        self.session_root().map(|root| root.join("parked"))
     }
 
     /// Write a typed run manifest to `{run_path}/manifest.json`.
@@ -2476,5 +2563,176 @@ mod tests {
         assert_eq!(meta[0].1, 5); // "short" = 5 bytes
         assert_eq!(meta[1].0, "task-1-sre-iter-1-result.txt");
         assert_eq!(meta[1].1, 20); // "a longer result here" = 20 bytes
+    }
+
+    // ========================================================================
+    // Parked-Run Checkpoint Tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_reopen_binds_to_recorded_run_directory() {
+        let temp_dir = TempDir::new().unwrap();
+        let session_id = "cs_reopen".to_string();
+        let original =
+            ExecutionPersistence::new(temp_dir.path().join("memory"), Some(session_id.clone()))
+                .await
+                .unwrap();
+        let run_id = original.run_id().to_string();
+        original
+            .write_result_artifact(0, None, 1, "prior artifact")
+            .await
+            .unwrap();
+        drop(original);
+
+        let reopened =
+            ExecutionPersistence::reopen(temp_dir.path().join("memory"), Some(session_id), &run_id)
+                .await
+                .unwrap();
+
+        assert_eq!(reopened.run_id(), run_id, "the recorded run id is kept");
+        assert_eq!(
+            reopened.run_path(),
+            temp_dir
+                .path()
+                .join("memory")
+                .join("cs_reopen")
+                .join(&run_id)
+        );
+        assert_eq!(reopened.current_iteration(), 1);
+        assert_eq!(
+            reopened
+                .read_artifact("task-0-default-iter-1-result.txt")
+                .await
+                .unwrap(),
+            "prior artifact",
+            "a resumed run reads the recorded run's artifacts"
+        );
+
+        let filename = reopened
+            .write_result_artifact(1, None, 1, "resume artifact")
+            .await
+            .unwrap();
+        assert!(
+            reopened
+                .run_path()
+                .join("artifacts")
+                .join(&filename)
+                .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reopen_rejects_traversal_run_id() {
+        let temp_dir = TempDir::new().unwrap();
+        for bad_id in &["../escape", "foo/bar", "..\\win", ""] {
+            let result =
+                ExecutionPersistence::reopen(temp_dir.path().join("memory"), None, bad_id).await;
+            assert!(result.is_err(), "Should reject run_id: {:?}", bad_id);
+            assert_eq!(
+                result.err().unwrap().kind(),
+                std::io::ErrorKind::InvalidInput
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_session_root_and_parked_dir_helpers() {
+        let temp_dir = TempDir::new().unwrap();
+        let session_id = "cs_parked".to_string();
+        let persistence =
+            ExecutionPersistence::new(temp_dir.path().join("memory"), Some(session_id))
+                .await
+                .unwrap();
+        assert_eq!(
+            persistence.session_root(),
+            Some(temp_dir.path().join("memory").join("cs_parked").as_path())
+        );
+        assert_eq!(
+            persistence.parked_dir(),
+            Some(
+                temp_dir
+                    .path()
+                    .join("memory")
+                    .join("cs_parked")
+                    .join("parked")
+            )
+        );
+
+        let flat = ExecutionPersistence::new(temp_dir.path().join("memory"), None)
+            .await
+            .unwrap();
+        assert!(
+            flat.session_root().is_none(),
+            "the flat layout has no session root"
+        );
+        assert!(flat.parked_dir().is_none());
+    }
+
+    /// Pruning skips the `parked` checkpoint directory itself and any run
+    /// holding a parked document (under either filename), while still
+    /// removing plain old runs past the cap.
+    #[tokio::test]
+    async fn test_prune_skips_parked_directory_and_parked_runs() {
+        let temp_dir = TempDir::new().unwrap();
+        let session_dir = temp_dir.path().join("memory").join("cs_prune");
+        let oldest = "0191e8c0-0000-7000-8000-000000000001";
+        let second = "0191e8c0-0aaa-7000-8000-000000000005";
+        let parked = "0191e8c0-1111-7000-8000-000000000002";
+        let parked_resuming = "0191e8c0-2222-7000-8000-000000000003";
+        let current = "0191e8c0-9999-7000-8000-000000000004";
+        for run in [oldest, second, parked, parked_resuming, current] {
+            tokio::fs::create_dir_all(session_dir.join(run))
+                .await
+                .unwrap();
+        }
+        let parked_dir = session_dir.join("parked");
+        tokio::fs::create_dir_all(&parked_dir).await.unwrap();
+        tokio::fs::write(parked_dir.join(format!("{parked}.json")), "{}")
+            .await
+            .unwrap();
+        tokio::fs::write(
+            parked_dir.join(format!("{parked_resuming}.resuming.json")),
+            "{}",
+        )
+        .await
+        .unwrap();
+
+        let persistence = ExecutionPersistence::reopen(
+            temp_dir.path().join("memory"),
+            Some("cs_prune".to_string()),
+            current,
+        )
+        .await
+        .unwrap();
+        persistence.prune_session_runs(1).await;
+
+        assert!(
+            !session_dir.join(oldest).exists() && !session_dir.join(second).exists(),
+            "plain old runs past the cap are pruned"
+        );
+        assert!(
+            session_dir.join(parked).exists(),
+            "a run with a parked document survives pruning"
+        );
+        assert!(
+            session_dir.join(parked_resuming).exists(),
+            "a run with only a resuming document survives pruning"
+        );
+        assert!(
+            session_dir.join(current).exists(),
+            "the current run survives pruning"
+        );
+        assert!(
+            parked_dir.join(format!("{parked}.json")).exists(),
+            "the parked directory's documents are never pruned as runs"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_status_parked_serializes_snake_case() {
+        let json = serde_json::to_string(&RunStatus::Parked).unwrap();
+        assert_eq!(json, r#""parked""#);
+        let back: RunStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, RunStatus::Parked);
     }
 }

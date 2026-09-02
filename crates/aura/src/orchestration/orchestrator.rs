@@ -37,6 +37,7 @@
 //! - `TaskStarted` - when a worker begins a task
 //! - `TaskCompleted` - when a worker finishes a task
 //! - `TaskBlocked` - when a worker parks gated calls (park mode)
+//! - `RunParked` - when a run parks with a published checkpoint (park mode)
 //! - `IterationComplete` - when the post-execute coordinator decision completes
 //! - `Synthesizing` - when task results are being consolidated for the coordinator
 
@@ -61,10 +62,12 @@ use super::tools::{InspectToolParamsTool, ListToolsTool, ReadArtifactTool};
 
 use super::config::OrchestrationConfig;
 use super::events::OrchestratorEvent;
+use super::park::{ParkGuard, ParkedTaskRecord, ParkedTaskRecords};
 use super::persistence::ExecutionPersistence;
 use super::types::{
     BlockedCell, CellOutcome, FailedTaskRecord, FailureCategory, FailureSummary, IterationContext,
-    IterationOutcome, IterationTimings, PendingCall, Plan, PlanningResponse, TaskState, TaskStatus,
+    IterationOutcome, IterationTimings, ParkSnapshot, PendingCall, Plan, PlanningResponse,
+    TaskState, TaskStatus,
 };
 
 // ============================================================================
@@ -104,10 +107,18 @@ struct TaskExecutionResult {
 /// `Ok(TaskOutcome::Completed(..))` / `Err(..)` exactly as before; a worker
 /// that parked gated calls (park mode) returns [`TaskOutcome::Blocked`] and
 /// the plan records it as `TaskState::AwaitingApproval`.
+#[allow(clippy::large_enum_variant)]
 enum TaskOutcome {
     Completed(TaskExecutionResult),
     /// The worker's blocked cell held parked calls with a captured snapshot.
-    Blocked(Vec<PendingCall>),
+    /// The cell drops when `execute_task` returns, so the snapshot and the
+    /// blocking attempt travel here — the park commit's checkpoint node
+    /// serializes them.
+    Blocked {
+        pending: Vec<PendingCall>,
+        attempt: usize,
+        snapshot: ParkSnapshot,
+    },
 }
 
 /// Per-attempt park-mode state for one worker stream: the blocked cell the
@@ -415,6 +426,10 @@ pub struct Orchestrator {
 
     /// Outer wall-clock budget for the whole run; `None` is unbounded.
     pub(super) outer_budget: Option<Duration>,
+
+    /// Run-scoped park guard (park mode); `None` off the conversational
+    /// route.
+    park_guard: Option<Arc<ParkGuard>>,
 }
 
 /// Stream context for reasoning attribution in `stream_and_forward`.
@@ -559,6 +574,21 @@ impl Orchestrator {
         let orchestrator_id = uuid::Uuid::new_v4().to_string();
 
         let run_id_str = persistence.lock().await.run_id().to_string();
+        // The guard exists only where park mode can register approvals: the
+        // conversational route. It stays inert until a worker blocks.
+        let park_guard = agent_config
+            .hitl
+            .as_ref()
+            .and_then(|hitl| match &*hitl.route {
+                crate::hitl::DecisionRoute::Conversational { registry, .. } => {
+                    Some(ParkGuard::new(
+                        registry.clone(),
+                        run_id_str.clone(),
+                        agent_config.request_id.clone().unwrap_or_default(),
+                    ))
+                }
+                crate::hitl::DecisionRoute::Webhook { .. } => None,
+            });
         let default_turn_depth = agent_config
             .agent
             .turn_depth
@@ -581,6 +611,7 @@ impl Orchestrator {
             persistence,
             usage_state: crate::UsageState::new(),
             outer_budget: None,
+            park_guard,
         })
     }
 
@@ -1044,6 +1075,28 @@ impl Orchestrator {
         })
     }
 
+    /// The worker approval scope stamped on a task's approvals — the same
+    /// shape `create_worker` builds for the gate and the park guard's
+    /// cancellation events.
+    async fn worker_scope(
+        &self,
+        task_id: usize,
+        worker_name: Option<&str>,
+    ) -> Option<crate::hitl::AgentScope> {
+        let (run_id, session_id) = {
+            let p = self.persistence.lock().await;
+            (p.run_id().to_string(), p.session_id().map(String::from))
+        };
+        run_id
+            .parse::<super::RunId>()
+            .ok()
+            .map(|run_id| crate::hitl::AgentScope::Worker {
+                run_id,
+                task: super::TaskIdentity::new(task_id, worker_name.map(String::from)),
+                session_id: session_id.map(crate::config::SessionId::new),
+            })
+    }
+
     /// Orphan cleanup for a parked worker whose stream ended before the hook
     /// captured its conversation: every pending decision id is removed from
     /// the store with an `approval_completed(cancelled)` event, so the human
@@ -1060,20 +1113,7 @@ impl Orchestrator {
         let crate::hitl::DecisionRoute::Conversational { registry, .. } = &*hitl.route else {
             return;
         };
-        let (run_id, session_id) = {
-            let p = self.persistence.lock().await;
-            (p.run_id().to_string(), p.session_id().map(String::from))
-        };
-        // Same scope shape `create_worker` stamps on the worker's approvals.
-        let scope =
-            run_id
-                .parse::<super::RunId>()
-                .ok()
-                .map(|run_id| crate::hitl::AgentScope::Worker {
-                    run_id,
-                    task: super::TaskIdentity::new(task_id, worker_name.map(String::from)),
-                    session_id: session_id.map(crate::config::SessionId::new),
-                });
+        let scope = self.worker_scope(task_id, worker_name).await;
         let request_id = self.agent_config.request_id.clone().unwrap_or_default();
         for call in pending {
             registry.remove(&call.decision_id).await;
@@ -3135,16 +3175,18 @@ Assign tasks to the worker whose tools best match the required operations."#,
     /// Each worker receives the plan goal (not the raw query) to understand context.
     ///
     /// Returns the aggregate task-compute time (sum of per-task wall durations
-    /// across all waves), used for the iteration's phase-timing breakdown.
+    /// across all waves) and the park records for the tasks that blocked —
+    /// the park commit's checkpoint nodes serialize them.
     async fn execute(
         &self,
         plan: &mut Plan,
         event_tx: &tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>,
-    ) -> Result<u64, StreamError> {
+    ) -> Result<(u64, ParkedTaskRecords), StreamError> {
         use futures::StreamExt;
         use futures::stream::FuturesUnordered;
 
         let mut task_compute_ms: u64 = 0;
+        let mut park_records: ParkedTaskRecords = ParkedTaskRecords::new();
         while !plan.is_finished() {
             // Collect ready tasks with their context and worker assignment
             // Tuple: (task_id, description, context, worker_name)
@@ -3275,12 +3317,18 @@ Assign tasks to the worker whose tools best match the required operations."#,
                             );
                         }
                     }
-                    Ok(TaskOutcome::Blocked(pending)) => {
+                    Ok(TaskOutcome::Blocked {
+                        pending,
+                        attempt,
+                        snapshot,
+                    }) => {
                         // Park mode: the worker parked gated calls and its
                         // captured conversation was confirmed by the cell's
                         // snapshot. The task awaits human decisions; no
                         // artifact, no completion event — one blocked event
-                        // per parked call is the wire signal.
+                        // per parked call is the wire signal. The snapshot
+                        // and attempt are recorded before the cell drops so
+                        // the park commit can serialize them.
                         let worker_id = worker_name.clone().unwrap_or(self.orchestrator_id.clone());
                         for call in &pending {
                             let _ = event_tx
@@ -3297,8 +3345,17 @@ Assign tasks to the worker whose tools best match the required operations."#,
                                 .await;
                         }
                         if let Some(t) = plan.get_task_mut(task_id) {
-                            t.state = TaskState::AwaitingApproval { pending };
+                            t.state = TaskState::AwaitingApproval {
+                                pending: pending.clone(),
+                            };
                         }
+                        if let Some(ref guard) = self.park_guard
+                            && let Some(scope) =
+                                self.worker_scope(task_id, worker_name.as_deref()).await
+                        {
+                            guard.record(&scope, &pending);
+                        }
+                        park_records.insert(task_id, ParkedTaskRecord { attempt, snapshot });
                         tracing::warn!(
                             "Task {} ('{}') blocked awaiting approval after {}ms",
                             task_id,
@@ -3342,7 +3399,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             }
         }
 
-        Ok(task_compute_ms)
+        Ok((task_compute_ms, park_records))
     }
 
     /// Collect failed tasks from this iteration into failure records.
@@ -3638,7 +3695,17 @@ Assign tasks to the worker whose tools best match the required operations."#,
                             task_id,
                             pending.len()
                         );
-                        return Ok(TaskOutcome::Blocked(pending));
+                        // `outcome` reports Blocked only when the snapshot
+                        // was captured, so the read-back cannot miss.
+                        let snapshot = park
+                            .cell
+                            .snapshot()
+                            .expect("cell outcome Blocked implies a captured snapshot");
+                        return Ok(TaskOutcome::Blocked {
+                            pending,
+                            attempt,
+                            snapshot,
+                        });
                     }
                     CellOutcome::Orphaned { pending } => {
                         // The stream ended before the hook could snapshot
@@ -4356,8 +4423,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
         // ----------------------------------------------------------------
         // EXECUTE: Run workers on tasks (parallel when possible)
         // ----------------------------------------------------------------
-        let task_compute_ms = match self.execute(&mut plan, event_tx).await {
-            Ok(ms) => ms,
+        let (task_compute_ms, park_records) = match self.execute(&mut plan, event_tx).await {
+            Ok(result) => result,
             Err(e) => {
                 self.write_run_manifest(&plan, iteration, None).await;
                 return Err(e);
@@ -4393,29 +4460,39 @@ Assign tasks to the worker whose tools best match the required operations."#,
         // ----------------------------------------------------------------
         // PARK PATH (park mode): any awaiting task at quiescence parks the
         // run. The persistence drain above already flushed in-flight tool
-        // writes (warn-and-continue; no barrier machinery). The checkpoint
-        // document and the terminal `run_parked` event are the park-commit
-        // card's work — this card stops at the quiescence verdict, ending
-        // the iteration without a post-execute coordinator call: the
-        // coordinator must not replan a task the human is deciding on.
+        // writes (warn-and-continue; no barrier machinery). The park commit
+        // below refreshes the awaiting set against the approval store,
+        // publishes the checkpoint document, emits the terminal
+        // `run_parked` event, and ends the run — the coordinator must not
+        // replan a task the human is deciding on. A failed commit publishes
+        // nothing and cancels the run's approvals.
         // ----------------------------------------------------------------
         if quiescence_verdict(&plan) == QuiescenceVerdict::Park {
-            let lines = park_verdict_lines(&plan);
-            let run_id = self.persistence.lock().await.run_id().to_string();
-            let mut message = format!("Run {} parked: task(s) awaiting human approval.\n", run_id);
-            for line in &lines {
-                message.push_str(&format!("- {line}\n"));
-            }
-            message.push_str(
-                "The run has stopped and no further tasks will execute until the \
-                 outstanding decisions are recorded.",
-            );
             tracing::info!(
                 "Iteration {} parked at quiescence; skipping post-execute coordinator call",
                 iteration
             );
-            self.write_run_manifest(&plan, iteration, None).await;
-            return Ok(IterationOutcome::FinalResult(message));
+            let conversation = coordinator_state.conversation.clone();
+            let routing_decision = coordinator_state.routing_decision.lock().await.clone();
+            let result = self
+                .park_run(
+                    query,
+                    chat_history,
+                    &conversation,
+                    routing_decision.as_ref(),
+                    iteration,
+                    planning_ms,
+                    failure_history.as_slice(),
+                    &plan,
+                    &park_records,
+                    event_tx,
+                )
+                .await;
+            match &result {
+                Ok(_) => self.write_parked_manifest(&plan, iteration).await,
+                Err(_) => self.write_run_manifest(&plan, iteration, None).await,
+            }
+            return result.map(IterationOutcome::FinalResult);
         }
 
         // ----------------------------------------------------------------
@@ -4852,20 +4929,189 @@ Assign tasks to the worker whose tools best match the required operations."#,
     ///
     /// `timings` carries the final iteration's phase timings when available
     /// (`None` for paths that failed before the timed consolidation step).
+    /// Commit the park checkpoint and end the run (park mode).
+    ///
+    /// The commit is shared by a first park and every re-park of a resumed
+    /// run: refresh the awaiting set against the approval store, serialize
+    /// from the run's current state, publish by temp write and
+    /// same-directory rename, then emit the terminal `run_parked` event —
+    /// only after the rename succeeded. A failed commit publishes nothing,
+    /// emits no event, and cancels the run's approvals with
+    /// `cancel_request("run:{run_id}")` before the stream ends.
+    #[allow(clippy::too_many_arguments)]
+    async fn park_run(
+        &self,
+        query: &str,
+        chat_history: &[rig::completion::Message],
+        coordinator_conversation: &[rig::completion::Message],
+        routing_decision: Option<&PlanningResponse>,
+        iteration: usize,
+        planning_ms: u64,
+        failure_history: &[FailedTaskRecord],
+        plan: &Plan,
+        park_records: &ParkedTaskRecords,
+        event_tx: &tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>,
+    ) -> Result<String, StreamError> {
+        let Some(hitl) = self.agent_config.hitl.clone() else {
+            return Err("run parked without the HITL runtime configured".into());
+        };
+        let crate::hitl::DecisionRoute::Conversational { registry, .. } = &*hitl.route else {
+            return Err("run parked without the conversational route".into());
+        };
+        let (run_id, session_id) = {
+            let p = self.persistence.lock().await;
+            (p.run_id().to_string(), p.session_id().map(String::from))
+        };
+
+        let Some(memory_dir) = self.agent_config.effective_memory_dir().map(str::to_string) else {
+            // No memory_dir means no checkpoint can exist, so the run's
+            // approvals must not stay decidable.
+            tracing::error!(
+                run_id = %run_id,
+                "park commit impossible: no memory_dir configured; cancelling approvals",
+            );
+            self.cancel_run_parked_approvals(plan, &run_id).await;
+            return Err(format!(
+                "Run {run_id} parked but no memory_dir is configured, so no \
+                 checkpoint can be written. The run's pending approvals were cancelled.",
+            )
+            .into());
+        };
+
+        let inputs = super::park::ParkCommitInputs {
+            state: super::park::RunStateForPark {
+                run_id: &run_id,
+                session_id: session_id.as_deref(),
+                query,
+                chat_history,
+                coordinator_conversation,
+                routing_decision,
+                iteration,
+                planning_ms,
+                failure_history,
+            },
+            plan,
+            records: park_records,
+            registry,
+            memory_dir: &memory_dir,
+            config: &self.agent_config,
+        };
+
+        match super::park::commit_from_run_state(&inputs).await {
+            Ok((_path, refreshed)) => {
+                if let Some(ref guard) = self.park_guard {
+                    guard.mark_published();
+                }
+                let expires_at = refreshed
+                    .expires_at
+                    .map(|t| t.to_rfc3339())
+                    .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+                Self::emit_event(
+                    event_tx,
+                    OrchestratorEvent::RunParked {
+                        run_id: run_id.clone(),
+                        decision_ids: refreshed
+                            .decision_ids
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect(),
+                        expires_at,
+                        iteration,
+                    },
+                )
+                .await;
+                let mut message =
+                    format!("Run {run_id} parked: task(s) awaiting human approval.\n");
+                for line in park_verdict_lines(plan) {
+                    message.push_str(&format!("- {line}\n"));
+                }
+                message.push_str(
+                    "The run has stopped and no further tasks will execute until the \
+                     outstanding decisions are recorded.",
+                );
+                Ok(message)
+            }
+            Err(e) => {
+                tracing::error!(
+                    run_id = %run_id,
+                    error = %e,
+                    "park commit failed; cancelling the run's approvals",
+                );
+                self.cancel_run_parked_approvals(plan, &run_id).await;
+                Err(format!(
+                    "Park commit failed for run {run_id}: {e}. The run's pending \
+                     approvals were cancelled.",
+                )
+                .into())
+            }
+        }
+    }
+
+    /// Cancel every approval this run parked, with `approval_completed(cancelled)`
+    /// events on the live request, so no decidable approval outlives a run
+    /// that has no checkpoint.
+    async fn cancel_run_parked_approvals(&self, plan: &Plan, run_id: &str) {
+        let Some(hitl) = self.agent_config.hitl.clone() else {
+            return;
+        };
+        let crate::hitl::DecisionRoute::Conversational { registry, .. } = &*hitl.route else {
+            return;
+        };
+        let mut cancelled = Vec::new();
+        for task in &plan.tasks {
+            let TaskState::AwaitingApproval { pending } = &task.state else {
+                continue;
+            };
+            let Some(scope) = self.worker_scope(task.id, task.worker.as_deref()).await else {
+                continue;
+            };
+            cancelled.extend(pending.iter().map(|call| (call.decision_id, scope.clone())));
+        }
+        let request_id = self.agent_config.request_id.clone().unwrap_or_default();
+        super::park::cancel_run_approvals(registry, run_id, &request_id, cancelled.into_iter())
+            .await;
+    }
+
     async fn write_run_manifest(
         &self,
         plan: &Plan,
         iterations: usize,
         timings: Option<IterationTimings>,
     ) {
-        self.write_run_manifest_with_summary(plan, iterations, None, timings)
+        self.write_run_manifest_inner(plan, iterations, None, None, timings)
             .await;
+    }
+
+    /// The manifest for a parked run: `RunStatus::Parked` with the awaiting
+    /// outcome, so session history records the park instead of deriving a
+    /// failure from the incomplete task counts.
+    async fn write_parked_manifest(&self, plan: &Plan, iterations: usize) {
+        self.write_run_manifest_inner(
+            plan,
+            iterations,
+            Some(super::persistence::RunStatus::Parked),
+            Some("Parked awaiting human approval".to_string()),
+            None,
+        )
+        .await;
     }
 
     async fn write_run_manifest_with_summary(
         &self,
         plan: &Plan,
         iterations: usize,
+        response_summary: Option<String>,
+        timings: Option<IterationTimings>,
+    ) {
+        self.write_run_manifest_inner(plan, iterations, None, response_summary, timings)
+            .await;
+    }
+
+    async fn write_run_manifest_inner(
+        &self,
+        plan: &Plan,
+        iterations: usize,
+        status_override: Option<super::persistence::RunStatus>,
         response_summary: Option<String>,
         timings: Option<IterationTimings>,
     ) {
@@ -4877,13 +5123,15 @@ Assign tasks to the worker whose tools best match the required operations."#,
         let persistence = self.persistence.lock().await;
 
         let all_complete = plan.completed_count() == plan.tasks.len();
-        let status = if all_complete {
-            RunStatus::Success
-        } else if plan.completed_count() > 0 {
-            RunStatus::PartialSuccess
-        } else {
-            RunStatus::Failed
-        };
+        let status = status_override.unwrap_or_else(|| {
+            if all_complete {
+                RunStatus::Success
+            } else if plan.completed_count() > 0 {
+                RunStatus::PartialSuccess
+            } else {
+                RunStatus::Failed
+            }
+        });
 
         let artifacts_meta = match persistence.list_artifacts_with_metadata().await {
             Ok(meta) => meta,
@@ -6921,9 +7169,13 @@ mod tests {
         mark_awaiting(&mut plan, 1, vec![parked_call("kubectl_apply")]);
 
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(32);
-        let compute_ms = orchestrator.execute(&mut plan, &event_tx).await.unwrap();
+        let (compute_ms, park_records) = orchestrator.execute(&mut plan, &event_tx).await.unwrap();
 
         assert_eq!(compute_ms, 0, "no worker ran");
+        assert!(
+            park_records.is_empty(),
+            "no park record exists for a pre-marked awaiting plan"
+        );
         assert!(matches!(
             plan.tasks[1].state,
             TaskState::AwaitingApproval { .. }
@@ -7077,6 +7329,308 @@ mod tests {
                 other => panic!("expected Completed(cancelled) event, got {other:?}"),
             }
         }
+
+        crate::approval_event_broker::unsubscribe(&request_id).await;
+    }
+
+    // ====================================================================
+    // Park commit (park mode)
+    // ====================================================================
+
+    use crate::hitl::{ApprovalItem, ParkedApproval};
+    use crate::session_store::ApprovalStore;
+
+    /// An orchestrator wired for park mode over an in-memory store, plus the
+    /// store handle and its memory dir.
+    async fn park_orchestrator(
+        memory_dir: &std::path::Path,
+    ) -> (
+        Orchestrator,
+        Arc<crate::session_store::InMemoryApprovalStore>,
+        crate::hitl::PendingApprovals,
+        String,
+    ) {
+        use crate::hitl::PendingApprovals;
+        use crate::session_store::{InMemoryApprovalStore, InMemoryEventBus};
+
+        let store = Arc::new(InMemoryApprovalStore::new());
+        let registry = PendingApprovals::with_backend(
+            store.clone() as Arc<dyn crate::session_store::ApprovalStore>,
+            Arc::new(InMemoryEventBus::new()),
+        );
+        let config = AgentRuntimeConfig {
+            hitl: Some(crate::hitl::HitlRuntime {
+                patterns: Arc::from([aura_config::GlobPattern::new("kubectl_*").unwrap()]),
+                route: Arc::new(crate::hitl::DecisionRoute::Conversational {
+                    registry: registry.clone(),
+                    timeout: Duration::from_secs(3600),
+                }),
+                park_enabled: true,
+            }),
+            memory_dir: Some(memory_dir.to_string_lossy().into_owned()),
+            session_id: Some("park-sess".to_string()),
+            request_id: Some(format!("req_park_{}", uuid::Uuid::new_v4().simple())),
+            ..AgentRuntimeConfig::default()
+        };
+        let orchestrator = Orchestrator::new(config).await.unwrap();
+        let run_id = orchestrator.persistence.lock().await.run_id().to_string();
+        (orchestrator, store, registry, run_id)
+    }
+
+    /// An awaiting plan plus its park record, with every pending call
+    /// durably parked under the run-scoped owner — the state the gate and
+    /// hook leave behind at the quiescence verdict.
+    async fn awaiting_plan_with_parked_calls(
+        registry: &crate::hitl::PendingApprovals,
+        run_id: &str,
+    ) -> (Plan, ParkedTaskRecords, Vec<TestPendingCall>) {
+        let mut plan = Plan::new("Deploy");
+        plan.add_task(Task::new(0, "Facts", "r"));
+        plan.add_task(Task::new(1, "Gated apply", "r").with_dependency(0));
+        plan.get_task_mut(0).unwrap().complete("facts");
+
+        let now = chrono::Utc::now();
+        let mut pending = Vec::new();
+        for tool in ["kubectl_apply", "kubectl_delete"] {
+            let decision_id = TestDecisionId::generate();
+            registry
+                .register_durable(ParkedApproval {
+                    request: crate::hitl::ApprovalRequest {
+                        version: crate::hitl::PROTOCOL_VERSION,
+                        decision_id,
+                        request_id: format!("run:{run_id}"),
+                        scope: crate::hitl::AgentScope::Single { session_id: None },
+                        origin: crate::hitl::ApprovalOrigin::ConfigGate {
+                            matched_pattern: "kubectl_*".to_string(),
+                            agent_name: "test-agent".to_string(),
+                        },
+                        items: vec![ApprovalItem {
+                            tool_name: tool.to_string(),
+                            arguments: serde_json::json!({ "namespace": "prod" }),
+                            tool_call_intent: None,
+                        }],
+                    },
+                    registered_at: now,
+                    expires_at: now + chrono::Duration::hours(1),
+                })
+                .await
+                .unwrap();
+            pending.push(TestPendingCall {
+                decision_id,
+                tool_name: tool.to_string(),
+                arguments: serde_json::json!({ "namespace": "prod" }),
+                call_id: format!("call_{}", pending.len()),
+            });
+        }
+        plan.tasks[1].state = TaskState::AwaitingApproval {
+            pending: pending.clone(),
+        };
+
+        let mut records = ParkedTaskRecords::new();
+        records.insert(
+            1,
+            crate::orchestration::park::ParkedTaskRecord {
+                attempt: 1,
+                snapshot: crate::orchestration::ParkSnapshot {
+                    history: vec![rig::completion::Message::user("apply it")],
+                    current_prompt: rig::completion::Message::user("tool results"),
+                },
+            },
+        );
+        (plan, records, pending)
+    }
+
+    /// The park commit publishes the document at
+    /// `{session_id}/parked/{run_id}.json`, emits the terminal `run_parked`
+    /// event, and marks the guard published — the approvals stay parked for
+    /// the resume, and the awaiting set re-derives from disk alone.
+    #[tokio::test]
+    async fn park_run_publishes_document_event_and_keeps_approvals() {
+        let dir = tempfile::tempdir().unwrap();
+        let (orchestrator, store, registry, run_id) = park_orchestrator(dir.path()).await;
+        let (plan, records, pending) = awaiting_plan_with_parked_calls(&registry, &run_id).await;
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(32);
+
+        let chat_history = vec![rig::completion::Message::user("deploy the service")];
+        let message = orchestrator
+            .park_run(
+                "deploy the service",
+                &chat_history,
+                &[],
+                None,
+                1,
+                2_500,
+                &[],
+                &plan,
+                &records,
+                &event_tx,
+            )
+            .await
+            .expect("the park commit succeeds");
+
+        assert!(message.contains(&run_id), "the end message names the run");
+
+        let document_path = dir
+            .path()
+            .join("park-sess")
+            .join("parked")
+            .join(format!("{run_id}.json"));
+        assert!(
+            document_path.try_exists().unwrap(),
+            "the document lands at {{session_id}}/parked/{{run_id}}.json"
+        );
+
+        let document = crate::orchestration::park::load_parked_run(&document_path).unwrap();
+        assert_eq!(document.run_id, run_id);
+        assert_eq!(document.iteration, 1);
+        assert!(document.executed.is_empty());
+        let expected_ids: Vec<String> = pending.iter().map(|c| c.decision_id.to_string()).collect();
+        assert_eq!(
+            document.awaiting_decision_ids(),
+            expected_ids,
+            "the awaiting set re-derives from disk alone"
+        );
+        let awaiting = document
+            .plan
+            .tasks
+            .iter()
+            .find(|t| t.status == TaskStatus::AwaitingApproval)
+            .unwrap();
+        assert_eq!(awaiting.attempt, Some(1));
+        assert!(awaiting.history.is_some() && awaiting.current_prompt.is_some());
+
+        match event_rx.recv().await {
+            Some(Ok(StreamItem::OrchestratorEvent(OrchestratorEvent::RunParked {
+                run_id: event_run,
+                decision_ids,
+                iteration,
+                ..
+            }))) => {
+                assert_eq!(event_run, run_id);
+                assert_eq!(decision_ids, expected_ids);
+                assert_eq!(iteration, 1);
+            }
+            other => panic!("expected a RunParked event, got {other:?}"),
+        }
+
+        for call in &pending {
+            assert!(
+                store.get(&call.decision_id).await.unwrap().is_some(),
+                "a published checkpoint keeps its approvals parked"
+            );
+        }
+        drop(orchestrator);
+    }
+    /// A failing commit publishes nothing, emits no `run_parked` event, and
+    /// cancels the run's approvals before the stream ends; the guard's later
+    /// drop sweep stays silent instead of double-reporting.
+    #[tokio::test]
+    async fn park_run_failure_publishes_nothing_and_cancels_approvals() {
+        let dir = tempfile::tempdir().unwrap();
+        let (orchestrator, store, registry, run_id) = park_orchestrator(dir.path()).await;
+        let (plan, records, pending) = awaiting_plan_with_parked_calls(&registry, &run_id).await;
+        let request_id = orchestrator
+            .agent_config
+            .request_id
+            .clone()
+            .unwrap_or_default();
+        let mut events = crate::approval_event_broker::subscribe(&request_id).await;
+        // Arm the run guard as `execute` would have before the commit.
+        if let Some(ref guard) = orchestrator.park_guard {
+            let scope = orchestrator
+                .worker_scope(1, plan.tasks[1].worker.as_deref())
+                .await
+                .expect("worker scope builds");
+            guard.record(
+                &scope,
+                &match &plan.tasks[1].state {
+                    TaskState::AwaitingApproval { pending } => pending.clone(),
+                    _ => unreachable!("the fixture task is awaiting"),
+                },
+            );
+        }
+
+        // A read-only session root makes the checkpoint write under
+        // `park-sess/parked/` fail.
+        let session_root = dir.path().join("park-sess");
+        let mut perms = std::fs::metadata(&session_root).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o555);
+        std::fs::set_permissions(&session_root, perms).unwrap();
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(32);
+        let chat_history = vec![rig::completion::Message::user("deploy the service")];
+        let result = orchestrator
+            .park_run(
+                "deploy the service",
+                &chat_history,
+                &[],
+                None,
+                1,
+                2_500,
+                &[],
+                &plan,
+                &records,
+                &event_tx,
+            )
+            .await;
+
+        // Restore writability so the tempdir can clean itself up.
+        let mut perms = std::fs::metadata(&session_root).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&session_root, perms).unwrap();
+
+        let err = result.expect_err("the commit must fail");
+        assert!(
+            err.to_string().contains("Park commit failed"),
+            "error names the failed commit: {err}"
+        );
+
+        assert!(
+            !dir.path()
+                .join("park-sess")
+                .join("parked")
+                .join(format!("{run_id}.json"))
+                .try_exists()
+                .unwrap(),
+            "no document is published on a failed commit"
+        );
+        for call in &pending {
+            assert!(
+                store.get(&call.decision_id).await.unwrap().is_none(),
+                "approval {} cancelled with the run",
+                call.decision_id
+            );
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), event_rx.recv())
+                .await
+                .is_err(),
+            "no run_parked event fires on a failed commit"
+        );
+
+        // One completed(cancelled) per decision from the immediate sweep…
+        for _ in &pending {
+            match tokio::time::timeout(Duration::from_secs(1), events.recv()).await {
+                Ok(Some(crate::approval_event_broker::ApprovalLifecycleEvent::Completed(
+                    completed,
+                ))) => {
+                    assert!(matches!(
+                        completed.outcome,
+                        aura_events::ApprovalOutcomeWire::Cancelled { .. }
+                    ));
+                }
+                other => panic!("expected one Completed(cancelled) per decision, got {other:?}"),
+            }
+        }
+        // …and the guard's drop sweep adds nothing.
+        drop(orchestrator);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), events.recv())
+                .await
+                .is_err(),
+            "the drop sweep does not double-report cancelled approvals"
+        );
 
         crate::approval_event_broker::unsubscribe(&request_id).await;
     }
