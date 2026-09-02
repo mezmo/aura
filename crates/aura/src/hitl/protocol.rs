@@ -18,6 +18,8 @@ pub const PROTOCOL_VERSION: u32 = 1;
 pub struct ApprovalRequest {
     /// Protocol version; always [`PROTOCOL_VERSION`].
     pub version: u32,
+    /// The instance ID of the AURA instance that raised this approval.
+    pub instance_id: String,
     /// The handle a decision resolves against.
     pub decision_id: DecisionId,
     /// The global request id (SSE routing + MCP cancellation), modeled as the
@@ -92,6 +94,7 @@ impl From<ApprovalDecisionWire> for ApprovalDecision {
 #[derive(Debug, Serialize)]
 pub(crate) struct ApprovalRequestWire<'a> {
     pub version: u32,
+    pub instance_id: &'a str,
     pub decision_id: DecisionId,
     pub request_id: &'a str,
     pub scope: AgentScopeWire,

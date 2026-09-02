@@ -790,6 +790,7 @@ mod tests {
     fn single_request(request_id: &str, origin: ApprovalOrigin) -> ApprovalRequest {
         ApprovalRequest {
             version: PROTOCOL_VERSION,
+            instance_id: "test-instance".to_string(),
             decision_id: DecisionId::generate(),
             request_id: request_id.into(),
             scope: AgentScope::Single { session_id: None },
@@ -802,6 +803,7 @@ mod tests {
     fn single_agent_request_wire_shape() {
         let request = ApprovalRequest {
             version: PROTOCOL_VERSION,
+            instance_id: "test-instance".to_string(),
             decision_id: DecisionId::generate(),
             request_id: "req-123".to_string(),
             scope: AgentScope::Single { session_id: None },
@@ -822,6 +824,7 @@ mod tests {
         assert_eq!(value["version"], PROTOCOL_VERSION);
         assert_eq!(value["request_id"], "req-123");
         assert!(value["decision_id"].is_string());
+        assert!(value["instance_id"].is_string());
         // scope/origin are flat, `kind`-tagged DTOs: no Rust variant names leak.
         assert_eq!(value["scope"]["kind"], "single");
         // a sessionless single-agent request omits session_id entirely (no null).
@@ -846,6 +849,7 @@ mod tests {
             "0191e8c0-1111-7000-8000-000000000000".parse().unwrap();
         let request = ApprovalRequest {
             version: PROTOCOL_VERSION,
+            instance_id: "test-instance".to_string(),
             decision_id: DecisionId::generate(),
             request_id: "req-9".to_string(),
             scope: AgentScope::Worker {
@@ -882,6 +886,7 @@ mod tests {
     fn config_gate_item_tool_call_intent_present_on_wire() {
         let request = ApprovalRequest {
             version: PROTOCOL_VERSION,
+            instance_id: "test-instance".to_string(),
             decision_id: DecisionId::generate(),
             request_id: "req-cg-intent".to_string(),
             scope: AgentScope::Single { session_id: None },
@@ -909,6 +914,7 @@ mod tests {
     fn agent_requested_item_tool_call_intent_omitted_when_absent() {
         let request = ApprovalRequest {
             version: PROTOCOL_VERSION,
+            instance_id: "test-instance".to_string(),
             decision_id: DecisionId::generate(),
             request_id: "req-ar-none".to_string(),
             scope: AgentScope::Single { session_id: None },
@@ -936,6 +942,7 @@ mod tests {
     fn agent_requested_item_tool_call_intent_present_on_wire() {
         let request = ApprovalRequest {
             version: PROTOCOL_VERSION,
+            instance_id: "test-instance".to_string(),
             decision_id: DecisionId::generate(),
             request_id: "req-ar-intent".to_string(),
             scope: AgentScope::Single { session_id: None },
@@ -1277,6 +1284,7 @@ mod tests {
         fn test_request(decision_id: DecisionId) -> ApprovalRequest {
             ApprovalRequest {
                 version: PROTOCOL_VERSION,
+                instance_id: "test-instance".to_string(),
                 decision_id,
                 request_id: "req-signed".into(),
                 scope: AgentScope::Single { session_id: None },
@@ -2204,6 +2212,7 @@ mod tests {
         };
         let request = ApprovalRequest {
             version: PROTOCOL_VERSION,
+            instance_id: "test-instance".to_string(),
             decision_id: DecisionId::generate(),
             request_id: request_id.clone(),
             scope: AgentScope::Single { session_id: None },
@@ -2554,6 +2563,7 @@ mod tests {
     fn make_approval_request() -> ApprovalRequest {
         ApprovalRequest {
             version: PROTOCOL_VERSION,
+            instance_id: "test-instance".to_string(),
             decision_id: DecisionId::generate(),
             request_id: "hdr-test".into(),
             scope: AgentScope::Single { session_id: None },

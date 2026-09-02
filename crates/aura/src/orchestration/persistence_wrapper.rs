@@ -1458,6 +1458,7 @@ mod tests {
             scope,
             request_id.clone(),
             "test-agent".to_string(),
+            "test-instance-id".to_string(),
         ));
         let persistence: Arc<dyn ToolWrapper> = Arc::new(test_wrapper(Arc::new(Mutex::new(
             ExecutionPersistence::disabled(),

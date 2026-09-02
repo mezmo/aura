@@ -825,6 +825,7 @@ impl Orchestrator {
                 scope.clone(),
                 request_id.clone(),
                 worker_config.agent.name.clone(),
+                worker_config.instance_id.clone(),
             ));
             wrappers.insert(0, gate);
             worker_config.hitl_request_approval_tool = Some(crate::hitl::RequestApprovalTool::new(
@@ -832,6 +833,7 @@ impl Orchestrator {
                 scope,
                 request_id,
                 worker_config.agent.name.clone(),
+                worker_config.instance_id.clone(),
             ));
         }
 

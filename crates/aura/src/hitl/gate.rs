@@ -32,6 +32,8 @@ pub struct HitlApprovalWrapper {
     request_id: String,
     /// `[agent].name` of the config that built this agent.
     agent_name: String,
+    /// Instance ID of the AURA process that built this wrapper.
+    instance_id: String,
 }
 
 impl HitlApprovalWrapper {
@@ -42,6 +44,7 @@ impl HitlApprovalWrapper {
         scope: AgentScope,
         request_id: String,
         agent_name: String,
+        instance_id: String,
     ) -> Self {
         Self {
             patterns,
@@ -49,6 +52,7 @@ impl HitlApprovalWrapper {
             scope,
             request_id,
             agent_name,
+            instance_id,
         }
     }
 
@@ -79,6 +83,7 @@ impl ToolWrapper for HitlApprovalWrapper {
         };
         let request = ApprovalRequest {
             version: PROTOCOL_VERSION,
+            instance_id: self.instance_id.clone(),
             decision_id: DecisionId::generate(),
             request_id: self.request_id.clone(),
             scope: self.scope.clone(),
@@ -147,6 +152,7 @@ mod tests {
             AgentScope::Single { session_id: None },
             "t".into(),
             "test-agent".to_string(),
+            "test-instance-id".to_string(),
         );
         assert_eq!(wrapper.matched_pattern("kubectl_apply"), Some("kubectl_*"));
         assert_eq!(wrapper.matched_pattern("request_approval"), None);
@@ -172,6 +178,7 @@ mod tests {
             AgentScope::Single { session_id: None },
             "req-test".into(),
             "test-agent".to_string(),
+            "test-instance-id".to_string(),
         );
         let args = serde_json::json!({});
 
@@ -424,6 +431,7 @@ mod tests {
                 AgentScope::Single { session_id: None },
                 request_id.to_string(),
                 "test-agent".to_string(),
+                "test-instance-id".to_string(),
             );
             (
                 WrappedTool::new(inner, Arc::new(gate) as Arc<dyn ToolWrapper>),

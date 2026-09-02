@@ -201,6 +201,7 @@ mod tests {
         ParkedApproval {
             request: ApprovalRequest {
                 version: PROTOCOL_VERSION,
+                instance_id: "test-instance".to_string(),
                 decision_id: DecisionId::generate(),
                 request_id: request_id.to_string(),
                 scope: AgentScope::Single { session_id: None },
