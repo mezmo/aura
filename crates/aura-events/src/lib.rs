@@ -262,6 +262,11 @@ pub enum McpServerOverview {
 pub struct AgentInfo {
     /// Agent identifier — matches the `id` field in `/v1/models` (alias or name).
     pub id: String,
+    /// Stable per-instance UUID derived from agent config and host identity.
+    ///
+    /// Absent when the response comes from a server that predates this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
     /// Short human-readable summary of what the agent does.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,

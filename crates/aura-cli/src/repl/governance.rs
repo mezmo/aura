@@ -14,14 +14,17 @@ pub(crate) fn handle_governance(ctx: &mut CommandContext, args: &str) -> Command
 
     match subcommand {
         Some("sync") if subargs.is_empty() => handle_sync(ctx),
+        Some("info") if subargs.is_empty() => handle_info(ctx),
         _ => {
             println!(
                 "{}: /governance <subcommand>\n\n \
                 Subcommands:\n\n \
-                   sync    {}\n\n",
+                   sync    {}\n \
+                   info    {}\n\n",
                 "Usage".themed(AuraStyle::Primary),
                 "Discover MCP tools and send catalog to governance webhook"
-                    .themed(AuraStyle::Muted)
+                    .themed(AuraStyle::Muted),
+                "Display the instance ID for each loaded agent config".themed(AuraStyle::Muted),
             );
             CommandOutcome::Handled
         }
@@ -47,6 +50,28 @@ fn handle_sync(ctx: &mut CommandContext) -> CommandOutcome {
         }
         #[cfg(feature = "standalone-cli")]
         Backend::Direct(direct) => ctx.rt.block_on(run_sync_standalone(direct)),
+    }
+}
+
+/// Handle `/governance info`.
+fn handle_info(ctx: &mut CommandContext) -> CommandOutcome {
+    match ctx.backend {
+        Backend::Http(_) => {
+            println!(
+                "{}: governance commands are only supported in standalone mode\n\n \
+                The /governance info command reads agent configs directly and cannot run\n \
+                when connected to an AURA web server over HTTP.\n\n \
+                {}\n\n",
+                "Error".themed(AuraStyle::Error),
+                "To use governance commands, run the CLI in standalone mode:\n  \
+                 • omit --api-url to use the default config.toml\n  \
+                 • pass --config <path> to specify a config file or directory"
+                    .themed(AuraStyle::Muted)
+            );
+            CommandOutcome::Handled
+        }
+        #[cfg(feature = "standalone-cli")]
+        Backend::Direct(direct) => run_info_standalone(direct),
     }
 }
 
@@ -122,5 +147,35 @@ async fn run_sync_standalone(direct: &crate::backend::direct::DirectBackend) -> 
         "Finished governence sync".themed(AuraStyle::Primary)
     );
 
+    CommandOutcome::Handled
+}
+
+/// Display instance IDs in standalone mode.
+#[cfg(feature = "standalone-cli")]
+fn run_info_standalone(direct: &crate::backend::direct::DirectBackend) -> CommandOutcome {
+    use aura::instance_id::instance_id as compute_instance_id;
+
+    println!(
+        "{} {}",
+        "●".themed(AuraStyle::Emphasis),
+        "Agent instance identities".themed(AuraStyle::Primary),
+    );
+
+    let configs = direct.configs();
+    for (idx, config) in configs.iter().enumerate() {
+        let pipe = if idx + 1 < configs.len() {
+            "├─"
+        } else {
+            "└─"
+        };
+        let id = compute_instance_id(&config.agent);
+        println!(
+            "  {} {} {}",
+            pipe.themed(AuraStyle::Connector),
+            format!("\"{}\"", config.agent.name).themed(AuraStyle::Primary),
+            format!("instance_id: {id}").themed(AuraStyle::Identifier),
+        );
+    }
+    println!();
     CommandOutcome::Handled
 }
