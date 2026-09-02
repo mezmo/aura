@@ -77,26 +77,34 @@ See the complete [security and data-handling model](SECURITY.md), including tele
 
 ## Integrations
 
-Through compatible [MCP](https://modelcontextprotocol.io) servers, AURA agents can work with:
+Through compatible [MCP](https://modelcontextprotocol.io) servers and built-in integrations, AURA agents can work with:
 
 | Integration | What agents can do |
 | --- | --- |
-| AWS | Inspect cloud resources, logs, metrics, and operational state |
+| [Argo CD](https://www.youtube.com/watch?v=3fvTiybcpqk) | Inspect applications, sync status, and hook logs, and re-run syncs |
+| [AWS](https://www.youtube.com/watch?v=o_M1MtHFYwU) | Inspect cloud resources, logs, metrics, and operational state |
 | Azure | Inspect cloud resources, deployments, monitoring, and operational state |
+| [ClickHouse](https://www.youtube.com/watch?v=5WIJmQ0nDwI) | Query system tables for disk, merge, and replication health |
 | Confluence | Search and maintain operational runbooks |
+| [Dash0](https://www.youtube.com/watch?v=W7G3jlGVBH0) | Query hosted OpenTelemetry traces, metrics, and logs |
 | Datadog | Query metrics, monitors, dashboards, and traces |
 | Docker | Inspect containers, images, logs, and runtime state |
 | GCP | Inspect cloud resources, logs, metrics, and operational state |
-| GitHub | Search code and work with repositories, issues, and pull requests |
+| [GitHub](https://www.youtube.com/watch?v=9MeK_V3U9YA) | Search code and work with repositories, issues, and pull requests |
 | GitLab | Search code and work with repositories, issues, merge requests, and pipelines |
+| [Grafana](https://www.youtube.com/watch?v=RMu0pTWxBec) | Query dashboards, alert rules, logs, and metric data sources |
 | Jira | Search and update issues, projects, and workflows |
 | Kafka | Inspect clusters, topics, consumer groups, and message flows |
-| Kubernetes | Inspect clusters, workloads, events, and logs |
-| Mezmo | Analyze logs, exports, and telemetry pipelines |
+| [Kubernetes](https://www.youtube.com/watch?v=IDkH4-FfGXo) | Inspect clusters, workloads, events, and logs |
+| [Mezmo](https://www.youtube.com/watch?v=sjb3D5tZiOg) | Analyze logs, exports, and telemetry pipelines |
 | New Relic | Query metrics, logs, traces, alerts, and dashboards |
-| Notion | Search and maintain operational runbooks |
-| PagerDuty | Investigate incidents, on-call schedules, and escalations |
-| Prometheus | Query metrics and alert status |
+| [Notion](https://www.youtube.com/watch?v=jXa1jDvpF34) | Search and maintain operational runbooks |
+| [PagerDuty](https://www.youtube.com/watch?v=TERHoRzT8cE) | Investigate incidents, on-call schedules, and escalations |
+| [Prometheus](https://www.youtube.com/watch?v=cw34mXc4XgM) | Query metrics and alert status |
+| [Qdrant](https://www.youtube.com/watch?v=cw34mXc4XgM) | Retrieve runbooks and reference material from vector collections |
+| [Slack](https://www.youtube.com/watch?v=9hWlh-xCzhQ) | Read incident channels and post investigation updates |
+| [Temporal](https://www.youtube.com/watch?v=kuUsojClQcA) | Run agent investigations as steps in durable workflows |
+| [Windows Server](https://www.youtube.com/watch?v=7nFvKJpp9Sk) | Inspect services, drives, processes, and resource usage |
 
 ## Ways to Run AURA
 
