@@ -74,7 +74,7 @@ pub fn sanitize_filename_component(s: &str) -> String {
 /// separators, no parent references. Artifact filenames and run IDs come from
 /// untrusted tool/LLM input and are validated with this before being joined
 /// into a persistence path.
-fn is_safe_path_component(s: &str) -> bool {
+pub(crate) fn is_safe_path_component(s: &str) -> bool {
     !s.is_empty() && !s.contains('/') && !s.contains('\\') && !s.contains("..")
 }
 
@@ -210,6 +210,8 @@ pub enum RunStatus {
     PartialSuccess,
     /// Run failed entirely.
     Failed,
+    /// Run stopped at the park verdict.
+    Parked,
 }
 
 /// Summary of a worker's execution for a task.
@@ -2476,5 +2478,17 @@ mod tests {
         assert_eq!(meta[0].1, 5); // "short" = 5 bytes
         assert_eq!(meta[1].0, "task-1-sre-iter-1-result.txt");
         assert_eq!(meta[1].1, 20); // "a longer result here" = 20 bytes
+    }
+
+    // ========================================================================
+    // Parked-Run Checkpoint Tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_run_status_parked_serializes_snake_case() {
+        let json = serde_json::to_string(&RunStatus::Parked).unwrap();
+        assert_eq!(json, r#""parked""#);
+        let back: RunStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, RunStatus::Parked);
     }
 }
