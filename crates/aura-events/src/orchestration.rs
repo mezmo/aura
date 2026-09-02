@@ -72,6 +72,7 @@ pub mod event_names {
     pub const CLARIFICATION_NEEDED: &str = "aura.orchestrator.clarification_needed";
     pub const TASK_STARTED: &str = "aura.orchestrator.task_started";
     pub const TASK_COMPLETED: &str = "aura.orchestrator.task_completed";
+    pub const TASK_BLOCKED: &str = "aura.orchestrator.task_blocked";
     pub const ITERATION_COMPLETE: &str = "aura.orchestrator.iteration_complete";
     pub const REPLAN_STARTED: &str = "aura.orchestrator.replan_started";
     pub const SYNTHESIZING: &str = "aura.orchestrator.synthesizing";
@@ -134,6 +135,18 @@ pub enum OrchestrationStreamEvent {
         worker_id: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         result: Option<String>,
+        #[serde(flatten)]
+        context: EventContext,
+    },
+    /// Emitted when a worker task blocks on a human approval decision
+    /// (park mode); one event per parked call.
+    TaskBlocked {
+        task_id: usize,
+        tool_call_id: String,
+        decision_id: String,
+        tool_name: String,
+        orchestrator_id: String,
+        worker_id: String,
         #[serde(flatten)]
         context: EventContext,
     },
@@ -236,6 +249,7 @@ impl OrchestrationStreamEvent {
             Self::ClarificationNeeded { .. } => event_names::CLARIFICATION_NEEDED,
             Self::TaskStarted { .. } => event_names::TASK_STARTED,
             Self::TaskCompleted { .. } => event_names::TASK_COMPLETED,
+            Self::TaskBlocked { .. } => event_names::TASK_BLOCKED,
             Self::IterationComplete { .. } => event_names::ITERATION_COMPLETE,
             Self::ReplanStarted { .. } => event_names::REPLAN_STARTED,
             Self::Synthesizing { .. } => event_names::SYNTHESIZING,
@@ -328,6 +342,28 @@ impl OrchestrationStreamEvent {
             orchestrator_id: orchestrator_id.into(),
             worker_id: worker_id.into(),
             result,
+            context,
+        }
+    }
+
+    /// Create a TaskBlocked event (one per parked call).
+    #[allow(clippy::too_many_arguments)]
+    pub fn task_blocked(
+        task_id: usize,
+        tool_call_id: impl Into<String>,
+        decision_id: impl Into<String>,
+        tool_name: impl Into<String>,
+        orchestrator_id: impl Into<String>,
+        worker_id: impl Into<String>,
+        context: EventContext,
+    ) -> Self {
+        Self::TaskBlocked {
+            task_id,
+            tool_call_id: tool_call_id.into(),
+            decision_id: decision_id.into(),
+            tool_name: tool_name.into(),
+            orchestrator_id: orchestrator_id.into(),
+            worker_id: worker_id.into(),
             context,
         }
     }
@@ -457,5 +493,44 @@ impl OrchestrationStreamEvent {
             orchestrator_id: orchestrator_id.into(),
             context,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_ctx() -> EventContext {
+        EventContext::new(
+            AgentContext::single_agent(),
+            CorrelationContext::new("test-session", None),
+        )
+    }
+
+    /// The blocked-task event is named `aura.orchestrator.task_blocked` and
+    /// carries the gated call's `tool_call_id`.
+    #[test]
+    fn task_blocked_event_name_and_payload() {
+        let event = OrchestrationStreamEvent::task_blocked(
+            2,
+            "call_42",
+            "0191e8c0-1111-7000-8000-00000000000a",
+            "kubectl_apply",
+            "orch-1",
+            "operations",
+            test_ctx(),
+        );
+
+        assert_eq!(event.event_name(), event_names::TASK_BLOCKED);
+        assert_eq!(event_names::TASK_BLOCKED, "aura.orchestrator.task_blocked");
+
+        let sse = event.format_sse();
+        assert!(sse.starts_with("event: aura.orchestrator.task_blocked\n"));
+        assert!(sse.contains("\"task_id\":2"));
+        assert!(sse.contains("\"tool_call_id\":\"call_42\""));
+        assert!(sse.contains("\"tool_name\":\"kubectl_apply\""));
+        assert!(sse.contains("\"decision_id\":\"0191e8c0-1111-7000-8000-00000000000a\""));
+        assert!(sse.contains("\"orchestrator_id\":\"orch-1\""));
+        assert!(sse.contains("\"worker_id\":\"operations\""));
     }
 }

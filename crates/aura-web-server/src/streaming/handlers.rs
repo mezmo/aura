@@ -1254,6 +1254,31 @@ fn handle_orchestrator_event(
                 event_context,
             )
         }
+        OrchestratorEvent::TaskBlocked {
+            task_id,
+            orchestrator_id,
+            worker_id,
+            tool_call_id,
+            decision_id,
+            tool_name,
+        } => {
+            tracing::debug!(
+                "Orchestrator: task {} blocked awaiting approval - {} ({}, decision {})",
+                task_id,
+                tool_name,
+                tool_call_id,
+                decision_id
+            );
+            OrchestrationStreamEvent::task_blocked(
+                *task_id,
+                tool_call_id,
+                decision_id,
+                tool_name,
+                orchestrator_id,
+                worker_id,
+                event_context,
+            )
+        }
         OrchestratorEvent::IterationComplete {
             iteration,
             will_replan,

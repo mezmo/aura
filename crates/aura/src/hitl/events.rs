@@ -126,6 +126,23 @@ pub fn completed_error(
     }
 }
 
+/// `approval_completed(cancelled)` for park-mode orphan cleanup: the approval
+/// was cancelled without a decision because the worker's stream ended before
+/// its conversation was captured, so nothing will ever consume the decision.
+#[must_use]
+pub fn completed_cancelled(
+    decision_id: DecisionId,
+    scope: &AgentScope,
+    duration: Duration,
+) -> ApprovalCompleted {
+    completed(
+        decision_id,
+        &ApprovalOutcome::Cancelled(CancelReason::Shutdown),
+        scope,
+        duration,
+    )
+}
+
 fn origin_to_wire(origin: &ApprovalOrigin) -> ApprovalOriginWire {
     match origin {
         ApprovalOrigin::ConfigGate {
