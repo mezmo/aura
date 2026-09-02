@@ -9,8 +9,8 @@ use serde_json::Value;
 use crate::approver_headers::{
     McpTransportKind, current_approver_overrides, ensure_transport_delivers_overrides,
 };
-use crate::mcp_streamable_http::McpClient;
-use crate::mcp_tool_execution::execute_mcp_tool;
+use crate::mcp::client::McpClient;
+use crate::mcp::execution::execute_mcp_tool;
 
 /// Dynamic MCP Tool Adaptor for MCP clients (transport-agnostic)
 #[derive(Clone)]
@@ -112,7 +112,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::mcp_streamable_http::tests::client_and_server;
+    use crate::mcp::client::tests::client_and_server;
 
     /// An adaptor for `tool_name`, fronting `client`, tagged as `kind`. The client is always streamable-HTTP: the tag, not the wire, is what the override path consults.
     async fn adaptor_for(

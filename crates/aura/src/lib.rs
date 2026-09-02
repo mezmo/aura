@@ -19,12 +19,6 @@ pub mod hitl;
 pub mod inactivity;
 pub mod logging;
 pub mod mcp;
-pub mod mcp_dynamic;
-pub mod mcp_progress;
-pub mod mcp_response;
-pub mod mcp_sse;
-pub mod mcp_streamable_http;
-pub mod mcp_tool_execution;
 #[cfg(feature = "otel")]
 pub mod openinference_exporter;
 pub mod orchestration;
@@ -101,9 +95,7 @@ pub use approval_event_broker::{
     ApprovalEventBroker, ApprovalLifecycleEvent, subscribe as approval_event_subscribe,
     unsubscribe as approval_event_unsubscribe,
 };
-pub use mcp::McpManager;
-pub use mcp_progress::ProgressEnabledHandler;
-pub use mcp_streamable_http::InFlightRequests;
+pub use mcp::{InFlightRequests, McpManager, ProgressEnabledHandler};
 pub use rag_tools::{AutoIngest, VectorIngestTool};
 pub use request_cancellation::{RequestCancellation, RequestId};
 pub use request_progress::{
