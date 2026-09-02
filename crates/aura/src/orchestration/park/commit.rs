@@ -1,5 +1,10 @@
 //! The park commit: publication, awaiting-set refresh, and the
 //! no-checkpoint cancellation sweep.
+//!
+//! When the refresh leaves the awaiting set empty — every call was
+//! decided before the commit — the document's `expires_at` is stamped
+//! with the current time, an immediately-expired checkpoint; that
+//! disposition is pending the schema gate.
 
 use std::collections::HashMap;
 use std::io;
@@ -188,11 +193,14 @@ pub(crate) async fn publish(
 /// Cancel every approval the run parked, so no decidable approval outlives
 /// a run that has no checkpoint.
 ///
-/// Publishes one `approval_completed(cancelled)` event per decision the
-/// store still holds (already-decided or already-cancelled approvals stay
-/// silent — the sweep is idempotent, so a failed commit's immediate sweep
-/// and the guard's drop sweep do not double-report), then clears the store
-/// by the run-scoped owner id.
+/// A decision can land between the caller's snapshot and this sweep: an
+/// id the store shows a recorded decision for is skipped entirely — no
+/// event, no removal — so the recorded decision survives. Ids no longer
+/// parked are skipped as well, keeping the sweep idempotent (a failed
+/// commit's immediate sweep and the guard's drop sweep do not
+/// double-report). Each remaining undecided id publishes one
+/// `approval_completed(cancelled)` event on the live request, then the
+/// store's parked entries clear by the run-scoped owner id.
 pub(crate) async fn cancel_run_approvals(
     registry: &PendingApprovals,
     run_id: &str,
@@ -200,6 +208,13 @@ pub(crate) async fn cancel_run_approvals(
     cancelled: impl Iterator<Item = (DecisionId, AgentScope)>,
 ) {
     for (decision_id, scope) in cancelled {
+        if registry.recorded_decision(&decision_id).await.is_some() {
+            tracing::info!(
+                decision_id = %decision_id,
+                "approval decided before the cancellation sweep; decision spared",
+            );
+            continue;
+        }
         if registry.parked(&decision_id).await.is_none() {
             continue;
         }
@@ -280,7 +295,7 @@ mod tests {
     };
     use crate::orchestration::park::document::{ParkedPlan, SCHEMA_VERSION, load_parked_run};
     use crate::orchestration::types::Task;
-    use crate::session_store::{InMemoryApprovalStore, InMemoryEventBus};
+    use crate::session_store::{ApprovalStore, InMemoryApprovalStore, InMemoryEventBus};
 
     fn conv_registry() -> (PendingApprovals, std::sync::Arc<InMemoryApprovalStore>) {
         let store = std::sync::Arc::new(InMemoryApprovalStore::new());
@@ -525,6 +540,82 @@ mod tests {
             (reported - expected).num_seconds().abs() < 1,
             "expiry is the earliest surviving expiry"
         );
+    }
+
+    /// The sweep spares an id with a recorded decision — no event, no
+    /// removal — while an undecided sibling under the same owner is
+    /// cancelled with exactly one event.
+    #[tokio::test]
+    async fn sweep_spares_recorded_decision_and_cancels_undecided_sibling() {
+        let (registry, store) = conv_registry();
+        let run_id = "0191e8c0-ffff-7000-8000-000000000006";
+        let owner = run_owner_id(run_id);
+        let request_id = format!("req_sweep_{}", uuid::Uuid::new_v4().simple());
+        let mut events = crate::approval_event_broker::subscribe(&request_id).await;
+
+        let now = chrono::Utc::now();
+        let decided = DecisionId::generate();
+        let sibling = DecisionId::generate();
+        let scope = AgentScope::Single { session_id: None };
+        registry
+            .register_durable(parked_approval(
+                decided,
+                &owner,
+                now + chrono::Duration::hours(1),
+            ))
+            .await
+            .unwrap();
+        registry
+            .register_durable(parked_approval(
+                sibling,
+                &owner,
+                now + chrono::Duration::hours(1),
+            ))
+            .await
+            .unwrap();
+        registry
+            .resolve(&decided, crate::hitl::ApprovalDecision::Approved)
+            .await
+            .unwrap();
+
+        cancel_run_approvals(
+            &registry,
+            run_id,
+            &request_id,
+            [(decided, scope.clone()), (sibling, scope)].into_iter(),
+        )
+        .await;
+
+        assert!(
+            store.get(&sibling).await.unwrap().is_none(),
+            "the undecided sibling's parked entry is cleared"
+        );
+        assert_eq!(
+            registry.recorded_decision(&decided).await,
+            Some(crate::hitl::ApprovalDecision::Approved),
+            "the recorded decision survives the sweep"
+        );
+
+        match tokio::time::timeout(Duration::from_secs(1), events.recv()).await {
+            Ok(Some(crate::approval_event_broker::ApprovalLifecycleEvent::Completed(
+                completed,
+            ))) => {
+                assert_eq!(completed.decision_id, sibling.to_string());
+                assert!(matches!(
+                    completed.outcome,
+                    aura_events::ApprovalOutcomeWire::Cancelled { .. }
+                ));
+            }
+            other => panic!("expected the sibling's completed(cancelled), got {other:?}"),
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), events.recv())
+                .await
+                .is_err(),
+            "the decided approval publishes no cancelled event"
+        );
+
+        crate::approval_event_broker::unsubscribe(&request_id).await;
     }
 
     /// The fingerprint is stable for an unchanged config and moves when the

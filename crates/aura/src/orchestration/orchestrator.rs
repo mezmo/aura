@@ -4924,20 +4924,16 @@ Assign tasks to the worker whose tools best match the required operations."#,
         traces
     }
 
-    /// Called at the end of `run_orchestration_loop()` on all exit paths.
-    /// Errors are logged but not propagated — manifest is observability, not control flow.
-    ///
-    /// `timings` carries the final iteration's phase timings when available
-    /// (`None` for paths that failed before the timed consolidation step).
     /// Commit the park checkpoint and end the run (park mode).
     ///
-    /// The commit is shared by a first park and every re-park of a resumed
-    /// run: refresh the awaiting set against the approval store, serialize
-    /// from the run's current state, publish by temp write and
-    /// same-directory rename, then emit the terminal `run_parked` event —
-    /// only after the rename succeeded. A failed commit publishes nothing,
-    /// emits no event, and cancels the run's approvals with
-    /// `cancel_request("run:{run_id}")` before the stream ends.
+    /// Runs only on the orchestration loop's park exit, and its error
+    /// returns to the stream. The commit is shared by a first park and
+    /// every re-park of a resumed run: refresh the awaiting set against
+    /// the approval store, serialize from the run's current state,
+    /// publish by temp write and same-directory rename, then emit the
+    /// terminal `run_parked` event — only after the rename succeeded. A
+    /// failed commit publishes nothing, emits no event, and cancels the
+    /// run's approvals before the stream ends.
     #[allow(clippy::too_many_arguments)]
     async fn park_run(
         &self,
@@ -5047,9 +5043,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
         }
     }
 
-    /// Cancel every approval this run parked, with `approval_completed(cancelled)`
-    /// events on the live request, so no decidable approval outlives a run
-    /// that has no checkpoint.
+    /// Collect the plan's awaiting decision ids and sweep them, so no
+    /// decidable approval outlives a run that has no checkpoint.
     async fn cancel_run_parked_approvals(&self, plan: &Plan, run_id: &str) {
         let Some(hitl) = self.agent_config.hitl.clone() else {
             return;
@@ -7630,6 +7625,117 @@ mod tests {
                 .await
                 .is_err(),
             "the drop sweep does not double-report cancelled approvals"
+        );
+
+        crate::approval_event_broker::unsubscribe(&request_id).await;
+    }
+
+    /// A decision recorded before a failed commit's sweep survives it —
+    /// and survives the guard's drop — with no cancelled event for it,
+    /// while an undecided sibling is cancelled with one event.
+    #[tokio::test]
+    async fn park_run_failure_spares_decided_approval_and_cancels_sibling() {
+        let dir = tempfile::tempdir().unwrap();
+        let (orchestrator, store, registry, run_id) = park_orchestrator(dir.path()).await;
+        let (plan, records, pending) = awaiting_plan_with_parked_calls(&registry, &run_id).await;
+        let request_id = orchestrator
+            .agent_config
+            .request_id
+            .clone()
+            .unwrap_or_default();
+        let mut events = crate::approval_event_broker::subscribe(&request_id).await;
+
+        // The human decides the first call before the commit is attempted.
+        let decided = pending[0].decision_id;
+        let sibling = pending[1].decision_id;
+        registry
+            .resolve(&decided, crate::hitl::ApprovalDecision::Approved)
+            .await
+            .unwrap();
+
+        // Arm the run guard as `execute` would have before the commit.
+        if let Some(ref guard) = orchestrator.park_guard {
+            let scope = orchestrator
+                .worker_scope(1, plan.tasks[1].worker.as_deref())
+                .await
+                .expect("worker scope builds");
+            guard.record(
+                &scope,
+                &match &plan.tasks[1].state {
+                    TaskState::AwaitingApproval { pending } => pending.clone(),
+                    _ => unreachable!("the fixture task is awaiting"),
+                },
+            );
+        }
+
+        // A read-only session root makes the checkpoint write under
+        // `park-sess/parked/` fail.
+        let session_root = dir.path().join("park-sess");
+        let mut perms = std::fs::metadata(&session_root).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o555);
+        std::fs::set_permissions(&session_root, perms).unwrap();
+
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(32);
+        let chat_history = vec![rig::completion::Message::user("deploy the service")];
+        let result = orchestrator
+            .park_run(
+                "deploy the service",
+                &chat_history,
+                &[],
+                None,
+                1,
+                2_500,
+                &[],
+                &plan,
+                &records,
+                &event_tx,
+            )
+            .await;
+
+        // Restore writability so the tempdir can clean itself up.
+        let mut perms = std::fs::metadata(&session_root).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&session_root, perms).unwrap();
+
+        assert!(result.is_err(), "the commit must fail");
+
+        assert!(
+            store.get(&sibling).await.unwrap().is_none(),
+            "the undecided sibling is cancelled with the run"
+        );
+        assert!(
+            registry.recorded_decision(&decided).await.is_some(),
+            "the recorded decision survives the failed commit's sweep"
+        );
+
+        // Exactly one cancelled event — the sibling's; the decided
+        // approval stays silent.
+        match tokio::time::timeout(Duration::from_secs(1), events.recv()).await {
+            Ok(Some(crate::approval_event_broker::ApprovalLifecycleEvent::Completed(
+                completed,
+            ))) => {
+                assert_eq!(completed.decision_id, sibling.to_string());
+                assert!(matches!(
+                    completed.outcome,
+                    aura_events::ApprovalOutcomeWire::Cancelled { .. }
+                ));
+            }
+            other => panic!("expected the sibling's completed(cancelled), got {other:?}"),
+        }
+
+        // The guard's drop sweep stays silent: the decided approval is
+        // spared, the already-cancelled sibling is not double-reported.
+        drop(orchestrator);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), events.recv())
+                .await
+                .is_err(),
+            "the drop sweep spares the decided approval and does not double-report the sibling"
+        );
+        assert!(
+            registry.recorded_decision(&decided).await.is_some(),
+            "the recorded decision survives the guard's drop"
         );
 
         crate::approval_event_broker::unsubscribe(&request_id).await;

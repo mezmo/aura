@@ -41,6 +41,7 @@ use tokio::fs;
 use tokio::sync::Notify;
 
 use super::events::RoutingMode;
+use super::park::{PARKED_DOCUMENT_SUFFIX, RESUMING_DOCUMENT_SUFFIX};
 use super::types::{Plan, TaskStatus};
 
 // ============================================================================
@@ -81,7 +82,7 @@ pub(crate) fn is_safe_path_component(s: &str) -> bool {
 /// Whether `run_id` has a parked checkpoint document under `parked_dir`,
 /// under either the published or the resuming filename.
 async fn run_has_parked_document(parked_dir: &Path, run_id: &str) -> bool {
-    for suffix in [".json", ".resuming.json"] {
+    for suffix in [PARKED_DOCUMENT_SUFFIX, RESUMING_DOCUMENT_SUFFIX] {
         if parked_dir
             .join(format!("{run_id}{suffix}"))
             .try_exists()
