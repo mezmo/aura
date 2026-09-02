@@ -81,6 +81,6 @@ pub use tools::{SubmitResultDecision, SubmitResultOutput, SubmitResultTool};
 
 pub use prompt_constants::{context, fields, sections};
 pub use types::{
-    Plan, PlanningResponse, RunId, StepInput, StructuredTaskOutput, Task, TaskIdentity, TaskJson,
-    TaskState, TaskStatus,
+    BlockedCell, CellOutcome, ParkSnapshot, PendingCall, Plan, PlanningResponse, RunId, StepInput,
+    StructuredTaskOutput, Task, TaskIdentity, TaskJson, TaskState, TaskStatus,
 };

@@ -8,6 +8,7 @@
 //! - `aura.orchestrator.plan_created` - Plan decomposed from user query
 //! - `aura.orchestrator.task_started` - Worker began task execution
 //! - `aura.orchestrator.task_completed` - Worker finished task (success/failure)
+//! - `aura.orchestrator.task_blocked` - Worker parked gated calls (park mode)
 //! - `aura.orchestrator.iteration_complete` - Plan-execute-continue cycle done
 //! - `aura.orchestrator.synthesizing` - Consolidating task results for coordinator decision
 //! - `aura.orchestrator.tool_call_started` - Worker tool execution began
@@ -69,6 +70,7 @@ pub mod event_names {
     pub const CLARIFICATION_NEEDED: &str = "aura.orchestrator.clarification_needed";
     pub const TASK_STARTED: &str = "aura.orchestrator.task_started";
     pub const TASK_COMPLETED: &str = "aura.orchestrator.task_completed";
+    pub const TASK_BLOCKED: &str = "aura.orchestrator.task_blocked";
     pub const ITERATION_COMPLETE: &str = "aura.orchestrator.iteration_complete";
     pub const REPLAN_STARTED: &str = "aura.orchestrator.replan_started";
     pub const SYNTHESIZING: &str = "aura.orchestrator.synthesizing";
@@ -125,6 +127,19 @@ pub enum OrchestrationStreamEvent {
         task: TaskContext,
         #[serde(flatten)]
         outcome: CompletionOutcome,
+        #[serde(flatten)]
+        context: EventContext,
+    },
+    /// A worker task parked a gated call (park mode); one event per call.
+    TaskBlocked {
+        /// The gated tool call's id.
+        tool_call_id: String,
+        /// The parked approval's decision id.
+        decision_id: String,
+        /// The gated tool's name.
+        tool_name: String,
+        #[serde(flatten)]
+        task: TaskContext,
         #[serde(flatten)]
         context: EventContext,
     },
@@ -195,6 +210,7 @@ impl OrchestrationStreamEvent {
             Self::ClarificationNeeded { .. } => event_names::CLARIFICATION_NEEDED,
             Self::TaskStarted { .. } => event_names::TASK_STARTED,
             Self::TaskCompleted { .. } => event_names::TASK_COMPLETED,
+            Self::TaskBlocked { .. } => event_names::TASK_BLOCKED,
             Self::IterationComplete { .. } => event_names::ITERATION_COMPLETE,
             Self::ReplanStarted { .. } => event_names::REPLAN_STARTED,
             Self::Synthesizing { .. } => event_names::SYNTHESIZING,
@@ -299,6 +315,29 @@ impl OrchestrationStreamEvent {
                 success,
                 duration_ms,
                 result,
+            },
+            context,
+        }
+    }
+
+    /// Create a TaskBlocked event (one per parked call).
+    pub fn task_blocked(
+        task_id: usize,
+        tool_call_id: impl Into<String>,
+        decision_id: impl Into<String>,
+        tool_name: impl Into<String>,
+        orchestrator_id: impl Into<String>,
+        worker_id: impl Into<String>,
+        context: EventContext,
+    ) -> Self {
+        Self::TaskBlocked {
+            tool_call_id: tool_call_id.into(),
+            decision_id: decision_id.into(),
+            tool_name: tool_name.into(),
+            task: TaskContext {
+                task_id,
+                orchestrator_id: orchestrator_id.into(),
+                worker_id: worker_id.into(),
             },
             context,
         }
@@ -552,6 +591,32 @@ mod tests {
         assert!(sse.starts_with(&format!("event: {}\n", event_names::TASK_COMPLETED)));
         assert!(sse.contains("\"result\":\"The mean is 30.0\""));
         assert!(sse.contains("\"success\":true"));
+    }
+
+    /// The blocked-task wire event carries the gated call's `tool_call_id`.
+    #[test]
+    fn test_format_sse_task_blocked() {
+        let event = OrchestrationStreamEvent::task_blocked(
+            2,
+            "call_42",
+            "0191e8c0-1111-7000-8000-00000000000a",
+            "kubectl_apply",
+            "orch-1",
+            "operations",
+            test_ctx(),
+        );
+        let sse = event.format_sse();
+
+        assert!(sse.starts_with("event: aura.orchestrator.task_blocked\n"));
+        assert_eq!(
+            event_names::TASK_BLOCKED,
+            aura_events::orchestration::event_names::TASK_BLOCKED
+        );
+        assert!(sse.contains("\"task_id\":2"));
+        assert!(sse.contains("\"tool_call_id\":\"call_42\""));
+        assert!(sse.contains("\"tool_name\":\"kubectl_apply\""));
+        assert!(sse.contains("\"decision_id\":\"0191e8c0-1111-7000-8000-00000000000a\""));
+        assert!(sse.contains("\"worker_id\":\"operations\""));
     }
 
     #[test]

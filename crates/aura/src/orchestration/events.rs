@@ -100,6 +100,21 @@ pub enum OrchestratorEvent {
         /// The task result (output string or error message; truncated to Option in SSE)
         result: String,
     },
+    /// A worker task parked a gated call (park mode); one event per call.
+    TaskBlocked {
+        /// Task identifier
+        task_id: usize,
+        /// The ID of the orchestrator
+        orchestrator_id: String,
+        /// The ID of the Worker who is handling the task
+        worker_id: String,
+        /// The gated tool call's id
+        tool_call_id: String,
+        /// The parked approval's decision id
+        decision_id: String,
+        /// The gated tool's name
+        tool_name: String,
+    },
     /// An iteration of the plan-execute loop has completed.
     ///
     /// Emitted after execution completes. Indicates whether the orchestrator

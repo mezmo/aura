@@ -72,6 +72,7 @@ pub mod event_names {
     pub const CLARIFICATION_NEEDED: &str = "aura.orchestrator.clarification_needed";
     pub const TASK_STARTED: &str = "aura.orchestrator.task_started";
     pub const TASK_COMPLETED: &str = "aura.orchestrator.task_completed";
+    pub const TASK_BLOCKED: &str = "aura.orchestrator.task_blocked";
     pub const ITERATION_COMPLETE: &str = "aura.orchestrator.iteration_complete";
     pub const REPLAN_STARTED: &str = "aura.orchestrator.replan_started";
     pub const SYNTHESIZING: &str = "aura.orchestrator.synthesizing";
@@ -134,6 +135,17 @@ pub enum OrchestrationStreamEvent {
         worker_id: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         result: Option<String>,
+        #[serde(flatten)]
+        context: EventContext,
+    },
+    /// A worker task parked a gated call (park mode); one event per call.
+    TaskBlocked {
+        task_id: usize,
+        tool_call_id: String,
+        decision_id: String,
+        tool_name: String,
+        orchestrator_id: String,
+        worker_id: String,
         #[serde(flatten)]
         context: EventContext,
     },
@@ -236,6 +248,7 @@ impl OrchestrationStreamEvent {
             Self::ClarificationNeeded { .. } => event_names::CLARIFICATION_NEEDED,
             Self::TaskStarted { .. } => event_names::TASK_STARTED,
             Self::TaskCompleted { .. } => event_names::TASK_COMPLETED,
+            Self::TaskBlocked { .. } => event_names::TASK_BLOCKED,
             Self::IterationComplete { .. } => event_names::ITERATION_COMPLETE,
             Self::ReplanStarted { .. } => event_names::REPLAN_STARTED,
             Self::Synthesizing { .. } => event_names::SYNTHESIZING,
@@ -328,6 +341,28 @@ impl OrchestrationStreamEvent {
             orchestrator_id: orchestrator_id.into(),
             worker_id: worker_id.into(),
             result,
+            context,
+        }
+    }
+
+    /// Create a TaskBlocked event (one per parked call).
+    #[allow(clippy::too_many_arguments)]
+    pub fn task_blocked(
+        task_id: usize,
+        tool_call_id: impl Into<String>,
+        decision_id: impl Into<String>,
+        tool_name: impl Into<String>,
+        orchestrator_id: impl Into<String>,
+        worker_id: impl Into<String>,
+        context: EventContext,
+    ) -> Self {
+        Self::TaskBlocked {
+            task_id,
+            tool_call_id: tool_call_id.into(),
+            decision_id: decision_id.into(),
+            tool_name: tool_name.into(),
+            orchestrator_id: orchestrator_id.into(),
+            worker_id: worker_id.into(),
             context,
         }
     }
