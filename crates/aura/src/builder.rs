@@ -897,7 +897,7 @@ impl Agent {
                     for mcp_tool in filtered_tools {
                         tracing::info!("  Adding dynamic HTTP tool: {}", mcp_tool.name);
 
-                        let tool_adaptor = crate::mcp::McpToolAdaptor::new(
+                        let tool_adaptor = crate::mcp_dynamic::McpToolAdaptor::new(
                             mcp_tool.clone(),
                             server_name.clone(),
                             Arc::clone(&client_arc),
@@ -931,7 +931,7 @@ impl Agent {
                     for mcp_tool in filtered_tools {
                         tracing::info!("  Adding dynamic SSE tool: {}", mcp_tool.name);
 
-                        let tool_adaptor = crate::mcp::McpToolAdaptor::new(
+                        let tool_adaptor = crate::mcp_dynamic::McpToolAdaptor::new(
                             mcp_tool.clone(),
                             server_name.clone(),
                             Arc::clone(&client_arc),
@@ -1008,7 +1008,7 @@ impl Agent {
                     for mcp_tool in filtered_tools {
                         tracing::info!("  Adding dynamic STDIO tool: {}", mcp_tool.name);
 
-                        let tool_adaptor = crate::mcp::McpToolAdaptor::new(
+                        let tool_adaptor = crate::mcp_dynamic::McpToolAdaptor::new(
                             mcp_tool.clone(),
                             server_name.clone(),
                             Arc::clone(&client_arc),
@@ -1979,9 +1979,9 @@ mod tests {
 
         use super::*;
         use crate::approver_headers::tests::captured_overrides;
-        use crate::mcp::McpClient;
         use crate::mcp::McpManager;
-        use crate::mcp::client::tests::RecordingMcpServer;
+        use crate::mcp_streamable_http::McpClient;
+        use crate::mcp_streamable_http::tests::RecordingMcpServer;
         use crate::tool_wrapper::{PreCallOutcome, ToolCallContext, ToolWrapper};
 
         /// A completion model that exists only to satisfy the builder's type
@@ -2207,7 +2207,7 @@ mod tests {
     /// `transform_args` will all surface here.
     #[tokio::test]
     async fn test_composed_scratchpad_then_existing_observes_raw_output() {
-        use crate::mcp::CallOutcome;
+        use crate::mcp_response::CallOutcome;
         use crate::scratchpad::{ScratchpadStorage, ScratchpadWrapper};
         use crate::tool_wrapper::{
             ComposedWrapper, ToolCallContext, ToolWrapper, TransformArgsResult,

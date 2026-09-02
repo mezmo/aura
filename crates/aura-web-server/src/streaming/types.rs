@@ -261,7 +261,7 @@ pub use openai::{
 };
 
 /// Error prefix patterns from Rig's tool error handling. The first is also
-/// `MCP_ERROR_PREFIX` in `aura::mcp::response`; both must stay in step with
+/// `MCP_ERROR_PREFIX` in `aura::mcp_response`; both must stay in step with
 /// `McpToolError` in rig's `tool/mod.rs`.
 const ERROR_PREFIXES: &[(&str, &str)] = &[
     ("Tool returned an error: ", "ToolError"),

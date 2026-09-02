@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use tracing::Instrument;
 
 use crate::mcp::McpManager;
-use crate::mcp::execute_mcp_tool;
+use crate::mcp_tool_execution::execute_mcp_tool;
 
 /// Hard ceiling on any single wait.
 pub const MAX_WAIT_HARD_CEILING_SECS: u64 = 300;
@@ -500,7 +500,7 @@ struct McpProbeDispatcher {
 
 impl McpProbeDispatcher {
     /// Find the client of the server exposing `tool`.
-    fn resolve(&self, tool: &str) -> Option<&crate::mcp::McpClient> {
+    fn resolve(&self, tool: &str) -> Option<&crate::mcp_streamable_http::McpClient> {
         let manager = &self.mcp;
         [
             (&manager.streamable_tools, &manager.streamable_clients),

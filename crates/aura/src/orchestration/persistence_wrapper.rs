@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::{Mutex, Notify};
 
 use super::persistence::{ExecutionPersistence, ToolCallRecord};
-use crate::mcp::CallOutcome;
+use crate::mcp_response::CallOutcome;
 use crate::tool_wrapper::{
     ToolCallContext, ToolWrapper, TransformArgsResult, TransformOutputResult, non_blank,
 };
@@ -841,7 +841,7 @@ mod tests {
             .to_string();
 
         let raw = "gigantic raw tool output that scratchpad would rewrite to a pointer";
-        let outcome = crate::mcp::CallOutcome::Success(raw.to_string());
+        let outcome = crate::mcp_response::CallOutcome::Success(raw.to_string());
         let _ = wrapper
             .transform_output(raw.to_string(), &outcome, &ctx, Some(&extracted))
             .await;
@@ -925,7 +925,7 @@ mod tests {
 
         // Use varied content to avoid tokenizer compression masking the threshold.
         let raw: String = (0..500).map(|i| format!("entry_{} ", i)).collect();
-        let outcome = crate::mcp::CallOutcome::Success(raw.clone());
+        let outcome = crate::mcp_response::CallOutcome::Success(raw.clone());
         let result = composed
             .transform_output(raw.clone(), &outcome, &ctx, Some(&extracted))
             .await;
