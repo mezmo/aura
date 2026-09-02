@@ -23,7 +23,8 @@ use super::orchestrator::{
     TREE_END_BULLET, TREE_END_DURATION, TREE_MID_BULLET, TREE_MID_DURATION, format_orch_duration_ms,
 };
 use super::state::{
-    EVENT_LOG, EXPANDED_OUTPUT, STREAM_CONV_DIR, WELCOME_STATE, random_bullet_color, task_color_for,
+    EVENT_LOG, EXPANDED_OUTPUT, PROCESSING, STREAM_CONV_DIR, WELCOME_STATE, random_bullet_color,
+    task_color_for,
 };
 use super::status_bar::{
     mark_orchestrated, reset_status_bar_tokens, seed_status_bar_tokens, set_context_window_usage,
@@ -42,7 +43,15 @@ pub fn replay_event_log_global() {
         terminal::Clear(terminal::ClearType::All),
         cursor::MoveTo(0, 0)
     );
-    reset_status_bar_tokens();
+    // While a turn is streaming, the live counters are authoritative: the
+    // in-flight turn's usage is still buffered per-turn, absent from both
+    // this log and the usage ledger, so a rebuild here would erase it (and
+    // it would stay lost — counters accumulate, nothing re-adds a turn).
+    // Mid-stream replays repaint the transcript only.
+    let rebuild_counters = !PROCESSING.load(Ordering::Relaxed);
+    if rebuild_counters {
+        reset_status_bar_tokens();
+    }
 
     if let Some(ref w) = *welcome {
         w.print_static();
@@ -199,9 +208,11 @@ pub fn replay_event_log_global() {
                 cache_read_input_tokens,
                 ..
             } => {
-                set_status_bar_tokens(*prompt_tokens, *completion_tokens);
-                if let Some(cache_read) = cache_read_input_tokens {
-                    super::status_bar::add_status_bar_cached_tokens(*cache_read);
+                if rebuild_counters {
+                    set_status_bar_tokens(*prompt_tokens, *completion_tokens);
+                    if let Some(cache_read) = cache_read_input_tokens {
+                        super::status_bar::add_status_bar_cached_tokens(*cache_read);
+                    }
                 }
                 i += 1;
             }
@@ -210,14 +221,18 @@ pub fn replay_event_log_global() {
                 response_tokens,
                 context_window,
             } => {
-                set_context_window_usage(*context_tokens, *response_tokens, *context_window);
+                if rebuild_counters {
+                    set_context_window_usage(*context_tokens, *response_tokens, *context_window);
+                }
                 i += 1;
             }
             DisplayEvent::OrchestratorScratchpadSavings {
                 tokens_intercepted,
                 tokens_extracted,
             } => {
-                super::status_bar::add_scratchpad_usage(*tokens_intercepted, *tokens_extracted);
+                if rebuild_counters {
+                    super::status_bar::add_scratchpad_usage(*tokens_intercepted, *tokens_extracted);
+                }
                 i += 1;
             }
             DisplayEvent::Compacted { messages_removed } => {
@@ -719,7 +734,7 @@ pub fn replay_event_log_global() {
     // be truncated; the conversation's usage ledger is authoritative, so it
     // gets the last word on every replay (resume, /expand, style repaints).
     // An empty ledger keeps the replay-derived values.
-    if let Some(dir) = STREAM_CONV_DIR.lock().ok().and_then(|g| g.clone()) {
+    if rebuild_counters && let Some(dir) = STREAM_CONV_DIR.lock().ok().and_then(|g| g.clone()) {
         let (prompt, completion, cache_read) = crate::repl::conversations::usage_totals_at(&dir);
         if prompt > 0 {
             seed_status_bar_tokens(prompt, completion, cache_read);
