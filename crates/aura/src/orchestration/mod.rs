@@ -52,7 +52,6 @@ mod overview;
 mod persistence;
 pub(crate) mod persistence_wrapper;
 mod prompt_constants;
-mod prompt_journal;
 mod stream_events;
 mod templates;
 pub mod tools;

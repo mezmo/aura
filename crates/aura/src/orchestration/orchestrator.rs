@@ -40,7 +40,6 @@
 //! - `Synthesizing` - when task results are being consolidated for the coordinator
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use rig::client::CompletionClient;
@@ -62,7 +61,6 @@ use super::tools::{InspectToolParamsTool, ListToolsTool, ReadArtifactTool};
 use super::config::OrchestrationConfig;
 use super::events::OrchestratorEvent;
 use super::persistence::ExecutionPersistence;
-use super::prompt_journal::{JournalPhase, PromptJournal};
 use super::types::{
     FailedTaskRecord, FailureCategory, FailureSummary, IterationContext, IterationOutcome,
     IterationTimings, Plan, PlanningResponse, TaskState, TaskStatus,
@@ -384,13 +382,6 @@ pub struct Orchestrator {
     /// Execution persistence for debugging and retry intelligence
     persistence: Arc<Mutex<ExecutionPersistence>>,
 
-    /// Optional prompt journal for dev diagnostics (gated by AURA_PROMPT_JOURNAL=1)
-    prompt_journal: Option<PromptJournal>,
-
-    /// Current orchestration iteration, set at the top of `run_orchestration_loop`.
-    /// Read by `journal_record` so that iteration doesn't pollute method signatures.
-    current_iteration: AtomicUsize,
-
     /// Accumulated token usage across all LLM calls in this orchestration run
     /// (planning, workers, continuation routing).
     ///
@@ -548,18 +539,6 @@ impl Orchestrator {
 
         let orchestrator_id = uuid::Uuid::new_v4().to_string();
 
-        // Initialize prompt journal (gated by AURA_PROMPT_JOURNAL env var, default off)
-        let journal_enabled = crate::env_flags::bool_env("AURA_PROMPT_JOURNAL", false);
-        let prompt_journal = if effective_memory_dir.is_some() {
-            let guard = persistence.lock().await;
-            let run_id = guard.run_id().to_string();
-            let run_path = guard.run_path().to_path_buf();
-            drop(guard);
-            PromptJournal::from_persistence(&run_path, &run_id, &orchestrator_id, journal_enabled)
-        } else {
-            None
-        };
-
         let run_id_str = persistence.lock().await.run_id().to_string();
         let default_turn_depth = agent_config
             .agent
@@ -581,22 +560,9 @@ impl Orchestrator {
             tool_call_observer,
             mcp_manager,
             persistence,
-            prompt_journal,
-            current_iteration: AtomicUsize::new(0),
             usage_state: crate::UsageState::new(),
             outer_budget: None,
         })
-    }
-
-    /// Record a prompt in the journal if enabled.
-    ///
-    /// Reads the current iteration from `self.current_iteration` so callers
-    /// don't need to pass it explicitly.
-    fn journal_record(&self, phase: JournalPhase, system_prompt: &str, user_prompt: &str) {
-        if let Some(ref journal) = self.prompt_journal {
-            let iteration = self.current_iteration.load(Ordering::Relaxed);
-            journal.record(phase, iteration, system_prompt, user_prompt);
-        }
     }
 
     /// Create a worker agent for task execution.
@@ -1743,15 +1709,6 @@ impl Orchestrator {
             // Build full history: external chat + accumulated coordinator conversation
             let mut full_history = chat_history.to_vec();
             full_history.extend(coordinator_state.conversation.iter().cloned());
-
-            self.journal_record(
-                JournalPhase::Planning {
-                    attempt,
-                    max_attempts: max_correction_attempts,
-                },
-                &coordinator_state.preamble,
-                &prompt,
-            );
 
             let response = match self
                 .planning_stream_with_transient_retry(
@@ -3441,17 +3398,6 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 );
             }
 
-            // Record in prompt journal
-            self.journal_record(
-                JournalPhase::Worker {
-                    task_id,
-                    worker_name: *worker_name,
-                    attempt,
-                },
-                &worker_preamble,
-                &prompt,
-            );
-
             // Execute the task
             let srd = submit_result_decision.clone();
             let stream_result = self
@@ -3630,7 +3576,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         }
     }
 
-    /// Persist a single worker execution attempt to the journal and persistence store.
+    /// Persist a single worker execution attempt to the persistence store.
     #[allow(clippy::too_many_arguments)]
     async fn persist_worker_execution(
         &self,
@@ -3946,8 +3892,6 @@ Assign tasks to the worker whose tools best match the required operations."#,
             routing_decision,
         };
 
-        // Set iteration for initial planning (journal reads this via AtomicUsize)
-        self.current_iteration.store(1, Ordering::Relaxed);
         // Planning latency: prompt → plan created (includes correction retries).
         // Spans the whole planning call, so any planning-correction retries
         // inside plan_with_routing are counted in planning_ms.
@@ -4071,7 +4015,6 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
         let final_result = loop {
             iteration += 1;
-            self.current_iteration.store(iteration, Ordering::Relaxed);
             match self
                 .run_iteration(
                     iteration,
@@ -4649,7 +4592,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
         response_summary: Option<String>,
         timings: Option<IterationTimings>,
     ) {
-        use super::persistence::{ArtifactEntry, ErrorContext, RunManifest, RunStatus, TaskSummary};
+        use super::persistence::{
+            ArtifactEntry, ErrorContext, RunManifest, RunStatus, TaskSummary,
+        };
         use crate::string_utils::safe_truncate;
 
         let persistence = self.persistence.lock().await;
