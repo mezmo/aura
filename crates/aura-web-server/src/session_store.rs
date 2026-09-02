@@ -34,24 +34,21 @@ pub trait SessionStore: Send + Sync {
     /// Durable A2A tasks (the upstream `a2a_server::TaskStore` trait).
     fn tasks(&self) -> Arc<dyn TaskStore>;
 
-    /// Allows for cross-instance pub/sub (in-memory SessionStore would be single-instance only).
+    /// Cross-instance pub/sub.
     fn bus(&self) -> Arc<dyn EventBus>;
 
     /// Cheap liveness check.
     async fn ping(&self) -> Result<(), SessionStoreError>;
 }
 
-/// Construct the configured backend. Fails fast on an unreachable networked
-/// backend, a `redis` config in a build without `session-store-redis`, or a
-/// `file` root that cannot be created.
+/// Construct configured backend, failing fast.
 pub async fn build_session_store(
     config: &SessionStoreConfig,
 ) -> Result<Arc<dyn SessionStore>, SessionStoreError> {
     match config {
         SessionStoreConfig::Memory => Ok(Arc::new(InMemorySessionStore::new())),
         SessionStoreConfig::File(file_config) => {
-            // File-backed approvals; the task store and bus stay in memory,
-            // the single-pod deployment model.
+            // File-backed approvals; tasks and bus stay in memory.
             Ok(Arc::new(FileSessionStore::new(file_config)?))
         }
         #[cfg(feature = "session-store-redis")]

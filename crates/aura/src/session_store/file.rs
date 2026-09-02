@@ -1,7 +1,5 @@
-//! File-backed HITL approval store: one JSON file per decision id under a
-//! root directory, so tickets and decisions survive a process restart — the
-//! park/reify V1 durability boundary (single writing process on a single
-//! pod; HA, leases, and reapers are out of scope).
+//! File-backed HITL approval store: one JSON file per decision id.
+//! Tickets survive process restart on a single host.
 //!
 //! Layout:
 //!
@@ -10,8 +8,7 @@
 //! | `{root}/tickets/{decision_id}.json`   | `ParkedApprovalRecord` (the undecided ticket)              |
 //! | `{root}/decisions/{decision_id}.json` | the resolved envelope: the ticket record plus the decision |
 //!
-//! Store contract (park/reify rev 7 §2.5), with the expiry refusal shared by
-//! the in-memory backend:
+//! Store contract (park/reify §2.5):
 //!
 //! - `resolve` refuses past the ticket's `expires_at`, uniformly with an
 //!   unknown id; expiry is enforced only by `resolve`.
@@ -23,30 +20,20 @@
 //! - `cancel_request` removes undecided tickets by owner (request) id;
 //!   decided entries are retained until their consumer removes them.
 //!
-//! Every decision id is validated as a canonical UUID before it touches a
-//! path, so no id can address a file outside the store root, and owner ids
-//! are matched against ticket contents rather than embedded in paths.
-//! Ticket publication is temp-file plus same-directory rename, so a crash
-//! never leaves a partial file under a final name. A `std::sync::Mutex`
+//! Decision ids are validated as UUIDs before path building, so none address
+//! outside the root.
+//! Temp-file plus rename prevents partial files after crashes. A `std::sync::Mutex`
 //! serializes operations for the single writing process; no operation awaits
 //! while holding it.
 //!
-//! Every store operation runs on the blocking thread pool behind its async
-//! trait method. A join failure — a panicked store operation — maps to the
-//! store request error callers already treat fail-closed, so a panicking
-//! store op is a store fault, not a server crash. Blocking work is also not
-//! cancelled when the requesting future is dropped: a dropped poll request
-//! still completes resolve's claim-write-move.
+//! Store operations run on the blocking pool. Join failures map to store
+//! errors—a panicked op is a store fault, not a crash. Blocking work is not
+//! cancelled when the requester is dropped: a dropped poll still completes
+//! resolve's claim-write-move.
 //!
-//! Crash window in `resolve`: the decision file is claimed with
-//! `create_new` and then written and synced, so a process death between
-//! the two can leave an empty `decisions/{id}.json`. The aftermath fails
-//! closed - `resolve` keeps refusing (the claim exists), `decision`
-//! reports a decode fault, and `get` still returns the live ticket - and
-//! operator recovery is deleting that one empty file, after which the
-//! still-present ticket makes the id resolvable again. Consumers of the
-//! decision read (`decision()`) must therefore treat `Err(Decode)` on a
-//! known id as this recoverable state, not as an unknown id.
+//! Crash window: claim-then-write leaves an empty file if process dies
+//! mid-resolve. The aftermath fails closed; `decision` reports decode
+//! fault, `get` returns ticket. Recovery is deleting the empty file.
 
 use std::fs;
 use std::io::{self, Write};
@@ -67,8 +54,7 @@ const TICKETS_DIR: &str = "tickets";
 const DECISIONS_DIR: &str = "decisions";
 
 /// The on-disk shape of a resolved approval: the ticket record carried over
-/// from `tickets/` plus the recorded decision, so a decided ticket stays
-/// readable through `get` until `remove`. Field names are a persisted
+/// from `tickets/` plus the recorded decision. Field names are a persisted
 /// contract shared by every instance reading the store — rename only with a
 /// migration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -90,10 +76,7 @@ struct Inner {
 }
 
 impl FileApprovalStore {
-    /// Open (or initialize) the store rooted at `root`, creating the ticket
-    /// and decision directories. Fails when they cannot be created: a store
-    /// that cannot hold files must fail at startup, not on the first
-    /// approval.
+    /// Open store at root, creating directories. Fails fast if cannot.
     pub fn open(root: impl AsRef<Path>) -> Result<Self, SessionStoreError> {
         let root = root.as_ref();
         fs::create_dir_all(root.join(TICKETS_DIR)).map_err(connect_err)?;
@@ -162,14 +145,12 @@ impl Inner {
         let _guard = self.lock();
         let id = canonical_id(id).map_err(ResolveError::Store)?;
 
-        // Read the undecided ticket before claiming: the claim must not fire
-        // for an unknown or already-decided id.
+        // Read ticket before claiming avoids claiming unknown ids.
         let record = match fs::read(self.ticket_path(&id)) {
             Ok(bytes) => serde_json::from_slice::<ParkedApprovalRecord>(&bytes)
                 .map_err(|e| ResolveError::Store(decode_err(e)))?,
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                // No undecided ticket: unknown, already resolved, or removed
-                // — all collapse to `NotFound`, and the claim is untouched.
+                // No ticket: unknown, resolved, or removed all return `NotFound`.
                 return Err(ResolveError::NotFound);
             }
             Err(err) => return Err(ResolveError::Store(request_err(err))),
@@ -191,24 +172,15 @@ impl Inner {
             }
             Err(err) => return Err(ResolveError::Store(request_err(err))),
         };
-        // Best-effort beyond the stated durability boundary (a process
-        // restart): the page cache already carries the write across
-        // restart, and no other write path fsyncs, so this sync only
-        // narrows the empty-file crash window documented atop the module
-        // rather than promising host-crash durability.
+        // Sync narrows the empty-file crash window but does not guarantee
+        // host-crash durability.
         if let Err(err) = file.write_all(&payload).and_then(|()| file.sync_all()) {
-            // Undo the claim: the decision was never fully written, and a
-            // retry must be able to take the claim again.
+            // Undo claim so retry can take it.
             let _ = fs::remove_file(&decision_path);
             return Err(ResolveError::Store(request_err(err)));
         }
-        // The sync above is the commit: the decision is recorded. Removing
-        // the ticket file is best-effort past it — `Ok(())` and `NotFound`
-        // pass, and any other failure leaves a stale ticket that is benign
-        // (`get` returns the identical record from either file, a repeat
-        // resolve still fails closed on the claim, and `remove` /
-        // `cancel_request` still clean it up), so resolve has already
-        // succeeded.
+        // After sync commit, ticket removal is best-effort. Failure leaves
+        // a stale ticket; resolve succeeded.
         match fs::remove_file(self.ticket_path(&id)) {
             Ok(()) => {}
             Err(err) if err.kind() == io::ErrorKind::NotFound => {}
@@ -240,8 +212,7 @@ impl Inner {
     fn remove_sync(&self, id: &DecisionId) -> Result<(), SessionStoreError> {
         let _guard = self.lock();
         let id = canonical_id(id)?;
-        // Both halves of a possibly-decided entry go; a missing half is not
-        // an error (remove is idempotent).
+        // Remove both halves; missing halves are fine (idempotent).
         for path in [self.ticket_path(&id), self.decision_path(&id)] {
             if let Err(err) = fs::remove_file(&path)
                 && err.kind() != io::ErrorKind::NotFound
@@ -345,10 +316,7 @@ impl ApprovalStore for FileApprovalStore {
     }
 }
 
-/// The canonical UUID form of a decision id, refusing anything that could
-/// address a file outside the store root once embedded in a file name.
-/// `DecisionId`'s `Display` is canonical today; this is the defense-in-depth
-/// check that keeps path building safe if construction paths ever widen.
+/// Validate decision id as canonical UUID for path safety.
 fn canonical_id(id: &DecisionId) -> Result<String, SessionStoreError> {
     let raw = id.to_string();
     if uuid::Uuid::parse_str(&raw).is_ok_and(|parsed| parsed.to_string() == raw) {
@@ -360,10 +328,7 @@ fn canonical_id(id: &DecisionId) -> Result<String, SessionStoreError> {
     }
 }
 
-/// Write `payload` to `path` via a uniquely-named temp file in the same
-/// directory followed by a rename: publication is atomic within the
-/// directory, so a crash never leaves a partial file under a final name, and
-/// a crashed publisher leaves at most an orphaned dot-prefixed temp.
+/// Write via temp-file plus rename: atomic within directory.
 fn publish(path: &Path, payload: &[u8]) -> Result<(), SessionStoreError> {
     let dir = path.parent().expect("a store file always has a parent");
     let name = path.file_name().expect("a store file is always named");
@@ -380,13 +345,13 @@ fn publish(path: &Path, payload: &[u8]) -> Result<(), SessionStoreError> {
     Ok(())
 }
 
-/// Decode a stored ticket file back to the domain.
+/// Decode stored ticket file.
 fn decode_ticket(bytes: &[u8]) -> Result<ParkedApproval, SessionStoreError> {
     let record: ParkedApprovalRecord = serde_json::from_slice(bytes).map_err(decode_err)?;
     restore_ticket(record)
 }
 
-/// Restore a decoded ticket record to the domain.
+/// Restore ticket record.
 fn restore_ticket(record: ParkedApprovalRecord) -> Result<ParkedApproval, SessionStoreError> {
     ParkedApproval::try_from(record).map_err(decode_err)
 }
@@ -409,8 +374,7 @@ fn decode_err(reason: impl std::fmt::Display) -> SessionStoreError {
     }
 }
 
-/// Map a `spawn_blocking` join failure (a panicked store operation) to the
-/// store request error.
+/// Join failure maps to store error.
 fn join_err(err: JoinError) -> SessionStoreError {
     SessionStoreError::Request {
         reason: format!("file store task failed: {err}"),

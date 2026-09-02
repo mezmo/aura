@@ -2,9 +2,7 @@
 //! server uses and how to reach it (when not in-memory).
 //!
 //! Configured **only via environment variables** — never in agent TOML files.
-//! TOML configs are per-agent (a server loads N of them), while the session
-//! store is deployment infrastructure with exactly one instance per server;
-//! a TOML surface would ambiguously imply one store per agent config.
+//! TOML configs are per-agent; session store is per-server.
 //!
 //! See `docs/design/session-storage.md` §8.
 //!
@@ -78,7 +76,7 @@ pub enum SessionStoreConfig {
 pub struct RedisSessionStoreConfig {
     /// Backend connection URL (`redis://` or `rediss://`; Valkey compatible).
     pub url: String,
-    /// Key/topic namespace, so multiple deployments can share a cluster.
+    /// Key/topic namespace.
     pub key_prefix: String,
     /// Backend connection timeout.
     pub connect_timeout: Duration,

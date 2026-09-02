@@ -42,7 +42,7 @@ impl InMemoryApprovalStore {
         self.entries.lock().expect("approval store lock poisoned")
     }
 
-    /// Lock the decided map, dropping entries past their retention window.
+    /// Lock decided map, dropping expired entries.
     fn lock_decided(&self) -> std::sync::MutexGuard<'_, BTreeMap<DecisionId, DecidedEntry>> {
         let mut decided = self.decided.lock().expect("approval store lock poisoned");
         let now = chrono::Utc::now();
@@ -67,10 +67,7 @@ impl ApprovalStore for InMemoryApprovalStore {
         id: &DecisionId,
         decision: ApprovalDecision,
     ) -> Result<(), ResolveError> {
-        // Removal under the lock is the at-most-once guarantee. The expiry
-        // check in front of it refuses a ticket past its `expires_at`
-        // uniformly with an unknown id (park/reify §2.5); the ticket itself
-        // stays readable through `get` until `remove`.
+        // Lock removal provides at-most-once.
         let parked = {
             let mut entries = self.lock();
             if entries
@@ -264,9 +261,7 @@ mod tests {
         assert_eq!(store.decision(&DecisionId::generate()).await.unwrap(), None);
     }
 
-    /// Retention pruning still drops an entry past its window. The §2.5
-    /// contract makes an expired ticket unresolvable, so the past-window
-    /// state is constructed directly rather than reached through `resolve`.
+    /// Retention pruning drops entries past window.
     #[tokio::test]
     async fn recorded_decision_is_pruned_after_retention_window() {
         let store = InMemoryApprovalStore::new();
@@ -282,8 +277,7 @@ mod tests {
         assert_eq!(store.decision(&id).await.unwrap(), None);
     }
 
-    /// §2.5: `resolve` refuses a ticket past its `expires_at`, uniformly with
-    /// an unknown id; nothing is decided and the ticket stays for `get`.
+    /// `resolve` refuses expired tickets.
     #[tokio::test]
     async fn expired_ticket_refuses_resolve() {
         let store = InMemoryApprovalStore::new();
@@ -300,8 +294,7 @@ mod tests {
         assert!(store.get(&id).await.unwrap().is_some());
     }
 
-    /// §2.5: expiry is enforced only by `resolve`; `get` returns the expired
-    /// ticket until `remove`.
+    /// `get` returns expired tickets.
     #[tokio::test]
     async fn expired_ticket_is_returned_by_get_until_remove() {
         let store = InMemoryApprovalStore::new();

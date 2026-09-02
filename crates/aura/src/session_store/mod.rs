@@ -55,20 +55,14 @@ pub enum SessionStoreError {
 #[async_trait]
 pub trait ApprovalStore: Send + Sync {
     /// Persist a parked approval, keyed by its `DecisionId`. Backends with
-    /// native expiry should TTL the entry from `expires_at` so abandoned
-    /// approvals self-clean; backends without it (the file store) retain
-    /// the entry until the consumer removes it, and expiry is enforced
-    /// only by `resolve`.
+    /// expiry TTL from `expires_at`; file store retains until removed.
     async fn register(&self, parked: ParkedApproval) -> Result<(), SessionStoreError>;
 
     /// Look up a parked approval.
     async fn get(&self, id: &DecisionId) -> Result<Option<ParkedApproval>, SessionStoreError>;
 
-    /// Record a terminal decision at most once per id: exactly one
-    /// resolve wins the claim and later attempts read as `NotFound`.
-    /// Backends remove the parked entry; the file backend instead moves
-    /// the ticket into its decision record, so `get` keeps returning the
-    /// ticket until `remove` (the retention contract park mode keys on).
+    /// Record a terminal decision at most once per id.
+    /// File backend moves ticket to decision record; others remove.
     async fn resolve(
         &self,
         id: &DecisionId,
