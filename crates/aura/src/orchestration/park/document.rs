@@ -8,6 +8,7 @@
 //! ever be read back from the approval store, never copied into a document.
 
 use std::io;
+#[cfg(test)]
 use std::path::Path;
 
 use rig::completion::Message;

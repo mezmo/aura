@@ -1,22 +1,32 @@
 //! An approval-store double for fault injection in tests.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use async_trait::async_trait;
 
 use super::{ApprovalStore, InMemoryApprovalStore, SessionStoreError};
 use crate::hitl::{ApprovalDecision, DecisionId, ParkedApproval, ResolveError};
 
 /// Delegates to an in-memory store; each `fail_*` flag makes that operation
-/// answer `SessionStoreError::Request`.
+/// answer `SessionStoreError::Request` (the `*_once` flag fires one time).
 #[derive(Default)]
 pub(crate) struct FaultInjectingStore {
     inner: InMemoryApprovalStore,
     fail_register: bool,
+    fail_get_once: AtomicBool,
 }
 
 impl FaultInjectingStore {
     pub(crate) fn failing_register() -> Self {
         Self {
             fail_register: true,
+            ..Default::default()
+        }
+    }
+
+    pub(crate) fn failing_first_get() -> Self {
+        Self {
+            fail_get_once: AtomicBool::new(true),
             ..Default::default()
         }
     }
@@ -34,6 +44,11 @@ impl ApprovalStore for FaultInjectingStore {
     }
 
     async fn get(&self, id: &DecisionId) -> Result<Option<ParkedApproval>, SessionStoreError> {
+        if self.fail_get_once.swap(false, Ordering::SeqCst) {
+            return Err(SessionStoreError::Request {
+                reason: "transient parked-approval lookup fault".to_string(),
+            });
+        }
         self.inner.get(id).await
     }
 

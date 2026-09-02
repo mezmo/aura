@@ -16,7 +16,7 @@ use super::decision::{AgentScope, ApprovalOrigin, DecisionId};
 use super::protocol::{ApprovalItem, ApprovalRequest, PROTOCOL_VERSION};
 use super::registry::{ParkedApproval, PendingApprovals};
 use super::route::{ApprovalError, DecisionRoute, GateDecision};
-use crate::orchestration::{BlockedCell, PendingCall};
+use crate::orchestration::{BlockedCell, ParkGuard, PendingCall};
 use crate::tool_wrapper::{PreCallOutcome, ToolCallContext, ToolWrapper};
 
 /// The placeholder tool result a parked call returns.
@@ -29,6 +29,8 @@ struct ParkContext {
     registry: PendingApprovals,
     /// The worker's blocked cell.
     cell: Arc<BlockedCell>,
+    /// The run's park guard.
+    guard: Arc<ParkGuard>,
 }
 
 /// Gates matching tool calls behind an approval decision.
@@ -75,8 +77,17 @@ impl HitlApprovalWrapper {
 
     /// Arm the park arm: glob-matched calls park as durable approvals.
     #[must_use]
-    pub fn with_park(mut self, registry: PendingApprovals, cell: Arc<BlockedCell>) -> Self {
-        self.park = Some(ParkContext { registry, cell });
+    pub(crate) fn with_park(
+        mut self,
+        registry: PendingApprovals,
+        cell: Arc<BlockedCell>,
+        guard: Arc<ParkGuard>,
+    ) -> Self {
+        self.park = Some(ParkContext {
+            registry,
+            cell,
+            guard,
+        });
         self
     }
 
@@ -166,6 +177,24 @@ impl HitlApprovalWrapper {
             ));
         }
 
+        let call_id = park.cell.take_current_call_id().unwrap_or_else(|| {
+            tracing::warn!(
+                decision_id = %decision_id,
+                tool_name = %ctx.tool_name,
+                "parked call has no tool-call id; recording an empty call_id",
+            );
+            String::new()
+        });
+        let call = PendingCall {
+            decision_id,
+            tool_name: ctx.tool_name.clone(),
+            arguments: args.clone(),
+            call_id,
+        };
+        // The guard learns the id now, so a run dropped before the task
+        // returns still sweeps this ticket.
+        park.guard.record(&self.scope, std::slice::from_ref(&call));
+
         // The lifecycle pair goes to the live request's broker, not the owner id.
         crate::approval_event_broker::publish(
             &self.request_id,
@@ -183,20 +212,7 @@ impl HitlApprovalWrapper {
         )
         .await;
 
-        let call_id = park.cell.take_current_call_id().unwrap_or_else(|| {
-            tracing::warn!(
-                decision_id = %decision_id,
-                tool_name = %ctx.tool_name,
-                "parked call has no tool-call id; recording an empty call_id",
-            );
-            String::new()
-        });
-        park.cell.push(PendingCall {
-            decision_id,
-            tool_name: ctx.tool_name.clone(),
-            arguments: args.clone(),
-            call_id,
-        });
+        park.cell.push(call);
         tracing::info!(
             decision_id = %decision_id,
             tool_name = %ctx.tool_name,
@@ -424,7 +440,15 @@ mod tests {
                 "test-agent".to_string(),
                 "test-instance".to_string(),
             )
-            .with_park(registry.clone(), cell.clone())
+            .with_park(
+                registry.clone(),
+                cell.clone(),
+                ParkGuard::new(
+                    registry.clone(),
+                    "0191e8c0-1111-7000-8000-000000000042".to_string(),
+                    request_id.to_string(),
+                ),
+            )
         }
 
         #[tokio::test]
@@ -596,6 +620,56 @@ mod tests {
                 .unwrap();
             assert_eq!(outcome, PreCallOutcome::Proceed { overrides: None });
             assert!(cell.is_empty());
+        }
+
+        #[tokio::test]
+        async fn guard_learns_the_decision_at_registration() {
+            let store: Arc<dyn crate::session_store::ApprovalStore> =
+                Arc::new(crate::session_store::InMemoryApprovalStore::new());
+            let registry = PendingApprovals::with_backend(
+                store.clone(),
+                Arc::new(crate::session_store::InMemoryEventBus::new()),
+            );
+            let route = conv_route_over(registry.clone(), Duration::from_secs(60));
+            let cell = Arc::new(crate::orchestration::BlockedCell::default());
+            let guard = ParkGuard::new(
+                registry.clone(),
+                "0191e8c0-1111-7000-8000-000000000042".to_string(),
+                "req-guard".to_string(),
+            );
+            let gate = HitlApprovalWrapper::new(
+                Arc::from([GlobPattern::new("kubectl_*").unwrap()]),
+                route,
+                worker_scope(),
+                "req-guard".to_string(),
+                "test-agent".to_string(),
+                "test-instance".to_string(),
+            )
+            .with_park(registry, cell.clone(), Arc::clone(&guard));
+
+            gate.pre_call(
+                &serde_json::json!({}),
+                &ToolCallContext::new("kubectl_apply"),
+            )
+            .await
+            .unwrap();
+            let decision_id = match cell.outcome() {
+                crate::orchestration::CellOutcome::Orphaned { pending } => pending[0].decision_id,
+                other => panic!("expected a parked call, got {other:?}"),
+            };
+            assert!(store.get(&decision_id).await.unwrap().is_some());
+
+            // The run ends unpublished: the guard sweeps the ticket the park
+            // arm registered, without any record from the orchestrator.
+            drop(gate);
+            drop(guard);
+            for _ in 0..200 {
+                if store.get(&decision_id).await.unwrap().is_none() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            assert!(store.get(&decision_id).await.unwrap().is_none());
         }
     }
 

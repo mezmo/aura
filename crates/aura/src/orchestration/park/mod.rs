@@ -1,14 +1,15 @@
-//! The park checkpoint document (park mode): the types, the builder from run
-//! state, and the load path.
+//! The park checkpoint (park mode): the document, the commit, and the
+//! run-scoped guard.
 
-// No production consumer yet; the park commit drops this allow.
-#![allow(dead_code, unused_imports)]
-
+mod commit;
 mod document;
+mod guard;
 
+pub(crate) use commit::{ParkCommitInputs, cancel_run_approvals, commit_from_run_state};
 #[cfg(test)]
 pub(crate) use document::load_parked_run;
 pub(crate) use document::{PARKED_DOCUMENT_SUFFIX, RESUMING_DOCUMENT_SUFFIX, RunStateForPark};
+pub(crate) use guard::ParkGuard;
 
 use std::collections::HashMap;
 

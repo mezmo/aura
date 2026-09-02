@@ -41,6 +41,7 @@ use tokio::fs;
 use tokio::sync::Notify;
 
 use super::events::RoutingMode;
+use super::park::{PARKED_DOCUMENT_SUFFIX, RESUMING_DOCUMENT_SUFFIX};
 use super::types::{Plan, TaskStatus};
 
 // ============================================================================
@@ -76,6 +77,21 @@ pub fn sanitize_filename_component(s: &str) -> String {
 /// into a persistence path.
 pub(crate) fn is_safe_path_component(s: &str) -> bool {
     !s.is_empty() && !s.contains('/') && !s.contains('\\') && !s.contains("..")
+}
+
+/// Whether `run_id` has a parked checkpoint document under `parked_dir`,
+/// under either the published or the resuming filename.
+async fn run_has_parked_document(parked_dir: &Path, run_id: &str) -> bool {
+    for suffix in [PARKED_DOCUMENT_SUFFIX, RESUMING_DOCUMENT_SUFFIX] {
+        if parked_dir
+            .join(format!("{run_id}{suffix}"))
+            .try_exists()
+            .is_ok_and(|e| e)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 // ============================================================================
@@ -342,6 +358,7 @@ impl ExecutionPersistence {
             Some(p) => p.to_path_buf(),
             None => return,
         };
+        let parked_dir = session_dir.join("parked");
 
         let mut run_dirs: Vec<String> = Vec::new();
         let mut entries = match fs::read_dir(&session_dir).await {
@@ -356,7 +373,11 @@ impl ExecutionPersistence {
                 _ => continue,
             }
             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if name == "latest" || name == self.run_id {
+                if name == "latest" || name == "parked" || name == self.run_id {
+                    continue;
+                }
+                if run_has_parked_document(&parked_dir, name).await {
+                    tracing::info!("Skipping prune of run {} with a parked document", name);
                     continue;
                 }
                 run_dirs.push(name.to_string());
@@ -2483,6 +2504,59 @@ mod tests {
     // ========================================================================
     // Parked-Run Checkpoint Tests
     // ========================================================================
+
+    #[tokio::test]
+    async fn test_prune_skips_parked_directory_and_parked_runs() {
+        let temp_dir = TempDir::new().unwrap();
+        let persistence =
+            ExecutionPersistence::new(temp_dir.path().join("memory"), Some("cs_prune".to_string()))
+                .await
+                .unwrap();
+        let session_dir = temp_dir.path().join("memory").join("cs_prune");
+        let oldest = "0191e8c0-0000-7000-8000-000000000001";
+        let second = "0191e8c0-0aaa-7000-8000-000000000005";
+        let parked = "0191e8c0-1111-7000-8000-000000000002";
+        let parked_resuming = "0191e8c0-2222-7000-8000-000000000003";
+        for run in [oldest, second, parked, parked_resuming] {
+            tokio::fs::create_dir_all(session_dir.join(run))
+                .await
+                .unwrap();
+        }
+        let parked_dir = session_dir.join("parked");
+        tokio::fs::create_dir_all(&parked_dir).await.unwrap();
+        tokio::fs::write(parked_dir.join(format!("{parked}.json")), "{}")
+            .await
+            .unwrap();
+        tokio::fs::write(
+            parked_dir.join(format!("{parked_resuming}.resuming.json")),
+            "{}",
+        )
+        .await
+        .unwrap();
+
+        persistence.prune_session_runs(1).await;
+
+        assert!(
+            !session_dir.join(oldest).exists() && !session_dir.join(second).exists(),
+            "plain old runs past the cap are pruned"
+        );
+        assert!(
+            session_dir.join(parked).exists(),
+            "a run with a parked document survives pruning"
+        );
+        assert!(
+            session_dir.join(parked_resuming).exists(),
+            "a run with only a resuming document survives pruning"
+        );
+        assert!(
+            session_dir.join(persistence.run_id()).exists(),
+            "the current run survives pruning"
+        );
+        assert!(
+            parked_dir.join(format!("{parked}.json")).exists(),
+            "the parked directory's documents are never pruned as runs"
+        );
+    }
 
     #[tokio::test]
     async fn test_run_status_parked_serializes_snake_case() {
