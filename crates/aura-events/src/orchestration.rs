@@ -73,6 +73,7 @@ pub mod event_names {
     pub const TASK_STARTED: &str = "aura.orchestrator.task_started";
     pub const TASK_COMPLETED: &str = "aura.orchestrator.task_completed";
     pub const TASK_BLOCKED: &str = "aura.orchestrator.task_blocked";
+    pub const RUN_PARKED: &str = "aura.orchestrator.run_parked";
     pub const ITERATION_COMPLETE: &str = "aura.orchestrator.iteration_complete";
     pub const REPLAN_STARTED: &str = "aura.orchestrator.replan_started";
     pub const SYNTHESIZING: &str = "aura.orchestrator.synthesizing";
@@ -146,6 +147,15 @@ pub enum OrchestrationStreamEvent {
         tool_name: String,
         orchestrator_id: String,
         worker_id: String,
+        #[serde(flatten)]
+        context: EventContext,
+    },
+    /// The run parked with a published checkpoint (park mode); terminal.
+    RunParked {
+        run_id: String,
+        decision_ids: Vec<String>,
+        expires_at: String,
+        iteration: usize,
         #[serde(flatten)]
         context: EventContext,
     },
@@ -249,6 +259,7 @@ impl OrchestrationStreamEvent {
             Self::TaskStarted { .. } => event_names::TASK_STARTED,
             Self::TaskCompleted { .. } => event_names::TASK_COMPLETED,
             Self::TaskBlocked { .. } => event_names::TASK_BLOCKED,
+            Self::RunParked { .. } => event_names::RUN_PARKED,
             Self::IterationComplete { .. } => event_names::ITERATION_COMPLETE,
             Self::ReplanStarted { .. } => event_names::REPLAN_STARTED,
             Self::Synthesizing { .. } => event_names::SYNTHESIZING,
@@ -363,6 +374,23 @@ impl OrchestrationStreamEvent {
             tool_name: tool_name.into(),
             orchestrator_id: orchestrator_id.into(),
             worker_id: worker_id.into(),
+            context,
+        }
+    }
+
+    /// Create a RunParked event (terminal, one per parked run).
+    pub fn run_parked(
+        run_id: impl Into<String>,
+        decision_ids: Vec<String>,
+        expires_at: impl Into<String>,
+        iteration: usize,
+        context: EventContext,
+    ) -> Self {
+        Self::RunParked {
+            run_id: run_id.into(),
+            decision_ids,
+            expires_at: expires_at.into(),
+            iteration,
             context,
         }
     }

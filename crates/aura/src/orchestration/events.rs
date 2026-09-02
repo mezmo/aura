@@ -115,6 +115,17 @@ pub enum OrchestratorEvent {
         /// The gated tool's name
         tool_name: String,
     },
+    /// The run parked with a published checkpoint (park mode); terminal.
+    RunParked {
+        /// The parked run's id.
+        run_id: String,
+        /// The decision ids still awaiting a human decision.
+        decision_ids: Vec<String>,
+        /// RFC 3339 timestamp after which the decisions expire.
+        expires_at: String,
+        /// Which iteration the run parked in (1-indexed).
+        iteration: usize,
+    },
     /// An iteration of the plan-execute loop has completed.
     ///
     /// Emitted after execution completes. Indicates whether the orchestrator
