@@ -14,19 +14,19 @@
 //! Each test namespaces its keys under a unique prefix with a short TTL, so
 //! tests neither collide nor leave state behind.
 
+mod common;
+
 use std::time::Duration;
 
 use a2a::{ListTasksRequest, Message, Part, Role, Task, TaskState, TaskStatus};
-use aura::hitl::{
-    AgentScope, ApprovalDecision, ApprovalItem, ApprovalOrigin, ApprovalOutcome, ApprovalRequest,
-    DecisionId, PROTOCOL_VERSION, ParkedApproval, PendingApprovals, ResolveError,
-};
+use aura::hitl::{ApprovalDecision, ApprovalOutcome, PendingApprovals, ResolveError};
 use aura::request_cancellation::RequestCancelToken;
-use aura::session_store::ParkedApprovalRecord;
 use aura_config::{RedisSessionStoreConfig, SessionStoreBackend};
 use aura_web_server::session_store::{RedisSessionStore, SessionStore};
 use bytes::Bytes;
 use futures_util::StreamExt;
+
+use common::make_parked;
 
 fn redis_url() -> String {
     std::env::var("AURA_TEST_REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string())
@@ -333,46 +333,15 @@ async fn expired_task_is_gone_and_pruned_from_list() {
 // HITL approval store
 // ---------------------------------------------------------------------------
 
-fn make_parked(request_id: &str, ttl: Duration) -> ParkedApproval {
-    let now = chrono::Utc::now();
-    ParkedApproval {
-        request: ApprovalRequest {
-            version: PROTOCOL_VERSION,
-            decision_id: DecisionId::generate(),
-            request_id: request_id.to_string(),
-            scope: AgentScope::Single { session_id: None },
-            origin: ApprovalOrigin::ConfigGate {
-                matched_pattern: "kubectl_*".to_string(),
-                agent_name: "test-agent".to_string(),
-            },
-            items: vec![ApprovalItem {
-                tool_name: "kubectl_delete".to_string(),
-                arguments: serde_json::json!({"pod": "web-1"}),
-                tool_call_intent: Some("restarting to pick up the config change".to_string()),
-            }],
-        },
-        registered_at: now,
-        expires_at: now + chrono::Duration::from_std(ttl).unwrap(),
-    }
-}
+// The backend-agnostic battery lives in `tests/common`; each test below
+// wires it to two live Redis connections.
 
 #[tokio::test]
 async fn approval_register_get_roundtrip_preserves_record() {
     let config = test_config(60);
     let instance_a = connect(&config).await.approvals();
     let instance_b = connect(&config).await.approvals();
-
-    let parked = make_parked("req-1", Duration::from_secs(60));
-    let id = parked.request.decision_id;
-    let expected = ParkedApprovalRecord::from(&parked);
-    instance_a.register(parked).await.unwrap();
-
-    let restored = instance_b
-        .get(&id)
-        .await
-        .unwrap()
-        .expect("instance B sees approval");
-    assert_eq!(ParkedApprovalRecord::from(&restored), expected);
+    common::register_get_roundtrip(&instance_a, &instance_b).await;
 }
 
 #[tokio::test]
@@ -380,20 +349,25 @@ async fn approval_resolve_is_at_most_once_across_instances() {
     let config = test_config(60);
     let instance_a = connect(&config).await.approvals();
     let instance_b = connect(&config).await.approvals();
+    common::resolve_is_at_most_once(&instance_a, &instance_b).await;
+}
 
-    let parked = make_parked("req-2", Duration::from_secs(60));
+/// Redis-specific: the consumed ticket is gone from the store. The file
+/// backend instead moves the ticket into the decision file and retains it
+/// until `remove` (§2.5).
+#[tokio::test]
+async fn approval_resolve_removes_the_parked_record() {
+    let approvals = connect(&test_config(60)).await.approvals();
+    let parked = make_parked("req-consumed", Duration::from_secs(60));
     let id = parked.request.decision_id;
-    instance_a.register(parked).await.unwrap();
+    approvals.register(parked).await.unwrap();
 
-    instance_b
+    approvals
         .resolve(&id, ApprovalDecision::Approved)
         .await
-        .expect("first resolve wins");
-    assert_eq!(
-        instance_a.resolve(&id, ApprovalDecision::Approved).await,
-        Err(ResolveError::NotFound)
-    );
-    assert!(instance_a.get(&id).await.unwrap().is_none());
+        .unwrap();
+
+    assert!(approvals.get(&id).await.unwrap().is_none());
 }
 
 #[tokio::test]
@@ -401,20 +375,7 @@ async fn approval_concurrent_resolves_have_exactly_one_winner() {
     let config = test_config(60);
     let instance_a = connect(&config).await.approvals();
     let instance_b = connect(&config).await.approvals();
-
-    let parked = make_parked("req-3", Duration::from_secs(60));
-    let id = parked.request.decision_id;
-    instance_a.register(parked).await.unwrap();
-
-    let (a, b) = tokio::join!(
-        instance_a.resolve(&id, ApprovalDecision::Approved),
-        instance_b.resolve(&id, ApprovalDecision::Approved),
-    );
-    assert_eq!(
-        [a.is_ok(), b.is_ok()].iter().filter(|ok| **ok).count(),
-        1,
-        "exactly one resolver must win: {a:?} / {b:?}"
-    );
+    common::concurrent_resolves_have_exactly_one_winner(&instance_a, &instance_b).await;
 }
 
 /// A resolution leaves a durable decision record readable from any instance (issue #474).
@@ -423,29 +384,7 @@ async fn approval_resolve_records_decision_readable_cross_instance() {
     let config = test_config(60);
     let instance_a = connect(&config).await.approvals();
     let instance_b = connect(&config).await.approvals();
-
-    let parked = make_parked("req-durable", Duration::from_secs(60));
-    let id = parked.request.decision_id;
-    instance_a.register(parked).await.unwrap();
-
-    let denied = ApprovalDecision::Denied {
-        reason: Some("not now".to_string()),
-    };
-    instance_b.resolve(&id, denied.clone()).await.unwrap();
-
-    assert_eq!(
-        instance_a.decision(&id).await.unwrap(),
-        Some(denied.clone())
-    );
-    assert_eq!(
-        instance_a.resolve(&id, ApprovalDecision::Approved).await,
-        Err(ResolveError::NotFound)
-    );
-    assert_eq!(instance_a.decision(&id).await.unwrap(), Some(denied));
-    assert_eq!(
-        instance_a.decision(&DecisionId::generate()).await.unwrap(),
-        None
-    );
+    common::resolve_records_readable_decision(&instance_a, &instance_b).await;
 }
 
 /// The decision record's TTL keeps a margin past the parked record's.
@@ -471,32 +410,13 @@ async fn decision_record_outlives_parked_record_ttl() {
 #[tokio::test]
 async fn approval_remove_makes_resolve_not_found() {
     let approvals = connect(&test_config(60)).await.approvals();
-    let parked = make_parked("req-4", Duration::from_secs(60));
-    let id = parked.request.decision_id;
-    approvals.register(parked).await.unwrap();
-
-    approvals.remove(&id).await.unwrap();
-
-    assert_eq!(
-        approvals.resolve(&id, ApprovalDecision::Approved).await,
-        Err(ResolveError::NotFound)
-    );
+    common::remove_makes_resolve_not_found(&approvals).await;
 }
 
 #[tokio::test]
 async fn approval_cancel_request_removes_only_matching() {
     let approvals = connect(&test_config(60)).await.approvals();
-    let cancel = make_parked("req-cancel", Duration::from_secs(60));
-    let keep = make_parked("req-keep", Duration::from_secs(60));
-    let cancel_id = cancel.request.decision_id;
-    let keep_id = keep.request.decision_id;
-    approvals.register(cancel).await.unwrap();
-    approvals.register(keep).await.unwrap();
-
-    approvals.cancel_request("req-cancel").await.unwrap();
-
-    assert!(approvals.get(&cancel_id).await.unwrap().is_none());
-    assert!(approvals.get(&keep_id).await.unwrap().is_some());
+    common::cancel_request_removes_only_matching(&approvals).await;
 }
 
 #[tokio::test]
