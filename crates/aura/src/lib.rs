@@ -17,6 +17,7 @@ pub mod fallback_tool_stream;
 pub mod governance;
 pub mod hitl;
 pub mod inactivity;
+pub mod instance_id;
 pub mod logging;
 pub mod mcp;
 #[cfg(feature = "otel")]
