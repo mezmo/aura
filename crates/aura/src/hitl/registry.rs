@@ -170,6 +170,18 @@ impl PendingApprovals {
         AwaitingDecision::new(id, rx, Instant::now() + timeout)
     }
 
+    /// Park-mode registration: persist the approval through the store
+    /// directly, failing on a store fault instead of parking anyway.
+    ///
+    /// Unlike [`Self::register`], no wake handle is created — nothing in this
+    /// process awaits the decision (the run is parked, and a later resume
+    /// consumes the recorded decision). A store error is returned to the
+    /// caller so the park arm can fail the gated call closed: a checkpoint
+    /// must never reference a decision id the store does not hold.
+    pub async fn register_durable(&self, parked: ParkedApproval) -> Result<(), SessionStoreError> {
+        self.0.store.register(parked).await
+    }
+
     /// Resolve a parked approval: durably record the decision in the store
     /// (at most once per `DecisionId`) and publish it on the bus, waking the
     /// parked await wherever it lives.

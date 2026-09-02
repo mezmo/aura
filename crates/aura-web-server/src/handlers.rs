@@ -1378,6 +1378,7 @@ mod tests {
         aura_config::Config {
             hitl: Some(aura_config::HitlConfig {
                 require_approval: vec![],
+                park: aura_config::ParkConfig::default(),
                 route,
             }),
             ..make_test_config()

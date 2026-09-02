@@ -1,10 +1,11 @@
 //! Streaming request hook for request lifecycle management.
 //!
 //! This hook manages the full lifecycle of streaming requests:
-//! 1. Timeout/cancellation - External cancellation signal (e.g., client disconnect)
-//! 2. Tool event emission - `aura.tool_requested`, `aura.tool_usage` events
-//! 3. Usage state tracking - Token counts for billing/metrics
-//! 4. Tool ID FIFO correlation - Associates tool calls with results
+//! 1. Parked approvals (park mode) - snapshot + cancel when the blocked cell is set
+//! 2. Timeout/cancellation - External cancellation signal (e.g., client disconnect)
+//! 3. Tool event emission - `aura.tool_requested`, `aura.tool_usage` events
+//! 4. Usage state tracking - Token counts for billing/metrics
+//! 5. Tool ID FIFO correlation - Associates tool calls with results
 //!
 //! # Tool Event Flow
 //!
@@ -15,6 +16,15 @@
 //!
 //! This relies on Rig's streaming mode executing tools sequentially.
 //! See `docs/rig-fork-changes.md` for analysis.
+//!
+//! # Park mode
+//!
+//! When the orchestrator registers a [`BlockedCell`] for this hook's request
+//! id (a per-worker-stream key), `on_completion_call` checks the cell first —
+//! before its external-cancel and timeout checks — and, when the cell holds a
+//! parked call, snapshots `(history, current_prompt)` into it and cancels the
+//! stream with reason `parked`. The cell, not the cancel reason, is the source
+//! of truth the orchestrator reads after the stream ends.
 //!
 //! # Usage
 //!
@@ -31,22 +41,63 @@
 //! let (prompt, completion, total) = usage_state.get_final_usage();
 //! ```
 
+use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use rig::agent::{CancelSignal, StreamingPromptHook};
+use rig::completion::{CompletionModel, GetTokenUsage, Message};
+use tokio::sync::watch;
+
+use crate::orchestration::BlockedCell;
 use crate::scratchpad::{self, ContextBudget};
 use crate::tool_event_broker::{
     pop_tool_call_id, publish_tool_requested, publish_tool_usage, push_tool_call_id,
 };
-use rig::agent::{CancelSignal, StreamingPromptHook};
-use rig::completion::{CompletionModel, GetTokenUsage, Message};
-use std::collections::HashSet;
-use std::future::Future;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
-use tokio::sync::watch;
 
 /// Maximum pending tool IDs before warning. Prevents unbounded growth if
 /// usage events never fire (e.g., provider doesn't return token counts).
 const MAX_PENDING_TOOL_IDS: usize = 256;
+
+// ============================================================================
+// Park cells (park mode)
+// ============================================================================
+
+/// Cancel reason the hook stamps when a parked call ends the worker stream.
+pub(crate) const PARK_CANCEL_REASON: &str = "parked";
+
+/// Global registry of worker blocked cells, keyed by the per-stream id the
+/// orchestrator passes as the hook's `request_id`.
+///
+/// The hook is constructed inside the streaming layer and cannot receive the
+/// cell as a parameter, so — like the tool-event and approval brokers — the
+/// cell travels through a request-keyed global for the lifetime of one worker
+/// stream: the orchestrator registers before opening the stream and removes
+/// the entry after it ends.
+static PARK_CELLS: OnceLock<tokio::sync::RwLock<HashMap<String, Arc<BlockedCell>>>> =
+    OnceLock::new();
+
+fn park_cells() -> &'static tokio::sync::RwLock<HashMap<String, Arc<BlockedCell>>> {
+    PARK_CELLS.get_or_init(|| tokio::sync::RwLock::new(HashMap::new()))
+}
+
+/// Register a worker's blocked cell under its stream key.
+pub(crate) async fn register_park_cell(key: &str, cell: Arc<BlockedCell>) {
+    park_cells().write().await.insert(key.to_string(), cell);
+}
+
+/// Remove the blocked cell registered under `key` (the worker stream ended).
+pub(crate) async fn remove_park_cell(key: &str) {
+    park_cells().write().await.remove(key);
+}
+
+/// The blocked cell for `key`, if this stream is in park mode.
+pub(crate) async fn park_cell_for(key: &str) -> Option<Arc<BlockedCell>> {
+    park_cells().read().await.get(key).cloned()
+}
 
 /// Shared usage state that survives hook cloning.
 ///
@@ -421,13 +472,30 @@ where
 {
     fn on_completion_call(
         &self,
-        _prompt: &Message,
-        _history: &[Message],
+        prompt: &Message,
+        history: &[Message],
         cancel_sig: CancelSignal,
     ) -> impl Future<Output = ()> + Send {
         let has_client_tools = !self.client_tool_names.is_empty();
         let client_tool_called = self.client_tool_called.clone();
         async move {
+            // Parked calls are checked FIRST — before the client-tool,
+            // external-cancel, and timeout checks (mirroring the
+            // `client_tool_called` ordering above them): when the blocked
+            // cell holds a parked call, the conversation snapshot must be
+            // captured no matter what else is simultaneously true, because
+            // the cell is the source of truth for the worker's outcome.
+            if let Some(cell) = park_cell_for(&self.request_id).await
+                && cell.snapshot_if_pending(history, prompt)
+            {
+                tracing::info!(
+                    request_id = %self.request_id,
+                    "Parked approval pending — cancelling stream (reason: {})",
+                    PARK_CANCEL_REASON
+                );
+                cancel_sig.cancel_with_reason(PARK_CANCEL_REASON);
+                return;
+            }
             // If a passthrough tool was called this turn, do not initiate
             // another LLM completion. Cancel here so the stream terminates
             // and the streaming layer can emit `finish_reason: "tool_calls"`
@@ -493,6 +561,14 @@ where
         let is_client_tool = self.client_tool_names.contains(&tool_name);
         let client_tool_called = self.client_tool_called.clone();
         async move {
+            // Park-mode correlation: remember the id of the call about to
+            // execute so the gate's park arm can stamp it on the blocked-cell
+            // entry. Rig runs tools sequentially inside a turn, so a single
+            // slot cannot interleave.
+            if let Some(cell) = park_cell_for(&request_id).await {
+                cell.set_current_call_id(tool_call_id.clone());
+            }
+
             if is_client_tool {
                 tracing::info!(
                     "Client tool '{}' called for request '{}' — marking for passthrough",
@@ -682,6 +758,48 @@ mod tests {
             StreamingRequestHook::new(Duration::from_secs(60), "test_req_1");
         assert!(!hook.should_cancel());
         assert_eq!(hook.request_id, "test_req_1");
+    }
+
+    // ---------------------------------------------------------------------
+    // Park-cell registry
+    // ---------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn park_cell_registry_roundtrip_and_isolation() {
+        let cell_a = Arc::new(BlockedCell::default());
+        let cell_b = Arc::new(BlockedCell::default());
+        let key_a = format!("park_reg_{}", uuid::Uuid::new_v4().simple());
+        let key_b = format!("park_reg_{}", uuid::Uuid::new_v4().simple());
+
+        assert!(
+            park_cell_for(&key_a).await.is_none(),
+            "absent key has no cell"
+        );
+        register_park_cell(&key_a, cell_a.clone()).await;
+        register_park_cell(&key_b, cell_b.clone()).await;
+
+        let looked_up = park_cell_for(&key_a).await.expect("registered cell");
+        looked_up.push(crate::orchestration::PendingCall {
+            decision_id: crate::hitl::DecisionId::generate(),
+            tool_name: "kubectl_apply".to_string(),
+            arguments: serde_json::json!({}),
+            call_id: "call_1".to_string(),
+        });
+        assert!(
+            cell_b.is_empty(),
+            "keys are isolated: the other worker's cell is untouched"
+        );
+
+        remove_park_cell(&key_a).await;
+        assert!(
+            park_cell_for(&key_a).await.is_none(),
+            "removed key has no cell"
+        );
+        assert!(
+            park_cell_for(&key_b).await.is_some(),
+            "sibling key survives"
+        );
+        remove_park_cell(&key_b).await;
     }
 
     #[test]
