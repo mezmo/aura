@@ -13,9 +13,10 @@ use std::sync::Arc;
 use a2a_server::{InMemoryTaskStore, TaskStore};
 use async_trait::async_trait;
 use aura::session_store::{
-    ApprovalStore, EventBus, InMemoryApprovalStore, InMemoryEventBus, SessionStoreError,
+    ApprovalStore, EventBus, FileApprovalStore, InMemoryApprovalStore, InMemoryEventBus,
+    SessionStoreError,
 };
-use aura_config::{SessionStoreBackend, SessionStoreConfig};
+use aura_config::{FileSessionStoreConfig, SessionStoreBackend, SessionStoreConfig};
 
 #[cfg(feature = "session-store-redis")]
 pub use redis::RedisSessionStore;
@@ -33,20 +34,25 @@ pub trait SessionStore: Send + Sync {
     /// Durable A2A tasks (the upstream `a2a_server::TaskStore` trait).
     fn tasks(&self) -> Arc<dyn TaskStore>;
 
-    /// Allows for cross-instance pub/sub (in-memory SessionStore would be single-instance only).
+    /// Cross-instance pub/sub.
     fn bus(&self) -> Arc<dyn EventBus>;
 
-    /// Cheap liveness check.
+    /// Backend health check. Implementations may touch the backend (a
+    /// round trip, a probe write) but must stay cheap enough to run on
+    /// every health probe.
     async fn ping(&self) -> Result<(), SessionStoreError>;
 }
 
-/// Construct the configured backend. Fails fast on an unreachable networked
-/// backend or a `redis` config in a build without `session-store-redis`.
+/// Construct configured backend, failing fast.
 pub async fn build_session_store(
     config: &SessionStoreConfig,
 ) -> Result<Arc<dyn SessionStore>, SessionStoreError> {
     match config {
         SessionStoreConfig::Memory => Ok(Arc::new(InMemorySessionStore::new())),
+        SessionStoreConfig::File(file_config) => {
+            // File-backed approvals; tasks and bus stay in memory.
+            Ok(Arc::new(FileSessionStore::new(file_config)?))
+        }
         #[cfg(feature = "session-store-redis")]
         SessionStoreConfig::Redis(redis_config) => {
             Ok(Arc::new(RedisSessionStore::connect(redis_config).await?))
@@ -59,8 +65,7 @@ pub async fn build_session_store(
     }
 }
 
-/// The default backend: every capability is process-local, so state is scoped
-/// to one process.
+/// The default backend.
 pub struct InMemorySessionStore {
     approvals: Arc<InMemoryApprovalStore>,
     tasks: Arc<InMemoryTaskStore>,
@@ -104,5 +109,46 @@ impl SessionStore for InMemorySessionStore {
 
     async fn ping(&self) -> Result<(), SessionStoreError> {
         Ok(())
+    }
+}
+
+/// The file-backed backend.
+pub struct FileSessionStore {
+    approvals: Arc<FileApprovalStore>,
+    tasks: Arc<InMemoryTaskStore>,
+    bus: Arc<InMemoryEventBus>,
+}
+
+impl FileSessionStore {
+    /// Open the approval store at the configured path, failing fast when it
+    /// cannot.
+    pub fn new(config: &FileSessionStoreConfig) -> Result<Self, SessionStoreError> {
+        Ok(Self {
+            approvals: Arc::new(FileApprovalStore::open(&config.path)?),
+            tasks: Arc::new(InMemoryTaskStore::new()),
+            bus: Arc::new(InMemoryEventBus::new()),
+        })
+    }
+}
+#[async_trait]
+impl SessionStore for FileSessionStore {
+    fn backend(&self) -> SessionStoreBackend {
+        SessionStoreBackend::File
+    }
+
+    fn approvals(&self) -> Arc<dyn ApprovalStore> {
+        self.approvals.clone()
+    }
+
+    fn tasks(&self) -> Arc<dyn TaskStore> {
+        self.tasks.clone()
+    }
+
+    fn bus(&self) -> Arc<dyn EventBus> {
+        self.bus.clone()
+    }
+
+    async fn ping(&self) -> Result<(), SessionStoreError> {
+        self.approvals.probe_writable().await
     }
 }
