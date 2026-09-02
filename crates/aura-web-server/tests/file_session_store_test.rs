@@ -387,8 +387,9 @@ async fn open_fails_when_a_store_directory_is_not_writable() {
     );
 }
 
-/// Ping is the file backend's readiness signal: it must report an
-/// unwritable directory, and recover when writability returns.
+/// Ping is the file backend's readiness signal: it must report either
+/// store directory becoming unwritable, and recover when writability
+/// returns.
 #[cfg(unix)]
 #[tokio::test]
 async fn ping_reports_an_unwritable_store_directory() {
@@ -398,24 +399,23 @@ async fn ping_reports_an_unwritable_store_directory() {
     let store = FileApprovalStore::open(dir.path()).unwrap();
     store.probe_writable().await.expect("healthy store pings");
 
-    let tickets = dir.path().join("tickets");
-    std::fs::set_permissions(&tickets, std::fs::Permissions::from_mode(0o500)).unwrap();
-    let _restore = Restore(&tickets);
+    for name in ["tickets", "decisions"] {
+        let locked = dir.path().join(name);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let restore = Restore(&locked);
 
-    let probe = tickets.join(".write-probe");
-    if std::fs::write(&probe, b"x").is_ok() {
-        let _ = std::fs::remove_file(&probe);
-        eprintln!("skipping: process bypasses directory permissions (running as root?)");
-        return;
+        let probe = locked.join(".write-probe");
+        if std::fs::write(&probe, b"x").is_ok() {
+            let _ = std::fs::remove_file(&probe);
+            eprintln!("skipping: process bypasses directory permissions (running as root?)");
+            return;
+        }
+
+        store
+            .probe_writable()
+            .await
+            .expect_err("ping must report the unwritable directory");
+        drop(restore);
+        store.probe_writable().await.expect("ping recovers");
     }
-
-    store
-        .probe_writable()
-        .await
-        .expect_err("ping must report the unwritable directory");
-    drop(store);
-
-    std::fs::set_permissions(&tickets, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let restored = FileApprovalStore::open(dir.path()).unwrap();
-    restored.probe_writable().await.expect("ping recovers");
 }

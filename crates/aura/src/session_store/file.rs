@@ -77,10 +77,9 @@ struct Inner {
 }
 
 impl FileApprovalStore {
-    /// Open (or initialize) the store rooted at `root`, creating its
-    /// directories and probing the ticket directory for writes. Fails
-    /// fast: a store that cannot hold files must fail at startup, not on
-    /// the first approval.
+    /// Open (or initialize) the store rooted at `root`, creating both
+    /// directories and probing them for writes. Fails fast: a store that
+    /// cannot hold files must fail at startup, not on the first approval.
     pub fn open(root: impl AsRef<Path>) -> Result<Self, SessionStoreError> {
         let root = root.as_ref();
         fs::create_dir_all(root.join(TICKETS_DIR)).map_err(connect_err)?;
@@ -123,17 +122,18 @@ impl Inner {
         self.lock.lock().expect("file approval store lock poisoned")
     }
 
-    /// Create and unlink an empty probe file in the ticket directory, where
-    /// the first write of any approval lands. This catches permission and
-    /// mount faults, not a full disk.
+    /// Create and unlink an empty probe file in each store directory. This
+    /// catches permission and mount faults, not a full disk.
     fn probe_writable_sync(&self) -> io::Result<()> {
-        let dir = self.tickets_dir();
-        let probe = dir.join(format!(".{}.probe", uuid::Uuid::new_v4()));
-        fs::write(&probe, b"")
-            .and_then(|()| fs::remove_file(&probe))
-            .map_err(|err| {
-                io::Error::new(err.kind(), format!("{} not writable: {err}", dir.display()))
-            })
+        for dir in [self.tickets_dir(), self.decisions_dir()] {
+            let probe = dir.join(format!(".{}.probe", uuid::Uuid::new_v4()));
+            fs::write(&probe, b"")
+                .and_then(|()| fs::remove_file(&probe))
+                .map_err(|err| {
+                    io::Error::new(err.kind(), format!("{} not writable: {err}", dir.display()))
+                })?;
+        }
+        Ok(())
     }
 
     fn register_sync(&self, parked: ParkedApproval) -> Result<(), SessionStoreError> {
