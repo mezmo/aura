@@ -49,6 +49,7 @@ use rig::streaming::{
     StreamingCompletionResponse,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
@@ -625,6 +626,7 @@ pub(crate) async fn drive_worker(
         Some(Duration::from_secs(60)),
         request_id,
         None,
+        HashSet::new(),
     );
 
     let mut stream = rig
