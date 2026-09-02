@@ -31,6 +31,13 @@
 //! serializes operations for the single writing process; no operation awaits
 //! while holding it.
 //!
+//! Every store operation runs on the blocking thread pool behind its async
+//! trait method. A join failure — a panicked store operation — maps to the
+//! store request error callers already treat fail-closed, so a panicking
+//! store op is a store fault, not a server crash. Blocking work is also not
+//! cancelled when the requesting future is dropped: a dropped poll request
+//! still completes resolve's claim-write-move.
+//!
 //! Crash window in `resolve`: the decision file is claimed with
 //! `create_new` and then written and synced, so a process death between
 //! the two can leave an empty `decisions/{id}.json`. The aftermath fails
@@ -44,10 +51,11 @@
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use tokio::task::{JoinError, spawn_blocking};
 
 use crate::hitl::{ApprovalDecision, DecisionId, ParkedApproval, ResolveError};
 
@@ -70,7 +78,13 @@ struct ResolvedEntry {
 }
 
 /// A file-backed [`ApprovalStore`] over one root directory.
+#[derive(Clone)]
 pub struct FileApprovalStore {
+    inner: Arc<Inner>,
+}
+
+/// The shared store state every blocking-pool operation runs against.
+struct Inner {
     root: PathBuf,
     /// Serializes compound operations for the single writing process.
     lock: Mutex<()>,
@@ -86,11 +100,15 @@ impl FileApprovalStore {
         fs::create_dir_all(root.join(TICKETS_DIR)).map_err(connect_err)?;
         fs::create_dir_all(root.join(DECISIONS_DIR)).map_err(connect_err)?;
         Ok(Self {
-            root: root.to_path_buf(),
-            lock: Mutex::new(()),
+            inner: Arc::new(Inner {
+                root: root.to_path_buf(),
+                lock: Mutex::new(()),
+            }),
         })
     }
+}
 
+impl Inner {
     fn tickets_dir(&self) -> PathBuf {
         self.root.join(TICKETS_DIR)
     }
@@ -110,11 +128,8 @@ impl FileApprovalStore {
     fn lock(&self) -> MutexGuard<'_, ()> {
         self.lock.lock().expect("file approval store lock poisoned")
     }
-}
 
-#[async_trait]
-impl ApprovalStore for FileApprovalStore {
-    async fn register(&self, parked: ParkedApproval) -> Result<(), SessionStoreError> {
+    fn register_sync(&self, parked: ParkedApproval) -> Result<(), SessionStoreError> {
         let _guard = self.lock();
         let id = canonical_id(&parked.request.decision_id)?;
         let payload = serde_json::to_vec(&ParkedApprovalRecord::from(&parked))
@@ -122,7 +137,7 @@ impl ApprovalStore for FileApprovalStore {
         publish(&self.ticket_path(&id), &payload)
     }
 
-    async fn get(&self, id: &DecisionId) -> Result<Option<ParkedApproval>, SessionStoreError> {
+    fn get_sync(&self, id: &DecisionId) -> Result<Option<ParkedApproval>, SessionStoreError> {
         let _guard = self.lock();
         let id = canonical_id(id)?;
         match fs::read(self.ticket_path(&id)) {
@@ -142,7 +157,7 @@ impl ApprovalStore for FileApprovalStore {
         }
     }
 
-    async fn resolve(
+    fn resolve_sync(
         &self,
         id: &DecisionId,
         decision: ApprovalDecision,
@@ -197,14 +212,26 @@ impl ApprovalStore for FileApprovalStore {
             let _ = fs::remove_file(&decision_path);
             return Err(ResolveError::Store(request_err(err)));
         }
-        // The move completes: from here the ticket lives inside the decision
-        // file, and `get` recovers it from there until `remove`.
-        fs::remove_file(self.ticket_path(&id))
-            .map_err(|err| ResolveError::Store(request_err(err)))?;
+        // The sync above is the commit: the decision is recorded. Removing
+        // the ticket file is best-effort past it — `Ok(())` and `NotFound`
+        // pass, and any other failure leaves a stale ticket that is benign
+        // (`get` returns the identical record from either file, a repeat
+        // resolve still fails closed on the claim, and `remove` /
+        // `cancel_request` still clean it up), so resolve has already
+        // succeeded.
+        match fs::remove_file(self.ticket_path(&id)) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => tracing::warn!(
+                decision_id = %id,
+                error = %err,
+                "stale ticket file remains after resolve; it is benign"
+            ),
+        }
         Ok(())
     }
 
-    async fn decision(
+    fn decision_sync(
         &self,
         id: &DecisionId,
     ) -> Result<Option<ApprovalDecision>, SessionStoreError> {
@@ -220,7 +247,7 @@ impl ApprovalStore for FileApprovalStore {
         }
     }
 
-    async fn remove(&self, id: &DecisionId) -> Result<(), SessionStoreError> {
+    fn remove_sync(&self, id: &DecisionId) -> Result<(), SessionStoreError> {
         let _guard = self.lock();
         let id = canonical_id(id)?;
         // Both halves of a possibly-decided entry go; a missing half is not
@@ -235,7 +262,7 @@ impl ApprovalStore for FileApprovalStore {
         Ok(())
     }
 
-    async fn cancel_request(&self, request_id: &str) -> Result<(), SessionStoreError> {
+    fn cancel_request_sync(&self, request_id: &str) -> Result<(), SessionStoreError> {
         let _guard = self.lock();
         let entries = match fs::read_dir(self.tickets_dir()) {
             Ok(entries) => entries,
@@ -270,6 +297,63 @@ impl ApprovalStore for FileApprovalStore {
             }
         }
         Ok(())
+    }
+}
+
+#[async_trait]
+impl ApprovalStore for FileApprovalStore {
+    async fn register(&self, parked: ParkedApproval) -> Result<(), SessionStoreError> {
+        let inner = Arc::clone(&self.inner);
+        spawn_blocking(move || inner.register_sync(parked))
+            .await
+            .map_err(join_err)?
+    }
+
+    async fn get(&self, id: &DecisionId) -> Result<Option<ParkedApproval>, SessionStoreError> {
+        let inner = Arc::clone(&self.inner);
+        let id = *id;
+        spawn_blocking(move || inner.get_sync(&id))
+            .await
+            .map_err(join_err)?
+    }
+
+    async fn resolve(
+        &self,
+        id: &DecisionId,
+        decision: ApprovalDecision,
+    ) -> Result<(), ResolveError> {
+        let inner = Arc::clone(&self.inner);
+        let id = *id;
+        spawn_blocking(move || inner.resolve_sync(&id, decision))
+            .await
+            .map_err(|err| ResolveError::Store(join_err(err)))?
+    }
+
+    async fn decision(
+        &self,
+        id: &DecisionId,
+    ) -> Result<Option<ApprovalDecision>, SessionStoreError> {
+        let inner = Arc::clone(&self.inner);
+        let id = *id;
+        spawn_blocking(move || inner.decision_sync(&id))
+            .await
+            .map_err(join_err)?
+    }
+
+    async fn remove(&self, id: &DecisionId) -> Result<(), SessionStoreError> {
+        let inner = Arc::clone(&self.inner);
+        let id = *id;
+        spawn_blocking(move || inner.remove_sync(&id))
+            .await
+            .map_err(join_err)?
+    }
+
+    async fn cancel_request(&self, request_id: &str) -> Result<(), SessionStoreError> {
+        let inner = Arc::clone(&self.inner);
+        let request_id = request_id.to_string();
+        spawn_blocking(move || inner.cancel_request_sync(&request_id))
+            .await
+            .map_err(join_err)?
     }
 }
 
@@ -334,5 +418,13 @@ fn request_err(reason: impl std::fmt::Display) -> SessionStoreError {
 fn decode_err(reason: impl std::fmt::Display) -> SessionStoreError {
     SessionStoreError::Decode {
         reason: reason.to_string(),
+    }
+}
+
+/// Map a `spawn_blocking` join failure (a panicked store operation) to the
+/// store request error.
+fn join_err(err: JoinError) -> SessionStoreError {
+    SessionStoreError::Request {
+        reason: format!("file store task failed: {err}"),
     }
 }

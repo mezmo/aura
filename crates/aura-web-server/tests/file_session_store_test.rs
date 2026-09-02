@@ -267,6 +267,63 @@ async fn cancel_request_removes_only_undecided_matching_tickets() {
     assert!(store.get(&other_id).await.unwrap().is_some());
 }
 
+/// A read-only `tickets/` directory must not fail `resolve`: the decision
+/// write and its sync are the commit, and the ticket removal past them is
+/// best-effort — the stale ticket remains, `get` still returns the record,
+/// and the claim still holds against a repeat resolve.
+#[cfg(unix)]
+#[tokio::test]
+async fn resolve_succeeds_when_the_ticket_file_cannot_be_removed() {
+    use std::os::unix::fs::PermissionsExt;
+
+    /// Restore write permission on drop, so a failed assertion cannot leave
+    /// the tempdir undeletable.
+    struct Restore<'a>(&'a std::path::Path);
+    impl Drop for Restore<'_> {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = FileApprovalStore::open(dir.path()).unwrap();
+    let parked = make_parked("req-readonly", Duration::from_secs(60));
+    let id = parked.request.decision_id;
+    store.register(parked).await.unwrap();
+
+    let tickets = dir.path().join("tickets");
+    std::fs::set_permissions(&tickets, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let _restore = Restore(&tickets);
+
+    // Root bypasses directory permission bits; the fault this test pins
+    // cannot be established there, so skip rather than pass vacuously.
+    let probe = tickets.join(".write-probe");
+    if std::fs::write(&probe, b"x").is_ok() {
+        let _ = std::fs::remove_file(&probe);
+        eprintln!("skipping: process bypasses directory permissions (running as root?)");
+        return;
+    }
+
+    store
+        .resolve(&id, ApprovalDecision::Approved)
+        .await
+        .expect("resolve commits without the ticket removal");
+    assert_eq!(
+        store.decision(&id).await.unwrap(),
+        Some(ApprovalDecision::Approved)
+    );
+    let restored = store
+        .get(&id)
+        .await
+        .unwrap()
+        .expect("ticket record survives the failed removal");
+    assert_eq!(restored.request.decision_id, id);
+    assert_eq!(
+        store.resolve(&id, ApprovalDecision::Approved).await,
+        Err(ResolveError::NotFound)
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Restart durability
 // ---------------------------------------------------------------------------
