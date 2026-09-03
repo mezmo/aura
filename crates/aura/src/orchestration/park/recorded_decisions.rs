@@ -22,7 +22,7 @@ use crate::hitl::ApprovalDecision;
 /// wrapper) and a task-local would not cross that boundary. The continuation
 /// drives `set_strict` through a drop guard so every exit path (error, panic,
 /// mismatch) clears the task's entry.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub(crate) struct RecordedDecisions {
     entries: Mutex<HashMap<CallKey, VecDeque<ApprovalDecision>>>,
     strict_tasks: Mutex<HashSet<usize>>,
@@ -94,7 +94,7 @@ impl RecordedDecisions {
 /// and canonical; a test pins that. The separator byte (`0x00`) keeps the tool
 /// name and the arguments from aliasing across names that end where another
 /// begins.
-#[derive(Hash, PartialEq, Eq)]
+#[derive(Debug, Hash, PartialEq, Eq)]
 pub(crate) struct CallKey {
     task_id: usize,
     tool_name: String,
