@@ -1,8 +1,8 @@
 //! Conformance and contract tests for the file-backed approval store
 //! (`AURA_SESSION_STORE=file`): the shared backend-agnostic battery plus the
 //! §2.5 contract points specific to durable, retention-until-remove storage —
-//! expiry refusal, retention past the decision, the ticket's move into the
-//! decision file, owner-scoped cancel of undecided tickets, and survival of a
+//! expiry refusal, retention past the decision, the approval's move into the
+//! decision file, owner-scoped cancel of undecided approvals, and survival of a
 //! process restart. The same battery runs against the memory backend to pin
 //! the uniform contract. No Docker: every test gets its own tempdir.
 
@@ -125,18 +125,18 @@ async fn memory_battery_cancel_request_removes_only_matching() {
 
 /// The constructor creates the layout's two directories.
 #[test]
-fn open_creates_the_ticket_and_decision_directories() {
+fn open_creates_the_approval_and_decision_directories() {
     let dir = tempfile::tempdir().unwrap();
     FileApprovalStore::open(dir.path()).unwrap();
-    assert!(dir.path().join("tickets").is_dir());
+    assert!(dir.path().join("approvals").is_dir());
     assert!(dir.path().join("decisions").is_dir());
 }
 
-/// §2.5: `resolve` refuses past the ticket's `expires_at`, uniformly with an
-/// unknown id; nothing is decided, and the expired ticket stays readable
+/// §2.5: `resolve` refuses past the approval's `expires_at`, uniformly with an
+/// unknown id; nothing is decided, and the expired approval stays readable
 /// through `get` until `remove`.
 #[tokio::test]
-async fn expired_resolve_is_not_found_and_ticket_is_retained() {
+async fn expired_resolve_is_not_found_and_approval_is_retained() {
     let dir = tempfile::tempdir().unwrap();
     let store = FileApprovalStore::open(dir.path()).unwrap();
     let mut parked = make_parked("req-expired", Duration::from_secs(60));
@@ -153,15 +153,15 @@ async fn expired_resolve_is_not_found_and_ticket_is_retained() {
         .get(&id)
         .await
         .unwrap()
-        .expect("expired ticket retained until remove");
+        .expect("expired approval retained until remove");
     assert_eq!(restored.request.decision_id, id);
 }
 
-/// §2.5: retention is until remove — `get` returns the ticket before and
+/// §2.5: retention is until remove — `get` returns the approval before and
 /// after the decision, `decision` returns the record, and only `remove`
 /// clears both.
 #[tokio::test]
-async fn ticket_and_decision_are_retained_until_remove() {
+async fn approval_and_decision_are_retained_until_remove() {
     let dir = tempfile::tempdir().unwrap();
     let store = FileApprovalStore::open(dir.path()).unwrap();
     let parked = make_parked("req-retain", Duration::from_secs(60));
@@ -185,7 +185,7 @@ async fn ticket_and_decision_are_retained_until_remove() {
                 .get(&id)
                 .await
                 .unwrap()
-                .expect("ticket survives its decision")
+                .expect("approval survives its decision")
         ),
         expected
     );
@@ -203,11 +203,11 @@ async fn ticket_and_decision_are_retained_until_remove() {
     );
 }
 
-/// §2.5: `resolve` moves the ticket into the decision file rather than
-/// deleting it — on disk the ticket file is gone and the decision file
-/// carries both the ticket record and the decision.
+/// §2.5: `resolve` moves the approval into the decision file rather than
+/// deleting it — on disk the approval file is gone and the decision file
+/// carries both the approval record and the decision.
 #[tokio::test]
-async fn resolve_moves_the_ticket_into_the_decision_file() {
+async fn resolve_moves_the_approval_into_the_decision_file() {
     let dir = tempfile::tempdir().unwrap();
     let store = FileApprovalStore::open(dir.path()).unwrap();
     let parked = make_parked("req-move", Duration::from_secs(60));
@@ -221,23 +221,23 @@ async fn resolve_moves_the_ticket_into_the_decision_file() {
 
     assert!(
         !dir.path()
-            .join("tickets")
+            .join("approvals")
             .join(format!("{id}.json"))
             .exists()
     );
     let decision_path = dir.path().join("decisions").join(format!("{id}.json"));
     let on_disk: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(decision_path).unwrap()).unwrap();
-    assert_eq!(on_disk["ticket"]["decision_id"], id.to_string());
-    assert_eq!(on_disk["ticket"]["request_id"], "req-move");
+    assert_eq!(on_disk["approval"]["decision_id"], id.to_string());
+    assert_eq!(on_disk["approval"]["request_id"], "req-move");
     assert_eq!(on_disk["decision"]["approved"], true);
     assert_eq!(on_disk["decision"]["reason"], serde_json::Value::Null);
 }
 
-/// §2.5: `cancel_request` removes undecided tickets by owner id; a decided
-/// ticket of the same owner and an undecided ticket of another owner survive.
+/// §2.5: `cancel_request` removes undecided approvals by owner id; a decided
+/// approval of the same owner and an undecided approval of another owner survive.
 #[tokio::test]
-async fn cancel_request_removes_only_undecided_matching_tickets() {
+async fn cancel_request_removes_only_undecided_matching_approvals() {
     let dir = tempfile::tempdir().unwrap();
     let store = FileApprovalStore::open(dir.path()).unwrap();
     let undecided = make_parked("req-owner", Duration::from_secs(60));
@@ -259,7 +259,7 @@ async fn cancel_request_removes_only_undecided_matching_tickets() {
     assert!(store.get(&undecided_id).await.unwrap().is_none());
     assert!(
         store.get(&decided_id).await.unwrap().is_some(),
-        "decided ticket is retained until remove"
+        "decided approval is retained until remove"
     );
     assert_eq!(
         store.decision(&decided_id).await.unwrap(),
@@ -268,13 +268,13 @@ async fn cancel_request_removes_only_undecided_matching_tickets() {
     assert!(store.get(&other_id).await.unwrap().is_some());
 }
 
-/// A read-only `tickets/` directory must not fail `resolve`: the decision
-/// write and its sync are the commit, and the ticket removal past them is
-/// best-effort — the stale ticket remains, `get` still returns the record,
+/// A read-only `approvals/` directory must not fail `resolve`: the decision
+/// write and its sync are the commit, and the approval removal past them is
+/// best-effort — the stale approval remains, `get` still returns the record,
 /// and the claim still holds against a repeat resolve.
 #[cfg(unix)]
 #[tokio::test]
-async fn resolve_succeeds_when_the_ticket_file_cannot_be_removed() {
+async fn resolve_succeeds_when_the_approval_file_cannot_be_removed() {
     use std::os::unix::fs::PermissionsExt;
 
     let dir = tempfile::tempdir().unwrap();
@@ -283,13 +283,13 @@ async fn resolve_succeeds_when_the_ticket_file_cannot_be_removed() {
     let id = parked.request.decision_id;
     store.register(parked).await.unwrap();
 
-    let tickets = dir.path().join("tickets");
-    std::fs::set_permissions(&tickets, std::fs::Permissions::from_mode(0o500)).unwrap();
-    let _restore = Restore(&tickets);
+    let approvals = dir.path().join("approvals");
+    std::fs::set_permissions(&approvals, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let _restore = Restore(&approvals);
 
     // Root bypasses directory permission bits; the fault this test pins
     // cannot be established there, so skip rather than pass vacuously.
-    let probe = tickets.join(".write-probe");
+    let probe = approvals.join(".write-probe");
     if std::fs::write(&probe, b"x").is_ok() {
         let _ = std::fs::remove_file(&probe);
         eprintln!("skipping: process bypasses directory permissions (running as root?)");
@@ -299,7 +299,7 @@ async fn resolve_succeeds_when_the_ticket_file_cannot_be_removed() {
     store
         .resolve(&id, ApprovalDecision::Approved)
         .await
-        .expect("resolve commits without the ticket removal");
+        .expect("resolve commits without the approval removal");
     assert_eq!(
         store.decision(&id).await.unwrap(),
         Some(ApprovalDecision::Approved)
@@ -308,7 +308,7 @@ async fn resolve_succeeds_when_the_ticket_file_cannot_be_removed() {
         .get(&id)
         .await
         .unwrap()
-        .expect("ticket record survives the failed removal");
+        .expect("approval record survives the failed removal");
     assert_eq!(restored.request.decision_id, id);
     assert_eq!(
         store.resolve(&id, ApprovalDecision::Approved).await,
@@ -366,11 +366,11 @@ async fn open_fails_when_a_store_directory_is_not_writable() {
 
     let dir = tempfile::tempdir().unwrap();
     drop(FileApprovalStore::open(dir.path()).unwrap());
-    let tickets = dir.path().join("tickets");
-    std::fs::set_permissions(&tickets, std::fs::Permissions::from_mode(0o500)).unwrap();
-    let _restore = Restore(&tickets);
+    let approvals = dir.path().join("approvals");
+    std::fs::set_permissions(&approvals, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let _restore = Restore(&approvals);
 
-    let probe = tickets.join(".write-probe");
+    let probe = approvals.join(".write-probe");
     if std::fs::write(&probe, b"x").is_ok() {
         let _ = std::fs::remove_file(&probe);
         eprintln!("skipping: process bypasses directory permissions (running as root?)");
@@ -399,7 +399,7 @@ async fn ping_reports_an_unwritable_store_directory() {
     let store = FileApprovalStore::open(dir.path()).unwrap();
     store.probe_writable().await.expect("healthy store pings");
 
-    for name in ["tickets", "decisions"] {
+    for name in ["approvals", "decisions"] {
         let locked = dir.path().join(name);
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
         let restore = Restore(&locked);
