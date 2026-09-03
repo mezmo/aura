@@ -12,11 +12,11 @@ use aura_config::GlobPattern;
 use rig::tool::ToolError;
 use serde_json::Value;
 
-use super::decision::{AgentScope, ApprovalOrigin, DecisionId};
+use super::decision::{AgentScope, ApprovalOrigin, ApprovalOutcome, DecisionId};
 use super::protocol::{ApprovalItem, ApprovalRequest, PROTOCOL_VERSION};
 use super::registry::{ParkedApproval, PendingApprovals};
 use super::route::{ApprovalError, DecisionRoute, GateDecision};
-use crate::orchestration::{BlockedCell, ParkGuard, PendingCall};
+use crate::orchestration::{BlockedCell, CallKey, ParkGuard, PendingCall, RecordedDecisions};
 use crate::tool_wrapper::{PreCallOutcome, ToolCallContext, ToolWrapper};
 
 /// The placeholder tool result a parked call returns.
@@ -52,6 +52,11 @@ pub struct HitlApprovalWrapper {
     instance_id: String,
     /// Park arm state.
     park: Option<ParkContext>,
+    /// The run's recorded decisions for its parked calls; `None` on the live
+    /// path so behavior is unchanged. When present, a recorded decision is
+    /// consumed before the park arm; a miss while the task is strict is a
+    /// resume fault, and a miss otherwise re-parks.
+    recorded_decisions: Option<Arc<RecordedDecisions>>,
 }
 
 impl HitlApprovalWrapper {
@@ -72,6 +77,7 @@ impl HitlApprovalWrapper {
             agent_name,
             instance_id,
             park: None,
+            recorded_decisions: None,
         }
     }
 
@@ -88,6 +94,17 @@ impl HitlApprovalWrapper {
             cell,
             guard,
         });
+        self
+    }
+
+    /// Arm the recorded-decisions consult: a glob-matched call checks the
+    /// run's recorded decisions before the park arm. `None` (the default)
+    /// leaves the live path byte-identical. Wired by the orchestrator
+    /// continuation (P44 commit 3).
+    #[allow(dead_code)]
+    #[must_use]
+    pub(crate) fn with_recorded_decisions(mut self, recorded: Arc<RecordedDecisions>) -> Self {
+        self.recorded_decisions = Some(recorded);
         self
     }
 
@@ -235,6 +252,42 @@ impl ToolWrapper for HitlApprovalWrapper {
         let Some(matched) = self.matched_pattern(&ctx.tool_name) else {
             return Ok(PreCallOutcome::Proceed { overrides: None });
         };
+        // Recorded-decisions consult: a resumed worker's gated call may
+        // already carry a stored decision. A hit maps through the same
+        // mapping the live route uses (so an approval proceeds and a denial
+        // produces the live path's denial feedback); a miss while the task is
+        // strict is a resume fault; a miss otherwise falls through to the park
+        // arm (or the live route when park is unset) and re-parks.
+        if let Some(recorded) = &self.recorded_decisions {
+            // A resumed worker's tools always carry a task id. A gated call
+            // without one on the resume path is a wiring fault, and falling
+            // through to the park arm would re-ask the human for a decided
+            // call.
+            let Some(task_id) = ctx.task_id else {
+                return Err(ToolError::ToolCallError(
+                    "resume mismatch: no task id".to_string().into(),
+                ));
+            };
+            match recorded.take(&CallKey::new(task_id, &ctx.tool_name, args)) {
+                Some(decision) => {
+                    return approval_result_to_pre_call(Ok(GateDecision::without_overrides(
+                        ApprovalOutcome::Decided(decision),
+                    )));
+                }
+                // A continuation invocation that misses is a resume fault,
+                // never a fresh park: the recorded call no longer matches what
+                // the chain produced. Fail the call closed and let the resume
+                // stream fail.
+                None if recorded.is_strict(task_id) => {
+                    return Err(ToolError::ToolCallError(
+                        "resume mismatch".to_string().into(),
+                    ));
+                }
+                // A model-issued gated call after the continuation re-parks
+                // normally: fall through to the park arm (or the live route).
+                None => {}
+            }
+        }
         if let Some(park) = &self.park {
             return self.park_pre_call(park, matched, args, ctx).await;
         }
@@ -670,6 +723,180 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
             assert!(store.get(&decision_id).await.unwrap().is_none());
+        }
+    }
+
+    // ====================================================================
+    // Recorded-decisions consult
+    // ====================================================================
+
+    mod recorded {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use super::*;
+        use crate::hitl::ApprovalDecision;
+
+        /// A route whose webhook is unreachable, so a fall-through to the
+        /// route fails closed rather than hanging. A recorded hit
+        /// short-circuits before the route, so it never sees this.
+        fn discard_route() -> Arc<DecisionRoute> {
+            Arc::new(DecisionRoute::Webhook {
+                client: WebhookClient::new(
+                    build_webhook_client(),
+                    // Discard port: nothing listens, so the POST fails closed.
+                    WebhookUrl::new("http://127.0.0.1:9").unwrap(),
+                ),
+                timeout: Duration::from_secs(2),
+            })
+        }
+
+        /// A gate armed with `recorded_decisions` and no park arm, so a miss
+        /// falls through to the live route (the contract path the brief calls
+        /// out for these tests).
+        fn recorded_gate(
+            recorded: Arc<RecordedDecisions>,
+            route: Arc<DecisionRoute>,
+        ) -> HitlApprovalWrapper {
+            HitlApprovalWrapper::new(
+                Arc::from([GlobPattern::new("kubectl_*").unwrap()]),
+                route,
+                AgentScope::Single { session_id: None },
+                "req-recorded".to_string(),
+                "test-agent".to_string(),
+                "test-instance".to_string(),
+            )
+            .with_recorded_decisions(recorded)
+        }
+
+        fn ctx_for(tool: &str, task_id: Option<usize>) -> ToolCallContext {
+            let mut ctx = ToolCallContext::new(tool);
+            ctx.task_id = task_id;
+            ctx
+        }
+
+        /// A recorded approval proceeds through the same mapping the live
+        /// route uses, without ever consulting the (unreachable) route.
+        #[tokio::test]
+        async fn recorded_hit_proceeds_without_invoking_route() {
+            let recorded = Arc::new(RecordedDecisions::default());
+            let args = serde_json::json!({"namespace": "prod"});
+            recorded.push(
+                CallKey::new(1, "kubectl_apply", &args),
+                ApprovalDecision::Approved,
+            );
+
+            let gate = recorded_gate(recorded, discard_route());
+            let outcome = gate
+                .pre_call(&args, &ctx_for("kubectl_apply", Some(1)))
+                .await
+                .unwrap();
+
+            assert_eq!(outcome, PreCallOutcome::Proceed { overrides: None });
+        }
+
+        /// A recorded denial produces the live path's denial feedback string,
+        /// through the shared mapping — the denial string is not duplicated
+        /// in the consult.
+        #[tokio::test]
+        async fn recorded_denial_produces_live_path_denial_feedback() {
+            let recorded = Arc::new(RecordedDecisions::default());
+            let args = serde_json::json!({"namespace": "prod"});
+            recorded.push(
+                CallKey::new(1, "kubectl_apply", &args),
+                ApprovalDecision::Denied {
+                    reason: Some("too risky".to_string()),
+                },
+            );
+
+            let gate = recorded_gate(recorded, discard_route());
+            let outcome = gate
+                .pre_call(&args, &ctx_for("kubectl_apply", Some(1)))
+                .await
+                .unwrap();
+
+            assert_eq!(
+                outcome,
+                PreCallOutcome::ShortCircuit {
+                    output: "Tool call blocked by human approval denial: too risky. Do not execute this action."
+                        .to_string(),
+                },
+            );
+        }
+
+        /// A miss while the task is strict is a resume fault, never a fresh
+        /// park: the route is not consulted (no "approval channel error").
+        #[tokio::test]
+        async fn recorded_miss_while_strict_fails_closed_with_resume_mismatch() {
+            let recorded = Arc::new(RecordedDecisions::default());
+            recorded.set_strict(1, true);
+
+            let gate = recorded_gate(recorded, discard_route());
+            let args = serde_json::json!({"namespace": "prod"});
+            let err = gate
+                .pre_call(&args, &ctx_for("kubectl_apply", Some(1)))
+                .await
+                .expect_err("a strict miss must fail closed");
+
+            let msg = err.to_string();
+            assert!(
+                msg.contains("resume mismatch"),
+                "a strict miss must report a resume mismatch, got: {msg}",
+            );
+            assert!(
+                !msg.contains("approval channel error"),
+                "the route must not be consulted on a strict miss, got: {msg}",
+            );
+        }
+
+        /// A miss when the task is not strict falls through to the live route
+        /// (park is unset), proving the consult did not short-circuit. The
+        /// contrast with the strict-miss test is the error class.
+        #[tokio::test]
+        async fn recorded_miss_not_strict_falls_through_to_route() {
+            let recorded = Arc::new(RecordedDecisions::default());
+
+            let gate = recorded_gate(recorded, discard_route());
+            let args = serde_json::json!({"namespace": "prod"});
+            let err = gate
+                .pre_call(&args, &ctx_for("kubectl_apply", Some(1)))
+                .await
+                .expect_err("the unreachable route must fail closed");
+
+            let msg = err.to_string();
+            assert!(
+                msg.contains("approval channel error"),
+                "a non-strict miss must fall through to the route, got: {msg}",
+            );
+            assert!(
+                !msg.contains("resume mismatch"),
+                "a non-strict miss must not report a resume mismatch, got: {msg}",
+            );
+        }
+
+        /// A gated call on the resume path with no task id is a wiring fault,
+        /// not a fall-through to the park arm (which would re-ask the human
+        /// for a decided call).
+        #[tokio::test]
+        async fn recorded_consult_without_task_id_is_a_resume_fault() {
+            let recorded = Arc::new(RecordedDecisions::default());
+
+            let gate = recorded_gate(recorded, discard_route());
+            let args = serde_json::json!({});
+            let err = gate
+                .pre_call(&args, &ctx_for("kubectl_apply", None))
+                .await
+                .expect_err("a gated resume call without a task id must fail");
+
+            let msg = err.to_string();
+            assert!(
+                msg.contains("resume mismatch: no task id"),
+                "expected the no-task-id wiring fault, got: {msg}",
+            );
+            assert!(
+                !msg.contains("approval channel error"),
+                "the route must not be consulted on the no-task-id fault, got: {msg}",
+            );
         }
     }
 

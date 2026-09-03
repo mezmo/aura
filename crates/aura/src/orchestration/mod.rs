@@ -80,7 +80,7 @@ pub use tools::ReadArtifactTool;
 pub use tools::wait_for::{StopReason, WaitForError, WaitForOutput, WaitForTool};
 pub use tools::{SubmitResultDecision, SubmitResultOutput, SubmitResultTool};
 
-pub(crate) use park::ParkGuard;
+pub(crate) use park::{CallKey, ParkGuard, RecordedDecisions};
 pub use prompt_constants::{context, fields, sections};
 pub use types::{
     BlockedCell, CellOutcome, ParkSnapshot, PendingCall, Plan, PlanningResponse, RunId, StepInput,

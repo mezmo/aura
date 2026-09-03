@@ -4,12 +4,14 @@
 mod commit;
 mod document;
 mod guard;
+mod recorded_decisions;
 
 pub(crate) use commit::{ParkCommitInputs, cancel_run_approvals, commit_from_run_state};
 #[cfg(test)]
 pub(crate) use document::load_parked_run;
 pub(crate) use document::{PARKED_DOCUMENT_SUFFIX, RESUMING_DOCUMENT_SUFFIX, RunStateForPark};
 pub(crate) use guard::ParkGuard;
+pub(crate) use recorded_decisions::{CallKey, RecordedDecisions};
 
 use std::collections::HashMap;
 
