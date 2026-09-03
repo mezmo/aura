@@ -59,9 +59,18 @@ pub(crate) enum RehydrateError {
     /// the resumer.
     Expired,
     /// Condition row "mismatch": the store and the document disagree — the
-    /// stored approval is missing, its recorded call differs from the
-    /// document's, or a call the resume needs has no recorded decision.
+    /// stored approval is missing, its scope names another run or task than
+    /// the checkpoint node, or its recorded call differs from the
+    /// document's.
     Mismatch(String),
+    /// Condition row "parked": a pending call still has no recorded
+    /// decision inside the decision window. The resume endpoint answers
+    /// 409 `parked` with the outstanding ids and `expires_at`; an
+    /// all-decided resume never sees this.
+    Parked {
+        outstanding: Vec<DecisionId>,
+        expires_at: chrono::DateTime<chrono::Utc>,
+    },
     /// Condition row "config_changed": the fingerprint no longer matches the
     /// rebuilt configuration. Checked by the resume endpoint against a
     /// header-resolved config entry point (P45 adoption).
@@ -80,6 +89,11 @@ impl std::fmt::Display for RehydrateError {
             Self::NotFound => write!(f, "no checkpoint document for the run"),
             Self::Expired => write!(f, "the run's decision window has expired"),
             Self::Mismatch(detail) => write!(f, "resume mismatch: {detail}"),
+            Self::Parked { outstanding, .. } => write!(
+                f,
+                "{} approval(s) still await a decision inside the window",
+                outstanding.len()
+            ),
             Self::ConfigChanged => write!(f, "configuration changed since the run parked"),
             Self::Store(detail) => write!(f, "approval store read failed: {detail}"),
             Self::Document(detail) => write!(f, "checkpoint document read failed: {detail}"),
@@ -189,6 +203,7 @@ pub(crate) async fn load_recorded_decisions(
 ) -> Result<(Arc<RecordedDecisions>, Vec<DecisionId>), RehydrateError> {
     let recorded = Arc::new(RecordedDecisions::default());
     let mut decision_ids = Vec::new();
+    let mut outstanding = Vec::new();
     // The document's expiry stamp is the run's decision window the 2.6
     // expired row is evaluated against.
     let expires_at = chrono::DateTime::parse_from_rfc3339(&doc.expires_at)
@@ -213,6 +228,31 @@ pub(crate) async fn load_recorded_decisions(
                     call.decision_id
                 )));
             };
+            // The stored approval must name this run and this checkpoint
+            // node: an approval borrowed from another run or task cannot
+            // decide this document's call (the 2.6 mismatch row).
+            match &parked.request.scope {
+                crate::hitl::AgentScope::Worker { run_id, task, .. } => {
+                    if run_id.to_string() != doc.run_id {
+                        return Err(RehydrateError::Mismatch(format!(
+                            "approval {} belongs to run {run_id}, not this run",
+                            call.decision_id
+                        )));
+                    }
+                    if task.task_id != node.task_id {
+                        return Err(RehydrateError::Mismatch(format!(
+                            "approval {} belongs to task {}, not task {}",
+                            call.decision_id, task.task_id, node.task_id
+                        )));
+                    }
+                }
+                other => {
+                    return Err(RehydrateError::Mismatch(format!(
+                        "approval {} carries a non-worker scope {other:?}",
+                        call.decision_id
+                    )));
+                }
+            }
             // The approval is single-item by construction (one parked call
             // raises one request); items[0] is the call the human decided on.
             let Some(item) = parked.request.items.first() else {
@@ -228,15 +268,14 @@ pub(crate) async fn load_recorded_decisions(
                 )));
             }
             let Some(decision) = store.recorded_decision(&call.decision_id).await else {
-                // No decision yet: expired past the window, still parked
-                // otherwise — both fail the all-decided resume.
+                // No decision yet: expired past the window (the 2.6 expired
+                // row outranks parked), still parked otherwise — collected
+                // so the 409 body can carry every outstanding id.
                 if chrono::Utc::now() > expires_at {
                     return Err(RehydrateError::Expired);
                 }
-                return Err(RehydrateError::Mismatch(format!(
-                    "approval {} has no recorded decision",
-                    call.decision_id
-                )));
+                outstanding.push(call.decision_id);
+                continue;
             };
             // The key's task id comes from the awaiting node, the tool name
             // and arguments from the store's approval record.
@@ -246,6 +285,12 @@ pub(crate) async fn load_recorded_decisions(
             );
             decision_ids.push(call.decision_id);
         }
+    }
+    if !outstanding.is_empty() {
+        return Err(RehydrateError::Parked {
+            outstanding,
+            expires_at,
+        });
     }
 
     Ok((recorded, decision_ids))
@@ -337,7 +382,11 @@ mod tests {
                 instance_id: "test-instance".to_string(),
                 decision_id,
                 request_id: "run:test".to_string(),
-                scope: AgentScope::Single { session_id: None },
+                scope: AgentScope::Worker {
+                    run_id: "0191e8c0-aaaa-7000-8000-00000000c0de".parse().unwrap(),
+                    task: crate::orchestration::types::TaskIdentity::new(3, None),
+                    session_id: None,
+                },
                 origin: ApprovalOrigin::ConfigGate {
                     matched_pattern: "kubectl_*".to_string(),
                     agent_name: "test-agent".to_string(),
@@ -416,7 +465,8 @@ mod tests {
 
     /// A pending call whose approval is gone from the store is a mismatch
     /// (the 2.6 mismatch row names a missing approval); one still parked but
-    /// undecided is a mismatch in time and expired past the window.
+    /// undecided is the parked row inside the window and the expired row
+    /// past it.
     #[tokio::test]
     async fn missing_approval_is_mismatch_and_undecided_follows_the_window() {
         let (registry, _dir) = file_store();
@@ -445,10 +495,12 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(
-            err.to_string().contains("no recorded decision"),
-            "got: {err}"
-        );
+        match err {
+            RehydrateError::Parked { outstanding, .. } => {
+                assert_eq!(outstanding, vec![undecided]);
+            }
+            other => panic!("expected Parked with the outstanding id, got: {other}"),
+        }
 
         // The same undecided call past the document's expiry is the expired
         // row.
