@@ -23,18 +23,18 @@
 //! [`crate::orchestration::orchestrator::Orchestrator::stream_and_forward`]
 //! reaches for a park-mode worker — `stream_chat` + the park-aware
 //! [`crate::streaming_request_hook::StreamingRequestHook`] + the rig tool
-//! server (`tool_server_handle.call_tool`) — over the scripted model. It does
-//! **not** reach `execute_task`: `create_worker` →
-//! `build_worker_provider_agent` builds the model from `LlmConfig` with no
-//! injection seam, so a scripted model cannot enter the worker path without a
-//! production change (reported to the board owner for commit 3). The
-//! orchestrator fixture below therefore assembles the park-mode scaffolding
-//! only; execute_task-level tests live in the orchestrator's own test module.
+//! server (`tool_server_handle.call_tool`) — over the scripted model. Full
+//! `execute_task` runs go through the worker-model injection seam
+//! ([`install_worker_overrides`]): the orchestrator's cfg(test) prelude in
+//! `build_worker_provider_agent` builds the worker from a queued override's
+//! scripted model and registers its tools through the worker's own wrapper
+//! chain, so execute_task-level tests drive the production path unmodified.
 
 use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -81,6 +81,11 @@ pub(crate) fn echo_tool_result_wire() -> String {
 pub(crate) struct ScriptedTurn {
     text: Option<String>,
     tool_calls: Vec<ScriptedToolCall>,
+    /// Fail the provider stream after this turn's tool calls ran, instead of
+    /// completing the turn. The pinned loop yields the error and ends the
+    /// stream without another `on_completion_call`, which is the
+    /// provider-error orphan window.
+    stream_failed: bool,
 }
 
 impl ScriptedTurn {
@@ -89,6 +94,7 @@ impl ScriptedTurn {
         Self {
             text: Some(text.into()),
             tool_calls: Vec::new(),
+            stream_failed: false,
         }
     }
 
@@ -98,11 +104,24 @@ impl ScriptedTurn {
         Self {
             text: None,
             tool_calls: calls,
+            stream_failed: false,
+        }
+    }
+
+    /// A turn that issues tool calls and then fails the provider stream
+    /// mid-turn, before the loop's next `on_completion_call` can fire — the
+    /// deterministic stand-in for a provider stream error after tools have
+    /// run (the pinned loop's mid-turn error break).
+    pub(crate) fn tool_calls_then_stream_failure(calls: Vec<ScriptedToolCall>) -> Self {
+        Self {
+            text: None,
+            tool_calls: calls,
+            stream_failed: true,
         }
     }
 
     /// Attach text alongside this turn's tool calls.
-    #[allow(dead_code)] // commit 3: text+tool-call turns in continuation scripts
+    #[allow(dead_code)] // reserved: text+tool-call turn scripts, not yet consumed
     pub(crate) fn with_text(mut self, text: impl Into<String>) -> Self {
         self.text = Some(text.into());
         self
@@ -212,7 +231,13 @@ impl ScriptedCompletionModel {
                 additional_params: None,
             })));
         }
-        items.push(Ok(RawStreamingChoice::FinalResponse(ScriptedFinalResponse)));
+        if turn.stream_failed {
+            items.push(Err(CompletionError::ProviderError(
+                "scripted model: provider stream failed mid-turn".to_string(),
+            )));
+        } else {
+            items.push(Ok(RawStreamingChoice::FinalResponse(ScriptedFinalResponse)));
+        }
         StreamingCompletionResponse::stream(Box::pin(futures::stream::iter(items)))
     }
 
@@ -267,6 +292,93 @@ impl CompletionModel for ScriptedCompletionModel {
     ) -> Result<StreamingCompletionResponse<Self::StreamingResponse>, CompletionError> {
         let turn = self.record_and_take(request)?;
         Ok(Self::turn_stream(&turn))
+    }
+}
+
+// ============================================================================
+// Worker-model injection seam (commit 3)
+// ============================================================================
+
+/// A scripted rig agent — the concrete type the `#[cfg(test)]` variant of
+/// `ProviderAgent` wraps.
+pub(crate) type ScriptedAgent = rig::agent::Agent<ScriptedCompletionModel>;
+
+/// One queued worker-model override: the scripted model the next
+/// `build_worker_provider_agent` call builds the worker from, plus tools
+/// registered alongside it. The orchestrator's cfg(test) prelude wraps each
+/// extra tool in the worker's own wrapper chain (gate included) before
+/// registering it, so a scripted worker's tool calls are gated exactly like
+/// live ones.
+pub(crate) struct WorkerOverride {
+    pub(crate) model: ScriptedCompletionModel,
+    pub(crate) extra_tools: Vec<Box<dyn rig::tool::ToolDyn>>,
+}
+
+/// Take-once override queue: a test installs one override per worker build
+/// it will drive, in order.
+static WORKER_OVERRIDES: OnceLock<Mutex<VecDeque<WorkerOverride>>> = OnceLock::new();
+
+/// Queue worker-model overrides. FIFO: the *n*-th worker build after this
+/// call consumes the *n*-th override. Tests that use the seam must serialize
+/// against each other — the queue is process-global.
+pub(crate) fn install_worker_overrides(overrides: Vec<WorkerOverride>) {
+    let queue = WORKER_OVERRIDES.get_or_init(|| Mutex::new(VecDeque::new()));
+    queue
+        .lock()
+        .expect("worker-override lock")
+        .extend(overrides);
+}
+
+/// Pop the next override, if one is queued. Consumed by the orchestrator's
+/// cfg(test) prelude in `build_worker_provider_agent`.
+pub(crate) fn take_worker_override() -> Option<WorkerOverride> {
+    let queue = WORKER_OVERRIDES.get_or_init(|| Mutex::new(VecDeque::new()));
+    queue.lock().expect("worker-override lock").pop_front()
+}
+
+/// Adapter presenting a boxed dynamic tool as a concrete [`rig::tool::Tool`]
+/// with the `Value`/`String`/`ToolError` shape the worker wrapper chain
+/// wraps, so an override's tools re-enter the same `WrappedTool` path the
+/// MCP tools take. `Clone` over an `Arc` because `WrappedTool` requires it.
+#[derive(Clone)]
+pub(crate) struct DynToolAsTool(Arc<dyn rig::tool::ToolDyn>);
+
+impl DynToolAsTool {
+    pub(crate) fn new(tool: Box<dyn rig::tool::ToolDyn>) -> Self {
+        Self(Arc::from(tool))
+    }
+}
+
+impl rig::tool::Tool for DynToolAsTool {
+    const NAME: &'static str = "dyn_tool_as_tool";
+
+    type Error = rig::tool::ToolError;
+    type Args = serde_json::Value;
+    type Output = String;
+
+    fn name(&self) -> String {
+        rig::tool::ToolDyn::name(&*self.0)
+    }
+
+    async fn definition(&self, prompt: String) -> rig::completion::ToolDefinition {
+        // The boxed dyn future is only `Send`; `Shared` makes awaiting it
+        // satisfy the `Tool` trait's `Sync` future bound (the shared state is
+        // behind an `Arc` + mutex, so the wrapper future is `Sync`).
+        use futures::FutureExt as _;
+        self.0.definition(prompt).shared().await
+    }
+
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        // The inner ToolDyn result is already JSON-encoded (the blanket impl
+        // serializes the tool's output on the way out). Decode string outputs
+        // so the wrapper boundary's own serialization is the only one applied
+        // — byte-identical to a concrete `Tool` registration. Non-string
+        // outputs keep their encoded text.
+        let encoded = self.0.call(args.to_string()).await?;
+        match serde_json::from_str::<serde_json::Value>(&encoded) {
+            Ok(serde_json::Value::String(text)) => Ok(text),
+            _ => Ok(encoded),
+        }
     }
 }
 
@@ -336,6 +448,9 @@ pub(crate) struct RecordingTool {
     result: String,
     invocations: Arc<Mutex<Vec<ToolInvocation>>>,
     stall: Option<StallHook>,
+    /// The name the tool registers under. Defaults to [`ECHO_TOOL_NAME`];
+    /// renamed instances give scripts an ungated sibling tool.
+    registered_name: String,
 }
 
 impl RecordingTool {
@@ -344,7 +459,16 @@ impl RecordingTool {
             result: ECHO_TOOL_RESULT.to_string(),
             invocations,
             stall: None,
+            registered_name: ECHO_TOOL_NAME.to_string(),
         }
+    }
+
+    /// Register under a different name: the default name is what the park
+    /// tests' glob matches, so a depth-exhaustion script needs an ungated
+    /// sibling tool to burn turns with.
+    pub(crate) fn with_name(mut self, name: &str) -> Self {
+        self.registered_name = name.to_string();
+        self
     }
 
     /// Arm the stall hook: invocations record, then hold until
@@ -364,7 +488,7 @@ impl rig::tool::Tool for RecordingTool {
 
     async fn definition(&self, _prompt: String) -> rig::completion::ToolDefinition {
         rig::completion::ToolDefinition {
-            name: Self::NAME.to_string(),
+            name: self.name(),
             description: "Test stand-in: records the call and echoes a fixed result.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -410,8 +534,9 @@ pub(crate) struct WorkerRig {
     pub(crate) model: ScriptedCompletionModel,
     pub(crate) invocations: Arc<Mutex<Vec<ToolInvocation>>>,
     /// Handle to the tool's stall hook; only live when built via
-    /// [`worker_rig_with_stall`]. Commit 3's race tests drive it.
-    #[allow(dead_code)] // commit 3: mid-invocation race tests
+    /// [`worker_rig_with_stall`]. Reserved for race tests driving the
+    /// worker-stream level directly.
+    #[allow(dead_code)] // reserved: stall-driven race tests
     pub(crate) stall: StallHook,
 }
 
@@ -423,7 +548,7 @@ pub(crate) fn worker_rig(turns: Vec<ScriptedTurn>) -> WorkerRig {
 /// A worker rig whose stub tool holds every invocation open until
 /// [`StallHook::release`]. The rig's `stall` handle shares the hook the
 /// tool holds; tests synchronize on it instead of sleeping.
-#[allow(dead_code)] // commit 3: race tests
+#[allow(dead_code)] // reserved: stall-driven race tests
 pub(crate) fn worker_rig_with_stall(turns: Vec<ScriptedTurn>) -> WorkerRig {
     worker_rig_inner(turns, true)
 }
@@ -551,8 +676,10 @@ fn tool_result_text(content: &rig::OneOrMany<rig::message::ToolResultContent>) -
 
 /// A worker definition wired for the rig: no MCP tools (`mcp_filter = []`),
 /// default depth, no overrides. Returns `(name, config)` for insertion into
-/// [`OrchestrationConfig::workers`].
-#[allow(dead_code)] // commit 3: execute_task-level tests
+/// [`OrchestrationConfig::workers`]. The execute_task-level tests build their
+/// worker configs inline (they need a settable turn depth), so this stays
+/// reserved.
+#[allow(dead_code)] // reserved: rig-level worker definition fixture
 pub(crate) fn worker_definition(
     name: &str,
     description: &str,
@@ -577,8 +704,9 @@ pub(crate) fn worker_definition(
 /// `memory_dir` — the construction pattern the orchestrator's own park tests
 /// use, minus the run id (that lives behind the orchestrator's private
 /// persistence handle, readable only from the orchestrator's own test
-/// module). Commit 3's rehydrate/continuation fixtures start here.
-#[allow(dead_code)] // commit 3: rehydrate/continuation fixtures
+/// module). The execute_task-level fixtures live in that test module for the
+/// same reason, so this stays reserved.
+#[allow(dead_code)] // reserved: rig-level orchestrator fixture
 pub(crate) async fn park_orchestrator_in(
     memory_dir: &Path,
 ) -> (
