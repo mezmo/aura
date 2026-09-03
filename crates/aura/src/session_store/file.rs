@@ -1,23 +1,23 @@
 //! File-backed HITL approval store: one JSON file per decision id.
-//! Tickets survive process restart on a single host.
+//! Parked approvals survive process restart on a single host.
 //!
 //! Layout:
 //!
 //! | Path                                 | Content                                                    |
 //! | ----------------------------------- | ---------------------------------------------------------- |
-//! | `{root}/tickets/{decision_id}.json`   | `ParkedApprovalRecord` (the undecided ticket)              |
-//! | `{root}/decisions/{decision_id}.json` | the resolved envelope: the ticket record plus the decision |
+//! | `{root}/approvals/{decision_id}.json` | `ParkedApprovalRecord` (the undecided approval)            |
+//! | `{root}/decisions/{decision_id}.json` | the resolved envelope: the approval record plus the decision |
 //!
 //! Store contract (park/reify §2.5):
 //!
-//! - `resolve` refuses past the ticket's `expires_at`, uniformly with an
+//! - `resolve` refuses past the approval's `expires_at`, uniformly with an
 //!   unknown id; expiry is enforced only by `resolve`.
-//! - `resolve` *moves* the ticket into the decision file rather than deleting
-//!   it: `get` returns the ticket before and after the decision, `decision`
+//! - `resolve` *moves* the approval into the decision file rather than deleting
+//!   it: `get` returns the approval before and after the decision, `decision`
 //!   returns the recorded decision, and both are retained until `remove`.
 //! - At-most-once `resolve` is the `File::create_new` claim on the decision
 //!   file: `AlreadyExists` reads as `NotFound`.
-//! - `cancel_request` removes undecided tickets by owner (request) id;
+//! - `cancel_request` removes undecided approvals by owner (request) id;
 //!   decided entries are retained until their consumer removes them.
 //!
 //! Decision ids are validated as UUIDs before path building, so none address
@@ -33,7 +33,7 @@
 //!
 //! Crash window: claim-then-write leaves an empty file if process dies
 //! mid-resolve. The aftermath fails closed; `decision` reports decode
-//! fault, `get` returns ticket. Recovery is deleting the empty file.
+//! fault, `get` returns the approval. Recovery is deleting the empty file.
 //! `decision()` consumers treat `Err(Decode)` on a known id as this
 //! recoverable state, not as an unknown id.
 
@@ -50,18 +50,18 @@ use crate::hitl::{ApprovalDecision, DecisionId, ParkedApproval, ResolveError};
 
 use super::{ApprovalStore, DecisionRecord, ParkedApprovalRecord, SessionStoreError};
 
-/// Undecided tickets, one `{decision_id}.json` file per ticket.
-const TICKETS_DIR: &str = "tickets";
+/// Undecided approvals, one `{decision_id}.json` file per approval.
+const APPROVALS_DIR: &str = "approvals";
 /// Recorded decisions, one `{decision_id}.json` file per decision.
 const DECISIONS_DIR: &str = "decisions";
 
-/// The on-disk shape of a resolved approval: the ticket record carried over
-/// from `tickets/` plus the recorded decision. Field names are a persisted
-/// contract shared by every instance reading the store — rename only with a
-/// migration.
+/// The on-disk shape of a resolved approval: the approval record carried
+/// over from `approvals/` plus the recorded decision. Field names are a
+/// persisted contract shared by every instance reading the store — rename
+/// only with a migration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct ResolvedEntry {
-    ticket: ParkedApprovalRecord,
+    approval: ParkedApprovalRecord,
     decision: DecisionRecord,
 }
 
@@ -82,7 +82,7 @@ impl FileApprovalStore {
     /// cannot hold files must fail at startup, not on the first approval.
     pub fn open(root: impl AsRef<Path>) -> Result<Self, SessionStoreError> {
         let root = root.as_ref();
-        fs::create_dir_all(root.join(TICKETS_DIR)).map_err(connect_err)?;
+        fs::create_dir_all(root.join(APPROVALS_DIR)).map_err(connect_err)?;
         fs::create_dir_all(root.join(DECISIONS_DIR)).map_err(connect_err)?;
         let inner = Arc::new(Inner {
             root: root.to_path_buf(),
@@ -102,16 +102,16 @@ impl FileApprovalStore {
 }
 
 impl Inner {
-    fn tickets_dir(&self) -> PathBuf {
-        self.root.join(TICKETS_DIR)
+    fn approvals_dir(&self) -> PathBuf {
+        self.root.join(APPROVALS_DIR)
     }
 
     fn decisions_dir(&self) -> PathBuf {
         self.root.join(DECISIONS_DIR)
     }
 
-    fn ticket_path(&self, id: &str) -> PathBuf {
-        self.tickets_dir().join(format!("{id}.json"))
+    fn approval_path(&self, id: &str) -> PathBuf {
+        self.approvals_dir().join(format!("{id}.json"))
     }
 
     fn decision_path(&self, id: &str) -> PathBuf {
@@ -125,7 +125,7 @@ impl Inner {
     /// Create and unlink an empty probe file in each store directory. This
     /// catches permission and mount faults, not a full disk.
     fn probe_writable_sync(&self) -> io::Result<()> {
-        for dir in [self.tickets_dir(), self.decisions_dir()] {
+        for dir in [self.approvals_dir(), self.decisions_dir()] {
             let probe = dir.join(format!(".{}.probe", uuid::Uuid::new_v4()));
             fs::write(&probe, b"")
                 .and_then(|()| fs::remove_file(&probe))
@@ -141,21 +141,21 @@ impl Inner {
         let id = canonical_id(&parked.request.decision_id)?;
         let payload = serde_json::to_vec(&ParkedApprovalRecord::from(&parked))
             .expect("approval record serializes to JSON");
-        publish(&self.ticket_path(&id), &payload)
+        publish(&self.approval_path(&id), &payload)
     }
 
     fn get_sync(&self, id: &DecisionId) -> Result<Option<ParkedApproval>, SessionStoreError> {
         let _guard = self.lock();
         let id = canonical_id(id)?;
-        match fs::read(self.ticket_path(&id)) {
-            Ok(bytes) => return decode_ticket(&bytes).map(Some),
+        match fs::read(self.approval_path(&id)) {
+            Ok(bytes) => return decode_approval(&bytes).map(Some),
             Err(err) if err.kind() == io::ErrorKind::NotFound => {}
             Err(err) => return Err(request_err(err)),
         }
         match fs::read(self.decision_path(&id)) {
             Ok(bytes) => {
                 let entry: ResolvedEntry = serde_json::from_slice(&bytes).map_err(decode_err)?;
-                restore_ticket(entry.ticket).map(Some)
+                restore_approval(entry.approval).map(Some)
             }
             Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(err) => Err(request_err(err)),
@@ -170,12 +170,12 @@ impl Inner {
         let _guard = self.lock();
         let id = canonical_id(id).map_err(ResolveError::Store)?;
 
-        // Read ticket before claiming avoids claiming unknown ids.
-        let record = match fs::read(self.ticket_path(&id)) {
+        // Reading the approval before claiming avoids claiming unknown ids.
+        let record = match fs::read(self.approval_path(&id)) {
             Ok(bytes) => serde_json::from_slice::<ParkedApprovalRecord>(&bytes)
                 .map_err(|e| ResolveError::Store(decode_err(e)))?,
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                // No ticket: unknown, resolved, or removed all return `NotFound`.
+                // No approval: unknown, resolved, or removed all return `NotFound`.
                 return Err(ResolveError::NotFound);
             }
             Err(err) => return Err(ResolveError::Store(request_err(err))),
@@ -184,7 +184,7 @@ impl Inner {
             return Err(ResolveError::NotFound);
         }
         let payload = serde_json::to_vec(&ResolvedEntry {
-            ticket: record,
+            approval: record,
             decision: DecisionRecord::from(&decision),
         })
         .expect("resolved entry serializes to JSON");
@@ -204,15 +204,15 @@ impl Inner {
             let _ = fs::remove_file(&decision_path);
             return Err(ResolveError::Store(request_err(err)));
         }
-        // After sync commit, ticket removal is best-effort. Failure leaves
-        // a stale ticket; resolve succeeded.
-        match fs::remove_file(self.ticket_path(&id)) {
+        // After sync commit, removing the approval file is best-effort.
+        // Failure leaves a stale approval file; resolve succeeded.
+        match fs::remove_file(self.approval_path(&id)) {
             Ok(()) => {}
             Err(err) if err.kind() == io::ErrorKind::NotFound => {}
             Err(err) => tracing::warn!(
                 decision_id = %id,
                 error = %err,
-                "stale ticket file remains after resolve; it is benign"
+                "stale approval file remains after resolve; it is benign"
             ),
         }
         Ok(())
@@ -238,7 +238,7 @@ impl Inner {
         let _guard = self.lock();
         let id = canonical_id(id)?;
         // Remove both halves; missing halves are fine (idempotent).
-        for path in [self.ticket_path(&id), self.decision_path(&id)] {
+        for path in [self.approval_path(&id), self.decision_path(&id)] {
             if let Err(err) = fs::remove_file(&path)
                 && err.kind() != io::ErrorKind::NotFound
             {
@@ -250,7 +250,7 @@ impl Inner {
 
     fn cancel_request_sync(&self, request_id: &str) -> Result<(), SessionStoreError> {
         let _guard = self.lock();
-        let entries = match fs::read_dir(self.tickets_dir()) {
+        let entries = match fs::read_dir(self.approvals_dir()) {
             Ok(entries) => entries,
             Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
             Err(err) => return Err(request_err(err)),
@@ -259,7 +259,7 @@ impl Inner {
             let entry = entry.map_err(request_err)?;
             let path = entry.path();
             if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
-                // A mid-publish temp file, never a ticket.
+                // A mid-publish temp file, never a stored approval.
                 continue;
             }
             let bytes = match fs::read(&path) {
@@ -275,7 +275,7 @@ impl Inner {
                 Err(err) => {
                     tracing::warn!(
                         path = %path.display(), error = %err,
-                        "undecodable ticket file skipped by cancel_request"
+                        "undecodable approval file skipped by cancel_request"
                     );
                 }
             }
@@ -370,14 +370,14 @@ fn publish(path: &Path, payload: &[u8]) -> Result<(), SessionStoreError> {
     Ok(())
 }
 
-/// Decode stored ticket file.
-fn decode_ticket(bytes: &[u8]) -> Result<ParkedApproval, SessionStoreError> {
+/// Decode a stored approval file.
+fn decode_approval(bytes: &[u8]) -> Result<ParkedApproval, SessionStoreError> {
     let record: ParkedApprovalRecord = serde_json::from_slice(bytes).map_err(decode_err)?;
-    restore_ticket(record)
+    restore_approval(record)
 }
 
-/// Restore ticket record.
-fn restore_ticket(record: ParkedApprovalRecord) -> Result<ParkedApproval, SessionStoreError> {
+/// Restore an approval record.
+fn restore_approval(record: ParkedApprovalRecord) -> Result<ParkedApproval, SessionStoreError> {
     ParkedApproval::try_from(record).map_err(decode_err)
 }
 
