@@ -83,7 +83,11 @@ pub use tools::wait_for::{StopReason, WaitForError, WaitForOutput, WaitForTool};
 pub use tools::{SubmitResultDecision, SubmitResultOutput, SubmitResultTool};
 
 pub(crate) use park::{CallKey, ParkGuard, RecordedDecisions};
+// The worker-model injection seam: `provider_agent.rs`'s cfg(test) variant
+// wraps the rig's scripted agent type.
 pub use prompt_constants::{context, fields, sections};
+#[cfg(test)]
+pub(crate) use test_rig::ScriptedAgent;
 pub use types::{
     BlockedCell, CellOutcome, ParkSnapshot, PendingCall, Plan, PlanningResponse, RunId, StepInput,
     StructuredTaskOutput, Task, TaskIdentity, TaskJson, TaskState, TaskStatus,
