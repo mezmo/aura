@@ -77,6 +77,7 @@ pub mod event_names {
     pub const SYNTHESIZING: &str = "aura.orchestrator.synthesizing";
     pub const WORKER_REASONING: &str = "aura.orchestrator.worker_reasoning";
     pub const TOOL_CALL_STARTED: &str = "aura.orchestrator.tool_call_started";
+    pub const TOOL_CALL_EXECUTING: &str = "aura.orchestrator.tool_call_executing";
     pub const TOOL_CALL_COMPLETED: &str = "aura.orchestrator.tool_call_completed";
     pub const PHASE_STARTED: &str = "aura.orchestrator.phase_started";
     pub const PHASE_COMPLETED: &str = "aura.orchestrator.phase_completed";
@@ -196,11 +197,24 @@ pub enum OrchestrationStreamEvent {
         #[serde(flatten)]
         context: EventContext,
     },
+    /// Emitted once a tool call has cleared every pre-call gate (e.g. HITL
+    /// approval) and is running. `ToolCallStarted` precedes any gate.
+    ToolCallExecuting {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        task_id: Option<usize>,
+        tool_call_id: String,
+        tool_name: String,
+        worker_id: String,
+        #[serde(flatten)]
+        context: EventContext,
+    },
     /// Emitted when a tool call completes within a worker task.
     ToolCallCompleted {
         #[serde(skip_serializing_if = "Option::is_none")]
         task_id: Option<usize>,
         tool_call_id: String,
+        tool_name: String,
+        worker_id: String,
         success: bool,
         duration_ms: u64,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -241,6 +255,7 @@ impl OrchestrationStreamEvent {
             Self::Synthesizing { .. } => event_names::SYNTHESIZING,
             Self::WorkerReasoning { .. } => event_names::WORKER_REASONING,
             Self::ToolCallStarted { .. } => event_names::TOOL_CALL_STARTED,
+            Self::ToolCallExecuting { .. } => event_names::TOOL_CALL_EXECUTING,
             Self::ToolCallCompleted { .. } => event_names::TOOL_CALL_COMPLETED,
             Self::PhaseStarted { .. } => event_names::PHASE_STARTED,
             Self::PhaseCompleted { .. } => event_names::PHASE_COMPLETED,
@@ -411,9 +426,28 @@ impl OrchestrationStreamEvent {
         }
     }
 
+    pub fn tool_call_executing(
+        task_id: Option<usize>,
+        tool_call_id: impl Into<String>,
+        tool_name: impl Into<String>,
+        worker_id: impl Into<String>,
+        context: EventContext,
+    ) -> Self {
+        Self::ToolCallExecuting {
+            task_id,
+            tool_call_id: tool_call_id.into(),
+            tool_name: tool_name.into(),
+            worker_id: worker_id.into(),
+            context,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn tool_call_completed(
         task_id: Option<usize>,
         tool_call_id: impl Into<String>,
+        tool_name: impl Into<String>,
+        worker_id: impl Into<String>,
         success: bool,
         duration_ms: u64,
         result: Option<String>,
@@ -422,6 +456,8 @@ impl OrchestrationStreamEvent {
         Self::ToolCallCompleted {
             task_id,
             tool_call_id: tool_call_id.into(),
+            tool_name: tool_name.into(),
+            worker_id: worker_id.into(),
             success,
             duration_ms,
             result,

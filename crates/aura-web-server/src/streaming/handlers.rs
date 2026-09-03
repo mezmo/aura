@@ -1349,16 +1349,39 @@ fn handle_orchestrator_event(
                 event_context,
             )
         }
+        OrchestratorEvent::ToolCallExecuting {
+            task_id,
+            tool_call_id,
+            tool_name,
+            worker_id,
+        } => {
+            tracing::debug!(
+                "Orchestrator: task {:?} tool call executing - {} ({})",
+                task_id,
+                tool_name,
+                tool_call_id
+            );
+            OrchestrationStreamEvent::tool_call_executing(
+                *task_id,
+                tool_call_id,
+                tool_name,
+                worker_id,
+                event_context,
+            )
+        }
         OrchestratorEvent::ToolCallCompleted {
             task_id,
             tool_call_id,
+            tool_name,
+            worker_id,
             success,
             duration_ms,
             result,
         } => {
             tracing::debug!(
-                "Orchestrator: task {:?} tool call completed - {} (success={}) in {}ms",
+                "Orchestrator: task {:?} tool call completed - {} ({}) (success={}) in {}ms",
                 task_id,
+                tool_name,
                 tool_call_id,
                 success,
                 duration_ms
@@ -1366,6 +1389,8 @@ fn handle_orchestrator_event(
             OrchestrationStreamEvent::tool_call_completed(
                 *task_id,
                 tool_call_id,
+                tool_name,
+                worker_id,
                 *success,
                 *duration_ms,
                 maybe_truncate(result, config.tool_result_max_length),

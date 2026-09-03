@@ -235,8 +235,20 @@ fn tool_event_to_orchestrator_event(
             worker_id: tool_initiator_id,
             arguments,
         },
+        crate::tool_call_observer::ToolEvent::CallExecuting {
+            tool_call_id,
+            tool_name,
+            tool_initiator_id,
+        } => OrchestratorEvent::ToolCallExecuting {
+            task_id: extract_task_id(&tool_call_id),
+            tool_call_id,
+            tool_name,
+            worker_id: tool_initiator_id,
+        },
         crate::tool_call_observer::ToolEvent::CallCompleted {
             tool_call_id,
+            tool_name,
+            tool_initiator_id,
             result,
             duration_ms,
         } => {
@@ -248,6 +260,8 @@ fn tool_event_to_orchestrator_event(
             OrchestratorEvent::ToolCallCompleted {
                 task_id: extract_task_id(&tool_call_id),
                 tool_call_id,
+                tool_name,
+                worker_id: tool_initiator_id,
                 success,
                 duration_ms,
                 result: result_str,
@@ -256,12 +270,22 @@ fn tool_event_to_orchestrator_event(
     }
 }
 
-/// Forward a `ToolCallStarted` event for a non-MCP tool the worker
-/// `ObserverWrapper` does not cover: skills, orchestration operations, and
-/// scratchpad tools when enabled (see [`scratchpad::should_forward_tool_event`]).
-/// Records the start instant so the completion can report a duration. No-op
-/// without an event channel. Used by both `stream_and_forward` (workers) and
-/// `stream_and_collect` (coordinator) so skill use surfaces in both roles.
+/// What [`forward_internal_tool_started`] records per call so the matching
+/// completion can report a duration and carry the tool identity.
+struct InternalToolStart {
+    at: std::time::Instant,
+    tool_name: String,
+    worker_id: String,
+}
+
+/// Forward `ToolCallStarted` and `ToolCallExecuting` events for a non-MCP tool
+/// the worker `ObserverWrapper` does not cover: skills, orchestration
+/// operations, and scratchpad tools when enabled (see
+/// [`scratchpad::should_forward_tool_event`]). These tools pass through no
+/// pre-call gate, so both events are emitted back to back. Records the start
+/// so the completion can report a duration. No-op without an event channel.
+/// Used by both `stream_and_forward` (workers) and `stream_and_collect`
+/// (coordinator) so skill use surfaces in both roles.
 async fn forward_internal_tool_started(
     event_tx: Option<&tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>>,
     task_id: Option<usize>,
@@ -269,20 +293,37 @@ async fn forward_internal_tool_started(
     tool_call_id: &str,
     tool_name: &str,
     raw_arguments: &str,
-    starts: &mut std::collections::HashMap<String, std::time::Instant>,
+    starts: &mut std::collections::HashMap<String, InternalToolStart>,
 ) {
     let Some(tx) = event_tx else { return };
     let tool_call_id = tool_call_id.to_string();
-    starts.insert(tool_call_id.clone(), std::time::Instant::now());
+    starts.insert(
+        tool_call_id.clone(),
+        InternalToolStart {
+            at: std::time::Instant::now(),
+            tool_name: tool_name.to_string(),
+            worker_id: worker_id.to_string(),
+        },
+    );
     let arguments = serde_json::from_str(raw_arguments).unwrap_or_else(|_| serde_json::json!({}));
     let _ = tx
         .send(Ok(StreamItem::OrchestratorEvent(
             OrchestratorEvent::ToolCallStarted {
                 task_id,
-                tool_call_id,
+                tool_call_id: tool_call_id.clone(),
                 tool_name: tool_name.to_string(),
                 worker_id: worker_id.to_string(),
                 arguments,
+            },
+        )))
+        .await;
+    let _ = tx
+        .send(Ok(StreamItem::OrchestratorEvent(
+            OrchestratorEvent::ToolCallExecuting {
+                task_id,
+                tool_call_id,
+                tool_name: tool_name.to_string(),
+                worker_id: worker_id.to_string(),
             },
         )))
         .await;
@@ -296,7 +337,7 @@ async fn forward_internal_tool_completed(
     task_id: Option<usize>,
     tool_call_id: &str,
     result: &str,
-    starts: &mut std::collections::HashMap<String, std::time::Instant>,
+    starts: &mut std::collections::HashMap<String, InternalToolStart>,
 ) {
     let Some(start) = starts.remove(tool_call_id) else {
         return;
@@ -311,8 +352,10 @@ async fn forward_internal_tool_completed(
             OrchestratorEvent::ToolCallCompleted {
                 task_id,
                 tool_call_id: tool_call_id.to_string(),
+                tool_name: start.tool_name,
+                worker_id: start.worker_id,
                 success,
-                duration_ms: start.elapsed().as_millis() as u64,
+                duration_ms: start.at.elapsed().as_millis() as u64,
                 result: result.to_string(),
             },
         )))
@@ -1040,7 +1083,7 @@ impl Orchestrator {
         // ToolResult can report a duration. Membership also gates completion:
         // only IDs we started get completed, so MCP tools (covered by
         // ObserverWrapper) are never double-emitted.
-        let mut internal_tool_starts: HashMap<String, std::time::Instant> = HashMap::new();
+        let mut internal_tool_starts: HashMap<String, InternalToolStart> = HashMap::new();
 
         // Two guarded phases per iteration, so the body (its sends and the
         // decision-ready branch's inner `next()`) runs under the deadline
@@ -1327,7 +1370,7 @@ impl Orchestrator {
             // The coordinator is not ObserverWrapped, so forward the same non-MCP
             // tool calls a worker does (skills, orchestration operations), attributed
             // to the main agent.
-            let mut internal_tool_starts: HashMap<String, std::time::Instant> = HashMap::new();
+            let mut internal_tool_starts: HashMap<String, InternalToolStart> = HashMap::new();
 
             // Same two-phase guarded shape as `stream_and_forward`; see the
             // rationale there, including why new_disarmed() rather than new().
