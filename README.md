@@ -110,7 +110,6 @@ Through compatible [MCP](https://modelcontextprotocol.io) servers, AURA agents c
 
 - [Browse agent configurations and advanced quickstarts](https://docs.mezmo.com/aura/example-configs)
 - [Browse the annotated configuration reference](https://docs.mezmo.com/aura/configuration-reference)
-- [Build an orchestrated multi-agent workflow](https://docs.mezmo.com/aura/quickstart-orchestration-math)
 - [Run a Kubernetes SRE agent](https://docs.mezmo.com/aura/quickstart-k8s-sre)
 - [Learn the full AURA CLI](https://docs.mezmo.com/aura/cli-reference)
 - [Use AURA's streaming API](https://docs.mezmo.com/aura/streaming-api-guide)
