@@ -246,9 +246,15 @@ pub(crate) async fn load_recorded_decisions(
                         )));
                     }
                 }
-                other => {
+                crate::hitl::AgentScope::Single { .. } => {
                     return Err(RehydrateError::Mismatch(format!(
-                        "approval {} carries a non-worker scope {other:?}",
+                        "approval {} carries a single-agent scope",
+                        call.decision_id
+                    )));
+                }
+                crate::hitl::AgentScope::Coordinator { .. } => {
+                    return Err(RehydrateError::Mismatch(format!(
+                        "approval {} carries a coordinator scope",
                         call.decision_id
                     )));
                 }
@@ -508,6 +514,61 @@ mod tests {
         doc.expires_at = (chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
         let err = load_recorded_decisions(&registry, &doc).await.unwrap_err();
         assert!(err.to_string().contains("expired"), "got: {err}");
+    }
+
+    /// The stored approval's scope must name this run and this checkpoint
+    /// node: wrong run, wrong task, and non-worker scopes are each the
+    /// mismatch row (the other-run/other-task borrow of T1).
+    #[tokio::test]
+    async fn scope_mismatch_refuses_the_borrowed_approval() {
+        let (registry, _dir) = file_store();
+        let decision_id = DecisionId::generate();
+        let args = serde_json::json!({ "namespace": "prod" });
+
+        let mut other_run = approval(decision_id, args.clone());
+        other_run.request.scope = crate::hitl::AgentScope::Worker {
+            run_id: "0191e8c0-bbbb-7000-8000-00000000c0de".parse().unwrap(),
+            task: crate::orchestration::types::TaskIdentity::new(3, None),
+            session_id: None,
+        };
+        registry.register_durable(other_run).await.unwrap();
+        let err = load_recorded_decisions(
+            &registry,
+            &parked_run(vec![pending_call(decision_id, args.clone())]),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("not this run"), "got: {err}");
+
+        let (registry, _dir) = file_store();
+        let mut other_task = approval(decision_id, args.clone());
+        other_task.request.scope = crate::hitl::AgentScope::Worker {
+            run_id: "0191e8c0-aaaa-7000-8000-00000000c0de".parse().unwrap(),
+            task: crate::orchestration::types::TaskIdentity::new(7, None),
+            session_id: None,
+        };
+        registry.register_durable(other_task).await.unwrap();
+        let err = load_recorded_decisions(
+            &registry,
+            &parked_run(vec![pending_call(decision_id, args.clone())]),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("not task 3"), "got: {err}");
+
+        let (registry, _dir) = file_store();
+        let mut coordinator_scope = approval(decision_id, args);
+        coordinator_scope.request.scope = crate::hitl::AgentScope::Coordinator {
+            run_id: "0191e8c0-aaaa-7000-8000-00000000c0de".parse().unwrap(),
+        };
+        registry.register_durable(coordinator_scope).await.unwrap();
+        let err = load_recorded_decisions(
+            &registry,
+            &parked_run(vec![pending_call(decision_id, serde_json::json!({}))]),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("coordinator scope"), "got: {err}");
     }
 
     /// Decision-during-refresh correction: the document's pending set still
