@@ -858,6 +858,14 @@ impl IterationContext {
                         }
                     };
                     redesign_lines.push(line);
+                    // A task can fail after its tools succeeded — a timeout or
+                    // depth limit reached before submit_result. Those artifacts
+                    // are on disk and readable, so list them as for completed
+                    // tasks; otherwise the findings are lost at the iteration
+                    // boundary and the next plan repeats the work blind.
+                    for line in render_artifact_lines(self.tool_traces.get(&t.id)) {
+                        redesign_lines.push(format!("    {}", line));
+                    }
                     for line in render_tool_chain_lines(self.tool_traces.get(&t.id)) {
                         redesign_lines.push(format!("    {}", line));
                     }
@@ -1602,6 +1610,39 @@ mod tests {
         assert!(prompt.contains("COMPLETED TASKS"));
         assert!(prompt.contains("saved to artifact: task-0-sre-iter-1-result.txt"));
         assert!(prompt.contains("12345 chars"));
+    }
+
+    #[test]
+    fn test_continuation_prompt_lists_artifacts_of_failed_tasks() {
+        use super::super::persistence::{ToolOutcome, ToolTraceEntry};
+
+        // Regression guard: a worker that times out or exhausts its depth
+        // budget still leaves usable tool output on disk. The coordinator must
+        // see those artifacts so it can forward them to the next iteration.
+        let mut plan = Plan::new("Investigate");
+        let mut task = Task::new(0, "Search logs", "Query the log index");
+        task.fail("timed out after 120s", FailureCategory::AgentTimeout);
+        plan.add_task(task);
+
+        let mut traces = HashMap::new();
+        traces.insert(
+            0,
+            vec![ToolTraceEntry {
+                tool: "search_logs".to_string(),
+                reasoning: String::new(),
+                duration_ms: 1200,
+                outcome: ToolOutcome::Success {
+                    output_bytes: 27171,
+                },
+                artifact_filename: Some("task-0-sre-iter-1-tool-1.txt".to_string()),
+            }],
+        );
+
+        let ctx = IterationContext::new(1, plan, None, vec![], traces);
+        let prompt = ctx.build_continuation_prompt(3, false, 2000);
+
+        assert!(prompt.contains("FAILED TASKS"));
+        assert!(prompt.contains("[Artifact: task-0-sre-iter-1-tool-1.txt (27171 bytes)]"));
     }
 
     #[test]

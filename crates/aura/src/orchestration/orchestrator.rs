@@ -4554,9 +4554,18 @@ Assign tasks to the worker whose tools best match the required operations."#,
         for t in &plan.tasks {
             match &t.state {
                 TaskState::Complete { result } => {
+                    // This text reaches the user unmediated — the coordinator
+                    // never ran, so the synthesis rules that preserve a
+                    // worker's confidence do not apply. Tag it here instead,
+                    // or an uncertain finding is shipped as an unqualified one.
+                    let confidence = t
+                        .structured_output
+                        .as_ref()
+                        .map(|so| format!(" (confidence: {})", so.confidence))
+                        .unwrap_or_default();
                     out.push_str(&format!(
-                        "## Task {}: {}\n\n{}\n\n",
-                        t.id, t.description, result
+                        "## Task {}: {}{}\n\n{}\n\n",
+                        t.id, t.description, confidence, result
                     ));
                 }
                 TaskState::Failed { error, .. } => {
@@ -4886,6 +4895,28 @@ mod tests {
             output_tokens,
             total_tokens: input_tokens + output_tokens,
         }
+    }
+
+    #[test]
+    fn test_raw_task_results_tag_worker_confidence() {
+        use super::super::tools::submit_result::Confidence;
+        use super::super::types::{StructuredTaskOutput, Task};
+
+        // Regression guard: this text goes to the user without passing through
+        // coordinator synthesis, so the confidence qualifier must be attached
+        // here or an uncertain finding is presented as an unqualified one.
+        let mut plan = Plan::new("Investigate");
+        let mut task = Task::new(0, "Search logs", "Query the log index");
+        task.complete("No matching records returned.".to_string());
+        task.structured_output = Some(StructuredTaskOutput {
+            summary: "Search returned no rows".to_string(),
+            confidence: Confidence::Low,
+        });
+        plan.add_task(task);
+
+        let out = Orchestrator::build_raw_task_results(&plan, "Coordinator timed out");
+
+        assert!(out.contains("## Task 0: Search logs (confidence: low)"));
     }
 
     /// Turn figures are AWS Bedrock invocation-log records for one `arithmetic`
