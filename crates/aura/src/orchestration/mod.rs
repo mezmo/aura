@@ -55,6 +55,8 @@ pub(crate) mod persistence_wrapper;
 mod prompt_constants;
 mod stream_events;
 mod templates;
+#[cfg(test)]
+mod test_rig;
 pub mod tools;
 mod types;
 
