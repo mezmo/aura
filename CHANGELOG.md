@@ -1,5 +1,12 @@
 ## Changelog
 
+## [0.2.15](https://github.com/mezmo/aura/compare/v0.2.14...v0.2.15) (2026-09-03)
+
+
+### Chores
+
+* **doc**: remove math orchestration links [c9b460e](https://github.com/mezmo/aura/commit/c9b460e7ff05320dc506efd35350381cf64af704) - Gregory Janco [#71](https://github.com/mezmo/aura/issues/71)
+
 ## [0.2.14](https://github.com/mezmo/aura/compare/v0.2.13...v0.2.14) (2026-09-02)
 
 
