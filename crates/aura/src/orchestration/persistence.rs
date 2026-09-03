@@ -40,9 +40,9 @@ use std::time::Duration;
 use tokio::fs;
 use tokio::sync::Notify;
 
-use super::events::RoutingMode;
 use super::park::{PARKED_DOCUMENT_SUFFIX, RESUMING_DOCUMENT_SUFFIX};
 use super::types::{Plan, TaskStatus};
+use aura_events::orchestration::RoutingMode;
 
 // ============================================================================
 // Filename Helpers

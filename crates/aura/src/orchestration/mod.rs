@@ -42,7 +42,6 @@
 
 mod config;
 mod duplicate_call_guard;
-mod events;
 mod factory;
 #[cfg(test)]
 mod frame_validation_tests;
@@ -58,11 +57,11 @@ mod templates;
 pub mod tools;
 mod types;
 
+pub use aura_events::orchestration::RoutingMode;
 pub use config::{
     ArtifactsConfig, OrchestrationConfig, TimeoutsConfig, ToolVisibility, WorkerConfig,
     build_coordinator_preamble, build_vector_store_context, build_worker_preamble,
 };
-pub use events::{OrchestratorEvent, RoutingMode};
 pub use factory::OrchestratorFactory;
 pub use observer_wrapper::ObserverWrapper;
 pub use orchestrator::Orchestrator;

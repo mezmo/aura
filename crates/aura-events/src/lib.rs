@@ -101,6 +101,24 @@ impl AgentContext {
         }
     }
 
+    /// Whether this is the lone agent of an unorchestrated run.
+    ///
+    /// Several payload variants are emitted by both modes, so the projection
+    /// that turns an event into a frame reads this rather than the variant.
+    pub fn is_single_agent(&self) -> bool {
+        self.agent_id == "main"
+    }
+
+    /// The agent that plans an orchestrated run and synthesises its answer.
+    /// Workers name it as their parent.
+    pub fn coordinator() -> Self {
+        Self {
+            agent_id: "coordinator".to_string(),
+            agent_name: None,
+            parent_agent_id: None,
+        }
+    }
+
     /// Create a worker agent context with parent hierarchy
     pub fn worker(
         id: impl Into<String>,

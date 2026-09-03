@@ -42,6 +42,7 @@ pub async fn publish_to_brokers(request_id: &str, event: &AgentEvent) -> Routed 
             tool_call_id,
             tool_name,
             arguments,
+            ..
         } => {
             publish_tool_requested(
                 request_id,
@@ -56,6 +57,7 @@ pub async fn publish_to_brokers(request_id: &str, event: &AgentEvent) -> Routed 
             tool_call_id,
             tool_name,
             progress_token,
+            ..
         } => {
             publish_tool_start(
                 request_id,
@@ -137,7 +139,7 @@ pub async fn publish_to_brokers(request_id: &str, event: &AgentEvent) -> Routed 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_events::agent::ToolOutcome;
+    use aura_events::agent::Outcome;
     use aura_events::{NumberOrString, ProgressToken};
     use serde_json::json;
 
@@ -188,6 +190,8 @@ mod tests {
         publish_to_brokers(
             request_id,
             &AgentEvent::single_agent(AgentEventPayload::ToolStart {
+                arguments: None,
+                task_id: None,
                 tool_call_id: "call_1".to_string(),
                 tool_name: "list_files".to_string(),
                 progress_token: Some(token(7)),
@@ -265,10 +269,11 @@ mod tests {
         let routed = publish_to_brokers(
             "req_adapter_complete",
             &AgentEvent::single_agent(AgentEventPayload::ToolComplete {
+                task_id: None,
                 tool_call_id: "call_1".to_string(),
                 tool_name: "list_files".to_string(),
                 duration_ms: 3,
-                outcome: ToolOutcome::Success {
+                outcome: Outcome::Success {
                     result: "ok".to_string(),
                 },
             }),

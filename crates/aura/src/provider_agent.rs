@@ -19,9 +19,9 @@ use std::pin::Pin;
 use std::time::Duration;
 use tokio::sync::watch;
 
-use crate::orchestration::OrchestratorEvent;
 use crate::scratchpad::ContextBudget;
 use crate::streaming_request_hook::StreamingRequestHook;
+use aura_events::agent::AgentEvent;
 
 // Type aliases for provider-specific completion models
 pub type OpenAICompletionModel =
@@ -386,7 +386,7 @@ pub enum StreamItem {
     /// even when they short-circuit before the terminal `FinalResponse`.
     TurnUsage(Usage, Option<rig::completion::CacheUsage>),
     /// Orchestrator status event (plan progress, task status, etc.)
-    OrchestratorEvent(OrchestratorEvent),
+    OrchestratorEvent(Box<AgentEvent>),
     /// Per-agent scratchpad usage report.
     ///
     /// Emitted after an agent (single-agent or orchestration worker) finishes
