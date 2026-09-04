@@ -234,8 +234,9 @@ async fn resolve_moves_the_approval_into_the_decision_file() {
     assert_eq!(on_disk["decision"]["reason"], serde_json::Value::Null);
 }
 
-/// §2.5: `cancel_request` removes undecided approvals by owner id; a decided
-/// approval of the same owner and an undecided approval of another owner survive.
+/// §2.5: `cancel_request` removes undecided approvals by owner id and
+/// returns exactly the cleared set; a decided approval of the same owner and
+/// an undecided approval of another owner survive.
 #[tokio::test]
 async fn cancel_request_removes_only_undecided_matching_approvals() {
     let dir = tempfile::tempdir().unwrap();
@@ -254,8 +255,10 @@ async fn cancel_request_removes_only_undecided_matching_approvals() {
     let other_id = other.request.decision_id;
     store.register(other).await.unwrap();
 
-    store.cancel_request("req-owner").await.unwrap();
+    let cleared = store.cancel_request("req-owner").await.unwrap();
 
+    assert_eq!(cleared.len(), 1, "only the undecided ticket is cleared");
+    assert_eq!(cleared[0].request.decision_id, undecided_id);
     assert!(store.get(&undecided_id).await.unwrap().is_none());
     assert!(
         store.get(&decided_id).await.unwrap().is_some(),

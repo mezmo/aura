@@ -84,8 +84,14 @@ pub trait ApprovalStore: Send + Sync {
     /// Remove a parked entry.
     async fn remove(&self, id: &DecisionId) -> Result<(), SessionStoreError>;
 
-    /// Remove every approval parked under a request id.
-    async fn cancel_request(&self, request_id: &str) -> Result<(), SessionStoreError>;
+    /// Remove every approval parked under a request id, returning the
+    /// approvals actually cleared. A ticket decided before the sweep is
+    /// absent — resolve removed it — so the return is the authoritative
+    /// record of what the cancellation applies to.
+    async fn cancel_request(
+        &self,
+        request_id: &str,
+    ) -> Result<Vec<ParkedApproval>, SessionStoreError>;
 }
 
 /// The payload stream returned by [`EventBus::subscribe`].

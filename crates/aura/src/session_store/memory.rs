@@ -102,10 +102,16 @@ impl ApprovalStore for InMemoryApprovalStore {
         Ok(())
     }
 
-    async fn cancel_request(&self, request_id: &str) -> Result<(), SessionStoreError> {
-        self.lock()
-            .retain(|_, parked| parked.request.request_id != request_id);
-        Ok(())
+    async fn cancel_request(
+        &self,
+        request_id: &str,
+    ) -> Result<Vec<ParkedApproval>, SessionStoreError> {
+        let cleared: Vec<ParkedApproval> = self
+            .lock()
+            .extract_if(.., |_, parked| parked.request.request_id == request_id)
+            .map(|(_, parked)| parked)
+            .collect();
+        Ok(cleared)
     }
 }
 
@@ -313,13 +319,16 @@ mod tests {
     async fn approval_store_cancel_request_removes_only_matching() {
         let store = InMemoryApprovalStore::new();
         let cancel = parked("req-cancel");
+        let cancel_id = cancel.request.decision_id;
         let keep = parked("req-keep");
         let keep_id = keep.request.decision_id;
         store.register(cancel).await.unwrap();
         store.register(keep).await.unwrap();
 
-        store.cancel_request("req-cancel").await.unwrap();
+        let cleared = store.cancel_request("req-cancel").await.unwrap();
 
+        assert_eq!(cleared.len(), 1, "only the matching ticket is cleared");
+        assert_eq!(cleared[0].request.decision_id, cancel_id);
         assert!(store.get(&keep_id).await.unwrap().is_some());
         assert_eq!(store.lock().len(), 1);
     }
