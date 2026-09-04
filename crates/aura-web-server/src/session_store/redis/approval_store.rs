@@ -15,10 +15,10 @@
 //! authoritative timeout. Decision records keep a margin past the parked
 //! record's remaining TTL, covering the parking instance's deadline-backstop
 //! read. The request index is refreshed on every register with a margin over
-//! the record TTL and pruned best-effort on resolve/remove; a stale indexed id
-//! only costs `cancel_request` a missed take, and a swept key that is
-//! wrong-typed or missing is silently left in place while a non-UTF-8
-//! record is warned and skipped.
+//! the record TTL and pruned best-effort on resolve/remove; the cancel
+//! sweep's script sweeps taken and stale ids from the index, warns on a
+//! wrong-typed key while leaving it and its index entry in place for a
+//! later sweep, and warns on a non-UTF-8 record it consumed.
 
 use std::sync::LazyLock;
 
@@ -38,12 +38,20 @@ const REQ_INDEX_TTL_MARGIN_SECS: u64 = 60;
 /// Decision TTL margin over the parked record's remaining TTL.
 const DECISION_TTL_MARGIN_MS: u64 = 60_000;
 
-/// Sweep-take script: a key that is not a string comes back as nil instead
-/// of erroring the pipe after EXEC already cleared the index.
+/// Sweep-take script over one approval key (KEYS[1]) and its request index
+/// (KEYS[2]): a string key is GETDEL'd and its id swept from the index; a
+/// present wrong-typed key returns integer 0 with its index entry kept, so
+/// a later sweep retries it; an absent key is a stale index entry, swept.
 static SWEEP_TAKE_SCRIPT: &str = r#"
 if redis.call('TYPE', KEYS[1]).ok == 'string' then
-    return redis.call('GETDEL', KEYS[1])
+    local record = redis.call('GETDEL', KEYS[1])
+    redis.call('SREM', KEYS[2], ARGV[1])
+    return record
 end
+if redis.call('EXISTS', KEYS[1]) == 1 then
+    return 0
+end
+redis.call('SREM', KEYS[2], ARGV[1])
 return nil
 "#;
 
@@ -206,33 +214,42 @@ impl ApprovalStore for RedisApprovalStore {
         }
 
         // One atomic pipe: a mid-sweep failure cannot drop an
-        // already-cleared prefix. The take reports a wrong-typed key as nil
-        // rather than erroring an EXEC that already ran. SREM (not DEL) only
-        // removes the swept ids, so a registration the index gained after
-        // the SMEMBERS stays discoverable by a later sweep.
+        // already-cleared prefix. The script owns index membership and only
+        // sweeps the ids this SMEMBERS saw, so a registration the index
+        // gained after it stays discoverable by a later sweep.
         let mut pipe = redis::pipe();
         pipe.atomic();
         for id in &ids {
             pipe.cmd("EVAL")
                 .arg(SWEEP_TAKE_SCRIPT)
-                .arg(1)
-                .arg(self.approval_key(id));
+                .arg(2)
+                .arg(self.approval_key(id))
+                .arg(&req_key)
+                .arg(id);
         }
-        pipe.srem(&req_key, &ids).ignore();
         let payloads: Vec<Option<redis::Value>> =
             pipe.query_async(&mut conn).await.map_err(request_err)?;
 
         let mut cleared = Vec::new();
         for (id, payload) in ids.into_iter().zip(payloads) {
-            let Some(json) = payload.and_then(|value| swept_record_json(&id, value)) else {
-                continue;
-            };
-            match decode(&json) {
-                Ok(parked) => cleared.push(parked),
-                Err(err) => tracing::warn!(
-                    decision_id = %id, error = %err,
-                    "undecodable approval record skipped by cancel_request"
+            match payload {
+                None => {}
+                Some(redis::Value::Int(0)) => tracing::warn!(
+                    decision_id = %id,
+                    "wrong-typed approval key left in place; index entry kept"
                 ),
+                Some(value) => {
+                    let Some(json) = swept_record_json(&id, value) else {
+                        continue;
+                    };
+                    match decode(&json) {
+                        Ok(parked) => cleared.push(parked),
+                        Err(err) => tracing::warn!(
+                            decision_id = %id, error = %err,
+                            "undecodable approval record skipped by cancel_request"
+                        ),
+                    }
+                }
             }
         }
         Ok(cleared)
@@ -256,8 +273,8 @@ fn decode(json: &str) -> Result<ParkedApproval, SessionStoreError> {
 }
 
 /// Decode one swept reply into record JSON, skipping entries the cancel can
-/// no longer deliver: a missing key, a wrong-typed key, or non-UTF-8 bytes
-/// (that record is consumed unrecoverably, like a decode failure).
+/// no longer deliver: non-UTF-8 bytes (that record is consumed
+/// unrecoverably, like a decode failure) or an unexpected reply kind.
 fn swept_record_json(id: &str, value: redis::Value) -> Option<String> {
     match value {
         redis::Value::BulkString(bytes) => match String::from_utf8(bytes) {

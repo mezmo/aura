@@ -208,28 +208,38 @@ pub(crate) async fn publish(
 
 /// Cancel every approval the run parked: the store's atomic
 /// `cancel_request` clears the run's remaining tickets by owner id and
-/// returns them; each cleared ticket publishes one
-/// `approval_completed(cancelled)`. A ticket decided before the sweep is
-/// absent from the cleared set by construction — resolve removed it — so the
-/// stream can never disagree with a decision that won the race.
-pub(crate) async fn cancel_run_approvals(
+/// returns them, and each cleared ticket publishes one
+/// `approval_completed(cancelled)`. The whole sequence runs as its own task
+/// on the current runtime, so a caller dropping the returned handle cannot
+/// abandon publication mid-flight: await the handle for ordered teardown,
+/// or drop it and let the sweep finish on its own. A ticket decided before
+/// the sweep is absent from the cleared set by construction — resolve
+/// removed it — so the stream can never disagree with a decision that won
+/// the race. A lost store reply still yields warn-and-empty, the conceded
+/// residual.
+pub(crate) fn cancel_run_approvals(
     registry: &PendingApprovals,
     run_id: &str,
     request_id: &str,
-) {
-    for parked in registry.cancel_request(&run_owner_id(run_id)).await {
-        crate::approval_event_broker::publish(
-            request_id,
-            crate::approval_event_broker::ApprovalLifecycleEvent::Completed(
-                crate::hitl::completed_cancelled(
-                    parked.request.decision_id,
-                    &parked.request.scope,
-                    std::time::Duration::ZERO,
+) -> tokio::task::JoinHandle<()> {
+    let registry = registry.clone();
+    let run_id = run_id.to_string();
+    let request_id = request_id.to_string();
+    tokio::task::spawn(async move {
+        for parked in registry.cancel_request(&run_owner_id(&run_id)).await {
+            crate::approval_event_broker::publish(
+                &request_id,
+                crate::approval_event_broker::ApprovalLifecycleEvent::Completed(
+                    crate::hitl::completed_cancelled(
+                        parked.request.decision_id,
+                        &parked.request.scope,
+                        std::time::Duration::ZERO,
+                    ),
                 ),
-            ),
-        )
-        .await;
-    }
+            )
+            .await;
+        }
+    })
 }
 
 /// The directory checkpoint documents live in:
@@ -574,7 +584,9 @@ mod tests {
             .await
             .unwrap();
 
-        cancel_run_approvals(&registry, run_id, &request_id).await;
+        cancel_run_approvals(&registry, run_id, &request_id)
+            .await
+            .unwrap();
 
         assert!(
             store.get(&sibling).await.unwrap().is_none(),
@@ -637,7 +649,9 @@ mod tests {
             .await
             .unwrap();
 
-        cancel_run_approvals(&registry, run_id, &request_id).await;
+        cancel_run_approvals(&registry, run_id, &request_id)
+            .await
+            .unwrap();
 
         assert!(store.get(&first).await.unwrap().is_none());
         assert!(store.get(&second).await.unwrap().is_none());
@@ -680,7 +694,9 @@ mod tests {
             .await
             .unwrap();
 
-        cancel_run_approvals(&registry, run_id, "req_late_resolve").await;
+        cancel_run_approvals(&registry, run_id, "req_late_resolve")
+            .await
+            .unwrap();
 
         assert_eq!(
             registry
