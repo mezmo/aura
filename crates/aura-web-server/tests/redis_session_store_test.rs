@@ -457,6 +457,34 @@ async fn approval_cancel_request_returns_cleared_set() {
         Err(ResolveError::NotFound),
         "a cleared ticket resolves NotFound"
     );
+
+    // A registration racing the sweep — same request id, added after the
+    // cancel — keeps its index entry: a second cancel still discovers and
+    // takes it.
+    let late = make_parked("req-cancel-return", Duration::from_secs(60));
+    let late_id = late.request.decision_id;
+    let late_record = ParkedApprovalRecord::from(&late);
+    approvals.register(late).await.unwrap();
+
+    let cleared_late = approvals.cancel_request("req-cancel-return").await.unwrap();
+
+    assert_eq!(
+        cleared_late.len(),
+        1,
+        "the post-cancel registration is discoverable"
+    );
+    assert_eq!(
+        ParkedApprovalRecord::from(&cleared_late[0]),
+        late_record,
+        "the late record is returned unchanged"
+    );
+    assert_eq!(
+        approvals
+            .resolve(&late_id, ApprovalDecision::Approved)
+            .await,
+        Err(ResolveError::NotFound),
+        "the second cancel GETDEL'd the late ticket"
+    );
 }
 
 #[tokio::test]

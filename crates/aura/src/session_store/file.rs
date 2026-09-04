@@ -254,12 +254,16 @@ impl Inner {
         request_id: &str,
     ) -> Result<Vec<ParkedApproval>, SessionStoreError> {
         let _guard = self.lock();
-        let mut cleared = Vec::new();
         let entries = match fs::read_dir(self.approvals_dir()) {
             Ok(entries) => entries,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(cleared),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(err) => return Err(request_err(err)),
         };
+
+        // Phase 1 classifies without mutating, so a fault past an earlier
+        // file cannot strand an already-removed approval.
+        let mut candidates = Vec::new();
+        let mut stale_decided = Vec::new();
         for entry in entries {
             let entry = entry.map_err(request_err)?;
             let path = entry.path();
@@ -272,18 +276,51 @@ impl Inner {
                 Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
                 Err(err) => return Err(request_err(err)),
             };
-            match serde_json::from_slice::<ParkedApprovalRecord>(&bytes) {
-                Ok(record) if record.request_id == request_id => {
-                    fs::remove_file(&path).map_err(request_err)?;
-                    cleared.push(restore_approval(record)?);
-                }
-                Ok(_) => {}
+            let parked = match decode_approval(&bytes) {
+                Ok(parked) => parked,
                 Err(err) => {
                     tracing::warn!(
                         path = %path.display(), error = %err,
                         "undecodable approval file skipped by cancel_request"
                     );
+                    continue;
                 }
+            };
+            if parked.request.request_id != request_id {
+                continue;
+            }
+            // resolve writes the decision before its best-effort approval
+            // unlink, so a decision file here marks the residue of an
+            // already-decided id: the recorded decision owns the outcome.
+            if self
+                .decision_path(&parked.request.decision_id.to_string())
+                .try_exists()
+                .map_err(request_err)?
+            {
+                stale_decided.push(path);
+                continue;
+            }
+            candidates.push((path, parked));
+        }
+
+        // Phase 2 removes; a file that survives drops its record from the
+        // returned set so a later cancel can clear it again.
+        let mut cleared = Vec::new();
+        for (path, parked) in candidates {
+            match fs::remove_file(&path) {
+                Ok(()) => cleared.push(parked),
+                Err(err) => tracing::warn!(
+                    path = %path.display(), decision_id = %parked.request.decision_id, error = %err,
+                    "approval file not removed by cancel_request; a later cancel can clear it"
+                ),
+            }
+        }
+        for path in stale_decided {
+            if let Err(err) = fs::remove_file(&path) {
+                tracing::warn!(
+                    path = %path.display(), error = %err,
+                    "stale decided approval file not removed by cancel_request"
+                );
             }
         }
         Ok(cleared)

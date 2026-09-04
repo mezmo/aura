@@ -190,15 +190,36 @@ impl ApprovalStore for RedisApprovalStore {
         let req_key = self.req_key(request_id);
         let mut conn = self.conn.clone();
         let ids: Vec<String> = conn.smembers(&req_key).await.map_err(request_err)?;
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // One atomic pipe: a mid-sweep failure cannot drop an
+        // already-cleared prefix. SREM (not DEL) only removes the swept ids,
+        // so a registration the index gained after the SMEMBERS stays
+        // discoverable by a later sweep.
+        let mut pipe = redis::pipe();
+        pipe.atomic();
+        for id in &ids {
+            pipe.get_del(self.approval_key(id));
+        }
+        pipe.srem(&req_key, &ids).ignore();
+        let payloads: Vec<Option<String>> =
+            pipe.query_async(&mut conn).await.map_err(request_err)?;
 
         let mut cleared = Vec::new();
-        for id in &ids {
-            // A stale indexed id costs one `GETDEL` of a missing key.
-            if let Some(parked) = self.take(id).await? {
-                cleared.push(parked);
+        for (id, payload) in ids.into_iter().zip(payloads) {
+            let Some(json) = payload else {
+                continue;
+            };
+            match decode(&json) {
+                Ok(parked) => cleared.push(parked),
+                Err(err) => tracing::warn!(
+                    decision_id = %id, error = %err,
+                    "undecodable approval record skipped by cancel_request"
+                ),
             }
         }
-        let _: i64 = conn.del(&req_key).await.map_err(request_err)?;
         Ok(cleared)
     }
 }
