@@ -505,8 +505,9 @@ async fn approval_cancel_request_returns_cleared_set() {
 
 /// One corrupt record must not fail `cancel_request` for its whole request:
 /// with a list planted at one approval key the sweep still returns the valid
-/// sibling and sweeps both ids from the index, and the same holds when the
-/// planted record is non-UTF-8 bytes.
+/// sibling and sweeps its id from the index, while the wrong-typed key and
+/// its index entry stay in place for a later sweep to retry; the same holds
+/// when the planted record is non-UTF-8 bytes, which the sweep consumes.
 #[tokio::test]
 async fn cancel_request_skips_a_wrong_type_value_and_returns_valid_records() {
     let config = test_config(60);
@@ -545,13 +546,60 @@ async fn cancel_request_skips_a_wrong_type_value_and_returns_valid_records() {
     );
     assert!(approvals.get(&valid_id).await.unwrap().is_none());
     assert!(
-        redis::cmd("SMEMBERS")
+        !redis::cmd("SISMEMBER")
             .arg(&req_index_key)
+            .arg(valid_id.to_string())
+            .query_async::<bool>(&mut raw)
+            .await
+            .unwrap(),
+        "the swept record's index entry went with it"
+    );
+    assert!(
+        redis::cmd("SISMEMBER")
+            .arg(&req_index_key)
+            .arg(corrupt_id.to_string())
+            .query_async::<bool>(&mut raw)
+            .await
+            .unwrap(),
+        "the wrong-typed id keeps its index entry"
+    );
+    assert_eq!(
+        redis::cmd("TYPE")
+            .arg(&corrupt_key)
+            .query_async::<String>(&mut raw)
+            .await
+            .unwrap(),
+        "list",
+        "the wrong-typed key is left in place"
+    );
+    assert_eq!(
+        redis::cmd("LRANGE")
+            .arg(&corrupt_key)
+            .arg(0)
+            .arg(-1)
             .query_async::<Vec<String>>(&mut raw)
             .await
-            .unwrap()
-            .is_empty(),
-        "SREM swept both ids from the request index"
+            .unwrap(),
+        ["planted list, not a record"],
+        "the planted list survives the sweep"
+    );
+
+    let cleared_again = approvals
+        .cancel_request("req-wrong-type")
+        .await
+        .expect("a retry over a wrong-typed key must not fail the sweep");
+    assert!(
+        cleared_again.is_empty(),
+        "a wrong-typed key alone clears nothing"
+    );
+    assert!(
+        redis::cmd("SISMEMBER")
+            .arg(&req_index_key)
+            .arg(corrupt_id.to_string())
+            .query_async::<bool>(&mut raw)
+            .await
+            .unwrap(),
+        "the retry keeps the wrong-typed id indexed"
     );
 
     let second_valid = make_parked("req-wrong-type", Duration::from_secs(60));
@@ -579,13 +627,17 @@ async fn cancel_request_skips_a_wrong_type_value_and_returns_valid_records() {
         "the valid record is returned unchanged"
     );
     assert!(
+        approvals.get(&non_utf8_id).await.unwrap().is_none(),
+        "the non-UTF-8 record was consumed"
+    );
+    assert_eq!(
         redis::cmd("SMEMBERS")
             .arg(&req_index_key)
             .query_async::<Vec<String>>(&mut raw)
             .await
-            .unwrap()
-            .is_empty(),
-        "SREM swept both ids from the request index"
+            .unwrap(),
+        vec![corrupt_id.to_string()],
+        "the non-UTF-8 record's index entry was swept; the wrong-typed one remains"
     );
 }
 

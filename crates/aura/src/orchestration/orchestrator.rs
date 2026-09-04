@@ -5279,7 +5279,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
             return;
         };
         let request_id = self.agent_config.request_id.clone().unwrap_or_default();
-        super::park::cancel_run_approvals(registry, run_id, &request_id).await;
+        super::park::cancel_run_approvals(registry, run_id, &request_id)
+            .await
+            .ok();
     }
 
     async fn write_run_manifest(
