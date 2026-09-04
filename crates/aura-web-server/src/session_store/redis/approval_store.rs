@@ -16,8 +16,9 @@
 //! record's remaining TTL, covering the parking instance's deadline-backstop
 //! read. The request index is refreshed on every register with a margin over
 //! the record TTL and pruned best-effort on resolve/remove; a stale indexed id
-//! only costs `cancel_request` a missed take, and a swept record that is
-//! wrong-typed or non-UTF-8 at its key is warned and skipped.
+//! only costs `cancel_request` a missed take, and a swept key that is
+//! wrong-typed or missing is silently left in place while a non-UTF-8
+//! record is warned and skipped.
 
 use std::sync::LazyLock;
 
@@ -272,7 +273,7 @@ fn swept_record_json(id: &str, value: redis::Value) -> Option<String> {
         _other => {
             tracing::warn!(
                 decision_id = %id,
-                "wrong-typed approval record skipped by cancel_request"
+                "unexpected approval record value kind skipped by cancel_request"
             );
             None
         }
