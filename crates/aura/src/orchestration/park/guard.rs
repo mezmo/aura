@@ -55,14 +55,12 @@ impl Drop for ParkGuard {
         let registry = self.registry.clone();
         let run_id = self.run_id.clone();
         let request_id = self.request_id.clone();
-        // Drop cannot await; the sweep runs as its own task on the runtime
+        // Drop cannot await; the sweep spawns its own task on the runtime
         // that dropped the guard. Off-runtime drops (a test teardown) log
         // and skip.
         match tokio::runtime::Handle::try_current() {
-            Ok(handle) => {
-                handle.spawn(async move {
-                    cancel_run_approvals(&registry, &run_id, &request_id).await;
-                });
+            Ok(_) => {
+                cancel_run_approvals(&registry, &run_id, &request_id);
             }
             Err(_) => {
                 tracing::warn!(
