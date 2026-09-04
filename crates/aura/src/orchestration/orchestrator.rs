@@ -5194,7 +5194,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 run_id = %run_id,
                 "park commit impossible: no memory_dir configured; cancelling approvals",
             );
-            self.cancel_run_parked_approvals(plan, &run_id).await;
+            self.cancel_run_parked_approvals(&run_id).await;
             return Err(format!(
                 "Run {run_id} parked but no memory_dir is configured, so no \
                  checkpoint can be written. The run's pending approvals were cancelled.",
@@ -5259,7 +5259,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     error = %e,
                     "park commit failed; cancelling the run's approvals",
                 );
-                self.cancel_run_parked_approvals(plan, &run_id).await;
+                self.cancel_run_parked_approvals(&run_id).await;
                 Err(format!(
                     "Park commit failed for run {run_id}: {e}. The run's pending \
                      approvals were cancelled.",
@@ -5269,28 +5269,17 @@ Assign tasks to the worker whose tools best match the required operations."#,
         }
     }
 
-    /// Collect the plan's awaiting decision ids and sweep them, so no
-    /// decidable approval outlives a run that has no checkpoint.
-    async fn cancel_run_parked_approvals(&self, plan: &Plan, run_id: &str) {
+    /// Sweep the run's parked approvals by owner id, so no decidable
+    /// approval outlives a run that has no checkpoint.
+    async fn cancel_run_parked_approvals(&self, run_id: &str) {
         let Some(hitl) = self.agent_config.hitl.clone() else {
             return;
         };
         let crate::hitl::DecisionRoute::Conversational { registry, .. } = &*hitl.route else {
             return;
         };
-        let mut cancelled = Vec::new();
-        for task in &plan.tasks {
-            let TaskState::AwaitingApproval { pending } = &task.state else {
-                continue;
-            };
-            let Some(scope) = self.worker_scope(task.id, task.worker.as_deref()).await else {
-                continue;
-            };
-            cancelled.extend(pending.iter().map(|call| (call.decision_id, scope.clone())));
-        }
         let request_id = self.agent_config.request_id.clone().unwrap_or_default();
-        super::park::cancel_run_approvals(registry, run_id, &request_id, cancelled.into_iter())
-            .await;
+        super::park::cancel_run_approvals(registry, run_id, &request_id).await;
     }
 
     async fn write_run_manifest(
@@ -7636,14 +7625,10 @@ mod tests {
             .park_guard
             .as_ref()
             .expect("park-mode orchestrator");
-        let scope = orchestrator
-            .worker_scope(1, plan.tasks[1].worker.as_deref())
-            .await
-            .expect("worker scope builds");
         let TaskState::AwaitingApproval { pending } = &plan.tasks[1].state else {
             unreachable!("the fixture task is awaiting")
         };
-        guard.record(&scope, pending);
+        guard.record(pending);
     }
 
     fn set_mode(path: &std::path::Path, mode: u32) {

@@ -21,6 +21,7 @@ use std::time::Duration;
 use a2a::{ListTasksRequest, Message, Part, Role, Task, TaskState, TaskStatus};
 use aura::hitl::{ApprovalDecision, ApprovalOutcome, PendingApprovals, ResolveError};
 use aura::request_cancellation::RequestCancelToken;
+use aura::session_store::ParkedApprovalRecord;
 use aura_config::{RedisSessionStoreConfig, SessionStoreBackend};
 use aura_web_server::session_store::{RedisSessionStore, SessionStore};
 use bytes::Bytes;
@@ -417,6 +418,45 @@ async fn approval_remove_makes_resolve_not_found() {
 async fn approval_cancel_request_removes_only_matching() {
     let approvals = connect(&test_config(60)).await.approvals();
     common::cancel_request_removes_only_matching(&approvals).await;
+}
+
+/// `cancel_request` returns exactly the records it cleared; a decided
+/// sibling of the same owner is absent, and a cleared ticket refuses a later
+/// resolve.
+#[tokio::test]
+async fn approval_cancel_request_returns_cleared_set() {
+    let approvals = connect(&test_config(60)).await.approvals();
+    let undecided = make_parked("req-cancel-return", Duration::from_secs(60));
+    let undecided_id = undecided.request.decision_id;
+    let cleared_record = ParkedApprovalRecord::from(&undecided);
+    let decided = make_parked("req-cancel-return", Duration::from_secs(60));
+    let decided_id = decided.request.decision_id;
+    let keep = make_parked("req-cancel-return-keep", Duration::from_secs(60));
+    let keep_id = keep.request.decision_id;
+    approvals.register(undecided).await.unwrap();
+    approvals.register(decided).await.unwrap();
+    approvals.register(keep).await.unwrap();
+    approvals
+        .resolve(&decided_id, ApprovalDecision::Approved)
+        .await
+        .unwrap();
+
+    let cleared = approvals.cancel_request("req-cancel-return").await.unwrap();
+
+    assert_eq!(cleared.len(), 1, "only the undecided ticket is cleared");
+    assert_eq!(
+        ParkedApprovalRecord::from(&cleared[0]),
+        cleared_record,
+        "the cleared record is returned unchanged"
+    );
+    assert!(approvals.get(&keep_id).await.unwrap().is_some());
+    assert_eq!(
+        approvals
+            .resolve(&undecided_id, ApprovalDecision::Approved)
+            .await,
+        Err(ResolveError::NotFound),
+        "a cleared ticket resolves NotFound"
+    );
 }
 
 #[tokio::test]

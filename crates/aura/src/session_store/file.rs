@@ -17,8 +17,9 @@
 //!   returns the recorded decision, and both are retained until `remove`.
 //! - At-most-once `resolve` is the `File::create_new` claim on the decision
 //!   file: `AlreadyExists` reads as `NotFound`.
-//! - `cancel_request` removes undecided approvals by owner (request) id;
-//!   decided entries are retained until their consumer removes them.
+//! - `cancel_request` removes undecided approvals by owner (request) id and
+//!   returns them; decided entries are retained until their consumer removes
+//!   them.
 //!
 //! Decision ids are validated as UUIDs before path building, so none address
 //! outside the root.
@@ -248,11 +249,15 @@ impl Inner {
         Ok(())
     }
 
-    fn cancel_request_sync(&self, request_id: &str) -> Result<(), SessionStoreError> {
+    fn cancel_request_sync(
+        &self,
+        request_id: &str,
+    ) -> Result<Vec<ParkedApproval>, SessionStoreError> {
         let _guard = self.lock();
+        let mut cleared = Vec::new();
         let entries = match fs::read_dir(self.approvals_dir()) {
             Ok(entries) => entries,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(cleared),
             Err(err) => return Err(request_err(err)),
         };
         for entry in entries {
@@ -270,6 +275,7 @@ impl Inner {
             match serde_json::from_slice::<ParkedApprovalRecord>(&bytes) {
                 Ok(record) if record.request_id == request_id => {
                     fs::remove_file(&path).map_err(request_err)?;
+                    cleared.push(restore_approval(record)?);
                 }
                 Ok(_) => {}
                 Err(err) => {
@@ -280,7 +286,7 @@ impl Inner {
                 }
             }
         }
-        Ok(())
+        Ok(cleared)
     }
 }
 
@@ -332,7 +338,10 @@ impl ApprovalStore for FileApprovalStore {
             .map_err(join_err)?
     }
 
-    async fn cancel_request(&self, request_id: &str) -> Result<(), SessionStoreError> {
+    async fn cancel_request(
+        &self,
+        request_id: &str,
+    ) -> Result<Vec<ParkedApproval>, SessionStoreError> {
         let inner = Arc::clone(&self.inner);
         let request_id = request_id.to_owned();
         spawn_blocking(move || inner.cancel_request_sync(&request_id))
