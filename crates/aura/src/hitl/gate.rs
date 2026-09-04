@@ -208,9 +208,9 @@ impl HitlApprovalWrapper {
             arguments: args.clone(),
             call_id,
         };
-        // The guard learns the id now, so a run dropped before the task
-        // returns still sweeps this ticket.
-        park.guard.record(&self.scope, std::slice::from_ref(&call));
+        // The guard sees the parked call now, so a run dropped before the
+        // task returns still sweeps this ticket.
+        park.guard.record(std::slice::from_ref(&call));
 
         // The lifecycle pair goes to the live request's broker, not the owner id.
         crate::approval_event_broker::publish(
