@@ -262,11 +262,16 @@ impl PendingApprovals {
     }
 
     /// Cancel every approval parked under a request id (stream drop /
-    /// shutdown); their awaits resolve to `Cancelled`.
-    pub async fn cancel_request(&self, request_id: &str) {
+    /// shutdown); their awaits resolve to `Cancelled`. Returns the approvals
+    /// the store cleared, empty on a store fault.
+    pub async fn cancel_request(&self, request_id: &str) -> Vec<ParkedApproval> {
         self.cancel_request_local(request_id);
-        if let Err(err) = self.0.store.cancel_request(request_id).await {
-            warn!(request_id, error = %err, "approval store cancel_request failed");
+        match self.0.store.cancel_request(request_id).await {
+            Ok(cleared) => cleared,
+            Err(err) => {
+                warn!(request_id, error = %err, "approval store cancel_request failed");
+                Vec::new()
+            }
         }
     }
 }

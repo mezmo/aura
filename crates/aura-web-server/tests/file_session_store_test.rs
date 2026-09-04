@@ -234,8 +234,9 @@ async fn resolve_moves_the_approval_into_the_decision_file() {
     assert_eq!(on_disk["decision"]["reason"], serde_json::Value::Null);
 }
 
-/// §2.5: `cancel_request` removes undecided approvals by owner id; a decided
-/// approval of the same owner and an undecided approval of another owner survive.
+/// §2.5: `cancel_request` removes undecided approvals by owner id and
+/// returns exactly the cleared set; a decided approval of the same owner and
+/// an undecided approval of another owner survive.
 #[tokio::test]
 async fn cancel_request_removes_only_undecided_matching_approvals() {
     let dir = tempfile::tempdir().unwrap();
@@ -254,8 +255,10 @@ async fn cancel_request_removes_only_undecided_matching_approvals() {
     let other_id = other.request.decision_id;
     store.register(other).await.unwrap();
 
-    store.cancel_request("req-owner").await.unwrap();
+    let cleared = store.cancel_request("req-owner").await.unwrap();
 
+    assert_eq!(cleared.len(), 1, "only the undecided ticket is cleared");
+    assert_eq!(cleared[0].request.decision_id, undecided_id);
     assert!(store.get(&undecided_id).await.unwrap().is_none());
     assert!(
         store.get(&decided_id).await.unwrap().is_some(),
@@ -266,6 +269,84 @@ async fn cancel_request_removes_only_undecided_matching_approvals() {
         Some(ApprovalDecision::Approved)
     );
     assert!(store.get(&other_id).await.unwrap().is_some());
+}
+
+/// The residue of resolve's best-effort approval unlink — a stale approval
+/// file whose decision file exists — is swept by `cancel_request` but absent
+/// from the returned set: the recorded decision owns the outcome.
+#[tokio::test]
+async fn cancel_request_sweeps_a_stale_decided_approval_without_returning_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = FileApprovalStore::open(dir.path()).unwrap();
+    let undecided = make_parked("req-residue", Duration::from_secs(60));
+    let undecided_id = undecided.request.decision_id;
+    store.register(undecided).await.unwrap();
+    let decided = make_parked("req-residue", Duration::from_secs(60));
+    let decided_id = decided.request.decision_id;
+    let residue = serde_json::to_vec(&ParkedApprovalRecord::from(&decided)).unwrap();
+    store.register(decided).await.unwrap();
+    store
+        .resolve(&decided_id, ApprovalDecision::Approved)
+        .await
+        .unwrap();
+
+    // Resolve's approval unlink failed: put the residue back.
+    std::fs::write(
+        dir.path()
+            .join("approvals")
+            .join(format!("{decided_id}.json")),
+        residue,
+    )
+    .unwrap();
+
+    let cleared = store.cancel_request("req-residue").await.unwrap();
+
+    assert_eq!(cleared.len(), 1, "only the undecided ticket is cleared");
+    assert_eq!(cleared[0].request.decision_id, undecided_id);
+    assert!(
+        !dir.path()
+            .join("approvals")
+            .join(format!("{undecided_id}.json"))
+            .exists()
+    );
+    assert!(
+        !dir.path()
+            .join("approvals")
+            .join(format!("{decided_id}.json"))
+            .exists(),
+        "the stale residue is swept too"
+    );
+    assert_eq!(
+        store.decision(&decided_id).await.unwrap(),
+        Some(ApprovalDecision::Approved),
+        "the recorded decision is retained"
+    );
+}
+
+/// A corrupt record in `approvals/` is warn-and-skipped: `cancel_request`
+/// still returns and removes the decodable files, leaving the corrupt file
+/// in place.
+#[tokio::test]
+async fn cancel_request_skips_an_undecodable_approval_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = FileApprovalStore::open(dir.path()).unwrap();
+    let parked = make_parked("req-corrupt", Duration::from_secs(60));
+    let id = parked.request.decision_id;
+    store.register(parked).await.unwrap();
+    let corrupt = dir.path().join("approvals").join("corrupt.json");
+    std::fs::write(&corrupt, b"not json").unwrap();
+
+    let cleared = store.cancel_request("req-corrupt").await.unwrap();
+
+    assert_eq!(cleared.len(), 1);
+    assert_eq!(cleared[0].request.decision_id, id);
+    assert!(
+        !dir.path()
+            .join("approvals")
+            .join(format!("{id}.json"))
+            .exists()
+    );
+    assert!(corrupt.exists(), "the undecodable file is left in place");
 }
 
 /// A read-only `approvals/` directory must not fail `resolve`: the decision

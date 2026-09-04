@@ -9,7 +9,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::config::AgentRuntimeConfig;
-use crate::hitl::{AgentScope, DecisionId, PendingApprovals};
+use crate::hitl::{DecisionId, PendingApprovals};
 use crate::orchestration::persistence::is_safe_path_component;
 use crate::orchestration::types::{PendingCall, Plan, TaskState};
 
@@ -206,44 +206,40 @@ pub(crate) async fn publish(
     .map_err(io::Error::other)?
 }
 
-/// Cancel every undecided approval the run parked: a recorded decision is
-/// spared, an id no longer parked is skipped (the sweep is idempotent), and
-/// each remaining id publishes one `approval_completed(cancelled)` before the
-/// store clears the run's tickets by owner id.
-pub(crate) async fn cancel_run_approvals(
+/// Cancel every approval the run parked: the store's atomic
+/// `cancel_request` clears the run's remaining tickets by owner id and
+/// returns them, and each cleared ticket publishes one
+/// `approval_completed(cancelled)`. The whole sequence runs as its own task
+/// on the current runtime, so a caller dropping the returned handle cannot
+/// abandon publication mid-flight: await the handle for ordered teardown,
+/// or drop it and let the sweep finish on its own. A ticket decided before
+/// the sweep is absent from the cleared set by construction — resolve
+/// removed it — so the stream can never disagree with a decision that won
+/// the race. A lost store reply still yields warn-and-empty, the conceded
+/// residual.
+pub(crate) fn cancel_run_approvals(
     registry: &PendingApprovals,
     run_id: &str,
     request_id: &str,
-    cancelled: impl Iterator<Item = (DecisionId, AgentScope)>,
-) {
-    for (decision_id, scope) in cancelled {
-        if registry.recorded_decision(&decision_id).await.is_some() {
-            tracing::info!(
-                decision_id = %decision_id,
-                "approval decided before the cancellation sweep; decision spared",
-            );
-            continue;
+) -> tokio::task::JoinHandle<()> {
+    let registry = registry.clone();
+    let run_id = run_id.to_string();
+    let request_id = request_id.to_string();
+    tokio::task::spawn(async move {
+        for parked in registry.cancel_request(&run_owner_id(&run_id)).await {
+            crate::approval_event_broker::publish(
+                &request_id,
+                crate::approval_event_broker::ApprovalLifecycleEvent::Completed(
+                    crate::hitl::completed_cancelled(
+                        parked.request.decision_id,
+                        &parked.request.scope,
+                        std::time::Duration::ZERO,
+                    ),
+                ),
+            )
+            .await;
         }
-        let parked = registry
-            .try_parked(&decision_id)
-            .await
-            .unwrap_or_else(|err| {
-                tracing::warn!(decision_id = %decision_id, error = %err, "parked approval lookup failed");
-                None
-            });
-        if parked.is_none() {
-            continue;
-        }
-        crate::approval_event_broker::publish(
-            request_id,
-            crate::approval_event_broker::ApprovalLifecycleEvent::Completed(
-                crate::hitl::completed_cancelled(decision_id, &scope, std::time::Duration::ZERO),
-            ),
-        )
-        .await;
-    }
-    // The owner id the park arm stamps on every ticket it registers.
-    registry.cancel_request(&run_owner_id(run_id)).await;
+    })
 }
 
 /// The directory checkpoint documents live in:
@@ -302,7 +298,7 @@ mod tests {
     use super::*;
     use crate::hitl::{
         AgentScope, ApprovalItem, ApprovalOrigin, ApprovalRequest, DecisionId, PROTOCOL_VERSION,
-        ParkedApproval, PendingApprovals,
+        ParkedApproval, PendingApprovals, ResolveError,
     };
     use crate::orchestration::park::document::{ParkedPlan, SCHEMA_VERSION, load_parked_run};
     use crate::orchestration::types::Task;
@@ -552,11 +548,12 @@ mod tests {
         );
     }
 
-    /// The sweep spares an id with a recorded decision — no event, no
-    /// removal — while an undecided sibling under the same owner is
-    /// cancelled with exactly one event.
+    /// The sweep cancels exactly what the store still holds: the undecided
+    /// sibling clears with one event, while the decided sibling — whose
+    /// ticket resolve already removed — is absent from the cleared set and
+    /// publishes nothing.
     #[tokio::test]
-    async fn sweep_spares_recorded_decision_and_cancels_undecided_sibling() {
+    async fn sweep_publishes_cancelled_for_undecided_sibling_only() {
         let (registry, store) = conv_registry();
         let run_id = "0191e8c0-ffff-7000-8000-000000000006";
         let owner = run_owner_id(run_id);
@@ -566,7 +563,6 @@ mod tests {
         let now = chrono::Utc::now();
         let decided = DecisionId::generate();
         let sibling = DecisionId::generate();
-        let scope = AgentScope::Single { session_id: None };
         registry
             .register_durable(parked_approval(
                 decided,
@@ -588,13 +584,9 @@ mod tests {
             .await
             .unwrap();
 
-        cancel_run_approvals(
-            &registry,
-            run_id,
-            &request_id,
-            [(decided, scope.clone()), (sibling, scope)].into_iter(),
-        )
-        .await;
+        cancel_run_approvals(&registry, run_id, &request_id)
+            .await
+            .unwrap();
 
         assert!(
             store.get(&sibling).await.unwrap().is_none(),
@@ -626,6 +618,92 @@ mod tests {
         );
 
         crate::approval_event_broker::unsubscribe(&request_id).await;
+    }
+
+    /// Two tickets under the same owner clear with one cancelled event each.
+    #[tokio::test]
+    async fn sweep_publishes_one_event_per_cleared_ticket() {
+        let (registry, store) = conv_registry();
+        let run_id = "0191e8c0-aaaa-7000-8000-000000000007";
+        let owner = run_owner_id(run_id);
+        let request_id = format!("req_sweep_{}", uuid::Uuid::new_v4().simple());
+        let mut events = crate::approval_event_broker::subscribe(&request_id).await;
+
+        let now = chrono::Utc::now();
+        let first = DecisionId::generate();
+        let second = DecisionId::generate();
+        registry
+            .register_durable(parked_approval(
+                first,
+                &owner,
+                now + chrono::Duration::hours(1),
+            ))
+            .await
+            .unwrap();
+        registry
+            .register_durable(parked_approval(
+                second,
+                &owner,
+                now + chrono::Duration::hours(1),
+            ))
+            .await
+            .unwrap();
+
+        cancel_run_approvals(&registry, run_id, &request_id)
+            .await
+            .unwrap();
+
+        assert!(store.get(&first).await.unwrap().is_none());
+        assert!(store.get(&second).await.unwrap().is_none());
+
+        let mut cancelled_ids = Vec::new();
+        for _ in 0..2 {
+            match tokio::time::timeout(Duration::from_secs(1), events.recv()).await {
+                Ok(Some(crate::approval_event_broker::ApprovalLifecycleEvent::Completed(
+                    completed,
+                ))) => cancelled_ids.push(completed.decision_id),
+                other => panic!("expected a second completed(cancelled), got {other:?}"),
+            }
+        }
+        assert!(cancelled_ids.contains(&first.to_string()));
+        assert!(cancelled_ids.contains(&second.to_string()));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), events.recv())
+                .await
+                .is_err(),
+            "exactly two cancelled events publish"
+        );
+
+        crate::approval_event_broker::unsubscribe(&request_id).await;
+    }
+
+    /// A cleared ticket refuses a late resolve: the sweep is terminal for it.
+    #[tokio::test]
+    async fn late_resolve_after_sweep_is_not_found() {
+        let (registry, _store) = conv_registry();
+        let run_id = "0191e8c0-bbbb-7000-8000-000000000008";
+        let owner = run_owner_id(run_id);
+        let now = chrono::Utc::now();
+        let ticket = DecisionId::generate();
+        registry
+            .register_durable(parked_approval(
+                ticket,
+                &owner,
+                now + chrono::Duration::hours(1),
+            ))
+            .await
+            .unwrap();
+
+        cancel_run_approvals(&registry, run_id, "req_late_resolve")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            registry
+                .resolve(&ticket, crate::hitl::ApprovalDecision::Approved)
+                .await,
+            Err(ResolveError::NotFound),
+        );
     }
 
     /// The fingerprint is stable for an unchanged config and moves when the

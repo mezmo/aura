@@ -3,22 +3,17 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::hitl::{AgentScope, DecisionId, PendingApprovals};
+use crate::hitl::PendingApprovals;
 
 use super::commit::cancel_run_approvals;
 
-/// The decision ids a run parked, swept when the run ends unpublished.
+/// Arms the unpublished-end sweep once the run has parked a call.
 pub(crate) struct ParkGuard {
     registry: PendingApprovals,
     run_id: String,
     request_id: String,
     published: AtomicBool,
-    decisions: Mutex<Vec<GuardedDecision>>,
-}
-
-struct GuardedDecision {
-    decision_id: DecisionId,
-    scope: AgentScope,
+    parked_calls: Mutex<usize>,
 }
 
 impl ParkGuard {
@@ -29,26 +24,16 @@ impl ParkGuard {
             run_id,
             request_id,
             published: AtomicBool::new(false),
-            decisions: Mutex::new(Vec::new()),
+            parked_calls: Mutex::new(0),
         })
     }
 
     /// Record parked calls; the first record arms the guard.
-    pub(crate) fn record(
-        &self,
-        task_scope: &AgentScope,
-        pending: &[crate::orchestration::PendingCall],
-    ) {
+    pub(crate) fn record(&self, pending: &[crate::orchestration::PendingCall]) {
         if pending.is_empty() {
             return;
         }
-        let mut decisions = self.decisions.lock().expect("park guard lock poisoned");
-        for call in pending {
-            decisions.push(GuardedDecision {
-                decision_id: call.decision_id,
-                scope: task_scope.clone(),
-            });
-        }
+        *self.parked_calls.lock().expect("park guard lock poisoned") += pending.len();
     }
 
     /// Mark the run's checkpoint published; the drop becomes a no-op.
@@ -59,34 +44,23 @@ impl ParkGuard {
 
 impl Drop for ParkGuard {
     fn drop(&mut self) {
-        // An unpublished drop sweeps every recorded id; a process crash inside
-        // the commit is the one accepted window.
+        // An unpublished drop sweeps the run's parked tickets by owner id; a
+        // process crash inside the commit is the one accepted window.
         if self.published.load(Ordering::Acquire) {
             return;
         }
-        let mut guard = self.decisions.lock().expect("park guard lock poisoned");
-        let decisions = std::mem::take(&mut *guard);
-        drop(guard);
-        if decisions.is_empty() {
+        if *self.parked_calls.lock().expect("park guard lock poisoned") == 0 {
             return;
         }
         let registry = self.registry.clone();
         let run_id = self.run_id.clone();
         let request_id = self.request_id.clone();
-        // Drop cannot await; the sweep runs as its own task on the runtime
+        // Drop cannot await; the sweep spawns its own task on the runtime
         // that dropped the guard. Off-runtime drops (a test teardown) log
         // and skip.
         match tokio::runtime::Handle::try_current() {
-            Ok(handle) => {
-                handle.spawn(async move {
-                    cancel_run_approvals(
-                        &registry,
-                        &run_id,
-                        &request_id,
-                        decisions.into_iter().map(|d| (d.decision_id, d.scope)),
-                    )
-                    .await;
-                });
+            Ok(_) => {
+                cancel_run_approvals(&registry, &run_id, &request_id);
             }
             Err(_) => {
                 tracing::warn!(
@@ -183,7 +157,7 @@ mod tests {
             .unwrap();
 
         let guard = ParkGuard::new(registry.clone(), run_id.to_string(), request_id.clone());
-        guard.record(&scope, std::slice::from_ref(&parked_call(decision_id)));
+        guard.record(std::slice::from_ref(&parked_call(decision_id)));
         drop(guard);
 
         // The sweep runs as its own task; poll the store until it empties.
@@ -228,7 +202,7 @@ mod tests {
             .unwrap();
 
         let guard = ParkGuard::new(registry.clone(), run_id.to_string(), "req_x".to_string());
-        guard.record(&scope, std::slice::from_ref(&parked_call(decision_id)));
+        guard.record(std::slice::from_ref(&parked_call(decision_id)));
         guard.mark_published();
         drop(guard);
 

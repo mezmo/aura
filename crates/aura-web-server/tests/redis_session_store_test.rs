@@ -21,6 +21,7 @@ use std::time::Duration;
 use a2a::{ListTasksRequest, Message, Part, Role, Task, TaskState, TaskStatus};
 use aura::hitl::{ApprovalDecision, ApprovalOutcome, PendingApprovals, ResolveError};
 use aura::request_cancellation::RequestCancelToken;
+use aura::session_store::ParkedApprovalRecord;
 use aura_config::{RedisSessionStoreConfig, SessionStoreBackend};
 use aura_web_server::session_store::{RedisSessionStore, SessionStore};
 use bytes::Bytes;
@@ -417,6 +418,227 @@ async fn approval_remove_makes_resolve_not_found() {
 async fn approval_cancel_request_removes_only_matching() {
     let approvals = connect(&test_config(60)).await.approvals();
     common::cancel_request_removes_only_matching(&approvals).await;
+}
+
+/// `cancel_request` returns exactly the records it cleared; a decided
+/// sibling of the same owner is absent, and a cleared ticket refuses a later
+/// resolve.
+#[tokio::test]
+async fn approval_cancel_request_returns_cleared_set() {
+    let config = test_config(60);
+    let approvals = connect(&config).await.approvals();
+    let undecided = make_parked("req-cancel-return", Duration::from_secs(60));
+    let undecided_id = undecided.request.decision_id;
+    let cleared_record = ParkedApprovalRecord::from(&undecided);
+    let decided = make_parked("req-cancel-return", Duration::from_secs(60));
+    let decided_id = decided.request.decision_id;
+    let keep = make_parked("req-cancel-return-keep", Duration::from_secs(60));
+    let keep_id = keep.request.decision_id;
+    approvals.register(undecided).await.unwrap();
+    approvals.register(decided).await.unwrap();
+    approvals.register(keep).await.unwrap();
+    approvals
+        .resolve(&decided_id, ApprovalDecision::Approved)
+        .await
+        .unwrap();
+
+    let cleared = approvals.cancel_request("req-cancel-return").await.unwrap();
+
+    assert_eq!(cleared.len(), 1, "only the undecided ticket is cleared");
+    assert_eq!(
+        ParkedApprovalRecord::from(&cleared[0]),
+        cleared_record,
+        "the cleared record is returned unchanged"
+    );
+    assert!(approvals.get(&keep_id).await.unwrap().is_some());
+    assert_eq!(
+        approvals
+            .resolve(&undecided_id, ApprovalDecision::Approved)
+            .await,
+        Err(ResolveError::NotFound),
+        "a cleared ticket resolves NotFound"
+    );
+
+    // A registration racing the sweep — same request id, added after the
+    // cancel — keeps its index entry: a second cancel still discovers and
+    // takes it.
+    let late = make_parked("req-cancel-return", Duration::from_secs(60));
+    let late_id = late.request.decision_id;
+    let late_record = ParkedApprovalRecord::from(&late);
+    approvals.register(late).await.unwrap();
+    let client = redis::Client::open(redis_url()).unwrap();
+    let mut raw = client.get_multiplexed_async_connection().await.unwrap();
+    let still_indexed: bool = redis::cmd("SISMEMBER")
+        .arg(format!(
+            "{}:approval:req:req-cancel-return",
+            config.key_prefix
+        ))
+        .arg(late_id.to_string())
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+    assert!(
+        still_indexed,
+        "the first cancel's SREM left the late registration's index entry"
+    );
+
+    let cleared_late = approvals.cancel_request("req-cancel-return").await.unwrap();
+
+    assert_eq!(
+        cleared_late.len(),
+        1,
+        "the post-cancel registration is discoverable"
+    );
+    assert_eq!(
+        ParkedApprovalRecord::from(&cleared_late[0]),
+        late_record,
+        "the late record is returned unchanged"
+    );
+    assert_eq!(
+        approvals
+            .resolve(&late_id, ApprovalDecision::Approved)
+            .await,
+        Err(ResolveError::NotFound),
+        "the second cancel GETDEL'd the late ticket"
+    );
+}
+
+/// One corrupt record must not fail `cancel_request` for its whole request:
+/// with a list planted at one approval key the sweep still returns the valid
+/// sibling and sweeps its id from the index, while the wrong-typed key and
+/// its index entry stay in place for a later sweep to retry; the same holds
+/// when the planted record is non-UTF-8 bytes, which the sweep consumes.
+#[tokio::test]
+async fn cancel_request_skips_a_wrong_type_value_and_returns_valid_records() {
+    let config = test_config(60);
+    let approvals = connect(&config).await.approvals();
+    let req_index_key = format!("{}:approval:req:req-wrong-type", config.key_prefix);
+    let client = redis::Client::open(redis_url()).unwrap();
+    let mut raw = client.get_multiplexed_async_connection().await.unwrap();
+
+    let valid = make_parked("req-wrong-type", Duration::from_secs(60));
+    let valid_id = valid.request.decision_id;
+    let valid_record = ParkedApprovalRecord::from(&valid);
+    let corrupt = make_parked("req-wrong-type", Duration::from_secs(60));
+    let corrupt_id = corrupt.request.decision_id;
+    approvals.register(valid).await.unwrap();
+    approvals.register(corrupt).await.unwrap();
+    let corrupt_key = format!("{}:approval:{corrupt_id}", config.key_prefix);
+    redis::pipe()
+        .del(&corrupt_key)
+        .ignore()
+        .rpush(&corrupt_key, "planted list, not a record")
+        .ignore()
+        .query_async::<()>(&mut raw)
+        .await
+        .unwrap();
+
+    let cleared = approvals
+        .cancel_request("req-wrong-type")
+        .await
+        .expect("a wrong-typed record must not fail the sweep");
+
+    assert_eq!(cleared.len(), 1, "only the valid record is cleared");
+    assert_eq!(
+        ParkedApprovalRecord::from(&cleared[0]),
+        valid_record,
+        "the valid record is returned unchanged"
+    );
+    assert!(approvals.get(&valid_id).await.unwrap().is_none());
+    assert!(
+        !redis::cmd("SISMEMBER")
+            .arg(&req_index_key)
+            .arg(valid_id.to_string())
+            .query_async::<bool>(&mut raw)
+            .await
+            .unwrap(),
+        "the swept record's index entry went with it"
+    );
+    assert!(
+        redis::cmd("SISMEMBER")
+            .arg(&req_index_key)
+            .arg(corrupt_id.to_string())
+            .query_async::<bool>(&mut raw)
+            .await
+            .unwrap(),
+        "the wrong-typed id keeps its index entry"
+    );
+    assert_eq!(
+        redis::cmd("TYPE")
+            .arg(&corrupt_key)
+            .query_async::<String>(&mut raw)
+            .await
+            .unwrap(),
+        "list",
+        "the wrong-typed key is left in place"
+    );
+    assert_eq!(
+        redis::cmd("LRANGE")
+            .arg(&corrupt_key)
+            .arg(0)
+            .arg(-1)
+            .query_async::<Vec<String>>(&mut raw)
+            .await
+            .unwrap(),
+        ["planted list, not a record"],
+        "the planted list survives the sweep"
+    );
+
+    let cleared_again = approvals
+        .cancel_request("req-wrong-type")
+        .await
+        .expect("a retry over a wrong-typed key must not fail the sweep");
+    assert!(
+        cleared_again.is_empty(),
+        "a wrong-typed key alone clears nothing"
+    );
+    assert!(
+        redis::cmd("SISMEMBER")
+            .arg(&req_index_key)
+            .arg(corrupt_id.to_string())
+            .query_async::<bool>(&mut raw)
+            .await
+            .unwrap(),
+        "the retry keeps the wrong-typed id indexed"
+    );
+
+    let second_valid = make_parked("req-wrong-type", Duration::from_secs(60));
+    let second_record = ParkedApprovalRecord::from(&second_valid);
+    let non_utf8 = make_parked("req-wrong-type", Duration::from_secs(60));
+    let non_utf8_id = non_utf8.request.decision_id;
+    approvals.register(second_valid).await.unwrap();
+    approvals.register(non_utf8).await.unwrap();
+    redis::cmd("SET")
+        .arg(format!("{}:approval:{non_utf8_id}", config.key_prefix))
+        .arg(vec![0xff_u8, 0xfe, b'{'])
+        .query_async::<()>(&mut raw)
+        .await
+        .unwrap();
+
+    let cleared = approvals
+        .cancel_request("req-wrong-type")
+        .await
+        .expect("a non-UTF-8 record must not fail the sweep");
+
+    assert_eq!(cleared.len(), 1, "only the valid record is cleared");
+    assert_eq!(
+        ParkedApprovalRecord::from(&cleared[0]),
+        second_record,
+        "the valid record is returned unchanged"
+    );
+    assert!(
+        approvals.get(&non_utf8_id).await.unwrap().is_none(),
+        "the non-UTF-8 record was consumed"
+    );
+    assert_eq!(
+        redis::cmd("SMEMBERS")
+            .arg(&req_index_key)
+            .query_async::<Vec<String>>(&mut raw)
+            .await
+            .unwrap(),
+        vec![corrupt_id.to_string()],
+        "the non-UTF-8 record's index entry was swept; the wrong-typed one remains"
+    );
 }
 
 #[tokio::test]

@@ -141,17 +141,26 @@ pub async fn remove_makes_resolve_not_found(instance: &Arc<dyn ApprovalStore>) {
     );
 }
 
-/// Cancelling by owner (request) id removes only that owner's tickets.
+/// Cancelling by owner (request) id removes only that owner's tickets and
+/// returns exactly the cleared set.
 pub async fn cancel_request_removes_only_matching(instance: &Arc<dyn ApprovalStore>) {
     let cancel = make_parked("req-cancel", Duration::from_secs(60));
     let keep = make_parked("req-keep", Duration::from_secs(60));
     let cancel_id = cancel.request.decision_id;
+    let cleared_record = ParkedApprovalRecord::from(&cancel);
     let keep_id = keep.request.decision_id;
     instance.register(cancel).await.unwrap();
     instance.register(keep).await.unwrap();
 
-    instance.cancel_request("req-cancel").await.unwrap();
+    let cleared = instance.cancel_request("req-cancel").await.unwrap();
 
+    assert_eq!(cleared.len(), 1, "exactly the matching ticket is cleared");
+    assert_eq!(
+        ParkedApprovalRecord::from(&cleared[0]),
+        cleared_record,
+        "the cleared record is returned unchanged"
+    );
+    assert_eq!(cleared[0].request.decision_id, cancel_id);
     assert!(instance.get(&cancel_id).await.unwrap().is_none());
     assert!(instance.get(&keep_id).await.unwrap().is_some());
 }
