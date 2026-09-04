@@ -16,7 +16,8 @@
 //! record's remaining TTL, covering the parking instance's deadline-backstop
 //! read. The request index is refreshed on every register with a margin over
 //! the record TTL and pruned best-effort on resolve/remove; a stale indexed id
-//! only costs `cancel_request` a `GETDEL` of a missing key.
+//! only costs `cancel_request` a missed take, and a swept record that is
+//! wrong-typed or non-UTF-8 at its key is warned and skipped.
 
 use std::sync::LazyLock;
 
@@ -35,6 +36,15 @@ const MIN_TTL_SECS: u64 = 1;
 const REQ_INDEX_TTL_MARGIN_SECS: u64 = 60;
 /// Decision TTL margin over the parked record's remaining TTL.
 const DECISION_TTL_MARGIN_MS: u64 = 60_000;
+
+/// Sweep-take script: a key that is not a string comes back as nil instead
+/// of erroring the pipe after EXEC already cleared the index.
+static SWEEP_TAKE_SCRIPT: &str = r#"
+if redis.call('TYPE', KEYS[1]).ok == 'string' then
+    return redis.call('GETDEL', KEYS[1])
+end
+return nil
+"#;
 
 /// Atomic script for the at-most-once claim and durable decision write.
 static RESOLVE_SCRIPT: LazyLock<redis::Script> = LazyLock::new(|| {
@@ -195,21 +205,25 @@ impl ApprovalStore for RedisApprovalStore {
         }
 
         // One atomic pipe: a mid-sweep failure cannot drop an
-        // already-cleared prefix. SREM (not DEL) only removes the swept ids,
-        // so a registration the index gained after the SMEMBERS stays
-        // discoverable by a later sweep.
+        // already-cleared prefix. The take reports a wrong-typed key as nil
+        // rather than erroring an EXEC that already ran. SREM (not DEL) only
+        // removes the swept ids, so a registration the index gained after
+        // the SMEMBERS stays discoverable by a later sweep.
         let mut pipe = redis::pipe();
         pipe.atomic();
         for id in &ids {
-            pipe.get_del(self.approval_key(id));
+            pipe.cmd("EVAL")
+                .arg(SWEEP_TAKE_SCRIPT)
+                .arg(1)
+                .arg(self.approval_key(id));
         }
         pipe.srem(&req_key, &ids).ignore();
-        let payloads: Vec<Option<String>> =
+        let payloads: Vec<Option<redis::Value>> =
             pipe.query_async(&mut conn).await.map_err(request_err)?;
 
         let mut cleared = Vec::new();
         for (id, payload) in ids.into_iter().zip(payloads) {
-            let Some(json) = payload else {
+            let Some(json) = payload.and_then(|value| swept_record_json(&id, value)) else {
                 continue;
             };
             match decode(&json) {
@@ -238,4 +252,29 @@ fn decode(json: &str) -> Result<ParkedApproval, SessionStoreError> {
     ParkedApproval::try_from(record).map_err(|e| SessionStoreError::Decode {
         reason: e.to_string(),
     })
+}
+
+/// Decode one swept reply into record JSON, skipping entries the cancel can
+/// no longer deliver: a missing key, a wrong-typed key, or non-UTF-8 bytes
+/// (that record is consumed unrecoverably, like a decode failure).
+fn swept_record_json(id: &str, value: redis::Value) -> Option<String> {
+    match value {
+        redis::Value::BulkString(bytes) => match String::from_utf8(bytes) {
+            Ok(json) => Some(json),
+            Err(err) => {
+                tracing::warn!(
+                    decision_id = %id, error = %err,
+                    "non-UTF-8 approval record skipped by cancel_request"
+                );
+                None
+            }
+        },
+        _other => {
+            tracing::warn!(
+                decision_id = %id,
+                "wrong-typed approval record skipped by cancel_request"
+            );
+            None
+        }
+    }
 }
