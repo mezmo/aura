@@ -96,6 +96,7 @@ Through compatible [MCP](https://modelcontextprotocol.io) servers and built-in i
 | Jira | Search and update issues, projects, and workflows |
 | Kafka | Inspect clusters, topics, consumer groups, and message flows |
 | [Kubernetes](https://www.youtube.com/watch?v=IDkH4-FfGXo) | Inspect clusters, workloads, events, and logs |
+| Linear | Search and update issues, projects, and cycles |
 | [Mezmo](https://www.youtube.com/watch?v=sjb3D5tZiOg) | Analyze logs, exports, and telemetry pipelines |
 | New Relic | Query metrics, logs, traces, alerts, and dashboards |
 | [Notion](https://www.youtube.com/watch?v=jXa1jDvpF34) | Search and maintain operational runbooks |
