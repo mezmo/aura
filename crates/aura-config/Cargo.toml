@@ -30,3 +30,5 @@ globset = "0.4"
 
 # Directory perms validation
 tempfile = "3"
+
+jsonschema = { version = "0.55.1", default-features = false }

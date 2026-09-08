@@ -1183,6 +1183,10 @@ fn handle_orchestrator_event(
     let event_context = EventContext::new(ctx.agent_context.clone(), ctx.correlation.clone());
 
     let sse_event: OrchestrationStreamEvent = match event {
+        OrchestratorEvent::WorkflowUpdated { run } => OrchestrationStreamEvent::WorkflowUpdated {
+            run: run.clone(),
+            context: event_context,
+        },
         OrchestratorEvent::PlanCreated {
             goal,
             tasks,

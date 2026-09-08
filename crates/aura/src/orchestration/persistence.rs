@@ -286,6 +286,14 @@ impl ExecutionPersistence {
     /// `{base_path}/{session_id}/{run_id}/...`, grouping runs by session.
     /// Without a session_id, the flat `{base_path}/{run_id}/...` layout is used.
     pub async fn new<P: AsRef<Path>>(base_path: P, session_id: Option<String>) -> io::Result<Self> {
+        Self::with_run_id(base_path, session_id, uuid::Uuid::now_v7()).await
+    }
+
+    pub(crate) async fn with_run_id<P: AsRef<Path>>(
+        base_path: P,
+        session_id: Option<String>,
+        run_id: uuid::Uuid,
+    ) -> io::Result<Self> {
         let base_path = base_path.as_ref().to_path_buf();
 
         // Validate session_id to prevent path traversal
@@ -306,7 +314,7 @@ impl ExecutionPersistence {
         };
 
         // Generate unique run ID
-        let run_id = uuid::Uuid::now_v7().to_string();
+        let run_id = run_id.to_string();
         let run_path = effective_base.join(&run_id);
 
         fs::create_dir_all(&run_path).await?;

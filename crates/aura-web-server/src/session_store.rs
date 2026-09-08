@@ -8,6 +8,8 @@
 #[cfg(feature = "session-store-redis")]
 mod redis;
 
+mod file_tasks;
+
 use std::sync::Arc;
 
 use a2a_server::{InMemoryTaskStore, TaskStore};
@@ -50,7 +52,7 @@ pub async fn build_session_store(
     match config {
         SessionStoreConfig::Memory => Ok(Arc::new(InMemorySessionStore::new())),
         SessionStoreConfig::File(file_config) => {
-            // File-backed approvals; tasks and bus stay in memory.
+            // File-backed approvals and tasks; the event bus stays in memory.
             Ok(Arc::new(FileSessionStore::new(file_config)?))
         }
         #[cfg(feature = "session-store-redis")]
@@ -115,7 +117,7 @@ impl SessionStore for InMemorySessionStore {
 /// The file-backed backend.
 pub struct FileSessionStore {
     approvals: Arc<FileApprovalStore>,
-    tasks: Arc<InMemoryTaskStore>,
+    tasks: Arc<file_tasks::FileTaskStore>,
     bus: Arc<InMemoryEventBus>,
 }
 
@@ -125,7 +127,11 @@ impl FileSessionStore {
     pub fn new(config: &FileSessionStoreConfig) -> Result<Self, SessionStoreError> {
         Ok(Self {
             approvals: Arc::new(FileApprovalStore::open(&config.path)?),
-            tasks: Arc::new(InMemoryTaskStore::new()),
+            tasks: Arc::new(file_tasks::FileTaskStore::open(&config.path).map_err(|e| {
+                SessionStoreError::Connect {
+                    reason: e.to_string(),
+                }
+            })?),
             bus: Arc::new(InMemoryEventBus::new()),
         })
     }

@@ -1,0 +1,82 @@
+# A configured incident lifecycle using existing MCP tools and A2A controls.
+# Replace the illustrative MCP endpoint/tools/schemas with your service's contract.
+# Server prerequisites: AURA_SESSION_STORE=file,
+# AURA_SESSION_STORE_PATH=/var/lib/aura/session-store, AURA_CUSTOM_EVENTS=true.
+# Persist both directories below on the single Aura instance.
+# Use a persistent volume path in production.
+memory_dir = "/tmp/aura-workflow-runs"
+
+[agent]
+name = "Incident lifecycle"
+system_prompt = "Follow the configured incident workflow."
+turn_depth = 12
+
+[agent.llm]
+provider = "openai"
+api_key = "{{ env.OPENAI_API_KEY }}"
+model = "gpt-5.2"
+
+[mcp.servers.operations]
+transport = "http_streamable"
+url = "http://localhost:8081/mcp"
+
+[hitl]
+require_approval = ["run_workflow"]
+[hitl.route]
+mode = "conversational"
+timeout_secs = 3600
+[hitl.park]
+enabled = true
+
+[orchestration]
+enabled = true
+stage_order = ["investigate", "decide", "act", "verify", "export"]
+
+[orchestration.worker.investigator]
+description = "Read incident evidence"
+preamble = "Read the incident evidence. Submit a JSON object with evidence and incident_id using submit_result."
+mcp_filter = ["read_incident"]
+
+[orchestration.worker.decision]
+description = "Choose an allowed SOP"
+preamble = "Use the evidence to choose restart_service or no_action. Submit workflow and incident_id using submit_result."
+mcp_filter = []
+
+[orchestration.worker.action]
+description = "Execute and verify exact configured calls"
+preamble = "Configured tool execution"
+mcp_filter = ["run_workflow", "check_recovery", "notify", "store_run"]
+
+[orchestration.stages.investigate]
+worker = "investigator"
+inputs = { incident = "/input" }
+output_schema = { type = "object", required = ["evidence", "incident_id"], properties = { evidence = { type = "string" }, incident_id = { type = "string" } } }
+operation = { kind = "worker", prompt = "Investigate this incident using the available read tool." }
+
+[orchestration.stages.decide]
+worker = "decision"
+inputs = { evidence = "/stages/investigate" }
+output_schema = { type = "object", required = ["workflow", "incident_id"], properties = { workflow = { enum = ["restart_service", "no_action"] }, incident_id = { type = "string" } }, additionalProperties = false }
+operation = { kind = "worker", prompt = "Select the SOP justified by this evidence. Use no_action if no mutation is justified." }
+
+[orchestration.stages.act]
+worker = "action"
+inputs = { workflow = "/stages/decide/workflow", incident_id = "/stages/decide/incident_id" }
+output_schema = { type = "object", required = ["status"], properties = { status = { const = "succeeded" } } }
+operation = { kind = "tool", tool = "run_workflow", arguments = {} }
+on_approval_wait = [
+  { after_secs = 0, worker = "action", tool = "notify", arguments = { channel = "oncall" }, inputs = { payload = "/run" } },
+  { after_secs = 900, worker = "action", tool = "notify", arguments = { channel = "escalation" }, inputs = { payload = "/run" } }
+]
+
+[orchestration.stages.verify]
+worker = "action"
+inputs = { incident_id = "/stages/investigate/incident_id" }
+output_schema = { type = "object", required = ["healthy"], properties = { healthy = { const = true } } }
+operation = { kind = "verify", tool = "check_recovery", arguments = {}, read_only = true, success_schema = { required = ["healthy"], properties = { healthy = { const = true } } }, interval_secs = 5, timeout_secs = 300 }
+
+[orchestration.stages.export]
+worker = "action"
+inputs = { record = "/run" }
+output_schema = { type = "object", required = ["stored"], properties = { stored = { const = true } } }
+operation = { kind = "tool", tool = "store_run", arguments = {} }

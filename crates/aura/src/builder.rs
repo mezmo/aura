@@ -1109,7 +1109,8 @@ impl Agent {
 
         // Add submit_result tool when orchestration submit decision is available
         if let Some(ref decision) = config.orchestration_submit_result {
-            let submit_tool = crate::orchestration::SubmitResultTool::new(decision.clone());
+            let submit_tool = crate::orchestration::SubmitResultTool::new(decision.clone())
+                .with_schema(config.orchestration_output_schema.clone())?;
             builder_state = builder_state.add_tool(submit_tool);
         }
 

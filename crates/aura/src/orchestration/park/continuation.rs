@@ -118,6 +118,13 @@ pub(crate) struct ResumingDocumentHandle {
 }
 
 impl ResumingDocumentHandle {
+    pub(crate) fn from_document(document: ParkedRun, publish_path: PathBuf) -> Self {
+        Self {
+            document: tokio::sync::Mutex::new(document),
+            publish_path,
+        }
+    }
+
     /// Load the parked document at `path` and arm the handle. Appends publish
     /// to the sibling `{run_id}.resuming.json`; the parked document itself is
     /// left untouched.

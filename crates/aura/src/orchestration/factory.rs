@@ -73,6 +73,8 @@ impl OrchestratorFactory {
                 // are visible to the streaming handler (UsageState is Arc-backed).
                 orchestrator.usage_state = usage_state;
                 orchestrator.outer_budget = outer_budget;
+                orchestrator.workflow_cancel = cancel_token_clone.clone();
+                let configured_workflow = orchestrator.has_configured_workflow();
 
                 // Set MCP request ID for progress notification routing, and
                 // surface per-server connection status so degraded/unavailable
@@ -117,7 +119,7 @@ impl OrchestratorFactory {
                             }
                         }
                     }
-                    _ = cancel_token_clone.cancelled() => {
+                    _ = cancel_token_clone.cancelled(), if !configured_workflow => {
                         tracing::info!("Orchestration cancelled");
                         if let Some(ref mcp_manager) = orchestrator.mcp_manager {
                             let cancelled = mcp_manager

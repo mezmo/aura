@@ -45,6 +45,8 @@ impl RoutingMode {
 /// to SSE events (`OrchestrationStreamEvent`) by the web server handlers.
 #[derive(Debug, Clone)]
 pub enum OrchestratorEvent {
+    /// Snapshot published only after the workflow record reaches durable storage.
+    WorkflowUpdated { run: serde_json::Value },
     /// A plan has been created from the user's query.
     PlanCreated {
         /// The goal being addressed

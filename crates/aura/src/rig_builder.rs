@@ -18,14 +18,25 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 pub struct RigBuilder {
+    workflow_request: Option<crate::orchestration::workflow::WorkflowRequest>,
     config: Config,
     pending_approvals: PendingApprovals,
     hitl_hmac: Option<crate::hitl::WebhookHmac>,
 }
 
 impl RigBuilder {
+    /// Attach a parsed workflow control; it never enters the model prompt.
+    pub fn with_workflow_request(
+        mut self,
+        request: Option<crate::orchestration::workflow::WorkflowRequest>,
+    ) -> Self {
+        self.workflow_request = request;
+        self
+    }
+
     pub fn new(config: Config, pending_approvals: PendingApprovals) -> Self {
         Self {
+            workflow_request: None,
             config,
             pending_approvals,
             hitl_hmac: None,
@@ -83,6 +94,10 @@ impl RigBuilder {
             tools: self.config.tools.clone(),
             memory_dir: self.config.memory_dir.clone(),
             orchestration: self.config.orchestration.clone(),
+            workflow_request: self.workflow_request.clone(),
+            workflow_target_fingerprint: Some(crate::orchestration::workflow::target_fingerprint(
+                &self.config.mcp,
+            )),
             hitl: self.config.hitl.as_ref().map(|cfg| {
                 crate::hitl::HitlRuntime::from_config(
                     cfg,

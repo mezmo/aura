@@ -125,6 +125,10 @@ impl AuraAgentExecutor {
             }
         };
 
+        let workflow = config
+            .as_ref()
+            .and_then(|c| c.orchestration.as_ref())
+            .is_some_and(|o| !o.stages.is_empty());
         AgentCard {
             name,
             description,
@@ -135,7 +139,7 @@ impl AuraAgentExecutor {
             capabilities: AgentCapabilities {
                 streaming: Some(true),
                 push_notifications: Some(false),
-                extensions: None,
+                extensions: workflow.then(|| vec![a2a::AgentExtension { uri: "urn:aura:workflow:v1".into(), description: Some("Configured workflow controls in aura.workflow data parts; durable snapshots in workflow artifacts".into()), required: Some(false), params: None }]),
                 extended_agent_card: None,
             },
             supported_interfaces: vec![
@@ -203,9 +207,12 @@ impl AgentExecutor for AuraAgentExecutor {
             let task_id = ctx.task_id.clone();
             let context_id = ctx.context_id.clone();
 
-            let text = ctx.message
-                .ok_or_else(|| A2AError::invalid_params("Message has no parts to use as a command."))
-                .and_then(|msg| extract_text(msg.parts))?;
+            let message = ctx.message.ok_or_else(|| A2AError::invalid_params("Message has no parts to use as a command."))?;
+            let configured_workflow = config.orchestration.as_ref().is_some_and(|o| !o.stages.is_empty());
+            let workflow_request = extract_workflow_request(&message, configured_workflow)?;
+            let text = if workflow_request.as_ref().is_some_and(|r| r.command != aura::orchestration::workflow::WorkflowCommand::Start) {
+                String::new()
+            } else { extract_text(message.parts.into_iter().filter(|part| !matches!(&part.content, PartContent::Data(data) if data.get("aura.workflow").is_some())).collect())? };
 
             let req_headers: HashMap<String, String> = ctx
                 .service_params
@@ -227,7 +234,8 @@ impl AgentExecutor for AuraAgentExecutor {
 
             let request_id = format!("a2a_{}", task_id);
             let session_id = Some(context_id.clone());
-            let builder = RigBuilder::new(config, pending_approvals).with_hitl_hmac(hitl_hmac);
+            let builder = RigBuilder::new(config, pending_approvals).with_hitl_hmac(hitl_hmac)
+                .with_workflow_request(workflow_request);
             let agent = match builder
                 .build_streaming_agent_with_headers(
                     Some(&req_headers),
@@ -278,6 +286,7 @@ impl AgentExecutor for AuraAgentExecutor {
             let _request_guard = ActiveRequestGuard::new(active_request_tracker);
 
             let mut success = true; // assume everything is successful
+            let mut final_state = TaskState::Completed;
 
             let mut reasoning_num = 0;
             loop {
@@ -404,7 +413,15 @@ impl AgentExecutor for AuraAgentExecutor {
                     Ok(StreamItem::ContextUsage { .. }) => {
                         event!(Level::DEBUG, request_id, "context usage");
                     }
+                    Ok(StreamItem::OrchestratorEvent(aura::orchestration::OrchestratorEvent::WorkflowUpdated { run })) => {
+                        yield Ok(StreamResponse::ArtifactUpdate(TaskArtifactUpdateEvent {
+                            task_id: task_id.clone(), context_id: context_id.clone(),
+                            artifact: Artifact { artifact_id: "workflow".into(), name: Some("Workflow run".into()), description: None, parts: vec![Part::data(run)], metadata: Some(HashMap::from([("type".into(), Value::String("workflow".into()))])), extensions: None },
+                            append: Some(false), last_chunk: Some(false), metadata: None,
+                        }));
+                    }
                     Ok(StreamItem::OrchestratorEvent(_)) => {
+
                         event!(Level::DEBUG, request_id, "orchestration event");
                     }
                     Ok(StreamItem::McpStatus(_)) => {
@@ -419,7 +436,19 @@ impl AgentExecutor for AuraAgentExecutor {
                     Ok(StreamItem::StreamAssistantItem(StreamedAssistantContent::ReasoningDelta { .. })) => {
                         event!(Level::DEBUG, request_id, "reasoning delta");
                     }
-                    Ok(StreamItem::Final(final_info)) => {
+                                        Ok(StreamItem::Final(final_info)) => {
+                        let final_parts;
+                        if configured_workflow {
+                            let record: Value = serde_json::from_str(&final_info.content).map_err(|e| A2AError::internal(format!("invalid workflow record: {e}")))?;
+                            final_state = match record.pointer("/state/state").and_then(Value::as_str) {
+                                Some("completed") => TaskState::Completed,
+                                Some("cancelled") => TaskState::Canceled,
+                                Some("failed" | "inconclusive") => TaskState::Failed,
+                                _ => TaskState::InputRequired,
+                            };
+                            final_parts = vec![Part::data(record)];
+                        } else { final_parts = vec![Part::text(final_info.content)]; }
+
                         let append = append_tracker.entry((task_id.clone(), context_id.clone(), FINAL_ARTIFACT_ID.to_owned()))
                             .and_modify(|e| *e = true)
                             .or_insert(false);
@@ -428,7 +457,7 @@ impl AgentExecutor for AuraAgentExecutor {
                             artifact_id: FINAL_ARTIFACT_ID.to_owned(),
                             name: Some("Final Info".into()),
                             description: None,
-                            parts: vec![Part::text(final_info.content)],
+                            parts: final_parts,
                             metadata: Some(HashMap::from([
                                 ("input_tokens".into(), Value::Number(final_info.usage.input_tokens.into())),
                                 ("output_tokens".into(), Value::Number(final_info.usage.output_tokens.into())),
@@ -495,7 +524,7 @@ impl AgentExecutor for AuraAgentExecutor {
                     task_id,
                     context_id,
                     status: TaskStatus {
-                        state: TaskState::Completed,
+                        state: final_state,
                         message: None,
                         timestamp: Some(chrono::Utc::now()),
                     },
@@ -509,8 +538,11 @@ impl AgentExecutor for AuraAgentExecutor {
         let task_id = ctx.task_id.clone();
         let context_id = ctx.context_id.clone();
         let task_cancel_state = self.task_cancel_state.clone();
+        let task_store = self.task_store.clone();
+        let configs = self.app_state.configs.clone();
+        let approvals = self.app_state.pending_approvals.clone();
 
-        Box::pin(futures_util::stream::once(async move {
+        Box::pin(async_stream::try_stream! {
             let entry = lock_cancel_state(&task_cancel_state).remove(&task_id);
 
             // Token-cancel wakes execute()'s select! → loop breaks → generator drops
@@ -528,7 +560,53 @@ impl AgentExecutor for AuraAgentExecutor {
                 RequestCancellation::unregister(&entry.request_id);
             }
 
-            Ok(StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+            let workflow = task_store.get(&task_id).await?
+                .and_then(|task| task.artifacts)
+                .and_then(|artifacts| artifacts.into_iter().find(|a| a.artifact_id == "workflow"))
+                .and_then(|artifact| match artifact.parts.first() {
+                    Some(Part { content: PartContent::Data(record), .. }) => Some((artifact.clone(), record.clone())),
+                    _ => None,
+                });
+            if let Some((mut artifact, record)) = workflow {
+                let run_id = record
+                    .get("run_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| A2AError::internal("workflow run id missing"))?
+                    .parse()
+                    .map_err(|_| A2AError::internal("invalid persisted run id"))?;
+                let agent_name = record
+                    .get("agent")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| A2AError::internal("workflow agent missing"))?;
+                let config = configs
+                    .iter()
+                    .find(|config| config.agent.name == agent_name)
+                    .ok_or_else(|| A2AError::internal("workflow configuration unavailable"))?;
+                let mut runtime = RigBuilder::new(config.clone(), approvals).get_agent_config();
+                runtime.session_id = Some(context_id.clone());
+                runtime.workflow_request = Some(aura::orchestration::workflow::WorkflowRequest {
+                    run_id,
+                    command: aura::orchestration::workflow::WorkflowCommand::Cancel,
+                    message_id: format!("cancel-task:{task_id}"),
+                });
+                let orchestrator = aura::orchestration::Orchestrator::new(runtime)
+                    .await
+                    .map_err(|e| A2AError::internal(e.to_string()))?;
+                let record = orchestrator
+                    .control_workflow()
+                    .await
+                    .map_err(|e| A2AError::internal(e.to_string()))?;
+                artifact.parts = vec![Part::data(record)];
+                yield StreamResponse::ArtifactUpdate(TaskArtifactUpdateEvent {
+                    task_id: task_id.clone(),
+                    context_id: context_id.clone(),
+                    artifact,
+                    metadata: None,
+                    append: Some(false),
+                    last_chunk: Some(true),
+                });
+            }
+            yield StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
                 task_id,
                 context_id,
                 status: TaskStatus {
@@ -537,9 +615,46 @@ impl AgentExecutor for AuraAgentExecutor {
                     timestamp: Some(chrono::Utc::now()),
                 },
                 metadata: None,
-            }))
-        }))
+            });
+        })
     }
+}
+
+/// Controls are transport data, never inferred from natural language.
+fn extract_workflow_request(
+    message: &Message,
+    configured: bool,
+) -> Result<Option<aura::orchestration::workflow::WorkflowRequest>, A2AError> {
+    use aura::orchestration::workflow::{WorkflowCommand, WorkflowRequest};
+    let mut request = None;
+    for part in &message.parts {
+        if let PartContent::Data(data) = &part.content
+            && let Some(control) = data.get("aura.workflow")
+        {
+            if !configured || request.is_some() {
+                return Err(A2AError::invalid_params(
+                    "workflow control requires configured stages and exactly one control part",
+                ));
+            }
+            #[derive(serde::Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Control {
+                run_id: uuid::Uuid,
+                command: WorkflowCommand,
+            }
+            let control: Control = serde_json::from_value(control.clone())
+                .map_err(|e| A2AError::invalid_params(format!("invalid workflow control: {e}")))?;
+            request = Some(WorkflowRequest {
+                run_id: control.run_id,
+                command: control.command,
+                message_id: message.message_id.clone(),
+            });
+        }
+    }
+    if configured && request.is_none() {
+        request = Some(WorkflowRequest::start(&message.message_id));
+    }
+    Ok(request)
 }
 
 fn extract_text(parts: Vec<Part>) -> Result<String, A2AError> {
@@ -763,6 +878,35 @@ mod tests {
                 ..aura_config::AgentConfig::default()
             },
         }
+    }
+
+    #[test]
+    fn workflow_controls_are_typed_data_and_require_configured_stages() {
+        use aura::orchestration::workflow::WorkflowCommand;
+        let id = uuid::Uuid::new_v4();
+        let message = Message::new(
+            Role::User,
+            vec![Part::data(
+                serde_json::json!({"aura.workflow":{"run_id":id,"command":"takeover"}}),
+            )],
+        );
+        assert!(extract_workflow_request(&message, false).is_err());
+        let request = extract_workflow_request(&message, true).unwrap().unwrap();
+        assert_eq!(request.command, WorkflowCommand::Takeover);
+        assert_eq!(request.message_id, message.message_id);
+        let text = Message::new(Role::User, vec![Part::text("takeover this run")]);
+        assert_eq!(
+            extract_workflow_request(&text, true)
+                .unwrap()
+                .unwrap()
+                .command,
+            WorkflowCommand::Start
+        );
+        let duplicate = Message::new(
+            Role::User,
+            vec![message.parts[0].clone(), message.parts[0].clone()],
+        );
+        assert!(extract_workflow_request(&duplicate, true).is_err());
     }
 
     #[test]

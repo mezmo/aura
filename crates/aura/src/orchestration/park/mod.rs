@@ -7,7 +7,9 @@ mod document;
 mod guard;
 mod recorded_decisions;
 
-pub(crate) use commit::{ParkCommitInputs, cancel_run_approvals, commit_from_run_state};
+pub(crate) use commit::{
+    ParkCommitInputs, cancel_run_approvals, commit_from_run_state, config_fingerprint,
+};
 // The rehydrate entry points: consumed by commit 3's tests; the P45 resume
 // endpoint consumes them in production.
 #[allow(unused_imports)]
@@ -17,7 +19,8 @@ pub(crate) use continuation::{
 };
 #[allow(unused_imports)]
 pub(crate) use document::{
-    PARKED_DOCUMENT_SUFFIX, ParkedRun, RESUMING_DOCUMENT_SUFFIX, RunStateForPark, load_parked_run,
+    PARKED_DOCUMENT_SUFFIX, ParkedPlan, ParkedRun, ParkedTaskNode, RESUMING_DOCUMENT_SUFFIX,
+    RunStateForPark, load_parked_run,
 };
 pub(crate) use guard::ParkGuard;
 pub(crate) use recorded_decisions::{CallKey, RecordedDecisions};

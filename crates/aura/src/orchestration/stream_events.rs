@@ -88,6 +88,12 @@ pub mod event_names {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum OrchestrationStreamEvent {
+    /// Durable workflow snapshot; sequence numbers support replay through A2A.
+    WorkflowUpdated {
+        run: serde_json::Value,
+        #[serde(flatten)]
+        context: EventContext,
+    },
     /// Emitted when orchestrator creates a plan from user query.
     PlanCreated {
         goal: String,
@@ -220,6 +226,7 @@ impl OrchestrationStreamEvent {
     /// Get the SSE event name for this event type.
     pub fn event_name(&self) -> &'static str {
         match self {
+            Self::WorkflowUpdated { .. } => "aura.orchestrator.workflow_updated",
             Self::PlanCreated { .. } => event_names::PLAN_CREATED,
             Self::DirectAnswer { .. } => event_names::DIRECT_ANSWER,
             Self::ClarificationNeeded { .. } => event_names::CLARIFICATION_NEEDED,

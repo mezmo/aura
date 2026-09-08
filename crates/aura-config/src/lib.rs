@@ -8,6 +8,7 @@ pub mod orchestration;
 pub mod scratchpad;
 pub mod session_store;
 pub mod skills;
+pub mod workflow;
 pub mod writer;
 
 #[cfg(test)]

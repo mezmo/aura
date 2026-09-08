@@ -311,6 +311,9 @@ impl Default for ArtifactsConfig {
 /// `artifacts.memory_dir`).
 #[derive(Debug, Clone, Serialize)]
 pub struct OrchestrationConfig {
+    /// Ordered stages; empty retains model-directed orchestration.
+    #[serde(flatten, serialize_with = "crate::workflow::serialize_stages")]
+    pub stages: Vec<crate::workflow::WorkflowStage>,
     // --- Mode ---
     /// Whether orchestration mode is enabled.
     /// When false (default), standard single-agent streaming is used.
@@ -371,6 +374,7 @@ impl Default for OrchestrationConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            stages: Vec::new(),
             max_planning_cycles: default_max_planning_cycles(),
             max_plan_parse_retries: default_max_plan_parse_retries(),
             worker_system_prompt: None,
@@ -539,6 +543,8 @@ impl OrchestrationConfig {
 /// Flat fields take precedence over sub-table values when both are present.
 #[derive(Deserialize)]
 struct RawOrchestrationConfig {
+    #[serde(flatten)]
+    workflow: crate::workflow::NamedStages,
     #[serde(default)]
     enabled: bool,
     #[serde(default = "default_max_planning_cycles")]
@@ -547,7 +553,7 @@ struct RawOrchestrationConfig {
     max_plan_parse_retries: usize,
     #[serde(default)]
     worker_system_prompt: Option<String>,
-    #[serde(default, rename = "worker")]
+    #[serde(default, rename = "worker", alias = "workers")]
     workers: HashMap<String, WorkerConfig>,
     #[serde(default)]
     coordinator_vector_stores: Vec<String>,
@@ -623,6 +629,10 @@ impl<'de> Deserialize<'de> for OrchestrationConfig {
 
         Ok(OrchestrationConfig {
             enabled: raw.enabled,
+            stages: raw
+                .workflow
+                .into_ordered()
+                .map_err(serde::de::Error::custom)?,
             max_planning_cycles: raw.max_planning_cycles,
             max_plan_parse_retries: raw.max_plan_parse_retries,
             worker_system_prompt: raw.worker_system_prompt,

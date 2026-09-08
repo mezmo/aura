@@ -59,6 +59,7 @@ mod templates;
 mod test_rig;
 pub mod tools;
 mod types;
+pub mod workflow;
 
 pub use config::{
     ArtifactsConfig, OrchestrationConfig, TimeoutsConfig, ToolVisibility, WorkerConfig,
