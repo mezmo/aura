@@ -59,7 +59,11 @@ impl Orchestrator {
             "{}:{}",
             config_fingerprint(&self.agent_config),
             serde_json::to_string(&json!([
-                self.config.stages,
+                self.config
+                    .stages
+                    .iter()
+                    .map(|stage| (&stage.id, stage))
+                    .collect::<Vec<_>>(),
                 self.agent_config
                     .workflow_target_fingerprint
                     .clone()

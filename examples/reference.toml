@@ -267,8 +267,9 @@ model = "gpt-5.2"
 # Native ordered workflow (optional; empty stages retain coordinator planning).
 # See examples/complete/native-workflow.toml for investigate → act → verify.
 # Requires durable memory_dir; parked approvals also require the file session backend.
-# [[orchestration.stages]]
-# id = "investigate"
+# [orchestration]
+# stage_order = ["investigate"]
+# [orchestration.stages.investigate]
 # worker = "operations"
 # inputs = { incident = "/input" }
 # output_schema = { type = "object", required = ["evidence"] }

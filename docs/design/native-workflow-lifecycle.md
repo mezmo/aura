@@ -8,8 +8,12 @@ for this single-instance implementation.
 
 ## Configuration and handoffs
 
-See the [complete example](../../examples/complete/native-workflow.toml). Each stage specifies a unique ID,
-worker, operation, input bindings and output JSON Schema. JSON pointers resolve
+See the [complete example](../../examples/complete/native-workflow.toml). Each
+stage uses a named table such as `[orchestration.stages.act]` and specifies its
+worker, operation, input bindings and output JSON Schema. The table name is the
+stage ID; there is no separate `id` field. Set `orchestration.stage_order` to list
+every stage ID exactly once in execution order. Table placement and alphabetical
+key ordering never determine execution order. JSON pointers resolve
 against `/input`, `/stages/<earlier_id>` and `/run`. Missing bindings fail before
 that stage executes. Tool arguments and bindings cannot overwrite one another.
 Schemas accept local fragment references only; schema loading does not fetch

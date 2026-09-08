@@ -109,12 +109,12 @@ api_key = "unused-test-key"
 model = "unused-test-model"
 [orchestration]
 enabled = true
+stage_order = ["wait"]
 [orchestration.worker.worker]
 description = "test"
 preamble = "test"
 mcp_filter = []
-[[orchestration.stages]]
-id = "wait"
+[orchestration.stages.wait]
 worker = "worker"
 output_schema = {{ type = "object", required = ["waited"] }}
 operation = {{ kind = "wait", seconds = 5 }}
@@ -277,18 +277,17 @@ timeout_secs = 30
 enabled = true
 [orchestration]
 enabled = true
+stage_order = ["act", "verify"]
 [orchestration.worker.action]
 description = "test"
 preamble = "test"
 mcp_filter = ["mutate", "probe", "notify"]
-[[orchestration.stages]]
-id = "act"
+[orchestration.stages.act]
 worker = "action"
 output_schema = {{ type = "object", required = ["applied"] }}
 operation = {{ kind = "tool", tool = "mutate", arguments = {{}} }}
 on_approval_wait = [{{after_secs=0, worker="action", tool="notify", arguments={{}}, inputs={{payload="/run"}}}}]
-[[orchestration.stages]]
-id = "verify"
+[orchestration.stages.verify]
 worker = "action"
 output_schema = {{ type = "object", required = ["healthy"] }}
 operation = {{ kind = "verify", tool = "probe", arguments = {{}}, read_only = true, success_schema = {{ required = ["healthy"], properties = {{ healthy = {{ const = true }} }} }}, interval_secs = 1, timeout_secs = 10 }}

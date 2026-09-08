@@ -12,6 +12,8 @@ use crate::{ConfigError, OrchestrationConfig};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkflowStage {
+    /// Derived from the named stage table, never a second configuration field.
+    #[serde(skip)]
     pub id: String,
     pub worker: String,
     #[serde(default)]
@@ -22,6 +24,58 @@ pub struct WorkflowStage {
     /// MCP notifications dispatched at offsets from the approval request.
     #[serde(default)]
     pub on_approval_wait: Vec<WaitNotification>,
+}
+
+/// Wire representation keeps execution order independent of map ordering.
+#[derive(Default, Deserialize)]
+pub(crate) struct NamedStages {
+    #[serde(default)]
+    stage_order: Vec<String>,
+    #[serde(default)]
+    stages: BTreeMap<String, WorkflowStage>,
+}
+
+impl NamedStages {
+    pub(crate) fn into_ordered(mut self) -> Result<Vec<WorkflowStage>, ConfigError> {
+        let mut ordered = Vec::with_capacity(self.stage_order.len());
+        for id in self.stage_order {
+            let mut stage = self.stages.remove(&id).ok_or_else(|| {
+                ConfigError::Validation(format!(
+                    "stage_order references unknown or repeated stage {id}"
+                ))
+            })?;
+            stage.id = id;
+            ordered.push(stage);
+        }
+        if !self.stages.is_empty() {
+            return Err(ConfigError::Validation(
+                "stage_order must list every configured stage exactly once".into(),
+            ));
+        }
+        Ok(ordered)
+    }
+}
+
+pub(crate) fn serialize_stages<S>(
+    stages: &[WorkflowStage],
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    #[derive(Serialize)]
+    struct NamedStagesRef<'a> {
+        stage_order: Vec<&'a str>,
+        stages: BTreeMap<&'a str, &'a WorkflowStage>,
+    }
+    NamedStagesRef {
+        stage_order: stages.iter().map(|stage| stage.id.as_str()).collect(),
+        stages: stages
+            .iter()
+            .map(|stage| (stage.id.as_str(), stage))
+            .collect(),
+    }
+    .serialize(serializer)
 }
 
 /// Uses the named worker's MCP permissions; recipient routing stays in that MCP.
@@ -206,6 +260,63 @@ fn valid_pointer(pointer: &str) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    const NAMED: &str = r#"
+enabled = true
+stage_order = ["verify", "act"]
+[worker.operator]
+description = "test"
+preamble = "test"
+[stages.act]
+worker = "operator"
+inputs = { evidence = "/stages/verify" }
+output_schema = { type = "object" }
+operation = { kind = "wait", seconds = 0 }
+[stages.verify]
+worker = "operator"
+output_schema = { type = "object" }
+operation = { kind = "wait", seconds = 0 }
+"#;
+
+    #[test]
+    fn named_stages_follow_explicit_order_and_round_trip() {
+        let config: OrchestrationConfig = toml::from_str(NAMED).unwrap();
+        config.validate_stages().unwrap();
+        assert_eq!(config.stages[0].id, "verify");
+        assert_eq!(config.stages[1].id, "act");
+        let serialized = serde_json::to_value(&config).unwrap();
+        assert_eq!(serialized["stage_order"], json!(["verify", "act"]));
+        assert!(serialized["stages"]["act"].get("id").is_none());
+        for round_trip in [
+            serde_json::from_value::<OrchestrationConfig>(serialized.clone()).unwrap(),
+            toml::from_str(&toml::to_string(&config).unwrap()).unwrap(),
+        ] {
+            round_trip.validate_stages().unwrap();
+            assert_eq!(serde_json::to_value(round_trip).unwrap(), serialized);
+        }
+    }
+
+    #[test]
+    fn rejects_missing_repeated_unknown_and_unordered_stages() {
+        for order in [
+            "[]",
+            "[\"verify\"]",
+            "[\"act\", \"act\"]",
+            "[\"unknown\", \"act\"]",
+        ] {
+            let invalid = NAMED.replace("[\"verify\", \"act\"]", order);
+            assert!(
+                toml::from_str::<OrchestrationConfig>(&invalid).is_err(),
+                "{order}"
+            );
+        }
+        let omitted = NAMED.replace("stage_order = [\"verify\", \"act\"]", "");
+        assert!(toml::from_str::<OrchestrationConfig>(&omitted).is_err());
+        let redundant_id = NAMED.replace("[stages.act]", "[stages.act]\nid = \"other\"");
+        assert!(toml::from_str::<OrchestrationConfig>(&redundant_id).is_err());
+        let array = NAMED.replace("[stages.act]", "[[stages.act]]");
+        assert!(toml::from_str::<OrchestrationConfig>(&array).is_err());
+    }
 
     #[test]
     fn rejects_external_references_and_invalid_schemas() {

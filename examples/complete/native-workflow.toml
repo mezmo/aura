@@ -30,6 +30,7 @@ enabled = true
 
 [orchestration]
 enabled = true
+stage_order = ["investigate", "decide", "act", "verify", "export"]
 
 [orchestration.worker.investigator]
 description = "Read incident evidence"
@@ -46,22 +47,19 @@ description = "Execute and verify exact configured calls"
 preamble = "Configured tool execution"
 mcp_filter = ["run_workflow", "check_recovery", "notify", "store_run"]
 
-[[orchestration.stages]]
-id = "investigate"
+[orchestration.stages.investigate]
 worker = "investigator"
 inputs = { incident = "/input" }
 output_schema = { type = "object", required = ["evidence", "incident_id"], properties = { evidence = { type = "string" }, incident_id = { type = "string" } } }
 operation = { kind = "worker", prompt = "Investigate this incident using the available read tool." }
 
-[[orchestration.stages]]
-id = "decide"
+[orchestration.stages.decide]
 worker = "decision"
 inputs = { evidence = "/stages/investigate" }
 output_schema = { type = "object", required = ["workflow", "incident_id"], properties = { workflow = { enum = ["restart_service", "no_action"] }, incident_id = { type = "string" } }, additionalProperties = false }
 operation = { kind = "worker", prompt = "Select the SOP justified by this evidence. Use no_action if no mutation is justified." }
 
-[[orchestration.stages]]
-id = "act"
+[orchestration.stages.act]
 worker = "action"
 inputs = { workflow = "/stages/decide/workflow", incident_id = "/stages/decide/incident_id" }
 output_schema = { type = "object", required = ["status"], properties = { status = { const = "succeeded" } } }
@@ -71,15 +69,13 @@ on_approval_wait = [
   { after_secs = 900, worker = "action", tool = "notify", arguments = { channel = "escalation" }, inputs = { payload = "/run" } }
 ]
 
-[[orchestration.stages]]
-id = "verify"
+[orchestration.stages.verify]
 worker = "action"
 inputs = { incident_id = "/stages/investigate/incident_id" }
 output_schema = { type = "object", required = ["healthy"], properties = { healthy = { const = true } } }
 operation = { kind = "verify", tool = "check_recovery", arguments = {}, read_only = true, success_schema = { required = ["healthy"], properties = { healthy = { const = true } } }, interval_secs = 5, timeout_secs = 300 }
 
-[[orchestration.stages]]
-id = "export"
+[orchestration.stages.export]
 worker = "action"
 inputs = { record = "/run" }
 output_schema = { type = "object", required = ["stored"], properties = { stored = { const = true } } }

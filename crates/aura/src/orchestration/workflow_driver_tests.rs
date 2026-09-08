@@ -4,6 +4,18 @@ use crate::orchestration::workflow::{WorkflowCommand, WorkflowRequest};
 use aura_config::workflow::WorkflowStage;
 
 fn config(root: &str, request: WorkflowRequest, stages: Value) -> AgentRuntimeConfig {
+    let mut order = Vec::new();
+    let stages: serde_json::Map<String, Value> = stages
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|stage| {
+            let mut stage = stage.as_object().unwrap().clone();
+            let id = stage.remove("id").unwrap().as_str().unwrap().to_owned();
+            order.push(id.clone());
+            (id, Value::Object(stage))
+        })
+        .collect();
     AgentRuntimeConfig {
         memory_dir: Some(root.into()),
         session_id: Some("test-session".into()),
@@ -11,7 +23,7 @@ fn config(root: &str, request: WorkflowRequest, stages: Value) -> AgentRuntimeCo
         orchestration: Some(serde_json::from_value(json!({
             "enabled":true,
             "worker":{"worker":{"description":"test", "preamble":"Submit the requested result", "mcp_filter":[], "turn_depth":8}},
-            "stages":stages
+            "stage_order":order, "stages":stages
         })).unwrap()),
         ..Default::default()
     }
@@ -209,7 +221,8 @@ async fn worker_receipt_recovery_preserves_json_looking_strings() {
         .await
         .unwrap();
     let (events, _rx) = tokio::sync::mpsc::channel(16);
-    let stage: WorkflowStage = serde_json::from_value(json!({"id":"worker", "worker":"worker", "output_schema":{"type":"string"}, "operation":{"kind":"worker", "prompt":"unused"}})).unwrap();
+    let mut stage: WorkflowStage = serde_json::from_value(json!({ "worker":"worker", "output_schema":{"type":"string"}, "operation":{"kind":"worker", "prompt":"unused"}})).unwrap();
+    stage.id = "worker".into();
     for text in ["42", "{}", "null"] {
         record.state = RunState::Received {
             output: serde_json::to_string(text).unwrap(),
