@@ -41,6 +41,9 @@
 //! - `IterationComplete` - when the post-execute coordinator decision completes
 //! - `Synthesizing` - when task results are being consolidated for the coordinator
 
+#[path = "workflow_driver.rs"]
+mod workflow_driver;
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -388,6 +391,7 @@ pub(super) fn spawn_tool_event_forwarder(
 /// Created lazily by `OrchestratorFactory::stream()` to coordinate multiple
 /// agents through a plan-execute-continue loop.
 pub struct Orchestrator {
+    pub(super) workflow_cancel: CancellationToken,
     /// ID for the orchestrator
     orchestrator_id: String,
 
@@ -528,6 +532,10 @@ enum LoopStep {
 }
 
 impl Orchestrator {
+    pub(super) fn has_configured_workflow(&self) -> bool {
+        !self.config.stages.is_empty()
+    }
+
     /// Create a new orchestrator from configuration.
     pub async fn new(
         agent_config: AgentRuntimeConfig,
@@ -535,7 +543,20 @@ impl Orchestrator {
         let orchestration_config = agent_config.orchestration.clone().unwrap_or_default();
 
         // Initialize MCP manager (shared across coordinator and all workers via Arc)
-        let mcp_manager = if let Some(ref mcp_config) = agent_config.mcp {
+        let controls_only = agent_config
+            .workflow_request
+            .as_ref()
+            .is_some_and(|request| {
+                matches!(
+                    request.command,
+                    super::workflow::WorkflowCommand::Inspect
+                        | super::workflow::WorkflowCommand::Takeover
+                        | super::workflow::WorkflowCommand::Cancel
+                )
+            });
+        let mcp_manager = if let Some(ref mcp_config) = agent_config.mcp
+            && !controls_only
+        {
             tracing::info!("Orchestrator: initializing MCP connections");
             Some(Arc::new(
                 McpManager::initialize_from_config(mcp_config).await?,
@@ -555,11 +576,22 @@ impl Orchestrator {
                 "Orchestrator: Initializing execution persistence at: {}",
                 memory_dir
             );
-            let p = ExecutionPersistence::new(memory_dir, agent_config.session_id.clone())
-                .await
-                .map_err(|e| format!("Failed to initialize persistence: {}", e))?;
-            p.prune_session_runs(orchestration_config.max_session_runs())
-                .await;
+            let run_id = agent_config
+                .workflow_request
+                .as_ref()
+                .map(|r| r.run_id)
+                .unwrap_or_else(uuid::Uuid::now_v7);
+            let p = ExecutionPersistence::with_run_id(
+                memory_dir,
+                agent_config.session_id.clone(),
+                run_id,
+            )
+            .await
+            .map_err(|e| format!("Failed to initialize persistence: {}", e))?;
+            if orchestration_config.stages.is_empty() {
+                p.prune_session_runs(orchestration_config.max_session_runs())
+                    .await;
+            }
             Arc::new(Mutex::new(p))
         } else {
             tracing::info!("Orchestrator: Persistence disabled (no memory_dir configured)");
@@ -599,6 +631,7 @@ impl Orchestrator {
         );
 
         Ok(Self {
+            workflow_cancel: CancellationToken::new(),
             orchestrator_id,
             config: orchestration_config,
             agent_config,
@@ -632,6 +665,7 @@ impl Orchestrator {
         worker_name: Option<&str>,
         park_cell: Option<&Arc<BlockedCell>>,
         recorded: Option<&Arc<RecordedDecisions>>,
+        exact_call: bool,
     ) -> Result<AgentWithPreamble, Box<dyn std::error::Error + Send + Sync>> {
         use super::duplicate_call_guard::DuplicateCallGuard;
         use super::observer_wrapper::ObserverWrapper;
@@ -694,9 +728,17 @@ impl Orchestrator {
         // Per-worker scratchpad override falls back to [agent.scratchpad].
         // Each worker gets a FRESH ContextBudget scoped to its effective LLM —
         // workers never share a budget.
+        let deterministic_stage = exact_call
+            || self.config.stages.get(task_id).is_some_and(|stage| {
+                !matches!(
+                    stage.operation,
+                    aura_config::workflow::StageOperation::Worker { .. }
+                )
+            });
         let effective_scratchpad = worker_cfg
             .and_then(|w| w.scratchpad.as_ref())
             .or(self.agent_config.agent.scratchpad.as_ref())
+            .filter(|_| !deterministic_stage)
             .cloned();
 
         let mut scratchpad_tools = Vec::<Arc<dyn ToolWrapper>>::new();
@@ -816,11 +858,15 @@ impl Orchestrator {
             tracing::info!("Worker {} turn_depth={}", task_id, resolved_depth);
         }
 
-        let turn_nudge = crate::turn_nudge::TurnNudgeState::new_with_submit_tool(
-            worker_config.agent.nudge_last_turn,
-            worker_config.agent.nudge_turns_remaining,
-            resolved_depth,
-        );
+        let turn_nudge = if deterministic_stage {
+            None
+        } else {
+            crate::turn_nudge::TurnNudgeState::new_with_submit_tool(
+                worker_config.agent.nudge_last_turn,
+                worker_config.agent.nudge_turns_remaining,
+                resolved_depth,
+            )
+        };
 
         // ComposedWrapper applies transform_output in reverse-list order, so
         // the LAST entry runs FIRST on the raw tool output. Persistence must
@@ -981,6 +1027,11 @@ impl Orchestrator {
         // Give workers the submit_result tool for structured output
         let submit_result_decision: super::tools::SubmitResultDecision = Arc::new(Mutex::new(None));
         worker_config.orchestration_submit_result = Some(submit_result_decision.clone());
+        worker_config.orchestration_output_schema = self
+            .config
+            .stages
+            .get(task_id)
+            .map(|stage| stage.output_schema.clone());
 
         // Disable orchestration in worker config to avoid nested orchestration
         worker_config.orchestration = None;
@@ -2909,6 +2960,11 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
         // Box<dyn ToolDyn> is not Clone, so each provider arm constructs its own instance.
         let wait_for_tools = || -> Vec<Box<dyn rig::tool::ToolDyn>> {
+            // Configured workflows poll through validated verification stages.
+            // The legacy wait_for dispatcher does not apply worker wrappers.
+            if !self.config.stages.is_empty() {
+                return Vec::new();
+            }
             shared_mcp
                 .as_ref()
                 .map(|mcp| {
@@ -3647,6 +3703,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     *worker_name,
                     park.as_ref().map(|p| &p.cell),
                     None,
+                    false,
                 )
                 .await?;
 
@@ -3951,6 +4008,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 worker_name,
                 Some(&park.cell),
                 Some(&resume.recorded),
+                false,
             )
             .await?;
 
@@ -4376,6 +4434,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
         chat_history: Vec<rig::completion::Message>,
         event_tx: tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>,
     ) -> Result<String, StreamError> {
+        if !self.config.stages.is_empty() {
+            return self.run_workflow(query, &event_tx).await;
+        }
         let span = tracing::Span::current();
         let (goal_preview, _) = safe_truncate(query, 200);
         span.record("orchestration.goal", goal_preview);
@@ -8072,7 +8133,8 @@ mod tests {
     /// Serializes the override-using tests: the override queue is
     /// process-global, and two parallel installs could cross-consume each
     /// other's scripted workers. Async-aware so the guard may cross awaits.
-    static WORKER_OVERRIDE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    pub(super) static WORKER_OVERRIDE_LOCK: tokio::sync::Mutex<()> =
+        tokio::sync::Mutex::const_new(());
 
     /// A park-mode orchestrator whose `operations` worker is built through
     /// the override seam: the gate glob matches the stub tool, and the

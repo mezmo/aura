@@ -83,6 +83,9 @@ pub struct AgentRuntimeConfig {
     pub memory_dir: Option<String>,
     /// Orchestration mode configuration (multi-agent workflows)
     pub orchestration: Option<OrchestrationConfig>,
+    /// Authenticated transport-level workflow operation.
+    pub workflow_target_fingerprint: Option<String>,
+    pub workflow_request: Option<crate::orchestration::workflow::WorkflowRequest>,
 
     /// Discovered per-worker skill overrides keyed by worker name. Populated
     /// by `RigBuilder` at build time because skill discovery does filesystem
@@ -129,6 +132,8 @@ pub struct AgentRuntimeConfig {
 
     /// Shared decision state for worker `submit_result` tool.
     /// When set, workers get the `submit_result` tool for structured output.
+    /// JSON Schema for a configured stage's submit_result payload.
+    pub orchestration_output_schema: Option<serde_json::Value>,
     pub orchestration_submit_result: Option<crate::orchestration::SubmitResultDecision>,
 
     /// Resolved HITL approval runtime (compiled globs + decision route), built
@@ -166,6 +171,8 @@ impl Clone for AgentRuntimeConfig {
             tools: self.tools.clone(),
             memory_dir: self.memory_dir.clone(),
             orchestration: self.orchestration.clone(),
+            workflow_request: self.workflow_request.clone(),
+            workflow_target_fingerprint: self.workflow_target_fingerprint.clone(),
             worker_skills: self.worker_skills.clone(),
             // Arc fields clone the Arc (shared reference)
             tool_wrapper: self.tool_wrapper.clone(),
@@ -177,6 +184,7 @@ impl Clone for AgentRuntimeConfig {
             scratchpad_tools_config: self.scratchpad_tools_config.clone(),
             turn_nudge: self.turn_nudge.clone(),
             orchestration_submit_result: self.orchestration_submit_result.clone(),
+            orchestration_output_schema: self.orchestration_output_schema.clone(),
             hitl: self.hitl.clone(),
             request_id: self.request_id.clone(),
             instance_id: self.instance_id.clone(),

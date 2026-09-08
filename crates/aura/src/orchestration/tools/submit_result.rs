@@ -45,11 +45,26 @@ pub type SubmitResultDecision = Arc<Mutex<Option<SubmitResultOutput>>>;
 #[derive(Clone)]
 pub struct SubmitResultTool {
     decision: SubmitResultDecision,
+    schema: Option<serde_json::Value>,
 }
 
 impl SubmitResultTool {
+    pub fn with_schema(
+        mut self,
+        schema: Option<serde_json::Value>,
+    ) -> Result<Self, aura_config::ConfigError> {
+        if let Some(schema) = &schema {
+            aura_config::workflow::compile_schema(schema)?;
+        }
+        self.schema = schema;
+        Ok(self)
+    }
+
     pub fn new(decision: SubmitResultDecision) -> Self {
-        Self { decision }
+        Self {
+            decision,
+            schema: None,
+        }
     }
 }
 
@@ -58,8 +73,8 @@ pub struct SubmitResultArgs {
     /// Concise summary of findings (1-3 sentences). Shown to the coordinator
     /// and stored in session history.
     pub summary: String,
-    /// Complete findings and analysis.
-    pub result: String,
+    /// Complete findings; configured workflows submit a native JSON value.
+    pub result: serde_json::Value,
     /// Confidence in the result: "high", "medium", or "low".
     pub confidence: String,
 }
@@ -96,10 +111,10 @@ impl Tool for SubmitResultTool {
                         "type": "string",
                         "description": "Concise summary of findings (1-3 sentences). This becomes the preview shown to the coordinator and stored in session history."
                     },
-                    "result": {
+                    "result": self.schema.clone().unwrap_or_else(|| serde_json::json!({
                         "type": "string",
                         "description": "Complete findings and analysis."
-                    },
+                    })),
                     "confidence": {
                         "type": "string",
                         "enum": ["high", "medium", "low"],
@@ -112,7 +127,24 @@ impl Tool for SubmitResultTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        if let Some(schema) = &self.schema {
+            let validator = aura_config::workflow::compile_schema(schema)
+                .expect("schema checked during construction");
+            if let Err(error) = validator.validate(&args.result) {
+                return Ok(SubmitResultToolOutput {
+                    status: format!(
+                        "Invalid result at {}: {error}. Correct the result and submit again.",
+                        error.instance_path()
+                    ),
+                });
+            }
+        } else if !args.result.is_string() {
+            return Ok(SubmitResultToolOutput {
+                status: "Result must be a string.".into(),
+            });
+        }
         let mut guard = self.decision.lock().await;
+
         if guard.is_some() {
             tracing::warn!(
                 summary = %args.summary,
@@ -126,7 +158,7 @@ impl Tool for SubmitResultTool {
         tracing::info!(
             summary = %args.summary,
             confidence = %args.confidence,
-            result_len = args.result.len(),
+            result_len = args.result.to_string().len(),
             "submit_result called (first submission accepted)"
         );
 
@@ -139,7 +171,14 @@ impl Tool for SubmitResultTool {
 
         *guard = Some(SubmitResultOutput {
             summary: args.summary,
-            result: args.result,
+            result: if self.schema.is_some() {
+                args.result.to_string()
+            } else {
+                args.result
+                    .as_str()
+                    .expect("string checked above")
+                    .to_owned()
+            },
             confidence,
         });
 
@@ -162,7 +201,7 @@ mod tests {
         let result = tool
             .call(SubmitResultArgs {
                 summary: "Found 42 errors".to_string(),
-                result: "Full analysis...".to_string(),
+                result: "Full analysis...".into(),
                 confidence: "high".to_string(),
             })
             .await
@@ -184,7 +223,7 @@ mod tests {
 
         tool.call(SubmitResultArgs {
             summary: "First".to_string(),
-            result: "First result".to_string(),
+            result: "First result".into(),
             confidence: "high".to_string(),
         })
         .await
@@ -193,7 +232,7 @@ mod tests {
         let result = tool
             .call(SubmitResultArgs {
                 summary: "Second".to_string(),
-                result: "Second result".to_string(),
+                result: "Second result".into(),
                 confidence: "low".to_string(),
             })
             .await
