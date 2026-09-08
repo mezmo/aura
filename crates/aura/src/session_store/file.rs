@@ -352,7 +352,6 @@ impl Inner {
                 Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
                 Err(err) => return Err(request_err(err)),
             };
-            // A corrupt record must not fail the whole scan.
             let parked = match decode_approval(&bytes) {
                 Ok(parked) => parked,
                 Err(err) => {

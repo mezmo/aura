@@ -409,9 +409,6 @@ impl Config {
         // Scratchpad validation
         self.validate_scratchpad()?;
 
-        // Poll delivery is reconciler-driven, so it has no in-flight request
-        // to attach request-derived headers to and needs park mode to hold
-        // long-lived approvals.
         if let Some(hitl) = &self.hitl
             && let DecisionRouteConfig::Webhook {
                 delivery: WebhookDelivery::Poll,
@@ -1287,130 +1284,93 @@ mode = "conversational"
         assert!(!hitl.park.enabled);
     }
 
-    // -------------------------------------------------------------------
-    // [hitl.route] delivery
-    // -------------------------------------------------------------------
+    /// A `[hitl]` config TOML with a webhook route carrying `route_lines`.
+    fn hitl_toml(route_lines: &str) -> String {
+        format!(
+            "require_approval = [\"kubectl_*\"]\n\n\
+             [route]\nmode = \"webhook\"\nurl = \"https://approvals.example.com/decide\"\n\
+             {route_lines}\n"
+        )
+    }
 
-    /// A webhook route without `delivery` parses as sync: the POST response
-    /// carries the decision, unchanged from before the field existed.
+    /// A full config TOML with a webhook route carrying `route_lines`;
+    /// `park` controls the `[hitl.park]` table.
+    fn poll_config_toml(park: bool, route_lines: &str) -> String {
+        let park_table = if park {
+            "[hitl.park]\nenabled = true\n\n"
+        } else {
+            ""
+        };
+        format!(
+            "[agent]\nname = \"Test\"\nsystem_prompt = \"test\"\n\n\
+             [agent.llm]\nprovider = \"openai\"\napi_key = \"test\"\nmodel = \"gpt-4o\"\n\n\
+             [hitl]\nrequire_approval = [\"kubectl_*\"]\n\n\
+             {park_table}\
+             [hitl.route]\nmode = \"webhook\"\nurl = \"https://approvals.example.com/decide\"\n\
+             {route_lines}\n"
+        )
+    }
+
+    fn poll_fields(route: &DecisionRouteConfig) -> (WebhookDelivery, Option<String>, u64, u64) {
+        let DecisionRouteConfig::Webhook {
+            delivery,
+            poll_url,
+            poll_interval_secs,
+            poll_request_timeout_secs,
+            ..
+        } = route
+        else {
+            panic!("expected Webhook route, got {route:?}");
+        };
+        (
+            *delivery,
+            poll_url.as_ref().map(|u| u.as_str().to_owned()),
+            *poll_interval_secs,
+            *poll_request_timeout_secs,
+        )
+    }
+
     #[test]
     fn hitl_webhook_delivery_defaults_to_sync() {
-        let toml = r#"
-require_approval = ["kubectl_*"]
-
-[route]
-mode = "webhook"
-url = "https://approvals.example.com/decide"
-"#;
-        let hitl: HitlConfig = toml::from_str(toml).unwrap();
-        match hitl.route {
-            DecisionRouteConfig::Webhook { delivery, .. } => {
-                assert_eq!(delivery, WebhookDelivery::Sync);
-            }
-            other => panic!("expected Webhook route, got {:?}", other),
-        }
+        let hitl: HitlConfig = toml::from_str(&hitl_toml("")).unwrap();
+        assert_eq!(poll_fields(&hitl.route).0, WebhookDelivery::Sync);
     }
 
-    /// `delivery = "poll"` parses with its defaults: 10s poll interval, 30s
-    /// per-attempt timeout, and an unresolved `poll_url` (None means poll
-    /// `url` itself).
     #[test]
     fn hitl_webhook_poll_delivery_parses_with_defaults() {
-        let toml = r#"
-require_approval = ["kubectl_*"]
-
-[route]
-mode = "webhook"
-url = "https://approvals.example.com/decide"
-delivery = "poll"
-"#;
-        let hitl: HitlConfig = toml::from_str(toml).unwrap();
-        match hitl.route {
-            DecisionRouteConfig::Webhook {
-                delivery,
-                poll_url,
-                poll_interval_secs,
-                poll_request_timeout_secs,
-                ..
-            } => {
-                assert_eq!(delivery, WebhookDelivery::Poll);
-                assert!(poll_url.is_none(), "poll_url defaults to unresolved");
-                assert_eq!(poll_interval_secs, 10);
-                assert_eq!(poll_request_timeout_secs, 30);
-            }
-            other => panic!("expected Webhook route, got {:?}", other),
-        }
+        let hitl: HitlConfig = toml::from_str(&hitl_toml("delivery = \"poll\"")).unwrap();
+        assert_eq!(
+            poll_fields(&hitl.route),
+            (WebhookDelivery::Poll, None, 10, 30)
+        );
     }
 
-    /// Explicit poll fields survive a serialize → deserialize round trip.
     #[test]
     fn hitl_webhook_poll_fields_round_trip() {
-        let toml = r#"
-require_approval = ["kubectl_*"]
+        let lines = "delivery = \"poll\"\n\
+                     poll_url = \"https://status.example.com/decisions\"\n\
+                     poll_interval_secs = 5\n\
+                     poll_request_timeout_secs = 45";
+        let hitl: HitlConfig = toml::from_str(&hitl_toml(lines)).unwrap();
+        let expected = (
+            WebhookDelivery::Poll,
+            Some("https://status.example.com/decisions".to_owned()),
+            5,
+            45,
+        );
+        assert_eq!(poll_fields(&hitl.route), expected);
 
-[route]
-mode = "webhook"
-url = "https://approvals.example.com/decide"
-delivery = "poll"
-poll_url = "https://status.example.com/decisions"
-poll_interval_secs = 5
-poll_request_timeout_secs = 45
-"#;
-        let parse_fields = |hitl: HitlConfig| match hitl.route {
-            DecisionRouteConfig::Webhook {
-                delivery,
-                poll_url,
-                poll_interval_secs,
-                poll_request_timeout_secs,
-                ..
-            } => (
-                delivery,
-                poll_url.map(|u| u.as_str().to_owned()),
-                poll_interval_secs,
-                poll_request_timeout_secs,
-            ),
-            other => panic!("expected Webhook route, got {other:?}"),
-        };
-
-        let hitl: HitlConfig = toml::from_str(toml).unwrap();
-        let (delivery, poll_url, interval, request_timeout) = parse_fields(hitl.clone());
-        assert_eq!(delivery, WebhookDelivery::Poll);
-        assert_eq!(poll_url.as_deref(), Some("https://status.example.com/decisions"));
-        assert_eq!(interval, 5);
-        assert_eq!(request_timeout, 45);
-
-        let round_tripped: HitlConfig =
-            toml::from_str(&toml::to_string(&hitl).unwrap()).unwrap();
+        let round_tripped: HitlConfig = toml::from_str(&toml::to_string(&hitl).unwrap()).unwrap();
         assert_eq!(
-            parse_fields(hitl),
-            parse_fields(round_tripped),
+            poll_fields(&round_tripped.route),
+            expected,
             "explicit poll fields must survive a round trip"
         );
     }
 
-    /// Poll delivery without park mode is rejected: poll approvals may be
-    /// long-lived and requests are never held open in flight.
     #[test]
     fn validate_rejects_poll_delivery_without_park() {
-        let config = r#"
-[agent]
-name = "Test"
-system_prompt = "test"
-
-[agent.llm]
-provider = "openai"
-api_key = "test"
-model = "gpt-4o"
-
-[hitl]
-require_approval = ["kubectl_*"]
-
-[hitl.route]
-mode = "webhook"
-url = "https://approvals.example.com/decide"
-delivery = "poll"
-"#;
-        let err = crate::load_config_from_str(config)
+        let err = crate::load_config_from_str(&poll_config_toml(false, "delivery = \"poll\""))
             .expect_err("poll delivery without park mode must be rejected");
         let msg = err.to_string();
         assert!(
@@ -1419,34 +1379,13 @@ delivery = "poll"
         );
     }
 
-    /// Request-derived headers cannot be reconstructed by the background
-    /// reconciler after a restart, so they are rejected with poll delivery.
     #[test]
     fn validate_rejects_poll_delivery_with_headers_from_request() {
-        let config = r#"
-[agent]
-name = "Test"
-system_prompt = "test"
-
-[agent.llm]
-provider = "openai"
-api_key = "test"
-model = "gpt-4o"
-
-[hitl]
-require_approval = ["kubectl_*"]
-
-[hitl.park]
-enabled = true
-
-[hitl.route]
-mode = "webhook"
-url = "https://approvals.example.com/decide"
-delivery = "poll"
-headers_from_request = { "authorization" = "authorization" }
-"#;
-        let err = crate::load_config_from_str(config)
-            .expect_err("headers_from_request with poll delivery must be rejected");
+        let err = crate::load_config_from_str(&poll_config_toml(
+            true,
+            "delivery = \"poll\"\nheaders_from_request = { \"authorization\" = \"authorization\" }",
+        ))
+        .expect_err("headers_from_request with poll delivery must be rejected");
         let msg = err.to_string();
         assert!(
             msg.contains("hitl.route.headers_from_request"),
@@ -1454,58 +1393,21 @@ headers_from_request = { "authorization" = "authorization" }
         );
     }
 
-    /// Poll + park + no `headers_from_request` is the supported poll
-    /// posture; `tool_headers_from_response` (approver identity) stays
-    /// allowed in this mode.
+    /// `tool_headers_from_response` (approver identity) stays allowed with
+    /// poll delivery.
     #[test]
     fn validate_accepts_poll_delivery_with_park() {
-        let config = r#"
-[agent]
-name = "Test"
-system_prompt = "test"
-
-[agent.llm]
-provider = "openai"
-api_key = "test"
-model = "gpt-4o"
-
-[hitl]
-require_approval = ["kubectl_*"]
-
-[hitl.park]
-enabled = true
-
-[hitl.route]
-mode = "webhook"
-url = "https://approvals.example.com/decide"
-delivery = "poll"
-tool_headers_from_response = { "X-Forwarded-User" = "X-Approver-Id" }
-"#;
-        crate::load_config_from_str(config)
-            .expect("poll delivery with park mode and no request-derived headers is valid");
+        crate::load_config_from_str(&poll_config_toml(
+            true,
+            "delivery = \"poll\"\n\
+             tool_headers_from_response = { \"X-Forwarded-User\" = \"X-Approver-Id\" }",
+        ))
+        .expect("poll delivery with park mode and no request-derived headers is valid");
     }
 
-    /// Sync delivery keeps working without park mode (unchanged behavior).
     #[test]
     fn validate_accepts_sync_delivery_without_park() {
-        let config = r#"
-[agent]
-name = "Test"
-system_prompt = "test"
-
-[agent.llm]
-provider = "openai"
-api_key = "test"
-model = "gpt-4o"
-
-[hitl]
-require_approval = ["kubectl_*"]
-
-[hitl.route]
-mode = "webhook"
-url = "https://approvals.example.com/decide"
-"#;
-        crate::load_config_from_str(config)
+        crate::load_config_from_str(&poll_config_toml(false, ""))
             .expect("sync webhook without park mode must stay valid");
     }
 

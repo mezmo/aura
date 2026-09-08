@@ -446,8 +446,6 @@ async fn approval_list_pending_excludes_expired() {
     common::list_pending_excludes_expired(&instance_a, &instance_b).await;
 }
 
-/// A wrong-typed key and an undecodable value in the approval subspace are
-/// skipped per id: neither fails the scan nor hides the genuine records.
 #[tokio::test]
 async fn approval_list_pending_skips_wrong_typed_and_undecodable_keys() {
     let config = test_config(60);
@@ -459,7 +457,6 @@ async fn approval_list_pending_skips_wrong_typed_and_undecodable_keys() {
     let client = redis::Client::open(redis_url()).unwrap();
     let mut conn = client.get_multiplexed_async_connection().await.unwrap();
     let prefix = &config.key_prefix;
-    // A set-typed key in the record subspace: the per-key GET TypeErrors.
     let wrong_typed = format!("{prefix}:approval:{}", uuid::Uuid::new_v4());
     redis::cmd("SADD")
         .arg(&wrong_typed)
@@ -467,7 +464,6 @@ async fn approval_list_pending_skips_wrong_typed_and_undecodable_keys() {
         .query_async::<()>(&mut conn)
         .await
         .unwrap();
-    // A string key whose value is not a decodable parked record.
     let undecodable = format!("{prefix}:approval:{}", uuid::Uuid::new_v4());
     redis::cmd("SET")
         .arg(&undecodable)

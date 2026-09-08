@@ -347,43 +347,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn approval_store_list_pending_returns_only_live_undecided() {
-        let store = InMemoryApprovalStore::new();
-        let resolved = parked("req-poll-resolved");
-        let resolved_id = resolved.request.decision_id;
-        let live = parked("req-poll-live");
-        let live_id = live.request.decision_id;
-        store.register(resolved).await.unwrap();
-        store.register(live).await.unwrap();
-        store
-            .resolve(&resolved_id, ApprovalDecision::Approved)
-            .await
-            .unwrap();
-
-        let pending = store.list_pending().await.unwrap();
-
-        let ids: Vec<DecisionId> = pending.iter().map(|p| p.request.decision_id).collect();
-        assert_eq!(ids, [live_id], "exactly the undecided ticket is listed");
-    }
-
-    /// `list_pending` filters expired tickets the map still holds.
-    #[tokio::test]
-    async fn approval_store_list_pending_excludes_expired() {
-        let store = InMemoryApprovalStore::new();
-        let mut expired = parked("req-poll-expired");
-        expired.expires_at = chrono::Utc::now() - chrono::Duration::seconds(1);
-        let live = parked("req-poll-live");
-        let live_id = live.request.decision_id;
-        store.register(expired).await.unwrap();
-        store.register(live).await.unwrap();
-
-        let pending = store.list_pending().await.unwrap();
-
-        let ids: Vec<DecisionId> = pending.iter().map(|p| p.request.decision_id).collect();
-        assert_eq!(ids, [live_id], "the expired ticket must not be listed");
-    }
-
-    #[tokio::test]
     async fn event_bus_delivers_to_subscriber() {
         let bus = InMemoryEventBus::new();
         let mut sub = bus.subscribe("topic-a").await.unwrap();

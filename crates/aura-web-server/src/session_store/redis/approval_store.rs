@@ -40,7 +40,6 @@ const MIN_TTL_SECS: u64 = 1;
 const REQ_INDEX_TTL_MARGIN_SECS: u64 = 60;
 /// Decision TTL margin over the parked record's remaining TTL.
 const DECISION_TTL_MARGIN_MS: u64 = 60_000;
-/// SCAN COUNT hint for the `list_pending` scan.
 const SCAN_BATCH_SIZE: usize = 200;
 /// Type-guarded GET for the `list_pending` scan: a string key's value,
 /// integer 0 for a wrong-typed key (the caller warns and skips), nil for a
@@ -309,16 +308,13 @@ impl ApprovalStore for RedisApprovalStore {
         for key in keys {
             // Strip the configured prefix before the subspace test: a prefix
             // containing ":decision:" or ":req:" must not exclude every key.
-            let Some(rest) = key
-                .strip_prefix(format!("{}:approval:", self.key_prefix).as_str())
+            let Some(rest) = key.strip_prefix(format!("{}:approval:", self.key_prefix).as_str())
             else {
                 continue;
             };
             if rest.starts_with(DECISION_KEY_SEGMENT) || rest.starts_with(REQ_KEY_SEGMENT) {
                 continue;
             }
-            // Per-key type-guarded GET, not MGET: one wrong-typed key (the
-            // residue the cancel sweep warns on) must not fail the whole scan.
             let value = redis::cmd("EVAL")
                 .arg(TYPED_GET_SCRIPT)
                 .arg(1)
@@ -343,9 +339,6 @@ impl ApprovalStore for RedisApprovalStore {
                         continue;
                     }
                 },
-                // The script returns only a string, nil, or the 0 sentinel;
-                // anything else is a script/contract bug — warn and skip
-                // rather than fail the scan.
                 _ => {
                     tracing::warn!(key = %key, "unexpected approval key value skipped by list_pending");
                     continue;

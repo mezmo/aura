@@ -388,8 +388,6 @@ async fn cancel_request_skips_an_undecodable_approval_file() {
     assert!(corrupt.exists(), "the undecodable file is left in place");
 }
 
-/// A corrupt record in `approvals/` is warn-and-skipped by `list_pending`
-/// too: the reconciler's scan still returns the decodable live sibling.
 #[tokio::test]
 async fn list_pending_skips_an_undecodable_approval_file() {
     let dir = tempfile::tempdir().unwrap();

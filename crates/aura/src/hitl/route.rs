@@ -1648,8 +1648,6 @@ mod tests {
             };
             let hmac = test_hmac();
 
-            // Secret + https url + http:// poll_url fails at boot, naming
-            // the poll url.
             let err = validate_webhook_signing_config(
                 &poll_route(
                     "https://approvals.example.com/aura",
@@ -1661,7 +1659,6 @@ mod tests {
             assert!(err.to_string().contains("plaintext http://"));
             assert!(err.to_string().contains("http://status.example.com/aura"));
 
-            // Secret + http:// url still fails even with an https poll_url.
             let err = validate_webhook_signing_config(
                 &poll_route(
                     "http://approvals.example.com/aura",
@@ -1670,9 +1667,11 @@ mod tests {
                 Some(&hmac),
             )
             .unwrap_err();
-            assert!(err.to_string().contains("http://approvals.example.com/aura"));
+            assert!(
+                err.to_string()
+                    .contains("http://approvals.example.com/aura")
+            );
 
-            // Without a secret, an http poll_url is allowed.
             validate_webhook_signing_config(
                 &poll_route(
                     "https://approvals.example.com/aura",
@@ -1682,7 +1681,6 @@ mod tests {
             )
             .unwrap();
 
-            // A None poll_url inherits the (https) url: passes with a secret.
             validate_webhook_signing_config(
                 &poll_route("https://approvals.example.com/aura", None),
                 Some(&hmac),

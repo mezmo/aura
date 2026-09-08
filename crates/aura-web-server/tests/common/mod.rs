@@ -188,7 +188,6 @@ pub async fn list_pending_returns_only_live_undecided(
     assert_eq!(ids, [live_id], "exactly the undecided ticket is listed");
 }
 
-/// An empty store lists nothing.
 pub async fn list_pending_empty_store_returns_empty(instance: &Arc<dyn ApprovalStore>) {
     assert!(instance.list_pending().await.unwrap().is_empty());
 }
