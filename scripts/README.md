@@ -11,6 +11,7 @@ Release and install helpers.
 | [`set-version.sh`](set-version.sh) | Set the workspace and crate versions in `Cargo.toml` |
 | [`next-version.mjs`](next-version.mjs) | Print the version semantic-release would release next |
 | [`sync-release-downloads.sh`](sync-release-downloads.sh) | Snapshot cumulative release-asset download totals into PostHog |
+| [`sync-cloudsmith-downloads.sh`](sync-cloudsmith-downloads.sh) | Snapshot cumulative Cloudsmith package download totals into PostHog |
 
 `BRANCH_NAME` selects the release channel; see
 [the release channels design note](../docs/design/release-channels.md).
@@ -166,6 +167,62 @@ GitHub-generated source archives are not release assets and never appear.
 | `GITHUB_REPOS` | `mezmo/aura` | Space-separated `owner/repo` list to snapshot. |
 | `BATCH_SIZE` | `1000` | Events per PostHog `/batch` request. |
 | `GH_TOKEN` / `GITHUB_TOKEN` | unset | Token `gh` authenticates with. |
+
+## `sync-cloudsmith-downloads.sh`
+
+```
+sync-cloudsmith-downloads.sh [--dry-run] [--date YYYY-MM-DD] [--selftest]
+```
+
+Sends one PostHog event per Cloudsmith package, carrying that package's
+cumulative download count as of a snapshot date. Run daily at 01:23 UTC by
+[the `Cloudsmith download metrics` workflow](../.github/workflows/cloudsmith-download-metrics.yml),
+which snapshots the previous UTC day.
+
+Packages are keyed by Cloudsmith's permanent identifier rather than by name and
+version: the same version can be uploaded to several distributions and
+architectures, each counting its own downloads.
+
+Retries are safe. The event UUID is derived from `(repository, package
+identifier, snapshot date)` and the timestamp is pinned to `23:59:59Z` on the
+snapshot date, so re-running a date re-sends byte-identical events that PostHog
+deduplicates. Deduplication is eventual, so reporting should aggregate with
+`max(download_count)` per package and snapshot date — cumulative counts only
+rise, which makes `max` correct while duplicates are still visible.
+
+After sending, the script reads the snapshot back and fails if PostHog cannot
+account for every event. This is not belt-and-braces: PostHog answers
+`200 {"status":"Ok"}` to a batch sent with an invalid project token, so an
+unverified send cannot tell success from silent discard. The read-back counts
+distinct event UUIDs rather than rows, because a re-run's rows stay visible
+until PostHog's background merges collapse them.
+
+A run also reports when the previous day holds no snapshot. That is advisory:
+the package list reports only current cumulative counts, so re-running a date
+that was missed files today's totals under it rather than reconstructing it.
+
+`CLOUDSMITH_API_KEY` is optional while `mezmo/aura` is public — the package
+list, download counts included, reads anonymously. A key raises the rate limit
+and becomes required if the repository is ever made private, where an anonymous
+read fails rather than returning a shorter list.
+
+| Switch | Default | Effect |
+| --- | --- | --- |
+| `--date` / `SNAPSHOT_DATE` | yesterday, UTC | Date the snapshot is filed under. Retrying the same date re-sends the same events; an older date is filed with today's totals. |
+| `--dry-run` / `DRY_RUN=1` | off | Collect from Cloudsmith and build the payload, print the first event, send nothing. Needs no PostHog token. |
+| `--selftest` | off | Run the built-in assertions (UUID vectors, header parsing, payload shape) and exit. Reaches no network. |
+| `POSTHOG_PROJECT_API_KEY` | unset | PostHog project write token. Required unless `--dry-run`. |
+| `POSTHOG_API_READ_KEY` | unset | Personal API key used to read the snapshot back. Required unless `--dry-run` or `SKIP_VERIFY=1`. |
+| `POSTHOG_PROJECT_ID` | `443794` | Numeric project id the read-back queries. Must be the project the write token belongs to. |
+| `POSTHOG_API_HOST` | `https://us.posthog.com` | PostHog query host. Distinct from the ingest host. |
+| `VERIFY_TIMEOUT` | `300` | Seconds to wait for ingestion before failing the read-back. |
+| `SKIP_VERIFY` | `0` | `1` sends without reading the snapshot back. |
+| `POSTHOG_HOST` | `https://us.i.posthog.com` | PostHog ingest host. |
+| `CLOUDSMITH_REPOS` | `mezmo/aura` | Space-separated `owner/repository` list to snapshot. |
+| `CLOUDSMITH_API_KEY` | unset | Cloudsmith API key. Only read access is used. |
+| `CLOUDSMITH_HOST` | `https://api.cloudsmith.io` | Cloudsmith API host. |
+| `PAGE_SIZE` | `500` | Packages per Cloudsmith page. `500` is the server's maximum; a larger value is clamped to it. |
+| `BATCH_SIZE` | `1000` | Events per PostHog `/batch` request. |
 
 ## `bump-homebrew-tap.sh`
 
