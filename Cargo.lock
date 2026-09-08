@@ -3769,7 +3769,7 @@ dependencies = [
 [[package]]
 name = "rig-bedrock"
 version = "0.3.10"
-source = "git+https://github.com/mezmo/rig.git?rev=8fbc59c4772566629d353459617505191e415ed2#8fbc59c4772566629d353459617505191e415ed2"
+source = "git+https://github.com/mezmo/rig.git?rev=097d08d6188c76debabedddd2ac65ca5bffd2863#097d08d6188c76debabedddd2ac65ca5bffd2863"
 dependencies = [
  "async-stream",
  "aws-config",
@@ -3789,7 +3789,7 @@ dependencies = [
 [[package]]
 name = "rig-core"
 version = "0.28.0"
-source = "git+https://github.com/mezmo/rig.git?rev=8fbc59c4772566629d353459617505191e415ed2#8fbc59c4772566629d353459617505191e415ed2"
+source = "git+https://github.com/mezmo/rig.git?rev=097d08d6188c76debabedddd2ac65ca5bffd2863#097d08d6188c76debabedddd2ac65ca5bffd2863"
 dependencies = [
  "as-any",
  "async-stream",
@@ -3820,7 +3820,7 @@ dependencies = [
 [[package]]
 name = "rig-derive"
 version = "0.1.10"
-source = "git+https://github.com/mezmo/rig.git?rev=8fbc59c4772566629d353459617505191e415ed2#8fbc59c4772566629d353459617505191e415ed2"
+source = "git+https://github.com/mezmo/rig.git?rev=097d08d6188c76debabedddd2ac65ca5bffd2863#097d08d6188c76debabedddd2ac65ca5bffd2863"
 dependencies = [
  "convert_case 0.8.0",
  "deluxe",

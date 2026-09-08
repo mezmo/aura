@@ -37,13 +37,13 @@ repository = "https://github.com/mezmo/aura"
 strip = "symbols"
 
 [workspace.dependencies]
-rig-core = { git = "https://github.com/mezmo/rig.git", rev = "8fbc59c4772566629d353459617505191e415ed2", default-features = false, features = ["rmcp", "reqwest-rustls"] }
+rig-core = { git = "https://github.com/mezmo/rig.git", rev = "097d08d6188c76debabedddd2ac65ca5bffd2863", default-features = false, features = ["rmcp", "reqwest-rustls"] }
 # The fork's vendored copy (versioned "0.3.10" but carrying prompt-caching
 # support beyond the crates.io release of that number), building against the
 # same rig-core. crates.io 0.3.11+ pulls rig-core 0.31, which is
 # semver-incompatible with the 0.28 fork. This also resolves rig-derive to the
 # fork's 0.1.10 rather than the newer crates.io release.
-rig-bedrock = { git = "https://github.com/mezmo/rig.git", rev = "8fbc59c4772566629d353459617505191e415ed2" }
+rig-bedrock = { git = "https://github.com/mezmo/rig.git", rev = "097d08d6188c76debabedddd2ac65ca5bffd2863" }
 
 # MCP support
 rmcp = { version = "0.12.0", features = ["transport-child-process", "client", "transport-streamable-http-client", "transport-streamable-http-client-reqwest"] }
@@ -111,5 +111,4 @@ http = "1.0"
 
 # Patch rig-core to use the fork with streaming hook + span propagation fix
 [patch.crates-io]
-rig-core = { git = "https://github.com/mezmo/rig.git", rev = "8fbc59c4772566629d353459617505191e415ed2" }
-
+rig-core = { git = "https://github.com/mezmo/rig.git", rev = "097d08d6188c76debabedddd2ac65ca5bffd2863" }
