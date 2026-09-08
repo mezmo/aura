@@ -40,7 +40,17 @@ fn merge_artifacts(mut task: Task) -> Task {
             .iter_mut()
             .find(|a| a.artifact_id == artifact.artifact_id)
         {
-            existing.parts.extend(artifact.parts);
+            if artifact
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("type"))
+                .and_then(serde_json::Value::as_str)
+                == Some("workflow")
+            {
+                *existing = artifact;
+            } else {
+                existing.parts.extend(artifact.parts);
+            }
         } else {
             merged.push(artifact);
         }
