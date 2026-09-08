@@ -14,7 +14,7 @@ use aura_cli::ui::prompt::AgentHost;
 /// template resolution has overrides.
 ///
 /// Returns whether the process is running standalone or not.
-fn resolve_env_config(args: &Args) -> bool {
+fn resolve_env_config(_args: &Args) -> bool {
     // Loads .env so a config's {{ env.* }} references resolve without manual
     // exporting. CWD first, then the config file's directory (init writes
     // .env next to the config). dotenvy never overwrites — shell exports and
@@ -24,7 +24,7 @@ fn resolve_env_config(args: &Args) -> bool {
     // `resolve_standalone` reads AURA_API_URL from the process environment, so
     // it must run after the CWD `.env` is loaded.
     #[cfg(feature = "standalone-cli")]
-    let is_standalone = aura_cli::cli::resolve_standalone(args);
+    let is_standalone = aura_cli::cli::resolve_standalone(_args);
     #[cfg(not(feature = "standalone-cli"))]
     let is_standalone = false;
 
@@ -33,7 +33,7 @@ fn resolve_env_config(args: &Args) -> bool {
     // is ignored here — the backend reports it.
     #[cfg(feature = "standalone-cli")]
     if is_standalone
-        && let Ok(path) = aura_cli::agent_config::resolve(args.agent_config.as_deref())
+        && let Ok(path) = aura_cli::agent_config::resolve(_args.agent_config.as_deref())
         && let Some(dir) = aura_cli::agent_config::env_dir(&path)
     {
         dotenvy::from_path(dir.join(".env")).ok();
