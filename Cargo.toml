@@ -32,9 +32,8 @@ license = "Apache-2.0"
 repository = "https://github.com/mezmo/aura"
 
 [profile.release]
-# prefer thin lto until runtime performance warrants optimizations
-lto = "thin"
-codegen-units = 1
+# Stripping is the only size optimization worth its build cost; see #668 for
+# the lto / codegen-units measurements.
 strip = "symbols"
 
 [workspace.dependencies]
