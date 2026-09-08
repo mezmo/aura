@@ -18,6 +18,13 @@ on:
         required: false
         default: false
         type: boolean
+  # TEMPORARY: remove before merging. schedule only fires on the default
+  # branch and workflow_dispatch only appears once the file is on it, so a
+  # push trigger is the only way to exercise this on a runner beforehand.
+  # No paths filter, so any push to the branch re-runs it.
+  push:
+    branches:
+      - "justingross/GH-648-sync-cloudsmith-download-totals-to-posthog"
   pull_request:
     paths:
       - "scripts/sync-cloudsmith-downloads.sh"
