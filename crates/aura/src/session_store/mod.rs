@@ -92,6 +92,12 @@ pub trait ApprovalStore: Send + Sync {
         &self,
         request_id: &str,
     ) -> Result<Vec<ParkedApproval>, SessionStoreError>;
+
+    /// List every parked approval that is undecided and non-expired
+    /// (`expires_at > now`). No ordering guarantee. The poll reconciler's
+    /// scan source; decided records (resolve moves or drops them) and
+    /// expired records are never returned.
+    async fn list_pending(&self) -> Result<Vec<ParkedApproval>, SessionStoreError>;
 }
 
 /// The payload stream returned by [`EventBus::subscribe`].

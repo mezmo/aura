@@ -79,6 +79,27 @@ async fn file_battery_cancel_request_removes_only_matching() {
     common::cancel_request_removes_only_matching(&instance_a).await;
 }
 
+#[tokio::test]
+async fn file_battery_list_pending_returns_only_live_undecided() {
+    let dir = tempfile::tempdir().unwrap();
+    let (instance_a, instance_b) = file_pair(&dir);
+    common::list_pending_returns_only_live_undecided(&instance_a, &instance_b).await;
+}
+
+#[tokio::test]
+async fn file_battery_list_pending_empty_store_returns_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    let (instance_a, _) = file_pair(&dir);
+    common::list_pending_empty_store_returns_empty(&instance_a).await;
+}
+
+#[tokio::test]
+async fn file_battery_list_pending_excludes_expired() {
+    let dir = tempfile::tempdir().unwrap();
+    let (instance_a, instance_b) = file_pair(&dir);
+    common::list_pending_excludes_expired(&instance_a, &instance_b).await;
+}
+
 // ---------------------------------------------------------------------------
 // Shared battery vs the memory backend (uniform contract, no Docker)
 // ---------------------------------------------------------------------------
@@ -117,6 +138,24 @@ async fn memory_battery_remove_makes_resolve_not_found() {
 async fn memory_battery_cancel_request_removes_only_matching() {
     let (instance_a, _) = memory_pair();
     common::cancel_request_removes_only_matching(&instance_a).await;
+}
+
+#[tokio::test]
+async fn memory_battery_list_pending_returns_only_live_undecided() {
+    let (instance_a, instance_b) = memory_pair();
+    common::list_pending_returns_only_live_undecided(&instance_a, &instance_b).await;
+}
+
+#[tokio::test]
+async fn memory_battery_list_pending_empty_store_returns_empty() {
+    let (instance_a, _) = memory_pair();
+    common::list_pending_empty_store_returns_empty(&instance_a).await;
+}
+
+#[tokio::test]
+async fn memory_battery_list_pending_excludes_expired() {
+    let (instance_a, instance_b) = memory_pair();
+    common::list_pending_excludes_expired(&instance_a, &instance_b).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -347,6 +386,59 @@ async fn cancel_request_skips_an_undecodable_approval_file() {
             .exists()
     );
     assert!(corrupt.exists(), "the undecodable file is left in place");
+}
+
+/// A corrupt record in `approvals/` is warn-and-skipped by `list_pending`
+/// too: the reconciler's scan still returns the decodable live sibling.
+#[tokio::test]
+async fn list_pending_skips_an_undecodable_approval_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = FileApprovalStore::open(dir.path()).unwrap();
+    let parked = make_parked("req-poll-corrupt", Duration::from_secs(60));
+    let id = parked.request.decision_id;
+    store.register(parked).await.unwrap();
+    let corrupt = dir.path().join("approvals").join("corrupt.json");
+    std::fs::write(&corrupt, b"not json").unwrap();
+
+    let pending = store.list_pending().await.unwrap();
+
+    let ids: Vec<_> = pending.iter().map(|p| p.request.decision_id).collect();
+    assert_eq!(ids, [id], "the corrupt file must not fail the scan");
+    assert!(corrupt.exists(), "the undecodable file is left in place");
+}
+
+/// The residue of resolve's best-effort approval unlink — a stale approval
+/// file whose decision file exists — never re-enters the reconciler's scan:
+/// the recorded decision owns the outcome.
+#[tokio::test]
+async fn list_pending_skips_a_stale_decided_approval() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = FileApprovalStore::open(dir.path()).unwrap();
+    let live = make_parked("req-poll-live", Duration::from_secs(60));
+    let live_id = live.request.decision_id;
+    store.register(live).await.unwrap();
+    let decided = make_parked("req-poll-residue", Duration::from_secs(60));
+    let decided_id = decided.request.decision_id;
+    let residue = serde_json::to_vec(&ParkedApprovalRecord::from(&decided)).unwrap();
+    store.register(decided).await.unwrap();
+    store
+        .resolve(&decided_id, ApprovalDecision::Approved)
+        .await
+        .unwrap();
+
+    // Resolve's approval unlink failed: put the residue back.
+    std::fs::write(
+        dir.path()
+            .join("approvals")
+            .join(format!("{decided_id}.json")),
+        residue,
+    )
+    .unwrap();
+
+    let pending = store.list_pending().await.unwrap();
+
+    let ids: Vec<_> = pending.iter().map(|p| p.request.decision_id).collect();
+    assert_eq!(ids, [live_id], "the decided residue must not be listed");
 }
 
 /// A read-only `approvals/` directory must not fail `resolve`: the decision

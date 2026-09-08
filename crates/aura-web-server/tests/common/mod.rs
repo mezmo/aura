@@ -164,3 +164,50 @@ pub async fn cancel_request_removes_only_matching(instance: &Arc<dyn ApprovalSto
     assert!(instance.get(&cancel_id).await.unwrap().is_none());
     assert!(instance.get(&keep_id).await.unwrap().is_some());
 }
+
+/// The poll reconciler's scan source: `list_pending` returns exactly the
+/// parked, undecided tickets — a resolved sibling is never listed.
+pub async fn list_pending_returns_only_live_undecided(
+    instance_a: &Arc<dyn ApprovalStore>,
+    instance_b: &Arc<dyn ApprovalStore>,
+) {
+    let resolved = make_parked("req-poll-resolved", Duration::from_secs(60));
+    let resolved_id = resolved.request.decision_id;
+    let live = make_parked("req-poll-live", Duration::from_secs(60));
+    let live_id = live.request.decision_id;
+    instance_a.register(resolved).await.unwrap();
+    instance_a.register(live).await.unwrap();
+    instance_b
+        .resolve(&resolved_id, ApprovalDecision::Approved)
+        .await
+        .unwrap();
+
+    let pending = instance_a.list_pending().await.unwrap();
+
+    let ids: Vec<DecisionId> = pending.iter().map(|p| p.request.decision_id).collect();
+    assert_eq!(ids, [live_id], "exactly the undecided ticket is listed");
+}
+
+/// An empty store lists nothing.
+pub async fn list_pending_empty_store_returns_empty(instance: &Arc<dyn ApprovalStore>) {
+    assert!(instance.list_pending().await.unwrap().is_empty());
+}
+
+/// Expired tickets are never listed, even where the backend retains them
+/// (the file store keeps them until remove; Redis floors the record TTL).
+pub async fn list_pending_excludes_expired(
+    instance_a: &Arc<dyn ApprovalStore>,
+    instance_b: &Arc<dyn ApprovalStore>,
+) {
+    let mut expired = make_parked("req-poll-expired", Duration::from_secs(60));
+    expired.expires_at = chrono::Utc::now() - chrono::Duration::seconds(1);
+    let live = make_parked("req-poll-live", Duration::from_secs(60));
+    let live_id = live.request.decision_id;
+    instance_a.register(expired).await.unwrap();
+    instance_a.register(live).await.unwrap();
+
+    let pending = instance_b.list_pending().await.unwrap();
+
+    let ids: Vec<DecisionId> = pending.iter().map(|p| p.request.decision_id).collect();
+    assert_eq!(ids, [live_id], "the expired ticket must not be listed");
+}

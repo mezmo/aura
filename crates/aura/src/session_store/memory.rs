@@ -113,6 +113,19 @@ impl ApprovalStore for InMemoryApprovalStore {
             .collect();
         Ok(cleared)
     }
+
+    async fn list_pending(&self) -> Result<Vec<ParkedApproval>, SessionStoreError> {
+        // The map self-prunes only decided entries; expired tickets stay
+        // until resolve/remove, so the contract filter repeats here.
+        let now = chrono::Utc::now();
+        let entries = self.lock();
+        let pending = entries
+            .values()
+            .filter(|parked| parked.expires_at > now)
+            .cloned()
+            .collect();
+        Ok(pending)
+    }
 }
 
 /// A local `tokio::broadcast` registry keyed by topic. Single-instance pub/sub:
@@ -331,6 +344,43 @@ mod tests {
         assert_eq!(cleared[0].request.decision_id, cancel_id);
         assert!(store.get(&keep_id).await.unwrap().is_some());
         assert_eq!(store.lock().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn approval_store_list_pending_returns_only_live_undecided() {
+        let store = InMemoryApprovalStore::new();
+        let resolved = parked("req-poll-resolved");
+        let resolved_id = resolved.request.decision_id;
+        let live = parked("req-poll-live");
+        let live_id = live.request.decision_id;
+        store.register(resolved).await.unwrap();
+        store.register(live).await.unwrap();
+        store
+            .resolve(&resolved_id, ApprovalDecision::Approved)
+            .await
+            .unwrap();
+
+        let pending = store.list_pending().await.unwrap();
+
+        let ids: Vec<DecisionId> = pending.iter().map(|p| p.request.decision_id).collect();
+        assert_eq!(ids, [live_id], "exactly the undecided ticket is listed");
+    }
+
+    /// `list_pending` filters expired tickets the map still holds.
+    #[tokio::test]
+    async fn approval_store_list_pending_excludes_expired() {
+        let store = InMemoryApprovalStore::new();
+        let mut expired = parked("req-poll-expired");
+        expired.expires_at = chrono::Utc::now() - chrono::Duration::seconds(1);
+        let live = parked("req-poll-live");
+        let live_id = live.request.decision_id;
+        store.register(expired).await.unwrap();
+        store.register(live).await.unwrap();
+
+        let pending = store.list_pending().await.unwrap();
+
+        let ids: Vec<DecisionId> = pending.iter().map(|p| p.request.decision_id).collect();
+        assert_eq!(ids, [live_id], "the expired ticket must not be listed");
     }
 
     #[tokio::test]

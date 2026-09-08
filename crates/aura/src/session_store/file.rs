@@ -20,6 +20,10 @@
 //! - `cancel_request` removes undecided approvals by owner (request) id and
 //!   returns them; decided entries are retained until their consumer removes
 //!   them.
+//! - `list_pending` scans the undecided approvals for the poll reconciler:
+//!   corrupt files are warn-and-skipped per id, a stale approval file whose
+//!   decision file exists is skipped (the recorded decision owns the
+//!   outcome), and expired records are filtered.
 //!
 //! Decision ids are validated as UUIDs before path building, so none address
 //! outside the root.
@@ -325,6 +329,56 @@ impl Inner {
         }
         Ok(cleared)
     }
+
+    fn list_pending_sync(&self) -> Result<Vec<ParkedApproval>, SessionStoreError> {
+        let _guard = self.lock();
+        let entries = match fs::read_dir(self.approvals_dir()) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) => return Err(request_err(err)),
+        };
+        let now = chrono::Utc::now();
+
+        let mut pending = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(request_err)?;
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                // A mid-publish temp file, never a stored approval.
+                continue;
+            }
+            let bytes = match fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(request_err(err)),
+            };
+            // A corrupt record must not fail the whole scan.
+            let parked = match decode_approval(&bytes) {
+                Ok(parked) => parked,
+                Err(err) => {
+                    tracing::warn!(
+                        path = %path.display(), error = %err,
+                        "undecodable approval file skipped by list_pending"
+                    );
+                    continue;
+                }
+            };
+            // resolve writes the decision before its best-effort approval
+            // unlink, so a decision file here marks the residue of an
+            // already-decided id: the reconciler must not re-poll it.
+            if self
+                .decision_path(&parked.request.decision_id.to_string())
+                .try_exists()
+                .map_err(request_err)?
+            {
+                continue;
+            }
+            if parked.expires_at > now {
+                pending.push(parked);
+            }
+        }
+        Ok(pending)
+    }
 }
 
 #[async_trait]
@@ -382,6 +436,13 @@ impl ApprovalStore for FileApprovalStore {
         let inner = Arc::clone(&self.inner);
         let request_id = request_id.to_owned();
         spawn_blocking(move || inner.cancel_request_sync(&request_id))
+            .await
+            .map_err(join_err)?
+    }
+
+    async fn list_pending(&self) -> Result<Vec<ParkedApproval>, SessionStoreError> {
+        let inner = Arc::clone(&self.inner);
+        spawn_blocking(move || inner.list_pending_sync())
             .await
             .map_err(join_err)?
     }

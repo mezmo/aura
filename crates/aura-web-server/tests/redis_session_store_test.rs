@@ -422,6 +422,66 @@ async fn approval_cancel_request_removes_only_matching() {
     common::cancel_request_removes_only_matching(&approvals).await;
 }
 
+#[tokio::test]
+async fn approval_list_pending_returns_only_live_undecided() {
+    let config = test_config(60);
+    let instance_a = connect(&config).await.approvals();
+    let instance_b = connect(&config).await.approvals();
+    common::list_pending_returns_only_live_undecided(&instance_a, &instance_b).await;
+}
+
+#[tokio::test]
+async fn approval_list_pending_empty_store_returns_empty() {
+    let approvals = connect(&test_config(60)).await.approvals();
+    common::list_pending_empty_store_returns_empty(&approvals).await;
+}
+
+/// An expired record still inside its MIN_TTL_SECS floor must not be
+/// listed: the post-decode filter backs the native TTL.
+#[tokio::test]
+async fn approval_list_pending_excludes_expired() {
+    let config = test_config(60);
+    let instance_a = connect(&config).await.approvals();
+    let instance_b = connect(&config).await.approvals();
+    common::list_pending_excludes_expired(&instance_a, &instance_b).await;
+}
+
+/// A wrong-typed key and an undecodable value in the approval subspace are
+/// skipped per id: neither fails the scan nor hides the genuine records.
+#[tokio::test]
+async fn approval_list_pending_skips_wrong_typed_and_undecodable_keys() {
+    let config = test_config(60);
+    let approvals = connect(&config).await.approvals();
+    let parked = make_parked("req-list-skips", std::time::Duration::from_secs(60));
+    let live_id = parked.request.decision_id;
+    approvals.register(parked).await.unwrap();
+
+    let client = redis::Client::open(redis_url()).unwrap();
+    let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+    let prefix = &config.key_prefix;
+    // A set-typed key in the record subspace: the per-key GET TypeErrors.
+    let wrong_typed = format!("{prefix}:approval:{}", uuid::Uuid::new_v4());
+    redis::cmd("SADD")
+        .arg(&wrong_typed)
+        .arg("x")
+        .query_async::<()>(&mut conn)
+        .await
+        .unwrap();
+    // A string key whose value is not a decodable parked record.
+    let undecodable = format!("{prefix}:approval:{}", uuid::Uuid::new_v4());
+    redis::cmd("SET")
+        .arg(&undecodable)
+        .arg("not a parked approval")
+        .query_async::<()>(&mut conn)
+        .await
+        .unwrap();
+
+    let pending = approvals.list_pending().await.unwrap();
+
+    let ids: Vec<_> = pending.iter().map(|p| p.request.decision_id).collect();
+    assert_eq!(ids, [live_id], "only the genuine record is listed");
+}
+
 /// `cancel_request` returns exactly the records it cleared; a decided
 /// sibling of the same owner is absent, and a cleared ticket refuses a later
 /// resolve.
@@ -694,6 +754,19 @@ async fn approval_expires_with_its_record_ttl() {
         approvals.resolve(&id, ApprovalDecision::Approved).await,
         Err(ResolveError::NotFound)
     );
+}
+
+/// Native TTL expiry removes the record outright: the `list_pending` scan
+/// sees neither the key nor a residue.
+#[tokio::test]
+async fn approval_list_pending_excludes_a_natively_expired_record() {
+    let approvals = connect(&test_config(60)).await.approvals();
+    let parked = make_parked("req-poll-ttl", Duration::from_secs(1));
+    approvals.register(parked).await.unwrap();
+
+    tokio::time::sleep(Duration::from_millis(1600)).await;
+
+    assert!(approvals.list_pending().await.unwrap().is_empty());
 }
 
 // ---------------------------------------------------------------------------
