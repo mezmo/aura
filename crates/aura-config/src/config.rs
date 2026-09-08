@@ -432,6 +432,12 @@ impl Config {
 
         if let Some(orch) = &self.orchestration {
             orch.validate_worker_names()?;
+            orch.validate_stages()?;
+            if !orch.stages.is_empty() && self.effective_memory_dir().is_none() {
+                return Err(crate::ConfigError::Validation(
+                    "configured workflow stages require memory_dir".into(),
+                ));
+            }
         }
 
         Ok(())

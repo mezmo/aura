@@ -311,6 +311,8 @@ impl Default for ArtifactsConfig {
 /// `artifacts.memory_dir`).
 #[derive(Debug, Clone, Serialize)]
 pub struct OrchestrationConfig {
+    /// Ordered stages; empty retains model-directed orchestration.
+    pub stages: Vec<crate::workflow::WorkflowStage>,
     // --- Mode ---
     /// Whether orchestration mode is enabled.
     /// When false (default), standard single-agent streaming is used.
@@ -371,6 +373,7 @@ impl Default for OrchestrationConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            stages: Vec::new(),
             max_planning_cycles: default_max_planning_cycles(),
             max_plan_parse_retries: default_max_plan_parse_retries(),
             worker_system_prompt: None,
@@ -540,6 +543,8 @@ impl OrchestrationConfig {
 #[derive(Deserialize)]
 struct RawOrchestrationConfig {
     #[serde(default)]
+    stages: Vec<crate::workflow::WorkflowStage>,
+    #[serde(default)]
     enabled: bool,
     #[serde(default = "default_max_planning_cycles")]
     max_planning_cycles: usize,
@@ -623,6 +628,7 @@ impl<'de> Deserialize<'de> for OrchestrationConfig {
 
         Ok(OrchestrationConfig {
             enabled: raw.enabled,
+            stages: raw.stages,
             max_planning_cycles: raw.max_planning_cycles,
             max_plan_parse_retries: raw.max_plan_parse_retries,
             worker_system_prompt: raw.worker_system_prompt,
