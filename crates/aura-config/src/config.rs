@@ -409,6 +409,33 @@ impl Config {
         // Scratchpad validation
         self.validate_scratchpad()?;
 
+        // Poll delivery is reconciler-driven, so it has no in-flight request
+        // to attach request-derived headers to and needs park mode to hold
+        // long-lived approvals.
+        if let Some(hitl) = &self.hitl
+            && let DecisionRouteConfig::Webhook {
+                delivery: WebhookDelivery::Poll,
+                headers_from_request,
+                ..
+            } = &hitl.route
+        {
+            if !hitl.park.enabled {
+                return Err(crate::ConfigError::Validation(
+                    "`hitl.route.delivery = \"poll\"` requires `hitl.park.enabled = true`: \
+                     poll approvals may be long-lived and requests are never held open"
+                        .to_string(),
+                ));
+            }
+            if !headers_from_request.is_empty() {
+                return Err(crate::ConfigError::Validation(
+                    "`hitl.route.headers_from_request` is unsupported with \
+                     `hitl.route.delivery = \"poll\"`: request-derived headers cannot be \
+                     reconstructed by the background reconciler after a restart"
+                        .to_string(),
+                ));
+            }
+        }
+
         if let (Some(hitl), Some(orch)) = (
             &self.hitl,
             self.orchestration.as_ref().filter(|o| o.enabled),
@@ -1112,6 +1139,10 @@ mod tests {
                 headers: HashMap::new(),
                 headers_from_request: HashMap::new(),
                 tool_headers_from_response: ToolHeaderMappings::default(),
+                delivery: WebhookDelivery::default(),
+                poll_url: None,
+                poll_interval_secs: default_poll_interval_secs(),
+                poll_request_timeout_secs: default_poll_request_timeout_secs(),
             },
         };
         assert!(hitl_timeout_conflict_warning(&hitl, 0).is_none());
@@ -1145,6 +1176,10 @@ mod tests {
                 headers: HashMap::new(),
                 headers_from_request: HashMap::new(),
                 tool_headers_from_response: ToolHeaderMappings::default(),
+                delivery: WebhookDelivery::default(),
+                poll_url: None,
+                poll_interval_secs: default_poll_interval_secs(),
+                poll_request_timeout_secs: default_poll_request_timeout_secs(),
             },
         };
         assert!(hitl_timeout_conflict_warning(&hitl, 60).is_none());
@@ -1161,6 +1196,10 @@ mod tests {
                 headers: HashMap::new(),
                 headers_from_request: HashMap::new(),
                 tool_headers_from_response: ToolHeaderMappings::default(),
+                delivery: WebhookDelivery::default(),
+                poll_url: None,
+                poll_interval_secs: default_poll_interval_secs(),
+                poll_request_timeout_secs: default_poll_request_timeout_secs(),
             },
         };
         let msg = hitl_timeout_conflict_warning(&hitl, 60).unwrap();
@@ -1179,6 +1218,10 @@ mod tests {
                 headers: HashMap::new(),
                 headers_from_request: HashMap::new(),
                 tool_headers_from_response: ToolHeaderMappings::default(),
+                delivery: WebhookDelivery::default(),
+                poll_url: None,
+                poll_interval_secs: default_poll_interval_secs(),
+                poll_request_timeout_secs: default_poll_request_timeout_secs(),
             },
         };
         let msg = hitl_timeout_conflict_warning(&hitl, 60).unwrap();
@@ -1242,6 +1285,228 @@ mode = "conversational"
 "#;
         let hitl: HitlConfig = toml::from_str(toml).unwrap();
         assert!(!hitl.park.enabled);
+    }
+
+    // -------------------------------------------------------------------
+    // [hitl.route] delivery
+    // -------------------------------------------------------------------
+
+    /// A webhook route without `delivery` parses as sync: the POST response
+    /// carries the decision, unchanged from before the field existed.
+    #[test]
+    fn hitl_webhook_delivery_defaults_to_sync() {
+        let toml = r#"
+require_approval = ["kubectl_*"]
+
+[route]
+mode = "webhook"
+url = "https://approvals.example.com/decide"
+"#;
+        let hitl: HitlConfig = toml::from_str(toml).unwrap();
+        match hitl.route {
+            DecisionRouteConfig::Webhook { delivery, .. } => {
+                assert_eq!(delivery, WebhookDelivery::Sync);
+            }
+            other => panic!("expected Webhook route, got {:?}", other),
+        }
+    }
+
+    /// `delivery = "poll"` parses with its defaults: 10s poll interval, 30s
+    /// per-attempt timeout, and an unresolved `poll_url` (None means poll
+    /// `url` itself).
+    #[test]
+    fn hitl_webhook_poll_delivery_parses_with_defaults() {
+        let toml = r#"
+require_approval = ["kubectl_*"]
+
+[route]
+mode = "webhook"
+url = "https://approvals.example.com/decide"
+delivery = "poll"
+"#;
+        let hitl: HitlConfig = toml::from_str(toml).unwrap();
+        match hitl.route {
+            DecisionRouteConfig::Webhook {
+                delivery,
+                poll_url,
+                poll_interval_secs,
+                poll_request_timeout_secs,
+                ..
+            } => {
+                assert_eq!(delivery, WebhookDelivery::Poll);
+                assert!(poll_url.is_none(), "poll_url defaults to unresolved");
+                assert_eq!(poll_interval_secs, 10);
+                assert_eq!(poll_request_timeout_secs, 30);
+            }
+            other => panic!("expected Webhook route, got {:?}", other),
+        }
+    }
+
+    /// Explicit poll fields survive a serialize → deserialize round trip.
+    #[test]
+    fn hitl_webhook_poll_fields_round_trip() {
+        let toml = r#"
+require_approval = ["kubectl_*"]
+
+[route]
+mode = "webhook"
+url = "https://approvals.example.com/decide"
+delivery = "poll"
+poll_url = "https://status.example.com/decisions"
+poll_interval_secs = 5
+poll_request_timeout_secs = 45
+"#;
+        let parse_fields = |hitl: HitlConfig| match hitl.route {
+            DecisionRouteConfig::Webhook {
+                delivery,
+                poll_url,
+                poll_interval_secs,
+                poll_request_timeout_secs,
+                ..
+            } => (
+                delivery,
+                poll_url.map(|u| u.as_str().to_owned()),
+                poll_interval_secs,
+                poll_request_timeout_secs,
+            ),
+            other => panic!("expected Webhook route, got {other:?}"),
+        };
+
+        let hitl: HitlConfig = toml::from_str(toml).unwrap();
+        let (delivery, poll_url, interval, request_timeout) = parse_fields(hitl.clone());
+        assert_eq!(delivery, WebhookDelivery::Poll);
+        assert_eq!(poll_url.as_deref(), Some("https://status.example.com/decisions"));
+        assert_eq!(interval, 5);
+        assert_eq!(request_timeout, 45);
+
+        let round_tripped: HitlConfig =
+            toml::from_str(&toml::to_string(&hitl).unwrap()).unwrap();
+        assert_eq!(
+            parse_fields(hitl),
+            parse_fields(round_tripped),
+            "explicit poll fields must survive a round trip"
+        );
+    }
+
+    /// Poll delivery without park mode is rejected: poll approvals may be
+    /// long-lived and requests are never held open in flight.
+    #[test]
+    fn validate_rejects_poll_delivery_without_park() {
+        let config = r#"
+[agent]
+name = "Test"
+system_prompt = "test"
+
+[agent.llm]
+provider = "openai"
+api_key = "test"
+model = "gpt-4o"
+
+[hitl]
+require_approval = ["kubectl_*"]
+
+[hitl.route]
+mode = "webhook"
+url = "https://approvals.example.com/decide"
+delivery = "poll"
+"#;
+        let err = crate::load_config_from_str(config)
+            .expect_err("poll delivery without park mode must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("hitl.route.delivery") && msg.contains("hitl.park.enabled"),
+            "error must name both keys: {msg}"
+        );
+    }
+
+    /// Request-derived headers cannot be reconstructed by the background
+    /// reconciler after a restart, so they are rejected with poll delivery.
+    #[test]
+    fn validate_rejects_poll_delivery_with_headers_from_request() {
+        let config = r#"
+[agent]
+name = "Test"
+system_prompt = "test"
+
+[agent.llm]
+provider = "openai"
+api_key = "test"
+model = "gpt-4o"
+
+[hitl]
+require_approval = ["kubectl_*"]
+
+[hitl.park]
+enabled = true
+
+[hitl.route]
+mode = "webhook"
+url = "https://approvals.example.com/decide"
+delivery = "poll"
+headers_from_request = { "authorization" = "authorization" }
+"#;
+        let err = crate::load_config_from_str(config)
+            .expect_err("headers_from_request with poll delivery must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("hitl.route.headers_from_request"),
+            "error must name the key: {msg}"
+        );
+    }
+
+    /// Poll + park + no `headers_from_request` is the supported poll
+    /// posture; `tool_headers_from_response` (approver identity) stays
+    /// allowed in this mode.
+    #[test]
+    fn validate_accepts_poll_delivery_with_park() {
+        let config = r#"
+[agent]
+name = "Test"
+system_prompt = "test"
+
+[agent.llm]
+provider = "openai"
+api_key = "test"
+model = "gpt-4o"
+
+[hitl]
+require_approval = ["kubectl_*"]
+
+[hitl.park]
+enabled = true
+
+[hitl.route]
+mode = "webhook"
+url = "https://approvals.example.com/decide"
+delivery = "poll"
+tool_headers_from_response = { "X-Forwarded-User" = "X-Approver-Id" }
+"#;
+        crate::load_config_from_str(config)
+            .expect("poll delivery with park mode and no request-derived headers is valid");
+    }
+
+    /// Sync delivery keeps working without park mode (unchanged behavior).
+    #[test]
+    fn validate_accepts_sync_delivery_without_park() {
+        let config = r#"
+[agent]
+name = "Test"
+system_prompt = "test"
+
+[agent.llm]
+provider = "openai"
+api_key = "test"
+model = "gpt-4o"
+
+[hitl]
+require_approval = ["kubectl_*"]
+
+[hitl.route]
+mode = "webhook"
+url = "https://approvals.example.com/decide"
+"#;
+        crate::load_config_from_str(config)
+            .expect("sync webhook without park mode must stay valid");
     }
 
     #[test]
@@ -1464,6 +1729,9 @@ pub struct ParkConfig {
 /// URL, so the "url required, never empty" invariant holds structurally.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
+// Parsed once at startup and never moved in a hot path; shrinking the webhook
+// variant with boxes is not worth the serde and call-site churn.
+#[allow(clippy::large_enum_variant)]
 pub enum DecisionRouteConfig {
     /// Attended: the approver is already at the client (default timeout 60s).
     Conversational {
@@ -1485,7 +1753,50 @@ pub enum DecisionRouteConfig {
         /// Outbound MCP header name → webhook approval-response header name.
         #[serde(default, skip_serializing_if = "ToolHeaderMappings::is_empty")]
         tool_headers_from_response: ToolHeaderMappings,
+        /// Sync (default) reads the decision off the POST response; poll
+        /// treats the POST as an ack-only notification and the reconciler
+        /// polls the status endpoint for the decision.
+        #[serde(default, skip_serializing_if = "WebhookDelivery::is_sync")]
+        delivery: WebhookDelivery,
+        /// Status endpoint the reconciler polls for the decision. `None`
+        /// polls `url` itself; resolution happens at route construction,
+        /// not at parse.
+        #[serde(default)]
+        poll_url: Option<WebhookUrl>,
+        /// Seconds between reconciler polls of the status endpoint.
+        #[serde(
+            default = "default_poll_interval_secs",
+            skip_serializing_if = "is_default_poll_interval_secs"
+        )]
+        poll_interval_secs: u64,
+        /// Per-attempt HTTP timeout bounding each notify/poll request;
+        /// `timeout_secs` remains the approval TTL.
+        #[serde(
+            default = "default_poll_request_timeout_secs",
+            skip_serializing_if = "is_default_poll_request_timeout_secs"
+        )]
+        poll_request_timeout_secs: u64,
     },
+}
+
+/// How the webhook route delivers an approval decision.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WebhookDelivery {
+    /// Synchronous: the POST response carries the decision.
+    #[default]
+    Sync,
+    /// Asynchronous: the POST is an ack-only notification; a reconciler
+    /// polls `poll_url` for the decision.
+    Poll,
+}
+
+impl WebhookDelivery {
+    /// True for the synchronous delivery mode (the serde skip condition).
+    #[must_use]
+    pub fn is_sync(&self) -> bool {
+        matches!(self, Self::Sync)
+    }
 }
 
 /// Transport-owned header names a `tool_headers_from_response` mapping may
@@ -1580,6 +1891,22 @@ fn default_conversational_timeout_secs() -> u64 {
 
 fn default_webhook_timeout_secs() -> u64 {
     300
+}
+
+fn default_poll_interval_secs() -> u64 {
+    10
+}
+
+fn is_default_poll_interval_secs(value: &u64) -> bool {
+    *value == default_poll_interval_secs()
+}
+
+fn default_poll_request_timeout_secs() -> u64 {
+    30
+}
+
+fn is_default_poll_request_timeout_secs(value: &u64) -> bool {
+    *value == default_poll_request_timeout_secs()
 }
 
 /// A validated webhook URL.
