@@ -183,19 +183,28 @@ Packages are keyed by Cloudsmith's permanent identifier rather than by name and
 version: the same version can be uploaded to several distributions and
 architectures, each counting its own downloads.
 
-Retries are safe. The event UUID is derived from `(repository, package
-identifier, snapshot date)` and the timestamp is pinned to `23:59:59Z` on the
-snapshot date, so re-running a date re-sends byte-identical events that PostHog
-deduplicates. Deduplication is eventual, so reporting should aggregate with
-`max(download_count)` per package and snapshot date — cumulative counts only
-rise, which makes `max` correct while duplicates are still visible.
+Retries cannot add a second snapshot. The event UUID is derived from
+`(repository, package identifier, snapshot date)` and the timestamp is pinned
+to `23:59:59Z` on the snapshot date, which is what PostHog deduplicates on.
+
+Reporting must aggregate with `max(download_count)` per package and snapshot
+date. Deduplication is eventual, so a retry's rows stay visible in the
+meantime, and a retry taken after the counts moved carries a higher count under
+the same key. Cumulative counts only rise, which makes `max` right in both
+cases.
 
 After sending, the script reads the snapshot back and fails if PostHog cannot
 account for every event. This is not belt-and-braces: PostHog answers
 `200 {"status":"Ok"}` to a batch sent with an invalid project token, so an
-unverified send cannot tell success from silent discard. The read-back counts
-distinct event UUIDs rather than rows, because a re-run's rows stay visible
-until PostHog's background merges collapse them.
+unverified send cannot tell success from silent discard.
+
+The read-back checks a package count *and* a download total, taking
+`max(download_count)` per package the way reporting must. The count alone would
+not survive a retry: event UUIDs are derived from the snapshot date, so a
+second run for a date re-sends UUIDs the first run already ingested, and the
+count would be met by those earlier events however completely the retry was
+discarded. Cumulative counts only rise, so requiring the stored total to reach
+the total just collected is what a staler snapshot cannot satisfy.
 
 A run also reports when the previous day holds no snapshot. That is advisory:
 the package list reports only current cumulative counts, so re-running a date
@@ -210,7 +219,7 @@ read fails rather than returning a shorter list.
 | --- | --- | --- |
 | `--date` / `SNAPSHOT_DATE` | yesterday, UTC | Date the snapshot is filed under. Retrying the same date re-sends the same events; an older date is filed with today's totals. |
 | `--dry-run` / `DRY_RUN=1` | off | Collect from Cloudsmith and build the payload, print the first event, send nothing. Needs no PostHog token. |
-| `--selftest` | off | Run the built-in assertions (UUID vectors, header parsing, payload shape) and exit. Reaches no network. |
+| `--selftest` | off | Run the built-in assertions (UUID vectors, header parsing, date validation, payload shape) and exit. Reaches no network. |
 | `POSTHOG_PROJECT_API_KEY` | unset | PostHog project write token. Required unless `--dry-run`. |
 | `POSTHOG_API_READ_KEY` | unset | Personal API key used to read the snapshot back. Required unless `--dry-run` or `SKIP_VERIFY=1`. |
 | `POSTHOG_PROJECT_ID` | `443794` | Numeric project id the read-back queries. Must be the project the write token belongs to. |
