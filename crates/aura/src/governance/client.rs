@@ -10,9 +10,6 @@ use tracing::info;
 use super::envelope::CatalogEnvelope;
 use crate::hitl::{SigningContext, WebhookHmac};
 
-/// Maximum time to wait for a TCP connection before failing.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-
 /// Errors that can occur while sending a catalog to the governance webhook.
 #[derive(Debug, thiserror::Error)]
 pub enum CatalogError {
@@ -48,18 +45,7 @@ impl CatalogClient {
         req_headers: Option<&HashMap<String, String>>,
         tls: Option<&aura_config::TlsConfig>,
     ) -> Result<Self, CatalogError> {
-        let builder = crate::tls::apply(
-            reqwest::Client::builder().connect_timeout(CONNECT_TIMEOUT),
-            tls,
-        )
-        .expect("bundle bytes were PEM-validated when the config loaded");
-        let client = builder.build().unwrap_or_else(|e| match tls {
-            Some(tls) => panic!(
-                "failed to build TLS client with CA bundle '{}': {e}",
-                tls.ca_bundle.display()
-            ),
-            None => panic!("reqwest client builder only fails on TLS backend init: {e:?}"),
-        });
+        let client = crate::webhook_utils::build_webhook_client(tls);
 
         let headers = crate::webhook_utils::resolve_headers(
             &config.headers,

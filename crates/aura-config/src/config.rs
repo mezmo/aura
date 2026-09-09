@@ -1501,9 +1501,6 @@ tool_headers_from_response = { "Content-Type" = "x-anything" }
         );
     }
 
-    /// rustls-pemfile base64-decodes each section without inspecting DER
-    /// structure, so alphabet-valid base64 bodies stand in for real
-    /// certificates at parse-count level.
     use crate::BASE64_VALID_CERT_PEM as VALID_CERT_PEM;
     const SECOND_CERT_PEM: &str = concat!(
         "-----BEGIN CERTIFICATE-----\n",
@@ -1543,10 +1540,8 @@ tool_headers_from_response = { "Content-Type" = "x-anything" }
             system_prompt = "test"
         "#;
         let config: Config = toml::from_str(toml).unwrap();
-        let tls = config.tls.as_ref().expect("[tls] section should parse");
-        assert_eq!(tls.ca_bundle, std::path::PathBuf::from("x"));
-
-        let mut populated = tls.clone();
+        let mut populated = config.tls.expect("[tls] section should parse");
+        assert_eq!(populated.ca_bundle, std::path::PathBuf::from("x"));
         populated.frozen_bundle = std::sync::Arc::from(b"deadbeef".as_slice());
         let serialized = toml::to_string(&populated).unwrap();
         assert!(

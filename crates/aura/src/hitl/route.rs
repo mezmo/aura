@@ -19,11 +19,6 @@ use super::registry::PendingApprovals;
 use super::signing::{SigningContext, WebhookHmac, authorize_ingress};
 use crate::approval_event_broker::{self, ApprovalLifecycleEvent};
 
-/// Maximum time to wait for a TCP connection to the approval webhook before
-/// failing closed. Without this, an unreachable host can hang the connect
-/// phase for the full route timeout (e.g. 300s).
-const WEBHOOK_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-
 /// Request-stable HITL state shared by the config gate and the agent-callable
 /// tool: the compiled glob patterns and the resolved decision route. Built once
 /// per request in the builder and shared (by `Arc`) across orchestration
@@ -388,23 +383,7 @@ impl DecisionRoute {
     }
 }
 
-/// Build the reqwest client used for approval webhook calls. Sets a short
-/// connect timeout so an unreachable host fails fast instead of hanging for
-/// the full route timeout.
-pub(crate) fn build_webhook_client(tls: Option<&aura_config::TlsConfig>) -> reqwest::Client {
-    let builder = crate::tls::apply(
-        reqwest::Client::builder().connect_timeout(WEBHOOK_CONNECT_TIMEOUT),
-        tls,
-    )
-    .expect("bundle bytes were PEM-validated when the config loaded");
-    builder.build().unwrap_or_else(|e| match tls {
-        Some(tls) => panic!(
-            "failed to build TLS client with CA bundle '{}': {e}",
-            tls.ca_bundle.display()
-        ),
-        None => panic!("reqwest client builder only fails on TLS backend init: {e:?}"),
-    })
-}
+pub(crate) use crate::webhook_utils::build_webhook_client;
 
 /// HMAC signing state for the webhook route.
 enum EgressSigning {

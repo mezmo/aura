@@ -9,11 +9,37 @@
 //! "secret → `WebhookHmac`" construction in one place.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use tracing::{info, warn};
 
+use aura_config::TlsConfig;
+
 use crate::hitl::{ConfigError, PrimarySecret, Tolerance, WebhookHmac};
+
+const WEBHOOK_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Build the reqwest client used for outbound webhook calls. Sets a short
+/// connect timeout so an unreachable host fails fast instead of hanging for
+/// the full route timeout.
+///
+/// `tls` applies the global `[tls]` CA bundle to the webhook's TLS;
+/// `None` keeps the built-in webpki roots.
+pub fn build_webhook_client(tls: Option<&TlsConfig>) -> reqwest::Client {
+    let builder = crate::tls::apply(
+        reqwest::Client::builder().connect_timeout(WEBHOOK_CONNECT_TIMEOUT),
+        tls,
+    )
+    .expect("bundle bytes were PEM-validated when the config loaded");
+    builder.build().unwrap_or_else(|e| match tls {
+        Some(tls) => panic!(
+            "failed to build TLS client with CA bundle '{}': {e}",
+            tls.ca_bundle.display()
+        ),
+        None => panic!("reqwest client builder only fails on TLS backend init: {e:?}"),
+    })
+}
 
 /// Resolve operator-configured webhook headers into a validated [`HeaderMap`]:
 /// `static_headers` overlaid with `headers_from_request` values pulled from the
