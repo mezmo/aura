@@ -192,13 +192,13 @@ post_batch() {
         "${POSTHOG_HOST%/}/batch/" >/dev/null
 }
 
-# Run a HogQL query and print its first scalar result.
+# Run a HogQL query and print the response body.
 #
 # Plain --retry covers the transient cases (timeouts, 429, 5xx) and leaves
 # 4xx alone: an auth or project error repeated four times is noise, and the
 # status is worth naming because every likely cause is a misconfiguration
 # rather than an outage.
-hogql_scalar() {
+hogql_request() {
     local query=$1 response status body
     response=$(jq -n --arg q "${query}" '{query: {kind: "HogQLQuery", query: $q}}' \
         | curl --silent --show-error --retry 3 --retry-delay 2 --max-time 60 \
@@ -216,7 +216,16 @@ hogql_scalar() {
         echo "       and POSTHOG_API_READ_KEY must hold query:read on that project" >&2
         return 1
     fi
-    jq -r '.results[0][0]' <<<"${body}"
+    printf '%s\n' "${body}"
+}
+
+hogql_scalar() {
+    hogql_request "$1" | jq -r '.results[0][0]'
+}
+
+# The whole first row, tab separated.
+hogql_row() {
+    hogql_request "$1" | jq -r '.results[0] | @tsv'
 }
 
 # Count what actually landed. Distinct UUIDs, not rows: PostHog deduplicates
@@ -234,37 +243,57 @@ distinct_events_on() {
     hogql_scalar "$(snapshot_count_query "$1")"
 }
 
-# Count how many of this run's own event UUIDs are queryable at this run's
-# timestamp. A date-wide count would also match UUIDs left by an earlier run
-# whose asset set differed, and those extras can satisfy the threshold while an
-# event from the current payload is still missing. Pinning the timestamp too
-# means a snapshot attributed to the wrong instant cannot read as verified.
+# Report how many of this run's own event UUIDs are queryable at this run's
+# timestamp, and what download total those events carry.
+#
+# The count alone is not enough. A date-wide count would let UUIDs from an
+# earlier run cover for a missing event, and scoping to this run's UUIDs still
+# cannot see a discarded retry whose asset set is unchanged, because the
+# earlier run already ingested those exact UUIDs. The total closes that:
+# counters only rise, so a stale row carries a smaller number than the payload
+# just sent. Pinning the timestamp keeps a snapshot filed against the wrong
+# instant from reading as verified.
 count_ingested() {
-    local date=$1 chunk list total=0 found
+    local date=$1 chunk list row found downloads events=0 total=0
     for chunk in "${WORK_DIR}"/uchunk.*; do
         list=$(sed "s/^/'/; s/$/'/" "${chunk}" | paste -sd, -)
-        found=$(hogql_scalar "SELECT count(DISTINCT uuid) FROM events \
+        row=$(hogql_row "SELECT count(), sum(dl) FROM ( \
+            SELECT uuid, max(toIntOrZero(toString(properties.download_count))) AS dl \
+            FROM events \
             WHERE event = '${EVENT_NAME}' \
               AND timestamp = toDateTime('${date} 23:59:59') \
-              AND uuid IN (${list})")
-        total=$((total + found))
+              AND uuid IN (${list}) \
+            GROUP BY uuid)")
+        found=${row%%$'\t'*}
+        downloads=${row##*$'\t'}
+        for value in "${found}" "${downloads}"; do
+            case "${value}" in
+                '' | *[!0-9]*)
+                    echo "error: PostHog answered the read-back with '${row}', which is not a count and a total" >&2
+                    return 1 ;;
+            esac
+        done
+        events=$(( events + found ))
+        total=$(( total + downloads ))
     done
-    printf '%s\n' "${total}"
+    printf '%s\t%s\n' "${events}" "${total}"
 }
 
 # Poll until the snapshot is queryable, since ingestion lags the send.
 verify_snapshot() {
-    local date=$1 expected=$2 deadline got
+    local date=$1 expected=$2 expected_downloads=$3 deadline row got downloads
     split -l 500 "${WORK_DIR}/uuids" "${WORK_DIR}/uchunk."
     deadline=$(( $(date +%s) + VERIFY_TIMEOUT ))
     while :; do
-        got=$(count_ingested "${date}")
-        if [ "${got}" -ge "${expected}" ]; then
-            echo "Verified ${got} of ${expected} event(s) queryable in PostHog for ${date}"
+        row=$(count_ingested "${date}")
+        got=${row%%$'\t'*}
+        downloads=${row##*$'\t'}
+        if [ "${got}" -ge "${expected}" ] && [ "${downloads}" -ge "${expected_downloads}" ]; then
+            echo "Verified ${got} of ${expected} event(s) and ${downloads} download(s) in PostHog for ${date}"
             return 0
         fi
         if [ "$(date +%s)" -ge "${deadline}" ]; then
-            echo "error: PostHog holds ${got} of ${expected} event(s) for ${date} after ${VERIFY_TIMEOUT}s" >&2
+            echo "error: PostHog holds ${got} of ${expected} event(s) and ${downloads} of ${expected_downloads} download(s) for ${date} after ${VERIFY_TIMEOUT}s" >&2
             return 1
         fi
         sleep 5
@@ -414,7 +443,9 @@ main() {
         echo "Skipping read-back verification (SKIP_VERIFY=1)"
         return 0
     fi
-    verify_snapshot "${date}" "${assets}"
+    local expected_downloads
+    expected_downloads=$(jq -s '[.[].download_count] | add' "${WORK_DIR}/assets.ndjson")
+    verify_snapshot "${date}" "${assets}" "${expected_downloads}"
     # Advisory only: a missing earlier day is worth reporting but is not a
     # failure of this run, and cannot be repaired by retrying it.
     warn_on_gap "${date}" || true
