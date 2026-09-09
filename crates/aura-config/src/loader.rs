@@ -269,14 +269,7 @@ mod tests {
         assert!(result.is_err());
     }
 
-    /// Base64-valid fixture body: rustls-pemfile does not inspect DER
-    /// structure, so stage-1 validation accepts it. Real-DER handling is
-    /// covered by the aura crate's live TLS tests.
-    const TEST_CA_PEM: &str = concat!(
-        "-----BEGIN CERTIFICATE-----\n",
-        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n",
-        "-----END CERTIFICATE-----\n",
-    );
+    use crate::BASE64_VALID_CERT_PEM as TEST_CA_PEM;
 
     #[test]
     fn build_hard_fails_on_garbage_ca_bundle() {

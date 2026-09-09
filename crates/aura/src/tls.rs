@@ -12,10 +12,9 @@ use aura_config::TlsConfig;
 ///
 /// Each certificate in `tls.frozen_bundle` is added as an extra trust root;
 /// built-in roots are never removed, so publicly-rooted endpoints keep
-/// working. `None` or an empty `frozen_bundle` returns the builder
-/// unchanged. Failures name the configured `ca_bundle` path. DER validity
-/// is enforced later, when the built client's root store parses each
-/// certificate.
+/// working. `None` adds no roots. Failures name the configured `ca_bundle`
+/// path. DER validity is enforced later, when the built client's root store
+/// parses each certificate.
 pub fn apply(
     builder: reqwest::ClientBuilder,
     tls: Option<&TlsConfig>,
@@ -23,9 +22,6 @@ pub fn apply(
     let Some(tls) = tls else {
         return Ok(builder);
     };
-    if tls.frozen_bundle.is_empty() {
-        return Ok(builder);
-    }
 
     let certificates =
         reqwest::Certificate::from_pem_bundle(&tls.frozen_bundle).with_context(|| {
@@ -99,9 +95,6 @@ mod tests {
         TlsAcceptor::from(Arc::new(config))
     }
 
-    /// Binds a TLS server on 127.0.0.1:0 that accepts exactly one
-    /// connection, reads to the end of the request headers, replies with a
-    /// canned HTTP/1.1 200 and closes.
     async fn spawn_one_shot_server(acceptor: TlsAcceptor) -> SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -215,10 +208,7 @@ mod tests {
         assert_certificate_failure(&error_chain(err));
 
         let addr = fresh_server().await;
-        let empty = TlsConfig {
-            ca_bundle: PathBuf::from("/tmp/p49-test/ca.pem"),
-            frozen_bundle: Default::default(),
-        };
+        let empty = test_tls(b"");
         let client = apply(client_builder(), Some(&empty))
             .expect("an empty frozen bundle must leave the builder unchanged")
             .build()
@@ -250,9 +240,7 @@ mod tests {
         let frozen = config
             .validate_tls_bundle()
             .expect("a real rcgen CA must pass validation");
-        if let Some(tls) = config.tls.as_mut() {
-            tls.frozen_bundle = frozen.into();
-        }
+        config.tls.as_mut().unwrap().frozen_bundle = frozen.into();
 
         let client = apply(client_builder(), config.tls.as_ref())
             .expect("real DER must parse")

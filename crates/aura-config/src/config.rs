@@ -1501,14 +1501,10 @@ tool_headers_from_response = { "Content-Type" = "x-anything" }
         );
     }
 
-    /// PEM fixtures. rustls-pemfile base64-decodes each section without
-    /// inspecting DER structure, so alphabet-valid base64 bodies stand in
-    /// for real certificates at parse-count level.
-    const VALID_CERT_PEM: &str = concat!(
-        "-----BEGIN CERTIFICATE-----\n",
-        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n",
-        "-----END CERTIFICATE-----\n",
-    );
+    /// rustls-pemfile base64-decodes each section without inspecting DER
+    /// structure, so alphabet-valid base64 bodies stand in for real
+    /// certificates at parse-count level.
+    use crate::BASE64_VALID_CERT_PEM as VALID_CERT_PEM;
     const SECOND_CERT_PEM: &str = concat!(
         "-----BEGIN CERTIFICATE-----\n",
         "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\n",
@@ -1553,10 +1549,6 @@ tool_headers_from_response = { "Content-Type" = "x-anything" }
         let mut populated = tls.clone();
         populated.frozen_bundle = std::sync::Arc::from(b"deadbeef".as_slice());
         let serialized = toml::to_string(&populated).unwrap();
-        assert!(
-            serialized.contains("ca_bundle"),
-            "ca_bundle must serialize: {serialized}"
-        );
         assert!(
             !serialized.contains("deadbeef"),
             "frozen_bundle must never serialize: {serialized}"

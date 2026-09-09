@@ -34,6 +34,17 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// Base64-valid PEM fixture body: rustls-pemfile base64-decodes each
+/// section without inspecting DER structure, so this stands in for a real
+/// certificate at parse-count level. Real-DER handling is covered by the
+/// aura crate's live TLS tests.
+#[cfg(test)]
+pub(crate) const BASE64_VALID_CERT_PEM: &str = concat!(
+    "-----BEGIN CERTIFICATE-----\n",
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n",
+    "-----END CERTIFICATE-----\n",
+);
+
 /// Load a single TOML file into a Config.
 fn load_single_config<P: AsRef<Path>>(path: P) -> Result<Config, ConfigError> {
     let contents = fs::read_to_string(path)?;
@@ -275,13 +286,7 @@ model = "gpt-4o"
         std::fs::set_permissions(&memory_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
-    /// Same fixture shape as the config.rs test module: base64-valid bodies
-    /// suffice because rustls-pemfile does not inspect DER structure.
-    const TEST_CA_PEM: &str = concat!(
-        "-----BEGIN CERTIFICATE-----\n",
-        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n",
-        "-----END CERTIFICATE-----\n",
-    );
+    use super::BASE64_VALID_CERT_PEM as TEST_CA_PEM;
 
     #[test]
     fn load_config_fails_loud_on_garbage_ca_bundle() {
