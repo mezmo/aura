@@ -131,9 +131,10 @@ rise, which makes `max` correct while duplicates are still visible.
 After sending, the script reads the snapshot back and fails if PostHog cannot
 account for every event. This is not belt-and-braces: PostHog answers
 `200 {"status":"Ok"}` to a batch sent with an invalid project token, so an
-unverified send cannot tell success from silent discard. The read-back counts
-distinct event UUIDs rather than rows, because a re-run's rows stay visible
-until PostHog's background merges collapse them.
+unverified send cannot tell success from silent discard. The read-back looks
+for this run's own event UUIDs at this run's timestamp, rather than counting a
+whole date: counting by date would also match UUIDs left by an earlier run
+whose asset set differed, and those can cover for an event that never arrived.
 
 A run also reports when the previous day holds no snapshot. That is advisory:
 GitHub only exposes current cumulative counts, so a missed day cannot be
