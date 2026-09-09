@@ -2,14 +2,16 @@
 # Snapshot cumulative Cloudsmith package download totals into PostHog.
 #
 # Sends one PostHog event per Cloudsmith package carrying that package's
-# cumulative download count as of a snapshot date. Retries are safe: the event
-# UUID is derived from (repository, package identifier, snapshot date) and the
-# timestamp is pinned to 23:59:59Z on the snapshot date, so re-running a date
-# re-sends byte-identical events that PostHog deduplicates.
+# cumulative download count as of a snapshot date. Retries cannot add a second
+# snapshot: the event UUID is derived from (repository, package identifier,
+# snapshot date) and the timestamp is pinned to 23:59:59Z on the snapshot date,
+# which is what PostHog deduplicates on.
 #
-# Reporting should still aggregate with max(download_count) per package and
-# snapshot date. PostHog deduplication is eventual, and cumulative counts
-# only ever rise, so max() is correct while duplicates remain visible.
+# Reporting must aggregate with max(download_count) per package and snapshot
+# date. Deduplication is eventual, so a retry's rows stay visible in the
+# meantime, and a retry taken after the counts moved carries a higher count
+# under the same key. Cumulative counts only rise, which makes max() right in
+# both cases.
 #
 # Cloudsmith identifies a package by its permanent identifier rather than by
 # name and version: the same version can be uploaded to several distributions
@@ -94,6 +96,13 @@ day_before() {
     jq -rn --arg d "$1" '($d + "T00:00:00Z" | fromdateiso8601) - 86400 | strftime("%Y-%m-%d")'
 }
 
+# Reformat a date through a parse, or print nothing if it will not parse.
+# A day that overflows its month survives the parse but comes back as the day
+# it rolled over to, so an unchanged answer is what proves the input was real.
+canonical_date() {
+    jq -rn --arg d "$1" '$d + "T00:00:00Z" | fromdateiso8601 | strftime("%Y-%m-%d")' 2>/dev/null
+}
+
 require_tools() {
     local tool
     for tool in jq curl openssl; do
@@ -168,34 +177,40 @@ package_records() {
 collect_packages() {
     local repo=$1
     local headers="${WORK_DIR}/page.headers" body="${WORK_DIR}/page.json"
-    local page=1 pages count got collected=0 value
+    local page=1 pages count first_count=0 got collected=0 value
 
-    cloudsmith_page "${repo}" 1 "${headers}" "${body}"
-    pages=$(header_value "${headers}" x-pagination-pagetotal)
-    count=$(header_value "${headers}" x-pagination-count)
-    for value in "${pages}" "${count}"; do
-        case "${value}" in
-            '' | *[!0-9]*)
-                echo "error: ${repo}: Cloudsmith returned unusable pagination headers (pagetotal='${pages}' count='${count}')" >&2
-                return 1 ;;
-        esac
-    done
-
+    # Every response supplies the page total afresh rather than page one
+    # settling it for the run. An upload mid-run can append a page beyond the
+    # total page one reported, and stopping at that stale total would drop the
+    # new package while the count check below, comparing against an equally
+    # stale count, still passed.
     while :; do
-        [ "${page}" -eq 1 ] || cloudsmith_page "${repo}" "${page}" "${headers}" "${body}"
+        cloudsmith_page "${repo}" "${page}" "${headers}" "${body}"
+        pages=$(header_value "${headers}" x-pagination-pagetotal)
+        count=$(header_value "${headers}" x-pagination-count)
+        for value in "${pages}" "${count}"; do
+            case "${value}" in
+                '' | *[!0-9]*)
+                    echo "error: ${repo}: Cloudsmith returned unusable pagination headers on page ${page} (pagetotal='${pages}' count='${count}')" >&2
+                    return 1 ;;
+            esac
+        done
+        [ "${page}" -ne 1 ] || first_count="${count}"
+
         got=$(jq 'length' "${body}")
         collected=$(( collected + got ))
         package_records "${body}" "${repo}"
+
         [ "${page}" -lt "${pages}" ] || break
         page=$(( page + 1 ))
     done
 
     # A page that came back short would under-report without failing anything.
     # Uploads only ever append under sort=date, so ending up above the count
-    # the first page reported is expected; ending up below it means a page was
-    # lost between the header and the records.
-    if [ "${collected}" -lt "${count}" ]; then
-        echo "error: ${repo}: collected ${collected} of ${count} package(s)" >&2
+    # page one reported is expected; ending up below it means a page was lost
+    # between the header and the records.
+    if [ "${collected}" -lt "${first_count}" ]; then
+        echo "error: ${repo}: collected ${collected} of ${first_count} package(s)" >&2
         return 1
     fi
     echo "Collected ${collected} ${repo} package(s)" >&2
@@ -240,13 +255,13 @@ post_batch() {
         "${POSTHOG_HOST%/}/batch/" >/dev/null
 }
 
-# Run a HogQL query and print its first scalar result.
+# Run a HogQL query and print its first result row, tab separated.
 #
 # Plain --retry covers the transient cases (timeouts, 429, 5xx) and leaves
 # 4xx alone: an auth or project error repeated four times is noise, and the
 # status is worth naming because every likely cause is a misconfiguration
 # rather than an outage.
-hogql_scalar() {
+hogql_row() {
     local query=$1 response status body
     response=$(jq -n --arg q "${query}" '{query: {kind: "HogQLQuery", query: $q}}' \
         | curl --silent --show-error --retry 3 --retry-delay 2 --max-time 60 \
@@ -264,36 +279,55 @@ hogql_scalar() {
         echo "       and POSTHOG_API_READ_KEY must hold query:read on that project" >&2
         return 1
     fi
-    jq -r '.results[0][0]' <<<"${body}"
+    jq -r '.results[0] // [] | @tsv' <<<"${body}"
 }
 
-# Count what actually landed. Distinct UUIDs, not rows: PostHog deduplicates
-# lazily during background merges, so a re-run's rows stay visible until then.
+# Measure what actually landed, as a package count and a download total.
+#
+# The count alone cannot answer whether this run's batch arrived. Event UUIDs
+# are derived from the snapshot date, so a retry re-sends the UUIDs the earlier
+# run already ingested, and a date that is already populated answers the count
+# question with that earlier run's events however completely the retry was
+# discarded. The download total closes that: cumulative counts only rise, so a
+# total at least as high as the one just collected cannot be satisfied by a
+# staler snapshot alone.
+#
+# max() per package mirrors what reporting must do, since a re-run's rows stay
+# visible until PostHog's background merges collapse them.
 #
 # printf builds the literals rather than nested shell quoting, which is easy to
 # get wrong in a way that still returns a well-formed answer: a quote stray
 # inside the string literal matches no rows and reads as "nothing ingested".
-snapshot_count_query() {
-    printf "SELECT count(DISTINCT uuid) FROM events WHERE event = '%s' AND properties.snapshot_date = '%s'" \
+snapshot_query() {
+    printf "SELECT count(), sum(dl) FROM (SELECT properties.repository AS repo, properties.package_id AS pid, max(toIntOrZero(toString(properties.download_count))) AS dl FROM events WHERE event = '%s' AND properties.snapshot_date = '%s' GROUP BY repo, pid)" \
         "${EVENT_NAME}" "$1"
 }
 
-distinct_events_on() {
-    hogql_scalar "$(snapshot_count_query "$1")"
+snapshot_totals() {
+    hogql_row "$(snapshot_query "$1")"
 }
 
 # Poll until the snapshot is queryable, since ingestion lags the send.
 verify_snapshot() {
-    local date=$1 expected=$2 deadline got
+    local date=$1 want_packages=$2 want_downloads=$3 deadline row packages downloads value
     deadline=$(( $(date +%s) + VERIFY_TIMEOUT ))
     while :; do
-        got=$(distinct_events_on "${date}")
-        if [ "${got}" -ge "${expected}" ]; then
-            echo "Verified ${got} event(s) queryable in PostHog for ${date}"
+        row=$(snapshot_totals "${date}")
+        packages=${row%%$'\t'*}
+        downloads=${row##*$'\t'}
+        for value in "${packages}" "${downloads}"; do
+            case "${value}" in
+                '' | *[!0-9]*)
+                    echo "error: PostHog answered the snapshot query with '${row}', which is not a package count and a download total" >&2
+                    return 1 ;;
+            esac
+        done
+        if [ "${packages}" -ge "${want_packages}" ] && [ "${downloads}" -ge "${want_downloads}" ]; then
+            echo "Verified ${packages} package(s) and ${downloads} download(s) queryable in PostHog for ${date}"
             return 0
         fi
         if [ "$(date +%s)" -ge "${deadline}" ]; then
-            echo "error: PostHog holds ${got} of ${expected} event(s) for ${date} after ${VERIFY_TIMEOUT}s" >&2
+            echo "error: PostHog holds ${packages} of ${want_packages} package(s) and ${downloads} of ${want_downloads} download(s) for ${date} after ${VERIFY_TIMEOUT}s" >&2
             return 1
         fi
         sleep 5
@@ -303,10 +337,10 @@ verify_snapshot() {
 # A dropped or disabled scheduled run leaves a hole no failure reports, since
 # nothing ran to fail. Surface it on the next run that does happen.
 warn_on_gap() {
-    local date=$1 previous got
+    local date=$1 previous row
     previous=$(day_before "${date}")
-    got=$(distinct_events_on "${previous}")
-    if [ "${got}" -eq 0 ]; then
+    row=$(snapshot_totals "${previous}")
+    if [ "${row%%$'\t'*}" = "0" ]; then
         echo "::warning::No Cloudsmith download snapshot in PostHog for ${previous}; the package list reports only current totals, so re-running that date would file today's counts under it"
     fi
 }
@@ -375,9 +409,20 @@ mezmo/aura|3uq7JmasvnKF|raw||null|0"
 
     # The read-back query must quote its literals exactly once. Nested quoting
     # bugs here return 0 rows, which is indistinguishable from a failed send.
-    got=$(snapshot_count_query "2026-08-20")
-    want="SELECT count(DISTINCT uuid) FROM events WHERE event = 'cloudsmith_package_downloads' AND properties.snapshot_date = '2026-08-20'"
+    got=$(snapshot_query "2026-08-20")
+    want="SELECT count(), sum(dl) FROM (SELECT properties.repository AS repo, properties.package_id AS pid, max(toIntOrZero(toString(properties.download_count))) AS dl FROM events WHERE event = 'cloudsmith_package_downloads' AND properties.snapshot_date = '2026-08-20' GROUP BY repo, pid)"
     [ "${got}" = "${want}" ] || { echo "selftest: query is"$'\n'"  ${got}"$'\n'"want"$'\n'"  ${want}" >&2; exit 1; }
+
+    # A date that overflows its month must not reach an event, where it would
+    # become both the timestamp and the snapshot key.
+    for got in 2026-02-31 2026-13-01 2026-00-10 2027-02-29; do
+        [ "$(canonical_date "${got}")" != "${got}" ] \
+            || { echo "selftest: ${got} accepted as a calendar date" >&2; exit 1; }
+    done
+    for got in 2024-02-29 2026-09-08 2026-12-31; do
+        [ "$(canonical_date "${got}")" = "${got}" ] \
+            || { echo "selftest: ${got} rejected as a calendar date" >&2; exit 1; }
+    done
 
     # Date arithmetic across month, year, and leap-day boundaries.
     got=$(day_before "2026-03-01"); want="2026-02-28"
@@ -407,6 +452,14 @@ main() {
         [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) ;;
         *) echo "error: --date must be YYYY-MM-DD (got '${date}')" >&2; exit 1 ;;
     esac
+    # Digit-shaped is not the same as real. A date like 2026-02-31 would be
+    # stamped onto every event as both its timestamp and its snapshot key, and
+    # the only later code that parses it runs advisory, so nothing downstream
+    # would reject it.
+    if [ "$(canonical_date "${date}")" != "${date}" ]; then
+        echo "error: --date must be a real calendar date (got '${date}')" >&2
+        exit 1
+    fi
 
     if [ -z "${CLOUDSMITH_API_KEY:-}" ]; then
         echo "CLOUDSMITH_API_KEY unset: reading the public package list anonymously"
@@ -456,7 +509,12 @@ main() {
         exit 1
     fi
 
-    echo "Snapshot ${date}: ${packages} packages in ${chunks} batch(es)"
+    # The total the read-back has to reach. Taken from what was collected, not
+    # from the payload, so it measures the snapshot rather than the encoding.
+    local downloads
+    downloads=$(jq -n '[inputs.download_count] | add // 0' "${WORK_DIR}/packages.ndjson")
+
+    echo "Snapshot ${date}: ${packages} packages, ${downloads} downloads, in ${chunks} batch(es)"
 
     if [ "${DRY_RUN}" = 1 ]; then
         jq -c '.batch[0]' "${WORK_DIR}/payload.1.json"
@@ -475,7 +533,7 @@ main() {
         echo "Skipping read-back verification (SKIP_VERIFY=1)"
         return 0
     fi
-    verify_snapshot "${date}" "${packages}"
+    verify_snapshot "${date}" "${packages}" "${downloads}"
     # Advisory only: a missing earlier day is worth reporting but is not a
     # failure of this run, and cannot be repaired by retrying it.
     warn_on_gap "${date}" || true
