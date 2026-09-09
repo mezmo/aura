@@ -1982,6 +1982,7 @@ impl AgentBuilder {
 mod tests {
     use super::*;
     use crate::scratchpad::TiktokenCounter;
+    use aura_events::PlanTaskId;
 
     fn budget() -> scratchpad::ContextBudget {
         let counter = Arc::new(TiktokenCounter::default_counter());
@@ -2304,7 +2305,11 @@ mod tests {
         );
 
         // Forward iter: scratchpad's transform_args runs first, then recording.
-        let ctx = ToolCallContext::new("big_tool").with_task_context(7, "single_agent".into(), 0);
+        let ctx = ToolCallContext::new("big_tool").with_task_context(
+            PlanTaskId::new(7),
+            "single_agent".into(),
+            0,
+        );
         let original_args = serde_json::json!({"input": "hello"});
         let _ = composed.transform_args(original_args.clone(), &ctx);
         assert_eq!(

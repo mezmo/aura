@@ -11,6 +11,7 @@
 //!
 //! [`ApprovalStore`]: super::ApprovalStore
 
+use aura_events::PlanTaskId;
 use serde::{Deserialize, Serialize};
 
 use crate::config::SessionId;
@@ -46,7 +47,7 @@ pub enum ScopeRecord {
     },
     Worker {
         run_id: String,
-        task_id: usize,
+        task_id: PlanTaskId,
         worker: Option<String>,
         session_id: Option<String>,
     },
@@ -244,6 +245,24 @@ mod tests {
     use super::*;
     use crate::hitl::PROTOCOL_VERSION;
 
+    /// The stored approval record carries a worker scope's `task_id` as a bare
+    /// JSON number. Every instance reading the store depends on that shape.
+    #[test]
+    fn worker_scope_task_id_persists_as_a_bare_number() {
+        let scope = ScopeRecord::Worker {
+            run_id: "0191e8c0-1111-7000-8000-000000000042".to_string(),
+            task_id: PlanTaskId::new(4),
+            worker: None,
+            session_id: None,
+        };
+
+        let json = serde_json::to_value(&scope).expect("scope serializes");
+        assert_eq!(json["task_id"], 4);
+
+        let back: ScopeRecord = serde_json::from_value(json).expect("a bare number parses back");
+        assert_eq!(back, scope);
+    }
+
     fn parked(scope: AgentScope, origin: ApprovalOrigin) -> ParkedApproval {
         let now = chrono::Utc::now();
         ParkedApproval {
@@ -294,7 +313,7 @@ mod tests {
         assert_round_trip(parked(
             AgentScope::Worker {
                 run_id: "0191e8c0-1111-7000-8000-000000000000".parse().unwrap(),
-                task: TaskIdentity::new(3, Some("ops".to_string())),
+                task: TaskIdentity::new(PlanTaskId::new(3), Some("ops".to_string())),
                 session_id: None,
             },
             ApprovalOrigin::AgentRequested {

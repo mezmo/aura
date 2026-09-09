@@ -6,6 +6,7 @@ pub use aura_events::orchestration::{EventContext, OrchestrationStreamEvent, eve
 mod tests {
     use super::*;
     use crate::stream_events::{AgentContext, CorrelationContext};
+    use aura_events::PlanTaskId;
     use aura_events::orchestration::RoutingMode;
 
     fn test_ctx() -> EventContext {
@@ -54,8 +55,14 @@ mod tests {
         );
 
         assert_eq!(
-            OrchestrationStreamEvent::task_started(0, "desc", "orch-id", "worker-id", ctx.clone())
-                .event_name(),
+            OrchestrationStreamEvent::task_started(
+                PlanTaskId::new(0),
+                "desc",
+                "orch-id",
+                "worker-id",
+                ctx.clone()
+            )
+            .event_name(),
             event_names::TASK_STARTED
         );
 
@@ -123,7 +130,7 @@ mod tests {
     #[test]
     fn test_format_sse_task_blocked() {
         let event = OrchestrationStreamEvent::task_blocked(
-            2,
+            PlanTaskId::new(2),
             "call_42",
             "0191e8c0-1111-7000-8000-00000000000a",
             "kubectl_apply",
@@ -189,7 +196,7 @@ mod tests {
     #[test]
     fn test_format_sse_task_completed_with_result() {
         let event = OrchestrationStreamEvent::task_completed(
-            0,
+            PlanTaskId::new(0),
             true,
             1500,
             "orch-1",
@@ -208,7 +215,7 @@ mod tests {
     fn test_format_sse_tool_call_started_with_arguments() {
         let args = serde_json::json!({"numbers": [10, 20, 30]});
         let event = OrchestrationStreamEvent::tool_call_started(
-            Some(0),
+            Some(PlanTaskId::new(0)),
             "call_1",
             "mean",
             "statistics",
@@ -224,7 +231,7 @@ mod tests {
     #[test]
     fn test_format_sse_tool_call_completed_with_result() {
         let event = OrchestrationStreamEvent::tool_call_completed(
-            Some(0),
+            Some(PlanTaskId::new(0)),
             "call_1",
             true,
             42,

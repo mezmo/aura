@@ -19,8 +19,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::orchestration::{IterationTimings, RoutingMode};
 use crate::{
-    AgentContext, ApprovalCompleted, ApprovalPending, ApprovalRequested, McpServerStatus, Progress,
-    ProgressToken, TokenCount, TokenUsage, ToolCallId, ToolName, WorkerPhase,
+    AgentContext, ApprovalCompleted, ApprovalPending, ApprovalRequested, McpServerStatus,
+    PlanTaskId, Progress, ProgressToken, TokenCount, TokenUsage, ToolCallId, ToolName, WorkerPhase,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -72,7 +72,7 @@ pub enum AgentEventPayload {
     Reasoning {
         content: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        task_id: Option<usize>,
+        task_id: Option<PlanTaskId>,
     },
 
     /// The model's decision to call a tool, ahead of any execution.
@@ -90,7 +90,7 @@ pub enum AgentEventPayload {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         arguments: Option<serde_json::Value>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        task_id: Option<usize>,
+        task_id: Option<PlanTaskId>,
     },
 
     ToolComplete {
@@ -100,7 +100,7 @@ pub enum AgentEventPayload {
         #[serde(flatten)]
         outcome: ToolOutcome,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        task_id: Option<usize>,
+        task_id: Option<PlanTaskId>,
     },
 
     ToolProgress {
@@ -112,9 +112,8 @@ pub enum AgentEventPayload {
 
     WorkerPhase {
         phase: WorkerPhase,
-        /// Plan-relative: unique within its iteration, not across a run.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        task_id: Option<usize>,
+        task_id: Option<PlanTaskId>,
     },
 
     /// One turn's tokens, attributed to the tool calls that turn covered.
@@ -174,13 +173,13 @@ pub enum AgentEventPayload {
     },
 
     TaskStarted {
-        task_id: usize,
+        task_id: PlanTaskId,
         description: String,
         orchestrator_id: String,
     },
 
     TaskCompleted {
-        task_id: usize,
+        task_id: PlanTaskId,
         duration_ms: u64,
         orchestrator_id: String,
         #[serde(flatten)]
@@ -190,7 +189,7 @@ pub enum AgentEventPayload {
     /// A worker's gated call is waiting on an approval the run will not block
     /// for; one per parked call.
     TaskBlocked {
-        task_id: usize,
+        task_id: PlanTaskId,
         tool_call_id: ToolCallId,
         decision_id: String,
         tool_name: ToolName,
