@@ -31,6 +31,10 @@ pub struct Config {
     /// Governance integration for catalog sync and policy endpoints.
     #[serde(default)]
     pub governance: Option<GovernanceConfig>,
+    /// Custom trusted CA roots for outbound TLS connections. `None` (no
+    /// `[tls]` table) keeps the built-in webpki roots only.
+    #[serde(default)]
+    pub tls: Option<TlsConfig>,
 }
 
 /// Reasoning effort level for GPT-5 models
@@ -359,6 +363,14 @@ impl Config {
     pub fn validate(&self) -> Result<(), crate::ConfigError> {
         validate_llm_api_key(&self.agent.llm, "agent.llm")?;
 
+        if let Some(tls) = &self.tls
+            && tls.ca_bundle.as_os_str().is_empty()
+        {
+            return Err(crate::ConfigError::Validation(
+                "tls.ca_bundle path cannot be empty".to_string(),
+            ));
+        }
+
         if let Some(orch) = &self.orchestration {
             for (name, worker) in &orch.workers {
                 if let Some(worker_llm) = &worker.llm {
@@ -461,6 +473,63 @@ impl Config {
         })?;
 
         Ok(())
+    }
+
+    /// Read the configured TLS CA trust bundle and validate it, returning
+    /// the raw bundle bytes.
+    ///
+    /// The bundle fails validation when the file is missing or unreadable,
+    /// when any PEM block fails to parse, when any block is not a
+    /// certificate, or when the bundle contains no certificates. This is
+    /// the same treatment reqwest applies when building a client from a
+    /// PEM bundle, so a bundle accepted here cannot fail later at client
+    /// construction. Without a `[tls]` section the bundle is empty and
+    /// validation succeeds.
+    ///
+    /// Like [`validate_memory_dir_writable`], this is not part of the
+    /// validate() method because it is not side effect free.
+    pub fn validate_tls_bundle(&self) -> Result<Vec<u8>, crate::ConfigError> {
+        let Some(tls) = &self.tls else {
+            return Ok(Vec::new());
+        };
+
+        let path = &tls.ca_bundle;
+
+        let bytes = std::fs::read(path).map_err(|e| {
+            crate::ConfigError::Validation(format!(
+                "Cannot read TLS CA bundle '{}': {e}",
+                path.display()
+            ))
+        })?;
+
+        let mut reader = std::io::Cursor::new(bytes.as_slice());
+        let mut cert_count = 0usize;
+        for item in rustls_pemfile::read_all(&mut reader) {
+            match item {
+                Ok(rustls_pemfile::Item::X509Certificate(_)) => cert_count += 1,
+                Ok(_) => {
+                    return Err(crate::ConfigError::Validation(format!(
+                        "TLS CA bundle '{}' contains non-certificate PEM content; only certificate blocks are allowed",
+                        path.display()
+                    )));
+                }
+                Err(e) => {
+                    return Err(crate::ConfigError::Validation(format!(
+                        "TLS CA bundle '{}' contains an unparseable PEM block: {e}",
+                        path.display()
+                    )));
+                }
+            }
+        }
+
+        if cert_count == 0 {
+            return Err(crate::ConfigError::Validation(format!(
+                "TLS CA bundle '{}' contains no certificates",
+                path.display()
+            )));
+        }
+
+        Ok(bytes)
     }
 
     /// When scratchpad is enabled on the agent or any worker, require a
@@ -1428,6 +1497,190 @@ tool_headers_from_response = { "Content-Type" = "x-anything" }
             "unexpected error: {err}"
         );
     }
+
+    /// PEM fixtures. rustls-pemfile base64-decodes each section without
+    /// inspecting DER structure, so alphabet-valid base64 bodies stand in
+    /// for real certificates at parse-count level.
+    const VALID_CERT_PEM: &str = concat!(
+        "-----BEGIN CERTIFICATE-----\n",
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n",
+        "-----END CERTIFICATE-----\n",
+    );
+    const SECOND_CERT_PEM: &str = concat!(
+        "-----BEGIN CERTIFICATE-----\n",
+        "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\n",
+        "-----END CERTIFICATE-----\n",
+    );
+    const CORRUPTED_BLOCK_PEM: &str = concat!(
+        "-----BEGIN CERTIFICATE-----\n",
+        "!!! not base64 !!!\n",
+        "-----END CERTIFICATE-----\n",
+    );
+    const PRIVATE_KEY_PEM: &str = concat!(
+        "-----BEGIN PRIVATE KEY-----\n",
+        "AAAA\n",
+        "-----END PRIVATE KEY-----\n",
+    );
+
+    #[test]
+    fn tls_section_absent_deserializes_as_none() {
+        let toml = r#"
+            [agent]
+            name = "test"
+            system_prompt = "test"
+        "#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.tls.is_none());
+    }
+
+    #[test]
+    fn tls_ca_bundle_round_trips_through_toml() {
+        let toml = r#"
+            [tls]
+            ca_bundle = "x"
+
+            [agent]
+            name = "test"
+            system_prompt = "test"
+        "#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let tls = config.tls.as_ref().expect("[tls] section should parse");
+        assert_eq!(tls.ca_bundle, std::path::PathBuf::from("x"));
+
+        let round_tripped: TlsConfig = toml::from_str(&toml::to_string(tls).unwrap()).unwrap();
+        assert_eq!(round_tripped.ca_bundle, tls.ca_bundle);
+    }
+
+    #[test]
+    fn validate_rejects_empty_ca_bundle_path() {
+        let toml = r#"
+            [tls]
+            ca_bundle = ""
+
+            [agent]
+            name = "test"
+            system_prompt = "test"
+
+            [agent.llm]
+            provider = "openai"
+            api_key = "test-key"
+            model = "gpt-4o"
+        "#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("ca_bundle"),
+            "empty ca_bundle must be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_ca_bundle_without_touching_filesystem() {
+        let toml = r#"
+            [tls]
+            ca_bundle = "/definitely/not/a/real/ca-bundle-514.pem"
+
+            [agent]
+            name = "test"
+            system_prompt = "test"
+
+            [agent.llm]
+            provider = "openai"
+            api_key = "test-key"
+            model = "gpt-4o"
+        "#;
+        let config: Config = toml::from_str(toml).unwrap();
+        config
+            .validate()
+            .expect("validate must stay IO-free: a nonexistent bundle path validates");
+    }
+
+    fn tls_config_with_bundle(path: &std::path::Path) -> Config {
+        Config {
+            tls: Some(TlsConfig {
+                ca_bundle: path.to_path_buf(),
+            }),
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn tls_bundle_missing_file_error_names_path() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let missing = dir.path().join("absent-ca.pem");
+        let config = tls_config_with_bundle(&missing);
+        let err = config.validate_tls_bundle().unwrap_err();
+        assert!(
+            err.to_string().contains("absent-ca.pem"),
+            "error must name the path: {err}"
+        );
+    }
+
+    #[test]
+    fn tls_bundle_garbage_bytes_rejected() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("garbage.pem");
+        std::fs::write(&path, b"this is not a pem bundle").unwrap();
+        let config = tls_config_with_bundle(&path);
+        let err = config.validate_tls_bundle().unwrap_err();
+        assert!(
+            err.to_string().contains("no certificates"),
+            "garbage bundle must fail with no certificates: {err}"
+        );
+    }
+
+    #[test]
+    fn tls_bundle_non_certificate_pem_rejected() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("key-only.pem");
+        std::fs::write(&path, PRIVATE_KEY_PEM).unwrap();
+        let config = tls_config_with_bundle(&path);
+        let err = config.validate_tls_bundle().unwrap_err();
+        assert!(
+            err.to_string().contains("non-certificate"),
+            "a bundle with no certificate blocks must fail loud: {err}"
+        );
+    }
+
+    #[test]
+    fn tls_bundle_single_certificate_accepted() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("ca.pem");
+        std::fs::write(&path, VALID_CERT_PEM).unwrap();
+        let config = tls_config_with_bundle(&path);
+        let bytes = config
+            .validate_tls_bundle()
+            .expect("single valid certificate bundle should pass");
+        assert_eq!(bytes, VALID_CERT_PEM.as_bytes());
+    }
+
+    #[test]
+    fn tls_bundle_multiple_certificates_accepted() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("multi.pem");
+        std::fs::write(&path, format!("{VALID_CERT_PEM}{SECOND_CERT_PEM}")).unwrap();
+        let config = tls_config_with_bundle(&path);
+        let bytes = config
+            .validate_tls_bundle()
+            .expect("concatenated certificate bundles should pass");
+        assert_eq!(
+            bytes,
+            format!("{VALID_CERT_PEM}{SECOND_CERT_PEM}").as_bytes()
+        );
+    }
+
+    #[test]
+    fn tls_bundle_corrupted_block_rejected() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("bad-block.pem");
+        std::fs::write(&path, format!("{VALID_CERT_PEM}{CORRUPTED_BLOCK_PEM}")).unwrap();
+        let config = tls_config_with_bundle(&path);
+        let err = config.validate_tls_bundle().unwrap_err();
+        assert!(
+            err.to_string().contains("unparseable"),
+            "a corrupted block must fail loud like reqwest's from_pem_bundle: {err}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1709,4 +1962,16 @@ fn default_catalog_timeout_secs() -> u64 {
 pub struct CatalogHmacConfig {
     /// Primary HMAC secret (minimum 32 bytes). Supports env var interpolation.
     pub secret: String,
+}
+
+/// `[tls]` config table for custom trusted CA roots on outbound TLS
+/// connections.
+///
+/// `ca_bundle` is the path to a PEM file of trusted root certificates,
+/// applied additively on top of the built-in webpki roots. An absolute
+/// path is recommended; a relative path resolves from the process working
+/// directory.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TlsConfig {
+    pub ca_bundle: std::path::PathBuf,
 }

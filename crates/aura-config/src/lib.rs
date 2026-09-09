@@ -43,6 +43,7 @@ fn load_single_config<P: AsRef<Path>>(path: P) -> Result<Config, ConfigError> {
     let config: Config = toml::from_str(&resolved)?;
     config.validate()?;
     config.validate_memory_dir_writable()?;
+    config.validate_tls_bundle()?;
 
     Ok(config)
 }
@@ -269,5 +270,39 @@ model = "gpt-4o"
 
         // Restore permissions so TempDir cleanup succeeds.
         std::fs::set_permissions(&memory_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// Same fixture shape as the config.rs test module: base64-valid bodies
+    /// suffice because rustls-pemfile does not inspect DER structure.
+    const TEST_CA_PEM: &str = concat!(
+        "-----BEGIN CERTIFICATE-----\n",
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n",
+        "-----END CERTIFICATE-----\n",
+    );
+
+    #[test]
+    fn load_config_fails_loud_on_garbage_ca_bundle() {
+        let dir = TempDir::new().unwrap();
+        let bundle = dir.path().join("ca.pem");
+        std::fs::write(&bundle, b"garbage").unwrap();
+        let toml = minimal_toml(&format!("[tls]\nca_bundle = \"{}\"\n", bundle.display()));
+        let path = write_config(&dir, "agent.toml", &toml);
+
+        let err = load_config(&path).expect_err("garbage CA bundle must fail load");
+        assert!(
+            err.to_string().contains("ca.pem"),
+            "error must name the bundle path: {err}"
+        );
+    }
+
+    #[test]
+    fn load_config_accepts_valid_ca_bundle() {
+        let dir = TempDir::new().unwrap();
+        let bundle = dir.path().join("ca.pem");
+        std::fs::write(&bundle, TEST_CA_PEM).unwrap();
+        let toml = minimal_toml(&format!("[tls]\nca_bundle = \"{}\"\n", bundle.display()));
+        let path = write_config(&dir, "agent.toml", &toml);
+
+        load_config(&path).expect("config with a valid CA bundle should load");
     }
 }

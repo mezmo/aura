@@ -28,5 +28,8 @@ regex = { workspace = true }
 # Glob matching for HITL tool-name patterns
 globset = "0.4"
 
+# PEM parsing for custom CA trust bundles
+rustls-pemfile = "2"
+
 # Directory perms validation
 tempfile = "3"

@@ -146,6 +146,9 @@ impl ConfigLoader {
         // Validate the final configuration
         config.validate()?;
 
+        // Hard failure, unlike the warn-and-continue on TOML load above: a trust bundle that silently fails validation would start the agent without the user's intended CAs.
+        config.validate_tls_bundle()?;
+
         Ok(config)
     }
 }
@@ -165,6 +168,10 @@ fn merge_configs(base_config: Config, override_config: Config) -> Result<Config,
     // Override MCP config if provided
     if override_config.mcp.is_some() {
         result.mcp = override_config.mcp;
+    }
+
+    if override_config.tls.is_some() {
+        result.tls = override_config.tls;
     }
 
     // Override vector stores if provided

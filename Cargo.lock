@@ -309,6 +309,7 @@ dependencies = [
  "globset",
  "http 1.4.0",
  "regex",
+ "rustls-pemfile",
  "serde",
  "serde_json",
  "serde_yaml",
