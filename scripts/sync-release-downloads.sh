@@ -2,10 +2,22 @@
 # Snapshot cumulative GitHub release-asset download totals into PostHog.
 #
 # Sends one PostHog event per release asset carrying that asset's cumulative
-# download count as of a snapshot date. Retries are safe: the event UUID is
-# derived from (repository, asset ID, snapshot date) and the timestamp is
-# pinned to 23:59:59Z on the snapshot date, so re-running a date re-sends
-# byte-identical events that PostHog deduplicates.
+# download count. Retries are safe: the event UUID is derived from
+# (repository, asset ID, snapshot date) and the timestamp is pinned to
+# 23:59:59Z on the snapshot date, so re-running a date re-sends byte-identical
+# events that PostHog deduplicates.
+#
+# The count is approximate for the day it names. GitHub publishes only a live
+# cumulative counter, never a historical one, so a run reads the counter at the
+# moment it executes and attributes it to the previous UTC day: the 01:17 run
+# folds that day's first 77 minutes into a value labelled 23:59:59Z the day
+# before. Every snapshot carries the same offset, so day-over-day differences
+# still cover a true 24 hours; a single day's cumulative value simply runs
+# slightly ahead of its label.
+#
+# For the same reason, naming an older date does not reconstruct it. A retry
+# later the same day is close enough to be worth running; a retry days later
+# stamps today's counters with that older date.
 #
 # Reporting should still aggregate with max(download_count) per asset and
 # snapshot date. PostHog deduplication is eventual, and cumulative counts

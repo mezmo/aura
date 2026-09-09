@@ -121,6 +121,14 @@ cumulative download count as of a snapshot date. Run daily at 01:17 UTC by
 [the `Release download metrics` workflow](../.github/workflows/release-download-metrics.yml),
 which snapshots the previous UTC day.
 
+The count is approximate for the day it names. GitHub publishes only a live
+cumulative counter, so a run reads it at execution time and attributes it to
+the previous UTC day — the 01:17 run folds that day's first 77 minutes into a
+value labelled `23:59:59Z` the day before. The offset is the same on every
+snapshot, so day-over-day differences still cover a true 24 hours. Naming an
+older date does not reconstruct it: a retry days later stamps today's counters
+with that date.
+
 Retries are safe. The event UUID is derived from `(repository, asset ID,
 snapshot date)` and the timestamp is pinned to `23:59:59Z` on the snapshot
 date, so re-running a date re-sends byte-identical events that PostHog
