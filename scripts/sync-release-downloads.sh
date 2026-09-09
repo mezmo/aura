@@ -266,6 +266,12 @@ count_ingested() {
             GROUP BY uuid)")
         found=${row%%$'\t'*}
         downloads=${row##*$'\t'}
+        # A chunk none of whose events are queryable yet answers with count 0
+        # and a null total, which @tsv renders as an empty field. That is
+        # "nothing has landed yet", which the poll is here to wait out, not a
+        # malformed answer to abort on.
+        case "${found}" in '' | null) found=0 ;; esac
+        case "${downloads}" in '' | null) downloads=0 ;; esac
         for value in "${found}" "${downloads}"; do
             case "${value}" in
                 '' | *[!0-9]*)
