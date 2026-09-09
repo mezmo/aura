@@ -12,11 +12,12 @@
 //! resolve time — and its notified markers are in-memory only, self-pruning
 //! when an id leaves `list_pending`.
 //!
-//! HA posture (V1): single-writer — parked documents are pod-local, so two
+//! HA posture: single-writer — parked documents are pod-local, so two
 //! instances' reconcilers never see each other's runs. Notify delivery is
 //! at-least-once: a crash between a 2xx ack and the marker being observed
 //! produces one duplicate, idempotent by `decision_id` at the receiver.
-//! Exactly-once poll-claim across instances is deferred to a follow-on card.
+//! Poll-claim is exactly-once within an instance; a shared-store,
+//! multi-instance deployment has no cross-instance claim guarantee.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -87,8 +88,8 @@ impl PollReconciler {
     }
 
     /// Spawn the tick loop on the current runtime. The loop stops when
-    /// `shutdown` cancels (the web server registers its phase-1 shutdown
-    /// token here) or when the returned handle's [`Self::stop`] runs.
+    /// `shutdown` cancels (the web server registers its shutdown token
+    /// here) or when the returned handle's [`Self::stop`] runs.
     /// Dropping the handle detaches the loop — the cancel-sweep task's
     /// caller convention (`park::cancel_run_approvals`): await it for
     /// ordered teardown, or drop it and let the loop keep running until
@@ -163,8 +164,9 @@ impl PollReconciler {
                         // against the route's mapping the same way the sync
                         // gate does. A capture failure records the decision
                         // WITHOUT identity — reify blocks the approved
-                        // execution later if identity is required (the
-                        // record-then-block precedent).
+                        // execution later if identity is required
+                        // (record-then-block, per the approver identity
+                        // ADR).
                         ApprovalDecision::Approved if !self.tool_header_mappings.is_empty() => {
                             match ApproverHeaders::from_captured(
                                 &self.tool_header_mappings,
@@ -711,7 +713,7 @@ mod tests {
     }
 
     /// Cancelling the token the loop was spawned under — the web server's
-    /// phase-1 shutdown path — ends the loop.
+    /// shutdown path — ends the loop.
     #[tokio::test]
     async fn shutdown_token_cancel_ends_the_loop() {
         let store: Arc<dyn ApprovalStore> = Arc::new(InMemoryApprovalStore::new());
@@ -731,7 +733,7 @@ mod tests {
     }
 
     // ====================================================================
-    // R2 egress at rest + identity docking on the decision record
+    // Egress headers at rest + identity docking on the decision record
     // ====================================================================
 
     mod at_rest {
@@ -1060,7 +1062,8 @@ mod tests {
         }
 
         /// A poll-200 missing the mapped identity header records the
-        /// decision WITHOUT identity (the record-then-block precedent): the
+        /// decision WITHOUT identity (record-then-block, per the approver
+        /// identity ADR): the
         /// resolution is not lost, reify blocks later if identity is
         /// required.
         #[tokio::test]

@@ -83,8 +83,8 @@ pub use tools::wait_for::{StopReason, WaitForError, WaitForOutput, WaitForTool};
 pub use tools::{SubmitResultDecision, SubmitResultOutput, SubmitResultTool};
 
 pub(crate) use park::{CallKey, ParkGuard, RecordedDecisions, run_owner_id};
-// The sentinel leak guard (P38 stage 6) drives the commit and the resuming
-// document from the reconciler side of the crate.
+// The sentinel leak guard drives the commit and the resuming document
+// from the reconciler side of the crate.
 #[cfg(test)]
 pub(crate) use park::{
     ParkCommitInputs, ParkedTaskRecord, ResumingDocumentHandle, RunStateForPark,

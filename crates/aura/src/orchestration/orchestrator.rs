@@ -7442,9 +7442,9 @@ mod tests {
         assert!(poll.park_enabled(), "webhook poll route: park on");
     }
 
-    /// Stage-5 activation, run level: a webhook route with poll delivery
+    /// Run-level activation: a webhook route with poll delivery
     /// arms the park guard, enables park, and the commit path publishes the
-    /// checkpoint. The reconciler flow itself is the poller's (stage 4).
+    /// checkpoint. The reconciler flow itself is the poller's.
     #[tokio::test]
     async fn webhook_poll_route_parks_and_commits_the_run() {
         let dir = tempfile::tempdir().unwrap();

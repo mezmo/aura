@@ -126,7 +126,7 @@ approver header forwarding section.
 
 ## Amendment (2026-09-08): the at-rest posture for poll delivery
 
-P38's async-webhook route changed the persistence picture this ADR's
+The async-webhook poll-delivery route changed the persistence picture this ADR's
 original decision assumed. The sync route captured identity in-process and
 consumed it on the very next tool call - nothing outlived the request. Under
 poll delivery the approval parks durably, a background reconciler POSTs the
@@ -173,13 +173,13 @@ none. Redacted `Debug` carriers are mandatory on every new carrier (the
 storage records print names only.
 
 The config-surface consequence: `delivery = "poll"` combined with
-`headers_from_request` is valid configuration (the stage-1 boot refusal is
+`headers_from_request` is valid configuration (the config boot refusal is
 flipped to an acceptance test). The other two refusals stand: poll without
 `[hitl.park].enabled`, and a plaintext `http://` URL with an HMAC secret
 (extended to `poll_url`). Poll tuning - `poll_url`, `poll_interval_secs`,
 `poll_request_timeout_secs` - is deliberately fingerprint-COMPATIBLE; the
 config fingerprint carries `"delivery"` only, and credential values never
-enter it. Enforcement remains P45's.
+enter it.
 
 Mechanism detail: [docs/design/hitl.md](../design/hitl.md), the storage
 records section.

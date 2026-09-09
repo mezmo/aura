@@ -1378,11 +1378,10 @@ mode = "conversational"
         );
     }
 
-    /// Full R2 (Mike, 2026-09-08; codex pre-gate settled): poll +
-    /// `headers_from_request` is valid. The resolved values are captured at
-    /// request-scoped route construction and persisted on the parked approval
-    /// record, so the background reconciler does NOT need to reconstruct
-    /// them after a restart — which is what the stage-1 refusal assumed.
+    /// Poll delivery + `headers_from_request` is valid: the resolved
+    /// values are captured at request-scoped route construction and
+    /// persisted on the parked approval record, so the background
+    /// reconciler does NOT need to reconstruct them after a restart.
     #[test]
     fn validate_accepts_poll_delivery_with_headers_from_request() {
         crate::load_config_from_str(&poll_config_toml(

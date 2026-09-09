@@ -262,8 +262,8 @@ pub(crate) fn parked_document_dir(memory_dir: &str, session_id: Option<&str>) ->
 /// client's poll marker — the same source `park_registry` reads; no second
 /// delivery flag exists. Poll tuning (poll_url, interval, per-attempt
 /// timeout) is deliberately fingerprint-COMPATIBLE, and no credential value
-/// (headers, secrets) enters the projection. ENFORCEMENT (the one-way bump)
-/// is P45's.
+/// (headers, secrets) enters the projection; resume-side enforcement is a
+/// one-way bump on change.
 pub(crate) fn config_fingerprint(config: &AgentRuntimeConfig) -> String {
     let hitl = config.hitl.as_ref();
     let route = hitl.map(|h| match &*h.route {
@@ -563,7 +563,7 @@ mod tests {
         );
     }
 
-    /// Codex plan-review finding 1: a decision landing between gate-hit and
+    /// A decision landing between gate-hit and
     /// park commit is retained by the refresh and consumed by the resume
     /// consult. Park mode's file backend keeps the approval readable after
     /// resolve, which is what both sides key on.

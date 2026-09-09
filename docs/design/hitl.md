@@ -227,11 +227,11 @@ pub struct ParkedApproval {
 }
 
 impl PendingApprovals {
-    pub fn register(&self, request: ApprovalRequest, timeout: Duration) -> AwaitingDecision;
-    pub fn register_durable(&self, parked: ParkedApproval) -> Result<(), SessionStoreError>;
-    pub fn resolve(&self, id: &DecisionId, d: ResolvedDecision) -> Result<(), ResolveError>;
-    pub fn recorded_decision(&self, id: &DecisionId) -> Option<ResolvedDecision>;
-    pub fn cancel_request(&self, request_id: &RequestId);
+    pub async fn register(&self, request: ApprovalRequest, timeout: Duration) -> AwaitingDecision;
+    pub async fn register_durable(&self, parked: ParkedApproval) -> Result<(), SessionStoreError>;
+    pub async fn resolve(&self, id: &DecisionId, d: ResolvedDecision) -> Result<(), ResolveError>;
+    pub async fn recorded_decision(&self, id: &DecisionId) -> Option<ResolvedDecision>;
+    pub async fn cancel_request(&self, request_id: &str) -> Vec<ParkedApproval>;
 }
 
 // decision.rs -- the identity-preserving resolve carrier: decision and

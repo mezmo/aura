@@ -1,21 +1,20 @@
 #![cfg(feature = "integration-hitl-header-forwarding")]
 
-//! Gate M end-to-end rig for P38: park -> notify -> poll -> durable resolve,
+//! End-to-end poll-delivery flow: park -> notify -> poll -> durable resolve,
 //! over a real `aura-web-server` child, the real model, and an in-process mock
 //! governance receiver, on the actual `/v1/chat/completions` path.
 //!
-//! Delivery is the ruled poll mode: the gate parks the gated `echo_headers`
-//! call, the startup reconciler POSTs the ack-only notification (whose
-//! decision-shaped body must NEVER be read as a decision), then polls the
-//! status GET until the receiver answers decided. No HMAC secret is
-//! configured — the rig runs unsigned; the signed legs are unit-proven in
-//! `hitl::route`.
+//! The gate parks the gated `echo_headers` call, the startup reconciler
+//! POSTs the ack-only notification (whose decision-shaped body must NEVER be
+//! read as a decision), then polls the status GET until the receiver answers
+//! decided. No HMAC secret is configured — the rig runs unsigned; the signed
+//! legs are unit-proven in `hitl::route`.
 //!
-//! Scope honesty: P45's resume endpoint does not exist yet, so the rig proves
-//! the flow THROUGH durable resolve with the run still parked — the parked run
-//! ends with the orchestrator's parked message and no tool output, and the
-//! decision landing in the store (carrying the captured approver identity) is
-//! the terminal state asserted here. Re-execution is P45's.
+//! The flow is proven through durable resolve with the run still parked: the
+//! parked run ends with the orchestrator's parked message and no tool output,
+//! and the decision landing in the store (carrying the captured approver
+//! identity) is the terminal state asserted here. Re-execution belongs to
+//! the resume endpoint, which this rig does not start.
 //!
 //! The park arm requires an orchestration worker scope, so the rig config
 //! enables `[orchestration]` (a single-agent config would fail the gated call
@@ -52,7 +51,8 @@ const HEALTH_TIMEOUT: Duration = Duration::from_secs(30);
 const TICK_BUDGET: Duration = Duration::from_secs(20);
 
 /// The chat request header mapped onto the webhook egress; the receiver must
-/// see its value on every notify POST (the R2 row, applied by the reconciler).
+/// see its value on every notify POST (the parked approval row's own header,
+/// applied by the reconciler).
 const EGRESS_NAME: &str = "x-tenant-egress";
 const EGRESS_VALUE: &str = "Bearer rig-egress-sentinel";
 /// The identity header the decided status GET carries, docked onto the
@@ -634,7 +634,7 @@ async fn park_and_notify(
     );
 
     // The parked approval row is at rest in the store, carrying its
-    // request-scoped resolved egress value (the R2 record).
+    // request-scoped resolved egress value.
     let (decision_id, approval_record) = wait_for_single_approval(store_root).await;
     assert!(
         approval_record.contains(EGRESS_VALUE),

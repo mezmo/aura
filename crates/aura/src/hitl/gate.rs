@@ -780,12 +780,12 @@ mod tests {
             assert!(store.get(&decision_id).await.unwrap().is_none());
         }
 
-        /// Stage-5 activation: a webhook route with poll delivery parks the
-        /// gated call. The route is wired the production way
+        /// A webhook route with poll delivery parks the gated call. The
+        /// route is wired the production way
         /// ([`crate::hitl::HitlRuntime::from_config`] over a poll config) so
         /// the client carries the poll marker; the park arm registers into
         /// the shared registry without consulting the unreachable webhook.
-        /// The reconciler flow itself is the poller's (stage 4).
+        /// The reconciler flow itself is the poller's.
         #[tokio::test]
         async fn webhook_poll_route_parks_the_gated_call() {
             let config = aura_config::HitlConfig {
@@ -894,7 +894,7 @@ mod tests {
                 .collect()
         }
 
-        /// R2 capture failure fails the REGISTRATION closed: a mapped
+        /// Capture failure fails the REGISTRATION closed: a mapped
         /// destination with no usable resolved value and no static fallback
         /// produces no approval row, no pending event, and no blocked-cell
         /// entry — so there is also nothing for the reconciler to notify.
@@ -1160,9 +1160,10 @@ mod tests {
         }
 
         /// Reify blocks an approved call whose identity capture failed
-        /// (recorded without identity) when the route demands identity: the
-        /// record-then-block precedent — the decision is not lost, but the
-        /// call never runs under the requester's credentials.
+        /// (recorded without identity) when the route demands identity:
+        /// record-then-block, per the approver identity ADR — the decision
+        /// is not lost, but the call never runs under the requester's
+        /// credentials.
         #[tokio::test]
         async fn approved_without_required_identity_fails_the_call_closed() {
             let recorded = Arc::new(RecordedDecisions::default());

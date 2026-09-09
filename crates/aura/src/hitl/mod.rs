@@ -44,7 +44,8 @@ pub use decision::{
 };
 pub(crate) use events::completed_cancelled;
 pub use gate::HitlApprovalWrapper;
-// Fingerprint tests construct the poll/sync clients the production way.
+// Re-exported so config-fingerprint tests construct the poll client the
+// production way.
 pub use poller::{PollReconciler, PollerHandle};
 pub use protocol::{ApprovalDecisionWire, ApprovalItem, ApprovalRequest, PROTOCOL_VERSION};
 pub use registry::{ParkedApproval, PendingApprovals, ResolveError};

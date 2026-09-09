@@ -32,7 +32,7 @@ impl RecordedDecisions {
     /// Record a resolved decision — decision and captured identity together —
     /// for a key, appending to that key's recorded-order queue so two
     /// same-turn calls with identical arguments keep their own decisions.
-    /// Wired by the orchestrator continuation (P44 commit 3).
+    /// Wired by the orchestrator continuation.
     #[allow(dead_code)]
     pub(crate) fn push(&self, key: CallKey, decision: ResolvedDecision) {
         self.entries

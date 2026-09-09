@@ -25,8 +25,8 @@ event bus) is implemented:** `RedisApprovalStore` persists approvals as
 `ParkedApprovalRecord` (`aura::session_store::record`, the round-trippable storage
 projection — the domain types stay deliberately unserializable), and
 `RedisEventBus` carries decision wakes over pub/sub (§6.1). Both storage
-records carry optional at-rest fields as of P38 stage 6 - resolved egress
-header values on `ParkedApprovalRecord` (R2 poll delivery) and approver
+records carry optional at-rest fields: resolved egress
+header values on `ParkedApprovalRecord` (poll delivery) and approver
 identity on `DecisionRecord` - additive serde (absence = uncaptured), with
 names-only `Debug` on both so no header value reaches logs (ADR
 `2026-08-13-approver-identity-forwarding.md`, `design/hitl.md` "Storage
