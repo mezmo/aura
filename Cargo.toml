@@ -109,6 +109,10 @@ schemars = "1.0.4"
 reqwest = { version = "0.12", default-features = false, features = ["charset", "http2", "system-proxy", "json", "stream", "rustls-tls"] }
 http = "1.0"
 
+# Live TLS test servers (dev-dependencies of crates/aura)
+rcgen = "0.13"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+
 # Patch rig-core to use the fork with streaming hook + span propagation fix
 [patch.crates-io]
 rig-core = { git = "https://github.com/mezmo/rig.git", rev = "097d08d6188c76debabedddd2ac65ca5bffd2863" }

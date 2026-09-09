@@ -147,7 +147,10 @@ impl ConfigLoader {
         config.validate()?;
 
         // Hard failure, unlike the warn-and-continue on TOML load above: a trust bundle that silently fails validation would start the agent without the user's intended CAs.
-        config.validate_tls_bundle()?;
+        let bundle_bytes = config.validate_tls_bundle()?;
+        if let Some(tls) = config.tls.as_mut() {
+            tls.frozen_bundle = bundle_bytes.into();
+        }
 
         Ok(config)
     }
@@ -233,6 +236,7 @@ impl ConfigLoader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     #[test]
     fn test_config_loader_builder() {
@@ -263,5 +267,102 @@ mod tests {
 
         // We expect this to fail because we don't have valid config files in test
         assert!(result.is_err());
+    }
+
+    /// Base64-valid fixture body: rustls-pemfile does not inspect DER
+    /// structure, so stage-1 validation accepts it. Real-DER handling is
+    /// covered by the aura crate's live TLS tests.
+    const TEST_CA_PEM: &str = concat!(
+        "-----BEGIN CERTIFICATE-----\n",
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n",
+        "-----END CERTIFICATE-----\n",
+    );
+
+    #[test]
+    fn build_hard_fails_on_garbage_ca_bundle() {
+        let dir = TempDir::new().unwrap();
+        let bundle = dir.path().join("ca.pem");
+        std::fs::write(&bundle, b"garbage").unwrap();
+        let config = dir.path().join("agent.toml");
+        std::fs::write(
+            &config,
+            format!(
+                r#"
+[agent]
+name = "Loader"
+system_prompt = "p"
+[agent.llm]
+provider = "openai"
+api_key = "k"
+model = "m"
+[tls]
+ca_bundle = "{}"
+"#,
+                bundle.display()
+            ),
+        )
+        .unwrap();
+
+        let err = ConfigLoader::new()
+            .with_toml_file(&config)
+            .build()
+            .expect_err("a garbage CA bundle must hard-fail build");
+        assert!(
+            err.to_string().contains("ca.pem"),
+            "error must name the bundle path: {err}"
+        );
+    }
+
+    #[test]
+    fn build_merges_tls_from_override_layer() {
+        let dir = TempDir::new().unwrap();
+        let bundle = dir.path().join("ca.pem");
+        std::fs::write(&bundle, TEST_CA_PEM).unwrap();
+        let base = dir.path().join("base.toml");
+        std::fs::write(
+            &base,
+            r#"
+[agent]
+name = "Base"
+system_prompt = "p"
+[agent.llm]
+provider = "openai"
+api_key = "k"
+model = "m"
+"#,
+        )
+        .unwrap();
+        let override_layer = dir.path().join("override.toml");
+        std::fs::write(
+            &override_layer,
+            format!(
+                r#"
+[agent]
+name = "Override"
+system_prompt = "p"
+[agent.llm]
+provider = "openai"
+api_key = "k"
+model = "m"
+[tls]
+ca_bundle = "{}"
+"#,
+                bundle.display()
+            ),
+        )
+        .unwrap();
+
+        let built = ConfigLoader::new()
+            .with_toml_file(&base)
+            .with_toml_file(&override_layer)
+            .build()
+            .expect("layered build with a valid CA bundle should succeed");
+        let tls = built.tls.expect("override layer must supply [tls]");
+        assert_eq!(tls.ca_bundle, bundle);
+        assert_eq!(
+            &tls.frozen_bundle[..],
+            TEST_CA_PEM.as_bytes(),
+            "build must freeze the validated bundle bytes"
+        );
     }
 }

@@ -40,10 +40,13 @@ fn load_single_config<P: AsRef<Path>>(path: P) -> Result<Config, ConfigError> {
     let resolved = resolve_env_vars(&contents)?;
     check_legacy_top_level_llm(&resolved)?;
 
-    let config: Config = toml::from_str(&resolved)?;
+    let mut config: Config = toml::from_str(&resolved)?;
     config.validate()?;
     config.validate_memory_dir_writable()?;
-    config.validate_tls_bundle()?;
+    let bundle_bytes = config.validate_tls_bundle()?;
+    if let Some(tls) = config.tls.as_mut() {
+        tls.frozen_bundle = bundle_bytes.into();
+    }
 
     Ok(config)
 }

@@ -84,4 +84,6 @@ integration-stdio = []
 tempfile = "3.23.0"
 toml = "0.8"
 tokio = { version = "1.45", features = ["test-util", "macros", "rt"] }
+rcgen = { workspace = true }
+tokio-rustls = { workspace = true }
 

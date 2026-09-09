@@ -481,10 +481,13 @@ impl Config {
     /// The bundle fails validation when the file is missing or unreadable,
     /// when any PEM block fails to parse, when any block is not a
     /// certificate, or when the bundle contains no certificates. This is
-    /// the same treatment reqwest applies when building a client from a
-    /// PEM bundle, so a bundle accepted here cannot fail later at client
-    /// construction. Without a `[tls]` section the bundle is empty and
-    /// validation succeeds.
+    /// the same PEM handling reqwest applies in
+    /// `Certificate::from_pem_bundle`, so a bundle accepted here passes
+    /// that decode step at client construction. DER validity is not
+    /// checked here: it is enforced later, when the runtime client's root
+    /// store parses each certificate, so a base64-valid but DER-corrupt
+    /// bundle passes this check and fails at client build. Without a
+    /// `[tls]` section the bundle is empty and validation succeeds.
     ///
     /// Like [`validate_memory_dir_writable`], this is not part of the
     /// validate() method because it is not side effect free.
@@ -1599,6 +1602,7 @@ tool_headers_from_response = { "Content-Type" = "x-anything" }
         Config {
             tls: Some(TlsConfig {
                 ca_bundle: path.to_path_buf(),
+                frozen_bundle: Default::default(),
             }),
             ..Config::default()
         }
@@ -1974,4 +1978,9 @@ pub struct CatalogHmacConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TlsConfig {
     pub ca_bundle: std::path::PathBuf,
+    /// PEM bundle bytes populated once by the load path's IO validation
+    /// ([`Config::validate_tls_bundle`]). Never serialized; empty means
+    /// the bundle has not been loaded.
+    #[serde(skip)]
+    pub frozen_bundle: std::sync::Arc<[u8]>,
 }
