@@ -37,7 +37,7 @@
 #   POSTHOG_API_READ_KEY    - personal API key used to read the snapshot back
 #   POSTHOG_PROJECT_ID      - numeric project id the read-back queries (default: 443794)
 #   POSTHOG_API_HOST        - PostHog query host (default: https://us.posthog.com)
-#   VERIFY_TIMEOUT          - seconds to wait for ingestion (default: 300)
+#   VERIFY_TIMEOUT          - seconds to wait for ingestion (default: 600)
 #   SKIP_VERIFY             - 1 sends without reading the snapshot back
 #   GITHUB_REPOS            - space-separated owner/repo list (default: mezmo/aura)
 #   SNAPSHOT_DATE           - same as --date
@@ -61,7 +61,7 @@ GITHUB_REPOS="${GITHUB_REPOS:-mezmo/aura}"
 BATCH_SIZE="${BATCH_SIZE:-1000}"
 POSTHOG_PROJECT_ID="${POSTHOG_PROJECT_ID:-443794}"
 POSTHOG_API_HOST="${POSTHOG_API_HOST:-https://us.posthog.com}"
-VERIFY_TIMEOUT="${VERIFY_TIMEOUT:-300}"
+VERIFY_TIMEOUT="${VERIFY_TIMEOUT:-600}"
 SKIP_VERIFY="${SKIP_VERIFY:-0}"
 WORK_DIR=""
 
