@@ -16,7 +16,9 @@ use reqwest::header::HeaderMap;
 
 use super::decision::{ApprovalDecision, ApprovalOutcome, DecisionId};
 use super::events;
-use super::protocol::{ApprovalDecisionWire, ApprovalRequest, ApprovalRequestWire};
+use super::protocol::{
+    ApprovalDecisionWire, ApprovalRequest, ApprovalRequestWire, PollDecisionWire, PollStatusWire,
+};
 use super::registry::PendingApprovals;
 use super::signing::{SigningContext, VerifiedBody, WebhookHmac, authorize_ingress};
 use crate::approval_event_broker::{self, ApprovalLifecycleEvent};
@@ -977,8 +979,9 @@ impl WebhookClient {
     /// context `approval-request:{decision_id}` (the receiver recomputes with
     /// the id from the query param), and a 200 response must verify under
     /// `approval-decision:{decision_id}` with the same ingress primitive the
-    /// sync response leg uses. A 200 body that does not parse as a decision
-    /// is pending-shaped, not an error: the caller keeps polling.
+    /// sync response leg uses. A decided 200 carries the receiver's
+    /// `{ "status": ... }` envelope; `pending` and any body outside the
+    /// envelope keep the caller polling (the latter logs a warn).
     pub(crate) async fn poll_decision(
         &self,
         decision_id: DecisionId,
@@ -1040,18 +1043,39 @@ impl WebhookClient {
             }
             None => body,
         };
-        match serde_json::from_slice::<ApprovalDecisionWire>(&verified) {
-            Ok(wire) => Ok(PollOutcome::Decided {
-                decision: ApprovalDecision::from(wire),
-                response_headers,
-            }),
+        match serde_json::from_slice::<PollDecisionWire>(&verified) {
+            Ok(wire) => match wire.status {
+                PollStatusWire::Pending => Ok(PollOutcome::NotYet),
+                PollStatusWire::Approved => {
+                    if let Some(reason) = wire.reason.as_deref() {
+                        tracing::debug!(
+                            decision_id = %decision_id,
+                            reason,
+                            "approve-side reason discarded; the decision model carries none"
+                        );
+                    }
+                    Ok(PollOutcome::Decided {
+                        decision: ApprovalDecision::Approved,
+                        response_headers,
+                    })
+                }
+                PollStatusWire::Denied => Ok(PollOutcome::Decided {
+                    decision: ApprovalDecision::Denied {
+                        reason: wire.reason,
+                    },
+                    response_headers,
+                }),
+            },
             Err(e) => {
-                // A pending-shaped body is a normal poll answer, not a
-                // fault: debug only, so per-tick polling stays quiet.
-                tracing::debug!(
+                // A body outside the status envelope keeps the poll alive —
+                // a pending read must never become a terminal denial — but
+                // with the envelope typed it now implies receiver schema
+                // drift or a proxy answering in the path, so it warns.
+                tracing::warn!(
                     decision_id = %decision_id,
                     error = %e,
-                    "poll response is not a decision yet"
+                    "poll 200 body is not a valid decision envelope: \
+                     receiver schema drift or a proxy in the path"
                 );
                 Ok(PollOutcome::NotYet)
             }
@@ -1687,7 +1711,9 @@ mod tests {
         use super::super::super::decision::{
             AgentScope, ApprovalDecision, ApprovalOrigin, CancelReason, DecisionId,
         };
-        use super::super::super::protocol::{ApprovalRequest, PROTOCOL_VERSION};
+        use super::super::super::protocol::{
+            ApprovalRequest, PROTOCOL_VERSION, PollDecisionWire, PollStatusWire,
+        };
         use super::super::super::signing::{
             PrimarySecret, SIGNATURE_HEADER, SigningContext, TIMESTAMP_HEADER, Tolerance,
             WebhookHmac, authorize_ingress,
@@ -2897,7 +2923,7 @@ mod tests {
         async fn poll_decision_200_signed_decision_resolves_and_get_signature_verifies() {
             let hmac = test_hmac();
             let decision_id = DecisionId::generate();
-            let response_body = r#"{"approved":true}"#.to_string();
+            let response_body = r#"{"status":"approved"}"#.to_string();
             let mut response_headers = signed_response_headers(&hmac, decision_id, &response_body);
             response_headers.push(("x-approver-id".to_owned(), "alice".to_owned()));
             let (url, received) = one_shot_receiver(response_headers, response_body).await;
@@ -2959,13 +2985,13 @@ mod tests {
             .expect("receiver must verify the GET signature over the empty body");
         }
 
-        /// A 200 body that verifies but does not parse as a decision is
-        /// pending-shaped, not a channel fault: keep polling.
+        /// A 200 body that verifies but is not the receiver's status
+        /// envelope keeps the approval alive: warn and keep polling.
         #[tokio::test]
         async fn poll_decision_200_unparsable_body_is_pending_not_an_error() {
             let hmac = test_hmac();
             let decision_id = DecisionId::generate();
-            let garbage = r#"{"status":"pending"}"#.to_string();
+            let garbage = "<html>upstream error page</html>".to_string();
             let response_headers = signed_response_headers(&hmac, decision_id, &garbage);
             let (url, _received) = one_shot_receiver(response_headers, garbage).await;
 
@@ -2978,10 +3004,139 @@ mod tests {
             let outcome = client
                 .poll_decision(decision_id)
                 .await
-                .expect("a pending-shaped body must not fault");
+                .expect("an out-of-envelope body must not fault");
             assert!(
                 matches!(outcome, PollOutcome::NotYet),
                 "expected NotYet, got {outcome:?}"
+            );
+        }
+
+        /// The receiver's undecided answer: a 200 carrying the status
+        /// envelope with `pending`.
+        #[tokio::test]
+        async fn poll_decision_envelope_pending_is_not_yet() {
+            let (url, _received) =
+                one_shot_receiver(vec![], r#"{"status":"pending"}"#.to_string()).await;
+
+            let client =
+                loopback_poll_client(&url, EgressSigning::Disabled, &url, Duration::from_secs(5));
+            let outcome = client
+                .poll_decision(DecisionId::generate())
+                .await
+                .expect("a pending envelope must not fault");
+            assert!(
+                matches!(outcome, PollOutcome::NotYet),
+                "expected NotYet, got {outcome:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn poll_decision_envelope_approved_resolves() {
+            let (url, _received) =
+                one_shot_receiver(vec![], r#"{"status":"approved"}"#.to_string()).await;
+
+            let client =
+                loopback_poll_client(&url, EgressSigning::Disabled, &url, Duration::from_secs(5));
+            let outcome = client
+                .poll_decision(DecisionId::generate())
+                .await
+                .expect("an approved envelope must resolve");
+            assert!(
+                matches!(
+                    outcome,
+                    PollOutcome::Decided {
+                        decision: ApprovalDecision::Approved,
+                        ..
+                    }
+                ),
+                "expected Decided(Approved), got {outcome:?}"
+            );
+        }
+
+        /// A denial's reason rides the envelope into the decision.
+        #[tokio::test]
+        async fn poll_decision_envelope_denied_carries_reason() {
+            let (url, _received) = one_shot_receiver(
+                vec![],
+                r#"{"status":"denied","reason":"quota exceeded"}"#.to_string(),
+            )
+            .await;
+
+            let client =
+                loopback_poll_client(&url, EgressSigning::Disabled, &url, Duration::from_secs(5));
+            let outcome = client
+                .poll_decision(DecisionId::generate())
+                .await
+                .expect("a denied envelope must resolve");
+            match outcome {
+                PollOutcome::Decided {
+                    decision: ApprovalDecision::Denied { reason },
+                    ..
+                } => assert_eq!(reason.as_deref(), Some("quota exceeded")),
+                other => panic!("expected Decided(Denied), got {other:?}"),
+            }
+        }
+
+        /// The envelope is additive-field tolerant: a receiver decorating a
+        /// decided body must not silently expire the approval.
+        #[tokio::test]
+        async fn poll_decision_envelope_tolerates_unknown_fields_on_decided() {
+            let (url, _received) = one_shot_receiver(
+                vec![],
+                r#"{"status":"approved","reason":null,"decided_by":"policy-x"}"#.to_string(),
+            )
+            .await;
+
+            let client =
+                loopback_poll_client(&url, EgressSigning::Disabled, &url, Duration::from_secs(5));
+            let outcome = client
+                .poll_decision(DecisionId::generate())
+                .await
+                .expect("an approved envelope with extra fields must resolve");
+            assert!(
+                matches!(
+                    outcome,
+                    PollOutcome::Decided {
+                        decision: ApprovalDecision::Approved,
+                        ..
+                    }
+                ),
+                "expected Decided(Approved), got {outcome:?}"
+            );
+        }
+
+        /// The serde matrix for the status envelope: every status parses
+        /// with the reason present, absent, and null; an unknown status
+        /// value fails the parse (which the poll leg treats as not-yet).
+        #[test]
+        fn poll_wire_parses_the_status_envelope_matrix() {
+            for status in ["pending", "approved", "denied"] {
+                for reason in [None, Some("null"), Some("\"policy: auto-approve\"")] {
+                    let body = match reason {
+                        None => format!(r#"{{"status":"{status}"}}"#),
+                        Some("null") => format!(r#"{{"status":"{status}","reason":null}}"#),
+                        Some(value) => format!(r#"{{"status":"{status}","reason":{value}}}"#),
+                    };
+                    let wire: PollDecisionWire = serde_json::from_str(&body)
+                        .unwrap_or_else(|e| panic!("{body} must parse: {e}"));
+                    let expected = match status {
+                        "pending" => PollStatusWire::Pending,
+                        "approved" => PollStatusWire::Approved,
+                        _ => PollStatusWire::Denied,
+                    };
+                    assert_eq!(wire.status, expected, "body: {body}");
+                    assert_eq!(
+                        wire.reason.as_deref(),
+                        reason
+                            .filter(|r| *r != "null")
+                            .map(|_| "policy: auto-approve"),
+                        "body: {body}"
+                    );
+                }
+            }
+            assert!(
+                serde_json::from_str::<PollDecisionWire>(r#"{"status":"revoked"}"#).is_err(),
+                "an unknown status value must fail the parse"
             );
         }
 
@@ -3011,7 +3166,7 @@ mod tests {
         #[tokio::test]
         async fn poll_decision_unverified_200_fails_closed() {
             let (url, _received) =
-                one_shot_receiver(vec![], r#"{"approved":true}"#.to_string()).await;
+                one_shot_receiver(vec![], r#"{"status":"approved"}"#.to_string()).await;
 
             let client = loopback_poll_client(
                 &url,
@@ -3035,7 +3190,7 @@ mod tests {
         #[tokio::test]
         async fn poll_decision_unsigned_mode_resolves_decision_and_garbage_stays_pending() {
             let (url, _received) =
-                one_shot_receiver(vec![], r#"{"approved":false,"reason":"no"}"#.to_string()).await;
+                one_shot_receiver(vec![], r#"{"status":"denied","reason":"no"}"#.to_string()).await;
             let client =
                 loopback_poll_client(&url, EgressSigning::Disabled, &url, Duration::from_secs(5));
             match client

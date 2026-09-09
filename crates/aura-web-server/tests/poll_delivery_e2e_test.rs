@@ -215,11 +215,12 @@ struct ReceiverShared {
     requests: Vec<String>,
 }
 
-/// An in-process governance receiver in the ruled shape: the notification
-/// POST is answered 200 with a DECISION-SHAPED body (`{"approved": true}`) —
-/// an ack whose body must never be read as a decision — and the status GET
-/// answers 404 until the test flips `decided`, then 200 with the approver
-/// identity header. Unsigned: aura's notify/poll legs run without HMAC.
+/// An in-process governance receiver: the notification POST is answered 200
+/// with a DECISION-SHAPED body (`{"approved": true}`) — an ack whose body
+/// must never be read as a decision — and the status GET answers 404 until
+/// the test flips `decided`, then 200 with the status envelope
+/// (`{"status": "approved"}`) and the approver identity header. Unsigned:
+/// aura's notify/poll legs run without HMAC.
 #[derive(Clone)]
 struct MockGovernanceReceiver {
     base_url: String,
@@ -294,7 +295,7 @@ async fn serve_one(mut socket: tokio::net::TcpStream, shared: Arc<Mutex<Receiver
 
 /// The receiver's HTTP/1.1 answer: the POST is ack-only with a deliberately
 /// decision-shaped body; an undecided GET is a 404; a decided GET carries the
-/// identity header and the decision body.
+/// status envelope and the identity header.
 fn build_receiver_response(captured: &str, decided: bool) -> String {
     let request_line = captured.lines().next().unwrap_or_default();
     if request_line.starts_with("POST ") {
@@ -306,7 +307,7 @@ fn build_receiver_response(captured: &str, decided: bool) -> String {
         );
     }
     if request_line.starts_with("GET ") && decided {
-        let body = json!({ "approved": true }).to_string();
+        let body = json!({ "status": "approved" }).to_string();
         return format!(
             "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n{IDENTITY_NAME}: \
              {IDENTITY_VALUE}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",

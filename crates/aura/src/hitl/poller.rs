@@ -390,7 +390,7 @@ mod tests {
             ("503 Service Unavailable", String::new()),
             ack_ok(),
             poll_pending(),
-            poll_decided(r#"{"approved":true}"#),
+            poll_decided(r#"{"status":"approved"}"#),
         ])
         .await;
         let reconciler = reconciler_with(store.clone(), &url);
@@ -431,14 +431,17 @@ mod tests {
         );
     }
 
-    /// A 200 whose body does not parse as a decision keeps the approval
+    /// A 200 whose body is outside the status envelope keeps the approval
     /// pending: nothing is recorded, and the reconciler polls again.
     #[tokio::test]
     async fn tick_unparsable_poll_200_records_no_decision() {
         let store: Arc<dyn ApprovalStore> = Arc::new(InMemoryApprovalStore::new());
         let id = park_pending(&store, INSTANCE_ID).await;
-        let (url, mut rx) =
-            scripted_receiver(vec![ack_ok(), poll_decided(r#"{"status":"pending"}"#)]).await;
+        let (url, mut rx) = scripted_receiver(vec![
+            ack_ok(),
+            poll_decided("<html>upstream error page</html>"),
+        ])
+        .await;
         let reconciler = reconciler_with(store.clone(), &url);
         let mut notified = HashSet::new();
 
@@ -450,9 +453,46 @@ mod tests {
         assert_eq!(
             store_decision(&store, &id).await,
             None,
-            "a pending-shaped body must never become a decision"
+            "an out-of-envelope body must never become a decision"
         );
         assert!(store.get(&id).await.unwrap().is_some());
+    }
+
+    /// A policy-instant approval on the notify POST is never read as a
+    /// decision: the ack body is dropped, and only the status GET resolves.
+    #[tokio::test]
+    async fn policy_instant_approve_on_the_notify_ack_waits_for_the_status_get() {
+        let store: Arc<dyn ApprovalStore> = Arc::new(InMemoryApprovalStore::new());
+        let id = park_pending(&store, INSTANCE_ID).await;
+        let (url, mut rx) = scripted_receiver(vec![
+            poll_decided(r#"{"status":"approved"}"#), // the approving ack body
+            poll_pending(),
+            poll_decided(r#"{"status":"approved"}"#),
+        ])
+        .await;
+        let reconciler = reconciler_with(store.clone(), &url);
+        let mut notified = HashSet::new();
+
+        reconciler.tick(&mut notified).await;
+        assert!(rx.recv().await.unwrap().starts_with("POST "));
+        let first_poll = rx.recv().await.unwrap();
+        assert!(
+            first_poll.starts_with("GET "),
+            "an acked id polls the same tick: {first_poll}"
+        );
+
+        assert!(
+            store_decision(&store, &id).await.is_none(),
+            "an approving ack body must never mint a decision"
+        );
+
+        reconciler.tick(&mut notified).await;
+        assert!(rx.recv().await.unwrap().starts_with("GET "));
+        assert_eq!(
+            store_decision(&store, &id).await,
+            Some(ResolvedDecision::from(ApprovalDecision::Approved)),
+            "the decided status GET resolves durably"
+        );
     }
 
     /// A pending row belonging to another instance is never notified,
@@ -464,7 +504,7 @@ mod tests {
         let own = park_pending(&store, INSTANCE_ID).await;
         let other = park_pending(&store, "another-instance").await;
         let (url, mut rx) =
-            scripted_receiver(vec![ack_ok(), poll_decided(r#"{"approved":true}"#)]).await;
+            scripted_receiver(vec![ack_ok(), poll_decided(r#"{"status":"approved"}"#)]).await;
         let reconciler = reconciler_with(store.clone(), &url);
         let mut notified = HashSet::new();
 
@@ -533,7 +573,7 @@ mod tests {
             ack_ok(),
             poll_pending(),
             ack_ok(),
-            poll_decided(r#"{"approved":true}"#),
+            poll_decided(r#"{"status":"approved"}"#),
         ])
         .await;
 
@@ -872,8 +912,8 @@ mod tests {
                 ("200 OK", vec![], ""),
                 ("204 No Content", vec![], ""),
                 ("204 No Content", vec![], ""),
-                ("200 OK", vec![], r#"{"approved":true}"#),
-                ("200 OK", vec![], r#"{"approved":true}"#),
+                ("200 OK", vec![], r#"{"status":"approved"}"#),
+                ("200 OK", vec![], r#"{"status":"approved"}"#),
             ])
             .await;
             let reconciler = reconciler_from(&config, Arc::clone(&reader), &url);
@@ -941,7 +981,7 @@ mod tests {
                 (
                     "200 OK",
                     vec![("x-approver-id", IDENTITY_SENTINEL)],
-                    r#"{"approved":true}"#,
+                    r#"{"status":"approved"}"#,
                 ),
             ])
             .await;
@@ -987,7 +1027,7 @@ mod tests {
             let config = poll_config_with(HashMap::new(), true);
             let (url, mut rx) = scripted_receiver_with_headers(vec![
                 ("200 OK", vec![], ""),
-                ("200 OK", vec![], r#"{"approved":true}"#),
+                ("200 OK", vec![], r#"{"status":"approved"}"#),
             ])
             .await;
             let reconciler = reconciler_from(&config, store.clone(), &url);
@@ -1063,7 +1103,7 @@ mod tests {
                 (
                     "200 OK",
                     vec![("x-approver-id", IDENTITY)],
-                    r#"{"approved":true}"#,
+                    r#"{"status":"approved"}"#,
                 ),
             ])
             .await;
