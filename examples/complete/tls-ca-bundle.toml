@@ -5,9 +5,9 @@
 # trusted in addition to the built-in webpki roots, so public endpoints keep
 # working.
 #
-# The same bundle applies to every outbound TLS connection the agent makes:
-# MCP servers (http_streamable and SSE transports), the HITL approval webhook,
-# and the governance catalog webhook.
+# The bundle applies to the agent's webhook and MCP egress: MCP servers
+# (http_streamable and SSE transports), the HITL approval webhook, and the
+# governance catalog webhook.
 #
 # Prerequisites:
 #   export OPENAI_API_KEY="sk-..."

@@ -26,7 +26,7 @@ const WEBHOOK_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// `tls` applies the global `[tls]` CA bundle to the webhook's TLS;
 /// `None` keeps the built-in webpki roots.
-pub fn build_webhook_client(tls: Option<&TlsConfig>) -> reqwest::Client {
+pub(crate) fn build_webhook_client(tls: Option<&TlsConfig>) -> reqwest::Client {
     let builder = crate::tls::apply(
         reqwest::Client::builder().connect_timeout(WEBHOOK_CONNECT_TIMEOUT),
         tls,
