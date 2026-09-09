@@ -306,7 +306,7 @@ Any value set here is overridden by environment variables or CLI flags.
 
 ### Custom trusted CA roots (`[tls]`)
 
-The standalone agent config (the TOML loaded by `--config` / [config discovery](#config-discovery), not `cli.toml`) accepts a `[tls]` table naming a PEM file of trusted root certificates. Certificates in the bundle are added **on top of** the built-in webpki roots — publicly-rooted endpoints keep working — and apply to every outbound TLS connection the agent makes: the HITL approval webhook, the governance catalog webhook, and MCP servers over HTTP streamable and SSE transports. One bundle may hold many certificates, e.g. an internal root CA plus an intermediate.
+The standalone agent config (the TOML loaded by `--config` / [config discovery](#config-discovery), not `cli.toml`) accepts a `[tls]` table naming a PEM file of trusted root certificates. Certificates in the bundle are added **on top of** the built-in webpki roots — publicly-rooted endpoints keep working — and apply to the agent's webhook and MCP egress: the HITL approval webhook, the governance catalog webhook, and MCP servers over HTTP streamable and SSE transports. One bundle may hold many certificates, e.g. an internal root CA plus an intermediate.
 
 ```toml
 # in the agent config.toml
