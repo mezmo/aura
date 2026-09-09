@@ -383,7 +383,7 @@ impl AuraServer {
                     break;
                 }
                 let mut log = log_sink.lock().expect("stderr log mutex");
-                log.push_str(&line);
+                log.push_str(line.trim_end_matches('\n'));
                 log.push('\n');
             }
         });

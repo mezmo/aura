@@ -55,9 +55,7 @@ pub(crate) async fn read_full_request(socket: &mut tokio::net::TcpStream) -> Str
     // Read until we have the complete header section (\r\n\r\n).
     loop {
         let n = socket.read(&mut chunk).await.unwrap();
-        if n == 0 {
-            break;
-        }
+        assert!(n > 0, "peer closed before request completed");
         buf.extend_from_slice(&chunk[..n]);
         if buf.windows(4).any(|w| w == b"\r\n\r\n") {
             break;
