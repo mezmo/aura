@@ -35,7 +35,7 @@
 #   POSTHOG_API_READ_KEY    - personal API key used to read the snapshot back
 #   POSTHOG_PROJECT_ID      - numeric project id the read-back queries (default: 443794)
 #   POSTHOG_API_HOST        - PostHog query host (default: https://us.posthog.com)
-#   VERIFY_TIMEOUT          - seconds to wait for ingestion (default: 300)
+#   VERIFY_TIMEOUT          - seconds to wait for ingestion (default: 600)
 #   SKIP_VERIFY             - 1 sends without reading the snapshot back
 #   CLOUDSMITH_REPOS        - space-separated owner/repo list (default: mezmo/aura)
 #   CLOUDSMITH_API_KEY      - Cloudsmith API key; unset reads the public package list
@@ -63,7 +63,7 @@ PAGE_SIZE="${PAGE_SIZE:-500}"
 BATCH_SIZE="${BATCH_SIZE:-1000}"
 POSTHOG_PROJECT_ID="${POSTHOG_PROJECT_ID:-443794}"
 POSTHOG_API_HOST="${POSTHOG_API_HOST:-https://us.posthog.com}"
-VERIFY_TIMEOUT="${VERIFY_TIMEOUT:-300}"
+VERIFY_TIMEOUT="${VERIFY_TIMEOUT:-600}"
 SKIP_VERIFY="${SKIP_VERIFY:-0}"
 WORK_DIR=""
 
@@ -351,6 +351,12 @@ verify_snapshot() {
     while :; do
         events=$(count_ingested "${date}")
         downloads=$(hogql_scalar "$(downloads_query "${date}")")
+        # A date none of whose events are queryable yet answers with a null
+        # sum, which reaches here as an empty or literal "null" value. That is
+        # "nothing has landed yet", which the poll exists to wait out, not a
+        # malformed answer to abort on.
+        case "${events}" in '' | null) events=0 ;; esac
+        case "${downloads}" in '' | null) downloads=0 ;; esac
         for value in "${events}" "${downloads}"; do
             case "${value}" in
                 '' | *[!0-9]*)
