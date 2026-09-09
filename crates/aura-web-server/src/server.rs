@@ -429,7 +429,7 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
     }
 
     let app_state = Arc::new(AppState {
-        configs: configs_arc,
+        configs: Arc::clone(&configs_arc),
         tool_result_mode: args.tool_result_mode,
         tool_result_max_length: args.tool_result_max_length,
         streaming_buffer_size: args.streaming_buffer_size,
@@ -456,6 +456,24 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
         "Starting server on {}:{} (shutdown_timeout={}s)",
         args.host, args.port, shutdown_timeout_secs
     );
+
+    // Poll delivery: one reconciler per poll-mode agent config, holding its
+    // own webhook client built from the same route config the per-request
+    // routes use, and the ingress registry's store. Each loop stops when the
+    // shutdown token cancels (phase 1).
+    for config in configs_arc.iter() {
+        if let Some(hitl) = &config.hitl
+            && let Some(reconciler) = aura::hitl::PollReconciler::from_config(
+                hitl,
+                ingress_hmac.as_ref(),
+                compute_instance_id(&config.agent).to_string(),
+                session_store.approvals(),
+                &app_state.pending_approvals,
+            )
+        {
+            reconciler.spawn(&shutdown_token);
+        }
+    }
 
     let app = Router::new()
         .route("/health", get(handlers::health))

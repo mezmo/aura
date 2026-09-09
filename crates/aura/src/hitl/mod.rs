@@ -31,6 +31,7 @@
 mod decision;
 mod events;
 mod gate;
+mod poller;
 mod protocol;
 mod registry;
 mod route;
@@ -43,6 +44,7 @@ pub use decision::{
 };
 pub(crate) use events::completed_cancelled;
 pub use gate::HitlApprovalWrapper;
+pub use poller::{PollReconciler, PollerHandle};
 pub use protocol::{ApprovalDecisionWire, ApprovalItem, ApprovalRequest, PROTOCOL_VERSION};
 pub use registry::{ParkedApproval, PendingApprovals, ResolveError};
 pub use route::{

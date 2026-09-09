@@ -413,6 +413,7 @@ impl Config {
             && let DecisionRouteConfig::Webhook {
                 delivery: WebhookDelivery::Poll,
                 headers_from_request,
+                poll_interval_secs,
                 ..
             } = &hitl.route
         {
@@ -428,6 +429,13 @@ impl Config {
                     "`hitl.route.headers_from_request` is unsupported with \
                      `hitl.route.delivery = \"poll\"`: request-derived headers cannot be \
                      reconstructed by the background reconciler after a restart"
+                        .to_string(),
+                ));
+            }
+            if *poll_interval_secs == 0 {
+                return Err(crate::ConfigError::Validation(
+                    "`hitl.route.poll_interval_secs` must be greater than zero: \
+                     the poll reconciler ticks on this interval"
                         .to_string(),
                 ));
             }
@@ -1389,6 +1397,20 @@ mode = "conversational"
         let msg = err.to_string();
         assert!(
             msg.contains("hitl.route.headers_from_request"),
+            "error must name the key: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_zero_poll_interval() {
+        let err = crate::load_config_from_str(&poll_config_toml(
+            true,
+            "delivery = \"poll\"\npoll_interval_secs = 0",
+        ))
+        .expect_err("a zero poll interval must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("hitl.route.poll_interval_secs"),
             "error must name the key: {msg}"
         );
     }

@@ -60,49 +60,11 @@ impl HitlRuntime {
         req_headers: Option<&HashMap<String, String>>,
     ) -> Self {
         let route = match &config.route {
-            DecisionRouteConfig::Webhook {
-                url,
-                timeout_secs,
-                headers,
-                headers_from_request,
-                tool_headers_from_response,
-                delivery,
-                poll_url,
-                poll_request_timeout_secs,
-                ..
-            } => {
-                let signing = match hmac {
-                    None => EgressSigning::Disabled,
-                    Some(hmac) => EgressSigning::Enabled(hmac.clone()),
-                };
-                // Poll settings exist only for poll delivery; `None` is the
-                // sync marker. `poll_interval_secs` stays unread here: the
-                // client carries no cadence, the reconciler owns it.
-                let poll = match delivery {
-                    WebhookDelivery::Poll => Some(PollSettings {
-                        // An unconfigured status endpoint polls the route
-                        // url itself; resolution happens here, once.
-                        poll_url: poll_url.clone().unwrap_or_else(|| url.clone()),
-                        request_timeout: Duration::from_secs(*poll_request_timeout_secs),
-                    }),
-                    WebhookDelivery::Sync => None,
-                };
-                DecisionRoute::Webhook {
-                    client: WebhookClient::with_headers_and_signing(
-                        build_webhook_client(),
-                        url.clone(),
-                        crate::webhook_utils::resolve_headers(
-                            headers,
-                            headers_from_request,
-                            req_headers,
-                        ),
-                        signing,
-                        tool_headers_from_response.clone(),
-                        poll,
-                    ),
-                    timeout: Duration::from_secs(*timeout_secs),
-                }
-            }
+            DecisionRouteConfig::Webhook { timeout_secs, .. } => DecisionRoute::Webhook {
+                client: webhook_client_from_config(&config.route, hmac, req_headers)
+                    .expect("the webhook arm of the route config builds a client"),
+                timeout: Duration::from_secs(*timeout_secs),
+            },
             DecisionRouteConfig::Conversational { timeout_secs } => DecisionRoute::Conversational {
                 registry: pending_approvals.clone(),
                 timeout: Duration::from_secs(*timeout_secs),
@@ -114,6 +76,55 @@ impl HitlRuntime {
             park_enabled: config.park.enabled,
         }
     }
+}
+
+/// Build the webhook route's client for a `[hitl.route]` config: the one
+/// construction every webhook arm shares (per-request [`HitlRuntime`]s and
+/// the poll reconciler's own client alike), so both see one wire shape.
+/// `None` for the conversational arm.
+///
+/// Poll settings exist only for poll delivery; `None` is the sync marker.
+/// `poll_interval_secs` stays unread here: the client carries no cadence,
+/// the reconciler owns it.
+pub(crate) fn webhook_client_from_config(
+    route: &DecisionRouteConfig,
+    hmac: Option<&WebhookHmac>,
+    req_headers: Option<&HashMap<String, String>>,
+) -> Option<WebhookClient> {
+    let DecisionRouteConfig::Webhook {
+        url,
+        headers,
+        headers_from_request,
+        tool_headers_from_response,
+        delivery,
+        poll_url,
+        poll_request_timeout_secs,
+        ..
+    } = route
+    else {
+        return None;
+    };
+    let signing = match hmac {
+        None => EgressSigning::Disabled,
+        Some(hmac) => EgressSigning::Enabled(hmac.clone()),
+    };
+    let poll = match delivery {
+        WebhookDelivery::Poll => Some(PollSettings {
+            // An unconfigured status endpoint polls the route url itself;
+            // resolution happens here, once.
+            poll_url: poll_url.clone().unwrap_or_else(|| url.clone()),
+            request_timeout: Duration::from_secs(*poll_request_timeout_secs),
+        }),
+        WebhookDelivery::Sync => None,
+    };
+    Some(WebhookClient::with_headers_and_signing(
+        build_webhook_client(),
+        url.clone(),
+        crate::webhook_utils::resolve_headers(headers, headers_from_request, req_headers),
+        signing,
+        tool_headers_from_response.clone(),
+        poll,
+    ))
 }
 
 /// Errors that can occur while asking a webhook for an approval decision.
@@ -445,9 +456,6 @@ enum EgressSigning {
 /// attempt may take. The route `timeout` is deliberately absent — under poll
 /// delivery it is the approval TTL, owned by the reconciler, not a request
 /// timeout.
-// The reconciler (P38 stage 4) is the lib-side consumer; the route.rs tests
-// exercise both fields meanwhile.
-#[allow(dead_code)]
 struct PollSettings {
     /// Status endpoint to GET: the configured `poll_url`, or the route `url`
     /// when unconfigured. Resolved once at [`HitlRuntime::from_config`].
@@ -496,7 +504,6 @@ impl WebhookReply {
 ///
 /// Pending is an outcome, not an error: a 404/204 or an unrecognized 200
 /// body only means "keep polling", so the caller can loop without catching.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) enum PollOutcome {
     /// 200 with a strictly-parsed, signature-verified decision; response
@@ -784,7 +791,6 @@ impl WebhookClient {
     /// A timeout is a transport fault, not a decision-shaped outcome — the
     /// reconciler simply retries on the next tick. The response body is
     /// dropped unread, so each attempt is its own connection.
-    #[allow(dead_code)]
     pub(crate) async fn notify(&self, request: &ApprovalRequest) -> Result<(), ApprovalError> {
         let Some(poll) = &self.poll else {
             return Err(ApprovalError::Misconfigured(
@@ -816,7 +822,6 @@ impl WebhookClient {
     /// `approval-decision:{decision_id}` with the same ingress primitive the
     /// sync response leg uses. A 200 body that does not parse as a decision
     /// is pending-shaped, not an error: the caller keeps polling.
-    #[allow(dead_code)]
     pub(crate) async fn poll_decision(
         &self,
         decision_id: DecisionId,
