@@ -85,6 +85,22 @@ yesterday_utc() {
     jq -rn 'now - 86400 | strftime("%Y-%m-%d")'
 }
 
+# A shell glob accepts digit-shaped nonsense like 2026-99-99, and an invalid
+# date reaches the wire as a malformed event timestamp. Round-trip the value
+# through jq's calendar and require it back unchanged: that rejects impossible
+# dates outright and catches the ones a parser silently rolls over, such as
+# 2026-02-30 becoming 2026-03-02.
+valid_date() {
+    local d=$1 normalized
+    case "${d}" in
+        [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) ;;
+        *) return 1 ;;
+    esac
+    normalized=$(jq -rn --arg d "${d}" \
+        'try ($d + "T00:00:00Z" | fromdateiso8601 | strftime("%Y-%m-%d")) catch ""')
+    [ "${normalized}" = "${d}" ]
+}
+
 day_before() {
     jq -rn --arg d "$1" '($d + "T00:00:00Z" | fromdateiso8601) - 86400 | strftime("%Y-%m-%d")'
 }
@@ -206,14 +222,33 @@ distinct_events_on() {
     hogql_scalar "$(snapshot_count_query "$1")"
 }
 
+# Count how many of this run's own event UUIDs are queryable at this run's
+# timestamp. A date-wide count would also match UUIDs left by an earlier run
+# whose asset set differed, and those extras can satisfy the threshold while an
+# event from the current payload is still missing. Pinning the timestamp too
+# means a snapshot attributed to the wrong instant cannot read as verified.
+count_ingested() {
+    local date=$1 chunk list total=0 found
+    for chunk in "${WORK_DIR}"/uchunk.*; do
+        list=$(sed "s/^/'/; s/$/'/" "${chunk}" | paste -sd, -)
+        found=$(hogql_scalar "SELECT count(DISTINCT uuid) FROM events \
+            WHERE event = '${EVENT_NAME}' \
+              AND timestamp = toDateTime('${date} 23:59:59') \
+              AND uuid IN (${list})")
+        total=$((total + found))
+    done
+    printf '%s\n' "${total}"
+}
+
 # Poll until the snapshot is queryable, since ingestion lags the send.
 verify_snapshot() {
     local date=$1 expected=$2 deadline got
+    split -l 500 "${WORK_DIR}/uuids" "${WORK_DIR}/uchunk."
     deadline=$(( $(date +%s) + VERIFY_TIMEOUT ))
     while :; do
-        got=$(distinct_events_on "${date}")
+        got=$(count_ingested "${date}")
         if [ "${got}" -ge "${expected}" ]; then
-            echo "Verified ${got} event(s) queryable in PostHog for ${date}"
+            echo "Verified ${got} of ${expected} event(s) queryable in PostHog for ${date}"
             return 0
         fi
         if [ "$(date +%s)" -ge "${deadline}" ]; then
@@ -277,6 +312,16 @@ selftest() {
     want="SELECT count(DISTINCT uuid) FROM events WHERE event = 'github_release_asset_downloads' AND properties.snapshot_date = '2026-08-20'"
     [ "${got}" = "${want}" ] || { echo "selftest: query is\n  ${got}\nwant\n  ${want}" >&2; exit 1; }
 
+    # Calendar validation must reject digit-shaped non-dates, rollovers, and
+    # anything that could carry a quote into the read-back query.
+    local d
+    for d in 2026-09-01 2024-02-29 2026-12-31 2026-01-01; do
+        valid_date "${d}" || { echo "selftest: rejected valid date ${d}" >&2; exit 1; }
+    done
+    for d in 2026-99-99 2026-13-01 2026-00-00 2026-02-30 2025-02-29 2026-9-1 "" "2026-09-0'"; do
+        if valid_date "${d}"; then echo "selftest: accepted invalid date '${d}'" >&2; exit 1; fi
+    done
+
     # Date arithmetic across month, year, and leap-day boundaries.
     got=$(day_before "2026-03-01"); want="2026-02-28"
     [ "${got}" = "${want}" ] || { echo "selftest: day_before(2026-03-01) = ${got}, want ${want}" >&2; exit 1; }
@@ -301,10 +346,10 @@ main() {
 
     local date="${SNAPSHOT_DATE}"
     [ -n "${date}" ] || date=$(yesterday_utc)
-    case "${date}" in
-        [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) ;;
-        *) echo "error: --date must be YYYY-MM-DD (got '${date}')" >&2; exit 1 ;;
-    esac
+    if ! valid_date "${date}"; then
+        echo "error: --date must be a real calendar date as YYYY-MM-DD (got '${date}')" >&2
+        exit 1
+    fi
 
     local repo
     for repo in ${GITHUB_REPOS}; do
