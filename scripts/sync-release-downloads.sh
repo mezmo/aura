@@ -93,6 +93,16 @@ uuid5() {
 # Dates go through jq rather than date(1): GNU and BSD date disagree on both
 # relative-date syntaxes, and jq is already a hard dependency here. jq's
 # strftime formats UTC regardless of the runner's timezone.
+# A fresh UUID, so nothing an earlier run wrote can be mistaken for it.
+uuid4() {
+    local h b6 b8
+    h=$(openssl rand -hex 16)
+    printf -v b6 '%02x' $(( 0x${h:12:2} & 0x0f | 0x40 ))
+    printf -v b8 '%02x' $(( 0x${h:16:2} & 0x3f | 0x80 ))
+    printf '%s-%s-%s%s-%s%s-%s\n' \
+        "${h:0:8}" "${h:8:4}" "${b6}" "${h:14:2}" "${b8}" "${h:18:2}" "${h:20:12}"
+}
+
 yesterday_utc() {
     jq -rn 'now - 86400 | strftime("%Y-%m-%d")'
 }
@@ -180,6 +190,29 @@ build_batch() {
               timestamp: ($date + "T23:59:59Z"),
               properties: ($r + {snapshot_date: $date, "$process_person_profile": false})}]}
     ' "${chunk}"
+}
+
+# Add a probe event to a payload, carrying a UUID no other run can produce.
+#
+# The snapshot events are identical across runs of the same date by design, so
+# finding them proves the snapshot is right but not that this run wrote
+# anything: PostHog answers 200 OK to a batch sent with a dead token, and on a
+# re-run of an already-populated date the stale rows satisfy every check. The
+# probe rides the same request, so it is absent exactly when that request was
+# discarded.
+add_probe() {
+    local payload=$1 probe=$2 ts
+    ts=$(jq -rn 'now | strftime("%Y-%m-%dT%H:%M:%SZ")')
+    jq --arg uuid "${probe}" --arg ts "${ts}" --arg event "${EVENT_NAME}_probe" '
+        .batch += [{uuid: $uuid, event: $event, distinct_id: "github:probe",
+                    timestamp: $ts,
+                    properties: {"$process_person_profile": false}}]' \
+        "${payload}" > "${payload}.probed"
+    mv "${payload}.probed" "${payload}"
+}
+
+probe_landed() {
+    hogql_scalar "SELECT count() FROM events WHERE event = '${EVENT_NAME}_probe' AND uuid = '$1'"
 }
 
 post_batch() {
@@ -287,19 +320,23 @@ count_ingested() {
 
 # Poll until the snapshot is queryable, since ingestion lags the send.
 verify_snapshot() {
-    local date=$1 expected=$2 expected_downloads=$3 deadline row got downloads
+    local date=$1 expected=$2 expected_downloads=$3 probe=$4
+    local deadline row got downloads seen
     split -l 500 "${WORK_DIR}/uuids" "${WORK_DIR}/uchunk."
     deadline=$(( $(date +%s) + VERIFY_TIMEOUT ))
     while :; do
         row=$(count_ingested "${date}")
         got=${row%%$'\t'*}
         downloads=${row##*$'\t'}
-        if [ "${got}" -ge "${expected}" ] && [ "${downloads}" -ge "${expected_downloads}" ]; then
-            echo "Verified ${got} of ${expected} event(s) and ${downloads} download(s) in PostHog for ${date}"
+        seen=$(probe_landed "${probe}")
+        case "${seen}" in '' | null) seen=0 ;; esac
+        if [ "${got}" -ge "${expected}" ] && [ "${downloads}" -ge "${expected_downloads}" ] \
+           && [ "${seen}" -ge 1 ]; then
+            echo "Verified ${got} of ${expected} event(s), ${downloads} download(s), and this run's probe in PostHog for ${date}"
             return 0
         fi
         if [ "$(date +%s)" -ge "${deadline}" ]; then
-            echo "error: PostHog holds ${got} of ${expected} event(s) and ${downloads} of ${expected_downloads} download(s) for ${date} after ${VERIFY_TIMEOUT}s" >&2
+            echo "error: PostHog holds ${got} of ${expected} event(s), ${downloads} of ${expected_downloads} download(s), and ${seen} probe(s) for ${date} after ${VERIFY_TIMEOUT}s" >&2
             return 1
         fi
         sleep 5
@@ -358,6 +395,14 @@ selftest() {
     got=$(snapshot_count_query "2026-08-20")
     want="SELECT count(DISTINCT uuid) FROM events WHERE event = 'github_release_asset_downloads' AND properties.snapshot_date = '2026-08-20'"
     [ "${got}" = "${want}" ] || { echo "selftest: query is\n  ${got}\nwant\n  ${want}" >&2; exit 1; }
+
+    # The probe UUID must be well formed and never repeat.
+    got=$(uuid4)
+    case "${got}" in
+        [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-*-4*-[89ab]*-*) ;;
+        *) echo "selftest: uuid4 produced '${got}'" >&2; exit 1 ;;
+    esac
+    [ "${got}" != "$(uuid4)" ] || { echo "selftest: uuid4 repeated" >&2; exit 1; }
 
     # Calendar validation must reject digit-shaped non-dates, rollovers, and
     # anything that could carry a quote into the read-back query.
@@ -438,7 +483,9 @@ main() {
         return 0
     fi
 
-    local payload
+    local probe payload
+    probe=$(uuid4)
+    add_probe "${WORK_DIR}/payload.1.json" "${probe}"
     for payload in "${WORK_DIR}"/payload.*.json; do
         post_batch "${payload}"
     done
@@ -451,7 +498,7 @@ main() {
     fi
     local expected_downloads
     expected_downloads=$(jq -s '[.[].download_count] | add' "${WORK_DIR}/assets.ndjson")
-    verify_snapshot "${date}" "${assets}" "${expected_downloads}"
+    verify_snapshot "${date}" "${assets}" "${expected_downloads}" "${probe}"
     # Advisory only: a missing earlier day is worth reporting but is not a
     # failure of this run, and cannot be repaired by retrying it.
     warn_on_gap "${date}" || true
