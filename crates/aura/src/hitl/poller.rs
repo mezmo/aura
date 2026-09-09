@@ -3,9 +3,11 @@
 //!
 //! Each tick the reconciler lists the undecided, non-expired approvals from
 //! the shared [`ApprovalStore`], keeps its own `instance_id`'s rows, and per
-//! id POSTs the ack-only notification until the receiver answers 2xx, then
-//! polls the status endpoint. A decided 200 resolves durably through the
-//! same [`PendingApprovals::resolve`] path the ingress handler uses. The
+//! id POSTs the ack-only notification until the receiver answers 2xx while
+//! polling the status endpoint every tick in parallel — the status read does
+//! not wait for the ack, so a receiver that holds the POST open cannot
+//! starve it. A decided 200 resolves durably through the same
+//! [`PendingApprovals::resolve`] path the ingress handler uses. The
 //! reconciler never terminalizes an approval — expiry stays fail-closed at
 //! resolve time — and its notified markers are in-memory only, self-pruning
 //! when an id leaves `list_pending`.
@@ -140,12 +142,13 @@ impl PollReconciler {
                         notified.insert(id);
                     }
                     Err(err) => {
+                        // The status read below runs regardless: a receiver
+                        // that holds the POST open must not starve it.
                         warn!(
                             decision_id = %id,
                             error = %err,
                             "approval notify failed; retrying next tick"
                         );
-                        continue;
                     }
                 }
             }
@@ -379,15 +382,16 @@ mod tests {
     }
 
     /// The tick loop against a scripted receiver: a failed notify retries
-    /// the POST next tick (no poll that tick), an acked id skips the POST
-    /// (the marker short-circuits it) and keeps polling, and the decided
-    /// 200 resolves durably through the ingress registry.
+    /// the POST next tick without delaying the status read, an acked id
+    /// skips the POST (the marker short-circuits it) and keeps polling,
+    /// and the decided 200 resolves durably through the ingress registry.
     #[tokio::test]
-    async fn tick_notifies_until_acked_then_polls_until_decided() {
+    async fn tick_polls_while_unacked_and_the_marker_skips_the_post() {
         let store: Arc<dyn ApprovalStore> = Arc::new(InMemoryApprovalStore::new());
         let id = park_pending(&store, INSTANCE_ID).await;
         let (url, mut rx) = scripted_receiver(vec![
             ("503 Service Unavailable", String::new()),
+            poll_pending(),
             ack_ok(),
             poll_pending(),
             poll_decided(r#"{"status":"approved"}"#),
@@ -399,25 +403,29 @@ mod tests {
         reconciler.tick(&mut notified).await;
         let first = rx.recv().await.unwrap();
         assert!(first.starts_with("POST "), "first tick notifies: {first}");
-
-        reconciler.tick(&mut notified).await;
-        let second = rx.recv().await.unwrap();
+        let same_tick = rx.recv().await.unwrap();
         assert!(
-            second.starts_with("POST "),
-            "a failed notify retries the POST: {second}"
+            same_tick.starts_with("GET "),
+            "a failed notify must not delay the status read: {same_tick}"
         );
-        let third = rx.recv().await.unwrap();
-        assert!(third.starts_with("GET "), "an acked id polls: {third}");
         assert!(
-            third.contains(&format!("decision_id={id}")),
-            "the poll query carries the decision id: {third}"
+            same_tick.contains(&format!("decision_id={id}")),
+            "the poll query carries the decision id: {same_tick}"
         );
 
         reconciler.tick(&mut notified).await;
-        let fourth = rx.recv().await.unwrap();
+        let retried = rx.recv().await.unwrap();
         assert!(
-            fourth.starts_with("GET "),
-            "the notified marker must skip the POST: {fourth}"
+            retried.starts_with("POST "),
+            "an unacked id retries the POST: {retried}"
+        );
+        assert!(rx.recv().await.unwrap().starts_with("GET "));
+
+        reconciler.tick(&mut notified).await;
+        let marked = rx.recv().await.unwrap();
+        assert!(
+            marked.starts_with("GET "),
+            "the notified marker must skip the POST: {marked}"
         );
 
         assert_eq!(
@@ -428,6 +436,37 @@ mod tests {
         assert!(
             store.get(&id).await.unwrap().is_none(),
             "resolve removed the pending ticket"
+        );
+    }
+
+    /// A receiver whose POSTs never succeed cannot starve the status read:
+    /// the approval still resolves through the GET alone.
+    #[tokio::test]
+    async fn tick_resolves_via_the_status_get_while_notify_never_acks() {
+        let store: Arc<dyn ApprovalStore> = Arc::new(InMemoryApprovalStore::new());
+        let id = park_pending(&store, INSTANCE_ID).await;
+        let (url, mut rx) = scripted_receiver(vec![
+            ("503 Service Unavailable", String::new()),
+            poll_pending(),
+            ("503 Service Unavailable", String::new()),
+            poll_decided(r#"{"status":"approved"}"#),
+        ])
+        .await;
+        let reconciler = reconciler_with(store.clone(), &url);
+        let mut notified = HashSet::new();
+
+        reconciler.tick(&mut notified).await;
+        assert!(rx.recv().await.unwrap().starts_with("POST "));
+        assert!(rx.recv().await.unwrap().starts_with("GET "));
+
+        reconciler.tick(&mut notified).await;
+        assert!(rx.recv().await.unwrap().starts_with("POST "));
+        assert!(rx.recv().await.unwrap().starts_with("GET "));
+
+        assert_eq!(
+            store_decision(&store, &id).await,
+            Some(ResolvedDecision::from(ApprovalDecision::Approved)),
+            "the status GET alone must carry the resolution"
         );
     }
 
@@ -906,12 +945,18 @@ mod tests {
             );
             let config = poll_config_with(static_headers, false);
             let (url, mut rx) = scripted_receiver_with_headers(vec![
+                // Tick 1: row A POST 503s (captured) then polls anyway; row B
+                // acks and polls. Four connections.
                 ("503 Service Unavailable", vec![], ""),
-                ("200 OK", vec![], ""),
                 ("204 No Content", vec![], ""),
                 ("200 OK", vec![], ""),
                 ("204 No Content", vec![], ""),
+                // Tick 2: the failed notify retries (captured); both rows
+                // poll. Three connections.
+                ("200 OK", vec![], ""),
                 ("204 No Content", vec![], ""),
+                ("204 No Content", vec![], ""),
+                // Tick 3: both rows resolve. Two connections.
                 ("200 OK", vec![], r#"{"status":"approved"}"#),
                 ("200 OK", vec![], r#"{"status":"approved"}"#),
             ])
@@ -919,24 +964,24 @@ mod tests {
             let reconciler = reconciler_from(&config, Arc::clone(&reader), &url);
             let mut notified = HashSet::new();
 
-            // Tick 1: one row's notify 503s (captured), the other acks and
-            // polls pending.
             reconciler.tick(&mut notified).await;
             let first = rx.recv().await.unwrap();
-            let second = rx.recv().await.unwrap();
-            let _third = rx.recv().await.unwrap();
-            // Tick 2: the failed notify retries (captured), the acked row
-            // polls again.
+            let _second = rx.recv().await.unwrap();
+            let third = rx.recv().await.unwrap();
+            let _fourth = rx.recv().await.unwrap();
             reconciler.tick(&mut notified).await;
-            let fourth = rx.recv().await.unwrap();
-            let _fifth = rx.recv().await.unwrap();
+            let fifth = rx.recv().await.unwrap();
             let _sixth = rx.recv().await.unwrap();
-            // Tick 3: both rows resolve.
-            reconciler.tick(&mut notified).await;
             let _seventh = rx.recv().await.unwrap();
+            reconciler.tick(&mut notified).await;
             let _eighth = rx.recv().await.unwrap();
+            let _ninth = rx.recv().await.unwrap();
 
-            for captured in [&first, &second, &fourth] {
+            assert!(first.starts_with("POST ") && third.starts_with("POST "));
+            assert!(fifth.starts_with("POST "), "the failed notify retries");
+
+            let posts = [first, third, fifth];
+            for captured in &posts {
                 let id = body_decision_id(captured);
                 let expected_value = expected[&id].as_str();
                 let header_line = captured
@@ -955,8 +1000,6 @@ mod tests {
                     "the client's static value must never leak beside the row's: {captured}"
                 );
             }
-            assert!(first.starts_with("POST ") && second.starts_with("POST "));
-            assert!(fourth.starts_with("POST "), "the failed notify retries");
 
             // Both rows resolved durably, decisions without identity.
             assert_eq!(
