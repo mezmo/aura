@@ -73,6 +73,7 @@ impl Drop for ParkGuard {
 
 #[cfg(test)]
 mod tests {
+    use aura_events::PlanTaskId;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -96,7 +97,7 @@ mod tests {
     fn worker_scope(run_id: RunId) -> AgentScope {
         AgentScope::Worker {
             run_id,
-            task: TaskIdentity::new(0, Some("operations".to_string())),
+            task: TaskIdentity::new(PlanTaskId::new(0), Some("operations".to_string())),
             session_id: None,
         }
     }

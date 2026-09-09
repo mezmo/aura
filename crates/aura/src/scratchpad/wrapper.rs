@@ -122,7 +122,7 @@ impl ToolWrapper for ScratchpadWrapper {
 
         let file_id = format!(
             "task_{}-{}-{}-{}-{}",
-            ctx.task_id.unwrap_or(0),
+            ctx.task_id.unwrap_or_default(),
             ctx.tool_initiator_id,
             ctx.tool_name,
             ctx.attempt.unwrap_or(0),
@@ -232,6 +232,7 @@ mod tests {
     use super::*;
     use crate::scratchpad::context_budget::{TiktokenCounter, TokenCounter};
     use crate::tool_wrapper::ToolCallContext;
+    use aura_events::PlanTaskId;
     use tempfile::TempDir;
 
     /// Build a `CallOutcome::Success` for tests that don't care about the
@@ -272,7 +273,7 @@ mod tests {
             .map(|i| format!("entry_{} ", i))
             .collect::<String>();
         let mut ctx = ToolCallContext::new("list_pipelines");
-        ctx.task_id = Some(1);
+        ctx.task_id = Some(PlanTaskId::new(1));
         ctx.tool_initiator_id = "incident".to_string();
         ctx.attempt = Some(0);
 
@@ -312,7 +313,7 @@ mod tests {
 
         let large_output = (0..200).map(|i| format!("entry_{i} ")).collect::<String>();
         let mut ctx = ToolCallContext::new("echo_large");
-        ctx.task_id = Some(3);
+        ctx.task_id = Some(PlanTaskId::new(3));
         ctx.tool_initiator_id = "worker_loop".to_string();
         ctx.attempt = Some(0);
 
@@ -346,7 +347,7 @@ mod tests {
         // Use varied content to avoid tokenizer compression of repeated chars
         let large_output = (0..500).map(|i| format!("item_{} ", i)).collect::<String>();
         let mut ctx = ToolCallContext::new("search_knowledge_base");
-        ctx.task_id = Some(1);
+        ctx.task_id = Some(PlanTaskId::new(1));
         ctx.tool_initiator_id = "worker_abc".to_string();
         ctx.attempt = Some(0);
 
@@ -405,7 +406,7 @@ mod tests {
         );
 
         let mut ctx = ToolCallContext::new("execute_range_query");
-        ctx.task_id = Some(0);
+        ctx.task_id = Some(PlanTaskId::new(0));
         ctx.tool_initiator_id = "metrics".to_string();
         ctx.attempt = Some(0);
 
@@ -553,7 +554,7 @@ mod tests {
         let wrapper = ScratchpadWrapper::new(tools, storage.clone(), budget);
 
         let mut ctx = ToolCallContext::new("tool_at_boundary");
-        ctx.task_id = Some(1);
+        ctx.task_id = Some(PlanTaskId::new(1));
         ctx.tool_initiator_id = "worker".to_string();
         ctx.attempt = Some(0);
 
@@ -601,7 +602,7 @@ mod tests {
         let wrapper = ScratchpadWrapper::new(tools, storage, budget.clone());
 
         let mut ctx = ToolCallContext::new("counted_tool");
-        ctx.task_id = Some(1);
+        ctx.task_id = Some(PlanTaskId::new(1));
         ctx.tool_initiator_id = "worker".to_string();
         ctx.attempt = Some(0);
 
@@ -638,7 +639,7 @@ mod tests {
 
         let large_output = (0..200).map(|i| format!("item_{} ", i)).collect::<String>();
         let mut ctx = ToolCallContext::new("failing_tool");
-        ctx.task_id = Some(1);
+        ctx.task_id = Some(PlanTaskId::new(1));
         ctx.tool_initiator_id = "worker".to_string();
         ctx.attempt = Some(0);
 
@@ -700,7 +701,7 @@ mod tests {
         let outer = serde_json::json!({ "status": "ok", "payload": payload_str });
 
         let mut ctx = ToolCallContext::new("nested_call");
-        ctx.task_id = Some(1);
+        ctx.task_id = Some(PlanTaskId::new(1));
         ctx.tool_initiator_id = "worker_a".to_string();
         ctx.attempt = Some(0);
 
@@ -763,7 +764,7 @@ mod tests {
         let large_output = json.to_string();
 
         let mut ctx = ToolCallContext::new("analyze_logs");
-        ctx.task_id = Some(1);
+        ctx.task_id = Some(PlanTaskId::new(1));
         ctx.tool_initiator_id = "worker_rca".to_string();
         ctx.attempt = Some(0);
 

@@ -6,6 +6,7 @@
 //! This separation keeps orchestration-specific types isolated from the base
 //! aura streaming infrastructure.
 
+use aura_events::PlanTaskId;
 use serde::{Deserialize, Serialize};
 
 /// How the coordinator routed a query that produced a plan.
@@ -77,7 +78,7 @@ pub enum OrchestratorEvent {
     /// A task has started execution.
     TaskStarted {
         /// Task identifier
-        task_id: usize,
+        task_id: PlanTaskId,
         /// Human-readable task description
         description: String,
         /// The ID of the orchestrator
@@ -88,7 +89,7 @@ pub enum OrchestratorEvent {
     /// A task has completed (success or failure).
     TaskCompleted {
         /// Task identifier
-        task_id: usize,
+        task_id: PlanTaskId,
         /// Whether the task succeeded
         success: bool,
         /// How long the task took in milliseconds
@@ -103,7 +104,7 @@ pub enum OrchestratorEvent {
     /// A worker task parked a gated call (park mode); one event per call.
     TaskBlocked {
         /// Task identifier
-        task_id: usize,
+        task_id: PlanTaskId,
         /// The ID of the orchestrator
         orchestrator_id: String,
         /// The ID of the Worker who is handling the task
@@ -168,7 +169,7 @@ pub enum OrchestratorEvent {
     /// with task and worker identity for proper SSE attribution.
     WorkerReasoning {
         /// Task identifier
-        task_id: usize,
+        task_id: PlanTaskId,
         /// The worker that produced this reasoning (e.g., "statistics")
         worker_id: String,
         /// The reasoning text content
@@ -177,7 +178,7 @@ pub enum OrchestratorEvent {
     /// A tool call has started within a worker task.
     ToolCallStarted {
         /// Task ID the tool call belongs to (None if ID couldn't be parsed)
-        task_id: Option<usize>,
+        task_id: Option<PlanTaskId>,
         /// Unique identifier for this tool call
         tool_call_id: String,
         /// Name of the tool being called
@@ -190,7 +191,7 @@ pub enum OrchestratorEvent {
     /// A tool call has completed within a worker task.
     ToolCallCompleted {
         /// Task ID the tool call belongs to (None if ID couldn't be parsed)
-        task_id: Option<usize>,
+        task_id: Option<PlanTaskId>,
         /// The tool call ID this result corresponds to
         tool_call_id: String,
         /// Whether the tool call succeeded

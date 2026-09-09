@@ -144,39 +144,68 @@ string_newtype! {
     ToolName
 }
 
-/// Tokens as reported by a model provider, never counted locally.
-#[derive(
-    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
-)]
-#[serde(transparent)]
-pub struct TokenCount(u64);
+/// Generates the shared surface of a numeric newtype — construction,
+/// unwrapping, conversion, and display.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! numeric_newtype {
+    ($(#[$meta:meta])* $name:ident($inner:ty)) => {
+        $(#[$meta])*
+        #[derive(
+            Debug,
+            Clone,
+            Copy,
+            Default,
+            PartialEq,
+            Eq,
+            Hash,
+            PartialOrd,
+            Ord,
+            ::serde::Serialize,
+            ::serde::Deserialize,
+        )]
+        #[serde(transparent)]
+        pub struct $name($inner);
 
-impl TokenCount {
-    pub fn new(tokens: u64) -> Self {
-        Self(tokens)
-    }
+        impl $name {
+            pub fn new(value: $inner) -> Self {
+                Self(value)
+            }
 
-    pub fn get(self) -> u64 {
-        self.0
-    }
+            pub fn get(self) -> $inner {
+                self.0
+            }
+        }
+
+        impl From<$inner> for $name {
+            fn from(value: $inner) -> Self {
+                Self(value)
+            }
+        }
+
+        impl From<$name> for $inner {
+            fn from(value: $name) -> Self {
+                value.0
+            }
+        }
+
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                self.0.fmt(f)
+            }
+        }
+    };
 }
 
-impl From<u64> for TokenCount {
-    fn from(tokens: u64) -> Self {
-        Self(tokens)
-    }
+numeric_newtype! {
+    /// A task's number within one iteration's plan, so it repeats across a run's
+    /// iterations.
+    PlanTaskId(u32)
 }
 
-impl From<TokenCount> for u64 {
-    fn from(count: TokenCount) -> Self {
-        count.0
-    }
-}
-
-impl std::fmt::Display for TokenCount {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
-    }
+numeric_newtype! {
+    /// Tokens as reported by a model provider, never counted locally.
+    TokenCount(u64)
 }
 
 /// One provider-billed token measurement.
@@ -1303,7 +1332,7 @@ mod tests {
             duration_ms: 42,
             scope: AgentScopeWire::Worker {
                 run_id: "019edead-beef-7000-8000-000000000002".to_string(),
-                task_id: 3,
+                task_id: PlanTaskId::new(3),
                 worker: Some("ops".to_string()),
                 session_id: None,
             },
@@ -1367,7 +1396,7 @@ pub enum AgentScopeWire {
     },
     Worker {
         run_id: String,
-        task_id: usize,
+        task_id: PlanTaskId,
         #[serde(skip_serializing_if = "Option::is_none")]
         worker: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]

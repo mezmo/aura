@@ -7,6 +7,7 @@
 //! This wrapper is only used for orchestrator workers, not regular agents.
 
 use async_trait::async_trait;
+use aura_events::PlanTaskId;
 use serde_json::Value;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -18,7 +19,7 @@ use rig::tool::ToolError;
 static CALL_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Generate a unique tool call ID.
-fn generate_tool_call_id(task_id: usize, tool_name: &str) -> String {
+fn generate_tool_call_id(task_id: PlanTaskId, tool_name: &str) -> String {
     let counter = CALL_COUNTER.fetch_add(1, Ordering::SeqCst);
     format!("task{}_{}_{}", task_id, tool_name, counter)
 }
@@ -36,11 +37,11 @@ pub struct ObserverWrapper {
     /// The observer to emit events to
     observer: ToolCallObserver,
     /// Task ID for correlating tool calls with tasks
-    task_id: usize,
+    task_id: PlanTaskId,
 }
 
 impl ObserverWrapper {
-    pub fn new(observer: ToolCallObserver, task_id: usize) -> Self {
+    pub fn new(observer: ToolCallObserver, task_id: PlanTaskId) -> Self {
         Self { observer, task_id }
     }
 }
@@ -128,9 +129,9 @@ mod tests {
 
     #[test]
     fn test_generate_tool_call_id() {
-        let id1 = generate_tool_call_id(0, "search");
-        let id2 = generate_tool_call_id(0, "search");
-        let id3 = generate_tool_call_id(1, "fetch");
+        let id1 = generate_tool_call_id(PlanTaskId::new(0), "search");
+        let id2 = generate_tool_call_id(PlanTaskId::new(0), "search");
+        let id3 = generate_tool_call_id(PlanTaskId::new(1), "fetch");
 
         // IDs should be unique
         assert_ne!(id1, id2);
@@ -146,7 +147,7 @@ mod tests {
     #[tokio::test]
     async fn test_observer_wrapper_emits_events() {
         let (observer, mut rx) = ToolCallObserver::new(8);
-        let wrapper = ObserverWrapper::new(observer, 42);
+        let wrapper = ObserverWrapper::new(observer, PlanTaskId::new(42));
 
         let ctx = ToolCallContext::new("test_tool");
         let args = serde_json::json!({"param": "value"});
@@ -193,9 +194,13 @@ mod tests {
     #[tokio::test]
     async fn test_observer_wrapper_includes_tool_initiator_id() {
         let (observer, mut rx) = ToolCallObserver::new(8);
-        let wrapper = ObserverWrapper::new(observer, 42);
+        let wrapper = ObserverWrapper::new(observer, PlanTaskId::new(42));
 
-        let ctx = ToolCallContext::new("test_tool").with_task_context(0, "worker".into(), 1);
+        let ctx = ToolCallContext::new("test_tool").with_task_context(
+            PlanTaskId::new(0),
+            "worker".into(),
+            1,
+        );
         let args = serde_json::json!({"param": "value"});
 
         // Call transform_args (should emit CallStarted)
@@ -239,7 +244,7 @@ mod tests {
     #[tokio::test]
     async fn test_observer_wrapper_handles_errors() {
         let (observer, mut rx) = ToolCallObserver::new(8);
-        let wrapper = ObserverWrapper::new(observer, 0);
+        let wrapper = ObserverWrapper::new(observer, PlanTaskId::new(0));
 
         let ctx = ToolCallContext::new("failing_tool");
         let result = wrapper.transform_args(serde_json::json!({}), &ctx);

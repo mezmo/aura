@@ -7,6 +7,7 @@
 //! fingerprint — and never carries approval decisions: a decision can only
 //! ever be read back from the approval store, never copied into a document.
 
+use aura_events::PlanTaskId;
 use std::io;
 use std::path::Path;
 
@@ -47,10 +48,10 @@ pub(crate) struct ParkedPlan {
 /// `current_prompt`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ParkedTaskNode {
-    pub task_id: usize,
+    pub task_id: PlanTaskId,
     pub description: String,
     #[serde(default)]
-    pub dependencies: Vec<usize>,
+    pub dependencies: Vec<PlanTaskId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worker: Option<String>,
     #[serde(default)]
@@ -153,7 +154,7 @@ pub(crate) fn build_document(
     state: &RunStateForPark<'_>,
     plan: &Plan,
     records: &ParkedTaskRecords,
-    pending_by_task: &std::collections::HashMap<usize, Vec<PendingCall>>,
+    pending_by_task: &std::collections::HashMap<PlanTaskId, Vec<PendingCall>>,
     expires_at: String,
     config_fingerprint: String,
 ) -> io::Result<ParkedRun> {
@@ -286,13 +287,19 @@ mod tests {
     #[test]
     fn build_document_shapes_nodes_by_state() {
         let mut plan = Plan::new("Deploy");
-        plan.add_task(Task::new(0, "Facts", "r"));
-        plan.add_task(Task::new(1, "Gated apply", "r").with_dependency(0));
-        plan.add_task(Task::new(2, "Verify", "r").with_dependency(1));
-        plan.get_task_mut(0).unwrap().complete("facts");
+        plan.add_task(Task::new(PlanTaskId::new(0), "Facts", "r"));
+        plan.add_task(
+            Task::new(PlanTaskId::new(1), "Gated apply", "r").with_dependency(PlanTaskId::new(0)),
+        );
+        plan.add_task(
+            Task::new(PlanTaskId::new(2), "Verify", "r").with_dependency(PlanTaskId::new(1)),
+        );
+        plan.get_task_mut(PlanTaskId::new(0))
+            .unwrap()
+            .complete("facts");
 
         let pending = vec![pending_call("kubectl_apply", "call_7")];
-        plan.get_task_mut(1).unwrap().state = TaskState::AwaitingApproval {
+        plan.get_task_mut(PlanTaskId::new(1)).unwrap().state = TaskState::AwaitingApproval {
             pending: pending.clone(),
         };
 
@@ -300,7 +307,7 @@ mod tests {
         let snapshot_prompt = rig::completion::Message::user("tool results");
         let mut records = ParkedTaskRecords::new();
         records.insert(
-            1,
+            PlanTaskId::new(1),
             ParkedTaskRecord {
                 attempt: 2,
                 snapshot: crate::orchestration::ParkSnapshot {
@@ -311,7 +318,7 @@ mod tests {
         );
 
         let mut pending_by_task = std::collections::HashMap::new();
-        pending_by_task.insert(1, pending);
+        pending_by_task.insert(PlanTaskId::new(1), pending);
 
         let chat_history = vec![rig::completion::Message::user("prior turn")];
         let doc = build_document(
@@ -351,17 +358,49 @@ mod tests {
         assert!(untouched.pending.is_none());
     }
 
+    /// The checkpoint stores `task_id` and `dependencies` as bare JSON
+    /// numbers. Every instance reading a checkpoint depends on that shape.
+    #[test]
+    fn task_ids_persist_as_bare_numbers() {
+        let node = ParkedTaskNode {
+            task_id: PlanTaskId::new(2),
+            description: "task".to_string(),
+            dependencies: vec![PlanTaskId::new(0), PlanTaskId::new(1)],
+            worker: None,
+            rationale: String::new(),
+            status: TaskStatus::Pending,
+            attempt: None,
+            pending: None,
+            history: None,
+            current_prompt: None,
+            result: None,
+            error: None,
+            failure_category: None,
+        };
+
+        let json = serde_json::to_value(&node).expect("node serializes");
+        assert_eq!(json["task_id"], 2);
+        assert_eq!(json["dependencies"], serde_json::json!([0, 1]));
+
+        let back: ParkedTaskNode = serde_json::from_value(json).expect("bare numbers parse back");
+        assert_eq!(back.task_id, PlanTaskId::new(2));
+        assert_eq!(
+            back.dependencies,
+            vec![PlanTaskId::new(0), PlanTaskId::new(1)]
+        );
+    }
+
     #[test]
     fn document_serde_roundtrip_rederives_awaiting_set() {
         let mut plan = Plan::new("Deploy");
-        plan.add_task(Task::new(0, "Gated apply", "r"));
+        plan.add_task(Task::new(PlanTaskId::new(0), "Gated apply", "r"));
         let pending = vec![pending_call("kubectl_delete", "call_9")];
-        plan.get_task_mut(0).unwrap().state = TaskState::AwaitingApproval {
+        plan.get_task_mut(PlanTaskId::new(0)).unwrap().state = TaskState::AwaitingApproval {
             pending: pending.clone(),
         };
         let mut records = ParkedTaskRecords::new();
         records.insert(
-            0,
+            PlanTaskId::new(0),
             ParkedTaskRecord {
                 attempt: 1,
                 snapshot: crate::orchestration::ParkSnapshot {
@@ -371,7 +410,7 @@ mod tests {
             },
         );
         let mut pending_by_task = std::collections::HashMap::new();
-        pending_by_task.insert(0, pending);
+        pending_by_task.insert(PlanTaskId::new(0), pending);
 
         let chat_history = vec![rig::completion::Message::user("prior turn")];
         let doc = build_document(
@@ -399,8 +438,8 @@ mod tests {
     #[test]
     fn build_document_fails_when_an_awaiting_node_has_no_record() {
         let mut plan = Plan::new("Deploy");
-        plan.add_task(Task::new(0, "Gated apply", "r"));
-        plan.get_task_mut(0).unwrap().state = TaskState::AwaitingApproval {
+        plan.add_task(Task::new(PlanTaskId::new(0), "Gated apply", "r"));
+        plan.get_task_mut(PlanTaskId::new(0)).unwrap().state = TaskState::AwaitingApproval {
             pending: vec![pending_call("kubectl_apply", "call_1")],
         };
         let chat_history = vec![];

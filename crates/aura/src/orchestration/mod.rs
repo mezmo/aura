@@ -90,5 +90,5 @@ pub use prompt_constants::{context, fields, sections};
 pub(crate) use test_rig::ScriptedAgent;
 pub use types::{
     BlockedCell, CellOutcome, ParkSnapshot, PendingCall, Plan, PlanningResponse, RunId, StepInput,
-    StructuredTaskOutput, Task, TaskIdentity, TaskJson, TaskState, TaskStatus,
+    StructuredTaskOutput, Task, TaskIdentity, TaskState, TaskStatus,
 };

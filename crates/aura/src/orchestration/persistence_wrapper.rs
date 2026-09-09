@@ -231,9 +231,15 @@ impl ToolWrapper for PersistenceWrapper {
             return TransformOutputResult::new(output);
         }
 
+        // The footer promises a file `on_complete` writes, and it declines on
+        // the same pair, so an absent one has to mean no footer rather than
+        // task 0 — that filename is both never written and another task's.
+        let (Some(task_id), Some(_)) = (ctx.task_id, ctx.attempt) else {
+            return TransformOutputResult::new(output);
+        };
+
         let worker = super::persistence::sanitize_filename_component(self.effective_worker_name());
         let tool = super::persistence::sanitize_filename_component(&ctx.tool_name);
-        let task_id = ctx.task_id.unwrap_or(0);
         let filename = format!(
             "task-{}-{}-iter-{}-{}-{}-output.txt",
             task_id, worker, self.iteration, tool, call_idx
@@ -426,6 +432,7 @@ pub fn extract_reasoning(mut args: Value) -> (Option<String>, Value) {
 mod tests {
     use crate::WrappedTool;
     use crate::hitl::ApprovalItem;
+    use aura_events::PlanTaskId;
     use rig::tool::{Tool as RigTool, ToolError};
 
     fn test_wrapper(persistence: Arc<Mutex<ExecutionPersistence>>) -> PersistenceWrapper {
@@ -681,7 +688,11 @@ mod tests {
             let wrapper = Arc::new(test_wrapper(persistence.clone()));
             let initiator = "initiator".to_string();
             WrappedTool::new(mock, wrapper).with_context_factory(move |tool_name| {
-                ToolCallContext::new(tool_name).with_task_context(0, initiator.clone(), 1)
+                ToolCallContext::new(tool_name).with_task_context(
+                    PlanTaskId::new(0),
+                    initiator.clone(),
+                    1,
+                )
             })
         };
 
@@ -709,7 +720,11 @@ mod tests {
             let wrapper = Arc::new(test_wrapper(persistence.clone()));
             let initiator = "initiator".to_string();
             WrappedTool::new(mock, wrapper).with_context_factory(move |tool_name| {
-                ToolCallContext::new(tool_name).with_task_context(1, initiator.clone(), 1)
+                ToolCallContext::new(tool_name).with_task_context(
+                    PlanTaskId::new(1),
+                    initiator.clone(),
+                    1,
+                )
             })
         };
 
@@ -731,7 +746,11 @@ mod tests {
             let wrapper = Arc::new(test_wrapper(persistence.clone()));
             let initiator = "initiator".to_string();
             WrappedTool::new(mock, wrapper).with_context_factory(move |tool_name| {
-                ToolCallContext::new(tool_name).with_task_context(2, initiator.clone(), 1)
+                ToolCallContext::new(tool_name).with_task_context(
+                    PlanTaskId::new(2),
+                    initiator.clone(),
+                    1,
+                )
             })
         };
 
@@ -754,7 +773,11 @@ mod tests {
             let wrapper = Arc::new(test_wrapper(persistence.clone()));
             let initiator = "initiator".to_string();
             WrappedTool::new(mock, wrapper).with_context_factory(move |tool_name| {
-                ToolCallContext::new(tool_name).with_task_context(2, initiator.clone(), 1)
+                ToolCallContext::new(tool_name).with_task_context(
+                    PlanTaskId::new(2),
+                    initiator.clone(),
+                    1,
+                )
             })
         };
 
@@ -778,7 +801,11 @@ mod tests {
             let wrapper = Arc::new(test_wrapper(persistence.clone()));
             let initiator = "initiator".to_string();
             WrappedTool::new(mock, wrapper).with_context_factory(move |tool_name| {
-                ToolCallContext::new(tool_name).with_task_context(2, initiator.clone(), 1)
+                ToolCallContext::new(tool_name).with_task_context(
+                    PlanTaskId::new(2),
+                    initiator.clone(),
+                    1,
+                )
             })
         };
 
@@ -803,7 +830,11 @@ mod tests {
             let wrapper = Arc::new(test_wrapper(persistence.clone()));
             let initiator = "initiator".to_string();
             WrappedTool::new(mock, wrapper).with_context_factory(move |tool_name| {
-                ToolCallContext::new(tool_name).with_task_context(0, initiator.clone(), 1)
+                ToolCallContext::new(tool_name).with_task_context(
+                    PlanTaskId::new(0),
+                    initiator.clone(),
+                    1,
+                )
             })
         };
 
@@ -831,7 +862,7 @@ mod tests {
             duration_threshold_ms: 0,
         });
 
-        let ctx = ToolCallContext::new("tool").with_task_context(1, "w".into(), 0);
+        let ctx = ToolCallContext::new("tool").with_task_context(PlanTaskId::new(1), "w".into(), 0);
         let TransformArgsResult { extracted, .. } =
             wrapper.transform_args(serde_json::json!({}), &ctx);
         let extracted = extracted.expect("transform_args always produces extracted");
@@ -918,7 +949,11 @@ mod tests {
         // scratchpad rewrites to the pointer.
         let composed = ComposedWrapper::new(vec![scratchpad, persistence_dyn]);
 
-        let ctx = ToolCallContext::new("big_tool").with_task_context(7, "worker_xyz".into(), 0);
+        let ctx = ToolCallContext::new("big_tool").with_task_context(
+            PlanTaskId::new(7),
+            "worker_xyz".into(),
+            0,
+        );
         let TransformArgsResult { extracted, .. } =
             composed.transform_args(serde_json::json!({}), &ctx);
         let extracted = extracted.expect("composed transform_args produces extracted");
@@ -1010,7 +1045,11 @@ mod tests {
 
         assert_eq!(in_flight.load(Ordering::Acquire), 0);
 
-        let ctx = ToolCallContext::new("test_tool").with_task_context(0, "worker".to_string(), 1);
+        let ctx = ToolCallContext::new("test_tool").with_task_context(
+            PlanTaskId::new(0),
+            "worker".to_string(),
+            1,
+        );
         wrapper.on_complete(&ctx, None, Ok("output"), 100).await;
 
         assert_eq!(in_flight.load(Ordering::Acquire), 0);
@@ -1065,7 +1104,11 @@ mod tests {
     async fn test_transform_output_appends_footer_when_size_exceeded() {
         let wrapper = promotion_wrapper(Some("sre".to_string()), 2, true, 10, 5000);
 
-        let ctx = ToolCallContext::new("log_search").with_task_context(0, "sre".to_string(), 1);
+        let ctx = ToolCallContext::new("log_search").with_task_context(
+            PlanTaskId::new(0),
+            "sre".to_string(),
+            1,
+        );
         let extracted = serde_json::json!({"reasoning": "", "call_idx": 0});
         let outcome = CallOutcome::Success(String::new());
         let long_output = "x".repeat(20);
@@ -1083,7 +1126,11 @@ mod tests {
     async fn test_transform_output_no_footer_when_below_threshold() {
         let wrapper = promotion_wrapper(Some("sre".to_string()), 1, true, 500, 5000);
 
-        let ctx = ToolCallContext::new("log_search").with_task_context(0, "sre".to_string(), 1);
+        let ctx = ToolCallContext::new("log_search").with_task_context(
+            PlanTaskId::new(0),
+            "sre".to_string(),
+            1,
+        );
         let extracted = serde_json::json!({"reasoning": "", "call_idx": 0});
         let outcome = CallOutcome::Success(String::new());
 
@@ -1098,7 +1145,11 @@ mod tests {
     async fn test_transform_output_promotes_all_when_size_zero() {
         let wrapper = promotion_wrapper(None, 1, true, 0, 5000);
 
-        let ctx = ToolCallContext::new("my_tool").with_task_context(3, "w".to_string(), 1);
+        let ctx = ToolCallContext::new("my_tool").with_task_context(
+            PlanTaskId::new(3),
+            "w".to_string(),
+            1,
+        );
         let extracted = serde_json::json!({"reasoning": "", "call_idx": 0});
         let outcome = CallOutcome::Success(String::new());
 
@@ -1114,7 +1165,11 @@ mod tests {
     fn test_call_counter_increments_across_calls() {
         let wrapper = promotion_wrapper(Some("worker".to_string()), 1, false, 0, 5000);
 
-        let ctx = ToolCallContext::new("tool_a").with_task_context(0, "worker".to_string(), 1);
+        let ctx = ToolCallContext::new("tool_a").with_task_context(
+            PlanTaskId::new(0),
+            "worker".to_string(),
+            1,
+        );
 
         let result1 = wrapper.transform_args(serde_json::json!({"key": "val"}), &ctx);
         assert_eq!(result1.extracted.as_ref().unwrap()["call_idx"], 0);
@@ -1134,7 +1189,11 @@ mod tests {
         let wrapper =
             enabled_wrapper(persistence.clone(), Some("research".to_string()), 10, 5000).await;
 
-        let ctx = ToolCallContext::new("kb_search").with_task_context(0, "research".to_string(), 1);
+        let ctx = ToolCallContext::new("kb_search").with_task_context(
+            PlanTaskId::new(0),
+            "research".to_string(),
+            1,
+        );
         let extracted = serde_json::json!({"reasoning": "test", "call_idx": 0});
         let long_output = "x".repeat(50);
 
@@ -1163,7 +1222,11 @@ mod tests {
         ));
         let wrapper = enabled_wrapper(persistence.clone(), Some("sre".to_string()), 500, 100).await;
 
-        let ctx = ToolCallContext::new("log_search").with_task_context(0, "sre".to_string(), 1);
+        let ctx = ToolCallContext::new("log_search").with_task_context(
+            PlanTaskId::new(0),
+            "sre".to_string(),
+            1,
+        );
         let extracted = serde_json::json!({"reasoning": "test", "call_idx": 0});
 
         wrapper
@@ -1186,7 +1249,11 @@ mod tests {
         let wrapper =
             enabled_wrapper(persistence.clone(), Some("worker".to_string()), 500, 5000).await;
 
-        let ctx = ToolCallContext::new("simple_tool").with_task_context(0, "worker".to_string(), 1);
+        let ctx = ToolCallContext::new("simple_tool").with_task_context(
+            PlanTaskId::new(0),
+            "worker".to_string(),
+            1,
+        );
         let extracted = serde_json::json!({"reasoning": "test", "call_idx": 0});
 
         wrapper
@@ -1209,7 +1276,11 @@ mod tests {
         let wrapper =
             enabled_wrapper(persistence.clone(), Some("worker".to_string()), 500, 0).await;
 
-        let ctx = ToolCallContext::new("slow_tool").with_task_context(0, "worker".to_string(), 1);
+        let ctx = ToolCallContext::new("slow_tool").with_task_context(
+            PlanTaskId::new(0),
+            "worker".to_string(),
+            1,
+        );
         let extracted = serde_json::json!({"reasoning": "test", "call_idx": 0});
 
         wrapper
@@ -1246,7 +1317,11 @@ mod tests {
     async fn test_tool_output_artifact_filename_sanitization() {
         let wrapper = promotion_wrapper(Some("SRE/Ops Worker".to_string()), 1, true, 0, 5000);
 
-        let ctx = ToolCallContext::new("my_search tool").with_task_context(0, "sre".to_string(), 1);
+        let ctx = ToolCallContext::new("my_search tool").with_task_context(
+            PlanTaskId::new(0),
+            "sre".to_string(),
+            1,
+        );
         let extracted = serde_json::json!({"reasoning": "", "call_idx": 0});
         let outcome = CallOutcome::Success(String::new());
 
@@ -1264,7 +1339,11 @@ mod tests {
     async fn test_transform_output_no_footer_when_persistence_disabled() {
         let wrapper = promotion_wrapper(Some("sre".to_string()), 1, false, 0, 5000);
 
-        let ctx = ToolCallContext::new("log_search").with_task_context(0, "sre".to_string(), 1);
+        let ctx = ToolCallContext::new("log_search").with_task_context(
+            PlanTaskId::new(0),
+            "sre".to_string(),
+            1,
+        );
         let extracted = serde_json::json!({"reasoning": "", "call_idx": 0});
         let outcome = CallOutcome::Success(String::new());
 
@@ -1291,7 +1370,11 @@ mod tests {
         let wrapper =
             enabled_wrapper(persistence.clone(), Some("worker".to_string()), 500, 5000).await;
 
-        let ctx = ToolCallContext::new("simple_tool").with_task_context(0, "worker".to_string(), 1);
+        let ctx = ToolCallContext::new("simple_tool").with_task_context(
+            PlanTaskId::new(0),
+            "worker".to_string(),
+            1,
+        );
         let extracted = serde_json::json!({"reasoning": "test", "call_idx": 0});
 
         wrapper
@@ -1299,7 +1382,7 @@ mod tests {
             .await;
 
         let p = persistence.lock().await;
-        let traces = p.tool_traces_for_task(0);
+        let traces = p.tool_traces_for_task(PlanTaskId::new(0));
         assert_eq!(traces.len(), 1);
         assert!(traces[0].artifact_filename.is_none());
     }
@@ -1314,7 +1397,11 @@ mod tests {
         ));
         let wrapper = enabled_wrapper(persistence.clone(), Some("sre".to_string()), 10, 5000).await;
 
-        let ctx = ToolCallContext::new("log_search").with_task_context(0, "sre".to_string(), 1);
+        let ctx = ToolCallContext::new("log_search").with_task_context(
+            PlanTaskId::new(0),
+            "sre".to_string(),
+            1,
+        );
         let extracted = serde_json::json!({"reasoning": "test", "call_idx": 0});
         let long_output = "x".repeat(50);
 
@@ -1323,7 +1410,7 @@ mod tests {
             .await;
 
         let p = persistence.lock().await;
-        let traces = p.tool_traces_for_task(0);
+        let traces = p.tool_traces_for_task(PlanTaskId::new(0));
         assert_eq!(traces.len(), 1);
         assert_eq!(
             traces[0].artifact_filename.as_deref(),
@@ -1446,7 +1533,7 @@ mod tests {
         let run_id: RunId = "0191e8c0-1111-7000-8000-000000000000".parse().unwrap();
         let scope = AgentScope::Worker {
             run_id,
-            task: TaskIdentity::new(2, Some("k8s-agent".to_string())),
+            task: TaskIdentity::new(PlanTaskId::new(2), Some("k8s-agent".to_string())),
             session_id: None,
         };
 
@@ -1472,7 +1559,11 @@ mod tests {
         let initiator = "k8s-agent".to_string();
         let wrapped =
             WrappedTool::new(inner, Arc::new(composed)).with_context_factory(move |tool_name| {
-                ToolCallContext::new(tool_name).with_task_context(2, initiator.clone(), 1)
+                ToolCallContext::new(tool_name).with_task_context(
+                    PlanTaskId::new(2),
+                    initiator.clone(),
+                    1,
+                )
             });
 
         // Subscribe before the spawn so the Requested event is not missed.

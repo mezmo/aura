@@ -341,6 +341,7 @@ fn approval_result_to_pre_call(
 
 #[cfg(test)]
 mod tests {
+    use aura_events::PlanTaskId;
     use std::time::Duration;
 
     use aura_config::WebhookUrl;
@@ -461,7 +462,10 @@ mod tests {
         fn worker_scope() -> AgentScope {
             AgentScope::Worker {
                 run_id: "0191e8c0-1111-7000-8000-000000000042".parse().unwrap(),
-                task: crate::orchestration::TaskIdentity::new(1, Some("operations".to_string())),
+                task: crate::orchestration::TaskIdentity::new(
+                    PlanTaskId::new(1),
+                    Some("operations".to_string()),
+                ),
                 session_id: None,
             }
         }
@@ -770,7 +774,7 @@ mod tests {
             .with_recorded_decisions(recorded)
         }
 
-        fn ctx_for(tool: &str, task_id: Option<usize>) -> ToolCallContext {
+        fn ctx_for(tool: &str, task_id: Option<PlanTaskId>) -> ToolCallContext {
             let mut ctx = ToolCallContext::new(tool);
             ctx.task_id = task_id;
             ctx
@@ -783,13 +787,13 @@ mod tests {
             let recorded = Arc::new(RecordedDecisions::default());
             let args = serde_json::json!({"namespace": "prod"});
             recorded.push(
-                CallKey::new(1, "kubectl_apply", &args),
+                CallKey::new(PlanTaskId::new(1), "kubectl_apply", &args),
                 ApprovalDecision::Approved,
             );
 
             let gate = recorded_gate(recorded, discard_route());
             let outcome = gate
-                .pre_call(&args, &ctx_for("kubectl_apply", Some(1)))
+                .pre_call(&args, &ctx_for("kubectl_apply", Some(PlanTaskId::new(1))))
                 .await
                 .unwrap();
 
@@ -804,7 +808,7 @@ mod tests {
             let recorded = Arc::new(RecordedDecisions::default());
             let args = serde_json::json!({"namespace": "prod"});
             recorded.push(
-                CallKey::new(1, "kubectl_apply", &args),
+                CallKey::new(PlanTaskId::new(1), "kubectl_apply", &args),
                 ApprovalDecision::Denied {
                     reason: Some("too risky".to_string()),
                 },
@@ -812,7 +816,7 @@ mod tests {
 
             let gate = recorded_gate(recorded, discard_route());
             let outcome = gate
-                .pre_call(&args, &ctx_for("kubectl_apply", Some(1)))
+                .pre_call(&args, &ctx_for("kubectl_apply", Some(PlanTaskId::new(1))))
                 .await
                 .unwrap();
 
@@ -830,12 +834,12 @@ mod tests {
         #[tokio::test]
         async fn recorded_miss_while_strict_fails_closed_with_resume_mismatch() {
             let recorded = Arc::new(RecordedDecisions::default());
-            recorded.set_strict(1, true);
+            recorded.set_strict(PlanTaskId::new(1), true);
 
             let gate = recorded_gate(recorded, discard_route());
             let args = serde_json::json!({"namespace": "prod"});
             let err = gate
-                .pre_call(&args, &ctx_for("kubectl_apply", Some(1)))
+                .pre_call(&args, &ctx_for("kubectl_apply", Some(PlanTaskId::new(1))))
                 .await
                 .expect_err("a strict miss must fail closed");
 
@@ -860,7 +864,7 @@ mod tests {
             let gate = recorded_gate(recorded, discard_route());
             let args = serde_json::json!({"namespace": "prod"});
             let err = gate
-                .pre_call(&args, &ctx_for("kubectl_apply", Some(1)))
+                .pre_call(&args, &ctx_for("kubectl_apply", Some(PlanTaskId::new(1))))
                 .await
                 .expect_err("the unreachable route must fail closed");
 
