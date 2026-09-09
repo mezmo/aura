@@ -54,8 +54,9 @@ async fn sync_one(config: &aura_config::Config) -> Result<()> {
         && let Some(catalog_config) = &governance_config.catalog
         && let Some(catalog) = build_catalog(config).await
     {
-        let client = aura::governance::CatalogClient::from_config(catalog_config, None)
-            .context("Failed to create catalog client")?;
+        let client =
+            aura::governance::CatalogClient::from_config(catalog_config, None, config.tls.as_ref())
+                .context("Failed to create catalog client")?;
         client
             .send(&catalog)
             .await

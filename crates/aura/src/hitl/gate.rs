@@ -354,7 +354,7 @@ mod tests {
             Arc::from([GlobPattern::new("kubectl_*").unwrap()]),
             Arc::new(DecisionRoute::Webhook {
                 client: WebhookClient::new(
-                    build_webhook_client(),
+                    build_webhook_client(None),
                     WebhookUrl::new("http://localhost:9").unwrap(),
                 ),
                 timeout: Duration::from_secs(1),
@@ -379,7 +379,7 @@ mod tests {
             Arc::from([GlobPattern::new("kubectl_*").unwrap()]),
             Arc::new(DecisionRoute::Webhook {
                 client: WebhookClient::new(
-                    build_webhook_client(),
+                    build_webhook_client(None),
                     // Discard port: nothing listens, so the POST fails closed.
                     WebhookUrl::new("http://127.0.0.1:9").unwrap(),
                 ),
@@ -743,7 +743,7 @@ mod tests {
         fn discard_route() -> Arc<DecisionRoute> {
             Arc::new(DecisionRoute::Webhook {
                 client: WebhookClient::new(
-                    build_webhook_client(),
+                    build_webhook_client(None),
                     // Discard port: nothing listens, so the POST fails closed.
                     WebhookUrl::new("http://127.0.0.1:9").unwrap(),
                 ),
@@ -1200,7 +1200,7 @@ mod tests {
             let (tool, ran) = gated_tool(
                 DecisionRoute::Webhook {
                     client: WebhookClient::new(
-                        build_webhook_client(),
+                        build_webhook_client(None),
                         // Discard port: nothing listens, so the POST fails closed.
                         WebhookUrl::new("http://127.0.0.1:9").unwrap(),
                     ),

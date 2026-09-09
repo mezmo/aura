@@ -84,6 +84,11 @@ pub struct AgentRuntimeConfig {
     /// Orchestration mode configuration (multi-agent workflows)
     pub orchestration: Option<OrchestrationConfig>,
 
+    /// Global custom trusted CA roots from the `[tls]` config table, threaded
+    /// to MCP client construction and the HITL webhook. `None` keeps the
+    /// built-in webpki roots only.
+    pub tls: Option<aura_config::TlsConfig>,
+
     /// Discovered per-worker skill overrides keyed by worker name. Populated
     /// by `RigBuilder` at build time because skill discovery does filesystem
     /// IO and can fail, so it cannot live on the pure config types. A present
@@ -166,6 +171,7 @@ impl Clone for AgentRuntimeConfig {
             tools: self.tools.clone(),
             memory_dir: self.memory_dir.clone(),
             orchestration: self.orchestration.clone(),
+            tls: self.tls.clone(),
             worker_skills: self.worker_skills.clone(),
             // Arc fields clone the Arc (shared reference)
             tool_wrapper: self.tool_wrapper.clone(),
@@ -195,6 +201,7 @@ impl std::fmt::Debug for AgentRuntimeConfig {
             .field("mcp", &self.mcp)
             .field("tools", &self.tools)
             .field("orchestration", &self.orchestration)
+            .field("tls", &self.tls)
             .field(
                 "tool_wrapper",
                 &self.tool_wrapper.as_ref().map(|_| "<wrapper>"),

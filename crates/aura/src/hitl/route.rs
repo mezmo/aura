@@ -50,12 +50,16 @@ impl HitlRuntime {
     /// `req_headers` is the inbound client request's HTTP headers, used to
     /// resolve `[hitl.route]` `headers_from_request` mappings. Pass `None`
     /// outside an HTTP request context (e.g. CLI standalone mode).
+    ///
+    /// `tls` applies the global `[tls]` CA bundle to the webhook's TLS;
+    /// `None` keeps the built-in webpki roots.
     #[must_use]
     pub fn from_config(
         config: &HitlConfig,
         pending_approvals: &PendingApprovals,
         hmac: Option<&WebhookHmac>,
         req_headers: Option<&HashMap<String, String>>,
+        tls: Option<&aura_config::TlsConfig>,
     ) -> Self {
         let route = match &config.route {
             DecisionRouteConfig::Webhook {
@@ -71,7 +75,7 @@ impl HitlRuntime {
                 };
                 DecisionRoute::Webhook {
                     client: WebhookClient::with_headers_and_signing(
-                        build_webhook_client(),
+                        build_webhook_client(tls),
                         url.clone(),
                         crate::webhook_utils::resolve_headers(
                             headers,
@@ -387,11 +391,19 @@ impl DecisionRoute {
 /// Build the reqwest client used for approval webhook calls. Sets a short
 /// connect timeout so an unreachable host fails fast instead of hanging for
 /// the full route timeout.
-pub(crate) fn build_webhook_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .connect_timeout(WEBHOOK_CONNECT_TIMEOUT)
-        .build()
-        .expect("reqwest client builder only fails on TLS backend init")
+pub(crate) fn build_webhook_client(tls: Option<&aura_config::TlsConfig>) -> reqwest::Client {
+    let builder = crate::tls::apply(
+        reqwest::Client::builder().connect_timeout(WEBHOOK_CONNECT_TIMEOUT),
+        tls,
+    )
+    .expect("bundle bytes were PEM-validated when the config loaded");
+    builder.build().unwrap_or_else(|e| match tls {
+        Some(tls) => panic!(
+            "failed to build TLS client with CA bundle '{}': {e}",
+            tls.ca_bundle.display()
+        ),
+        None => panic!("reqwest client builder only fails on TLS backend init: {e:?}"),
+    })
 }
 
 /// HMAC signing state for the webhook route.
@@ -1432,7 +1444,7 @@ mod tests {
             tool_header_mappings: aura_config::ToolHeaderMappings,
         ) -> WebhookClient {
             WebhookClient {
-                client: build_webhook_client(),
+                client: build_webhook_client(None),
                 url: aura_config::WebhookUrl::new(url).unwrap(),
                 headers: HeaderMap::new(),
                 signing,
@@ -1563,7 +1575,7 @@ mod tests {
         #[tokio::test]
         async fn http_url_with_secret_fails_closed() {
             let client = WebhookClient::with_headers_and_signing(
-                build_webhook_client(),
+                build_webhook_client(None),
                 aura_config::WebhookUrl::new("http://approvals.example.com/aura").unwrap(),
                 HeaderMap::new(),
                 EgressSigning::Enabled(test_hmac()),
@@ -1658,6 +1670,7 @@ mod tests {
                 &pending,
                 Some(&hmac),
                 None,
+                None,
             );
             assert!(
                 matches!(signing_of(&signed), EgressSigning::Enabled(_)),
@@ -1667,6 +1680,7 @@ mod tests {
             let unsigned = HitlRuntime::from_config(
                 &config("http://approvals.example.com/aura"),
                 &pending,
+                None,
                 None,
                 None,
             );
@@ -1679,6 +1693,7 @@ mod tests {
                 &config("http://approvals.example.com/aura"),
                 &pending,
                 Some(&hmac),
+                None,
                 None,
             );
             assert!(
@@ -1699,6 +1714,7 @@ mod tests {
                 &pending,
                 None,
                 None,
+                None,
             );
             assert!(
                 matches!(signing_of(&plaintext), EgressSigning::Disabled),
@@ -1708,6 +1724,7 @@ mod tests {
             let secure = HitlRuntime::from_config(
                 &webhook_config("https://approvals.example.com/aura", user_mapping()),
                 &pending,
+                None,
                 None,
                 None,
             );
@@ -1724,6 +1741,7 @@ mod tests {
                 &pending,
                 None,
                 None,
+                None,
             );
             assert!(
                 matches!(signing_of(&legacy), EgressSigning::Disabled),
@@ -1736,6 +1754,7 @@ mod tests {
                 &webhook_config("http://approvals.example.com/aura", user_mapping()),
                 &pending,
                 Some(&test_hmac()),
+                None,
                 None,
             );
             assert!(
@@ -1767,6 +1786,7 @@ mod tests {
                 let _ = super::super::HitlRuntime::from_config(
                     &webhook_config("http://approvals.example.com/aura", user_mapping()),
                     &pending,
+                    None,
                     None,
                     None,
                 );
@@ -1871,7 +1891,7 @@ mod tests {
                 one_shot_receiver(vec![], r#"{"approved":true}"#.to_string()).await;
 
             let client = WebhookClient::with_headers_and_signing(
-                build_webhook_client(),
+                build_webhook_client(None),
                 aura_config::WebhookUrl::new(&url).unwrap(),
                 HeaderMap::new(),
                 EgressSigning::Disabled,
@@ -2210,7 +2230,7 @@ mod tests {
         let mut rx = crate::approval_event_broker::subscribe(&request_id).await;
         let route = super::DecisionRoute::Webhook {
             client: super::WebhookClient::new(
-                super::build_webhook_client(),
+                super::build_webhook_client(None),
                 aura_config::WebhookUrl::new("http://127.0.0.1:9").unwrap(),
             ),
             timeout: std::time::Duration::from_secs(1),
@@ -2595,7 +2615,7 @@ mod tests {
             reqwest::header::HeaderValue::from_static("sre-prod"),
         );
         let client = super::WebhookClient::new_with_headers(
-            super::build_webhook_client(),
+            super::build_webhook_client(None),
             aura_config::WebhookUrl::new(format!("http://127.0.0.1:{port}")).unwrap(),
             header_map,
         );
@@ -2621,7 +2641,7 @@ mod tests {
 
         // Empty HeaderMap: the POST carries no custom headers.
         let client = super::WebhookClient::new_with_headers(
-            super::build_webhook_client(),
+            super::build_webhook_client(None),
             aura_config::WebhookUrl::new(format!("http://127.0.0.1:{port}")).unwrap(),
             reqwest::header::HeaderMap::new(),
         );
@@ -2666,7 +2686,7 @@ mod tests {
 
         // Capture 1: the bare constructor (no headers configured).
         let bare = super::DecisionRoute::Webhook {
-            client: super::WebhookClient::new(super::build_webhook_client(), url.clone()),
+            client: super::WebhookClient::new(super::build_webhook_client(None), url.clone()),
             timeout: std::time::Duration::from_secs(5),
         };
         let result = bare.decide(request.clone(), &cancel).await;
@@ -2677,7 +2697,7 @@ mod tests {
         // Host header and port do not drift between captures.
         let with_empty = super::DecisionRoute::Webhook {
             client: super::WebhookClient::new_with_headers(
-                super::build_webhook_client(),
+                super::build_webhook_client(None),
                 url,
                 reqwest::header::HeaderMap::new(),
             ),

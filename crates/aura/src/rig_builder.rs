@@ -83,12 +83,14 @@ impl RigBuilder {
             tools: self.config.tools.clone(),
             memory_dir: self.config.memory_dir.clone(),
             orchestration: self.config.orchestration.clone(),
+            tls: self.config.tls.clone(),
             hitl: self.config.hitl.as_ref().map(|cfg| {
                 crate::hitl::HitlRuntime::from_config(
                     cfg,
                     &self.pending_approvals,
                     self.hitl_hmac.as_ref(),
                     req_headers,
+                    self.config.tls.as_ref(),
                 )
             }),
             instance_id: crate::instance_id::instance_id(&self.config.agent).to_string(),

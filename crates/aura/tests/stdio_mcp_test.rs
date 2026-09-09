@@ -42,7 +42,7 @@ async fn test_stdio_mcp_connection_and_tool_execution() {
         .collect(),
     };
 
-    let manager = McpManager::initialize_from_config(&mcp_config)
+    let manager = McpManager::initialize_from_config(&mcp_config, None)
         .await
         .expect("Failed to initialize STDIO MCP manager");
 

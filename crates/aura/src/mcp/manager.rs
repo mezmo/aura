@@ -60,6 +60,7 @@ impl McpManager {
     /// Initialize MCP connections and discover tools from all configured servers
     pub async fn initialize_from_config(
         mcp_config: &crate::config::McpConfig,
+        tls: Option<&aura_config::TlsConfig>,
     ) -> Result<Self, BuilderError> {
         let mut manager = Self::with_sanitization(mcp_config.sanitize_schemas);
 
@@ -78,7 +79,7 @@ impl McpManager {
 
             let transport = Self::transport_label(server_config).to_string();
             match manager
-                .connect_and_discover_tools(server_name, server_config)
+                .connect_and_discover_tools(server_name, server_config, tls)
                 .await
             {
                 Ok(tools_count) => {
@@ -149,14 +150,15 @@ impl McpManager {
         &mut self,
         server_name: &str,
         server_config: &McpServerConfig,
+        tls: Option<&aura_config::TlsConfig>,
     ) -> Result<usize, BuilderError> {
         match server_config {
             McpServerConfig::HttpStreamable { url, headers, .. } => {
-                self.connect_http_streamable(server_name, url, headers)
+                self.connect_http_streamable(server_name, url, headers, tls)
                     .await
             }
             McpServerConfig::Sse { url, headers, .. } => {
-                self.connect_sse(server_name, url, headers).await
+                self.connect_sse(server_name, url, headers, tls).await
             }
             McpServerConfig::Stdio { cmd, args, env, .. } => {
                 self.connect_stdio(server_name, cmd, args, env).await
@@ -170,11 +172,12 @@ impl McpManager {
         server_name: &str,
         url: &str,
         headers: &HashMap<String, String>,
+        tls: Option<&aura_config::TlsConfig>,
     ) -> Result<usize, BuilderError> {
         info!("  Connecting to HTTP streamable server at: {}", url);
 
         match self
-            .try_connect_http_streamable(server_name, url, headers)
+            .try_connect_http_streamable(server_name, url, headers, tls)
             .await
         {
             Ok(tools_count) => {
@@ -207,6 +210,7 @@ impl McpManager {
         server_name: &str,
         url: &str,
         headers: &HashMap<String, String>,
+        tls: Option<&aura_config::TlsConfig>,
     ) -> Result<usize, BuilderError> {
         debug!("  Creating HTTP Streamable client for: {}", url);
         debug!("  Headers to be applied: {:?}", headers.keys());
@@ -218,7 +222,7 @@ impl McpManager {
         // Use McpClient. Render with `{e:#}` so anyhow's full cause chain (e.g.
         // the captured HTTP status → transport error) is included, not just the
         // outermost context.
-        let client = McpClient::new(url.to_string(), headers)
+        let client = McpClient::new(url.to_string(), headers, tls)
             .await
             .map_err(|e| {
                 BuilderError::McpInitError(format!(
@@ -266,10 +270,11 @@ impl McpManager {
         server_name: &str,
         url: &str,
         headers: &HashMap<String, String>,
+        tls: Option<&aura_config::TlsConfig>,
     ) -> Result<usize, BuilderError> {
         info!("  Connecting to SSE server at: {}", url);
 
-        match self.try_connect_sse(server_name, url, headers).await {
+        match self.try_connect_sse(server_name, url, headers, tls).await {
             Ok(tools_count) => {
                 info!("  SSE connection successful");
                 Ok(tools_count)
@@ -295,10 +300,11 @@ impl McpManager {
         server_name: &str,
         url: &str,
         headers: &HashMap<String, String>,
+        tls: Option<&aura_config::TlsConfig>,
     ) -> Result<usize, BuilderError> {
         debug!("  Creating SSE client for: {}", url);
 
-        let transport = crate::mcp::sse::SseTransport::connect(url, headers)
+        let transport = crate::mcp::sse::SseTransport::connect(url, headers, tls)
             .await
             .map_err(BuilderError::SseTransport)?;
 
@@ -1025,7 +1031,7 @@ mod tests {
             servers,
         };
 
-        let manager = McpManager::initialize_from_config(&config)
+        let manager = McpManager::initialize_from_config(&config, None)
             .await
             .expect("initialize_from_config should succeed even when a server fails");
 
@@ -1099,7 +1105,9 @@ mod tests {
             servers,
         };
 
-        let manager = McpManager::initialize_from_config(&config).await.unwrap();
+        let manager = McpManager::initialize_from_config(&config, None)
+            .await
+            .unwrap();
         server.abort();
 
         let info = manager.server_info.get("ghost").unwrap();

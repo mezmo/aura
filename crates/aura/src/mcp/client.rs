@@ -411,6 +411,7 @@ impl McpClient {
     pub async fn new(
         server_url: String,
         forwarded_headers: &HashMap<String, String>,
+        tls: Option<&aura_config::TlsConfig>,
     ) -> Result<Self> {
         info!("Creating streamable HTTP MCP client for: {}", server_url);
 
@@ -432,10 +433,18 @@ impl McpClient {
             }
         }
 
-        let http_client = reqwest::Client::builder()
-            .default_headers(header_map)
-            .build()
-            .context("Failed to build HTTP client")?;
+        let builder =
+            crate::tls::apply(reqwest::Client::builder().default_headers(header_map), tls)?;
+        let http_client = builder.build().map_err(|e| {
+            let error = anyhow::Error::from(e).context("Failed to build HTTP client");
+            match tls {
+                Some(tls) => error.context(format!(
+                    "failed to build TLS client with CA bundle '{}'",
+                    tls.ca_bundle.display()
+                )),
+                None => error,
+            }
+        })?;
 
         // Use our own StreamableHttpClient so a failing HTTP status (404/401/…)
         // is captured at the transport layer. rmcp's worker otherwise collapses
@@ -1204,7 +1213,7 @@ pub(crate) mod tests {
         headers: &HashMap<String, String>,
     ) -> (RecordingMcpServer, McpClient) {
         let server = RecordingMcpServer::start().await;
-        let client = McpClient::new(server.url.clone(), headers)
+        let client = McpClient::new(server.url.clone(), headers, None)
             .await
             .expect("the loopback server completes the handshake");
         (server, client)

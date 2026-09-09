@@ -1550,8 +1550,25 @@ tool_headers_from_response = { "Content-Type" = "x-anything" }
         let tls = config.tls.as_ref().expect("[tls] section should parse");
         assert_eq!(tls.ca_bundle, std::path::PathBuf::from("x"));
 
-        let round_tripped: TlsConfig = toml::from_str(&toml::to_string(tls).unwrap()).unwrap();
-        assert_eq!(round_tripped.ca_bundle, tls.ca_bundle);
+        let mut populated = tls.clone();
+        populated.frozen_bundle = std::sync::Arc::from(b"deadbeef".as_slice());
+        let serialized = toml::to_string(&populated).unwrap();
+        assert!(
+            serialized.contains("ca_bundle"),
+            "ca_bundle must serialize: {serialized}"
+        );
+        assert!(
+            !serialized.contains("deadbeef"),
+            "frozen_bundle must never serialize: {serialized}"
+        );
+
+        let round_tripped: TlsConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(round_tripped.ca_bundle, populated.ca_bundle);
+        assert!(
+            round_tripped.frozen_bundle.is_empty(),
+            "frozen_bundle must deserialize empty, got {} bytes",
+            round_tripped.frozen_bundle.len()
+        );
     }
 
     #[test]

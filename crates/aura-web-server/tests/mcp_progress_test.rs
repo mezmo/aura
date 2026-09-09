@@ -12,7 +12,12 @@ use tokio::time::timeout;
 #[tokio::test]
 async fn test_mcp_progress_notifications_received() {
     // Skip if mock server not running
-    let client = match McpClient::new("http://127.0.0.1:9999/mcp".to_owned(), &HashMap::new()).await
+    let client = match McpClient::new(
+        "http://127.0.0.1:9999/mcp".to_owned(),
+        &HashMap::new(),
+        None,
+    )
+    .await
     {
         Ok(c) => c,
         Err(_) => {
@@ -107,7 +112,12 @@ async fn test_mcp_progress_notifications_received() {
 #[tokio::test]
 async fn test_call_tool_without_progress_still_works() {
     // Skip if mock server not running
-    let client = match McpClient::new("http://127.0.0.1:9999/mcp".to_owned(), &HashMap::new()).await
+    let client = match McpClient::new(
+        "http://127.0.0.1:9999/mcp".to_owned(),
+        &HashMap::new(),
+        None,
+    )
+    .await
     {
         Ok(c) => c,
         Err(_) => {

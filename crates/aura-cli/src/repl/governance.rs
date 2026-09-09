@@ -103,7 +103,8 @@ async fn run_sync_standalone(direct: &crate::backend::direct::DirectBackend) -> 
                 "├─".themed(AuraStyle::Connector),
                 "governance is enabled, syncing information".themed(AuraStyle::Muted)
             );
-            let client = match CatalogClient::from_config(catalog_config, None) {
+            let client = match CatalogClient::from_config(catalog_config, None, config.tls.as_ref())
+            {
                 Ok(c) => c,
                 Err(e) => {
                     println!(

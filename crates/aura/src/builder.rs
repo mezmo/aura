@@ -301,7 +301,7 @@ impl Agent {
         let mcp_manager = if let Some(mcp_config) = &config.mcp {
             tracing::info!("Initializing MCP tools using dynamic adaptors");
             Some(Arc::new(
-                McpManager::initialize_from_config(mcp_config).await?,
+                McpManager::initialize_from_config(mcp_config, config.tls.as_ref()).await?,
             ))
         } else {
             None
@@ -2059,7 +2059,7 @@ mod tests {
         /// A manager offering the same tool name on each of the three transports, all backed by `server`, so the tag composition distinguishes them downstream.
         async fn manager_serving_all_transports(server: &RecordingMcpServer) -> McpManager {
             let connect = async || {
-                McpClient::new(server.url.clone(), &HashMap::new())
+                McpClient::new(server.url.clone(), &HashMap::new(), None)
                     .await
                     .expect("the loopback server completes the handshake")
             };

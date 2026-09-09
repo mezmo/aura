@@ -55,7 +55,7 @@ pub async fn agent_info_with_tools(
     };
     crate::rig_builder::resolve_mcp_headers_in(&mut mcp_config, req_headers);
 
-    let discovered = discover_tools(&mcp_config, timeout).await;
+    let discovered = discover_tools(&mcp_config, config.tls.as_ref(), timeout).await;
     if let Some(servers) = info.mcp_servers.as_mut() {
         for (name, server) in servers.iter_mut() {
             set_tools(server, discovered.get(name).cloned());
@@ -68,11 +68,12 @@ pub async fn agent_info_with_tools(
 /// keyed by server name. Servers that did not connect are absent from the map.
 async fn discover_tools(
     mcp_config: &aura_config::McpConfig,
+    tls: Option<&aura_config::TlsConfig>,
     timeout: Duration,
 ) -> HashMap<String, Vec<McpToolOverview>> {
     let manager = match tokio::time::timeout(
         timeout,
-        crate::mcp::McpManager::initialize_from_config(mcp_config),
+        crate::mcp::McpManager::initialize_from_config(mcp_config, tls),
     )
     .await
     {

@@ -119,7 +119,8 @@ impl From<&rmcp::model::Tool> for ToolEntry {
 /// This is the single-agent path used when only one config is loaded.
 pub async fn build_catalog(config: &aura_config::Config) -> Option<CatalogEnvelope> {
     if let Some(mcp_config) = &config.mcp
-        && let Ok(manager) = McpManager::initialize_from_config(mcp_config).await
+        && let Ok(manager) =
+            McpManager::initialize_from_config(mcp_config, config.tls.as_ref()).await
     {
         let server_entries = build_server_entries(&manager);
         let agent = build_agent_entry(config, server_entries);

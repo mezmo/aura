@@ -1,0 +1,53 @@
+# Custom trusted CA roots — connect to HTTPS endpoints whose certificates are
+# issued by a private CA (an internal PKI, a corporate proxy doing TLS
+# interception, a self-hosted MCP server). Without the [tls] table such
+# endpoints fail the TLS handshake with "unknown CA"; with it, their chain is
+# trusted in addition to the built-in webpki roots, so public endpoints keep
+# working.
+#
+# The same bundle applies to every outbound TLS connection the agent makes:
+# MCP servers (http_streamable and SSE transports), the HITL approval webhook,
+# and the governance catalog webhook.
+#
+# Prerequisites:
+#   export OPENAI_API_KEY="sk-..."
+#   A PEM bundle of the private root (and intermediate) certificates, e.g.
+#     /etc/pki/corporate-ca.pem
+#
+# Usage:
+#   CONFIG_PATH=examples/complete/tls-ca-bundle.toml cargo run --bin aura -- webserver
+#
+# Docs: https://docs.mezmo.com/aura/config
+
+# Uncomment and point ca_bundle at your PEM bundle to enable custom trust
+# roots. The file may hold many certificates. Use an absolute path — a
+# relative one resolves from the working directory aura starts in. The bundle
+# is read and every certificate parsed once at startup: a missing file or an
+# empty bundle fails the load, which is why this example ships commented out.
+#
+# [tls]
+# ca_bundle = "/etc/pki/corporate-ca.pem"
+
+# An HTTPS MCP server whose chain terminates at the private CA.
+[mcp]
+sanitize_schemas = true
+
+[mcp.servers.internal]
+transport = "http_streamable"
+url = "https://mcp.internal.example.com/mcp"
+description = "Internal tools behind the corporate CA"
+
+[agent]
+name = "Internal Tools Assistant"
+model_owner = "mezmo"
+system_prompt = """
+You are an operations assistant for internal tooling. Use the connected
+internal MCP tools to answer questions about the fleet. If a tool call
+fails, report the error plainly — do not retry more than once.
+"""
+turn_depth = 10
+
+[agent.llm]
+provider = "openai"
+api_key = "{{ env.OPENAI_API_KEY }}"
+model = "gpt-5.2"

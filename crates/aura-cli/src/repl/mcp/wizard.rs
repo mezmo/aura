@@ -371,7 +371,7 @@ fn verify_server(
     rt.block_on(async {
         let manager = match tokio::time::timeout(
             VERIFY_TIMEOUT,
-            aura::mcp::McpManager::initialize_from_config(&mcp_config),
+            aura::mcp::McpManager::initialize_from_config(&mcp_config, None),
         )
         .await
         {

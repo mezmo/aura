@@ -538,7 +538,7 @@ impl Orchestrator {
         let mcp_manager = if let Some(ref mcp_config) = agent_config.mcp {
             tracing::info!("Orchestrator: initializing MCP connections");
             Some(Arc::new(
-                McpManager::initialize_from_config(mcp_config).await?,
+                McpManager::initialize_from_config(mcp_config, agent_config.tls.as_ref()).await?,
             ))
         } else {
             None

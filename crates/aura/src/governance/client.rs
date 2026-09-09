@@ -40,14 +40,26 @@ impl CatalogClient {
     ///
     /// `req_headers` is the inbound request headers for `headers_from_request`
     /// resolution. Pass `None` in CLI standalone mode.
+    ///
+    /// `tls` applies the global `[tls]` CA bundle to the webhook's TLS;
+    /// `None` keeps the built-in webpki roots.
     pub fn from_config(
         config: &CatalogWebhookConfig,
         req_headers: Option<&HashMap<String, String>>,
+        tls: Option<&aura_config::TlsConfig>,
     ) -> Result<Self, CatalogError> {
-        let client = reqwest::Client::builder()
-            .connect_timeout(CONNECT_TIMEOUT)
-            .build()
-            .expect("reqwest client builder only fails on TLS backend init");
+        let builder = crate::tls::apply(
+            reqwest::Client::builder().connect_timeout(CONNECT_TIMEOUT),
+            tls,
+        )
+        .expect("bundle bytes were PEM-validated when the config loaded");
+        let client = builder.build().unwrap_or_else(|e| match tls {
+            Some(tls) => panic!(
+                "failed to build TLS client with CA bundle '{}': {e}",
+                tls.ca_bundle.display()
+            ),
+            None => panic!("reqwest client builder only fails on TLS backend init: {e:?}"),
+        });
 
         let headers = crate::webhook_utils::resolve_headers(
             &config.headers,

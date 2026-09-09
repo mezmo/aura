@@ -105,6 +105,7 @@ impl SseTransport {
     pub async fn connect(
         url: &str,
         headers: &HashMap<String, String>,
+        tls: Option<&aura_config::TlsConfig>,
     ) -> Result<Self, SseTransportError> {
         let sse_endpoint = url::Url::parse(url)?;
 
@@ -123,10 +124,10 @@ impl SseTransport {
             }
         }
 
-        let http_client = reqwest::Client::builder()
-            .default_headers(header_map)
-            .build()
-            .map_err(SseTransportError::Http)?;
+        let builder =
+            crate::tls::apply(reqwest::Client::builder().default_headers(header_map), tls)
+                .expect("bundle bytes were PEM-validated when the config loaded");
+        let http_client = builder.build().map_err(SseTransportError::Http)?;
 
         let response = http_client
             .get(url.to_string())

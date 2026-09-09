@@ -1,5 +1,12 @@
 ## Changelog
 
+## Unreleased
+
+
+### Features
+
+* **tls**: add custom trusted CA roots for outbound TLS - Mike Shearer [#514](https://github.com/mezmo/aura/issues/514)
+
 ## [0.2.12](https://github.com/mezmo/aura/compare/v0.2.11...v0.2.12) (2026-08-28)
 
 
