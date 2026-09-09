@@ -30,8 +30,9 @@ pub(crate) struct ParkCommitInputs<'a> {
     pub decision_window: std::time::Duration,
 }
 
-/// The refreshed awaiting set: per-task pending calls still awaiting a
-/// decision, and the earliest expiry among them.
+/// The refreshed awaiting set: per-task pending calls still parked —
+/// including calls decided since the gate hit, retained for the resume
+/// consult — and the earliest expiry among the undecided tickets.
 pub(crate) struct RefreshedAwaiting {
     pub pending_by_task: HashMap<usize, Vec<PendingCall>>,
     pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -53,10 +54,13 @@ pub(crate) fn run_owner_id(run_id: &str) -> String {
     format!("run:{run_id}")
 }
 
-/// Narrow the plan's awaiting tasks to the calls still parked and undecided,
-/// with the earliest surviving ticket expiry. A store fault fails the
-/// refresh, and with it the commit, rather than dropping a still-decidable
-/// approval from the checkpoint.
+/// Narrow the plan's awaiting tasks to the calls still parked, with the
+/// earliest surviving ticket expiry. A call decided between gate-hit and
+/// commit stays in the checkpoint — the resume consult consumes its
+/// recorded decision — but its settled ticket contributes neither expiry
+/// nor an outstanding id. A store fault fails the refresh, and with it the
+/// commit, rather than dropping a still-decidable approval from the
+/// checkpoint.
 pub(crate) async fn refresh_awaiting(
     plan: &Plan,
     registry: &PendingApprovals,
@@ -91,8 +95,9 @@ pub(crate) async fn refresh_awaiting(
                 tracing::info!(
                     decision_id = %call.decision_id,
                     task_id = task.id,
-                    "park approval decided before commit; dropping from checkpoint",
+                    "park approval decided before commit; retaining for the resume consult",
                 );
+                surviving.push(call.clone());
                 continue;
             }
             expires_at = Some(match expires_at {
@@ -451,8 +456,11 @@ mod tests {
         );
     }
 
-    /// Refresh drops decided and removed approvals, keeps the undecided
-    /// ones, and reports the earliest surviving expiry.
+    /// Refresh drops approvals the store no longer holds, keeps the
+    /// undecided ones, and reports the earliest surviving expiry. The memory
+    /// backend's resolve moves the row, so a decided call reads as removed
+    /// here; the file-backed retention case is
+    /// [`early_decision_is_retained_and_consumed_at_resume`].
     #[tokio::test]
     async fn refresh_drops_decided_and_takes_earliest_expiry() {
         let (registry, _store) = conv_registry();
@@ -541,6 +549,129 @@ mod tests {
         assert!(
             (reported - expected).num_seconds().abs() < 1,
             "expiry is the earliest surviving expiry"
+        );
+    }
+
+    /// Codex plan-review finding 1: a decision landing between gate-hit and
+    /// park commit is retained by the refresh and consumed by the resume
+    /// consult. Park mode's file backend keeps the approval readable after
+    /// resolve, which is what both sides key on.
+    #[tokio::test]
+    async fn early_decision_is_retained_and_consumed_at_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn ApprovalStore> = Arc::new(
+            crate::session_store::FileApprovalStore::open(dir.path().join("approvals")).unwrap(),
+        );
+        let registry = PendingApprovals::with_backend(store, Arc::new(InMemoryEventBus::new()));
+
+        let run_id = "0191e8c0-cccc-7000-8000-000000000009";
+        let owner = run_owner_id(run_id);
+        let decided = DecisionId::generate();
+        let args = serde_json::json!({ "namespace": "prod" });
+        let now = chrono::Utc::now();
+        registry
+            .register_durable(ParkedApproval {
+                request: ApprovalRequest {
+                    version: PROTOCOL_VERSION,
+                    instance_id: "test-instance".to_string(),
+                    decision_id: decided,
+                    request_id: owner,
+                    scope: AgentScope::Worker {
+                        run_id: run_id.parse().unwrap(),
+                        task: crate::orchestration::TaskIdentity::new(3, None),
+                        session_id: None,
+                    },
+                    origin: ApprovalOrigin::ConfigGate {
+                        matched_pattern: "kubectl_*".to_string(),
+                        agent_name: "test-agent".to_string(),
+                    },
+                    items: vec![ApprovalItem {
+                        tool_name: "kubectl_apply".to_string(),
+                        arguments: args.clone(),
+                        tool_call_intent: None,
+                    }],
+                },
+                registered_at: now,
+                expires_at: now + chrono::Duration::hours(1),
+            })
+            .await
+            .unwrap();
+        // The decision wins the race against the park commit.
+        registry
+            .resolve(&decided, crate::hitl::ApprovalDecision::Approved)
+            .await
+            .unwrap();
+
+        let mut plan = Plan::new("Deploy");
+        plan.add_task(Task::new(3, "Gated apply", "r"));
+        plan.tasks[0].state = TaskState::AwaitingApproval {
+            pending: vec![PendingCall {
+                decision_id: decided,
+                tool_name: "kubectl_apply".to_string(),
+                arguments: args.clone(),
+                call_id: "c1".to_string(),
+            }],
+        };
+
+        let refreshed = refresh_awaiting(&plan, &registry).await.unwrap();
+        assert_eq!(
+            refreshed.pending_by_task[&3].len(),
+            1,
+            "the decided call stays in the checkpoint"
+        );
+        assert!(
+            refreshed.decision_ids.is_empty(),
+            "a decided call is no longer outstanding"
+        );
+        assert!(
+            refreshed.expires_at.is_none(),
+            "a settled ticket bounds nothing"
+        );
+
+        // The resume consult consumes the retained call's recorded decision.
+        let mut records = ParkedTaskRecords::new();
+        records.insert(
+            3,
+            crate::orchestration::park::ParkedTaskRecord {
+                attempt: 1,
+                snapshot: crate::orchestration::ParkSnapshot {
+                    history: vec![rig::completion::Message::user("apply it")],
+                    current_prompt: rig::completion::Message::user("tool results"),
+                },
+            },
+        );
+        let document = build_document(
+            &RunStateForPark {
+                run_id,
+                session_id: None,
+                query: "Deploy",
+                chat_history: &[],
+                coordinator_conversation: &[],
+                routing_decision: None,
+                iteration: 1,
+                planning_ms: 0,
+                failure_history: &[],
+            },
+            &plan,
+            &records,
+            &refreshed.pending_by_task,
+            (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
+            config_fingerprint(&AgentRuntimeConfig::default()),
+        )
+        .unwrap();
+        let (recorded, ids) =
+            crate::orchestration::park::load_recorded_decisions(&registry, &document)
+                .await
+                .unwrap();
+        assert_eq!(ids, vec![decided]);
+        assert_eq!(
+            recorded.take(&crate::orchestration::CallKey::new(
+                3,
+                "kubectl_apply",
+                &args
+            )),
+            Some(crate::hitl::ApprovalDecision::Approved),
+            "the early decision is consumed at resume",
         );
     }
 

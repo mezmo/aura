@@ -145,9 +145,9 @@ impl HitlApprovalWrapper {
             ));
         };
         // The route timeout bounds the decision window until a park TTL exists.
-        let DecisionRoute::Conversational { timeout, .. } = &*self.route else {
+        let Some((_, timeout)) = self.route.park_registry() else {
             return Err(ToolError::ToolCallError(
-                "tool call blocked: park mode requires the conversational route"
+                "tool call blocked: park mode requires a park-capable route"
                     .to_string()
                     .into(),
             ));
@@ -155,7 +155,7 @@ impl HitlApprovalWrapper {
 
         let now = chrono::Utc::now();
         let expires_at =
-            now + chrono::Duration::from_std(*timeout).expect("approval timeout fits in chrono");
+            now + chrono::Duration::from_std(timeout).expect("approval timeout fits in chrono");
         let decision_id = DecisionId::generate();
         let request = ApprovalRequest {
             version: PROTOCOL_VERSION,
@@ -358,6 +358,7 @@ mod tests {
                     build_webhook_client(),
                     WebhookUrl::new("http://localhost:9").unwrap(),
                 ),
+                registry: PendingApprovals::new(),
                 timeout: Duration::from_secs(1),
             }),
             AgentScope::Single { session_id: None },
@@ -384,6 +385,7 @@ mod tests {
                     // Discard port: nothing listens, so the POST fails closed.
                     WebhookUrl::new("http://127.0.0.1:9").unwrap(),
                 ),
+                registry: PendingApprovals::new(),
                 timeout: Duration::from_secs(2),
             }),
             AgentScope::Single { session_id: None },
@@ -725,6 +727,78 @@ mod tests {
             }
             assert!(store.get(&decision_id).await.unwrap().is_none());
         }
+
+        /// Stage-5 activation: a webhook route with poll delivery parks the
+        /// gated call. The route is wired the production way
+        /// ([`crate::hitl::HitlRuntime::from_config`] over a poll config) so
+        /// the client carries the poll marker; the park arm registers into
+        /// the shared registry without consulting the unreachable webhook.
+        /// The reconciler flow itself is the poller's (stage 4).
+        #[tokio::test]
+        async fn webhook_poll_route_parks_the_gated_call() {
+            let config = aura_config::HitlConfig {
+                require_approval: vec![aura_config::GlobPattern::new("kubectl_*").unwrap()],
+                park: aura_config::ParkConfig { enabled: true },
+                route: aura_config::DecisionRouteConfig::Webhook {
+                    url: WebhookUrl::new("http://127.0.0.1:9").unwrap(),
+                    timeout_secs: 60,
+                    headers: std::collections::HashMap::new(),
+                    headers_from_request: std::collections::HashMap::new(),
+                    tool_headers_from_response: aura_config::ToolHeaderMappings::default(),
+                    delivery: aura_config::WebhookDelivery::Poll,
+                    poll_url: None,
+                    poll_interval_secs: 10,
+                    poll_request_timeout_secs: 30,
+                },
+            };
+            let store: Arc<dyn crate::session_store::ApprovalStore> =
+                Arc::new(crate::session_store::InMemoryApprovalStore::new());
+            let registry = PendingApprovals::with_backend(
+                store.clone(),
+                Arc::new(crate::session_store::InMemoryEventBus::new()),
+            );
+            let runtime = crate::hitl::HitlRuntime::from_config(&config, &registry, None, None);
+            assert!(
+                runtime.route.park_registry().is_some(),
+                "the poll route arms the park arm"
+            );
+
+            let cell = Arc::new(crate::orchestration::BlockedCell::default());
+            cell.set_current_call_id(Some("call_poll".to_string()));
+            let gate = parked_gate(&registry, &runtime.route, "req-poll-park", &cell);
+
+            let args = serde_json::json!({ "namespace": "prod" });
+            let outcome = gate
+                .pre_call(&args, &ToolCallContext::new("kubectl_apply"))
+                .await
+                .unwrap();
+            assert_eq!(
+                outcome,
+                PreCallOutcome::ShortCircuit {
+                    output: super::PARK_SENTINEL.to_string()
+                },
+                "a gated call parks under poll delivery"
+            );
+
+            // The registration landed in the shared store under the
+            // run-scoped owner.
+            cell.snapshot_if_pending(&[], &rig::completion::Message::user("results"));
+            match cell.outcome() {
+                crate::orchestration::CellOutcome::Blocked { pending } => {
+                    assert_eq!(pending.len(), 1);
+                    let parked = store
+                        .get(&pending[0].decision_id)
+                        .await
+                        .unwrap()
+                        .expect("ticket parked in the store");
+                    assert_eq!(
+                        parked.request.request_id,
+                        "run:0191e8c0-1111-7000-8000-000000000042"
+                    );
+                }
+                other => panic!("expected Blocked, got {other:?}"),
+            }
+        }
     }
 
     // ====================================================================
@@ -748,6 +822,7 @@ mod tests {
                     // Discard port: nothing listens, so the POST fails closed.
                     WebhookUrl::new("http://127.0.0.1:9").unwrap(),
                 ),
+                registry: PendingApprovals::new(),
                 timeout: Duration::from_secs(2),
             })
         }
@@ -1205,6 +1280,7 @@ mod tests {
                         // Discard port: nothing listens, so the POST fails closed.
                         WebhookUrl::new("http://127.0.0.1:9").unwrap(),
                     ),
+                    registry: PendingApprovals::new(),
                     timeout: Duration::from_secs(2),
                 },
                 &request_id,

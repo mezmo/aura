@@ -63,6 +63,7 @@ impl HitlRuntime {
             DecisionRouteConfig::Webhook { timeout_secs, .. } => DecisionRoute::Webhook {
                 client: webhook_client_from_config(&config.route, hmac, req_headers)
                     .expect("the webhook arm of the route config builds a client"),
+                registry: pending_approvals.clone(),
                 timeout: Duration::from_secs(*timeout_secs),
             },
             DecisionRouteConfig::Conversational { timeout_secs } => DecisionRoute::Conversational {
@@ -227,9 +228,14 @@ pub enum DecisionRoute {
         registry: PendingApprovals,
         timeout: Duration,
     },
-    /// Unattended: one synchronous HTTP round-trip to a webhook.
+    /// Unattended: one synchronous HTTP round-trip to a webhook, or — under
+    /// poll delivery — the park arm registering into `registry`, with the
+    /// reconciler driving the decision.
     Webhook {
         client: WebhookClient,
+        /// The shared approval registry, consulted by the park arm under
+        /// poll delivery (inert for sync).
+        registry: PendingApprovals,
         timeout: Duration,
     },
 }
@@ -307,6 +313,23 @@ fn poll_delivery_guard(client: &WebhookClient) -> Result<(), ApprovalError> {
 }
 
 impl DecisionRoute {
+    /// The park arm's inputs: the approval registry to register against and
+    /// the decision window the route timeout bounds. `Some` for the
+    /// conversational route and for a webhook route with poll delivery,
+    /// `None` for sync delivery — whose decision returns on the POST
+    /// response itself. The client's poll settings are the one delivery
+    /// marker; this switch must not grow a second one.
+    pub(crate) fn park_registry(&self) -> Option<(&PendingApprovals, Duration)> {
+        match self {
+            Self::Conversational { registry, timeout } => Some((registry, *timeout)),
+            Self::Webhook {
+                client,
+                registry,
+                timeout,
+            } => client.poll.is_some().then_some((registry, *timeout)),
+        }
+    }
+
     /// Obtain a decision for a config-gated call, carrying any captured
     /// approver header overrides on the approved arm.
     ///
@@ -326,7 +349,9 @@ impl DecisionRoute {
                 let outcome = self.decide_inner(request, cancel).await?;
                 Ok(GateDecision::without_overrides(outcome))
             }
-            Self::Webhook { client, timeout } => {
+            Self::Webhook {
+                client, timeout, ..
+            } => {
                 poll_delivery_guard(client)?;
                 webhook_round_trip(
                     &request,
@@ -411,7 +436,9 @@ impl DecisionRoute {
 
                 Ok(outcome)
             }
-            Self::Webhook { client, timeout } => {
+            Self::Webhook {
+                client, timeout, ..
+            } => {
                 poll_delivery_guard(client)?;
                 webhook_round_trip(
                     &request,
@@ -1222,6 +1249,46 @@ mod tests {
         );
     }
 
+    /// The park switch, built the production way (`HitlRuntime::from_config`
+    /// over the `[hitl]` config): conversational and webhook-poll park, and
+    /// webhook-sync keeps the live decision path.
+    #[test]
+    fn park_registry_follows_delivery() {
+        fn webhook_route(delivery: aura_config::WebhookDelivery) -> DecisionRoute {
+            let config = aura_config::HitlConfig {
+                require_approval: vec![],
+                park: aura_config::ParkConfig::default(),
+                route: aura_config::DecisionRouteConfig::Webhook {
+                    url: aura_config::WebhookUrl::new("https://approvals.example.com/").unwrap(),
+                    timeout_secs: 60,
+                    headers: std::collections::HashMap::new(),
+                    headers_from_request: std::collections::HashMap::new(),
+                    tool_headers_from_response: aura_config::ToolHeaderMappings::default(),
+                    delivery,
+                    poll_url: None,
+                    poll_interval_secs: 10,
+                    poll_request_timeout_secs: 30,
+                },
+            };
+            let runtime =
+                super::HitlRuntime::from_config(&config, &PendingApprovals::new(), None, None);
+            std::sync::Arc::try_unwrap(runtime.route)
+                .ok()
+                .expect("test-owned route")
+        }
+
+        let (_, conv) = conv_route(Duration::from_secs(60));
+        let (_, got) = conv.park_registry().expect("conversational parks");
+        assert_eq!(got, Duration::from_secs(60));
+
+        let sync = webhook_route(aura_config::WebhookDelivery::Sync);
+        assert!(sync.park_registry().is_none(), "webhook sync does not park");
+
+        let poll = webhook_route(aura_config::WebhookDelivery::Poll);
+        let (_, got) = poll.park_registry().expect("webhook poll parks");
+        assert_eq!(got, Duration::from_secs(60));
+    }
+
     #[tokio::test(start_paused = true)]
     async fn conversational_decide_approved() {
         let (registry, route) = conv_route(Duration::from_secs(60));
@@ -1495,8 +1562,8 @@ mod tests {
             WebhookHmac, authorize_ingress,
         };
         use super::super::{
-            ApprovalError, ApprovalOutcome, EgressSigning, GateDecision, PollOutcome, PollSettings,
-            WebhookClient, build_webhook_client,
+            ApprovalError, ApprovalOutcome, EgressSigning, GateDecision, PendingApprovals,
+            PollOutcome, PollSettings, WebhookClient, build_webhook_client,
         };
         use crate::approver_headers::CaptureError;
 
@@ -2464,6 +2531,7 @@ mod tests {
                 let (url, accepted) = stalled_receiver().await;
                 let route = super::super::DecisionRoute::Webhook {
                     client: loopback_client(&url, EgressSigning::Disabled, user_mapping()),
+                    registry: PendingApprovals::new(),
                     timeout: Duration::from_secs(300),
                 };
                 let cancel = crate::request_cancellation::RequestCancelToken::unbound();
@@ -2507,6 +2575,7 @@ mod tests {
             .await;
             let route = super::super::DecisionRoute::Webhook {
                 client: loopback_client(&url, EgressSigning::Disabled, user_mapping()),
+                registry: PendingApprovals::new(),
                 timeout: Duration::from_secs(300),
             };
 
@@ -2857,6 +2926,7 @@ mod tests {
                     &url,
                     Duration::from_secs(5),
                 ),
+                registry: PendingApprovals::new(),
                 timeout: Duration::from_secs(300),
             };
             let cancel = crate::request_cancellation::RequestCancelToken::unbound();
@@ -2957,6 +3027,7 @@ mod tests {
                 super::build_webhook_client(),
                 aura_config::WebhookUrl::new("http://127.0.0.1:9").unwrap(),
             ),
+            registry: PendingApprovals::new(),
             timeout: std::time::Duration::from_secs(1),
         };
         let request = ApprovalRequest {
@@ -3346,6 +3417,7 @@ mod tests {
 
         let route = super::DecisionRoute::Webhook {
             client,
+            registry: PendingApprovals::new(),
             timeout: std::time::Duration::from_secs(5),
         };
         let cancel = crate::request_cancellation::RequestCancelToken::unbound();
@@ -3372,6 +3444,7 @@ mod tests {
 
         let route = super::DecisionRoute::Webhook {
             client,
+            registry: PendingApprovals::new(),
             timeout: std::time::Duration::from_secs(5),
         };
         let cancel = crate::request_cancellation::RequestCancelToken::unbound();
@@ -3411,6 +3484,7 @@ mod tests {
         // Capture 1: the bare constructor (no headers configured).
         let bare = super::DecisionRoute::Webhook {
             client: super::WebhookClient::new(super::build_webhook_client(), url.clone()),
+            registry: PendingApprovals::new(),
             timeout: std::time::Duration::from_secs(5),
         };
         let result = bare.decide(request.clone(), &cancel).await;
@@ -3425,6 +3499,7 @@ mod tests {
                 url,
                 reqwest::header::HeaderMap::new(),
             ),
+            registry: PendingApprovals::new(),
             timeout: std::time::Duration::from_secs(5),
         };
         let result = with_empty.decide(request, &cancel).await;
