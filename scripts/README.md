@@ -179,6 +179,13 @@ cumulative download count as of a snapshot date. Run daily at 01:23 UTC by
 [the `Cloudsmith download metrics` workflow](../.github/workflows/cloudsmith-download-metrics.yml),
 which snapshots the previous UTC day.
 
+The count is observed when the run happens, not at the instant it is filed
+under. The 01:23 UTC run reads totals that already include that morning's
+downloads and attributes them to `23:59:59Z` the day before, so this is an
+approximate daily snapshot — running early keeps the overlap small. Cloudsmith
+exposes only a current counter on the package list, so no exact figure for a
+past instant is available to use instead.
+
 Packages are keyed by Cloudsmith's permanent identifier rather than by name and
 version: the same version can be uploaded to several distributions and
 architectures, each counting its own downloads.
@@ -198,13 +205,18 @@ account for every event. This is not belt-and-braces: PostHog answers
 `200 {"status":"Ok"}` to a batch sent with an invalid project token, so an
 unverified send cannot tell success from silent discard.
 
-The read-back checks a package count *and* a download total, taking
-`max(download_count)` per package the way reporting must. The count alone would
-not survive a retry: event UUIDs are derived from the snapshot date, so a
-second run for a date re-sends UUIDs the first run already ingested, and the
-count would be met by those earlier events however completely the retry was
-discarded. Cumulative counts only rise, so requiring the stored total to reach
-the total just collected is what a staler snapshot cannot satisfy.
+The read-back looks for this run's own event UUIDs at this run's timestamp,
+rather than counting a whole date: counting by date would also match UUIDs left
+by an earlier run whose package set differed, and those can cover for an event
+that never arrived.
+
+It also checks a download total, taking `max(download_count)` per package the
+way reporting must. UUIDs alone cannot answer whether a *retry* landed — they
+are derived from the snapshot date, so an earlier run for that date has already
+ingested every one of them and they stay present however completely the retry
+was discarded. Only the total moves when the counts do, and cumulative counts
+only rise, so requiring the stored total to reach the total just collected is a
+bar a staler snapshot cannot clear.
 
 A run also reports when the previous day holds no snapshot. That is advisory:
 the package list reports only current cumulative counts, so re-running a date

@@ -13,6 +13,13 @@
 # under the same key. Cumulative counts only rise, which makes max() right in
 # both cases.
 #
+# The count is observed when the run happens, not at the instant it is filed
+# under. A 01:23 UTC run reads totals that already include that morning's
+# downloads and attributes them to 23:59:59Z the day before, so this is an
+# approximate daily snapshot; running early keeps the overlap small. The
+# package list exposes only a current counter, so no exact figure for a past
+# instant is available to use instead.
+#
 # Cloudsmith identifies a package by its permanent identifier rather than by
 # name and version: the same version can be uploaded to several distributions
 # and architectures, each with its own download count.
@@ -96,11 +103,21 @@ day_before() {
     jq -rn --arg d "$1" '($d + "T00:00:00Z" | fromdateiso8601) - 86400 | strftime("%Y-%m-%d")'
 }
 
-# Reformat a date through a parse, or print nothing if it will not parse.
-# A day that overflows its month survives the parse but comes back as the day
-# it rolled over to, so an unchanged answer is what proves the input was real.
-canonical_date() {
-    jq -rn --arg d "$1" '$d + "T00:00:00Z" | fromdateiso8601 | strftime("%Y-%m-%d")' 2>/dev/null
+# A shell glob accepts digit-shaped nonsense like 2026-99-99, and an invalid
+# date reaches the wire as a malformed event timestamp. Round-trip the value
+# through jq's calendar and require it back unchanged: that rejects impossible
+# dates outright and catches the ones a parser silently rolls over, such as
+# 2026-02-30 becoming 2026-03-02. The glob also keeps a quote out of the date,
+# which the read-back interpolates into a SQL literal.
+valid_date() {
+    local d=$1 normalized
+    case "${d}" in
+        [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) ;;
+        *) return 1 ;;
+    esac
+    normalized=$(jq -rn --arg d "${d}" \
+        'try ($d + "T00:00:00Z" | fromdateiso8601 | strftime("%Y-%m-%d")) catch ""')
+    [ "${normalized}" = "${d}" ]
 }
 
 require_tools() {
@@ -255,13 +272,13 @@ post_batch() {
         "${POSTHOG_HOST%/}/batch/" >/dev/null
 }
 
-# Run a HogQL query and print its first result row, tab separated.
+# Run a HogQL query and print its first scalar result.
 #
 # Plain --retry covers the transient cases (timeouts, 429, 5xx) and leaves
 # 4xx alone: an auth or project error repeated four times is noise, and the
 # status is worth naming because every likely cause is a misconfiguration
 # rather than an outage.
-hogql_row() {
+hogql_scalar() {
     local query=$1 response status body
     response=$(jq -n --arg q "${query}" '{query: {kind: "HogQLQuery", query: $q}}' \
         | curl --silent --show-error --retry 3 --retry-delay 2 --max-time 60 \
@@ -279,18 +296,35 @@ hogql_row() {
         echo "       and POSTHOG_API_READ_KEY must hold query:read on that project" >&2
         return 1
     fi
-    jq -r '.results[0] // [] | @tsv' <<<"${body}"
+    jq -r '.results[0][0]' <<<"${body}"
 }
 
-# Measure what actually landed, as a package count and a download total.
+# Count how many of this run's own event UUIDs are queryable at this run's
+# timestamp. A date-wide count would also match UUIDs left by an earlier run
+# whose package set differed, and those extras can satisfy the threshold while
+# an event from the current payload is still missing. Pinning the timestamp too
+# means a snapshot attributed to the wrong instant cannot read as verified.
+count_ingested() {
+    local date=$1 chunk list total=0 found
+    for chunk in "${WORK_DIR}"/uchunk.*; do
+        list=$(sed "s/^/'/; s/$/'/" "${chunk}" | paste -sd, -)
+        found=$(hogql_scalar "SELECT count(DISTINCT uuid) FROM events \
+            WHERE event = '${EVENT_NAME}' \
+              AND timestamp = toDateTime('${date} 23:59:59') \
+              AND uuid IN (${list})")
+        total=$((total + found))
+    done
+    printf '%s\n' "${total}"
+}
+
+# The download total the stored snapshot accounts for.
 #
-# The count alone cannot answer whether this run's batch arrived. Event UUIDs
-# are derived from the snapshot date, so a retry re-sends the UUIDs the earlier
-# run already ingested, and a date that is already populated answers the count
-# question with that earlier run's events however completely the retry was
-# discarded. The download total closes that: cumulative counts only rise, so a
-# total at least as high as the one just collected cannot be satisfied by a
-# staler snapshot alone.
+# Scoping to this run's UUIDs cannot answer whether a retry landed: those UUIDs
+# are derived from the snapshot date, so an earlier run for the same date has
+# already ingested every one of them, and they stay present however completely
+# the retry was discarded. Only the total moves when the counts do, and
+# cumulative counts only rise, so a total at least as high as the one just
+# collected is a bar a staler snapshot cannot clear.
 #
 # max() per package mirrors what reporting must do, since a re-run's rows stay
 # visible until PostHog's background merges collapse them.
@@ -298,36 +332,38 @@ hogql_row() {
 # printf builds the literals rather than nested shell quoting, which is easy to
 # get wrong in a way that still returns a well-formed answer: a quote stray
 # inside the string literal matches no rows and reads as "nothing ingested".
-snapshot_query() {
-    printf "SELECT count(), sum(dl) FROM (SELECT properties.repository AS repo, properties.package_id AS pid, max(toIntOrZero(toString(properties.download_count))) AS dl FROM events WHERE event = '%s' AND properties.snapshot_date = '%s' GROUP BY repo, pid)" \
+downloads_query() {
+    printf "SELECT sum(dl) FROM (SELECT properties.repository AS repo, properties.package_id AS pid, max(toIntOrZero(toString(properties.download_count))) AS dl FROM events WHERE event = '%s' AND timestamp = toDateTime('%s 23:59:59') GROUP BY repo, pid)" \
         "${EVENT_NAME}" "$1"
 }
 
-snapshot_totals() {
-    hogql_row "$(snapshot_query "$1")"
+# A date-wide count, for asking whether a day holds any snapshot at all. This
+# run has no UUIDs for an earlier date to scope by.
+snapshot_count_query() {
+    printf "SELECT count(DISTINCT uuid) FROM events WHERE event = '%s' AND properties.snapshot_date = '%s'" \
+        "${EVENT_NAME}" "$1"
 }
 
 # Poll until the snapshot is queryable, since ingestion lags the send.
 verify_snapshot() {
-    local date=$1 want_packages=$2 want_downloads=$3 deadline row packages downloads value
+    local date=$1 want_events=$2 want_downloads=$3 deadline events downloads value
     deadline=$(( $(date +%s) + VERIFY_TIMEOUT ))
     while :; do
-        row=$(snapshot_totals "${date}")
-        packages=${row%%$'\t'*}
-        downloads=${row##*$'\t'}
-        for value in "${packages}" "${downloads}"; do
+        events=$(count_ingested "${date}")
+        downloads=$(hogql_scalar "$(downloads_query "${date}")")
+        for value in "${events}" "${downloads}"; do
             case "${value}" in
                 '' | *[!0-9]*)
-                    echo "error: PostHog answered the snapshot query with '${row}', which is not a package count and a download total" >&2
+                    echo "error: PostHog answered the read-back with '${events}' event(s) and '${downloads}' download(s), which are not both counts" >&2
                     return 1 ;;
             esac
         done
-        if [ "${packages}" -ge "${want_packages}" ] && [ "${downloads}" -ge "${want_downloads}" ]; then
-            echo "Verified ${packages} package(s) and ${downloads} download(s) queryable in PostHog for ${date}"
+        if [ "${events}" -ge "${want_events}" ] && [ "${downloads}" -ge "${want_downloads}" ]; then
+            echo "Verified ${events} of ${want_events} event(s) and ${downloads} download(s) queryable in PostHog for ${date}"
             return 0
         fi
         if [ "$(date +%s)" -ge "${deadline}" ]; then
-            echo "error: PostHog holds ${packages} of ${want_packages} package(s) and ${downloads} of ${want_downloads} download(s) for ${date} after ${VERIFY_TIMEOUT}s" >&2
+            echo "error: PostHog holds ${events} of ${want_events} event(s) and ${downloads} of ${want_downloads} download(s) for ${date} after ${VERIFY_TIMEOUT}s" >&2
             return 1
         fi
         sleep 5
@@ -337,10 +373,10 @@ verify_snapshot() {
 # A dropped or disabled scheduled run leaves a hole no failure reports, since
 # nothing ran to fail. Surface it on the next run that does happen.
 warn_on_gap() {
-    local date=$1 previous row
+    local date=$1 previous got
     previous=$(day_before "${date}")
-    row=$(snapshot_totals "${previous}")
-    if [ "${row%%$'\t'*}" = "0" ]; then
+    got=$(hogql_scalar "$(snapshot_count_query "${previous}")")
+    if [ "${got}" = "0" ]; then
         echo "::warning::No Cloudsmith download snapshot in PostHog for ${previous}; the package list reports only current totals, so re-running that date would file today's counts under it"
     fi
 }
@@ -407,21 +443,25 @@ mezmo/aura|3uq7JmasvnKF|raw||null|0"
     got=$(jq -r '.batch[0].distinct_id' <<<"${payload}")
     [ "${got}" = "cloudsmith:mezmo/aura" ] || { echo "selftest: distinct_id = ${got}" >&2; exit 1; }
 
-    # The read-back query must quote its literals exactly once. Nested quoting
-    # bugs here return 0 rows, which is indistinguishable from a failed send.
-    got=$(snapshot_query "2026-08-20")
-    want="SELECT count(), sum(dl) FROM (SELECT properties.repository AS repo, properties.package_id AS pid, max(toIntOrZero(toString(properties.download_count))) AS dl FROM events WHERE event = 'cloudsmith_package_downloads' AND properties.snapshot_date = '2026-08-20' GROUP BY repo, pid)"
-    [ "${got}" = "${want}" ] || { echo "selftest: query is"$'\n'"  ${got}"$'\n'"want"$'\n'"  ${want}" >&2; exit 1; }
+    # The read-back queries must quote their literals exactly once. Nested
+    # quoting bugs here return 0 rows, which is indistinguishable from a failed
+    # send.
+    got=$(downloads_query "2026-08-20")
+    want="SELECT sum(dl) FROM (SELECT properties.repository AS repo, properties.package_id AS pid, max(toIntOrZero(toString(properties.download_count))) AS dl FROM events WHERE event = 'cloudsmith_package_downloads' AND timestamp = toDateTime('2026-08-20 23:59:59') GROUP BY repo, pid)"
+    [ "${got}" = "${want}" ] || { echo "selftest: downloads query is"$'\n'"  ${got}"$'\n'"want"$'\n'"  ${want}" >&2; exit 1; }
 
-    # A date that overflows its month must not reach an event, where it would
-    # become both the timestamp and the snapshot key.
-    for got in 2026-02-31 2026-13-01 2026-00-10 2027-02-29; do
-        [ "$(canonical_date "${got}")" != "${got}" ] \
-            || { echo "selftest: ${got} accepted as a calendar date" >&2; exit 1; }
+    got=$(snapshot_count_query "2026-08-20")
+    want="SELECT count(DISTINCT uuid) FROM events WHERE event = 'cloudsmith_package_downloads' AND properties.snapshot_date = '2026-08-20'"
+    [ "${got}" = "${want}" ] || { echo "selftest: count query is"$'\n'"  ${got}"$'\n'"want"$'\n'"  ${want}" >&2; exit 1; }
+
+    # Calendar validation must reject digit-shaped non-dates, rollovers, and
+    # anything that could carry a quote into the read-back query.
+    local d
+    for d in 2026-09-01 2024-02-29 2026-12-31 2026-01-01; do
+        valid_date "${d}" || { echo "selftest: rejected valid date ${d}" >&2; exit 1; }
     done
-    for got in 2024-02-29 2026-09-08 2026-12-31; do
-        [ "$(canonical_date "${got}")" = "${got}" ] \
-            || { echo "selftest: ${got} rejected as a calendar date" >&2; exit 1; }
+    for d in 2026-99-99 2026-13-01 2026-00-00 2026-02-30 2025-02-29 2026-9-1 "" "2026-09-0'"; do
+        if valid_date "${d}"; then echo "selftest: accepted invalid date '${d}'" >&2; exit 1; fi
     done
 
     # Date arithmetic across month, year, and leap-day boundaries.
@@ -448,16 +488,8 @@ main() {
 
     local date="${SNAPSHOT_DATE}"
     [ -n "${date}" ] || date=$(yesterday_utc)
-    case "${date}" in
-        [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) ;;
-        *) echo "error: --date must be YYYY-MM-DD (got '${date}')" >&2; exit 1 ;;
-    esac
-    # Digit-shaped is not the same as real. A date like 2026-02-31 would be
-    # stamped onto every event as both its timestamp and its snapshot key, and
-    # the only later code that parses it runs advisory, so nothing downstream
-    # would reject it.
-    if [ "$(canonical_date "${date}")" != "${date}" ]; then
-        echo "error: --date must be a real calendar date (got '${date}')" >&2
+    if ! valid_date "${date}"; then
+        echo "error: --date must be a real calendar date as YYYY-MM-DD (got '${date}')" >&2
         exit 1
     fi
 
@@ -492,6 +524,8 @@ main() {
 
     key_packages "${WORK_DIR}/packages.ndjson" "${date}" "${WORK_DIR}/uuids" > "${WORK_DIR}/keyed"
     split -l "${BATCH_SIZE}" "${WORK_DIR}/keyed" "${WORK_DIR}/chunk."
+    # The read-back names this run's UUIDs explicitly, in query-sized groups.
+    split -l 500 "${WORK_DIR}/uuids" "${WORK_DIR}/uchunk."
 
     local chunk chunks=0
     for chunk in "${WORK_DIR}"/chunk.*; do
