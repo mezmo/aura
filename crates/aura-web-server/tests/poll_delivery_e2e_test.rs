@@ -71,19 +71,28 @@ const ECHO_PROMPT: &str = "Call the echo_headers tool now and reply with only it
 // A mock governance receiver: POST /notify + GET /status on one port
 // ---------------------------------------------------------------------------
 
+/// How long the held-notify mode parks each POST before answering:
+/// past the rig's 5s per-attempt timeout, modeling an authorization
+/// endpoint that long-polls for a decision.
+const NOTIFY_HOLD: Duration = Duration::from_secs(8);
+
 /// The receiver's mutable state, shared across its connection tasks.
 struct ReceiverShared {
     decided: bool,
+    /// Hold every POST past the client's per-attempt timeout.
+    hold_notify: bool,
     /// Every request captured verbatim (request line, headers, body).
     requests: Vec<String>,
 }
 
 /// An in-process governance receiver: the notification POST is answered 200
-/// with a DECISION-SHAPED body (`{"approved": true}`) — an ack whose body
-/// must never be read as a decision — and the status GET answers 404 until
-/// the test flips `decided`, then 200 with the status envelope
-/// (`{"status": "approved"}`) and the approver identity header. Unsigned:
-/// aura's notify/poll legs run without HMAC.
+/// with a pending status envelope — a body the poll legs must never read as
+/// a decision — and the status GET answers 404 until the test flips
+/// `decided`, then 200 with the decided status envelope and the approver
+/// identity header. `start_with_held_notify` parks each POST past the
+/// client's per-attempt timeout, modeling an authorization endpoint that
+/// long-polls for the decision. Unsigned: aura's notify/poll legs run
+/// without HMAC.
 #[derive(Clone)]
 struct MockGovernanceReceiver {
     base_url: String,
@@ -92,6 +101,16 @@ struct MockGovernanceReceiver {
 
 impl MockGovernanceReceiver {
     async fn start() -> Self {
+        Self::start_with(false).await
+    }
+
+    /// The held variant: every POST is parked past the client's per-attempt
+    /// timeout before answering, so no notify ever acks.
+    async fn start_with_held_notify() -> Self {
+        Self::start_with(true).await
+    }
+
+    async fn start_with(hold_notify: bool) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind mock governance receiver");
@@ -101,6 +120,7 @@ impl MockGovernanceReceiver {
         );
         let shared = Arc::new(Mutex::new(ReceiverShared {
             decided: false,
+            hold_notify,
             requests: Vec::new(),
         }));
         let sink = Arc::clone(&shared);
@@ -147,11 +167,17 @@ async fn serve_one(mut socket: tokio::net::TcpStream, shared: Arc<Mutex<Receiver
     let Some(captured) = read_full_request(&mut socket).await else {
         return;
     };
-    let response = {
+    let (response, hold) = {
         let mut state = shared.lock().expect("receiver state mutex");
         state.requests.push(captured.clone());
-        build_receiver_response(&captured, state.decided)
+        (
+            build_receiver_response(&captured, state.decided),
+            state.hold_notify,
+        )
     };
+    if hold && captured.starts_with("POST ") {
+        tokio::time::sleep(NOTIFY_HOLD).await;
+    }
     socket.write_all(response.as_bytes()).await.ok();
     socket.shutdown().await.ok();
 }
@@ -162,7 +188,7 @@ async fn serve_one(mut socket: tokio::net::TcpStream, shared: Arc<Mutex<Receiver
 fn build_receiver_response(captured: &str, decided: bool) -> String {
     let request_line = captured.lines().next().unwrap_or_default();
     if request_line.starts_with("POST ") {
-        let body = json!({ "approved": true }).to_string();
+        let body = json!({ "status": "pending" }).to_string();
         return format!(
             "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: \
              {}\r\nconnection: close\r\n\r\n{body}",
@@ -567,27 +593,29 @@ async fn park_and_notify(
 // Cases
 // ---------------------------------------------------------------------------
 
-/// The full poll flow with the run still parked: the decision-shaped notify
-/// ack is ignored (nothing resolves, the status GETs keep coming), and a
-/// decision landing at the receiver later resolves durably with the approver
-/// identity docked — while the run's completion stays the parked message.
+/// The full poll flow with the run still parked, against an authorization
+/// POST that is held past every per-attempt timeout: no notify ever acks,
+/// yet the status GETs keep the flow alive, and a decision landing at the
+/// receiver later resolves durably with the approver identity docked —
+/// while the run's completion stays the parked message.
 #[tokio::test]
 async fn poll_flow_parks_notifies_and_resolves_with_the_run_still_parked() {
     ensure_unsigned_mode();
     let store_dir = tempfile::tempdir().expect("temp store dir");
     let store_root = store_dir.path().to_path_buf();
-    let receiver = MockGovernanceReceiver::start().await;
+    let receiver = MockGovernanceReceiver::start_with_held_notify().await;
     let server = spawn_rig_server(&receiver, &store_root, "poll-e2e-single").await;
 
     let decision_id = park_and_notify(&receiver, &server, &store_root).await;
 
-    // (3) The ack body is never read as a decision: past the 200 ack, the
-    // reconciler keeps polling the undecided status endpoint, and nothing
-    // resolves. Two polls is past any single-tick misread.
+    // (3) No notify ever acks (each attempt times out under the hold), so
+    // resolution can only come from the status GET: while the receiver is
+    // undecided nothing resolves, and the GETs keep coming. Two polls is
+    // past any single-tick misread.
     wait_for_request_count(
         &receiver,
         2,
-        "status polls past the ack (the reconciler must keep polling)",
+        "status polls continue while every notify attempt times out",
         |captured| captured.starts_with("GET /status"),
     )
     .await;
@@ -602,7 +630,7 @@ async fn poll_flow_parks_notifies_and_resolves_with_the_run_still_parked() {
     );
     assert!(
         decision_files(&store_root).is_empty(),
-        "the decision-shaped notify ack must never resolve anything: {:?}",
+        "an undecided receiver must never resolve anything: {:?}",
         decision_files(&store_root)
     );
     assert!(
