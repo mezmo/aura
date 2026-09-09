@@ -236,7 +236,7 @@ read fails rather than returning a shorter list.
 | `POSTHOG_API_READ_KEY` | unset | Personal API key used to read the snapshot back. Required unless `--dry-run` or `SKIP_VERIFY=1`. |
 | `POSTHOG_PROJECT_ID` | `443794` | Numeric project id the read-back queries. Must be the project the write token belongs to. |
 | `POSTHOG_API_HOST` | `https://us.posthog.com` | PostHog query host. Distinct from the ingest host. |
-| `VERIFY_TIMEOUT` | `300` | Seconds to wait for ingestion before failing the read-back. |
+| `VERIFY_TIMEOUT` | `600` | Seconds to wait for ingestion before failing the read-back. |
 | `SKIP_VERIFY` | `0` | `1` sends without reading the snapshot back. |
 | `POSTHOG_HOST` | `https://us.i.posthog.com` | PostHog ingest host. |
 | `CLOUDSMITH_REPOS` | `mezmo/aura` | Space-separated `owner/repository` list to snapshot. |
