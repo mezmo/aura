@@ -45,6 +45,10 @@ mod common;
 use common::AuraServer;
 
 const CHAT_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// The reboot's resolve must land within ~two poll intervals of the health
+/// check — a reconciler that only resolves on tick N > 1 fails this budget.
+const FIRST_TICK_BUDGET: Duration = Duration::from_secs(3);
 /// Wall-clock budget for one reconciler side effect (the notify POST, a run
 /// of status GETs, the durable resolve). `poll_interval_secs` is 1, so this
 /// tolerates ~20 missed ticks before failing.
@@ -663,10 +667,7 @@ async fn restart_resolves_the_parked_approval_on_a_rebooted_server() {
     // is gone, so the first tick re-notifies (one duplicate, idempotent at
     // the receiver) and then polls the now-decided status endpoint.
     let second_boot = spawn_rig_server(&receiver, &store_root, instance_id).await;
-    // First-tick claim: the reboot's resolve must land within ~two poll
-    // intervals of the health check, not anywhere inside TICK_BUDGET - a
-    // reconciler that only resolves on tick N > 1 fails here.
-    let decision_record = wait_for_decision_file_within(&store_root, Duration::from_secs(3)).await;
+    let decision_record = wait_for_decision_file_within(&store_root, FIRST_TICK_BUDGET).await;
     assert!(
         decision_record.contains(IDENTITY_VALUE),
         "the rebooted server's resolve docks the approver identity, got: {decision_record}"

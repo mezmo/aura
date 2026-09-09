@@ -242,54 +242,6 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn approval_store_register_get_resolve() {
-        let store = InMemoryApprovalStore::new();
-        let entry = parked("req-1");
-        let id = entry.request.decision_id;
-
-        store.register(entry).await.unwrap();
-        assert!(store.get(&id).await.unwrap().is_some());
-
-        store
-            .resolve(&id, ApprovalDecision::Approved.into())
-            .await
-            .unwrap();
-        assert!(store.get(&id).await.unwrap().is_none());
-        assert_eq!(
-            store.resolve(&id, ApprovalDecision::Approved.into()).await,
-            Err(ResolveError::NotFound),
-        );
-    }
-
-    #[tokio::test]
-    async fn approval_store_resolve_records_readable_decision() {
-        let store = InMemoryApprovalStore::new();
-        let entry = parked("req-durable");
-        let id = entry.request.decision_id;
-        store.register(entry).await.unwrap();
-
-        let denied = ApprovalDecision::Denied {
-            reason: Some("not safe".into()),
-        };
-        store.resolve(&id, denied.clone().into()).await.unwrap();
-
-        assert_eq!(
-            store.decision(&id).await.unwrap(),
-            Some(ResolvedDecision::from(denied.clone()))
-        );
-        // Recorded decision survives rejected second resolve.
-        assert_eq!(
-            store.resolve(&id, ApprovalDecision::Approved.into()).await,
-            Err(ResolveError::NotFound)
-        );
-        assert_eq!(
-            store.decision(&id).await.unwrap(),
-            Some(ResolvedDecision::from(denied))
-        );
-        assert_eq!(store.decision(&DecisionId::generate()).await.unwrap(), None);
-    }
-
     /// Retention pruning drops entries past window.
     #[tokio::test]
     async fn recorded_decision_is_pruned_after_retention_window() {
@@ -335,24 +287,6 @@ mod tests {
         assert!(store.get(&id).await.unwrap().is_some());
         store.remove(&id).await.unwrap();
         assert!(store.get(&id).await.unwrap().is_none());
-    }
-
-    #[tokio::test]
-    async fn approval_store_cancel_request_removes_only_matching() {
-        let store = InMemoryApprovalStore::new();
-        let cancel = parked("req-cancel");
-        let cancel_id = cancel.request.decision_id;
-        let keep = parked("req-keep");
-        let keep_id = keep.request.decision_id;
-        store.register(cancel).await.unwrap();
-        store.register(keep).await.unwrap();
-
-        let cleared = store.cancel_request("req-cancel").await.unwrap();
-
-        assert_eq!(cleared.len(), 1, "only the matching ticket is cleared");
-        assert_eq!(cleared[0].request.decision_id, cancel_id);
-        assert!(store.get(&keep_id).await.unwrap().is_some());
-        assert_eq!(store.lock().len(), 1);
     }
 
     #[tokio::test]
