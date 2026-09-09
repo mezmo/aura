@@ -211,8 +211,11 @@ add_probe() {
     mv "${payload}.probed" "${payload}"
 }
 
-probe_landed() {
-    hogql_scalar "SELECT count() FROM events WHERE event = '${EVENT_NAME}_probe' AND uuid = '$1'"
+probes_landed() {
+    local list
+    list=$(sed "s/^/'/; s/$/'/" "${WORK_DIR}/probes" | paste -sd, -)
+    hogql_scalar "SELECT count(DISTINCT uuid) FROM events \
+        WHERE event = '${EVENT_NAME}_probe' AND uuid IN (${list})"
 }
 
 post_batch() {
@@ -320,7 +323,7 @@ count_ingested() {
 
 # Poll until the snapshot is queryable, since ingestion lags the send.
 verify_snapshot() {
-    local date=$1 expected=$2 expected_downloads=$3 probe=$4
+    local date=$1 expected=$2 expected_downloads=$3 probes=$4
     local deadline row got downloads seen
     split -l 500 "${WORK_DIR}/uuids" "${WORK_DIR}/uchunk."
     deadline=$(( $(date +%s) + VERIFY_TIMEOUT ))
@@ -328,15 +331,15 @@ verify_snapshot() {
         row=$(count_ingested "${date}")
         got=${row%%$'\t'*}
         downloads=${row##*$'\t'}
-        seen=$(probe_landed "${probe}")
+        seen=$(probes_landed)
         case "${seen}" in '' | null) seen=0 ;; esac
         if [ "${got}" -ge "${expected}" ] && [ "${downloads}" -ge "${expected_downloads}" ] \
-           && [ "${seen}" -ge 1 ]; then
-            echo "Verified ${got} of ${expected} event(s), ${downloads} download(s), and this run's probe in PostHog for ${date}"
+           && [ "${seen}" -ge "${probes}" ]; then
+            echo "Verified ${got} of ${expected} event(s), ${downloads} download(s), and ${seen} probe(s) in PostHog for ${date}"
             return 0
         fi
         if [ "$(date +%s)" -ge "${deadline}" ]; then
-            echo "error: PostHog holds ${got} of ${expected} event(s), ${downloads} of ${expected_downloads} download(s), and ${seen} probe(s) for ${date} after ${VERIFY_TIMEOUT}s" >&2
+            echo "error: PostHog holds ${got} of ${expected} event(s), ${downloads} of ${expected_downloads} download(s), and ${seen} of ${probes} probe(s) for ${date} after ${VERIFY_TIMEOUT}s" >&2
             return 1
         fi
         sleep 5
@@ -483,11 +486,17 @@ main() {
         return 0
     fi
 
-    local probe payload
-    probe=$(uuid4)
-    add_probe "${WORK_DIR}/payload.1.json" "${probe}"
+    # Every batch carries its own probe. One probe in the first batch cannot
+    # speak for a later batch that was discarded, because the deterministic
+    # events a retry re-sends are already present from the earlier run.
+    local probe payload probes=0
+    : > "${WORK_DIR}/probes"
     for payload in "${WORK_DIR}"/payload.*.json; do
+        probe=$(uuid4)
+        printf '%s\n' "${probe}" >> "${WORK_DIR}/probes"
+        add_probe "${payload}" "${probe}"
         post_batch "${payload}"
+        probes=$(( probes + 1 ))
     done
 
     echo "Sent ${assets} event(s) for ${date} to ${POSTHOG_HOST%/}"
@@ -498,7 +507,7 @@ main() {
     fi
     local expected_downloads
     expected_downloads=$(jq -s '[.[].download_count] | add' "${WORK_DIR}/assets.ndjson")
-    verify_snapshot "${date}" "${assets}" "${expected_downloads}" "${probe}"
+    verify_snapshot "${date}" "${assets}" "${expected_downloads}" "${probes}"
     # Advisory only: a missing earlier day is worth reporting but is not a
     # failure of this run, and cannot be repaired by retrying it.
     warn_on_gap "${date}" || true
