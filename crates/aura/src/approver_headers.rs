@@ -7,7 +7,7 @@
 //! request-extension side-channel).
 
 use aura_config::ToolHeaderMappings;
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+use reqwest::header::{HeaderMap, HeaderName};
 
 /// Validated approver identity headers captured from one approved webhook
 /// response.
@@ -62,18 +62,7 @@ impl ApproverHeaders {
     /// ASCII by construction (`from_captured` reads a parsed `HeaderMap`),
     /// so `to_str` cannot fail.
     pub(crate) fn to_pair_map(&self) -> std::collections::BTreeMap<String, String> {
-        self.headers
-            .iter()
-            .map(|(name, value)| {
-                (
-                    name.as_str().to_owned(),
-                    value
-                        .to_str()
-                        .expect("captured header values are visible ASCII")
-                        .to_owned(),
-                )
-            })
-            .collect()
+        crate::webhook_utils::header_map_to_pairs(&self.headers)
     }
 
     /// Restore a captured identity from its stored pair map: every name and
@@ -84,15 +73,9 @@ impl ApproverHeaders {
     pub(crate) fn from_pairs(
         pairs: impl IntoIterator<Item = (String, String)>,
     ) -> Result<Self, String> {
-        let mut headers = HeaderMap::new();
-        for (name, value) in pairs {
-            let name = HeaderName::from_bytes(name.as_bytes())
-                .map_err(|e| format!("invalid header name '{name}': {e}"))?;
-            let value = HeaderValue::from_str(&value)
-                .map_err(|_| format!("invalid header value for '{name}'"))?;
-            headers.insert(name, value);
-        }
-        Ok(Self { headers })
+        Ok(Self {
+            headers: crate::webhook_utils::pairs_to_header_map(pairs)?,
+        })
     }
 
     /// Apply the overrides to an outbound request builder as per-request

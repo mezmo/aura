@@ -47,6 +47,11 @@ pub struct ParkedApprovalRecord {
     pub egress_headers: Option<BTreeMap<String, String>>,
 }
 
+/// The names of an optional pair map, for names-only Debug rendering.
+fn pair_names(pairs: &Option<BTreeMap<String, String>>) -> Option<Vec<&String>> {
+    pairs.as_ref().map(BTreeMap::keys).map(Iterator::collect)
+}
+
 impl std::fmt::Debug for ParkedApprovalRecord {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ParkedApprovalRecord")
@@ -59,14 +64,7 @@ impl std::fmt::Debug for ParkedApprovalRecord {
             .field("items", &self.items)
             .field("registered_at", &self.registered_at)
             .field("expires_at", &self.expires_at)
-            .field(
-                "egress_header_names",
-                &self
-                    .egress_headers
-                    .as_ref()
-                    .map(BTreeMap::keys)
-                    .map(Iterator::collect::<Vec<_>>),
-            )
+            .field("egress_header_names", &pair_names(&self.egress_headers))
             .finish()
     }
 }
@@ -129,14 +127,7 @@ impl std::fmt::Debug for DecisionRecord {
             .field("approved", &self.approved)
             .field("reason", &self.reason)
             .field("decided_at", &self.decided_at)
-            .field(
-                "identity_names",
-                &self
-                    .identity
-                    .as_ref()
-                    .map(BTreeMap::keys)
-                    .map(Iterator::collect::<Vec<_>>),
-            )
+            .field("identity_names", &pair_names(&self.identity))
             .finish()
     }
 }
@@ -209,7 +200,10 @@ impl From<&ParkedApproval> for ParkedApprovalRecord {
             items: request.items.clone(),
             registered_at: parked.registered_at,
             expires_at: parked.expires_at,
-            egress_headers: parked.egress_headers.as_ref().map(header_pairs),
+            egress_headers: parked
+                .egress_headers
+                .as_ref()
+                .map(crate::webhook_utils::header_map_to_pairs),
         }
     }
 }
@@ -219,7 +213,11 @@ impl TryFrom<ParkedApprovalRecord> for ParkedApproval {
 
     fn try_from(record: ParkedApprovalRecord) -> Result<Self, Self::Error> {
         let egress_headers = match record.egress_headers {
-            Some(pairs) => Some(header_map_from_pairs(pairs)?),
+            Some(pairs) => Some(crate::webhook_utils::pairs_to_header_map(pairs).map_err(
+                |reason| InvalidRecord {
+                    reason: format!("stored egress headers: {reason}"),
+                },
+            )?),
             None => None,
         };
         Ok(Self {
@@ -237,46 +235,6 @@ impl TryFrom<ParkedApprovalRecord> for ParkedApproval {
             egress_headers,
         })
     }
-}
-
-/// The storage projection of a resolved egress header map. Values are
-/// validated `HeaderValue`s by construction of [`resolve_headers`], so
-/// `to_str` cannot fail.
-///
-/// [`resolve_headers`]: crate::webhook_utils::resolve_headers
-fn header_pairs(headers: &reqwest::header::HeaderMap) -> BTreeMap<String, String> {
-    headers
-        .iter()
-        .map(|(name, value)| {
-            (
-                name.as_str().to_owned(),
-                value
-                    .to_str()
-                    .expect("resolved egress header values are visible ASCII")
-                    .to_owned(),
-            )
-        })
-        .collect()
-}
-
-/// Restore an egress header map from its storage pairs: every pair must be a
-/// valid header, so a corrupted record fails the decode instead of dropping
-/// the credential the notify POST needs.
-fn header_map_from_pairs(
-    pairs: BTreeMap<String, String>,
-) -> Result<reqwest::header::HeaderMap, InvalidRecord> {
-    use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
-    let mut map = HeaderMap::new();
-    for (name, value) in pairs {
-        let name = HeaderName::from_bytes(name.as_bytes()).map_err(|e| InvalidRecord {
-            reason: format!("stored egress header name '{name}': {e}"),
-        })?;
-        let value = HeaderValue::from_str(&value).map_err(|_| InvalidRecord {
-            reason: format!("stored egress header value for '{name}' is not a valid header value"),
-        })?;
-        map.insert(name, value);
-    }
-    Ok(map)
 }
 
 impl From<&AgentScope> for ScopeRecord {
@@ -489,7 +447,11 @@ mod tests {
             },
         );
         parked.egress_headers = Some(
-            header_map_from_pairs(pairs(&[("authorization", "Bearer from-request")])).unwrap(),
+            crate::webhook_utils::pairs_to_header_map(pairs(&[(
+                "authorization",
+                "Bearer from-request",
+            )]))
+            .unwrap(),
         );
 
         let record = ParkedApprovalRecord::from(&parked);
@@ -560,7 +522,11 @@ mod tests {
             },
         );
         parked.egress_headers = Some(
-            header_map_from_pairs(pairs(&[("authorization", "Bearer sentinel-egress")])).unwrap(),
+            crate::webhook_utils::pairs_to_header_map(pairs(&[(
+                "authorization",
+                "Bearer sentinel-egress",
+            )]))
+            .unwrap(),
         );
         let rendered = format!("{:?}", ParkedApprovalRecord::from(&parked));
         assert!(
@@ -668,8 +634,9 @@ mod tests {
     /// fail-loud rather than as a partial map.
     #[test]
     fn corrupt_pair_is_rejected_fail_loud() {
-        let err = header_map_from_pairs(pairs(&[("authorization", "sentinel\nbad")]))
-            .expect_err("a control character in a header value is corrupt");
+        let err =
+            crate::webhook_utils::pairs_to_header_map(pairs(&[("authorization", "sentinel\nbad")]))
+                .expect_err("a control character in a header value is corrupt");
         assert!(
             err.to_string().contains("is not a valid header value"),
             "error names the corrupt value: {err}"

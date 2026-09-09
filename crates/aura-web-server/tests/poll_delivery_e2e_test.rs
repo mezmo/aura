@@ -34,17 +34,17 @@
 //! ```
 
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::process::{Child, Command};
+mod common;
+
+use common::AuraServer;
 
 const CHAT_TIMEOUT: Duration = Duration::from_secs(90);
-const HEALTH_TIMEOUT: Duration = Duration::from_secs(30);
 /// Wall-clock budget for one reconciler side effect (the notify POST, a run
 /// of status GETs, the durable resolve). `poll_interval_secs` is 1, so this
 /// tolerates ~20 missed ticks before failing.
@@ -62,147 +62,6 @@ const IDENTITY_VALUE: &str = "approver-mike";
 
 /// The prompt that has the model call `echo_headers` and relay its output.
 const ECHO_PROMPT: &str = "Call the echo_headers tool now and reply with only its raw JSON output.";
-
-// ---------------------------------------------------------------------------
-// A dedicated aura-web-server, spawned fresh per test case
-// ---------------------------------------------------------------------------
-
-/// A freshly spawned `aura-web-server`, bound to its own port and reading a config generated for exactly one test case, pointed at a per-test file store under a pinned `AURA_INSTANCE_ID` (the restart test reboots onto the same values). Killed and its config file removed on drop.
-struct AuraServer {
-    port: u16,
-    child: Child,
-    config_path: PathBuf,
-    /// Accumulated stderr, drained continuously so the child's pipe never
-    /// blocks; read back to explain a health-check timeout.
-    stderr_log: Arc<Mutex<String>>,
-}
-
-impl AuraServer {
-    fn base_url(&self) -> String {
-        format!("http://127.0.0.1:{}", self.port)
-    }
-
-    /// Spawn `aura-web-server` against `config_toml`, wait until it answers `/health`. `free_port`'s bind-then-drop leaves a window for another process to grab the port; one retry on a fresh port covers that.
-    async fn start(config_toml: &str, store_root: &Path, instance_id: &str) -> Self {
-        match Self::try_start(config_toml, store_root, instance_id).await {
-            Ok(server) => server,
-            Err(failed) => {
-                let log = failed.stderr_log.lock().expect("stderr log mutex").clone();
-                eprintln!(
-                    "aura-web-server on port {} never answered /health within {HEALTH_TIMEOUT:?}; \
-                     retrying once on a fresh port. stderr:\n{log}",
-                    failed.port
-                );
-                failed.stop().await;
-                match Self::try_start(config_toml, store_root, instance_id).await {
-                    Ok(server) => server,
-                    Err(failed) => {
-                        let log = failed.stderr_log.lock().expect("stderr log mutex").clone();
-                        let port = failed.port;
-                        failed.stop().await;
-                        panic!(
-                            "aura-web-server never answered /health, on a fresh port either; \
-                             last tried port {port}; stderr:\n{log}"
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    /// One spawn-and-wait attempt. `Err` carries the (still-running) server
-    /// so the caller can log its stderr and stop it before retrying.
-    async fn try_start(
-        config_toml: &str,
-        store_root: &Path,
-        instance_id: &str,
-    ) -> Result<Self, Self> {
-        let port = free_port();
-        let config_path =
-            std::env::temp_dir().join(format!("aura-poll-e2e-{}.toml", uuid::Uuid::new_v4()));
-        std::fs::write(&config_path, config_toml).expect("write generated test config");
-
-        let mut child = Command::new(env!("CARGO_BIN_EXE_aura-web-server"))
-            .env("CONFIG_PATH", &config_path)
-            .env("HOST", "127.0.0.1")
-            .env("PORT", port.to_string())
-            .env("RUST_LOG", "warn")
-            .env("AURA_INSTANCE_ID", instance_id)
-            .env("AURA_SESSION_STORE", "file")
-            .env("AURA_SESSION_STORE_PATH", store_root)
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .expect("spawn aura-web-server (did `cargo build -p aura-web-server` succeed?)");
-
-        let stderr_log = Arc::new(Mutex::new(String::new()));
-        let stderr = child.stderr.take().expect("stderr was piped");
-        let log_sink = Arc::clone(&stderr_log);
-        tokio::spawn(async move {
-            let mut lines = tokio::io::BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let mut log = log_sink.lock().expect("stderr log mutex");
-                log.push_str(&line);
-                log.push('\n');
-            }
-        });
-
-        let server = Self {
-            port,
-            child,
-            config_path,
-            stderr_log,
-        };
-        if server.is_healthy_within(HEALTH_TIMEOUT).await {
-            Ok(server)
-        } else {
-            Err(server)
-        }
-    }
-
-    async fn is_healthy_within(&self, timeout: Duration) -> bool {
-        let client = reqwest::Client::new();
-        let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            if let Ok(resp) = client
-                .get(format!("{}/health", self.base_url()))
-                .send()
-                .await
-                && resp.status().is_success()
-            {
-                return true;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return false;
-            }
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
-    }
-
-    /// Kill the child and await its exit, reaping the process, then remove its generated config file. Call this explicitly at test end; `Drop`'s `start_kill` is only the fallback for a test that panics.
-    async fn stop(mut self) {
-        let _ = self.child.kill().await;
-        let _ = std::fs::remove_file(&self.config_path);
-    }
-}
-
-impl Drop for AuraServer {
-    fn drop(&mut self) {
-        let _ = self.child.start_kill();
-        let _ = std::fs::remove_file(&self.config_path);
-    }
-}
-
-/// An OS-assigned free port, read and released before the caller uses it.
-/// The bind-then-drop race is the standard tolerance for test-local ports.
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("bind ephemeral port")
-        .local_addr()
-        .expect("local addr")
-        .port()
-}
 
 // ---------------------------------------------------------------------------
 // A mock governance receiver: POST /notify + GET /status on one port
@@ -360,6 +219,32 @@ async fn read_full_request(socket: &mut tokio::net::TcpStream) -> Option<String>
 fn mcp_url() -> String {
     let host = std::env::var("MCP_MOCK_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
     format!("http://{host}:9999/mcp")
+}
+
+/// Spawn a rig server: the rig config plus the store/instance env the
+/// reconciler identity depends on.
+async fn spawn_rig_server(
+    receiver: &MockGovernanceReceiver,
+    store_root: &std::path::Path,
+    instance_id: &str,
+) -> common::AuraServer {
+    let config_toml = rig_config_toml(&mcp_url(), &store_root.join("memory"), receiver);
+    AuraServer::start(
+        &config_toml,
+        "aura-poll-e2e-",
+        &[
+            ("AURA_INSTANCE_ID", instance_id.to_string()),
+            ("AURA_SESSION_STORE", "file".to_string()),
+            (
+                "AURA_SESSION_STORE_PATH",
+                store_root
+                    .to_str()
+                    .expect("store root is UTF-8")
+                    .to_string(),
+            ),
+        ],
+    )
+    .await
 }
 
 /// A minimal orchestrated single-worker rig: `memory_dir` (the park commit
@@ -688,12 +573,7 @@ async fn poll_flow_parks_notifies_and_resolves_with_the_run_still_parked() {
     let store_dir = tempfile::tempdir().expect("temp store dir");
     let store_root = store_dir.path().to_path_buf();
     let receiver = MockGovernanceReceiver::start().await;
-    let server = AuraServer::start(
-        &rig_config_toml(&mcp_url(), &store_root.join("memory"), &receiver),
-        &store_root,
-        "poll-e2e-single",
-    )
-    .await;
+    let server = spawn_rig_server(&receiver, &store_root, "poll-e2e-single").await;
 
     let decision_id = park_and_notify(&receiver, &server, &store_root).await;
 
@@ -754,10 +634,9 @@ async fn restart_resolves_the_parked_approval_on_a_rebooted_server() {
     let store_dir = tempfile::tempdir().expect("temp store dir");
     let store_root = store_dir.path().to_path_buf();
     let receiver = MockGovernanceReceiver::start().await;
-    let config_toml = rig_config_toml(&mcp_url(), &store_root.join("memory"), &receiver);
     let instance_id = "poll-e2e-restart";
 
-    let first_boot = AuraServer::start(&config_toml, &store_root, instance_id).await;
+    let first_boot = spawn_rig_server(&receiver, &store_root, instance_id).await;
     park_and_notify(&receiver, &first_boot, &store_root).await;
     let notifies_before_kill = receiver
         .requests()
@@ -783,7 +662,7 @@ async fn restart_resolves_the_parked_approval_on_a_rebooted_server() {
     // Reboot onto the SAME store and config: the in-memory notified marker
     // is gone, so the first tick re-notifies (one duplicate, idempotent at
     // the receiver) and then polls the now-decided status endpoint.
-    let second_boot = AuraServer::start(&config_toml, &store_root, instance_id).await;
+    let second_boot = spawn_rig_server(&receiver, &store_root, instance_id).await;
     // First-tick claim: the reboot's resolve must land within ~two poll
     // intervals of the health check, not anywhere inside TICK_BUDGET - a
     // reconciler that only resolves on tick N > 1 fails here.

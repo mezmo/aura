@@ -130,6 +130,43 @@ pub fn build_hmac_from_secret(secret: Option<&str>) -> Result<Option<WebhookHmac
     Ok(Some(hmac))
 }
 
+/// Header pairs as a storage projection: (lowercased name, value) strings.
+/// Values are visible ASCII by construction, so `to_str` cannot fail here.
+pub(crate) fn header_map_to_pairs(
+    headers: &reqwest::header::HeaderMap,
+) -> std::collections::BTreeMap<String, String> {
+    headers
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.as_str().to_owned(),
+                value
+                    .to_str()
+                    .expect("header values are visible ASCII")
+                    .to_owned(),
+            )
+        })
+        .collect()
+}
+
+/// Restore a header map from its storage pairs: every pair must be a valid
+/// header, so a corrupted record fails the decode instead of dropping the
+/// credential.
+pub(crate) fn pairs_to_header_map(
+    pairs: impl IntoIterator<Item = (String, String)>,
+) -> Result<reqwest::header::HeaderMap, String> {
+    use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+    let mut map = HeaderMap::new();
+    for (name, value) in pairs {
+        let name = HeaderName::from_bytes(name.as_bytes())
+            .map_err(|e| format!("invalid header name '{name}': {e}"))?;
+        let value = HeaderValue::from_str(&value)
+            .map_err(|_| format!("header value for '{name}' is not a valid header value"))?;
+        map.insert(name, value);
+    }
+    Ok(map)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
