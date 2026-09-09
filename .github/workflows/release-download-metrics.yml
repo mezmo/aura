@@ -38,7 +38,30 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Pull requests run code from the PR revision, which a contributor with push
+  # access controls before review. It is given no PostHog credentials and no
+  # write permissions: --selftest and --dry-run need neither, and a modified
+  # script would not be bound by DRY_RUN.
+  verify:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Self-test
+        run: scripts/sync-release-downloads.sh --selftest
+
+      - name: Dry run
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DRY_RUN: "1"
+        run: scripts/sync-release-downloads.sh
+
   sync:
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -59,7 +82,7 @@ jobs:
           # Inputs arrive as environment variables the script already reads, so
           # nothing user-supplied is interpolated into a shell command.
           SNAPSHOT_DATE: ${{ inputs.date }}
-          DRY_RUN: ${{ (github.event_name == 'pull_request' || inputs.dry_run) && '1' || '0' }}
+          DRY_RUN: ${{ inputs.dry_run && '1' || '0' }}
         run: scripts/sync-release-downloads.sh
 
       - name: Report failure
