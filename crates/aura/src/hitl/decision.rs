@@ -65,14 +65,10 @@ pub enum ApprovalDecision {
 
 /// A decision plus the approver identity captured alongside it: the carrier
 /// every decision-bearing store API (`resolve`, `decision`) and
-/// `RecordedDecisions` moves as a unit, so identity cannot drift from the
-/// decision it rode in with.
+/// `RecordedDecisions` moves as a unit.
 ///
 /// Identity exists only on an approval — a denial carries nothing to forward —
-/// so the pairing is the enum itself, not two parallel `Option`s. Construction
-/// goes through [`ResolvedDecision::approved`] or [`From<ApprovalDecision>`]:
-/// identity is captured at resolve time (the
-/// poll-200), never fabricated later.
+/// so the pairing is the enum itself, not two parallel `Option`s.
 #[derive(Clone, PartialEq, Eq)]
 pub enum ResolvedDecision {
     /// Approved; the only variant that may carry captured approver identity.

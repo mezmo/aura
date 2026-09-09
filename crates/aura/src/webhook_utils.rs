@@ -71,9 +71,7 @@ pub fn resolve_headers(
 /// and its static fallback is absent or invalid.
 ///
 /// The `names` payload is the audit signal: the mapped destination NAMES,
-/// sorted, never a value. Notify is egress auth with no later reify
-/// checkpoint, so this error closes the registration (no approval row, no
-/// pending event, no blocked-cell entry, no notify POST).
+/// sorted, never a value.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("webhook egress capture failed: no usable value for mapped headers {names:?}")]
 pub struct EgressCaptureError {

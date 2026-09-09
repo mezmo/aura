@@ -14,9 +14,7 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 ///
 /// A value of this type exists only for an approved webhook decision whose
 /// mapped response headers were all present and valid; a partial capture
-/// is unrepresentable (construction fails closed). Construction is
-/// crate-private: the producers are the webhook client's gate-scoped path
-/// and the poll reconciler's poll-200 capture.
+/// is unrepresentable (construction fails closed, crate-private).
 #[derive(Clone)]
 pub struct ApproverHeaders {
     /// Validated override pairs, keys lowercased. Keys serve as the audit surface (names only); no separate name list exists.

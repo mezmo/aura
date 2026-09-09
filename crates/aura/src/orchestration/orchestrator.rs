@@ -876,8 +876,7 @@ impl Orchestrator {
                 worker_config.agent.name.clone(),
                 worker_config.instance_id.clone(),
             );
-            // The park arm needs the park-capable route's registry; sync
-            // webhook deployments keep the live decision path.
+            // The park arm needs the park-capable route's registry.
             if let (Some(cell), Some(guard), Some((registry, _))) = (
                 park_cell,
                 self.park_guard.as_ref(),

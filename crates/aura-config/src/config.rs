@@ -1667,14 +1667,10 @@ pub enum DecisionRouteConfig {
         /// Outbound MCP header name → webhook approval-response header name.
         #[serde(default, skip_serializing_if = "ToolHeaderMappings::is_empty")]
         tool_headers_from_response: ToolHeaderMappings,
-        /// Sync (default) reads the decision off the POST response; poll
-        /// treats the POST as an ack-only notification and the reconciler
-        /// polls the status endpoint for the decision.
         #[serde(default, skip_serializing_if = "WebhookDelivery::is_sync")]
         delivery: WebhookDelivery,
-        /// Status endpoint the reconciler polls for the decision. `None`
-        /// polls `url` itself; resolution happens at route construction,
-        /// not at parse.
+        /// Status endpoint the reconciler polls for the decision (`None`
+        /// polls the route `url`).
         #[serde(default)]
         poll_url: Option<WebhookUrl>,
         /// Seconds between reconciler polls of the status endpoint.
@@ -1683,8 +1679,7 @@ pub enum DecisionRouteConfig {
             skip_serializing_if = "is_default_poll_interval_secs"
         )]
         poll_interval_secs: u64,
-        /// Per-attempt HTTP timeout bounding each notify/poll request;
-        /// `timeout_secs` remains the approval TTL.
+        /// Per-attempt HTTP timeout for each notify/poll request.
         #[serde(
             default = "default_poll_request_timeout_secs",
             skip_serializing_if = "is_default_poll_request_timeout_secs"

@@ -116,10 +116,9 @@ pub struct DecisionRecord {
     pub reason: Option<String>,
     pub decided_at: Timestamp,
     /// Approver identity captured off the poll-200 (lowercased outbound
-    /// header name → value), persisted in the SAME record as the decision so
-    /// concurrent resolvers can never separate them. Present only on
-    /// approvals; additive: absent on records stored before identity docking
-    /// existed, decoding to `None` (uncaptured).
+    /// header name → value), persisted in the same record as the decision.
+    /// Additive: absent on records stored before identity docking existed,
+    /// decoding to `None` (uncaptured).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity: Option<BTreeMap<String, String>>,
 }

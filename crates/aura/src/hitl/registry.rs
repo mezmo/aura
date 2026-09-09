@@ -83,11 +83,8 @@ pub struct ParkedApproval {
     pub registered_at: Timestamp,
     pub expires_at: Timestamp,
     /// Resolved egress headers (`headers_from_request` overlaying the static
-    /// headers) captured at request-scoped route construction and copied in
-    /// before `register_durable`. The reconciler applies them per notify
-    /// without mutating its shared client. `None` for the conversational arm,
-    /// for rows with nothing resolved, and for legacy stored rows. Values are
-    /// credentials at rest: the storage projection's Debug prints names only.
+    /// headers) for this row's notify POST. Values are credentials at rest:
+    /// the storage projection's Debug prints names only.
     pub egress_headers: Option<reqwest::header::HeaderMap>,
 }
 

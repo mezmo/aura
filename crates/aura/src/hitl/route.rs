@@ -252,15 +252,11 @@ pub enum DecisionRoute {
     /// reconciler driving the decision.
     Webhook {
         client: WebhookClient,
-        /// The shared approval registry, consulted by the park arm under
-        /// poll delivery (inert for sync).
+        /// The shared approval registry the park arm registers into.
         registry: PendingApprovals,
         timeout: Duration,
-        /// The request-scoped egress-capture verdict behind the park arm's
-        /// registration-closed rule. `Ok` means `client.headers` is the
-        /// resolved at-rest value parked rows copy; `Err` fails the
-        /// registration closed (notify is egress auth with no later reify
-        /// checkpoint).
+        /// The request-scoped egress-capture verdict for this client's
+        /// resolved headers.
         egress_capture: Result<(), crate::webhook_utils::EgressCaptureError>,
     },
 }
@@ -537,12 +533,10 @@ enum EgressSigning {
 
 /// Per-attempt settings for the poll-delivery legs ([`WebhookClient::notify`]
 /// and [`WebhookClient::poll_decision`]): where to poll and how long one
-/// attempt may take. The route `timeout` is deliberately absent — under poll
-/// delivery it is the approval TTL, owned by the reconciler, not a request
-/// timeout.
+/// attempt may take.
 struct PollSettings {
     /// Status endpoint to GET: the configured `poll_url`, or the route `url`
-    /// when unconfigured. Resolved once at [`HitlRuntime::from_config`].
+    /// when unconfigured.
     poll_url: WebhookUrl,
     /// Per-attempt HTTP timeout for both poll legs.
     request_timeout: Duration,
@@ -586,8 +580,8 @@ impl WebhookReply {
 
 /// One poll attempt's answer ([`WebhookClient::poll_decision`]).
 ///
-/// Pending is an outcome, not an error: a 404/204 or an unrecognized 200
-/// body only means "keep polling", so the caller can loop without catching.
+/// Pending is an outcome, not an error: the caller can loop without
+/// catching.
 ///
 /// Manual `Debug`: the response headers may carry approver identity, so
 /// their values never render — names only.
@@ -598,9 +592,8 @@ pub(crate) enum PollOutcome {
         decision: ApprovalDecision,
         response_headers: HeaderMap,
     },
-    /// 404, 204, or a 200 whose body does not parse as
-    /// [`ApprovalDecisionWire`] (a pending-shaped body we don't
-    /// recognize): keep polling.
+    /// Keep polling: 404/204, a pending status, or a 200 body outside
+    /// the status envelope (the full contract sits at the poll match).
     NotYet,
 }
 
