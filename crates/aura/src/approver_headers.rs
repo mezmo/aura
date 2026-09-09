@@ -7,7 +7,7 @@
 //! request-extension side-channel).
 
 use aura_config::ToolHeaderMappings;
-use reqwest::header::{HeaderMap, HeaderName};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 
 /// Validated approver identity headers captured from one approved webhook
 /// response.
@@ -15,8 +15,8 @@ use reqwest::header::{HeaderMap, HeaderName};
 /// A value of this type exists only for an approved webhook decision whose
 /// mapped response headers were all present and valid; a partial capture
 /// is unrepresentable (construction fails closed). Construction is
-/// crate-private: the webhook client's gate-scoped path is the only
-/// producer.
+/// crate-private: the producers are the webhook client's gate-scoped path
+/// and the poll reconciler's poll-200 capture.
 #[derive(Clone)]
 pub struct ApproverHeaders {
     /// Validated override pairs, keys lowercased. Keys serve as the audit surface (names only); no separate name list exists.
@@ -57,6 +57,44 @@ impl ApproverHeaders {
     /// The captured outbound header names (never values), lowercased.
     pub fn captured_names(&self) -> impl Iterator<Item = &str> {
         self.headers.keys().map(HeaderName::as_str)
+    }
+
+    /// The captured pairs as plain `(lowercased name, value)` strings — the
+    /// storage projection the decision record persists. Values are visible
+    /// ASCII by construction (`from_captured` reads a parsed `HeaderMap`),
+    /// so `to_str` cannot fail.
+    pub(crate) fn to_pair_map(&self) -> std::collections::BTreeMap<String, String> {
+        self.headers
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.as_str().to_owned(),
+                    value
+                        .to_str()
+                        .expect("captured header values are visible ASCII")
+                        .to_owned(),
+                )
+            })
+            .collect()
+    }
+
+    /// Restore a captured identity from its stored pair map: every name and
+    /// value must be a valid header pair, so a corrupted record fails the
+    /// decode instead of fabricating a partial identity. Keys are stored
+    /// lowercased (the capture convention); a non-lowercase name is still
+    /// valid per HTTP and lands normalized by `HeaderName`.
+    pub(crate) fn from_pairs(
+        pairs: impl IntoIterator<Item = (String, String)>,
+    ) -> Result<Self, String> {
+        let mut headers = HeaderMap::new();
+        for (name, value) in pairs {
+            let name = HeaderName::from_bytes(name.as_bytes())
+                .map_err(|e| format!("invalid header name '{name}': {e}"))?;
+            let value = HeaderValue::from_str(&value)
+                .map_err(|_| format!("invalid header value for '{name}'"))?;
+            headers.insert(name, value);
+        }
+        Ok(Self { headers })
     }
 
     /// Apply the overrides to an outbound request builder as per-request

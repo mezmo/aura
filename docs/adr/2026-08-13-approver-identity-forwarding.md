@@ -124,6 +124,66 @@ approver header forwarding section.
   never forwards identity either, so the two approval surfaces are not
   symmetric.
 
+## Amendment (2026-09-08): the at-rest posture for poll delivery
+
+P38's async-webhook route changed the persistence picture this ADR's
+original decision assumed. The sync route captured identity in-process and
+consumed it on the very next tool call - nothing outlived the request. Under
+poll delivery the approval parks durably, a background reconciler POSTs the
+notification, and the decision may return minutes later on a polled status
+read, across a restart. Two new surfaces carry credentials at rest, and both
+follow the same posture as the original decision: values live only in the
+session store and on the wire of the one request they authenticate; events,
+logs, errors, and Debug carry names only; the parked checkpoint document
+carries neither.
+
+**Egress values ride the parked approval record.** The webhook route's
+`headers_from_request` mappings resolve at request-scoped runtime
+construction (where the route is built per request - the park arm never
+sees the client request), and the resolved values are copied onto the
+parked approval row before `register_durable`. The reconciler applies the
+row's own headers to each notify POST as a per-row override, never as
+client state: two approvals parked under two different requests keep
+authenticating with their own credentials on every retry, including
+after a store reopen.
+
+**Capture failure closes the registration.** A mapped destination with no
+usable resolved value - its request header absent and no explicit valid
+static fallback - produces no approval row, no pending event, no
+blocked-cell entry, and no notify POST. This is deliberately stricter than
+the identity half of this ADR: notify is egress *auth* with no later reify
+checkpoint to fail at, so an undeliverable registration must not exist. The
+static-fallback exception preserves the pre-existing resolution semantics:
+an explicitly configured static value keeps the registration open and
+parks with it.
+
+**Identity rides the decision record, record-then-block.** The poll-200's
+response headers dock onto the DECISION record through an
+identity-preserving carrier (`ResolvedDecision`): decision and optional
+identity persist in the same resolve - the redis backend's atomic Lua
+script writes both in one record, so concurrent resolvers can never
+separate them. The decision bus publishes only the credential-free
+decision; the wake and the lifecycle events see no identity. Capture
+failure at the poll-200 records the decision WITHOUT identity; re-execution
+applies the recorded identity at the same apply point as the sync gate
+(the `Proceed.overrides` seam), and blocks the approved call closed when
+the route's mapping demands identity and the recorded approval carries
+none. Redacted `Debug` carriers are mandatory on every new carrier (the
+`ApproverHeaders` precedent): `PollOutcome`'s response headers and both
+storage records print names only.
+
+The config-surface consequence: `delivery = "poll"` combined with
+`headers_from_request` is valid configuration (the stage-1 boot refusal is
+flipped to an acceptance test). The other two refusals stand: poll without
+`[hitl.park].enabled`, and a plaintext `http://` URL with an HMAC secret
+(extended to `poll_url`). Poll tuning - `poll_url`, `poll_interval_secs`,
+`poll_request_timeout_secs` - is deliberately fingerprint-COMPATIBLE; the
+config fingerprint carries `"delivery"` only, and credential values never
+enter it. Enforcement remains P45's.
+
+Mechanism detail: [docs/design/hitl.md](../design/hitl.md), the storage
+records section.
+
 ## Links
 
 - Design and implementation note: [docs/design/hitl.md](../design/hitl.md)

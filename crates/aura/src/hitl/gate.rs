@@ -12,7 +12,7 @@ use aura_config::GlobPattern;
 use rig::tool::ToolError;
 use serde_json::Value;
 
-use super::decision::{AgentScope, ApprovalOrigin, ApprovalOutcome, DecisionId};
+use super::decision::{AgentScope, ApprovalOrigin, DecisionId};
 use super::protocol::{ApprovalItem, ApprovalRequest, PROTOCOL_VERSION};
 use super::registry::{ParkedApproval, PendingApprovals};
 use super::route::{ApprovalError, DecisionRoute, GateDecision};
@@ -153,6 +153,24 @@ impl HitlApprovalWrapper {
             ));
         };
 
+        // Egress capture, resolved where the route was built per request: a
+        // mapped destination with no usable value closes the registration
+        // before anything persists — notify is egress auth with no later
+        // reify checkpoint (deliberately stricter than identity docking).
+        let egress_headers = match self.route.park_egress() {
+            Ok(headers) => (!headers.is_empty()).then(|| headers.into_owned()),
+            Err(err) => {
+                tracing::warn!(
+                    tool_name = %ctx.tool_name,
+                    error = %err,
+                    "park-mode webhook egress capture failed; failing the gated call closed",
+                );
+                return Err(ToolError::ToolCallError(
+                    format!("tool call blocked: {err}").into(),
+                ));
+            }
+        };
+
         let now = chrono::Utc::now();
         let expires_at =
             now + chrono::Duration::from_std(timeout).expect("approval timeout fits in chrono");
@@ -183,6 +201,7 @@ impl HitlApprovalWrapper {
             request,
             registered_at: now,
             expires_at,
+            egress_headers,
         };
         if let Err(err) = park.registry.register_durable(parked.clone()).await {
             tracing::warn!(
@@ -270,11 +289,7 @@ impl ToolWrapper for HitlApprovalWrapper {
                 ));
             };
             match recorded.take(&CallKey::new(task_id, &ctx.tool_name, args)) {
-                Some(decision) => {
-                    return approval_result_to_pre_call(Ok(GateDecision::without_overrides(
-                        ApprovalOutcome::Decided(decision),
-                    )));
-                }
+                Some(resolved) => return recorded_pre_call(&self.route, resolved),
                 // A continuation invocation that misses is a resume fault,
                 // never a fresh park: the recorded call no longer matches what
                 // the chain produced. Fail the call closed and let the resume
@@ -321,12 +336,7 @@ fn approval_result_to_pre_call(
 ) -> Result<PreCallOutcome, ToolError> {
     match result {
         Ok(GateDecision::Approved { overrides }) => Ok(PreCallOutcome::Proceed { overrides }),
-        Ok(GateDecision::Denied { reason }) => Ok(PreCallOutcome::ShortCircuit {
-            output: format!(
-                "Tool call blocked by human approval denial: {}. Do not execute this action.",
-                reason.unwrap_or_else(|| "no reason provided".to_string())
-            ),
-        }),
+        Ok(GateDecision::Denied { reason }) => Ok(denial_outcome(reason)),
         Ok(GateDecision::TimedOut { .. }) => Err(ToolError::ToolCallError(
             "tool call denied: approval timed out".to_string().into(),
         )),
@@ -336,6 +346,45 @@ fn approval_result_to_pre_call(
         Err(e) => Err(ToolError::ToolCallError(
             format!("tool call blocked: approval channel error: {e}").into(),
         )),
+    }
+}
+
+/// The live path's denial feedback: the denial is feedback the model can act
+/// on, so it short-circuits the call rather than erroring it.
+fn denial_outcome(reason: Option<String>) -> PreCallOutcome {
+    PreCallOutcome::ShortCircuit {
+        output: format!(
+            "Tool call blocked by human approval denial: {}. Do not execute this action.",
+            reason.unwrap_or_else(|| "no reason provided".to_string())
+        ),
+    }
+}
+
+/// Map a recorded decision to a pre-call outcome — the same surfaces the live
+/// gate produces. An approved call re-executes under its recorded identity,
+/// riding the same `Proceed.overrides` apply point the sync gate captures
+/// into; when the route's identity mapping demands identity and the recorded
+/// approval carries none (the poll-200 capture failed closed), reify blocks
+/// the approved execution rather than sending it under the requester's
+/// credentials.
+fn recorded_pre_call(
+    route: &DecisionRoute,
+    resolved: super::decision::ResolvedDecision,
+) -> Result<PreCallOutcome, ToolError> {
+    match resolved {
+        super::decision::ResolvedDecision::Approved { identity } => {
+            if identity.is_none() && route.requires_identity() {
+                return Err(ToolError::ToolCallError(
+                    "resume mismatch: approved call is missing required approver identity"
+                        .to_string()
+                        .into(),
+                ));
+            }
+            Ok(PreCallOutcome::Proceed {
+                overrides: identity,
+            })
+        }
+        super::decision::ResolvedDecision::Denied { reason } => Ok(denial_outcome(reason)),
     }
 }
 
@@ -360,6 +409,7 @@ mod tests {
                 ),
                 registry: PendingApprovals::new(),
                 timeout: Duration::from_secs(1),
+                egress_capture: Ok(()),
             }),
             AgentScope::Single { session_id: None },
             "t".into(),
@@ -386,7 +436,8 @@ mod tests {
                     WebhookUrl::new("http://127.0.0.1:9").unwrap(),
                 ),
                 registry: PendingApprovals::new(),
-                timeout: Duration::from_secs(2),
+                timeout: Duration::from_secs(1),
+                egress_capture: Ok(()),
             }),
             AgentScope::Single { session_id: None },
             "req-test".into(),
@@ -459,6 +510,7 @@ mod tests {
         use std::time::Duration;
 
         use super::*;
+        use crate::session_store::ApprovalStore;
 
         fn worker_scope() -> AgentScope {
             AgentScope::Worker {
@@ -799,6 +851,189 @@ mod tests {
                 other => panic!("expected Blocked, got {other:?}"),
             }
         }
+
+        /// A poll webhook config with `headers_from_request`, built the
+        /// production way with `req_headers` supplied by the caller.
+        fn poll_route_with_mapping(
+            registry: &PendingApprovals,
+            req_headers: Option<&std::collections::HashMap<String, String>>,
+            static_headers: std::collections::HashMap<String, String>,
+        ) -> (
+            Arc<dyn crate::session_store::ApprovalStore>,
+            Arc<DecisionRoute>,
+        ) {
+            let store: Arc<dyn crate::session_store::ApprovalStore> =
+                Arc::new(crate::session_store::InMemoryApprovalStore::new());
+            let config = aura_config::HitlConfig {
+                require_approval: vec![aura_config::GlobPattern::new("kubectl_*").unwrap()],
+                park: aura_config::ParkConfig { enabled: true },
+                route: aura_config::DecisionRouteConfig::Webhook {
+                    url: WebhookUrl::new("https://approvals.example.com/hook").unwrap(),
+                    timeout_secs: 60,
+                    headers: static_headers,
+                    headers_from_request: std::collections::HashMap::from([(
+                        "authorization".to_string(),
+                        "x-incoming-auth".to_string(),
+                    )]),
+                    tool_headers_from_response: aura_config::ToolHeaderMappings::default(),
+                    delivery: aura_config::WebhookDelivery::Poll,
+                    poll_url: None,
+                    poll_interval_secs: 10,
+                    poll_request_timeout_secs: 30,
+                },
+            };
+            let runtime =
+                crate::hitl::HitlRuntime::from_config(&config, registry, None, req_headers);
+            (store, runtime.route)
+        }
+
+        fn req_headers(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect()
+        }
+
+        /// R2 capture failure fails the REGISTRATION closed: a mapped
+        /// destination with no usable resolved value and no static fallback
+        /// produces no approval row, no pending event, and no blocked-cell
+        /// entry — so there is also nothing for the reconciler to notify.
+        #[tokio::test]
+        async fn egress_capture_failure_fails_the_registration_closed() {
+            let request_id = format!("req_egress_fail_{}", uuid::Uuid::new_v4().simple());
+            let mut events = crate::approval_event_broker::subscribe(&request_id).await;
+            let store = Arc::new(crate::session_store::InMemoryApprovalStore::new());
+            let registry = PendingApprovals::with_backend(
+                store.clone(),
+                Arc::new(crate::session_store::InMemoryEventBus::new()),
+            );
+            let (_, route) = poll_route_with_mapping(&registry, None, Default::default());
+            let cell = Arc::new(crate::orchestration::BlockedCell::default());
+            let gate = parked_gate(&registry, &route, &request_id, &cell);
+
+            let err = gate
+                .pre_call(
+                    &serde_json::json!({ "namespace": "prod" }),
+                    &ToolCallContext::new("kubectl_apply"),
+                )
+                .await
+                .expect_err("an unresolvable mapped destination must fail the call closed");
+
+            let message = err.to_string();
+            assert!(
+                message.contains("egress capture failed") && message.contains("authorization"),
+                "the error names the capture failure and the destination: {message}"
+            );
+            assert!(
+                store.list_pending().await.unwrap().is_empty(),
+                "no approval row may exist"
+            );
+            assert!(cell.is_empty(), "no blocked-cell entry may exist");
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), events.recv())
+                    .await
+                    .is_err(),
+                "no approval event may be published"
+            );
+            crate::approval_event_broker::unsubscribe(&request_id).await;
+        }
+
+        /// The successful capture copies the request-scoped resolved values
+        /// onto the parked row: the row carries THIS request's credential,
+        /// the input the reconciler will notify with.
+        #[tokio::test]
+        async fn egress_capture_lands_on_the_parked_row() {
+            let store = Arc::new(crate::session_store::InMemoryApprovalStore::new());
+            let registry = PendingApprovals::with_backend(
+                store.clone(),
+                Arc::new(crate::session_store::InMemoryEventBus::new()),
+            );
+            let (_, route) = poll_route_with_mapping(
+                &registry,
+                Some(&req_headers(&[(
+                    "x-incoming-auth",
+                    "Bearer request-scoped",
+                )])),
+                Default::default(),
+            );
+            let cell = Arc::new(crate::orchestration::BlockedCell::default());
+            let gate = parked_gate(&registry, &route, "req-egress-ok", &cell);
+
+            gate.pre_call(
+                &serde_json::json!({ "namespace": "prod" }),
+                &ToolCallContext::new("kubectl_apply"),
+            )
+            .await
+            .expect("a resolvable mapping parks normally");
+
+            cell.snapshot_if_pending(&[], &rig::completion::Message::user("results"));
+            match cell.outcome() {
+                crate::orchestration::CellOutcome::Blocked { pending } => {
+                    let parked = store
+                        .get(&pending[0].decision_id)
+                        .await
+                        .unwrap()
+                        .expect("ticket parked");
+                    let row = parked.egress_headers.as_ref().expect("row egress headers");
+                    assert_eq!(
+                        row.get("authorization").unwrap(),
+                        "Bearer request-scoped",
+                        "the parked row carries this request's resolved credential"
+                    );
+                }
+                other => panic!("expected Blocked, got {other:?}"),
+            }
+        }
+
+        /// An explicit valid static fallback keeps the existing resolution
+        /// semantics: the absent request header resolves to the static value
+        /// and the row parks with it.
+        #[tokio::test]
+        async fn static_fallback_keeps_registration_open() {
+            let store = Arc::new(crate::session_store::InMemoryApprovalStore::new());
+            let registry = PendingApprovals::with_backend(
+                store.clone(),
+                Arc::new(crate::session_store::InMemoryEventBus::new()),
+            );
+            let (_, route) = poll_route_with_mapping(
+                &registry,
+                None,
+                std::collections::HashMap::from([(
+                    "authorization".to_string(),
+                    "Bearer static-fallback".to_string(),
+                )]),
+            );
+            let cell = Arc::new(crate::orchestration::BlockedCell::default());
+            let gate = parked_gate(&registry, &route, "req-egress-fallback", &cell);
+
+            gate.pre_call(
+                &serde_json::json!({}),
+                &ToolCallContext::new("kubectl_apply"),
+            )
+            .await
+            .expect("a static fallback keeps the registration open");
+
+            cell.snapshot_if_pending(&[], &rig::completion::Message::user("results"));
+            match cell.outcome() {
+                crate::orchestration::CellOutcome::Blocked { pending } => {
+                    let parked = store
+                        .get(&pending[0].decision_id)
+                        .await
+                        .unwrap()
+                        .expect("ticket parked");
+                    assert_eq!(
+                        parked
+                            .egress_headers
+                            .as_ref()
+                            .expect("row egress headers")
+                            .get("authorization")
+                            .unwrap(),
+                        "Bearer static-fallback",
+                    );
+                }
+                other => panic!("expected Blocked, got {other:?}"),
+            }
+        }
     }
 
     // ====================================================================
@@ -810,7 +1045,7 @@ mod tests {
         use std::time::Duration;
 
         use super::*;
-        use crate::hitl::ApprovalDecision;
+        use crate::hitl::{ApprovalDecision, ResolvedDecision};
 
         /// A route whose webhook is unreachable, so a fall-through to the
         /// route fails closed rather than hanging. A recorded hit
@@ -824,6 +1059,7 @@ mod tests {
                 ),
                 registry: PendingApprovals::new(),
                 timeout: Duration::from_secs(2),
+                egress_capture: Ok(()),
             })
         }
 
@@ -851,6 +1087,128 @@ mod tests {
             ctx
         }
 
+        /// A route with `tool_headers_from_response` configured, so the
+        /// reify-side rule "approved calls must carry identity" is armed.
+        fn identity_route() -> Arc<DecisionRoute> {
+            let config = aura_config::HitlConfig {
+                require_approval: vec![],
+                park: aura_config::ParkConfig::default(),
+                route: aura_config::DecisionRouteConfig::Webhook {
+                    url: WebhookUrl::new("https://approvals.example.com/hook").unwrap(),
+                    timeout_secs: 60,
+                    headers: Default::default(),
+                    headers_from_request: Default::default(),
+                    tool_headers_from_response: crate::approver_headers::tests::mappings(&[(
+                        "x-forwarded-user",
+                        "x-approver-id",
+                    )]),
+                    delivery: aura_config::WebhookDelivery::Sync,
+                    poll_url: None,
+                    poll_interval_secs: 10,
+                    poll_request_timeout_secs: 30,
+                },
+            };
+            let client =
+                crate::hitl::webhook_client_from_config(&config.route, None, None).unwrap();
+            Arc::new(DecisionRoute::Webhook {
+                client,
+                registry: PendingApprovals::new(),
+                timeout: Duration::from_secs(2),
+                egress_capture: Ok(()),
+            })
+        }
+
+        fn identity(values: &[(&str, &str)]) -> crate::approver_headers::ApproverHeaders {
+            crate::approver_headers::ApproverHeaders::from_pairs(
+                values
+                    .iter()
+                    .map(|(k, v)| ((*k).to_string(), (*v).to_string())),
+            )
+            .expect("identity test pairs are valid headers")
+        }
+
+        /// A recorded approval WITH captured identity re-executes under it:
+        /// the overrides ride the same `Proceed` apply point the sync gate
+        /// captures into.
+        #[tokio::test]
+        async fn recorded_identity_is_applied_at_reexecution() {
+            let recorded = Arc::new(RecordedDecisions::default());
+            let args = serde_json::json!({"namespace": "prod"});
+            recorded.push(
+                CallKey::new(1, "kubectl_apply", &args),
+                ResolvedDecision::approved(Some(identity(&[(
+                    "x-forwarded-user",
+                    "approver-alice",
+                )]))),
+            );
+
+            let gate = recorded_gate(recorded, identity_route());
+            let outcome = gate
+                .pre_call(&args, &ctx_for("kubectl_apply", Some(1)))
+                .await
+                .expect("a recorded approval with its identity re-executes");
+
+            match outcome {
+                PreCallOutcome::Proceed {
+                    overrides: Some(overrides),
+                } => assert_eq!(
+                    overrides.captured_names().collect::<Vec<_>>(),
+                    ["x-forwarded-user"],
+                ),
+                other => panic!("expected Proceed with overrides, got {other:?}"),
+            }
+        }
+
+        /// Reify blocks an approved call whose identity capture failed
+        /// (recorded without identity) when the route demands identity: the
+        /// record-then-block precedent — the decision is not lost, but the
+        /// call never runs under the requester's credentials.
+        #[tokio::test]
+        async fn approved_without_required_identity_fails_the_call_closed() {
+            let recorded = Arc::new(RecordedDecisions::default());
+            let args = serde_json::json!({"namespace": "prod"});
+            recorded.push(
+                CallKey::new(1, "kubectl_apply", &args),
+                ResolvedDecision::approved(None),
+            );
+
+            let gate = recorded_gate(recorded, identity_route());
+            let err = gate
+                .pre_call(&args, &ctx_for("kubectl_apply", Some(1)))
+                .await
+                .expect_err("an approved call missing required identity must fail closed");
+
+            let message = err.to_string();
+            assert!(
+                message.contains("required approver identity"),
+                "the error names the missing identity, got: {message}"
+            );
+            assert!(
+                !message.contains("approval channel"),
+                "this is a reify block, not a route fault: {message}"
+            );
+        }
+
+        /// Without an identity mapping the same uncaptured approval proceeds:
+        /// the block keys off the route's demand, not off identity being
+        /// absent per se.
+        #[tokio::test]
+        async fn approved_without_identity_proceeds_when_route_demands_none() {
+            let recorded = Arc::new(RecordedDecisions::default());
+            let args = serde_json::json!({"namespace": "prod"});
+            recorded.push(
+                CallKey::new(1, "kubectl_apply", &args),
+                ResolvedDecision::approved(None),
+            );
+
+            let gate = recorded_gate(recorded, discard_route());
+            let outcome = gate
+                .pre_call(&args, &ctx_for("kubectl_apply", Some(1)))
+                .await
+                .unwrap();
+            assert_eq!(outcome, PreCallOutcome::Proceed { overrides: None });
+        }
+
         /// A recorded approval proceeds through the same mapping the live
         /// route uses, without ever consulting the (unreachable) route.
         #[tokio::test]
@@ -859,7 +1217,7 @@ mod tests {
             let args = serde_json::json!({"namespace": "prod"});
             recorded.push(
                 CallKey::new(1, "kubectl_apply", &args),
-                ApprovalDecision::Approved,
+                ApprovalDecision::Approved.into(),
             );
 
             let gate = recorded_gate(recorded, discard_route());
@@ -882,7 +1240,8 @@ mod tests {
                 CallKey::new(1, "kubectl_apply", &args),
                 ApprovalDecision::Denied {
                     reason: Some("too risky".to_string()),
-                },
+                }
+                .into(),
             );
 
             let gate = recorded_gate(recorded, discard_route());
@@ -1084,7 +1443,7 @@ mod tests {
 
             let payload_id = payload_decision_id(&mut events).await;
             registry
-                .resolve(&payload_id, ApprovalDecision::Approved)
+                .resolve(&payload_id, ApprovalDecision::Approved.into())
                 .await
                 .expect("parked approval resolves");
             call.await
@@ -1213,7 +1572,7 @@ mod tests {
                 tokio::join!(tool.call(json!({ "namespace": "prod" })), async {
                     let id = payload_decision_id(&mut events).await;
                     registry
-                        .resolve(&id, ApprovalDecision::Approved)
+                        .resolve(&id, ApprovalDecision::Approved.into())
                         .await
                         .expect("parked approval resolves");
                     id
@@ -1282,6 +1641,7 @@ mod tests {
                     ),
                     registry: PendingApprovals::new(),
                     timeout: Duration::from_secs(2),
+                    egress_capture: Ok(()),
                 },
                 &request_id,
                 "kubectl_delete",

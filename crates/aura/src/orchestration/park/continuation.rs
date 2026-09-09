@@ -273,7 +273,7 @@ pub(crate) async fn load_recorded_decisions(
                     call.tool_name, call.decision_id
                 )));
             }
-            let Some(decision) = store.recorded_decision(&call.decision_id).await else {
+            let Some(resolved) = store.recorded_decision(&call.decision_id).await else {
                 // No decision yet: expired past the window (the 2.6 expired
                 // row outranks parked), still parked otherwise — collected
                 // so the 409 body can carry every outstanding id.
@@ -284,10 +284,11 @@ pub(crate) async fn load_recorded_decisions(
                 continue;
             };
             // The key's task id comes from the awaiting node, the tool name
-            // and arguments from the store's approval record.
+            // and arguments from the store's approval record. The carrier
+            // keeps the recorded identity with the decision it rode in with.
             recorded.push(
                 CallKey::new(node.task_id, &item.tool_name, &item.arguments),
-                decision,
+                resolved,
             );
             decision_ids.push(call.decision_id);
         }
@@ -329,7 +330,7 @@ mod tests {
     use super::*;
     use crate::hitl::{
         AgentScope, ApprovalDecision, ApprovalItem, ApprovalOrigin, ApprovalRequest,
-        PROTOCOL_VERSION, ParkedApproval,
+        PROTOCOL_VERSION, ParkedApproval, ResolvedDecision,
     };
     use crate::orchestration::park::document::{ParkedPlan, ParkedTaskNode, SCHEMA_VERSION};
     use crate::orchestration::types::TaskStatus;
@@ -405,6 +406,7 @@ mod tests {
             },
             registered_at: chrono::Utc::now(),
             expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+            egress_headers: None,
         }
     }
 
@@ -434,7 +436,7 @@ mod tests {
             .await
             .unwrap();
         registry
-            .resolve(&decision_id, ApprovalDecision::Approved)
+            .resolve(&decision_id, ApprovalDecision::Approved.into())
             .await
             .unwrap();
 
@@ -459,7 +461,7 @@ mod tests {
         assert_eq!(ids, vec![decision_id]);
         assert_eq!(
             recorded.take(&CallKey::new(3, "kubectl_apply", &args)),
-            Some(ApprovalDecision::Approved),
+            Some(ResolvedDecision::from(ApprovalDecision::Approved)),
             "the recorded decision is consumable at the resume gate"
         );
         assert!(
@@ -586,7 +588,7 @@ mod tests {
             .unwrap();
         // The decision lands after the document was committed.
         registry
-            .resolve(&decision_id, ApprovalDecision::Approved)
+            .resolve(&decision_id, ApprovalDecision::Approved.into())
             .await
             .unwrap();
 
@@ -595,7 +597,7 @@ mod tests {
         assert_eq!(ids, vec![decision_id]);
         assert_eq!(
             recorded.take(&CallKey::new(3, "kubectl_apply", &args)),
-            Some(ApprovalDecision::Approved)
+            Some(ResolvedDecision::from(ApprovalDecision::Approved))
         );
     }
 

@@ -11,7 +11,7 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aura::hitl::{ApprovalDecision, ResolveError};
+use aura::hitl::{ApprovalDecision, ResolveError, ResolvedDecision};
 use aura::session_store::{
     ApprovalStore, FileApprovalStore, InMemoryApprovalStore, ParkedApprovalRecord,
     SessionStoreError,
@@ -63,6 +63,21 @@ async fn file_battery_resolve_records_readable_decision() {
     let dir = tempfile::tempdir().unwrap();
     let (instance_a, instance_b) = file_pair(&dir);
     common::resolve_records_readable_decision(&instance_a, &instance_b).await;
+}
+
+#[tokio::test]
+async fn file_battery_resolve_records_identity_with_the_decision() {
+    let dir = tempfile::tempdir().unwrap();
+    let (instance_a, instance_b) = file_pair(&dir);
+    common::resolve_records_identity_with_the_decision(&instance_a, &instance_b).await;
+}
+
+#[tokio::test]
+async fn memory_battery_resolve_records_identity_with_the_decision() {
+    let instance_a: std::sync::Arc<dyn aura::session_store::ApprovalStore> =
+        std::sync::Arc::new(aura::session_store::InMemoryApprovalStore::new());
+    let instance_b = std::sync::Arc::clone(&instance_a);
+    common::resolve_records_identity_with_the_decision(&instance_a, &instance_b).await;
 }
 
 #[tokio::test]
@@ -184,7 +199,7 @@ async fn expired_resolve_is_not_found_and_approval_is_retained() {
     store.register(parked).await.unwrap();
 
     assert_eq!(
-        store.resolve(&id, ApprovalDecision::Approved).await,
+        store.resolve(&id, ApprovalDecision::Approved.into()).await,
         Err(ResolveError::NotFound)
     );
     assert_eq!(store.decision(&id).await.unwrap(), None);
@@ -214,7 +229,7 @@ async fn approval_and_decision_are_retained_until_remove() {
     );
 
     store
-        .resolve(&id, ApprovalDecision::Approved)
+        .resolve(&id, ApprovalDecision::Approved.into())
         .await
         .unwrap();
 
@@ -230,14 +245,14 @@ async fn approval_and_decision_are_retained_until_remove() {
     );
     assert_eq!(
         store.decision(&id).await.unwrap(),
-        Some(ApprovalDecision::Approved)
+        Some(ResolvedDecision::from(ApprovalDecision::Approved))
     );
 
     store.remove(&id).await.unwrap();
     assert!(store.get(&id).await.unwrap().is_none());
     assert_eq!(store.decision(&id).await.unwrap(), None);
     assert_eq!(
-        store.resolve(&id, ApprovalDecision::Approved).await,
+        store.resolve(&id, ApprovalDecision::Approved.into()).await,
         Err(ResolveError::NotFound)
     );
 }
@@ -254,7 +269,7 @@ async fn resolve_moves_the_approval_into_the_decision_file() {
     store.register(parked).await.unwrap();
 
     store
-        .resolve(&id, ApprovalDecision::Approved)
+        .resolve(&id, ApprovalDecision::Approved.into())
         .await
         .unwrap();
 
@@ -287,7 +302,7 @@ async fn cancel_request_removes_only_undecided_matching_approvals() {
     let decided_id = decided.request.decision_id;
     store.register(decided).await.unwrap();
     store
-        .resolve(&decided_id, ApprovalDecision::Approved)
+        .resolve(&decided_id, ApprovalDecision::Approved.into())
         .await
         .unwrap();
     let other = make_parked("req-other", Duration::from_secs(60));
@@ -305,7 +320,7 @@ async fn cancel_request_removes_only_undecided_matching_approvals() {
     );
     assert_eq!(
         store.decision(&decided_id).await.unwrap(),
-        Some(ApprovalDecision::Approved)
+        Some(ResolvedDecision::from(ApprovalDecision::Approved))
     );
     assert!(store.get(&other_id).await.unwrap().is_some());
 }
@@ -325,7 +340,7 @@ async fn cancel_request_sweeps_a_stale_decided_approval_without_returning_it() {
     let residue = serde_json::to_vec(&ParkedApprovalRecord::from(&decided)).unwrap();
     store.register(decided).await.unwrap();
     store
-        .resolve(&decided_id, ApprovalDecision::Approved)
+        .resolve(&decided_id, ApprovalDecision::Approved.into())
         .await
         .unwrap();
 
@@ -357,7 +372,7 @@ async fn cancel_request_sweeps_a_stale_decided_approval_without_returning_it() {
     );
     assert_eq!(
         store.decision(&decided_id).await.unwrap(),
-        Some(ApprovalDecision::Approved),
+        Some(ResolvedDecision::from(ApprovalDecision::Approved)),
         "the recorded decision is retained"
     );
 }
@@ -420,7 +435,7 @@ async fn list_pending_skips_a_stale_decided_approval() {
     let residue = serde_json::to_vec(&ParkedApprovalRecord::from(&decided)).unwrap();
     store.register(decided).await.unwrap();
     store
-        .resolve(&decided_id, ApprovalDecision::Approved)
+        .resolve(&decided_id, ApprovalDecision::Approved.into())
         .await
         .unwrap();
 
@@ -468,12 +483,12 @@ async fn resolve_succeeds_when_the_approval_file_cannot_be_removed() {
     }
 
     store
-        .resolve(&id, ApprovalDecision::Approved)
+        .resolve(&id, ApprovalDecision::Approved.into())
         .await
         .expect("resolve commits without the approval removal");
     assert_eq!(
         store.decision(&id).await.unwrap(),
-        Some(ApprovalDecision::Approved)
+        Some(ResolvedDecision::from(ApprovalDecision::Approved))
     );
     let restored = store
         .get(&id)
@@ -482,7 +497,7 @@ async fn resolve_succeeds_when_the_approval_file_cannot_be_removed() {
         .expect("approval record survives the failed removal");
     assert_eq!(restored.request.decision_id, id);
     assert_eq!(
-        store.resolve(&id, ApprovalDecision::Approved).await,
+        store.resolve(&id, ApprovalDecision::Approved.into()).await,
         Err(ResolveError::NotFound)
     );
 }
@@ -506,12 +521,12 @@ async fn state_survives_reopening_the_store() {
 
     let reopened = FileApprovalStore::open(dir.path()).unwrap();
     reopened
-        .resolve(&id, ApprovalDecision::Approved)
+        .resolve(&id, ApprovalDecision::Approved.into())
         .await
         .expect("resolve after reopen");
     assert_eq!(
         reopened.decision(&id).await.unwrap(),
-        Some(ApprovalDecision::Approved)
+        Some(ResolvedDecision::from(ApprovalDecision::Approved))
     );
 }
 

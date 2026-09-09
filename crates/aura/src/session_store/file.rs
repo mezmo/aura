@@ -51,7 +51,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::task::{JoinError, spawn_blocking};
 
-use crate::hitl::{ApprovalDecision, DecisionId, ParkedApproval, ResolveError};
+use crate::hitl::{DecisionId, ParkedApproval, ResolveError, ResolvedDecision};
 
 use super::{ApprovalStore, DecisionRecord, ParkedApprovalRecord, SessionStoreError};
 
@@ -170,7 +170,7 @@ impl Inner {
     fn resolve_sync(
         &self,
         id: &DecisionId,
-        decision: ApprovalDecision,
+        decision: ResolvedDecision,
     ) -> Result<(), ResolveError> {
         let _guard = self.lock();
         let id = canonical_id(id).map_err(ResolveError::Store)?;
@@ -226,13 +226,15 @@ impl Inner {
     fn decision_sync(
         &self,
         id: &DecisionId,
-    ) -> Result<Option<ApprovalDecision>, SessionStoreError> {
+    ) -> Result<Option<ResolvedDecision>, SessionStoreError> {
         let _guard = self.lock();
         let id = canonical_id(id)?;
         match fs::read(self.decision_path(&id)) {
             Ok(bytes) => {
                 let entry: ResolvedEntry = serde_json::from_slice(&bytes).map_err(decode_err)?;
-                Ok(Some(ApprovalDecision::from(entry.decision)))
+                ResolvedDecision::try_from(entry.decision)
+                    .map(Some)
+                    .map_err(decode_err)
             }
             Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(err) => Err(request_err(err)),
@@ -400,7 +402,7 @@ impl ApprovalStore for FileApprovalStore {
     async fn resolve(
         &self,
         id: &DecisionId,
-        decision: ApprovalDecision,
+        decision: ResolvedDecision,
     ) -> Result<(), ResolveError> {
         let inner = Arc::clone(&self.inner);
         let id = *id;
@@ -412,7 +414,7 @@ impl ApprovalStore for FileApprovalStore {
     async fn decision(
         &self,
         id: &DecisionId,
-    ) -> Result<Option<ApprovalDecision>, SessionStoreError> {
+    ) -> Result<Option<ResolvedDecision>, SessionStoreError> {
         let inner = Arc::clone(&self.inner);
         let id = *id;
         spawn_blocking(move || inner.decision_sync(&id))

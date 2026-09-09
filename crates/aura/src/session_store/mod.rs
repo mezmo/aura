@@ -22,7 +22,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::Stream;
 
-use crate::hitl::{ApprovalDecision, DecisionId, ParkedApproval, ResolveError};
+use crate::hitl::{DecisionId, ParkedApproval, ResolveError, ResolvedDecision};
 
 #[cfg(test)]
 pub(crate) use fault_store::FaultInjectingStore;
@@ -66,20 +66,22 @@ pub trait ApprovalStore: Send + Sync {
     /// Look up a parked approval.
     async fn get(&self, id: &DecisionId) -> Result<Option<ParkedApproval>, SessionStoreError>;
 
-    /// Record a terminal decision at most once per id; later attempts read
-    /// as `NotFound`. The file backend moves the ticket into its decision
+    /// Record a terminal decision — and the approver identity captured
+    /// alongside it, as one carrier — at most once per id; later attempts
+    /// read as `NotFound`. The file backend moves the ticket into its decision
     /// record, other backends drop it.
     async fn resolve(
         &self,
         id: &DecisionId,
-        decision: ApprovalDecision,
+        decision: ResolvedDecision,
     ) -> Result<(), ResolveError>;
 
-    /// Look up the decision recorded for an already-resolved approval.
+    /// Look up the decision recorded for an already-resolved approval,
+    /// carrying any captured identity with it.
     async fn decision(
         &self,
         id: &DecisionId,
-    ) -> Result<Option<ApprovalDecision>, SessionStoreError>;
+    ) -> Result<Option<ResolvedDecision>, SessionStoreError>;
 
     /// Remove a parked entry.
     async fn remove(&self, id: &DecisionId) -> Result<(), SessionStoreError>;

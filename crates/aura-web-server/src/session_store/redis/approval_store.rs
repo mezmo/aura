@@ -26,7 +26,7 @@
 use std::sync::LazyLock;
 
 use async_trait::async_trait;
-use aura::hitl::{ApprovalDecision, DecisionId, ParkedApproval, ResolveError};
+use aura::hitl::{DecisionId, ParkedApproval, ResolveError, ResolvedDecision};
 use aura::session_store::{ApprovalStore, DecisionRecord, ParkedApprovalRecord, SessionStoreError};
 use redis::AsyncCommands;
 use redis::aio::ConnectionManager;
@@ -176,12 +176,13 @@ impl ApprovalStore for RedisApprovalStore {
     async fn resolve(
         &self,
         id: &DecisionId,
-        decision: ApprovalDecision,
+        decision: ResolvedDecision,
     ) -> Result<(), ResolveError> {
         // The script's atomic take is the at-most-once guarantee: exactly one
         // resolver gets the record; everyone else (and every later attempt)
-        // sees `NotFound`. The same step writes the decision record, so a
-        // consumed parked entry always leaves a recoverable decision.
+        // sees `NotFound`. The same step writes the decision record — the
+        // serialized record carries the decision AND any captured identity,
+        // so one atomic SET keeps the pair together under concurrency.
         let payload = serde_json::to_string(&DecisionRecord::from(&decision))
             .expect("decision record serializes to JSON");
         let mut conn = self.conn.clone();
@@ -203,7 +204,7 @@ impl ApprovalStore for RedisApprovalStore {
     async fn decision(
         &self,
         id: &DecisionId,
-    ) -> Result<Option<ApprovalDecision>, SessionStoreError> {
+    ) -> Result<Option<ResolvedDecision>, SessionStoreError> {
         let mut conn = self.conn.clone();
         let payload: Option<String> = conn
             .get(self.decision_key(&id.to_string()))
@@ -212,9 +213,13 @@ impl ApprovalStore for RedisApprovalStore {
         payload
             .map(|json| {
                 serde_json::from_str::<DecisionRecord>(&json)
-                    .map(ApprovalDecision::from)
                     .map_err(|e| SessionStoreError::Decode {
                         reason: e.to_string(),
+                    })
+                    .and_then(|record| {
+                        ResolvedDecision::try_from(record).map_err(|e| SessionStoreError::Decode {
+                            reason: e.to_string(),
+                        })
                     })
             })
             .transpose()

@@ -412,7 +412,6 @@ impl Config {
         if let Some(hitl) = &self.hitl
             && let DecisionRouteConfig::Webhook {
                 delivery: WebhookDelivery::Poll,
-                headers_from_request,
                 poll_interval_secs,
                 ..
             } = &hitl.route
@@ -421,14 +420,6 @@ impl Config {
                 return Err(crate::ConfigError::Validation(
                     "`hitl.route.delivery = \"poll\"` requires `hitl.park.enabled = true`: \
                      poll approvals may be long-lived and requests are never held open"
-                        .to_string(),
-                ));
-            }
-            if !headers_from_request.is_empty() {
-                return Err(crate::ConfigError::Validation(
-                    "`hitl.route.headers_from_request` is unsupported with \
-                     `hitl.route.delivery = \"poll\"`: request-derived headers cannot be \
-                     reconstructed by the background reconciler after a restart"
                         .to_string(),
                 ));
             }
@@ -1387,18 +1378,18 @@ mode = "conversational"
         );
     }
 
+    /// Full R2 (Mike, 2026-09-08; codex pre-gate settled): poll +
+    /// `headers_from_request` is valid. The resolved values are captured at
+    /// request-scoped route construction and persisted on the parked approval
+    /// record, so the background reconciler does NOT need to reconstruct
+    /// them after a restart — which is what the stage-1 refusal assumed.
     #[test]
-    fn validate_rejects_poll_delivery_with_headers_from_request() {
-        let err = crate::load_config_from_str(&poll_config_toml(
+    fn validate_accepts_poll_delivery_with_headers_from_request() {
+        crate::load_config_from_str(&poll_config_toml(
             true,
             "delivery = \"poll\"\nheaders_from_request = { \"authorization\" = \"authorization\" }",
         ))
-        .expect_err("headers_from_request with poll delivery must be rejected");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("hitl.route.headers_from_request"),
-            "error must name the key: {msg}"
-        );
+        .expect("headers_from_request with poll delivery is valid: values persist at rest");
     }
 
     #[test]

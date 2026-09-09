@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use tokio::sync::broadcast;
 
-use crate::hitl::{ApprovalDecision, DecisionId, ParkedApproval, ResolveError, Timestamp};
+use crate::hitl::{DecisionId, ParkedApproval, ResolveError, ResolvedDecision, Timestamp};
 
 use super::{ApprovalStore, EventBus, SessionStoreError, Subscription};
 
@@ -18,9 +18,10 @@ const TOPIC_CAPACITY: usize = 64;
 /// Decision retention margin.
 const DECISION_RETENTION_MARGIN_SECS: i64 = 60;
 
-/// A recorded decision and its retention deadline.
+/// A recorded resolved decision (decision plus captured identity) and its
+/// retention deadline.
 struct DecidedEntry {
-    decision: ApprovalDecision,
+    decision: ResolvedDecision,
     keep_until: Timestamp,
 }
 
@@ -65,7 +66,7 @@ impl ApprovalStore for InMemoryApprovalStore {
     async fn resolve(
         &self,
         id: &DecisionId,
-        decision: ApprovalDecision,
+        decision: ResolvedDecision,
     ) -> Result<(), ResolveError> {
         // Lock removal provides at-most-once.
         let parked = {
@@ -93,7 +94,7 @@ impl ApprovalStore for InMemoryApprovalStore {
     async fn decision(
         &self,
         id: &DecisionId,
-    ) -> Result<Option<ApprovalDecision>, SessionStoreError> {
+    ) -> Result<Option<ResolvedDecision>, SessionStoreError> {
         Ok(self.lock_decided().get(id).map(|e| e.decision.clone()))
     }
 
@@ -212,7 +213,8 @@ mod tests {
 
     use super::*;
     use crate::hitl::{
-        AgentScope, ApprovalItem, ApprovalOrigin, ApprovalRequest, PROTOCOL_VERSION,
+        AgentScope, ApprovalDecision, ApprovalItem, ApprovalOrigin, ApprovalRequest,
+        PROTOCOL_VERSION,
     };
 
     fn parked(request_id: &str) -> ParkedApproval {
@@ -236,6 +238,7 @@ mod tests {
             },
             registered_at: now,
             expires_at: now + chrono::Duration::seconds(60),
+            egress_headers: None,
         }
     }
 
@@ -249,12 +252,12 @@ mod tests {
         assert!(store.get(&id).await.unwrap().is_some());
 
         store
-            .resolve(&id, ApprovalDecision::Approved)
+            .resolve(&id, ApprovalDecision::Approved.into())
             .await
             .unwrap();
         assert!(store.get(&id).await.unwrap().is_none());
         assert_eq!(
-            store.resolve(&id, ApprovalDecision::Approved).await,
+            store.resolve(&id, ApprovalDecision::Approved.into()).await,
             Err(ResolveError::NotFound),
         );
     }
@@ -269,15 +272,21 @@ mod tests {
         let denied = ApprovalDecision::Denied {
             reason: Some("not safe".into()),
         };
-        store.resolve(&id, denied.clone()).await.unwrap();
+        store.resolve(&id, denied.clone().into()).await.unwrap();
 
-        assert_eq!(store.decision(&id).await.unwrap(), Some(denied.clone()));
+        assert_eq!(
+            store.decision(&id).await.unwrap(),
+            Some(ResolvedDecision::from(denied.clone()))
+        );
         // Recorded decision survives rejected second resolve.
         assert_eq!(
-            store.resolve(&id, ApprovalDecision::Approved).await,
+            store.resolve(&id, ApprovalDecision::Approved.into()).await,
             Err(ResolveError::NotFound)
         );
-        assert_eq!(store.decision(&id).await.unwrap(), Some(denied));
+        assert_eq!(
+            store.decision(&id).await.unwrap(),
+            Some(ResolvedDecision::from(denied))
+        );
         assert_eq!(store.decision(&DecisionId::generate()).await.unwrap(), None);
     }
 
@@ -289,7 +298,7 @@ mod tests {
         store.lock_decided().insert(
             id,
             DecidedEntry {
-                decision: ApprovalDecision::Approved,
+                decision: ResolvedDecision::from(ApprovalDecision::Approved),
                 keep_until: chrono::Utc::now() - chrono::Duration::seconds(1),
             },
         );
@@ -307,7 +316,7 @@ mod tests {
         store.register(entry).await.unwrap();
 
         assert_eq!(
-            store.resolve(&id, ApprovalDecision::Approved).await,
+            store.resolve(&id, ApprovalDecision::Approved.into()).await,
             Err(ResolveError::NotFound)
         );
         assert_eq!(store.decision(&id).await.unwrap(), None);

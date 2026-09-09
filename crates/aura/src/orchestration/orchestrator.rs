@@ -7570,6 +7570,7 @@ mod tests {
                     },
                     registered_at: now,
                     expires_at: now + chrono::Duration::seconds(60),
+                    egress_headers: None,
                 })
                 .await
                 .expect("durable register succeeds");
@@ -7702,6 +7703,7 @@ mod tests {
                     },
                     registered_at: now,
                     expires_at: now + chrono::Duration::hours(1),
+                    egress_headers: None,
                 })
                 .await
                 .unwrap();
@@ -7835,7 +7837,10 @@ mod tests {
         let (plan, records, pending) = awaiting_plan_with_parked_calls(&registry, &run_id).await;
         for call in &pending {
             registry
-                .resolve(&call.decision_id, crate::hitl::ApprovalDecision::Approved)
+                .resolve(
+                    &call.decision_id,
+                    crate::hitl::ApprovalDecision::Approved.into(),
+                )
                 .await
                 .unwrap();
         }
@@ -7996,7 +8001,7 @@ mod tests {
         let decided = pending[0].decision_id;
         let sibling = pending[1].decision_id;
         registry
-            .resolve(&decided, crate::hitl::ApprovalDecision::Approved)
+            .resolve(&decided, crate::hitl::ApprovalDecision::Approved.into())
             .await
             .unwrap();
 
@@ -8611,7 +8616,10 @@ mod tests {
             .expect("the park commit succeeds");
         drop(orchestrator);
 
-        registry.resolve(&decision_id, decision).await.unwrap();
+        registry
+            .resolve(&decision_id, decision.into())
+            .await
+            .unwrap();
 
         let document_path = dir
             .path()
@@ -8803,13 +8811,14 @@ mod tests {
         let args = serde_json::json!({ "namespace": "prod" });
         recorded.push(
             CallKey::new(1, "kubectl_apply", &args),
-            ApprovalDecision::Approved,
+            ApprovalDecision::Approved.into(),
         );
         recorded.push(
             CallKey::new(1, "kubectl_apply", &args),
             ApprovalDecision::Denied {
                 reason: Some("no".to_string()),
-            },
+            }
+            .into(),
         );
 
         let taken = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -8835,12 +8844,12 @@ mod tests {
             "two decisions consumed exactly once each: {taken:?}"
         );
         assert!(
-            matches!(taken[0].1, ApprovalDecision::Approved),
+            matches!(taken[0].1, crate::hitl::ResolvedDecision::Approved { .. }),
             "recorded order holds across consumers: the approval is consumed first"
         );
         assert!(matches!(
             &taken[1].1,
-            ApprovalDecision::Denied {
+            crate::hitl::ResolvedDecision::Denied {
                 reason: Some(reason),
             } if reason == "no"
         ));

@@ -3620,7 +3620,7 @@ impl StreamHandler for ReplStreamHandler {
                     let resolve = tracing::Instrument::instrument(
                         async move {
                             if let Err(aura::hitl::ResolveError::NotFound) =
-                                registry.resolve(&id, decision).await
+                                registry.resolve(&id, decision.into()).await
                             {
                                 eprintln!(
                                     "warning: approval decision was not found \

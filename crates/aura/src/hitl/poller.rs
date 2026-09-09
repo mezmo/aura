@@ -24,24 +24,27 @@ use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
-use aura_config::{DecisionRouteConfig, HitlConfig, WebhookDelivery};
+use aura_config::{DecisionRouteConfig, HitlConfig, ToolHeaderMappings, WebhookDelivery};
 
-use super::decision::DecisionId;
+use super::decision::{ApprovalDecision, DecisionId, ResolvedDecision};
 use super::registry::{PendingApprovals, ResolveError};
 use super::route::{PollOutcome, WebhookClient, webhook_client_from_config};
 use super::signing::WebhookHmac;
+use crate::approver_headers::ApproverHeaders;
 use crate::session_store::ApprovalStore;
 
 /// The poll-delivery reconciler for one process: a private webhook client,
-/// the shared approval store it scans, and the ingress registry it resolves
-/// through. Built once at startup from the `[hitl.route]` config; [`Self::spawn`]
-/// runs the tick loop until its shutdown token cancels.
+/// the shared approval store it scans, the ingress registry it resolves
+/// through, and the identity mapping its poll-200 captures against. Built
+/// once at startup from the `[hitl.route]` config; [`Self::spawn`] runs the
+/// tick loop until its shutdown token cancels.
 pub struct PollReconciler {
     client: WebhookClient,
     store: Arc<dyn ApprovalStore>,
     registry: PendingApprovals,
     instance_id: String,
     interval: Duration,
+    tool_header_mappings: ToolHeaderMappings,
 }
 
 impl PollReconciler {
@@ -50,8 +53,10 @@ impl PollReconciler {
     /// and the webhook arm under sync delivery. The client is built by the
     /// same construction [`super::route::HitlRuntime::from_config`] uses, so
     /// the reconciler's notify/poll legs carry the exact wire shape of the
-    /// per-request routes (static operator headers only — poll delivery
-    /// refuses `headers_from_request` at config validation).
+    /// per-request routes. Its operator headers are the static set only —
+    /// `headers_from_request` values are per-row: each parked approval
+    /// carries its own request-scoped resolved values, which the notify
+    /// overlays without mutating this client.
     #[must_use]
     pub fn from_config(
         config: &HitlConfig,
@@ -63,6 +68,7 @@ impl PollReconciler {
         let DecisionRouteConfig::Webhook {
             delivery: WebhookDelivery::Poll,
             poll_interval_secs,
+            tool_headers_from_response,
             ..
         } = &config.route
         else {
@@ -74,6 +80,7 @@ impl PollReconciler {
             registry: registry.clone(),
             instance_id,
             interval: Duration::from_secs(*poll_interval_secs),
+            tool_header_mappings: tool_headers_from_response.clone(),
         })
     }
 
@@ -124,7 +131,11 @@ impl PollReconciler {
             }
             let id = parked.request.decision_id;
             if !notified.contains(&id) {
-                match self.client.notify(&parked.request).await {
+                match self
+                    .client
+                    .notify(&parked.request, parked.egress_headers.as_ref())
+                    .await
+                {
                     Ok(()) => {
                         notified.insert(id);
                     }
@@ -144,10 +155,33 @@ impl PollReconciler {
                     decision,
                     response_headers,
                 }) => {
-                    // Approver identity rides these headers; P38 stage 6
-                    // docks it. The reconciler resolves without them.
-                    drop(response_headers);
-                    match self.registry.resolve(&id, decision).await {
+                    let resolved = match decision {
+                        // Approver identity rides these headers: capture
+                        // against the route's mapping the same way the sync
+                        // gate does. A capture failure records the decision
+                        // WITHOUT identity — reify blocks the approved
+                        // execution later if identity is required (the
+                        // record-then-block precedent).
+                        ApprovalDecision::Approved if !self.tool_header_mappings.is_empty() => {
+                            match ApproverHeaders::from_captured(
+                                &self.tool_header_mappings,
+                                &response_headers,
+                            ) {
+                                Ok(identity) => ResolvedDecision::approved(Some(identity)),
+                                Err(err) => {
+                                    warn!(
+                                        decision_id = %id,
+                                        error = %err,
+                                        "approver identity capture failed; recording the \
+                                         decision without identity",
+                                    );
+                                    ResolvedDecision::approved(None)
+                                }
+                            }
+                        }
+                        other => ResolvedDecision::from(other),
+                    };
+                    match self.registry.resolve(&id, resolved).await {
                         Ok(()) => {}
                         // The ticket expired or was swept between
                         // list_pending and resolve; the decision is
@@ -263,6 +297,7 @@ mod tests {
                 request,
                 registered_at: chrono::Utc::now(),
                 expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+                egress_headers: None,
             })
             .await
             .expect("pending approval registers");
@@ -339,7 +374,7 @@ mod tests {
     async fn store_decision(
         store: &Arc<dyn ApprovalStore>,
         id: &DecisionId,
-    ) -> Option<ApprovalDecision> {
+    ) -> Option<ResolvedDecision> {
         store.decision(id).await.unwrap()
     }
 
@@ -387,7 +422,7 @@ mod tests {
 
         assert_eq!(
             store_decision(&store, &id).await,
-            Some(ApprovalDecision::Approved),
+            Some(ResolvedDecision::from(ApprovalDecision::Approved)),
             "the decided 200 resolves durably"
         );
         assert!(
@@ -446,7 +481,7 @@ mod tests {
 
         assert_eq!(
             store_decision(&store, &own).await,
-            Some(ApprovalDecision::Approved),
+            Some(ResolvedDecision::from(ApprovalDecision::Approved)),
         );
         assert!(
             store.get(&other).await.unwrap().is_some(),
@@ -518,6 +553,7 @@ mod tests {
                     request,
                     registered_at: chrono::Utc::now(),
                     expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+                    egress_headers: None,
                 })
                 .await
                 .expect("pending approval parks durably");
@@ -558,7 +594,7 @@ mod tests {
         })
         .await
         .expect("the first tick after the reboot resolves");
-        assert_eq!(recorded, ApprovalDecision::Approved);
+        assert_eq!(recorded, ResolvedDecision::from(ApprovalDecision::Approved));
         // The file backend retains the record behind `get` (resolve moves
         // the ticket into the decision file); the pending scan is what the
         // reconciler consumes, so that is what must be empty now.
@@ -613,5 +649,585 @@ mod tests {
         })
         .await
         .expect("the loop must end when the shutdown token cancels");
+    }
+
+    // ====================================================================
+    // R2 egress at rest + identity docking on the decision record
+    // ====================================================================
+
+    mod at_rest {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        use futures::StreamExt;
+        use reqwest::header::{HeaderMap, HeaderValue};
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+        use tokio::sync::mpsc;
+
+        use super::super::super::decision::ResolvedDecision;
+        use super::super::super::registry::ParkedApproval;
+        use super::*;
+        use crate::session_store::EventBus;
+        use crate::session_store::FileApprovalStore;
+
+        const EGRESS_ALPHA: &str = "Bearer egress-sentinel-alpha";
+        const EGRESS_BETA: &str = "Bearer egress-sentinel-beta";
+        const IDENTITY_SENTINEL: &str = "approver-identity-sentinel";
+
+        /// Minimal tracing-capture buffer, shared as the writer (the
+        /// route.rs `CapturedLog` pattern).
+        struct CaptureLog(std::sync::Mutex<Vec<u8>>);
+
+        impl std::io::Write for &CaptureLog {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        /// A poll config with static client headers and an optional identity
+        /// mapping, built the production way.
+        fn poll_config_with(
+            static_headers: HashMap<String, String>,
+            identity_mapping: bool,
+        ) -> aura_config::HitlConfig {
+            aura_config::HitlConfig {
+                require_approval: vec![],
+                park: aura_config::ParkConfig::default(),
+                route: aura_config::DecisionRouteConfig::Webhook {
+                    url: aura_config::WebhookUrl::new("http://127.0.0.1:1").unwrap(),
+                    timeout_secs: 300,
+                    headers: static_headers,
+                    headers_from_request: HashMap::new(),
+                    tool_headers_from_response: if identity_mapping {
+                        crate::approver_headers::tests::mappings(&[(
+                            "x-forwarded-user",
+                            "x-approver-id",
+                        )])
+                    } else {
+                        aura_config::ToolHeaderMappings::default()
+                    },
+                    delivery: aura_config::WebhookDelivery::Poll,
+                    poll_url: None,
+                    poll_interval_secs: 10,
+                    poll_request_timeout_secs: 30,
+                },
+            }
+        }
+
+        /// A reconciler built from `config`, pointed at `url`, resolving
+        /// through the given registry.
+        fn reconciler_over(
+            config: &aura_config::HitlConfig,
+            store: Arc<dyn ApprovalStore>,
+            url: &str,
+            registry: &PendingApprovals,
+        ) -> PollReconciler {
+            let mut config = config.clone();
+            if let aura_config::DecisionRouteConfig::Webhook { url: route_url, .. } =
+                &mut config.route
+            {
+                *route_url = aura_config::WebhookUrl::new(url).unwrap();
+            }
+            PollReconciler::from_config(&config, None, INSTANCE_ID.to_string(), store, registry)
+                .expect("a poll config builds a reconciler")
+        }
+
+        /// A reconciler over its own registry, the standalone shape.
+        fn reconciler_from(
+            config: &aura_config::HitlConfig,
+            store: Arc<dyn ApprovalStore>,
+            url: &str,
+        ) -> PollReconciler {
+            let registry = PendingApprovals::with_backend(
+                store.clone(),
+                Arc::new(crate::session_store::InMemoryEventBus::new()),
+            );
+            reconciler_over(config, store, url, &registry)
+        }
+
+        /// Park a durable row carrying `egress` as its resolved authorization
+        /// value.
+        async fn park_row(store: &Arc<dyn ApprovalStore>, egress: &str) -> DecisionId {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "authorization",
+                HeaderValue::from_str(egress).expect("sentinels are valid header values"),
+            );
+            let request = parked_request(DecisionId::generate(), INSTANCE_ID);
+            let id = request.decision_id;
+            store
+                .register(ParkedApproval {
+                    request,
+                    registered_at: chrono::Utc::now(),
+                    expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+                    egress_headers: Some(headers),
+                })
+                .await
+                .expect("pending approval registers");
+            id
+        }
+
+        /// One scripted receiver response: status line, extra headers, body.
+        type ScriptedResponse = (
+            &'static str,
+            Vec<(&'static str, &'static str)>,
+            &'static str,
+        );
+
+        /// Sequential-connection receiver whose responses may carry headers:
+        /// connection `i` gets `responses[i]`, every captured raw request
+        /// lands on the channel in order.
+        async fn scripted_receiver_with_headers(
+            responses: Vec<ScriptedResponse>,
+        ) -> (String, mpsc::Receiver<String>) {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let (tx, rx) = mpsc::channel(responses.len());
+            tokio::spawn(async move {
+                for (status, headers, body) in responses {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let captured = read_full_request(&mut socket).await;
+                    let mut response = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n\
+                         content-length: {}\r\nconnection: close\r\n",
+                        body.len()
+                    );
+                    for (name, value) in &headers {
+                        response.push_str(&format!("{name}: {value}\r\n"));
+                    }
+                    response.push_str("\r\n");
+                    response.push_str(body);
+                    socket.write_all(response.as_bytes()).await.ok();
+                    socket.shutdown().await.ok();
+                    tx.send(captured).await.expect("capture channel open");
+                }
+            });
+            (url, rx)
+        }
+
+        /// The `decision_id` a captured notify POST body carries.
+        fn body_decision_id(captured: &str) -> String {
+            let body = captured
+                .split("\r\n\r\n")
+                .nth(1)
+                .expect("the capture carries a body");
+            let json: serde_json::Value = serde_json::from_str(body).expect("wire body is JSON");
+            json["decision_id"]
+                .as_str()
+                .expect("the wire carries the decision id")
+                .to_string()
+        }
+
+        /// Distinct-credential approvals keep their own headers through
+        /// registration, notify retry, and store reopen: each notify POST —
+        /// including the retried one — authenticates with ITS row's value,
+        /// never the sibling's and never the client's static fallback.
+        #[tokio::test]
+        async fn distinct_rows_keep_their_own_headers_through_retry_and_reopen() {
+            let dir = tempfile::tempdir().unwrap();
+            let store_root = dir.path().join("approvals");
+
+            // Registration: both rows land with their own resolved values.
+            let writer: Arc<dyn ApprovalStore> =
+                Arc::new(FileApprovalStore::open(&store_root).unwrap());
+            let alpha = park_row(&writer, EGRESS_ALPHA).await;
+            let beta = park_row(&writer, EGRESS_BETA).await;
+
+            // Store reopen: a second handle over the same root — the
+            // reconciler's view — still sees each row's own headers.
+            let reader: Arc<dyn ApprovalStore> =
+                Arc::new(FileApprovalStore::open(&store_root).unwrap());
+            let pending = reader.list_pending().await.unwrap();
+            let expected: HashMap<String, String> = HashMap::from([
+                (alpha.to_string(), EGRESS_ALPHA.to_string()),
+                (beta.to_string(), EGRESS_BETA.to_string()),
+            ]);
+            assert_eq!(pending.len(), 2);
+            for parked in &pending {
+                let row = parked.egress_headers.as_ref().expect("row headers survive");
+                assert_eq!(
+                    row.get("authorization")
+                        .map(|value| value.to_str().unwrap()),
+                    Some(expected[&parked.request.decision_id.to_string()].as_str()),
+                );
+            }
+
+            // The reconciler's client carries a DIFFERENT static value for
+            // the same header name, so a per-row override failure is visible.
+            let mut static_headers = HashMap::new();
+            static_headers.insert(
+                "authorization".to_string(),
+                "Bearer client-static".to_string(),
+            );
+            let config = poll_config_with(static_headers, false);
+            let (url, mut rx) = scripted_receiver_with_headers(vec![
+                ("503 Service Unavailable", vec![], ""),
+                ("200 OK", vec![], ""),
+                ("204 No Content", vec![], ""),
+                ("200 OK", vec![], ""),
+                ("204 No Content", vec![], ""),
+                ("204 No Content", vec![], ""),
+                ("200 OK", vec![], r#"{"approved":true}"#),
+                ("200 OK", vec![], r#"{"approved":true}"#),
+            ])
+            .await;
+            let reconciler = reconciler_from(&config, Arc::clone(&reader), &url);
+            let mut notified = HashSet::new();
+
+            // Tick 1: one row's notify 503s (captured), the other acks and
+            // polls pending.
+            reconciler.tick(&mut notified).await;
+            let first = rx.recv().await.unwrap();
+            let second = rx.recv().await.unwrap();
+            let _third = rx.recv().await.unwrap();
+            // Tick 2: the failed notify retries (captured), the acked row
+            // polls again.
+            reconciler.tick(&mut notified).await;
+            let fourth = rx.recv().await.unwrap();
+            let _fifth = rx.recv().await.unwrap();
+            let _sixth = rx.recv().await.unwrap();
+            // Tick 3: both rows resolve.
+            reconciler.tick(&mut notified).await;
+            let _seventh = rx.recv().await.unwrap();
+            let _eighth = rx.recv().await.unwrap();
+
+            for captured in [&first, &second, &fourth] {
+                let id = body_decision_id(captured);
+                let expected_value = expected[&id].as_str();
+                let header_line = captured
+                    .lines()
+                    .find(|line| line.to_lowercase().starts_with("authorization:"))
+                    .unwrap_or_else(|| {
+                        panic!("every notify POST carries its row header: {captured}")
+                    });
+                assert_eq!(
+                    header_line.split_once(':').expect("header line").1.trim(),
+                    expected_value,
+                    "each notify POST authenticates with its own row's value: {captured}"
+                );
+                assert!(
+                    !captured.contains("Bearer client-static"),
+                    "the client's static value must never leak beside the row's: {captured}"
+                );
+            }
+            assert!(first.starts_with("POST ") && second.starts_with("POST "));
+            assert!(fourth.starts_with("POST "), "the failed notify retries");
+
+            // Both rows resolved durably, decisions without identity.
+            assert_eq!(
+                store_decision(&reader, &alpha).await,
+                Some(ResolvedDecision::from(ApprovalDecision::Approved)),
+            );
+            assert_eq!(
+                store_decision(&reader, &beta).await,
+                Some(ResolvedDecision::from(ApprovalDecision::Approved)),
+            );
+        }
+
+        /// The poll-200's configured identity headers are captured and
+        /// recorded in the SAME resolve as the decision.
+        #[tokio::test]
+        async fn poll_200_identity_is_captured_into_the_decision_record() {
+            let store: Arc<dyn ApprovalStore> = Arc::new(InMemoryApprovalStore::new());
+            let id = park_row(&store, EGRESS_ALPHA).await;
+            let config = poll_config_with(HashMap::new(), true);
+            let (url, mut rx) = scripted_receiver_with_headers(vec![
+                ("200 OK", vec![], ""),
+                (
+                    "200 OK",
+                    vec![("x-approver-id", IDENTITY_SENTINEL)],
+                    r#"{"approved":true}"#,
+                ),
+            ])
+            .await;
+            let reconciler = reconciler_from(&config, store.clone(), &url);
+            let mut notified = HashSet::new();
+
+            reconciler.tick(&mut notified).await;
+            let _ack = rx.recv().await.unwrap();
+            let poll = rx.recv().await.unwrap();
+            assert!(poll.starts_with("GET "), "the status read: {poll}");
+            assert!(
+                !poll.contains(EGRESS_ALPHA) && !poll.contains(IDENTITY_SENTINEL),
+                "the status GET carries no row egress or identity values: {poll}"
+            );
+
+            match store_decision(&store, &id).await.expect("resolved") {
+                ResolvedDecision::Approved {
+                    identity: Some(captured),
+                } => {
+                    assert_eq!(
+                        captured.captured_names().collect::<Vec<_>>(),
+                        ["x-forwarded-user"],
+                        "the identity is stored under the outbound name",
+                    );
+                    assert_eq!(
+                        captured.to_pair_map()["x-forwarded-user"],
+                        IDENTITY_SENTINEL,
+                        "the captured value is the poll-200's, whole",
+                    );
+                }
+                other => panic!("expected Approved with captured identity, got {other:?}"),
+            }
+        }
+
+        /// A poll-200 missing the mapped identity header records the
+        /// decision WITHOUT identity (the record-then-block precedent): the
+        /// resolution is not lost, reify blocks later if identity is
+        /// required.
+        #[tokio::test]
+        async fn identity_capture_failure_records_the_decision_without_identity() {
+            let store: Arc<dyn ApprovalStore> = Arc::new(InMemoryApprovalStore::new());
+            let id = park_row(&store, EGRESS_ALPHA).await;
+            let config = poll_config_with(HashMap::new(), true);
+            let (url, mut rx) = scripted_receiver_with_headers(vec![
+                ("200 OK", vec![], ""),
+                ("200 OK", vec![], r#"{"approved":true}"#),
+            ])
+            .await;
+            let reconciler = reconciler_from(&config, store.clone(), &url);
+            let mut notified = HashSet::new();
+
+            reconciler.tick(&mut notified).await;
+            let _ack = rx.recv().await.unwrap();
+            let _poll = rx.recv().await.unwrap();
+
+            assert_eq!(
+                store_decision(&store, &id).await,
+                Some(ResolvedDecision::approved(None)),
+                "the decision records without identity",
+            );
+        }
+
+        /// The sentinel leak guard. Distinct egress and identity sentinels
+        /// are proven to reach ONLY the allowed store fields (the parked row's
+        /// `egress_headers`, the decision record's `identity`) and the
+        /// intended HTTP headers (the notify POST's authorization), and to be
+        /// absent from the decision-bus payload, lifecycle/SSE events,
+        /// tracing and error text, and the run's serialized checkpoints (the
+        /// parked document, the `.resuming.json`, and the commit's temp
+        /// write).
+        #[tokio::test]
+        async fn sentinels_reach_only_allowed_store_fields_and_intended_headers() {
+            const EGRESS: &str = "Bearer egress-leakguard-sentinel";
+            const IDENTITY: &str = "identity-leakguard-sentinel";
+
+            let dir = tempfile::tempdir().unwrap();
+            let store_root = dir.path().join("approvals");
+            let memory_dir = dir.path().join("memory");
+            std::fs::create_dir_all(&memory_dir).unwrap();
+
+            let store: Arc<dyn ApprovalStore> =
+                Arc::new(FileApprovalStore::open(&store_root).unwrap());
+            let bus = Arc::new(crate::session_store::InMemoryEventBus::new());
+            let registry = PendingApprovals::with_backend(store.clone(), bus.clone());
+
+            // The parked row: the run-scoped owner a production park arm
+            // writes, with the egress sentinel on the allowed field.
+            let run_id = "0191e8c0-1eak-7000-8000-000000000001";
+            let request = parked_request(DecisionId::generate(), INSTANCE_ID);
+            let id = request.decision_id;
+            let mut request = request;
+            request.request_id = format!("run:{run_id}");
+            let mut egress = HeaderMap::new();
+            egress.insert("authorization", HeaderValue::from_str(EGRESS).unwrap());
+            registry
+                .register_durable(ParkedApproval {
+                    request,
+                    registered_at: chrono::Utc::now(),
+                    expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+                    egress_headers: Some(egress),
+                })
+                .await
+                .unwrap();
+
+            // Watch the decision bus and the lifecycle broker before any
+            // traffic.
+            let mut bus_sub = bus.subscribe(&format!("approval:{id}")).await.unwrap();
+            let mut sse = crate::approval_event_broker::subscribe(&format!("run:{run_id}")).await;
+
+            // Tracing capture around the whole reconcile: strict DEBUG, so
+            // every warn/error/debug line the flow could emit is checked.
+            // The thread-local default reaches the awaited tick on this
+            // single-thread test runtime.
+            let log_buf = Arc::new(CaptureLog(std::sync::Mutex::new(Vec::<u8>::new())));
+
+            let config = poll_config_with(HashMap::new(), true);
+            let (url, mut rx) = scripted_receiver_with_headers(vec![
+                ("200 OK", vec![], ""),
+                (
+                    "200 OK",
+                    vec![("x-approver-id", IDENTITY)],
+                    r#"{"approved":true}"#,
+                ),
+            ])
+            .await;
+            let reconciler = reconciler_over(&config, store.clone(), &url, &registry);
+            let mut notified = HashSet::new();
+
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(Arc::clone(&log_buf))
+                .with_max_level(tracing::Level::DEBUG)
+                .with_ansi(false)
+                .finish();
+            let notify = {
+                let _log_guard = tracing::subscriber::set_default(subscriber);
+                reconciler.tick(&mut notified).await;
+                let captured = rx.recv().await.unwrap();
+                let _poll = rx.recv().await.unwrap();
+                captured
+            };
+
+            // ---- POSITIVE: only the allowed store fields and headers. ----
+
+            // The notify POST carried the egress sentinel on authorization,
+            // and nothing else on the wire carried either sentinel.
+            assert!(notify.starts_with("POST "));
+            let header_line = notify
+                .lines()
+                .find(|line| line.to_lowercase().starts_with("authorization:"))
+                .expect("the notify carries the row header");
+            assert_eq!(header_line.split_once(':').unwrap().1.trim(), EGRESS);
+            assert!(
+                !notify.contains(IDENTITY),
+                "identity never rides the notify POST: {notify}"
+            );
+
+            // The store decision file holds BOTH allowed fields: the moved
+            // approval record keeps its egress headers, the decision record
+            // keeps the captured identity. (File backend: resolve moves the
+            // approval into `decisions/{id}.json`.)
+            let decision_file = store_root.join("decisions").join(format!("{id}.json"));
+            let stored = std::fs::read_to_string(&decision_file).expect("decision file exists");
+            assert!(
+                stored.contains(EGRESS),
+                "the parked row's egress headers persist in the store: {stored}"
+            );
+            assert!(
+                stored.contains(IDENTITY),
+                "the captured identity persists beside the decision: {stored}"
+            );
+            // And the carrier reads both back together.
+            match store_decision(&store, &id).await.expect("resolved") {
+                ResolvedDecision::Approved {
+                    identity: Some(got),
+                } => {
+                    assert_eq!(got.to_pair_map()["x-forwarded-user"], IDENTITY);
+                }
+                other => panic!("expected the identity to read back, got {other:?}"),
+            }
+
+            // ---- NEGATIVE: everywhere else is sentinel-free. ----
+
+            // Decision-bus payload: the credential-free decision alone.
+            let payload = tokio::time::timeout(Duration::from_secs(1), bus_sub.next())
+                .await
+                .expect("the bus wake arrives")
+                .expect("stream open");
+            let bus_text = String::from_utf8_lossy(&payload).to_string();
+            assert!(
+                !bus_text.contains(EGRESS) && !bus_text.contains(IDENTITY),
+                "the bus payload is credential-free, got: {bus_text}"
+            );
+
+            // Lifecycle/SSE events: the reconciler publishes none for the
+            // run's owner id, so nothing can carry a sentinel.
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), sse.recv())
+                    .await
+                    .is_err(),
+                "no lifecycle event may be published by the reconcile",
+            );
+
+            // Tracing and error text across the whole tick.
+            let log = String::from_utf8_lossy(&log_buf.0.lock().unwrap()).to_string();
+            assert!(
+                !log.contains(EGRESS) && !log.contains(IDENTITY),
+                "no sentinel may reach tracing, got: {log}"
+            );
+
+            // Serialized checkpoints: the same run's parked document, the
+            // resuming document, and the commit's temp write.
+            let mut plan = crate::orchestration::Plan::new("Deploy");
+            plan.add_task(crate::orchestration::Task::new(3, "Gated apply", "r"));
+            plan.tasks[0].state = crate::orchestration::TaskState::AwaitingApproval {
+                pending: vec![crate::orchestration::PendingCall {
+                    decision_id: id,
+                    tool_name: "kubectl_apply".to_string(),
+                    arguments: serde_json::json!({ "namespace": "prod" }),
+                    call_id: "call-1".to_string(),
+                }],
+            };
+            let mut records = std::collections::HashMap::new();
+            records.insert(
+                3,
+                crate::orchestration::ParkedTaskRecord {
+                    attempt: 1,
+                    snapshot: crate::orchestration::ParkSnapshot {
+                        history: vec![rig::completion::Message::user("apply it")],
+                        current_prompt: rig::completion::Message::user("tool results"),
+                    },
+                },
+            );
+            let inputs = crate::orchestration::ParkCommitInputs {
+                state: crate::orchestration::RunStateForPark {
+                    run_id,
+                    session_id: None,
+                    query: "Deploy",
+                    chat_history: &[],
+                    coordinator_conversation: &[],
+                    routing_decision: None,
+                    iteration: 1,
+                    planning_ms: 0,
+                    failure_history: &[],
+                },
+                plan: &plan,
+                records: &records,
+                registry: &registry,
+                memory_dir: memory_dir.to_str().unwrap(),
+                config: &crate::config::AgentRuntimeConfig::default(),
+                decision_window: Duration::from_secs(300),
+            };
+            crate::orchestration::commit_from_run_state(&inputs)
+                .await
+                .expect("the park commit publishes");
+
+            let parked_doc = memory_dir.join("parked").join(format!("{run_id}.json"));
+            let parked_text = std::fs::read_to_string(&parked_doc).expect("parked document");
+            assert!(
+                !parked_text.contains(EGRESS) && !parked_text.contains(IDENTITY),
+                "the parked document must never carry approval credentials, got: {parked_text}"
+            );
+
+            let handle = crate::orchestration::ResumingDocumentHandle::open(&parked_doc)
+                .await
+                .expect("the resuming handle opens");
+            handle
+                .append_executed_and_publish("call-1")
+                .await
+                .expect("the resuming append publishes");
+            let resuming_text = std::fs::read_to_string(
+                memory_dir
+                    .join("parked")
+                    .join(format!("{run_id}.resuming.json")),
+            )
+            .expect("resuming document");
+            assert!(
+                !resuming_text.contains(EGRESS) && !resuming_text.contains(IDENTITY),
+                "the resuming document must never carry approval credentials, got: {resuming_text}"
+            );
+            let tmp_residue = std::fs::read_dir(memory_dir.join("parked"))
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|e| e.file_name().to_string_lossy().ends_with(".tmp"));
+            assert!(!tmp_residue, "the append's temp write is renamed away");
+
+            crate::approval_event_broker::unsubscribe(&format!("run:{run_id}")).await;
+        }
     }
 }

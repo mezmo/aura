@@ -40,13 +40,16 @@ mod tool;
 
 pub use decision::{
     AgentScope, ApprovalDecision, ApprovalOrigin, ApprovalOutcome, AwaitingDecision, CancelReason,
-    DecisionId, Timestamp,
+    DecisionId, ResolvedDecision, Timestamp,
 };
 pub(crate) use events::completed_cancelled;
 pub use gate::HitlApprovalWrapper;
+// Fingerprint tests construct the poll/sync clients the production way.
 pub use poller::{PollReconciler, PollerHandle};
 pub use protocol::{ApprovalDecisionWire, ApprovalItem, ApprovalRequest, PROTOCOL_VERSION};
 pub use registry::{ParkedApproval, PendingApprovals, ResolveError};
+#[cfg(test)]
+pub(crate) use route::webhook_client_from_config;
 pub use route::{
     ApprovalError, DecisionRoute, HitlRuntime, PlaintextWebhookUrlError, WebhookClient,
     cleartext_capture_warning, validate_webhook_signing_config, warn_on_cleartext_capture,

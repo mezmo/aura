@@ -257,6 +257,13 @@ pub(crate) fn parked_document_dir(memory_dir: &str, session_id: Option<&str>) ->
 /// Fingerprint the configuration a resume must not drift from: the HITL
 /// gating surface (globs, route, park flag), the agent's model and tool
 /// filter, and the per-worker model and tool configuration.
+///
+/// The webhook route's projection carries `"delivery"` derived from the
+/// client's poll marker — the same source `park_registry` reads; no second
+/// delivery flag exists. Poll tuning (poll_url, interval, per-attempt
+/// timeout) is deliberately fingerprint-COMPATIBLE, and no credential value
+/// (headers, secrets) enters the projection. ENFORCEMENT (the one-way bump)
+/// is P45's.
 pub(crate) fn config_fingerprint(config: &AgentRuntimeConfig) -> String {
     let hitl = config.hitl.as_ref();
     let route = hitl.map(|h| match &*h.route {
@@ -264,9 +271,12 @@ pub(crate) fn config_fingerprint(config: &AgentRuntimeConfig) -> String {
             "kind": "conversational",
             "timeout_secs": timeout.as_secs(),
         }),
-        crate::hitl::DecisionRoute::Webhook { timeout, .. } => json!({
+        crate::hitl::DecisionRoute::Webhook {
+            client, timeout, ..
+        } => json!({
             "kind": "webhook",
             "timeout_secs": timeout.as_secs(),
+            "delivery": if client.poll_delivery() { "poll" } else { "sync" },
         }),
     });
     let source = json!({
@@ -338,6 +348,7 @@ mod tests {
             },
             registered_at: chrono::Utc::now(),
             expires_at,
+            egress_headers: None,
         }
     }
 
@@ -504,7 +515,7 @@ mod tests {
             .await
             .unwrap();
         registry
-            .resolve(&decided, crate::hitl::ApprovalDecision::Approved)
+            .resolve(&decided, crate::hitl::ApprovalDecision::Approved.into())
             .await
             .unwrap();
         registry.remove(&removed).await;
@@ -593,12 +604,13 @@ mod tests {
                 },
                 registered_at: now,
                 expires_at: now + chrono::Duration::hours(1),
+                egress_headers: None,
             })
             .await
             .unwrap();
         // The decision wins the race against the park commit.
         registry
-            .resolve(&decided, crate::hitl::ApprovalDecision::Approved)
+            .resolve(&decided, crate::hitl::ApprovalDecision::Approved.into())
             .await
             .unwrap();
 
@@ -670,7 +682,9 @@ mod tests {
                 "kubectl_apply",
                 &args
             )),
-            Some(crate::hitl::ApprovalDecision::Approved),
+            Some(crate::hitl::ResolvedDecision::from(
+                crate::hitl::ApprovalDecision::Approved
+            )),
             "the early decision is consumed at resume",
         );
     }
@@ -707,7 +721,7 @@ mod tests {
             .await
             .unwrap();
         registry
-            .resolve(&decided, crate::hitl::ApprovalDecision::Approved)
+            .resolve(&decided, crate::hitl::ApprovalDecision::Approved.into())
             .await
             .unwrap();
 
@@ -721,8 +735,9 @@ mod tests {
         );
         assert_eq!(
             registry.recorded_decision(&decided).await,
-            Some(crate::hitl::ApprovalDecision::Approved),
-            "the recorded decision survives the sweep"
+            Some(crate::hitl::ResolvedDecision::from(
+                crate::hitl::ApprovalDecision::Approved
+            )),
         );
 
         match tokio::time::timeout(Duration::from_secs(1), events.recv()).await {
@@ -827,7 +842,7 @@ mod tests {
 
         assert_eq!(
             registry
-                .resolve(&ticket, crate::hitl::ApprovalDecision::Approved)
+                .resolve(&ticket, crate::hitl::ApprovalDecision::Approved.into())
                 .await,
             Err(ResolveError::NotFound),
         );
@@ -862,6 +877,125 @@ mod tests {
             config_fingerprint(&config("kubectl_*")),
             config_fingerprint(&config("helm_*")),
             "a changed gate surface changes the hash"
+        );
+    }
+
+    /// Webhook routes: the fingerprint carries `"delivery"` from the client's
+    /// poll marker, so poll and sync differ, an unchanged webhook config is
+    /// stable, and poll TUNING (poll_url, interval, per-attempt timeout)
+    /// stays compatible. Credentials (static headers, mapped-header values)
+    /// never enter the projection.
+    #[test]
+    fn config_fingerprint_carries_delivery_and_stays_tuning_compatible() {
+        use aura_config::{
+            DecisionRouteConfig, GlobPattern, ToolHeaderMappings, WebhookDelivery, WebhookUrl,
+        };
+        use std::collections::HashMap;
+
+        fn config_with_route(
+            route: DecisionRouteConfig,
+            patterns: &str,
+        ) -> crate::config::AgentRuntimeConfig {
+            crate::config::AgentRuntimeConfig {
+                hitl: Some(crate::hitl::HitlRuntime {
+                    patterns: Arc::from([GlobPattern::new(patterns).unwrap()]),
+                    route: Arc::new(match &route {
+                        DecisionRouteConfig::Conversational { .. } => {
+                            crate::hitl::DecisionRoute::Conversational {
+                                registry: PendingApprovals::new(),
+                                timeout: Duration::from_secs(120),
+                            }
+                        }
+                        DecisionRouteConfig::Webhook { .. } => {
+                            let client =
+                                crate::hitl::webhook_client_from_config(&route, None, None)
+                                    .expect("a webhook route config builds a client");
+                            crate::hitl::DecisionRoute::Webhook {
+                                client,
+                                registry: PendingApprovals::new(),
+                                timeout: Duration::from_secs(300),
+                                egress_capture: Ok(()),
+                            }
+                        }
+                    }),
+                    park_enabled: true,
+                }),
+                ..crate::config::AgentRuntimeConfig::default()
+            }
+        }
+
+        fn webhook_route(
+            delivery: WebhookDelivery,
+            poll_url: Option<&str>,
+            poll_interval_secs: u64,
+            poll_request_timeout_secs: u64,
+            headers: HashMap<String, String>,
+        ) -> DecisionRouteConfig {
+            DecisionRouteConfig::Webhook {
+                url: WebhookUrl::new("https://approvals.example.com/hook").unwrap(),
+                timeout_secs: 300,
+                headers,
+                headers_from_request: HashMap::new(),
+                tool_headers_from_response: ToolHeaderMappings::default(),
+                delivery,
+                poll_url: poll_url.map(|u| WebhookUrl::new(u).unwrap()),
+                poll_interval_secs,
+                poll_request_timeout_secs,
+            }
+        }
+
+        let sync = webhook_route(WebhookDelivery::Sync, None, 10, 30, HashMap::new());
+        let poll = webhook_route(WebhookDelivery::Poll, None, 10, 30, HashMap::new());
+
+        assert_eq!(
+            config_fingerprint(&config_with_route(poll.clone(), "kubectl_*")),
+            config_fingerprint(&config_with_route(poll.clone(), "kubectl_*")),
+            "an unchanged webhook config is a stable hash"
+        );
+        assert_ne!(
+            config_fingerprint(&config_with_route(sync.clone(), "kubectl_*")),
+            config_fingerprint(&config_with_route(poll.clone(), "kubectl_*")),
+            "poll and sync deliveries must fingerprint differently"
+        );
+
+        // Poll tuning is fingerprint-compatible: a redeploy that only moves
+        // the status endpoint or retunes cadence/timeouts resumes.
+        let retuned = webhook_route(
+            WebhookDelivery::Poll,
+            Some("https://status.example.com/x"),
+            45,
+            7,
+            HashMap::new(),
+        );
+        assert_eq!(
+            config_fingerprint(&config_with_route(poll.clone(), "kubectl_*")),
+            config_fingerprint(&config_with_route(retuned, "kubectl_*")),
+            "poll tuning must not change the fingerprint"
+        );
+
+        // The gate surface still moves the hash on a webhook route.
+        assert_ne!(
+            config_fingerprint(&config_with_route(poll.clone(), "kubectl_*")),
+            config_fingerprint(&config_with_route(poll, "helm_*")),
+            "a changed gate surface changes the hash"
+        );
+
+        // Credential values are excluded: a route whose static headers carry
+        // a secret fingerprints the same as one with none.
+        let with_secret = webhook_route(
+            WebhookDelivery::Sync,
+            None,
+            10,
+            30,
+            HashMap::from([(
+                "authorization".to_string(),
+                "Bearer credential-value".to_string(),
+            )]),
+        );
+        assert_eq!(
+            config_fingerprint(&config_with_route(sync, "kubectl_*")),
+            config_fingerprint(&config_with_route(with_secret, "kubectl_*")),
+            "credential values must not enter the fingerprint"
         );
     }
 }
