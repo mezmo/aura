@@ -401,7 +401,10 @@ fn verify_server(
             })
             .ok_or_else(|| format!("`{name}` missing from the connection status snapshot"));
         manager
-            .cancel_and_close_all("mcp-add-verify", "verification complete")
+            .cancel_and_close_all(
+                &aura::RequestId::new("mcp-add-verify"),
+                "verification complete",
+            )
             .await;
         result
     })

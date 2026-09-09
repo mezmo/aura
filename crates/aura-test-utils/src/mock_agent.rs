@@ -1,5 +1,6 @@
 //! A [`StreamingAgent`] for tests that need an agent without a provider.
 
+use aura::RequestId;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -12,8 +13,8 @@ use futures::stream::{self, BoxStream, StreamExt};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
-type StartHook = Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
-type EffectHook = Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+type StartHook = Arc<dyn Fn(RequestId) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+type EffectHook = Arc<dyn Fn(RequestId) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 /// Pause inserted after each scripted step.
 ///
@@ -41,7 +42,7 @@ impl Step {
     /// be published to from inside the script.
     pub fn effect<F, Fut>(effect: F) -> Self
     where
-        F: Fn(String) -> Fut + Send + Sync + 'static,
+        F: Fn(RequestId) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
         Self::Effect(Arc::new(move |request_id| Box::pin(effect(request_id))))
@@ -120,16 +121,19 @@ impl MockAgent {
     /// call's `request_id`.
     pub fn on_stream_start<F, Fut>(mut self, hook: F) -> Self
     where
-        F: Fn(String) -> Fut + Send + Sync + 'static,
+        F: Fn(RequestId) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
         self.on_stream_start = Some(Arc::new(move |request_id| Box::pin(hook(request_id))));
         self
     }
 
-    async fn start(&self, request_id: &str) -> BoxStream<'static, Result<StreamItem, StreamError>> {
+    async fn start(
+        &self,
+        request_id: &RequestId,
+    ) -> BoxStream<'static, Result<StreamItem, StreamError>> {
         if let Some(hook) = &self.on_stream_start {
-            hook(request_id.to_string()).await;
+            hook(request_id.clone()).await;
         }
 
         let stream: BoxStream<'static, Result<StreamItem, StreamError>> = match &self.script {
@@ -140,7 +144,7 @@ impl MockAgent {
                     .expect("script lock")
                     .take()
                     .unwrap_or_default();
-                let request_id = request_id.to_string();
+                let request_id = request_id.clone();
                 Box::pin(
                     stream::iter(steps)
                         .then(move |step| {
@@ -176,7 +180,7 @@ impl StreamingAgent for MockAgent {
         _query: &str,
         _chat_history: Vec<Message>,
         _cancel_token: CancellationToken,
-        request_id: &str,
+        request_id: &RequestId,
     ) -> Result<BoxStream<'static, Result<StreamItem, StreamError>>, StreamError> {
         Ok(self.start(request_id).await)
     }
@@ -186,7 +190,7 @@ impl StreamingAgent for MockAgent {
         _query: &str,
         _chat_history: Vec<Message>,
         _timeout: Duration,
-        request_id: &str,
+        request_id: &RequestId,
     ) -> (
         BoxStream<'static, Result<StreamItem, StreamError>>,
         watch::Sender<bool>,
@@ -197,7 +201,7 @@ impl StreamingAgent for MockAgent {
         (stream, cancel_tx, UsageState::new())
     }
 
-    async fn cancel_and_close_mcp(&self, _request_id: &str, _reason: &str) -> usize {
+    async fn cancel_and_close_mcp(&self, _request_id: &RequestId, _reason: &str) -> usize {
         0
     }
 }
@@ -211,7 +215,12 @@ mod tests {
     async fn a_pending_agent_never_yields() {
         let agent = MockAgent::pending();
         let mut stream = agent
-            .stream("q", vec![], CancellationToken::new(), "req_1")
+            .stream(
+                "q",
+                vec![],
+                CancellationToken::new(),
+                &RequestId::new("req_1"),
+            )
             .await
             .expect("mock stream should start");
         assert!(
@@ -236,12 +245,22 @@ mod tests {
 
             if entry_point == "stream" {
                 let _ = agent
-                    .stream("q", vec![], CancellationToken::new(), "req_1")
+                    .stream(
+                        "q",
+                        vec![],
+                        CancellationToken::new(),
+                        &RequestId::new("req_1"),
+                    )
                     .await
                     .expect("mock stream should start");
             } else {
                 let _ = agent
-                    .stream_with_timeout("q", vec![], Duration::from_secs(1), "req_1")
+                    .stream_with_timeout(
+                        "q",
+                        vec![],
+                        Duration::from_secs(1),
+                        &RequestId::new("req_1"),
+                    )
                     .await;
             }
 
@@ -256,7 +275,12 @@ mod tests {
     async fn a_yielding_agent_produces_its_items_then_ends() {
         let agent = MockAgent::yielding([items::text("hello "), items::text("world")]);
         let stream = agent
-            .stream("q", vec![], CancellationToken::new(), "req_1")
+            .stream(
+                "q",
+                vec![],
+                CancellationToken::new(),
+                &RequestId::new("req_1"),
+            )
             .await
             .expect("mock stream should start");
 
@@ -290,7 +314,12 @@ mod tests {
         ]);
 
         let stream = agent
-            .stream("q", vec![], CancellationToken::new(), "req_42")
+            .stream(
+                "q",
+                vec![],
+                CancellationToken::new(),
+                &RequestId::new("req_42"),
+            )
             .await
             .expect("mock stream should start");
         let items: Vec<_> = stream.collect().await;
@@ -304,13 +333,23 @@ mod tests {
         let agent = MockAgent::yielding([items::text("once")]);
 
         let first: Vec<_> = agent
-            .stream("q", vec![], CancellationToken::new(), "req_1")
+            .stream(
+                "q",
+                vec![],
+                CancellationToken::new(),
+                &RequestId::new("req_1"),
+            )
             .await
             .expect("mock stream should start")
             .collect()
             .await;
         let second: Vec<_> = agent
-            .stream("q", vec![], CancellationToken::new(), "req_1")
+            .stream(
+                "q",
+                vec![],
+                CancellationToken::new(),
+                &RequestId::new("req_1"),
+            )
             .await
             .expect("mock stream should start")
             .collect()
@@ -337,7 +376,12 @@ mod tests {
         ]);
 
         let mut stream = agent
-            .stream("q", vec![], CancellationToken::new(), "req_1")
+            .stream(
+                "q",
+                vec![],
+                CancellationToken::new(),
+                &RequestId::new("req_1"),
+            )
             .await
             .expect("mock stream should start");
         while stream.next().await.is_some() {

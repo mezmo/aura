@@ -6,6 +6,7 @@
 //! persistence handles, shared chat history, scratchpad runtime state, and the
 //! session id.
 
+use crate::RequestId;
 use crate::hitl::HitlRuntime;
 use crate::scratchpad::ScratchpadToolsConfig;
 use crate::tool_wrapper::{ToolCallContext, ToolWrapper};
@@ -139,7 +140,7 @@ pub struct AgentRuntimeConfig {
     /// Request id (`req_…`) for this build, used to stamp HITL approval requests
     /// and route their SSE events. Threaded from the web server so the
     /// single-agent and orchestration paths share one value.
-    pub request_id: Option<String>,
+    pub request_id: Option<RequestId>,
 
     /// Computed instance UUID for this agent, derived from agent config and
     /// host identity. Threaded into HITL approval requests so webhook

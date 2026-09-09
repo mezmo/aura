@@ -8,6 +8,7 @@
 //! server; for single-process backends they are two handles to the same
 //! store, which is that backend's deployment shape.
 
+use aura::RequestId;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -25,7 +26,7 @@ pub fn make_parked(request_id: &str, ttl: Duration) -> ParkedApproval {
             version: PROTOCOL_VERSION,
             instance_id: "test-instance".to_string(),
             decision_id: DecisionId::generate(),
-            request_id: request_id.to_string(),
+            request_id: RequestId::new(request_id),
             scope: AgentScope::Single { session_id: None },
             origin: ApprovalOrigin::ConfigGate {
                 matched_pattern: "kubectl_*".to_string(),
@@ -152,7 +153,10 @@ pub async fn cancel_request_removes_only_matching(instance: &Arc<dyn ApprovalSto
     instance.register(cancel).await.unwrap();
     instance.register(keep).await.unwrap();
 
-    let cleared = instance.cancel_request("req-cancel").await.unwrap();
+    let cleared = instance
+        .cancel_request(&RequestId::new("req-cancel"))
+        .await
+        .unwrap();
 
     assert_eq!(cleared.len(), 1, "exactly the matching ticket is cleared");
     assert_eq!(

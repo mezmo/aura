@@ -230,6 +230,7 @@ impl ToolWrapper for ScratchpadWrapper {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::RequestId;
     use crate::scratchpad::context_budget::{TiktokenCounter, TokenCounter};
     use crate::tool_wrapper::ToolCallContext;
     use tempfile::TempDir;
@@ -255,7 +256,7 @@ mod tests {
     async fn test_wrapper_intercepts_via_resolved_tool_name() {
         let tmp = TempDir::new().unwrap();
         let storage = Arc::new(
-            ScratchpadStorage::with_base_dir(tmp.path(), "req-wrap-glob")
+            ScratchpadStorage::with_base_dir(tmp.path(), &RequestId::new("req-wrap-glob"))
                 .await
                 .unwrap(),
         );
@@ -300,7 +301,7 @@ mod tests {
     async fn test_wrapper_pointer_is_deterministic_for_identical_output() {
         let tmp = TempDir::new().unwrap();
         let storage = Arc::new(
-            ScratchpadStorage::with_base_dir(tmp.path(), "req-wrap-deterministic")
+            ScratchpadStorage::with_base_dir(tmp.path(), &RequestId::new("req-wrap-deterministic"))
                 .await
                 .unwrap(),
         );
@@ -332,7 +333,7 @@ mod tests {
     async fn test_wrapper_intercepts_large_output() {
         let tmp = TempDir::new().unwrap();
         let storage = Arc::new(
-            ScratchpadStorage::with_base_dir(tmp.path(), "req-wrap-1")
+            ScratchpadStorage::with_base_dir(tmp.path(), &RequestId::new("req-wrap-1"))
                 .await
                 .unwrap(),
         );
@@ -383,7 +384,7 @@ mod tests {
     async fn test_wrapper_strips_persistence_footer_before_write() {
         let tmp = TempDir::new().unwrap();
         let storage = Arc::new(
-            ScratchpadStorage::with_base_dir(tmp.path(), "req-wrap-footer")
+            ScratchpadStorage::with_base_dir(tmp.path(), &RequestId::new("req-wrap-footer"))
                 .await
                 .unwrap(),
         );
@@ -437,7 +438,7 @@ mod tests {
     async fn test_wrapper_passes_through_small_output() {
         let tmp = TempDir::new().unwrap();
         let storage = Arc::new(
-            ScratchpadStorage::with_base_dir(tmp.path(), "req-wrap-2")
+            ScratchpadStorage::with_base_dir(tmp.path(), &RequestId::new("req-wrap-2"))
                 .await
                 .unwrap(),
         );
@@ -475,7 +476,7 @@ mod tests {
     async fn test_wrapper_ignores_non_scratchpad_tools() {
         let tmp = TempDir::new().unwrap();
         let storage = Arc::new(
-            ScratchpadStorage::with_base_dir(tmp.path(), "req-wrap-3")
+            ScratchpadStorage::with_base_dir(tmp.path(), &RequestId::new("req-wrap-3"))
                 .await
                 .unwrap(),
         );
@@ -503,7 +504,7 @@ mod tests {
     async fn test_wrapper_passes_through_skill_tool_outputs() {
         let tmp = TempDir::new().unwrap();
         let storage = Arc::new(
-            ScratchpadStorage::with_base_dir(tmp.path(), "req-wrap-skills")
+            ScratchpadStorage::with_base_dir(tmp.path(), &RequestId::new("req-wrap-skills"))
                 .await
                 .unwrap(),
         );
@@ -535,7 +536,7 @@ mod tests {
     async fn test_wrapper_intercepts_at_exact_threshold() {
         let tmp = TempDir::new().unwrap();
         let storage = Arc::new(
-            ScratchpadStorage::with_base_dir(tmp.path(), "req-wrap-boundary")
+            ScratchpadStorage::with_base_dir(tmp.path(), &RequestId::new("req-wrap-boundary"))
                 .await
                 .unwrap(),
         );
@@ -585,7 +586,7 @@ mod tests {
     async fn test_wrapper_records_intercepted_tokens() {
         let tmp = TempDir::new().unwrap();
         let storage = Arc::new(
-            ScratchpadStorage::with_base_dir(tmp.path(), "req-wrap-counter")
+            ScratchpadStorage::with_base_dir(tmp.path(), &RequestId::new("req-wrap-counter"))
                 .await
                 .unwrap(),
         );
@@ -623,7 +624,7 @@ mod tests {
         // so the write will fail with an I/O error.
         let tmp = TempDir::new().unwrap();
         let storage = Arc::new(
-            ScratchpadStorage::with_base_dir(tmp.path(), "req-wrap-fail")
+            ScratchpadStorage::with_base_dir(tmp.path(), &RequestId::new("req-wrap-fail"))
                 .await
                 .unwrap(),
         );
@@ -680,7 +681,7 @@ mod tests {
     async fn test_wrapper_json_companion_pointer_recommends_get_in() {
         let tmp = TempDir::new().unwrap();
         let storage = Arc::new(
-            ScratchpadStorage::with_base_dir(tmp.path(), "req-wrap-json-comp")
+            ScratchpadStorage::with_base_dir(tmp.path(), &RequestId::new("req-wrap-json-comp"))
                 .await
                 .unwrap(),
         );
@@ -743,7 +744,7 @@ mod tests {
     async fn test_wrapper_companion_files_in_pointer() {
         let tmp = TempDir::new().unwrap();
         let storage = Arc::new(
-            ScratchpadStorage::with_base_dir(tmp.path(), "req-wrap-comp")
+            ScratchpadStorage::with_base_dir(tmp.path(), &RequestId::new("req-wrap-comp"))
                 .await
                 .unwrap(),
         );

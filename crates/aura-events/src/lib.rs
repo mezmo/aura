@@ -68,12 +68,28 @@ pub fn format_named_sse(event_name: &str, data: &impl Serialize) -> String {
 // and the wire schema below. Opaque newtypes reached through canonical
 // conversion traits; each serializes as its inner value.
 
-/// Generates the shared surface of a string newtype: construction, borrowing,
+/// Generates the shared surface of a string newtype — construction, borrowing,
 /// display, and comparison against the string types.
+///
+/// The expansion derives `serde::Serialize`/`Deserialize` through a plain
+/// `::serde` path, so an invoking crate needs `serde` as a direct dependency
+/// or the derive fails to resolve at the call site.
+#[doc(hidden)]
+#[macro_export]
 macro_rules! string_newtype {
     ($(#[$meta:meta])* $name:ident) => {
         $(#[$meta])*
-        #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+        #[derive(
+            Debug,
+            Clone,
+            PartialEq,
+            Eq,
+            Hash,
+            PartialOrd,
+            Ord,
+            ::serde::Serialize,
+            ::serde::Deserialize,
+        )]
         #[serde(transparent)]
         pub struct $name(String);
 

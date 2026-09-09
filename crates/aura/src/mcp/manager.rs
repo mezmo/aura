@@ -1,3 +1,4 @@
+use crate::RequestId;
 use crate::config::McpServerConfig;
 use crate::error::BuilderError;
 use crate::mcp::client::McpClient;
@@ -691,7 +692,7 @@ impl McpManager {
     }
 
     /// Cancel all in-flight MCP requests for an HTTP request.
-    pub async fn cancel_all_for_request(&self, http_request_id: &str, reason: &str) -> usize {
+    pub async fn cancel_all_for_request(&self, http_request_id: &RequestId, reason: &str) -> usize {
         let mut total_cancelled = 0;
 
         for (server_name, client) in &self.streamable_clients {
@@ -732,7 +733,7 @@ impl McpManager {
 
     /// Cancel in-flight requests and close all MCP client connections.
     /// After calling this, all MCP clients become unusable until reinitialized.
-    pub async fn cancel_and_close_all(&self, http_request_id: &str, reason: &str) -> usize {
+    pub async fn cancel_and_close_all(&self, http_request_id: &RequestId, reason: &str) -> usize {
         let mut total_cancelled = 0;
 
         for (server_name, client) in &self.streamable_clients {
@@ -772,7 +773,7 @@ impl McpManager {
     }
 
     /// Set the current HTTP request ID for cancellation tracking.
-    pub async fn set_current_request(&self, http_request_id: &str) {
+    pub async fn set_current_request(&self, http_request_id: &RequestId) {
         for client in self.streamable_clients.values() {
             client.set_current_request(http_request_id).await;
         }

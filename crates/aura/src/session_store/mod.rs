@@ -22,6 +22,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::Stream;
 
+use crate::RequestId;
 use crate::hitl::{ApprovalDecision, DecisionId, ParkedApproval, ResolveError};
 
 #[cfg(test)]
@@ -90,7 +91,7 @@ pub trait ApprovalStore: Send + Sync {
     /// the cancellation applies to.
     async fn cancel_request(
         &self,
-        request_id: &str,
+        request_id: &RequestId,
     ) -> Result<Vec<ParkedApproval>, SessionStoreError>;
 }
 

@@ -19,6 +19,7 @@ use std::pin::Pin;
 use std::time::Duration;
 use tokio::sync::watch;
 
+use crate::RequestId;
 use crate::orchestration::OrchestratorEvent;
 use crate::scratchpad::ContextBudget;
 use crate::streaming_request_hook::StreamingRequestHook;
@@ -110,7 +111,7 @@ impl ProviderAgent {
         chat_history: Vec<rig::completion::Message>,
         max_depth: usize,
         timeout: Duration,
-        request_id: &str,
+        request_id: &RequestId,
         scratchpad_budget: Option<ContextBudget>,
         client_tool_names: HashSet<String>,
     ) -> (
@@ -118,8 +119,11 @@ impl ProviderAgent {
         watch::Sender<bool>,
         crate::streaming_request_hook::UsageState,
     ) {
-        let (hook, cancel_tx, usage_state) =
-            StreamingRequestHook::with_scratchpad_budget(timeout, request_id, scratchpad_budget);
+        let (hook, cancel_tx, usage_state) = StreamingRequestHook::with_scratchpad_budget(
+            timeout,
+            request_id.clone(),
+            scratchpad_budget,
+        );
         let hook = hook.with_client_tool_names(client_tool_names);
 
         match self {
@@ -325,7 +329,7 @@ impl ProviderAgent {
         query: &str,
         max_depth: usize,
         timeout: Duration,
-        request_id: &str,
+        request_id: &RequestId,
         scratchpad_budget: Option<ContextBudget>,
         client_tool_names: HashSet<String>,
     ) -> (
@@ -333,8 +337,11 @@ impl ProviderAgent {
         watch::Sender<bool>,
         crate::streaming_request_hook::UsageState,
     ) {
-        let (hook, cancel_tx, usage_state) =
-            StreamingRequestHook::with_scratchpad_budget(timeout, request_id, scratchpad_budget);
+        let (hook, cancel_tx, usage_state) = StreamingRequestHook::with_scratchpad_budget(
+            timeout,
+            request_id.clone(),
+            scratchpad_budget,
+        );
         let hook = hook.with_client_tool_names(client_tool_names);
 
         match self {
@@ -439,7 +446,7 @@ impl ProviderAgent {
         chat_history: Vec<rig::completion::Message>,
         max_depth: usize,
         timeout: Duration,
-        request_id: &str,
+        request_id: &RequestId,
         scratchpad_budget: Option<ContextBudget>,
         client_tool_names: HashSet<String>,
     ) -> (
@@ -447,8 +454,11 @@ impl ProviderAgent {
         watch::Sender<bool>,
         crate::streaming_request_hook::UsageState,
     ) {
-        let (hook, cancel_tx, usage_state) =
-            StreamingRequestHook::with_scratchpad_budget(timeout, request_id, scratchpad_budget);
+        let (hook, cancel_tx, usage_state) = StreamingRequestHook::with_scratchpad_budget(
+            timeout,
+            request_id.clone(),
+            scratchpad_budget,
+        );
         let hook = hook.with_client_tool_names(client_tool_names);
 
         match self {

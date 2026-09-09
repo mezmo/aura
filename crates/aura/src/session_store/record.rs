@@ -13,6 +13,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::RequestId;
 use crate::config::SessionId;
 use crate::hitl::{
     AgentScope, ApprovalDecision, ApprovalItem, ApprovalOrigin, ApprovalRequest, DecisionId,
@@ -29,7 +30,7 @@ pub struct ParkedApprovalRecord {
     #[serde(default)]
     pub instance_id: String,
     pub decision_id: DecisionId,
-    pub request_id: String,
+    pub request_id: RequestId,
     pub scope: ScopeRecord,
     pub origin: OriginRecord,
     pub items: Vec<ApprovalItem>,
@@ -251,7 +252,7 @@ mod tests {
                 version: PROTOCOL_VERSION,
                 instance_id: "test-instance".to_string(),
                 decision_id: DecisionId::generate(),
-                request_id: "req-1".to_string(),
+                request_id: RequestId::new("req-1"),
                 scope,
                 origin,
                 items: vec![ApprovalItem {
@@ -274,6 +275,28 @@ mod tests {
         assert_eq!(stored, record);
         let restored = ParkedApproval::try_from(stored).expect("record restores");
         assert_eq!(ParkedApprovalRecord::from(&restored), record);
+    }
+
+    /// The stored record carries `request_id` as a bare JSON string. Every
+    /// instance reading the store depends on that shape.
+    #[test]
+    fn request_id_persists_as_a_bare_string() {
+        let record = ParkedApprovalRecord::from(&parked(
+            AgentScope::Single { session_id: None },
+            ApprovalOrigin::ConfigGate {
+                matched_pattern: "kubectl_*".to_string(),
+                agent_name: "test-agent".to_string(),
+            },
+        ));
+
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&record).expect("record serializes"))
+                .expect("record is json");
+        assert_eq!(json["request_id"], "req-1");
+
+        let stored: ParkedApprovalRecord =
+            serde_json::from_value(json).expect("bare string parses back");
+        assert_eq!(stored.request_id, "req-1");
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use aura::RequestId;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -38,7 +39,7 @@ pub struct AuraAgentExecutor {
 struct TaskCancelEntry {
     token: CancellationToken,
     agent: Arc<dyn StreamingAgent>,
-    request_id: String,
+    request_id: RequestId,
 }
 
 /// The live executions' cancel handles, keyed by task id.
@@ -59,7 +60,7 @@ fn lock_cancel_state(state: &TaskCancelState) -> MutexGuard<'_, HashMap<String, 
 struct TaskCancelGuard {
     state: Arc<TaskCancelState>,
     task_id: String,
-    request_id: String,
+    request_id: RequestId,
 }
 
 impl Drop for TaskCancelGuard {
@@ -225,7 +226,7 @@ impl AgentExecutor for AuraAgentExecutor {
                 metadata: None,
             }));
 
-            let request_id = format!("a2a_{}", task_id);
+            let request_id = RequestId::new(format!("a2a_{}", task_id));
             let session_id = Some(context_id.clone());
             let builder = RigBuilder::new(config, pending_approvals).with_hitl_hmac(hitl_hmac);
             let agent = match builder
@@ -250,7 +251,7 @@ impl AgentExecutor for AuraAgentExecutor {
             let cancel_token = stream_shutdown_token.child_token();
             // Register with the global cancellation registry for parity with the OpenAI handler
             // and to let any future code address this request by id.
-            RequestCancellation::register(request_id.clone());
+            RequestCancellation::register(&request_id);
             let _cancel_guard = TaskCancelGuard {
                 state: task_cancel_state.clone(),
                 task_id: task_id.clone(),
@@ -289,13 +290,13 @@ impl AgentExecutor for AuraAgentExecutor {
                 let Some(item) = next else { break };
                 match item {
                     Ok(StreamItem::StreamAssistantItem(StreamedAssistantContent::Text(t))) => {
-                        event!(Level::DEBUG, request_id, t, "stream content received");
+                        event!(Level::DEBUG, %request_id, t, "stream content received");
 
                         let append = append_tracker.entry((task_id.clone(), context_id.clone(), RESPONSE_ARTIFACT_ID.to_owned()))
                             .and_modify(|e| *e = true)
                             .or_insert(false);
 
-                        event!(Level::DEBUG, request_id, "response returned and should be appended: {}", *append);
+                        event!(Level::DEBUG, %request_id, "response returned and should be appended: {}", *append);
 
                         let artifact = Artifact {
                             artifact_id: RESPONSE_ARTIFACT_ID.to_owned(),
@@ -315,7 +316,7 @@ impl AgentExecutor for AuraAgentExecutor {
                         }));
                     }
                     Ok(StreamItem::StreamAssistantItem(StreamedAssistantContent::ToolCall(tc))) => {
-                        event!(Level::DEBUG, request_id, tool_name = tc.name.as_str(), "tool call received");
+                        event!(Level::DEBUG, %request_id, tool_name = tc.name.as_str(), "tool call received");
 
                         let artifact_id: String = format!("tool_call_{}", tc.id);
                         let append = append_tracker.entry((task_id.clone(), context_id.clone(), artifact_id.to_owned()))
@@ -345,7 +346,7 @@ impl AgentExecutor for AuraAgentExecutor {
                         }));
                     }
                     Ok(StreamItem::StreamAssistantItem(StreamedAssistantContent::Reasoning(r))) => {
-                        event!(Level::DEBUG, request_id, reasoning = r, "reasoning received");
+                        event!(Level::DEBUG, %request_id, reasoning = r, "reasoning received");
                         reasoning_num += 1;
 
                         let artifact_id: String = format!("reasoning_{}", reasoning_num);
@@ -371,7 +372,7 @@ impl AgentExecutor for AuraAgentExecutor {
                         }));
                     }
                     Ok(StreamItem::ScratchpadUsage { agent_id, tokens_intercepted, tokens_extracted }) => {
-                        event!(Level::DEBUG, request_id, "scratchpad usage");
+                        event!(Level::DEBUG, %request_id, "scratchpad usage");
 
                         let artifact_id: String = format!("scratchpad_{}", agent_id);
                         let append = append_tracker.entry((task_id.clone(), context_id.clone(), artifact_id.to_owned()))
@@ -399,25 +400,25 @@ impl AgentExecutor for AuraAgentExecutor {
                         }));
                     }
                     Ok(StreamItem::TurnUsage(..)) => {
-                        event!(Level::DEBUG, request_id, "turn usage");
+                        event!(Level::DEBUG, %request_id, "turn usage");
                     }
                     Ok(StreamItem::ContextUsage { .. }) => {
-                        event!(Level::DEBUG, request_id, "context usage");
+                        event!(Level::DEBUG, %request_id, "context usage");
                     }
                     Ok(StreamItem::OrchestratorEvent(_)) => {
-                        event!(Level::DEBUG, request_id, "orchestration event");
+                        event!(Level::DEBUG, %request_id, "orchestration event");
                     }
                     Ok(StreamItem::McpStatus(_)) => {
-                        event!(Level::DEBUG, request_id, "mcp status");
+                        event!(Level::DEBUG, %request_id, "mcp status");
                     }
                     Ok(StreamItem::StreamUserItem(_)) => {
-                        event!(Level::DEBUG, request_id, "stream user item");
+                        event!(Level::DEBUG, %request_id, "stream user item");
                     }
                     Ok(StreamItem::StreamAssistantItem(StreamedAssistantContent::ToolCallDelta { .. })) => {
-                        event!(Level::DEBUG, request_id, "stream assistant item");
+                        event!(Level::DEBUG, %request_id, "stream assistant item");
                     }
                     Ok(StreamItem::StreamAssistantItem(StreamedAssistantContent::ReasoningDelta { .. })) => {
-                        event!(Level::DEBUG, request_id, "reasoning delta");
+                        event!(Level::DEBUG, %request_id, "reasoning delta");
                     }
                     Ok(StreamItem::Final(final_info)) => {
                         let append = append_tracker.entry((task_id.clone(), context_id.clone(), FINAL_ARTIFACT_ID.to_owned()))
@@ -447,11 +448,11 @@ impl AgentExecutor for AuraAgentExecutor {
                         break; // done processing
                     }
                     Ok(StreamItem::FinalMarker) => {
-                        event!(Level::DEBUG, request_id, "stream final marker");
+                        event!(Level::DEBUG, %request_id, "stream final marker");
                         break; // done processing
                     }
                     Err(e) => {
-                        event!(Level::ERROR, request_id, task_id, error = e.to_string(), "stream error");
+                        event!(Level::ERROR, %request_id, task_id, error = e.to_string(), "stream error");
                         yield Ok(fail_status(&task_id, &context_id, &e.to_string()));
                         success = false;
                         break; // done processing
@@ -585,7 +586,7 @@ pub(super) fn fail_status(task_id: &str, context_id: &str, error_msg: &str) -> S
 
 async fn get_history_for_context(
     task_store: SharedTaskStore,
-    request_id: &str,
+    request_id: &RequestId,
     context_id: &str,
     task_id: &str,
 ) -> Result<Vec<aura::Message>, A2AError> {
@@ -595,7 +596,7 @@ async fn get_history_for_context(
     loop {
         event!(
             Level::DEBUG,
-            request_id,
+            %request_id,
             context_id,
             "processing history for context"
         );
@@ -616,7 +617,7 @@ async fn get_history_for_context(
 
         event!(
             Level::DEBUG,
-            request_id,
+            %request_id,
             context_id,
             "found {} tasks, continue token '{}'",
             page.tasks.len(),
@@ -638,7 +639,7 @@ async fn get_history_for_context(
 
     let chat_history: Vec<aura::Message> = tasks.iter().flat_map(task_turns).collect();
 
-    event!(Level::DEBUG, request_id, context_id, chat_history = ?chat_history, "determined this following history to use");
+    event!(Level::DEBUG, %request_id, context_id, chat_history = ?chat_history, "determined this following history to use");
     Ok(chat_history)
 }
 
@@ -852,10 +853,10 @@ mod tests {
     #[test]
     fn dropping_the_cancel_guard_releases_the_entry_and_registration() {
         let task_id = format!("t_{}", uuid::Uuid::new_v4());
-        let request_id = format!("a2a_{task_id}");
+        let request_id = RequestId::new(format!("a2a_{task_id}"));
         let state: Arc<TaskCancelState> = Arc::new(Mutex::new(HashMap::new()));
 
-        RequestCancellation::register(request_id.clone());
+        RequestCancellation::register(&request_id);
         let guard = TaskCancelGuard {
             state: state.clone(),
             task_id: task_id.clone(),
@@ -882,10 +883,10 @@ mod tests {
     #[test]
     fn dropping_the_cancel_guard_after_an_explicit_cleanup_is_a_noop() {
         let task_id = format!("t_{}", uuid::Uuid::new_v4());
-        let request_id = format!("a2a_{task_id}");
+        let request_id = RequestId::new(format!("a2a_{task_id}"));
         let state: Arc<TaskCancelState> = Arc::new(Mutex::new(HashMap::new()));
 
-        RequestCancellation::register(request_id.clone());
+        RequestCancellation::register(&request_id);
         let guard = TaskCancelGuard {
             state: state.clone(),
             task_id: task_id.clone(),
@@ -967,7 +968,7 @@ mod tests {
         for task in tasks {
             store.create(task).await.expect("task created");
         }
-        get_history_for_context(store, "req", "ctx", executing)
+        get_history_for_context(store, &RequestId::new("req"), "ctx", executing)
             .await
             .expect("history built")
     }

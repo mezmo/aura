@@ -1,6 +1,7 @@
 //! Projections of an agent [`Config`] into the wire types served by
 //! `GET /aura/info` ([`AgentInfo`], [`WorkerOverview`]).
 
+use crate::RequestId;
 use aura_config::{Config, McpServerConfig};
 use aura_events::{
     AgentInfo, McpServerOverview, McpToolAnnotations, McpToolOverview, WorkerOverview,
@@ -107,7 +108,7 @@ async fn discover_tools(
         .collect();
 
     manager
-        .cancel_and_close_all("aura-info", "tool detail collected")
+        .cancel_and_close_all(&RequestId::new("aura-info"), "tool detail collected")
         .await;
     per_server
 }

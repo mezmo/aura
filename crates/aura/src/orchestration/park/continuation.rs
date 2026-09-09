@@ -327,6 +327,7 @@ pub(crate) fn replace_tool_result(current_prompt: &mut Message, call_id: &str, w
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::RequestId;
     use crate::hitl::{
         AgentScope, ApprovalDecision, ApprovalItem, ApprovalOrigin, ApprovalRequest,
         PROTOCOL_VERSION, ParkedApproval,
@@ -387,7 +388,7 @@ mod tests {
                 version: PROTOCOL_VERSION,
                 instance_id: "test-instance".to_string(),
                 decision_id,
-                request_id: "run:test".to_string(),
+                request_id: RequestId::new("run:test"),
                 scope: AgentScope::Worker {
                     run_id: "0191e8c0-aaaa-7000-8000-00000000c0de".parse().unwrap(),
                     task: crate::orchestration::types::TaskIdentity::new(3, None),

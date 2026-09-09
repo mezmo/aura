@@ -30,6 +30,7 @@
 //! scripted model and registers its tools through the worker's own wrapper
 //! chain, so execute_task-level tests drive the production path unmodified.
 
+use crate::RequestId;
 use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::Arc;
@@ -620,7 +621,7 @@ pub(crate) async fn drive_worker(
     history: Vec<rig::completion::Message>,
     max_depth: usize,
 ) -> Result<StreamRun, Box<dyn std::error::Error + Send + Sync>> {
-    let request_id = format!("rig_{}", uuid::Uuid::new_v4().simple());
+    let request_id = RequestId::new(format!("rig_{}", uuid::Uuid::new_v4().simple()));
     let (hook, cancel_tx, usage_state) =
         StreamingRequestHook::with_scratchpad_budget(Duration::from_secs(60), request_id, None);
 
@@ -737,7 +738,10 @@ pub(crate) async fn park_orchestrator_in(
         }),
         memory_dir: Some(memory_dir.to_string_lossy().into_owned()),
         session_id: Some("park-sess".to_string()),
-        request_id: Some(format!("req_rig_{}", uuid::Uuid::new_v4().simple())),
+        request_id: Some(RequestId::new(format!(
+            "req_rig_{}",
+            uuid::Uuid::new_v4().simple()
+        ))),
         orchestration: Some(super::OrchestrationConfig {
             enabled: true,
             workers,

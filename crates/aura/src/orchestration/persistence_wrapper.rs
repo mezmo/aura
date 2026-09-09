@@ -424,6 +424,7 @@ pub fn extract_reasoning(mut args: Value) -> (Option<String>, Value) {
 
 #[cfg(test)]
 mod tests {
+    use crate::RequestId;
     use crate::WrappedTool;
     use crate::hitl::ApprovalItem;
     use rig::tool::{Tool as RigTool, ToolError};
@@ -881,7 +882,7 @@ mod tests {
 
         let tmp = tempfile::TempDir::new().unwrap();
         let storage = Arc::new(
-            ScratchpadStorage::with_base_dir(tmp.path(), "req-compose-1")
+            ScratchpadStorage::with_base_dir(tmp.path(), &RequestId::new("req-compose-1"))
                 .await
                 .unwrap(),
         );
@@ -1450,7 +1451,7 @@ mod tests {
             session_id: None,
         };
 
-        let request_id = format!("req_w2_{}", uuid::Uuid::new_v4().simple());
+        let request_id = RequestId::new(format!("req_w2_{}", uuid::Uuid::new_v4().simple()));
 
         let gate: Arc<dyn ToolWrapper> = Arc::new(HitlApprovalWrapper::new(
             Arc::from([GlobPattern::new("kubectl_*").unwrap()]),

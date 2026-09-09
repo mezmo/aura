@@ -31,6 +31,7 @@
 //! }
 //! ```
 
+use crate::RequestId;
 use crate::provider_agent::{StreamError, StreamItem};
 use crate::streaming_request_hook::UsageState;
 use async_trait::async_trait;
@@ -86,7 +87,7 @@ pub trait StreamingAgent: Send + Sync {
         query: &str,
         chat_history: Vec<Message>,
         cancel_token: CancellationToken,
-        request_id: &str,
+        request_id: &RequestId,
     ) -> Result<BoxStream<'static, Result<StreamItem, StreamError>>, StreamError>;
 
     /// Stream with timeout support.
@@ -111,7 +112,7 @@ pub trait StreamingAgent: Send + Sync {
         query: &str,
         chat_history: Vec<Message>,
         timeout: Duration,
-        request_id: &str,
+        request_id: &RequestId,
     ) -> (
         BoxStream<'static, Result<StreamItem, StreamError>>,
         tokio::sync::watch::Sender<bool>,
@@ -122,7 +123,7 @@ pub trait StreamingAgent: Send + Sync {
     ///
     /// Called on client disconnect or timeout to propagate `notifications/cancelled`
     /// to MCP servers. Returns the number of cancelled requests.
-    async fn cancel_and_close_mcp(&self, request_id: &str, reason: &str) -> usize;
+    async fn cancel_and_close_mcp(&self, request_id: &RequestId, reason: &str) -> usize;
 
     /// Return the configured context window size in tokens (from TOML config).
     /// Returns `None` if not configured (e.g., Orchestrator).

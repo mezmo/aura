@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use tokio::sync::broadcast;
 
+use crate::RequestId;
 use crate::hitl::{ApprovalDecision, DecisionId, ParkedApproval, ResolveError, Timestamp};
 
 use super::{ApprovalStore, EventBus, SessionStoreError, Subscription};
@@ -104,11 +105,11 @@ impl ApprovalStore for InMemoryApprovalStore {
 
     async fn cancel_request(
         &self,
-        request_id: &str,
+        request_id: &RequestId,
     ) -> Result<Vec<ParkedApproval>, SessionStoreError> {
         let cleared: Vec<ParkedApproval> = self
             .lock()
-            .extract_if(.., |_, parked| parked.request.request_id == request_id)
+            .extract_if(.., |_, parked| &parked.request.request_id == request_id)
             .map(|(_, parked)| parked)
             .collect();
         Ok(cleared)
@@ -202,14 +203,14 @@ mod tests {
         AgentScope, ApprovalItem, ApprovalOrigin, ApprovalRequest, PROTOCOL_VERSION,
     };
 
-    fn parked(request_id: &str) -> ParkedApproval {
+    fn parked(request_id: &RequestId) -> ParkedApproval {
         let now = chrono::Utc::now();
         ParkedApproval {
             request: ApprovalRequest {
                 version: PROTOCOL_VERSION,
                 instance_id: "test-instance".to_string(),
                 decision_id: DecisionId::generate(),
-                request_id: request_id.to_string(),
+                request_id: request_id.clone(),
                 scope: AgentScope::Single { session_id: None },
                 origin: ApprovalOrigin::ConfigGate {
                     matched_pattern: "test_*".to_string(),
@@ -229,7 +230,7 @@ mod tests {
     #[tokio::test]
     async fn approval_store_register_get_resolve() {
         let store = InMemoryApprovalStore::new();
-        let entry = parked("req-1");
+        let entry = parked(&RequestId::new("req-1"));
         let id = entry.request.decision_id;
 
         store.register(entry).await.unwrap();
@@ -249,7 +250,7 @@ mod tests {
     #[tokio::test]
     async fn approval_store_resolve_records_readable_decision() {
         let store = InMemoryApprovalStore::new();
-        let entry = parked("req-durable");
+        let entry = parked(&RequestId::new("req-durable"));
         let id = entry.request.decision_id;
         store.register(entry).await.unwrap();
 
@@ -272,7 +273,7 @@ mod tests {
     #[tokio::test]
     async fn recorded_decision_is_pruned_after_retention_window() {
         let store = InMemoryApprovalStore::new();
-        let id = parked("req-prune").request.decision_id;
+        let id = parked(&RequestId::new("req-prune")).request.decision_id;
         store.lock_decided().insert(
             id,
             DecidedEntry {
@@ -288,7 +289,7 @@ mod tests {
     #[tokio::test]
     async fn expired_ticket_refuses_resolve() {
         let store = InMemoryApprovalStore::new();
-        let mut entry = parked("req-expired");
+        let mut entry = parked(&RequestId::new("req-expired"));
         entry.expires_at = chrono::Utc::now() - chrono::Duration::seconds(1);
         let id = entry.request.decision_id;
         store.register(entry).await.unwrap();
@@ -305,7 +306,7 @@ mod tests {
     #[tokio::test]
     async fn expired_ticket_is_returned_by_get_until_remove() {
         let store = InMemoryApprovalStore::new();
-        let mut entry = parked("req-expired-get");
+        let mut entry = parked(&RequestId::new("req-expired-get"));
         entry.expires_at = chrono::Utc::now() - chrono::Duration::seconds(1);
         let id = entry.request.decision_id;
         store.register(entry).await.unwrap();
@@ -318,14 +319,17 @@ mod tests {
     #[tokio::test]
     async fn approval_store_cancel_request_removes_only_matching() {
         let store = InMemoryApprovalStore::new();
-        let cancel = parked("req-cancel");
+        let cancel = parked(&RequestId::new("req-cancel"));
         let cancel_id = cancel.request.decision_id;
-        let keep = parked("req-keep");
+        let keep = parked(&RequestId::new("req-keep"));
         let keep_id = keep.request.decision_id;
         store.register(cancel).await.unwrap();
         store.register(keep).await.unwrap();
 
-        let cleared = store.cancel_request("req-cancel").await.unwrap();
+        let cleared = store
+            .cancel_request(&RequestId::new("req-cancel"))
+            .await
+            .unwrap();
 
         assert_eq!(cleared.len(), 1, "only the matching ticket is cleared");
         assert_eq!(cleared[0].request.decision_id, cancel_id);

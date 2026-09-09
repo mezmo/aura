@@ -35,6 +35,7 @@ use crate::session_store::{
 
 use super::decision::{ApprovalDecision, AwaitingDecision, DecisionId, Timestamp};
 use super::protocol::ApprovalRequest;
+use crate::RequestId;
 
 /// Bus topic carrying the decision for one parked approval.
 fn approval_topic(id: &DecisionId) -> String {
@@ -60,7 +61,7 @@ struct PendingApprovalsInner {
 
 /// The process-local half of one parked approval.
 struct WakeEntry {
-    request_id: String,
+    request_id: RequestId,
     wake: oneshot::Sender<ApprovalDecision>,
     wake_task: AbortHandle,
 }
@@ -246,13 +247,13 @@ impl PendingApprovals {
     /// Synchronously drop the wake handles parked under a request id; their
     /// awaits resolve to `Cancelled`. Leaves store entries in place — use
     /// [`Self::cancel_request`] to also clean the store.
-    pub fn cancel_request_local(&self, request_id: &str) {
+    pub fn cancel_request_local(&self, request_id: &RequestId) {
         self.0
             .wakes
             .lock()
             .expect("registry lock poisoned")
             .retain(|_, entry| {
-                if entry.request_id == request_id {
+                if &entry.request_id == request_id {
                     entry.abort_wake_task();
                     false
                 } else {
@@ -264,12 +265,12 @@ impl PendingApprovals {
     /// Cancel every approval parked under a request id (stream drop /
     /// shutdown); their awaits resolve to `Cancelled`. Returns the approvals
     /// the store cleared, empty on a store fault.
-    pub async fn cancel_request(&self, request_id: &str) -> Vec<ParkedApproval> {
+    pub async fn cancel_request(&self, request_id: &RequestId) -> Vec<ParkedApproval> {
         self.cancel_request_local(request_id);
         match self.0.store.cancel_request(request_id).await {
             Ok(cleared) => cleared,
             Err(err) => {
-                warn!(request_id, error = %err, "approval store cancel_request failed");
+                warn!(%request_id, error = %err, "approval store cancel_request failed");
                 Vec::new()
             }
         }
@@ -371,12 +372,12 @@ mod tests {
     };
     use crate::hitl::protocol::{ApprovalItem, ApprovalRequest, PROTOCOL_VERSION};
 
-    fn test_request(request_id: &str) -> ApprovalRequest {
+    fn test_request(request_id: &RequestId) -> ApprovalRequest {
         ApprovalRequest {
             version: PROTOCOL_VERSION,
             instance_id: "test-instance".to_string(),
             decision_id: DecisionId::generate(),
-            request_id: request_id.to_string(),
+            request_id: request_id.clone(),
             scope: AgentScope::Single { session_id: None },
             origin: ApprovalOrigin::ConfigGate {
                 matched_pattern: "test_*".to_string(),
@@ -393,7 +394,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn register_and_resolve_approved() {
         let registry = PendingApprovals::new();
-        let req = test_request("req-1");
+        let req = test_request(&RequestId::new("req-1"));
         let id = req.decision_id;
         let handle = registry.register(req, Duration::from_secs(60)).await;
         let cancel = RequestCancelToken::unbound();
@@ -412,7 +413,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn register_and_resolve_denied() {
         let registry = PendingApprovals::new();
-        let req = test_request("req-2");
+        let req = test_request(&RequestId::new("req-2"));
         let id = req.decision_id;
         let handle = registry.register(req, Duration::from_secs(60)).await;
         let cancel = RequestCancelToken::unbound();
@@ -448,7 +449,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_twice_returns_not_found_on_second() {
         let registry = PendingApprovals::new();
-        let req = test_request("req-3");
+        let req = test_request(&RequestId::new("req-3"));
         let id = req.decision_id;
         let _handle = registry.register(req, Duration::from_secs(60)).await;
 
@@ -465,7 +466,7 @@ mod tests {
     #[tokio::test]
     async fn remove_makes_resolve_return_not_found() {
         let registry = PendingApprovals::new();
-        let req = test_request("req-remove");
+        let req = test_request(&RequestId::new("req-remove"));
         let id = req.decision_id;
         let _handle = registry.register(req, Duration::from_secs(60)).await;
 
@@ -482,7 +483,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_succeeds_after_awaiting_handle_dropped() {
         let registry = PendingApprovals::new();
-        let req = test_request("req-dropped");
+        let req = test_request(&RequestId::new("req-dropped"));
         let id = req.decision_id;
         let handle = registry.register(req, Duration::from_secs(60)).await;
         drop(handle);
@@ -502,7 +503,7 @@ mod tests {
         let registry = PendingApprovals::with_backend(store, bus.clone());
         let cancel = RequestCancelToken::unbound();
 
-        let req = test_request("req-garbage");
+        let req = test_request(&RequestId::new("req-garbage"));
         let id = req.decision_id;
         let handle = registry.register(req, Duration::from_secs(60)).await;
 
@@ -527,12 +528,12 @@ mod tests {
         let store: Arc<dyn ApprovalStore> = Arc::new(InMemoryApprovalStore::new());
         let registry =
             PendingApprovals::with_backend(store.clone(), Arc::new(InMemoryEventBus::new()));
-        let req = test_request("req-local");
+        let req = test_request(&RequestId::new("req-local"));
         let id = req.decision_id;
         let handle = registry.register(req, Duration::from_secs(60)).await;
         let cancel = RequestCancelToken::unbound();
 
-        registry.cancel_request_local("req-local");
+        registry.cancel_request_local(&RequestId::new("req-local"));
 
         assert_eq!(
             handle.outcome(&cancel).await,
@@ -543,22 +544,22 @@ mod tests {
             "store entry remains for the async half"
         );
 
-        registry.cancel_request("req-local").await;
+        registry.cancel_request(&RequestId::new("req-local")).await;
         assert!(store.get(&id).await.unwrap().is_none());
     }
 
     #[tokio::test(start_paused = true)]
     async fn cancel_request_drops_matching_entries() {
         let registry = PendingApprovals::new();
-        let req_a = test_request("req-cancel");
-        let req_b = test_request("req-keep");
+        let req_a = test_request(&RequestId::new("req-cancel"));
+        let req_b = test_request(&RequestId::new("req-keep"));
         let id_a = req_a.decision_id;
         let id_b = req_b.decision_id;
         let handle_a = registry.register(req_a, Duration::from_secs(60)).await;
         let handle_b = registry.register(req_b, Duration::from_secs(60)).await;
         let cancel = RequestCancelToken::unbound();
 
-        registry.cancel_request("req-cancel").await;
+        registry.cancel_request(&RequestId::new("req-cancel")).await;
 
         assert_eq!(
             handle_a.outcome(&cancel).await,
@@ -585,7 +586,7 @@ mod tests {
         let store = Arc::new(InMemoryApprovalStore::new());
         let registry =
             PendingApprovals::with_backend(store.clone(), Arc::new(InMemoryEventBus::new()));
-        let req = test_request("req-ts");
+        let req = test_request(&RequestId::new("req-ts"));
         let id = req.decision_id;
         let timeout = Duration::from_secs(300);
         let before = chrono::Utc::now();
@@ -641,7 +642,7 @@ mod tests {
         let resolver = PendingApprovals::with_backend(store, bus);
         let cancel = RequestCancelToken::unbound();
 
-        let req = test_request("req-lost-wake");
+        let req = test_request(&RequestId::new("req-lost-wake"));
         let id = req.decision_id;
         let started = Instant::now();
         let handle = parker.register(req, Duration::from_secs(60)).await;
@@ -672,7 +673,7 @@ mod tests {
         );
         let cancel = RequestCancelToken::unbound();
 
-        let req = test_request("req-deaf");
+        let req = test_request(&RequestId::new("req-deaf"));
         let id = req.decision_id;
         let handle = registry.register(req, Duration::from_secs(60)).await;
 
@@ -705,7 +706,7 @@ mod tests {
         let instance_b = PendingApprovals::with_backend(store, bus);
         let cancel = RequestCancelToken::unbound();
 
-        let req = test_request("req-cross");
+        let req = test_request(&RequestId::new("req-cross"));
         let id = req.decision_id;
         let handle = instance_a.register(req, Duration::from_secs(60)).await;
 

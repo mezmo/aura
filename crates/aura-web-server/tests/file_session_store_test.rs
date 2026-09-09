@@ -8,6 +8,7 @@
 
 mod common;
 
+use aura::RequestId;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -255,7 +256,10 @@ async fn cancel_request_removes_only_undecided_matching_approvals() {
     let other_id = other.request.decision_id;
     store.register(other).await.unwrap();
 
-    let cleared = store.cancel_request("req-owner").await.unwrap();
+    let cleared = store
+        .cancel_request(&RequestId::new("req-owner"))
+        .await
+        .unwrap();
 
     assert_eq!(cleared.len(), 1, "only the undecided ticket is cleared");
     assert_eq!(cleared[0].request.decision_id, undecided_id);
@@ -299,7 +303,10 @@ async fn cancel_request_sweeps_a_stale_decided_approval_without_returning_it() {
     )
     .unwrap();
 
-    let cleared = store.cancel_request("req-residue").await.unwrap();
+    let cleared = store
+        .cancel_request(&RequestId::new("req-residue"))
+        .await
+        .unwrap();
 
     assert_eq!(cleared.len(), 1, "only the undecided ticket is cleared");
     assert_eq!(cleared[0].request.decision_id, undecided_id);
@@ -336,7 +343,10 @@ async fn cancel_request_skips_an_undecodable_approval_file() {
     let corrupt = dir.path().join("approvals").join("corrupt.json");
     std::fs::write(&corrupt, b"not json").unwrap();
 
-    let cleared = store.cancel_request("req-corrupt").await.unwrap();
+    let cleared = store
+        .cancel_request(&RequestId::new("req-corrupt"))
+        .await
+        .unwrap();
 
     assert_eq!(cleared.len(), 1);
     assert_eq!(cleared[0].request.decision_id, id);

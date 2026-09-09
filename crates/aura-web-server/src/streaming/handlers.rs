@@ -19,6 +19,7 @@
 //! 3. Cancel MCP requests and close connections via `agent.cancel_and_close_mcp()`
 
 use crate::streaming::types::openai::UsageInfo;
+use aura::RequestId;
 
 use super::types::{
     CHUNK_OBJECT, ChatCompletionChunk, ChatCompletionChunkChoice, ChatCompletionChunkDelta,
@@ -42,7 +43,7 @@ use tokio::sync::{mpsc, watch};
 /// Context for cancellation and cleanup callbacks.
 pub struct StreamingCallbacks {
     /// Request ID for cancellation registry
-    pub request_id: String,
+    pub request_id: RequestId,
     /// Agent reference for MCP cleanup (cancel_and_close_mcp)
     pub agent: Arc<dyn StreamingAgent>,
     /// MCP tool event receiver (for aura.tool_requested and aura.tool_start events)
@@ -2128,7 +2129,7 @@ mod tests {
             let (approval_tx, approval_event_rx) = mpsc::channel(8);
             (
                 StreamingCallbacks {
-                    request_id: "req_inactivity_test".to_string(),
+                    request_id: RequestId::new("req_inactivity_test"),
                     agent: Arc::new(MockAgent::pending()),
                     tool_event_rx,
                     progress_rx,
@@ -2514,7 +2515,7 @@ mod tests {
                     _approval_tx: approval_tx,
                 },
                 StreamingCallbacks {
-                    request_id: "req_tool_events".to_string(),
+                    request_id: RequestId::new("req_tool_events"),
                     agent: Arc::new(MockAgent::pending()),
                     tool_event_rx,
                     progress_rx,
@@ -2567,7 +2568,12 @@ mod tests {
             );
 
             let stream = MockAgent::scripted(steps)
-                .stream("q", vec![], CancellationToken::new(), "req_tool_events")
+                .stream(
+                    "q",
+                    vec![],
+                    CancellationToken::new(),
+                    &RequestId::new("req_tool_events"),
+                )
                 .await
                 .expect("mock stream should start");
 

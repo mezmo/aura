@@ -25,7 +25,7 @@
 //! # Usage
 //!
 //! ```ignore
-//! let (hook, cancel_sender, usage_state) = StreamingRequestHook::new(Duration::from_secs(60), "req_123");
+//! let (hook, cancel_sender, usage_state) = StreamingRequestHook::new(Duration::from_secs(60), RequestId::new("req_123"));
 //!
 //! // Pass hook to streaming request
 //! agent.stream_prompt(query).with_hook(hook).multi_turn(depth).await;
@@ -48,6 +48,7 @@ use rig::agent::{CancelSignal, StreamingPromptHook};
 use rig::completion::{CompletionModel, GetTokenUsage, Message};
 use tokio::sync::watch;
 
+use crate::RequestId;
 use crate::orchestration::BlockedCell;
 use crate::scratchpad::{self, ContextBudget};
 use crate::tool_event_broker::{
@@ -70,23 +71,24 @@ pub(crate) const PARK_CANCEL_REASON: &str = "parked";
 /// id the orchestrator passes as the hook's `request_id`. The hook is built
 /// inside the streaming layer and cannot take the cell as a parameter, so it
 /// travels through this request-keyed global like the tool-event broker.
-static PARK_CELLS: OnceLock<std::sync::RwLock<HashMap<String, Arc<BlockedCell>>>> = OnceLock::new();
+static PARK_CELLS: OnceLock<std::sync::RwLock<HashMap<RequestId, Arc<BlockedCell>>>> =
+    OnceLock::new();
 
-fn park_cells() -> &'static std::sync::RwLock<HashMap<String, Arc<BlockedCell>>> {
+fn park_cells() -> &'static std::sync::RwLock<HashMap<RequestId, Arc<BlockedCell>>> {
     PARK_CELLS.get_or_init(|| std::sync::RwLock::new(HashMap::new()))
 }
 
 /// A worker stream's park-cell registration; dropping it removes the cell
 /// and the stream's tool-event subscription.
-pub(crate) struct ParkCellRegistration(String);
+pub(crate) struct ParkCellRegistration(RequestId);
 
 impl ParkCellRegistration {
-    pub(crate) fn new(key: &str, cell: Arc<BlockedCell>) -> Self {
+    pub(crate) fn new(key: &RequestId, cell: Arc<BlockedCell>) -> Self {
         park_cells()
             .write()
             .expect("park cell registry poisoned")
-            .insert(key.to_string(), cell);
-        Self(key.to_string())
+            .insert(key.clone(), cell);
+        Self(key.clone())
     }
 }
 
@@ -99,14 +101,14 @@ impl Drop for ParkCellRegistration {
         // The hook keyed its tool-event FIFO under the same id; the broker is
         // async, so that cleanup runs as its own task when a runtime exists.
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            let key = std::mem::take(&mut self.0);
+            let key = self.0.clone();
             handle.spawn(async move { crate::tool_event_broker::unsubscribe(&key).await });
         }
     }
 }
 
 /// The blocked cell for `key`, if this stream is in park mode.
-pub(crate) fn park_cell_for(key: &str) -> Option<Arc<BlockedCell>> {
+pub(crate) fn park_cell_for(key: &RequestId) -> Option<Arc<BlockedCell>> {
     park_cells()
         .read()
         .expect("park cell registry poisoned")
@@ -370,7 +372,7 @@ pub struct StreamingRequestHook {
     /// External cancellation signal (e.g., from client disconnect)
     cancelled: watch::Receiver<bool>,
     /// Request ID for event correlation
-    request_id: String,
+    request_id: RequestId,
     /// Shared usage state (returned separately for handler access)
     usage_state: UsageState,
     /// Optional per-agent scratchpad budget. When set, the hook feeds the
@@ -395,7 +397,7 @@ impl StreamingRequestHook {
     /// - `usage_state`: Shared state - handler keeps clone to read final usage at stream end
     pub fn new(
         timeout: Duration,
-        request_id: impl Into<String>,
+        request_id: RequestId,
     ) -> (Self, watch::Sender<bool>, UsageState) {
         Self::with_scratchpad_budget(timeout, request_id, None)
     }
@@ -406,7 +408,7 @@ impl StreamingRequestHook {
     /// `StreamItem::TurnUsage`).
     pub fn with_scratchpad_budget(
         timeout: Duration,
-        request_id: impl Into<String>,
+        request_id: RequestId,
         scratchpad_budget: Option<ContextBudget>,
     ) -> (Self, watch::Sender<bool>, UsageState) {
         let (tx, rx) = watch::channel(false);
@@ -415,7 +417,7 @@ impl StreamingRequestHook {
             start_time: Instant::now(),
             timeout,
             cancelled: rx,
-            request_id: request_id.into(),
+            request_id,
             usage_state: usage_state.clone(),
             scratchpad_budget,
             client_tool_names: HashSet::new(),
@@ -766,7 +768,7 @@ mod tests {
     #[test]
     fn test_streaming_request_hook_creation() {
         let (hook, _tx, _usage_state) =
-            StreamingRequestHook::new(Duration::from_secs(60), "test_req_1");
+            StreamingRequestHook::new(Duration::from_secs(60), RequestId::new("test_req_1"));
         assert!(!hook.should_cancel());
         assert_eq!(hook.request_id, "test_req_1");
     }
@@ -779,8 +781,8 @@ mod tests {
     async fn park_cell_registration_isolates_keys_and_removes_on_drop() {
         let cell_a = Arc::new(BlockedCell::default());
         let cell_b = Arc::new(BlockedCell::default());
-        let key_a = format!("park_reg_{}", uuid::Uuid::new_v4().simple());
-        let key_b = format!("park_reg_{}", uuid::Uuid::new_v4().simple());
+        let key_a = RequestId::new(format!("park_reg_{}", uuid::Uuid::new_v4().simple()));
+        let key_b = RequestId::new(format!("park_reg_{}", uuid::Uuid::new_v4().simple()));
 
         assert!(park_cell_for(&key_a).is_none());
         let reg_a = ParkCellRegistration::new(&key_a, cell_a.clone());
@@ -808,7 +810,7 @@ mod tests {
     #[test]
     fn test_external_cancellation() {
         let (hook, tx, _usage_state) =
-            StreamingRequestHook::new(Duration::from_secs(60), "test_req_2");
+            StreamingRequestHook::new(Duration::from_secs(60), RequestId::new("test_req_2"));
         assert!(!hook.should_cancel());
 
         // Signal cancellation
@@ -820,7 +822,7 @@ mod tests {
     fn test_timeout_detection() {
         // Create hook with very short timeout
         let (hook, _tx, _usage_state) =
-            StreamingRequestHook::new(Duration::from_millis(1), "test_req_3");
+            StreamingRequestHook::new(Duration::from_millis(1), RequestId::new("test_req_3"));
 
         // Wait for timeout
         std::thread::sleep(Duration::from_millis(5));
@@ -830,7 +832,7 @@ mod tests {
     #[test]
     fn test_usage_state_creation() {
         let (_hook, _tx, usage_state) =
-            StreamingRequestHook::new(Duration::from_secs(60), "test_req_4");
+            StreamingRequestHook::new(Duration::from_secs(60), RequestId::new("test_req_4"));
 
         // Initially all zeros
         let (prompt, completion, total) = usage_state.get_final_usage();
@@ -957,7 +959,7 @@ mod tests {
     #[test]
     fn test_usage_state_shared_between_clones() {
         let (_hook, _tx, usage_state) =
-            StreamingRequestHook::new(Duration::from_secs(60), "test_req_5");
+            StreamingRequestHook::new(Duration::from_secs(60), RequestId::new("test_req_5"));
         let usage_state_clone = usage_state.clone();
 
         // Modify through original (tool turn)
@@ -1017,9 +1019,13 @@ mod tests {
 
     #[test]
     fn test_with_scratchpad_budget_none_matches_new() {
-        let (hook_a, _, _) = StreamingRequestHook::new(Duration::from_secs(60), "req_a");
-        let (hook_b, _, _) =
-            StreamingRequestHook::with_scratchpad_budget(Duration::from_secs(60), "req_b", None);
+        let (hook_a, _, _) =
+            StreamingRequestHook::new(Duration::from_secs(60), RequestId::new("req_a"));
+        let (hook_b, _, _) = StreamingRequestHook::with_scratchpad_budget(
+            Duration::from_secs(60),
+            RequestId::new("req_b"),
+            None,
+        );
         // Both hooks should report no scratchpad budget.
         assert!(hook_a.scratchpad_budget.is_none());
         assert!(hook_b.scratchpad_budget.is_none());
@@ -1032,7 +1038,7 @@ mod tests {
         let budget = ContextBudget::new(128_000, 0.20, 0, counter);
         let (hook, _, _) = StreamingRequestHook::with_scratchpad_budget(
             Duration::from_secs(60),
-            "req_with_budget",
+            RequestId::new("req_with_budget"),
             Some(budget.clone()),
         );
         let stored = hook

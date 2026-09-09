@@ -3,6 +3,7 @@
 //! Routes progress notifications to specific HTTP requests only (no cross-customer leakage).
 //! Channels auto-cleanup when receiver is dropped at request end.
 
+use crate::RequestId;
 use rmcp::model::ProgressToken;
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -35,7 +36,7 @@ impl ProgressNotification {
 /// to specific HTTP requests only.
 pub struct RequestProgressBroker {
     /// Map of request_id -> progress channel sender
-    senders: RwLock<HashMap<String, mpsc::Sender<ProgressNotification>>>,
+    senders: RwLock<HashMap<RequestId, mpsc::Sender<ProgressNotification>>>,
 }
 
 impl RequestProgressBroker {
@@ -46,11 +47,11 @@ impl RequestProgressBroker {
     }
 
     /// Subscribe to progress notifications for a request. Auto-unsubscribes when receiver dropped.
-    pub async fn subscribe(&self, request_id: &str) -> mpsc::Receiver<ProgressNotification> {
+    pub async fn subscribe(&self, request_id: &RequestId) -> mpsc::Receiver<ProgressNotification> {
         let (tx, rx) = mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
 
         let mut senders = self.senders.write().await;
-        senders.insert(request_id.to_string(), tx);
+        senders.insert(request_id.clone(), tx);
 
         debug!(
             "Progress subscription created for request '{}' (total active: {})",
@@ -61,7 +62,7 @@ impl RequestProgressBroker {
         rx
     }
 
-    pub async fn unsubscribe(&self, request_id: &str) {
+    pub async fn unsubscribe(&self, request_id: &RequestId) {
         let mut senders = self.senders.write().await;
         if senders.remove(request_id).is_some() {
             debug!(
@@ -74,7 +75,11 @@ impl RequestProgressBroker {
 
     /// Publish a progress notification. Returns true if sent, false if no subscriber.
     /// Automatically cleans up stale entries when receiver has been dropped.
-    pub async fn publish(&self, request_id: &str, notification: ProgressNotification) -> bool {
+    pub async fn publish(
+        &self,
+        request_id: &RequestId,
+        notification: ProgressNotification,
+    ) -> bool {
         // First try with read lock
         let send_result = {
             let senders = self.senders.read().await;
@@ -126,15 +131,15 @@ pub fn global() -> &'static RequestProgressBroker {
     GLOBAL_BROKER.get_or_init(RequestProgressBroker::new)
 }
 
-pub async fn subscribe(request_id: &str) -> mpsc::Receiver<ProgressNotification> {
+pub async fn subscribe(request_id: &RequestId) -> mpsc::Receiver<ProgressNotification> {
     global().subscribe(request_id).await
 }
 
-pub async fn unsubscribe(request_id: &str) {
+pub async fn unsubscribe(request_id: &RequestId) {
     global().unsubscribe(request_id).await
 }
 
-pub async fn publish(request_id: &str, notification: ProgressNotification) -> bool {
+pub async fn publish(request_id: &RequestId, notification: ProgressNotification) -> bool {
     global().publish(request_id, notification).await
 }
 
@@ -163,24 +168,24 @@ mod tests {
     #[tokio::test]
     async fn test_subscribe_creates_channel() {
         let broker = RequestProgressBroker::new();
-        let _rx = broker.subscribe("req_123").await;
+        let _rx = broker.subscribe(&RequestId::new("req_123")).await;
         assert_eq!(broker.active_subscriptions().await, 1);
     }
 
     #[tokio::test]
     async fn test_unsubscribe_removes_channel() {
         let broker = RequestProgressBroker::new();
-        let _rx = broker.subscribe("req_123").await;
+        let _rx = broker.subscribe(&RequestId::new("req_123")).await;
         assert_eq!(broker.active_subscriptions().await, 1);
 
-        broker.unsubscribe("req_123").await;
+        broker.unsubscribe(&RequestId::new("req_123")).await;
         assert_eq!(broker.active_subscriptions().await, 0);
     }
 
     #[tokio::test]
     async fn test_publish_to_subscribed_request() {
         let broker = RequestProgressBroker::new();
-        let mut rx = broker.subscribe("req_123").await;
+        let mut rx = broker.subscribe(&RequestId::new("req_123")).await;
 
         let notification = ProgressNotification {
             progress_token: numeric_token(1),
@@ -189,7 +194,9 @@ mod tests {
             agent: None,
         };
 
-        let sent = broker.publish("req_123", notification).await;
+        let sent = broker
+            .publish(&RequestId::new("req_123"), notification)
+            .await;
         assert!(sent);
 
         let received = rx.recv().await.unwrap();
@@ -209,15 +216,17 @@ mod tests {
         };
 
         // No subscriber - should return false
-        let sent = broker.publish("req_nonexistent", notification).await;
+        let sent = broker
+            .publish(&RequestId::new("req_nonexistent"), notification)
+            .await;
         assert!(!sent);
     }
 
     #[tokio::test]
     async fn test_requests_are_isolated() {
         let broker = RequestProgressBroker::new();
-        let mut rx1 = broker.subscribe("req_1").await;
-        let mut rx2 = broker.subscribe("req_2").await;
+        let mut rx1 = broker.subscribe(&RequestId::new("req_1")).await;
+        let mut rx2 = broker.subscribe(&RequestId::new("req_2")).await;
 
         // Send to req_1 only
         let notification = ProgressNotification {
@@ -226,7 +235,7 @@ mod tests {
             message: Some("Request 1 progress".to_string()),
             agent: None,
         };
-        broker.publish("req_1", notification).await;
+        broker.publish(&RequestId::new("req_1"), notification).await;
 
         // req_1 should receive it
         let received = rx1.recv().await.unwrap();
@@ -239,7 +248,7 @@ mod tests {
     #[tokio::test]
     async fn test_multiple_notifications_same_request() {
         let broker = RequestProgressBroker::new();
-        let mut rx = broker.subscribe("req_123").await;
+        let mut rx = broker.subscribe(&RequestId::new("req_123")).await;
 
         // Send multiple notifications
         for i in 1..=5 {
@@ -249,7 +258,9 @@ mod tests {
                 message: Some(format!("Step {}", i)),
                 agent: None,
             };
-            broker.publish("req_123", notification).await;
+            broker
+                .publish(&RequestId::new("req_123"), notification)
+                .await;
         }
 
         // Should receive all 5
@@ -266,7 +277,7 @@ mod tests {
 
         // Subscribe and verify entry exists
         {
-            let _rx = broker.subscribe("req_cleanup").await;
+            let _rx = broker.subscribe(&RequestId::new("req_cleanup")).await;
             assert_eq!(broker.active_subscriptions().await, 1);
         } // Receiver dropped here
 
@@ -278,7 +289,9 @@ mod tests {
             message: Some("Should fail".to_string()),
             agent: None,
         };
-        let sent = broker.publish("req_cleanup", notification).await;
+        let sent = broker
+            .publish(&RequestId::new("req_cleanup"), notification)
+            .await;
 
         // Publish returns false when receiver is dropped
         assert!(!sent);
@@ -292,7 +305,7 @@ mod tests {
         let broker = RequestProgressBroker::new();
 
         // Subscribe and keep receiver alive
-        let mut rx = broker.subscribe("req_active").await;
+        let mut rx = broker.subscribe(&RequestId::new("req_active")).await;
         assert_eq!(broker.active_subscriptions().await, 1);
 
         // Publish should succeed
@@ -302,7 +315,9 @@ mod tests {
             message: Some("Should succeed".to_string()),
             agent: None,
         };
-        let sent = broker.publish("req_active", notification).await;
+        let sent = broker
+            .publish(&RequestId::new("req_active"), notification)
+            .await;
         assert!(sent);
 
         // Receiver should get the message
@@ -323,7 +338,7 @@ mod tests {
     #[tokio::test]
     async fn test_channel_backpressure_behavior() {
         let broker = RequestProgressBroker::new();
-        let _rx = broker.subscribe("req_backpressure").await;
+        let _rx = broker.subscribe(&RequestId::new("req_backpressure")).await;
         // Don't read from _rx - simulate slow consumer
 
         // Send more messages than channel capacity (1024)
@@ -339,7 +354,9 @@ mod tests {
                     message: Some(format!("msg {}", i)),
                     agent: None,
                 };
-                broker.publish("req_backpressure", notification).await;
+                broker
+                    .publish(&RequestId::new("req_backpressure"), notification)
+                    .await;
             }
         })
         .await;
@@ -355,7 +372,7 @@ mod tests {
     #[tokio::test]
     async fn test_channel_drains_properly() {
         let broker = RequestProgressBroker::new();
-        let mut rx = broker.subscribe("req_drain").await;
+        let mut rx = broker.subscribe(&RequestId::new("req_drain")).await;
 
         // Send exactly capacity messages
         for i in 0..PROGRESS_CHANNEL_CAPACITY {
@@ -365,7 +382,11 @@ mod tests {
                 message: None,
                 agent: None,
             };
-            assert!(broker.publish("req_drain", notification).await);
+            assert!(
+                broker
+                    .publish(&RequestId::new("req_drain"), notification)
+                    .await
+            );
         }
 
         // Drain all messages
@@ -383,7 +404,7 @@ mod tests {
     #[tokio::test]
     async fn test_concurrent_publish_to_same_request() {
         let broker = std::sync::Arc::new(RequestProgressBroker::new());
-        let mut rx = broker.subscribe("req_concurrent").await;
+        let mut rx = broker.subscribe(&RequestId::new("req_concurrent")).await;
 
         // Spawn multiple publishers
         let handles: Vec<_> = (0..10)
@@ -397,7 +418,9 @@ mod tests {
                             message: Some(format!("pub {} msg {}", publisher_id, i)),
                             agent: None,
                         };
-                        broker.publish("req_concurrent", notification).await;
+                        broker
+                            .publish(&RequestId::new("req_concurrent"), notification)
+                            .await;
                     }
                 })
             })

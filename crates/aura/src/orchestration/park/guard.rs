@@ -3,6 +3,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::RequestId;
 use crate::hitl::PendingApprovals;
 
 use super::commit::cancel_run_approvals;
@@ -11,14 +12,18 @@ use super::commit::cancel_run_approvals;
 pub(crate) struct ParkGuard {
     registry: PendingApprovals,
     run_id: String,
-    request_id: String,
+    request_id: RequestId,
     published: AtomicBool,
     armed: AtomicBool,
 }
 
 impl ParkGuard {
     /// Create the guard for a run; inert until the first [`Self::record`].
-    pub(crate) fn new(registry: PendingApprovals, run_id: String, request_id: String) -> Arc<Self> {
+    pub(crate) fn new(
+        registry: PendingApprovals,
+        run_id: String,
+        request_id: RequestId,
+    ) -> Arc<Self> {
         Arc::new(Self {
             registry,
             run_id,
@@ -103,7 +108,7 @@ mod tests {
 
     fn durable_approval(
         decision_id: DecisionId,
-        owner: &str,
+        owner: &RequestId,
         scope: &AgentScope,
     ) -> ParkedApproval {
         ParkedApproval {
@@ -111,7 +116,7 @@ mod tests {
                 version: PROTOCOL_VERSION,
                 instance_id: "test-instance".to_string(),
                 decision_id,
-                request_id: owner.to_string(),
+                request_id: owner.clone(),
                 scope: scope.clone(),
                 origin: ApprovalOrigin::ConfigGate {
                     matched_pattern: "kubectl_*".to_string(),
@@ -141,7 +146,7 @@ mod tests {
     async fn unpublished_guard_drop_cancels_run_approvals() {
         let (registry, store) = registry_with_store();
         let run_id: RunId = "0191e8c0-2222-7000-8000-000000000042".parse().unwrap();
-        let request_id = format!("req_guard_{}", uuid::Uuid::new_v4().simple());
+        let request_id = RequestId::new(format!("req_guard_{}", uuid::Uuid::new_v4().simple()));
         let mut events = crate::approval_event_broker::subscribe(&request_id).await;
 
         let scope = worker_scope(run_id);
@@ -149,7 +154,7 @@ mod tests {
         registry
             .register_durable(durable_approval(
                 decision_id,
-                &format!("run:{run_id}"),
+                &RequestId::new(format!("run:{run_id}")),
                 &scope,
             ))
             .await
@@ -194,13 +199,17 @@ mod tests {
         registry
             .register_durable(durable_approval(
                 decision_id,
-                &format!("run:{run_id}"),
+                &RequestId::new(format!("run:{run_id}")),
                 &scope,
             ))
             .await
             .unwrap();
 
-        let guard = ParkGuard::new(registry.clone(), run_id.to_string(), "req_x".to_string());
+        let guard = ParkGuard::new(
+            registry.clone(),
+            run_id.to_string(),
+            RequestId::new("req_x"),
+        );
         guard.record(std::slice::from_ref(&parked_call(decision_id)));
         guard.mark_published();
         drop(guard);
@@ -228,7 +237,11 @@ mod tests {
             .await
             .unwrap();
 
-        let guard = ParkGuard::new(registry.clone(), run_id.to_string(), "req_y".to_string());
+        let guard = ParkGuard::new(
+            registry.clone(),
+            run_id.to_string(),
+            RequestId::new("req_y"),
+        );
         drop(guard);
 
         tokio::time::sleep(Duration::from_millis(25)).await;

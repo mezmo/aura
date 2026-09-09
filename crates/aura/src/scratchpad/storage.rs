@@ -1,5 +1,6 @@
 //! Scratchpad storage: file I/O, path validation, format detection, cleanup.
 
+use crate::RequestId;
 use std::path::{Path, PathBuf};
 use tokio::fs;
 use tracing::{debug, info, warn};
@@ -141,8 +142,19 @@ impl ScratchpadStorage {
     }
 
     /// Create storage with a specific base directory (for testing).
-    pub async fn with_base_dir(base: &Path, request_id: &str) -> std::io::Result<Self> {
-        let dir = base.join(request_id);
+    ///
+    /// Rejects an id that would not name a child of `base`, because `dir` is
+    /// what [`cleanup`](Self::cleanup) hands to `remove_dir_all`: an empty or
+    /// traversing id would aim that at `base` itself or above it.
+    pub async fn with_base_dir(base: &Path, request_id: &RequestId) -> std::io::Result<Self> {
+        let id = request_id.as_str();
+        if id.is_empty() || Path::new(id).components().count() != 1 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("request id {id:?} does not name a scratchpad directory"),
+            ));
+        }
+        let dir = base.join(id);
         fs::create_dir_all(&dir).await?;
         Ok(Self {
             read_root: dir.clone(),
@@ -621,7 +633,7 @@ mod tests {
     #[tokio::test]
     async fn test_write_and_read() {
         let tmp = TempDir::new().unwrap();
-        let storage = ScratchpadStorage::with_base_dir(tmp.path(), "req-1")
+        let storage = ScratchpadStorage::with_base_dir(tmp.path(), &RequestId::new("req-1"))
             .await
             .unwrap();
 
@@ -640,7 +652,7 @@ mod tests {
     #[tokio::test]
     async fn test_text_format_detection() {
         let tmp = TempDir::new().unwrap();
-        let storage = ScratchpadStorage::with_base_dir(tmp.path(), "req-2")
+        let storage = ScratchpadStorage::with_base_dir(tmp.path(), &RequestId::new("req-2"))
             .await
             .unwrap();
 
@@ -700,7 +712,7 @@ mod tests {
     #[tokio::test]
     async fn test_companion_extraction() {
         let tmp = TempDir::new().unwrap();
-        let storage = ScratchpadStorage::with_base_dir(tmp.path(), "req-comp")
+        let storage = ScratchpadStorage::with_base_dir(tmp.path(), &RequestId::new("req-comp"))
             .await
             .unwrap();
 
@@ -736,9 +748,10 @@ mod tests {
     #[tokio::test]
     async fn test_companion_path_traversal_is_sanitized() {
         let tmp = TempDir::new().unwrap();
-        let storage = ScratchpadStorage::with_base_dir(tmp.path(), "req-traversal")
-            .await
-            .unwrap();
+        let storage =
+            ScratchpadStorage::with_base_dir(tmp.path(), &RequestId::new("req-traversal"))
+                .await
+                .unwrap();
 
         // A malicious tool output with a JSON key that tries to escape the
         // scratchpad directory. Content is large enough to trigger companion
@@ -789,7 +802,7 @@ mod tests {
     #[tokio::test]
     async fn test_companion_not_extracted_for_small_strings() {
         let tmp = TempDir::new().unwrap();
-        let storage = ScratchpadStorage::with_base_dir(tmp.path(), "req-small")
+        let storage = ScratchpadStorage::with_base_dir(tmp.path(), &RequestId::new("req-small"))
             .await
             .unwrap();
 
@@ -804,7 +817,7 @@ mod tests {
     #[tokio::test]
     async fn test_companion_extraction_escaped_json() {
         let tmp = TempDir::new().unwrap();
-        let storage = ScratchpadStorage::with_base_dir(tmp.path(), "req-esc")
+        let storage = ScratchpadStorage::with_base_dir(tmp.path(), &RequestId::new("req-esc"))
             .await
             .unwrap();
 
@@ -848,7 +861,7 @@ mod tests {
     #[tokio::test]
     async fn test_validate_path_ok() {
         let tmp = TempDir::new().unwrap();
-        let storage = ScratchpadStorage::with_base_dir(tmp.path(), "req-3")
+        let storage = ScratchpadStorage::with_base_dir(tmp.path(), &RequestId::new("req-3"))
             .await
             .unwrap();
 
@@ -924,7 +937,7 @@ mod tests {
     #[tokio::test]
     async fn test_with_read_root_ignores_non_ancestor() {
         let tmp = TempDir::new().unwrap();
-        let storage = ScratchpadStorage::with_base_dir(tmp.path(), "req-rr")
+        let storage = ScratchpadStorage::with_base_dir(tmp.path(), &RequestId::new("req-rr"))
             .await
             .unwrap();
         let dir = storage.dir().to_path_buf();
@@ -937,7 +950,7 @@ mod tests {
     #[tokio::test]
     async fn test_validate_path_traversal_rejected() {
         let tmp = TempDir::new().unwrap();
-        let storage = ScratchpadStorage::with_base_dir(tmp.path(), "req-4")
+        let storage = ScratchpadStorage::with_base_dir(tmp.path(), &RequestId::new("req-4"))
             .await
             .unwrap();
 
@@ -961,7 +974,7 @@ mod tests {
         let secret = outside_tmp.path().join("secret.txt");
         std::fs::write(&secret, "out of bounds").unwrap();
 
-        let storage = ScratchpadStorage::with_base_dir(tmp.path(), "req-symlink")
+        let storage = ScratchpadStorage::with_base_dir(tmp.path(), &RequestId::new("req-symlink"))
             .await
             .unwrap();
         // Plant a symlink inside the scratchpad dir that points at `secret`.
@@ -983,7 +996,7 @@ mod tests {
     #[tokio::test]
     async fn test_validate_path_nonexistent_path_passes() {
         let tmp = TempDir::new().unwrap();
-        let storage = ScratchpadStorage::with_base_dir(tmp.path(), "req-nx")
+        let storage = ScratchpadStorage::with_base_dir(tmp.path(), &RequestId::new("req-nx"))
             .await
             .unwrap();
         let result = storage.validate_path("not_yet_written.json").await;
@@ -1000,7 +1013,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let tmp = TempDir::new().unwrap();
-        let storage = ScratchpadStorage::with_base_dir(tmp.path(), "req-io")
+        let storage = ScratchpadStorage::with_base_dir(tmp.path(), &RequestId::new("req-io"))
             .await
             .unwrap();
         let sub = storage.dir().join("locked");
@@ -1031,7 +1044,7 @@ mod tests {
     async fn test_validate_path_dangling_symlink_rejected() {
         let tmp = TempDir::new().unwrap();
         let outside = TempDir::new().unwrap();
-        let storage = ScratchpadStorage::with_base_dir(tmp.path(), "req-dangle")
+        let storage = ScratchpadStorage::with_base_dir(tmp.path(), &RequestId::new("req-dangle"))
             .await
             .unwrap();
 
@@ -1051,7 +1064,7 @@ mod tests {
     async fn test_validate_path_symlinked_ancestor_rejected() {
         let tmp = TempDir::new().unwrap();
         let outside = TempDir::new().unwrap();
-        let storage = ScratchpadStorage::with_base_dir(tmp.path(), "req-alias")
+        let storage = ScratchpadStorage::with_base_dir(tmp.path(), &RequestId::new("req-alias"))
             .await
             .unwrap();
 
@@ -1071,7 +1084,7 @@ mod tests {
     #[cfg(unix)]
     async fn test_validate_path_in_root_symlink_ancestor_accepted() {
         let tmp = TempDir::new().unwrap();
-        let storage = ScratchpadStorage::with_base_dir(tmp.path(), "req-inlink")
+        let storage = ScratchpadStorage::with_base_dir(tmp.path(), &RequestId::new("req-inlink"))
             .await
             .unwrap();
 
@@ -1089,7 +1102,7 @@ mod tests {
     #[tokio::test]
     async fn test_list_files() {
         let tmp = TempDir::new().unwrap();
-        let storage = ScratchpadStorage::with_base_dir(tmp.path(), "req-5")
+        let storage = ScratchpadStorage::with_base_dir(tmp.path(), &RequestId::new("req-5"))
             .await
             .unwrap();
 
@@ -1105,7 +1118,7 @@ mod tests {
     #[tokio::test]
     async fn test_cleanup() {
         let tmp = TempDir::new().unwrap();
-        let storage = ScratchpadStorage::with_base_dir(tmp.path(), "req-6")
+        let storage = ScratchpadStorage::with_base_dir(tmp.path(), &RequestId::new("req-6"))
             .await
             .unwrap();
 

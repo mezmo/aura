@@ -16,8 +16,8 @@ use aura::agent_events::{Routed, publish_to_brokers};
 use aura::tool_event_broker::publish_tool_requested;
 use aura::{
     ApprovalLifecycleEvent, NumberOrString, Progress, ProgressNotification, ProgressToken,
-    ResponseContent, StreamError, StreamItem, StreamingAgent, TokenUsage, ToolCallId, ToolName,
-    UsageState,
+    RequestId, ResponseContent, StreamError, StreamItem, StreamingAgent, TokenUsage, ToolCallId,
+    ToolName, UsageState,
 };
 use aura::{
     approval_event_subscribe, approval_event_unsubscribe, publish_tool_start, publish_tool_usage,
@@ -59,9 +59,9 @@ fn usage() -> TokenUsage {
 
 /// Subscribes exactly as the production handler does, so events reach the
 /// stream through the global brokers keyed by `request_id`.
-async fn callbacks_for(request_id: &str) -> StreamingCallbacks {
+async fn callbacks_for(request_id: &RequestId) -> StreamingCallbacks {
     StreamingCallbacks {
-        request_id: request_id.to_string(),
+        request_id: request_id.clone(),
         agent: Arc::new(MockAgent::pending()),
         tool_event_rx: tool_event_subscribe(request_id).await,
         progress_rx: request_progress_subscribe(request_id).await,
@@ -74,14 +74,14 @@ async fn callbacks_for(request_id: &str) -> StreamingCallbacks {
     }
 }
 
-async fn unsubscribe_all(request_id: &str) {
+async fn unsubscribe_all(request_id: &RequestId) {
     tool_event_unsubscribe(request_id).await;
     request_progress_unsubscribe(request_id).await;
     tool_usage_unsubscribe(request_id).await;
     approval_event_unsubscribe(request_id).await;
 }
 
-async fn run(request_id: &str, steps: Vec<Step>) -> Vec<SseEvent> {
+async fn run(request_id: &RequestId, steps: Vec<Step>) -> Vec<SseEvent> {
     let callbacks = callbacks_for(request_id).await;
     let config = StreamConfig::new(true, false, ToolResultMode::Aura, 0);
     let ctx = TurnContext::new(
@@ -142,11 +142,11 @@ fn frames(events: &[SseEvent]) -> Vec<(Option<String>, String)> {
 /// distinct request ids so their broker registrations cannot alias.
 async fn assert_paths_agree(
     case: &str,
-    broker: impl FnOnce(&str) -> Vec<Step>,
-    schema: impl FnOnce(&str) -> Vec<Step>,
+    broker: impl FnOnce(&RequestId) -> Vec<Step>,
+    schema: impl FnOnce(&RequestId) -> Vec<Step>,
 ) {
-    let broker_id = format!("req_broker_{case}");
-    let schema_id = format!("req_schema_{case}");
+    let broker_id = RequestId::new(format!("req_broker_{case}"));
+    let schema_id = RequestId::new(format!("req_schema_{case}"));
 
     let via_broker = run(&broker_id, broker(&broker_id)).await;
     let via_schema = run(&schema_id, schema(&schema_id)).await;
@@ -166,8 +166,8 @@ async fn assert_paths_agree(
 /// `NoSubscriber` would make both paths agree on emptiness.
 fn emit(
     event: AgentEvent,
-) -> impl Fn(String) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>> {
-    move |request_id: String| {
+) -> impl Fn(RequestId) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>> {
+    move |request_id: RequestId| {
         let event = event.clone();
         Box::pin(async move {
             let routed = publish_to_brokers(&request_id, event).await;
@@ -190,7 +190,7 @@ async fn tool_requested_matches() {
         "tool_requested",
         |_| {
             vec![
-                Step::effect(|request_id: String| async move {
+                Step::effect(|request_id: RequestId| async move {
                     publish_tool_requested(
                         &request_id,
                         ToolCallId::new(TOOL_ID),
@@ -224,7 +224,7 @@ async fn a_full_tool_turn_matches() {
         "full_turn",
         |_| {
             vec![
-                Step::effect(|request_id: String| async move {
+                Step::effect(|request_id: RequestId| async move {
                     publish_tool_requested(
                         &request_id,
                         ToolCallId::new(TOOL_ID),
@@ -234,7 +234,7 @@ async fn a_full_tool_turn_matches() {
                     .await;
                 }),
                 Step::item(items::tool_call(TOOL_ID, TOOL_NAME, TOOL_ARGS)),
-                Step::effect(|request_id: String| async move {
+                Step::effect(|request_id: RequestId| async move {
                     publish_tool_start(
                         &request_id,
                         ToolCallId::new(TOOL_ID),
@@ -243,7 +243,7 @@ async fn a_full_tool_turn_matches() {
                     )
                     .await;
                 }),
-                Step::effect(|request_id: String| async move {
+                Step::effect(|request_id: RequestId| async move {
                     aura::request_progress::publish(
                         &request_id,
                         ProgressNotification {
@@ -293,9 +293,9 @@ async fn a_full_tool_turn_matches() {
 
 #[tokio::test(start_paused = true)]
 async fn progress_without_a_message_matches() {
-    let build_broker = |_: &str| {
+    let build_broker = |_: &RequestId| {
         vec![
-            Step::effect(|request_id: String| async move {
+            Step::effect(|request_id: RequestId| async move {
                 aura::request_progress::publish(
                     &request_id,
                     ProgressNotification {
@@ -310,7 +310,7 @@ async fn progress_without_a_message_matches() {
             Step::item(items::text("done")),
         ]
     };
-    let build_schema = |_: &str| {
+    let build_schema = |_: &RequestId| {
         vec![
             Step::effect(emit(AgentEvent::single_agent(
                 AgentEventPayload::ToolProgress {
@@ -332,7 +332,7 @@ async fn tool_usage_matches() {
         "tool_usage",
         |_| {
             vec![
-                Step::effect(|request_id: String| async move {
+                Step::effect(|request_id: RequestId| async move {
                     publish_tool_usage(&request_id, vec![ToolCallId::new(TOOL_ID)], usage()).await;
                 }),
                 Step::item(items::text("done")),
@@ -374,7 +374,7 @@ async fn approval_lifecycle_matches() {
         "approval",
         move |_| {
             vec![
-                Step::effect(move |request_id: String| {
+                Step::effect(move |request_id: RequestId| {
                     let event = ApprovalLifecycleEvent::Requested(for_broker.clone());
                     async move {
                         aura::approval_event_broker::publish(&request_id, event).await;

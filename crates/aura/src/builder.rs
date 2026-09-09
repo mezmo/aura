@@ -326,7 +326,15 @@ impl Agent {
                     .clone()
                     .map(crate::config::SessionId::new),
             };
-            let request_id = config_owned.request_id.clone().unwrap_or_default();
+            // One id for the gate and the tool below, so both publish to the
+            // same topic. A build with no HTTP request behind it still gets a
+            // distinct value rather than sharing one with every other build.
+            let request_id = config_owned.request_id.clone().unwrap_or_else(|| {
+                crate::request_cancellation::RequestId::new(format!(
+                    "local:{}",
+                    uuid::Uuid::new_v4()
+                ))
+            });
             let gate: Arc<dyn crate::tool_wrapper::ToolWrapper> =
                 Arc::new(crate::hitl::HitlApprovalWrapper::new(
                     hitl.patterns.clone(),
@@ -1428,7 +1436,7 @@ impl Agent {
         &self,
         query: &str,
         timeout: Duration,
-        request_id: &str,
+        request_id: &RequestId,
     ) -> (
         Pin<Box<dyn futures::stream::Stream<Item = Result<StreamItem, StreamError>> + Send>>,
         watch::Sender<bool>,
@@ -1473,7 +1481,7 @@ impl Agent {
         query: &str,
         chat_history: Vec<rig::completion::Message>,
         timeout: Duration,
-        request_id: &str,
+        request_id: &RequestId,
     ) -> (
         Pin<Box<dyn futures::stream::Stream<Item = Result<StreamItem, StreamError>> + Send>>,
         watch::Sender<bool>,
@@ -1539,7 +1547,7 @@ impl Agent {
     ///
     /// # Returns
     /// Total number of cancellation notifications sent
-    pub async fn cancel_mcp_requests(&self, http_request_id: &str, reason: &str) -> usize {
+    pub async fn cancel_mcp_requests(&self, http_request_id: &RequestId, reason: &str) -> usize {
         if let Some(mcp_manager) = &self.mcp_manager {
             mcp_manager
                 .cancel_all_for_request(http_request_id, reason)
@@ -1565,7 +1573,7 @@ impl Agent {
     ///
     /// # Returns
     /// Total number of cancellation notifications sent
-    pub async fn cancel_and_close_mcp(&self, http_request_id: &str, reason: &str) -> usize {
+    pub async fn cancel_and_close_mcp(&self, http_request_id: &RequestId, reason: &str) -> usize {
         if let Some(mcp_manager) = &self.mcp_manager {
             mcp_manager
                 .cancel_and_close_all(http_request_id, reason)
@@ -1667,6 +1675,7 @@ fn record_completion_result(
 }
 
 // Implement StreamingAgent trait for Agent
+use crate::RequestId;
 use crate::streaming::StreamingAgent;
 use async_trait::async_trait;
 use futures::stream::BoxStream;
@@ -1683,7 +1692,7 @@ impl StreamingAgent for Agent {
         query: &str,
         chat_history: Vec<rig::completion::Message>,
         _cancel_token: CancellationToken,
-        request_id: &str,
+        request_id: &RequestId,
     ) -> Result<BoxStream<'static, Result<StreamItem, StreamError>>, StreamError> {
         if let Some(mcp_manager) = &self.mcp_manager {
             mcp_manager.set_current_request(request_id).await;
@@ -1703,7 +1712,7 @@ impl StreamingAgent for Agent {
         query: &str,
         chat_history: Vec<rig::completion::Message>,
         timeout: Duration,
-        request_id: &str,
+        request_id: &RequestId,
     ) -> (
         BoxStream<'static, Result<StreamItem, StreamError>>,
         watch::Sender<bool>,
@@ -1725,7 +1734,7 @@ impl StreamingAgent for Agent {
         (Box::pin(stream), cancel_tx, usage_state)
     }
 
-    async fn cancel_and_close_mcp(&self, request_id: &str, reason: &str) -> usize {
+    async fn cancel_and_close_mcp(&self, request_id: &RequestId, reason: &str) -> usize {
         Agent::cancel_and_close_mcp(self, request_id, reason).await
     }
 
@@ -1976,6 +1985,7 @@ impl AgentBuilder {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use crate::scratchpad::TiktokenCounter;
 
@@ -2268,7 +2278,7 @@ mod tests {
 
         let tmp = tempfile::TempDir::new().unwrap();
         let storage = Arc::new(
-            ScratchpadStorage::with_base_dir(tmp.path(), "req-single-compose")
+            ScratchpadStorage::with_base_dir(tmp.path(), &RequestId::new("req-single-compose"))
                 .await
                 .unwrap(),
         );

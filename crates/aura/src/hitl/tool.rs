@@ -16,6 +16,7 @@ use serde_json::Value;
 use super::decision::{AgentScope, ApprovalDecision, ApprovalOrigin, ApprovalOutcome, DecisionId};
 use super::protocol::{ApprovalItem, ApprovalRequest, PROTOCOL_VERSION};
 use super::route::{ApprovalError, DecisionRoute};
+use crate::RequestId;
 
 /// The `request_approval` tool. Constructs an
 /// [`ApprovalOrigin::AgentRequested`] and dispatches through the shared
@@ -26,7 +27,7 @@ use super::route::{ApprovalError, DecisionRoute};
 pub struct RequestApprovalTool {
     route: Arc<DecisionRoute>,
     scope: AgentScope,
-    request_id: String,
+    request_id: RequestId,
     agent_name: String,
     /// Instance ID of the AURA process that built this tool.
     instance_id: String,
@@ -37,7 +38,7 @@ impl RequestApprovalTool {
     pub fn new(
         route: Arc<DecisionRoute>,
         scope: AgentScope,
-        request_id: String,
+        request_id: RequestId,
         agent_name: String,
         instance_id: String,
     ) -> Self {
@@ -309,7 +310,7 @@ mod tests {
         route: &Arc<DecisionRoute>,
         args: RequestApprovalArgs,
     ) -> ApprovalItem {
-        let request_id = format!("req_w2_{}", uuid::Uuid::new_v4().simple());
+        let request_id = RequestId::new(format!("req_w2_{}", uuid::Uuid::new_v4().simple()));
         let tool = RequestApprovalTool::new(
             route.clone(),
             AgentScope::Single { session_id: None },
@@ -476,7 +477,8 @@ mod tests {
                 timeout: std::time::Duration::from_secs(60),
             });
 
-            let request_id = format!("req_tool_span_{}", uuid::Uuid::new_v4().simple());
+            let request_id =
+                RequestId::new(format!("req_tool_span_{}", uuid::Uuid::new_v4().simple()));
             let mut events = approval_event_broker::subscribe(&request_id).await;
             let tool = RequestApprovalTool::new(
                 route,

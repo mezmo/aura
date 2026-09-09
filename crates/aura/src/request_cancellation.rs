@@ -13,7 +13,12 @@ use tracing::{debug, info};
 
 use crate::mcp::McpClient;
 
-pub type RequestId = String;
+aura_events::string_newtype! {
+    /// Routing key for the request-scoped brokers and the cancellation
+    /// registry. Two values that differ by one byte address different
+    /// subscribers, so an id is only ever passed along, never rebuilt.
+    RequestId
+}
 
 /// Request-scoped cancellation signal. Fired by the handler on client
 /// disconnect, timeout, or server shutdown. Observed by MCP notifications,
@@ -68,8 +73,8 @@ pub struct RequestCancellation {
 
 impl RequestCancellation {
     /// Register a new request in the global cancellation registry.
-    pub fn register(request_id: impl Into<RequestId>) -> Self {
-        let request_id = request_id.into();
+    pub fn register(request_id: &RequestId) -> Self {
+        let request_id = request_id.clone();
         let raw = CancellationToken::new();
 
         registry()
@@ -91,7 +96,7 @@ impl RequestCancellation {
 
     /// Look up the cancel token for a request id. Returns `None` if the
     /// request was never registered (e.g. CLI standalone mode).
-    pub fn token_for_id(request_id: &str) -> Option<RequestCancelToken> {
+    pub fn token_for_id(request_id: &RequestId) -> Option<RequestCancelToken> {
         registry()
             .requests
             .read()
@@ -104,7 +109,7 @@ impl RequestCancellation {
     }
 
     /// Cancel a request by ID. Called on timeout or client disconnect.
-    pub fn cancel(request_id: &str, reason: &str) {
+    pub fn cancel(request_id: &RequestId, reason: &str) {
         let requests = registry().requests.read().unwrap_or_else(|poisoned| {
             tracing::error!("Cancellation registry read lock poisoned, recovering");
             poisoned.into_inner()
@@ -116,7 +121,7 @@ impl RequestCancellation {
     }
 
     /// Remove a completed request from the registry.
-    pub fn unregister(request_id: &str) {
+    pub fn unregister(request_id: &RequestId) {
         registry()
             .requests
             .write()
@@ -149,38 +154,38 @@ mod tests {
 
     #[test]
     fn test_register_and_cancel() {
-        let ctx = RequestCancellation::register("test_req_cancel_1");
+        let ctx = RequestCancellation::register(&RequestId::new("test_req_cancel_1"));
         assert!(!ctx.is_cancelled());
 
-        RequestCancellation::cancel("test_req_cancel_1", "test");
+        RequestCancellation::cancel(&RequestId::new("test_req_cancel_1"), "test");
         assert!(ctx.is_cancelled());
 
-        RequestCancellation::unregister("test_req_cancel_1");
+        RequestCancellation::unregister(&RequestId::new("test_req_cancel_1"));
     }
 
     #[test]
     fn test_multiple_requests_independent() {
-        let ctx1 = RequestCancellation::register("test_req_cancel_a");
-        let ctx2 = RequestCancellation::register("test_req_cancel_b");
+        let ctx1 = RequestCancellation::register(&RequestId::new("test_req_cancel_a"));
+        let ctx2 = RequestCancellation::register(&RequestId::new("test_req_cancel_b"));
 
-        RequestCancellation::cancel("test_req_cancel_a", "test");
+        RequestCancellation::cancel(&RequestId::new("test_req_cancel_a"), "test");
 
         assert!(ctx1.is_cancelled());
         assert!(!ctx2.is_cancelled()); // Independent
 
-        RequestCancellation::unregister("test_req_cancel_a");
-        RequestCancellation::unregister("test_req_cancel_b");
+        RequestCancellation::unregister(&RequestId::new("test_req_cancel_a"));
+        RequestCancellation::unregister(&RequestId::new("test_req_cancel_b"));
     }
 
     #[test]
     fn test_cancel_nonexistent_request_safe() {
         // Should not panic
-        RequestCancellation::cancel("nonexistent_request", "test");
+        RequestCancellation::cancel(&RequestId::new("nonexistent_request"), "test");
     }
 
     #[test]
     fn test_unregister_nonexistent_request_safe() {
         // Should not panic
-        RequestCancellation::unregister("nonexistent_request");
+        RequestCancellation::unregister(&RequestId::new("nonexistent_request"));
     }
 }

@@ -1812,13 +1812,14 @@ pub fn emit_scratchpad_tool_events_enabled() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::RequestId;
     use crate::scratchpad::context_budget::{TiktokenCounter, TokenCounter};
     use tempfile::TempDir;
 
     async fn setup() -> (TempDir, Arc<ScratchpadStorage>, ContextBudget) {
         let tmp = TempDir::new().unwrap();
         let storage = Arc::new(
-            ScratchpadStorage::with_base_dir(tmp.path(), "test-req")
+            ScratchpadStorage::with_base_dir(tmp.path(), &RequestId::new("test-req"))
                 .await
                 .unwrap(),
         );

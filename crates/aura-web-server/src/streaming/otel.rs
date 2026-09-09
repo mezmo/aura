@@ -7,6 +7,7 @@
 //! - [`StreamOtelContext::record_input`] — called at span start
 //! - [`StreamOtelContext::record_output`] — called after the stream ends
 
+use aura::RequestId;
 use aura::ResponseContent;
 
 use super::StreamTermination;
@@ -22,7 +23,7 @@ use super::StreamTermination;
 pub struct StreamOtelContext {
     pub provider: String,
     pub model: String,
-    pub request_id: String,
+    pub request_id: RequestId,
     pub session_id: String,
     pub query: String,
     /// OpenAI-compatible `user` field from the request.
@@ -50,7 +51,7 @@ impl StreamOtelContext {
         if let Some(system_prompt) = &self.system_prompt {
             aura::logging::set_system_prompt_attribute(&span, system_prompt);
         }
-        aura::logging::set_span_attribute(&span, "http.request_id", self.request_id.clone());
+        aura::logging::set_span_attribute(&span, "http.request_id", self.request_id.to_string());
         aura::logging::set_span_attribute(&span, "session.id", self.session_id.clone());
         aura::logging::set_span_attribute(
             &span,

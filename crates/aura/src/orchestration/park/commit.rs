@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
+use crate::RequestId;
 use crate::config::AgentRuntimeConfig;
 use crate::hitl::{DecisionId, PendingApprovals};
 use crate::orchestration::persistence::is_safe_path_component;
@@ -49,8 +50,8 @@ pub(crate) struct ParkCommitOutcome {
 
 /// The run-scoped owner id every approval parked by `run_id` is registered
 /// under.
-pub(crate) fn run_owner_id(run_id: &str) -> String {
-    format!("run:{run_id}")
+pub(crate) fn run_owner_id(run_id: &str) -> RequestId {
+    RequestId::new(format!("run:{run_id}"))
 }
 
 /// Narrow the plan's awaiting tasks to the calls still parked and undecided,
@@ -216,11 +217,11 @@ pub(crate) async fn publish(
 pub(crate) fn cancel_run_approvals(
     registry: &PendingApprovals,
     run_id: &str,
-    request_id: &str,
+    request_id: &RequestId,
 ) -> tokio::task::JoinHandle<()> {
     let registry = registry.clone();
     let run_id = run_id.to_string();
-    let request_id = request_id.to_string();
+    let request_id = request_id.clone();
     tokio::task::spawn(async move {
         for parked in registry.cancel_request(&run_owner_id(&run_id)).await {
             crate::approval_event_broker::publish(
@@ -311,7 +312,7 @@ mod tests {
 
     fn parked_approval(
         decision_id: DecisionId,
-        owner: &str,
+        owner: &RequestId,
         expires_at: chrono::DateTime<chrono::Utc>,
     ) -> ParkedApproval {
         ParkedApproval {
@@ -319,7 +320,7 @@ mod tests {
                 version: PROTOCOL_VERSION,
                 instance_id: "test-instance".to_string(),
                 decision_id,
-                request_id: owner.to_string(),
+                request_id: owner.clone(),
                 scope: AgentScope::Single { session_id: None },
                 origin: ApprovalOrigin::ConfigGate {
                     matched_pattern: "kubectl_*".to_string(),
@@ -456,7 +457,7 @@ mod tests {
     #[tokio::test]
     async fn refresh_drops_decided_and_takes_earliest_expiry() {
         let (registry, _store) = conv_registry();
-        let owner = "run:0191e8c0-eeee-7000-8000-000000000003";
+        let owner = RequestId::new("run:0191e8c0-eeee-7000-8000-000000000003");
         let now = chrono::Utc::now();
         let decided = DecisionId::generate();
         let removed = DecisionId::generate();
@@ -466,7 +467,7 @@ mod tests {
         registry
             .register_durable(parked_approval(
                 decided,
-                owner,
+                &owner,
                 now + chrono::Duration::hours(2),
             ))
             .await
@@ -474,7 +475,7 @@ mod tests {
         registry
             .register_durable(parked_approval(
                 removed,
-                owner,
+                &owner,
                 now + chrono::Duration::hours(2),
             ))
             .await
@@ -482,7 +483,7 @@ mod tests {
         registry
             .register_durable(parked_approval(
                 earliest,
-                owner,
+                &owner,
                 now + chrono::Duration::minutes(30),
             ))
             .await
@@ -490,7 +491,7 @@ mod tests {
         registry
             .register_durable(parked_approval(
                 latest,
-                owner,
+                &owner,
                 now + chrono::Duration::hours(1),
             ))
             .await
@@ -553,7 +554,7 @@ mod tests {
         let (registry, store) = conv_registry();
         let run_id = "0191e8c0-ffff-7000-8000-000000000006";
         let owner = run_owner_id(run_id);
-        let request_id = format!("req_sweep_{}", uuid::Uuid::new_v4().simple());
+        let request_id = RequestId::new(format!("req_sweep_{}", uuid::Uuid::new_v4().simple()));
         let mut events = crate::approval_event_broker::subscribe(&request_id).await;
 
         let now = chrono::Utc::now();
@@ -622,7 +623,7 @@ mod tests {
         let (registry, store) = conv_registry();
         let run_id = "0191e8c0-aaaa-7000-8000-000000000007";
         let owner = run_owner_id(run_id);
-        let request_id = format!("req_sweep_{}", uuid::Uuid::new_v4().simple());
+        let request_id = RequestId::new(format!("req_sweep_{}", uuid::Uuid::new_v4().simple()));
         let mut events = crate::approval_event_broker::subscribe(&request_id).await;
 
         let now = chrono::Utc::now();
@@ -690,7 +691,7 @@ mod tests {
             .await
             .unwrap();
 
-        cancel_run_approvals(&registry, run_id, "req_late_resolve")
+        cancel_run_approvals(&registry, run_id, &RequestId::new("req_late_resolve"))
             .await
             .unwrap();
 

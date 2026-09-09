@@ -8,6 +8,7 @@
 //! handles request-scoped MCP header resolution (`headers_from_request`) so the
 //! web server can inject per-request credentials into MCP calls.
 
+use crate::RequestId;
 use crate::builder::{Agent, ClientTool, build_streaming_agent};
 use crate::config::{AgentRuntimeConfig, WorkerSkills};
 use crate::error::BuilderError;
@@ -140,7 +141,7 @@ impl RigBuilder {
         req_headers: Option<&HashMap<String, String>>,
         additional_tools: Vec<Box<dyn rig::tool::ToolDyn>>,
         client_tools: Option<Vec<ClientTool>>,
-        request_id: Option<String>,
+        request_id: Option<RequestId>,
         session_id: Option<String>,
     ) -> Result<Agent, BuilderError> {
         let mut agent_config = self.discovered_agent_config(req_headers)?;
@@ -167,7 +168,7 @@ impl RigBuilder {
         req_headers: Option<&HashMap<String, String>>,
         session_id: Option<String>,
         client_tools: Option<Vec<ClientTool>>,
-        request_id: Option<String>,
+        request_id: Option<RequestId>,
     ) -> Result<Arc<dyn StreamingAgent>, BuilderError> {
         let mut agent_config = self.discovered_agent_config(req_headers)?;
         resolve_mcp_headers(&mut agent_config, req_headers);

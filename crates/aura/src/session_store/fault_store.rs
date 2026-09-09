@@ -1,5 +1,6 @@
 //! An approval-store double for fault injection in tests.
 
+use crate::RequestId;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
@@ -73,7 +74,7 @@ impl ApprovalStore for FaultInjectingStore {
 
     async fn cancel_request(
         &self,
-        request_id: &str,
+        request_id: &RequestId,
     ) -> Result<Vec<ParkedApproval>, SessionStoreError> {
         self.inner.cancel_request(request_id).await
     }

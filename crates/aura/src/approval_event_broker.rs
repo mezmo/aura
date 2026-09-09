@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
+use crate::RequestId;
 use aura_events::{ApprovalCompleted, ApprovalPending, ApprovalRequested};
 use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, warn};
@@ -23,7 +24,7 @@ pub enum ApprovalLifecycleEvent {
 
 /// Request-scoped approval event broker.
 pub struct ApprovalEventBroker {
-    senders: RwLock<HashMap<String, mpsc::Sender<ApprovalLifecycleEvent>>>,
+    senders: RwLock<HashMap<RequestId, mpsc::Sender<ApprovalLifecycleEvent>>>,
 }
 
 impl ApprovalEventBroker {
@@ -35,7 +36,10 @@ impl ApprovalEventBroker {
     }
 
     /// Subscribe to approval lifecycle events for one request.
-    pub async fn subscribe(&self, request_id: &str) -> mpsc::Receiver<ApprovalLifecycleEvent> {
+    pub async fn subscribe(
+        &self,
+        request_id: &RequestId,
+    ) -> mpsc::Receiver<ApprovalLifecycleEvent> {
         let (tx, rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
         let mut senders = self.senders.write().await;
         senders.insert(request_id.to_owned(), tx);
@@ -48,7 +52,7 @@ impl ApprovalEventBroker {
     }
 
     /// Remove a request subscription.
-    pub async fn unsubscribe(&self, request_id: &str) {
+    pub async fn unsubscribe(&self, request_id: &RequestId) {
         let mut senders = self.senders.write().await;
         if senders.remove(request_id).is_some() {
             debug!(
@@ -61,7 +65,7 @@ impl ApprovalEventBroker {
 
     /// Publish an approval lifecycle event. Returns false if no stream is active
     /// or the receiver cannot accept the event immediately.
-    pub async fn publish(&self, request_id: &str, event: ApprovalLifecycleEvent) -> bool {
+    pub async fn publish(&self, request_id: &RequestId, event: ApprovalLifecycleEvent) -> bool {
         let sender = {
             let senders = self.senders.read().await;
             senders.get(request_id).cloned()
@@ -116,15 +120,15 @@ pub fn global() -> &'static ApprovalEventBroker {
     GLOBAL_BROKER.get_or_init(ApprovalEventBroker::new)
 }
 
-pub async fn subscribe(request_id: &str) -> mpsc::Receiver<ApprovalLifecycleEvent> {
+pub async fn subscribe(request_id: &RequestId) -> mpsc::Receiver<ApprovalLifecycleEvent> {
     global().subscribe(request_id).await
 }
 
-pub async fn unsubscribe(request_id: &str) {
+pub async fn unsubscribe(request_id: &RequestId) {
     global().unsubscribe(request_id).await;
 }
 
-pub async fn publish(request_id: &str, event: ApprovalLifecycleEvent) -> bool {
+pub async fn publish(request_id: &RequestId, event: ApprovalLifecycleEvent) -> bool {
     global().publish(request_id, event).await
 }
 
@@ -149,9 +153,13 @@ mod tests {
     #[tokio::test]
     async fn subscribe_publish_recv_roundtrip() {
         let broker = ApprovalEventBroker::new();
-        let mut rx = broker.subscribe("req-1").await;
+        let mut rx = broker.subscribe(&RequestId::new("req-1")).await;
 
-        assert!(broker.publish("req-1", requested("dec-1")).await);
+        assert!(
+            broker
+                .publish(&RequestId::new("req-1"), requested("dec-1"))
+                .await
+        );
 
         match rx.recv().await.expect("event") {
             ApprovalLifecycleEvent::Requested(event) => assert_eq!(event.decision_id, "dec-1"),
@@ -163,26 +171,38 @@ mod tests {
     async fn publish_without_subscriber_returns_false() {
         let broker = ApprovalEventBroker::new();
 
-        assert!(!broker.publish("missing", requested("dec-1")).await);
+        assert!(
+            !broker
+                .publish(&RequestId::new("missing"), requested("dec-1"))
+                .await
+        );
     }
 
     #[tokio::test]
     async fn receiver_drop_cleans_stale_subscription() {
         let broker = ApprovalEventBroker::new();
-        let rx = broker.subscribe("req-1").await;
+        let rx = broker.subscribe(&RequestId::new("req-1")).await;
         drop(rx);
 
-        assert!(!broker.publish("req-1", requested("dec-1")).await);
+        assert!(
+            !broker
+                .publish(&RequestId::new("req-1"), requested("dec-1"))
+                .await
+        );
         assert_eq!(broker.active_subscriptions().await, 0);
     }
 
     #[tokio::test]
     async fn events_are_isolated_by_request() {
         let broker = ApprovalEventBroker::new();
-        let mut rx_a = broker.subscribe("req-a").await;
-        let mut rx_b = broker.subscribe("req-b").await;
+        let mut rx_a = broker.subscribe(&RequestId::new("req-a")).await;
+        let mut rx_b = broker.subscribe(&RequestId::new("req-b")).await;
 
-        assert!(broker.publish("req-b", requested("dec-b")).await);
+        assert!(
+            broker
+                .publish(&RequestId::new("req-b"), requested("dec-b"))
+                .await
+        );
 
         assert!(rx_a.try_recv().is_err());
         match rx_b.recv().await.expect("event") {

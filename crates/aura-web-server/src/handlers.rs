@@ -1,4 +1,5 @@
 use a2a::VERSION;
+use aura::RequestId;
 use aura::RigBuilder;
 use aura::{
     RequestCancellation, ResponseContent, StreamingAgent, UsageState, approval_event_subscribe,
@@ -28,12 +29,12 @@ use crate::types::*;
 
 /// RAII guard for request-scoped subscriptions. Ensures cleanup even on panic.
 struct RequestResourceGuard {
-    request_id: String,
+    request_id: RequestId,
     pending_approvals: aura::hitl::PendingApprovals,
 }
 
 impl RequestResourceGuard {
-    fn new(request_id: String, pending_approvals: aura::hitl::PendingApprovals) -> Self {
+    fn new(request_id: RequestId, pending_approvals: aura::hitl::PendingApprovals) -> Self {
         Self {
             request_id,
             pending_approvals,
@@ -121,7 +122,7 @@ impl std::fmt::Display for PrepareError {
 /// Both streaming and non-streaming handlers delegate to the same core logic with different
 /// delivery modes but the same observability instrumentation and stream processing.
 pub struct CompletionConfig {
-    pub request_id: String,
+    pub request_id: RequestId,
     pub timeout_duration: std::time::Duration,
     pub first_chunk_timeout: Option<std::time::Duration>,
     pub inactivity_timeout: Option<std::time::Duration>,
@@ -189,7 +190,7 @@ async fn build_agent_for_request(
     req_headers: &HashMap<String, String>,
     additional_tools: Vec<Box<dyn aura::ToolDyn>>,
     client_tools: Option<&[ClientToolDefinition]>,
-    request_id: String,
+    request_id: RequestId,
     session_id: String,
     data: &AppState,
 ) -> Result<Arc<aura::Agent>, PrepareError> {
@@ -230,7 +231,7 @@ pub struct RequestSetup {
     /// invokes a passthrough tool.
     pub has_client_tools: bool,
     /// Request id (`req_…`) shared by the agent build and the completion stream.
-    pub request_id: String,
+    pub request_id: RequestId,
     /// OpenAI-compatible `user` field, for the `user.id` span attribute.
     pub user_id: Option<String>,
     /// Request `metadata` serialized as a JSON object string, for the
@@ -261,7 +262,7 @@ pub async fn prepare_request(
     // orchestration) shares one value with the completion stream. The HITL gate
     // and approval events stamp this id; previously it was minted later in
     // `build_completion_config`, after the agent was already built.
-    let request_id = format!("req_{}", Uuid::new_v4().simple());
+    let request_id = RequestId::new(format!("req_{}", Uuid::new_v4().simple()));
 
     // Single pass: pull the user query out of `messages` and convert the rest
     // into Aura/Rig history, with optional client-tool support (preserves
@@ -519,7 +520,7 @@ pub async fn execute_completion(
     delivery: DeliveryMode,
 ) {
     let _active_guard = ActiveRequestGuard::new(config.active_requests.clone());
-    let _cancellation = RequestCancellation::register(config.request_id.clone());
+    let _cancellation = RequestCancellation::register(&config.request_id);
 
     let _resource_guard =
         RequestResourceGuard::new(config.request_id.clone(), config.pending_approvals.clone());
@@ -731,7 +732,7 @@ async fn handle_non_streaming_completion(
 
     {
         let span = tracing::Span::current();
-        aura::logging::set_span_attribute(&span, "http.request_id", config.request_id.clone());
+        aura::logging::set_span_attribute(&span, "http.request_id", config.request_id.to_string());
     }
 
     let response_ctx = ResponseContext {
@@ -778,7 +779,7 @@ async fn handle_streaming_completion(
 
     {
         let span = tracing::Span::current();
-        aura::logging::set_span_attribute(&span, "http.request_id", config.request_id.clone());
+        aura::logging::set_span_attribute(&span, "http.request_id", config.request_id.to_string());
     }
 
     let chat_session_id = setup.chat_session_id.clone();
@@ -1342,6 +1343,7 @@ fn error_response(
 mod tests {
     use super::*;
     use crate::types::{ChatMessage, ChatMessageFunctionCall, ChatMessageToolCall, Role};
+    use aura::RequestId;
     use aura_test_utils::mock_agent::MockAgent;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1439,7 +1441,7 @@ mod tests {
 
     #[tokio::test]
     async fn sse_approval_subscription_exists_before_stream_startup() {
-        let request_id = format!("req_test_{}", Uuid::new_v4().simple());
+        let request_id = RequestId::new(format!("req_test_{}", Uuid::new_v4().simple()));
         let published = Arc::new(AtomicBool::new(false));
         let agent: Arc<dyn StreamingAgent> = Arc::new(MockAgent::pending().on_stream_start({
             let published = Arc::clone(&published);
@@ -2325,6 +2327,8 @@ url = "http://127.0.0.1:9"
     }
 
     mod approval_ingress {
+        use aura::RequestId;
+
         use std::sync::Arc;
         use std::time::Duration;
 
@@ -2384,7 +2388,7 @@ url = "http://127.0.0.1:9"
                 version: aura::hitl::PROTOCOL_VERSION,
                 instance_id: "test-instance".to_string(),
                 decision_id: aura::hitl::DecisionId::generate(),
-                request_id: "req-smoke".into(),
+                request_id: RequestId::new("req-smoke"),
                 scope: aura::hitl::AgentScope::Single { session_id: None },
                 origin: aura::hitl::ApprovalOrigin::ConfigGate {
                     matched_pattern: "test_*".into(),
@@ -2593,7 +2597,7 @@ url = "http://127.0.0.1:9"
                 version: aura::hitl::PROTOCOL_VERSION,
                 instance_id: "test-instance".to_string(),
                 decision_id: aura::hitl::DecisionId::generate(),
-                request_id: "req-hmac".into(),
+                request_id: RequestId::new("req-hmac"),
                 scope: aura::hitl::AgentScope::Single { session_id: None },
                 origin: aura::hitl::ApprovalOrigin::ConfigGate {
                     matched_pattern: "test_*".into(),

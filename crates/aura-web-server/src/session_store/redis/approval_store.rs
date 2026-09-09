@@ -19,6 +19,7 @@
 //! prunes per id, never the whole index key; `SWEEP_TAKE_SCRIPT` states what
 //! each id yields.
 
+use aura::RequestId;
 use std::sync::LazyLock;
 
 use async_trait::async_trait;
@@ -94,7 +95,7 @@ impl RedisApprovalStore {
         format!("{}:approval:decision:{decision_id}", self.key_prefix)
     }
 
-    fn req_key(&self, request_id: &str) -> String {
+    fn req_key(&self, request_id: &RequestId) -> String {
         format!("{}:approval:req:{request_id}", self.key_prefix)
     }
 
@@ -204,7 +205,7 @@ impl ApprovalStore for RedisApprovalStore {
 
     async fn cancel_request(
         &self,
-        request_id: &str,
+        request_id: &RequestId,
     ) -> Result<Vec<ParkedApproval>, SessionStoreError> {
         let req_key = self.req_key(request_id);
         let mut conn = self.conn.clone();

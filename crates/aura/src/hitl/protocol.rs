@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::decision::{AgentScope, ApprovalDecision, ApprovalOrigin, DecisionId};
+use crate::RequestId;
 
 /// Current approval webhook protocol version.
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -22,15 +23,9 @@ pub struct ApprovalRequest {
     pub instance_id: String,
     /// The handle a decision resolves against.
     pub decision_id: DecisionId,
-    /// The global request id (SSE routing + MCP cancellation), modeled as the
-    /// existing bare `String` id used throughout the codebase.
-    ///
-    /// A `RequestId` newtype is deliberately not introduced. Unlike RunId /
-    /// SessionId / TaskIdentity it has no single owning module, and it threads
-    /// through SSE routing, the tool event broker, and MCP cancellation, so
-    /// branding it is a cross-cutting refactor out of scope here. The design
-    /// note's `RequestId` typing is aspirational.
-    pub request_id: String,
+    /// The owner every approval of one request or one parked run shares. A
+    /// live request stamps its own id here; a parked run stamps `run:{run_id}`.
+    pub request_id: RequestId,
     /// Who is asking.
     pub scope: AgentScope,
     /// Why this approval exists.

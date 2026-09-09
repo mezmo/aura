@@ -49,6 +49,7 @@ use tokio::sync::{Mutex, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::Agent;
+use crate::RequestId;
 use crate::config::{AgentRuntimeConfig, LlmConfig};
 use crate::inactivity::{Liveness, STALL_MESSAGE, liveness_of};
 use crate::mcp::McpManager;
@@ -122,7 +123,7 @@ enum TaskOutcome {
 /// the hook looks the cell up by.
 struct WorkerPark {
     cell: Arc<BlockedCell>,
-    key: String,
+    key: RequestId,
 }
 
 /// Named return type for `create_*` coordinator/worker methods.
@@ -202,7 +203,7 @@ pub(super) fn spawn_cancellation_watcher(
     cancel_rx: watch::Receiver<bool>,
     timeout: Duration,
     cancel_token: CancellationToken,
-    request_id: String,
+    request_id: RequestId,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         tokio::select! {
@@ -527,6 +528,16 @@ enum LoopStep {
     Continue,
 }
 
+/// Approval-event topic for `request_id`, falling back to an
+/// orchestrator-scoped value when no HTTP request drives the run. The
+/// fallback is keyed on the orchestrator id so two concurrent request-less
+/// runs never share one topic, and every site resolving it agrees.
+fn approval_topic_for(request_id: &Option<RequestId>, orchestrator_id: &str) -> RequestId {
+    request_id
+        .clone()
+        .unwrap_or_else(|| RequestId::new(format!("local:{orchestrator_id}")))
+}
+
 impl Orchestrator {
     /// Create a new orchestrator from configuration.
     pub async fn new(
@@ -579,7 +590,7 @@ impl Orchestrator {
                     Some(ParkGuard::new(
                         registry.clone(),
                         run_id_str.clone(),
-                        agent_config.request_id.clone().unwrap_or_default(),
+                        approval_topic_for(&agent_config.request_id, &orchestrator_id),
                     ))
                 }
                 crate::hitl::DecisionRoute::Webhook { .. } => None,
@@ -869,7 +880,7 @@ impl Orchestrator {
                 task: super::TaskIdentity::new(task_id, worker_name.map(String::from)),
                 session_id: session_id_owned.map(crate::config::SessionId::new),
             };
-            let request_id = worker_config.request_id.clone().unwrap_or_default();
+            let request_id = approval_topic_for(&worker_config.request_id, &self.orchestrator_id);
             let mut gate = crate::hitl::HitlApprovalWrapper::new(
                 hitl.patterns.clone(),
                 hitl.route.clone(),
@@ -1057,7 +1068,10 @@ impl Orchestrator {
             cell: Arc::new(BlockedCell::default()),
             // A per-stream synthetic id, not the live request id, so the hook's
             // tool-event publishes dead-letter instead of reaching the SSE stream.
-            key: format!("{}:task:{task_id}:attempt:{attempt}", self.orchestrator_id),
+            key: RequestId::new(format!(
+                "{}:task:{task_id}:attempt:{attempt}",
+                self.orchestrator_id
+            )),
         })
     }
 
@@ -1111,7 +1125,7 @@ impl Orchestrator {
             return;
         };
         let scope = self.worker_scope(task_id, worker_name).await;
-        let request_id = self.agent_config.request_id.clone().unwrap_or_default();
+        let request_id = self.approval_topic();
         for call in pending {
             registry.remove(&call.decision_id).await;
             if let Some(ref scope) = scope {
@@ -1367,7 +1381,7 @@ impl Orchestrator {
         params: StreamCallParams<'_>,
         stream_context: Option<StreamContext<'_>>,
         decision_ready: impl Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>,
-        park_key: Option<&str>,
+        park_key: Option<&RequestId>,
     ) -> Result<ForwardedRun, Box<dyn std::error::Error + Send + Sync>> {
         let StreamCallParams {
             prompt,
@@ -3710,7 +3724,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         let srd = srd.clone();
                         Box::pin(async move { srd.lock().await.is_some() })
                     },
-                    park.as_ref().map(|p| p.key.as_str()),
+                    park.as_ref().map(|p| &p.key),
                 )
                 .await;
             drop(park_registration);
@@ -5268,6 +5282,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
         }
     }
 
+    fn approval_topic(&self) -> RequestId {
+        approval_topic_for(&self.agent_config.request_id, &self.orchestrator_id)
+    }
+
     /// Sweep the run's parked approvals by owner id, so no decidable
     /// approval outlives a run that has no checkpoint.
     async fn cancel_run_parked_approvals(&self, run_id: &str) {
@@ -5277,7 +5295,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         let crate::hitl::DecisionRoute::Conversational { registry, .. } = &*hitl.route else {
             return;
         };
-        let request_id = self.agent_config.request_id.clone().unwrap_or_default();
+        let request_id = self.approval_topic();
         super::park::cancel_run_approvals(registry, run_id, &request_id)
             .await
             .ok();
@@ -6426,7 +6444,7 @@ mod tests {
             cancel_rx,
             Duration::from_secs(300),
             cancel_token.clone(),
-            "test-normal".to_string(),
+            RequestId::new("test-normal"),
         );
 
         drop(cancel_tx);
@@ -6443,7 +6461,7 @@ mod tests {
             cancel_rx,
             Duration::from_secs(300),
             cancel_token.clone(),
-            "test-cancel".to_string(),
+            RequestId::new("test-cancel"),
         );
 
         cancel_tx.send(true).unwrap();
@@ -6461,7 +6479,7 @@ mod tests {
             cancel_rx,
             Duration::from_secs(60),
             cancel_token.clone(),
-            "test-timeout".to_string(),
+            RequestId::new("test-timeout"),
         );
 
         tokio::time::advance(Duration::from_secs(61)).await;
@@ -6478,7 +6496,7 @@ mod tests {
             cancel_rx,
             Duration::from_secs(60),
             cancel_token.clone(),
-            "test-no-spurious".to_string(),
+            RequestId::new("test-no-spurious"),
         );
 
         // Advance to T=30s, then drop sender (simulating stream completing mid-timeout)
@@ -6511,7 +6529,7 @@ mod tests {
             cancel_rx,
             Duration::from_secs(300),
             cancel_token.clone(),
-            "test-false-signal".to_string(),
+            RequestId::new("test-false-signal"),
         );
 
         // Send false — triggers rx.changed() but borrow_and_update() sees false,
@@ -7418,7 +7436,7 @@ mod tests {
         };
         use crate::session_store::{InMemoryApprovalStore, InMemoryEventBus};
 
-        let request_id = format!("req_cancel_{}", uuid::Uuid::new_v4().simple());
+        let request_id = RequestId::new(format!("req_cancel_{}", uuid::Uuid::new_v4().simple()));
         let mut events = crate::approval_event_broker::subscribe(&request_id).await;
 
         let store: Arc<dyn crate::session_store::ApprovalStore> =
@@ -7450,7 +7468,7 @@ mod tests {
                         version: PROTOCOL_VERSION,
                         instance_id: "test-instance".to_string(),
                         decision_id,
-                        request_id: "run:test".to_string(),
+                        request_id: RequestId::new("run:test"),
                         scope: AgentScope::Single { session_id: None },
                         origin: ApprovalOrigin::ConfigGate {
                             matched_pattern: "kubectl_*".to_string(),
@@ -7548,7 +7566,10 @@ mod tests {
             }),
             memory_dir: Some(memory_dir.to_string_lossy().into_owned()),
             session_id: Some("park-sess".to_string()),
-            request_id: Some(format!("req_park_{}", uuid::Uuid::new_v4().simple())),
+            request_id: Some(RequestId::new(format!(
+                "req_park_{}",
+                uuid::Uuid::new_v4().simple()
+            ))),
             ..AgentRuntimeConfig::default()
         };
         let orchestrator = Orchestrator::new(config).await.unwrap();
@@ -7578,7 +7599,7 @@ mod tests {
                         version: crate::hitl::PROTOCOL_VERSION,
                         instance_id: "test-instance".to_string(),
                         decision_id,
-                        request_id: format!("run:{run_id}"),
+                        request_id: RequestId::new(format!("run:{run_id}")),
                         scope: crate::hitl::AgentScope::Single { session_id: None },
                         origin: crate::hitl::ApprovalOrigin::ConfigGate {
                             matched_pattern: "kubectl_*".to_string(),
@@ -7783,11 +7804,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (orchestrator, store, registry, run_id) = park_orchestrator(dir.path()).await;
         let (plan, records, pending) = awaiting_plan_with_parked_calls(&registry, &run_id).await;
-        let request_id = orchestrator
-            .agent_config
-            .request_id
-            .clone()
-            .unwrap_or_default();
+        let request_id = orchestrator.approval_topic();
         let mut events = crate::approval_event_broker::subscribe(&request_id).await;
         arm_guard(&orchestrator, &plan).await;
 
@@ -7875,11 +7892,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (orchestrator, store, registry, run_id) = park_orchestrator(dir.path()).await;
         let (plan, records, pending) = awaiting_plan_with_parked_calls(&registry, &run_id).await;
-        let request_id = orchestrator
-            .agent_config
-            .request_id
-            .clone()
-            .unwrap_or_default();
+        let request_id = orchestrator.approval_topic();
         let mut events = crate::approval_event_broker::subscribe(&request_id).await;
 
         // The human decides the first call before the commit is attempted.
@@ -7966,11 +7979,7 @@ mod tests {
         let (orchestrator, registry, run_id) =
             park_orchestrator_over(store.clone(), dir.path()).await;
         let (plan, records, pending) = awaiting_plan_with_parked_calls(&registry, &run_id).await;
-        let request_id = orchestrator
-            .agent_config
-            .request_id
-            .clone()
-            .unwrap_or_default();
+        let request_id = orchestrator.approval_topic();
         let mut events = crate::approval_event_broker::subscribe(&request_id).await;
         arm_guard(&orchestrator, &plan).await;
 
@@ -8070,7 +8079,7 @@ mod tests {
         Orchestrator,
         Arc<crate::session_store::InMemoryApprovalStore>,
         crate::hitl::PendingApprovals,
-        String,
+        RequestId,
     ) {
         use crate::hitl::PendingApprovals;
         use crate::session_store::{InMemoryApprovalStore, InMemoryEventBus};
@@ -8093,7 +8102,7 @@ mod tests {
                 skills: None,
             },
         )]);
-        let request_id = format!("req_orphan_{}", uuid::Uuid::new_v4().simple());
+        let request_id = RequestId::new(format!("req_orphan_{}", uuid::Uuid::new_v4().simple()));
         let config = AgentRuntimeConfig {
             hitl: Some(crate::hitl::HitlRuntime {
                 patterns: Arc::from([aura_config::GlobPattern::new("echo_tool").unwrap()]),
@@ -8393,7 +8402,10 @@ mod tests {
             }),
             memory_dir: Some(memory_dir.to_string_lossy().into_owned()),
             session_id: Some(session_id.to_string()),
-            request_id: Some(format!("req_resume_{}", uuid::Uuid::new_v4().simple())),
+            request_id: Some(RequestId::new(format!(
+                "req_resume_{}",
+                uuid::Uuid::new_v4().simple()
+            ))),
             orchestration: Some(OrchestrationConfig {
                 enabled: true,
                 workers,

@@ -16,6 +16,7 @@ use super::decision::{AgentScope, ApprovalOrigin, ApprovalOutcome, DecisionId};
 use super::protocol::{ApprovalItem, ApprovalRequest, PROTOCOL_VERSION};
 use super::registry::{ParkedApproval, PendingApprovals};
 use super::route::{ApprovalError, DecisionRoute, GateDecision};
+use crate::RequestId;
 use crate::orchestration::{
     BlockedCell, CallKey, ParkGuard, PendingCall, RecordedDecisions, run_owner_id,
 };
@@ -47,7 +48,7 @@ pub struct HitlApprovalWrapper {
     /// Who this wrapper speaks for, stamped onto every request it raises.
     scope: AgentScope,
     /// Global request id, for SSE event routing.
-    request_id: String,
+    request_id: RequestId,
     /// `[agent].name` of the config that built this agent.
     agent_name: String,
     /// Instance ID of the AURA process that built this wrapper.
@@ -67,7 +68,7 @@ impl HitlApprovalWrapper {
         patterns: Arc<[GlobPattern]>,
         route: Arc<DecisionRoute>,
         scope: AgentScope,
-        request_id: String,
+        request_id: RequestId,
         agent_name: String,
         instance_id: String,
     ) -> Self {
@@ -483,14 +484,14 @@ mod tests {
         fn parked_gate(
             registry: &PendingApprovals,
             route: &Arc<DecisionRoute>,
-            request_id: &str,
+            request_id: &RequestId,
             cell: &Arc<crate::orchestration::BlockedCell>,
         ) -> HitlApprovalWrapper {
             HitlApprovalWrapper::new(
                 Arc::from([GlobPattern::new("kubectl_*").unwrap()]),
                 route.clone(),
                 worker_scope(),
-                request_id.to_string(),
+                request_id.clone(),
                 "test-agent".to_string(),
                 "test-instance".to_string(),
             )
@@ -500,14 +501,15 @@ mod tests {
                 ParkGuard::new(
                     registry.clone(),
                     "0191e8c0-1111-7000-8000-000000000042".to_string(),
-                    request_id.to_string(),
+                    request_id.clone(),
                 ),
             )
         }
 
         #[tokio::test]
         async fn register_error_fails_closed_with_no_cell_entry_and_no_event() {
-            let request_id = format!("req_park_fail_{}", uuid::Uuid::new_v4().simple());
+            let request_id =
+                RequestId::new(format!("req_park_fail_{}", uuid::Uuid::new_v4().simple()));
             let mut events = crate::approval_event_broker::subscribe(&request_id).await;
             let store: Arc<dyn crate::session_store::ApprovalStore> =
                 Arc::new(crate::session_store::FaultInjectingStore::failing_register());
@@ -548,7 +550,8 @@ mod tests {
 
         #[tokio::test]
         async fn happy_path_registers_publishes_appends_and_short_circuits() {
-            let request_id = format!("req_park_ok_{}", uuid::Uuid::new_v4().simple());
+            let request_id =
+                RequestId::new(format!("req_park_ok_{}", uuid::Uuid::new_v4().simple()));
             let mut events = crate::approval_event_broker::subscribe(&request_id).await;
             let store: Arc<dyn crate::session_store::ApprovalStore> =
                 Arc::new(crate::session_store::InMemoryApprovalStore::new());
@@ -630,7 +633,7 @@ mod tests {
         async fn two_gated_calls_append_two_cell_entries() {
             let (registry, route) = conv_route(Duration::from_secs(60));
             let cell = Arc::new(crate::orchestration::BlockedCell::default());
-            let gate = parked_gate(&registry, &route, "req-two-calls", &cell);
+            let gate = parked_gate(&registry, &route, &RequestId::new("req-two-calls"), &cell);
 
             let first = gate
                 .pre_call(
@@ -666,7 +669,7 @@ mod tests {
         async fn ungated_tool_proceeds_without_parking() {
             let (registry, route) = conv_route(Duration::from_secs(60));
             let cell = Arc::new(crate::orchestration::BlockedCell::default());
-            let gate = parked_gate(&registry, &route, "req-ungated", &cell);
+            let gate = parked_gate(&registry, &route, &RequestId::new("req-ungated"), &cell);
 
             let outcome = gate
                 .pre_call(&serde_json::json!({}), &ToolCallContext::new("ls"))
@@ -689,13 +692,13 @@ mod tests {
             let guard = ParkGuard::new(
                 registry.clone(),
                 "0191e8c0-1111-7000-8000-000000000042".to_string(),
-                "req-guard".to_string(),
+                RequestId::new("req-guard"),
             );
             let gate = HitlApprovalWrapper::new(
                 Arc::from([GlobPattern::new("kubectl_*").unwrap()]),
                 route,
                 worker_scope(),
-                "req-guard".to_string(),
+                RequestId::new("req-guard"),
                 "test-agent".to_string(),
                 "test-instance".to_string(),
             )
@@ -763,7 +766,7 @@ mod tests {
                 Arc::from([GlobPattern::new("kubectl_*").unwrap()]),
                 route,
                 AgentScope::Single { session_id: None },
-                "req-recorded".to_string(),
+                RequestId::new("req-recorded"),
                 "test-agent".to_string(),
                 "test-instance".to_string(),
             )
@@ -1081,7 +1084,7 @@ mod tests {
         /// it, plus the flag that reports whether the inner tool ran.
         fn gated_tool(
             route: DecisionRoute,
-            request_id: &str,
+            request_id: &RequestId,
             tool_name: &str,
         ) -> (WrappedTool<StubTool>, Arc<AtomicBool>) {
             let ran = Arc::new(AtomicBool::new(false));
@@ -1093,7 +1096,7 @@ mod tests {
                 Arc::from([GlobPattern::new("kubectl_*").unwrap()]),
                 Arc::new(route),
                 AgentScope::Single { session_id: None },
-                request_id.to_string(),
+                request_id.clone(),
                 "test-agent".to_string(),
                 "test-instance-id".to_string(),
             );
@@ -1114,8 +1117,8 @@ mod tests {
             }
         }
 
-        fn unique_request_id() -> String {
-            format!("req_span_{}", uuid::Uuid::new_v4().simple())
+        fn unique_request_id() -> RequestId {
+            RequestId::new(format!("req_span_{}", uuid::Uuid::new_v4().simple()))
         }
 
         /// The correlation the whole feature exists for: the id the approver

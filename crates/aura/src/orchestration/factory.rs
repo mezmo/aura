@@ -12,6 +12,7 @@ use futures::stream::{self, BoxStream};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
+use crate::RequestId;
 use crate::config::AgentRuntimeConfig;
 use crate::provider_agent::{StreamError, StreamItem};
 use crate::streaming::StreamingAgent;
@@ -47,7 +48,7 @@ impl OrchestratorFactory {
         query: String,
         chat_history: Vec<rig::completion::Message>,
         cancel_token: CancellationToken,
-        request_id: String,
+        request_id: RequestId,
         usage_state: crate::UsageState,
         outer_budget: Option<Duration>,
     ) -> BoxStream<'static, Result<StreamItem, StreamError>> {
@@ -153,7 +154,7 @@ impl StreamingAgent for OrchestratorFactory {
         query: &str,
         chat_history: Vec<rig::completion::Message>,
         cancel_token: CancellationToken,
-        request_id: &str,
+        request_id: &RequestId,
     ) -> Result<BoxStream<'static, Result<StreamItem, StreamError>>, StreamError> {
         // Raw-stream callers don't observe usage; hand the spawn a detached
         // UsageState so the field is populated but nobody reads it.
@@ -161,7 +162,7 @@ impl StreamingAgent for OrchestratorFactory {
             query.to_string(),
             chat_history,
             cancel_token,
-            request_id.to_string(),
+            request_id.clone(),
             crate::UsageState::new(),
             None,
         ))
@@ -172,7 +173,7 @@ impl StreamingAgent for OrchestratorFactory {
         query: &str,
         chat_history: Vec<rig::completion::Message>,
         timeout: Duration,
-        request_id: &str,
+        request_id: &RequestId,
     ) -> (
         BoxStream<'static, Result<StreamItem, StreamError>>,
         watch::Sender<bool>,
@@ -181,7 +182,7 @@ impl StreamingAgent for OrchestratorFactory {
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let cancel_token = CancellationToken::new();
         let watcher_cancel_token = cancel_token.clone();
-        let request_id_owned = request_id.to_string();
+        let request_id_owned = request_id.clone();
 
         // Fire-and-forget: task self-terminates when cancel_tx is dropped or timeout fires.
         let _watcher_handle =
@@ -195,7 +196,7 @@ impl StreamingAgent for OrchestratorFactory {
             query.to_string(),
             chat_history,
             cancel_token,
-            request_id.to_string(),
+            request_id.clone(),
             usage_state.clone(),
             (!timeout.is_zero()).then_some(timeout),
         );
@@ -203,7 +204,7 @@ impl StreamingAgent for OrchestratorFactory {
         (stream, cancel_tx, usage_state)
     }
 
-    async fn cancel_and_close_mcp(&self, _request_id: &str, _reason: &str) -> usize {
+    async fn cancel_and_close_mcp(&self, _request_id: &RequestId, _reason: &str) -> usize {
         // No-op: cancellation is handled inside the spawned task via cancel_token.
         0
     }

@@ -8,7 +8,7 @@ use rmcp::{
     RoleClient,
     model::{
         CallToolRequestParam, CancelledNotificationParam, ClientRequest, ProgressNotificationParam,
-        Request, RequestId, Tool,
+        Request, RequestId as McpRequestId, Tool,
     },
     serve_client,
     service::{PeerRequestOptions, RunningService},
@@ -25,6 +25,7 @@ use std::time::Duration;
 use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, error, info, warn};
 
+use crate::RequestId;
 use crate::approver_headers::ApproverHeaders;
 use crate::mcp::progress::ProgressEnabledHandler;
 use crate::mcp::response::extract_tool_result;
@@ -320,7 +321,7 @@ const CANCEL_NOTIFICATION_TIMEOUT: Duration = Duration::from_secs(2);
 /// Maps HTTP request_id → set of MCP request_ids that are in-flight.
 #[derive(Default)]
 pub struct InFlightRequests {
-    requests: RwLock<HashMap<String, HashSet<RequestId>>>,
+    requests: RwLock<HashMap<RequestId, HashSet<McpRequestId>>>,
 }
 
 impl InFlightRequests {
@@ -329,15 +330,15 @@ impl InFlightRequests {
     }
 
     /// Register an in-flight MCP request for an HTTP request
-    pub async fn register(&self, http_request_id: &str, mcp_request_id: RequestId) {
+    pub async fn register(&self, http_request_id: &RequestId, mcp_request_id: McpRequestId) {
         let mut map = self.requests.write().await;
-        map.entry(http_request_id.to_string())
+        map.entry(http_request_id.clone())
             .or_default()
             .insert(mcp_request_id);
     }
 
     /// Remove an MCP request (completed or cancelled)
-    pub async fn remove(&self, http_request_id: &str, mcp_request_id: &RequestId) {
+    pub async fn remove(&self, http_request_id: &RequestId, mcp_request_id: &McpRequestId) {
         let mut map = self.requests.write().await;
         if let Some(set) = map.get_mut(http_request_id) {
             set.remove(mcp_request_id);
@@ -348,7 +349,7 @@ impl InFlightRequests {
     }
 
     /// Get all in-flight MCP request IDs for an HTTP request
-    pub async fn get_all(&self, http_request_id: &str) -> Vec<RequestId> {
+    pub async fn get_all(&self, http_request_id: &RequestId) -> Vec<McpRequestId> {
         let map = self.requests.read().await;
         map.get(http_request_id)
             .map(|set| set.iter().cloned().collect())
@@ -356,7 +357,7 @@ impl InFlightRequests {
     }
 
     /// Clear all in-flight requests for an HTTP request (cleanup)
-    pub async fn clear(&self, http_request_id: &str) {
+    pub async fn clear(&self, http_request_id: &RequestId) {
         let mut map = self.requests.write().await;
         map.remove(http_request_id);
     }
@@ -369,7 +370,7 @@ pub struct McpClient {
     /// Tracks in-flight MCP requests for cancellation support
     in_flight: Arc<InFlightRequests>,
     /// Current HTTP request ID for automatic cancellation tracking.
-    current_http_request_id: Arc<RwLock<Option<String>>>,
+    current_http_request_id: Arc<RwLock<Option<RequestId>>>,
 }
 
 impl Clone for McpClient {
@@ -472,9 +473,9 @@ impl McpClient {
     }
 
     /// Set the current HTTP request ID for cancellation tracking.
-    pub async fn set_current_request(&self, http_request_id: &str) {
+    pub async fn set_current_request(&self, http_request_id: &RequestId) {
         let mut guard = self.current_http_request_id.write().await;
-        *guard = Some(http_request_id.to_string());
+        *guard = Some(http_request_id.clone());
         debug!(
             "Set current HTTP request ID for MCP client: {}",
             http_request_id
@@ -490,7 +491,7 @@ impl McpClient {
         *guard = None;
     }
 
-    pub async fn get_current_request(&self) -> Option<String> {
+    pub async fn get_current_request(&self) -> Option<RequestId> {
         self.current_http_request_id.read().await.clone()
     }
 
@@ -734,7 +735,7 @@ impl McpClient {
         &self,
         tool_name: &str,
         arguments: HashMap<String, Value>,
-        http_request_id: &str,
+        http_request_id: &RequestId,
         approver_overrides: Option<ApproverHeaders>,
     ) -> Result<String> {
         debug!(
@@ -771,8 +772,7 @@ impl McpClient {
         // We peek (not pop) here - the pop happens in on_tool_result to ensure
         // push/pop pairing for ALL tools (MCP and non-MCP like vector stores).
         let progress_token = Some(handle.progress_token.clone());
-        let request_id_string = http_request_id.to_string();
-        if let Some(tool_call_id) = peek_tool_call_id(&request_id_string).await {
+        if let Some(tool_call_id) = peek_tool_call_id(http_request_id).await {
             publish_tool_start(
                 http_request_id,
                 tool_call_id.clone(),
@@ -818,7 +818,7 @@ impl McpClient {
     }
 
     /// Cancel all in-flight MCP requests for an HTTP request.
-    pub async fn cancel_all_for_request(&self, http_request_id: &str, reason: &str) -> usize {
+    pub async fn cancel_all_for_request(&self, http_request_id: &RequestId, reason: &str) -> usize {
         let mcp_request_ids = self.in_flight.get_all(http_request_id).await;
 
         if mcp_request_ids.is_empty() {
@@ -886,7 +886,7 @@ impl McpClient {
     }
 
     /// Cancel all in-flight requests and close the connection.
-    pub async fn cancel_and_close(&self, http_request_id: &str, reason: &str) -> usize {
+    pub async fn cancel_and_close(&self, http_request_id: &RequestId, reason: &str) -> usize {
         let count = self.cancel_all_for_request(http_request_id, reason).await;
 
         // Also clear the request ID to stop routing any straggler progress notifications
@@ -917,8 +917,8 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn test_in_flight_requests_tracking() {
         let tracker = InFlightRequests::new();
-        let http_id = "http-123";
-        let mcp_id = RequestId::Number(1);
+        let http_id = &RequestId::new("http-123");
+        let mcp_id = McpRequestId::Number(1);
 
         tracker.register(http_id, mcp_id.clone()).await;
         assert_eq!(tracker.get_all(http_id).await.len(), 1);
@@ -1167,7 +1167,7 @@ pub(crate) mod tests {
         let Some(id) = message
             .get("id")
             .cloned()
-            .and_then(|id| serde_json::from_value::<RequestId>(id).ok())
+            .and_then(|id| serde_json::from_value::<McpRequestId>(id).ok())
         else {
             return ("202 Accepted", Vec::new(), String::new());
         };
@@ -1343,7 +1343,9 @@ pub(crate) mod tests {
             .await
             .expect("the untracked call succeeds");
 
-        client.set_current_request("http-req-1").await;
+        client
+            .set_current_request(&RequestId::new("http-req-1"))
+            .await;
         client
             .call_tool(
                 "tracked",
