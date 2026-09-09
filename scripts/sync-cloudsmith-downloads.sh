@@ -272,13 +272,13 @@ post_batch() {
         "${POSTHOG_HOST%/}/batch/" >/dev/null
 }
 
-# Run a HogQL query and print its first scalar result.
+# Run a HogQL query and print the response body.
 #
 # Plain --retry covers the transient cases (timeouts, 429, 5xx) and leaves
 # 4xx alone: an auth or project error repeated four times is noise, and the
 # status is worth naming because every likely cause is a misconfiguration
 # rather than an outage.
-hogql_scalar() {
+hogql_request() {
     local query=$1 response status body
     response=$(jq -n --arg q "${query}" '{query: {kind: "HogQLQuery", query: $q}}' \
         | curl --silent --show-error --retry 3 --retry-delay 2 --max-time 60 \
@@ -296,7 +296,16 @@ hogql_scalar() {
         echo "       and POSTHOG_API_READ_KEY must hold query:read on that project" >&2
         return 1
     fi
-    jq -r '.results[0][0]' <<<"${body}"
+    printf '%s\n' "${body}"
+}
+
+hogql_scalar() {
+    hogql_request "$1" | jq -r '.results[0][0]'
+}
+
+# The whole first row, tab separated.
+hogql_row() {
+    hogql_request "$1" | jq -r '.results[0] | @tsv'
 }
 
 # Count how many of this run's own event UUIDs are queryable at this run's
@@ -305,36 +314,31 @@ hogql_scalar() {
 # an event from the current payload is still missing. Pinning the timestamp too
 # means a snapshot attributed to the wrong instant cannot read as verified.
 count_ingested() {
-    local date=$1 chunk list total=0 found
+    local date=$1 chunk list row found downloads value events=0 total=0
     for chunk in "${WORK_DIR}"/uchunk.*; do
         list=$(sed "s/^/'/; s/$/'/" "${chunk}" | paste -sd, -)
-        found=$(hogql_scalar "SELECT count(DISTINCT uuid) FROM events \
+        row=$(hogql_row "SELECT count(), sum(dl) FROM ( \
+            SELECT uuid, max(toIntOrZero(toString(properties.download_count))) AS dl \
+            FROM events \
             WHERE event = '${EVENT_NAME}' \
               AND timestamp = toDateTime('${date} 23:59:59') \
-              AND uuid IN (${list})")
-        total=$((total + found))
+              AND uuid IN (${list}) \
+            GROUP BY uuid)")
+        found=${row%%$'\t'*}
+        downloads=${row##*$'\t'}
+        case "${found}" in '' | null) found=0 ;; esac
+        case "${downloads}" in '' | null) downloads=0 ;; esac
+        for value in "${found}" "${downloads}"; do
+            case "${value}" in
+                '' | *[!0-9]*)
+                    echo "error: PostHog answered the read-back with '${row}', which is not a count and a total" >&2
+                    return 1 ;;
+            esac
+        done
+        events=$(( events + found ))
+        total=$(( total + downloads ))
     done
-    printf '%s\n' "${total}"
-}
-
-# The download total the stored snapshot accounts for.
-#
-# Scoping to this run's UUIDs cannot answer whether a retry landed: those UUIDs
-# are derived from the snapshot date, so an earlier run for the same date has
-# already ingested every one of them, and they stay present however completely
-# the retry was discarded. Only the total moves when the counts do, and
-# cumulative counts only rise, so a total at least as high as the one just
-# collected is a bar a staler snapshot cannot clear.
-#
-# max() per package mirrors what reporting must do, since a re-run's rows stay
-# visible until PostHog's background merges collapse them.
-#
-# printf builds the literals rather than nested shell quoting, which is easy to
-# get wrong in a way that still returns a well-formed answer: a quote stray
-# inside the string literal matches no rows and reads as "nothing ingested".
-downloads_query() {
-    printf "SELECT sum(dl) FROM (SELECT properties.repository AS repo, properties.package_id AS pid, max(toIntOrZero(toString(properties.download_count))) AS dl FROM events WHERE event = '%s' AND timestamp = toDateTime('%s 23:59:59') GROUP BY repo, pid)" \
-        "${EVENT_NAME}" "$1"
+    printf '%s\t%s\n' "${events}" "${total}"
 }
 
 # A date-wide count, for asking whether a day holds any snapshot at all. This
@@ -346,24 +350,12 @@ snapshot_count_query() {
 
 # Poll until the snapshot is queryable, since ingestion lags the send.
 verify_snapshot() {
-    local date=$1 want_events=$2 want_downloads=$3 deadline events downloads value
+    local date=$1 want_events=$2 want_downloads=$3 deadline row events downloads
     deadline=$(( $(date +%s) + VERIFY_TIMEOUT ))
     while :; do
-        events=$(count_ingested "${date}")
-        downloads=$(hogql_scalar "$(downloads_query "${date}")")
-        # A date none of whose events are queryable yet answers with a null
-        # sum, which reaches here as an empty or literal "null" value. That is
-        # "nothing has landed yet", which the poll exists to wait out, not a
-        # malformed answer to abort on.
-        case "${events}" in '' | null) events=0 ;; esac
-        case "${downloads}" in '' | null) downloads=0 ;; esac
-        for value in "${events}" "${downloads}"; do
-            case "${value}" in
-                '' | *[!0-9]*)
-                    echo "error: PostHog answered the read-back with '${events}' event(s) and '${downloads}' download(s), which are not both counts" >&2
-                    return 1 ;;
-            esac
-        done
+        row=$(count_ingested "${date}")
+        events=${row%%$'\t'*}
+        downloads=${row##*$'\t'}
         if [ "${events}" -ge "${want_events}" ] && [ "${downloads}" -ge "${want_downloads}" ]; then
             echo "Verified ${events} of ${want_events} event(s) and ${downloads} download(s) queryable in PostHog for ${date}"
             return 0
@@ -452,10 +444,6 @@ mezmo/aura|3uq7JmasvnKF|raw||null|0"
     # The read-back queries must quote their literals exactly once. Nested
     # quoting bugs here return 0 rows, which is indistinguishable from a failed
     # send.
-    got=$(downloads_query "2026-08-20")
-    want="SELECT sum(dl) FROM (SELECT properties.repository AS repo, properties.package_id AS pid, max(toIntOrZero(toString(properties.download_count))) AS dl FROM events WHERE event = 'cloudsmith_package_downloads' AND timestamp = toDateTime('2026-08-20 23:59:59') GROUP BY repo, pid)"
-    [ "${got}" = "${want}" ] || { echo "selftest: downloads query is"$'\n'"  ${got}"$'\n'"want"$'\n'"  ${want}" >&2; exit 1; }
-
     got=$(snapshot_count_query "2026-08-20")
     want="SELECT count(DISTINCT uuid) FROM events WHERE event = 'cloudsmith_package_downloads' AND properties.snapshot_date = '2026-08-20'"
     [ "${got}" = "${want}" ] || { echo "selftest: count query is"$'\n'"  ${got}"$'\n'"want"$'\n'"  ${want}" >&2; exit 1; }
