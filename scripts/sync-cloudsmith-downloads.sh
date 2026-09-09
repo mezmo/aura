@@ -240,6 +240,14 @@ collect_packages() {
         echo "error: ${repo}: collected ${collected} of ${first_count} package(s)" >&2
         return 1
     fi
+
+    # An upload landing after the final page was read cannot be seen by this
+    # run, however the loop is written: the list is live and the snapshot is
+    # not atomic. Say so rather than omitting the package silently. Cumulative
+    # totals mean the next run picks it up, so this is not a failure.
+    if [ "${collected}" -lt "${count}" ]; then
+        echo "::warning::${repo}: $(( count - collected )) package(s) appeared during collection and are not in this snapshot; the next run includes them" >&2
+    fi
     echo "Collected ${collected} ${repo} package(s)" >&2
 }
 
@@ -291,8 +299,11 @@ add_probe() {
     mv "${payload}.probed" "${payload}"
 }
 
-probe_landed() {
-    hogql_scalar "SELECT count() FROM events WHERE event = '${EVENT_NAME}_probe' AND uuid = '$1'"
+probes_landed() {
+    local list
+    list=$(sed "s/^/'/; s/$/'/" "${WORK_DIR}/probes" | paste -sd, -)
+    hogql_scalar "SELECT count(DISTINCT uuid) FROM events \
+        WHERE event = '${EVENT_NAME}_probe' AND uuid IN (${list})"
 }
 
 post_batch() {
@@ -383,22 +394,22 @@ snapshot_count_query() {
 
 # Poll until the snapshot is queryable, since ingestion lags the send.
 verify_snapshot() {
-    local date=$1 want_events=$2 want_downloads=$3 probe=$4
+    local date=$1 want_events=$2 want_downloads=$3 probes=$4
     local deadline row events downloads seen
     deadline=$(( $(date +%s) + VERIFY_TIMEOUT ))
     while :; do
         row=$(count_ingested "${date}")
         events=${row%%$'\t'*}
         downloads=${row##*$'\t'}
-        seen=$(probe_landed "${probe}")
+        seen=$(probes_landed)
         case "${seen}" in '' | null) seen=0 ;; esac
         if [ "${events}" -ge "${want_events}" ] && [ "${downloads}" -ge "${want_downloads}" ] \
-           && [ "${seen}" -ge 1 ]; then
-            echo "Verified ${events} of ${want_events} event(s), ${downloads} download(s), and this run's probe in PostHog for ${date}"
+           && [ "${seen}" -ge "${probes}" ]; then
+            echo "Verified ${events} of ${want_events} event(s), ${downloads} download(s), and ${seen} probe(s) in PostHog for ${date}"
             return 0
         fi
         if [ "$(date +%s)" -ge "${deadline}" ]; then
-            echo "error: PostHog holds ${events} of ${want_events} event(s), ${downloads} of ${want_downloads} download(s), and ${seen} probe(s) for ${date} after ${VERIFY_TIMEOUT}s" >&2
+            echo "error: PostHog holds ${events} of ${want_events} event(s), ${downloads} of ${want_downloads} download(s), and ${seen} of ${probes} probe(s) for ${date} after ${VERIFY_TIMEOUT}s" >&2
             return 1
         fi
         sleep 5
@@ -595,11 +606,17 @@ main() {
         return 0
     fi
 
-    local probe payload
-    probe=$(uuid4)
-    add_probe "${WORK_DIR}/payload.1.json" "${probe}"
+    # Every batch carries its own probe. One probe in the first batch cannot
+    # speak for a later batch that was discarded, because the deterministic
+    # events a retry re-sends are already present from the earlier run.
+    local probe payload probes=0
+    : > "${WORK_DIR}/probes"
     for payload in "${WORK_DIR}"/payload.*.json; do
+        probe=$(uuid4)
+        printf '%s\n' "${probe}" >> "${WORK_DIR}/probes"
+        add_probe "${payload}" "${probe}"
         post_batch "${payload}"
+        probes=$(( probes + 1 ))
     done
 
     echo "Sent ${packages} event(s) for ${date} to ${POSTHOG_HOST%/}"
@@ -608,7 +625,7 @@ main() {
         echo "Skipping read-back verification (SKIP_VERIFY=1)"
         return 0
     fi
-    verify_snapshot "${date}" "${packages}" "${downloads}" "${probe}"
+    verify_snapshot "${date}" "${packages}" "${downloads}" "${probes}"
     # Advisory only: a missing earlier day is worth reporting but is not a
     # failure of this run, and cannot be repaired by retrying it.
     warn_on_gap "${date}" || true
