@@ -11,7 +11,7 @@
 //! Store contract (park/reify §2.5):
 //!
 //! - `resolve` refuses past the approval's `expires_at`, uniformly with an
-//!   unknown id; expiry is enforced only by `resolve`.
+//!   unknown id.
 //! - `resolve` *moves* the approval into the decision file rather than deleting
 //!   it, minus its egress headers (a decided id is never notified again):
 //!   `get` returns the approval before and after the decision, `decision`
@@ -24,7 +24,7 @@
 //! - `list_pending` scans the undecided approvals for the poll reconciler:
 //!   corrupt files are warn-and-skipped per id, a stale approval file whose
 //!   decision file exists is skipped (the recorded decision owns the
-//!   outcome), and expired records are filtered.
+//!   outcome), and expired records are unlinked.
 //!
 //! Decision ids are validated as UUIDs before path building, so none address
 //! outside the root.
@@ -382,6 +382,11 @@ impl Inner {
             }
             if parked.expires_at > now {
                 pending.push(parked);
+            } else if let Err(err) = fs::remove_file(&path) {
+                tracing::warn!(
+                    path = %path.display(), error = %err,
+                    "expired approval file not removed by list_pending"
+                );
             }
         }
         Ok(pending)

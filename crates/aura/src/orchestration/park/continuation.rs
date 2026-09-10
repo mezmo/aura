@@ -223,6 +223,9 @@ pub(crate) async fn load_recorded_decisions(
                 .await
                 .map_err(|e| RehydrateError::Store(e.to_string()))?;
             let Some(parked) = parked else {
+                if chrono::Utc::now() > expires_at {
+                    return Err(RehydrateError::Expired);
+                }
                 return Err(RehydrateError::Mismatch(format!(
                     "store approval {} is missing",
                     call.decision_id
@@ -512,10 +515,16 @@ mod tests {
 
         // The same undecided call past the document's expiry is the expired
         // row.
-        let mut doc = parked_run(vec![pending_call(undecided, args)]);
+        let mut doc = parked_run(vec![pending_call(undecided, args.clone())]);
         doc.expires_at = (chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
         let err = load_recorded_decisions(&registry, &doc).await.unwrap_err();
         assert!(err.to_string().contains("expired"), "got: {err}");
+
+        // A row the store already swept past the window is expired, not a
+        // mismatch.
+        doc.plan.tasks[0].pending = Some(vec![pending_call(vanished, args)]);
+        let err = load_recorded_decisions(&registry, &doc).await.unwrap_err();
+        assert!(matches!(err, RehydrateError::Expired), "got: {err}");
     }
 
     /// The stored approval's scope must name this run and this checkpoint

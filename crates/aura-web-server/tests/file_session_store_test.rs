@@ -295,6 +295,27 @@ async fn resolve_moves_the_approval_into_the_decision_file() {
     );
 }
 
+/// An expired undecided approval leaves the store on the scan that finds
+/// it, so no credential outlives the decision window.
+#[tokio::test]
+async fn list_pending_unlinks_expired_approval_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = FileApprovalStore::open(dir.path()).unwrap();
+    let mut expired = make_parked("req-expired", Duration::from_secs(60));
+    expired.expires_at = chrono::Utc::now() - chrono::Duration::seconds(1);
+    let id = expired.request.decision_id;
+    store.register(expired).await.unwrap();
+
+    assert!(store.list_pending().await.unwrap().is_empty());
+    assert!(
+        !dir.path()
+            .join("approvals")
+            .join(format!("{id}.json"))
+            .exists(),
+        "the expired approval file was unlinked"
+    );
+}
+
 /// Rows hold credentials, so the store's directories and files are
 /// readable by the owner only.
 #[cfg(unix)]
