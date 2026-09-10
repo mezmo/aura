@@ -516,20 +516,15 @@ async fn remove_tolerates_an_undecodable_record() {
     let id = parked.request.decision_id;
     approvals.register(parked).await.unwrap();
 
-    // Corrupt the record in place and bound both keys, atomically, so a
-    // failed plant or assertion cannot leak an immortal key.
-    let approval_key = format!("{}:approval:{id}", config.key_prefix);
-    let req_index_key = format!("{}:approval:req:req-remove-corrupt", config.key_prefix);
+    // Corrupt the record in place, TTL-bounded; its index entry dies with
+    // the index key's own TTL.
     let client = redis::Client::open(redis_url()).unwrap();
     let mut raw = client.get_multiplexed_async_connection().await.unwrap();
-    redis::pipe()
-        .atomic()
-        .set(&approval_key, "{not valid json")
-        .ignore()
-        .expire(&approval_key, 60)
-        .ignore()
-        .expire(&req_index_key, 60)
-        .ignore()
+    redis::cmd("SET")
+        .arg(format!("{}:approval:{id}", config.key_prefix))
+        .arg("{not valid json")
+        .arg("EX")
+        .arg(60)
         .query_async::<()>(&mut raw)
         .await
         .unwrap();
@@ -540,15 +535,6 @@ async fn remove_tolerates_an_undecodable_record() {
         .expect("a corrupt payload must not fail the removal");
 
     assert!(approvals.get(&id).await.unwrap().is_none());
-
-    // The unparseable record kept its index entry (prune cannot find its
-    // request id); clean it up rather than leaving it to the TTL.
-    redis::cmd("SREM")
-        .arg(&req_index_key)
-        .arg(id.to_string())
-        .query_async::<()>(&mut raw)
-        .await
-        .unwrap();
 }
 
 /// One corrupt record must not fail `cancel_request` for its whole request:
@@ -692,17 +678,6 @@ async fn cancel_request_skips_a_wrong_type_value_and_returns_valid_records() {
         vec![corrupt_id.to_string()],
         "the non-UTF-8 record's index entry was swept; the wrong-typed one remains"
     );
-
-    // Success-path cleanup for the one fixture the sweep deliberately
-    // leaves in place; the TTLs bound every other failure path.
-    redis::pipe()
-        .del(&corrupt_key)
-        .ignore()
-        .srem(&req_index_key, corrupt_id.to_string())
-        .ignore()
-        .query_async::<()>(&mut raw)
-        .await
-        .unwrap();
 }
 
 #[tokio::test]
@@ -725,247 +700,174 @@ async fn approval_expires_with_its_record_ttl() {
 // SMEMBERS-hold proxy: pin the sweep's SMEMBERS-to-pipe window
 // ---------------------------------------------------------------------------
 
-/// Shared hold state: armed once, fires once, on the connection that
-/// carries the matching SMEMBERS.
-struct SmembersHold {
-    needle: Vec<u8>,
-    armed: AtomicBool,
-    fired: AtomicBool,
-    captured: tokio::sync::mpsc::Sender<()>,
-    release: tokio::sync::Notify,
-    error: tokio::sync::mpsc::Sender<String>,
+/// What a pump reports: the held SMEMBERS reply is in hand, or it failed.
+#[derive(Debug)]
+enum ProxyEvent {
+    Captured,
+    Failed(String),
 }
 
-/// A lockstep TCP proxy between the store under test and the live server.
-/// Every request frame is forwarded, then its response frame, which keeps
-/// pipelined and MULTI/EXEC traffic ordered without interpreting payloads.
-/// When armed, the first SMEMBERS whose key argument contains the needle
-/// has its *response* withheld until released: the client cannot proceed to
-/// its next command, a hard barrier with no sleeps. The store's pub/sub
-/// dispatcher connection passes through untouched (this scenario creates no
-/// subscriptions, so no unsolicited frames break the lockstep).
+/// A lockstep TCP proxy in front of the test server: each request frame is
+/// forwarded, then its response frame, so pipelined and MULTI/EXEC traffic
+/// stays ordered without interpreting payloads. Once armed, the first
+/// SMEMBERS on `needle` has its response withheld until `release` fires: a
+/// hard barrier with no sleeps. The store's pub/sub connection creates no
+/// subscriptions here, so no unsolicited frame breaks the lockstep. Every
+/// task dies with the test runtime.
 struct SmembersHoldProxy {
     addr: std::net::SocketAddr,
-    hold: std::sync::Arc<SmembersHold>,
-    tasks: std::sync::Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
-}
-
-impl Drop for SmembersHoldProxy {
-    fn drop(&mut self) {
-        // Abort every proxy task so no pump outlives the test that owns it.
-        for task in self.tasks.lock().unwrap().drain(..) {
-            task.abort();
-        }
-    }
+    armed: AtomicBool,
+    release: tokio::sync::Notify,
+    events: tokio::sync::mpsc::Sender<ProxyEvent>,
 }
 
 impl SmembersHoldProxy {
     async fn start(
-        needle: Vec<u8>,
+        needle: String,
     ) -> (
-        Self,
-        tokio::sync::mpsc::Receiver<()>,
-        tokio::sync::mpsc::Receiver<String>,
+        std::sync::Arc<Self>,
+        tokio::sync::mpsc::Receiver<ProxyEvent>,
     ) {
-        // Parse the test server URL with the client's own parser so
-        // credentials, database selection, and trailing forms resolve
-        // exactly as the store sees them; only the endpoint is proxied.
-        let info = redis::Client::open(redis_url())
-            .unwrap()
-            .get_connection_info()
-            .clone();
-        let (host, port) = match &info.addr {
-            redis::ConnectionAddr::Tcp(host, port) => (host.clone(), *port),
-            other => panic!("the pin proxy expects a plain TCP test server, got {other:?}"),
-        };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let (captured_tx, captured_rx) = tokio::sync::mpsc::channel(1);
-        let (error_tx, error_rx) = tokio::sync::mpsc::channel(1);
-        let hold = std::sync::Arc::new(SmembersHold {
-            needle,
+        let (events, rx) = tokio::sync::mpsc::channel(4);
+        let proxy = std::sync::Arc::new(Self {
+            addr: listener.local_addr().unwrap(),
             armed: AtomicBool::new(false),
-            fired: AtomicBool::new(false),
-            captured: captured_tx,
             release: tokio::sync::Notify::new(),
-            error: error_tx,
+            events,
         });
-        let tasks = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let server_addr = format!("{host}:{port}");
-        let accept = tokio::spawn({
-            let hold = hold.clone();
-            let tasks = tasks.clone();
+        tokio::spawn({
+            let proxy = proxy.clone();
             async move {
-                loop {
-                    match listener.accept().await {
-                        Ok((client, _)) => {
-                            let pump = tokio::spawn(pump_lockstep(
-                                client,
-                                server_addr.clone(),
-                                hold.clone(),
-                            ));
-                            tasks.lock().unwrap().push(pump);
-                        }
-                        Err(err) => {
-                            let _ = hold.error.send(format!("accept: {err}")).await;
-                            return;
-                        }
-                    }
+                while let Ok((client, _)) = listener.accept().await {
+                    tokio::spawn(proxy.clone().pump(client, needle.clone()));
                 }
             }
         });
-        tasks.lock().unwrap().push(accept);
-        (Self { addr, hold, tasks }, captured_rx, error_rx)
+        (proxy, rx)
+    }
+
+    /// The test server URL with only its `host:port` swapped for the proxy's,
+    /// so credentials, database, and options survive byte for byte.
+    fn url(&self) -> String {
+        let url = redis_url();
+        let lower = url.to_ascii_lowercase();
+        assert!(
+            !lower.contains("protocol=resp3") && !lower.contains("protocol=3"),
+            "the pin proxy forwards RESP2 only"
+        );
+        let endpoint = test_server_endpoint();
+        assert!(
+            url.contains(&endpoint),
+            "the test server URL must spell {endpoint}"
+        );
+        url.replacen(&endpoint, &self.addr.to_string(), 1)
+    }
+
+    async fn pump(self: std::sync::Arc<Self>, client: tokio::net::TcpStream, needle: String) {
+        use tokio::io::AsyncBufReadExt;
+        let run = async {
+            let server = tokio::net::TcpStream::connect(test_server_endpoint()).await?;
+            let (client_read, mut client_write) = client.into_split();
+            let (server_read, mut server_write) = server.into_split();
+            let mut client_read = tokio::io::BufReader::new(client_read);
+            let mut server_read = tokio::io::BufReader::new(server_read);
+            let (mut request, mut response) = (Vec::new(), Vec::new());
+            // EOF between frames is normal teardown; mid-frame it is a defect.
+            while !client_read.fill_buf().await?.is_empty() {
+                request.clear();
+                let args = read_frame(&mut client_read, &mut request).await?;
+                let hold = args.len() >= 2
+                    && args[0].eq_ignore_ascii_case(b"SMEMBERS")
+                    && args[1] == needle.as_bytes()
+                    && self.armed.swap(false, Ordering::AcqRel);
+                server_write.write_all(&request).await?;
+                response.clear();
+                read_frame(&mut server_read, &mut response).await?;
+                if hold {
+                    // The store's own response timeout fails the sweep
+                    // loudly if the release never comes.
+                    let _ = self.events.send(ProxyEvent::Captured).await;
+                    self.release.notified().await;
+                }
+                client_write.write_all(&response).await?;
+            }
+            Ok::<(), std::io::Error>(())
+        };
+        if let Err(err) = run.await {
+            let _ = self.events.send(ProxyEvent::Failed(err.to_string())).await;
+        }
     }
 }
 
-/// The test server URL with only its endpoint swapped for the proxy's.
-/// The userinfo and the suffix (path, query, fragment) move verbatim —
-/// never decoded and re-encoded — so escaped credentials, the database
-/// selection, and URL options survive byte-for-byte.
-fn proxied_redis_url(proxy_addr: std::net::SocketAddr) -> String {
-    let url = redis_url();
-    let rest = url.strip_prefix("redis://").unwrap_or(url.as_str());
-    // The lockstep forwarder speaks request-response only; RESP3 push
-    // frames would break it.
-    let lower = rest.to_ascii_lowercase();
-    assert!(
-        !lower.contains("protocol=resp3") && !lower.contains("protocol=3"),
-        "the pin proxy forwards RESP2 only"
-    );
-    let suffix_at = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let (authority, suffix) = rest.split_at(suffix_at);
-    let userinfo = match authority.rsplit_once('@') {
-        Some((userinfo, _)) => format!("{userinfo}@"),
-        None => String::new(),
-    };
-    format!("redis://{userinfo}{proxy_addr}{suffix}")
+/// The test server's `host:port`, resolved by the client's own URL parser.
+fn test_server_endpoint() -> String {
+    let info = redis::Client::open(redis_url())
+        .unwrap()
+        .get_connection_info()
+        .clone();
+    match info.addr {
+        redis::ConnectionAddr::Tcp(host, port) => format!("{host}:{port}"),
+        other => panic!("the pin proxy expects a plain TCP test server, got {other:?}"),
+    }
 }
 
-/// Read one RESP frame, returning its raw bytes and, for a flat array of
-/// bulk strings (the shape every command redis-rs sends takes), the
-/// argument contents.
-async fn read_frame<R>(reader: &mut R) -> std::io::Result<(Vec<u8>, Vec<Vec<u8>>)>
-where
-    R: tokio::io::AsyncBufRead + Unpin + Send,
-{
-    let mut raw = Vec::new();
-    let args = read_value(reader, &mut raw).await?;
-    Ok((raw, args))
-}
-
-/// The decoded argument contents of one RESP frame.
-type RespArgs = std::io::Result<Vec<Vec<u8>>>;
-/// One in-flight frame read (boxed for the array recursion).
-type RespRead<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = RespArgs> + Send + 'a>>;
-
-fn read_value<'a, R>(reader: &'a mut R, raw: &'a mut Vec<u8>) -> RespRead<'a>
-where
-    R: tokio::io::AsyncBufRead + Unpin + Send,
-{
-    Box::pin(async move {
-        use tokio::io::{AsyncBufReadExt, AsyncReadExt};
-        let mut line = Vec::new();
-        if reader.read_until(b'\n', &mut line).await? == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "closed",
-            ));
+/// Append one RESP2 frame to `raw`, returning its bulk strings: for a
+/// command, its arguments. Arrays are consumed by element count, so nested
+/// replies (an `EXEC` result) stay one frame.
+async fn read_frame<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    raw: &mut Vec<u8>,
+) -> std::io::Result<Vec<Vec<u8>>> {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+    let invalid = || std::io::Error::new(std::io::ErrorKind::InvalidData, "bad RESP frame");
+    let mut bulks = Vec::new();
+    let mut pending = 1usize;
+    while pending > 0 {
+        pending -= 1;
+        let start = raw.len();
+        if reader.read_until(b'\n', raw).await? == 0 {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
         }
-        raw.extend_from_slice(&line);
-        let invalid = || std::io::Error::new(std::io::ErrorKind::InvalidData, "bad RESP frame");
-        let len = |line: &[u8]| -> std::io::Result<isize> {
+        let line = &raw[start..];
+        let count = || -> std::io::Result<isize> {
             std::str::from_utf8(&line[1..line.len().saturating_sub(2)])
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .ok_or_else(invalid)
         };
-        match line.first() {
-            Some(b'+' | b'-' | b':') => Ok(Vec::new()),
-            Some(b'$') => {
-                let n = len(&line)?;
-                if n < 0 {
-                    return Ok(Vec::new());
+        match line[0] {
+            b'+' | b'-' | b':' => {}
+            b'$' => {
+                let n = count()?;
+                if n >= 0 {
+                    let at = raw.len();
+                    raw.resize(at + n as usize + 2, 0);
+                    reader.read_exact(&mut raw[at..]).await?;
+                    bulks.push(raw[at..at + n as usize].to_vec());
                 }
-                let mut body = vec![0u8; n as usize + 2];
-                reader.read_exact(&mut body).await?;
-                raw.extend_from_slice(&body);
-                body.truncate(n as usize);
-                Ok(vec![body])
             }
-            Some(b'*') => {
-                let n = len(&line)?;
-                let mut args = Vec::new();
-                for _ in 0..n.max(0) {
-                    args.extend(read_value(reader, raw).await?);
-                }
-                Ok(args)
-            }
-            _ => Err(invalid()),
+            b'*' => pending += count()?.max(0) as usize,
+            _ => return Err(invalid()),
         }
-    })
-}
-
-async fn pump_lockstep(
-    client: tokio::net::TcpStream,
-    server_addr: String,
-    hold: std::sync::Arc<SmembersHold>,
-) {
-    use tokio::io::AsyncBufReadExt;
-    let run = async {
-        let server = tokio::net::TcpStream::connect(server_addr).await?;
-        let (client_read, mut client_write) = client.into_split();
-        let (server_read, mut server_write) = server.into_split();
-        let mut client_read = tokio::io::BufReader::new(client_read);
-        let mut server_read = tokio::io::BufReader::new(server_read);
-        loop {
-            // A closed connection between frames is normal teardown; a
-            // failure mid-frame is a proxy defect and must surface.
-            if client_read.fill_buf().await?.is_empty() {
-                return Ok(());
-            }
-            let (request, args) = read_frame(&mut client_read).await?;
-            let hold_this = hold.armed.load(Ordering::Acquire)
-                && args.len() >= 2
-                && args[0].eq_ignore_ascii_case(b"SMEMBERS")
-                && args[1]
-                    .windows(hold.needle.len())
-                    .any(|w| w == hold.needle.as_slice())
-                && !hold.fired.swap(true, Ordering::AcqRel);
-            server_write.write_all(&request).await?;
-            let (response, _) = read_frame(&mut server_read).await?;
-            if hold_this {
-                // The SMEMBERS reply is captured; wait for the release. The
-                // store's own response timeout (5s in these fixtures) fails
-                // the sweep loudly if the release never comes.
-                let _ = hold.captured.send(()).await;
-                hold.release.notified().await;
-            }
-            client_write.write_all(&response).await?;
-        }
-    };
-    let result: std::io::Result<()> = run.await;
-    if let Err(err) = result {
-        let _ = hold.error.send(format!("pump: {err}")).await;
     }
+    Ok(bulks)
 }
 
 /// The sweep's SMEMBERS-to-pipe window, pinned end to end: a registration
 /// that lands after the sweep read the index but before its pipe executes
-/// keeps its index entry and stays discoverable by a later cancel. The
-/// proxy withholds the production SMEMBERS reply until the late
-/// registration has fully completed on a direct connection — a hard
-/// barrier, not a sleep. Under the old whole-index `DEL` this test fails at
-/// the SISMEMBER assertion every run.
+/// keeps its index entry and stays discoverable by a later cancel. Under
+/// the old whole-index `DEL` this fails at the SISMEMBER assertion.
 #[tokio::test]
 async fn cancel_request_leaves_a_mid_sweep_registration_indexed() {
     tokio::time::timeout(Duration::from_secs(30), async {
         let config = test_config(60);
         let req_index_key = format!("{}:approval:req:req-mid-sweep", config.key_prefix);
-        let (proxy, mut captured, mut proxy_errors) =
-            SmembersHoldProxy::start(req_index_key.clone().into_bytes()).await;
-        let mut proxied = config.clone();
-        proxied.url = proxied_redis_url(proxy.addr);
+        let (proxy, mut events) = SmembersHoldProxy::start(req_index_key.clone()).await;
+        let proxied = RedisSessionStoreConfig {
+            url: proxy.url(),
+            ..config.clone()
+        };
         let approvals = connect(&proxied).await.approvals();
 
         let first = make_parked("req-mid-sweep", Duration::from_secs(60));
@@ -974,31 +876,29 @@ async fn cancel_request_leaves_a_mid_sweep_registration_indexed() {
 
         // Arm after the fixture registration, so the held SMEMBERS is the
         // sweep's own.
-        proxy.hold.armed.store(true, Ordering::Release);
+        proxy.armed.store(true, Ordering::Release);
         let sweep = tokio::spawn({
             let approvals = approvals.clone();
             async move { approvals.cancel_request("req-mid-sweep").await }
         });
-
-        // Production read the index and is parked ahead of its sweep pipe;
-        // a proxy defect instead of a capture fails here, with its cause.
-        tokio::select! {
-            received = captured.recv() => {
-                received.expect("the sweep's SMEMBERS was captured");
-            }
-            err = proxy_errors.recv() => {
-                panic!("the pin proxy failed: {}", err.unwrap());
-            }
+        match events.recv().await {
+            Some(ProxyEvent::Captured) => {}
+            Some(ProxyEvent::Failed(err)) => panic!("the pin proxy failed: {err}"),
+            None => panic!("the pin proxy went away"),
         }
 
         // The racing registration completes end to end on a direct
-        // connection before the sweep's pipe is even sent.
+        // connection while the sweep is parked ahead of its pipe.
         let late = make_parked("req-mid-sweep", Duration::from_secs(60));
         let late_id = late.request.decision_id;
-        let direct = connect(&config).await.approvals();
-        direct.register(late).await.unwrap();
+        connect(&config)
+            .await
+            .approvals()
+            .register(late)
+            .await
+            .unwrap();
+        proxy.release.notify_one();
 
-        proxy.hold.release.notify_one();
         let cleared = sweep.await.unwrap().unwrap();
         assert_eq!(
             cleared.len(),
@@ -1009,15 +909,13 @@ async fn cancel_request_leaves_a_mid_sweep_registration_indexed() {
 
         let client = redis::Client::open(redis_url()).unwrap();
         let mut raw = client.get_multiplexed_async_connection().await.unwrap();
-        assert!(
-            redis::cmd("SISMEMBER")
-                .arg(&req_index_key)
-                .arg(late_id.to_string())
-                .query_async::<bool>(&mut raw)
-                .await
-                .unwrap(),
-            "the mid-sweep registration kept its index entry"
-        );
+        let indexed: bool = redis::cmd("SISMEMBER")
+            .arg(&req_index_key)
+            .arg(late_id.to_string())
+            .query_async(&mut raw)
+            .await
+            .unwrap();
+        assert!(indexed, "the mid-sweep registration kept its index entry");
 
         let cleared_late = approvals.cancel_request("req-mid-sweep").await.unwrap();
         assert_eq!(
@@ -1026,11 +924,8 @@ async fn cancel_request_leaves_a_mid_sweep_registration_indexed() {
             "the mid-sweep registration stays discoverable"
         );
         assert_eq!(cleared_late[0].request.decision_id, late_id);
-
-        // No proxy connection failed at any point in the scenario,
-        // including a failure that raced the capture.
         assert!(
-            proxy_errors.try_recv().is_err(),
+            events.try_recv().is_err(),
             "the pin proxy reported a failure"
         );
     })
