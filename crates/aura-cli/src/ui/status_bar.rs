@@ -73,6 +73,19 @@ pub fn set_context_used(tokens: u64) {
     CONTEXT_USED.store(tokens, Ordering::Relaxed);
 }
 
+/// Record a mid-turn context estimate taken from an `aura.tool_usage` reading.
+///
+/// Ignored in an orchestrated conversation: those readings come from every
+/// worker as well as the coordinator (the event carries no agent id), so only
+/// the coordinator's end-of-turn `aura.context_usage` reading describes the
+/// conversation's context there.
+pub fn set_mid_turn_context_estimate(tokens: u64) {
+    if ORCHESTRATED.load(Ordering::Relaxed) {
+        return;
+    }
+    set_context_used(tokens);
+}
+
 /// Record the latest MCP server tally.
 pub fn set_mcp_counts(counts: McpCounts) {
     if let Ok(mut g) = MCP_COUNTS.lock() {
@@ -137,18 +150,12 @@ fn capture_snapshot() -> Snapshot {
     } else {
         None
     };
-    // In an orchestrated conversation the mid-turn aura.tool_usage readings
-    // come from every worker as well as the coordinator (the event carries no
-    // agent id), so there is no single context to show. Otherwise show the
-    // count once something has been reported, with the meter when the
-    // model's window is known.
+    // Show the count once something has been reported, with the meter when
+    // the model's window is known. In an orchestrated conversation this is the
+    // coordinator's context — the persistent conversation the user is in.
     let used = CONTEXT_USED.load(Ordering::Relaxed);
     let limit = NonZeroU64::new(MODEL_CONTEXT_LIMIT.load(Ordering::Relaxed));
-    let context = if ORCHESTRATED.load(Ordering::Relaxed) || (used == 0 && limit.is_none()) {
-        None
-    } else {
-        Some(ContextUsage { used, limit })
-    };
+    let context = (used > 0 || limit.is_some()).then_some(ContextUsage { used, limit });
     Snapshot {
         model: get_selected_model().or_else(|| SESSION_MODEL.lock().ok().and_then(|g| g.clone())),
         server,
@@ -539,6 +546,15 @@ pub fn reset_ctrlc_state() {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::{Mutex, MutexGuard};
+
+    // The status-line counters are process globals; tests that write them
+    // take turns so one test's reset does not land inside another's readings.
+    static STATE_LOCK: Mutex<()> = Mutex::new(());
+
+    fn state_lock() -> MutexGuard<'static, ()> {
+        STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     fn session_model() -> Option<String> {
         SESSION_MODEL.lock().unwrap().clone()
@@ -546,6 +562,7 @@ mod tests {
 
     #[test]
     fn record_session_event_seeds_and_reset_clears() {
+        let _guard = state_lock();
         record_session_event(
             event_names::SESSION_INFO,
             &json!({ "model": "gpt-4o", "model_context_limit": 128000 }),
@@ -575,7 +592,32 @@ mod tests {
     }
 
     #[test]
+    fn orchestrated_conversation_shows_the_coordinators_context() {
+        let _guard = state_lock();
+        reset_session_status();
+        mark_orchestrated();
+
+        // Worker tool turns stream mid-turn estimates that say nothing about
+        // the conversation's own context; they never reach the meter.
+        set_mid_turn_context_estimate(180_000);
+        assert_eq!(CONTEXT_USED.load(Ordering::Relaxed), 0);
+        assert_eq!(capture_snapshot().context, None);
+
+        // The coordinator's end-of-turn reading is the conversation's context.
+        set_context_window_usage(40_000, 1_200, Some(500_000));
+        assert_eq!(
+            capture_snapshot().context,
+            Some(ContextUsage {
+                used: 41_200,
+                limit: NonZeroU64::new(500_000),
+            })
+        );
+        reset_session_status();
+    }
+
+    #[test]
     fn a_previous_turns_reading_still_displays_but_stops_driving_decisions() {
+        let _guard = state_lock();
         set_context_window_usage(100_000, 5_000, Some(200_000));
         assert_eq!(fresh_context_fill_ratio(), Some(0.525));
 
