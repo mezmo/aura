@@ -446,7 +446,6 @@ struct StreamCallParams<'a> {
     history: Vec<rig::completion::Message>,
     phase: &'a str,
     event_tx: Option<&'a tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>>,
-    /// Agent id that owns this call's context-occupancy reading.
     context_agent: Option<&'a str>,
 }
 
