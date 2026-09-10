@@ -17,13 +17,6 @@ on:
         required: false
         default: false
         type: boolean
-  # TEMPORARY: remove before merging. schedule only fires on the default branch
-  # and workflow_dispatch only appears once the file is on it, so a push
-  # trigger is the only way to exercise the credentialed sync job beforehand.
-  # It also hands the secrets to whatever is pushed, ahead of review.
-  push:
-    branches:
-      - "justingross/GH-647-docker-download-totals-to-posthog"
   pull_request:
     paths:
       - "scripts/sync-docker-dvp-reports.sh"
