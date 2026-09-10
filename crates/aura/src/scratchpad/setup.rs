@@ -7,7 +7,7 @@ use super::{
     ContextBudget, SCRATCHPAD_PREAMBLE, ScratchpadConfig, ScratchpadStorage, ScratchpadToolsConfig,
     ScratchpadWrapper, TokenCounter, scratchpad_tool_schema_tokens,
 };
-use crate::config::glob_match;
+use crate::mcp::AuraTool;
 use crate::tool_wrapper::ToolWrapper;
 use std::collections::HashMap;
 use std::path::Path;
@@ -113,27 +113,28 @@ pub fn estimate_scratchpad_overhead(
 /// optionally filtered by glob patterns (`None` = include all).
 ///
 /// Each tool is serialized as `{name, description, input_schema}` — the same
-/// shape the LLM sees in its tool list. Per-provider serialization differs
+/// shape the LLM sees in its tool list. `name` is the bare tool name, the
+/// only one ever sent to a model. Per-provider serialization differs
 /// slightly (OpenAI vs. Anthropic envelope keys), so the BPE count is a
 /// conservative approximation of the wire format. That over-counts a few
 /// tokens per tool — the safer direction for budget gating, and accuracy is
 /// recovered after turn 1 anyway via the LLM's reported `input_tokens`.
 pub fn count_mcp_tool_schema_tokens<'a>(
     counter: &dyn TokenCounter,
-    tools: impl IntoIterator<Item = &'a rmcp::model::Tool>,
+    tools: impl IntoIterator<Item = &'a AuraTool>,
     mcp_filter: Option<&[String]>,
 ) -> usize {
     tools
         .into_iter()
         .filter(|t| match mcp_filter {
             None => true,
-            Some(filter) => filter.iter().any(|p| glob_match(p, t.name.as_ref())),
+            Some(filter) => filter.iter().any(|p| t.matches(p)),
         })
         .map(|t| {
             let json = serde_json::json!({
-                "name": t.name,
-                "description": t.description,
-                "input_schema": &*t.input_schema,
+                "name": t.name().to_string(),
+                "description": t.description(),
+                "input_schema": t.input_schema(),
             });
             counter.count_tokens(&json.to_string())
         })
@@ -150,14 +151,15 @@ mod tests {
     }
 
     fn synth_tool(
+        namespace: &str,
         name: &str,
         description: &str,
         input_schema: serde_json::Value,
-    ) -> rmcp::model::Tool {
+    ) -> AuraTool {
         let serde_json::Value::Object(map) = input_schema else {
             panic!("input_schema must be a JSON object");
         };
-        rmcp::model::Tool {
+        let tool = rmcp::model::Tool {
             name: name.to_string().into(),
             title: None,
             description: Some(description.to_string().into()),
@@ -166,7 +168,8 @@ mod tests {
             annotations: None,
             icons: None,
             meta: None,
-        }
+        };
+        AuraTool::new(tool, namespace)
     }
 
     #[test]
@@ -217,6 +220,7 @@ mod tests {
     fn count_mcp_tool_schema_tokens_returns_serialized_bpe_count() {
         let c = counter();
         let tool = synth_tool(
+            "logs",
             "search_logs",
             "Search log lines by regex",
             serde_json::json!({
@@ -230,9 +234,9 @@ mod tests {
         );
         let actual = count_mcp_tool_schema_tokens(&*c, std::iter::once(&tool), None);
         let expected_json = serde_json::json!({
-            "name": tool.name,
-            "description": tool.description,
-            "input_schema": &*tool.input_schema,
+            "name": tool.name().to_string(),
+            "description": tool.description(),
+            "input_schema": tool.input_schema(),
         });
         assert_eq!(actual, c.count_tokens(&expected_json.to_string()));
     }
@@ -244,11 +248,13 @@ mod tests {
     fn count_mcp_tool_schema_tokens_filters_via_glob() {
         let c = counter();
         let alpha = synth_tool(
+            "ns",
             "alpha_get",
             "alpha desc",
             serde_json::json!({"type": "object"}),
         );
         let beta = synth_tool(
+            "ns",
             "beta_get",
             "beta desc",
             serde_json::json!({"type": "object"}),

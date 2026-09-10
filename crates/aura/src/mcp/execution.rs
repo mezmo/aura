@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use tracing::{error, info};
 
 use crate::mcp::client::McpClient;
+use crate::mcp::types::ToolNamespace;
 use crate::request_cancellation::call_http_tool_cancellable;
 
 // ---------------------------------------------------------------------------
@@ -106,10 +107,24 @@ fn record_tool_call_result(span: &tracing::Span, result: &Result<String, anyhow:
 /// 2. Response preview for large outputs
 /// 3. Standardized error handling
 /// 4. Per-request cancellation support (when executed within a cancellation context)
-#[tracing::instrument(name = "mcp.tool_call", skip(client, args, approver_overrides), fields(tool.name = %tool_name, server.url = %client.server_url()))]
+///
+/// `namespace` is the MCP server (config key) the tool came from, recorded
+/// as a separate `tool.namespace` span attribute — never folded into
+/// `tool_name`, which is always the bare name sent to the model. `None` for
+/// callers with no server context (e.g. liveness probes).
+#[tracing::instrument(
+    name = "mcp.tool_call",
+    skip(client, args, approver_overrides),
+    fields(
+        tool.name = %tool_name,
+        tool.namespace = %namespace.map(ToolNamespace::as_str).unwrap_or_default(),
+        server.url = %client.server_url()
+    )
+)]
 pub async fn execute_mcp_tool(
     client: &McpClient,
     tool_name: &str,
+    namespace: Option<&ToolNamespace>,
     args: Value,
     approver_overrides: Option<crate::approver_headers::ApproverHeaders>,
 ) -> Result<String, ToolError> {
@@ -314,7 +329,7 @@ mod tests {
                     .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("test"))),
             );
 
-            execute_mcp_tool(client, "gated", json!({}), overrides)
+            execute_mcp_tool(client, "gated", None, json!({}), overrides)
                 .await
                 .expect("the call succeeds");
 

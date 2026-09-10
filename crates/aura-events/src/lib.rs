@@ -1184,6 +1184,9 @@ pub enum CancelReasonWire {
 pub struct ApprovalRequested {
     pub decision_id: String,
     pub tool_name: String,
+    /// The MCP server (config key) `tool_name` came from, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_namespace: Option<String>,
     pub origin: ApprovalOriginWire,
     pub scope: AgentScopeWire,
 }
@@ -1193,6 +1196,9 @@ pub struct ApprovalRequested {
 pub struct ApprovalPending {
     pub decision_id: String,
     pub tool_name: String,
+    /// The MCP server (config key) `tool_name` came from, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_namespace: Option<String>,
     pub arguments: serde_json::Value,
     pub origin: ApprovalOriginWire,
     pub scope: AgentScopeWire,

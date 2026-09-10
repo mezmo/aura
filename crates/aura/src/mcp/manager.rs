@@ -1,6 +1,7 @@
 use crate::config::{McpServerConfig, McpUserAgent, default_mcp_user_agent};
 use crate::error::BuilderError;
 use crate::mcp::client::McpClient;
+use crate::mcp::types::{AuraTool, ToolName};
 use rig::completion::ToolDefinition;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -11,13 +12,13 @@ pub struct McpManager {
     pub server_info: HashMap<String, ServerInfo>,
     /// Store streamable HTTP clients for http_streamable transport
     pub streamable_clients: HashMap<String, McpClient>,
-    pub streamable_tools: HashMap<String, Vec<rmcp::model::Tool>>,
+    pub streamable_tools: HashMap<String, Vec<AuraTool>>,
     /// Store SSE clients for sse transport
     pub sse_clients: HashMap<String, McpClient>,
-    pub sse_tools: HashMap<String, Vec<rmcp::model::Tool>>,
+    pub sse_tools: HashMap<String, Vec<AuraTool>>,
     /// Store STDIO clients for stdio transport
     pub stdio_clients: HashMap<String, McpClient>,
-    pub stdio_tools: HashMap<String, Vec<rmcp::model::Tool>>,
+    pub stdio_tools: HashMap<String, Vec<AuraTool>>,
     /// Whether to sanitize tool schemas for OpenAI compatibility
     pub sanitize_schemas: bool,
     /// Manager-wide client identity.
@@ -261,8 +262,12 @@ impl McpManager {
         );
 
         // Sanitize tools at build time (instead of per-request)
-        let sanitized_tools =
-            Self::sanitize_and_collect_tools(tools, self.sanitize_schemas, "HTTP Streamable");
+        let sanitized_tools = Self::sanitize_and_collect_tools(
+            tools,
+            self.sanitize_schemas,
+            "HTTP Streamable",
+            server_name,
+        );
 
         // Store the client for later use in tool execution
         self.streamable_clients
@@ -344,7 +349,8 @@ impl McpManager {
             server_name
         );
 
-        let sanitized_tools = Self::sanitize_and_collect_tools(tools, self.sanitize_schemas, "SSE");
+        let sanitized_tools =
+            Self::sanitize_and_collect_tools(tools, self.sanitize_schemas, "SSE", server_name);
 
         self.sse_clients.insert(server_name.to_string(), client);
         self.sse_tools
@@ -442,7 +448,7 @@ impl McpManager {
         );
 
         let sanitized_tools =
-            Self::sanitize_and_collect_tools(tools, self.sanitize_schemas, "STDIO");
+            Self::sanitize_and_collect_tools(tools, self.sanitize_schemas, "STDIO", server_name);
 
         let tools_count = sanitized_tools.len();
         let owned_name = server_name.to_string();
@@ -619,15 +625,17 @@ impl McpManager {
         tools: Vec<rmcp::model::Tool>,
         sanitize_schemas: bool,
         transport_name: &str,
-    ) -> Vec<rmcp::model::Tool> {
+        namespace: &str,
+    ) -> Vec<AuraTool> {
         tools
             .into_iter()
             .filter_map(|tool| {
                 let tool_name = tool.name.to_string();
                 match Self::sanitize_mcp_tool(tool, sanitize_schemas) {
                     Ok(sanitized) => {
-                        debug!("{} tool '{}' sanitized", transport_name, sanitized.name);
-                        Some(sanitized)
+                        let tool = AuraTool::new(sanitized, namespace);
+                        debug!("{} tool '{}' sanitized", transport_name, tool.name());
+                        Some(tool)
                     }
                     Err(reason) => {
                         warn!(
@@ -838,30 +846,17 @@ impl McpManager {
     ///
     /// Returns a list of tool names that can be used for fallback tool execution.
     pub fn get_available_tool_names(&self) -> Vec<String> {
-        let mut names = Vec::new();
+        self.tool_definitions_iter()
+            .map(|tool| tool.name().to_string())
+            .collect()
+    }
 
-        // HTTP Streamable tools
-        for tools in self.streamable_tools.values() {
-            for tool in tools {
-                names.push(tool.name.to_string());
-            }
-        }
-
-        // SSE tools
-        for tools in self.sse_tools.values() {
-            for tool in tools {
-                names.push(tool.name.to_string());
-            }
-        }
-
-        // STDIO tools
-        for tools in self.stdio_tools.values() {
-            for tool in tools {
-                names.push(tool.name.to_string());
-            }
-        }
-
-        names
+    /// Snapshot of every discovered tool across all transports, for
+    /// namespace-aware `mcp_filter` matching (e.g. the scratchpad
+    /// accessibility check) where the caller needs both the bare name and
+    /// the namespace, not just the model-facing name.
+    pub fn all_tools(&self) -> Vec<AuraTool> {
+        self.tool_definitions_iter().cloned().collect()
     }
 
     /// Iterate over every discovered MCP tool across both HTTP-streamable and
@@ -870,7 +865,7 @@ impl McpManager {
     /// Used by the scratchpad budget seed to BPE-count the actual JSON
     /// schemas the LLM sees in its tool list, instead of falling back to a
     /// per-tool constant heuristic.
-    pub fn tool_definitions_iter(&self) -> impl Iterator<Item = &rmcp::model::Tool> {
+    pub fn tool_definitions_iter(&self) -> impl Iterator<Item = &AuraTool> {
         self.streamable_tools
             .values()
             .flat_map(|tools| tools.iter())
@@ -887,17 +882,15 @@ impl McpManager {
         self.tool_definitions_iter()
             .filter(|tool| match filter {
                 None => true,
-                Some(patterns) => patterns
-                    .iter()
-                    .any(|p| crate::config::glob_match(p, &tool.name)),
+                Some(patterns) => patterns.iter().any(|p| tool.matches(p)),
             })
             .map(|tool| {
                 serde_json::json!({
                     "type": "function",
                     "function": {
-                        "name": tool.name,
-                        "description": tool.description,
-                        "parameters": tool.input_schema,
+                        "name": tool.name().to_string(),
+                        "description": tool.description(),
+                        "parameters": tool.input_schema(),
                     }
                 })
                 .to_string()
@@ -911,27 +904,27 @@ impl McpManager {
     /// patterns to concrete tool names at boot time, so the runtime
     /// interception lookup is a server-aware exact match (not a
     /// server-agnostic glob — see `scratchpad::scratchpad_tool_map`).
-    pub fn tool_names_per_server(&self) -> HashMap<String, Vec<String>> {
-        let mut map: HashMap<String, Vec<String>> = self
+    pub fn tool_names_per_server(&self) -> HashMap<String, Vec<ToolName>> {
+        let mut map: HashMap<String, Vec<ToolName>> = self
             .streamable_tools
             .iter()
             .map(|(server_name, tools)| {
-                let names = tools.iter().map(|t| t.name.to_string()).collect();
+                let names = tools.iter().map(|t| t.name().clone()).collect();
                 (server_name.clone(), names)
             })
             .collect();
         for (server_name, tools) in &self.sse_tools {
-            let names = tools.iter().map(|t| t.name.to_string()).collect();
+            let names = tools.iter().map(|t| t.name().clone()).collect();
             map.insert(server_name.clone(), names);
         }
         for (server_name, tools) in &self.stdio_tools {
-            let names = tools.iter().map(|t| t.name.to_string()).collect();
+            let names = tools.iter().map(|t| t.name().clone()).collect();
             map.insert(server_name.clone(), names);
         }
         map
     }
 
-    pub fn get_tool_definition_by_server(&self, name: &str) -> Vec<rmcp::model::Tool> {
+    pub fn get_tool_definition_by_server(&self, name: &str) -> Vec<AuraTool> {
         if let Some(tools) = self.streamable_tools.get(name) {
             tools.clone()
         } else if let Some(tools) = self.sse_tools.get(name) {
@@ -964,17 +957,21 @@ impl McpManager {
             _ => HashMap::new(),
         };
 
+        // `tool_name` is whatever the model echoed back — the bare tool
+        // name, since that's the only thing ever sent to the model. The MCP
+        // wire call dispatches by the same sanitized bare name (`inner.name`).
+
         // Try HTTP Streamable clients first
         for (server_name, client) in &self.streamable_clients {
             if let Some(tools) = self.streamable_tools.get(server_name)
-                && tools.iter().any(|t| t.name.as_ref() == tool_name)
+                && let Some(tool) = tools.iter().find(|t| t.name().to_string() == tool_name)
             {
                 info!(
                     "Executing fallback tool '{}' via HTTP Streamable",
                     tool_name
                 );
                 return client
-                    .call_tool(tool_name, args_map, None)
+                    .call_tool(tool.name().as_str(), args_map, None)
                     .await
                     .map_err(|e| format!("Tool execution failed: {}", e));
             }
@@ -983,11 +980,11 @@ impl McpManager {
         // Try SSE clients
         for (server_name, client) in &self.sse_clients {
             if let Some(tools) = self.sse_tools.get(server_name)
-                && tools.iter().any(|t| t.name.as_ref() == tool_name)
+                && let Some(tool) = tools.iter().find(|t| t.name().to_string() == tool_name)
             {
                 info!("Executing fallback tool '{}' via SSE", tool_name);
                 return client
-                    .call_tool(tool_name, args_map, None)
+                    .call_tool(tool.name().as_str(), args_map, None)
                     .await
                     .map_err(|e| format!("Tool execution failed: {}", e));
             }
@@ -996,11 +993,11 @@ impl McpManager {
         // Try STDIO clients
         for (server_name, client) in &self.stdio_clients {
             if let Some(tools) = self.stdio_tools.get(server_name)
-                && tools.iter().any(|t| t.name.as_ref() == tool_name)
+                && let Some(tool) = tools.iter().find(|t| t.name().to_string() == tool_name)
             {
                 info!("Executing fallback tool '{}' via STDIO", tool_name);
                 return client
-                    .call_tool(tool_name, args_map, None)
+                    .call_tool(tool.name().as_str(), args_map, None)
                     .await
                     .map_err(|e| format!("Tool execution failed: {}", e));
             }

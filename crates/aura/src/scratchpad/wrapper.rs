@@ -249,8 +249,9 @@ mod tests {
     /// End-to-end coverage of the wrapper's exact-name lookup. The map is
     /// keyed by bare tool name (resolved per-request during agent/worker
     /// construction by `scratchpad::scratchpad_tool_map` from per-server glob
-    /// patterns). This guards against the regression where the wrapper tried
-    /// to do glob matching at tool-call time against pattern keys.
+    /// patterns). This guards against the regression where
+    /// the wrapper tried to do glob matching at tool-call time against
+    /// pattern keys.
     #[tokio::test]
     async fn test_wrapper_intercepts_via_resolved_tool_name() {
         let tmp = TempDir::new().unwrap();

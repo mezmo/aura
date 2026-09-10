@@ -28,6 +28,7 @@ mod progress;
 mod response;
 mod sse;
 mod tools;
+mod types;
 
 pub use client::{InFlightRequests, McpClient};
 pub use dynamic::McpToolAdaptor;
@@ -36,6 +37,7 @@ pub use manager::{ConnectionStatus, McpManager, ServerInfo};
 pub use progress::ProgressEnabledHandler;
 pub use response::{CallOutcome, MAX_TOOL_ERROR_BYTES, bound_error_content, extract_tool_result};
 pub use sse::SseTransport;
+pub use types::{AuraTool, ToolName, ToolNamespace};
 
 #[allow(deprecated)]
 pub use tools::{

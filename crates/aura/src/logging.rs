@@ -154,6 +154,10 @@ pub const ATTR_OUTPUT_VALUE: &str = "output.value";
 
 // Tool-level attributes (used by `mcp/execution.rs` and `openinference_exporter.rs`)
 pub const ATTR_TOOL_NAME: &str = "tool.name";
+/// The MCP server (config key) a tool came from, recorded on `mcp.tool_call`
+/// spans as a separate attribute alongside `ATTR_TOOL_NAME` — never folded
+/// into the tool name itself, which is always the bare name sent to the model.
+pub const ATTR_TOOL_NAMESPACE: &str = "tool.namespace";
 pub const ATTR_TOOL_PARAMETERS: &str = "tool.parameters";
 pub const ATTR_TOOL_PARAMETERS_COUNT: &str = "tool.parameters.count";
 pub const ATTR_TOOL_RESULT: &str = "tool.result";

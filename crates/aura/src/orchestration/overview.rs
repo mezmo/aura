@@ -2,9 +2,7 @@
 //! `GET /aura/info` ([`AgentInfo`], [`WorkerOverview`]).
 
 use aura_config::{Config, McpServerConfig};
-use aura_events::{
-    AgentInfo, McpServerOverview, McpToolAnnotations, McpToolOverview, WorkerOverview,
-};
+use aura_events::{AgentInfo, McpServerOverview, McpToolOverview, WorkerOverview};
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -100,7 +98,7 @@ async fn discover_tools(
                 .get(name)
                 .or_else(|| manager.sse_tools.get(name))
                 .or_else(|| manager.stdio_tools.get(name))
-                .map(|tools| tools.iter().map(tool_overview).collect())
+                .map(|tools| tools.iter().cloned().map(Into::into).collect())
                 .unwrap_or_default();
             (name.clone(), tools)
         })
@@ -110,43 +108,6 @@ async fn discover_tools(
         .cancel_and_close_all("aura-info", "tool detail collected")
         .await;
     per_server
-}
-
-/// Project a discovered MCP tool into its wire form.
-///
-/// These are the values AURA holds, not the ones the server advertised:
-/// `McpManager::sanitize_mcp_tool` has already rewritten the name to the
-/// LLM-safe character set and, under `[mcp].sanitize_schemas`, rewritten the
-/// input schema. Publishing that form is what makes the output usable for
-/// governance — it names the tools AURA actually invokes with the schemas the
-/// model actually receives.
-///
-/// `icons` is dropped; everything else in the MCP `Tool` object carries over.
-fn tool_overview(tool: &rmcp::model::Tool) -> McpToolOverview {
-    McpToolOverview {
-        name: tool.name.to_string(),
-        title: tool.title.clone(),
-        description: tool.description.as_ref().map(|d| d.to_string()),
-        input_schema: Some(serde_json::Value::Object((*tool.input_schema).clone())),
-        output_schema: tool
-            .output_schema
-            .as_ref()
-            .map(|schema| serde_json::Value::Object((**schema).clone())),
-        annotations: tool
-            .annotations
-            .as_ref()
-            .map(|annotations| McpToolAnnotations {
-                title: annotations.title.clone(),
-                read_only_hint: annotations.read_only_hint,
-                destructive_hint: annotations.destructive_hint,
-                idempotent_hint: annotations.idempotent_hint,
-                open_world_hint: annotations.open_world_hint,
-            }),
-        meta: tool
-            .meta
-            .as_ref()
-            .map(|meta| serde_json::Value::Object(meta.0.clone())),
-    }
 }
 
 fn set_tools(server: &mut McpServerOverview, discovered: Option<Vec<McpToolOverview>>) {
