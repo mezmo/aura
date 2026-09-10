@@ -4073,7 +4073,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
         // Step 5: the consumed decisions leave the store with the task.
         if let Some(hitl) = self.agent_config.hitl.clone()
-            && let crate::hitl::DecisionRoute::Conversational { registry, .. } = &*hitl.route
+            && let Some((registry, _)) = hitl.route.park_registry()
         {
             for call in &continuation.pending {
                 registry.remove(&call.decision_id).await;
@@ -8475,11 +8475,39 @@ mod tests {
             .join("\n")
     }
 
+    fn conversational_route(registry: &PendingApprovals) -> Arc<crate::hitl::DecisionRoute> {
+        Arc::new(crate::hitl::DecisionRoute::Conversational {
+            registry: registry.clone(),
+            timeout: Duration::from_secs(3600),
+        })
+    }
+
+    /// A webhook route under poll delivery, built the production way; the
+    /// resume path never reaches its unroutable url.
+    fn poll_webhook_route(registry: &PendingApprovals) -> Arc<crate::hitl::DecisionRoute> {
+        let config = aura_config::HitlConfig {
+            require_approval: vec![],
+            park: aura_config::ParkConfig { enabled: true },
+            route: aura_config::DecisionRouteConfig::Webhook {
+                url: aura_config::WebhookUrl::new("http://127.0.0.1:9").unwrap(),
+                timeout_secs: 3600,
+                headers: std::collections::HashMap::new(),
+                headers_from_request: std::collections::HashMap::new(),
+                tool_headers_from_response: aura_config::ToolHeaderMappings::default(),
+                delivery: aura_config::WebhookDelivery::Poll,
+                poll_url: None,
+                poll_interval_secs: 10,
+                poll_request_timeout_secs: 30,
+            },
+        };
+        crate::hitl::HitlRuntime::from_config(&config, registry, None, None).route
+    }
+
     /// A park-mode orchestrator over a file-backed approval store (the park
     /// contract's backend: `get` returns the approval before and after the
-    /// decision), sharing the given registry.
+    /// decision), gating `echo_tool` on `route`.
     async fn file_backed_park_orchestrator(
-        registry: &PendingApprovals,
+        route: Arc<crate::hitl::DecisionRoute>,
         memory_dir: &std::path::Path,
         session_id: &str,
     ) -> (Orchestrator, String) {
@@ -8499,10 +8527,7 @@ mod tests {
         let config = AgentRuntimeConfig {
             hitl: Some(crate::hitl::HitlRuntime {
                 patterns: Arc::from([aura_config::GlobPattern::new("echo_tool").unwrap()]),
-                route: Arc::new(crate::hitl::DecisionRoute::Conversational {
-                    registry: registry.clone(),
-                    timeout: Duration::from_secs(3600),
-                }),
+                route,
                 park_enabled: true,
             }),
             memory_dir: Some(memory_dir.to_string_lossy().into_owned()),
@@ -8561,6 +8586,7 @@ mod tests {
     /// disk, and drive the continuation with `resume_turns`. Returns the
     /// task outcome plus the handles the proofs assert through.
     async fn park_then_resume(
+        route_for: fn(&PendingApprovals) -> Arc<crate::hitl::DecisionRoute>,
         decision: ApprovalDecision,
         resume_turns: Vec<ScriptedTurn>,
     ) -> (
@@ -8576,7 +8602,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (registry, store) = file_store_registry(&dir.path().join("approvals"));
         let (orchestrator, run_id) =
-            file_backed_park_orchestrator(&registry, dir.path(), "loop-sess").await;
+            file_backed_park_orchestrator(route_for(&registry), dir.path(), "loop-sess").await;
         let (event_tx, _event_rx) = tokio::sync::mpsc::channel(64);
 
         let (park_model, park_invocations) =
@@ -8671,7 +8697,7 @@ mod tests {
         };
 
         let (orchestrator2, _run_id2) =
-            file_backed_park_orchestrator(&registry, dir.path(), "loop-sess").await;
+            file_backed_park_orchestrator(route_for(&registry), dir.path(), "loop-sess").await;
         let (resume_model, resume_invocations) = gated_worker_override(resume_turns);
         let params = TaskExecutionParams {
             task_description: "apply the manifest",
@@ -8701,6 +8727,37 @@ mod tests {
         )
     }
 
+    /// The same loop on a webhook route under poll delivery: the resume
+    /// consumes the recorded decision and removes the row, as the
+    /// conversational route does.
+    #[tokio::test]
+    async fn full_loop_on_a_poll_route_removes_the_consumed_row() {
+        let _serial = WORKER_OVERRIDE_LOCK.lock().await;
+
+        let (outcome, _model, _resumed, _parked, _document, store, decision_id, _dir) =
+            park_then_resume(
+                poll_webhook_route,
+                ApprovalDecision::Approved,
+                vec![ScriptedTurn::tool_calls(vec![ScriptedToolCall::new(
+                    "call_final",
+                    "submit_result",
+                    serde_json::json!({
+                        "summary": "applied the manifest",
+                        "result": "applied successfully to prod",
+                        "confidence": "high",
+                    }),
+                )])],
+            )
+            .await;
+
+        let outcome = outcome.expect("the resumed task completes");
+        assert!(matches!(outcome, TaskOutcome::Completed(_)));
+        assert!(
+            store.get(&decision_id).await.unwrap().is_none(),
+            "the consumed decision is removed on the poll route"
+        );
+    }
+
     /// FULL LOOP, zero human input: the scripted worker parks, the document
     /// publishes, in-memory state drops, the store holds the approval, and
     /// the rehydrated continuation completes the task — the tool running
@@ -8721,6 +8778,7 @@ mod tests {
             decision_id,
             _dir,
         ) = park_then_resume(
+            conversational_route,
             ApprovalDecision::Approved,
             vec![ScriptedTurn::tool_calls(vec![ScriptedToolCall::new(
                 "call_final",
@@ -8944,6 +9002,7 @@ mod tests {
             _decision_id,
             _dir,
         ) = park_then_resume(
+            conversational_route,
             ApprovalDecision::Denied {
                 reason: Some("too risky".to_string()),
             },
