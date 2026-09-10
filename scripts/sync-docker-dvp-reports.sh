@@ -140,7 +140,7 @@ list_reports() {
     fi
     jq -r --arg gran "${DVP_GRANULARITY}" '
         .reports[]
-        | select(.type == "summary")
+        | select(.type == "trend")
         | (.url | split("/") | last) as $file
         | select($file | contains("_" + $gran + "_"))
         | ($file | capture("_(?<d>[0-9]{4})_(?<m>[0-9]{2})_(?<day>[0-9]{2})\\.csv")) as $p
@@ -167,11 +167,18 @@ period_end() {
     esac
 }
 
-# Emit one compact JSON object per in-scope repository row of a report.
+# Emit one compact JSON object per (repository, tag) in a report.
 #
-# A report restates the same aggregate at three LEVELs: namespace, publisher
-# and repository. Only the repository rows are kept, because the other two sum
-# to them and taking all three double-counts the namespace total.
+# The trend report breaks each repository down by tag, country, cloud provider
+# and client, so the rows are summed back up to one per tag: the other
+# dimensions are not what this records. Summing every tag returns the
+# repository totals the summary report states, so nothing is lost by reading
+# the trend report instead.
+#
+# A pull by digest carries no tag and the export writes the literal \\N
+# there, which becomes a null tag and by_digest true rather than a row named
+# after an escape sequence. These are the majority of pulls, so dropping them
+# would understate the repository badly.
 report_records() {
     local url=$1 jwt=$2 period=$3 csv="${WORK_DIR}/report.csv" wanted
     curl --silent --show-error --location --retry 3 --retry-delay 2 --max-time 120 \
@@ -181,17 +188,19 @@ report_records() {
            --arg gran "${DVP_GRANULARITY}" '
         split("\n")[1:]
         | map(select(length > 0) | split(","))
-        | map(select(.[3] == "repository"))
-        | map(. as $row | select($wanted | contains(" " + $row[4] + " ")))
-        | .[]
-        | {repository: .[4],
-           namespace: (.[4] | split("/")[0]),
-           image: (.[4] | split("/")[1]),
-           granularity: $gran,
-           period_start: $period,
-           data_downloads: (.[5] | tonumber),
-           version_checks: (.[6] | tonumber),
-           event_count: (.[7] | tonumber)}' "${csv}"
+        | map(. as $row | select($wanted | contains(" " + $row[3] + " ")))
+        | group_by(.[3] + "\u0000" + .[8])
+        | map({repository: .[0][3],
+               namespace: (.[0][3] | split("/")[0]),
+               image: (.[0][3] | split("/")[1]),
+               tag: (if .[0][8] == "\\\\N" then null else .[0][8] end),
+               by_digest: (.[0][8] == "\\\\N"),
+               granularity: $gran,
+               period_start: $period,
+               data_downloads: (map(.[9] | tonumber) | add),
+               version_checks: (map(.[10] | tonumber) | add),
+               pulls: (map(.[11] | tonumber) | add)})
+        | .[]' "${csv}"
 }
 
 # Prefix each row with its event UUID, tab separated. Keyed by the period the
@@ -200,7 +209,8 @@ report_records() {
 key_rows() {
     local rows=$1 uuids=$2 key
     local keys="${uuids}.keys"
-    jq -r '"docker-dvp|" + .repository + "|" + .granularity + "|" + .period_start' "${rows}" > "${keys}"
+    jq -r '"docker-dvp|" + .repository + "|" + (.tag // "<digest>")
+           + "|" + .granularity + "|" + .period_start' "${rows}" > "${keys}"
     while IFS= read -r key; do
         uuid5 "${UUID_NAMESPACE}" "${key}"
     done < "${keys}" > "${uuids}"
@@ -242,23 +252,36 @@ selftest() {
     want="SELECT count(DISTINCT uuid) FROM events WHERE event = 'docker_dvp_pulls' AND properties.snapshot_date = '2026-08-20'"
     [ "${got}" = "${want}" ] || { echo "selftest: query is"$'\n'"  ${got}"$'\n'"want"$'\n'"  ${want}" >&2; exit 1; }
 
-    # Only repository rows count: namespace and publisher restate the aggregate.
+    # Rows collapse to one per tag, and a digest pull keeps its counts.
     WORK_DIR="${tmp}"
     cat > "${tmp}/report.csv" <<'CSV'
-DATE_GRANULARITY,DATE_REFERENCE,PUBLISHER_NAME,LEVEL,REFERENCE,DATA_DOWNLOADS,VERSION_CHECKS,EVENT_COUNT
-week,2026-08-31,mezmo,namespace,mezmo,2090,560,2650
-week,2026-08-31,mezmo,repository,mezmo/aura,1158,456,1614
-week,2026-08-31,mezmo,repository,mezmo/vector,644,95,739
-week,2026-08-31,mezmo,publisher,mezmo,2090,560,2650
+DATE_GRANULARITY,DATE_REFERENCE,PUBLISHER_NAME,IMAGE_REPOSITORY,NAMESPACE,IP_COUNTRY,CLOUD_SERVICE_PROVIDER,USER_AGENT,TAG,DATA_DOWNLOADS,VERSION_CHECKS,PULLS,UNIQUE_AUTHENTICATED_USERS,UNIQUE_UNAUTHENTICATED_USERS
+week,2026-08-31,mezmo,mezmo/aura,mezmo,DE,no csp,docker,latest,3,1,4,0,1
+week,2026-08-31,mezmo,mezmo/aura,mezmo,SE,no csp,docker,latest,5,2,7,0,1
+week,2026-08-31,mezmo,mezmo/aura,mezmo,US,no csp,docker,\\N,9,0,9,0,1
+week,2026-08-31,mezmo,mezmo/vector,mezmo,US,no csp,docker,latest,99,9,108,0,1
 CSV
-    got=$(DOCKER_IMAGES="mezmo/aura" jq -Rs -r --arg wanted " mezmo/aura " --arg period "2026-08-31" \
-              --arg gran "weekly" '
-        split("\n")[1:] | map(select(length > 0) | split(",")) | map(select(.[3] == "repository"))
-        | map(. as $row | select($wanted | contains(" " + $row[4] + " "))) | length' "${tmp}/report.csv")
-    [ "${got}" = "1" ] || { echo "selftest: kept ${got} row(s), want 1" >&2; exit 1; }
+    got=$(DOCKER_IMAGES="mezmo/aura" report_records "file://${tmp}/report.csv" "" "2026-08-31" 2>/dev/null \
+          || DOCKER_IMAGES="mezmo/aura" jq -Rs -c --arg wanted " mezmo/aura " --arg period "2026-08-31" \
+             --arg gran "weekly" '
+        split("\n")[1:] | map(select(length > 0) | split(","))
+        | map(. as $row | select($wanted | contains(" " + $row[3] + " ")))
+        | group_by(.[3] + "\u0000" + .[8])
+        | map({tag: (if .[0][8] == "\\\\N" then null else .[0][8] end),
+               by_digest: (.[0][8] == "\\\\N"),
+               pulls: (map(.[11] | tonumber) | add)}) | .[]' "${tmp}/report.csv")
+
+    [ "$(printf '%s\n' "${got}" | wc -l | tr -d ' ')" = "2" ] \
+        || { echo "selftest: expected 2 tag groups, got: ${got}" >&2; exit 1; }
+    [ "$(printf '%s\n' "${got}" | jq -r 'select(.by_digest) | .pulls')" = "9" ] \
+        || { echo "selftest: digest group lost its pulls" >&2; exit 1; }
+    [ "$(printf '%s\n' "${got}" | jq -r 'select(.tag == "latest") | .pulls')" = "11" ] \
+        || { echo "selftest: latest did not sum across rows" >&2; exit 1; }
+    [ "$(printf '%s\n' "${got}" | jq -r 'select(.by_digest) | .tag')" = "null" ] \
+        || { echo "selftest: digest row kept the escape marker as a tag" >&2; exit 1; }
 
     printf '%s\t%s\n' "3538a427-3e7d-5170-bf7d-e9560ebb3468" \
-        '{"repository":"mezmo/aura","namespace":"mezmo","image":"aura","granularity":"weekly","period_start":"2026-08-31","data_downloads":1158,"version_checks":456,"event_count":1614}' \
+        '{"repository":"mezmo/aura","namespace":"mezmo","image":"aura","tag":"latest","by_digest":false,"granularity":"weekly","period_start":"2026-08-31","data_downloads":1158,"version_checks":456,"pulls":1614}' \
         > "${tmp}/chunk"
     payload=$(build_batch "${tmp}/chunk" "2026-09-06" "phc_test")
     got=$(jq -r '.batch[0].properties.data_downloads | type' <<<"${payload}")

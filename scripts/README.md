@@ -13,7 +13,7 @@ Release and install helpers.
 | [`sync-release-downloads.sh`](sync-release-downloads.sh) | Snapshot cumulative release-asset download totals into PostHog |
 | [`sync-cloudsmith-downloads.sh`](sync-cloudsmith-downloads.sh) | Snapshot cumulative Cloudsmith package download totals into PostHog |
 | [`sync-docker-downloads.sh`](sync-docker-downloads.sh) | Snapshot cumulative Docker Hub pull totals into PostHog |
-| [`sync-docker-dvp-reports.sh`](sync-docker-dvp-reports.sh) | Snapshot Docker Verified Publisher pull reports into PostHog |
+| [`sync-docker-dvp-reports.sh`](sync-docker-dvp-reports.sh) | Snapshot Docker Verified Publisher pulls per tag into PostHog |
 | [`lib/posthog-snapshot.sh`](lib/posthog-snapshot.sh) | Shared machinery the snapshot scripts source |
 
 `BRANCH_NAME` selects the release channel; see
@@ -298,8 +298,18 @@ period, so re-reading a report on any later day produces byte-identical events.
 Docker retains only the last few reports and nothing reconstructs one that ages
 out, which is the reason to run this daily even though reports appear weekly.
 
+Events are one per `(repository, tag)`. The trend report splits each tag
+further by country, cloud provider and client; those rows are summed back up,
+since the tag is what this records, and summing every tag reproduces the totals
+the summary report states.
+
+Most pulls carry **no tag** — they are pulls by digest, which the export marks
+with a literal `\\N`. Those arrive as `tag: null` with `by_digest: true`. For
+`mezmo/aura` they were 963 of 1,614 pulls in the week of 2026-08-31, so a query
+that filters to named tags only sees a minority of activity.
+
 `DATA_DOWNLOADS` counts image layer transfers; `VERSION_CHECKS` counts manifest
-requests that transferred no layers, and `EVENT_COUNT` is their sum. These are
+requests that transferred no layers, and `PULLS` is their sum. These are
 **not** comparable with the public counter that
 [`sync-docker-downloads.sh`](sync-docker-downloads.sh) records — a week of DVP
 events annualises far above that counter's all-time total, because the two
