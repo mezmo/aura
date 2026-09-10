@@ -1,6 +1,7 @@
 //! The park commit: awaiting-set refresh, publication, and the
 //! no-checkpoint cancellation sweep.
 
+use aura_events::PlanTaskId;
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -33,7 +34,7 @@ pub(crate) struct ParkCommitInputs<'a> {
 /// The refreshed awaiting set: per-task pending calls still awaiting a
 /// decision, and the earliest expiry among them.
 pub(crate) struct RefreshedAwaiting {
-    pub pending_by_task: HashMap<usize, Vec<PendingCall>>,
+    pub pending_by_task: HashMap<PlanTaskId, Vec<PendingCall>>,
     pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Every decision id still awaiting a decision, in plan order.
     pub decision_ids: Vec<DecisionId>,
@@ -78,7 +79,7 @@ pub(crate) async fn refresh_awaiting(
             else {
                 tracing::info!(
                     decision_id = %call.decision_id,
-                    task_id = task.id,
+                    task_id = task.id.get(),
                     "park approval no longer parked at commit time; dropping from checkpoint",
                 );
                 continue;
@@ -90,7 +91,7 @@ pub(crate) async fn refresh_awaiting(
             {
                 tracing::info!(
                     decision_id = %call.decision_id,
-                    task_id = task.id,
+                    task_id = task.id.get(),
                     "park approval decided before commit; dropping from checkpoint",
                 );
                 continue;
@@ -502,7 +503,7 @@ mod tests {
         registry.remove(&removed).await;
 
         let mut plan = Plan::new("Deploy");
-        plan.add_task(Task::new(0, "Gated apply", "r"));
+        plan.add_task(Task::new(PlanTaskId::new(0), "Gated apply", "r"));
         let pending = vec![
             crate::orchestration::PendingCall {
                 decision_id: decided,
@@ -533,7 +534,7 @@ mod tests {
 
         let refreshed = refresh_awaiting(&plan, &registry).await.unwrap();
 
-        let surviving = &refreshed.pending_by_task[&0];
+        let surviving = &refreshed.pending_by_task[&PlanTaskId::new(0)];
         assert_eq!(surviving.len(), 2, "decided and removed drop out");
         assert_eq!(refreshed.decision_ids, vec![earliest, latest]);
         let reported = refreshed.expires_at.expect("earliest expiry reported");

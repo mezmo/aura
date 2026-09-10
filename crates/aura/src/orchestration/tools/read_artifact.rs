@@ -221,6 +221,7 @@ impl Tool for ReadArtifactTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aura_events::PlanTaskId;
     use tempfile::TempDir;
 
     async fn setup_tool() -> (ReadArtifactTool, TempDir) {
@@ -233,9 +234,14 @@ mod tests {
         // Write a test artifact
         {
             let p = persistence.lock().await;
-            p.write_result_artifact(0, Some("research"), 1, "full result content here")
-                .await
-                .unwrap();
+            p.write_result_artifact(
+                PlanTaskId::new(0),
+                Some("research"),
+                1,
+                "full result content here",
+            )
+            .await
+            .unwrap();
         }
 
         (ReadArtifactTool::new(persistence), temp_dir)
@@ -312,7 +318,12 @@ mod tests {
             .unwrap();
         let run_a_id = run_a.run_id().to_string();
         run_a
-            .write_result_artifact(0, Some("sre"), 1, "cross-run artifact content")
+            .write_result_artifact(
+                PlanTaskId::new(0),
+                Some("sre"),
+                1,
+                "cross-run artifact content",
+            )
             .await
             .unwrap();
 
@@ -372,7 +383,12 @@ mod tests {
         let run_a = ExecutionPersistence::new(&memory_dir, None).await.unwrap();
         let run_a_id = run_a.run_id().to_string();
         run_a
-            .write_result_artifact(0, Some("default"), 1, "flat layout artifact")
+            .write_result_artifact(
+                PlanTaskId::new(0),
+                Some("default"),
+                1,
+                "flat layout artifact",
+            )
             .await
             .unwrap();
 
@@ -436,7 +452,7 @@ mod tests {
         let iter_dir = persistence.iteration_path();
 
         persistence
-            .write_result_artifact(0, Some("research"), 1, artifact_content)
+            .write_result_artifact(PlanTaskId::new(0), Some("research"), 1, artifact_content)
             .await
             .unwrap();
 
@@ -584,7 +600,7 @@ mod tests {
             .unwrap();
         let run_a_id = run_a.run_id().to_string();
         run_a
-            .write_result_artifact(0, Some("sre"), 1, &big)
+            .write_result_artifact(PlanTaskId::new(0), Some("sre"), 1, &big)
             .await
             .unwrap();
 
@@ -655,7 +671,7 @@ mod tests {
             .await
             .unwrap();
         persistence
-            .write_result_artifact(0, Some("research"), 1, &big)
+            .write_result_artifact(PlanTaskId::new(0), Some("research"), 1, &big)
             .await
             .unwrap();
         let tool = ReadArtifactTool::new(Arc::new(Mutex::new(persistence)));

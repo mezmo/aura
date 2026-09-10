@@ -3,6 +3,7 @@
 //! This module defines the core types used by the orchestrator to decompose
 //! queries into tasks, track their execution, and manage dependencies.
 
+use aura_events::PlanTaskId;
 use std::collections::HashMap;
 use std::fmt;
 use std::str::FromStr;
@@ -55,7 +56,7 @@ impl FromStr for RunId {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct TaskIdentity {
     /// Task number within the iteration's plan; matches the DAG `Task::id`.
-    pub task_id: usize,
+    pub task_id: PlanTaskId,
     /// Assigned worker's config name, or `None` for the generic worker.
     pub worker: Option<String>,
 }
@@ -63,7 +64,7 @@ pub struct TaskIdentity {
 impl TaskIdentity {
     /// Construct a task identity from its plan number and optional worker name.
     #[must_use]
-    pub fn new(task_id: usize, worker: Option<String>) -> Self {
+    pub fn new(task_id: PlanTaskId, worker: Option<String>) -> Self {
         Self { task_id, worker }
     }
 }
@@ -99,7 +100,7 @@ pub fn flatten_steps(steps: &[StepInput]) -> Result<Vec<Task>, String> {
         return Err("Steps list is empty".to_string());
     }
     let mut tasks = Vec::new();
-    let mut counter: usize = 0;
+    let mut counter: u32 = 0;
     let frontier = Vec::new(); // initial frontier is empty (no deps for first step)
     flatten_sequential(steps, &frontier, &mut counter, &mut tasks, 0)?;
     Ok(tasks)
@@ -109,11 +110,11 @@ pub fn flatten_steps(steps: &[StepInput]) -> Result<Vec<Task>, String> {
 /// and produces a new frontier for the next step.
 fn flatten_sequential(
     steps: &[StepInput],
-    initial_frontier: &[usize],
-    counter: &mut usize,
+    initial_frontier: &[PlanTaskId],
+    counter: &mut u32,
     tasks: &mut Vec<Task>,
     depth: usize,
-) -> Result<Vec<usize>, String> {
+) -> Result<Vec<PlanTaskId>, String> {
     let mut frontier = initial_frontier.to_vec();
 
     for step in steps {
@@ -126,14 +127,14 @@ fn flatten_sequential(
 /// Flatten a single step, returning the new frontier (task IDs produced).
 fn flatten_one(
     step: &StepInput,
-    frontier: &[usize],
-    counter: &mut usize,
+    frontier: &[PlanTaskId],
+    counter: &mut u32,
     tasks: &mut Vec<Task>,
     depth: usize,
-) -> Result<Vec<usize>, String> {
+) -> Result<Vec<PlanTaskId>, String> {
     match step {
         StepInput::LeafTask { task, worker } => {
-            let id = *counter;
+            let id = PlanTaskId::new(*counter);
             *counter += 1;
             let mut t = Task::new(id, task.clone(), String::new());
             t.dependencies = frontier.to_vec();
@@ -258,7 +259,7 @@ impl Plan {
     }
 
     /// Get a mutable reference to a task by ID.
-    pub fn get_task_mut(&mut self, task_id: usize) -> Option<&mut Task> {
+    pub fn get_task_mut(&mut self, task_id: PlanTaskId) -> Option<&mut Task> {
         self.tasks.iter_mut().find(|t| t.id == task_id)
     }
 
@@ -315,11 +316,11 @@ impl Plan {
 #[derive(Debug, Clone)]
 pub struct Task {
     /// Unique identifier for this task.
-    pub id: usize,
+    pub id: PlanTaskId,
     /// Human-readable description of what this task accomplishes.
     pub description: String,
     /// IDs of tasks that must complete before this one can start.
-    pub dependencies: Vec<usize>,
+    pub dependencies: Vec<PlanTaskId>,
     /// Execution state — use pattern matching to access variant data.
     pub state: TaskState,
     /// Assigned worker name (when specialized workers are configured).
@@ -369,10 +370,10 @@ impl<'de> Deserialize<'de> for Task {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         #[derive(Deserialize)]
         struct TaskHelper {
-            id: usize,
+            id: PlanTaskId,
             description: String,
             #[serde(default)]
-            dependencies: Vec<usize>,
+            dependencies: Vec<PlanTaskId>,
             status: TaskStatus,
             result: Option<String>,
             error: Option<String>,
@@ -424,7 +425,11 @@ pub struct StructuredTaskOutput {
 
 impl Task {
     /// Create a new pending task.
-    pub fn new(id: usize, description: impl Into<String>, rationale: impl Into<String>) -> Self {
+    pub fn new(
+        id: PlanTaskId,
+        description: impl Into<String>,
+        rationale: impl Into<String>,
+    ) -> Self {
         Self {
             id,
             description: description.into(),
@@ -443,13 +448,13 @@ impl Task {
     }
 
     /// Add a dependency on another task.
-    pub fn with_dependency(mut self, task_id: usize) -> Self {
+    pub fn with_dependency(mut self, task_id: PlanTaskId) -> Self {
         self.dependencies.push(task_id);
         self
     }
 
     /// Add multiple dependencies.
-    pub fn with_dependencies(mut self, task_ids: impl IntoIterator<Item = usize>) -> Self {
+    pub fn with_dependencies(mut self, task_ids: impl IntoIterator<Item = PlanTaskId>) -> Self {
         self.dependencies.extend(task_ids);
         self
     }
@@ -795,22 +800,6 @@ impl PlanningResponse {
     }
 }
 
-/// JSON representation of a task in a planning response.
-///
-/// This is the shape the LLM produces when calling `create_plan`.
-/// Converted to `Task` via `PlanningResponse::into_plan()`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TaskJson {
-    pub id: usize,
-    pub description: String,
-    #[serde(default)]
-    pub rationale: Option<String>,
-    #[serde(default)]
-    pub dependencies: Option<Vec<usize>>,
-    #[serde(default)]
-    pub worker: Option<String>,
-}
-
 /// Summary of task failures during an iteration.
 ///
 /// Populated on the failure-replan path so the coordinator can see what
@@ -882,7 +871,7 @@ pub struct IterationContext {
     /// Populated when `show_tool_reasoning_in_continuation` is enabled;
     /// empty HashMap otherwise.
     #[serde(default)]
-    pub tool_traces: HashMap<usize, Vec<super::persistence::ToolTraceEntry>>,
+    pub tool_traces: HashMap<PlanTaskId, Vec<super::persistence::ToolTraceEntry>>,
 }
 
 impl IterationContext {
@@ -892,7 +881,7 @@ impl IterationContext {
         previous_plan: Plan,
         failure_summary: Option<FailureSummary>,
         failure_history: Vec<FailedTaskRecord>,
-        tool_traces: HashMap<usize, Vec<super::persistence::ToolTraceEntry>>,
+        tool_traces: HashMap<PlanTaskId, Vec<super::persistence::ToolTraceEntry>>,
     ) -> Self {
         Self {
             iteration,
@@ -1279,8 +1268,15 @@ mod tests {
         assert_eq!(plan.goal, "Test goal");
         assert!(plan.tasks.is_empty());
 
-        plan.add_task(Task::new(0, "First task", "Test the first functionality"));
-        plan.add_task(Task::new(1, "Second task", "Build on first task").with_dependency(0));
+        plan.add_task(Task::new(
+            PlanTaskId::new(0),
+            "First task",
+            "Test the first functionality",
+        ));
+        plan.add_task(
+            Task::new(PlanTaskId::new(1), "Second task", "Build on first task")
+                .with_dependency(PlanTaskId::new(0)),
+        );
 
         assert_eq!(plan.tasks.len(), 2);
         assert_eq!(plan.pending_count(), 2);
@@ -1289,41 +1285,54 @@ mod tests {
     #[test]
     fn test_task_dependencies() {
         let mut plan = Plan::new("Test");
-        plan.add_task(Task::new(0, "Task A", "Initial task"));
-        plan.add_task(Task::new(1, "Task B", "Depends on A").with_dependency(0));
-        plan.add_task(Task::new(2, "Task C", "Depends on A and B").with_dependencies([0, 1]));
+        plan.add_task(Task::new(PlanTaskId::new(0), "Task A", "Initial task"));
+        plan.add_task(
+            Task::new(PlanTaskId::new(1), "Task B", "Depends on A")
+                .with_dependency(PlanTaskId::new(0)),
+        );
+        plan.add_task(
+            Task::new(PlanTaskId::new(2), "Task C", "Depends on A and B")
+                .with_dependencies([PlanTaskId::new(0), PlanTaskId::new(1)]),
+        );
 
         // Only task 0 should be ready initially
         let ready = plan.ready_tasks();
         assert_eq!(ready.len(), 1);
-        assert_eq!(ready[0].id, 0);
+        assert_eq!(ready[0].id, PlanTaskId::new(0));
 
         // Complete task 0
-        plan.get_task_mut(0).unwrap().complete("Done");
+        plan.get_task_mut(PlanTaskId::new(0))
+            .unwrap()
+            .complete("Done");
 
         // Now task 1 should be ready
         let ready = plan.ready_tasks();
         assert_eq!(ready.len(), 1);
-        assert_eq!(ready[0].id, 1);
+        assert_eq!(ready[0].id, PlanTaskId::new(1));
 
         // Complete task 1
-        plan.get_task_mut(1).unwrap().complete("Done");
+        plan.get_task_mut(PlanTaskId::new(1))
+            .unwrap()
+            .complete("Done");
 
         // Now task 2 should be ready
         let ready = plan.ready_tasks();
         assert_eq!(ready.len(), 1);
-        assert_eq!(ready[0].id, 2);
+        assert_eq!(ready[0].id, PlanTaskId::new(2));
     }
 
     #[test]
     fn test_ready_tasks_excludes_blocked_by_failure() {
         let mut plan = Plan::new("Test");
-        plan.add_task(Task::new(0, "Task A", "Initial task"));
-        plan.add_task(Task::new(1, "Task B", "Depends on A").with_dependency(0));
-        plan.add_task(Task::new(2, "Task C", "Independent task"));
+        plan.add_task(Task::new(PlanTaskId::new(0), "Task A", "Initial task"));
+        plan.add_task(
+            Task::new(PlanTaskId::new(1), "Task B", "Depends on A")
+                .with_dependency(PlanTaskId::new(0)),
+        );
+        plan.add_task(Task::new(PlanTaskId::new(2), "Task C", "Independent task"));
 
         // Fail task 0
-        plan.get_task_mut(0)
+        plan.get_task_mut(PlanTaskId::new(0))
             .unwrap()
             .fail("Something went wrong", FailureCategory::AgentError);
 
@@ -1331,15 +1340,18 @@ mod tests {
         // Task 2 should be ready (no dependencies)
         let ready = plan.ready_tasks();
         assert_eq!(ready.len(), 1, "Only independent task should be ready");
-        assert_eq!(ready[0].id, 2);
+        assert_eq!(ready[0].id, PlanTaskId::new(2));
     }
 
     #[test]
     fn test_blocked_tasks_with_failed_dependency() {
         let mut plan = Plan::new("Test");
-        plan.add_task(Task::new(0, "Task A", "Initial task"));
-        plan.add_task(Task::new(1, "Task B", "Depends on A").with_dependency(0));
-        plan.add_task(Task::new(2, "Task C", "Independent task"));
+        plan.add_task(Task::new(PlanTaskId::new(0), "Task A", "Initial task"));
+        plan.add_task(
+            Task::new(PlanTaskId::new(1), "Task B", "Depends on A")
+                .with_dependency(PlanTaskId::new(0)),
+        );
+        plan.add_task(Task::new(PlanTaskId::new(2), "Task C", "Independent task"));
 
         // Initially no blocked tasks
         assert!(
@@ -1348,7 +1360,7 @@ mod tests {
         );
 
         // Fail task 0
-        plan.get_task_mut(0)
+        plan.get_task_mut(PlanTaskId::new(0))
             .unwrap()
             .fail("Something went wrong", FailureCategory::AgentError);
 
@@ -1356,7 +1368,8 @@ mod tests {
         let blocked = plan.blocked_tasks();
         assert_eq!(blocked.len(), 1, "One task should be blocked");
         assert_eq!(
-            blocked[0].id, 1,
+            blocked[0].id,
+            PlanTaskId::new(1),
             "Task 1 should be blocked by failed task 0"
         );
     }
@@ -1366,12 +1379,18 @@ mod tests {
         // Test: A -> B -> C, where A fails
         // Both B and C depend (transitively) on A
         let mut plan = Plan::new("Test");
-        plan.add_task(Task::new(0, "Task A", "Initial task"));
-        plan.add_task(Task::new(1, "Task B", "Depends on A").with_dependency(0));
-        plan.add_task(Task::new(2, "Task C", "Depends on B").with_dependency(1));
+        plan.add_task(Task::new(PlanTaskId::new(0), "Task A", "Initial task"));
+        plan.add_task(
+            Task::new(PlanTaskId::new(1), "Task B", "Depends on A")
+                .with_dependency(PlanTaskId::new(0)),
+        );
+        plan.add_task(
+            Task::new(PlanTaskId::new(2), "Task C", "Depends on B")
+                .with_dependency(PlanTaskId::new(1)),
+        );
 
         // Fail task 0
-        plan.get_task_mut(0)
+        plan.get_task_mut(PlanTaskId::new(0))
             .unwrap()
             .fail("Error", FailureCategory::AgentError);
 
@@ -1379,7 +1398,7 @@ mod tests {
         // Task 2 is not blocked yet because its direct dependency (task 1) hasn't failed
         let blocked = plan.blocked_tasks();
         assert_eq!(blocked.len(), 1, "Only direct dependents are blocked");
-        assert_eq!(blocked[0].id, 1);
+        assert_eq!(blocked[0].id, PlanTaskId::new(1));
 
         // No tasks should be ready
         assert!(
@@ -1391,15 +1410,17 @@ mod tests {
     #[test]
     fn test_plan_finished() {
         let mut plan = Plan::new("Test");
-        plan.add_task(Task::new(0, "Task A", "First task"));
-        plan.add_task(Task::new(1, "Task B", "Second task"));
+        plan.add_task(Task::new(PlanTaskId::new(0), "Task A", "First task"));
+        plan.add_task(Task::new(PlanTaskId::new(1), "Task B", "Second task"));
 
         assert!(!plan.is_finished());
 
-        plan.get_task_mut(0).unwrap().complete("Done");
+        plan.get_task_mut(PlanTaskId::new(0))
+            .unwrap()
+            .complete("Done");
         assert!(!plan.is_finished());
 
-        plan.get_task_mut(1)
+        plan.get_task_mut(PlanTaskId::new(1))
             .unwrap()
             .fail("Error", FailureCategory::AgentError);
         assert!(plan.is_finished()); // All tasks either complete or failed
@@ -1416,31 +1437,37 @@ mod tests {
     #[test]
     fn test_task_worker_assignment() {
         // Task without worker
-        let task = Task::new(0, "Generic task", "Test rationale");
+        let task = Task::new(PlanTaskId::new(0), "Generic task", "Test rationale");
         assert!(task.worker.is_none());
 
         // Task with worker via builder
-        let task = Task::new(1, "Operations task", "Ops rationale").with_worker("operations");
+        let task = Task::new(PlanTaskId::new(1), "Operations task", "Ops rationale")
+            .with_worker("operations");
         assert_eq!(task.worker, Some("operations".to_string()));
 
         // Chained builders
-        let task = Task::new(2, "Dependent ops task", "Depends on previous")
-            .with_dependency(1)
-            .with_worker("operations");
-        assert_eq!(task.dependencies, vec![1]);
+        let task = Task::new(
+            PlanTaskId::new(2),
+            "Dependent ops task",
+            "Depends on previous",
+        )
+        .with_dependency(PlanTaskId::new(1))
+        .with_worker("operations");
+        assert_eq!(task.dependencies, vec![PlanTaskId::new(1)]);
         assert_eq!(task.worker, Some("operations".to_string()));
     }
 
     #[test]
     fn test_task_serialization_with_worker() {
         // Task with worker should serialize the field
-        let task = Task::new(0, "Test", "Test rationale").with_worker("operations");
+        let task =
+            Task::new(PlanTaskId::new(0), "Test", "Test rationale").with_worker("operations");
         let json = serde_json::to_string(&task).unwrap();
         assert!(json.contains("\"worker\":\"operations\""));
         assert!(json.contains("\"rationale\":\"Test rationale\""));
 
         // Task without worker should omit the worker field but include rationale
-        let task = Task::new(0, "Test", "Another rationale");
+        let task = Task::new(PlanTaskId::new(0), "Test", "Another rationale");
         let json = serde_json::to_string(&task).unwrap();
         assert!(!json.contains("worker"));
         assert!(json.contains("\"rationale\":\"Another rationale\""));
@@ -1464,7 +1491,11 @@ mod tests {
     #[test]
     fn test_task_rationale_required() {
         // Task must have a rationale
-        let task = Task::new(0, "Test task", "This explains why the task exists");
+        let task = Task::new(
+            PlanTaskId::new(0),
+            "Test task",
+            "This explains why the task exists",
+        );
         assert_eq!(task.rationale, "This explains why the task exists");
     }
 
@@ -1474,7 +1505,7 @@ mod tests {
 
     #[test]
     fn test_task_serde_roundtrip_pending() {
-        let task = Task::new(0, "Fetch data", "test rationale");
+        let task = Task::new(PlanTaskId::new(0), "Fetch data", "test rationale");
         let json = serde_json::to_string(&task).unwrap();
         assert!(json.contains(r#""status":"pending"#));
         assert!(!json.contains("result"));
@@ -1485,7 +1516,7 @@ mod tests {
 
     #[test]
     fn test_task_serde_roundtrip_complete() {
-        let mut task = Task::new(0, "Fetch data", "test rationale");
+        let mut task = Task::new(PlanTaskId::new(0), "Fetch data", "test rationale");
         task.complete("42");
         let json = serde_json::to_string(&task).unwrap();
         assert!(json.contains(r#""status":"complete"#));
@@ -1500,7 +1531,7 @@ mod tests {
 
     #[test]
     fn test_task_serde_roundtrip_failed() {
-        let mut task = Task::new(0, "Fetch data", "test rationale");
+        let mut task = Task::new(PlanTaskId::new(0), "Fetch data", "test rationale");
         task.fail("timed out", FailureCategory::AgentTimeout);
         let json = serde_json::to_string(&task).unwrap();
         assert!(json.contains(r#""status":"failed"#));
@@ -1566,9 +1597,16 @@ mod tests {
     #[test]
     fn awaiting_approval_is_unfinished_and_dependents_not_ready() {
         let mut plan = Plan::new("Test");
-        plan.add_task(Task::new(0, "Gated task", "Runs the gated tool"));
-        plan.add_task(Task::new(1, "Dependent", "Needs task 0").with_dependency(0));
-        plan.get_task_mut(0).unwrap().state = TaskState::AwaitingApproval {
+        plan.add_task(Task::new(
+            PlanTaskId::new(0),
+            "Gated task",
+            "Runs the gated tool",
+        ));
+        plan.add_task(
+            Task::new(PlanTaskId::new(1), "Dependent", "Needs task 0")
+                .with_dependency(PlanTaskId::new(0)),
+        );
+        plan.get_task_mut(PlanTaskId::new(0)).unwrap().state = TaskState::AwaitingApproval {
             pending: vec![pending_call("kubectl_apply", "call_1")],
         };
 
@@ -1586,7 +1624,7 @@ mod tests {
 
     #[test]
     fn task_serde_roundtrip_awaiting_approval_carries_pending_calls() {
-        let mut task = Task::new(3, "Gated task", "test rationale");
+        let mut task = Task::new(PlanTaskId::new(3), "Gated task", "test rationale");
         task.state = TaskState::AwaitingApproval {
             pending: vec![pending_call("kubectl_delete", "call_9")],
         };
@@ -1621,7 +1659,7 @@ mod tests {
     #[test]
     fn continuation_prompt_renders_awaiting_approval_line() {
         let mut plan = Plan::new("Goal");
-        let mut task = Task::new(0, "Gated task", "Waits on a human");
+        let mut task = Task::new(PlanTaskId::new(0), "Gated task", "Waits on a human");
         task.state = TaskState::AwaitingApproval {
             pending: vec![pending_call("kubectl_apply", "call_1")],
         };
@@ -1764,7 +1802,7 @@ mod tests {
     #[test]
     fn test_iteration_context_creation() {
         let mut plan = Plan::new("Test goal");
-        plan.add_task(Task::new(0, "Task 1", "First task"));
+        plan.add_task(Task::new(PlanTaskId::new(0), "Task 1", "First task"));
 
         let fs = FailureSummary {
             reasoning: "Incomplete response".into(),
@@ -1785,7 +1823,7 @@ mod tests {
     #[test]
     fn test_iteration_context_continuation_prompt() {
         let mut plan = Plan::new("Investigate the issue");
-        let mut task = Task::new(0, "Gather logs", "Get system logs");
+        let mut task = Task::new(PlanTaskId::new(0), "Gather logs", "Get system logs");
         task.complete("Here are the logs...".to_string());
         plan.add_task(task);
 
@@ -1824,7 +1862,7 @@ mod tests {
         // Clean-success path: failure_summary = None means no FAILURE SUMMARY
         // section is rendered.
         let mut plan = Plan::new("Simple query");
-        let mut task = Task::new(0, "Execute", "Run query");
+        let mut task = Task::new(PlanTaskId::new(0), "Execute", "Run query");
         task.complete("Done".to_string());
         plan.add_task(task);
 
@@ -1841,7 +1879,7 @@ mod tests {
     #[test]
     fn test_continuation_prompt_with_failure_history() {
         let mut plan = Plan::new("Debug the issue");
-        let mut task = Task::new(0, "Gather logs", "Collect logs");
+        let mut task = Task::new(PlanTaskId::new(0), "Gather logs", "Collect logs");
         task.fail("Timeout contacting service", FailureCategory::AgentTimeout);
         plan.add_task(task);
 
@@ -1871,7 +1909,7 @@ mod tests {
     #[test]
     fn test_continuation_prompt_with_repeated_failures() {
         let mut plan = Plan::new("Debug the issue");
-        let mut task = Task::new(0, "Fetch data", "Get data");
+        let mut task = Task::new(PlanTaskId::new(0), "Fetch data", "Get data");
         task.fail("Connection refused", FailureCategory::AgentError);
         plan.add_task(task);
 
@@ -1908,7 +1946,7 @@ mod tests {
     #[test]
     fn test_continuation_prompt_inlines_small_result() {
         let mut plan = Plan::new("Test inline");
-        let mut task = Task::new(0, "Big result", "Produce output");
+        let mut task = Task::new(PlanTaskId::new(0), "Big result", "Produce output");
         // 600-char result has no artifact footer → inlined fully
         let long_result = "x".repeat(600);
         task.complete(long_result.clone());
@@ -1928,7 +1966,7 @@ mod tests {
         // appended by maybe_create_artifact, the truncation must preserve
         // the footer so the coordinator can call read_artifact.
         let mut plan = Plan::new("Test artifact footer");
-        let mut task = Task::new(0, "Big result", "Produce output");
+        let mut task = Task::new(PlanTaskId::new(0), "Big result", "Produce output");
         // 600 'x' chars + the artifact footer (past 500-byte budget)
         let body = "x".repeat(600);
         let long_result = format!(
@@ -1951,7 +1989,7 @@ mod tests {
         use super::super::tools::submit_result::Confidence;
 
         let mut plan = Plan::new("Test summary + artifact footer");
-        let mut task = Task::new(0, "Big result", "Produce output");
+        let mut task = Task::new(PlanTaskId::new(0), "Big result", "Produce output");
         let body = "x".repeat(600);
         let long_result = format!(
             "{body}\n\n[Full result (12345 chars) saved to artifact: task-0-sre-iter-1-result.txt]"
@@ -1974,7 +2012,7 @@ mod tests {
     #[test]
     fn test_continuation_prompt_urgency_final_attempt() {
         let mut plan = Plan::new("Goal");
-        let mut task = Task::new(0, "Task", "Do it");
+        let mut task = Task::new(PlanTaskId::new(0), "Task", "Do it");
         task.fail("error", FailureCategory::AgentError);
         plan.add_task(task);
 
@@ -1992,7 +2030,7 @@ mod tests {
     #[test]
     fn test_continuation_prompt_no_urgency_early_iteration() {
         let mut plan = Plan::new("Goal");
-        let mut task = Task::new(0, "Task", "Do it");
+        let mut task = Task::new(PlanTaskId::new(0), "Task", "Do it");
         task.fail("error", FailureCategory::AgentError);
         plan.add_task(task);
 
@@ -2012,10 +2050,10 @@ mod tests {
 
         // Mixed (completed + failed): guidance present
         let mut mixed_plan = Plan::new("Goal");
-        let mut completed = Task::new(0, "Completed task", "Done");
+        let mut completed = Task::new(PlanTaskId::new(0), "Completed task", "Done");
         completed.complete("Some result");
         mixed_plan.add_task(completed);
-        let mut failed = Task::new(1, "Failed task", "Broken");
+        let mut failed = Task::new(PlanTaskId::new(1), "Failed task", "Broken");
         failed.fail("boom", FailureCategory::AgentError);
         mixed_plan.add_task(failed);
         let fs = FailureSummary {
@@ -2031,7 +2069,7 @@ mod tests {
 
         // All completed: guidance absent
         let mut all_ok = Plan::new("Goal");
-        let mut t = Task::new(0, "Completed task", "Done");
+        let mut t = Task::new(PlanTaskId::new(0), "Completed task", "Done");
         t.complete("Some result");
         all_ok.add_task(t);
         let ctx = IterationContext::new(1, all_ok, None, vec![], HashMap::new());
@@ -2043,7 +2081,7 @@ mod tests {
 
         // All failed: guidance absent
         let mut all_fail = Plan::new("Goal");
-        let mut t = Task::new(0, "Failed task", "Tried");
+        let mut t = Task::new(PlanTaskId::new(0), "Failed task", "Tried");
         t.fail("error", FailureCategory::AgentError);
         all_fail.add_task(t);
         let fs = FailureSummary {
@@ -2062,17 +2100,17 @@ mod tests {
     fn test_continuation_prompt_mixed_categories() {
         let mut plan = Plan::new("Mixed results");
 
-        let mut completed = Task::new(0, "Completed task", "Worked");
+        let mut completed = Task::new(PlanTaskId::new(0), "Completed task", "Worked");
         completed.complete("Good result");
         plan.add_task(completed);
 
-        let mut failed = Task::new(1, "Failed task", "Broken");
+        let mut failed = Task::new(PlanTaskId::new(1), "Failed task", "Broken");
         failed.fail("Connection refused", FailureCategory::AgentError);
         plan.add_task(failed);
 
         // Task 2 depends on failed task 1, so it stays Pending (blocked)
-        let mut blocked = Task::new(2, "Blocked task", "Waiting");
-        blocked.dependencies = vec![1];
+        let mut blocked = Task::new(PlanTaskId::new(2), "Blocked task", "Waiting");
+        blocked.dependencies = vec![PlanTaskId::new(1)];
         plan.add_task(blocked);
 
         let fs = FailureSummary {
@@ -2252,11 +2290,11 @@ mod tests {
         ];
         let tasks = flatten_steps(&steps).unwrap();
         assert_eq!(tasks.len(), 2);
-        assert_eq!(tasks[0].id, 0);
+        assert_eq!(tasks[0].id, PlanTaskId::new(0));
         assert!(tasks[0].dependencies.is_empty());
         assert_eq!(tasks[0].worker.as_deref(), Some("statistics"));
-        assert_eq!(tasks[1].id, 1);
-        assert_eq!(tasks[1].dependencies, vec![0]);
+        assert_eq!(tasks[1].id, PlanTaskId::new(1));
+        assert_eq!(tasks[1].dependencies, vec![PlanTaskId::new(0)]);
         assert_eq!(tasks[1].worker.as_deref(), Some("arithmetic"));
     }
 
@@ -2286,7 +2324,10 @@ mod tests {
         assert!(tasks[0].dependencies.is_empty());
         assert!(tasks[1].dependencies.is_empty());
         // Third task depends on both parallel exits
-        assert_eq!(tasks[2].dependencies, vec![0, 1]);
+        assert_eq!(
+            tasks[2].dependencies,
+            vec![PlanTaskId::new(0), PlanTaskId::new(1)]
+        );
     }
 
     #[test]
@@ -2321,17 +2362,20 @@ mod tests {
         let tasks = flatten_steps(&steps).unwrap();
         assert_eq!(tasks.len(), 4);
         // Get A: id=0, deps=[]
-        assert_eq!(tasks[0].id, 0);
+        assert_eq!(tasks[0].id, PlanTaskId::new(0));
         assert!(tasks[0].dependencies.is_empty());
         // Transform A: id=1, deps=[0]
-        assert_eq!(tasks[1].id, 1);
-        assert_eq!(tasks[1].dependencies, vec![0]);
+        assert_eq!(tasks[1].id, PlanTaskId::new(1));
+        assert_eq!(tasks[1].dependencies, vec![PlanTaskId::new(0)]);
         // Get B: id=2, deps=[]
-        assert_eq!(tasks[2].id, 2);
+        assert_eq!(tasks[2].id, PlanTaskId::new(2));
         assert!(tasks[2].dependencies.is_empty());
         // Combine: id=3, deps=[1, 2] (exits of both branches)
-        assert_eq!(tasks[3].id, 3);
-        assert_eq!(tasks[3].dependencies, vec![1, 2]);
+        assert_eq!(tasks[3].id, PlanTaskId::new(3));
+        assert_eq!(
+            tasks[3].dependencies,
+            vec![PlanTaskId::new(1), PlanTaskId::new(2)]
+        );
     }
 
     #[test]
@@ -2376,7 +2420,7 @@ mod tests {
         }];
         let tasks = flatten_steps(&steps).unwrap();
         assert_eq!(tasks.len(), 1);
-        assert_eq!(tasks[0].id, 0);
+        assert_eq!(tasks[0].id, PlanTaskId::new(0));
         assert!(tasks[0].dependencies.is_empty());
         assert!(tasks[0].worker.is_none());
     }
@@ -2442,7 +2486,10 @@ mod tests {
         let steps: Vec<StepInput> = serde_json::from_str(json).unwrap();
         let tasks = flatten_steps(&steps).unwrap();
         assert_eq!(tasks.len(), 4);
-        assert_eq!(tasks[3].dependencies, vec![1, 2]);
+        assert_eq!(
+            tasks[3].dependencies,
+            vec![PlanTaskId::new(1), PlanTaskId::new(2)]
+        );
     }
 
     #[test]
@@ -2466,7 +2513,7 @@ mod tests {
         assert_eq!(plan.goal, "Test goal");
         assert_eq!(plan.tasks.len(), 2);
         assert!(plan.tasks[0].dependencies.is_empty());
-        assert_eq!(plan.tasks[1].dependencies, vec![0]);
+        assert_eq!(plan.tasks[1].dependencies, vec![PlanTaskId::new(0)]);
     }
 
     #[test]
@@ -2517,10 +2564,41 @@ mod tests {
         assert_eq!(deserialized.worker, Some("math".into()));
     }
 
+    /// `tool_traces` keys the map by `PlanTaskId`, and serde_json only accepts
+    /// map keys that reduce to a string or a primitive. `#[serde(transparent)]`
+    /// on the newtype is what makes that hold, and nothing else pins it.
+    #[test]
+    fn tool_traces_key_by_task_id_round_trip() {
+        let mut traces = HashMap::new();
+        traces.insert(
+            PlanTaskId::new(3),
+            vec![crate::orchestration::persistence::ToolTraceEntry {
+                tool: "grep".to_string(),
+                reasoning: String::new(),
+                duration_ms: 9,
+                outcome: crate::orchestration::persistence::ToolOutcome::Success {
+                    output_bytes: 12,
+                },
+                artifact_filename: None,
+            }],
+        );
+
+        let ctx = IterationContext::new(1, Plan::new("Test"), None, Vec::new(), traces);
+        let json = serde_json::to_value(&ctx).expect("context serializes");
+        assert_eq!(
+            json["tool_traces"]["3"][0]["tool"], "grep",
+            "the task id is the bare-number map key"
+        );
+
+        let back: IterationContext =
+            serde_json::from_value(json).expect("a bare-number key parses back");
+        assert_eq!(back.tool_traces[&PlanTaskId::new(3)].len(), 1);
+    }
+
     #[test]
     fn test_iteration_context_serde_roundtrip() {
         let mut plan = Plan::new("Test");
-        let mut t = Task::new(0, "Task 0", "reason");
+        let mut t = Task::new(PlanTaskId::new(0), "Task 0", "reason");
         t.complete("result".to_string());
         plan.add_task(t);
 
@@ -2557,7 +2635,7 @@ mod tests {
     fn test_iteration_context_serde_roundtrip_clean_success() {
         // failure_summary=None on the clean-success path
         let mut plan = Plan::new("Test");
-        let mut t = Task::new(0, "Task 0", "reason");
+        let mut t = Task::new(PlanTaskId::new(0), "Task 0", "reason");
         t.complete("result".to_string());
         plan.add_task(t);
 
@@ -2570,7 +2648,7 @@ mod tests {
     #[test]
     fn test_continuation_prompt_renders_failure_category() {
         let mut plan = Plan::new("Goal");
-        let mut task = Task::new(0, "Gather logs", "Collect logs");
+        let mut task = Task::new(PlanTaskId::new(0), "Gather logs", "Collect logs");
         task.fail("Worker timed out after 30s", FailureCategory::AgentTimeout);
         plan.add_task(task);
 
@@ -2592,7 +2670,7 @@ mod tests {
     #[test]
     fn test_failure_history_includes_category() {
         let mut plan = Plan::new("Goal");
-        let mut task = Task::new(0, "Fetch data", "Get data");
+        let mut task = Task::new(PlanTaskId::new(0), "Fetch data", "Get data");
         task.fail("Connection refused", FailureCategory::AgentError);
         plan.add_task(task);
 
@@ -2621,7 +2699,7 @@ mod tests {
     fn test_long_error_strings_truncated_in_continuation_prompt() {
         let long_error = "x".repeat(5000);
         let mut plan = Plan::new("Goal");
-        let mut task = Task::new(0, "Fetch data", "Get data");
+        let mut task = Task::new(PlanTaskId::new(0), "Fetch data", "Get data");
         task.fail(long_error.clone(), FailureCategory::ContextOverflow);
         plan.add_task(task);
 
@@ -2658,7 +2736,7 @@ mod tests {
     #[test]
     fn test_observed_patterns_group_by_description_and_category() {
         let mut plan = Plan::new("Goal");
-        let mut task = Task::new(0, "Fetch data", "Get data");
+        let mut task = Task::new(PlanTaskId::new(0), "Fetch data", "Get data");
         task.fail("timeout", FailureCategory::AgentTimeout);
         plan.add_task(task);
 
@@ -2715,7 +2793,7 @@ mod tests {
     #[test]
     fn test_soft_failure_renders_worker_summary() {
         let mut plan = Plan::new("Goal");
-        let mut task = Task::new(0, "Analyze logs", "Check logs");
+        let mut task = Task::new(PlanTaskId::new(0), "Analyze logs", "Check logs");
         task.fail(
             "Worker did not call submit_result",
             FailureCategory::SoftFailure,
@@ -2753,7 +2831,7 @@ mod tests {
     #[test]
     fn test_soft_failure_empty_summary_falls_back_to_bracket_format() {
         let mut plan = Plan::new("Goal");
-        let mut task = Task::new(0, "Analyze logs", "Check logs");
+        let mut task = Task::new(PlanTaskId::new(0), "Analyze logs", "Check logs");
         task.fail("inconclusive", FailureCategory::SoftFailure);
         task.structured_output = Some(StructuredTaskOutput {
             summary: "".into(),
@@ -2815,7 +2893,7 @@ mod tests {
     #[test]
     fn test_observed_patterns_same_category_triggers_warning() {
         let mut plan = Plan::new("Goal");
-        let mut task = Task::new(0, "Fetch data", "Get data");
+        let mut task = Task::new(PlanTaskId::new(0), "Fetch data", "Get data");
         task.fail("timeout", FailureCategory::AgentTimeout);
         plan.add_task(task);
 
@@ -2853,7 +2931,7 @@ mod tests {
     #[test]
     fn test_soft_failure_without_structured_output() {
         let mut plan = Plan::new("Goal");
-        let mut task = Task::new(0, "Analyze logs", "Check logs");
+        let mut task = Task::new(PlanTaskId::new(0), "Analyze logs", "Check logs");
         task.fail(
             "Worker did not call submit_result",
             FailureCategory::SoftFailure,
@@ -2905,13 +2983,17 @@ mod tests {
     #[test]
     fn continuation_with_tool_reasoning_completed_task() {
         let mut plan = Plan::new("Test goal");
-        let mut t = Task::new(0, "Search logs", "Search prod logs for errors");
+        let mut t = Task::new(
+            PlanTaskId::new(0),
+            "Search logs",
+            "Search prod logs for errors",
+        );
         t.complete("Found 47 error groups".to_string());
         plan.add_task(t);
 
         let mut traces = HashMap::new();
         traces.insert(
-            0,
+            PlanTaskId::new(0),
             vec![
                 make_trace("log_search", "searching for error patterns", 8200, None),
                 make_trace("get_metrics", "checking pool utilization", 3100, None),
@@ -2944,13 +3026,17 @@ mod tests {
     #[test]
     fn continuation_with_tool_reasoning_failed_task() {
         let mut plan = Plan::new("Test goal");
-        let mut t = Task::new(0, "Query deployments", "Query deployment history");
+        let mut t = Task::new(
+            PlanTaskId::new(0),
+            "Query deployments",
+            "Query deployment history",
+        );
         t.fail("403 Forbidden".to_string(), FailureCategory::AgentError);
         plan.add_task(t);
 
         let mut traces = HashMap::new();
         traces.insert(
-            0,
+            PlanTaskId::new(0),
             vec![
                 make_trace("get_deployments", "checking staging", 1200, None),
                 make_trace(
@@ -2983,7 +3069,7 @@ mod tests {
     #[test]
     fn continuation_without_tool_reasoning_unchanged() {
         let mut plan = Plan::new("Test goal");
-        let mut t = Task::new(0, "Search logs", "Search prod logs");
+        let mut t = Task::new(PlanTaskId::new(0), "Search logs", "Search prod logs");
         t.complete("Found errors".to_string());
         plan.add_task(t);
 
@@ -3000,12 +3086,15 @@ mod tests {
     fn tool_reasoning_truncation() {
         let long_reasoning = "a".repeat(150);
         let mut plan = Plan::new("Test goal");
-        let mut t = Task::new(0, "Task", "Some task");
+        let mut t = Task::new(PlanTaskId::new(0), "Task", "Some task");
         t.complete("Done".to_string());
         plan.add_task(t);
 
         let mut traces = HashMap::new();
-        traces.insert(0, vec![make_trace("tool_a", &long_reasoning, 1000, None)]);
+        traces.insert(
+            PlanTaskId::new(0),
+            vec![make_trace("tool_a", &long_reasoning, 1000, None)],
+        );
 
         let ctx = IterationContext::new(1, plan, None, vec![], traces);
         let prompt = ctx.build_continuation_prompt(3, true, 2000);
@@ -3024,15 +3113,18 @@ mod tests {
     #[test]
     fn mixed_tasks_some_with_some_without_traces() {
         let mut plan = Plan::new("Test goal");
-        let mut t0 = Task::new(0, "With traces", "Has tool records");
+        let mut t0 = Task::new(PlanTaskId::new(0), "With traces", "Has tool records");
         t0.complete("Done".to_string());
-        let mut t1 = Task::new(1, "No traces", "No tool records");
+        let mut t1 = Task::new(PlanTaskId::new(1), "No traces", "No tool records");
         t1.complete("Also done".to_string());
         plan.add_task(t0);
         plan.add_task(t1);
 
         let mut traces = HashMap::new();
-        traces.insert(0, vec![make_trace("log_search", "searching", 5000, None)]);
+        traces.insert(
+            PlanTaskId::new(0),
+            vec![make_trace("log_search", "searching", 5000, None)],
+        );
 
         let ctx = IterationContext::new(1, plan, None, vec![], traces);
         let prompt = ctx.build_continuation_prompt(3, true, 2000);
@@ -3048,12 +3140,15 @@ mod tests {
     #[test]
     fn empty_reasoning_omits_quotes() {
         let mut plan = Plan::new("Test goal");
-        let mut t = Task::new(0, "Task", "Some task");
+        let mut t = Task::new(PlanTaskId::new(0), "Task", "Some task");
         t.complete("Done".to_string());
         plan.add_task(t);
 
         let mut traces = HashMap::new();
-        traces.insert(0, vec![make_trace("tool_a", "", 1000, None)]);
+        traces.insert(
+            PlanTaskId::new(0),
+            vec![make_trace("tool_a", "", 1000, None)],
+        );
 
         let ctx = IterationContext::new(1, plan, None, vec![], traces);
         let prompt = ctx.build_continuation_prompt(3, true, 2000);
@@ -3069,12 +3164,15 @@ mod tests {
     #[test]
     fn single_tool_chain_no_stray_arrow() {
         let mut plan = Plan::new("Test goal");
-        let mut t = Task::new(0, "Task", "Some task");
+        let mut t = Task::new(PlanTaskId::new(0), "Task", "Some task");
         t.complete("Done".to_string());
         plan.add_task(t);
 
         let mut traces = HashMap::new();
-        traces.insert(0, vec![make_trace("only_tool", "single call", 2000, None)]);
+        traces.insert(
+            PlanTaskId::new(0),
+            vec![make_trace("only_tool", "single call", 2000, None)],
+        );
 
         let ctx = IterationContext::new(1, plan, None, vec![], traces);
         let prompt = ctx.build_continuation_prompt(3, true, 2000);

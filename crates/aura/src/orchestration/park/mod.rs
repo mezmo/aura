@@ -24,6 +24,7 @@ pub(crate) use document::{
 pub(crate) use guard::ParkGuard;
 pub(crate) use recorded_decisions::{CallKey, RecordedDecisions};
 
+use aura_events::PlanTaskId;
 use std::collections::HashMap;
 
 use crate::orchestration::ParkSnapshot;
@@ -37,4 +38,4 @@ pub(crate) struct ParkedTaskRecord {
 }
 
 /// Park records for a run's awaiting tasks, keyed by task id.
-pub(crate) type ParkedTaskRecords = HashMap<usize, ParkedTaskRecord>;
+pub(crate) type ParkedTaskRecords = HashMap<PlanTaskId, ParkedTaskRecord>;

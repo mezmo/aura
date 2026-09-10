@@ -18,8 +18,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AgentContext, ApprovalCompleted, ApprovalPending, ApprovalRequested, McpServerStatus, Progress,
-    ProgressToken, TokenCount, TokenUsage, ToolCallId, ToolName, WorkerPhase,
+    AgentContext, ApprovalCompleted, ApprovalPending, ApprovalRequested, McpServerStatus,
+    PlanTaskId, Progress, ProgressToken, TokenCount, TokenUsage, ToolCallId, ToolName, WorkerPhase,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -103,9 +103,8 @@ pub enum AgentEventPayload {
 
     WorkerPhase {
         phase: WorkerPhase,
-        /// Plan-relative: unique within its iteration, not across a run.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        task_id: Option<usize>,
+        task_id: Option<PlanTaskId>,
     },
 
     /// One turn's tokens, attributed to the tool calls that turn covered.

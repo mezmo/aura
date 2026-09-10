@@ -41,6 +41,7 @@
 //! - `IterationComplete` - when the post-execute coordinator decision completes
 //! - `Synthesizing` - when task results are being consolidated for the coordinator
 
+use aura_events::PlanTaskId;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -232,13 +233,15 @@ pub(super) fn spawn_cancellation_watcher(
 
 /// Extract task_id from a tool_call_id string.
 ///
-/// Tool call IDs follow the format: `task{id}_{toolname}_{counter}`
-/// Returns `None` if the ID doesn't match the expected format.
-fn extract_task_id(tool_call_id: &str) -> Option<usize> {
+/// Tool call IDs follow the format `task{id}_{toolname}_{counter}`.
+/// Returns `None` if the ID does not match that format, including an id past
+/// [`u32::MAX`] — the range [`PlanTaskId`] accepts.
+fn extract_task_id(tool_call_id: &str) -> Option<PlanTaskId> {
     tool_call_id
         .strip_prefix("task")
         .and_then(|s| s.split('_').next())
-        .and_then(|s| s.parse().ok())
+        .and_then(|s| s.parse::<u32>().ok())
+        .map(PlanTaskId::new)
 }
 
 /// Convert a `ToolEvent` to an `OrchestratorEvent`.
@@ -288,7 +291,7 @@ fn tool_event_to_orchestrator_event(
 /// `stream_and_collect` (coordinator) so skill use surfaces in both roles.
 async fn forward_internal_tool_started(
     event_tx: Option<&tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>>,
-    task_id: Option<usize>,
+    task_id: Option<PlanTaskId>,
     worker_id: &str,
     tool_call_id: &str,
     tool_name: &str,
@@ -317,7 +320,7 @@ async fn forward_internal_tool_started(
 /// (tracked by `ObserverWrapper`, not here) are left untouched.
 async fn forward_internal_tool_completed(
     event_tx: Option<&tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>>,
-    task_id: Option<usize>,
+    task_id: Option<PlanTaskId>,
     tool_call_id: &str,
     result: &str,
     starts: &mut std::collections::HashMap<String, std::time::Instant>,
@@ -433,7 +436,7 @@ pub struct Orchestrator {
 /// with proper task/worker attribution. When `None`, reasoning is forwarded raw
 /// (coordinator context — attributed as `agent_id: "main"` by handlers).
 struct StreamContext<'a> {
-    task_id: usize,
+    task_id: PlanTaskId,
     worker_id: &'a str,
 }
 
@@ -626,7 +629,7 @@ impl Orchestrator {
     /// live path leaves the gate byte-identical.
     async fn create_worker(
         &self,
-        task_id: usize,
+        task_id: PlanTaskId,
         attempt: usize,
         worker_name: Option<&str>,
         park_cell: Option<&Arc<BlockedCell>>,
@@ -1049,7 +1052,7 @@ impl Orchestrator {
 
     /// Park-mode wiring for one worker attempt: `Some` only when this run
     /// parks gated calls (see [`Self::park_enabled`]).
-    fn worker_park(&self, task_id: usize, attempt: usize) -> Option<WorkerPark> {
+    fn worker_park(&self, task_id: PlanTaskId, attempt: usize) -> Option<WorkerPark> {
         if !self.park_enabled() {
             return None;
         }
@@ -1077,7 +1080,7 @@ impl Orchestrator {
     /// cancellation events.
     async fn worker_scope(
         &self,
-        task_id: usize,
+        task_id: PlanTaskId,
         worker_name: Option<&str>,
     ) -> Option<crate::hitl::AgentScope> {
         let (run_id, session_id) = {
@@ -1100,7 +1103,7 @@ impl Orchestrator {
     /// is not left with a decidable approval nothing will consume.
     async fn cancel_parked_approvals(
         &self,
-        task_id: usize,
+        task_id: PlanTaskId,
         worker_name: Option<&str>,
         pending: &[PendingCall],
     ) {
@@ -1126,7 +1129,7 @@ impl Orchestrator {
             tracing::warn!(
                 decision_id = %call.decision_id,
                 tool = %call.tool_name,
-                task_id,
+                task_id = task_id.get(),
                 "orphaned park approval cancelled (stream ended before snapshot)",
             );
         }
@@ -3226,7 +3229,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         while !plan.is_finished() {
             // Collect ready tasks with their context and worker assignment
             // Tuple: (task_id, description, context, worker_name)
-            let ready_tasks: Vec<(usize, String, Option<String>, Option<String>)> = plan
+            let ready_tasks: Vec<(PlanTaskId, String, Option<String>, Option<String>)> = plan
                 .ready_tasks()
                 .iter()
                 .map(|t| {
@@ -3446,7 +3449,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
     /// and return a summary. Otherwise return the original result unchanged.
     async fn maybe_create_artifact(
         &self,
-        task_id: usize,
+        task_id: PlanTaskId,
         worker_name: Option<&str>,
         result: String,
     ) -> String {
@@ -3497,7 +3500,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
     /// - LangChain's Write-Select-Compress-Isolate framework
     /// - LlamaIndex's Sub-Question Query Engine
     /// - Anthropic's context engineering principles
-    fn build_task_context(&self, plan: &Plan, task_id: usize) -> Option<String> {
+    fn build_task_context(&self, plan: &Plan, task_id: PlanTaskId) -> Option<String> {
         use super::prompt_constants::{context, sections};
 
         let task = plan.tasks.iter().find(|t| t.id == task_id)?;
@@ -3543,14 +3546,14 @@ Assign tasks to the worker whose tools best match the required operations."#,
         name = "orchestration.worker",
         skip_all,
         fields(
-            orchestration.task_id = task_id,
+            orchestration.task_id = task_id.get(),
             orchestration.worker = tracing::field::Empty,
             orchestration.task = tracing::field::Empty,
         )
     )]
     async fn execute_task(
         &self,
-        task_id: usize,
+        task_id: PlanTaskId,
         params: &TaskExecutionParams<'_>,
         event_tx: Option<&tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>>,
         continuation: Option<&TaskContinuation>,
@@ -3927,7 +3930,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
     /// here: the resuming document's executed list is the resume's record.
     async fn resume_task(
         &self,
-        task_id: usize,
+        task_id: PlanTaskId,
         worker_name: Option<&str>,
         continuation: &TaskContinuation,
         resume: &ResumeContext,
@@ -4096,7 +4099,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
     #[allow(clippy::too_many_arguments)]
     async fn persist_worker_execution(
         &self,
-        task_id: usize,
+        task_id: PlanTaskId,
         task_description: &str,
         attempt: usize,
         duration_ms: u64,
@@ -5116,7 +5119,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
     /// continuation prompt rendering.
     /// The iteration's phase timings, recorded on the current span.
     fn iteration_timings(
-        tool_traces: &std::collections::HashMap<usize, Vec<super::persistence::ToolTraceEntry>>,
+        tool_traces: &std::collections::HashMap<
+            PlanTaskId,
+            Vec<super::persistence::ToolTraceEntry>,
+        >,
         planning_ms: u64,
         execution_start: Instant,
         task_compute_ms: u64,
@@ -5142,7 +5148,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
     async fn load_tool_traces_for_plan(
         &self,
         plan: &Plan,
-    ) -> std::collections::HashMap<usize, Vec<super::persistence::ToolTraceEntry>> {
+    ) -> std::collections::HashMap<PlanTaskId, Vec<super::persistence::ToolTraceEntry>> {
         let persistence = self.persistence.lock().await;
         let mut traces = std::collections::HashMap::new();
 
@@ -6551,7 +6557,7 @@ mod tests {
         {
             let p = persistence.lock().await;
             let filename = p
-                .write_result_artifact(0, Some("research"), 1, &large_result)
+                .write_result_artifact(PlanTaskId::new(0), Some("research"), 1, &large_result)
                 .await
                 .unwrap();
             assert_eq!(filename, "task-0-research-iter-1-result.txt");
@@ -6605,13 +6611,13 @@ mod tests {
         // Write artifacts for multiple tasks
         {
             let p = persistence.lock().await;
-            p.write_result_artifact(0, None, 1, "result 0")
+            p.write_result_artifact(PlanTaskId::new(0), None, 1, "result 0")
                 .await
                 .unwrap();
-            p.write_result_artifact(1, Some("stats"), 1, "result 1")
+            p.write_result_artifact(PlanTaskId::new(1), Some("stats"), 1, "result 1")
                 .await
                 .unwrap();
-            p.write_result_artifact(2, Some("math"), 1, "result 2")
+            p.write_result_artifact(PlanTaskId::new(2), Some("math"), 1, "result 2")
                 .await
                 .unwrap();
 
@@ -7225,7 +7231,7 @@ mod tests {
         }
     }
 
-    fn mark_awaiting(plan: &mut Plan, task_id: usize, pending: Vec<TestPendingCall>) {
+    fn mark_awaiting(plan: &mut Plan, task_id: PlanTaskId, pending: Vec<TestPendingCall>) {
         plan.get_task_mut(task_id).unwrap().state = TaskState::AwaitingApproval { pending };
     }
 
@@ -7234,11 +7240,21 @@ mod tests {
     #[test]
     fn quiescence_single_blocker_mid_dag_parks() {
         let mut plan = Plan::new("Deploy");
-        plan.add_task(Task::new(0, "Collect facts", "r"));
-        plan.add_task(Task::new(1, "Gated apply", "r").with_dependency(0));
-        plan.add_task(Task::new(2, "Verify", "r").with_dependency(1));
-        plan.get_task_mut(0).unwrap().complete("facts");
-        mark_awaiting(&mut plan, 1, vec![parked_call("kubectl_apply")]);
+        plan.add_task(Task::new(PlanTaskId::new(0), "Collect facts", "r"));
+        plan.add_task(
+            Task::new(PlanTaskId::new(1), "Gated apply", "r").with_dependency(PlanTaskId::new(0)),
+        );
+        plan.add_task(
+            Task::new(PlanTaskId::new(2), "Verify", "r").with_dependency(PlanTaskId::new(1)),
+        );
+        plan.get_task_mut(PlanTaskId::new(0))
+            .unwrap()
+            .complete("facts");
+        mark_awaiting(
+            &mut plan,
+            PlanTaskId::new(1),
+            vec![parked_call("kubectl_apply")],
+        );
 
         assert!(!plan.is_finished());
         assert!(plan.ready_tasks().is_empty(), "the dependent is not ready");
@@ -7263,10 +7279,18 @@ mod tests {
     #[test]
     fn quiescence_two_parallel_blockers_park() {
         let mut plan = Plan::new("Migrate");
-        plan.add_task(Task::new(0, "Gated apply A", "r"));
-        plan.add_task(Task::new(1, "Gated delete B", "r"));
-        mark_awaiting(&mut plan, 0, vec![parked_call("kubectl_apply")]);
-        mark_awaiting(&mut plan, 1, vec![parked_call("kubectl_delete")]);
+        plan.add_task(Task::new(PlanTaskId::new(0), "Gated apply A", "r"));
+        plan.add_task(Task::new(PlanTaskId::new(1), "Gated delete B", "r"));
+        mark_awaiting(
+            &mut plan,
+            PlanTaskId::new(0),
+            vec![parked_call("kubectl_apply")],
+        );
+        mark_awaiting(
+            &mut plan,
+            PlanTaskId::new(1),
+            vec![parked_call("kubectl_delete")],
+        );
 
         assert!(has_awaiting_task(&plan));
         let lines = park_verdict_lines(&plan);
@@ -7280,13 +7304,17 @@ mod tests {
     #[test]
     fn quiescence_not_reached_while_ready_work_remains() {
         let mut plan = Plan::new("Mix");
-        plan.add_task(Task::new(0, "Gated apply", "r"));
-        plan.add_task(Task::new(1, "Independent research", "r"));
-        mark_awaiting(&mut plan, 0, vec![parked_call("kubectl_apply")]);
+        plan.add_task(Task::new(PlanTaskId::new(0), "Gated apply", "r"));
+        plan.add_task(Task::new(PlanTaskId::new(1), "Independent research", "r"));
+        mark_awaiting(
+            &mut plan,
+            PlanTaskId::new(0),
+            vec![parked_call("kubectl_apply")],
+        );
 
         let ready = plan.ready_tasks();
         assert_eq!(ready.len(), 1, "the independent task is still dispatched");
-        assert_eq!(ready[0].id, 1);
+        assert_eq!(ready[0].id, PlanTaskId::new(1));
     }
 
     /// Poisoned sibling: a failed task would route the existing replan path,
@@ -7294,13 +7322,20 @@ mod tests {
     #[test]
     fn quiescence_park_takes_precedence_over_replan() {
         let mut plan = Plan::new("Risky");
-        plan.add_task(Task::new(0, "Exploding sibling", "r"));
-        plan.add_task(Task::new(1, "Gated apply", "r"));
-        plan.add_task(Task::new(2, "Downstream of sibling", "r").with_dependency(0));
-        plan.get_task_mut(0)
+        plan.add_task(Task::new(PlanTaskId::new(0), "Exploding sibling", "r"));
+        plan.add_task(Task::new(PlanTaskId::new(1), "Gated apply", "r"));
+        plan.add_task(
+            Task::new(PlanTaskId::new(2), "Downstream of sibling", "r")
+                .with_dependency(PlanTaskId::new(0)),
+        );
+        plan.get_task_mut(PlanTaskId::new(0))
             .unwrap()
             .fail("boom", FailureCategory::AgentError);
-        mark_awaiting(&mut plan, 1, vec![parked_call("kubectl_apply")]);
+        mark_awaiting(
+            &mut plan,
+            PlanTaskId::new(1),
+            vec![parked_call("kubectl_apply")],
+        );
 
         assert!(plan.ready_tasks().is_empty(), "dependency chain broken");
         assert!(
@@ -7313,9 +7348,11 @@ mod tests {
     #[test]
     fn quiescence_without_awaiting_task_is_the_replan_path() {
         let mut plan = Plan::new("Plain");
-        plan.add_task(Task::new(0, "Exploding", "r"));
-        plan.add_task(Task::new(1, "Downstream", "r").with_dependency(0));
-        plan.get_task_mut(0)
+        plan.add_task(Task::new(PlanTaskId::new(0), "Exploding", "r"));
+        plan.add_task(
+            Task::new(PlanTaskId::new(1), "Downstream", "r").with_dependency(PlanTaskId::new(0)),
+        );
+        plan.get_task_mut(PlanTaskId::new(0))
             .unwrap()
             .fail("boom", FailureCategory::AgentError);
 
@@ -7332,11 +7369,19 @@ mod tests {
             .await
             .unwrap();
         let mut plan = Plan::new("Park smoke");
-        plan.add_task(Task::new(0, "Done task", "r"));
-        plan.add_task(Task::new(1, "Gated task", "r"));
-        plan.add_task(Task::new(2, "Dependent", "r").with_dependency(1));
-        plan.get_task_mut(0).unwrap().complete("ok");
-        mark_awaiting(&mut plan, 1, vec![parked_call("kubectl_apply")]);
+        plan.add_task(Task::new(PlanTaskId::new(0), "Done task", "r"));
+        plan.add_task(Task::new(PlanTaskId::new(1), "Gated task", "r"));
+        plan.add_task(
+            Task::new(PlanTaskId::new(2), "Dependent", "r").with_dependency(PlanTaskId::new(1)),
+        );
+        plan.get_task_mut(PlanTaskId::new(0))
+            .unwrap()
+            .complete("ok");
+        mark_awaiting(
+            &mut plan,
+            PlanTaskId::new(1),
+            vec![parked_call("kubectl_apply")],
+        );
 
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(32);
         let (compute_ms, park_records) = orchestrator.execute(&mut plan, &event_tx).await.unwrap();
@@ -7476,7 +7521,7 @@ mod tests {
         }
 
         orchestrator
-            .cancel_parked_approvals(3, Some("operations"), &pending)
+            .cancel_parked_approvals(PlanTaskId::new(3), Some("operations"), &pending)
             .await;
 
         for call in &pending {
@@ -7564,9 +7609,13 @@ mod tests {
         run_id: &str,
     ) -> (Plan, ParkedTaskRecords, Vec<TestPendingCall>) {
         let mut plan = Plan::new("Deploy");
-        plan.add_task(Task::new(0, "Facts", "r"));
-        plan.add_task(Task::new(1, "Gated apply", "r").with_dependency(0));
-        plan.get_task_mut(0).unwrap().complete("facts");
+        plan.add_task(Task::new(PlanTaskId::new(0), "Facts", "r"));
+        plan.add_task(
+            Task::new(PlanTaskId::new(1), "Gated apply", "r").with_dependency(PlanTaskId::new(0)),
+        );
+        plan.get_task_mut(PlanTaskId::new(0))
+            .unwrap()
+            .complete("facts");
 
         let now = chrono::Utc::now();
         let mut pending = Vec::new();
@@ -7608,7 +7657,7 @@ mod tests {
 
         let mut records = ParkedTaskRecords::new();
         records.insert(
-            1,
+            PlanTaskId::new(1),
             crate::orchestration::park::ParkedTaskRecord {
                 attempt: 1,
                 snapshot: crate::orchestration::ParkSnapshot {
@@ -8246,7 +8295,7 @@ mod tests {
         ]);
 
         let mut plan = Plan::new("Deploy");
-        plan.add_task(Task::new(0, "Gated apply", "r").with_worker("operations"));
+        plan.add_task(Task::new(PlanTaskId::new(0), "Gated apply", "r").with_worker("operations"));
         let params = TaskExecutionParams {
             task_description: "apply the manifest",
             task_context: &None,
@@ -8254,7 +8303,7 @@ mod tests {
         };
         let (event_tx, _event_rx) = tokio::sync::mpsc::channel(32);
         let result = orchestrator
-            .execute_task(0, &params, Some(&event_tx), None, None)
+            .execute_task(PlanTaskId::new(0), &params, Some(&event_tx), None, None)
             .await;
 
         assert_orphaned(result, &store, &mut events, 1, "MaxDepthError").await;
@@ -8288,7 +8337,7 @@ mod tests {
             ])]);
 
         let mut plan = Plan::new("Deploy");
-        plan.add_task(Task::new(0, "Gated apply", "r").with_worker("operations"));
+        plan.add_task(Task::new(PlanTaskId::new(0), "Gated apply", "r").with_worker("operations"));
         let params = TaskExecutionParams {
             task_description: "apply the manifest",
             task_context: &None,
@@ -8296,7 +8345,7 @@ mod tests {
         };
         let (event_tx, _event_rx) = tokio::sync::mpsc::channel(32);
         let result = orchestrator
-            .execute_task(0, &params, Some(&event_tx), None, None)
+            .execute_task(PlanTaskId::new(0), &params, Some(&event_tx), None, None)
             .await;
 
         assert_orphaned(
@@ -8474,7 +8523,7 @@ mod tests {
         let _ = park_model;
 
         let mut plan = Plan::new("Deploy");
-        plan.add_task(Task::new(0, "Gated apply", "r").with_worker("operations"));
+        plan.add_task(Task::new(PlanTaskId::new(0), "Gated apply", "r").with_worker("operations"));
         let (_compute_ms, park_records) = orchestrator.execute(&mut plan, &event_tx).await.unwrap();
         let TaskState::AwaitingApproval { pending } = &plan.tasks[0].state else {
             unreachable!("the fixture task is awaiting")
@@ -8564,7 +8613,7 @@ mod tests {
         let (event_tx2, _event_rx2) = tokio::sync::mpsc::channel(64);
         let outcome = orchestrator2
             .execute_task(
-                0,
+                PlanTaskId::new(0),
                 &params,
                 Some(&event_tx2),
                 Some(&continuation),
@@ -8692,11 +8741,11 @@ mod tests {
         let recorded = Arc::new(RecordedDecisions::default());
         let args = serde_json::json!({ "namespace": "prod" });
         recorded.push(
-            CallKey::new(1, "kubectl_apply", &args),
+            CallKey::new(PlanTaskId::new(1), "kubectl_apply", &args),
             ApprovalDecision::Approved,
         );
         recorded.push(
-            CallKey::new(1, "kubectl_apply", &args),
+            CallKey::new(PlanTaskId::new(1), "kubectl_apply", &args),
             ApprovalDecision::Denied {
                 reason: Some("no".to_string()),
             },
@@ -8708,7 +8757,7 @@ mod tests {
             let taken = Arc::clone(&taken);
             let args = args.clone();
             tokio::spawn(async move {
-                let key = CallKey::new(1, "kubectl_apply", &args);
+                let key = CallKey::new(PlanTaskId::new(1), "kubectl_apply", &args);
                 while let Some(decision) = recorded.take(&key) {
                     taken.lock().unwrap().push((consumer, decision));
                 }
@@ -8741,21 +8790,21 @@ mod tests {
     #[tokio::test]
     async fn strict_guards_are_isolated_per_task() {
         let recorded = Arc::new(RecordedDecisions::default());
-        let guard_a = recorded.strict_guard(1);
-        let guard_b = recorded.strict_guard(2);
-        assert!(recorded.is_strict(1) && recorded.is_strict(2));
+        let guard_a = recorded.strict_guard(PlanTaskId::new(1));
+        let guard_b = recorded.strict_guard(PlanTaskId::new(2));
+        assert!(recorded.is_strict(PlanTaskId::new(1)) && recorded.is_strict(PlanTaskId::new(2)));
 
         drop(guard_a);
         assert!(
-            !recorded.is_strict(1),
+            !recorded.is_strict(PlanTaskId::new(1)),
             "the early drop clears only its own task"
         );
         assert!(
-            recorded.is_strict(2),
+            recorded.is_strict(PlanTaskId::new(2)),
             "the sibling continuation stays strict"
         );
         drop(guard_b);
-        assert!(!recorded.is_strict(2));
+        assert!(!recorded.is_strict(PlanTaskId::new(2)));
     }
 
     /// RACE-set companion: the transform_args idempotence pin — the worker
@@ -8771,7 +8820,7 @@ mod tests {
         let (observer, _rx) = ToolCallObserver::new(32);
         let persistence = Arc::new(Mutex::new(ExecutionPersistence::disabled()));
         let chain = Arc::new(ComposedWrapper::new(vec![
-            Arc::new(ObserverWrapper::new(observer, 1)),
+            Arc::new(ObserverWrapper::new(observer, PlanTaskId::new(1))),
             Arc::new(DuplicateCallGuard::new(
                 3,
                 5,
@@ -8803,8 +8852,8 @@ mod tests {
             "re-entering the chain is a no-op on already-clean arguments"
         );
         assert_eq!(
-            CallKey::new(1, test_rig::ECHO_TOOL_NAME, &args),
-            CallKey::new(1, test_rig::ECHO_TOOL_NAME, &second.args),
+            CallKey::new(PlanTaskId::new(1), test_rig::ECHO_TOOL_NAME, &args),
+            CallKey::new(PlanTaskId::new(1), test_rig::ECHO_TOOL_NAME, &second.args),
             "the recorded call digests to the same key after re-entering the chain"
         );
     }

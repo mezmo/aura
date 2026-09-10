@@ -5,6 +5,7 @@
 //! the *decision* recorded against it is what this set holds. "Ticket" is
 //! retired vocabulary (DECISIONS-2026-09-03 item 2).
 
+use aura_events::PlanTaskId;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
@@ -25,7 +26,7 @@ use crate::hitl::ApprovalDecision;
 #[derive(Debug, Default)]
 pub(crate) struct RecordedDecisions {
     entries: Mutex<HashMap<CallKey, VecDeque<ApprovalDecision>>>,
-    strict_tasks: Mutex<HashSet<usize>>,
+    strict_tasks: Mutex<HashSet<PlanTaskId>>,
 }
 
 impl RecordedDecisions {
@@ -45,7 +46,7 @@ impl RecordedDecisions {
     /// Mark a task's continuation as in-flight (`on = true`) or clear it. A
     /// miss for a strict task is a resume fault; a miss otherwise re-parks.
     #[allow(dead_code)]
-    pub(crate) fn set_strict(&self, task_id: usize, on: bool) {
+    pub(crate) fn set_strict(&self, task_id: PlanTaskId, on: bool) {
         let mut strict = self.strict_tasks.lock().expect("recorded-decisions lock");
         if on {
             strict.insert(task_id);
@@ -56,7 +57,7 @@ impl RecordedDecisions {
 
     /// Whether a task's continuation is in-flight, and so a recorded-decisions
     /// miss must fail closed rather than re-park.
-    pub(crate) fn is_strict(&self, task_id: usize) -> bool {
+    pub(crate) fn is_strict(&self, task_id: PlanTaskId) -> bool {
         self.strict_tasks
             .lock()
             .expect("recorded-decisions lock")
@@ -79,7 +80,7 @@ impl RecordedDecisions {
     /// unwind) regardless of the recorder's own lifetime. Wired by the
     /// orchestrator continuation (P44 commit 3).
     #[allow(dead_code)]
-    pub(crate) fn strict_guard(self: &Arc<Self>, task_id: usize) -> StrictGuard {
+    pub(crate) fn strict_guard(self: &Arc<Self>, task_id: PlanTaskId) -> StrictGuard {
         self.set_strict(task_id, true);
         StrictGuard {
             recorded: Arc::clone(self),
@@ -96,7 +97,7 @@ impl RecordedDecisions {
 /// begins.
 #[derive(Debug, Hash, PartialEq, Eq)]
 pub(crate) struct CallKey {
-    task_id: usize,
+    task_id: PlanTaskId,
     tool_name: String,
     args_digest: [u8; 32],
 }
@@ -104,7 +105,7 @@ pub(crate) struct CallKey {
 impl CallKey {
     /// Build a key from the task id, the tool name, and a digest of
     /// `tool_name || 0x00 || canonical_json(args)`.
-    pub(crate) fn new(task_id: usize, tool_name: &str, args: &Value) -> Self {
+    pub(crate) fn new(task_id: PlanTaskId, tool_name: &str, args: &Value) -> Self {
         let mut h = Sha256::new();
         h.update(tool_name.as_bytes());
         h.update([0u8]);
@@ -125,7 +126,7 @@ impl CallKey {
 #[allow(dead_code)]
 pub(crate) struct StrictGuard {
     recorded: Arc<RecordedDecisions>,
-    task_id: usize,
+    task_id: PlanTaskId,
 }
 
 impl Drop for StrictGuard {
@@ -140,7 +141,7 @@ mod tests {
 
     use super::*;
 
-    fn key(task_id: usize, tool_name: &str, args: &Value) -> CallKey {
+    fn key(task_id: PlanTaskId, tool_name: &str, args: &Value) -> CallKey {
         CallKey::new(task_id, tool_name, args)
     }
 
@@ -151,15 +152,18 @@ mod tests {
         let recorded = RecordedDecisions::default();
         let args = serde_json::json!({"namespace": "prod"});
 
-        recorded.push(key(1, "kubectl_apply", &args), ApprovalDecision::Approved);
         recorded.push(
-            key(1, "kubectl_apply", &args),
+            key(PlanTaskId::new(1), "kubectl_apply", &args),
+            ApprovalDecision::Approved,
+        );
+        recorded.push(
+            key(PlanTaskId::new(1), "kubectl_apply", &args),
             ApprovalDecision::Denied {
                 reason: Some("too risky".to_string()),
             },
         );
 
-        let probe = key(1, "kubectl_apply", &args);
+        let probe = key(PlanTaskId::new(1), "kubectl_apply", &args);
         assert_eq!(
             recorded.take(&probe),
             Some(ApprovalDecision::Approved),
@@ -182,15 +186,21 @@ mod tests {
     #[test]
     fn strict_set_toggles_membership() {
         let recorded = RecordedDecisions::default();
-        assert!(!recorded.is_strict(1));
-        recorded.set_strict(1, true);
-        assert!(recorded.is_strict(1), "set_strict(true) enters the task");
+        assert!(!recorded.is_strict(PlanTaskId::new(1)));
+        recorded.set_strict(PlanTaskId::new(1), true);
         assert!(
-            !recorded.is_strict(2),
+            recorded.is_strict(PlanTaskId::new(1)),
+            "set_strict(true) enters the task"
+        );
+        assert!(
+            !recorded.is_strict(PlanTaskId::new(2)),
             "a sibling task is unaffected by another's strict entry",
         );
-        recorded.set_strict(1, false);
-        assert!(!recorded.is_strict(1), "set_strict(false) clears the task");
+        recorded.set_strict(PlanTaskId::new(1), false);
+        assert!(
+            !recorded.is_strict(PlanTaskId::new(1)),
+            "set_strict(false) clears the task"
+        );
     }
 
     /// The drop guard clears the task's strict entry on a normal drop, so a
@@ -199,11 +209,14 @@ mod tests {
     fn strict_guard_clears_on_normal_drop() {
         let recorded = std::sync::Arc::new(RecordedDecisions::default());
         {
-            let _guard = recorded.strict_guard(1);
-            assert!(recorded.is_strict(1), "guard arms the strict entry");
+            let _guard = recorded.strict_guard(PlanTaskId::new(1));
+            assert!(
+                recorded.is_strict(PlanTaskId::new(1)),
+                "guard arms the strict entry"
+            );
         }
         assert!(
-            !recorded.is_strict(1),
+            !recorded.is_strict(PlanTaskId::new(1)),
             "guard's drop clears the entry after the scope ends",
         );
     }
@@ -215,7 +228,7 @@ mod tests {
         let recorded = std::sync::Arc::new(RecordedDecisions::default());
 
         fn drive(recorded: &std::sync::Arc<RecordedDecisions>) -> Result<(), &'static str> {
-            let _guard = recorded.strict_guard(1);
+            let _guard = recorded.strict_guard(PlanTaskId::new(1));
             // An early-return path the continuation might take on a non-fatal
             // error: the guard drops here, not at the end of the function.
             Err("simulated non-fatal error")
@@ -223,7 +236,7 @@ mod tests {
 
         assert!(drive(&recorded).is_err());
         assert!(
-            !recorded.is_strict(1),
+            !recorded.is_strict(PlanTaskId::new(1)),
             "an early return drops the guard and clears strict",
         );
     }
@@ -233,8 +246,8 @@ mod tests {
     #[test]
     fn strict_guard_clears_on_panic_unwind() {
         let recorded = std::sync::Arc::new(RecordedDecisions::default());
-        let guard = recorded.strict_guard(1);
-        assert!(recorded.is_strict(1));
+        let guard = recorded.strict_guard(PlanTaskId::new(1));
+        assert!(recorded.is_strict(PlanTaskId::new(1)));
 
         let result = catch_unwind(AssertUnwindSafe(|| {
             let _held = guard;
@@ -242,7 +255,7 @@ mod tests {
         }));
         assert!(result.is_err(), "the panic must be caught");
         assert!(
-            !recorded.is_strict(1),
+            !recorded.is_strict(PlanTaskId::new(1)),
             "the guard's drop must clear strict even when unwinding",
         );
     }
@@ -252,8 +265,16 @@ mod tests {
     /// BTreeMap-ordered, so `to_string` is canonical. A test pins that.
     #[test]
     fn digest_is_stable_across_argument_key_order() {
-        let a = key(1, "kubectl_apply", &serde_json::json!({"a": 1, "b": 2}));
-        let b = key(1, "kubectl_apply", &serde_json::json!({"b": 2, "a": 1}));
+        let a = key(
+            PlanTaskId::new(1),
+            "kubectl_apply",
+            &serde_json::json!({"a": 1, "b": 2}),
+        );
+        let b = key(
+            PlanTaskId::new(1),
+            "kubectl_apply",
+            &serde_json::json!({"b": 2, "a": 1}),
+        );
         assert_eq!(
             a.args_digest, b.args_digest,
             "canonical json: key order must not affect the digest",
@@ -266,12 +287,12 @@ mod tests {
     #[test]
     fn different_arguments_digest_differ() {
         let a = key(
-            1,
+            PlanTaskId::new(1),
             "kubectl_apply",
             &serde_json::json!({"namespace": "prod"}),
         );
         let b = key(
-            1,
+            PlanTaskId::new(1),
             "kubectl_apply",
             &serde_json::json!({"namespace": "stage"}),
         );
@@ -284,8 +305,8 @@ mod tests {
     #[test]
     fn different_tool_names_digest_differ() {
         let args = serde_json::json!({"namespace": "prod"});
-        let a = key(1, "kubectl_apply", &args);
-        let b = key(1, "kubectl_delete", &args);
+        let a = key(PlanTaskId::new(1), "kubectl_apply", &args);
+        let b = key(PlanTaskId::new(1), "kubectl_delete", &args);
         assert!(a != b);
     }
 }

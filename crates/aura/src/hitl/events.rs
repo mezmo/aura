@@ -211,6 +211,7 @@ mod tests {
     use super::*;
     use crate::hitl::decision::{AgentScope, CancelReason, DecisionId};
     use crate::orchestration::{RunId, TaskIdentity};
+    use aura_events::PlanTaskId;
 
     #[test]
     fn sender_dropped_outcome_serializes_as_sender_dropped() {
@@ -218,7 +219,7 @@ mod tests {
         let run_id: RunId = "0191e8c0-1111-7000-8000-000000000000".parse().unwrap();
         let scope = AgentScope::Worker {
             run_id,
-            task: TaskIdentity::new(0, Some("ops".to_string())),
+            task: TaskIdentity::new(PlanTaskId::new(0), Some("ops".to_string())),
             session_id: None,
         };
         let completed = completed(

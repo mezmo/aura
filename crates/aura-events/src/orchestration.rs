@@ -3,7 +3,7 @@
 //! These events are emitted during orchestrated multi-agent execution to provide
 //! visibility into plan creation, task execution, and synthesis phases.
 
-use crate::{format_named_sse, AgentContext, CorrelationContext};
+use crate::{format_named_sse, AgentContext, CorrelationContext, PlanTaskId};
 use serde::{Deserialize, Serialize};
 
 /// Shared context included in every orchestration SSE event.
@@ -120,7 +120,7 @@ pub enum OrchestrationStreamEvent {
     },
     /// Emitted when orchestrator starts a task.
     TaskStarted {
-        task_id: usize,
+        task_id: PlanTaskId,
         description: String,
         worker_id: String,
         orchestrator_id: String,
@@ -129,7 +129,7 @@ pub enum OrchestrationStreamEvent {
     },
     /// Emitted when orchestrator completes a task.
     TaskCompleted {
-        task_id: usize,
+        task_id: PlanTaskId,
         success: bool,
         duration_ms: u64,
         orchestrator_id: String,
@@ -141,7 +141,7 @@ pub enum OrchestrationStreamEvent {
     },
     /// A worker task parked a gated call (park mode); one event per call.
     TaskBlocked {
-        task_id: usize,
+        task_id: PlanTaskId,
         tool_call_id: String,
         decision_id: String,
         tool_name: String,
@@ -200,7 +200,7 @@ pub enum OrchestrationStreamEvent {
     },
     /// Emitted when a worker produces reasoning content.
     WorkerReasoning {
-        task_id: usize,
+        task_id: PlanTaskId,
         worker_id: String,
         content: String,
         #[serde(flatten)]
@@ -209,7 +209,7 @@ pub enum OrchestrationStreamEvent {
     /// Emitted when a tool call starts within a worker task.
     ToolCallStarted {
         #[serde(skip_serializing_if = "Option::is_none")]
-        task_id: Option<usize>,
+        task_id: Option<PlanTaskId>,
         tool_call_id: String,
         tool_name: String,
         worker_id: String,
@@ -221,7 +221,7 @@ pub enum OrchestrationStreamEvent {
     /// Emitted when a tool call completes within a worker task.
     ToolCallCompleted {
         #[serde(skip_serializing_if = "Option::is_none")]
-        task_id: Option<usize>,
+        task_id: Option<PlanTaskId>,
         tool_call_id: String,
         success: bool,
         duration_ms: u64,
@@ -321,7 +321,7 @@ impl OrchestrationStreamEvent {
     }
 
     pub fn task_started(
-        task_id: usize,
+        task_id: PlanTaskId,
         description: impl Into<String>,
         orchestrator_id: impl Into<String>,
         worker_id: impl Into<String>,
@@ -337,7 +337,7 @@ impl OrchestrationStreamEvent {
     }
 
     pub fn task_completed(
-        task_id: usize,
+        task_id: PlanTaskId,
         success: bool,
         duration_ms: u64,
         orchestrator_id: impl Into<String>,
@@ -359,7 +359,7 @@ impl OrchestrationStreamEvent {
     /// Create a TaskBlocked event (one per parked call).
     #[allow(clippy::too_many_arguments)]
     pub fn task_blocked(
-        task_id: usize,
+        task_id: PlanTaskId,
         tool_call_id: impl Into<String>,
         decision_id: impl Into<String>,
         tool_name: impl Into<String>,
@@ -443,7 +443,7 @@ impl OrchestrationStreamEvent {
     }
 
     pub fn worker_reasoning(
-        task_id: usize,
+        task_id: PlanTaskId,
         worker_id: impl Into<String>,
         content: impl Into<String>,
         context: EventContext,
@@ -457,7 +457,7 @@ impl OrchestrationStreamEvent {
     }
 
     pub fn tool_call_started(
-        task_id: Option<usize>,
+        task_id: Option<PlanTaskId>,
         tool_call_id: impl Into<String>,
         tool_name: impl Into<String>,
         worker_id: impl Into<String>,
@@ -475,7 +475,7 @@ impl OrchestrationStreamEvent {
     }
 
     pub fn tool_call_completed(
-        task_id: Option<usize>,
+        task_id: Option<PlanTaskId>,
         tool_call_id: impl Into<String>,
         success: bool,
         duration_ms: u64,

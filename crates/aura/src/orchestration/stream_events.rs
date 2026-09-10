@@ -27,6 +27,7 @@
 
 use crate::orchestration::events::RoutingMode;
 use crate::stream_events::{AgentContext, CorrelationContext};
+use aura_events::PlanTaskId;
 use serde::{Deserialize, Serialize};
 
 /// Shared context included in every orchestration SSE event.
@@ -50,7 +51,7 @@ impl EventContext {
 /// Shared identity fields for task events (TaskStarted, TaskCompleted).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TaskContext {
-    pub task_id: usize,
+    pub task_id: PlanTaskId,
     pub orchestrator_id: String,
     pub worker_id: String,
 }
@@ -186,7 +187,7 @@ pub enum OrchestrationStreamEvent {
     },
     /// Emitted when a worker produces reasoning content.
     WorkerReasoning {
-        task_id: usize,
+        task_id: PlanTaskId,
         worker_id: String,
         content: String,
         #[serde(flatten)]
@@ -195,7 +196,7 @@ pub enum OrchestrationStreamEvent {
     /// Emitted when a tool call starts within a worker task.
     ToolCallStarted {
         #[serde(skip_serializing_if = "Option::is_none")]
-        task_id: Option<usize>,
+        task_id: Option<PlanTaskId>,
         tool_call_id: String,
         tool_name: String,
         worker_id: String,
@@ -207,7 +208,7 @@ pub enum OrchestrationStreamEvent {
     /// Emitted when a tool call completes within a worker task.
     ToolCallCompleted {
         #[serde(skip_serializing_if = "Option::is_none")]
-        task_id: Option<usize>,
+        task_id: Option<PlanTaskId>,
         tool_call_id: String,
         #[serde(flatten)]
         outcome: CompletionOutcome,
@@ -294,7 +295,7 @@ impl OrchestrationStreamEvent {
 
     /// Create a TaskStarted event.
     pub fn task_started(
-        task_id: usize,
+        task_id: PlanTaskId,
         description: impl Into<String>,
         orchestrator_id: impl Into<String>,
         worker_id: impl Into<String>,
@@ -313,7 +314,7 @@ impl OrchestrationStreamEvent {
 
     /// Create a TaskCompleted event.
     pub fn task_completed(
-        task_id: usize,
+        task_id: PlanTaskId,
         success: bool,
         duration_ms: u64,
         orchestrator_id: impl Into<String>,
@@ -338,7 +339,7 @@ impl OrchestrationStreamEvent {
 
     /// Create a TaskBlocked event (one per parked call).
     pub fn task_blocked(
-        task_id: usize,
+        task_id: PlanTaskId,
         tool_call_id: impl Into<String>,
         decision_id: impl Into<String>,
         tool_name: impl Into<String>,
@@ -415,7 +416,7 @@ impl OrchestrationStreamEvent {
 
     /// Create a WorkerReasoning event.
     pub fn worker_reasoning(
-        task_id: usize,
+        task_id: PlanTaskId,
         worker_id: impl Into<String>,
         content: impl Into<String>,
         context: EventContext,
@@ -430,7 +431,7 @@ impl OrchestrationStreamEvent {
 
     /// Create a ToolCallStarted event.
     pub fn tool_call_started(
-        task_id: Option<usize>,
+        task_id: Option<PlanTaskId>,
         tool_call_id: impl Into<String>,
         tool_name: impl Into<String>,
         worker_id: impl Into<String>,
@@ -449,7 +450,7 @@ impl OrchestrationStreamEvent {
 
     /// Create a ToolCallCompleted event.
     pub fn tool_call_completed(
-        task_id: Option<usize>,
+        task_id: Option<PlanTaskId>,
         tool_call_id: impl Into<String>,
         success: bool,
         duration_ms: u64,
@@ -519,8 +520,14 @@ mod tests {
         );
 
         assert_eq!(
-            OrchestrationStreamEvent::task_started(0, "desc", "orch-id", "worker-id", ctx.clone())
-                .event_name(),
+            OrchestrationStreamEvent::task_started(
+                PlanTaskId::new(0),
+                "desc",
+                "orch-id",
+                "worker-id",
+                ctx.clone()
+            )
+            .event_name(),
             event_names::TASK_STARTED
         );
 
@@ -611,7 +618,7 @@ mod tests {
     #[test]
     fn test_format_sse_task_completed_with_result() {
         let event = OrchestrationStreamEvent::task_completed(
-            0,
+            PlanTaskId::new(0),
             true,
             1500,
             "orch-1",
@@ -630,7 +637,7 @@ mod tests {
     #[test]
     fn test_format_sse_task_blocked() {
         let event = OrchestrationStreamEvent::task_blocked(
-            2,
+            PlanTaskId::new(2),
             "call_42",
             "0191e8c0-1111-7000-8000-00000000000a",
             "kubectl_apply",
@@ -683,7 +690,7 @@ mod tests {
     fn test_format_sse_tool_call_started_with_arguments() {
         let args = serde_json::json!({"numbers": [10, 20, 30]});
         let event = OrchestrationStreamEvent::tool_call_started(
-            Some(0),
+            Some(PlanTaskId::new(0)),
             "call_1",
             "mean",
             "statistics",
@@ -699,7 +706,7 @@ mod tests {
     #[test]
     fn test_format_sse_tool_call_completed_with_result() {
         let event = OrchestrationStreamEvent::tool_call_completed(
-            Some(0),
+            Some(PlanTaskId::new(0)),
             "call_1",
             true,
             42,
