@@ -42,11 +42,11 @@ impl KeepSet {
 /// dirs strictly below the epoch of the claims-row read its keep-set
 /// came from.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct GcScope {
+pub(crate) struct SweepScope {
     below: Epoch,
 }
 
-impl GcScope {
+impl SweepScope {
     /// Scope a sweep to the epoch the claim was granted at.
     pub(crate) fn at_read(below: Epoch) -> Self {
         Self { below }
@@ -66,7 +66,7 @@ impl GcScope {
 #[derive(Debug)]
 pub(crate) struct DebrisSweep {
     keep: KeepSet,
-    scope: GcScope,
+    scope: SweepScope,
 }
 
 impl DebrisSweep {
@@ -76,7 +76,7 @@ impl DebrisSweep {
     pub(crate) fn at_claim_time(manifest: &Manifest, claimed_epoch: Epoch) -> Self {
         Self {
             keep: KeepSet::from_manifest(manifest, claimed_epoch),
-            scope: GcScope::at_read(claimed_epoch),
+            scope: SweepScope::at_read(claimed_epoch),
         }
     }
 
@@ -195,7 +195,7 @@ mod tests {
         let e1 = Epoch::initial();
         let e2 = e1.next().expect("epoch 2");
         let e3 = e2.next().expect("epoch 3");
-        let scope = GcScope::at_read(e3);
+        let scope = SweepScope::at_read(e3);
 
         assert!(scope.permits(e1));
         assert!(scope.permits(e2));

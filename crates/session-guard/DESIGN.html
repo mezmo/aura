@@ -208,7 +208,7 @@
 <table>
   <tr><th>Type</th><th>Role</th></tr>
   <tr><td><code>KeepSet</code></td><td>Manifest-referenced paths ∪ own epoch dir.</td></tr>
-  <tr><td><code>GcScope { below: Epoch }</code></td><td>The deletion-scope rule as a type: a sweep built from a claims-row read at epoch k may only touch <code>e0..e{k-1}</code> — a thawed zombie-GC is structurally harmless (I3).</td></tr>
+  <tr><td><code>SweepScope { below: Epoch }</code></td><td>The deletion-scope rule as a type: a sweep built from a claims-row read at epoch k may only touch <code>e0..e{k-1}</code> — a thawed zombie-GC is structurally harmless (I3).</td></tr>
   <tr><td><code>DebrisSweep</code> / <code>SweepOutcome</code></td><td>Holder-run at claim time, after the manifest read. Unlink-ENOENT = no-op (idempotent).</td></tr>
 </table>
 
