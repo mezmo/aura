@@ -92,8 +92,8 @@ pub fn set_context_used(tokens: u64) {
 ///
 /// Ignored in an orchestrated conversation: those readings come from every
 /// worker as well as the coordinator (the event carries no agent id), so only
-/// the coordinator's end-of-turn `aura.context_usage` reading describes the
-/// conversation's context there.
+/// the conversation's own `aura.context_usage` reading describes its context
+/// there.
 pub fn set_mid_turn_context_estimate(tokens: u64) {
     if ORCHESTRATED.load(Ordering::Relaxed) {
         return;
@@ -167,7 +167,7 @@ fn capture_snapshot() -> Snapshot {
     };
     // Show the count once something has been reported, with the meter when
     // the model's window is known. In an orchestrated conversation this is the
-    // coordinator's context — the persistent conversation the user is in.
+    // persistent conversation's context, not any worker's.
     let used = CONTEXT_USED.load(Ordering::Relaxed);
     let limit = NonZeroU64::new(MODEL_CONTEXT_LIMIT.load(Ordering::Relaxed));
     let context = (used > 0 || limit.is_some()).then_some(ContextUsage { used, limit });
@@ -624,7 +624,7 @@ mod tests {
     }
 
     #[test]
-    fn orchestrated_conversation_shows_the_coordinators_context() {
+    fn orchestrated_conversation_shows_the_conversations_context() {
         let _guard = state_lock();
         reset_session_status();
         mark_orchestrated();
@@ -635,7 +635,7 @@ mod tests {
         assert_eq!(CONTEXT_USED.load(Ordering::Relaxed), 0);
         assert_eq!(capture_snapshot().context, None);
 
-        // The coordinator's end-of-turn reading is the conversation's context.
+        // The conversation's own reading drives the meter.
         set_context_window_usage(40_000, 1_200, Some(500_000));
         assert_eq!(
             capture_snapshot().context,

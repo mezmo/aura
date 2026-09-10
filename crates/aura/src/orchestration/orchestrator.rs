@@ -446,6 +446,8 @@ struct StreamCallParams<'a> {
     history: Vec<rig::completion::Message>,
     phase: &'a str,
     event_tx: Option<&'a tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>>,
+    /// Agent id this call's context occupancy is reported under.
+    context_agent: Option<&'a str>,
 }
 
 /// Agent id for the conversation-level context an orchestration run carries,
@@ -1374,6 +1376,7 @@ impl Orchestrator {
             history,
             phase,
             event_tx,
+            ..
         } = params;
         let timeout_secs = self.config.per_call_timeout_secs();
         let stream_future = async {
@@ -1454,6 +1457,7 @@ impl Orchestrator {
             history,
             phase,
             event_tx,
+            context_agent,
         } = params;
         let timeout_secs = self.config.per_call_timeout_secs();
         let inactivity_secs = self.config.stream_inactivity_timeout_secs();
@@ -1619,14 +1623,14 @@ impl Orchestrator {
                     deadline.suspend();
                 }
             }
-            // Coordinator occupancy under the same agent id single-agent uses,
-            // so clients track one conversation context across both modes. The
-            // last planning cycle runs after the workers, so its event is the
-            // one that lands last.
-            if let Some(tx) = event_tx.filter(|_| tally.last.input_tokens > 0) {
+            // Report this call's occupancy under the agent id the caller asked
+            // for; callers whose context is scratch pass none.
+            if let (Some(tx), Some(agent_id)) = (event_tx, context_agent)
+                && tally.last.input_tokens > 0
+            {
                 let _ = tx
                     .send(Ok(StreamItem::ContextUsage {
-                        agent_id: COORDINATOR_AGENT_ID.to_string(),
+                        agent_id: agent_id.to_string(),
                         context_tokens: tally.last.input_tokens,
                         response_tokens: tally.last.output_tokens,
                         context_window: agent.context_window,
@@ -1743,6 +1747,7 @@ impl Orchestrator {
                         history: params.history.clone(),
                         phase: params.phase,
                         event_tx: params.event_tx,
+                        context_agent: params.context_agent,
                     },
                     || {
                         let rd = rd.clone();
@@ -1882,6 +1887,14 @@ impl Orchestrator {
                         history: full_history,
                         phase: "Planning",
                         event_tx,
+                        // Only a request's first planning call sees the
+                        // persistent conversation — the chat history plus the
+                        // planning prompt — so its occupancy is the
+                        // conversation's, reported under the same agent id
+                        // single-agent mode uses. Continuation cycles carry
+                        // the turn's scratch conversation, discarded when the
+                        // turn ends, and report nothing.
+                        context_agent: previous.is_none().then_some(COORDINATOR_AGENT_ID),
                     },
                     &coordinator_state.routing_decision,
                 )
@@ -3701,6 +3714,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         history,
                         phase: "Worker task",
                         event_tx,
+                        context_agent: None,
                     },
                     worker_name.map(|name| StreamContext {
                         task_id,
