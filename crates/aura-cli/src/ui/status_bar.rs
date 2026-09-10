@@ -61,11 +61,26 @@ pub fn set_agent_host(host: AgentHost) {
 }
 
 /// Record the model and context window reported by `aura.session_info`.
+///
+/// A window already learned for the same model — from an earlier
+/// `session_info` or an `aura.context_usage` reading — survives an event that
+/// omits one, so the meter does not blink out at the start of every turn. A
+/// different model has a different window, so a model change forgets the old
+/// one unless the event reports a new one.
 pub fn set_session_info(model: String, context_limit: Option<u64>) {
-    if let Ok(mut g) = SESSION_MODEL.lock() {
-        *g = Some(model);
+    let model_changed = SESSION_MODEL
+        .lock()
+        .map(|mut g| {
+            let changed = g.as_deref() != Some(model.as_str());
+            *g = Some(model);
+            changed
+        })
+        .unwrap_or(true);
+    match context_limit {
+        Some(limit) => MODEL_CONTEXT_LIMIT.store(limit, Ordering::Relaxed),
+        None if model_changed => MODEL_CONTEXT_LIMIT.store(0, Ordering::Relaxed),
+        None => {}
     }
-    MODEL_CONTEXT_LIMIT.store(context_limit.unwrap_or(0), Ordering::Relaxed);
 }
 
 /// Record the tokens currently occupying the model's context.
@@ -589,6 +604,23 @@ mod tests {
         assert_eq!(session_model(), None);
         assert_eq!(MODEL_CONTEXT_LIMIT.load(Ordering::Relaxed), 0);
         assert_eq!(*MCP_COUNTS.lock().unwrap(), None);
+    }
+
+    #[test]
+    fn session_info_without_a_window_keeps_the_known_one_for_the_same_model() {
+        let _guard = state_lock();
+        reset_session_status();
+        set_session_info("sonnet".to_owned(), Some(500_000));
+        // A later turn's session_info that omits the window (or a reading
+        // that reported it) leaves the meter's limit alone.
+        set_session_info("sonnet".to_owned(), None);
+        assert_eq!(MODEL_CONTEXT_LIMIT.load(Ordering::Relaxed), 500_000);
+        // A different model's window is unknown until something reports it.
+        set_session_info("haiku".to_owned(), None);
+        assert_eq!(MODEL_CONTEXT_LIMIT.load(Ordering::Relaxed), 0);
+        set_session_info("haiku".to_owned(), Some(200_000));
+        assert_eq!(MODEL_CONTEXT_LIMIT.load(Ordering::Relaxed), 200_000);
+        reset_session_status();
     }
 
     #[test]
