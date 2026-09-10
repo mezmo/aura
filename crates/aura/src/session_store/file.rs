@@ -1,5 +1,6 @@
 //! File-backed HITL approval store: one JSON file per decision id.
-//! Parked approvals survive process restart on a single host.
+//! Parked approvals survive process restart on a single host. The
+//! skill-invocation store shares the same root under `skills/`.
 //!
 //! Layout:
 //!
@@ -38,6 +39,8 @@
 //! `decision()` consumers treat `Err(Decode)` on a known id as this
 //! recoverable state, not as an unknown id.
 
+mod skill_store;
+
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -50,6 +53,8 @@ use tokio::task::{JoinError, spawn_blocking};
 use crate::hitl::{ApprovalDecision, DecisionId, ParkedApproval, ResolveError};
 
 use super::{ApprovalStore, DecisionRecord, ParkedApprovalRecord, SessionStoreError};
+
+pub use skill_store::FileSkillInvocationStore;
 
 /// Undecided approvals, one `{decision_id}.json` file per approval.
 const APPROVALS_DIR: &str = "approvals";

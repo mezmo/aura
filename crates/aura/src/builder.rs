@@ -153,6 +153,8 @@ pub struct Agent {
     pub(crate) system_prompt: String,
     /// `llm.invocation_parameters` JSON for OTel spans.
     pub(crate) invocation_parameters: Option<String>,
+    /// Skills discovered for this agent.
+    pub(crate) skills: Vec<crate::config::SkillConfig>,
 }
 
 impl Agent {
@@ -837,6 +839,7 @@ impl Agent {
             turn_nudge,
             system_prompt,
             invocation_parameters: crate::logging::llm_invocation_parameters(&config.llm),
+            skills: config.agent.skills.clone(),
         })
     }
 
@@ -1126,7 +1129,9 @@ impl Agent {
             builder_state = builder_state.add_tools_dyn(additional_tools);
         }
 
-        if let Some(toolset) = SkillToolset::new(&config.agent.skills) {
+        if let Some(toolset) =
+            SkillToolset::new(&config.agent.skills, config.skill_recorder.clone())
+        {
             tracing::info!(
                 "Adding skill tools (load_skill, read_skill_file) with {} skills",
                 config.agent.skills.len(),
@@ -1738,6 +1743,10 @@ impl StreamingAgent for Agent {
             .as_ref()
             .map(|m| m.server_status_snapshot())
             .unwrap_or_default()
+    }
+
+    fn skills(&self) -> &[aura_config::SkillConfig] {
+        &self.skills
     }
 
     fn system_prompt(&self) -> Option<&str> {

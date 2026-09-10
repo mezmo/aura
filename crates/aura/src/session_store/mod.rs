@@ -1,10 +1,10 @@
 //! Pluggable cross-instance session-state capabilities: a durable store for parked
-//! HITL approvals and a pub/sub event bus.
+//! HITL approvals, a per-session skill-invocation store, and a pub/sub event bus.
 //!
-//! The in-memory implementations are the default; a file-backed approval
-//! store survives a process restart on a single host, and a networked backend
-//! (e.g. Redis/Valkey) implements the same traits to make a load-balanced
-//! multi-instance deployment behave like one process.
+//! The in-memory implementations are the default; file-backed approval and
+//! skill-invocation stores survive a process restart on a single host, and a
+//! networked backend (e.g. Redis/Valkey) implements the same traits to make a
+//! load-balanced multi-instance deployment behave like one process.
 //!
 //! See `docs/design/session-storage.md` and
 //! `docs/adr/2026-07-08-session-storage.md`.
@@ -14,6 +14,7 @@ pub(crate) mod fault_store;
 mod file;
 mod memory;
 mod record;
+mod skill_record;
 
 use std::pin::Pin;
 use std::time::Duration;
@@ -22,13 +23,17 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::Stream;
 
+use crate::config::SessionId;
 use crate::hitl::{ApprovalDecision, DecisionId, ParkedApproval, ResolveError};
 
 #[cfg(test)]
 pub(crate) use fault_store::FaultInjectingStore;
-pub use file::FileApprovalStore;
-pub use memory::{InMemoryApprovalStore, InMemoryEventBus};
+pub use file::{FileApprovalStore, FileSkillInvocationStore};
+pub use memory::{InMemoryApprovalStore, InMemoryEventBus, InMemorySkillInvocationStore};
 pub use record::{DecisionRecord, InvalidRecord, OriginRecord, ParkedApprovalRecord, ScopeRecord};
+pub use skill_record::{
+    SKILL_INVOCATION_RECORD_VERSION, SkillInvocation, SkillInvocationRecord, SkillRecordDecodeError,
+};
 
 /// A fault in the backing session-store/bus backend.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -92,6 +97,34 @@ pub trait ApprovalStore: Send + Sync {
         &self,
         request_id: &str,
     ) -> Result<Vec<ParkedApproval>, SessionStoreError>;
+}
+
+/// Distinct skill-invocation records one session may hold.
+pub const MAX_SKILL_RECORDS_PER_SESSION: usize = 64;
+
+/// Per-session storage of skill-tool invocations, over the serializable
+/// [`SkillInvocationRecord`].
+#[async_trait]
+pub trait SkillInvocationStore: Send + Sync {
+    /// Persist an invocation under a session. Idempotent per
+    /// (session, [`SkillInvocation::dedup_key`]): the first record for a key
+    /// wins and later duplicates are no-ops, so a re-invoked skill keeps its
+    /// original position. A session holds at most
+    /// [`MAX_SKILL_RECORDS_PER_SESSION`] distinct invocations; a write past
+    /// the cap is dropped with a warning, not failed. Backends with native
+    /// expiry should TTL the session's entries so abandoned sessions
+    /// self-clean.
+    async fn record(
+        &self,
+        session_id: &SessionId,
+        record: SkillInvocationRecord,
+    ) -> Result<(), SessionStoreError>;
+
+    /// Every invocation recorded for a session, ordered by (anchor, seq).
+    async fn list(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<SkillInvocationRecord>, SessionStoreError>;
 }
 
 /// The payload stream returned by [`EventBus::subscribe`].

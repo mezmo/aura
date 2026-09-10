@@ -154,6 +154,10 @@ impl StreamingAgent for OrchestratorFactory {
         self.agent_config.llm.context_window()
     }
 
+    fn skills(&self) -> &[aura_config::SkillConfig] {
+        &self.agent_config.agent.skills
+    }
+
     async fn stream(
         &self,
         query: &str,

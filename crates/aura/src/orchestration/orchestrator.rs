@@ -710,6 +710,11 @@ impl Orchestrator {
         }
 
         apply_worker_skills_override(&mut worker_config, worker_name);
+        // Workers are per-run ephemeral and receive no chat history, so their
+        // skill invocations are never rehydrated into the session — recording
+        // them would leak task-scoped loads across turns. Coordinator-side
+        // invocations keep the recorder from the top-level config.
+        worker_config.skill_recorder = None;
 
         // Per-worker scratchpad override falls back to [agent.scratchpad].
         // Each worker gets a FRESH ContextBudget scoped to its effective LLM —
@@ -1058,6 +1063,7 @@ impl Orchestrator {
             turn_nudge,
             system_prompt: preamble.clone(),
             invocation_parameters: crate::logging::llm_invocation_parameters(&worker_config.llm),
+            skills: worker_config.agent.skills.clone(),
         };
 
         Ok(AgentWithPreamble {
@@ -2688,7 +2694,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
             } else {
                 None
             },
-            skill_tools: crate::skill_tool::SkillToolset::new(&self.agent_config.agent.skills),
+            skill_tools: crate::skill_tool::SkillToolset::new(
+                &self.agent_config.agent.skills,
+                self.agent_config.skill_recorder.clone(),
+            ),
         };
 
         let provider_agent = self
@@ -2725,6 +2734,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 invocation_parameters: crate::logging::llm_invocation_parameters(
                     &self.agent_config.llm,
                 ),
+                skills: self.agent_config.agent.skills.clone(),
             },
             preamble,
             escalation_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
