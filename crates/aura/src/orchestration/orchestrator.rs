@@ -446,7 +446,7 @@ struct StreamCallParams<'a> {
     history: Vec<rig::completion::Message>,
     phase: &'a str,
     event_tx: Option<&'a tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>>,
-    /// Agent id this call's context occupancy is reported under.
+    /// Agent id that owns this call's context-occupancy reading.
     context_agent: Option<&'a str>,
 }
 
@@ -1898,8 +1898,11 @@ impl Orchestrator {
                         // conversation's, reported under the same agent id
                         // single-agent mode uses. Continuation cycles carry
                         // the turn's scratch conversation, discarded when the
-                        // turn ends, and report nothing.
-                        context_agent: previous.is_none().then_some(COORDINATOR_AGENT_ID),
+                        // turn ends, and so do routing-correction attempts
+                        // (the skipped reply plus the correction), so neither
+                        // reports.
+                        context_agent: (previous.is_none() && attempt == 1)
+                            .then_some(COORDINATOR_AGENT_ID),
                     },
                     &coordinator_state.routing_decision,
                 )
