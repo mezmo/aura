@@ -140,6 +140,13 @@ pub trait StreamingAgent: Send + Sync {
         Vec::new()
     }
 
+    /// The discovered skills this agent (or, in orchestration mode, its
+    /// coordinator) can load. Defaults to empty for implementors without
+    /// skills.
+    fn skills(&self) -> &[aura_config::SkillConfig] {
+        &[]
+    }
+
     /// The assembled system prompt sent to the provider, if this agent has a
     /// single static one.
     ///

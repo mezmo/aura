@@ -1,6 +1,7 @@
 //! The session-store factory: one backend handing out the capability handles
-//! for cross-instance session state ([`ApprovalStore`] and [`EventBus`] from
-//! `aura::session_store`, plus the upstream `a2a_server::TaskStore`).
+//! for cross-instance session state ([`ApprovalStore`], [`SkillInvocationStore`]
+//! and [`EventBus`] from `aura::session_store`, plus the upstream
+//! `a2a_server::TaskStore`).
 //!
 //! See `docs/design/session-storage.md` and
 //! `docs/adr/2026-07-08-session-storage.md`.
@@ -13,8 +14,8 @@ use std::sync::Arc;
 use a2a_server::{InMemoryTaskStore, TaskStore};
 use async_trait::async_trait;
 use aura::session_store::{
-    ApprovalStore, EventBus, FileApprovalStore, InMemoryApprovalStore, InMemoryEventBus,
-    SessionStoreError,
+    ApprovalStore, EventBus, FileApprovalStore, FileSkillInvocationStore, InMemoryApprovalStore,
+    InMemoryEventBus, InMemorySkillInvocationStore, SessionStoreError, SkillInvocationStore,
 };
 use aura_config::{FileSessionStoreConfig, SessionStoreBackend, SessionStoreConfig};
 
@@ -34,6 +35,9 @@ pub trait SessionStore: Send + Sync {
     /// Durable A2A tasks (the upstream `a2a_server::TaskStore` trait).
     fn tasks(&self) -> Arc<dyn TaskStore>;
 
+    /// Durable per-session skill invocations.
+    fn skills(&self) -> Arc<dyn SkillInvocationStore>;
+
     /// Cross-instance pub/sub.
     fn bus(&self) -> Arc<dyn EventBus>;
 
@@ -50,7 +54,7 @@ pub async fn build_session_store(
     match config {
         SessionStoreConfig::Memory => Ok(Arc::new(InMemorySessionStore::new())),
         SessionStoreConfig::File(file_config) => {
-            // File-backed approvals; tasks and bus stay in memory.
+            // File-backed approvals and skill logs; tasks and bus stay in memory.
             Ok(Arc::new(FileSessionStore::new(file_config)?))
         }
         #[cfg(feature = "session-store-redis")]
@@ -69,6 +73,7 @@ pub async fn build_session_store(
 pub struct InMemorySessionStore {
     approvals: Arc<InMemoryApprovalStore>,
     tasks: Arc<InMemoryTaskStore>,
+    skills: Arc<InMemorySkillInvocationStore>,
     bus: Arc<InMemoryEventBus>,
 }
 
@@ -78,6 +83,7 @@ impl InMemorySessionStore {
         Self {
             approvals: Arc::new(InMemoryApprovalStore::new()),
             tasks: Arc::new(InMemoryTaskStore::new()),
+            skills: Arc::new(InMemorySkillInvocationStore::new()),
             bus: Arc::new(InMemoryEventBus::new()),
         }
     }
@@ -103,6 +109,10 @@ impl SessionStore for InMemorySessionStore {
         self.tasks.clone()
     }
 
+    fn skills(&self) -> Arc<dyn SkillInvocationStore> {
+        self.skills.clone()
+    }
+
     fn bus(&self) -> Arc<dyn EventBus> {
         self.bus.clone()
     }
@@ -116,16 +126,21 @@ impl SessionStore for InMemorySessionStore {
 pub struct FileSessionStore {
     approvals: Arc<FileApprovalStore>,
     tasks: Arc<InMemoryTaskStore>,
+    skills: Arc<FileSkillInvocationStore>,
     bus: Arc<InMemoryEventBus>,
 }
 
 impl FileSessionStore {
-    /// Open the approval store at the configured path, failing fast when it
-    /// cannot.
+    /// Open the approval and skill stores under the configured path, failing
+    /// fast when either cannot.
     pub fn new(config: &FileSessionStoreConfig) -> Result<Self, SessionStoreError> {
         Ok(Self {
             approvals: Arc::new(FileApprovalStore::open(&config.path)?),
             tasks: Arc::new(InMemoryTaskStore::new()),
+            skills: Arc::new(FileSkillInvocationStore::open(
+                &config.path,
+                config.skills_ttl_secs,
+            )?),
             bus: Arc::new(InMemoryEventBus::new()),
         })
     }
@@ -144,11 +159,16 @@ impl SessionStore for FileSessionStore {
         self.tasks.clone()
     }
 
+    fn skills(&self) -> Arc<dyn SkillInvocationStore> {
+        self.skills.clone()
+    }
+
     fn bus(&self) -> Arc<dyn EventBus> {
         self.bus.clone()
     }
 
     async fn ping(&self) -> Result<(), SessionStoreError> {
-        self.approvals.probe_writable().await
+        self.approvals.probe_writable().await?;
+        self.skills.probe_writable().await
     }
 }
