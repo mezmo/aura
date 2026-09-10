@@ -1,1 +1,1 @@
-slice=A from=(new) sel=refusal.diff temporary boot refusal; C applies refusal.diff in reverse
+slice=A from=(new) sel=refusal.diff temporary refusal: AuraConfig::validate error + HitlRuntime::from_config assert (code-constructed configs); B1's C5 replay drops the assert when the real guard lands; C restores config.rs verbatim
