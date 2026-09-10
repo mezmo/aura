@@ -461,6 +461,7 @@ const COORDINATOR_AGENT_ID: &str = "main";
 #[derive(Default)]
 struct TurnTally {
     total: rig::completion::Usage,
+    first: Option<rig::completion::Usage>,
     last: rig::completion::Usage,
 }
 
@@ -479,6 +480,7 @@ impl TurnTally {
             output_tokens: turn.output_tokens,
             total_tokens: turn.total_tokens,
         };
+        self.first.get_or_insert(self.last);
         usage_state.accumulate_usage(turn.input_tokens, turn.output_tokens);
         if let Some(cache) = cache {
             usage_state.store_cache_usage(
@@ -1624,15 +1626,18 @@ impl Orchestrator {
                 }
             }
             // Report this call's occupancy under the agent id the caller asked
-            // for; callers whose context is scratch pass none.
-            if let (Some(tx), Some(agent_id)) = (event_tx, context_agent)
-                && tally.last.input_tokens > 0
+            // for; callers whose context is scratch pass none. The reading is
+            // the call's first inner turn: later inner turns add the tool
+            // results the coordinator pulled in on the way to its decision
+            // (skill bodies, prior-run listings), which is scratch too.
+            if let (Some(tx), Some(agent_id), Some(first)) = (event_tx, context_agent, tally.first)
+                && first.input_tokens > 0
             {
                 let _ = tx
                     .send(Ok(StreamItem::ContextUsage {
                         agent_id: agent_id.to_string(),
-                        context_tokens: tally.last.input_tokens,
-                        response_tokens: tally.last.output_tokens,
+                        context_tokens: first.input_tokens,
+                        response_tokens: first.output_tokens,
                         context_window: agent.context_window,
                     }))
                     .await;
@@ -5676,6 +5681,23 @@ mod tests {
 
         assert_eq!(unrecorded.input_tokens, 0);
         assert_eq!(unrecorded.output_tokens, 0);
+    }
+
+    #[test]
+    fn test_tally_keeps_the_first_turn_as_the_context_reading() {
+        let usage_state = crate::UsageState::new();
+        let mut tally = TurnTally::default();
+        assert_eq!(tally.first, None);
+
+        // Coordinator loads a skill, lists prior runs, then plans: each inner
+        // turn re-sends the growing scratch context.
+        tally.record(&usage(10_741, 58), None, &usage_state);
+        tally.record(&usage(12_763, 127), None, &usage_state);
+        tally.record(&usage(40_112, 1_240), None, &usage_state);
+
+        let first = tally.first.unwrap();
+        assert_eq!((first.input_tokens, first.output_tokens), (10_741, 58));
+        assert_eq!(tally.last.input_tokens, 40_112);
     }
 
     /// A two-worker orchestration run replayed from its Bedrock
