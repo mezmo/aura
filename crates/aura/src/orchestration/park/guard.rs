@@ -1,7 +1,7 @@
 //! The run-scoped park guard (park mode).
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 
 use crate::hitl::PendingApprovals;
 
@@ -13,7 +13,7 @@ pub(crate) struct ParkGuard {
     run_id: String,
     request_id: String,
     published: AtomicBool,
-    parked_calls: Mutex<usize>,
+    armed: AtomicBool,
 }
 
 impl ParkGuard {
@@ -24,16 +24,15 @@ impl ParkGuard {
             run_id,
             request_id,
             published: AtomicBool::new(false),
-            parked_calls: Mutex::new(0),
+            armed: AtomicBool::new(false),
         })
     }
 
     /// Record parked calls; the first record arms the guard.
     pub(crate) fn record(&self, pending: &[crate::orchestration::PendingCall]) {
-        if pending.is_empty() {
-            return;
+        if !pending.is_empty() {
+            self.armed.store(true, Ordering::Release);
         }
-        *self.parked_calls.lock().expect("park guard lock poisoned") += pending.len();
     }
 
     /// Mark the run's checkpoint published; the drop becomes a no-op.
@@ -49,7 +48,7 @@ impl Drop for ParkGuard {
         if self.published.load(Ordering::Acquire) {
             return;
         }
-        if *self.parked_calls.lock().expect("park guard lock poisoned") == 0 {
+        if !self.armed.load(Ordering::Acquire) {
             return;
         }
         let registry = self.registry.clone();
@@ -82,7 +81,7 @@ mod tests {
         AgentScope, ApprovalItem, ApprovalOrigin, ApprovalRequest, DecisionId, PROTOCOL_VERSION,
         ParkedApproval, PendingApprovals,
     };
-    use crate::orchestration::{RunId, TaskIdentity};
+    use crate::orchestration::{RunId, TaskIdentity, run_owner_id};
     use crate::session_store::{ApprovalStore, InMemoryApprovalStore, InMemoryEventBus};
 
     fn registry_with_store() -> (PendingApprovals, Arc<InMemoryApprovalStore>) {
@@ -218,10 +217,12 @@ mod tests {
         let (registry, store) = registry_with_store();
         let run_id: RunId = "0191e8c0-4444-7000-8000-000000000042".parse().unwrap();
         let other = DecisionId::generate();
+        // The ticket belongs to this run's owner id, so the arming condition
+        // is load-bearing: an armed guard's drop would sweep and clear it.
         registry
             .register_durable(durable_approval(
                 other,
-                "run:someone-else",
+                &run_owner_id(&run_id.to_string()),
                 &worker_scope(run_id),
             ))
             .await
