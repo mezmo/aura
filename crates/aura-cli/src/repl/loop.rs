@@ -35,8 +35,8 @@ use crate::ui::prompt::{
     print_tool_call_expanded, print_user_echo, print_welcome_state_animated, push_display_event,
     push_mid_stream_history, push_sse_event, random_bullet_color, record_session_event,
     redraw_input_frame, replay_event_log_global, reset_ctrlc_state, reset_input_geometry,
-    restore_terminal_mode, seed_model_cache, set_context_used, set_context_window_usage,
-    set_expanded_output, set_mid_stream_history, set_noncanonical_noecho, set_processing,
+    restore_terminal_mode, seed_model_cache, set_context_window_usage, set_expanded_output,
+    set_mid_stream_history, set_mid_turn_context_estimate, set_noncanonical_noecho, set_processing,
     set_readline_active, set_selected_model, set_startup_status, set_status_bar_tokens,
     set_stream_conv_dir, set_welcome_state, setup_terminal, stop_and_clear_animation,
     styled_prompt, take_pending_command, take_queued_input, task_color_for, text_lines,
@@ -2479,7 +2479,7 @@ impl StreamHandler for ReplStreamHandler {
         self.turn_context_peak = self
             .turn_context_peak
             .max(prompt_tokens + completion_tokens);
-        set_context_used(self.turn_context_peak);
+        set_mid_turn_context_estimate(self.turn_context_peak);
         update_status_bar();
     }
 
