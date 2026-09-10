@@ -1,0 +1,1 @@
+slice=B2 from=be0ef8bf sel=gate,mod,orch/mod,orchestrator,commit,recorded_decisions,docs:all;poller.rs:2,4,5 C11 identity/activation wording; config.rs + e2e to C
