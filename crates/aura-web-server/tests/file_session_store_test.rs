@@ -295,6 +295,37 @@ async fn resolve_moves_the_approval_into_the_decision_file() {
     );
 }
 
+/// Rows hold credentials, so the store's directories and files are
+/// readable by the owner only.
+#[cfg(unix)]
+#[tokio::test]
+async fn store_directories_and_files_are_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let store = FileApprovalStore::open(dir.path()).unwrap();
+    let parked = make_parked("req-mode", Duration::from_secs(60));
+    let id = parked.request.decision_id;
+    store.register(parked).await.unwrap();
+    let mode =
+        |path: std::path::PathBuf| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+
+    assert_eq!(mode(dir.path().join("approvals")), 0o700);
+    assert_eq!(mode(dir.path().join("decisions")), 0o700);
+    assert_eq!(
+        mode(dir.path().join("approvals").join(format!("{id}.json"))),
+        0o600
+    );
+
+    store
+        .resolve(&id, ApprovalDecision::Approved.into())
+        .await
+        .unwrap();
+    assert_eq!(
+        mode(dir.path().join("decisions").join(format!("{id}.json"))),
+        0o600
+    );
+}
+
 /// §2.5: `cancel_request` removes undecided approvals by owner id and
 /// returns exactly the cleared set; a decided approval of the same owner and
 /// an undecided approval of another owner survive.

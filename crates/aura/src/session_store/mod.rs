@@ -27,6 +27,7 @@ use crate::hitl::{DecisionId, ParkedApproval, ResolveError, ResolvedDecision};
 #[cfg(test)]
 pub(crate) use fault_store::FaultInjectingStore;
 pub use file::FileApprovalStore;
+pub(crate) use file::{private_dir, write_private};
 pub use memory::{InMemoryApprovalStore, InMemoryEventBus};
 pub use record::{DecisionRecord, InvalidRecord, OriginRecord, ParkedApprovalRecord, ScopeRecord};
 

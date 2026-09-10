@@ -166,7 +166,7 @@ impl ResumingDocumentHandle {
                 .unwrap_or_default()
         ));
         tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-            std::fs::write(&tmp, &bytes)?;
+            crate::session_store::write_private(&tmp, &bytes)?;
             std::fs::rename(&tmp, &publish_path)
         })
         .await
@@ -700,6 +700,16 @@ mod tests {
             .filter_map(|e| e.ok())
             .any(|e| e.file_name().to_string_lossy().ends_with(".tmp"));
         assert!(!residue, "no temp file residue");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(handle.publish_path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "the resuming document is owner-only");
+        }
     }
 
     /// A missing document opens as NotFound — the section 2.6 "not found"

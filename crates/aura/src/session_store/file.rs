@@ -88,8 +88,8 @@ impl FileApprovalStore {
     /// cannot hold files must fail at startup, not on the first approval.
     pub fn open(root: impl AsRef<Path>) -> Result<Self, SessionStoreError> {
         let root = root.as_ref();
-        fs::create_dir_all(root.join(APPROVALS_DIR)).map_err(connect_err)?;
-        fs::create_dir_all(root.join(DECISIONS_DIR)).map_err(connect_err)?;
+        private_dir(&root.join(APPROVALS_DIR)).map_err(connect_err)?;
+        private_dir(&root.join(DECISIONS_DIR)).map_err(connect_err)?;
         let inner = Arc::new(Inner {
             root: root.to_path_buf(),
             lock: Mutex::new(()),
@@ -133,7 +133,7 @@ impl Inner {
     fn probe_writable_sync(&self) -> io::Result<()> {
         for dir in [self.approvals_dir(), self.decisions_dir()] {
             let probe = dir.join(format!(".{}.probe", uuid::Uuid::new_v4()));
-            fs::write(&probe, b"")
+            write_private(&probe, b"")
                 .and_then(|()| fs::remove_file(&probe))
                 .map_err(|err| {
                     io::Error::new(err.kind(), format!("{} not writable: {err}", dir.display()))
@@ -197,7 +197,11 @@ impl Inner {
         .expect("resolved entry serializes to JSON");
 
         let decision_path = self.decision_path(&id);
-        let mut file = match fs::File::create_new(&decision_path) {
+        let mut file = match private_file()
+            .write(true)
+            .create_new(true)
+            .open(&decision_path)
+        {
             Ok(file) => file,
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
                 return Err(ResolveError::NotFound);
@@ -472,12 +476,39 @@ fn publish(path: &Path, payload: &[u8]) -> Result<(), SessionStoreError> {
         name.to_string_lossy(),
         uuid::Uuid::new_v4()
     ));
-    let written = fs::write(&tmp, payload).and_then(|()| fs::rename(&tmp, path));
+    let written = write_private(&tmp, payload).and_then(|()| fs::rename(&tmp, path));
     if let Err(err) = written {
         let _ = fs::remove_file(&tmp);
         return Err(request_err(err));
     }
     Ok(())
+}
+
+/// Open options that create files readable by the owner only.
+fn private_file() -> fs::OpenOptions {
+    let mut options = fs::OpenOptions::new();
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    options
+}
+
+/// Write `payload` to a new or truncated owner-only file.
+pub(crate) fn write_private(path: &Path, payload: &[u8]) -> io::Result<()> {
+    private_file()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)?
+        .write_all(payload)
+}
+
+/// Create `path` and any missing parents as owner-only directories.
+pub(crate) fn private_dir(path: &Path) -> io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder.create(path)
 }
 
 /// Decode a stored approval file.
