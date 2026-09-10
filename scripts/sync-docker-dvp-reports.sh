@@ -193,6 +193,15 @@ period_end() {
 # there, which becomes a null tag and by_digest true rather than a row named
 # after an escape sequence. These are the majority of pulls, so dropping them
 # would understate the repository badly.
+# Split one CSV line, honouring quoted fields.
+#
+# A plain split(",") shifts every later column the moment a field contains a
+# comma, which reads as a valid row with the wrong values rather than as an
+# error. Docker normalises the text fields today, so this changes nothing for
+# the reports as they stand; it stops a future comma from silently rewriting
+# the counts.
+readonly CSV_SPLIT='def csvsplit: [ match("(\"(?:[^\"]|\"\")*\"|[^,]*)(,|$)"; "g") | .captures[0].string | if startswith("\"") then .[1:-1] | gsub("\"\"";"\"") else . end ] | if (length > 0 and .[-1] == "") then .[0:-1] else . end;'
+
 report_records() {
     local url=$1 jwt=$2 period=$3 csv="${WORK_DIR}/report.csv"
     curl --silent --show-error --location --retry 3 --retry-delay 2 --max-time 120 \
@@ -206,9 +215,9 @@ report_records() {
 trend_records() {
     local csv=$1 period=$2 wanted=" ${DOCKER_IMAGES} "
     jq -Rs -c --arg wanted "${wanted}" --arg period "${period}" \
-           --arg gran "${DVP_GRANULARITY}" '
+           --arg gran "${DVP_GRANULARITY}" "${CSV_SPLIT}"'
         split("\n")[1:]
-        | map(select(length > 0) | split(","))
+        | map(select(length > 0) | csvsplit)
         | map(. as $row | select($wanted | contains(" " + $row[3] + " ")))
         | group_by(.[3] + "\u0000" + .[8] + "\u0000" + .[7] + "\u0000" + .[6])
         | map({repository: .[0][3],
@@ -238,9 +247,9 @@ trend_records() {
 technographic_records() {
     local csv=$1 period=$2 wanted=" ${DOCKER_IMAGES} "
     jq -Rs -c --arg wanted "${wanted}" --arg period "${period}" \
-           --arg gran "${DVP_GRANULARITY}" '
+           --arg gran "${DVP_GRANULARITY}" "${CSV_SPLIT}"'
         (split("\n")[1:]
-         | map(select(length > 0) | split(","))
+         | map(select(length > 0) | csvsplit)
          | map(. as $row | select($wanted | contains(" " + $row[3] + " ")))) as $rows
         | ($rows | group_by(.[3]) | map({
               repository: .[0][3],
@@ -323,33 +332,37 @@ selftest() {
     want="SELECT count(DISTINCT uuid) FROM events WHERE event = 'docker_dvp_pulls' AND properties.snapshot_date = '2026-08-20'"
     [ "${got}" = "${want}" ] || { echo "selftest: query is"$'\n'"  ${got}"$'\n'"want"$'\n'"  ${want}" >&2; exit 1; }
 
-    # Rows collapse to one per tag, and a digest pull keeps its counts.
+    # Exercise the real parser, not a copy of it: rows collapse to one group
+    # per tag, client and provider, a digest pull keeps its counts, and a
+    # quoted field carrying a comma does not shift the columns after it.
     WORK_DIR="${tmp}"
-    cat > "${tmp}/report.csv" <<'CSV'
+    cat > "${tmp}/fixture.csv" <<'CSV'
 DATE_GRANULARITY,DATE_REFERENCE,PUBLISHER_NAME,IMAGE_REPOSITORY,NAMESPACE,IP_COUNTRY,CLOUD_SERVICE_PROVIDER,USER_AGENT,TAG,DATA_DOWNLOADS,VERSION_CHECKS,PULLS,UNIQUE_AUTHENTICATED_USERS,UNIQUE_UNAUTHENTICATED_USERS
 week,2026-08-31,mezmo,mezmo/aura,mezmo,DE,no csp,docker,latest,3,1,4,0,1
 week,2026-08-31,mezmo,mezmo/aura,mezmo,SE,no csp,docker,latest,5,2,7,0,1
 week,2026-08-31,mezmo,mezmo/aura,mezmo,US,no csp,docker,\\N,9,0,9,0,1
+week,2026-08-31,mezmo,mezmo/aura,mezmo,GB,no csp,"curl, 8.4",latest,2,0,2,0,1
 week,2026-08-31,mezmo,mezmo/vector,mezmo,US,no csp,docker,latest,99,9,108,0,1
 CSV
-    got=$(DOCKER_IMAGES="mezmo/aura" report_records "file://${tmp}/report.csv" "" "2026-08-31" 2>/dev/null \
-          || DOCKER_IMAGES="mezmo/aura" jq -Rs -c --arg wanted " mezmo/aura " --arg period "2026-08-31" \
-             --arg gran "weekly" '
-        split("\n")[1:] | map(select(length > 0) | split(","))
-        | map(. as $row | select($wanted | contains(" " + $row[3] + " ")))
-        | group_by(.[3] + "\u0000" + .[8])
-        | map({tag: (if .[0][8] == "\\\\N" then null else .[0][8] end),
-               by_digest: (.[0][8] == "\\\\N"),
-               pulls: (map(.[11] | tonumber) | add)}) | .[]' "${tmp}/report.csv")
+    got=$(DOCKER_IMAGES="mezmo/aura" DVP_GRANULARITY="weekly" \
+          trend_records "${tmp}/fixture.csv" "2026-08-31")
 
-    [ "$(printf '%s\n' "${got}" | wc -l | tr -d ' ')" = "2" ] \
-        || { echo "selftest: expected 2 tag groups, got: ${got}" >&2; exit 1; }
+    [ "$(printf '%s\n' "${got}" | wc -l | tr -d ' ')" = "3" ] \
+        || { echo "selftest: expected 3 groups, got:"$'\n'"${got}" >&2; exit 1; }
     [ "$(printf '%s\n' "${got}" | jq -r 'select(.by_digest) | .pulls')" = "9" ] \
         || { echo "selftest: digest group lost its pulls" >&2; exit 1; }
-    [ "$(printf '%s\n' "${got}" | jq -r 'select(.tag == "latest") | .pulls')" = "11" ] \
-        || { echo "selftest: latest did not sum across rows" >&2; exit 1; }
     [ "$(printf '%s\n' "${got}" | jq -r 'select(.by_digest) | .tag')" = "null" ] \
         || { echo "selftest: digest row kept the escape marker as a tag" >&2; exit 1; }
+    [ "$(printf '%s\n' "${got}" | jq -r 'select(.user_agent == "docker" and .tag == "latest") | .pulls')" = "11" ] \
+        || { echo "selftest: latest did not sum across countries" >&2; exit 1; }
+
+    # The quoted user agent keeps its comma, and the columns after it survive.
+    [ "$(printf '%s\n' "${got}" | jq -r 'select(.user_agent | test(",")) | .user_agent')" = "curl, 8.4" ] \
+        || { echo "selftest: quoted field lost its comma" >&2; exit 1; }
+    [ "$(printf '%s\n' "${got}" | jq -r 'select(.user_agent | test(",")) | .pulls')" = "2" ] \
+        || { echo "selftest: a quoted comma shifted the numeric columns" >&2; exit 1; }
+    [ -z "$(printf '%s\n' "${got}" | jq -r 'select(.repository != "mezmo/aura")')" ] \
+        || { echo "selftest: another repository leaked through the filter" >&2; exit 1; }
 
     printf '%s\t%s\n' "3538a427-3e7d-5170-bf7d-e9560ebb3468" \
         '{"repository":"mezmo/aura","namespace":"mezmo","image":"aura","tag":"latest","by_digest":false,"granularity":"weekly","period_start":"2026-08-31","data_downloads":1158,"version_checks":456,"pulls":1614}' \

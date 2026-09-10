@@ -331,9 +331,8 @@ measure different things. Keep the series apart and never add them together.
 Two implementation details worth knowing. The endpoint is
 `/api/publisher/proxylytics/v1`, not the `/api/publisher/analytics/v1` in
 Docker's published spec, which answers this namespace with no data at all. And
-each report restates the same aggregate at three `LEVEL`s — `namespace`,
-`publisher` and `repository` — so only repository rows are kept; taking all
-three double-counts.
+report rows are parsed with a quote-aware CSV split, so a field that grows a
+comma shifts no columns.
 
 | Switch | Default | Effect |
 | --- | --- | --- |
