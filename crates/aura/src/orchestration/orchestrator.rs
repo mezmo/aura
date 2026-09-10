@@ -524,6 +524,24 @@ struct ForwardedRun {
     last_turn: rig::completion::Usage,
 }
 
+/// Replay an assistant turn as conversation history.
+///
+/// Anthropic-family providers reject a message whose text block is empty
+/// (`messages: text content blocks must be non-empty`), and a turn spent
+/// entirely on reasoning or cut off before any output yields exactly that.
+/// Blank content is replaced with
+/// [`prompt_constants::corrections::EMPTY_ASSISTANT_TURN`] so the correction
+/// call that follows is accepted.
+fn assistant_history_message(content: &str) -> rig::completion::Message {
+    if content.trim().is_empty() {
+        rig::completion::Message::assistant(
+            super::prompt_constants::corrections::EMPTY_ASSISTANT_TURN,
+        )
+    } else {
+        rig::completion::Message::assistant(content)
+    }
+}
+
 /// One guarded step of a deadline-wrapped stream loop.
 enum LoopStep {
     End,
@@ -1999,7 +2017,7 @@ impl Orchestrator {
             let response_text = response.content.clone();
             coordinator_state
                 .conversation
-                .push(rig::completion::Message::assistant(&response_text));
+                .push(assistant_history_message(&response_text));
 
             {
                 let persistence = self.persistence.lock().await;
@@ -3687,7 +3705,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     super::prompt_constants::corrections::WORKER_SUBMIT_RESULT.to_string();
                 let history = vec![
                     rig::completion::Message::user(base_worker_prompt.clone()),
-                    rig::completion::Message::assistant(last_raw_response.clone()),
+                    assistant_history_message(&last_raw_response),
                 ];
                 (correction, history)
             };
@@ -5620,6 +5638,38 @@ fn context_overflow_suggestion(phase: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assistant_text(msg: &rig::completion::Message) -> String {
+        match msg {
+            rig::completion::Message::Assistant { content, .. } => content
+                .iter()
+                .map(|c| match c {
+                    rig::message::AssistantContent::Text(t) => t.text.clone(),
+                    other => panic!("expected text content, got {other:?}"),
+                })
+                .collect(),
+            other => panic!("expected assistant message, got {other:?}"),
+        }
+    }
+
+    /// Blank assistant turns must be replayed as non-empty text so providers
+    /// accept the correction request.
+    #[test]
+    fn assistant_history_message_replaces_blank_content() {
+        for blank in ["", " ", "\n\t "] {
+            assert_eq!(
+                assistant_text(&assistant_history_message(blank)),
+                super::super::prompt_constants::corrections::EMPTY_ASSISTANT_TURN,
+                "blank {blank:?} must be replaced",
+            );
+        }
+    }
+
+    #[test]
+    fn assistant_history_message_keeps_real_content() {
+        let text = "I fetched the check runs but forgot to submit.";
+        assert_eq!(assistant_text(&assistant_history_message(text)), text);
+    }
 
     fn usage(input_tokens: u64, output_tokens: u64) -> rig::completion::Usage {
         rig::completion::Usage {
