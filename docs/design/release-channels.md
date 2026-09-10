@@ -184,6 +184,17 @@ exists, so Cut creates `beta` on the remote and Sync deletes it there.
 The Cut commit must descend from the latest `main` tag; do not re-merge
 `nightly → beta` during a cycle (it would pull in features landed after the cut).
 
+`.github/workflows/sync-main.yml` proposes the `main →` back-merges as pull
+requests. It leaves an open one alone, respects a closed one, never overwrites
+a sync branch carrying commits `main` lacks, and skips `beta` once that branch
+is contained in `main`. Deleting `beta` and the Stabilize `beta → nightly`
+back-merge stay manual.
+
+`.github/workflows/pr-target-branch.yml` fails a pull request into `main` whose
+head is not `nightly`, `beta`, or `hotfix/*`. Both files have to exist on
+`main`, because GitHub runs a schedule only from the default branch and reads
+a `pull_request_target` workflow from the pull request's base branch.
+
 **Promotion invariants.** Channel branches are merged, not cherry-picked, so `main`
 retains the exact candidate history; published history is never squashed or rebased.
 Promotion freezes `beta` at the blessed commit. The merge into `main` must
@@ -285,6 +296,10 @@ Recovery rules:
 - `.dockerignore` — excludes `CHANGELOG.md` from the image build context (§4).
 - Repository ruleset — persistent name-matched protection for `nightly`, `beta`,
   `main` (§9).
+- `.github/workflows/pr-target-branch.yml` — fails pull requests into `main`
+  from outside the promotion and hotfix branches (§5).
+- `.github/workflows/sync-main.yml` — proposes the `main →` channel back-merges
+  as pull requests (§5).
 
 ## 11. Related docs
 
