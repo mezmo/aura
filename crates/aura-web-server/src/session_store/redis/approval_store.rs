@@ -99,20 +99,23 @@ impl RedisApprovalStore {
         format!("{}:approval:req:{request_id}", self.key_prefix)
     }
 
-    /// Atomically take a record (`GETDEL`) and decode it, pruning the
-    /// request index best-effort. `None` means no live entry existed.
-    async fn take(&self, id: &str) -> Result<Option<ParkedApproval>, SessionStoreError> {
+    /// Atomically take a record (`GETDEL`) and prune the request index
+    /// best-effort, returning the raw payload. `None` means no live entry
+    /// existed. No decode: the caller decides what a corrupt payload means.
+    /// A payload that cannot identify its request id keeps its index entry
+    /// (`prune_req_index` cannot find it); the entry dies with the index
+    /// key's TTL.
+    async fn take_json(&self, id: &str) -> Result<Option<String>, SessionStoreError> {
         let mut conn = self.conn.clone();
         let payload: Option<String> = redis::cmd("GETDEL")
             .arg(self.approval_key(id))
             .query_async(&mut conn)
             .await
             .map_err(request_err)?;
-        let Some(json) = payload else {
-            return Ok(None);
-        };
-        self.prune_req_index(id, &json).await;
-        decode(&json).map(Some)
+        if let Some(json) = &payload {
+            self.prune_req_index(id, json).await;
+        }
+        Ok(payload)
     }
 
     /// Drop a taken record's id from its request index, best-effort.
@@ -199,7 +202,9 @@ impl ApprovalStore for RedisApprovalStore {
     }
 
     async fn remove(&self, id: &DecisionId) -> Result<(), SessionStoreError> {
-        self.take(&id.to_string()).await.map(|_| ())
+        // The record is discarded, so skip the decode: a corrupt payload must
+        // not fail the removal of an entry already GETDEL'd.
+        self.take_json(&id.to_string()).await.map(|_| ())
     }
 
     async fn cancel_request(
