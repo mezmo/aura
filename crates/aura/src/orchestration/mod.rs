@@ -82,7 +82,7 @@ pub use tools::ReadArtifactTool;
 pub use tools::wait_for::{StopReason, WaitForError, WaitForOutput, WaitForTool};
 pub use tools::{SubmitResultDecision, SubmitResultOutput, SubmitResultTool};
 
-pub(crate) use park::{CallKey, ParkGuard, RecordedDecisions};
+pub(crate) use park::{CallKey, ParkGuard, RecordedDecisions, run_owner_id};
 // The worker-model injection seam: `provider_agent.rs`'s cfg(test) variant
 // wraps the rig's scripted agent type.
 pub use prompt_constants::{context, fields, sections};

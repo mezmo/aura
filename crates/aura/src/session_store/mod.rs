@@ -86,8 +86,11 @@ pub trait ApprovalStore: Send + Sync {
 
     /// Remove every approval parked under a request id, returning the
     /// approvals actually cleared. A ticket decided before the sweep is
-    /// absent — resolve removed it — so the return is the authoritative
-    /// record of what the cancellation applies to.
+    /// absent from the return, so the return is the authoritative record
+    /// of what the cancellation applies to. Each backend achieves that
+    /// its own way: memory and Redis consume the ticket at resolve,
+    /// while the file backend classifies decision-file residue as stale
+    /// and sweeps it without returning it.
     async fn cancel_request(
         &self,
         request_id: &str,

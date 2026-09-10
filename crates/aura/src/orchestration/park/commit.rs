@@ -213,10 +213,10 @@ pub(crate) async fn publish(
 /// on the current runtime, so a caller dropping the returned handle cannot
 /// abandon publication mid-flight: await the handle for ordered teardown,
 /// or drop it and let the sweep finish on its own. A ticket decided before
-/// the sweep is absent from the cleared set by construction — resolve
-/// removed it — so the stream can never disagree with a decision that won
-/// the race. A lost store reply still yields warn-and-empty, the conceded
-/// residual.
+/// the sweep is absent from the cleared set by construction (the store
+/// returns only what it cleared), so the stream can never disagree with a
+/// decision that won the race. A lost store reply still yields
+/// warn-and-empty, the conceded residual.
 pub(crate) fn cancel_run_approvals(
     registry: &PendingApprovals,
     run_id: &str,
