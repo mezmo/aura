@@ -16,7 +16,9 @@ use super::decision::{AgentScope, ApprovalOrigin, ApprovalOutcome, DecisionId};
 use super::protocol::{ApprovalItem, ApprovalRequest, PROTOCOL_VERSION};
 use super::registry::{ParkedApproval, PendingApprovals};
 use super::route::{ApprovalError, DecisionRoute, GateDecision};
-use crate::orchestration::{BlockedCell, CallKey, ParkGuard, PendingCall, RecordedDecisions};
+use crate::orchestration::{
+    BlockedCell, CallKey, ParkGuard, PendingCall, RecordedDecisions, run_owner_id,
+};
 use crate::tool_wrapper::{PreCallOutcome, ToolCallContext, ToolWrapper};
 
 /// The placeholder tool result a parked call returns.
@@ -159,11 +161,12 @@ impl HitlApprovalWrapper {
             version: PROTOCOL_VERSION,
             instance_id: self.instance_id.clone(),
             decision_id,
-            // Owner-id convention: every backend sweeps `cancel_request` by
-            // this field, and request teardown passes the live request id, so
-            // the run-scoped value keeps a parked ticket out of that sweep.
-            // The run's own sweep passes the same value.
-            request_id: format!("run:{run_id}"),
+            // Owner id: every backend sweeps `cancel_request` by this field,
+            // and request teardown passes the live request id, so the
+            // run-scoped value keeps a parked ticket out of that sweep.
+            // `run_owner_id` is the single definition; the run's own sweep
+            // passes the same value.
+            request_id: run_owner_id(&run_id.to_string()),
             scope: self.scope.clone(),
             origin: ApprovalOrigin::ConfigGate {
                 matched_pattern: matched.to_string(),

@@ -570,7 +570,8 @@ impl Orchestrator {
 
         let run_id_str = persistence.lock().await.run_id().to_string();
         // One guard per park-mode run; it stays inert until the park arm
-        // records a decision id.
+        // records the first parked call, and an unpublished drop sweeps the
+        // run's owner id.
         let park_guard = agent_config
             .hitl
             .as_ref()
