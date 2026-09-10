@@ -1,1 +1,1 @@
-slice=A from=9436d509 sel=whole owner-only files; .into() compiles at A via From<T> for T
+slice=A from=9436d509 sel=whole owner-only files; .into() dropped on the new test (clippy useless_conversion), B2 restores it in C7's replay
