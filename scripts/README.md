@@ -12,6 +12,8 @@ Release and install helpers.
 | [`next-version.mjs`](next-version.mjs) | Print the version semantic-release would release next |
 | [`sync-release-downloads.sh`](sync-release-downloads.sh) | Snapshot cumulative release-asset download totals into PostHog |
 | [`sync-cloudsmith-downloads.sh`](sync-cloudsmith-downloads.sh) | Snapshot cumulative Cloudsmith package download totals into PostHog |
+| [`sync-docker-downloads.sh`](sync-docker-downloads.sh) | Snapshot cumulative Docker Hub pull totals into PostHog |
+| [`lib/posthog-snapshot.sh`](lib/posthog-snapshot.sh) | Shared machinery the three snapshot scripts source |
 
 `BRANCH_NAME` selects the release channel; see
 [the release channels design note](../docs/design/release-channels.md).
@@ -244,6 +246,37 @@ read fails rather than returning a shorter list.
 | `CLOUDSMITH_HOST` | `https://api.cloudsmith.io` | Cloudsmith API host. |
 | `PAGE_SIZE` | `500` | Packages per Cloudsmith page. `500` is the server's maximum; a larger value is clamped to it. |
 | `BATCH_SIZE` | `1000` | Events per PostHog `/batch` request. |
+
+## `sync-docker-downloads.sh`
+
+```
+sync-docker-downloads.sh [--dry-run] [--date YYYY-MM-DD] [--selftest]
+```
+
+Sends one PostHog event per Docker Hub image, carrying that image's cumulative
+pull count as of a snapshot date. Run daily at 01:29 UTC by
+[the `Docker download metrics` workflow](../.github/workflows/docker-download-metrics.yml).
+Needs no Docker credentials: the repository endpoint is public.
+
+Shares [`lib/posthog-snapshot.sh`](lib/posthog-snapshot.sh) with the other two
+snapshots, so identifiers, batching, sending, the per-batch probe and the
+read-back all behave identically. Report with `max(pull_count)` per image and
+snapshot date, for the reason given under `sync-release-downloads.sh`.
+
+The public counter is not the same measure as the Docker Verified Publisher
+reports: a week of DVP events annualises far above this counter's all-time
+total, because the two count different things. Keep the series apart and never
+add them together.
+
+| Switch | Default | Effect |
+| --- | --- | --- |
+| `--date` / `SNAPSHOT_DATE` | yesterday, UTC | Date to snapshot. Re-running a past date stamps today's counters with it. |
+| `--dry-run` / `DRY_RUN=1` | off | Collect and build the payload, print the first event, send nothing. |
+| `--selftest` | off | Run the built-in assertions and exit. Reaches no network. |
+| `DOCKER_IMAGES` | `mezmo/aura` | Space-separated `namespace/image` list to snapshot. |
+| `DOCKER_HUB_HOST` | `https://hub.docker.com` | Docker Hub API host. |
+
+The PostHog variables are the same as the other two snapshots.
 
 ## `bump-homebrew-tap.sh`
 

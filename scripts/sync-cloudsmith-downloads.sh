@@ -52,20 +52,16 @@ USAGE="usage: $0 [--dry-run] [--date YYYY-MM-DD] [--selftest]"
 # event key ever sent.
 readonly UUID_NAMESPACE="0d08662c-b474-467e-b476-20688fdb1f2c"
 readonly EVENT_NAME="cloudsmith_package_downloads"
+readonly SUBJECT_PREFIX="cloudsmith"
 
-DRY_RUN="${DRY_RUN:-0}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/posthog-snapshot.sh
+. "${SCRIPT_DIR}/lib/posthog-snapshot.sh"
+
 SELFTEST=0
-SNAPSHOT_DATE="${SNAPSHOT_DATE:-}"
-POSTHOG_HOST="${POSTHOG_HOST:-https://us.i.posthog.com}"
 CLOUDSMITH_REPOS="${CLOUDSMITH_REPOS:-mezmo/aura}"
 CLOUDSMITH_HOST="${CLOUDSMITH_HOST:-https://api.cloudsmith.io}"
 PAGE_SIZE="${PAGE_SIZE:-500}"
-BATCH_SIZE="${BATCH_SIZE:-1000}"
-POSTHOG_PROJECT_ID="${POSTHOG_PROJECT_ID:-443794}"
-POSTHOG_API_HOST="${POSTHOG_API_HOST:-https://us.posthog.com}"
-VERIFY_TIMEOUT="${VERIFY_TIMEOUT:-600}"
-SKIP_VERIFY="${SKIP_VERIFY:-0}"
-WORK_DIR=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -79,56 +75,6 @@ while [ $# -gt 0 ]; do
         *) echo "${USAGE}" >&2; exit 1 ;;
     esac
 done
-
-# RFC 4122 version-5 UUID: sha1(namespace bytes || name), with the version and
-# variant nibbles forced. Matches Python's uuid.uuid5 byte for byte.
-uuid5() {
-    local ns_hex=${1//-/} name=$2 h b6 b8
-    h=$( { printf '%b' "$(printf '%s' "${ns_hex}" | sed 's/../\\x&/g')"; printf '%s' "${name}"; } \
-         | openssl dgst -sha1 -r | cut -d' ' -f1 )
-    printf -v b6 '%02x' $(( 0x${h:12:2} & 0x0f | 0x50 ))
-    printf -v b8 '%02x' $(( 0x${h:16:2} & 0x3f | 0x80 ))
-    printf '%s-%s-%s%s-%s%s-%s\n' \
-        "${h:0:8}" "${h:8:4}" "${b6}" "${h:14:2}" "${b8}" "${h:18:2}" "${h:20:12}"
-}
-
-# A fresh UUID, so nothing an earlier run wrote can be mistaken for it.
-uuid4() {
-    local h b6 b8
-    h=$(openssl rand -hex 16)
-    printf -v b6 '%02x' $(( 0x${h:12:2} & 0x0f | 0x40 ))
-    printf -v b8 '%02x' $(( 0x${h:16:2} & 0x3f | 0x80 ))
-    printf '%s-%s-%s%s-%s%s-%s\n' \
-        "${h:0:8}" "${h:8:4}" "${b6}" "${h:14:2}" "${b8}" "${h:18:2}" "${h:20:12}"
-}
-
-# Dates go through jq rather than date(1): GNU and BSD date disagree on both
-# relative-date syntaxes, and jq is already a hard dependency here. jq's
-# strftime formats UTC regardless of the runner's timezone.
-yesterday_utc() {
-    jq -rn 'now - 86400 | strftime("%Y-%m-%d")'
-}
-
-day_before() {
-    jq -rn --arg d "$1" '($d + "T00:00:00Z" | fromdateiso8601) - 86400 | strftime("%Y-%m-%d")'
-}
-
-# A shell glob accepts digit-shaped nonsense like 2026-99-99, and an invalid
-# date reaches the wire as a malformed event timestamp. Round-trip the value
-# through jq's calendar and require it back unchanged: that rejects impossible
-# dates outright and catches the ones a parser silently rolls over, such as
-# 2026-02-30 becoming 2026-03-02. The glob also keeps a quote out of the date,
-# which the read-back interpolates into a SQL literal.
-valid_date() {
-    local d=$1 normalized
-    case "${d}" in
-        [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) ;;
-        *) return 1 ;;
-    esac
-    normalized=$(jq -rn --arg d "${d}" \
-        'try ($d + "T00:00:00Z" | fromdateiso8601 | strftime("%Y-%m-%d")) catch ""')
-    [ "${normalized}" = "${d}" ]
-}
 
 require_tools() {
     local tool
@@ -262,158 +208,6 @@ key_packages() {
         uuid5 "${UUID_NAMESPACE}" "${key}|${date}"
     done < "${keys}" > "${uuids}"
     paste "${uuids}" "${packages}"
-}
-
-build_batch() {
-    local chunk=$1 date=$2 api_key=$3
-    jq -R -n --arg key "${api_key}" --arg date "${date}" --arg event "${EVENT_NAME}" '
-        {api_key: $key,
-         batch: [inputs
-           | index("\t") as $i
-           | (.[:$i]) as $uuid
-           | (.[$i+1:] | fromjson) as $r
-           | {uuid: $uuid,
-              event: $event,
-              distinct_id: ("cloudsmith:" + $r.repository),
-              timestamp: ($date + "T23:59:59Z"),
-              properties: ($r + {snapshot_date: $date, "$process_person_profile": false})}]}
-    ' "${chunk}"
-}
-
-# Add a probe event to a payload, carrying a UUID no other run can produce.
-#
-# The snapshot events are identical across runs of the same date by design, so
-# finding them proves the snapshot is right but not that this run wrote
-# anything: PostHog answers 200 OK to a batch sent with a dead token, and on a
-# re-run of an already-populated date the stale rows satisfy every check. The
-# probe rides the same request, so it is absent exactly when that request was
-# discarded.
-add_probe() {
-    local payload=$1 probe=$2 ts
-    ts=$(jq -rn 'now | strftime("%Y-%m-%dT%H:%M:%SZ")')
-    jq --arg uuid "${probe}" --arg ts "${ts}" --arg event "${EVENT_NAME}_probe" '
-        .batch += [{uuid: $uuid, event: $event, distinct_id: "cloudsmith:probe",
-                    timestamp: $ts,
-                    properties: {"$process_person_profile": false}}]' \
-        "${payload}" > "${payload}.probed"
-    mv "${payload}.probed" "${payload}"
-}
-
-probes_landed() {
-    local list
-    list=$(sed "s/^/'/; s/$/'/" "${WORK_DIR}/probes" | paste -sd, -)
-    hogql_scalar "SELECT count(DISTINCT uuid) FROM events \
-        WHERE event = '${EVENT_NAME}_probe' AND uuid IN (${list})"
-}
-
-post_batch() {
-    local payload=$1
-    curl --silent --show-error --fail-with-body \
-        --retry 5 --retry-delay 2 \
-        --max-time 60 \
-        --header 'Content-Type: application/json' \
-        --data-binary "@${payload}" \
-        "${POSTHOG_HOST%/}/batch/" >/dev/null
-}
-
-# Run a HogQL query and print the response body.
-#
-# Plain --retry covers the transient cases (timeouts, 429, 5xx) and leaves
-# 4xx alone: an auth or project error repeated four times is noise, and the
-# status is worth naming because every likely cause is a misconfiguration
-# rather than an outage.
-hogql_request() {
-    local query=$1 response status body
-    response=$(jq -n --arg q "${query}" '{query: {kind: "HogQLQuery", query: $q}}' \
-        | curl --silent --show-error --retry 3 --retry-delay 2 --max-time 60 \
-            --write-out '\n%{http_code}' \
-            --header "Authorization: Bearer ${POSTHOG_API_READ_KEY}" \
-            --header 'Content-Type: application/json' \
-            --data-binary @- \
-            "${POSTHOG_API_HOST%/}/api/projects/${POSTHOG_PROJECT_ID}/query/")
-    status=${response##*$'\n'}
-    body=${response%$'\n'*}
-    if [ "${status}" != 200 ]; then
-        echo "error: PostHog query API returned ${status} for project ${POSTHOG_PROJECT_ID}" >&2
-        echo "       ${body}" >&2
-        echo "       POSTHOG_PROJECT_ID must name the project POSTHOG_PROJECT_API_KEY writes to," >&2
-        echo "       and POSTHOG_API_READ_KEY must hold query:read on that project" >&2
-        return 1
-    fi
-    printf '%s\n' "${body}"
-}
-
-hogql_scalar() {
-    hogql_request "$1" | jq -r '.results[0][0]'
-}
-
-# The whole first row, tab separated.
-hogql_row() {
-    hogql_request "$1" | jq -r '.results[0] | @tsv'
-}
-
-# Count how many of this run's own event UUIDs are queryable at this run's
-# timestamp. A date-wide count would also match UUIDs left by an earlier run
-# whose package set differed, and those extras can satisfy the threshold while
-# an event from the current payload is still missing. Pinning the timestamp too
-# means a snapshot attributed to the wrong instant cannot read as verified.
-count_ingested() {
-    local date=$1 chunk list row found downloads value events=0 total=0
-    for chunk in "${WORK_DIR}"/uchunk.*; do
-        list=$(sed "s/^/'/; s/$/'/" "${chunk}" | paste -sd, -)
-        row=$(hogql_row "SELECT count(), sum(dl) FROM ( \
-            SELECT uuid, max(toIntOrZero(toString(properties.download_count))) AS dl \
-            FROM events \
-            WHERE event = '${EVENT_NAME}' \
-              AND timestamp = toDateTime('${date} 23:59:59') \
-              AND uuid IN (${list}) \
-            GROUP BY uuid)")
-        found=${row%%$'\t'*}
-        downloads=${row##*$'\t'}
-        case "${found}" in '' | null) found=0 ;; esac
-        case "${downloads}" in '' | null) downloads=0 ;; esac
-        for value in "${found}" "${downloads}"; do
-            case "${value}" in
-                '' | *[!0-9]*)
-                    echo "error: PostHog answered the read-back with '${row}', which is not a count and a total" >&2
-                    return 1 ;;
-            esac
-        done
-        events=$(( events + found ))
-        total=$(( total + downloads ))
-    done
-    printf '%s\t%s\n' "${events}" "${total}"
-}
-
-# A date-wide count, for asking whether a day holds any snapshot at all. This
-# run has no UUIDs for an earlier date to scope by.
-snapshot_count_query() {
-    printf "SELECT count(DISTINCT uuid) FROM events WHERE event = '%s' AND properties.snapshot_date = '%s'" \
-        "${EVENT_NAME}" "$1"
-}
-
-# Poll until the snapshot is queryable, since ingestion lags the send.
-verify_snapshot() {
-    local date=$1 want_events=$2 want_downloads=$3 probes=$4
-    local deadline row events downloads seen
-    deadline=$(( $(date +%s) + VERIFY_TIMEOUT ))
-    while :; do
-        row=$(count_ingested "${date}")
-        events=${row%%$'\t'*}
-        downloads=${row##*$'\t'}
-        seen=$(probes_landed)
-        case "${seen}" in '' | null) seen=0 ;; esac
-        if [ "${events}" -ge "${want_events}" ] && [ "${downloads}" -ge "${want_downloads}" ] \
-           && [ "${seen}" -ge "${probes}" ]; then
-            echo "Verified ${events} of ${want_events} event(s), ${downloads} download(s), and ${seen} probe(s) in PostHog for ${date}"
-            return 0
-        fi
-        if [ "$(date +%s)" -ge "${deadline}" ]; then
-            echo "error: PostHog holds ${events} of ${want_events} event(s), ${downloads} of ${want_downloads} download(s), and ${seen} of ${probes} probe(s) for ${date} after ${VERIFY_TIMEOUT}s" >&2
-            return 1
-        fi
-        sleep 5
-    done
 }
 
 # A dropped or disabled scheduled run leaves a hole no failure reports, since
