@@ -21,6 +21,7 @@ on:
   pull_request:
     paths:
       - "scripts/sync-cloudsmith-downloads.sh"
+      - "scripts/lib/posthog-snapshot.sh"
       - ".github/workflows/cloudsmith-download-metrics.yml"
 
 permissions:

@@ -21,6 +21,7 @@ on:
   pull_request:
     paths:
       - "scripts/sync-release-downloads.sh"
+      - "scripts/lib/posthog-snapshot.sh"
       - ".github/workflows/release-download-metrics.yml"
 
 permissions:
