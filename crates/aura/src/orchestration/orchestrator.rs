@@ -1101,7 +1101,7 @@ impl Orchestrator {
         let Some(hitl) = self.agent_config.hitl.clone() else {
             return;
         };
-        let crate::hitl::DecisionRoute::Conversational { registry, .. } = &*hitl.route else {
+        let Some((registry, _)) = hitl.route.park_registry() else {
             return;
         };
         let scope = self.worker_scope(task_id, worker_name).await;
