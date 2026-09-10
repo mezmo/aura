@@ -13,7 +13,8 @@ Release and install helpers.
 | [`sync-release-downloads.sh`](sync-release-downloads.sh) | Snapshot cumulative release-asset download totals into PostHog |
 | [`sync-cloudsmith-downloads.sh`](sync-cloudsmith-downloads.sh) | Snapshot cumulative Cloudsmith package download totals into PostHog |
 | [`sync-docker-downloads.sh`](sync-docker-downloads.sh) | Snapshot cumulative Docker Hub pull totals into PostHog |
-| [`lib/posthog-snapshot.sh`](lib/posthog-snapshot.sh) | Shared machinery the three snapshot scripts source |
+| [`sync-docker-dvp-reports.sh`](sync-docker-dvp-reports.sh) | Snapshot Docker Verified Publisher pull reports into PostHog |
+| [`lib/posthog-snapshot.sh`](lib/posthog-snapshot.sh) | Shared machinery the snapshot scripts source |
 
 `BRANCH_NAME` selects the release channel; see
 [the release channels design note](../docs/design/release-channels.md).
@@ -277,6 +278,52 @@ add them together.
 | `DOCKER_HUB_HOST` | `https://hub.docker.com` | Docker Hub API host. |
 
 The PostHog variables are the same as the other two snapshots.
+
+## `sync-docker-dvp-reports.sh`
+
+```
+sync-docker-dvp-reports.sh [--dry-run] [--period YYYY-MM-DD] [--selftest]
+```
+
+Reads Docker Verified Publisher analytics reports and files them into PostHog.
+Run daily at 01:35 UTC by
+[the `Docker DVP metrics` workflow](../.github/workflows/docker-dvp-metrics.yml).
+
+Unlike the other snapshots this is not a cumulative counter sampled at run
+time. Each report states the counts for a closed period, so a period's value is
+final and needs no day-over-day differencing. Events are keyed by
+`(repository, granularity, period start)` and timestamped at the end of the
+period, so re-reading a report on any later day produces byte-identical events.
+
+Docker retains only the last few reports and nothing reconstructs one that ages
+out, which is the reason to run this daily even though reports appear weekly.
+
+`DATA_DOWNLOADS` counts image layer transfers; `VERSION_CHECKS` counts manifest
+requests that transferred no layers, and `EVENT_COUNT` is their sum. These are
+**not** comparable with the public counter that
+[`sync-docker-downloads.sh`](sync-docker-downloads.sh) records — a week of DVP
+events annualises far above that counter's all-time total, because the two
+measure different things. Keep the series apart and never add them together.
+
+Two implementation details worth knowing. The endpoint is
+`/api/publisher/proxylytics/v1`, not the `/api/publisher/analytics/v1` in
+Docker's published spec, which answers this namespace with no data at all. And
+each report restates the same aggregate at three `LEVEL`s — `namespace`,
+`publisher` and `repository` — so only repository rows are kept; taking all
+three double-counts.
+
+| Switch | Default | Effect |
+| --- | --- | --- |
+| `--period` | every retained report | Process only the report starting on this date. |
+| `--dry-run` / `DRY_RUN=1` | off | Fetch and build payloads, print them, send nothing. Still needs Docker credentials, since the catalogue is not public. |
+| `--selftest` | off | Run the built-in assertions and exit. Reaches no network. |
+| `DOCKER_USERNAME` | unset | Docker Hub account the token belongs to. Required. |
+| `DOCKER_TOKEN` | unset | Docker Hub personal access token, exchanged for a short-lived JWT on every run. Required. |
+| `DOCKER_NAMESPACE` | `mezmo` | Publisher namespace to read reports for. |
+| `DOCKER_IMAGES` | `mezmo/aura` | Space-separated repositories to keep from each report. |
+| `DVP_GRANULARITY` | `weekly` | `weekly` or `monthly`. Mixing both in one series double-counts. |
+
+The PostHog variables are the same as the other snapshots.
 
 ## `bump-homebrew-tap.sh`
 
