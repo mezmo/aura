@@ -256,6 +256,18 @@ pub enum AuraStreamEvent {
         #[serde(flatten)]
         correlation: CorrelationContext,
     },
+    /// Emitted at stream start when skill invocations recorded in prior turns
+    /// of this session were re-inserted into the conversation context.
+    ///
+    /// `skills` holds one label per rehydrated invocation: the skill name for
+    /// a `load_skill`, or `skill/relative-path` for a `read_skill_file`. Its
+    /// unique required `skills` field keeps `#[serde(untagged)]`
+    /// deserialization unambiguous.
+    SkillsRehydrated {
+        skills: Vec<String>,
+        #[serde(flatten)]
+        correlation: CorrelationContext,
+    },
     /// Emitted when the LLM decides to call a tool (immediate UI feedback).
     /// This is sent as soon as we know a tool will be called, before MCP execution.
     ToolRequested {
@@ -401,6 +413,7 @@ impl AuraStreamEvent {
     pub fn event_name(&self) -> &'static str {
         match self {
             Self::SessionInfo { .. } => event_names::SESSION_INFO,
+            Self::SkillsRehydrated { .. } => event_names::SKILLS_REHYDRATED,
             Self::ToolRequested { .. } => event_names::TOOL_REQUESTED,
             Self::ToolStart { .. } => event_names::TOOL_START,
             Self::ToolComplete { .. } => event_names::TOOL_COMPLETE,
@@ -539,6 +552,14 @@ impl AuraStreamEvent {
         Self::SessionInfo {
             model: model.into(),
             model_context_limit,
+            correlation,
+        }
+    }
+
+    /// Create a SkillsRehydrated event (emitted at stream start).
+    pub fn skills_rehydrated(skills: Vec<String>, correlation: CorrelationContext) -> Self {
+        Self::SkillsRehydrated {
+            skills,
             correlation,
         }
     }

@@ -79,6 +79,11 @@ EXAMPLES:
 """
 turn_depth = 3 # Lower depth for faster tests
 
+# On-demand skills: exercises load_skill capture and cross-turn rehydration.
+# Resolves against the server CWD; compose/base.yml mounts the fixture at /app/skills.
+[[agent.skills.local]]
+source = "./skills"
+
 # LLM Configuration
 [agent.llm]
 provider = "openai"

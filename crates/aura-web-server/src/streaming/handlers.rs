@@ -61,6 +61,9 @@ pub struct StreamingCallbacks {
     pub model_name: String,
     /// Stream shutdown token (cancelled after grace period on SIGTERM/SIGINT)
     pub stream_shutdown_token: tokio_util::sync::CancellationToken,
+    /// Labels of the skill invocations rehydrated into this request's history
+    /// (for the aura.skills_rehydrated event)
+    pub rehydrated_skills: Vec<String>,
 }
 
 /// Reason for stream termination.
@@ -137,6 +140,27 @@ where
             callbacks.model_name,
             context_limit
         );
+
+        // Emit aura.skills_rehydrated so clients can see which prior-turn
+        // skill invocations were re-inserted into this request's context.
+        if !callbacks.rehydrated_skills.is_empty() {
+            let skills_rehydrated = AuraStreamEvent::skills_rehydrated(
+                callbacks.rehydrated_skills.clone(),
+                ctx.correlation.clone(),
+            );
+            if tx
+                .send(Ok(Bytes::from(skills_rehydrated.format_sse())))
+                .await
+                .is_err()
+            {
+                tracing::info!("Client disconnected during skills_rehydrated emit");
+                return StreamTermination::Disconnected;
+            }
+            tracing::debug!(
+                "Emitted aura.skills_rehydrated: {:?}",
+                callbacks.rehydrated_skills
+            );
+        }
 
         // Emit aura.mcp_status so clients can distinguish degraded/unavailable and available
         // MCP servers. Skipped when no servers are configured (single-agent without MCP,
@@ -1909,6 +1933,7 @@ mod tests {
                     response_content: ResponseContent::new(),
                     model_name: "test/fake".to_string(),
                     stream_shutdown_token: CancellationToken::new(),
+                    rehydrated_skills: vec![],
                 },
                 EventSenders {
                     _tool_event_tx: tool_event_tx,

@@ -8,12 +8,23 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use tokio::sync::broadcast;
 
+use crate::config::SessionId;
 use crate::hitl::{ApprovalDecision, DecisionId, ParkedApproval, ResolveError};
 
-use super::{ApprovalStore, EventBus, SessionStoreError, Subscription};
+use super::{
+    ApprovalStore, EventBus, SessionStoreError, SkillInvocationRecord, SkillInvocationStore,
+    Subscription,
+};
 
 /// Buffered payloads per topic before slow subscribers start lagging.
 const TOPIC_CAPACITY: usize = 64;
+
+/// Skill-invocation records kept per session before new writes are dropped.
+const MAX_SKILL_RECORDS_PER_SESSION: usize = 64;
+
+/// Sessions kept in the skill-invocation store before the least-recently
+/// touched one is evicted.
+const MAX_SKILL_SESSIONS: usize = 1024;
 
 /// The parked-approval registry as a plain map.
 #[derive(Default)]
@@ -66,6 +77,108 @@ impl ApprovalStore for InMemoryApprovalStore {
         self.lock()
             .retain(|_, parked| parked.request.request_id != request_id);
         Ok(())
+    }
+}
+
+/// The per-session skill-invocation log as a plain map.
+///
+/// Unlike approvals, skill records have no natural removal event, so this
+/// store bounds growth itself: a per-session record cap and a
+/// least-recently-touched session eviction cap.
+#[derive(Default)]
+pub struct InMemorySkillInvocationStore {
+    // `std::sync::Mutex`: every operation is a synchronous map op; nothing
+    // awaits while holding the lock.
+    inner: Mutex<SkillSessions>,
+}
+
+#[derive(Default)]
+struct SkillSessions {
+    sessions: HashMap<String, SkillSessionEntry>,
+    /// Monotonic touch counter backing least-recently-touched eviction.
+    clock: u64,
+}
+
+#[derive(Default)]
+struct SkillSessionEntry {
+    records: Vec<SkillInvocationRecord>,
+    last_touched: u64,
+}
+
+impl InMemorySkillInvocationStore {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, SkillSessions> {
+        self.inner
+            .lock()
+            .expect("skill invocation store lock poisoned")
+    }
+}
+
+#[async_trait]
+impl SkillInvocationStore for InMemorySkillInvocationStore {
+    async fn record(
+        &self,
+        session_id: &SessionId,
+        record: SkillInvocationRecord,
+    ) -> Result<(), SessionStoreError> {
+        let mut inner = self.lock();
+        inner.clock += 1;
+        let clock = inner.clock;
+
+        let entry = inner
+            .sessions
+            .entry(session_id.as_str().to_string())
+            .or_default();
+        entry.last_touched = clock;
+
+        let key = record.invocation.dedup_key();
+        if entry
+            .records
+            .iter()
+            .any(|existing| existing.invocation.dedup_key() == key)
+        {
+            return Ok(());
+        }
+        if entry.records.len() >= MAX_SKILL_RECORDS_PER_SESSION {
+            tracing::warn!(
+                session_id = session_id.as_str(),
+                cap = MAX_SKILL_RECORDS_PER_SESSION,
+                "skill invocation store at per-session capacity; dropping new record"
+            );
+            return Ok(());
+        }
+        entry.records.push(record);
+
+        if inner.sessions.len() > MAX_SKILL_SESSIONS
+            && let Some(evict) = inner
+                .sessions
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_touched)
+                .map(|(id, _)| id.clone())
+        {
+            inner.sessions.remove(&evict);
+        }
+        Ok(())
+    }
+
+    async fn list(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<SkillInvocationRecord>, SessionStoreError> {
+        let mut inner = self.lock();
+        inner.clock += 1;
+        let clock = inner.clock;
+        let Some(entry) = inner.sessions.get_mut(session_id.as_str()) else {
+            return Ok(Vec::new());
+        };
+        entry.last_touched = clock;
+        let mut records = entry.records.clone();
+        records.sort_by_key(|r| (r.anchor, r.seq));
+        Ok(records)
     }
 }
 
@@ -285,6 +398,136 @@ mod tests {
             }
         }
         assert!(saw_sentinel, "subscription must survive lagging");
+    }
+
+    fn skill_record(name: &str, anchor: u32, seq: u32) -> SkillInvocationRecord {
+        SkillInvocationRecord {
+            version: crate::session_store::SKILL_INVOCATION_RECORD_VERSION,
+            invocation: crate::session_store::SkillInvocation::LoadSkill {
+                name: name.to_string(),
+            },
+            tool_call_id: format!("call_{name}_{anchor}_{seq}"),
+            anchor,
+            seq,
+            invoked_at: chrono::Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn skill_store_lists_records_ordered_by_anchor_then_seq() {
+        let store = InMemorySkillInvocationStore::new();
+        let session = SessionId::new("sess-1");
+
+        store
+            .record(&session, skill_record("late", 5, 0))
+            .await
+            .unwrap();
+        store
+            .record(&session, skill_record("second", 1, 1))
+            .await
+            .unwrap();
+        store
+            .record(&session, skill_record("first", 1, 0))
+            .await
+            .unwrap();
+
+        let names: Vec<String> = store
+            .list(&session)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.invocation.label())
+            .collect();
+        assert_eq!(names, vec!["first", "second", "late"]);
+    }
+
+    #[tokio::test]
+    async fn skill_store_record_is_idempotent_per_invocation() {
+        let store = InMemorySkillInvocationStore::new();
+        let session = SessionId::new("sess-1");
+
+        store
+            .record(&session, skill_record("dup", 1, 0))
+            .await
+            .unwrap();
+        // Same invocation re-recorded later must keep the first position.
+        store
+            .record(&session, skill_record("dup", 7, 3))
+            .await
+            .unwrap();
+
+        let records = store.list(&session).await.unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].anchor, 1);
+    }
+
+    #[tokio::test]
+    async fn skill_store_sessions_are_independent() {
+        let store = InMemorySkillInvocationStore::new();
+        store
+            .record(&SessionId::new("sess-a"), skill_record("a", 1, 0))
+            .await
+            .unwrap();
+
+        assert!(
+            store
+                .list(&SessionId::new("sess-b"))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store.list(&SessionId::new("sess-a")).await.unwrap().len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn skill_store_caps_records_per_session() {
+        let store = InMemorySkillInvocationStore::new();
+        let session = SessionId::new("sess-cap");
+        for i in 0..(MAX_SKILL_RECORDS_PER_SESSION + 5) {
+            store
+                .record(&session, skill_record(&format!("s{i}"), i as u32, 0))
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            store.list(&session).await.unwrap().len(),
+            MAX_SKILL_RECORDS_PER_SESSION
+        );
+    }
+
+    #[tokio::test]
+    async fn skill_store_evicts_least_recently_touched_session() {
+        let store = InMemorySkillInvocationStore::new();
+        for i in 0..MAX_SKILL_SESSIONS {
+            store
+                .record(
+                    &SessionId::new(format!("sess-{i}")),
+                    skill_record("s", 1, 0),
+                )
+                .await
+                .unwrap();
+        }
+        // Touch the oldest session so it is no longer the eviction candidate.
+        let oldest = SessionId::new("sess-0");
+        assert_eq!(store.list(&oldest).await.unwrap().len(), 1);
+
+        // One past the cap evicts the least-recently-touched session (sess-1).
+        store
+            .record(&SessionId::new("sess-overflow"), skill_record("s", 1, 0))
+            .await
+            .unwrap();
+
+        assert_eq!(store.list(&oldest).await.unwrap().len(), 1);
+        assert!(
+            store
+                .list(&SessionId::new("sess-1"))
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]

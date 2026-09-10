@@ -75,6 +75,10 @@ services:
     volumes:
       # Mount test config
       - ../crates/aura-web-server/tests/test-config.toml:/app/config/test-config.toml:ro
+      # Skills fixture: test-config.toml declares `source = "./skills"`, which
+      # resolves against the server's CWD (/app), so the fixture must land at
+      # /app/skills for discovery to find it.
+      - ../tests/integration/skills:/app/skills:ro
     depends_on:
       mock-mcp:
         condition: service_healthy

@@ -13,7 +13,8 @@ use std::sync::Arc;
 use a2a_server::{InMemoryTaskStore, TaskStore};
 use async_trait::async_trait;
 use aura::session_store::{
-    ApprovalStore, EventBus, InMemoryApprovalStore, InMemoryEventBus, SessionStoreError,
+    ApprovalStore, EventBus, InMemoryApprovalStore, InMemoryEventBus, InMemorySkillInvocationStore,
+    SessionStoreError, SkillInvocationStore,
 };
 use aura_config::{SessionStoreBackend, SessionStoreConfig};
 
@@ -32,6 +33,9 @@ pub trait SessionStore: Send + Sync {
 
     /// Durable A2A tasks (the upstream `a2a_server::TaskStore` trait).
     fn tasks(&self) -> Arc<dyn TaskStore>;
+
+    /// Durable per-session skill invocations.
+    fn skills(&self) -> Arc<dyn SkillInvocationStore>;
 
     /// Allows for cross-instance pub/sub (in-memory SessionStore would be single-instance only).
     fn bus(&self) -> Arc<dyn EventBus>;
@@ -64,6 +68,7 @@ pub async fn build_session_store(
 pub struct InMemorySessionStore {
     approvals: Arc<InMemoryApprovalStore>,
     tasks: Arc<InMemoryTaskStore>,
+    skills: Arc<InMemorySkillInvocationStore>,
     bus: Arc<InMemoryEventBus>,
 }
 
@@ -73,6 +78,7 @@ impl InMemorySessionStore {
         Self {
             approvals: Arc::new(InMemoryApprovalStore::new()),
             tasks: Arc::new(InMemoryTaskStore::new()),
+            skills: Arc::new(InMemorySkillInvocationStore::new()),
             bus: Arc::new(InMemoryEventBus::new()),
         }
     }
@@ -96,6 +102,10 @@ impl SessionStore for InMemorySessionStore {
 
     fn tasks(&self) -> Arc<dyn TaskStore> {
         self.tasks.clone()
+    }
+
+    fn skills(&self) -> Arc<dyn SkillInvocationStore> {
+        self.skills.clone()
     }
 
     fn bus(&self) -> Arc<dyn EventBus> {

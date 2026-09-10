@@ -8,13 +8,14 @@
 //!
 //! See `docs/design/session-storage.md` §8.
 //!
-//! | Env var                                   | Meaning                                     |
-//! | ----------------------------------------- | ------------------------------------------- |
-//! | `AURA_SESSION_STORE`                      | backend: `memory` (default) or `redis`      |
-//! | `AURA_SESSION_STORE_URL`                  | `redis://` / `rediss://` (Valkey ok)        |
-//! | `AURA_SESSION_STORE_PREFIX`               | key/topic namespace (default `aura`)        |
-//! | `AURA_SESSION_STORE_CONNECT_TIMEOUT_SECS` | connection timeout (default 5)              |
-//! | `AURA_SESSION_STORE_TASK_TTL_SECS`        | A2A task TTL, 0 = no expiry (default 86400) |
+//! | Env var                                   | Meaning                                              |
+//! | ----------------------------------------- | ---------------------------------------------------- |
+//! | `AURA_SESSION_STORE`                      | backend: `memory` (default) or `redis`               |
+//! | `AURA_SESSION_STORE_URL`                  | `redis://` / `rediss://` (Valkey ok)                 |
+//! | `AURA_SESSION_STORE_PREFIX`               | key/topic namespace (default `aura`)                 |
+//! | `AURA_SESSION_STORE_CONNECT_TIMEOUT_SECS` | connection timeout (default 5)                       |
+//! | `AURA_SESSION_STORE_TASK_TTL_SECS`        | A2A task TTL, 0 = no expiry (default 86400)          |
+//! | `AURA_SESSION_STORE_SKILLS_TTL_SECS`      | skill-invocation TTL, 0 = no expiry (default 86400)  |
 
 use crate::error::ConfigError;
 use std::fmt;
@@ -77,11 +78,14 @@ pub struct RedisSessionStoreConfig {
     pub connect_timeout: Duration,
     /// A2A task record TTL in seconds.
     pub task_ttl_secs: Option<NonZeroU64>,
+    /// Per-session skill-invocation TTL in seconds.
+    pub skills_ttl_secs: Option<NonZeroU64>,
 }
 
 const DEFAULT_KEY_PREFIX: &str = "aura";
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_TASK_TTL_SECS: u64 = 86_400;
+const DEFAULT_SKILLS_TTL_SECS: u64 = 86_400;
 
 impl SessionStoreConfig {
     /// Build the deployment's session-store configuration from the
@@ -128,6 +132,10 @@ impl RedisSessionStoreConfig {
             task_ttl_secs: NonZeroU64::new(
                 env_var_u64("AURA_SESSION_STORE_TASK_TTL_SECS")?.unwrap_or(DEFAULT_TASK_TTL_SECS),
             ),
+            skills_ttl_secs: NonZeroU64::new(
+                env_var_u64("AURA_SESSION_STORE_SKILLS_TTL_SECS")?
+                    .unwrap_or(DEFAULT_SKILLS_TTL_SECS),
+            ),
         })
     }
 }
@@ -159,6 +167,7 @@ mod tests {
             "AURA_SESSION_STORE_PREFIX",
             "AURA_SESSION_STORE_CONNECT_TIMEOUT_SECS",
             "AURA_SESSION_STORE_TASK_TTL_SECS",
+            "AURA_SESSION_STORE_SKILLS_TTL_SECS",
         ] {
             unsafe { std::env::remove_var(var) };
         }
@@ -190,6 +199,7 @@ mod tests {
             std::env::set_var("AURA_SESSION_STORE_PREFIX", "aura:env");
             std::env::set_var("AURA_SESSION_STORE_CONNECT_TIMEOUT_SECS", "2");
             std::env::set_var("AURA_SESSION_STORE_TASK_TTL_SECS", "3600");
+            std::env::set_var("AURA_SESSION_STORE_SKILLS_TTL_SECS", "7200");
         }
         let config = SessionStoreConfig::from_env();
         clear_env();
@@ -198,6 +208,7 @@ mod tests {
         assert_eq!(redis.key_prefix, "aura:env");
         assert_eq!(redis.connect_timeout, Duration::from_secs(2));
         assert_eq!(redis.task_ttl_secs, NonZeroU64::new(3600));
+        assert_eq!(redis.skills_ttl_secs, NonZeroU64::new(7200));
     }
 
     #[test]
@@ -214,6 +225,7 @@ mod tests {
         assert_eq!(redis.key_prefix, "aura");
         assert_eq!(redis.connect_timeout, Duration::from_secs(5));
         assert_eq!(redis.task_ttl_secs, NonZeroU64::new(86_400));
+        assert_eq!(redis.skills_ttl_secs, NonZeroU64::new(86_400));
     }
 
     #[test]
@@ -269,10 +281,13 @@ mod tests {
             std::env::set_var("AURA_SESSION_STORE", "redis");
             std::env::set_var("AURA_SESSION_STORE_URL", "redis://envhost:6379");
             std::env::set_var("AURA_SESSION_STORE_TASK_TTL_SECS", "0");
+            std::env::set_var("AURA_SESSION_STORE_SKILLS_TTL_SECS", "0");
         }
         let config = SessionStoreConfig::from_env();
         clear_env();
-        assert_eq!(expect_redis(config.unwrap()).task_ttl_secs, None);
+        let redis = expect_redis(config.unwrap());
+        assert_eq!(redis.task_ttl_secs, None);
+        assert_eq!(redis.skills_ttl_secs, None);
     }
 
     #[test]

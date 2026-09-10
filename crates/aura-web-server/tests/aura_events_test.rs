@@ -866,3 +866,128 @@ async fn test_multiple_tools_fifo_ordering() {
         "tool_start and tool_complete should have same tool_id order (FIFO)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Skill invocation persistence and rehydration (GH-396)
+// ---------------------------------------------------------------------------
+
+/// Send a full message array under a fixed chat session id, returning the
+/// parsed SSE events and the accumulated assistant text.
+async fn send_session_messages(
+    client: &reqwest::Client,
+    session_id: &str,
+    messages: Value,
+) -> (Vec<SseEvent>, String) {
+    let response = client
+        .post(format!("{AURA_SERVER}/v1/chat/completions"))
+        .json(&json!({
+            "model": "test-assistant",
+            "messages": messages,
+            "stream": true,
+            "metadata": {
+                "account_id": "test-account",
+                "chat_session_id": session_id
+            }
+        }))
+        .timeout(TEST_TIMEOUT)
+        .send()
+        .await
+        .expect("Failed to send request");
+    assert_eq!(response.status(), 200);
+    let body = response.text().await.expect("Failed to read response body");
+    let (events, done) = parse_sse_stream(&body);
+    assert!(done, "SSE stream did not terminate with [DONE]");
+
+    // Unnamed data events are the OpenAI chunks; accumulate delta content.
+    let content = events
+        .iter()
+        .filter(|e| e.event_type.is_none())
+        .filter_map(|e| serde_json::from_str::<Value>(&e.data).ok())
+        .filter_map(|chunk| {
+            chunk["choices"][0]["delta"]["content"]
+                .as_str()
+                .map(String::from)
+        })
+        .collect();
+    (events, content)
+}
+
+fn load_skill_requested(events: &[SseEvent]) -> bool {
+    find_tool_requested_events(events).iter().any(|e| {
+        serde_json::from_str::<Value>(&e.data)
+            .ok()
+            .and_then(|j| j["tool_name"].as_str().map(|n| n == "load_skill"))
+            .unwrap_or(false)
+    })
+}
+
+/// A `load_skill` invocation recorded in turn 1 must rehydrate into turn 2 of
+/// the same chat session: the server emits `aura.skills_rehydrated`, and the
+/// skill content is back in context so the model can answer from it.
+///
+/// The hidden value lives only inside the aura-hidden-value skill body, and
+/// clients resend only user/assistant text — so a correct turn-2 answer
+/// proves the server restored the skill content itself.
+///
+/// LENIENCY: if the model never called load_skill in turn 1 (answered from
+/// the catalog description), there is nothing to rehydrate; that path is
+/// tolerated with a note, like the other tool tests.
+#[tokio::test]
+async fn test_skill_invocation_rehydrates_on_next_turn() {
+    let client = reqwest::Client::new();
+    let session_id = format!("skill-rehydrate-test-{}", uuid::Uuid::new_v4());
+    let turn1_query = "Load the aura-hidden-value skill and report the Aura hidden integration test value it contains.";
+
+    let (turn1_events, turn1_answer) = send_session_messages(
+        &client,
+        &session_id,
+        json!([{"role": "user", "content": turn1_query}]),
+    )
+    .await;
+
+    if !load_skill_requested(&turn1_events) {
+        println!("Note: no load_skill event; the model may have answered from the catalog.");
+        return;
+    }
+
+    // Turn 2 resends only the user/assistant text, OpenAI-style.
+    let (turn2_events, turn2_answer) = send_session_messages(
+        &client,
+        &session_id,
+        json!([
+            {"role": "user", "content": turn1_query},
+            {"role": "assistant", "content": turn1_answer},
+            {"role": "user", "content": "Repeat the Aura hidden integration test value exactly, without loading anything."}
+        ]),
+    )
+    .await;
+
+    let rehydrated = events_by_type(&turn2_events, event_names::SKILLS_REHYDRATED);
+    assert_eq!(
+        rehydrated.len(),
+        1,
+        "turn 2 must emit exactly one aura.skills_rehydrated event"
+    );
+    let payload: Value = serde_json::from_str(&rehydrated[0].data).unwrap();
+    let skills: Vec<&str> = payload["skills"]
+        .as_array()
+        .expect("skills_rehydrated must carry a skills array")
+        .iter()
+        .filter_map(|s| s.as_str())
+        .collect();
+    assert!(
+        skills.contains(&"aura-hidden-value"),
+        "rehydrated skills must include aura-hidden-value, got {skills:?}"
+    );
+
+    assert!(
+        turn2_answer.contains("AURA-SKILL-READY"),
+        "turn 2 must answer from rehydrated skill content, got: {turn2_answer}"
+    );
+
+    if load_skill_requested(&turn2_events) {
+        println!(
+            "Note: model re-called load_skill in turn 2 despite the rehydrated call in history."
+        );
+    }
+}

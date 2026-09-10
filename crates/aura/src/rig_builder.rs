@@ -21,6 +21,7 @@ pub struct RigBuilder {
     config: Config,
     pending_approvals: PendingApprovals,
     hitl_hmac: Option<crate::hitl::WebhookHmac>,
+    skill_recorder: Option<Arc<crate::skill_tool::SkillInvocationRecorder>>,
 }
 
 impl RigBuilder {
@@ -29,6 +30,7 @@ impl RigBuilder {
             config,
             pending_approvals,
             hitl_hmac: None,
+            skill_recorder: None,
         }
     }
 
@@ -36,6 +38,17 @@ impl RigBuilder {
     #[must_use]
     pub fn with_hitl_hmac(mut self, hmac: Option<crate::hitl::WebhookHmac>) -> Self {
         self.hitl_hmac = hmac;
+        self
+    }
+
+    /// Set the recorder the built agent's skill tools persist invocations
+    /// with (see [`crate::skill_tool::SkillInvocationRecorder`]).
+    #[must_use]
+    pub fn with_skill_recorder(
+        mut self,
+        recorder: Option<Arc<crate::skill_tool::SkillInvocationRecorder>>,
+    ) -> Self {
+        self.skill_recorder = recorder;
         self
     }
 
@@ -146,6 +159,7 @@ impl RigBuilder {
         resolve_mcp_headers(&mut agent_config, req_headers);
         agent_config.request_id = request_id;
         agent_config.session_id = session_id;
+        agent_config.skill_recorder = self.skill_recorder.clone();
         Agent::new(&agent_config, additional_tools, client_tools)
             .await
             .map_err(|e| BuilderError::AgentError(format!("Failed to build agent: {e}")))
@@ -172,6 +186,7 @@ impl RigBuilder {
         resolve_mcp_headers(&mut agent_config, req_headers);
         agent_config.session_id = session_id;
         agent_config.request_id = request_id;
+        agent_config.skill_recorder = self.skill_recorder.clone();
 
         build_streaming_agent(&agent_config, client_tools)
             .await

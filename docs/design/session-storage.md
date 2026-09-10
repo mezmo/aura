@@ -398,6 +398,7 @@ default `aura`), so multiple AURA deployments can share a cluster.
 | `{p}:a2a:tasks`                   | set of `task_id`                      | `list` without a `context_id` filter   | same as task             |
 | `{p}:bus:a2a:task:{task_id}`      | pub/sub channel                       | streaming fan-out to subscribers       | —                        |
 | `{p}:bus:a2a:cancel:{task_id}`    | pub/sub channel                       | route `cancel` to the pod running it   | —                        |
+| `{p}:skills:{session_id}`         | hash (dedup key → JSON record)        | session's skill-invocation log         | configurable (e.g. 24h)  |
 
 Notes:
 
@@ -420,6 +421,17 @@ Notes:
   hash-tagged keys and is out of scope.
 - Records carry a plain `EXPIRE`-style TTL; no background sweeper needed. The parking
   pod's `await` remains the authoritative timeout.
+- Skill-invocation records (`aura::session_store::skill_record`, GH-396) store
+  only the invocation — tool, arguments, tool-call id, and position in the
+  client-visible history — never skill content: skills ship with the agent
+  config on every pod, so rehydration replays content from local disk and the
+  store can never serve stale skill bodies. Writes are `HSETNX` keyed by the
+  invocation's dedup key (first write wins → idempotent re-loads), each write
+  refreshes the hash TTL, and `list` skips undecodable entries the same way
+  the task store does. `aura-web-server::handlers::prepare_request` records
+  invocations via `SkillInvocationRecorder` and splices stored records back
+  into the next turn's chat history as synthetic tool-call/result pairs
+  (`aura::skill_rehydration`), emitting `aura.skills_rehydrated` over SSE.
 
 ### In-memory default impl
 
@@ -449,6 +461,7 @@ ambiguously imply one store per agent config.
 | `AURA_SESSION_STORE_PREFIX`               | key namespace; lets deployments share a cluster (default `aura`) |
 | `AURA_SESSION_STORE_CONNECT_TIMEOUT_SECS` | backend connection timeout (default 5)                           |
 | `AURA_SESSION_STORE_TASK_TTL_SECS`        | A2A task record TTL, `0` → no expiry (default 86400)             |
+| `AURA_SESSION_STORE_SKILLS_TTL_SECS`      | skill-invocation log TTL, `0` → no expiry (default 86400)        |
 
 An approval-TTL env var lands with phase 3 (`0` → derive from each approval's
 `expires_at`).

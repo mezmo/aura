@@ -1,5 +1,5 @@
 //! Pluggable cross-instance session-state capabilities: a durable store for parked
-//! HITL approvals and a pub/sub event bus.
+//! HITL approvals, a per-session skill-invocation store, and a pub/sub event bus.
 //!
 //! The in-memory implementations are the default; a networked backend (e.g.
 //! Redis/Valkey) implements the same traits to make a load-balanced multi-instance
@@ -10,6 +10,7 @@
 
 mod memory;
 mod record;
+mod skill_record;
 
 use std::pin::Pin;
 use std::time::Duration;
@@ -18,10 +19,12 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::Stream;
 
+use crate::config::SessionId;
 use crate::hitl::{ApprovalDecision, DecisionId, ParkedApproval, ResolveError};
 
-pub use memory::{InMemoryApprovalStore, InMemoryEventBus};
+pub use memory::{InMemoryApprovalStore, InMemoryEventBus, InMemorySkillInvocationStore};
 pub use record::{InvalidRecord, OriginRecord, ParkedApprovalRecord, ScopeRecord};
+pub use skill_record::{SKILL_INVOCATION_RECORD_VERSION, SkillInvocation, SkillInvocationRecord};
 
 /// A fault in the backing session-store/bus backend.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -72,6 +75,28 @@ pub trait ApprovalStore: Send + Sync {
 
     /// Remove every approval parked under a request id.
     async fn cancel_request(&self, request_id: &str) -> Result<(), SessionStoreError>;
+}
+
+/// Per-session storage of skill-tool invocations, over the serializable
+/// [`SkillInvocationRecord`].
+#[async_trait]
+pub trait SkillInvocationStore: Send + Sync {
+    /// Persist an invocation under a session. Idempotent per
+    /// (session, [`SkillInvocation::dedup_key`]): the first record for a key
+    /// wins and later duplicates are no-ops, so a re-invoked skill keeps its
+    /// original position. Backends with native expiry should TTL the
+    /// session's entries so abandoned sessions self-clean.
+    async fn record(
+        &self,
+        session_id: &SessionId,
+        record: SkillInvocationRecord,
+    ) -> Result<(), SessionStoreError>;
+
+    /// Every invocation recorded for a session, ordered by (anchor, seq).
+    async fn list(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<SkillInvocationRecord>, SessionStoreError>;
 }
 
 /// The payload stream returned by [`EventBus::subscribe`].

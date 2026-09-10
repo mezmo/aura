@@ -151,6 +151,10 @@ impl StreamingAgent for OrchestratorFactory {
         true
     }
 
+    fn skills(&self) -> &[aura_config::SkillConfig] {
+        &self.agent_config.agent.skills
+    }
+
     async fn stream(
         &self,
         query: &str,

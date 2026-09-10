@@ -140,6 +140,13 @@ pub trait StreamingAgent: Send + Sync {
         Vec::new()
     }
 
+    /// The discovered skills this agent (or, in orchestration mode, its
+    /// coordinator) can load. Defaults to empty for implementors without
+    /// skills.
+    fn skills(&self) -> &[aura_config::SkillConfig] {
+        &[]
+    }
+
     /// Whether this agent is an orchestrator (emits per-phase LLM spans).
     ///
     /// Returned `true` by the multi-agent `OrchestratorFactory`. The web-server

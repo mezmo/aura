@@ -10,12 +10,16 @@
 //! YAML frontmatter. Content is read from disk on demand, keeping the base
 //! system prompt small.
 
-use crate::config::SkillConfig;
+use crate::config::{SessionId, SkillConfig};
+use crate::session_store::{
+    SKILL_INVOCATION_RECORD_VERSION, SkillInvocation, SkillInvocationRecord, SkillInvocationStore,
+};
 use rig::{completion::ToolDefinition, tool::Tool};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::fs;
 
 /// Size threshold (in bytes) above which a warning is logged.
@@ -40,6 +44,65 @@ pub fn is_skill_tool(tool_name: &str) -> bool {
     tool_name == LOAD_SKILL_TOOL_NAME || tool_name == READ_SKILL_FILE_TOOL_NAME
 }
 
+/// Records successful skill-tool invocations into a session's
+/// [`SkillInvocationStore`] so later turns can rehydrate them
+/// (see `crate::skill_rehydration`).
+pub struct SkillInvocationRecorder {
+    store: Arc<dyn SkillInvocationStore>,
+    session_id: SessionId,
+    /// Anchor stamped on every record this recorder writes (one recorder per
+    /// request turn).
+    anchor: u32,
+    seq: AtomicU32,
+}
+
+impl SkillInvocationRecorder {
+    #[must_use]
+    pub fn new(store: Arc<dyn SkillInvocationStore>, session_id: SessionId, anchor: u32) -> Self {
+        Self {
+            store,
+            session_id,
+            anchor,
+            seq: AtomicU32::new(0),
+        }
+    }
+
+    /// Persist an invocation, fire-and-forget: the tool result must not wait
+    /// on (or fail with) the store, so the write is spawned and a failure
+    /// only logs a warning — the turn itself already has the skill content.
+    fn record(&self, invocation: SkillInvocation) {
+        let record = SkillInvocationRecord {
+            version: SKILL_INVOCATION_RECORD_VERSION,
+            invocation,
+            tool_call_id: format!("call_{}", uuid::Uuid::new_v4().simple()),
+            anchor: self.anchor,
+            seq: self.seq.fetch_add(1, Ordering::Relaxed),
+            invoked_at: chrono::Utc::now(),
+        };
+        let store = Arc::clone(&self.store);
+        let session_id = self.session_id.clone();
+        tokio::spawn(async move {
+            let label = record.invocation.label();
+            if let Err(e) = store.record(&session_id, record).await {
+                tracing::warn!(
+                    session_id = session_id.as_str(),
+                    invocation = %label,
+                    "failed to persist skill invocation: {e}"
+                );
+            }
+        });
+    }
+}
+
+impl std::fmt::Debug for SkillInvocationRecorder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SkillInvocationRecorder")
+            .field("session_id", &self.session_id)
+            .field("anchor", &self.anchor)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Tool that loads skill content on demand from disk.
 ///
 /// The LLM sees a catalog of available skills in the tool description
@@ -47,6 +110,7 @@ pub fn is_skill_tool(tool_name: &str) -> bool {
 #[derive(Debug, Clone)]
 pub struct LoadSkillTool {
     skills: Arc<[SkillConfig]>,
+    recorder: Option<Arc<SkillInvocationRecorder>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -208,6 +272,7 @@ impl SkillResourcePath {
 #[derive(Debug, Clone)]
 pub struct ReadSkillFileTool {
     skills: Arc<[SkillConfig]>,
+    recorder: Option<Arc<SkillInvocationRecorder>>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -255,26 +320,42 @@ impl Tool for ReadSkillFileTool {
             .find(|s| s.name == args.skill)
             .ok_or_else(|| SkillError::UnknownSkill(args.skill.clone()))?;
 
-        let resource = SkillResourcePath::resolve(&skill.path, &args.path)?;
-        tracing::info!(
-            "Reading skill '{}' resource '{}' from {:?}",
-            skill.name,
-            args.path,
-            resource.as_path()
-        );
-
-        let content = fs::read_to_string(resource.as_path()).await?;
-        if content.len() > SKILL_SIZE_WARN_THRESHOLD {
-            tracing::warn!(
-                "Skill '{}' resource '{}' is large ({} bytes). This may consume significant \
-                 LLM context window. Consider splitting into smaller files if possible.",
-                skill.name,
-                args.path,
-                content.len()
-            );
+        let content = render_read_skill_file_output(skill, &args.path).await?;
+        if let Some(recorder) = &self.recorder {
+            recorder.record(SkillInvocation::ReadSkillFile {
+                skill: args.skill,
+                path: args.path,
+            });
         }
         Ok(content)
     }
+}
+
+/// Read a skill resource file, guarding the path against escapes. Shared by
+/// the tool and rehydration replay so both produce identical content.
+pub async fn render_read_skill_file_output(
+    skill: &SkillConfig,
+    path: &str,
+) -> Result<String, SkillError> {
+    let resource = SkillResourcePath::resolve(&skill.path, path)?;
+    tracing::info!(
+        "Reading skill '{}' resource '{}' from {:?}",
+        skill.name,
+        path,
+        resource.as_path()
+    );
+
+    let content = fs::read_to_string(resource.as_path()).await?;
+    if content.len() > SKILL_SIZE_WARN_THRESHOLD {
+        tracing::warn!(
+            "Skill '{}' resource '{}' is large ({} bytes). This may consume significant \
+             LLM context window. Consider splitting into smaller files if possible.",
+            skill.name,
+            path,
+            content.len()
+        );
+    }
+    Ok(content)
 }
 
 /// The skill tool pair sharing a single skill list.
@@ -285,7 +366,13 @@ pub struct SkillToolset {
 
 impl SkillToolset {
     /// Build both skill tools, or `None` when no skills are configured.
-    pub fn new(skills: &[SkillConfig]) -> Option<Self> {
+    ///
+    /// With a `recorder`, each successful invocation is persisted to the
+    /// session's skill-invocation store; `None` disables recording.
+    pub fn new(
+        skills: &[SkillConfig],
+        recorder: Option<Arc<SkillInvocationRecorder>>,
+    ) -> Option<Self> {
         if skills.is_empty() {
             return None;
         }
@@ -293,19 +380,22 @@ impl SkillToolset {
         Some(Self {
             load: LoadSkillTool {
                 skills: Arc::clone(&skills),
+                recorder: recorder.clone(),
             },
-            read_file: ReadSkillFileTool { skills },
+            read_file: ReadSkillFileTool { skills, recorder },
         })
     }
 }
 
 impl LoadSkillTool {
-    /// Create a new LoadSkillTool from discovered skill configs.
+    /// Create a new LoadSkillTool from discovered skill configs, without
+    /// invocation recording.
     ///
     /// Each `SkillConfig` contains an absolute path to the skill directory.
     pub fn new(skills: &[SkillConfig]) -> Self {
         Self {
             skills: skills.into(),
+            recorder: None,
         }
     }
 
@@ -351,43 +441,53 @@ impl Tool for LoadSkillTool {
             .find(|s| s.name == args.name)
             .ok_or_else(|| SkillError::UnknownSkill(args.name.clone()))?;
 
-        let skill_file = skill.path.join("SKILL.md");
-        tracing::info!("Loading skill '{}' from {:?}", skill.name, skill_file);
-
-        let content = fs::read_to_string(&skill_file).await?;
-        let body = strip_frontmatter(&content);
-
-        if body.len() > SKILL_SIZE_WARN_THRESHOLD {
-            tracing::warn!(
-                "Skill '{}' content is large ({} bytes). This may consume significant \
-                 LLM context window. Consider splitting into smaller skills if possible.",
-                skill.name,
-                body.len()
-            );
+        let result = render_load_skill_output(skill).await?;
+        if let Some(recorder) = &self.recorder {
+            recorder.record(SkillInvocation::LoadSkill { name: args.name });
         }
-
-        // Progressive disclosure: list resource files instead of inlining
-        // them, so the LLM fetches only what it needs via read_skill_file.
-        let mut result = body.to_string();
-        let resources = list_skill_resources(&skill.path).await;
-        if !resources.is_empty() {
-            result.push_str(
-                "\n\n## Skill resources\nLoad any of these with the `read_skill_file` tool when needed:\n",
-            );
-            for resource in &resources {
-                result.push_str(&format!("- {resource}\n"));
-            }
-        }
-
-        tracing::info!(
-            "Skill '{}' loaded ({} bytes body, {} resources listed)",
-            skill.name,
-            body.len(),
-            resources.len()
-        );
-
         Ok(result)
     }
+}
+
+/// Read a skill's SKILL.md body and append its resource listing. Shared by
+/// the tool and rehydration replay so both produce identical content.
+pub async fn render_load_skill_output(skill: &SkillConfig) -> Result<String, SkillError> {
+    let skill_file = skill.path.join("SKILL.md");
+    tracing::info!("Loading skill '{}' from {:?}", skill.name, skill_file);
+
+    let content = fs::read_to_string(&skill_file).await?;
+    let body = strip_frontmatter(&content);
+
+    if body.len() > SKILL_SIZE_WARN_THRESHOLD {
+        tracing::warn!(
+            "Skill '{}' content is large ({} bytes). This may consume significant \
+             LLM context window. Consider splitting into smaller skills if possible.",
+            skill.name,
+            body.len()
+        );
+    }
+
+    // Progressive disclosure: list resource files instead of inlining
+    // them, so the LLM fetches only what it needs via read_skill_file.
+    let mut result = body.to_string();
+    let resources = list_skill_resources(&skill.path).await;
+    if !resources.is_empty() {
+        result.push_str(
+            "\n\n## Skill resources\nLoad any of these with the `read_skill_file` tool when needed:\n",
+        );
+        for resource in &resources {
+            result.push_str(&format!("- {resource}\n"));
+        }
+    }
+
+    tracing::info!(
+        "Skill '{}' loaded ({} bytes body, {} resources listed)",
+        skill.name,
+        body.len(),
+        resources.len()
+    );
+
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -596,7 +696,7 @@ mod tests {
     async fn test_read_skill_file_success() {
         let dir = TempDir::new().unwrap();
         let configs = make_skill_with_resources(dir.path());
-        let toolset = SkillToolset::new(&configs).unwrap();
+        let toolset = SkillToolset::new(&configs, None).unwrap();
         let result = toolset
             .read_file
             .call(ReadSkillFileArgs {
@@ -613,7 +713,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         std::fs::write(dir.path().join("escape.md"), "secret").unwrap();
         let configs = make_skill_with_resources(dir.path());
-        let toolset = SkillToolset::new(&configs).unwrap();
+        let toolset = SkillToolset::new(&configs, None).unwrap();
         let result = toolset
             .read_file
             .call(ReadSkillFileArgs {
@@ -628,7 +728,7 @@ mod tests {
     async fn test_read_skill_file_absolute_path_escape() {
         let dir = TempDir::new().unwrap();
         let configs = make_skill_with_resources(dir.path());
-        let toolset = SkillToolset::new(&configs).unwrap();
+        let toolset = SkillToolset::new(&configs, None).unwrap();
         let result = toolset
             .read_file
             .call(ReadSkillFileArgs {
@@ -648,7 +748,7 @@ mod tests {
         let configs = make_skill_with_resources(dir.path());
         std::os::unix::fs::symlink(&outside, configs[0].path.join("references/link.md")).unwrap();
 
-        let toolset = SkillToolset::new(&configs).unwrap();
+        let toolset = SkillToolset::new(&configs, None).unwrap();
         let result = toolset
             .read_file
             .call(ReadSkillFileArgs {
@@ -672,7 +772,7 @@ mod tests {
         std::os::unix::fs::symlink(&outside_dir, configs[0].path.join("references/extdir"))
             .unwrap();
 
-        let toolset = SkillToolset::new(&configs).unwrap();
+        let toolset = SkillToolset::new(&configs, None).unwrap();
         let result = toolset
             .read_file
             .call(ReadSkillFileArgs {
@@ -703,7 +803,7 @@ mod tests {
     async fn test_read_skill_file_not_found() {
         let dir = TempDir::new().unwrap();
         let configs = make_skill_with_resources(dir.path());
-        let toolset = SkillToolset::new(&configs).unwrap();
+        let toolset = SkillToolset::new(&configs, None).unwrap();
         let result = toolset
             .read_file
             .call(ReadSkillFileArgs {
@@ -718,7 +818,7 @@ mod tests {
     async fn test_read_skill_file_unknown_skill() {
         let dir = TempDir::new().unwrap();
         let configs = make_skill_with_resources(dir.path());
-        let toolset = SkillToolset::new(&configs).unwrap();
+        let toolset = SkillToolset::new(&configs, None).unwrap();
         let result = toolset
             .read_file
             .call(ReadSkillFileArgs {
@@ -749,7 +849,7 @@ mod tests {
 
     #[test]
     fn test_skill_toolset_empty() {
-        assert!(SkillToolset::new(&[]).is_none());
+        assert!(SkillToolset::new(&[], None).is_none());
     }
 
     #[test]

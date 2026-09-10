@@ -148,6 +148,9 @@ pub struct Agent {
     pub(crate) client_tool_names: HashSet<String>,
     /// Turn-limit nudge state shared with this agent's `TurnNudgeWrapper`.
     pub(crate) turn_nudge: Option<Arc<crate::turn_nudge::TurnNudgeState>>,
+    /// Discovered skills this agent's `load_skill`/`read_skill_file` tools
+    /// serve.
+    pub(crate) skills: Vec<crate::config::SkillConfig>,
 }
 
 impl Agent {
@@ -783,6 +786,7 @@ impl Agent {
             scratchpad_budget: agent_scratchpad_budget,
             client_tool_names,
             turn_nudge,
+            skills: config.agent.skills.clone(),
         })
     }
 
@@ -1069,7 +1073,9 @@ impl Agent {
             builder_state = builder_state.add_tools_dyn(additional_tools);
         }
 
-        if let Some(toolset) = SkillToolset::new(&config.agent.skills) {
+        if let Some(toolset) =
+            SkillToolset::new(&config.agent.skills, config.skill_recorder.clone())
+        {
             tracing::info!(
                 "Adding skill tools (load_skill, read_skill_file) with {} skills",
                 config.agent.skills.len(),
@@ -1638,6 +1644,10 @@ impl StreamingAgent for Agent {
             .as_ref()
             .map(|m| m.server_status_snapshot())
             .unwrap_or_default()
+    }
+
+    fn skills(&self) -> &[aura_config::SkillConfig] {
+        &self.skills
     }
 }
 

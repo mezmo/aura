@@ -148,6 +148,10 @@ pub struct AgentRuntimeConfig {
     ///
     /// [`AgentScope`]: crate::hitl::AgentScope
     pub hitl_request_approval_tool: Option<crate::hitl::RequestApprovalTool>,
+
+    /// Recorder the skill tools use to persist successful invocations for
+    /// this session. `None` disables recording.
+    pub skill_recorder: Option<Arc<crate::skill_tool::SkillInvocationRecorder>>,
 }
 
 // Manual Clone implementation because Arc<dyn Trait> fields require special handling
@@ -175,6 +179,7 @@ impl Clone for AgentRuntimeConfig {
             hitl: self.hitl.clone(),
             request_id: self.request_id.clone(),
             hitl_request_approval_tool: self.hitl_request_approval_tool.clone(),
+            skill_recorder: self.skill_recorder.clone(),
         }
     }
 }
@@ -223,6 +228,10 @@ impl std::fmt::Debug for AgentRuntimeConfig {
                     .hitl_request_approval_tool
                     .as_ref()
                     .map(|_| "<request_approval>"),
+            )
+            .field(
+                "skill_recorder",
+                &self.skill_recorder.as_ref().map(|_| "<recorder>"),
             )
             .finish()
     }

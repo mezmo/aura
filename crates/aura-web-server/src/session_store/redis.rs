@@ -1,21 +1,23 @@
 //! Redis/Valkey session-store backend.
 //!
 //! The A2A task store ([`task_store`]), the HITL approval store
-//! ([`approval_store`]), and the event bus ([`event_bus`]) are all
-//! Redis-backed, so A2A send/poll/list, conversational approvals, and —
-//! through `crate::a2a`'s bus bridge — A2A streaming/subscribe/cancel all
-//! work across instances. Each submodule documents its own key schema under
-//! the configured `key_prefix`. See `docs/design/session-storage.md`.
+//! ([`approval_store`]), the skill-invocation store ([`skill_store`]), and
+//! the event bus ([`event_bus`]) are all Redis-backed, so A2A send/poll/list,
+//! conversational approvals, skill rehydration, and — through `crate::a2a`'s
+//! bus bridge — A2A streaming/subscribe/cancel all work across instances.
+//! Each submodule documents its own key schema under the configured
+//! `key_prefix`. See `docs/design/session-storage.md`.
 
 mod approval_store;
 mod event_bus;
+mod skill_store;
 mod task_store;
 
 use std::sync::Arc;
 
 use a2a_server::TaskStore;
 use async_trait::async_trait;
-use aura::session_store::{ApprovalStore, EventBus, SessionStoreError};
+use aura::session_store::{ApprovalStore, EventBus, SessionStoreError, SkillInvocationStore};
 use aura_config::{RedisSessionStoreConfig, SessionStoreBackend};
 use redis::Client;
 use redis::aio::{ConnectionManager, ConnectionManagerConfig};
@@ -23,12 +25,14 @@ use redis::aio::{ConnectionManager, ConnectionManagerConfig};
 use super::SessionStore;
 use approval_store::RedisApprovalStore;
 use event_bus::RedisEventBus;
+use skill_store::RedisSkillInvocationStore;
 use task_store::RedisTaskStore;
 
 pub struct RedisSessionStore {
     conn: ConnectionManager,
     tasks: Arc<RedisTaskStore>,
     approvals: Arc<RedisApprovalStore>,
+    skills: Arc<RedisSkillInvocationStore>,
     bus: Arc<RedisEventBus>,
 }
 
@@ -63,6 +67,11 @@ impl RedisSessionStore {
                 config.task_ttl_secs,
             )),
             approvals: Arc::new(RedisApprovalStore::new(conn.clone(), &config.key_prefix)),
+            skills: Arc::new(RedisSkillInvocationStore::new(
+                conn.clone(),
+                &config.key_prefix,
+                config.skills_ttl_secs,
+            )),
             bus: Arc::new(RedisEventBus::new(
                 client,
                 conn.clone(),
@@ -86,6 +95,10 @@ impl SessionStore for RedisSessionStore {
 
     fn tasks(&self) -> Arc<dyn TaskStore> {
         self.tasks.clone()
+    }
+
+    fn skills(&self) -> Arc<dyn SkillInvocationStore> {
+        self.skills.clone()
     }
 
     fn bus(&self) -> Arc<dyn EventBus> {

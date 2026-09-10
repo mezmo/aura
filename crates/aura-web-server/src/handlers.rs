@@ -185,18 +185,15 @@ struct ResponseContext {
 /// and optionally registering additional tools (e.g., CLI tools in standalone mode)
 /// or client-side passthrough tools.
 async fn build_agent_for_request(
-    config: &aura_config::Config,
+    builder: RigBuilder,
     req_headers: &HashMap<String, String>,
     additional_tools: Vec<Box<dyn aura::ToolDyn>>,
     client_tools: Option<&[ClientToolDefinition]>,
     request_id: String,
     session_id: String,
-    data: &AppState,
 ) -> Result<Arc<aura::Agent>, PrepareError> {
     let client_tool_defs =
         client_tools.map(|tools| tools.iter().map(aura::builder::ClientTool::from).collect());
-    let builder = RigBuilder::new(config.clone(), data.pending_approvals.clone())
-        .with_hitl_hmac(data.hitl_webhook_hmac.clone());
     let agent = builder
         .build_agent(
             Some(req_headers),
@@ -231,6 +228,8 @@ pub struct RequestSetup {
     pub has_client_tools: bool,
     /// Request id (`req_…`) shared by the agent build and the completion stream.
     pub request_id: String,
+    /// Labels of the skill invocations rehydrated into `chat_history`.
+    pub rehydrated_skills: Vec<String>,
 }
 
 /// Extract query, chat history, and build agent -- shared across both code paths.
@@ -258,7 +257,7 @@ pub async fn prepare_request(
     // Single pass: pull the user query out of `messages` and convert the rest
     // into Aura/Rig history, with optional client-tool support (preserves
     // assistant `tool_calls` and `role: "tool"` follow-up results).
-    let (query, chat_history) = convert_chat_messages(&req.messages, has_client_tools)?;
+    let (query, mut chat_history) = convert_chat_messages(&req.messages, has_client_tools)?;
 
     // Find the matching config: single-config passthrough > explicit model > DEFAULT_AGENT
     // Single-config servers accept any model field value (clients like LibreChat always send one).
@@ -287,12 +286,27 @@ pub async fn prepare_request(
         .as_deref()
         .map(|tools| tools.iter().map(aura::builder::ClientTool::from).collect());
 
+    // Skill invocations this turn record under the session so later turns can
+    // rehydrate them. The anchor addresses the client-visible history frame:
+    // the converted history plus this turn's user query message. Recording is
+    // unconditional — even a server-generated session id is echoed back via
+    // `X-Chat-Session-Id`, so the client may adopt it on its next request,
+    // and an id that is never reused just leaves TTL-bounded orphan records.
+    let skill_recorder = (!config.agent.skills.local.is_empty()).then(|| {
+        Arc::new(aura::skill_tool::SkillInvocationRecorder::new(
+            data.session_store.skills(),
+            aura::SessionId::new(chat_session_id),
+            chat_history.len() as u32 + 1,
+        ))
+    });
+
     // Build the appropriate agent type based on orchestration config
     let streaming_agent: Arc<dyn StreamingAgent> = if config.orchestration_enabled() {
         // Orchestration path: build via streaming agent builder (returns Orchestrator).
         // Client tools are filtered per-coordinator/per-worker inside the orchestrator.
         let builder = RigBuilder::new(config.clone(), data.pending_approvals.clone())
-            .with_hitl_hmac(data.hitl_webhook_hmac.clone());
+            .with_hitl_hmac(data.hitl_webhook_hmac.clone())
+            .with_skill_recorder(skill_recorder.clone());
         builder
             .build_streaming_agent_with_headers(
                 Some(req_headers_map),
@@ -313,16 +327,46 @@ pub async fn prepare_request(
         } else {
             None
         };
+        let builder = RigBuilder::new(config.clone(), data.pending_approvals.clone())
+            .with_hitl_hmac(data.hitl_webhook_hmac.clone())
+            .with_skill_recorder(skill_recorder.clone());
         build_agent_for_request(
-            &config,
+            builder,
             req_headers_map,
             additional_tools,
             client_tools,
             request_id.clone(),
             chat_session_id.to_string(),
-            data,
         )
         .await? as Arc<dyn StreamingAgent>
+    };
+
+    // Rehydrate this session's recorded skill invocations into the history
+    // before streaming, replaying content against the skills the agent just
+    // discovered. A store read failure only costs continuity — the request
+    // itself proceeds.
+    let rehydrated_skills = if skill_recorder.is_some() && !chat_history.is_empty() {
+        match data
+            .session_store
+            .skills()
+            .list(&aura::SessionId::new(chat_session_id))
+            .await
+        {
+            Ok(records) => {
+                aura::skill_rehydration::rehydrate_chat_history(
+                    &mut chat_history,
+                    records,
+                    streaming_agent.skills(),
+                )
+                .await
+            }
+            Err(e) => {
+                tracing::warn!("skipping skill rehydration: session store list failed: {e}");
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
     };
 
     let (provider, model) = streaming_agent.get_provider_info();
@@ -341,6 +385,7 @@ pub async fn prepare_request(
         chat_session_id: chat_session_id.to_string(),
         has_client_tools,
         request_id,
+        rehydrated_skills,
     })
 }
 
@@ -513,6 +558,7 @@ pub async fn execute_completion(
         chat_session_id,
         has_client_tools: _,
         request_id: _,
+        rehydrated_skills,
     } = setup;
 
     // Orchestration spawns inside `stream_with_timeout`, so SSE side-channel
@@ -592,6 +638,7 @@ pub async fn execute_completion(
                 response_content,
                 model_name: model_str,
                 stream_shutdown_token: config.stream_shutdown_token.clone(),
+                rehydrated_skills,
             };
 
             process_sse_stream_full(
@@ -1393,6 +1440,7 @@ mod tests {
             chat_session_id: "cs-test".to_string(),
             has_client_tools: false,
             request_id: request_id.clone(),
+            rehydrated_skills: vec![],
         };
         let config = CompletionConfig {
             request_id,

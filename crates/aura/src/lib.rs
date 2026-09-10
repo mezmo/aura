@@ -36,6 +36,7 @@ pub mod rig_builder;
 mod schema_sanitize; // Private - MCP schema sanitization for OpenAI compatibility
 pub mod scratchpad;
 pub mod session_store;
+pub mod skill_rehydration;
 pub mod skill_tool;
 pub mod stream_events;
 pub mod streaming;
