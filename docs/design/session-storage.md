@@ -222,8 +222,12 @@ pub trait ApprovalStore: Send + Sync {
     /// Remove a parked entry (timeout / cancellation).
     async fn remove(&self, id: &DecisionId) -> Result<(), SessionStoreError>;
 
-    /// Remove every approval parked under a request id (stream drop / shutdown).
-    async fn cancel_request(&self, request_id: &str) -> Result<(), SessionStoreError>;
+    /// Remove every approval parked under a request id (stream drop / shutdown),
+    /// returning the approvals actually cleared. The returned set is the sole
+    /// source of `approval_completed(cancelled)` events; a ticket decided before
+    /// the sweep is absent from it.
+    async fn cancel_request(&self, request_id: &str)
+        -> Result<Vec<ParkedApproval>, SessionStoreError>;
 }
 ```
 
@@ -329,8 +333,10 @@ Changes:
 - The `POST /v1/approvals/{id}` handler calls `approvals.resolve()` then
   `bus.publish("approval:{id}", decision)`. It no longer needs the parked entry to be
   local — it may run on any pod.
-- `cancel_request()` deletes matching store entries and (optionally) publishes a cancel so
-  the parking pod stops waiting.
+- `cancel_request()` deletes matching store entries and returns the records it cleared;
+  the caller publishes one `approval_completed(cancelled)` lifecycle event per returned
+  record (stream-facing: the parking pod's own waiters are cancelled locally, not woken
+  through the bus).
 - **Default backend = in-memory** collapses this back to exactly today's behavior:
   `resolve()` finds the local entry and fires the `oneshot` directly; `subscribe`/`publish`
   are a local broadcast. Single-pod and CLI standalone are unchanged.
@@ -428,6 +434,12 @@ Notes:
   nor a resolver crash between claim and publish can lose a granted approval
   (#474). The decision record's TTL keeps a margin past the parked record's
   remaining TTL, covering the parking pod's deadline-backstop read.
+- `cancel_request` reads the request index (`SMEMBERS`) and sweeps each id it saw in
+  one atomic pipe (per-id take plus `SREM`). A registration the index gains mid-sweep
+  keeps its index entry and stays discoverable by a later cancel: the sweep prunes per
+  id, never a whole-key `DEL`. (`SREM` on the last member deletes the emptied set, so
+  what survives is the unobserved member, not the key itself.) A wrong-typed approval
+  key is left in place with its index entry kept, so a later sweep can retry it.
 - Each task create/update is one Lua script covering the exists-check, `version`
   bump, terminal-state gate (updates to a terminal task are rejected, except a
   rewrite of the state already recorded, which leaves it alone), record
