@@ -1,0 +1,118 @@
+name: "PR target branch"
+
+on:
+  # pull_request_target so the job can comment on pull requests from forks,
+  # which a fork-triggered pull_request token cannot do.
+  #
+  # DANGER: this runs with a repository token against pull requests from
+  # untrusted forks. It is safe only because nothing from the head revision is
+  # checked out or executed, and no pull-request-controlled string reaches a
+  # `run:` block. Do not add actions/checkout, and keep permissions scoped to
+  # pull-requests: write.
+  #
+  # GitHub reads this file from the pull request's base branch, so it must
+  # exist on main to guard pull requests into main, and on nightly to clear
+  # the comment once one is retargeted there.
+  pull_request_target:
+    types: [opened, reopened, edited, synchronize]
+
+permissions:
+  pull-requests: write
+
+concurrency:
+  group: pr-target-branch-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: "Reject pull requests targeting main"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # Runs for every base branch rather than filtering on main, so
+      # retargeting a rejected pull request to nightly re-runs the check and
+      # clears both the failure and the comment.
+      #
+      # Pinned to a commit SHA because the tag is mutable and this step holds
+      # a write-scoped token.
+      - uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const action = context.payload.action;
+            const base = pr.base.ref;
+            const head = pr.head.ref;
+            const marker = '<!-- pr-target-branch -->';
+            const {owner, repo} = context.repo;
+
+            // Retargeting and reopening are the only ways a comment written
+            // on a previous run can survive onto a passing pull request, so
+            // every other event skips the comment lookup entirely.
+            const mayHaveStaleComment =
+              action === 'reopened' ||
+              (action === 'edited' && Boolean(context.payload.changes?.base));
+
+            if (base !== 'main' && !mayHaveStaleComment) {
+              core.info(`Base branch is ${base}; nothing to check.`);
+              return;
+            }
+
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner,
+              repo,
+              issue_number: pr.number,
+              per_page: 100,
+            });
+
+            // Author match as well as marker match. The marker is public, and
+            // matching it alone would let a contributor's comment be selected
+            // and then overwritten with this workflow's text.
+            const existing = comments.find(
+              (c) => c.user?.login === 'github-actions[bot]' && (c.body || '').includes(marker),
+            );
+
+            // One marker comment per pull request, rewritten in place, so a
+            // retarget leaves no stale instruction behind and a retarget back
+            // to main restates them.
+            const upsert = async (lines) => {
+              const body = [marker, ...lines].join('\n');
+              if (!existing) {
+                await github.rest.issues.createComment({owner, repo, issue_number: pr.number, body});
+              } else if (existing.body !== body) {
+                await github.rest.issues.updateComment({owner, repo, comment_id: existing.id, body});
+              }
+            };
+
+            const accept = async (reason) => {
+              core.info(reason);
+              if (existing) {
+                await upsert([`Resolved — this pull request targets \`${base}\`.`]);
+              }
+            };
+
+            if (base !== 'main') {
+              return accept(`Base branch is ${base}; nothing to check.`);
+            }
+
+            // A promotion merge from nightly or beta, and a hotfix release,
+            // may land on main directly. Each comes from a branch in this
+            // repository, so a fork branch of the same name does not qualify.
+            // head.repo is null once a fork is deleted, which is not internal.
+            const internal = pr.head.repo?.full_name === context.payload.repository.full_name;
+            const promotion = head === 'nightly' || head === 'beta' || head.startsWith('hotfix/');
+            if (internal && promotion) {
+              return accept(`${head} is allowed to target main.`);
+            }
+
+            await upsert([
+              '**This pull request targets `main`. Please retarget it to `nightly`.**',
+              '',
+              '`main` carries the stable release line. It only takes promotion merges from',
+              '`nightly` or `beta` and hotfix branches, so day-to-day changes branch from and',
+              'merge into `nightly`. See [docs/design/release-channels.md](https://github.com/mezmo/aura/blob/main/docs/design/release-channels.md).',
+              '',
+              'Use **Edit** next to the pull request title to change the base branch, then',
+              'rebase onto `nightly` if the diff picked up unrelated commits.',
+            ]);
+
+            core.setFailed(`Pull requests may not target main (head: ${head}). Retarget to nightly.`);
