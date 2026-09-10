@@ -211,7 +211,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "aura"
-version = "0.2.12"
+version = "0.2.15"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -262,7 +262,7 @@ dependencies = [
 
 [[package]]
 name = "aura-cli"
-version = "0.2.12"
+version = "0.2.15"
 dependencies = [
  "anyhow",
  "aura",
@@ -302,7 +302,7 @@ dependencies = [
 
 [[package]]
 name = "aura-config"
-version = "0.2.12"
+version = "0.2.15"
 dependencies = [
  "clap",
  "dotenvy",
@@ -321,7 +321,7 @@ dependencies = [
 
 [[package]]
 name = "aura-events"
-version = "0.2.12"
+version = "0.2.15"
 dependencies = [
  "rmcp",
  "serde",
@@ -330,7 +330,7 @@ dependencies = [
 
 [[package]]
 name = "aura-telemetry"
-version = "0.2.12"
+version = "0.2.15"
 dependencies = [
  "aura-telemetry-derive",
  "chrono",
@@ -349,7 +349,7 @@ dependencies = [
 
 [[package]]
 name = "aura-telemetry-derive"
-version = "0.2.12"
+version = "0.2.15"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -358,7 +358,7 @@ dependencies = [
 
 [[package]]
 name = "aura-test-utils"
-version = "0.2.12"
+version = "0.2.15"
 dependencies = [
  "async-trait",
  "aura",
@@ -372,7 +372,7 @@ dependencies = [
 
 [[package]]
 name = "aura-web-server"
-version = "0.2.12"
+version = "0.2.15"
 dependencies = [
  "a2a-lf",
  "a2a-server-lf",

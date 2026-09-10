@@ -1,5 +1,32 @@
 ## Changelog
 
+## [0.2.15](https://github.com/mezmo/aura/compare/v0.2.14...v0.2.15) (2026-09-03)
+
+
+### Chores
+
+* **doc**: remove math orchestration links [c9b460e](https://github.com/mezmo/aura/commit/c9b460e7ff05320dc506efd35350381cf64af704) - Gregory Janco [#71](https://github.com/mezmo/aura/issues/71)
+
+## [0.2.14](https://github.com/mezmo/aura/compare/v0.2.13...v0.2.14) (2026-09-02)
+
+
+### Miscellaneous
+
+* Revert "refactor(mcp): consolidate MCP client code into mcp/ module" [444a935](https://github.com/mezmo/aura/commit/444a935282e1d87c0f1a1e115b885e9cae8f2e3c) - Dan Hable
+
+## [0.2.13](https://github.com/mezmo/aura/compare/v0.2.12...v0.2.13) (2026-09-02)
+
+
+### Code Refactoring
+
+* **mcp**: consolidate MCP client code into mcp/ module [60fbf66](https://github.com/mezmo/aura/commit/60fbf66bdb9bee6092819f986f065122745947d2) - Dan Hable
+
+
+
+### Continuous Integration
+
+* **release**: release per-channel from nightly, beta and main [8b114b9](https://github.com/mezmo/aura/commit/8b114b9f0f4cea589a1c50b868d06fe04fb96042) - Jacob Hull
+
 ## [0.2.12](https://github.com/mezmo/aura/compare/v0.2.11...v0.2.12) (2026-08-28)
 
 
