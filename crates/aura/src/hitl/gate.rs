@@ -161,11 +161,9 @@ impl HitlApprovalWrapper {
             version: PROTOCOL_VERSION,
             instance_id: self.instance_id.clone(),
             decision_id,
-            // Owner id: every backend sweeps `cancel_request` by this field,
-            // and request teardown passes the live request id, so the
-            // run-scoped value keeps a parked ticket out of that sweep.
-            // `run_owner_id` is the single definition; the run's own sweep
-            // passes the same value.
+            // Request teardown sweeps `cancel_request` by the live request
+            // id; the run-scoped owner id keeps a parked ticket out of that
+            // sweep. The run's own sweep passes the same `run_owner_id`.
             request_id: run_owner_id(&run_id.to_string()),
             scope: self.scope.clone(),
             origin: ApprovalOrigin::ConfigGate {

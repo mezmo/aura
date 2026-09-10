@@ -84,13 +84,10 @@ pub trait ApprovalStore: Send + Sync {
     /// Remove a parked entry.
     async fn remove(&self, id: &DecisionId) -> Result<(), SessionStoreError>;
 
-    /// Remove every approval parked under a request id, returning the
-    /// approvals actually cleared. A ticket decided before the sweep is
-    /// absent from the return, so the return is the authoritative record
-    /// of what the cancellation applies to. Each backend achieves that
-    /// its own way: memory and Redis consume the ticket at resolve,
-    /// while the file backend classifies decision-file residue as stale
-    /// and sweeps it without returning it.
+    /// Remove every approval parked under a request id and return the
+    /// approvals cleared. A ticket with a recorded decision is never in
+    /// the return: the cleared set is the authoritative record of what
+    /// the cancellation applies to.
     async fn cancel_request(
         &self,
         request_id: &str,

@@ -206,17 +206,13 @@ pub(crate) async fn publish(
     .map_err(io::Error::other)?
 }
 
-/// Cancel every approval the run parked: the store's atomic
-/// `cancel_request` clears the run's remaining tickets by owner id and
-/// returns them, and each cleared ticket publishes one
-/// `approval_completed(cancelled)`. The whole sequence runs as its own task
-/// on the current runtime, so a caller dropping the returned handle cannot
-/// abandon publication mid-flight: await the handle for ordered teardown,
-/// or drop it and let the sweep finish on its own. A ticket decided before
-/// the sweep is absent from the cleared set by construction (the store
-/// returns only what it cleared), so the stream can never disagree with a
-/// decision that won the race. A lost store reply still yields
-/// warn-and-empty, the conceded residual.
+/// Cancel every approval the run parked: `cancel_request` clears the run's
+/// tickets by owner id, and each returned ticket publishes one
+/// `approval_completed(cancelled)`. The sweep runs as its own task, so a
+/// dropped handle cannot abandon publication mid-flight; await it for
+/// ordered teardown. A decided ticket is never in the cleared set, so the
+/// stream cannot disagree with a decision that won the race. A lost store
+/// reply yields warn-and-empty, the conceded residual.
 pub(crate) fn cancel_run_approvals(
     registry: &PendingApprovals,
     run_id: &str,
