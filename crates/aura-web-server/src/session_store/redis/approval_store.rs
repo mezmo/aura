@@ -15,10 +15,9 @@
 //! authoritative timeout. Decision records keep a margin past the parked
 //! record's remaining TTL, covering the parking instance's deadline-backstop
 //! read. The request index is refreshed on every register with a margin over
-//! the record TTL and pruned best-effort on resolve/remove; the cancel
-//! sweep's script sweeps taken and stale ids from the index, warns on a
-//! wrong-typed key while leaving it and its index entry in place for a
-//! later sweep, and warns on a non-UTF-8 record it consumed.
+//! the record TTL and pruned best-effort on resolve/remove. The cancel sweep
+//! prunes per id, never the whole index key; `SWEEP_TAKE_SCRIPT` states what
+//! each id yields.
 
 use std::sync::LazyLock;
 
@@ -38,10 +37,10 @@ const REQ_INDEX_TTL_MARGIN_SECS: u64 = 60;
 /// Decision TTL margin over the parked record's remaining TTL.
 const DECISION_TTL_MARGIN_MS: u64 = 60_000;
 
-/// Sweep-take script over one approval key (KEYS[1]) and its request index
-/// (KEYS[2]): a string key is GETDEL'd and its id swept from the index; a
-/// present wrong-typed key returns integer 0 with its index entry kept, so
-/// a later sweep retries it; an absent key is a stale index entry, swept.
+/// Sweep one approval key (KEYS[1]) out of its request index (KEYS[2]):
+/// a string key is GETDEL'd and its id SREM'd; a wrong-typed key returns 0
+/// and keeps its index entry for a later sweep; an absent key is a stale
+/// index entry, SREM'd.
 static SWEEP_TAKE_SCRIPT: &str = r#"
 if redis.call('TYPE', KEYS[1]).ok == 'string' then
     local record = redis.call('GETDEL', KEYS[1])
@@ -99,12 +98,9 @@ impl RedisApprovalStore {
         format!("{}:approval:req:{request_id}", self.key_prefix)
     }
 
-    /// Atomically take a record (`GETDEL`) and prune the request index
-    /// best-effort, returning the raw payload. `None` means no live entry
-    /// existed. No decode: the caller decides what a corrupt payload means.
-    /// A payload that cannot identify its request id keeps its index entry
-    /// (`prune_req_index` cannot find it); the entry dies with the index
-    /// key's TTL.
+    /// `GETDEL` a record and prune its request index best-effort, returning
+    /// the raw payload; `None` means no live entry existed. An unparseable
+    /// payload keeps its index entry until the index key's TTL.
     async fn take_json(&self, id: &str) -> Result<Option<String>, SessionStoreError> {
         let mut conn = self.conn.clone();
         let payload: Option<String> = redis::cmd("GETDEL")
@@ -202,8 +198,7 @@ impl ApprovalStore for RedisApprovalStore {
     }
 
     async fn remove(&self, id: &DecisionId) -> Result<(), SessionStoreError> {
-        // The record is discarded, so skip the decode: a corrupt payload must
-        // not fail the removal of an entry already GETDEL'd.
+        // No decode: a corrupt payload must not fail a removal already done.
         self.take_json(&id.to_string()).await.map(|_| ())
     }
 

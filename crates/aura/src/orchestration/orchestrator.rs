@@ -569,9 +569,7 @@ impl Orchestrator {
         let orchestrator_id = uuid::Uuid::new_v4().to_string();
 
         let run_id_str = persistence.lock().await.run_id().to_string();
-        // One guard per park-mode run; it stays inert until the park arm
-        // records the first parked call, and an unpublished drop sweeps the
-        // run's owner id.
+        // One guard per park-mode run; `ParkGuard` documents arming and drop.
         let park_guard = agent_config
             .hitl
             .as_ref()

@@ -334,9 +334,8 @@ Changes:
   `bus.publish("approval:{id}", decision)`. It no longer needs the parked entry to be
   local — it may run on any pod.
 - `cancel_request()` deletes matching store entries and returns the records it cleared;
-  the caller publishes one `approval_completed(cancelled)` lifecycle event per returned
-  record (stream-facing: the parking pod's own waiters are cancelled locally, not woken
-  through the bus).
+  the caller publishes one `approval_completed(cancelled)` event per returned record.
+  No cancel travels the bus: the parking pod cancels its own waiters locally.
 - **Default backend = in-memory** collapses this back to exactly today's behavior:
   `resolve()` finds the local entry and fires the `oneshot` directly; `subscribe`/`publish`
   are a local broadcast. Single-pod and CLI standalone are unchanged.
@@ -434,12 +433,10 @@ Notes:
   nor a resolver crash between claim and publish can lose a granted approval
   (#474). The decision record's TTL keeps a margin past the parked record's
   remaining TTL, covering the parking pod's deadline-backstop read.
-- `cancel_request` reads the request index (`SMEMBERS`) and sweeps each id it saw in
-  one atomic pipe (per-id take plus `SREM`). A registration the index gains mid-sweep
-  keeps its index entry and stays discoverable by a later cancel: the sweep prunes per
-  id, never a whole-key `DEL`. (`SREM` on the last member deletes the emptied set, so
-  what survives is the unobserved member, not the key itself.) A wrong-typed approval
-  key is left in place with its index entry kept, so a later sweep can retry it.
+- `cancel_request` reads the request index (`SMEMBERS`), then takes each id it saw and
+  `SREM`s it in one atomic pipe. The index key is never deleted whole, so a registration
+  that lands mid-sweep keeps its entry for a later cancel. A wrong-typed approval key
+  stays, with its index entry, for a later sweep to retry.
 - Each task create/update is one Lua script covering the exists-check, `version`
   bump, terminal-state gate (updates to a terminal task are rejected, except a
   rewrite of the state already recorded, which leaves it alone), record
