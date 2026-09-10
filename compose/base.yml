@@ -75,6 +75,11 @@ services:
     volumes:
       # Mount test config
       - ../crates/aura-web-server/tests/test-config.toml:/app/config/test-config.toml:ro
+      # Skills fixture: test-config.toml declares
+      # `source = "./tests/integration/skills"`, which resolves against the
+      # server's CWD (/app), so the fixture must land at that path. The same
+      # source works for a local run from the repo root.
+      - ../tests/integration/skills:/app/tests/integration/skills:ro
     depends_on:
       mock-mcp:
         condition: service_healthy

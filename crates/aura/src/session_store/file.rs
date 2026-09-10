@@ -1,5 +1,6 @@
 //! File-backed HITL approval store: one JSON file per decision id.
-//! Parked approvals survive process restart on a single host.
+//! Parked approvals survive process restart on a single host. The
+//! skill-invocation store shares the same root under `skills/`.
 //!
 //! Layout:
 //!
@@ -27,16 +28,21 @@
 //! serializes operations for the single writing process; no operation awaits
 //! while holding it.
 //!
-//! Store operations run on the blocking pool. Join failures map to store
-//! errors—a panicked op is a store fault, not a crash. Blocking work is not
-//! cancelled when the requester is dropped: a dropped poll still completes
-//! resolve's claim-write-move.
+//! Store operations run sync on the blocking pool rather than over
+//! `tokio::fs`, which is itself one `spawn_blocking` per call: a whole
+//! read-modify-write costs one hop instead of one per file access, and the
+//! lock spanning it stays a `std::sync::Mutex` instead of one held across
+//! awaits. Join failures map to store errors—a panicked op is a store fault,
+//! not a crash. Blocking work is not cancelled when the requester is
+//! dropped: a dropped poll still completes resolve's claim-write-move.
 //!
 //! Crash window: claim-then-write leaves an empty file if process dies
 //! mid-resolve. The aftermath fails closed; `decision` reports decode
 //! fault, `get` returns the approval. Recovery is deleting the empty file.
 //! `decision()` consumers treat `Err(Decode)` on a known id as this
 //! recoverable state, not as an unknown id.
+
+mod skill_store;
 
 use std::fs;
 use std::io::{self, Write};
@@ -50,6 +56,8 @@ use tokio::task::{JoinError, spawn_blocking};
 use crate::hitl::{ApprovalDecision, DecisionId, ParkedApproval, ResolveError};
 
 use super::{ApprovalStore, DecisionRecord, ParkedApprovalRecord, SessionStoreError};
+
+pub use skill_store::FileSkillInvocationStore;
 
 /// Undecided approvals, one `{decision_id}.json` file per approval.
 const APPROVALS_DIR: &str = "approvals";

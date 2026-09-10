@@ -71,6 +71,10 @@ async fn callbacks_for(request_id: &str) -> StreamingCallbacks {
         response_content: ResponseContent::new(),
         model_name: "test/fake".to_string(),
         stream_shutdown_token: CancellationToken::new(),
+        // Both runs of a differential case share this, so the stream-start
+        // frames stay identical; rehydration is server-side request setup and
+        // has no agent-event producer.
+        rehydrated_skills: vec![],
     }
 }
 
