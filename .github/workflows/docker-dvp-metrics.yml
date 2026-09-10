@@ -94,6 +94,22 @@ jobs:
           [ -z "${PERIOD}" ] || args+=(--period "${PERIOD}")
           scripts/sync-docker-dvp-reports.sh "${args[@]}"
 
+      - name: Sync Docker DVP audience
+        env:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_TOKEN: ${{ secrets.DOCKER_TOKEN }}
+          POSTHOG_PROJECT_API_KEY: ${{ secrets.POSTHOG_PROJECT_API_KEY }}
+          POSTHOG_API_READ_KEY: ${{ secrets.POSTHOG_API_READ_KEY }}
+          POSTHOG_PROJECT_ID: ${{ vars.POSTHOG_PROJECT_ID }}
+          REPORT_TYPE: technographic
+          PERIOD: ${{ inputs.period }}
+          DRY_RUN: ${{ inputs.dry_run && '1' || '0' }}
+        run: |
+          set -euo pipefail
+          args=()
+          [ -z "${PERIOD}" ] || args+=(--period "${PERIOD}")
+          scripts/sync-docker-dvp-reports.sh "${args[@]}"
+
       - name: Report failure
         if: failure() && github.event_name == 'schedule'
         env:

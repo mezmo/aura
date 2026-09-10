@@ -20,7 +20,9 @@
 # DATA_DOWNLOADS counts image layer transfers. VERSION_CHECKS counts manifest
 # requests that transferred no layers, and EVENT_COUNT is their sum.
 #
-# Usage: sync-docker-dvp-reports.sh [--dry-run] [--period YYYY-MM-DD] [--selftest]
+# Usage: sync-docker-dvp-reports.sh [--dry-run] [--period YYYY-MM-DD]
+#                                   [--report trend|technographic] [--selftest]
+#   --report     - which report to read (default: trend)
 #   --period     - process only the report starting on this date
 #   --dry-run    - fetch and build payloads, print a summary, send nothing
 #   --selftest   - run the built-in assertions and exit
@@ -38,24 +40,24 @@
 #   DOCKER_NAMESPACE        - publisher namespace to read (default: mezmo)
 #   DOCKER_IMAGES           - space-separated repositories to keep (default: mezmo/aura)
 #   DVP_GRANULARITY         - weekly or monthly (default: weekly)
+#   REPORT_TYPE             - same as --report
 #   DOCKER_HUB_HOST         - Docker Hub API host (default: https://hub.docker.com)
 #   DRY_RUN                 - 1 is the same as --dry-run
 #   BATCH_SIZE              - events per PostHog /batch request (default: 1000)
 set -euo pipefail
 
-USAGE="usage: $0 [--dry-run] [--period YYYY-MM-DD] [--selftest]"
+USAGE="usage: $0 [--dry-run] [--period YYYY-MM-DD] [--report trend|technographic] [--selftest]"
 
 # Namespace for the version-5 event UUIDs. Permanent: it is part of every
 # event key ever sent.
 readonly UUID_NAMESPACE="6d3cea6d-9fef-46af-aec1-e9c705245832"
-readonly EVENT_NAME="docker_dvp_pulls"
 readonly SUBJECT_PREFIX="docker-dvp"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/posthog-snapshot.sh
 . "${SCRIPT_DIR}/lib/posthog-snapshot.sh"
 
-COUNT_PROPERTY="data_downloads"
+REPORT_TYPE="${REPORT_TYPE:-trend}"
 SELFTEST=0
 PERIOD=""
 DOCKER_NAMESPACE="${DOCKER_NAMESPACE:-mezmo}"
@@ -72,10 +74,23 @@ while [ $# -gt 0 ]; do
             if [ $# -lt 2 ]; then echo "error: --period needs a value" >&2; exit 1; fi
             PERIOD="$2"; shift 2 ;;
         --period=*) PERIOD="${1#--period=}"; shift ;;
+        --report)
+            if [ $# -lt 2 ]; then echo "error: --report needs a value" >&2; exit 1; fi
+            REPORT_TYPE="$2"; shift 2 ;;
+        --report=*) REPORT_TYPE="${1#--report=}"; shift ;;
         -h|--help) echo "${USAGE}" >&2; exit 0 ;;
         *) echo "${USAGE}" >&2; exit 1 ;;
     esac
 done
+
+# The two reports answer different questions and so become different events:
+# trend counts pulls, technographic counts the people and organisations behind
+# them. Both share everything else about how a report is fetched and filed.
+case "${REPORT_TYPE}" in
+    trend)          EVENT_NAME="docker_dvp_pulls";    COUNT_PROPERTY="data_downloads" ;;
+    technographic)  EVENT_NAME="docker_dvp_audience"; COUNT_PROPERTY="total_pullers" ;;
+    *) echo "error: --report must be trend or technographic (got '${REPORT_TYPE}')" >&2; exit 1 ;;
+esac
 
 require_tools() {
     local tool
@@ -138,9 +153,9 @@ list_reports() {
         echo "error: report catalogue returned ${status} for ${DOCKER_NAMESPACE}" >&2
         return 1
     fi
-    jq -r --arg gran "${DVP_GRANULARITY}" '
+    jq -r --arg gran "${DVP_GRANULARITY}" --arg type "${REPORT_TYPE}" '
         .reports[]
-        | select(.type == "trend")
+        | select(.type == $type)
         | (.url | split("/") | last) as $file
         | select($file | contains("_" + $gran + "_"))
         | ($file | capture("_(?<d>[0-9]{4})_(?<m>[0-9]{2})_(?<day>[0-9]{2})\\.csv")) as $p
@@ -170,8 +185,7 @@ period_end() {
 # Emit one compact JSON object per (repository, tag) in a report.
 #
 # The trend report breaks each repository down by tag, country, cloud provider
-# and client, so the rows are summed back up to one per tag: the other
-# dimensions are not what this records. Summing every tag returns the
+# and client. Country is summed back up; the rest are kept. Summing every tag returns the
 # repository totals the summary report states, so nothing is lost by reading
 # the trend report instead.
 #
@@ -180,26 +194,76 @@ period_end() {
 # after an escape sequence. These are the majority of pulls, so dropping them
 # would understate the repository badly.
 report_records() {
-    local url=$1 jwt=$2 period=$3 csv="${WORK_DIR}/report.csv" wanted
+    local url=$1 jwt=$2 period=$3 csv="${WORK_DIR}/report.csv"
     curl --silent --show-error --location --retry 3 --retry-delay 2 --max-time 120 \
         --fail --header "Authorization: Bearer ${jwt}" --output "${csv}" "${url}"
-    wanted=" ${DOCKER_IMAGES} "
+    case "${REPORT_TYPE}" in
+        trend)         trend_records "${csv}" "${period}" ;;
+        technographic) technographic_records "${csv}" "${period}" ;;
+    esac
+}
+
+trend_records() {
+    local csv=$1 period=$2 wanted=" ${DOCKER_IMAGES} "
     jq -Rs -c --arg wanted "${wanted}" --arg period "${period}" \
            --arg gran "${DVP_GRANULARITY}" '
         split("\n")[1:]
         | map(select(length > 0) | split(","))
         | map(. as $row | select($wanted | contains(" " + $row[3] + " ")))
-        | group_by(.[3] + "\u0000" + .[8])
+        | group_by(.[3] + "\u0000" + .[8] + "\u0000" + .[7] + "\u0000" + .[6])
         | map({repository: .[0][3],
                namespace: (.[0][3] | split("/")[0]),
                image: (.[0][3] | split("/")[1]),
                tag: (if .[0][8] == "\\\\N" then null else .[0][8] end),
                by_digest: (.[0][8] == "\\\\N"),
+               user_agent: .[0][7],
+               cloud_service_provider: .[0][6],
                granularity: $gran,
                period_start: $period,
                data_downloads: (map(.[9] | tonumber) | add),
                version_checks: (map(.[10] | tonumber) | add),
                pulls: (map(.[11] | tonumber) | add)})
+        | .[]' "${csv}"
+}
+
+# One event per image carrying its distinct puller and domain counts, plus one
+# per image it shares pullers with.
+#
+# TOTAL_PULLERS and TOTAL_DOMAINS are the deduplicated counts for the whole
+# period, which is the only place Docker reports them: the per-row unique
+# counts in the trend report cannot be added up, because one person pulling two
+# tags appears in both rows. They repeat on every row of this report, so the
+# image-level event carries them once and reporting takes max() rather than a
+# sum.
+technographic_records() {
+    local csv=$1 period=$2 wanted=" ${DOCKER_IMAGES} "
+    jq -Rs -c --arg wanted "${wanted}" --arg period "${period}" \
+           --arg gran "${DVP_GRANULARITY}" '
+        (split("\n")[1:]
+         | map(select(length > 0) | split(","))
+         | map(. as $row | select($wanted | contains(" " + $row[3] + " ")))) as $rows
+        | ($rows | group_by(.[3]) | map({
+              repository: .[0][3],
+              namespace: (.[0][3] | split("/")[0]),
+              image: (.[0][3] | split("/")[1]),
+              paired_image: null,
+              granularity: $gran,
+              period_start: $period,
+              total_pullers: (.[0][6] | tonumber),
+              total_domains: (.[0][9] | tonumber)}))
+          + ($rows | map({
+              repository: .[3],
+              namespace: (.[3] | split("/")[0]),
+              image: (.[3] | split("/")[1]),
+              paired_image: .[4],
+              granularity: $gran,
+              period_start: $period,
+              total_pullers: (.[6] | tonumber),
+              total_domains: (.[9] | tonumber),
+              paired_users: (.[5] | tonumber),
+              paired_domains: (.[8] | tonumber),
+              pct_users: (.[7] | tonumber),
+              pct_domains: (.[10] | tonumber)}))
         | .[]' "${csv}"
 }
 
@@ -209,8 +273,15 @@ report_records() {
 key_rows() {
     local rows=$1 uuids=$2 key
     local keys="${uuids}.keys"
-    jq -r '"docker-dvp|" + .repository + "|" + (.tag // "<digest>")
-           + "|" + .granularity + "|" + .period_start' "${rows}" > "${keys}"
+    case "${REPORT_TYPE}" in
+        trend)
+            jq -r '"docker-dvp|" + .repository + "|" + (.tag // "<digest>")
+                   + "|" + .user_agent + "|" + .cloud_service_provider
+                   + "|" + .granularity + "|" + .period_start' "${rows}" > "${keys}" ;;
+        technographic)
+            jq -r '"docker-dvp-audience|" + .repository + "|" + (.paired_image // "<all>")
+                   + "|" + .granularity + "|" + .period_start' "${rows}" > "${keys}" ;;
+    esac
     while IFS= read -r key; do
         uuid5 "${UUID_NAMESPACE}" "${key}"
     done < "${keys}" > "${uuids}"
@@ -297,7 +368,7 @@ CSV
 # Collect, send and verify one report as its own unit, so each period's events
 # carry the timestamp of the period they describe.
 sync_report() {
-    local period=$1 url=$2 jwt=$3 ends rows chunk chunks=0 events probe payload probes=0
+    local period=$1 url=$2 jwt=$3 ends rows chunk chunks=0 events probe payload probes=0 counted
 
     ends=$(period_end "${period}")
     report_records "${url}" "${jwt}" "${period}" > "${WORK_DIR}/rows.ndjson"
@@ -321,9 +392,11 @@ sync_report() {
         return 1
     fi
 
-    local downloads
-    downloads=$(jq -s '[.[].data_downloads] | add' "${WORK_DIR}/rows.ndjson")
-    echo "  ${period} through ${ends}: ${rows} row(s), ${downloads} download(s)"
+    # The counter differs per report, so the read-back total is summed over
+    # whichever property this report's events carry.
+    local counted
+    counted=$(jq -s --arg k "${COUNT_PROPERTY}" '[.[][$k]] | add' "${WORK_DIR}/rows.ndjson")
+    echo "  ${period} through ${ends}: ${rows} row(s), ${counted} ${COUNT_PROPERTY}"
 
     if [ "${DRY_RUN}" = 1 ]; then
         jq -c '.batch[0]' "${WORK_DIR}/payload.1.json"
@@ -342,7 +415,7 @@ sync_report() {
     if [ "${SKIP_VERIFY}" = 1 ]; then
         return 0
     fi
-    verify_snapshot "${ends}" "${rows}" "${downloads}" "${probes}"
+    verify_snapshot "${ends}" "${rows}" "${counted}" "${probes}"
 }
 
 main() {
