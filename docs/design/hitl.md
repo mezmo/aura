@@ -284,6 +284,12 @@ notify POST as a per-name overlay on the shared client's operator headers:
 per-row override, not client state, so two rows authenticate with their own
 credentials on every retry and after a store reopen.
 
+At rest, the file backend creates rows, decision envelopes, and parked
+documents owner-only (0600 files in 0700 directories). `resolve` writes the
+decision envelope without the row's egress headers, `list_pending` unlinks
+expired undecided rows, and a resume removes the envelopes it consumed. Redis
+rows carry a TTL of the remaining decision window instead.
+
 Registration-closed semantics: a mapped destination with no usable resolved
 value (request header absent, no explicit valid static fallback) fails the
 capture at route construction, and the park arm fails the gated call closed —

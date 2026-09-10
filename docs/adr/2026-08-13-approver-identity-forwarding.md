@@ -137,6 +137,13 @@ session store and on the wire of the one request they authenticate; events,
 logs, errors, and Debug carry names only; the parked checkpoint document
 carries neither.
 
+Addendum (2026-09-10). Each value's lifetime is bounded by its last use:
+egress headers leave the record at `resolve` (a decided id is never notified
+again), expired undecided rows are unlinked by the poll scan, and a resume
+removes the decision envelopes it consumed on every park-capable route. The
+file backend creates store files and parked documents owner-only, and a
+transport error renders without the webhook URL, which may embed a token.
+
 **Egress values ride the parked approval record.** The webhook route's
 `headers_from_request` mappings resolve at request-scoped runtime
 construction (where the route is built per request - the park arm never
