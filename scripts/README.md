@@ -282,7 +282,8 @@ The PostHog variables are the same as the other two snapshots.
 ## `sync-docker-dvp-reports.sh`
 
 ```
-sync-docker-dvp-reports.sh [--dry-run] [--period YYYY-MM-DD] [--selftest]
+sync-docker-dvp-reports.sh [--dry-run] [--period YYYY-MM-DD]
+                           [--report trend|technographic] [--selftest]
 ```
 
 Reads Docker Verified Publisher analytics reports and files them into PostHog.
@@ -298,10 +299,22 @@ period, so re-reading a report on any later day produces byte-identical events.
 Docker retains only the last few reports and nothing reconstructs one that ages
 out, which is the reason to run this daily even though reports appear weekly.
 
-Events are one per `(repository, tag)`. The trend report splits each tag
-further by country, cloud provider and client; those rows are summed back up,
-since the tag is what this records, and summing every tag reproduces the totals
-the summary report states.
+`--report trend` emits one event per `(repository, tag, user_agent,
+cloud_service_provider)` — 95 a week for `mezmo/aura`. Country is summed back
+up. Summing every group reproduces the totals the summary report states.
+
+The client and cloud provider are what separate a person from a pipeline:
+`containerd` and `buildkit` are never someone's laptop, and a pull from a cloud
+provider is infrastructure by definition. Neither is proof alone, so both are
+recorded rather than folded into a verdict.
+
+`--report technographic` answers "how many people", which the trend report
+cannot: its per-row unique counts cannot be added up, because one person
+pulling two tags appears in both rows. This report states `TOTAL_PULLERS` and
+`TOTAL_DOMAINS` deduplicated for the whole period — 55 users across 10 domains
+for `mezmo/aura` in the week of 2026-08-24. It emits one event per image
+carrying those totals, plus one per image its pullers also pull. The totals
+repeat on every row, so report them with `max()`, never `sum()`.
 
 Most pulls carry **no tag** — they are pulls by digest, which the export marks
 with a literal `\\N`. Those arrive as `tag: null` with `by_digest: true`. For
@@ -324,6 +337,7 @@ three double-counts.
 
 | Switch | Default | Effect |
 | --- | --- | --- |
+| `--report` / `REPORT_TYPE` | `trend` | Which report to read. `trend` counts pulls per tag, client and cloud provider; `technographic` counts the distinct people and organisations pulling. |
 | `--period` | every retained report | Process only the report starting on this date. |
 | `--dry-run` / `DRY_RUN=1` | off | Fetch and build payloads, print them, send nothing. Still needs Docker credentials, since the catalogue is not public. |
 | `--selftest` | off | Run the built-in assertions and exit. Reaches no network. |
