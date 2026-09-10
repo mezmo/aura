@@ -354,57 +354,70 @@ pub fn get_cumulative_tokens() -> u64 {
     prompt + completion
 }
 
-/// Tokens used to gauge context-window pressure: the reported context
-/// occupancy when available, otherwise the cumulative billed total as a
-/// pre-`aura.context_usage` fallback.
-fn context_pressure_tokens(cumulative_total: u64) -> u64 {
-    let occupancy = CONTEXT_USED.load(Ordering::Relaxed);
-    if occupancy > 0 {
-        occupancy
-    } else {
-        cumulative_total
-    }
-}
-
 /// Mark the occupancy reading as belonging to a previous turn.
 ///
 /// The reading itself is kept: it is the closest estimate available while the
-/// current turn streams, and dropping it would fall back to cumulative billed
-/// tokens, which exceed the window and blank the indicator. Decisions that must
-/// not act on a previous turn's context use
-/// [`fresh_context_fill_ratio`] instead.
+/// current turn streams, and dropping it would blank the indicator. Decisions
+/// that must not act on a previous turn's context use
+/// [`fresh_context_window_usage`] instead.
 pub fn begin_turn_context_tracking() {
     CONTEXT_USED_FRESH.store(false, Ordering::Relaxed);
 }
 
-/// Occupied fraction of the model's context window.
+/// Tokens occupying the model's context window, measured against that window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ContextWindowUsage {
+    pub used: u64,
+    pub window: NonZeroU64,
+}
+
+impl ContextWindowUsage {
+    /// Occupied fraction of the window.
+    pub fn fill(self) -> f64 {
+        self.used as f64 / self.window.get() as f64
+    }
+}
+
+/// Occupancy of the model's context window.
 ///
 /// `None` when either the occupancy or the window is unknown — no
 /// `aura.context_usage` has arrived, or neither it nor `aura.session_info`
-/// reported the model's window — which callers treat as "fall back to
-/// token-count thresholds".
-pub fn context_fill_ratio() -> Option<f64> {
-    let occupancy = CONTEXT_USED.load(Ordering::Relaxed);
-    let window = MODEL_CONTEXT_LIMIT.load(Ordering::Relaxed);
-    (occupancy > 0 && window > 0).then(|| occupancy as f64 / window as f64)
+/// reported the model's window. Cumulative billed tokens are never a
+/// substitute: they grow with every turn of every agent and say nothing about
+/// what the window currently holds.
+pub fn context_window_usage() -> Option<ContextWindowUsage> {
+    let used = CONTEXT_USED.load(Ordering::Relaxed);
+    let window = NonZeroU64::new(MODEL_CONTEXT_LIMIT.load(Ordering::Relaxed))?;
+    (used > 0).then_some(ContextWindowUsage { used, window })
 }
 
-/// [`context_fill_ratio`] restricted to a reading the current turn reported.
+/// [`context_window_usage`] restricted to a reading the current turn reported.
 ///
 /// `None` once a turn passes without an `aura.context_usage` event, so callers
-/// fall back to token-count thresholds rather than acting on a fill fraction
-/// that describes an earlier turn's context.
-pub fn fresh_context_fill_ratio() -> Option<f64> {
+/// do not act on a fill that describes an earlier turn's context.
+pub fn fresh_context_window_usage() -> Option<ContextWindowUsage> {
     if !CONTEXT_USED_FRESH.load(Ordering::Relaxed) {
         return None;
     }
-    context_fill_ratio()
+    context_window_usage()
 }
 
-/// Context-window pressure in tokens — used for auto-compaction decisions.
-/// Reflects actual context occupancy (not cumulative billed usage).
+/// Occupied fraction of the model's context window; see
+/// [`context_window_usage`].
+pub fn context_fill_ratio() -> Option<f64> {
+    context_window_usage().map(ContextWindowUsage::fill)
+}
+
+/// [`context_fill_ratio`] restricted to a reading the current turn reported;
+/// see [`fresh_context_window_usage`].
+pub fn fresh_context_fill_ratio() -> Option<f64> {
+    fresh_context_window_usage().map(ContextWindowUsage::fill)
+}
+
+/// Tokens occupying the model's context, as last reported by
+/// `aura.context_usage`; zero until a reading arrives.
 pub fn get_context_tokens() -> u64 {
-    context_pressure_tokens(get_cumulative_tokens())
+    CONTEXT_USED.load(Ordering::Relaxed)
 }
 
 /// Record context-window occupancy from an `aura.context_usage` event.
@@ -572,8 +585,9 @@ mod tests {
         assert_eq!(CONTEXT_USED.load(Ordering::Relaxed), 105_000);
         assert_eq!(context_fill_ratio(), Some(0.525));
 
-        // ...while compaction decisions see no usable reading and fall back.
+        // ...while compaction decisions see no usable reading.
         assert_eq!(fresh_context_fill_ratio(), None);
+        assert_eq!(fresh_context_window_usage(), None);
 
         // A reading from the current turn drives decisions again.
         set_context_window_usage(150_000, 5_000, Some(200_000));
