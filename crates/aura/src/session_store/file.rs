@@ -13,7 +13,8 @@
 //! - `resolve` refuses past the approval's `expires_at`, uniformly with an
 //!   unknown id; expiry is enforced only by `resolve`.
 //! - `resolve` *moves* the approval into the decision file rather than deleting
-//!   it: `get` returns the approval before and after the decision, `decision`
+//!   it, minus its egress headers (a decided id is never notified again):
+//!   `get` returns the approval before and after the decision, `decision`
 //!   returns the recorded decision, and both are retained until `remove`.
 //! - At-most-once `resolve` is the `File::create_new` claim on the decision
 //!   file: `AlreadyExists` reads as `NotFound`.
@@ -176,7 +177,7 @@ impl Inner {
         let id = canonical_id(id).map_err(ResolveError::Store)?;
 
         // Reading the approval before claiming avoids claiming unknown ids.
-        let record = match fs::read(self.approval_path(&id)) {
+        let mut record = match fs::read(self.approval_path(&id)) {
             Ok(bytes) => serde_json::from_slice::<ParkedApprovalRecord>(&bytes)
                 .map_err(|e| ResolveError::Store(decode_err(e)))?,
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
@@ -188,6 +189,7 @@ impl Inner {
         if chrono::Utc::now() > record.expires_at {
             return Err(ResolveError::NotFound);
         }
+        record.egress_headers = None;
         let payload = serde_json::to_vec(&ResolvedEntry {
             approval: record,
             decision: DecisionRecord::from(&decision),

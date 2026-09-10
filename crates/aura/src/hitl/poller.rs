@@ -1063,8 +1063,8 @@ mod tests {
         }
 
         /// The sentinel leak guard. Distinct egress and identity sentinels
-        /// are proven to reach ONLY the allowed store fields (the parked row's
-        /// `egress_headers`, the decision record's `identity`) and the
+        /// are proven to reach ONLY the allowed store fields (the undecided
+        /// row's `egress_headers`, the decision record's `identity`) and the
         /// intended HTTP headers (the notify POST's authorization), and to be
         /// absent from the decision-bus payload, lifecycle/SSE events,
         /// tracing and error text, and the run's serialized checkpoints (the
@@ -1156,15 +1156,14 @@ mod tests {
                 "identity never rides the notify POST: {notify}"
             );
 
-            // The store decision file holds BOTH allowed fields: the moved
-            // approval record keeps its egress headers, the decision record
-            // keeps the captured identity. (File backend: resolve moves the
-            // approval into `decisions/{id}.json`.)
+            // The store decision file holds the captured identity beside the
+            // decision and nothing of the egress: resolve moves the approval
+            // into `decisions/{id}.json` without its egress headers.
             let decision_file = store_root.join("decisions").join(format!("{id}.json"));
             let stored = std::fs::read_to_string(&decision_file).expect("decision file exists");
             assert!(
-                stored.contains(EGRESS),
-                "the parked row's egress headers persist in the store: {stored}"
+                !stored.contains(EGRESS),
+                "the egress credential outlived resolve: {stored}"
             );
             assert!(
                 stored.contains(IDENTITY),

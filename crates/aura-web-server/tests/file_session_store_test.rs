@@ -259,12 +259,15 @@ async fn approval_and_decision_are_retained_until_remove() {
 
 /// §2.5: `resolve` moves the approval into the decision file rather than
 /// deleting it — on disk the approval file is gone and the decision file
-/// carries both the approval record and the decision.
+/// carries the approval record, minus its egress headers, and the decision.
 #[tokio::test]
 async fn resolve_moves_the_approval_into_the_decision_file() {
     let dir = tempfile::tempdir().unwrap();
     let store = FileApprovalStore::open(dir.path()).unwrap();
-    let parked = make_parked("req-move", Duration::from_secs(60));
+    let mut parked = make_parked("req-move", Duration::from_secs(60));
+    let mut egress = reqwest::header::HeaderMap::new();
+    egress.insert("x-tenant-egress", "tenant-secret".parse().unwrap());
+    parked.egress_headers = Some(egress);
     let id = parked.request.decision_id;
     store.register(parked).await.unwrap();
 
@@ -280,12 +283,16 @@ async fn resolve_moves_the_approval_into_the_decision_file() {
             .exists()
     );
     let decision_path = dir.path().join("decisions").join(format!("{id}.json"));
-    let on_disk: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(decision_path).unwrap()).unwrap();
+    let raw = std::fs::read_to_string(decision_path).unwrap();
+    let on_disk: serde_json::Value = serde_json::from_str(&raw).unwrap();
     assert_eq!(on_disk["approval"]["decision_id"], id.to_string());
     assert_eq!(on_disk["approval"]["request_id"], "req-move");
     assert_eq!(on_disk["decision"]["approved"], true);
     assert_eq!(on_disk["decision"]["reason"], serde_json::Value::Null);
+    assert!(
+        !raw.contains("tenant-secret"),
+        "egress credential survived resolve"
+    );
 }
 
 /// §2.5: `cancel_request` removes undecided approvals by owner id and

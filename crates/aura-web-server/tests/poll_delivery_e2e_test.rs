@@ -640,8 +640,8 @@ async fn poll_flow_parks_notifies_and_resolves_with_the_run_still_parked() {
 
     // (4)+(5) The receiver decides; the reconciler's next poll resolves
     // durably with the captured approver identity beside the decision, and
-    // the approval record (with its egress value) carried into the resolved
-    // entry.
+    // the approval record carried into the resolved entry without its
+    // egress value.
     receiver.set_decided();
     let decision_record = wait_for_decision_file(&store_root).await;
     assert!(
@@ -649,8 +649,8 @@ async fn poll_flow_parks_notifies_and_resolves_with_the_run_still_parked() {
         "the decision record docks the poll-200's approver identity, got: {decision_record}"
     );
     assert!(
-        decision_record.contains(EGRESS_VALUE),
-        "the resolved entry carries the approval row's egress value, got: {decision_record}"
+        !decision_record.contains(EGRESS_VALUE),
+        "the egress value outlived resolve, got: {decision_record}"
     );
 
     server.stop().await;
