@@ -1,0 +1,1 @@
+slice=B2 from=bc6a9509 sel=memory.rs:0 C14 deletion of C7-touched memory tests (placed after C7 to avoid a pre-carrier rewrite)
