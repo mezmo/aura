@@ -2513,11 +2513,14 @@ impl StreamHandler for ReplStreamHandler {
     ) {
         // Orchestration workers report their own sub-context; only the
         // conversation-level agent's occupancy belongs on the status bar, and
-        // worker completion order is nondeterministic.
-        if agent_id == CONVERSATION_AGENT_ID {
-            set_context_window_usage(context_tokens, response_tokens, context_window);
-            update_status_bar();
+        // worker completion order is nondeterministic. The display event has
+        // no agent id and a replay applies every entry to the meter, so only
+        // the conversation agent's reading is recorded.
+        if agent_id != CONVERSATION_AGENT_ID {
+            return;
         }
+        set_context_window_usage(context_tokens, response_tokens, context_window);
+        update_status_bar();
         if let Ok(mut events) = self.turn_events.lock() {
             events.push(DisplayEvent::ContextUsage {
                 context_tokens,
