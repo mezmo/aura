@@ -31,7 +31,7 @@ use tokio::io::AsyncWriteExt;
 
 use crate::arbiter::HeldGuard;
 use crate::claim::GrantedClaim;
-use crate::epoch::Epoch;
+use crate::epoch::{Epoch, epoch_dir};
 use crate::identity::{HolderId, OpId, PodId, SessionId, TurnId};
 use crate::lease::{
     BeatInterval, HeartbeatLease, LeaseLost, LeaseTtl, SelfFenceMargin, WriteCapability,
@@ -684,7 +684,7 @@ pub struct FencedRun {
 }
 
 impl FencedRun {
-    /// The fenced run directory, crate-internal (the write/read/scratch
+    /// The fenced run directory, crate-internal (the write/scratch
     /// paths and the sweep derive from it; it never crosses the public
     /// boundary).
     #[must_use]
@@ -708,10 +708,12 @@ impl FencedRun {
 
     /// Read a manifest-referenced artifact, verifying its digest on
     /// first read. Miss handling is internal: `ENOENT` retries inside
-    /// the propagation window, then escalates through the repair lane
-    /// (`refresh_dir`, then `force_cure`); a digest mismatch fails loud
-    /// immediately (write-once ⇒ mismatch is corruption, not
-    /// propagation).
+    /// the propagation window; once the window closes, the repair lane
+    /// escalates (`refresh_dir`, then `force_cure`) against the
+    /// artifact's recorded epoch dir — the missing bytes live under the
+    /// epoch that committed them — with one read-back per tier; a
+    /// digest mismatch fails loud immediately (write-once ⇒ mismatch
+    /// is corruption, not propagation).
     ///
     /// # Errors
     /// [`ReadError`] after the window and the repair lane are exhausted,
@@ -744,27 +746,31 @@ impl FencedRun {
                     .into());
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                    if Instant::now() >= deadline {
+                    if Instant::now() < deadline {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
+                    // The window closed on a missing artifact: fire one
+                    // repair tier per pass (Pg only), the next pass's
+                    // read as that tier's read-back. Escalation targets
+                    // the artifact's recorded epoch dir, where the
+                    // missing bytes were committed. Local mode has no
+                    // lane and fails loud.
+                    let Some(repair) = self.lock.repair_lane() else {
                         return Err(ReadMiss::NotFound(path.clone()).into());
-                    }
-                    // Escalate the repair lane once per tier between
-                    // retries (Pg only); a cure's own failure is benign —
-                    // the window keeps retrying, then fails loud. Local
-                    // mode has no lane and simply window-retries.
-                    if let Some(repair) = self.lock.repair_lane() {
-                        match escalation {
-                            0 => {
-                                let _ = repair.refresh_dir(self.run_dir()).await;
-                                escalation = 1;
-                            }
-                            1 => {
-                                let _ = repair.force_cure(self.run_dir()).await;
-                                escalation = 2;
-                            }
-                            _ => {}
+                    };
+                    let dir = epoch_dir(self.lock.session_root(), path.epoch());
+                    match escalation {
+                        0 => {
+                            let _ = repair.refresh_dir(&dir).await;
+                            escalation = 1;
                         }
+                        1 => {
+                            let _ = repair.force_cure(&dir).await;
+                            escalation = 2;
+                        }
+                        _ => return Err(ReadMiss::NotFound(path.clone()).into()),
                     }
-                    tokio::time::sleep(Duration::from_millis(100)).await;
                 }
                 Err(err) => return Err(err.into()),
             }
@@ -1502,7 +1508,7 @@ mod tests {
     use crate::arbiter::SessionArbiter;
     use crate::config::AdmissionEnv;
     use crate::lease::ClaimLeaseSource;
-    use crate::repair::build_repair_lane;
+    use crate::repair::{RepairError, build_repair_lane};
     use crate::store::scripted::ScriptedStore;
 
     /// A wrong `write_artifact` that skips the private-delta record still
@@ -1621,6 +1627,267 @@ mod tests {
             .await
             .expect("run dir exists");
         run_dir
+    }
+
+    /// The cure a [`RecordingLane`] publishes on — the timing oracle for
+    /// the read path's escalation order.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Cure {
+        Refresh,
+        ForceCure,
+    }
+
+    /// A repair lane recording every call in order; on a scripted cure
+    /// it publishes bytes to a target path, so a test decides exactly
+    /// which read-back succeeds.
+    struct RecordingLane {
+        calls: Mutex<Vec<(Cure, PathBuf)>>,
+        publish_on: Option<Cure>,
+        publish_target: PathBuf,
+        publish_bytes: Vec<u8>,
+    }
+
+    impl RecordingLane {
+        fn new(publish_on: Option<Cure>, publish_target: PathBuf, publish_bytes: &[u8]) -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                publish_on,
+                publish_target,
+                publish_bytes: publish_bytes.to_vec(),
+            }
+        }
+
+        async fn record(&self, cure: Cure, dir: &Path) -> Result<(), RepairError> {
+            self.calls
+                .lock()
+                .expect("calls mutex")
+                .push((cure, dir.to_path_buf()));
+            if self.publish_on == Some(cure) {
+                tokio::fs::write(&self.publish_target, &self.publish_bytes)
+                    .await
+                    .expect("publish target writable");
+            }
+            Ok(())
+        }
+
+        fn calls(&self) -> Vec<(Cure, PathBuf)> {
+            self.calls.lock().expect("calls mutex").clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RepairLane for RecordingLane {
+        async fn refresh_dir(&self, dir: &Path) -> Result<(), RepairError> {
+            self.record(Cure::Refresh, dir).await
+        }
+
+        async fn force_cure(&self, dir: &Path) -> Result<(), RepairError> {
+            self.record(Cure::ForceCure, dir).await
+        }
+    }
+
+    /// A manifest with one committed entry for `content` at `path`.
+    fn committed_manifest(path: &ArtifactPath, content: &[u8], epoch: Epoch) -> Manifest {
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&Sha256::digest(content)[..]);
+        let mut manifest = Manifest::empty();
+        manifest
+            .declare(
+                path.clone(),
+                ManifestEntry {
+                    digest: Digest::from_bytes(hash),
+                    turn: TurnId::new(),
+                    epoch,
+                    bytes: content.len() as u64,
+                },
+            )
+            .expect("fresh manifest declares");
+        manifest
+    }
+
+    /// Assemble a Pg-backed [`FencedRun`] holding `epoch` with a scripted
+    /// manifest and repair lane, so a read can reference artifacts
+    /// committed under an earlier epoch than the reader's own.
+    fn pg_fenced_run(
+        session_root: PathBuf,
+        epoch: Epoch,
+        manifest: Manifest,
+        repair: Arc<RecordingLane>,
+        window: Duration,
+    ) -> FencedRun {
+        let session = SessionId::parse("pg-session").expect("session id parses");
+        let turn = TurnId::new();
+        let holder = HolderId::mint();
+        let pod = PodId::parse("pod-0").expect("pod id parses");
+        let arbiter = SessionArbiter::new()
+            .try_acquire(&session)
+            .expect("fresh arbiter admits")
+            .confirm();
+        let lease = HeartbeatLease::static_from(ClaimLeaseSource {
+            session: session.clone(),
+            turn,
+            epoch,
+            holder,
+        });
+        let store: Arc<dyn ClaimStore> = Arc::new(ScriptedStore::default());
+        let release: ReleaseAction = Box::new(|| Box::pin(async { Ok(()) }));
+        let run_dir = epoch_dir(&session_root, epoch);
+        let lock = HeldLock::from_parts(HeldParts {
+            session,
+            turn,
+            epoch,
+            holder,
+            pod,
+            session_root,
+            manifest,
+            backend: Backend::Pg { store, repair },
+            propagation_window: window,
+            release,
+            arbiter,
+            lease,
+        });
+        FencedRun {
+            issued: Mutex::new(BTreeSet::new()),
+            delta: Mutex::new(Manifest::empty()),
+            lock,
+            run_dir,
+        }
+    }
+
+    /// The epoch-k artifact / epoch-(k+1) reader state these frames
+    /// exercise: the reader holds `e2` while the manifest references an
+    /// artifact committed under `e1` whose bytes have not propagated.
+    struct ReadFrame {
+        _root: tempfile::TempDir,
+        run: FencedRun,
+        lane: Arc<RecordingLane>,
+        committed_dir: PathBuf,
+        path: ArtifactPath,
+    }
+
+    async fn read_frame(publish_on: Option<Cure>, window: Duration) -> ReadFrame {
+        let root = tempfile::tempdir().expect("temp root");
+        let session_root = root.path().join("pg-session");
+        let e1 = Epoch::initial();
+        let e2 = e1.next().expect("epoch successor");
+        let committed_dir = epoch_dir(&session_root, e1);
+        tokio::fs::create_dir_all(&committed_dir)
+            .await
+            .expect("committed epoch dir exists");
+        tokio::fs::create_dir_all(epoch_dir(&session_root, e2))
+            .await
+            .expect("run dir exists");
+        let path = ArtifactPath::parse("e1/page").expect("artifact path parses");
+        let content = b"committed bytes";
+        let manifest = committed_manifest(&path, content, e1);
+        let lane = Arc::new(RecordingLane::new(
+            publish_on,
+            committed_dir.join("page"),
+            content,
+        ));
+        let run = pg_fenced_run(session_root, e2, manifest, lane.clone(), window);
+        ReadFrame {
+            _root: root,
+            run,
+            lane,
+            committed_dir,
+            path,
+        }
+    }
+
+    #[tokio::test]
+    async fn read_repair_targets_the_recorded_epoch_dir() {
+        let frame = read_frame(Some(Cure::Refresh), Duration::ZERO).await;
+        let read = frame
+            .run
+            .read_artifact(&frame.path)
+            .await
+            .expect("refresh publishes, its read-back hits");
+        assert_eq!(read.bytes(), b"committed bytes");
+        assert_eq!(
+            frame.lane.calls(),
+            vec![(Cure::Refresh, frame.committed_dir.clone())],
+            "the cure targets the committing epoch's dir, not the run dir"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_second_tier_also_targets_the_recorded_epoch_dir() {
+        let frame = read_frame(Some(Cure::ForceCure), Duration::ZERO).await;
+        let read = frame
+            .run
+            .read_artifact(&frame.path)
+            .await
+            .expect("force cure publishes, its read-back hits");
+        assert_eq!(read.bytes(), b"committed bytes");
+        assert_eq!(
+            frame.lane.calls(),
+            vec![
+                (Cure::Refresh, frame.committed_dir.clone()),
+                (Cure::ForceCure, frame.committed_dir.clone()),
+            ],
+            "both tiers target the committing epoch's dir, in order"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_stays_in_the_window_before_escalating() {
+        let frame = read_frame(None, Duration::from_secs(5)).await;
+        let target = frame.committed_dir.join("page");
+        let writer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            tokio::fs::write(target, b"committed bytes")
+                .await
+                .expect("propagation delivers");
+        });
+        let read = frame
+            .run
+            .read_artifact(&frame.path)
+            .await
+            .expect("the window retry finds the propagated bytes");
+        assert_eq!(read.bytes(), b"committed bytes");
+        writer.await.expect("writer joins");
+        assert!(
+            frame.lane.calls().is_empty(),
+            "no escalation fires inside the propagation window"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_escalation_is_bounded_then_fails_loud() {
+        let frame = read_frame(None, Duration::ZERO).await;
+        let err = frame
+            .run
+            .read_artifact(&frame.path)
+            .await
+            .expect_err("nothing publishes: the read exhausts");
+        assert!(matches!(err, ReadError::Miss(ReadMiss::NotFound(_))));
+        assert_eq!(
+            frame.lane.calls(),
+            vec![
+                (Cure::Refresh, frame.committed_dir.clone()),
+                (Cure::ForceCure, frame.committed_dir.clone()),
+            ],
+            "each tier fires exactly once before the loud failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_corruption_fails_loud_without_repair() {
+        let frame = read_frame(None, Duration::from_secs(5)).await;
+        tokio::fs::write(frame.committed_dir.join("page"), b"tampered bytes")
+            .await
+            .expect("corrupt bytes land");
+        let err = frame
+            .run
+            .read_artifact(&frame.path)
+            .await
+            .expect_err("a digest mismatch is corruption");
+        assert!(matches!(err, ReadError::Miss(ReadMiss::Corrupt { .. })));
+        assert!(
+            frame.lane.calls().is_empty(),
+            "corruption is never escalated as propagation"
+        );
     }
 
     #[tokio::test]
