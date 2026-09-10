@@ -179,6 +179,12 @@ pub enum ApprovalError {
     CaptureFailed(#[from] crate::approver_headers::CaptureError),
 }
 
+impl From<reqwest::Error> for ApprovalError {
+    fn from(err: reqwest::Error) -> Self {
+        Self::Transport(err.without_url().to_string())
+    }
+}
+
 /// A decision as seen by the config gate.
 ///
 /// An enum, not a product type: only the [`GateDecision::Approved`] variant
@@ -877,7 +883,7 @@ impl WebhookClient {
         let post = self.build_approval_post(request, timeout, None)?;
         match post.send().await {
             Err(e) if e.is_timeout() => Ok(WebhookReply::TimedOut { waited: timeout }),
-            Err(e) => Err(ApprovalError::Transport(e.to_string())),
+            Err(e) => Err(e.into()),
             Ok(resp) => {
                 let status = resp.status();
                 if !status.is_success() {
@@ -897,7 +903,7 @@ impl WebhookClient {
                             Err(e) if e.is_timeout() => {
                                 return Ok(WebhookReply::TimedOut { waited: timeout });
                             }
-                            Err(e) => return Err(ApprovalError::Transport(e.to_string())),
+                            Err(e) => return Err(e.into()),
                         };
                         let verified = Self::verify_decision_response(
                             hmac,
@@ -952,7 +958,7 @@ impl WebhookClient {
         };
         let post = self.build_approval_post(request, poll.request_timeout, row_headers)?;
         match post.send().await {
-            Err(e) => Err(ApprovalError::Transport(e.to_string())),
+            Err(e) => Err(e.into()),
             Ok(resp) => {
                 let status = resp.status();
                 if status.is_success() {
@@ -1001,8 +1007,7 @@ impl WebhookClient {
             .query(&[("decision_id", decision_id.to_string())])
             .timeout(poll.request_timeout)
             .send()
-            .await
-            .map_err(|e| ApprovalError::Transport(e.to_string()))?;
+            .await?;
 
         // The status contract is exact: 200 carries (or withholds) a
         // decision, 404/204 mean pending. Any other status, including other
@@ -1025,10 +1030,7 @@ impl WebhookClient {
         // Unlike the sync leg there is no decision-shaped timeout outcome to
         // preserve, so a timeout firing mid-body download is a plain
         // transport fault.
-        let body = resp
-            .bytes()
-            .await
-            .map_err(|e| ApprovalError::Transport(e.to_string()))?;
+        let body = resp.bytes().await?;
         let verified = match self.egress_hmac()? {
             Some(hmac) => {
                 Self::verify_decision_response(hmac, &response_headers, body, decision_id)?
@@ -2845,6 +2847,24 @@ mod tests {
             assert!(
                 matches!(err, ApprovalError::Transport(_)),
                 "expected Transport, got {err:?}"
+            );
+        }
+
+        /// A transport fault renders without its URL: a token embedded in
+        /// the webhook URL must not reach the reconciler's warn log.
+        #[tokio::test]
+        async fn transport_fault_omits_the_url() {
+            let url = "http://127.0.0.1:1/hook?token=SECRET";
+            let client =
+                loopback_poll_client(url, EgressSigning::Disabled, url, Duration::from_secs(1));
+            let err = client
+                .notify(&test_request(DecisionId::generate()), None)
+                .await
+                .expect_err("a refused connection must fault");
+            let rendered = err.to_string();
+            assert!(
+                !rendered.contains("SECRET") && !rendered.contains("127.0.0.1"),
+                "transport error leaked the url: {rendered}"
             );
         }
 
