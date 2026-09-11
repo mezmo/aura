@@ -412,7 +412,6 @@ impl Config {
         if let Some(hitl) = &self.hitl
             && let DecisionRouteConfig::Webhook {
                 delivery: WebhookDelivery::Poll,
-                headers_from_request,
                 poll_interval_secs,
                 ..
             } = &hitl.route
@@ -424,14 +423,6 @@ impl Config {
                         .to_string(),
                 ));
             }
-            if !headers_from_request.is_empty() {
-                return Err(crate::ConfigError::Validation(
-                    "`hitl.route.headers_from_request` is unsupported with \
-                     `hitl.route.delivery = \"poll\"`: request-derived headers cannot be \
-                     reconstructed by the background reconciler after a restart"
-                        .to_string(),
-                ));
-            }
             if *poll_interval_secs == 0 {
                 return Err(crate::ConfigError::Validation(
                     "`hitl.route.poll_interval_secs` must be greater than zero: \
@@ -439,11 +430,6 @@ impl Config {
                         .to_string(),
                 ));
             }
-            return Err(crate::ConfigError::Validation(
-                "`hitl.route.delivery = \"poll\"` is not enabled in this build; use \
-                 `delivery = \"sync\"`"
-                    .to_string(),
-            ));
         }
 
         if let (Some(hitl), Some(orch)) = (
@@ -1392,18 +1378,17 @@ mode = "conversational"
         );
     }
 
+    /// Poll delivery + `headers_from_request` is valid: the resolved
+    /// values are captured at request-scoped route construction and
+    /// persisted on the parked approval record, so the background
+    /// reconciler does NOT need to reconstruct them after a restart.
     #[test]
-    fn validate_rejects_poll_delivery_with_headers_from_request() {
-        let err = crate::load_config_from_str(&poll_config_toml(
+    fn validate_accepts_poll_delivery_with_headers_from_request() {
+        crate::load_config_from_str(&poll_config_toml(
             true,
             "delivery = \"poll\"\nheaders_from_request = { \"authorization\" = \"authorization\" }",
         ))
-        .expect_err("headers_from_request with poll delivery must be rejected");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("hitl.route.headers_from_request"),
-            "error must name the key: {msg}"
-        );
+        .expect("headers_from_request with poll delivery is valid: values persist at rest");
     }
 
     #[test]
@@ -1420,21 +1405,16 @@ mode = "conversational"
         );
     }
 
-    /// Until the poll path lands, an otherwise valid poll route is refused at
-    /// boot, naming the knob and the way out.
+    /// `tool_headers_from_response` (approver identity) stays allowed with
+    /// poll delivery.
     #[test]
-    fn validate_refuses_poll_delivery_until_the_poll_path_lands() {
-        let err = crate::load_config_from_str(&poll_config_toml(
+    fn validate_accepts_poll_delivery_with_park() {
+        crate::load_config_from_str(&poll_config_toml(
             true,
             "delivery = \"poll\"\n\
              tool_headers_from_response = { \"X-Forwarded-User\" = \"X-Approver-Id\" }",
         ))
-        .expect_err("poll delivery is refused until the poll path lands");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("not enabled") && msg.contains("delivery = \"sync\""),
-            "unexpected error: {msg}"
-        );
+        .expect("poll delivery with park mode and no request-derived headers is valid");
     }
 
     #[test]

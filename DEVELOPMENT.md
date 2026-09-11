@@ -131,10 +131,12 @@ make test-integration-stdio-local
 # set AURA_TEST_REDIS_URL and run the cargo command directly.
 make test-integration-session-store-local
 
-# HITL header-forwarding tests (local only; needs mock-mcp up, same as the
-# base suite, but each test case spawns and tears down its own
-# aura-web-server against a generated per-case config, so there is no
-# separate -up/-down aura-web-server step).
+# HITL header-forwarding and poll-delivery e2e tests (local only; needs
+# mock-mcp up plus OPENAI_API_KEY, same as the base suite, but each test
+# case spawns and tears down its own aura-web-server against a generated
+# per-case config, so there is no separate -up/--down aura-web-server
+# step). The target runs the header-forwarding suite, then the
+# poll-delivery e2e suite.
 make test-integration-hitl-local
 ```
 
@@ -156,7 +158,7 @@ Integration tests run single-threaded (`--test-threads=1`) due to LLM API rate l
 | `integration-orchestration-sre` | SRE orchestration (requires k8s-sre-mcp server config)   |
 | `integration-scratchpad`        | Scratchpad (separate from parent `integration`; requires scratchpad-test-mcp server config) |
 | `integration-session-store`     | Redis/Valkey session store (separate from parent `integration`; requires a live Redis/Valkey via `AURA_TEST_REDIS_URL`) |
-| `integration-hitl-header-forwarding` | HITL approver header forwarding (separate from parent `integration`; spawns a per-case aura-web-server) |
+| `integration-hitl-header-forwarding` | HITL approver header forwarding + poll-delivery e2e (separate from parent `integration`; spawns a per-case aura-web-server) |
 | `integration-vector`            | Vector store / RAG (requires external Qdrant)            |
 
 Example, run only the streaming tests:
