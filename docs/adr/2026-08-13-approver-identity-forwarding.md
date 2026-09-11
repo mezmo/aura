@@ -179,6 +179,15 @@ none. Redacted `Debug` carriers are mandatory on every new carrier (the
 `ApproverHeaders` precedent): `PollOutcome`'s response headers and both
 storage records print names only.
 
+The config-surface consequence: `delivery = "poll"` combined with
+`headers_from_request` is valid configuration and is covered by a
+config-validation test. The other two refusals stand: poll without
+`[hitl.park].enabled`, and a plaintext `http://` URL with an HMAC secret
+(extended to `poll_url`). Poll tuning - `poll_url`, `poll_interval_secs`,
+`poll_request_timeout_secs` - is deliberately fingerprint-COMPATIBLE; the
+config fingerprint carries `"delivery"` only, and credential values never
+enter it.
+
 Mechanism detail: [docs/design/hitl.md](../design/hitl.md), the storage
 records section.
 
