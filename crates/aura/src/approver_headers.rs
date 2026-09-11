@@ -14,9 +14,7 @@ use reqwest::header::{HeaderMap, HeaderName};
 ///
 /// A value of this type exists only for an approved webhook decision whose
 /// mapped response headers were all present and valid; a partial capture
-/// is unrepresentable (construction fails closed). Construction is
-/// crate-private: the webhook client's gate-scoped path is the only
-/// producer.
+/// is unrepresentable (construction fails closed, crate-private).
 #[derive(Clone)]
 pub struct ApproverHeaders {
     /// Validated override pairs, keys lowercased. Keys serve as the audit surface (names only); no separate name list exists.
@@ -38,6 +36,15 @@ impl ApproverHeaders {
         for (outbound, response_name) in mapping.iter() {
             match response_headers.get(response_name) {
                 Some(value) => {
+                    // A parsed `HeaderValue` may still carry opaque bytes
+                    // outside visible ASCII; the identity is persisted as
+                    // text, so such a value fails the capture closed rather
+                    // than the later projection.
+                    if value.to_str().is_err() {
+                        return Err(CaptureError::InvalidValue {
+                            name: outbound.to_owned(),
+                        });
+                    }
                     // The outbound name is a validated lowercase header name
                     // by construction of `ToolHeaderMappings`.
                     let name = HeaderName::from_bytes(outbound.as_bytes())
@@ -57,6 +64,27 @@ impl ApproverHeaders {
     /// The captured outbound header names (never values), lowercased.
     pub fn captured_names(&self) -> impl Iterator<Item = &str> {
         self.headers.keys().map(HeaderName::as_str)
+    }
+
+    /// The captured pairs as plain `(lowercased name, value)` strings — the
+    /// storage projection the decision record persists. Values are visible
+    /// ASCII by construction (`from_captured` rejects any other value), so
+    /// `to_str` cannot fail.
+    pub(crate) fn to_pair_map(&self) -> std::collections::BTreeMap<String, String> {
+        crate::webhook_utils::header_map_to_pairs(&self.headers)
+    }
+
+    /// Restore a captured identity from its stored pair map: every name and
+    /// value must be a valid header pair, so a corrupted record fails the
+    /// decode instead of fabricating a partial identity. Keys are stored
+    /// lowercased (the capture convention); a non-lowercase name is still
+    /// valid per HTTP and lands normalized by `HeaderName`.
+    pub(crate) fn from_pairs(
+        pairs: impl IntoIterator<Item = (String, String)>,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            headers: crate::webhook_utils::pairs_to_header_map(pairs)?,
+        })
     }
 
     /// Apply the overrides to an outbound request builder as per-request
@@ -96,18 +124,20 @@ impl Eq for ApproverHeaders {}
 /// Capture-time failures: the approved webhook response could not yield
 /// the configured approver headers (fail closed).
 ///
-/// The `names` payload is diagnostic-only text for the error message and
-/// the event-level audit signal: always non-empty by construction (capture
-/// fails only when at least one name is missing), lowercased outbound
-/// header names, never values, and no domain logic branches on it.
+/// The payload is diagnostic-only text for the error message and the
+/// event-level audit signal: lowercased outbound header names, never
+/// values, and no domain logic branches on it.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CaptureError {
-    /// Mapped response headers absent from the approved response. Invalid
-    /// values cannot occur here: capture reads a parsed `HeaderMap`, whose
-    /// values are already syntactically valid; invalid outbound names are
-    /// rejected earlier, at config parse.
+    /// Mapped response headers absent from the approved response.
     #[error("approver identity capture failed: response missing mapped headers {names:?}")]
     MissingHeaders { names: Vec<String> },
+    /// A mapped response header whose value is not visible ASCII. The name
+    /// is the outbound header name; the value is never carried.
+    #[error(
+        "approver identity capture failed: header {name} carries a value outside visible ASCII"
+    )]
+    InvalidValue { name: String },
 }
 
 /// Application-time failures at the execution seam (double override,
@@ -288,6 +318,33 @@ pub(crate) mod tests {
         assert_eq!(
             captured.headers.get_all("x-forwarded-user").iter().count(),
             1
+        );
+    }
+
+    /// A mapped response header carrying bytes outside visible ASCII fails
+    /// the capture closed, naming the outbound header and never its value.
+    #[test]
+    fn non_ascii_value_fails_the_capture_closed() {
+        let mut response_headers = HeaderMap::new();
+        response_headers.insert(
+            "x-approver-id",
+            reqwest::header::HeaderValue::from_bytes(b"s3cr\xfft-value").unwrap(),
+        );
+        let err = ApproverHeaders::from_captured(
+            &mappings(&[("x-forwarded-user", "x-approver-id")]),
+            &response_headers,
+        )
+        .expect_err("a value outside visible ASCII must not be captured");
+
+        assert_eq!(
+            err,
+            CaptureError::InvalidValue {
+                name: "x-forwarded-user".to_owned(),
+            }
+        );
+        assert!(
+            !err.to_string().contains("s3cr"),
+            "the value never leaks: {err}"
         );
     }
 

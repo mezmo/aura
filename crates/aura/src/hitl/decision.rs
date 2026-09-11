@@ -63,6 +63,67 @@ pub enum ApprovalDecision {
     Denied { reason: Option<String> },
 }
 
+/// A decision plus the approver identity captured alongside it.
+#[derive(Clone, PartialEq, Eq)]
+pub enum ResolvedDecision {
+    Approved {
+        /// Captured approver identity.
+        identity: Option<crate::approver_headers::ApproverHeaders>,
+    },
+    Denied {
+        reason: Option<String>,
+    },
+}
+
+impl ResolvedDecision {
+    /// An approved decision with its captured identity.
+    #[must_use]
+    pub fn approved(identity: Option<crate::approver_headers::ApproverHeaders>) -> Self {
+        Self::Approved { identity }
+    }
+
+    /// The credential-free decision, the only part that reaches the bus, the
+    /// wake, and the events.
+    #[must_use]
+    pub fn decision(&self) -> ApprovalDecision {
+        match self {
+            Self::Approved { .. } => ApprovalDecision::Approved,
+            Self::Denied { reason } => ApprovalDecision::Denied {
+                reason: reason.clone(),
+            },
+        }
+    }
+}
+
+impl From<ApprovalDecision> for ResolvedDecision {
+    fn from(decision: ApprovalDecision) -> Self {
+        match decision {
+            ApprovalDecision::Approved => Self::Approved { identity: None },
+            ApprovalDecision::Denied { reason } => Self::Denied { reason },
+        }
+    }
+}
+
+impl std::fmt::Debug for ResolvedDecision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // Identity values are credentials: names only, the ApproverHeaders
+            // precedent.
+            Self::Approved { identity } => f
+                .debug_struct("Approved")
+                .field(
+                    "identity_names",
+                    &identity
+                        .as_ref()
+                        .map(crate::approver_headers::ApproverHeaders::captured_names)
+                        .map(Iterator::collect::<Vec<_>>),
+                )
+                .finish(),
+            Self::Denied { reason } => f.debug_struct("Denied").field("reason", reason).finish(),
+        }
+    }
+}
+
 /// Why a parked approval was cancelled rather than decided or timed out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum CancelReason {
