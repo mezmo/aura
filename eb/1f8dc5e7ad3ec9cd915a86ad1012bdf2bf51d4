@@ -1,1 +1,1 @@
-slice=B1 from=bbd9a216 sel=poller.rs:0-4,protocol.rs:all,route.rs:0,1,2,4,5,7,8 C9 envelope; ResolvedDecision::from assertion rewritten to ApprovalDecision (B2 re-migrates); poller:5-8,route:3,6 to B2; e2e to C
+slice=B1 from=344c835c round=2 reword nightly-rebase
