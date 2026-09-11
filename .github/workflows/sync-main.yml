@@ -9,6 +9,13 @@ on:
     # GitHub runs schedule and workflow_dispatch only from the default
     # branch, so this file has no effect until it is on main.
     - cron: "41 */6 * * *"
+  # semantic-release pushes the version commit and tag before it publishes the
+  # release, so main is complete by the time this fires. The schedule alone
+  # would leave the channels numbering themselves below the new stable version
+  # for up to six hours. `released` skips beta's prereleases, which do not
+  # move main.
+  release:
+    types: [released]
   workflow_dispatch:
     inputs:
       target:
@@ -47,7 +54,9 @@ jobs:
           # so neither the CLA check nor pr-target-branch runs on it. Jenkins
           # runs off webhooks and is unaffected.
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
+          # `gh pr` resolves the repository from the local git remote, and this
+          # job has no checkout. It also supplies {owner}/{repo} to `gh api`.
+          GH_REPO: ${{ github.repository }}
           TARGET: ${{ matrix.target }}
           REQUESTED: ${{ github.event.inputs.target || 'all' }}
           DESIGN_DOC: "https://github.com/mezmo/aura/blob/main/docs/design/release-channels.md"
@@ -63,14 +72,14 @@ jobs:
           # inline would read a network or auth error as a missing branch and
           # report a green no-op. Exact name match, because a ref pattern also
           # matches refs/heads/hotfix/$TARGET.
-          branches="$(gh api "repos/${REPO}/branches?per_page=100" --paginate --jq '.[].name')"
+          branches="$(gh api "repos/{owner}/{repo}/branches?per_page=100" --paginate --jq '.[].name')"
           if ! printf '%s\n' "$branches" | grep -Fxq "$TARGET"; then
             echo "No $TARGET branch on the remote; nothing to sync."
             exit 0
           fi
 
           # compare/{base}...{head} reports head's position relative to base.
-          compare() { gh api "repos/${REPO}/compare/${1}...${2}" --jq .status; }
+          compare() { gh api "repos/{owner}/{repo}/compare/${1}...${2}" --jq .status; }
 
           position="$(compare "$TARGET" main)"
           if [ "$position" = "identical" ] || [ "$position" = "behind" ]; then
@@ -90,43 +99,81 @@ jobs:
           fi
 
           sync_branch="sync/main-to-${TARGET}"
-          MAIN_SHA="$(gh api "repos/${REPO}/commits/main" --jq .sha)"
+
+          # The branch should be nothing but a pointer at main, so its position
+          # relative to main decides everything below. Commits main does not
+          # have are someone's reconciliation work — conflict resolutions
+          # pushed onto an open pull request, most likely — and outrank any
+          # conclusion drawn from pull request state.
+          #
+          # Assigned first so a failed compare fails the job. As a `case` word
+          # the same substitution would fall through to the default arm and
+          # force-push over that work.
+          if printf '%s\n' "$branches" | grep -Fxq "$sync_branch"; then
+            position="$(compare main "$sync_branch")"
+            case "$position" in
+              ahead|diverged)
+                echo "${sync_branch} carries commits main does not; leaving it alone."
+                exit 0 ;;
+              identical) action=current ;;
+              behind)    action=move ;;
+              *)
+                echo "unexpected compare status for ${sync_branch}: ${position}" >&2
+                exit 1 ;;
+            esac
+          else
+            action=create
+          fi
+
+          MAIN_SHA="$(gh api "repos/{owner}/{repo}/commits/main" --jq .sha)"
           export MAIN_SHA
 
-          # An open pull request may carry conflict resolutions pushed by a
-          # maintainer, so the branch is left exactly as it is.
           open_pr="$(gh pr list --head "$sync_branch" --base "$TARGET" \
             --state open --json number --jq '.[0].number // empty')"
-          if [ -n "$open_pr" ]; then
-            echo "Pull request #${open_pr} is open; leaving ${sync_branch} untouched."
-            exit 0
-          fi
 
           # A closed pull request at this exact tip was already answered,
           # whether declined or squash-merged. Reopening it every six hours
-          # would argue with the person who closed it.
-          settled="$(gh pr list --head "$sync_branch" --base "$TARGET" --state all \
-            --json number,headRefOid \
-            --jq '[.[] | select(.headRefOid == env.MAIN_SHA)] | .[0].number // empty')"
-          if [ -n "$settled" ]; then
-            echo "Pull request #${settled} already covered main at ${MAIN_SHA}; not reopening."
-            exit 0
-          fi
-
-          # The branch should be nothing but a pointer at main. Commits main
-          # does not have are someone's reconciliation work, which outranks
-          # any conclusion drawn from pull request state above.
-          if printf '%s\n' "$branches" | grep -Fxq "$sync_branch"; then
-            drift="$(compare main "$sync_branch")"
-            if [ "$drift" = "ahead" ] || [ "$drift" = "diverged" ]; then
-              echo "${sync_branch} carries commits main does not; leaving it alone."
+          # would argue with the person who closed it. An open one is moved
+          # forward instead, so it always proposes the whole of main.
+          if [ -z "$open_pr" ]; then
+            settled="$(gh pr list --head "$sync_branch" --base "$TARGET" --state all \
+              --json number,headRefOid \
+              --jq '[.[] | select(.headRefOid == env.MAIN_SHA)] | .[0].number // empty')"
+            if [ -n "$settled" ]; then
+              echo "Pull request #${settled} already covered main at ${MAIN_SHA}; not reopening."
               exit 0
             fi
-            gh api -X PATCH "repos/${REPO}/git/refs/heads/${sync_branch}" \
-              -f "sha=${MAIN_SHA}" -F force=true --silent
-          else
-            gh api -X POST "repos/${REPO}/git/refs" \
-              -f "ref=refs/heads/${sync_branch}" -f "sha=${MAIN_SHA}" --silent
+          fi
+
+          # `current` needs no call — the branch already points at main.
+          case "$action" in
+            create)
+              gh api -X POST "repos/{owner}/{repo}/git/refs" \
+                -f "ref=refs/heads/${sync_branch}" -f "sha=${MAIN_SHA}" --silent ;;
+            move)
+              # Unforced, so the update is a fast-forward or nothing. Moving a
+              # branch that is behind main is a fast-forward; a commit pushed
+              # since the compare above is not, and fails here instead of being
+              # discarded. That closes the window between the two.
+              if ! gh api -X PATCH "repos/{owner}/{repo}/git/refs/heads/${sync_branch}" \
+                  -f "sha=${MAIN_SHA}" --silent; then
+                recheck="$(compare main "$sync_branch")"
+                if [ "$recheck" != "behind" ]; then
+                  echo "${sync_branch} moved while this ran; leaving it alone."
+                  exit 0
+                fi
+                echo "could not move ${sync_branch} to ${MAIN_SHA}" >&2
+                exit 1
+              fi ;;
+          esac
+
+          if [ -n "$open_pr" ]; then
+            if [ "$action" = current ]; then
+              echo "Pull request #${open_pr} already covers main at ${MAIN_SHA}."
+            else
+              echo "Moved ${sync_branch} to ${MAIN_SHA}; pull request #${open_pr} covers it."
+            fi
+            exit 0
           fi
 
           # shellcheck disable=SC2016  # backticks are markdown, not expansions
@@ -144,8 +191,10 @@ jobs:
             'Merging into `beta` changes the release candidate, so a new beta has to be' \
             'validated before promotion.' \
             '' \
-            'Opened by a workflow, so GitHub Actions checks do not start on it. Closing' \
-            'this pull request is respected — it is not reopened unless `main` advances.' \
+            'Opened by a workflow, so GitHub Actions checks do not start on it. While' \
+            'this pull request stays open it is moved forward as `main` advances, unless' \
+            'it carries commits `main` does not. Closing it is respected — it is not' \
+            'reopened unless `main` advances.' \
             '' \
             "See [docs/design/release-channels.md](${DESIGN_DOC})." \
             > "${RUNNER_TEMP}/sync-body.md"
