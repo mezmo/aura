@@ -1,1 +1,1 @@
-slice=A from=9436d509 sel=whole owner-only files; .into() dropped on the new test (clippy useless_conversion), B2 restores it in C7's replay
+slice=A from=576e2069 round=2 changed nightly-rebase
