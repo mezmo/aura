@@ -429,7 +429,7 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
     }
 
     let app_state = Arc::new(AppState {
-        configs: configs_arc,
+        configs: Arc::clone(&configs_arc),
         tool_result_mode: args.tool_result_mode,
         tool_result_max_length: args.tool_result_max_length,
         streaming_buffer_size: args.streaming_buffer_size,
@@ -456,6 +456,57 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
         "Starting server on {}:{} (shutdown_timeout={}s)",
         args.host, args.port, shutdown_timeout_secs
     );
+
+    // Poll delivery: one reconciler per poll-mode agent config, holding its
+    // own webhook client built from the same route config the per-request
+    // routes use, and the ingress registry's store. Each loop stops when the
+    // shutdown token cancels (phase 1).
+    //
+    // Boot guard: two poll-mode configs whose agent settings produce the
+    // same effective instance id would each spawn a reconciler claiming
+    // the same pending rows in one process, breaking the single-writer
+    // posture the poller documents — refuse at boot, the same loud config
+    // error as the plaintext-http-with-secret refusal. In-process only: a
+    // cross-process same-id deployment (active/standby) must fence
+    // reconciler leadership externally.
+    let mut reconcilers = Vec::new();
+    let mut claims = Vec::new();
+    for config in configs_arc.iter() {
+        let Some(hitl) = &config.hitl else {
+            continue;
+        };
+        let instance_id = compute_instance_id(&config.agent).to_string();
+        let Some(reconciler) = aura::hitl::PollReconciler::from_config(
+            hitl,
+            ingress_hmac.as_ref(),
+            instance_id.clone(),
+            session_store.approvals(),
+            &app_state.pending_approvals,
+        ) else {
+            continue;
+        };
+        let label = config.agent.alias.as_deref().unwrap_or(&config.agent.name);
+        claims.push((label.to_string(), instance_id));
+        reconcilers.push(reconciler);
+    }
+    if let Some(((first, second), id)) = reconciler_id_conflicts(&claims) {
+        error!(
+            "poll-delivery conflict: agents '{first}' and '{second}' resolve to the same \
+             effective instance id {id}"
+        );
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "poll-delivery conflict: agents '{first}' and '{second}' resolve to the same \
+                 effective instance id {id}; two reconcilers in one process would claim the \
+                 same pending approvals. give each poll-mode agent a distinct instance_seed \
+                 (or a distinct name)"
+            ),
+        ));
+    }
+    for reconciler in reconcilers {
+        reconciler.spawn(&shutdown_token);
+    }
 
     let app = Router::new()
         .route("/health", get(handlers::health))
@@ -561,6 +612,52 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
             shutdown_rx.await.ok();
         })
         .await
+}
+
+/// The reconciler boot guard's conflict scan: the first duplicate
+/// effective instance id among the configs that would spawn a reconciler,
+/// as `((first agent label, second agent label), shared id)`.
+fn reconciler_id_conflicts(claims: &[(String, String)]) -> Option<((String, String), String)> {
+    let mut seen = std::collections::HashMap::new();
+    for (label, id) in claims {
+        if let Some(first) = seen.insert(id, label) {
+            return Some(((first.clone(), label.clone()), id.clone()));
+        }
+    }
+    None
+}
+
+/// The scan sees only configs `PollReconciler::from_config` arms (the
+/// spawn loop claims no others), so a non-poll config sharing an id never
+/// reaches it; that gating is pinned by the poller's
+/// `from_config_gates_on_poll_delivery`.
+#[cfg(test)]
+mod reconciler_boot_guard_tests {
+    use super::reconciler_id_conflicts;
+
+    fn claim(label: &str, id: &str) -> (String, String) {
+        (label.to_string(), id.to_string())
+    }
+
+    #[test]
+    fn duplicate_id_reports_both_labels_and_the_id() {
+        let ((first, second), id) = reconciler_id_conflicts(&[
+            claim("alpha", "id-1"),
+            claim("beta", "id-2"),
+            claim("gamma", "id-1"),
+        ])
+        .expect("the shared id must conflict");
+        assert_eq!(first, "alpha");
+        assert_eq!(second, "gamma");
+        assert_eq!(id, "id-1");
+    }
+
+    #[test]
+    fn distinct_ids_do_not_conflict() {
+        assert!(
+            reconciler_id_conflicts(&[claim("alpha", "id-1"), claim("beta", "id-2")]).is_none()
+        );
+    }
 }
 
 #[cfg(test)]
