@@ -61,16 +61,44 @@ pub fn set_agent_host(host: AgentHost) {
 }
 
 /// Record the model and context window reported by `aura.session_info`.
+///
+/// A window already learned for the same model — from an earlier
+/// `session_info` or an `aura.context_usage` reading — survives an event that
+/// omits one, so the meter does not blink out at the start of every turn. A
+/// different model has a different window, so a model change forgets the old
+/// one unless the event reports a new one.
 pub fn set_session_info(model: String, context_limit: Option<u64>) {
-    if let Ok(mut g) = SESSION_MODEL.lock() {
-        *g = Some(model);
+    let model_changed = SESSION_MODEL
+        .lock()
+        .map(|mut g| {
+            let changed = g.as_deref() != Some(model.as_str());
+            *g = Some(model);
+            changed
+        })
+        .unwrap_or(true);
+    match context_limit {
+        Some(limit) => MODEL_CONTEXT_LIMIT.store(limit, Ordering::Relaxed),
+        None if model_changed => MODEL_CONTEXT_LIMIT.store(0, Ordering::Relaxed),
+        None => {}
     }
-    MODEL_CONTEXT_LIMIT.store(context_limit.unwrap_or(0), Ordering::Relaxed);
 }
 
 /// Record the tokens currently occupying the model's context.
 pub fn set_context_used(tokens: u64) {
     CONTEXT_USED.store(tokens, Ordering::Relaxed);
+}
+
+/// Record a mid-turn context estimate taken from an `aura.tool_usage` reading.
+///
+/// Ignored in an orchestrated conversation: those readings come from every
+/// worker as well as the coordinator (the event carries no agent id), so only
+/// the conversation's own `aura.context_usage` reading describes its context
+/// there.
+pub fn set_mid_turn_context_estimate(tokens: u64) {
+    if ORCHESTRATED.load(Ordering::Relaxed) {
+        return;
+    }
+    set_context_used(tokens);
 }
 
 /// Record the latest MCP server tally.
@@ -137,18 +165,12 @@ fn capture_snapshot() -> Snapshot {
     } else {
         None
     };
-    // In an orchestrated conversation the mid-turn aura.tool_usage readings
-    // come from every worker as well as the coordinator (the event carries no
-    // agent id), so there is no single context to show. Otherwise show the
-    // count once something has been reported, with the meter when the
-    // model's window is known.
+    // Show the count once something has been reported, with the meter when
+    // the model's window is known. In an orchestrated conversation this is the
+    // persistent conversation's context, not any worker's.
     let used = CONTEXT_USED.load(Ordering::Relaxed);
     let limit = NonZeroU64::new(MODEL_CONTEXT_LIMIT.load(Ordering::Relaxed));
-    let context = if ORCHESTRATED.load(Ordering::Relaxed) || (used == 0 && limit.is_none()) {
-        None
-    } else {
-        Some(ContextUsage { used, limit })
-    };
+    let context = (used > 0 || limit.is_some()).then_some(ContextUsage { used, limit });
     Snapshot {
         model: get_selected_model().or_else(|| SESSION_MODEL.lock().ok().and_then(|g| g.clone())),
         server,
@@ -354,57 +376,70 @@ pub fn get_cumulative_tokens() -> u64 {
     prompt + completion
 }
 
-/// Tokens used to gauge context-window pressure: the reported context
-/// occupancy when available, otherwise the cumulative billed total as a
-/// pre-`aura.context_usage` fallback.
-fn context_pressure_tokens(cumulative_total: u64) -> u64 {
-    let occupancy = CONTEXT_USED.load(Ordering::Relaxed);
-    if occupancy > 0 {
-        occupancy
-    } else {
-        cumulative_total
-    }
-}
-
 /// Mark the occupancy reading as belonging to a previous turn.
 ///
 /// The reading itself is kept: it is the closest estimate available while the
-/// current turn streams, and dropping it would fall back to cumulative billed
-/// tokens, which exceed the window and blank the indicator. Decisions that must
-/// not act on a previous turn's context use
-/// [`fresh_context_fill_ratio`] instead.
+/// current turn streams, and dropping it would blank the indicator. Decisions
+/// that must not act on a previous turn's context use
+/// [`fresh_context_window_usage`] instead.
 pub fn begin_turn_context_tracking() {
     CONTEXT_USED_FRESH.store(false, Ordering::Relaxed);
 }
 
-/// Occupied fraction of the model's context window.
+/// Tokens occupying the model's context window, measured against that window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ContextWindowUsage {
+    pub used: u64,
+    pub window: NonZeroU64,
+}
+
+impl ContextWindowUsage {
+    /// Occupied fraction of the window.
+    pub fn fill(self) -> f64 {
+        self.used as f64 / self.window.get() as f64
+    }
+}
+
+/// Occupancy of the model's context window.
 ///
 /// `None` when either the occupancy or the window is unknown — no
 /// `aura.context_usage` has arrived, or neither it nor `aura.session_info`
-/// reported the model's window — which callers treat as "fall back to
-/// token-count thresholds".
-pub fn context_fill_ratio() -> Option<f64> {
-    let occupancy = CONTEXT_USED.load(Ordering::Relaxed);
-    let window = MODEL_CONTEXT_LIMIT.load(Ordering::Relaxed);
-    (occupancy > 0 && window > 0).then(|| occupancy as f64 / window as f64)
+/// reported the model's window. Cumulative billed tokens are never a
+/// substitute: they grow with every turn of every agent and say nothing about
+/// what the window currently holds.
+pub fn context_window_usage() -> Option<ContextWindowUsage> {
+    let used = CONTEXT_USED.load(Ordering::Relaxed);
+    let window = NonZeroU64::new(MODEL_CONTEXT_LIMIT.load(Ordering::Relaxed))?;
+    (used > 0).then_some(ContextWindowUsage { used, window })
 }
 
-/// [`context_fill_ratio`] restricted to a reading the current turn reported.
+/// [`context_window_usage`] restricted to a reading the current turn reported.
 ///
 /// `None` once a turn passes without an `aura.context_usage` event, so callers
-/// fall back to token-count thresholds rather than acting on a fill fraction
-/// that describes an earlier turn's context.
-pub fn fresh_context_fill_ratio() -> Option<f64> {
+/// do not act on a fill that describes an earlier turn's context.
+pub fn fresh_context_window_usage() -> Option<ContextWindowUsage> {
     if !CONTEXT_USED_FRESH.load(Ordering::Relaxed) {
         return None;
     }
-    context_fill_ratio()
+    context_window_usage()
 }
 
-/// Context-window pressure in tokens — used for auto-compaction decisions.
-/// Reflects actual context occupancy (not cumulative billed usage).
+/// Occupied fraction of the model's context window; see
+/// [`context_window_usage`].
+pub fn context_fill_ratio() -> Option<f64> {
+    context_window_usage().map(ContextWindowUsage::fill)
+}
+
+/// [`context_fill_ratio`] restricted to a reading the current turn reported;
+/// see [`fresh_context_window_usage`].
+pub fn fresh_context_fill_ratio() -> Option<f64> {
+    fresh_context_window_usage().map(ContextWindowUsage::fill)
+}
+
+/// Tokens occupying the model's context, as last reported by
+/// `aura.context_usage`; zero until a reading arrives.
 pub fn get_context_tokens() -> u64 {
-    context_pressure_tokens(get_cumulative_tokens())
+    CONTEXT_USED.load(Ordering::Relaxed)
 }
 
 /// Record context-window occupancy from an `aura.context_usage` event.
@@ -526,6 +561,15 @@ pub fn reset_ctrlc_state() {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::{Mutex, MutexGuard};
+
+    // The status-line counters are process globals; tests that write them
+    // take turns so one test's reset does not land inside another's readings.
+    static STATE_LOCK: Mutex<()> = Mutex::new(());
+
+    fn state_lock() -> MutexGuard<'static, ()> {
+        STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     fn session_model() -> Option<String> {
         SESSION_MODEL.lock().unwrap().clone()
@@ -533,6 +577,7 @@ mod tests {
 
     #[test]
     fn record_session_event_seeds_and_reset_clears() {
+        let _guard = state_lock();
         record_session_event(
             event_names::SESSION_INFO,
             &json!({ "model": "gpt-4o", "model_context_limit": 128000 }),
@@ -562,7 +607,49 @@ mod tests {
     }
 
     #[test]
+    fn session_info_without_a_window_keeps_the_known_one_for_the_same_model() {
+        let _guard = state_lock();
+        reset_session_status();
+        set_session_info("sonnet".to_owned(), Some(500_000));
+        // A later turn's session_info that omits the window (or a reading
+        // that reported it) leaves the meter's limit alone.
+        set_session_info("sonnet".to_owned(), None);
+        assert_eq!(MODEL_CONTEXT_LIMIT.load(Ordering::Relaxed), 500_000);
+        // A different model's window is unknown until something reports it.
+        set_session_info("haiku".to_owned(), None);
+        assert_eq!(MODEL_CONTEXT_LIMIT.load(Ordering::Relaxed), 0);
+        set_session_info("haiku".to_owned(), Some(200_000));
+        assert_eq!(MODEL_CONTEXT_LIMIT.load(Ordering::Relaxed), 200_000);
+        reset_session_status();
+    }
+
+    #[test]
+    fn orchestrated_conversation_shows_the_conversations_context() {
+        let _guard = state_lock();
+        reset_session_status();
+        mark_orchestrated();
+
+        // Worker tool turns stream mid-turn estimates that say nothing about
+        // the conversation's own context; they never reach the meter.
+        set_mid_turn_context_estimate(180_000);
+        assert_eq!(CONTEXT_USED.load(Ordering::Relaxed), 0);
+        assert_eq!(capture_snapshot().context, None);
+
+        // The conversation's own reading drives the meter.
+        set_context_window_usage(40_000, 1_200, Some(500_000));
+        assert_eq!(
+            capture_snapshot().context,
+            Some(ContextUsage {
+                used: 41_200,
+                limit: NonZeroU64::new(500_000),
+            })
+        );
+        reset_session_status();
+    }
+
+    #[test]
     fn a_previous_turns_reading_still_displays_but_stops_driving_decisions() {
+        let _guard = state_lock();
         set_context_window_usage(100_000, 5_000, Some(200_000));
         assert_eq!(fresh_context_fill_ratio(), Some(0.525));
 
@@ -572,8 +659,9 @@ mod tests {
         assert_eq!(CONTEXT_USED.load(Ordering::Relaxed), 105_000);
         assert_eq!(context_fill_ratio(), Some(0.525));
 
-        // ...while compaction decisions see no usable reading and fall back.
+        // ...while compaction decisions see no usable reading.
         assert_eq!(fresh_context_fill_ratio(), None);
+        assert_eq!(fresh_context_window_usage(), None);
 
         // A reading from the current turn drives decisions again.
         set_context_window_usage(150_000, 5_000, Some(200_000));

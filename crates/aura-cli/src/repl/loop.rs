@@ -26,17 +26,17 @@ use crate::repl::telemetry_notice::{FirstMessageConsent, consent_on_first_messag
 use crate::tools;
 use crate::ui::markdown::{render_markdown, render_summary};
 use crate::ui::prompt::{
-    WaveAnimation, cleanup_terminal, clear_display_events, clear_input_hint, drain_stdin,
-    erase_input_frame, extend_display_events, frame_lines, fresh_context_fill_ratio,
-    get_context_tokens, get_cumulative_tokens, get_selected_model, handle_ctrlc,
+    ContextWindowUsage, WaveAnimation, cleanup_terminal, clear_display_events, clear_input_hint,
+    drain_stdin, erase_input_frame, extend_display_events, frame_lines, fresh_context_fill_ratio,
+    fresh_context_window_usage, get_context_tokens, get_selected_model, handle_ctrlc,
     install_sigint_handler, is_expanded_output, is_processing, is_readline_active,
     last_mid_stream_history_entry, load_and_restore_sse_events, lock_term,
     overwrite_orch_task_header_unlocked, prepare_input_line, print_fields_tree,
     print_tool_call_expanded, print_user_echo, print_welcome_state_animated, push_display_event,
     push_mid_stream_history, push_sse_event, random_bullet_color, record_session_event,
     redraw_input_frame, replay_event_log_global, reset_ctrlc_state, reset_input_geometry,
-    restore_terminal_mode, seed_model_cache, set_context_used, set_context_window_usage,
-    set_expanded_output, set_mid_stream_history, set_noncanonical_noecho, set_processing,
+    restore_terminal_mode, seed_model_cache, set_context_window_usage, set_expanded_output,
+    set_mid_stream_history, set_mid_turn_context_estimate, set_noncanonical_noecho, set_processing,
     set_readline_active, set_selected_model, set_startup_status, set_status_bar_tokens,
     set_stream_conv_dir, set_welcome_state, setup_terminal, stop_and_clear_animation,
     styled_prompt, take_pending_command, take_queued_input, task_color_for, text_lines,
@@ -66,9 +66,8 @@ const _: () = assert!(AUTO_COMPACT_FILL < 1.0);
 /// Whether to nudge at this fill, updating the armed flag.
 ///
 /// Hysteresis between [`COMPACT_NUDGE_FILL`] and [`COMPACT_NUDGE_REARM_FILL`]
-/// replaces the token-count bands used when the window size is unknown: a
-/// conversation hovering near the threshold nudges once, and compacting it
-/// re-arms the next one.
+/// means a conversation hovering near the threshold nudges once, and
+/// compacting it re-arms the next one.
 fn should_nudge_at_fill(fill: f64, armed: &mut bool) -> bool {
     if *armed && fill >= COMPACT_NUDGE_FILL {
         *armed = false;
@@ -78,6 +77,19 @@ fn should_nudge_at_fill(fill: f64, armed: &mut bool) -> bool {
         *armed = true;
     }
     false
+}
+
+/// The user message with the compaction nudge appended, telling the model how
+/// full its context window is so it can offer `CompactContext`.
+fn compaction_note(input: &str, usage: ContextWindowUsage) -> String {
+    format!(
+        "{input}\n\n[System note: The context window is {:.0}% full \
+         ({} of {} tokens). Ask the user if they'd like to compact the \
+         conversation using the CompactContext tool to free context space.]",
+        usage.fill() * 100.0,
+        usage.used,
+        usage.window,
+    )
 }
 
 /// Repaints the frame after a terminal resize while idle at the prompt.
@@ -648,9 +660,8 @@ pub fn run_repl(
     }
 
     // Context compaction state
-    let mut last_compact_prompt_threshold: u64 = 2_000_000;
     let mut compact_nudge_armed = true;
-    let mut compact_hint_pending = false;
+    let mut compact_hint: Option<ContextWindowUsage> = None;
 
     // Handle --resume flag: load conversation from disk
     if let Some(ref resume_id) = config.resume {
@@ -937,19 +948,10 @@ pub fn run_repl(
                 // unsent unless telemetry is Enabled).
                 telemetry.capture(aura_telemetry::events::ChatRequestStarted {});
 
-                // Append compaction hint to user message if pending
-                if compact_hint_pending {
-                    compact_hint_pending = false;
-                    let tokens = get_cumulative_tokens();
-                    let augmented = format!(
-                        "{}\n\n[System note: Context is at {} tokens. \
-                         Ask the user if they'd like to compact the conversation \
-                         using the CompactContext tool to free context space.]",
-                        input, tokens
-                    );
-                    conversation.add_user(&augmented);
-                } else {
-                    conversation.add_user(&input);
+                // Append the compaction nudge to the user message if one is pending
+                match compact_hint.take() {
+                    Some(usage) => conversation.add_user(&compaction_note(&input, usage)),
+                    None => conversation.add_user(&input),
                 }
 
                 // Persist: set conversation name from first user input
@@ -1204,12 +1206,11 @@ pub fn run_repl(
                         Ok(StreamResult::TextResponse(text)) => {
                             // Check for auto-compaction trigger (context pressure).
                             // Occupancy is bounded by the window, so it is
-                            // judged as a fill fraction; the token count only
-                            // applies when no window-relative reading exists.
-                            let under_pressure = match fresh_context_fill_ratio() {
-                                Some(fill) => fill >= AUTO_COMPACT_FILL,
-                                None => get_cumulative_tokens() >= 8_000_000,
-                            };
+                            // judged as a fill fraction; without a
+                            // window-relative reading there is no pressure to
+                            // act on.
+                            let under_pressure = fresh_context_fill_ratio()
+                                .is_some_and(|fill| fill >= AUTO_COMPACT_FILL);
                             if under_pressure
                                 && text.contains(
                                     "My tools returned more data than I can work with at once",
@@ -1969,21 +1970,10 @@ pub fn run_repl(
                     conversation.add_assistant(&final_text);
 
                     // Nudge on the next turn once the context is filling up.
-                    match fresh_context_fill_ratio() {
-                        Some(fill) => {
-                            if should_nudge_at_fill(fill, &mut compact_nudge_armed) {
-                                compact_hint_pending = true;
-                            }
-                        }
-                        None => {
-                            let current_tokens = get_cumulative_tokens();
-                            if current_tokens >= last_compact_prompt_threshold {
-                                while last_compact_prompt_threshold <= current_tokens {
-                                    last_compact_prompt_threshold += 2_000_000;
-                                }
-                                compact_hint_pending = true;
-                            }
-                        }
+                    if let Some(usage) = fresh_context_window_usage()
+                        && should_nudge_at_fill(usage.fill(), &mut compact_nudge_armed)
+                    {
+                        compact_hint = Some(usage);
                     }
                 }
 
@@ -2026,7 +2016,7 @@ pub fn run_repl(
                 let queued = take_queued_input();
 
                 if !queued.is_empty() {
-                    if was_cancelled || compact_hint_pending {
+                    if was_cancelled || compact_hint.is_some() {
                         // Pre-fill readline so user can confirm/edit
                         // (also don't auto-submit when compact hint is pending,
                         // so the user can see the LLM's response first)
@@ -2489,7 +2479,7 @@ impl StreamHandler for ReplStreamHandler {
         self.turn_context_peak = self
             .turn_context_peak
             .max(prompt_tokens + completion_tokens);
-        set_context_used(self.turn_context_peak);
+        set_mid_turn_context_estimate(self.turn_context_peak);
         update_status_bar();
     }
 
@@ -2523,11 +2513,14 @@ impl StreamHandler for ReplStreamHandler {
     ) {
         // Orchestration workers report their own sub-context; only the
         // conversation-level agent's occupancy belongs on the status bar, and
-        // worker completion order is nondeterministic.
-        if agent_id == CONVERSATION_AGENT_ID {
-            set_context_window_usage(context_tokens, response_tokens, context_window);
-            update_status_bar();
+        // worker completion order is nondeterministic. The display event has
+        // no agent id and a replay applies every entry to the meter, so only
+        // the conversation agent's reading is recorded.
+        if agent_id != CONVERSATION_AGENT_ID {
+            return;
         }
+        set_context_window_usage(context_tokens, response_tokens, context_window);
+        update_status_bar();
         if let Ok(mut events) = self.turn_events.lock() {
             events.push(DisplayEvent::ContextUsage {
                 context_tokens,
@@ -3750,9 +3743,27 @@ impl StreamHandler for ReplStreamHandler {
 mod tests {
     use super::{
         COMMAND_ALIASES, COMPACT_NUDGE_FILL, ReplTelemetryLifecycle, approval_requested_line,
-        command_hint, should_nudge_at_fill,
+        command_hint, compaction_note, should_nudge_at_fill,
     };
     use crate::repl::registry;
+    use crate::ui::prompt::ContextWindowUsage;
+    use std::num::NonZeroU64;
+
+    #[test]
+    fn compaction_note_reports_window_fill() {
+        let usage = ContextWindowUsage {
+            used: 150_000,
+            window: NonZeroU64::new(200_000).unwrap(),
+        };
+        let note = compaction_note("hello", usage);
+        assert!(
+            note.starts_with(
+                "hello\n\n[System note: The context window is 75% full (150000 of 200000 tokens)."
+            ),
+            "{note}"
+        );
+        assert!(note.contains("CompactContext"));
+    }
 
     #[test]
     fn nudges_once_while_the_context_stays_full() {

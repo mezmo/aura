@@ -257,14 +257,11 @@ where
         ctx.field_format()
             .format_fields(field_writer.by_ref(), event)?;
 
-        // Check length and truncate if needed
-        if buf.len() > self.max_length {
-            writeln!(
-                writer,
-                "{}... ({} chars)",
-                &buf[..self.max_length],
-                buf.len()
-            )?;
+        // Check length and truncate if needed, on a char boundary: slicing at
+        // the raw byte limit panics when a multibyte character straddles it.
+        let (shown, truncated) = crate::string_utils::truncate_for_log(&buf, self.max_length);
+        if truncated {
+            writeln!(writer, "{shown}... ({} chars)", buf.len())?;
         } else {
             writeln!(writer, "{buf}")?;
         }
@@ -920,6 +917,39 @@ mod tests {
             !log.contains("info noise stays filtered"),
             "the directive is warn-level, not a blanket enable, got log: {log}"
         );
+    }
+
+    /// Console lines longer than the formatter's limit are cut on a char
+    /// boundary, including when a multibyte character straddles the byte
+    /// limit, so the output stays valid UTF-8.
+    #[test]
+    fn truncating_formatter_cuts_long_lines_on_char_boundaries() {
+        use std::sync::Arc;
+
+        // `—` is 3 bytes, so of any three consecutive limits that land inside
+        // the message, at least two fall mid-character.
+        for max_length in 60..63 {
+            let buf = Arc::new(CapturedLog(std::sync::Mutex::new(Vec::new())));
+            let subscriber = tracing_subscriber::fmt()
+                .event_format(TruncatingFormatter { max_length })
+                .with_writer(buf.clone())
+                .finish();
+
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::info!(target: "aura::logging", "{}", "—".repeat(100));
+            });
+
+            let log = String::from_utf8(buf.0.lock().unwrap().clone())
+                .expect("a truncated line must still be valid UTF-8");
+            let (shown, _) = log
+                .split_once("... (")
+                .unwrap_or_else(|| panic!("line was not truncated: {log}"));
+            assert!(
+                shown.len() <= max_length && shown.len() + 3 > max_length,
+                "expected a cut within one char of {max_length} bytes, got {} bytes",
+                shown.len()
+            );
+        }
     }
 
     /// A prompt longer than `OTEL_CONTENT_MAX_LENGTH` must still serialize to

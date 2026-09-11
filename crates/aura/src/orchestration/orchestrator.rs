@@ -446,6 +446,7 @@ struct StreamCallParams<'a> {
     history: Vec<rig::completion::Message>,
     phase: &'a str,
     event_tx: Option<&'a tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>>,
+    context_agent: Option<&'a str>,
 }
 
 /// Agent id for the conversation-level context an orchestration run carries,
@@ -459,6 +460,7 @@ const COORDINATOR_AGENT_ID: &str = "main";
 #[derive(Default)]
 struct TurnTally {
     total: rig::completion::Usage,
+    first: Option<rig::completion::Usage>,
     last: rig::completion::Usage,
 }
 
@@ -477,6 +479,7 @@ impl TurnTally {
             output_tokens: turn.output_tokens,
             total_tokens: turn.total_tokens,
         };
+        self.first.get_or_insert(self.last);
         usage_state.accumulate_usage(turn.input_tokens, turn.output_tokens);
         if let Some(cache) = cache {
             usage_state.store_cache_usage(
@@ -519,6 +522,24 @@ struct ForwardedRun {
     /// Provider-reported usage of the loop's last turn — context-window
     /// occupancy, as opposed to `response.usage`'s loop total.
     last_turn: rig::completion::Usage,
+}
+
+/// Replay an assistant turn as conversation history.
+///
+/// Anthropic-family providers reject a message whose text block is empty
+/// (`messages: text content blocks must be non-empty`), and a turn spent
+/// entirely on reasoning or cut off before any output yields exactly that.
+/// Blank content is replaced with
+/// [`prompt_constants::corrections::EMPTY_ASSISTANT_TURN`] so the correction
+/// call that follows is accepted.
+fn assistant_history_message(content: &str) -> rig::completion::Message {
+    if content.trim().is_empty() {
+        rig::completion::Message::assistant(
+            super::prompt_constants::corrections::EMPTY_ASSISTANT_TURN,
+        )
+    } else {
+        rig::completion::Message::assistant(content)
+    }
 }
 
 /// One guarded step of a deadline-wrapped stream loop.
@@ -1374,6 +1395,7 @@ impl Orchestrator {
             history,
             phase,
             event_tx,
+            ..
         } = params;
         let timeout_secs = self.config.per_call_timeout_secs();
         let stream_future = async {
@@ -1454,6 +1476,7 @@ impl Orchestrator {
             history,
             phase,
             event_tx,
+            context_agent,
         } = params;
         let timeout_secs = self.config.per_call_timeout_secs();
         let inactivity_secs = self.config.stream_inactivity_timeout_secs();
@@ -1619,16 +1642,19 @@ impl Orchestrator {
                     deadline.suspend();
                 }
             }
-            // Coordinator occupancy under the same agent id single-agent uses,
-            // so clients track one conversation context across both modes. The
-            // last planning cycle runs after the workers, so its event is the
-            // one that lands last.
-            if let Some(tx) = event_tx.filter(|_| tally.last.input_tokens > 0) {
+            // Report this call's occupancy under the agent id the caller asked
+            // for; callers whose context is scratch pass none. The reading is
+            // the call's first inner turn: later inner turns add the tool
+            // results the coordinator pulled in on the way to its decision
+            // (skill bodies, prior-run listings), which is scratch too.
+            if let (Some(tx), Some(agent_id), Some(first)) = (event_tx, context_agent, tally.first)
+                && first.input_tokens > 0
+            {
                 let _ = tx
                     .send(Ok(StreamItem::ContextUsage {
-                        agent_id: COORDINATOR_AGENT_ID.to_string(),
-                        context_tokens: tally.last.input_tokens,
-                        response_tokens: tally.last.output_tokens,
+                        agent_id: agent_id.to_string(),
+                        context_tokens: first.input_tokens,
+                        response_tokens: first.output_tokens,
                         context_window: agent.context_window,
                     }))
                     .await;
@@ -1743,6 +1769,7 @@ impl Orchestrator {
                         history: params.history.clone(),
                         phase: params.phase,
                         event_tx: params.event_tx,
+                        context_agent: params.context_agent,
                     },
                     || {
                         let rd = rd.clone();
@@ -1882,6 +1909,17 @@ impl Orchestrator {
                         history: full_history,
                         phase: "Planning",
                         event_tx,
+                        // Only a request's first planning call sees the
+                        // persistent conversation — the chat history plus the
+                        // planning prompt — so its occupancy is the
+                        // conversation's, reported under the same agent id
+                        // single-agent mode uses. Continuation cycles carry
+                        // the turn's scratch conversation, discarded when the
+                        // turn ends, and so do routing-correction attempts
+                        // (the skipped reply plus the correction), so neither
+                        // reports.
+                        context_agent: (previous.is_none() && attempt == 1)
+                            .then_some(COORDINATOR_AGENT_ID),
                     },
                     &coordinator_state.routing_decision,
                 )
@@ -1979,7 +2017,7 @@ impl Orchestrator {
             let response_text = response.content.clone();
             coordinator_state
                 .conversation
-                .push(rig::completion::Message::assistant(&response_text));
+                .push(assistant_history_message(&response_text));
 
             {
                 let persistence = self.persistence.lock().await;
@@ -3667,7 +3705,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     super::prompt_constants::corrections::WORKER_SUBMIT_RESULT.to_string();
                 let history = vec![
                     rig::completion::Message::user(base_worker_prompt.clone()),
-                    rig::completion::Message::assistant(last_raw_response.clone()),
+                    assistant_history_message(&last_raw_response),
                 ];
                 (correction, history)
             };
@@ -3701,6 +3739,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         history,
                         phase: "Worker task",
                         event_tx,
+                        context_agent: None,
                     },
                     worker_name.map(|name| StreamContext {
                         task_id,
@@ -5600,6 +5639,38 @@ fn context_overflow_suggestion(phase: &str) -> String {
 mod tests {
     use super::*;
 
+    fn assistant_text(msg: &rig::completion::Message) -> String {
+        match msg {
+            rig::completion::Message::Assistant { content, .. } => content
+                .iter()
+                .map(|c| match c {
+                    rig::message::AssistantContent::Text(t) => t.text.clone(),
+                    other => panic!("expected text content, got {other:?}"),
+                })
+                .collect(),
+            other => panic!("expected assistant message, got {other:?}"),
+        }
+    }
+
+    /// Blank assistant turns must be replayed as non-empty text so providers
+    /// accept the correction request.
+    #[test]
+    fn assistant_history_message_replaces_blank_content() {
+        for blank in ["", " ", "\n\t "] {
+            assert_eq!(
+                assistant_text(&assistant_history_message(blank)),
+                super::super::prompt_constants::corrections::EMPTY_ASSISTANT_TURN,
+                "blank {blank:?} must be replaced",
+            );
+        }
+    }
+
+    #[test]
+    fn assistant_history_message_keeps_real_content() {
+        let text = "I fetched the check runs but forgot to submit.";
+        assert_eq!(assistant_text(&assistant_history_message(text)), text);
+    }
+
     fn usage(input_tokens: u64, output_tokens: u64) -> rig::completion::Usage {
         rig::completion::Usage {
             input_tokens,
@@ -5662,6 +5733,23 @@ mod tests {
 
         assert_eq!(unrecorded.input_tokens, 0);
         assert_eq!(unrecorded.output_tokens, 0);
+    }
+
+    #[test]
+    fn test_tally_keeps_the_first_turn_as_the_context_reading() {
+        let usage_state = crate::UsageState::new();
+        let mut tally = TurnTally::default();
+        assert_eq!(tally.first, None);
+
+        // Coordinator loads a skill, lists prior runs, then plans: each inner
+        // turn re-sends the growing scratch context.
+        tally.record(&usage(10_741, 58), None, &usage_state);
+        tally.record(&usage(12_763, 127), None, &usage_state);
+        tally.record(&usage(40_112, 1_240), None, &usage_state);
+
+        let first = tally.first.unwrap();
+        assert_eq!((first.input_tokens, first.output_tokens), (10_741, 58));
+        assert_eq!(tally.last.input_tokens, 40_112);
     }
 
     /// A two-worker orchestration run replayed from its Bedrock

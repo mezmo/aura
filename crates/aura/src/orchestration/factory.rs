@@ -148,6 +148,12 @@ impl StreamingAgent for OrchestratorFactory {
         self.agent_config.llm.model_info()
     }
 
+    /// The coordinator's window: it holds the persistent conversation, so it
+    /// is the context a client measures the session against.
+    fn context_window(&self) -> Option<u64> {
+        self.agent_config.llm.context_window()
+    }
+
     async fn stream(
         &self,
         query: &str,
