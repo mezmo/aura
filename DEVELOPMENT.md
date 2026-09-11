@@ -90,9 +90,11 @@ Make targets are composed from modular includes under `.makefiles/` (rust, docke
 ### Docker image features
 
 The release image compiles `aura` and `aura-web-server` with no optional
-cargo features. The `CARGO_FEATURES` build arg (a comma-separated cargo
-feature list) enables them for both binaries, for example the Redis/Valkey
-session store a multi-instance deployment needs:
+cargo features. The `CARGO_FEATURES` build arg accepts a comma-separated list
+of features shared by both packages (`aura-cli` and `aura-web-server`) and
+enables them for both binaries; a feature only one package defines fails the
+build. For example, the Redis/Valkey session store a multi-instance deployment
+needs:
 
 ```bash
 docker build --build-arg CARGO_FEATURES=session-store-redis --target release -t aura:redis .

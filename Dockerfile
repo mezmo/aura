@@ -288,16 +288,19 @@ COPY crates/ ./crates/
 RUN cargo build --workspace --bin aura
 
 ### 010 Cook-release
-# CARGO_FEATURES is a comma-separated cargo feature list for the release
-# binaries (e.g. session-store-redis). Empty by default; the cook and the
-# build both apply it so the dependency cache is keyed on the same set.
+# CARGO_FEATURES is a comma-separated cargo feature list applied to both
+# release binaries, so every name must exist in aura-cli and aura-web-server
+# (e.g. session-store-redis). Empty by default; the cook and the build both
+# apply it so the dependency cache is keyed on the same set. Each RUN
+# expands it once into the positional parameters.
 FROM core AS cook-release
 ARG CARGO_FEATURES=""
 WORKDIR /usr/src/app
 COPY --from=planner /usr/src/app/recipe.json recipe.json
 ENV CARGO_TARGET_DIR=/usr/src/app/target
-RUN cargo chef cook --release -p aura-cli --bin aura ${CARGO_FEATURES:+--features "$CARGO_FEATURES"} --recipe-path recipe.json \
- && cargo chef cook --release --bin aura-web-server ${CARGO_FEATURES:+--features "$CARGO_FEATURES"} --recipe-path recipe.json
+RUN set -- ${CARGO_FEATURES:+--features "$CARGO_FEATURES"} \
+ && cargo chef cook --release -p aura-cli --bin aura "$@" --recipe-path recipe.json \
+ && cargo chef cook --release --bin aura-web-server "$@" --recipe-path recipe.json
 
 ### 011 Release-build
 # Source changes only recompile workspace crates.
@@ -309,8 +312,9 @@ COPY crates/ ./crates/
 
 RUN <<EOR
   set -e
-  cargo build --release -p aura-cli --bin aura ${CARGO_FEATURES:+--features "$CARGO_FEATURES"}
-  cargo build --release --bin aura-web-server ${CARGO_FEATURES:+--features "$CARGO_FEATURES"}
+  set -- ${CARGO_FEATURES:+--features "$CARGO_FEATURES"}
+  cargo build --release -p aura-cli --bin aura "$@"
+  cargo build --release --bin aura-web-server "$@"
 EOR
 
 ### 012 Runtime
