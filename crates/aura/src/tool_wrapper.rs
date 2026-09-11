@@ -26,7 +26,7 @@
 //! ```ignore
 //! use std::sync::Arc;
 //!
-//! use aura::mcp_response::CallOutcome;
+//! use aura::mcp::CallOutcome;
 //! use aura::tool_wrapper::{
 //!     ToolCallContext, ToolWrapper, TransformOutputResult, WrappedTool,
 //! };
@@ -61,7 +61,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::config::ToolContextFactory;
-use crate::mcp_response::CallOutcome;
+use crate::mcp::CallOutcome;
 
 /// Context passed to wrapper methods during tool execution.
 ///

@@ -398,7 +398,7 @@ impl AgentExecutor for AuraAgentExecutor {
                             metadata: None,
                         }));
                     }
-                    Ok(StreamItem::TurnUsage(_)) => {
+                    Ok(StreamItem::TurnUsage(..)) => {
                         event!(Level::DEBUG, request_id, "turn usage");
                     }
                     Ok(StreamItem::ContextUsage { .. }) => {

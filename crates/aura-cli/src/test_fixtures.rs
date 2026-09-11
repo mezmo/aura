@@ -37,6 +37,7 @@ pub(crate) fn worker(name: &str) -> WorkerOverview {
 pub(crate) fn agent(id: &str, workers: Vec<WorkerOverview>) -> AgentInfo {
     AgentInfo {
         id: id.to_string(),
+        instance_id: None,
         description: None,
         model: "gpt-4o".to_string(),
         workers,

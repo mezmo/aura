@@ -14,7 +14,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use tracing::{error, info};
 
-use crate::mcp_streamable_http::McpClient;
+use crate::mcp::client::McpClient;
 use crate::request_cancellation::call_http_tool_cancellable;
 
 // ---------------------------------------------------------------------------
@@ -132,7 +132,7 @@ pub async fn execute_mcp_tool(
         serde_json::to_string(&args).unwrap_or_else(|_| "Invalid JSON".to_string())
     );
 
-    // Note: aura.tool_start is now emitted from mcp_streamable_http.rs call_tool_tracked()
+    // Note: aura.tool_start is now emitted from mcp/client.rs's call_tool_tracked()
     // using Rig 0.28's id parameter for correct correlation via the FIFO queue.
     // This eliminates thread-local context dependency.
 
@@ -181,14 +181,14 @@ pub async fn execute_mcp_tool(
 /// `Some(bounded)`, the message bounded to [`MAX_TOOL_ERROR_BYTES`] so a
 /// multi-KB transport/provider payload cannot flood a worker's context window.
 ///
-/// [`MAX_TOOL_ERROR_BYTES`]: crate::mcp_response::MAX_TOOL_ERROR_BYTES
+/// [`MAX_TOOL_ERROR_BYTES`]: crate::mcp::response::MAX_TOOL_ERROR_BYTES
 fn bound_transport_error(err_str: &str) -> Option<String> {
     if err_str.contains("Request cancelled") {
         None
     } else {
-        Some(crate::mcp_response::bound_error_content(
+        Some(crate::mcp::response::bound_error_content(
             err_str.to_string(),
-            crate::mcp_response::MAX_TOOL_ERROR_BYTES,
+            crate::mcp::response::MAX_TOOL_ERROR_BYTES,
         ))
     }
 }
@@ -276,7 +276,7 @@ mod tests {
         let huge = format!("Tool execution failed: {}", "stack frame\n".repeat(8000));
         let bounded = bound_transport_error(&huge).expect("non-cancel error must be bounded");
         assert!(
-            bounded.len() <= crate::mcp_response::MAX_TOOL_ERROR_BYTES + 128,
+            bounded.len() <= crate::mcp::response::MAX_TOOL_ERROR_BYTES + 128,
             "bounded transport error must stay near the budget; got {} bytes",
             bounded.len()
         );
@@ -297,7 +297,7 @@ mod tests {
 
         use super::*;
         use crate::logging::ATTR_APPLIED_HEADERS;
-        use crate::mcp_streamable_http::tests::client_and_server;
+        use crate::mcp::client::tests::client_and_server;
         use crate::test_span_capture::CapturedSpans;
 
         /// Run `execute_mcp_tool` under a subscriber that exports to memory, returning the `applied_headers` attribute its `mcp.tool_call` span carries.

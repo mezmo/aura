@@ -42,7 +42,7 @@ impl InMemoryApprovalStore {
         self.entries.lock().expect("approval store lock poisoned")
     }
 
-    /// Lock the decided map, dropping entries past their retention window.
+    /// Lock decided map, dropping expired entries.
     fn lock_decided(&self) -> std::sync::MutexGuard<'_, BTreeMap<DecisionId, DecidedEntry>> {
         let mut decided = self.decided.lock().expect("approval store lock poisoned");
         let now = chrono::Utc::now();
@@ -67,8 +67,18 @@ impl ApprovalStore for InMemoryApprovalStore {
         id: &DecisionId,
         decision: ApprovalDecision,
     ) -> Result<(), ResolveError> {
-        // Removal under the lock is the at-most-once guarantee.
-        let parked = self.lock().remove(id).ok_or(ResolveError::NotFound)?;
+        // Lock removal provides at-most-once.
+        let parked = {
+            let mut entries = self.lock();
+            if entries
+                .get(id)
+                .is_some_and(|parked| chrono::Utc::now() > parked.expires_at)
+            {
+                return Err(ResolveError::NotFound);
+            }
+            entries.remove(id)
+        };
+        let parked = parked.ok_or(ResolveError::NotFound)?;
         self.lock_decided().insert(
             *id,
             DecidedEntry {
@@ -92,10 +102,16 @@ impl ApprovalStore for InMemoryApprovalStore {
         Ok(())
     }
 
-    async fn cancel_request(&self, request_id: &str) -> Result<(), SessionStoreError> {
-        self.lock()
-            .retain(|_, parked| parked.request.request_id != request_id);
-        Ok(())
+    async fn cancel_request(
+        &self,
+        request_id: &str,
+    ) -> Result<Vec<ParkedApproval>, SessionStoreError> {
+        let cleared: Vec<ParkedApproval> = self
+            .lock()
+            .extract_if(.., |_, parked| parked.request.request_id == request_id)
+            .map(|(_, parked)| parked)
+            .collect();
+        Ok(cleared)
     }
 }
 
@@ -191,6 +207,7 @@ mod tests {
         ParkedApproval {
             request: ApprovalRequest {
                 version: PROTOCOL_VERSION,
+                instance_id: "test-instance".to_string(),
                 decision_id: DecisionId::generate(),
                 request_id: request_id.to_string(),
                 scope: AgentScope::Single { session_id: None },
@@ -251,34 +268,67 @@ mod tests {
         assert_eq!(store.decision(&DecisionId::generate()).await.unwrap(), None);
     }
 
+    /// Retention pruning drops entries past window.
     #[tokio::test]
     async fn recorded_decision_is_pruned_after_retention_window() {
         let store = InMemoryApprovalStore::new();
-        let mut entry = parked("req-prune");
-        // Retention margin is already past.
-        entry.expires_at =
-            chrono::Utc::now() - chrono::Duration::seconds(2 * DECISION_RETENTION_MARGIN_SECS);
-        let id = entry.request.decision_id;
-        store.register(entry).await.unwrap();
-        store
-            .resolve(&id, ApprovalDecision::Approved)
-            .await
-            .unwrap();
+        let id = parked("req-prune").request.decision_id;
+        store.lock_decided().insert(
+            id,
+            DecidedEntry {
+                decision: ApprovalDecision::Approved,
+                keep_until: chrono::Utc::now() - chrono::Duration::seconds(1),
+            },
+        );
 
         assert_eq!(store.decision(&id).await.unwrap(), None);
+    }
+
+    /// `resolve` refuses expired tickets.
+    #[tokio::test]
+    async fn expired_ticket_refuses_resolve() {
+        let store = InMemoryApprovalStore::new();
+        let mut entry = parked("req-expired");
+        entry.expires_at = chrono::Utc::now() - chrono::Duration::seconds(1);
+        let id = entry.request.decision_id;
+        store.register(entry).await.unwrap();
+
+        assert_eq!(
+            store.resolve(&id, ApprovalDecision::Approved).await,
+            Err(ResolveError::NotFound)
+        );
+        assert_eq!(store.decision(&id).await.unwrap(), None);
+        assert!(store.get(&id).await.unwrap().is_some());
+    }
+
+    /// `get` returns expired tickets.
+    #[tokio::test]
+    async fn expired_ticket_is_returned_by_get_until_remove() {
+        let store = InMemoryApprovalStore::new();
+        let mut entry = parked("req-expired-get");
+        entry.expires_at = chrono::Utc::now() - chrono::Duration::seconds(1);
+        let id = entry.request.decision_id;
+        store.register(entry).await.unwrap();
+
+        assert!(store.get(&id).await.unwrap().is_some());
+        store.remove(&id).await.unwrap();
+        assert!(store.get(&id).await.unwrap().is_none());
     }
 
     #[tokio::test]
     async fn approval_store_cancel_request_removes_only_matching() {
         let store = InMemoryApprovalStore::new();
         let cancel = parked("req-cancel");
+        let cancel_id = cancel.request.decision_id;
         let keep = parked("req-keep");
         let keep_id = keep.request.decision_id;
         store.register(cancel).await.unwrap();
         store.register(keep).await.unwrap();
 
-        store.cancel_request("req-cancel").await.unwrap();
+        let cleared = store.cancel_request("req-cancel").await.unwrap();
 
+        assert_eq!(cleared.len(), 1, "only the matching ticket is cleared");
+        assert_eq!(cleared[0].request.decision_id, cancel_id);
         assert!(store.get(&keep_id).await.unwrap().is_some());
         assert_eq!(store.lock().len(), 1);
     }

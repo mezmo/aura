@@ -333,6 +333,68 @@ model = "claude-3-sonnet-20240229"
     }
 
     #[test]
+    fn test_anthropic_prompt_caching_flag() {
+        let base = r#"
+[agent]
+name = "Cache Agent"
+system_prompt = "Basic prompt"
+
+[agent.llm]
+provider = "anthropic"
+api_key = "test_key"
+model = "claude-sonnet-4-5"
+"#;
+
+        let config = load_config_from_str(base).expect("Failed to parse config");
+        match &config.agent.llm {
+            crate::config::LlmConfig::Anthropic { prompt_caching, .. } => {
+                assert!(!prompt_caching, "prompt_caching should default to false");
+            }
+            _ => panic!("Expected Anthropic LLM config"),
+        }
+
+        let enabled = format!("{base}prompt_caching = true\n");
+        let config = load_config_from_str(&enabled).expect("Failed to parse config");
+        match &config.agent.llm {
+            crate::config::LlmConfig::Anthropic { prompt_caching, .. } => {
+                assert!(prompt_caching);
+            }
+            _ => panic!("Expected Anthropic LLM config"),
+        }
+    }
+
+    #[test]
+    fn test_bedrock_prompt_caching_flag() {
+        let base = r#"
+[agent]
+name = "Bedrock Cache Agent"
+system_prompt = "Basic prompt"
+
+[agent.llm]
+provider = "bedrock"
+model = "anthropic.claude-sonnet-4-20250514-v1:0"
+region = "us-east-1"
+"#;
+
+        let config = load_config_from_str(base).expect("Failed to parse config");
+        match &config.agent.llm {
+            crate::config::LlmConfig::Bedrock { prompt_caching, .. } => {
+                assert!(!prompt_caching, "prompt_caching should default to false");
+            }
+            _ => panic!("Expected Bedrock LLM config"),
+        }
+
+        let enabled = format!("{base}prompt_caching = true\n");
+        let config = load_config_from_str(&enabled).expect("Failed to parse config");
+        match &config.agent.llm {
+            crate::config::LlmConfig::Bedrock { prompt_caching, .. } => {
+                assert!(prompt_caching);
+            }
+            _ => panic!("Expected Bedrock LLM config"),
+        }
+    }
+
+    #[test]
     fn test_config_validation() {
         // Test config with missing API key (should fail validation)
         let invalid_config = r#"

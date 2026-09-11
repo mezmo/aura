@@ -442,8 +442,8 @@ where
     termination
 }
 
-/// Resolve the cumulative billed usage `(prompt, completion, total)` for the
-/// final `aura.usage` event.
+/// Resolve the cumulative billed usage `(prompt, completion, total,
+/// cache_usage)` for the final `aura.usage` event.
 ///
 /// The single-agent path carries rig's turn-aggregated usage on
 /// `StreamItem::Final` (`usage_stats`), which sums every LLM turn — including
@@ -451,22 +451,30 @@ where
 /// rig invokes `on_stream_completion_response_finish` only for turns that
 /// produced assistant text, so the hook total (`UsageState::get_final_usage`)
 /// under-reports whenever a tool turn had no text preamble (common on
-/// Bedrock-Claude). Prefer the aggregated `Final` usage when present.
+/// Bedrock-Claude). Prefer the aggregated `Final` usage when present — and
+/// take the cache split from the same source (`final_cache_usage`), so the
+/// event's cache counts stay a subset of the prompt total next to them.
 ///
-/// Orchestration leaves `Final.usage` zero and accumulates billed tokens through
-/// `UsageState::accumulate_usage`, so fall back to the hook total when no
-/// aggregated `Final` usage is available.
+/// Orchestration leaves `Final.usage` zero and accumulates billed tokens
+/// through `UsageState::accumulate_usage` (which sees every turn via
+/// `TurnUsage`), so fall back to the hook totals — billed and cache alike —
+/// when no aggregated `Final` usage is available.
 fn resolve_billed_usage(
     usage_stats: &Option<UsageInfo>,
+    final_cache_usage: Option<(u64, u64)>,
     usage_state: &UsageState,
-) -> (u64, u64, u64) {
+) -> (u64, u64, u64, Option<(u64, u64)>) {
     match usage_stats {
         Some(u) if u.prompt_tokens > 0 => (
             u.prompt_tokens,
             u.completion_tokens,
             u.prompt_tokens + u.completion_tokens,
+            final_cache_usage,
         ),
-        _ => usage_state.get_final_usage(),
+        _ => {
+            let (prompt, completion, total) = usage_state.get_final_usage();
+            (prompt, completion, total, usage_state.get_cache_usage())
+        }
     }
 }
 
@@ -500,8 +508,11 @@ async fn send_final_events(
 
     // Emit aura.usage (cumulative billed) and aura.context_usage at stream end.
     if emit_custom_events {
-        let (prompt, completion, total) =
-            resolve_billed_usage(&state.usage_stats, &callbacks.usage_state);
+        let (prompt, completion, total, cache_usage) = resolve_billed_usage(
+            &state.usage_stats,
+            state.final_cache_usage,
+            &callbacks.usage_state,
+        );
         if prompt > 0 {
             tracing::debug!(
                 "Emitting aura.usage event: prompt={}, completion={}, total={}",
@@ -509,8 +520,13 @@ async fn send_final_events(
                 completion,
                 total
             );
-            let usage_event =
-                AuraStreamEvent::usage(prompt, completion, total, ctx.correlation.clone());
+            let usage_event = AuraStreamEvent::usage(
+                prompt,
+                completion,
+                total,
+                cache_usage,
+                ctx.correlation.clone(),
+            );
             let _ = tx.send(Ok(Bytes::from(usage_event.format_sse()))).await;
         }
 
@@ -707,6 +723,12 @@ fn handle_stream_item(
                 completion_tokens: final_info.usage.output_tokens,
                 total_tokens: final_info.usage.total_tokens,
             });
+            state.final_cache_usage = final_info.cache_usage.map(|cache| {
+                (
+                    cache.cache_read_input_tokens,
+                    cache.cache_creation_input_tokens,
+                )
+            });
 
             tracing::debug!(
                 "Token usage: input={}, output={}, total={}",
@@ -717,7 +739,7 @@ fn handle_stream_item(
 
             vec![]
         }
-        StreamItem::FinalMarker | StreamItem::TurnUsage(_) => {
+        StreamItem::FinalMarker | StreamItem::TurnUsage(..) => {
             // Internal markers - filtered out
             tracing::debug!("Received final/turn-usage marker");
             vec![]
@@ -1254,6 +1276,31 @@ fn handle_orchestrator_event(
                 event_context,
             )
         }
+        OrchestratorEvent::TaskBlocked {
+            task_id,
+            orchestrator_id,
+            worker_id,
+            tool_call_id,
+            decision_id,
+            tool_name,
+        } => {
+            tracing::debug!(
+                "Orchestrator: task {} blocked awaiting approval - {} ({}, decision {})",
+                task_id,
+                tool_name,
+                tool_call_id,
+                decision_id
+            );
+            OrchestrationStreamEvent::task_blocked(
+                *task_id,
+                tool_call_id,
+                decision_id,
+                tool_name,
+                orchestrator_id,
+                worker_id,
+                event_context,
+            )
+        }
         OrchestratorEvent::IterationComplete {
             iteration,
             will_replan,
@@ -1369,6 +1416,27 @@ fn handle_orchestrator_event(
                 *success,
                 *duration_ms,
                 maybe_truncate(result, config.tool_result_max_length),
+                event_context,
+            )
+        }
+        OrchestratorEvent::RunParked {
+            run_id,
+            decision_ids,
+            expires_at,
+            iteration,
+        } => {
+            tracing::debug!(
+                "Orchestrator: run {} parked at iteration {} ({} decision(s), expires {})",
+                run_id,
+                iteration,
+                decision_ids.len(),
+                expires_at
+            );
+            OrchestrationStreamEvent::run_parked(
+                run_id,
+                decision_ids.clone(),
+                expires_at,
+                *iteration,
                 event_context,
             )
         }
@@ -1552,7 +1620,7 @@ mod tests {
     }
 
     /// An MCP server's error reaches `handle_tool_result` with the prefix
-    /// `aura::mcp_response` applies, and must be reported as a failure rather
+    /// `aura::mcp::response` applies, and must be reported as a failure rather
     /// than a successful result carrying the error text.
     #[test]
     fn test_handle_tool_result_reports_mcp_error_as_failure() {
@@ -1660,10 +1728,11 @@ mod tests {
             total_tokens: 12_250,
         });
 
-        // The fix: aura.usage reflects the aggregated total, not the undercount.
+        // The fix: aura.usage reflects the aggregated total, not the undercount,
+        // and the cache split comes from the same aggregated population.
         assert_eq!(
-            resolve_billed_usage(&usage_stats, &usage_state),
-            (12_000, 250, 12_250),
+            resolve_billed_usage(&usage_stats, Some((9_000, 2_000)), &usage_state),
+            (12_000, 250, 12_250, Some((9_000, 2_000))),
             "aura.usage must include every turn, including tool-only turns"
         );
     }
@@ -1683,9 +1752,10 @@ mod tests {
             total_tokens: 0,
         });
 
+        usage_state.store_cache_usage(4_000, 1_000);
         assert_eq!(
-            resolve_billed_usage(&usage_stats, &usage_state),
-            (13_000, 600, 13_600),
+            resolve_billed_usage(&usage_stats, None, &usage_state),
+            (13_000, 600, 13_600, Some((4_000, 1_000))),
             "orchestration billed usage comes from accumulate_usage"
         );
     }
@@ -1696,7 +1766,35 @@ mod tests {
         // usage, so fall back to whatever the hook recorded.
         let usage_state = UsageState::new();
         usage_state.store_usage(1500, 100, 1600, false);
-        assert_eq!(resolve_billed_usage(&None, &usage_state), (1500, 100, 1600));
+        assert_eq!(
+            resolve_billed_usage(&None, None, &usage_state),
+            (1500, 100, 1600, None)
+        );
+    }
+
+    #[test]
+    fn test_resolve_billed_usage_cache_split_matches_population() {
+        // A Bedrock-style tool loop: the hook missed the tool-only turn
+        // (it fires only on text turns), so its counters — billed and cache —
+        // under-report. The aggregated Final carries the full-run cache
+        // split; using the hook's split next to the aggregated totals would
+        // break the "cache is a subset of prompt_tokens" contract.
+        let usage_state = UsageState::new();
+        usage_state.store_usage(4_000, 150, 4_150, false); // text turn only
+        usage_state.store_cache_usage(3_000, 500); // text turn's split only
+
+        let usage_stats = Some(UsageInfo {
+            prompt_tokens: 12_000,
+            completion_tokens: 250,
+            total_tokens: 12_250,
+        });
+        let (_, _, _, cache) =
+            resolve_billed_usage(&usage_stats, Some((9_000, 2_000)), &usage_state);
+        assert_eq!(
+            cache,
+            Some((9_000, 2_000)),
+            "cache split must come from the same turn population as the totals"
+        );
     }
 
     #[tokio::test]
@@ -1751,6 +1849,7 @@ mod tests {
                     output_tokens: 5,
                     total_tokens: 15,
                 },
+                cache_usage: None,
             })),
         ];
         let stream = futures_util::stream::iter(items);
@@ -2374,6 +2473,526 @@ mod tests {
             .await;
             assert_eq!(termination, StreamTermination::Timeout);
             assert_eq!(elapsed, 30);
+        }
+    }
+
+    /// Drives `process_sse_stream_full` from a `MockAgent` script and returns
+    /// the SSE frames it produced.
+    mod harness {
+        use super::*;
+        use aura::ProgressNotification;
+        use aura_test_utils::mock_agent::{MockAgent, Step};
+        use aura_test_utils::sse::{SseEvent, parse_sse_stream};
+        use serde_json::Value;
+        use std::sync::Arc;
+        use tokio_util::sync::CancellationToken;
+
+        pub(super) const SESSION_ID: &str = "cs-tool-events";
+
+        /// Must outlive the loop, for the reason given on
+        /// [`inactivity::EventSenders`]; the two live senders additionally feed
+        /// scripted steps.
+        pub(super) struct Senders {
+            pub(super) tool_event_tx: mpsc::Sender<ToolLifecycleEvent>,
+            pub(super) progress_tx: mpsc::Sender<ProgressNotification>,
+            _tool_usage_tx: mpsc::Sender<ToolUsageEvent>,
+            _approval_tx: mpsc::Sender<ApprovalLifecycleEvent>,
+        }
+
+        fn channels() -> (Senders, StreamingCallbacks) {
+            let (tool_event_tx, tool_event_rx) = mpsc::channel(16);
+            let (progress_tx, progress_rx) = mpsc::channel(16);
+            let (tool_usage_tx, tool_usage_rx) = mpsc::channel(16);
+            let (approval_tx, approval_event_rx) = mpsc::channel(16);
+            (
+                Senders {
+                    tool_event_tx,
+                    progress_tx,
+                    _tool_usage_tx: tool_usage_tx,
+                    _approval_tx: approval_tx,
+                },
+                StreamingCallbacks {
+                    request_id: "req_tool_events".to_string(),
+                    agent: Arc::new(MockAgent::pending()),
+                    tool_event_rx,
+                    progress_rx,
+                    tool_usage_rx,
+                    approval_event_rx,
+                    usage_state: UsageState::new(),
+                    response_content: ResponseContent::new(),
+                    model_name: "test/fake".to_string(),
+                    stream_shutdown_token: CancellationToken::new(),
+                },
+            )
+        }
+
+        pub(super) fn payload(event: &SseEvent) -> Value {
+            serde_json::from_str(&event.data).expect("event data should be JSON")
+        }
+
+        pub(super) async fn run_items(
+            items: Vec<Result<StreamItem, StreamError>>,
+        ) -> Vec<SseEvent> {
+            run_with(|_| items.into_iter().map(Step::Item).collect()).await
+        }
+
+        pub(super) async fn run_with<F>(build: F) -> Vec<SseEvent>
+        where
+            F: FnOnce(&Senders) -> Vec<Step>,
+        {
+            run_scoped(true, SESSION_ID, build).await
+        }
+
+        /// `build` receives the senders whose receivers the loop reads, so a
+        /// script can push side-channel events into the run it drives.
+        pub(super) async fn run_scoped<F>(
+            emit_custom_events: bool,
+            session_id: &str,
+            build: F,
+        ) -> Vec<SseEvent>
+        where
+            F: FnOnce(&Senders) -> Vec<Step>,
+        {
+            let (senders, callbacks) = channels();
+            let steps = build(&senders);
+            let config = StreamConfig::new(emit_custom_events, false, ToolResultMode::Aura, 0);
+            let ctx = TurnContext::new(
+                "chatcmpl-test".to_string(),
+                "test/fake".to_string(),
+                1_700_000_000,
+                None,
+                session_id,
+            );
+
+            let stream = MockAgent::scripted(steps)
+                .stream("q", vec![], CancellationToken::new(), "req_tool_events")
+                .await
+                .expect("mock stream should start");
+
+            let (chunk_tx, mut chunk_rx) = mpsc::channel::<Result<Bytes, String>>(64);
+            let collector = tokio::spawn(async move {
+                let mut body = String::new();
+                while let Some(chunk) = chunk_rx.recv().await {
+                    body.push_str(std::str::from_utf8(&chunk.expect("SSE chunk")).expect("UTF-8"));
+                }
+                body
+            });
+            let (cancel_tx, _cancel_rx) = watch::channel(false);
+
+            let termination = process_sse_stream_full(
+                &config,
+                &ctx,
+                stream,
+                chunk_tx,
+                cancel_tx,
+                Duration::from_secs(900),
+                // Far enough out that heartbeats never interleave with the script.
+                Duration::from_secs(86_400),
+                None,
+                None,
+                callbacks,
+            )
+            .await;
+            assert_eq!(termination, StreamTermination::Complete);
+            drop(senders);
+
+            let body = collector.await.expect("collector should not panic");
+            let (events, done) = parse_sse_stream(&body);
+            assert!(done, "stream should terminate with [DONE]");
+            events
+        }
+    }
+
+    /// The two sources `process_sse_stream_full` merges into one SSE stream:
+    /// `tool_requested`/`tool_start`/`progress` arrive on the side channels,
+    /// while `tool_complete` is derived from the `ToolResult` stream item. A
+    /// `MockAgent` script drives both, so ordering between them is fixed.
+    mod tool_events {
+        use super::harness::{SESSION_ID, Senders, payload, run_scoped, run_with};
+        use super::*;
+        use aura::{NumberOrString, ProgressNotification, ProgressToken};
+        use aura_test_utils::mock_agent::{Step, items};
+        use aura_test_utils::sse::{SseEvent, events_by_type};
+        use serde_json::{Value, json};
+
+        const TOOL_ID: &str = "call_abc123";
+        const TOOL_NAME: &str = "list_files";
+        const TOOL_ARGS: &str = r#"{"path":"/mock"}"#;
+
+        fn tool_requested(senders: &Senders) -> Step {
+            let tx = senders.tool_event_tx.clone();
+            Step::effect(move |_| {
+                let tx = tx.clone();
+                async move {
+                    tx.send(ToolLifecycleEvent::Requested {
+                        tool_id: TOOL_ID.to_string(),
+                        tool_name: TOOL_NAME.to_string(),
+                        arguments: json!({ "path": "/mock" }),
+                    })
+                    .await
+                    .expect("tool event channel open");
+                }
+            })
+        }
+
+        fn tool_start(senders: &Senders) -> Step {
+            let tx = senders.tool_event_tx.clone();
+            Step::effect(move |_| {
+                let tx = tx.clone();
+                async move {
+                    tx.send(ToolLifecycleEvent::Start {
+                        tool_id: TOOL_ID.to_string(),
+                        tool_name: TOOL_NAME.to_string(),
+                        progress_token: Some(ProgressToken(NumberOrString::Number(7))),
+                    })
+                    .await
+                    .expect("tool event channel open");
+                }
+            })
+        }
+
+        fn progress(senders: &Senders) -> Step {
+            let tx = senders.progress_tx.clone();
+            Step::effect(move |_| {
+                let tx = tx.clone();
+                async move {
+                    tx.send(ProgressNotification {
+                        progress_token: ProgressToken(NumberOrString::Number(7)),
+                        progress: 50.0,
+                        total: Some(100.0),
+                        message: Some("halfway".to_string()),
+                    })
+                    .await
+                    .expect("progress channel open");
+                }
+            })
+        }
+
+        fn tool_turn(senders: &Senders, result: Result<StreamItem, StreamError>) -> Vec<Step> {
+            vec![
+                tool_requested(senders),
+                Step::item(items::tool_call(TOOL_ID, TOOL_NAME, TOOL_ARGS)),
+                tool_start(senders),
+                Step::item(result),
+                Step::item(items::text("Here are the files.")),
+            ]
+        }
+
+        async fn run_successful_tool_call() -> Vec<SseEvent> {
+            run_with(|s| tool_turn(s, items::tool_result(TOOL_ID, "README.md\nsrc/"))).await
+        }
+
+        fn tool_ids(events: &[&SseEvent]) -> Vec<String> {
+            events
+                .iter()
+                .map(|e| payload(e)["tool_id"].as_str().expect("tool_id").to_string())
+                .collect()
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn tool_requested_carries_the_call_and_its_arguments() {
+            let events = run_successful_tool_call().await;
+            let requested = events_by_type(&events, event_names::TOOL_REQUESTED);
+
+            assert_eq!(requested.len(), 1, "expected one aura.tool_requested");
+            let json = payload(requested[0]);
+            assert_eq!(json["tool_id"], TOOL_ID);
+            assert_eq!(json["tool_name"], TOOL_NAME);
+            assert_eq!(json["arguments"], json!({ "path": "/mock" }));
+            assert!(json["agent_id"].is_string(), "missing agent_id");
+            assert_eq!(json["session_id"], SESSION_ID);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn tool_start_carries_the_progress_token_for_correlation() {
+            let events = run_successful_tool_call().await;
+            let start = events_by_type(&events, event_names::TOOL_START);
+
+            assert_eq!(start.len(), 1, "expected one aura.tool_start");
+            let json = payload(start[0]);
+            assert_eq!(json["tool_id"], TOOL_ID);
+            assert_eq!(json["tool_name"], TOOL_NAME);
+            assert_eq!(json["progress_token"], 7);
+            assert!(json["agent_id"].is_string(), "missing agent_id");
+            assert_eq!(json["session_id"], SESSION_ID);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn tool_complete_reports_success_with_duration_and_result() {
+            let events = run_successful_tool_call().await;
+            let complete = events_by_type(&events, event_names::TOOL_COMPLETE);
+
+            assert_eq!(complete.len(), 1, "expected one aura.tool_complete");
+            let json = payload(complete[0]);
+            assert_eq!(json["tool_id"], TOOL_ID);
+            // Resolved from the ToolCall item via tool_call_map, not the channel.
+            assert_eq!(json["tool_name"], TOOL_NAME);
+            assert_eq!(json["success"], true);
+            assert_eq!(json["result"], "README.md\nsrc/");
+            assert!(
+                json["duration_ms"].is_u64(),
+                "duration_ms must be an integer"
+            );
+            assert!(
+                json.get("error").is_none(),
+                "successful tool_complete must not carry an error"
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn tool_complete_reports_failure_with_the_error_message() {
+            let events = run_with(|s| {
+                tool_turn(
+                    s,
+                    items::tool_result(TOOL_ID, "Tool execution failed: Connection refused"),
+                )
+            })
+            .await;
+
+            let complete = events_by_type(&events, event_names::TOOL_COMPLETE);
+            assert_eq!(complete.len(), 1, "expected one aura.tool_complete");
+            let json = payload(complete[0]);
+            assert_eq!(json["success"], false);
+            assert_eq!(json["error"], "ExecutionError: Connection refused");
+            assert!(
+                json.get("result").is_none(),
+                "failed tool_complete must not carry a result"
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn every_requested_tool_is_paired_with_a_start_and_a_complete() {
+            let events = run_successful_tool_call().await;
+
+            let requested = tool_ids(&events_by_type(&events, event_names::TOOL_REQUESTED));
+            let start = tool_ids(&events_by_type(&events, event_names::TOOL_START));
+            let complete = tool_ids(&events_by_type(&events, event_names::TOOL_COMPLETE));
+
+            assert_eq!(requested, start, "tool_requested/tool_start must pair");
+            assert_eq!(start, complete, "tool_start/tool_complete must pair");
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn the_lifecycle_is_ordered_requested_start_progress_complete() {
+            let events = run_with(|s| {
+                let mut steps = tool_turn(s, items::tool_result(TOOL_ID, "README.md"));
+                // After tool_start, before the result — where MCP progress lands.
+                steps.insert(3, progress(s));
+                steps
+            })
+            .await;
+
+            let position = |event_type: &str| {
+                events
+                    .iter()
+                    .position(|e| e.event_type.as_deref() == Some(event_type))
+                    .unwrap_or_else(|| panic!("no {event_type} event in stream"))
+            };
+
+            let requested = position(event_names::TOOL_REQUESTED);
+            let start = position(event_names::TOOL_START);
+            let progress_pos = position(event_names::PROGRESS);
+            let complete = position(event_names::TOOL_COMPLETE);
+
+            assert!(requested < start, "tool_requested must precede tool_start");
+            assert!(start < progress_pos, "tool_start must precede progress");
+            assert!(
+                progress_pos < complete,
+                "progress must precede tool_complete"
+            );
+            assert_eq!(
+                payload(&events[progress_pos])["progress_token"],
+                7,
+                "progress must correlate with tool_start's token"
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn openai_chunks_are_emitted_alongside_the_custom_events() {
+            let events = run_successful_tool_call().await;
+
+            let chunks: Vec<Value> = events
+                .iter()
+                .filter(|e| e.event_type.is_none())
+                .map(payload)
+                .filter(|json| json["object"] == "chat.completion.chunk")
+                .collect();
+
+            assert!(
+                !chunks.is_empty(),
+                "custom events must not displace the OpenAI chunks"
+            );
+            for chunk in &chunks {
+                assert_eq!(chunk["id"], "chatcmpl-test");
+                assert!(chunk["choices"].is_array(), "chunk missing choices");
+            }
+
+            let text: String = chunks
+                .iter()
+                .filter_map(|c| c["choices"][0]["delta"]["content"].as_str())
+                .collect();
+            // Text resuming after a tool result is separated from the prior turn.
+            assert_eq!(text, "\n\nHere are the files.");
+
+            let call = chunks
+                .iter()
+                .find(|c| c["choices"][0]["delta"]["tool_calls"].is_array())
+                .map(|c| c["choices"][0]["delta"]["tool_calls"][0].clone())
+                .expect("tool call should surface as an OpenAI delta");
+            assert_eq!(call["id"], TOOL_ID);
+            assert_eq!(call["function"]["name"], TOOL_NAME);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn every_aura_event_carries_the_requests_session_id() {
+            let session_id = "correlation-test-session";
+            let events = run_scoped(true, session_id, |s| {
+                tool_turn(s, items::tool_result(TOOL_ID, "README.md"))
+            })
+            .await;
+
+            let aura_events: Vec<&SseEvent> = events
+                .iter()
+                .filter(|e| {
+                    e.event_type
+                        .as_deref()
+                        .is_some_and(|t| t.starts_with("aura."))
+                })
+                .collect();
+
+            assert!(!aura_events.is_empty(), "expected aura.* events");
+            for event in aura_events {
+                assert_eq!(
+                    payload(event)["session_id"],
+                    session_id,
+                    "session_id mismatch in {:?}",
+                    event.event_type
+                );
+            }
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn custom_events_are_suppressed_when_the_flag_is_off() {
+            let events = run_scoped(false, SESSION_ID, |s| {
+                tool_turn(s, items::tool_result(TOOL_ID, "README.md"))
+            })
+            .await;
+
+            assert!(
+                events.iter().all(|e| e.event_type.is_none()),
+                "no aura.* events should be emitted when custom events are off"
+            );
+            assert!(
+                !events.is_empty(),
+                "OpenAI chunks must still flow with custom events off"
+            );
+        }
+    }
+
+    /// End-of-stream output: the OpenAI final chunk's `usage`/`finish_reason`
+    /// and the `aura.usage` event, both derived from `StreamItem::Final`.
+    mod stream_output {
+        use super::harness::{payload, run_items, run_scoped};
+        use super::*;
+        use aura_test_utils::mock_agent::items;
+        use aura_test_utils::sse::events_by_type;
+        use rig::completion::Usage as RigUsage;
+        use serde_json::Value;
+
+        fn final_item(content: &str, input: u64, output: u64) -> Result<StreamItem, StreamError> {
+            Ok(StreamItem::Final(aura::FinalResponseInfo {
+                content: content.to_string(),
+                usage: RigUsage {
+                    input_tokens: input,
+                    output_tokens: output,
+                    total_tokens: input + output,
+                },
+                cache_usage: None,
+            }))
+        }
+
+        /// The one chunk carrying `finish_reason`; OpenAI clients read usage here.
+        fn final_chunk(events: &[aura_test_utils::sse::SseEvent]) -> Value {
+            events
+                .iter()
+                .filter(|e| e.event_type.is_none())
+                .map(payload)
+                .filter(|json| json["object"] == "chat.completion.chunk")
+                .find(|json| json["choices"][0]["finish_reason"].is_string())
+                .expect("stream should end with a finish_reason chunk")
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn the_final_chunk_carries_usage_from_the_streams_final_item() {
+            let events = run_items(vec![items::text("Hello."), final_item("Hello.", 12, 7)]).await;
+            let chunk = final_chunk(&events);
+
+            assert_eq!(chunk["choices"][0]["finish_reason"], "stop");
+            assert_eq!(chunk["usage"]["prompt_tokens"], 12);
+            assert_eq!(chunk["usage"]["completion_tokens"], 7);
+            assert_eq!(
+                chunk["usage"]["total_tokens"].as_u64().expect("total"),
+                chunk["usage"]["prompt_tokens"].as_u64().expect("prompt")
+                    + chunk["usage"]["completion_tokens"]
+                        .as_u64()
+                        .expect("completion"),
+                "total_tokens must equal prompt + completion"
+            );
+        }
+
+        /// A turn that ends without a `Final` still terminates cleanly; clients
+        /// must tolerate the absent usage rather than the field being zero.
+        #[tokio::test(start_paused = true)]
+        async fn the_final_chunk_omits_usage_when_the_stream_carries_none() {
+            let events = run_items(vec![items::text("Hello.")]).await;
+            let chunk = final_chunk(&events);
+
+            assert_eq!(chunk["choices"][0]["finish_reason"], "stop");
+            assert!(
+                chunk.get("usage").is_none_or(Value::is_null),
+                "usage must be absent, not zeroed: {chunk}"
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn aura_usage_is_emitted_at_stream_end() {
+            let events = run_items(vec![items::text("Hello."), final_item("Hello.", 12, 7)]).await;
+            let usage = events_by_type(&events, event_names::USAGE);
+
+            assert_eq!(usage.len(), 1, "expected one aura.usage");
+            let json = payload(usage[0]);
+            assert_eq!(json["prompt_tokens"], 12);
+            assert_eq!(json["completion_tokens"], 7);
+            assert_eq!(json["total_tokens"], 19);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_text_turn_streams_content_chunks_in_order() {
+            let events = run_scoped(false, "cs-basic", |_| {
+                ["Count: ", "1", "2", "3"]
+                    .into_iter()
+                    .map(|t| aura_test_utils::mock_agent::Step::Item(items::text(t)))
+                    .collect()
+            })
+            .await;
+
+            let chunks: Vec<Value> = events.iter().map(payload).collect();
+            assert!(
+                chunks.len() > 1,
+                "expected token-by-token delivery, got {}",
+                chunks.len()
+            );
+            for chunk in &chunks {
+                assert_eq!(chunk["object"], "chat.completion.chunk");
+                assert_eq!(chunk["id"], "chatcmpl-test");
+                assert!(chunk["choices"].is_array(), "chunk missing choices");
+            }
+
+            let text: String = chunks
+                .iter()
+                .filter_map(|c| c["choices"][0]["delta"]["content"].as_str())
+                .collect();
+            assert_eq!(text, "Count: 123");
         }
     }
 }

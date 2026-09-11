@@ -229,6 +229,9 @@ pub mod context {
         pub needs_separator: bool,
         pub is_first_chunk: bool,
         pub usage_stats: Option<UsageInfo>,
+        /// Prompt-cache split from `StreamItem::Final`, matching
+        /// `usage_stats`'s turn population.
+        pub final_cache_usage: Option<(u64, u64)>,
         /// Accumulated response content - Always populated regardless of streaming or not.
         pub accumulated_content: String,
         /// Stream error captured for OTel span recording.
@@ -261,7 +264,7 @@ pub use openai::{
 };
 
 /// Error prefix patterns from Rig's tool error handling. The first is also
-/// `MCP_ERROR_PREFIX` in `aura::mcp_response`; both must stay in step with
+/// `MCP_ERROR_PREFIX` in `aura::mcp::response`; both must stay in step with
 /// `McpToolError` in rig's `tool/mod.rs`.
 const ERROR_PREFIXES: &[(&str, &str)] = &[
     ("Tool returned an error: ", "ToolError"),

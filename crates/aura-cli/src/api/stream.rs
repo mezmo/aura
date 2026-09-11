@@ -73,8 +73,15 @@ pub trait StreamHandler {
     /// Called with (prompt_tokens, completion_tokens) from `aura.usage` events.
     /// These are cumulative provider-billed totals for the request, not context
     /// size — use [`on_context_usage`](Self::on_context_usage) for the context
-    /// window indicator.
-    fn on_usage(&mut self, _prompt_tokens: u64, _completion_tokens: u64) {}
+    /// window indicator. `cache_usage` is the provider-reported prompt-cache
+    /// split as `(read, creation)` tokens, if any.
+    fn on_usage(
+        &mut self,
+        _prompt_tokens: u64,
+        _completion_tokens: u64,
+        _cache_usage: Option<(u64, u64)>,
+    ) {
+    }
 
     /// Called with (context_tokens, response_tokens, context_window) from
     /// `aura.context_usage` events. `context_tokens` is the absolute size of the
@@ -263,10 +270,19 @@ where
                     if let Ok(AuraStreamEvent::Usage {
                         prompt_tokens,
                         completion_tokens,
+                        cache_read_input_tokens,
+                        cache_creation_input_tokens,
                         ..
                     }) = serde_json::from_str::<AuraStreamEvent>(&event.data)
                     {
-                        handler.on_usage(prompt_tokens, completion_tokens);
+                        let cache_usage =
+                            match (cache_read_input_tokens, cache_creation_input_tokens) {
+                                (None, None) => None,
+                                (read, creation) => {
+                                    Some((read.unwrap_or(0), creation.unwrap_or(0)))
+                                }
+                            };
+                        handler.on_usage(prompt_tokens, completion_tokens, cache_usage);
                     }
                 }
                 event_names::CONTEXT_USAGE => {
@@ -527,7 +543,12 @@ mod tests {
                 result.map(|s| s.to_string()),
             ));
         }
-        fn on_usage(&mut self, prompt_tokens: u64, completion_tokens: u64) {
+        fn on_usage(
+            &mut self,
+            prompt_tokens: u64,
+            completion_tokens: u64,
+            _cache_usage: Option<(u64, u64)>,
+        ) {
             self.usages.push((prompt_tokens, completion_tokens));
         }
         fn on_tool_usage(&mut self, prompt_tokens: u64, completion_tokens: u64) {

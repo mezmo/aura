@@ -11,6 +11,7 @@ use std::time::Duration;
 pub fn agent_info(config: &Config) -> AgentInfo {
     AgentInfo {
         id: config.agent_id().to_owned(),
+        instance_id: Some(crate::instance_id::instance_id(&config.agent).to_string()),
         description: config.agent.description.clone(),
         model: config.agent.llm.model_info().1.to_owned(),
         workers: worker_overview(config),
@@ -382,6 +383,30 @@ api_key = "k"
     }
 
     #[test]
+    fn agent_info_carries_instance_id() {
+        let config = load_config_from_str(
+            r#"
+[agent]
+name = "my-agent"
+system_prompt = "p"
+[agent.llm]
+provider = "openai"
+model = "gpt-4o"
+api_key = "k"
+"#,
+        )
+        .expect("config should parse");
+
+        let id = agent_info(&config)
+            .instance_id
+            .expect("instance_id must be set");
+        // Must be a valid hyphenated UUID.
+        assert!(uuid::Uuid::parse_str(&id).is_ok(), "not a UUID: {id}");
+        // Must be stable — same config always produces the same ID.
+        assert_eq!(agent_info(&config).instance_id.unwrap(), id);
+    }
+
+    #[test]
     fn agent_info_projects_credential_free_mcp_config_view_without_connecting() {
         let base = r#"
 [agent]
@@ -535,6 +560,7 @@ api_key = "k"
         };
         let mut info = AgentInfo {
             id: "a".to_string(),
+            instance_id: None,
             description: None,
             model: "gpt-4o".to_string(),
             workers: Vec::new(),

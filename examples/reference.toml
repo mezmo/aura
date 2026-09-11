@@ -215,6 +215,8 @@ model = "gpt-5.2"
 # reasoning_effort = "medium"  # none, minimal, low, medium, high, xhigh (provider/model support varies)
 # max_tokens = 8192
 # base_url = "https://api.openai.com/v1"  # custom endpoint
+# (OpenAI caches prompts >= 1024 tokens automatically -- no flag needed;
+# cache reads appear in aura.usage as cache_read_input_tokens.)
 # Context window size in tokens. Used for usage percentage reporting
 # in aura.session_info streaming events. Set this to your model's
 # actual context window.
@@ -224,6 +226,12 @@ model = "gpt-5.2"
 # provider = "anthropic"
 # api_key = "{{ env.ANTHROPIC_API_KEY }}"
 # model = "claude-sonnet-4-20250514"
+# Prompt caching (default: off). Places cache_control breakpoints so
+# repeated prefixes (system prompt, tools, conversation history) are
+# served from Anthropic's prompt cache: reads bill at ~10% of input
+# price, writes at a premium over it. Workers inherit this with
+# [agent.llm]; override per worker under [orchestration.worker.<name>.llm].
+# prompt_caching = true
 
 # Ollama alternative (no API key needed):
 # provider = "ollama"
@@ -234,6 +242,12 @@ model = "gpt-5.2"
 # provider = "bedrock"
 # model = "us.anthropic.claude-3-5-sonnet-20241022-v2:0"
 # region = "{{ env.AWS_REGION }}"
+# Prompt caching (default: off). Adds cachePoint blocks after the system
+# prompt, tool definitions, and last message. Enable only for models
+# that support caching (Claude 3.5 Sonnet v2 / 3.7 / 4.x / 5, Nova) --
+# Bedrock rejects requests carrying cachePoints on other models. Reads
+# bill at a reduced rate, writes at a premium. Workers inherit as above.
+# prompt_caching = true
 
 # Google Gemini alternative:
 # provider = "gemini"

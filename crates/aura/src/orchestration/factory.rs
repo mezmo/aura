@@ -108,6 +108,7 @@ impl OrchestratorFactory {
                                     crate::provider_agent::FinalResponseInfo {
                                         content: final_result,
                                         usage: Default::default(),
+                                        cache_usage: None,
                                     }
                                 ))).await;
                             }

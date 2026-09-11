@@ -32,6 +32,8 @@ pub struct CatalogEnvelope {
 pub struct AgentEntry {
     /// Agent identifier (from config).
     pub id: String,
+    /// Stable per-instance UUID derived from agent config and host identity.
+    pub instance_id: String,
     /// Human-readable agent name.
     pub name: String,
     /// LLM model identifier.
@@ -149,6 +151,7 @@ fn build_agent_entry(config: &Config, mcp_servers: Vec<McpServerEntry>) -> Agent
 
     AgentEntry {
         id,
+        instance_id: crate::instance_id::instance_id(&config.agent).to_string(),
         name,
         model,
         mcp_servers,
@@ -476,6 +479,22 @@ api_key = "k"
         let entry = build_agent_entry(&config, vec![]);
         assert_eq!(entry.id, "sre-agent");
         assert_eq!(entry.name, "sre-agent");
+    }
+
+    #[test]
+    fn build_agent_entry_carries_instance_id() {
+        let config = agent_config_toml("sre-agent", "", "");
+        let entry = build_agent_entry(&config, vec![]);
+        assert!(
+            uuid::Uuid::parse_str(&entry.instance_id).is_ok(),
+            "instance_id must be a valid UUID: {}",
+            entry.instance_id
+        );
+        // Stable — same config produces the same ID.
+        assert_eq!(
+            build_agent_entry(&config, vec![]).instance_id,
+            entry.instance_id
+        );
     }
 
     #[test]

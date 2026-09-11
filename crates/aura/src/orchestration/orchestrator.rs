@@ -36,11 +36,12 @@
 //! - `PlanCreated` - when the coordinator produces a plan
 //! - `TaskStarted` - when a worker begins a task
 //! - `TaskCompleted` - when a worker finishes a task
+//! - `TaskBlocked` - when a worker parks gated calls (park mode)
+//! - `RunParked` - when a run parks with a published checkpoint (park mode)
 //! - `IterationComplete` - when the post-execute coordinator decision completes
 //! - `Synthesizing` - when task results are being consolidated for the coordinator
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use rig::client::CompletionClient;
@@ -61,11 +62,15 @@ use super::tools::{InspectToolParamsTool, ListToolsTool, ReadArtifactTool};
 
 use super::config::OrchestrationConfig;
 use super::events::OrchestratorEvent;
+use super::park::{
+    ParkGuard, ParkedTaskRecord, ParkedTaskRecords, RecordedDecisions, ResumeContext,
+    TaskContinuation,
+};
 use super::persistence::ExecutionPersistence;
-use super::prompt_journal::{JournalPhase, PromptJournal};
 use super::types::{
-    FailedTaskRecord, FailureCategory, FailureSummary, IterationContext, IterationOutcome,
-    IterationTimings, Plan, PlanningResponse, TaskState, TaskStatus,
+    BlockedCell, CellOutcome, FailedTaskRecord, FailureCategory, FailureSummary, IterationContext,
+    IterationOutcome, IterationTimings, ParkSnapshot, PendingCall, Plan, PlanningResponse,
+    TaskState, TaskStatus,
 };
 
 // ============================================================================
@@ -99,6 +104,25 @@ struct TaskExecutionParams<'a> {
 struct TaskExecutionResult {
     result: String,
     structured_output: Option<super::types::StructuredTaskOutput>,
+}
+
+/// The outcome of one worker task.
+#[allow(clippy::large_enum_variant)]
+enum TaskOutcome {
+    Completed(TaskExecutionResult),
+    /// The worker parked gated calls and its snapshot was captured.
+    Blocked {
+        pending: Vec<PendingCall>,
+        attempt: usize,
+        snapshot: ParkSnapshot,
+    },
+}
+
+/// Park-mode state for one worker stream: its blocked cell and the stream key
+/// the hook looks the cell up by.
+struct WorkerPark {
+    cell: Arc<BlockedCell>,
+    key: String,
 }
 
 /// Named return type for `create_*` coordinator/worker methods.
@@ -384,13 +408,6 @@ pub struct Orchestrator {
     /// Execution persistence for debugging and retry intelligence
     persistence: Arc<Mutex<ExecutionPersistence>>,
 
-    /// Optional prompt journal for dev diagnostics (gated by AURA_PROMPT_JOURNAL=1)
-    prompt_journal: Option<PromptJournal>,
-
-    /// Current orchestration iteration, set at the top of `run_orchestration_loop`.
-    /// Read by `journal_record` so that iteration doesn't pollute method signatures.
-    current_iteration: AtomicUsize,
-
     /// Accumulated token usage across all LLM calls in this orchestration run
     /// (planning, workers, continuation routing).
     ///
@@ -405,6 +422,9 @@ pub struct Orchestrator {
 
     /// Outer wall-clock budget for the whole run; `None` is unbounded.
     pub(super) outer_budget: Option<Duration>,
+
+    /// Run-scoped park guard (park mode).
+    park_guard: Option<Arc<ParkGuard>>,
 }
 
 /// Stream context for reasoning attribution in `stream_and_forward`.
@@ -443,7 +463,12 @@ struct TurnTally {
 }
 
 impl TurnTally {
-    fn record(&mut self, turn: &rig::completion::Usage, usage_state: &crate::UsageState) {
+    fn record(
+        &mut self,
+        turn: &rig::completion::Usage,
+        cache: Option<rig::completion::CacheUsage>,
+        usage_state: &crate::UsageState,
+    ) {
         self.total.input_tokens += turn.input_tokens;
         self.total.output_tokens += turn.output_tokens;
         self.total.total_tokens += turn.total_tokens;
@@ -453,6 +478,12 @@ impl TurnTally {
             total_tokens: turn.total_tokens,
         };
         usage_state.accumulate_usage(turn.input_tokens, turn.output_tokens);
+        if let Some(cache) = cache {
+            usage_state.store_cache_usage(
+                cache.cache_read_input_tokens,
+                cache.cache_creation_input_tokens,
+            );
+        }
     }
 
     /// Reconcile against a loop total the provider reported separately.
@@ -537,19 +568,22 @@ impl Orchestrator {
 
         let orchestrator_id = uuid::Uuid::new_v4().to_string();
 
-        // Initialize prompt journal (gated by AURA_PROMPT_JOURNAL env var, default off)
-        let journal_enabled = crate::env_flags::bool_env("AURA_PROMPT_JOURNAL", false);
-        let prompt_journal = if effective_memory_dir.is_some() {
-            let guard = persistence.lock().await;
-            let run_id = guard.run_id().to_string();
-            let run_path = guard.run_path().to_path_buf();
-            drop(guard);
-            PromptJournal::from_persistence(&run_path, &run_id, &orchestrator_id, journal_enabled)
-        } else {
-            None
-        };
-
         let run_id_str = persistence.lock().await.run_id().to_string();
+        // One guard per park-mode run; `ParkGuard` documents arming and drop.
+        let park_guard = agent_config
+            .hitl
+            .as_ref()
+            .filter(|hitl| hitl.park_enabled)
+            .and_then(|hitl| match &*hitl.route {
+                crate::hitl::DecisionRoute::Conversational { registry, .. } => {
+                    Some(ParkGuard::new(
+                        registry.clone(),
+                        run_id_str.clone(),
+                        agent_config.request_id.clone().unwrap_or_default(),
+                    ))
+                }
+                crate::hitl::DecisionRoute::Webhook { .. } => None,
+            });
         let default_turn_depth = agent_config
             .agent
             .turn_depth
@@ -570,22 +604,10 @@ impl Orchestrator {
             tool_call_observer,
             mcp_manager,
             persistence,
-            prompt_journal,
-            current_iteration: AtomicUsize::new(0),
             usage_state: crate::UsageState::new(),
             outer_budget: None,
+            park_guard,
         })
-    }
-
-    /// Record a prompt in the journal if enabled.
-    ///
-    /// Reads the current iteration from `self.current_iteration` so callers
-    /// don't need to pass it explicitly.
-    fn journal_record(&self, phase: JournalPhase, system_prompt: &str, user_prompt: &str) {
-        if let Some(ref journal) = self.prompt_journal {
-            let iteration = self.current_iteration.load(Ordering::Relaxed);
-            journal.record(phase, iteration, system_prompt, user_prompt);
-        }
     }
 
     /// Create a worker agent for task execution.
@@ -598,11 +620,17 @@ impl Orchestrator {
     ///
     /// If a specialized worker is assigned via `worker_name`, it uses that worker's
     /// custom preamble and MCP filter. Otherwise uses generic worker with all tools.
+    ///
+    /// `park_cell` arms the gate's park arm for this worker. `recorded`
+    /// arms the recorded-decisions consult (the resume path); `None` on the
+    /// live path leaves the gate byte-identical.
     async fn create_worker(
         &self,
         task_id: usize,
         attempt: usize,
         worker_name: Option<&str>,
+        park_cell: Option<&Arc<BlockedCell>>,
+        recorded: Option<&Arc<RecordedDecisions>>,
     ) -> Result<AgentWithPreamble, Box<dyn std::error::Error + Send + Sync>> {
         use super::duplicate_call_guard::DuplicateCallGuard;
         use super::observer_wrapper::ObserverWrapper;
@@ -842,19 +870,34 @@ impl Orchestrator {
                 session_id: session_id_owned.map(crate::config::SessionId::new),
             };
             let request_id = worker_config.request_id.clone().unwrap_or_default();
-            let gate = Arc::new(crate::hitl::HitlApprovalWrapper::new(
+            let mut gate = crate::hitl::HitlApprovalWrapper::new(
                 hitl.patterns.clone(),
                 hitl.route.clone(),
                 scope.clone(),
                 request_id.clone(),
                 worker_config.agent.name.clone(),
-            ));
-            wrappers.insert(0, gate);
+                worker_config.instance_id.clone(),
+            );
+            // The park arm needs the store-bearing route; webhook deployments
+            // keep the live decision path.
+            if let (
+                Some(cell),
+                Some(guard),
+                crate::hitl::DecisionRoute::Conversational { registry, .. },
+            ) = (park_cell, self.park_guard.as_ref(), &*hitl.route)
+            {
+                gate = gate.with_park(registry.clone(), cell.clone(), Arc::clone(guard));
+            }
+            if let Some(recorded) = recorded {
+                gate = gate.with_recorded_decisions(Arc::clone(recorded));
+            }
+            wrappers.insert(0, Arc::new(gate));
             worker_config.hitl_request_approval_tool = Some(crate::hitl::RequestApprovalTool::new(
                 hitl.route.clone(),
                 scope,
                 request_id,
                 worker_config.agent.name.clone(),
+                worker_config.instance_id.clone(),
             ));
         }
 
@@ -1002,6 +1045,91 @@ impl Orchestrator {
             escalation_flag,
             submit_result_decision,
         })
+    }
+
+    /// Park-mode wiring for one worker attempt: `Some` only when this run
+    /// parks gated calls (see [`Self::park_enabled`]).
+    fn worker_park(&self, task_id: usize, attempt: usize) -> Option<WorkerPark> {
+        if !self.park_enabled() {
+            return None;
+        }
+        Some(WorkerPark {
+            cell: Arc::new(BlockedCell::default()),
+            // A per-stream synthetic id, not the live request id, so the hook's
+            // tool-event publishes dead-letter instead of reaching the SSE stream.
+            key: format!("{}:task:{task_id}:attempt:{attempt}", self.orchestrator_id),
+        })
+    }
+
+    /// `[hitl.park].enabled` on the conversational route.
+    fn park_enabled(&self) -> bool {
+        self.agent_config.hitl.as_ref().is_some_and(|hitl| {
+            hitl.park_enabled
+                && matches!(
+                    &*hitl.route,
+                    crate::hitl::DecisionRoute::Conversational { .. }
+                )
+        })
+    }
+
+    /// The worker approval scope stamped on a task's approvals — the same
+    /// shape `create_worker` builds for the gate and the park guard's
+    /// cancellation events.
+    async fn worker_scope(
+        &self,
+        task_id: usize,
+        worker_name: Option<&str>,
+    ) -> Option<crate::hitl::AgentScope> {
+        let (run_id, session_id) = {
+            let p = self.persistence.lock().await;
+            (p.run_id().to_string(), p.session_id().map(String::from))
+        };
+        run_id
+            .parse::<super::RunId>()
+            .ok()
+            .map(|run_id| crate::hitl::AgentScope::Worker {
+                run_id,
+                task: super::TaskIdentity::new(task_id, worker_name.map(String::from)),
+                session_id: session_id.map(crate::config::SessionId::new),
+            })
+    }
+
+    /// Orphan cleanup for a parked worker whose stream ended before the hook
+    /// captured its conversation: every pending decision id is removed from
+    /// the store with an `approval_completed(cancelled)` event, so the human
+    /// is not left with a decidable approval nothing will consume.
+    async fn cancel_parked_approvals(
+        &self,
+        task_id: usize,
+        worker_name: Option<&str>,
+        pending: &[PendingCall],
+    ) {
+        let Some(hitl) = self.agent_config.hitl.clone() else {
+            return;
+        };
+        let crate::hitl::DecisionRoute::Conversational { registry, .. } = &*hitl.route else {
+            return;
+        };
+        let scope = self.worker_scope(task_id, worker_name).await;
+        let request_id = self.agent_config.request_id.clone().unwrap_or_default();
+        for call in pending {
+            registry.remove(&call.decision_id).await;
+            if let Some(ref scope) = scope {
+                crate::approval_event_broker::publish(
+                    &request_id,
+                    crate::approval_event_broker::ApprovalLifecycleEvent::Completed(
+                        crate::hitl::completed_cancelled(call.decision_id, scope, Duration::ZERO),
+                    ),
+                )
+                .await;
+            }
+            tracing::warn!(
+                decision_id = %call.decision_id,
+                tool = %call.tool_name,
+                task_id,
+                "orphaned park approval cancelled (stream ended before snapshot)",
+            );
+        }
     }
 
     /// Drive one agent loop's stream, forwarding events and tallying usage.
@@ -1156,8 +1284,8 @@ impl Orchestrator {
                     Ok(StreamItem::FinalMarker) => {
                         // Per-turn marker — not end-of-stream. Continue collecting.
                     }
-                    Ok(StreamItem::TurnUsage(turn)) => {
-                        tally.record(&turn, usage_state);
+                    Ok(StreamItem::TurnUsage(turn, cache)) => {
+                        tally.record(&turn, cache, usage_state);
                         if let Some(budget) = scratchpad_budget {
                             budget.set_estimated_used(turn.input_tokens, turn.output_tokens);
                         }
@@ -1183,8 +1311,10 @@ impl Orchestrator {
                         );
                         if decision_ready().await {
                             tracing::debug!("{}: decision captured, reading turn usage", phase);
-                            if let Some(Ok(StreamItem::TurnUsage(turn))) = stream.next().await {
-                                tally.record(&turn, usage_state);
+                            if let Some(Ok(StreamItem::TurnUsage(turn, cache))) =
+                                stream.next().await
+                            {
+                                tally.record(&turn, cache, usage_state);
                             }
                             return Ok(LoopStep::End);
                         }
@@ -1227,12 +1357,17 @@ impl Orchestrator {
     /// - Forwards `ReasoningDelta`/`Reasoning` items through `event_tx`
     /// - No early-exit — runs the complete ReAct loop
     /// - Timeout wrapping via `per_call_timeout_secs`
+    ///
+    /// `park_key` routes a park-mode worker through the hook-carrying stream
+    /// so the park-aware hook runs; the hook's own deadline is disabled because
+    /// the per-call wrap below is the single wall-clock authority.
     async fn stream_and_forward(
         &self,
         agent: &Agent,
         params: StreamCallParams<'_>,
         stream_context: Option<StreamContext<'_>>,
         decision_ready: impl Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>,
+        park_key: Option<&str>,
     ) -> Result<ForwardedRun, Box<dyn std::error::Error + Send + Sync>> {
         let StreamCallParams {
             prompt,
@@ -1242,7 +1377,15 @@ impl Orchestrator {
         } = params;
         let timeout_secs = self.config.per_call_timeout_secs();
         let stream_future = async {
-            let stream = agent.stream_chat(prompt, history).await;
+            let stream = match park_key {
+                Some(key) => {
+                    agent
+                        .stream_chat_with_timeout(prompt, history, Duration::MAX, key)
+                        .await
+                        .0
+                }
+                None => agent.stream_chat(prompt, history).await,
+            };
             Self::drive_forward_loop(
                 stream,
                 &self.usage_state,
@@ -1413,8 +1556,10 @@ impl Orchestrator {
                             );
                             if decision_ready().await {
                                 tracing::debug!("{}: decision captured, reading turn usage", phase);
-                                if let Some(Ok(StreamItem::TurnUsage(turn))) = stream.next().await {
-                                    tally.record(&turn, &self.usage_state);
+                                if let Some(Ok(StreamItem::TurnUsage(turn, cache))) =
+                                    stream.next().await
+                                {
+                                    tally.record(&turn, cache, &self.usage_state);
                                 }
                                 return Ok(LoopStep::End);
                             }
@@ -1439,8 +1584,8 @@ impl Orchestrator {
                             final_total = Some(info.usage);
                             return Ok(LoopStep::End);
                         }
-                        Ok(StreamItem::TurnUsage(turn)) => {
-                            tally.record(&turn, &self.usage_state);
+                        Ok(StreamItem::TurnUsage(turn, cache)) => {
+                            tally.record(&turn, cache, &self.usage_state);
                         }
                         Ok(StreamItem::FinalMarker) => return Ok(LoopStep::End),
                         // MaxDepthError: success if decision was captured, error otherwise
@@ -1728,15 +1873,6 @@ impl Orchestrator {
             // Build full history: external chat + accumulated coordinator conversation
             let mut full_history = chat_history.to_vec();
             full_history.extend(coordinator_state.conversation.iter().cloned());
-
-            self.journal_record(
-                JournalPhase::Planning {
-                    attempt,
-                    max_attempts: max_correction_attempts,
-                },
-                &coordinator_state.preamble,
-                &prompt,
-            );
 
             let response = match self
                 .planning_stream_with_transient_retry(
@@ -2615,6 +2751,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 api_key,
                 model,
                 base_url,
+                prompt_caching,
                 ..
             } => {
                 let mut cb = rig::providers::anthropic::Client::<reqwest::Client>::builder()
@@ -2622,10 +2759,13 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 if let Some(url) = base_url {
                     cb = cb.base_url(url);
                 }
-                let cm = cb
+                let mut cm = cb
                     .build()
                     .map_err(|e| format!("Failed to build Anthropic coordinator: {}", e))?
                     .completion_model(model);
+                if *prompt_caching {
+                    cm = cm.with_prompt_caching();
+                }
                 Ok(ProviderAgent::Anthropic(Self::build_agent_with_tools(
                     cm,
                     preamble,
@@ -2641,6 +2781,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 model,
                 region,
                 profile,
+                prompt_caching,
                 ..
             } => {
                 use aws_config::{BehaviorVersion, Region};
@@ -2656,10 +2797,13 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         .load()
                         .await
                 };
-                let cm = rig_bedrock::client::Client::from(aws_sdk_bedrockruntime::Client::new(
-                    &sdk_config,
-                ))
+                let mut cm = rig_bedrock::client::Client::from(
+                    aws_sdk_bedrockruntime::Client::new(&sdk_config),
+                )
                 .completion_model(model);
+                if *prompt_caching {
+                    cm = cm.with_prompt_caching();
+                }
                 Ok(ProviderAgent::Bedrock(Self::build_agent_with_tools(
                     cm,
                     preamble,
@@ -2775,6 +2919,53 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 .unwrap_or_default()
         };
 
+        // Test-only model injection (park/reify rig): a queued override builds
+        // this worker from a scripted model. The override's extra tools go
+        // through the worker's own wrapper chain — `worker_config.tool_wrapper`
+        // carries the composed chain (observer, duplicate guard, persistence,
+        // HITL gate) create_worker assembled — so a scripted worker's gated
+        // calls park exactly like live ones. No override queued: unchanged
+        // behavior.
+        #[cfg(test)]
+        if let Some(worker_override) = crate::orchestration::test_rig::take_worker_override() {
+            use rig::tool::Tool as _;
+
+            use crate::orchestration::test_rig::DynToolAsTool;
+            use crate::tool_wrapper::WrappedTool;
+
+            let mut builder = rig::agent::AgentBuilder::new(worker_override.model);
+            builder = builder.name(&worker_config.agent.name);
+            builder = builder.provider_name(llm_provider).model_name(llm_model);
+            builder = builder.preamble(preamble);
+            let mut state = BuilderState::Initial(builder);
+            for tool in worker_override.extra_tools {
+                let shim = DynToolAsTool::new(tool);
+                match (
+                    &worker_config.tool_wrapper,
+                    &worker_config.tool_context_factory,
+                ) {
+                    (Some(wrapper), Some(factory)) => {
+                        let factory = factory.clone();
+                        let tool_name = shim.name();
+                        state = state.add_tool(
+                            WrappedTool::new(shim, wrapper.clone())
+                                .with_context_factory(move |_| factory(&tool_name)),
+                        );
+                    }
+                    (Some(wrapper), None) => {
+                        state = state.add_tool(WrappedTool::new(shim, wrapper.clone()));
+                    }
+                    (None, _) => state = state.add_tool(shim),
+                }
+            }
+            let state =
+                Agent::add_all_tools(state, worker_config, &shared_mcp, wait_for_tools()).await?;
+            return Ok((
+                ProviderAgent::Scripted(state.build()),
+                "scripted".to_string(),
+            ));
+        }
+
         match &worker_config.llm {
             LlmConfig::OpenAI {
                 api_key,
@@ -2829,6 +3020,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 api_key,
                 model,
                 base_url,
+                prompt_caching,
                 additional_params,
                 ..
             } => {
@@ -2837,10 +3029,13 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 if let Some(url) = base_url {
                     cb = cb.base_url(url);
                 }
-                let cm = cb
+                let mut cm = cb
                     .build()
                     .map_err(|e| format!("Failed to build Anthropic worker: {}", e))?
                     .completion_model(model);
+                if *prompt_caching {
+                    cm = cm.with_prompt_caching();
+                }
                 let mut builder = rig::agent::AgentBuilder::new(cm);
                 builder = builder.name(&worker_config.agent.name);
                 builder = builder.provider_name(llm_provider).model_name(llm_model);
@@ -2864,6 +3059,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 model,
                 region,
                 profile,
+                prompt_caching,
                 additional_params,
                 ..
             } => {
@@ -2880,10 +3076,13 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         .load()
                         .await
                 };
-                let cm = rig_bedrock::client::Client::from(aws_sdk_bedrockruntime::Client::new(
-                    &sdk_config,
-                ))
+                let mut cm = rig_bedrock::client::Client::from(
+                    aws_sdk_bedrockruntime::Client::new(&sdk_config),
+                )
                 .completion_model(model);
+                if *prompt_caching {
+                    cm = cm.with_prompt_caching();
+                }
                 let mut builder = rig::agent::AgentBuilder::new(cm);
                 builder = builder.name(&worker_config.agent.name);
                 builder = builder.provider_name(llm_provider).model_name(llm_model);
@@ -3013,16 +3212,17 @@ Assign tasks to the worker whose tools best match the required operations."#,
     /// Each worker receives the plan goal (not the raw query) to understand context.
     ///
     /// Returns the aggregate task-compute time (sum of per-task wall durations
-    /// across all waves), used for the iteration's phase-timing breakdown.
+    /// across all waves) and the park records of the tasks that blocked.
     async fn execute(
         &self,
         plan: &mut Plan,
         event_tx: &tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>,
-    ) -> Result<u64, StreamError> {
+    ) -> Result<(u64, ParkedTaskRecords), StreamError> {
         use futures::StreamExt;
         use futures::stream::FuturesUnordered;
 
         let mut task_compute_ms: u64 = 0;
+        let mut park_records: ParkedTaskRecords = ParkedTaskRecords::new();
         while !plan.is_finished() {
             // Collect ready tasks with their context and worker assignment
             // Tuple: (task_id, description, context, worker_name)
@@ -3036,10 +3236,19 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 .collect();
 
             if ready_tasks.is_empty() {
-                // No ready tasks but not finished - this shouldn't happen with valid plans
-                tracing::warn!(
-                    "No ready tasks but plan not finished — blocked tasks remaining after failure (dependency chain broken)"
-                );
+                // Quiescence: park outranks the replan path while a decision
+                // is outstanding.
+                if has_awaiting_task(plan) {
+                    for line in park_verdict_lines(plan) {
+                        tracing::warn!("{line}");
+                    }
+                } else {
+                    // No ready tasks but not finished - this shouldn't happen
+                    // with valid plans
+                    tracing::warn!(
+                        "No ready tasks but plan not finished — blocked tasks remaining after failure (dependency chain broken)"
+                    );
+                }
                 break;
             }
 
@@ -3084,7 +3293,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
                             task_context: &task_context,
                             worker_name: worker_name.as_deref(),
                         };
-                        let result = self.execute_task(task_id, &params, Some(event_tx)).await;
+                        let result = self
+                            .execute_task(task_id, &params, Some(event_tx), None, None)
+                            .await;
                         let duration_ms = start_time.elapsed().as_millis() as u64;
                         (task_id, result, duration_ms, worker_name, task_desc)
                     },
@@ -3097,7 +3308,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             {
                 task_compute_ms += duration_ms;
                 match result {
-                    Ok(exec_result) => {
+                    Ok(TaskOutcome::Completed(exec_result)) => {
                         let final_result = self
                             .maybe_create_artifact(
                                 task_id,
@@ -3139,6 +3350,39 @@ Assign tasks to the worker whose tools best match the required operations."#,
                             );
                         }
                     }
+                    Ok(TaskOutcome::Blocked {
+                        pending,
+                        attempt,
+                        snapshot,
+                    }) => {
+                        // The task awaits human decisions: no artifact, no
+                        // completion event; one blocked event per parked call.
+                        let worker_id = worker_name.clone().unwrap_or(self.orchestrator_id.clone());
+                        for call in &pending {
+                            let _ = event_tx
+                                .send(Ok(StreamItem::OrchestratorEvent(
+                                    OrchestratorEvent::TaskBlocked {
+                                        task_id,
+                                        orchestrator_id: self.orchestrator_id.clone(),
+                                        worker_id: worker_id.clone(),
+                                        tool_call_id: call.call_id.clone(),
+                                        decision_id: call.decision_id.to_string(),
+                                        tool_name: call.tool_name.clone(),
+                                    },
+                                )))
+                                .await;
+                        }
+                        if let Some(t) = plan.get_task_mut(task_id) {
+                            t.state = TaskState::AwaitingApproval { pending };
+                        }
+                        park_records.insert(task_id, ParkedTaskRecord { attempt, snapshot });
+                        tracing::warn!(
+                            "Task {} ('{}') blocked awaiting approval after {}ms",
+                            task_id,
+                            task_desc,
+                            duration_ms
+                        );
+                    }
                     Err(e) => {
                         let err_str = e.to_string();
                         let category = Self::categorize_failure_error(&err_str);
@@ -3175,7 +3419,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             }
         }
 
-        Ok(task_compute_ms)
+        Ok((task_compute_ms, park_records))
     }
 
     /// Collect failed tasks from this iteration into failure records.
@@ -3291,7 +3535,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
         }
     }
 
-    /// Execute a single task using a worker agent.
+    /// Execute a single task using a worker agent. `continuation` carries a
+    /// parked task's checkpointed conversation (the resume path) and `resume`
+    /// the recorded decisions + resuming document it drives; both are `None`
+    /// on the live path.
     #[tracing::instrument(
         name = "orchestration.worker",
         skip_all,
@@ -3306,12 +3553,27 @@ Assign tasks to the worker whose tools best match the required operations."#,
         task_id: usize,
         params: &TaskExecutionParams<'_>,
         event_tx: Option<&tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>>,
-    ) -> Result<TaskExecutionResult, StreamError> {
+        continuation: Option<&TaskContinuation>,
+        resume: Option<&ResumeContext>,
+    ) -> Result<TaskOutcome, StreamError> {
         let TaskExecutionParams {
             task_description,
             task_context,
             worker_name,
         } = params;
+
+        // The resume path: the checkpointed conversation drives everything,
+        // so the live prompt-building and retry loop below do not apply.
+        if let (Some(continuation), Some(resume)) = (continuation, resume) {
+            return self
+                .resume_task(task_id, *worker_name, continuation, resume, event_tx)
+                .await;
+        }
+        if continuation.is_some() != resume.is_some() {
+            return Err("task resume state is incomplete: continuation and \
+                        resume context must be provided together"
+                .into());
+        }
 
         {
             let span = tracing::Span::current();
@@ -3368,12 +3630,24 @@ Assign tasks to the worker whose tools best match the required operations."#,
             actual_attempts = attempt;
             let is_final_attempt = attempt == MAX_WORKER_ATTEMPTS;
 
+            // A fresh cell per attempt: a failed attempt's entries must not
+            // leak into its retry.
+            let park = self.worker_park(task_id, attempt);
+
             let AgentWithPreamble {
                 agent: worker,
                 preamble: worker_preamble,
                 escalation_flag,
                 submit_result_decision,
-            } = self.create_worker(task_id, attempt, *worker_name).await?;
+            } = self
+                .create_worker(
+                    task_id,
+                    attempt,
+                    *worker_name,
+                    park.as_ref().map(|p| &p.cell),
+                    None,
+                )
+                .await?;
 
             // Retries rebuild the same preamble, and `set_attribute` appends
             // rather than replaces, so record it once per worker span.
@@ -3399,8 +3673,12 @@ Assign tasks to the worker whose tools best match the required operations."#,
             };
 
             // initial_used only counts templates + tool schemas, so bill the
-            // per-task prompt here.
-            if let Some(ref budget) = worker.scratchpad_budget {
+            // per-task prompt here. Park-mode workers skip the manual seed:
+            // their hook-carrying stream (`stream_chat_with_timeout`) seeds
+            // the budget itself, from the prompt *and* the retry history.
+            if park.is_none()
+                && let Some(ref budget) = worker.scratchpad_budget
+            {
                 let task_prompt_tokens = budget.count_tokens(&prompt);
                 budget.record_usage(task_prompt_tokens);
                 tracing::debug!(
@@ -3410,20 +3688,12 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 );
             }
 
-            // Record in prompt journal
-            self.journal_record(
-                JournalPhase::Worker {
-                    task_id,
-                    worker_name: *worker_name,
-                    attempt,
-                },
-                &worker_preamble,
-                &prompt,
-            );
-
             // Execute the task
             let srd = submit_result_decision.clone();
-            let stream_result = self
+            let park_registration = park.as_ref().map(|p| {
+                crate::streaming_request_hook::ParkCellRegistration::new(&p.key, p.cell.clone())
+            });
+            let mut stream_result = self
                 .stream_and_forward(
                     &worker,
                     StreamCallParams {
@@ -3440,8 +3710,55 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         let srd = srd.clone();
                         Box::pin(async move { srd.lock().await.is_some() })
                     },
+                    park.as_ref().map(|p| p.key.as_str()),
                 )
                 .await;
+            drop(park_registration);
+
+            // The cell is read before the normal result handling: it is the
+            // source of truth after any stream end, the park cancel's Err included.
+            if let Some(ref park) = park {
+                match park.cell.outcome() {
+                    CellOutcome::Blocked { pending } => {
+                        tracing::info!(
+                            "Task {} blocked awaiting approval ({} pending call(s))",
+                            task_id,
+                            pending.len()
+                        );
+                        // `outcome` reports Blocked only when the snapshot
+                        // was captured, so the read-back cannot miss.
+                        let snapshot = park
+                            .cell
+                            .snapshot()
+                            .expect("cell outcome Blocked implies a captured snapshot");
+                        return Ok(TaskOutcome::Blocked {
+                            pending,
+                            attempt,
+                            snapshot,
+                        });
+                    }
+                    CellOutcome::Orphaned { pending } => {
+                        // The stream ended before the hook could snapshot: the
+                        // gated action never ran and cannot resume from a
+                        // conversation nobody captured, so cancel the decisions
+                        // and fail the task.
+                        self.cancel_parked_approvals(task_id, *worker_name, &pending)
+                            .await;
+                        let underlying = match stream_result.as_ref() {
+                            Err(e) => format!(" Underlying error: {e}"),
+                            Ok(_) => String::new(),
+                        };
+                        stream_result = Err(format!(
+                            "Worker stream ended before the parked approval snapshot \
+                             was captured for task {task_id}; {} pending approval(s) \
+                             cancelled.{underlying}",
+                            pending.len()
+                        )
+                        .into());
+                    }
+                    CellOutcome::Normal => {}
+                }
+            }
 
             // Emit per-agent ScratchpadUsage event if this worker used scratchpad.
             if let (Some(budget), Some(tx)) = (worker.scratchpad_budget.as_ref(), event_tx) {
@@ -3514,13 +3831,13 @@ Assign tasks to the worker whose tools best match the required operations."#,
                                 &prompt,
                             )
                             .await;
-                            return Ok(TaskExecutionResult {
+                            return Ok(TaskOutcome::Completed(TaskExecutionResult {
                                 result: output.result,
                                 structured_output: Some(super::types::StructuredTaskOutput {
                                     summary: output.summary,
                                     confidence: output.confidence,
                                 }),
-                            });
+                            }));
                         }
                         None if is_final_attempt => {
                             tracing::warn!(
@@ -3539,10 +3856,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
                                 &prompt,
                             )
                             .await;
-                            return Ok(TaskExecutionResult {
+                            return Ok(TaskOutcome::Completed(TaskExecutionResult {
                                 result: raw_response,
                                 structured_output: None,
-                            });
+                            }));
                         }
                         None => {
                             tracing::info!(
@@ -3592,14 +3909,190 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 &base_worker_prompt,
             )
             .await;
-            Ok(TaskExecutionResult {
+            Ok(TaskOutcome::Completed(TaskExecutionResult {
                 result: last_raw_response,
                 structured_output: None,
-            })
+            }))
         }
     }
 
-    /// Persist a single worker execution attempt to the journal and persistence store.
+    /// The continuation arm (design doc sections 2.7–2.8): finish a parked
+    /// task from its checkpoint. Rebuilds the worker for the recorded
+    /// attempt with the run's recorded decisions at the gate, tombstones and
+    /// invokes each pending call in recorded order through the wrapper
+    /// chain, replaces the checkpointed sentinel tool results with the real
+    /// ones, then hands the conversation back to the normal multi-turn loop
+    /// via `stream_chat`. Consumed decisions are removed from the store
+    /// after the task completes. The task execution record is not re-persisted
+    /// here: the resuming document's executed list is the resume's record.
+    async fn resume_task(
+        &self,
+        task_id: usize,
+        worker_name: Option<&str>,
+        continuation: &TaskContinuation,
+        resume: &ResumeContext,
+        event_tx: Option<&tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>>,
+    ) -> Result<TaskOutcome, StreamError> {
+        let attempt = continuation.attempt;
+        let Some(park) = self.worker_park(task_id, attempt) else {
+            return Err("cannot resume a task without park mode enabled".into());
+        };
+
+        let AgentWithPreamble {
+            agent: worker,
+            preamble: _,
+            escalation_flag: _,
+            submit_result_decision,
+        } = self
+            .create_worker(
+                task_id,
+                attempt,
+                worker_name,
+                Some(&park.cell),
+                Some(&resume.recorded),
+            )
+            .await?;
+
+        let mut current_prompt = continuation.current_prompt.clone();
+        // Strict arm: a continuation invocation that misses the recorded set
+        // is a resume fault, never a fresh park. The drop guard clears the
+        // task's entry on every exit path (error, panic, and the normal drop
+        // after the last pending call, before the loop resumes).
+        let strict = resume.recorded.strict_guard(task_id);
+        for call in &continuation.pending {
+            // The tombstone precedes the invocation: a crash after this
+            // write shows the call as executed, never re-asks the human.
+            resume
+                .document
+                .append_executed_and_publish(&call.call_id)
+                .await
+                .map_err(|e| -> StreamError {
+                    format!(
+                        "resume tombstone write for call {} failed: {e}",
+                        call.call_id
+                    )
+                    .into()
+                })?;
+            let wire = worker
+                .inner
+                .call_tool(&call.tool_name, &call.arguments.to_string())
+                .await
+                .map_err(|e| -> StreamError {
+                    format!("resume invocation of {} failed: {e}", call.tool_name).into()
+                })?;
+            if !super::park::replace_tool_result(&mut current_prompt, &call.call_id, &wire) {
+                return Err(format!(
+                    "continuation prompt has no tool result for call {}",
+                    call.call_id
+                )
+                .into());
+            }
+        }
+        drop(strict);
+
+        // stream_chat(current_prompt, history): the normal multi-turn loop,
+        // to submit_result or depth exhaustion — park-aware, so a
+        // model-issued gated call re-parks through the live arm.
+        let srd = submit_result_decision.clone();
+        let park_registration =
+            crate::streaming_request_hook::ParkCellRegistration::new(&park.key, park.cell.clone());
+        let (stream, _cancel_tx, _usage_state) = worker
+            .inner
+            .stream_chat_message_with_timeout(
+                current_prompt,
+                continuation.history.clone(),
+                worker.max_depth,
+                Duration::MAX,
+                &park.key,
+                worker.scratchpad_budget.clone(),
+                worker.client_tool_names.clone(),
+            )
+            .await;
+        let stream_result = Self::drive_forward_loop(
+            stream,
+            &self.usage_state,
+            self.config.stream_inactivity_timeout_secs(),
+            worker.scratchpad_budget.as_ref(),
+            "Worker resume",
+            event_tx,
+            worker_name.map(|name| StreamContext {
+                task_id,
+                worker_id: name,
+            }),
+            || {
+                let srd = srd.clone();
+                Box::pin(async move { srd.lock().await.is_some() })
+            },
+        )
+        .await;
+        drop(park_registration);
+
+        // Same cell contract as the live path: the cell is the source of
+        // truth after any stream end.
+        match park.cell.outcome() {
+            CellOutcome::Blocked { pending } => {
+                let snapshot = park
+                    .cell
+                    .snapshot()
+                    .expect("cell outcome Blocked implies a captured snapshot");
+                return Ok(TaskOutcome::Blocked {
+                    pending,
+                    attempt,
+                    snapshot,
+                });
+            }
+            CellOutcome::Orphaned { pending } => {
+                self.cancel_parked_approvals(task_id, worker_name, &pending)
+                    .await;
+                let underlying = match stream_result.as_ref() {
+                    Err(e) => format!(" Underlying error: {e}"),
+                    Ok(_) => String::new(),
+                };
+                return Err(format!(
+                    "Worker resume stream ended before the parked approval snapshot \
+                     was captured for task {task_id}; {} pending approval(s) \
+                     cancelled.{underlying}",
+                    pending.len()
+                )
+                .into());
+            }
+            CellOutcome::Normal => {}
+        }
+
+        let raw_response = match stream_result {
+            Ok(run) => run.response.content,
+            Err(e) => {
+                return Err(format!("Worker resume failed for task {task_id}: {e}").into());
+            }
+        };
+        let structured = submit_result_decision.lock().await.take();
+        let (result, structured_output) = match structured {
+            Some(output) => (
+                output.result,
+                Some(super::types::StructuredTaskOutput {
+                    summary: output.summary,
+                    confidence: output.confidence,
+                }),
+            ),
+            None => (raw_response, None),
+        };
+
+        // Step 5: the consumed decisions leave the store with the task.
+        if let Some(hitl) = self.agent_config.hitl.clone()
+            && let crate::hitl::DecisionRoute::Conversational { registry, .. } = &*hitl.route
+        {
+            for call in &continuation.pending {
+                registry.remove(&call.decision_id).await;
+            }
+        }
+
+        Ok(TaskOutcome::Completed(TaskExecutionResult {
+            result,
+            structured_output,
+        }))
+    }
+
+    /// Persist a single worker execution attempt to the persistence store.
     #[allow(clippy::too_many_arguments)]
     async fn persist_worker_execution(
         &self,
@@ -3688,6 +4181,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         }
                     }
                     TaskState::Running => "▶ running".to_string(),
+                    TaskState::AwaitingApproval { pending } => {
+                        format!("⏸ awaiting approval ({} call(s))", pending.len())
+                    }
                 };
                 format!("Task {}: {} [{}]", t.id, t.description, status_detail)
             })
@@ -3915,8 +4411,6 @@ Assign tasks to the worker whose tools best match the required operations."#,
             routing_decision,
         };
 
-        // Set iteration for initial planning (journal reads this via AtomicUsize)
-        self.current_iteration.store(1, Ordering::Relaxed);
         // Planning latency: prompt → plan created (includes correction retries).
         // Spans the whole planning call, so any planning-correction retries
         // inside plan_with_routing are counted in planning_ms.
@@ -4040,7 +4534,6 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
         let final_result = loop {
             iteration += 1;
-            self.current_iteration.store(iteration, Ordering::Relaxed);
             match self
                 .run_iteration(
                     iteration,
@@ -4133,8 +4626,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
         // ----------------------------------------------------------------
         // EXECUTE: Run workers on tasks (parallel when possible)
         // ----------------------------------------------------------------
-        let task_compute_ms = match self.execute(&mut plan, event_tx).await {
-            Ok(ms) => ms,
+        let (task_compute_ms, park_records) = match self.execute(&mut plan, event_tx).await {
+            Ok(result) => result,
             Err(e) => {
                 self.write_run_manifest(&plan, iteration, None).await;
                 return Err(e);
@@ -4165,6 +4658,60 @@ Assign tasks to the worker whose tools best match the required operations."#,
             if let Err(e) = persistence.write_plan(&plan).await {
                 tracing::warn!("Failed to persist plan after execution: {}", e);
             }
+        }
+
+        // ----------------------------------------------------------------
+        // PARK PATH (park mode): an awaiting task at quiescence ends the run
+        // here, with no post-execute coordinator call: the coordinator must
+        // not replan a task the human is deciding on. The commit refreshes
+        // the awaiting set, publishes the checkpoint, and emits run_parked;
+        // a failed commit publishes nothing and cancels the run's approvals.
+        // ----------------------------------------------------------------
+        if has_awaiting_task(&plan) {
+            tracing::info!(
+                "Iteration {} parked at quiescence; skipping post-execute coordinator call",
+                iteration
+            );
+            let conversation = coordinator_state.conversation.clone();
+            let routing_decision = coordinator_state.routing_decision.lock().await.clone();
+            let result = self
+                .park_run(
+                    query,
+                    chat_history,
+                    &conversation,
+                    routing_decision.as_ref(),
+                    iteration,
+                    planning_ms,
+                    failure_history.as_slice(),
+                    &plan,
+                    &park_records,
+                    event_tx,
+                )
+                .await;
+            let tool_traces = self.load_tool_traces_for_plan(&plan).await;
+            let timings = Self::iteration_timings(
+                &tool_traces,
+                planning_ms,
+                execution_start,
+                task_compute_ms,
+            );
+            match &result {
+                Ok(_) => {
+                    self.write_run_manifest_full(
+                        &plan,
+                        iteration,
+                        Some(super::persistence::RunStatus::Parked),
+                        Some("Parked awaiting human approval".to_string()),
+                        Some(timings),
+                    )
+                    .await
+                }
+                Err(_) => {
+                    self.write_run_manifest(&plan, iteration, Some(timings))
+                        .await
+                }
+            }
+            return result.map(IterationOutcome::FinalResult);
         }
 
         // ----------------------------------------------------------------
@@ -4254,27 +4801,15 @@ Assign tasks to the worker whose tools best match the required operations."#,
         // build_raw_task_results ships the worker output the user already
         // paid for instead of an empty response.
         // ----------------------------------------------------------------
+
         let tool_traces = self.load_tool_traces_for_plan(&plan).await;
 
         // Phase timings for this iteration. `execution_ms` is the wall-clock
         // from plan-ready to here (the continuation-prompt entrypoint);
         // `tool_ms` is the aggregate tool-execution time within it, so
         // `execution_ms - tool_ms` approximates LLM-thinking time.
-        let tool_ms: u64 = tool_traces
-            .values()
-            .flat_map(|entries| entries.iter())
-            .map(|e| e.duration_ms)
-            .sum();
-        let timings = IterationTimings {
-            planning_ms,
-            execution_ms: execution_start.elapsed().as_millis() as u64,
-            task_compute_ms,
-            tool_ms,
-        };
-        let current_span = tracing::Span::current();
-        current_span.record("orchestration.execution_ms", timings.execution_ms);
-        current_span.record("orchestration.task_compute_ms", timings.task_compute_ms);
-        current_span.record("orchestration.tool_ms", timings.tool_ms);
+        let timings =
+            Self::iteration_timings(&tool_traces, planning_ms, execution_start, task_compute_ms);
 
         let post_execute_ctx = IterationContext::new(
             iteration,
@@ -4341,9 +4876,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     orchestration_start.elapsed().as_secs_f64(),
                     decision_latency,
                 );
-                self.write_run_manifest_with_summary(
+                self.write_run_manifest_full(
                     &plan,
                     iteration,
+                    None,
                     response_summary,
                     Some(timings),
                 )
@@ -4565,7 +5101,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         t.id, t.description, error
                     ));
                 }
-                TaskState::Pending | TaskState::Running => {
+                TaskState::Pending | TaskState::Running | TaskState::AwaitingApproval { .. } => {
                     out.push_str(&format!(
                         "## Task {}: {}\n\n(not executed)\n\n",
                         t.id, t.description
@@ -4576,68 +5112,213 @@ Assign tasks to the worker whose tools best match the required operations."#,
         out
     }
 
-    /// Write a typed `RunManifest` summarizing this orchestration run.
-    ///
-    /// Pre-load tool call records for all tasks in a plan, converting to
-    /// condensed `ToolTraceEntry` for continuation prompt rendering.
+    /// Collect the condensed tool traces for all tasks in a plan, for
+    /// continuation prompt rendering.
+    /// The iteration's phase timings, recorded on the current span.
+    fn iteration_timings(
+        tool_traces: &std::collections::HashMap<usize, Vec<super::persistence::ToolTraceEntry>>,
+        planning_ms: u64,
+        execution_start: Instant,
+        task_compute_ms: u64,
+    ) -> IterationTimings {
+        let tool_ms: u64 = tool_traces
+            .values()
+            .flat_map(|entries| entries.iter())
+            .map(|e| e.duration_ms)
+            .sum();
+        let timings = IterationTimings {
+            planning_ms,
+            execution_ms: execution_start.elapsed().as_millis() as u64,
+            task_compute_ms,
+            tool_ms,
+        };
+        let current_span = tracing::Span::current();
+        current_span.record("orchestration.execution_ms", timings.execution_ms);
+        current_span.record("orchestration.task_compute_ms", timings.task_compute_ms);
+        current_span.record("orchestration.tool_ms", timings.tool_ms);
+        timings
+    }
+
     async fn load_tool_traces_for_plan(
         &self,
         plan: &Plan,
     ) -> std::collections::HashMap<usize, Vec<super::persistence::ToolTraceEntry>> {
-        use super::persistence::ToolTraceEntry;
-
         let persistence = self.persistence.lock().await;
         let mut traces = std::collections::HashMap::new();
 
         for t in &plan.tasks {
-            let records = persistence.load_tool_records_for_task(t.id).await;
-            if records.is_empty() {
+            let entries = persistence.tool_traces_for_task(t.id);
+            if entries.is_empty() {
                 continue;
             }
-            let entries: Vec<ToolTraceEntry> = records.iter().map(ToolTraceEntry::from).collect();
             traces.insert(t.id, entries);
         }
 
         traces
     }
 
-    /// Called at the end of `run_orchestration_loop()` on all exit paths.
-    /// Errors are logged but not propagated — manifest is observability, not control flow.
-    ///
-    /// `timings` carries the final iteration's phase timings when available
-    /// (`None` for paths that failed before the timed consolidation step).
+    /// Commit the park checkpoint and end the run: refresh the awaiting set
+    /// against the store, publish the document, then emit the terminal
+    /// `run_parked` event only after the publish succeeded. A failed commit
+    /// publishes nothing, emits no event, and cancels the run's approvals.
+    #[allow(clippy::too_many_arguments)]
+    async fn park_run(
+        &self,
+        query: &str,
+        chat_history: &[rig::completion::Message],
+        coordinator_conversation: &[rig::completion::Message],
+        routing_decision: Option<&PlanningResponse>,
+        iteration: usize,
+        planning_ms: u64,
+        failure_history: &[FailedTaskRecord],
+        plan: &Plan,
+        park_records: &ParkedTaskRecords,
+        event_tx: &tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>,
+    ) -> Result<String, StreamError> {
+        let Some(hitl) = self.agent_config.hitl.clone() else {
+            return Err("run parked without the HITL runtime configured".into());
+        };
+        let crate::hitl::DecisionRoute::Conversational { registry, timeout } = &*hitl.route else {
+            return Err("run parked without the conversational route".into());
+        };
+        let (run_id, session_id) = {
+            let p = self.persistence.lock().await;
+            (p.run_id().to_string(), p.session_id().map(String::from))
+        };
+
+        let Some(memory_dir) = self.agent_config.effective_memory_dir().map(str::to_string) else {
+            // No memory_dir means no checkpoint can exist, so the run's
+            // approvals must not stay decidable.
+            tracing::error!(
+                run_id = %run_id,
+                "park commit impossible: no memory_dir configured; cancelling approvals",
+            );
+            self.cancel_run_parked_approvals(&run_id).await;
+            return Err(format!(
+                "Run {run_id} parked but no memory_dir is configured, so no \
+                 checkpoint can be written. The run's pending approvals were cancelled.",
+            )
+            .into());
+        };
+
+        let inputs = super::park::ParkCommitInputs {
+            state: super::park::RunStateForPark {
+                run_id: &run_id,
+                session_id: session_id.as_deref(),
+                query,
+                chat_history,
+                coordinator_conversation,
+                routing_decision,
+                iteration,
+                planning_ms,
+                failure_history,
+            },
+            plan,
+            records: park_records,
+            registry,
+            memory_dir: &memory_dir,
+            config: &self.agent_config,
+            decision_window: *timeout,
+        };
+
+        match super::park::commit_from_run_state(&inputs).await {
+            Ok(commit) => {
+                if let Some(ref guard) = self.park_guard {
+                    guard.mark_published();
+                }
+                Self::emit_event(
+                    event_tx,
+                    OrchestratorEvent::RunParked {
+                        run_id: run_id.clone(),
+                        decision_ids: commit
+                            .refreshed
+                            .decision_ids
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect(),
+                        expires_at: commit.expires_at,
+                        iteration,
+                    },
+                )
+                .await;
+                let mut message =
+                    format!("Run {run_id} parked: task(s) awaiting human approval.\n");
+                for line in park_verdict_lines(plan) {
+                    message.push_str(&format!("- {line}\n"));
+                }
+                message.push_str(
+                    "The run has stopped and no further tasks will execute until the \
+                     outstanding decisions are recorded.",
+                );
+                Ok(message)
+            }
+            Err(e) => {
+                tracing::error!(
+                    run_id = %run_id,
+                    error = %e,
+                    "park commit failed; cancelling the run's approvals",
+                );
+                self.cancel_run_parked_approvals(&run_id).await;
+                Err(format!(
+                    "Park commit failed for run {run_id}: {e}. The run's pending \
+                     approvals were cancelled.",
+                )
+                .into())
+            }
+        }
+    }
+
+    /// Sweep the run's parked approvals by owner id, so no decidable
+    /// approval outlives a run that has no checkpoint.
+    async fn cancel_run_parked_approvals(&self, run_id: &str) {
+        let Some(hitl) = self.agent_config.hitl.clone() else {
+            return;
+        };
+        let crate::hitl::DecisionRoute::Conversational { registry, .. } = &*hitl.route else {
+            return;
+        };
+        let request_id = self.agent_config.request_id.clone().unwrap_or_default();
+        super::park::cancel_run_approvals(registry, run_id, &request_id)
+            .await
+            .ok();
+    }
+
     async fn write_run_manifest(
         &self,
         plan: &Plan,
         iterations: usize,
         timings: Option<IterationTimings>,
     ) {
-        self.write_run_manifest_with_summary(plan, iterations, None, timings)
+        self.write_run_manifest_full(plan, iterations, None, None, timings)
             .await;
     }
 
-    async fn write_run_manifest_with_summary(
+    /// `status_override` replaces the status derived from the task counts.
+    async fn write_run_manifest_full(
         &self,
         plan: &Plan,
         iterations: usize,
+        status_override: Option<super::persistence::RunStatus>,
         response_summary: Option<String>,
         timings: Option<IterationTimings>,
     ) {
         use super::persistence::{
-            ArtifactEntry, ErrorContext, RunManifest, RunStatus, TaskSummary, ToolTraceEntry,
+            ArtifactEntry, ErrorContext, RunManifest, RunStatus, TaskSummary,
         };
         use crate::string_utils::safe_truncate;
 
         let persistence = self.persistence.lock().await;
 
         let all_complete = plan.completed_count() == plan.tasks.len();
-        let status = if all_complete {
-            RunStatus::Success
-        } else if plan.completed_count() > 0 {
-            RunStatus::PartialSuccess
-        } else {
-            RunStatus::Failed
-        };
+        let status = status_override.unwrap_or_else(|| {
+            if all_complete {
+                RunStatus::Success
+            } else if plan.completed_count() > 0 {
+                RunStatus::PartialSuccess
+            } else {
+                RunStatus::Failed
+            }
+        });
 
         let artifacts_meta = match persistence.list_artifacts_with_metadata().await {
             Ok(meta) => meta,
@@ -4661,9 +5342,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 })
                 .collect();
 
-            let tool_records = persistence.load_tool_records_for_task(t.id).await;
-            let tool_trace: Vec<ToolTraceEntry> =
-                tool_records.iter().map(ToolTraceEntry::from).collect();
+            let tool_trace = persistence.tool_traces_for_task(t.id);
 
             let (error, error_context) = match &t.state {
                 TaskState::Failed { error, category } => {
@@ -4829,6 +5508,47 @@ fn truncate_query(query: &str, max_len: usize) -> String {
     }
 }
 
+// ============================================================================
+// Park quiescence (park mode)
+// ============================================================================
+
+/// Whether any task carries non-empty parked calls.
+fn has_awaiting_task(plan: &Plan) -> bool {
+    plan.tasks
+        .iter()
+        .any(|t| matches!(&t.state, TaskState::AwaitingApproval { pending } if !pending.is_empty()))
+}
+
+/// The warm-log verdict lines for the awaiting tasks: one line per task,
+/// naming its decision ids and gated tools.
+fn park_verdict_lines(plan: &Plan) -> Vec<String> {
+    plan.tasks
+        .iter()
+        .filter_map(|t| match &t.state {
+            TaskState::AwaitingApproval { pending } if !pending.is_empty() => {
+                let decisions = pending
+                    .iter()
+                    .map(|c| c.decision_id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let tools = pending
+                    .iter()
+                    .map(|c| c.tool_name.clone())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                Some(format!(
+                    "Park verdict: task {} (\"{}\") awaiting approval — decision(s) [{}] on tool(s) [{}]",
+                    t.id,
+                    truncate_query(&t.description, 80),
+                    decisions,
+                    tools,
+                ))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 /// Check if an error indicates a MaxDepthError from rig's ReAct loop.
 fn is_max_depth_error(error: &(dyn std::error::Error + Send + Sync)) -> bool {
     let msg = error.to_string();
@@ -4895,8 +5615,8 @@ mod tests {
         let usage_state = crate::UsageState::new();
         let mut tally = TurnTally::default();
 
-        tally.record(&usage(2012, 115), &usage_state);
-        tally.record(&usage(2152, 124), &usage_state);
+        tally.record(&usage(2012, 115), None, &usage_state);
+        tally.record(&usage(2152, 124), None, &usage_state);
 
         // Billed usage is the whole loop.
         assert_eq!(usage_state.get_final_usage(), (4164, 239, 4403));
@@ -4910,8 +5630,8 @@ mod tests {
     fn test_tally_reconciles_to_zero_when_every_turn_was_recorded() {
         let usage_state = crate::UsageState::new();
         let mut tally = TurnTally::default();
-        tally.record(&usage(2012, 115), &usage_state);
-        tally.record(&usage(2152, 124), &usage_state);
+        tally.record(&usage(2012, 115), None, &usage_state);
+        tally.record(&usage(2152, 124), None, &usage_state);
 
         // The provider's loop total for these turns — nothing bypassed record().
         let unrecorded = tally.reconcile(&usage(4164, 239));
@@ -4924,7 +5644,7 @@ mod tests {
     fn test_tally_reconcile_surfaces_turns_that_bypassed_record() {
         let usage_state = crate::UsageState::new();
         let mut tally = TurnTally::default();
-        tally.record(&usage(2012, 115), &usage_state);
+        tally.record(&usage(2012, 115), None, &usage_state);
 
         let unrecorded = tally.reconcile(&usage(4164, 239));
 
@@ -4936,7 +5656,7 @@ mod tests {
     fn test_tally_reconcile_saturates_when_total_trails_recorded() {
         let usage_state = crate::UsageState::new();
         let mut tally = TurnTally::default();
-        tally.record(&usage(4164, 239), &usage_state);
+        tally.record(&usage(4164, 239), None, &usage_state);
 
         let unrecorded = tally.reconcile(&usage(100, 10));
 
@@ -4960,7 +5680,7 @@ mod tests {
         ] {
             let mut tally = TurnTally::default();
             for turn in &turns {
-                tally.record(turn, &usage_state);
+                tally.record(turn, None, &usage_state);
             }
         }
 
@@ -4988,7 +5708,10 @@ mod tests {
     }
 
     fn turn(input_tokens: u64, output_tokens: u64) -> Result<StreamItem, StreamError> {
-        Ok(StreamItem::TurnUsage(usage(input_tokens, output_tokens)))
+        Ok(StreamItem::TurnUsage(
+            usage(input_tokens, output_tokens),
+            None,
+        ))
     }
 
     fn tool_result(id: &str) -> Result<StreamItem, StreamError> {
@@ -5046,6 +5769,7 @@ mod tests {
                     crate::provider_agent::FinalResponseInfo {
                         content: "done".to_string(),
                         usage: usage(4164, 239),
+                        cache_usage: None,
                     },
                 )),
             ],
@@ -5099,6 +5823,7 @@ mod tests {
                     crate::provider_agent::FinalResponseInfo {
                         content: "done".to_string(),
                         usage: usage(4164, 239),
+                        cache_usage: None,
                     },
                 )),
             ],
@@ -6481,5 +7206,1671 @@ mod tests {
             }
             _ => panic!("Expected ToolOutput"),
         }
+    }
+
+    // ====================================================================
+    // Park quiescence (park mode)
+    // ====================================================================
+
+    use crate::hitl::DecisionId as TestDecisionId;
+    use crate::orchestration::PendingCall as TestPendingCall;
+    use crate::orchestration::Task;
+
+    fn parked_call(tool: &str) -> TestPendingCall {
+        TestPendingCall {
+            decision_id: TestDecisionId::generate(),
+            tool_name: tool.to_string(),
+            arguments: serde_json::json!({ "namespace": "prod" }),
+            call_id: "call_1".to_string(),
+        }
+    }
+
+    fn mark_awaiting(plan: &mut Plan, task_id: usize, pending: Vec<TestPendingCall>) {
+        plan.get_task_mut(task_id).unwrap().state = TaskState::AwaitingApproval { pending };
+    }
+
+    /// Single blocker mid-DAG: the gated task awaits, its dependent is not
+    /// ready, and the quiescence verdict is park.
+    #[test]
+    fn quiescence_single_blocker_mid_dag_parks() {
+        let mut plan = Plan::new("Deploy");
+        plan.add_task(Task::new(0, "Collect facts", "r"));
+        plan.add_task(Task::new(1, "Gated apply", "r").with_dependency(0));
+        plan.add_task(Task::new(2, "Verify", "r").with_dependency(1));
+        plan.get_task_mut(0).unwrap().complete("facts");
+        mark_awaiting(&mut plan, 1, vec![parked_call("kubectl_apply")]);
+
+        assert!(!plan.is_finished());
+        assert!(plan.ready_tasks().is_empty(), "the dependent is not ready");
+        assert!(has_awaiting_task(&plan));
+
+        let lines = park_verdict_lines(&plan);
+        assert_eq!(lines.len(), 1, "one verdict line per awaiting task");
+        assert!(
+            lines[0].contains("task 1"),
+            "line names the task: {}",
+            lines[0]
+        );
+        assert!(
+            lines[0].contains("kubectl_apply"),
+            "line names the tool: {}",
+            lines[0]
+        );
+    }
+
+    /// Two parallel blockers: both verdict lines appear, each naming its own
+    /// decision id.
+    #[test]
+    fn quiescence_two_parallel_blockers_park() {
+        let mut plan = Plan::new("Migrate");
+        plan.add_task(Task::new(0, "Gated apply A", "r"));
+        plan.add_task(Task::new(1, "Gated delete B", "r"));
+        mark_awaiting(&mut plan, 0, vec![parked_call("kubectl_apply")]);
+        mark_awaiting(&mut plan, 1, vec![parked_call("kubectl_delete")]);
+
+        assert!(has_awaiting_task(&plan));
+        let lines = park_verdict_lines(&plan);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("task 0") && lines[0].contains("kubectl_apply"));
+        assert!(lines[1].contains("task 1") && lines[1].contains("kubectl_delete"));
+    }
+
+    /// A blocker does not stop dispatching while independent work remains:
+    /// a ready task keeps the run away from the quiescence point.
+    #[test]
+    fn quiescence_not_reached_while_ready_work_remains() {
+        let mut plan = Plan::new("Mix");
+        plan.add_task(Task::new(0, "Gated apply", "r"));
+        plan.add_task(Task::new(1, "Independent research", "r"));
+        mark_awaiting(&mut plan, 0, vec![parked_call("kubectl_apply")]);
+
+        let ready = plan.ready_tasks();
+        assert_eq!(ready.len(), 1, "the independent task is still dispatched");
+        assert_eq!(ready[0].id, 1);
+    }
+
+    /// Poisoned sibling: a failed task would route the existing replan path,
+    /// but an outstanding decision takes precedence — park, not replan.
+    #[test]
+    fn quiescence_park_takes_precedence_over_replan() {
+        let mut plan = Plan::new("Risky");
+        plan.add_task(Task::new(0, "Exploding sibling", "r"));
+        plan.add_task(Task::new(1, "Gated apply", "r"));
+        plan.add_task(Task::new(2, "Downstream of sibling", "r").with_dependency(0));
+        plan.get_task_mut(0)
+            .unwrap()
+            .fail("boom", FailureCategory::AgentError);
+        mark_awaiting(&mut plan, 1, vec![parked_call("kubectl_apply")]);
+
+        assert!(plan.ready_tasks().is_empty(), "dependency chain broken");
+        assert!(
+            has_awaiting_task(&plan),
+            "an outstanding decision outranks the failure-replan path"
+        );
+    }
+
+    /// No awaiting task, broken chain: the existing replan verdict.
+    #[test]
+    fn quiescence_without_awaiting_task_is_the_replan_path() {
+        let mut plan = Plan::new("Plain");
+        plan.add_task(Task::new(0, "Exploding", "r"));
+        plan.add_task(Task::new(1, "Downstream", "r").with_dependency(0));
+        plan.get_task_mut(0)
+            .unwrap()
+            .fail("boom", FailureCategory::AgentError);
+
+        assert!(!has_awaiting_task(&plan));
+        assert!(park_verdict_lines(&plan).is_empty());
+    }
+
+    /// The real `execute()` loop parks at quiescence: no worker is dispatched
+    /// for the awaiting task or its dependent, the run does not spin, and the
+    /// awaiting state survives untouched.
+    #[tokio::test]
+    async fn execute_parks_at_quiescence_without_dispatching() {
+        let orchestrator = Orchestrator::new(crate::config::AgentRuntimeConfig::default())
+            .await
+            .unwrap();
+        let mut plan = Plan::new("Park smoke");
+        plan.add_task(Task::new(0, "Done task", "r"));
+        plan.add_task(Task::new(1, "Gated task", "r"));
+        plan.add_task(Task::new(2, "Dependent", "r").with_dependency(1));
+        plan.get_task_mut(0).unwrap().complete("ok");
+        mark_awaiting(&mut plan, 1, vec![parked_call("kubectl_apply")]);
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(32);
+        let (compute_ms, park_records) = orchestrator.execute(&mut plan, &event_tx).await.unwrap();
+
+        assert_eq!(compute_ms, 0, "no worker ran");
+        assert!(
+            park_records.is_empty(),
+            "no park record exists for a pre-marked awaiting plan"
+        );
+        assert!(matches!(
+            plan.tasks[1].state,
+            TaskState::AwaitingApproval { .. }
+        ));
+        assert!(
+            matches!(plan.tasks[2].state, TaskState::Pending),
+            "the dependent must not be dispatched while a decision is outstanding"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), event_rx.recv())
+                .await
+                .is_err(),
+            "no task events fire at the park verdict"
+        );
+    }
+
+    /// `park_enabled` requires the flag AND the conversational route — the
+    /// webhook arm of park mode is out of V1 scope.
+    #[tokio::test]
+    async fn park_enabled_requires_flag_and_conversational_route() {
+        use aura_config::GlobPattern;
+
+        fn config(park_enabled: bool, conversational: bool) -> AgentRuntimeConfig {
+            let mut config = AgentRuntimeConfig::default();
+            let route = if conversational {
+                crate::hitl::DecisionRoute::Conversational {
+                    registry: crate::hitl::PendingApprovals::new(),
+                    timeout: Duration::from_secs(60),
+                }
+            } else {
+                crate::hitl::DecisionRoute::Webhook {
+                    client: crate::hitl::WebhookClient::new(
+                        reqwest::Client::new(),
+                        aura_config::WebhookUrl::new("https://approvals.example.com/").unwrap(),
+                    ),
+                    timeout: Duration::from_secs(5),
+                }
+            };
+            config.hitl = Some(crate::hitl::HitlRuntime {
+                patterns: Arc::from([GlobPattern::new("kubectl_*").unwrap()]),
+                route: Arc::new(route),
+                park_enabled,
+            });
+            config
+        }
+
+        let no_hitl = Orchestrator::new(AgentRuntimeConfig::default())
+            .await
+            .unwrap();
+        assert!(!no_hitl.park_enabled(), "no [hitl] table: park off");
+
+        let off = Orchestrator::new(config(false, true)).await.unwrap();
+        assert!(!off.park_enabled(), "flag off: park off");
+
+        let on = Orchestrator::new(config(true, true)).await.unwrap();
+        assert!(on.park_enabled(), "flag on + conversational: park on");
+
+        let webhook = Orchestrator::new(config(true, false)).await.unwrap();
+        assert!(!webhook.park_enabled(), "webhook route: park off");
+    }
+
+    /// The orphan cleanup: every pending decision id is removed from the
+    /// store with an `approval_completed(cancelled)` event, so no decidable
+    /// approval outlives a worker whose conversation was never captured.
+    #[tokio::test]
+    async fn cancel_parked_approvals_removes_tickets_and_publishes_cancelled() {
+        use crate::hitl::{
+            AgentScope, ApprovalOrigin, ApprovalRequest, PROTOCOL_VERSION, ParkedApproval,
+            PendingApprovals,
+        };
+        use crate::session_store::{InMemoryApprovalStore, InMemoryEventBus};
+
+        let request_id = format!("req_cancel_{}", uuid::Uuid::new_v4().simple());
+        let mut events = crate::approval_event_broker::subscribe(&request_id).await;
+
+        let store: Arc<dyn crate::session_store::ApprovalStore> =
+            Arc::new(InMemoryApprovalStore::new());
+        let registry =
+            PendingApprovals::with_backend(store.clone(), Arc::new(InMemoryEventBus::new()));
+        let config = AgentRuntimeConfig {
+            hitl: Some(crate::hitl::HitlRuntime {
+                patterns: Arc::from([aura_config::GlobPattern::new("kubectl_*").unwrap()]),
+                route: Arc::new(crate::hitl::DecisionRoute::Conversational {
+                    registry: registry.clone(),
+                    timeout: Duration::from_secs(60),
+                }),
+                park_enabled: true,
+            }),
+            request_id: Some(request_id.clone()),
+            ..AgentRuntimeConfig::default()
+        };
+        let orchestrator = Orchestrator::new(config).await.unwrap();
+
+        // Two durable registrations, as the park arm would make them.
+        let now = chrono::Utc::now();
+        let mut pending = Vec::new();
+        for tool in ["kubectl_apply", "kubectl_delete"] {
+            let decision_id = TestDecisionId::generate();
+            registry
+                .register_durable(ParkedApproval {
+                    request: ApprovalRequest {
+                        version: PROTOCOL_VERSION,
+                        instance_id: "test-instance".to_string(),
+                        decision_id,
+                        request_id: "run:test".to_string(),
+                        scope: AgentScope::Single { session_id: None },
+                        origin: ApprovalOrigin::ConfigGate {
+                            matched_pattern: "kubectl_*".to_string(),
+                            agent_name: "test-agent".to_string(),
+                        },
+                        items: vec![],
+                    },
+                    registered_at: now,
+                    expires_at: now + chrono::Duration::seconds(60),
+                })
+                .await
+                .expect("durable register succeeds");
+            assert!(
+                store.get(&decision_id).await.unwrap().is_some(),
+                "ticket parked before cleanup"
+            );
+            pending.push(TestPendingCall {
+                decision_id,
+                tool_name: tool.to_string(),
+                arguments: serde_json::json!({}),
+                call_id: "call_1".to_string(),
+            });
+        }
+
+        orchestrator
+            .cancel_parked_approvals(3, Some("operations"), &pending)
+            .await;
+
+        for call in &pending {
+            assert!(
+                store.get(&call.decision_id).await.unwrap().is_none(),
+                "orphaned decision {} removed from the store",
+                call.decision_id
+            );
+        }
+        for expected in &pending {
+            match tokio::time::timeout(Duration::from_secs(1), events.recv()).await {
+                Ok(Some(crate::approval_event_broker::ApprovalLifecycleEvent::Completed(
+                    completed,
+                ))) => {
+                    assert_eq!(completed.decision_id, expected.decision_id.to_string());
+                    assert!(matches!(
+                        completed.outcome,
+                        aura_events::ApprovalOutcomeWire::Cancelled { .. }
+                    ));
+                }
+                other => panic!("expected Completed(cancelled) event, got {other:?}"),
+            }
+        }
+
+        crate::approval_event_broker::unsubscribe(&request_id).await;
+    }
+
+    // ====================================================================
+    // Park commit (park mode)
+    // ====================================================================
+
+    use crate::hitl::{ApprovalItem, ParkedApproval};
+    use crate::session_store::ApprovalStore;
+
+    /// An orchestrator wired for park mode over an in-memory store, plus the
+    /// store handle and its memory dir.
+    async fn park_orchestrator(
+        memory_dir: &std::path::Path,
+    ) -> (
+        Orchestrator,
+        Arc<crate::session_store::InMemoryApprovalStore>,
+        crate::hitl::PendingApprovals,
+        String,
+    ) {
+        let store = Arc::new(crate::session_store::InMemoryApprovalStore::new());
+        let (orchestrator, registry, run_id) =
+            park_orchestrator_over(store.clone(), memory_dir).await;
+        (orchestrator, store, registry, run_id)
+    }
+
+    /// An orchestrator wired for park mode over an explicit approval-store
+    /// backend, plus its registry and run id.
+    async fn park_orchestrator_over(
+        store: Arc<dyn crate::session_store::ApprovalStore>,
+        memory_dir: &std::path::Path,
+    ) -> (Orchestrator, crate::hitl::PendingApprovals, String) {
+        use crate::hitl::PendingApprovals;
+        use crate::session_store::InMemoryEventBus;
+
+        let registry = PendingApprovals::with_backend(store, Arc::new(InMemoryEventBus::new()));
+        let config = AgentRuntimeConfig {
+            hitl: Some(crate::hitl::HitlRuntime {
+                patterns: Arc::from([aura_config::GlobPattern::new("kubectl_*").unwrap()]),
+                route: Arc::new(crate::hitl::DecisionRoute::Conversational {
+                    registry: registry.clone(),
+                    timeout: Duration::from_secs(3600),
+                }),
+                park_enabled: true,
+            }),
+            memory_dir: Some(memory_dir.to_string_lossy().into_owned()),
+            session_id: Some("park-sess".to_string()),
+            request_id: Some(format!("req_park_{}", uuid::Uuid::new_v4().simple())),
+            ..AgentRuntimeConfig::default()
+        };
+        let orchestrator = Orchestrator::new(config).await.unwrap();
+        let run_id = orchestrator.persistence.lock().await.run_id().to_string();
+        (orchestrator, registry, run_id)
+    }
+
+    /// An awaiting plan plus its park record, with every pending call
+    /// durably parked under the run-scoped owner — the state the gate and
+    /// hook leave behind at the quiescence verdict.
+    async fn awaiting_plan_with_parked_calls(
+        registry: &crate::hitl::PendingApprovals,
+        run_id: &str,
+    ) -> (Plan, ParkedTaskRecords, Vec<TestPendingCall>) {
+        let mut plan = Plan::new("Deploy");
+        plan.add_task(Task::new(0, "Facts", "r"));
+        plan.add_task(Task::new(1, "Gated apply", "r").with_dependency(0));
+        plan.get_task_mut(0).unwrap().complete("facts");
+
+        let now = chrono::Utc::now();
+        let mut pending = Vec::new();
+        for tool in ["kubectl_apply", "kubectl_delete"] {
+            let decision_id = TestDecisionId::generate();
+            registry
+                .register_durable(ParkedApproval {
+                    request: crate::hitl::ApprovalRequest {
+                        version: crate::hitl::PROTOCOL_VERSION,
+                        instance_id: "test-instance".to_string(),
+                        decision_id,
+                        request_id: format!("run:{run_id}"),
+                        scope: crate::hitl::AgentScope::Single { session_id: None },
+                        origin: crate::hitl::ApprovalOrigin::ConfigGate {
+                            matched_pattern: "kubectl_*".to_string(),
+                            agent_name: "test-agent".to_string(),
+                        },
+                        items: vec![ApprovalItem {
+                            tool_name: tool.to_string(),
+                            arguments: serde_json::json!({ "namespace": "prod" }),
+                            tool_call_intent: None,
+                        }],
+                    },
+                    registered_at: now,
+                    expires_at: now + chrono::Duration::hours(1),
+                })
+                .await
+                .unwrap();
+            pending.push(TestPendingCall {
+                decision_id,
+                tool_name: tool.to_string(),
+                arguments: serde_json::json!({ "namespace": "prod" }),
+                call_id: format!("call_{}", pending.len()),
+            });
+        }
+        plan.tasks[1].state = TaskState::AwaitingApproval {
+            pending: pending.clone(),
+        };
+
+        let mut records = ParkedTaskRecords::new();
+        records.insert(
+            1,
+            crate::orchestration::park::ParkedTaskRecord {
+                attempt: 1,
+                snapshot: crate::orchestration::ParkSnapshot {
+                    history: vec![rig::completion::Message::user("apply it")],
+                    current_prompt: rig::completion::Message::user("tool results"),
+                },
+            },
+        );
+        (plan, records, pending)
+    }
+
+    /// Record the fixture's awaiting task on the run guard, as the park arm does.
+    async fn arm_guard(orchestrator: &Orchestrator, plan: &Plan) {
+        let guard = orchestrator
+            .park_guard
+            .as_ref()
+            .expect("park-mode orchestrator");
+        let TaskState::AwaitingApproval { pending } = &plan.tasks[1].state else {
+            unreachable!("the fixture task is awaiting")
+        };
+        guard.record(pending);
+    }
+
+    fn set_mode(path: &std::path::Path, mode: u32) {
+        let mut perms = std::fs::metadata(path).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, mode);
+        std::fs::set_permissions(path, perms).unwrap();
+    }
+
+    #[tokio::test]
+    async fn park_run_publishes_document_event_and_keeps_approvals() {
+        let dir = tempfile::tempdir().unwrap();
+        let (orchestrator, store, registry, run_id) = park_orchestrator(dir.path()).await;
+        let (plan, records, pending) = awaiting_plan_with_parked_calls(&registry, &run_id).await;
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(32);
+
+        let chat_history = vec![rig::completion::Message::user("deploy the service")];
+        let message = orchestrator
+            .park_run(
+                "deploy the service",
+                &chat_history,
+                &[],
+                None,
+                1,
+                2_500,
+                &[],
+                &plan,
+                &records,
+                &event_tx,
+            )
+            .await
+            .expect("the park commit succeeds");
+
+        assert!(message.contains(&run_id), "the end message names the run");
+
+        let document_path = dir
+            .path()
+            .join("park-sess")
+            .join("parked")
+            .join(format!("{run_id}.json"));
+        assert!(
+            document_path.try_exists().unwrap(),
+            "the document lands at {{session_id}}/parked/{{run_id}}.json"
+        );
+
+        let document = crate::orchestration::park::load_parked_run(&document_path)
+            .await
+            .unwrap();
+        assert_eq!(document.run_id, run_id);
+        assert_eq!(document.iteration, 1);
+        assert!(document.executed.is_empty());
+        let expected_ids: Vec<String> = pending.iter().map(|c| c.decision_id.to_string()).collect();
+        assert_eq!(
+            document.awaiting_decision_ids(),
+            expected_ids,
+            "the awaiting set re-derives from disk alone"
+        );
+        let awaiting = document
+            .plan
+            .tasks
+            .iter()
+            .find(|t| t.status == TaskStatus::AwaitingApproval)
+            .unwrap();
+        assert_eq!(awaiting.attempt, Some(1));
+        assert!(awaiting.history.is_some() && awaiting.current_prompt.is_some());
+
+        match event_rx.recv().await {
+            Some(Ok(StreamItem::OrchestratorEvent(OrchestratorEvent::RunParked {
+                run_id: event_run,
+                decision_ids,
+                iteration,
+                ..
+            }))) => {
+                assert_eq!(event_run, run_id);
+                assert_eq!(decision_ids, expected_ids);
+                assert_eq!(iteration, 1);
+            }
+            other => panic!("expected a RunParked event, got {other:?}"),
+        }
+
+        for call in &pending {
+            assert!(
+                store.get(&call.decision_id).await.unwrap().is_some(),
+                "a published checkpoint keeps its approvals parked"
+            );
+        }
+        drop(orchestrator);
+    }
+
+    #[tokio::test]
+    async fn park_run_with_every_call_decided_stamps_the_decision_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let (orchestrator, _store, registry, run_id) = park_orchestrator(dir.path()).await;
+        let (plan, records, pending) = awaiting_plan_with_parked_calls(&registry, &run_id).await;
+        for call in &pending {
+            registry
+                .resolve(&call.decision_id, crate::hitl::ApprovalDecision::Approved)
+                .await
+                .unwrap();
+        }
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(32);
+        let chat_history = vec![rig::completion::Message::user("deploy the service")];
+        let before = chrono::Utc::now();
+
+        orchestrator
+            .park_run(
+                "deploy the service",
+                &chat_history,
+                &[],
+                None,
+                1,
+                2_500,
+                &[],
+                &plan,
+                &records,
+                &event_tx,
+            )
+            .await
+            .expect("the park commit succeeds");
+
+        let document = crate::orchestration::park::load_parked_run(
+            &dir.path()
+                .join("park-sess")
+                .join("parked")
+                .join(format!("{run_id}.json")),
+        )
+        .await
+        .unwrap();
+        assert!(document.awaiting_decision_ids().is_empty());
+        let expires_at = chrono::DateTime::parse_from_rfc3339(&document.expires_at).unwrap();
+        // The fixture route timeout is one hour.
+        assert!(
+            expires_at >= before + chrono::Duration::seconds(3600 - 5),
+            "expires_at carries the decision window: {}",
+            document.expires_at
+        );
+        match event_rx.recv().await {
+            Some(Ok(StreamItem::OrchestratorEvent(OrchestratorEvent::RunParked {
+                decision_ids,
+                expires_at: stamp,
+                ..
+            }))) => {
+                assert!(decision_ids.is_empty());
+                assert_eq!(stamp, document.expires_at);
+            }
+            other => panic!("expected a RunParked event, got {other:?}"),
+        }
+        drop(orchestrator);
+    }
+    #[tokio::test]
+    async fn park_run_failure_publishes_nothing_and_cancels_approvals() {
+        let dir = tempfile::tempdir().unwrap();
+        let (orchestrator, store, registry, run_id) = park_orchestrator(dir.path()).await;
+        let (plan, records, pending) = awaiting_plan_with_parked_calls(&registry, &run_id).await;
+        let request_id = orchestrator
+            .agent_config
+            .request_id
+            .clone()
+            .unwrap_or_default();
+        let mut events = crate::approval_event_broker::subscribe(&request_id).await;
+        arm_guard(&orchestrator, &plan).await;
+
+        // A read-only session root makes the checkpoint write fail.
+        let session_root = dir.path().join("park-sess");
+        set_mode(&session_root, 0o555);
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(32);
+        let chat_history = vec![rig::completion::Message::user("deploy the service")];
+        let result = orchestrator
+            .park_run(
+                "deploy the service",
+                &chat_history,
+                &[],
+                None,
+                1,
+                2_500,
+                &[],
+                &plan,
+                &records,
+                &event_tx,
+            )
+            .await;
+
+        set_mode(&session_root, 0o755);
+
+        let err = result.expect_err("the commit must fail");
+        assert!(
+            err.to_string().contains("Park commit failed"),
+            "error names the failed commit: {err}"
+        );
+
+        assert!(
+            !dir.path()
+                .join("park-sess")
+                .join("parked")
+                .join(format!("{run_id}.json"))
+                .try_exists()
+                .unwrap(),
+            "no document is published on a failed commit"
+        );
+        for call in &pending {
+            assert!(
+                store.get(&call.decision_id).await.unwrap().is_none(),
+                "approval {} cancelled with the run",
+                call.decision_id
+            );
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), event_rx.recv())
+                .await
+                .is_err(),
+            "no run_parked event fires on a failed commit"
+        );
+
+        // One completed(cancelled) per decision from the immediate sweep…
+        for _ in &pending {
+            match tokio::time::timeout(Duration::from_secs(1), events.recv()).await {
+                Ok(Some(crate::approval_event_broker::ApprovalLifecycleEvent::Completed(
+                    completed,
+                ))) => {
+                    assert!(matches!(
+                        completed.outcome,
+                        aura_events::ApprovalOutcomeWire::Cancelled { .. }
+                    ));
+                }
+                other => panic!("expected one Completed(cancelled) per decision, got {other:?}"),
+            }
+        }
+        // …and the guard's drop sweep adds nothing.
+        drop(orchestrator);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), events.recv())
+                .await
+                .is_err(),
+            "the drop sweep does not double-report cancelled approvals"
+        );
+
+        crate::approval_event_broker::unsubscribe(&request_id).await;
+    }
+
+    #[tokio::test]
+    async fn park_run_failure_spares_decided_approval_and_cancels_sibling() {
+        let dir = tempfile::tempdir().unwrap();
+        let (orchestrator, store, registry, run_id) = park_orchestrator(dir.path()).await;
+        let (plan, records, pending) = awaiting_plan_with_parked_calls(&registry, &run_id).await;
+        let request_id = orchestrator
+            .agent_config
+            .request_id
+            .clone()
+            .unwrap_or_default();
+        let mut events = crate::approval_event_broker::subscribe(&request_id).await;
+
+        // The human decides the first call before the commit is attempted.
+        let decided = pending[0].decision_id;
+        let sibling = pending[1].decision_id;
+        registry
+            .resolve(&decided, crate::hitl::ApprovalDecision::Approved)
+            .await
+            .unwrap();
+
+        arm_guard(&orchestrator, &plan).await;
+
+        // A read-only session root makes the checkpoint write fail.
+        let session_root = dir.path().join("park-sess");
+        set_mode(&session_root, 0o555);
+
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(32);
+        let chat_history = vec![rig::completion::Message::user("deploy the service")];
+        let result = orchestrator
+            .park_run(
+                "deploy the service",
+                &chat_history,
+                &[],
+                None,
+                1,
+                2_500,
+                &[],
+                &plan,
+                &records,
+                &event_tx,
+            )
+            .await;
+
+        set_mode(&session_root, 0o755);
+
+        assert!(result.is_err(), "the commit must fail");
+
+        assert!(
+            store.get(&sibling).await.unwrap().is_none(),
+            "the undecided sibling is cancelled with the run"
+        );
+        assert!(
+            registry.recorded_decision(&decided).await.is_some(),
+            "the recorded decision survives the failed commit's sweep"
+        );
+
+        // Exactly one cancelled event — the sibling's; the decided
+        // approval stays silent.
+        match tokio::time::timeout(Duration::from_secs(1), events.recv()).await {
+            Ok(Some(crate::approval_event_broker::ApprovalLifecycleEvent::Completed(
+                completed,
+            ))) => {
+                assert_eq!(completed.decision_id, sibling.to_string());
+                assert!(matches!(
+                    completed.outcome,
+                    aura_events::ApprovalOutcomeWire::Cancelled { .. }
+                ));
+            }
+            other => panic!("expected the sibling's completed(cancelled), got {other:?}"),
+        }
+
+        // The guard's drop sweep stays silent: the decided approval is
+        // spared, the already-cancelled sibling is not double-reported.
+        drop(orchestrator);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), events.recv())
+                .await
+                .is_err(),
+            "the drop sweep spares the decided approval and does not double-report the sibling"
+        );
+        assert!(
+            registry.recorded_decision(&decided).await.is_some(),
+            "the recorded decision survives the guard's drop"
+        );
+
+        crate::approval_event_broker::unsubscribe(&request_id).await;
+    }
+
+    #[tokio::test]
+    async fn park_run_store_fault_during_refresh_fails_commit_and_sweeps() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::session_store::FaultInjectingStore::failing_first_get());
+        let (orchestrator, registry, run_id) =
+            park_orchestrator_over(store.clone(), dir.path()).await;
+        let (plan, records, pending) = awaiting_plan_with_parked_calls(&registry, &run_id).await;
+        let request_id = orchestrator
+            .agent_config
+            .request_id
+            .clone()
+            .unwrap_or_default();
+        let mut events = crate::approval_event_broker::subscribe(&request_id).await;
+        arm_guard(&orchestrator, &plan).await;
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(32);
+        let chat_history = vec![rig::completion::Message::user("deploy the service")];
+        let result = orchestrator
+            .park_run(
+                "deploy the service",
+                &chat_history,
+                &[],
+                None,
+                1,
+                2_500,
+                &[],
+                &plan,
+                &records,
+                &event_tx,
+            )
+            .await;
+
+        let err = result.expect_err("the store fault must fail the commit");
+        assert!(
+            err.to_string().contains("Park commit failed"),
+            "error names the failed commit: {err}"
+        );
+
+        assert!(
+            !dir.path()
+                .join("park-sess")
+                .join("parked")
+                .join(format!("{run_id}.json"))
+                .try_exists()
+                .unwrap(),
+            "no document is published when the refresh faults"
+        );
+        for call in &pending {
+            assert!(
+                store.get(&call.decision_id).await.unwrap().is_none(),
+                "approval {} cancelled by the failed-commit sweep",
+                call.decision_id
+            );
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), event_rx.recv())
+                .await
+                .is_err(),
+            "no run_parked event fires on a faulted refresh"
+        );
+
+        // One completed(cancelled) per decision from the immediate sweep…
+        for _ in &pending {
+            match tokio::time::timeout(Duration::from_secs(1), events.recv()).await {
+                Ok(Some(crate::approval_event_broker::ApprovalLifecycleEvent::Completed(
+                    completed,
+                ))) => {
+                    assert!(matches!(
+                        completed.outcome,
+                        aura_events::ApprovalOutcomeWire::Cancelled { .. }
+                    ));
+                }
+                other => panic!("expected one Completed(cancelled) per decision, got {other:?}"),
+            }
+        }
+        // …and the guard's drop sweep adds nothing.
+        drop(orchestrator);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), events.recv())
+                .await
+                .is_err(),
+            "the drop sweep does not double-report cancelled approvals"
+        );
+
+        crate::approval_event_broker::unsubscribe(&request_id).await;
+    }
+
+    // ====================================================================
+    // Orphan dual-trigger (P42 → P43 → P44 handoff): execute_task through
+    // CellOutcome::Orphaned, via the worker-model injection seam.
+    // ====================================================================
+
+    use crate::orchestration::test_rig;
+    use test_rig::{ScriptedToolCall, ScriptedTurn, WorkerOverride};
+
+    /// Serializes the override-using tests: the override queue is
+    /// process-global, and two parallel installs could cross-consume each
+    /// other's scripted workers. Async-aware so the guard may cross awaits.
+    static WORKER_OVERRIDE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// A park-mode orchestrator whose `operations` worker is built through
+    /// the override seam: the gate glob matches the stub tool, and the
+    /// worker's turn depth is settable for the depth-exhaustion trigger.
+    async fn override_park_orchestrator(
+        memory_dir: &std::path::Path,
+        turn_depth: usize,
+    ) -> (
+        Orchestrator,
+        Arc<crate::session_store::InMemoryApprovalStore>,
+        crate::hitl::PendingApprovals,
+        String,
+    ) {
+        use crate::hitl::PendingApprovals;
+        use crate::session_store::{InMemoryApprovalStore, InMemoryEventBus};
+
+        let store = Arc::new(InMemoryApprovalStore::new());
+        let registry = PendingApprovals::with_backend(
+            store.clone() as Arc<dyn crate::session_store::ApprovalStore>,
+            Arc::new(InMemoryEventBus::new()),
+        );
+        let workers = std::collections::HashMap::from([(
+            "operations".to_string(),
+            crate::orchestration::WorkerConfig {
+                description: "Runs the scripted tool".to_string(),
+                preamble: "You apply changes with the echo tool.".to_string(),
+                mcp_filter: Some(vec![]),
+                vector_stores: vec![],
+                turn_depth: Some(turn_depth),
+                llm: None,
+                scratchpad: None,
+                skills: None,
+            },
+        )]);
+        let request_id = format!("req_orphan_{}", uuid::Uuid::new_v4().simple());
+        let config = AgentRuntimeConfig {
+            hitl: Some(crate::hitl::HitlRuntime {
+                patterns: Arc::from([aura_config::GlobPattern::new("echo_tool").unwrap()]),
+                route: Arc::new(crate::hitl::DecisionRoute::Conversational {
+                    registry: registry.clone(),
+                    timeout: Duration::from_secs(3600),
+                }),
+                park_enabled: true,
+            }),
+            memory_dir: Some(memory_dir.to_string_lossy().into_owned()),
+            session_id: Some("orphan-sess".to_string()),
+            request_id: Some(request_id.clone()),
+            orchestration: Some(OrchestrationConfig {
+                enabled: true,
+                workers,
+                ..Default::default()
+            }),
+            ..AgentRuntimeConfig::default()
+        };
+        let orchestrator = Orchestrator::new(config).await.unwrap();
+        (orchestrator, store, registry, request_id)
+    }
+
+    /// Queue one override: a scripted model plus the gated stub tool and an
+    /// ungated sibling (for scripts that must burn turns without parking).
+    /// Returns the model handle (request log) and the gated tool's
+    /// invocation log.
+    fn gated_worker_override(
+        turns: Vec<ScriptedTurn>,
+    ) -> (
+        test_rig::ScriptedCompletionModel,
+        Arc<std::sync::Mutex<Vec<test_rig::ToolInvocation>>>,
+    ) {
+        let model = test_rig::ScriptedCompletionModel::new(turns);
+        let gated_invocations: Arc<std::sync::Mutex<Vec<test_rig::ToolInvocation>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let gated_tool = Box::new(test_rig::RecordingTool::new(Arc::clone(&gated_invocations)))
+            as Box<dyn rig::tool::ToolDyn>;
+        let setup_tool = Box::new(
+            test_rig::RecordingTool::new(Arc::new(std::sync::Mutex::new(Vec::new())))
+                .with_name("setup_tool"),
+        ) as Box<dyn rig::tool::ToolDyn>;
+        test_rig::install_worker_overrides(vec![WorkerOverride {
+            model: model.clone(),
+            extra_tools: vec![setup_tool, gated_tool],
+        }]);
+        (model, gated_invocations)
+    }
+
+    /// Assert the orphaned task's outcome: the task fails naming the
+    /// cancelled approvals, every parked decision id is swept from the store,
+    /// one `approval_completed(cancelled)` fires per decision, and nothing
+    /// decidable remains.
+    async fn assert_orphaned(
+        result: Result<TaskOutcome, StreamError>,
+        store: &Arc<crate::session_store::InMemoryApprovalStore>,
+        events: &mut tokio::sync::mpsc::Receiver<
+            crate::approval_event_broker::ApprovalLifecycleEvent,
+        >,
+        expected_events: usize,
+        underlying: &str,
+    ) {
+        let err = match result {
+            Ok(_) => panic!("the orphaned task must fail"),
+            Err(e) => e,
+        };
+        let message = err.to_string();
+        assert!(
+            message.contains("pending approval(s) cancelled"),
+            "the task failure must name the cancelled approvals: {message}"
+        );
+        assert!(
+            message.contains(underlying),
+            "the task failure must carry the {underlying} trigger: {message}"
+        );
+
+        let mut decision_ids = Vec::new();
+        while decision_ids.len() < expected_events {
+            match tokio::time::timeout(Duration::from_secs(1), events.recv()).await {
+                Ok(Some(crate::approval_event_broker::ApprovalLifecycleEvent::Completed(
+                    completed,
+                ))) => {
+                    assert!(matches!(
+                        completed.outcome,
+                        aura_events::ApprovalOutcomeWire::Cancelled { .. }
+                    ));
+                    decision_ids.push(completed.decision_id);
+                }
+                // The park arm's Requested/Pending pair precedes the sweep's
+                // Completed events on the same broker.
+                Ok(Some(_)) => continue,
+                other => panic!("expected completed(cancelled), got {other:?}"),
+            }
+        }
+        assert_eq!(
+            decision_ids.len(),
+            expected_events,
+            "one cancelled event per parked decision"
+        );
+        for id in &decision_ids {
+            let parsed = crate::hitl::DecisionId::parse(id).expect("wire decision id parses");
+            assert!(
+                store.get(&parsed).await.unwrap().is_none(),
+                "parked decision {id} must be removed from the store"
+            );
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), events.recv())
+                .await
+                .is_err(),
+            "no further approval events fire after the sweep"
+        );
+    }
+
+    /// Depth exhaustion: the scripted model parks a gated call on the loop's
+    /// final turn, so the stream ends at the depth break before the next
+    /// `on_completion_call` could snapshot. The task fails and every parked
+    /// decision is cancelled.
+    #[tokio::test]
+    async fn orphan_depth_exhaustion_cancels_parked_approvals_and_fails_the_task() {
+        let _serial = WORKER_OVERRIDE_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let (orchestrator, store, _registry, request_id) =
+            override_park_orchestrator(dir.path(), 1).await;
+        let mut events = crate::approval_event_broker::subscribe(&request_id).await;
+
+        // Depth 1 gives the loop three turns (the rig's +1 safety net), so
+        // the gated call must land on the third: the first two turns burn
+        // ungated setup calls, and the depth break fires right after the
+        // park, before the next hook snapshot.
+        let (_model, gated_invocations) = gated_worker_override(vec![
+            ScriptedTurn::tool_calls(vec![ScriptedToolCall::new(
+                "call_s0",
+                "setup_tool",
+                serde_json::json!({"step": 1}),
+            )]),
+            ScriptedTurn::tool_calls(vec![ScriptedToolCall::new(
+                "call_s1",
+                "setup_tool",
+                serde_json::json!({"step": 2}),
+            )]),
+            ScriptedTurn::tool_calls(vec![
+                ScriptedToolCall::new(
+                    "call_2",
+                    test_rig::ECHO_TOOL_NAME,
+                    serde_json::json!({"namespace": "prod"}),
+                )
+                .with_call_id("call_id_2"),
+            ]),
+        ]);
+
+        let mut plan = Plan::new("Deploy");
+        plan.add_task(Task::new(0, "Gated apply", "r").with_worker("operations"));
+        let params = TaskExecutionParams {
+            task_description: "apply the manifest",
+            task_context: &None,
+            worker_name: Some("operations"),
+        };
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(32);
+        let result = orchestrator
+            .execute_task(0, &params, Some(&event_tx), None, None)
+            .await;
+
+        assert_orphaned(result, &store, &mut events, 1, "MaxDepthError").await;
+        assert!(
+            gated_invocations.lock().unwrap().is_empty(),
+            "the parked call must never have reached the inner tool"
+        );
+
+        crate::approval_event_broker::unsubscribe(&request_id).await;
+    }
+
+    /// Provider stream error: the scripted turn issues the gated call and
+    /// then fails the stream mid-turn, ending it before the next
+    /// `on_completion_call`. Same orphan contract as depth exhaustion.
+    #[tokio::test]
+    async fn orphan_provider_stream_error_cancels_parked_approvals_and_fails_the_task() {
+        let _serial = WORKER_OVERRIDE_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let (orchestrator, store, _registry, request_id) =
+            override_park_orchestrator(dir.path(), 4).await;
+        let mut events = crate::approval_event_broker::subscribe(&request_id).await;
+
+        let (_model, gated_invocations) =
+            gated_worker_override(vec![ScriptedTurn::tool_calls_then_stream_failure(vec![
+                ScriptedToolCall::new(
+                    "call_0",
+                    test_rig::ECHO_TOOL_NAME,
+                    serde_json::json!({"namespace": "prod"}),
+                )
+                .with_call_id("call_id_0"),
+            ])]);
+
+        let mut plan = Plan::new("Deploy");
+        plan.add_task(Task::new(0, "Gated apply", "r").with_worker("operations"));
+        let params = TaskExecutionParams {
+            task_description: "apply the manifest",
+            task_context: &None,
+            worker_name: Some("operations"),
+        };
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(32);
+        let result = orchestrator
+            .execute_task(0, &params, Some(&event_tx), None, None)
+            .await;
+
+        assert_orphaned(
+            result,
+            &store,
+            &mut events,
+            1,
+            "provider stream failed mid-turn",
+        )
+        .await;
+        assert!(
+            gated_invocations.lock().unwrap().is_empty(),
+            "the parked call must never have reached the inner tool"
+        );
+
+        crate::approval_event_broker::unsubscribe(&request_id).await;
+    }
+
+    // ====================================================================
+    // Reify and continuation proofs (P44 commit 3)
+    // ====================================================================
+
+    use crate::hitl::{ApprovalDecision, PendingApprovals};
+    use crate::orchestration::CallKey;
+    use crate::orchestration::ObserverWrapper;
+    use crate::orchestration::duplicate_call_guard::DuplicateCallGuard;
+    use crate::orchestration::persistence_wrapper::{PersistenceWrapper, PersistenceWrapperParams};
+    use crate::tool_wrapper::ToolCallContext;
+
+    /// The denial feedback the gate produces, quoted for the wire (rig
+    /// JSON-serializes tool outputs). Mirrors `approval_result_to_pre_call`'s
+    /// denial arm in `gate.rs` verbatim.
+    fn denial_feedback_wire(reason: &str) -> String {
+        serde_json::to_string(&format!(
+            "Tool call blocked by human approval denial: {reason}. Do not execute this action."
+        ))
+        .expect("a plain string serializes")
+    }
+
+    /// The tool-result text carried by a chat-history message, decoded —
+    /// assertions compare the actual content, not a serialization level.
+    fn tool_result_text(message: &rig::completion::Message) -> String {
+        let rig::completion::Message::User { content } = message else {
+            return String::new();
+        };
+        content
+            .iter()
+            .filter_map(|item| match item {
+                rig::message::UserContent::ToolResult(tr) => Some(
+                    tr.content
+                        .iter()
+                        .map(|c| match c {
+                            rig::message::ToolResultContent::Text(t) => t.text.clone(),
+                            rig::message::ToolResultContent::Image(_) => String::new(),
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// A park-mode orchestrator over a file-backed approval store (the park
+    /// contract's backend: `get` returns the approval before and after the
+    /// decision), sharing the given registry.
+    async fn file_backed_park_orchestrator(
+        registry: &PendingApprovals,
+        memory_dir: &std::path::Path,
+        session_id: &str,
+    ) -> (Orchestrator, String) {
+        let workers = std::collections::HashMap::from([(
+            "operations".to_string(),
+            crate::orchestration::WorkerConfig {
+                description: "Runs the scripted tool".to_string(),
+                preamble: "You apply changes with the echo tool.".to_string(),
+                mcp_filter: Some(vec![]),
+                vector_stores: vec![],
+                turn_depth: None,
+                llm: None,
+                scratchpad: None,
+                skills: None,
+            },
+        )]);
+        let config = AgentRuntimeConfig {
+            hitl: Some(crate::hitl::HitlRuntime {
+                patterns: Arc::from([aura_config::GlobPattern::new("echo_tool").unwrap()]),
+                route: Arc::new(crate::hitl::DecisionRoute::Conversational {
+                    registry: registry.clone(),
+                    timeout: Duration::from_secs(3600),
+                }),
+                park_enabled: true,
+            }),
+            memory_dir: Some(memory_dir.to_string_lossy().into_owned()),
+            session_id: Some(session_id.to_string()),
+            request_id: Some(format!("req_resume_{}", uuid::Uuid::new_v4().simple())),
+            orchestration: Some(OrchestrationConfig {
+                enabled: true,
+                workers,
+                ..Default::default()
+            }),
+            ..AgentRuntimeConfig::default()
+        };
+        let orchestrator = Orchestrator::new(config).await.unwrap();
+        let run_id = orchestrator.persistence.lock().await.run_id().to_string();
+        (orchestrator, run_id)
+    }
+
+    fn file_store_registry(
+        root: &std::path::Path,
+    ) -> (
+        PendingApprovals,
+        Arc<dyn crate::session_store::ApprovalStore>,
+    ) {
+        let store = crate::session_store::FileApprovalStore::open(root).unwrap();
+        let store: Arc<dyn crate::session_store::ApprovalStore> = Arc::new(store);
+        let registry = PendingApprovals::with_backend(
+            store.clone(),
+            Arc::new(crate::session_store::InMemoryEventBus::new()),
+        );
+        (registry, store)
+    }
+
+    /// The routed decision the coordinator records before the park, so the
+    /// document carries a non-trivial `routing_decision` for the round trip.
+    fn routed_plan() -> PlanningResponse {
+        PlanningResponse::StepsPlan {
+            goal: "Deploy the service".to_string(),
+            steps: vec![],
+            routing_rationale: "the gated apply needs a human decision".to_string(),
+            planning_summary: String::new(),
+        }
+    }
+
+    /// Open is `pub(crate)` through the park module; this thin wrapper keeps
+    /// the test honest about the error type while staying inside the crate.
+    async fn open_resuming_document(
+        path: &std::path::Path,
+    ) -> crate::orchestration::park::ResumingDocumentHandle {
+        crate::orchestration::park::ResumingDocumentHandle::open(path)
+            .await
+            .expect("the published document opens")
+    }
+
+    /// The shared full-loop harness: park over the file-backed store, drop
+    /// the in-memory state, record `decision` in the store, rehydrate from
+    /// disk, and drive the continuation with `resume_turns`. Returns the
+    /// task outcome plus the handles the proofs assert through.
+    async fn park_then_resume(
+        decision: ApprovalDecision,
+        resume_turns: Vec<ScriptedTurn>,
+    ) -> (
+        Result<TaskOutcome, StreamError>,
+        test_rig::ScriptedCompletionModel,
+        Arc<std::sync::Mutex<Vec<test_rig::ToolInvocation>>>,
+        Arc<std::sync::Mutex<Vec<test_rig::ToolInvocation>>>,
+        Arc<crate::orchestration::park::ResumingDocumentHandle>,
+        Arc<dyn crate::session_store::ApprovalStore>,
+        crate::hitl::DecisionId,
+        tempfile::TempDir,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, store) = file_store_registry(&dir.path().join("approvals"));
+        let (orchestrator, run_id) =
+            file_backed_park_orchestrator(&registry, dir.path(), "loop-sess").await;
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(64);
+
+        let (park_model, park_invocations) =
+            gated_worker_override(vec![ScriptedTurn::tool_calls(vec![ScriptedToolCall::new(
+                "call_apply_1",
+                test_rig::ECHO_TOOL_NAME,
+                serde_json::json!({"namespace": "prod"}),
+            )])]);
+        let _ = park_model;
+
+        let mut plan = Plan::new("Deploy");
+        plan.add_task(Task::new(0, "Gated apply", "r").with_worker("operations"));
+        let (_compute_ms, park_records) = orchestrator.execute(&mut plan, &event_tx).await.unwrap();
+        let TaskState::AwaitingApproval { pending } = &plan.tasks[0].state else {
+            unreachable!("the fixture task is awaiting")
+        };
+        let decision_id = pending[0].decision_id;
+
+        let chat_history = vec![rig::completion::Message::user("deploy the service")];
+        let coordinator_conversation = vec![rig::completion::Message::user("plan the deploy")];
+        let routing_decision = routed_plan();
+        orchestrator
+            .park_run(
+                "deploy the service",
+                &chat_history,
+                &coordinator_conversation,
+                Some(&routing_decision),
+                2,
+                1_234,
+                &[],
+                &plan,
+                &park_records,
+                &event_tx,
+            )
+            .await
+            .expect("the park commit succeeds");
+        drop(orchestrator);
+
+        registry.resolve(&decision_id, decision).await.unwrap();
+
+        let document_path = dir
+            .path()
+            .join("loop-sess")
+            .join("parked")
+            .join(format!("{run_id}.json"));
+        let document = crate::orchestration::park::load_parked_run(&document_path)
+            .await
+            .unwrap();
+        // The replan state round-trips: iteration, planning latency, the
+        // coordinator conversation, and the routing decision all re-derive
+        // from the document alone.
+        assert_eq!(
+            document.iteration, 2,
+            "the iteration survives the round trip"
+        );
+        assert_eq!(document.planning_ms, 1_234);
+        assert_eq!(
+            document.coordinator_conversation.len(),
+            1,
+            "the coordinator conversation survives the round trip"
+        );
+        assert_eq!(
+            serde_json::to_value(&document.routing_decision).unwrap(),
+            serde_json::to_value(Some(routing_decision)).unwrap(),
+            "the routing decision survives the round trip"
+        );
+        let (recorded, consumed_ids) =
+            crate::orchestration::park::load_recorded_decisions(&registry, &document)
+                .await
+                .unwrap();
+        assert_eq!(consumed_ids, vec![decision_id]);
+
+        let node = document
+            .plan
+            .tasks
+            .iter()
+            .find(|t| t.status == TaskStatus::AwaitingApproval)
+            .expect("the awaiting node is in the document");
+        let continuation = TaskContinuation {
+            attempt: node.attempt.expect("the recorded attempt"),
+            history: node.history.clone().expect("the captured history"),
+            current_prompt: node.current_prompt.clone().expect("the sentinel prompt"),
+            pending: node.pending.clone().expect("the pending calls"),
+        };
+        let document_handle = Arc::new(open_resuming_document(&document_path).await);
+        let resume_ctx = ResumeContext {
+            recorded,
+            document: Arc::clone(&document_handle),
+        };
+
+        let (orchestrator2, _run_id2) =
+            file_backed_park_orchestrator(&registry, dir.path(), "loop-sess").await;
+        let (resume_model, resume_invocations) = gated_worker_override(resume_turns);
+        let params = TaskExecutionParams {
+            task_description: "apply the manifest",
+            task_context: &None,
+            worker_name: Some("operations"),
+        };
+        let (event_tx2, _event_rx2) = tokio::sync::mpsc::channel(64);
+        let outcome = orchestrator2
+            .execute_task(
+                0,
+                &params,
+                Some(&event_tx2),
+                Some(&continuation),
+                Some(&resume_ctx),
+            )
+            .await;
+
+        (
+            outcome,
+            resume_model,
+            resume_invocations,
+            park_invocations,
+            document_handle,
+            store,
+            decision_id,
+            dir,
+        )
+    }
+
+    /// FULL LOOP, zero human input: the scripted worker parks, the document
+    /// publishes, in-memory state drops, the store holds the approval, and
+    /// the rehydrated continuation completes the task — the tool running
+    /// exactly once with the recorded arguments, the executed tombstone
+    /// landing, the consumed decision removed, and no sentinel surviving in
+    /// the resumed conversation.
+    #[tokio::test]
+    async fn full_loop_park_rehydrate_and_resume_completes() {
+        let _serial = WORKER_OVERRIDE_LOCK.lock().await;
+
+        let (
+            outcome,
+            resume_model,
+            resume_invocations,
+            park_invocations,
+            document_handle,
+            store,
+            decision_id,
+            _dir,
+        ) = park_then_resume(
+            ApprovalDecision::Approved,
+            vec![ScriptedTurn::tool_calls(vec![ScriptedToolCall::new(
+                "call_final",
+                "submit_result",
+                serde_json::json!({
+                    "summary": "applied the manifest",
+                    "result": "applied successfully to prod",
+                    "confidence": "high",
+                }),
+            )])],
+        )
+        .await;
+
+        // The replan state survived the round trip and the task completes
+        // with the injected tool result flowing through submit_result.
+        let outcome = outcome.expect("the resumed task completes");
+        let TaskOutcome::Completed(execution) = outcome else {
+            panic!("the resumed task must complete");
+        };
+        assert_eq!(
+            execution
+                .structured_output
+                .as_ref()
+                .map(|s| s.summary.as_str()),
+            Some("applied the manifest"),
+            "the submit_result structured output flows through"
+        );
+
+        // The tool ran exactly once, with the recorded arguments — on the
+        // resume side only.
+        assert_eq!(
+            resume_invocations.lock().unwrap().len(),
+            1,
+            "exactly one resumed invocation"
+        );
+        assert_eq!(
+            resume_invocations.lock().unwrap()[0].arguments,
+            serde_json::json!({"namespace": "prod"})
+        );
+        assert!(
+            park_invocations.lock().unwrap().is_empty(),
+            "the gated action did not run at park time"
+        );
+
+        // The tombstone published: the resuming document's executed list is
+        // non-empty and terminal.
+        let executed = document_handle.executed().await;
+        assert_eq!(executed, vec!["call_apply_1".to_string()]);
+        let resuming: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(document_handle.publish_path()).unwrap())
+                .unwrap();
+        assert_eq!(resuming["executed"][0], "call_apply_1");
+
+        // The consumed decision left the store.
+        assert!(
+            store.get(&decision_id).await.unwrap().is_none(),
+            "the consumed decision is removed"
+        );
+
+        // No sentinel remains in the resumed conversation: the resume turn's
+        // prompt carries the real tool result in the wire form.
+        let requests = resume_model.requests();
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1, "the resume turn is the only model turn");
+        let last = requests[0]
+            .chat_history
+            .iter()
+            .last()
+            .expect("the prompt is in the history");
+        let tool_text = tool_result_text(last);
+        assert!(
+            tool_text.contains(&test_rig::echo_tool_result_wire()),
+            "the resumed prompt must carry the tool result wire text: {tool_text}"
+        );
+        assert!(
+            !tool_text.contains("parked pending human approval"),
+            "no sentinel may survive the sentinel replacement: {tool_text}"
+        );
+    }
+
+    /// RACE (b): concurrent takes on one recorded key — two decisions
+    /// consumed exactly once each, in recorded order, regardless of which
+    /// consumer wins the race.
+    #[tokio::test]
+    async fn concurrent_takes_consume_one_key_exactly_once_in_recorded_order() {
+        let recorded = Arc::new(RecordedDecisions::default());
+        let args = serde_json::json!({ "namespace": "prod" });
+        recorded.push(
+            CallKey::new(1, "kubectl_apply", &args),
+            ApprovalDecision::Approved,
+        );
+        recorded.push(
+            CallKey::new(1, "kubectl_apply", &args),
+            ApprovalDecision::Denied {
+                reason: Some("no".to_string()),
+            },
+        );
+
+        let taken = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let consumers = (0..2).map(|consumer| {
+            let recorded = Arc::clone(&recorded);
+            let taken = Arc::clone(&taken);
+            let args = args.clone();
+            tokio::spawn(async move {
+                let key = CallKey::new(1, "kubectl_apply", &args);
+                while let Some(decision) = recorded.take(&key) {
+                    taken.lock().unwrap().push((consumer, decision));
+                }
+            })
+        });
+        for consumer in consumers {
+            consumer.await.unwrap();
+        }
+
+        let taken = taken.lock().unwrap();
+        assert_eq!(
+            taken.len(),
+            2,
+            "two decisions consumed exactly once each: {taken:?}"
+        );
+        assert!(
+            matches!(taken[0].1, ApprovalDecision::Approved),
+            "recorded order holds across consumers: the approval is consumed first"
+        );
+        assert!(matches!(
+            &taken[1].1,
+            ApprovalDecision::Denied {
+                reason: Some(reason),
+            } if reason == "no"
+        ));
+    }
+
+    /// RACE (c): strict isolation — two StrictGuards on different task ids,
+    /// and an early drop of one leaves the other strict.
+    #[tokio::test]
+    async fn strict_guards_are_isolated_per_task() {
+        let recorded = Arc::new(RecordedDecisions::default());
+        let guard_a = recorded.strict_guard(1);
+        let guard_b = recorded.strict_guard(2);
+        assert!(recorded.is_strict(1) && recorded.is_strict(2));
+
+        drop(guard_a);
+        assert!(
+            !recorded.is_strict(1),
+            "the early drop clears only its own task"
+        );
+        assert!(
+            recorded.is_strict(2),
+            "the sibling continuation stays strict"
+        );
+        drop(guard_b);
+        assert!(!recorded.is_strict(2));
+    }
+
+    /// RACE-set companion: the transform_args idempotence pin — the worker
+    /// chain (composed as `create_worker` composes it) leaves already-clean
+    /// arguments untouched, so a recorded call re-entering the chain digests
+    /// to the same CallKey the gate consults.
+    #[test]
+    fn transform_args_is_idempotent_on_clean_arguments_for_the_worker_chain() {
+        use crate::tool_wrapper::{ComposedWrapper, ToolWrapper};
+        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::AtomicUsize;
+
+        let (observer, _rx) = ToolCallObserver::new(32);
+        let persistence = Arc::new(Mutex::new(ExecutionPersistence::disabled()));
+        let chain = Arc::new(ComposedWrapper::new(vec![
+            Arc::new(ObserverWrapper::new(observer, 1)),
+            Arc::new(DuplicateCallGuard::new(
+                3,
+                5,
+                Arc::new(AtomicBool::new(false)),
+            )),
+            Arc::new(PersistenceWrapper::new(PersistenceWrapperParams {
+                persistence,
+                in_flight: Arc::new(AtomicUsize::new(0)),
+                drain_notify: Arc::new(tokio::sync::Notify::new()),
+                worker_name: Some("operations".to_string()),
+                iteration: 1,
+                persistence_enabled: false,
+                size_threshold: 0,
+                duration_threshold_ms: 0,
+            })),
+        ]));
+
+        let args = serde_json::json!({ "namespace": "prod" });
+        let ctx = ToolCallContext::new(test_rig::ECHO_TOOL_NAME);
+        let first = chain.transform_args(args.clone(), &ctx);
+        let second = chain.transform_args(first.args.clone(), &ctx);
+
+        assert_eq!(
+            first.args, args,
+            "clean arguments pass through the chain unchanged"
+        );
+        assert_eq!(
+            second.args, first.args,
+            "re-entering the chain is a no-op on already-clean arguments"
+        );
+        assert_eq!(
+            CallKey::new(1, test_rig::ECHO_TOOL_NAME, &args),
+            CallKey::new(1, test_rig::ECHO_TOOL_NAME, &second.args),
+            "the recorded call digests to the same key after re-entering the chain"
+        );
+    }
+
+    /// DENIAL PARITY: a denial recorded in the store produces the live
+    /// path's denial feedback string as the tool result, byte-identical to
+    /// the gate's denial arm, and the inner tool never runs.
+    #[tokio::test]
+    async fn denial_parity_the_recorded_denial_produces_the_live_denial_feedback() {
+        let _serial = WORKER_OVERRIDE_LOCK.lock().await;
+
+        let (
+            outcome,
+            resume_model,
+            resume_invocations,
+            park_invocations,
+            _document_handle,
+            _store,
+            _decision_id,
+            _dir,
+        ) = park_then_resume(
+            ApprovalDecision::Denied {
+                reason: Some("too risky".to_string()),
+            },
+            vec![ScriptedTurn::tool_calls(vec![ScriptedToolCall::new(
+                "call_final",
+                "submit_result",
+                serde_json::json!({
+                    "summary": "blocked, moving on",
+                    "result": "the apply was denied; reporting back",
+                    "confidence": "low",
+                }),
+            )])],
+        )
+        .await;
+
+        let outcome = outcome.expect("the resumed task completes");
+        let TaskOutcome::Completed(execution) = outcome else {
+            panic!("the resumed task must complete even on a denial");
+        };
+        assert_eq!(
+            execution.result, "the apply was denied; reporting back",
+            "the worker continues past the denial"
+        );
+
+        // The denial feedback reached the model's prompt in the wire form,
+        // identical to the live path's denial arm — and no tool invocation
+        // happened on either side.
+        let requests = resume_model.requests();
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1, "the resume turn is the only model turn");
+        let last = requests[0]
+            .chat_history
+            .iter()
+            .last()
+            .expect("the prompt is in the history");
+        let tool_text = tool_result_text(last);
+        assert!(
+            tool_text.contains(&denial_feedback_wire("too risky")),
+            "the denial feedback must appear in the resumed prompt verbatim: {tool_text}"
+        );
+        assert!(
+            !tool_text.contains("parked pending human approval"),
+            "no sentinel may survive the sentinel replacement: {tool_text}"
+        );
+        assert!(resume_invocations.lock().unwrap().is_empty());
+        assert!(park_invocations.lock().unwrap().is_empty());
     }
 }

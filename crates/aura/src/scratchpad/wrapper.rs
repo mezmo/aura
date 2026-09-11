@@ -3,7 +3,7 @@
 
 use super::context_budget::ContextBudget;
 use super::storage::ScratchpadStorage;
-use crate::mcp_response::CallOutcome;
+use crate::mcp::CallOutcome;
 use crate::orchestration::persistence_wrapper::strip_artifact_footer;
 use crate::tool_wrapper::{ToolCallContext, ToolWrapper, TransformOutputResult};
 use async_trait::async_trait;

@@ -1,5 +1,6 @@
 //! Web-server entry point, shared by every binary that can launch the server.
 
+use aura::instance_id::instance_id as compute_instance_id;
 use aura_config::load_config;
 use axum::Json;
 use axum::extract::{Request, State};
@@ -335,7 +336,11 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
     for config in &configs {
         let id = config.agent.alias.as_deref().unwrap_or(&config.agent.name);
         let (provider, model) = config.agent.llm.model_info();
-        info!("Loaded agent '{}' ({}/{})", id, provider, model);
+        let iid = compute_instance_id(&config.agent);
+        info!(
+            "Loaded agent '{}' ({}/{}) [instance_id={}]",
+            id, provider, model, iid
+        );
         warn_timeout_relationships(id, config, &args);
     }
 

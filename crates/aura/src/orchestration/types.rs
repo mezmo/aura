@@ -6,9 +6,12 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::str::FromStr;
+use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+use crate::hitl::DecisionId;
 
 /// Maximum nesting depth for step structures.
 /// Depth 0 = top-level steps list, depth 1 = inside a parallel group,
@@ -346,6 +349,9 @@ impl Serialize for Task {
                 map.serialize_entry("error", error)?;
                 map.serialize_entry("failure_category", category)?;
             }
+            TaskState::AwaitingApproval { pending } => {
+                map.serialize_entry("pending_calls", pending)?;
+            }
             _ => {}
         }
         if let Some(ref w) = self.worker {
@@ -373,6 +379,8 @@ impl<'de> Deserialize<'de> for Task {
             #[serde(default)]
             failure_category: Option<FailureCategory>,
             #[serde(default)]
+            pending_calls: Option<Vec<PendingCall>>,
+            #[serde(default)]
             worker: Option<String>,
             #[serde(default)]
             rationale: String,
@@ -389,6 +397,9 @@ impl<'de> Deserialize<'de> for Task {
             TaskStatus::Failed => TaskState::Failed {
                 error: h.error.unwrap_or_else(|| "unknown".into()),
                 category: h.failure_category.unwrap_or_default(),
+            },
+            TaskStatus::AwaitingApproval => TaskState::AwaitingApproval {
+                pending: h.pending_calls.unwrap_or_default(),
             },
         };
         Ok(Task {
@@ -477,6 +488,9 @@ pub enum TaskStatus {
     Complete,
     /// Task failed.
     Failed,
+    /// Task's worker parked gated calls; awaiting human decisions (park mode).
+    #[serde(rename = "awaiting_approval")]
+    AwaitingApproval,
 }
 
 /// Structured classification of why a task failed, surfaced in the
@@ -510,6 +524,133 @@ pub enum FailureCategory {
     AgentError,
 }
 
+/// One gated tool call parked for a human decision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingCall {
+    /// The decision id the parked approval resolves against.
+    pub decision_id: DecisionId,
+    /// The gated tool's name.
+    pub tool_name: String,
+    /// The transformed arguments the gate saw.
+    pub arguments: serde_json::Value,
+    /// The model's tool-call id.
+    pub call_id: String,
+}
+
+/// The worker conversation captured for its parked calls: `history` up to the
+/// final turn, and that turn's aggregated tool-result prompt.
+#[derive(Debug, Clone)]
+pub struct ParkSnapshot {
+    pub history: Vec<rig::completion::Message>,
+    pub current_prompt: rig::completion::Message,
+}
+
+/// One worker attempt's parked calls and the conversation snapshot taken for
+/// them. Every operation is a short op under a std mutex; nothing awaits
+/// while holding the lock.
+#[derive(Debug, Default)]
+pub struct BlockedCell {
+    inner: Mutex<BlockedCellInner>,
+}
+
+#[derive(Debug, Default)]
+struct BlockedCellInner {
+    pending: Vec<PendingCall>,
+    snapshot: Option<ParkSnapshot>,
+    /// The tool-call id of the call about to execute (tools run sequentially).
+    current_call_id: Option<String>,
+}
+
+/// The blocked cell's verdict after a worker stream ends.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CellOutcome {
+    /// No parked call.
+    Normal,
+    /// Parked calls with a captured snapshot.
+    Blocked { pending: Vec<PendingCall> },
+    /// Parked calls without a snapshot: the stream ended before the hook ran.
+    Orphaned { pending: Vec<PendingCall> },
+}
+
+impl BlockedCell {
+    /// Append a parked call.
+    pub fn push(&self, call: PendingCall) {
+        self.inner
+            .lock()
+            .expect("blocked cell lock poisoned")
+            .pending
+            .push(call);
+    }
+
+    /// Stash the tool-call id the hook observed for the call about to execute.
+    pub fn set_current_call_id(&self, id: Option<String>) {
+        self.inner
+            .lock()
+            .expect("blocked cell lock poisoned")
+            .current_call_id = id;
+    }
+
+    /// Take the stashed tool-call id (consumed by the gate's park arm).
+    pub fn take_current_call_id(&self) -> Option<String> {
+        self.inner
+            .lock()
+            .expect("blocked cell lock poisoned")
+            .current_call_id
+            .take()
+    }
+
+    /// Snapshot `(history, current_prompt)` if a parked call is waiting for
+    /// one. Returns whether the snapshot was taken; an existing snapshot is
+    /// never overwritten.
+    pub fn snapshot_if_pending(
+        &self,
+        history: &[rig::completion::Message],
+        current_prompt: &rig::completion::Message,
+    ) -> bool {
+        let mut inner = self.inner.lock().expect("blocked cell lock poisoned");
+        if inner.pending.is_empty() || inner.snapshot.is_some() {
+            return false;
+        }
+        inner.snapshot = Some(ParkSnapshot {
+            history: history.to_vec(),
+            current_prompt: current_prompt.clone(),
+        });
+        true
+    }
+
+    /// The cell's verdict after a stream end, consuming the parked calls.
+    pub fn outcome(&self) -> CellOutcome {
+        let mut inner = self.inner.lock().expect("blocked cell lock poisoned");
+        if inner.pending.is_empty() {
+            return CellOutcome::Normal;
+        }
+        let pending = std::mem::take(&mut inner.pending);
+        if inner.snapshot.is_some() {
+            CellOutcome::Blocked { pending }
+        } else {
+            CellOutcome::Orphaned { pending }
+        }
+    }
+
+    /// Whether no parked call is recorded.
+    pub fn is_empty(&self) -> bool {
+        self.inner
+            .lock()
+            .expect("blocked cell lock poisoned")
+            .pending
+            .is_empty()
+    }
+
+    /// The captured snapshot, if the hook fired.
+    pub fn snapshot(&self) -> Option<ParkSnapshot> {
+        self.inner
+            .lock()
+            .expect("blocked cell lock poisoned")
+            .snapshot
+            .clone()
+    }
+}
+
 /// Rich state of a task, making invalid states unrepresentable.
 ///
 /// Use pattern matching or `matches!()` for boolean checks.
@@ -524,6 +665,10 @@ pub enum TaskState {
         error: String,
         category: FailureCategory,
     },
+    /// The worker parked gated calls and awaits human decisions.
+    AwaitingApproval {
+        pending: Vec<PendingCall>,
+    },
 }
 
 impl From<&TaskState> for TaskStatus {
@@ -533,6 +678,7 @@ impl From<&TaskState> for TaskStatus {
             TaskState::Running => TaskStatus::Running,
             TaskState::Complete { .. } => TaskStatus::Complete,
             TaskState::Failed { .. } => TaskStatus::Failed,
+            TaskState::AwaitingApproval { .. } => TaskStatus::AwaitingApproval,
         }
     }
 }
@@ -544,6 +690,7 @@ impl std::fmt::Display for TaskStatus {
             TaskStatus::Running => write!(f, "running"),
             TaskStatus::Complete => write!(f, "complete"),
             TaskStatus::Failed => write!(f, "failed"),
+            TaskStatus::AwaitingApproval => write!(f, "awaiting_approval"),
         }
     }
 }
@@ -866,6 +1013,16 @@ impl IterationContext {
                     blocked_lines.push(format!(
                         "- Task {}: {} → blocked (dependency failed)",
                         t.id, t.description
+                    ));
+                }
+                TaskState::AwaitingApproval { pending } => {
+                    // A parked run never renders a continuation prompt; if an
+                    // awaiting task reaches here, name what it waits on.
+                    blocked_lines.push(format!(
+                        "- Task {}: {} → awaiting approval ({} pending call(s))",
+                        t.id,
+                        t.description,
+                        pending.len()
                     ));
                 }
             }
@@ -1391,6 +1548,191 @@ mod tests {
         };
         assert_eq!(error, "boom");
         assert_eq!(category, FailureCategory::AgentError);
+    }
+
+    // ========================================================================
+    // AwaitingApproval (park mode)
+    // ========================================================================
+
+    fn pending_call(tool: &str, call_id: &str) -> PendingCall {
+        PendingCall {
+            decision_id: DecisionId::generate(),
+            tool_name: tool.to_string(),
+            arguments: serde_json::json!({ "namespace": "prod" }),
+            call_id: call_id.to_string(),
+        }
+    }
+
+    #[test]
+    fn awaiting_approval_is_unfinished_and_dependents_not_ready() {
+        let mut plan = Plan::new("Test");
+        plan.add_task(Task::new(0, "Gated task", "Runs the gated tool"));
+        plan.add_task(Task::new(1, "Dependent", "Needs task 0").with_dependency(0));
+        plan.get_task_mut(0).unwrap().state = TaskState::AwaitingApproval {
+            pending: vec![pending_call("kubectl_apply", "call_1")],
+        };
+
+        assert!(!plan.is_finished(), "an awaiting task is unfinished");
+        assert!(
+            plan.ready_tasks().is_empty(),
+            "dependents of an awaiting task are not ready"
+        );
+        assert_eq!(
+            plan.pending_count(),
+            1,
+            "only the dependent counts as Pending; the awaiting task is its own state"
+        );
+    }
+
+    #[test]
+    fn task_serde_roundtrip_awaiting_approval_carries_pending_calls() {
+        let mut task = Task::new(3, "Gated task", "test rationale");
+        task.state = TaskState::AwaitingApproval {
+            pending: vec![pending_call("kubectl_delete", "call_9")],
+        };
+        let json = serde_json::to_string(&task).unwrap();
+        assert!(json.contains(r#""status":"awaiting_approval"#));
+        assert!(json.contains(r#""tool_name":"kubectl_delete"#));
+
+        let roundtripped: Task = serde_json::from_str(&json).unwrap();
+        let TaskState::AwaitingApproval { pending } = roundtripped.state else {
+            panic!("expected AwaitingApproval");
+        };
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].tool_name, "kubectl_delete");
+        assert_eq!(pending[0].call_id, "call_9");
+        assert_eq!(pending[0].arguments["namespace"], "prod");
+    }
+
+    #[test]
+    fn task_status_display_and_from_for_awaiting_approval() {
+        assert_eq!(
+            TaskStatus::AwaitingApproval.to_string(),
+            "awaiting_approval"
+        );
+        let state = TaskState::AwaitingApproval { pending: vec![] };
+        assert_eq!(
+            TaskStatus::from(&state),
+            TaskStatus::AwaitingApproval,
+            "empty pending round-trips the status without panicking"
+        );
+    }
+
+    #[test]
+    fn continuation_prompt_renders_awaiting_approval_line() {
+        let mut plan = Plan::new("Goal");
+        let mut task = Task::new(0, "Gated task", "Waits on a human");
+        task.state = TaskState::AwaitingApproval {
+            pending: vec![pending_call("kubectl_apply", "call_1")],
+        };
+        plan.add_task(task);
+
+        let ctx = IterationContext::new(1, plan, None, vec![], HashMap::new());
+        let prompt = ctx.build_continuation_prompt(3, false, 2000);
+        assert!(prompt.contains("awaiting approval (1 pending call(s))"));
+    }
+
+    // ========================================================================
+    // BlockedCell
+    // ========================================================================
+
+    #[test]
+    fn blocked_cell_empty_stream_end_is_normal() {
+        let cell = BlockedCell::default();
+        assert!(cell.is_empty());
+        assert_eq!(cell.outcome(), CellOutcome::Normal);
+    }
+
+    #[test]
+    fn blocked_cell_with_snapshot_blocks() {
+        let cell = BlockedCell::default();
+        let parked = pending_call("kubectl_apply", "call_1");
+        cell.push(parked.clone());
+        assert!(!cell.is_empty());
+
+        let history = vec![rig::completion::Message::user("do the thing")];
+        let prompt = rig::completion::Message::user("tool results");
+        assert!(cell.snapshot_if_pending(&history, &prompt));
+
+        match cell.outcome() {
+            CellOutcome::Blocked { pending } => {
+                assert_eq!(pending, vec![parked]);
+            }
+            other => panic!("expected Blocked, got {other:?}"),
+        }
+
+        // The snapshot survives the outcome read.
+        let snapshot = cell.snapshot().expect("snapshot captured");
+        assert_eq!(snapshot.history.len(), 1);
+        // Consumed: a second outcome read is normal.
+        assert_eq!(cell.outcome(), CellOutcome::Normal);
+    }
+
+    #[test]
+    fn blocked_cell_without_snapshot_is_orphaned() {
+        // Stream ended before the hook fired: cell set, no snapshot.
+        let cell = BlockedCell::default();
+        let parked = pending_call("kubectl_apply", "call_1");
+        cell.push(parked.clone());
+
+        match cell.outcome() {
+            CellOutcome::Orphaned { pending } => {
+                assert_eq!(pending, vec![parked]);
+            }
+            other => panic!("expected Orphaned, got {other:?}"),
+        }
+        assert!(
+            cell.snapshot().is_none(),
+            "no snapshot exists on the orphaned path"
+        );
+    }
+
+    #[test]
+    fn blocked_cell_snapshots_only_when_pending() {
+        let cell = BlockedCell::default();
+        let history = vec![];
+        let prompt = rig::completion::Message::user("tool results");
+        assert!(
+            !cell.snapshot_if_pending(&history, &prompt),
+            "an empty cell must not capture a snapshot"
+        );
+        assert!(cell.snapshot().is_none());
+    }
+
+    #[test]
+    fn blocked_cell_never_overwrites_the_snapshot() {
+        let cell = BlockedCell::default();
+        cell.push(pending_call("kubectl_apply", "call_1"));
+        let first_prompt = rig::completion::Message::user("first");
+        assert!(cell.snapshot_if_pending(&[], &first_prompt));
+        let second_prompt = rig::completion::Message::user("second");
+        assert!(
+            !cell.snapshot_if_pending(&[], &second_prompt),
+            "a second capture must not overwrite the first"
+        );
+    }
+
+    #[test]
+    fn blocked_cell_two_gated_calls_one_turn() {
+        let cell = BlockedCell::default();
+        cell.set_current_call_id(Some("call_a".to_string()));
+        let mut first = pending_call("kubectl_apply", "");
+        first.call_id = cell.take_current_call_id().unwrap_or_default();
+        cell.set_current_call_id(Some("call_b".to_string()));
+        let mut second = pending_call("kubectl_delete", "");
+        second.call_id = cell.take_current_call_id().unwrap_or_default();
+        cell.push(first);
+        cell.push(second);
+
+        cell.snapshot_if_pending(&[], &rig::completion::Message::user("results"));
+        match cell.outcome() {
+            CellOutcome::Blocked { pending } => {
+                assert_eq!(pending.len(), 2);
+                assert_eq!(pending[0].call_id, "call_a");
+                assert_eq!(pending[1].call_id, "call_b");
+            }
+            other => panic!("expected Blocked, got {other:?}"),
+        }
     }
 
     // ========================================================================

@@ -1,7 +1,7 @@
 //! Streamable HTTP MCP client with progress and cancellation support.
 
 use anyhow::{Context, Result};
-use futures::StreamExt;
+use futures::{StreamExt, stream::BoxStream};
 use reqwest;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use rmcp::{
@@ -13,20 +13,290 @@ use rmcp::{
     serve_client,
     service::{PeerRequestOptions, RunningService},
     transport::{
-        StreamableHttpClientTransport, streamable_http_client::StreamableHttpClientTransportConfig,
+        StreamableHttpClientTransport,
+        streamable_http_client::{StreamableHttpClient, StreamableHttpClientTransportConfig},
     },
 };
 use serde_json::{Map, Value};
+use sse_stream::{Sse, SseStream};
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, error, info, warn};
 
 use crate::approver_headers::ApproverHeaders;
-use crate::mcp_progress::ProgressEnabledHandler;
-use crate::mcp_response::extract_tool_result;
+use crate::mcp::progress::ProgressEnabledHandler;
+use crate::mcp::response::extract_tool_result;
 use crate::tool_event_broker::{peek_tool_call_id, publish_tool_start};
+
+/// Custom HTTP client that captures the underlying HTTP status when a request
+/// fails.
+#[derive(Clone, Default)]
+pub struct CustomHttpClient {
+    client: reqwest::Client,
+    /// First failing HTTP status observed on this client.
+    first_error: Arc<Mutex<Option<String>>>,
+}
+
+impl CustomHttpClient {
+    /// Wrap an existing `reqwest::Client` (already carrying any forwarded
+    /// headers, including auth) so transport HTTP errors can be captured.
+    ///
+    /// rmcp's streamable-HTTP transport runs in a background worker: when a
+    /// request fails (e.g. 404/401), the worker logs the `reqwest` error and
+    /// closes the channel, so `serve_client` only sees "channel closed" — the
+    /// status code is lost. This client records the status into `first_error`
+    /// at the layer it occurs (in `post_message`/`get_stream`), then
+    /// `McpClient::new` reads it back after the connection fails to surface a
+    /// precise reason.
+    pub fn from_reqwest(client: reqwest::Client) -> Self {
+        Self {
+            client,
+            first_error: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Shared handle to the first captured failing HTTP status, if any.
+    ///
+    /// The `Arc` is shared across clones because the rmcp transport worker
+    /// clones the client when setting up the background task.
+    pub fn first_error(&self) -> Arc<Mutex<Option<String>>> {
+        Arc::clone(&self.first_error)
+    }
+
+    /// Record the first non-success HTTP status seen (first error wins, so the
+    /// root cause isn't overwritten by any follow-on failures).
+    fn record_http_status(&self, status: reqwest::StatusCode) {
+        if status.is_success() {
+            return;
+        }
+        if let Ok(mut guard) = self.first_error.lock()
+            && guard.is_none()
+        {
+            *guard = Some(format!("{}{status}", aura_events::HTTP_STATUS_MARKER));
+        }
+    }
+}
+
+impl StreamableHttpClient for CustomHttpClient {
+    type Error = reqwest::Error;
+
+    async fn get_stream(
+        &self,
+        uri: Arc<str>,
+        session_id: Arc<str>,
+        last_event_id: Option<String>,
+        _auth_token: Option<String>, // auth flows through the client's default headers
+    ) -> Result<
+        BoxStream<'static, Result<Sse, sse_stream::Error>>,
+        rmcp::transport::streamable_http_client::StreamableHttpError<Self::Error>,
+    > {
+        use reqwest::header::ACCEPT;
+        use rmcp::transport::common::http_header::{
+            EVENT_STREAM_MIME_TYPE, HEADER_LAST_EVENT_ID, HEADER_SESSION_ID, JSON_MIME_TYPE,
+        };
+
+        let mut request_builder = self
+            .client
+            .get(uri.as_ref())
+            .header(ACCEPT, "application/json, text/event-stream")
+            .header(HEADER_SESSION_ID, session_id.as_ref());
+
+        if let Some(last_event_id) = last_event_id {
+            request_builder = request_builder.header(HEADER_LAST_EVENT_ID, last_event_id);
+        }
+
+        let response = request_builder
+            .send()
+            .await
+            .map_err(rmcp::transport::streamable_http_client::StreamableHttpError::Client)?;
+        if response.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED {
+            // Not a failure — the server just doesn't support the SSE GET.
+            return Err(rmcp::transport::streamable_http_client::StreamableHttpError::ServerDoesNotSupportSse);
+        }
+        self.record_http_status(response.status());
+        let response = response
+            .error_for_status()
+            .map_err(rmcp::transport::streamable_http_client::StreamableHttpError::Client)?;
+
+        match response.headers().get(reqwest::header::CONTENT_TYPE) {
+            Some(ct) => {
+                // Accept both `text/event-stream` and `application/json`, matching
+                // rmcp's reference reqwest client — a server may answer the GET
+                // stream with either. Rejecting JSON here would mark an otherwise
+                // healthy server as `Failed`.
+                if !ct.as_bytes().starts_with(EVENT_STREAM_MIME_TYPE.as_bytes())
+                    && !ct.as_bytes().starts_with(JSON_MIME_TYPE.as_bytes())
+                {
+                    return Err(rmcp::transport::streamable_http_client::StreamableHttpError::UnexpectedContentType(Some(
+                        String::from_utf8_lossy(ct.as_bytes()).to_string(),
+                    )));
+                }
+            }
+            None => {
+                return Err(rmcp::transport::streamable_http_client::StreamableHttpError::UnexpectedContentType(None));
+            }
+        }
+
+        let event_stream = SseStream::from_byte_stream(response.bytes_stream()).boxed();
+        Ok(event_stream)
+    }
+
+    async fn delete_session(
+        &self,
+        uri: Arc<str>,
+        session: Arc<str>,
+        _auth_token: Option<String>, // auth flows through the client's default headers
+    ) -> Result<(), rmcp::transport::streamable_http_client::StreamableHttpError<Self::Error>> {
+        use rmcp::transport::common::http_header::HEADER_SESSION_ID;
+
+        let response = self
+            .client
+            .delete(uri.as_ref())
+            .header(HEADER_SESSION_ID, session.as_ref())
+            .send()
+            .await
+            .map_err(rmcp::transport::streamable_http_client::StreamableHttpError::Client)?;
+
+        if response.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED {
+            return Err(rmcp::transport::streamable_http_client::StreamableHttpError::ServerDoesNotSupportDeleteSession);
+        }
+        response
+            .error_for_status()
+            .map_err(rmcp::transport::streamable_http_client::StreamableHttpError::Client)?;
+        Ok(())
+    }
+
+    async fn post_message(
+        &self,
+        uri: Arc<str>,
+        message: rmcp::model::ClientJsonRpcMessage,
+        session_id: Option<Arc<str>>,
+        _auth_token: Option<String>, // auth flows through the client's default headers
+    ) -> Result<
+        rmcp::transport::streamable_http_client::StreamableHttpPostResponse,
+        rmcp::transport::streamable_http_client::StreamableHttpError<Self::Error>,
+    > {
+        use rmcp::transport::common::http_header::{HEADER_SESSION_ID, JSON_MIME_TYPE};
+
+        // Approver header overrides ride the request's extensions: present
+        // only on the one gated call whose approval captured them, and
+        // never serialized into the JSON body below (the rmcp serializer
+        // emits only `_meta`).
+        let approver_overrides = crate::approver_headers::extract_from_client_message(&message);
+
+        let mut request_builder = self
+            .client
+            .post(uri.as_ref())
+            .header(reqwest::header::CONTENT_TYPE, JSON_MIME_TYPE)
+            .header(
+                reqwest::header::ACCEPT,
+                "application/json, text/event-stream",
+            );
+
+        // Forward the negotiated session id on every post after `initialize`.
+        // The server returns the id in the initialize response and requires it
+        // on subsequent requests (`notifications/initialized`, tool calls, …);
+        // dropping it makes the server reject them (FastMCP: 400, rmcp: 422),
+        // which the transport worker then collapses into "channel closed".
+        if let Some(session_id) = session_id {
+            request_builder = request_builder.header(HEADER_SESSION_ID, session_id.as_ref());
+        }
+
+        // Per-request override headers beat the client's frozen
+        // `default_headers` for exactly this request. Applied last, after
+        // every transport-owned header above; reserved names are
+        // additionally rejected at config parse, so framing and session
+        // routing stay intact.
+        let mut request_builder = request_builder.json(&message);
+        if let Some(overrides) = approver_overrides {
+            request_builder = overrides.apply_to(request_builder);
+        }
+
+        let response = request_builder
+            .send()
+            .await
+            .map_err(rmcp::transport::streamable_http_client::StreamableHttpError::Client)?;
+        // Capture the status before error_for_status consumes the response — this
+        // is the initialize/JSON-RPC POST, where auth (401) and endpoint (404)
+        // failures surface, and where the transport worker would otherwise hide
+        // them behind a "channel closed" error.
+        let status = response.status();
+        self.record_http_status(status);
+        let response = response
+            .error_for_status()
+            .map_err(rmcp::transport::streamable_http_client::StreamableHttpError::Client)?;
+
+        // A notification/response-less POST (e.g. `notifications/initialized`)
+        // comes back as 202 Accepted / 204 No Content with an empty body. Some
+        // servers (FastMCP) still tag the empty body `application/json`; parsing
+        // it as a JSON-RPC message fails and the worker reports "channel closed".
+        // Short-circuit on these statuses before touching the body, matching
+        // rmcp's reference reqwest client.
+        if matches!(
+            status,
+            reqwest::StatusCode::ACCEPTED | reqwest::StatusCode::NO_CONTENT
+        ) {
+            return Ok(
+                rmcp::transport::streamable_http_client::StreamableHttpPostResponse::Accepted,
+            );
+        }
+
+        // Extract session ID from headers before consuming response
+        let session_id = response
+            .headers()
+            .get("mcp-session-id")
+            .and_then(|h| h.to_str().ok())
+            .map(|s| s.to_string());
+
+        // Snapshot the content type as an owned string before consuming the
+        // response body in the branches below.
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .map(|ct| String::from_utf8_lossy(ct.as_bytes()).to_string());
+
+        match content_type.as_deref() {
+            Some(ct) if ct.starts_with("application/json") => {
+                let json_text = response.text().await.map_err(
+                    rmcp::transport::streamable_http_client::StreamableHttpError::Client,
+                )?;
+                let json_message: rmcp::model::ServerJsonRpcMessage =
+                    serde_json::from_str(&json_text).map_err(
+                        rmcp::transport::streamable_http_client::StreamableHttpError::Deserialize,
+                    )?;
+                Ok(
+                    rmcp::transport::streamable_http_client::StreamableHttpPostResponse::Json(
+                        json_message,
+                        session_id,
+                    ),
+                )
+            }
+            Some(ct) if ct.starts_with("text/event-stream") => {
+                let event_stream =
+                    sse_stream::SseStream::from_byte_stream(response.bytes_stream()).boxed();
+                Ok(
+                    rmcp::transport::streamable_http_client::StreamableHttpPostResponse::Sse(
+                        event_stream,
+                        session_id,
+                    ),
+                )
+            }
+            // A 2xx body that is neither JSON nor SSE (or carries no content
+            // type) is unexpected for a JSON-RPC request — the response-less
+            // 202/204 acks are already handled above. Surface it as an error
+            // like rmcp's reference client rather than silently reporting
+            // `Accepted`, which would drop the real response and hang the
+            // request until it times out.
+            other => Err(
+                rmcp::transport::streamable_http_client::StreamableHttpError::UnexpectedContentType(
+                    other.map(|s| s.to_string()),
+                ),
+            ),
+        }
+    }
+}
 
 /// Build the CallTool request, attaching approver header overrides as a
 /// request extension when present. The extension rides on this one
@@ -170,7 +440,7 @@ impl McpClient {
         // Use our own StreamableHttpClient so a failing HTTP status (404/401/…)
         // is captured at the transport layer. rmcp's worker otherwise collapses
         // it into a generic "channel closed", losing the actionable detail.
-        let custom_client = crate::mcp::CustomHttpClient::from_reqwest(http_client);
+        let custom_client = CustomHttpClient::from_reqwest(http_client);
         let captured_status = custom_client.first_error();
 
         let transport = StreamableHttpClientTransport::with_client(
@@ -655,6 +925,76 @@ pub(crate) mod tests {
 
         tracker.remove(http_id, &mcp_id).await;
         assert_eq!(tracker.get_all(http_id).await.len(), 0);
+    }
+
+    /// `post_message` must (a) forward the negotiated `mcp-session-id` header on
+    /// every post after `initialize`, and (b) treat a `202 Accepted` /
+    /// `204 No Content` response as `Accepted` *without* parsing the (empty)
+    /// body — even when the server tags that empty body `application/json`
+    /// (FastMCP does).
+    ///
+    /// Both are regression guards for the `notifications/initialized` post:
+    /// dropping the session id makes the server reject it (FastMCP 400, rmcp
+    /// 422); parsing the empty 202 body as JSON-RPC fails to deserialize. Either
+    /// bug collapses into a generic "channel closed" and the whole server is
+    /// recorded as `Failed`, so no tools are available.
+    #[tokio::test]
+    async fn post_message_forwards_session_id_and_accepts_empty_202() {
+        use serde_json::json;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Capture the raw request bytes the server received so the test can
+        // assert the session-id header was actually sent on the wire.
+        let seen_request = Arc::new(Mutex::new(String::new()));
+        let seen_for_server = Arc::clone(&seen_request);
+
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let n = sock.read(&mut buf).await.unwrap();
+            *seen_for_server.lock().unwrap() = String::from_utf8_lossy(&buf[..n]).to_string();
+            // FastMCP-style ack: 202 Accepted, application/json content-type,
+            // and an empty body.
+            sock.write_all(
+                b"HTTP/1.1 202 Accepted\r\ncontent-type: application/json\r\ncontent-length: 0\r\n\r\n",
+            )
+            .await
+            .unwrap();
+            let _ = sock.flush().await;
+        });
+
+        let client = CustomHttpClient::from_reqwest(reqwest::Client::new());
+        let uri: Arc<str> = format!("http://{addr}/mcp").into();
+        let message: rmcp::model::ClientJsonRpcMessage = serde_json::from_value(
+            json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+        )
+        .unwrap();
+        let session: Arc<str> = "test-session-abc123".into();
+
+        let result = client
+            .post_message(uri, message, Some(Arc::clone(&session)), None)
+            .await;
+
+        server.await.unwrap();
+
+        // (b) Empty 202 → Accepted, not a deserialize error.
+        assert!(
+            matches!(
+                result,
+                Ok(rmcp::transport::streamable_http_client::StreamableHttpPostResponse::Accepted)
+            ),
+            "empty 202 should yield Accepted, got {result:?}"
+        );
+
+        // (a) The session id was forwarded as the mcp-session-id header.
+        let request = seen_request.lock().unwrap();
+        let lowered = request.to_lowercase();
+        assert!(
+            lowered.contains("mcp-session-id: test-session-abc123"),
+            "post_message must forward the session id header; request was:\n{request}"
+        );
     }
 
     /// One HTTP request the server received, kept whole so a test can ask
