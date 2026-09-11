@@ -183,10 +183,10 @@ pub(crate) async fn publish(
     let parked_dir = parked_dir.to_path_buf();
     let run_id = run_id.to_string();
     tokio::task::spawn_blocking(move || {
-        std::fs::create_dir_all(&parked_dir)?;
+        crate::session_store::private_dir(&parked_dir)?;
 
         let tmp = parked_dir.join(format!(".{run_id}.tmp"));
-        std::fs::write(&tmp, &bytes)?;
+        crate::session_store::write_private(&tmp, &bytes)?;
         let dest = parked_dir.join(format!("{run_id}{PARKED_DOCUMENT_SUFFIX}"));
         std::fs::rename(&tmp, &dest)?;
 
@@ -390,10 +390,15 @@ mod tests {
 
         let reloaded = load_parked_run(&dest).await.unwrap();
         assert_eq!(reloaded.run_id, run_id);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "the checkpoint is owner-only");
+        }
     }
 
-    /// A read-only parked directory fails the temp write, publishes nothing,
-    /// and leaves no partial document.
+    /// An obstructed temp-file path fails the write and publishes nothing.
     #[tokio::test]
     async fn failing_temp_write_publishes_nothing() {
         let dir = tempfile::tempdir().unwrap();
@@ -422,24 +427,9 @@ mod tests {
             config_fingerprint: "f".to_string(),
         };
 
-        let mut perms = tokio::fs::metadata(&parked_dir)
-            .await
-            .unwrap()
-            .permissions();
-        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o555);
-        tokio::fs::set_permissions(&parked_dir, perms)
-            .await
-            .unwrap();
+        let tmp = parked_dir.join(format!(".{run_id}.tmp"));
+        tokio::fs::create_dir(&tmp).await.unwrap();
         let result = publish(&document, &parked_dir, run_id).await;
-        // Restore writability so the tempdir can clean itself up.
-        let mut perms = tokio::fs::metadata(&parked_dir)
-            .await
-            .unwrap()
-            .permissions();
-        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
-        tokio::fs::set_permissions(&parked_dir, perms)
-            .await
-            .unwrap();
 
         assert!(result.is_err(), "the temp write must fail");
         assert!(
@@ -449,6 +439,7 @@ mod tests {
                 .unwrap(),
             "no document is published on a failed temp write"
         );
+        assert!(tmp.is_dir(), "the obstruction is left in place");
     }
 
     /// Refresh drops decided and removed approvals, keeps the undecided
