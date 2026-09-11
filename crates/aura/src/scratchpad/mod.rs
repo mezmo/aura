@@ -231,6 +231,7 @@ mod tests {
             description: None,
             headers_from_request: HashMap::new(),
             scratchpad,
+            user_agent: None,
         }
     }
 
@@ -241,6 +242,7 @@ mod tests {
                 .map(|(name, cfg)| (name.to_string(), cfg))
                 .collect(),
             sanitize_schemas: false,
+            ..Default::default()
         }
     }
 

@@ -366,7 +366,7 @@ fn verify_server(
 ) -> Result<(aura::mcp::ConnectionStatus, Vec<String>), String> {
     let mcp_config = aura_config::config::McpConfig {
         servers: HashMap::from([(name.to_string(), server)]),
-        sanitize_schemas: true,
+        ..Default::default()
     };
     rt.block_on(async {
         let manager = match tokio::time::timeout(
@@ -780,6 +780,7 @@ fn collect_catalog(
                 env: HashMap::new(),
                 description: Some(entry.description.to_string()),
                 scratchpad: HashMap::new(),
+                user_agent: None,
             },
             Vec::new(),
         ),
@@ -823,6 +824,7 @@ fn collect_custom(ctx: &mut CommandContext, config_path: &Path) -> Option<Collec
                 env: HashMap::new(),
                 description: None,
                 scratchpad: HashMap::new(),
+                user_agent: None,
             },
             Vec::new(),
         )
@@ -887,6 +889,7 @@ fn collect_custom(ctx: &mut CommandContext, config_path: &Path) -> Option<Collec
                 description: None,
                 headers_from_request: HashMap::new(),
                 scratchpad: HashMap::new(),
+                user_agent: None,
             }
         };
         (server, secrets)
@@ -911,6 +914,7 @@ fn http_streamable(
         description: (!description.is_empty()).then(|| description.to_string()),
         headers_from_request: HashMap::new(),
         scratchpad: HashMap::new(),
+        user_agent: None,
     }
 }
 
@@ -1188,6 +1192,7 @@ mod tests {
                         env: HashMap::new(),
                         description: Some(entry.description.to_string()),
                         scratchpad: HashMap::new(),
+                        user_agent: None,
                     },
                     (),
                 ),

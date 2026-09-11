@@ -36,10 +36,12 @@ async fn test_stdio_mcp_connection_and_tool_execution() {
                 env: HashMap::new(),
                 description: Some("Everything MCP server for STDIO testing".to_string()),
                 scratchpad: HashMap::new(),
+                user_agent: None,
             },
         )]
         .into_iter()
         .collect(),
+        ..Default::default()
     };
 
     let manager = McpManager::initialize_from_config(&mcp_config)
