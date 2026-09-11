@@ -1,4 +1,4 @@
-use crate::config::McpServerConfig;
+use crate::config::{McpServerConfig, McpUserAgent, default_mcp_user_agent};
 use crate::error::BuilderError;
 use crate::mcp::client::McpClient;
 use rig::completion::ToolDefinition;
@@ -20,6 +20,8 @@ pub struct McpManager {
     pub stdio_tools: HashMap<String, Vec<rmcp::model::Tool>>,
     /// Whether to sanitize tool schemas for OpenAI compatibility
     pub sanitize_schemas: bool,
+    /// Manager-wide client identity.
+    pub user_agent: McpUserAgent,
 }
 
 #[derive(Debug, Clone)]
@@ -54,6 +56,7 @@ impl McpManager {
             stdio_clients: HashMap::new(),
             stdio_tools: HashMap::new(),
             sanitize_schemas,
+            user_agent: default_mcp_user_agent(),
         }
     }
 
@@ -62,10 +65,12 @@ impl McpManager {
         mcp_config: &crate::config::McpConfig,
     ) -> Result<Self, BuilderError> {
         let mut manager = Self::with_sanitization(mcp_config.sanitize_schemas);
+        manager.user_agent = mcp_config.user_agent.clone();
 
         info!(
-            "Initializing MCP servers ({} configured)",
-            mcp_config.servers.len()
+            "Initializing MCP servers ({} configured) as {:?}",
+            mcp_config.servers.len(),
+            manager.user_agent
         );
         if mcp_config.sanitize_schemas {
             info!("Schema sanitization: ENABLED (OpenAI compatibility)");
@@ -150,16 +155,24 @@ impl McpManager {
         server_name: &str,
         server_config: &McpServerConfig,
     ) -> Result<usize, BuilderError> {
+        // A server-level identity replaces the manager-wide one for this
+        // server alone.
+        let user_agent = server_config
+            .user_agent()
+            .unwrap_or(&self.user_agent)
+            .clone();
         match server_config {
             McpServerConfig::HttpStreamable { url, headers, .. } => {
-                self.connect_http_streamable(server_name, url, headers)
+                self.connect_http_streamable(server_name, url, headers, &user_agent)
                     .await
             }
             McpServerConfig::Sse { url, headers, .. } => {
-                self.connect_sse(server_name, url, headers).await
+                self.connect_sse(server_name, url, headers, &user_agent)
+                    .await
             }
             McpServerConfig::Stdio { cmd, args, env, .. } => {
-                self.connect_stdio(server_name, cmd, args, env).await
+                self.connect_stdio(server_name, cmd, args, env, &user_agent)
+                    .await
             }
         }
     }
@@ -170,11 +183,12 @@ impl McpManager {
         server_name: &str,
         url: &str,
         headers: &HashMap<String, String>,
+        user_agent: &str,
     ) -> Result<usize, BuilderError> {
         info!("  Connecting to HTTP streamable server at: {}", url);
 
         match self
-            .try_connect_http_streamable(server_name, url, headers)
+            .try_connect_http_streamable(server_name, url, headers, user_agent)
             .await
         {
             Ok(tools_count) => {
@@ -207,6 +221,7 @@ impl McpManager {
         server_name: &str,
         url: &str,
         headers: &HashMap<String, String>,
+        user_agent: &str,
     ) -> Result<usize, BuilderError> {
         debug!("  Creating HTTP Streamable client for: {}", url);
         debug!("  Headers to be applied: {:?}", headers.keys());
@@ -218,7 +233,7 @@ impl McpManager {
         // Use McpClient. Render with `{e:#}` so anyhow's full cause chain (e.g.
         // the captured HTTP status → transport error) is included, not just the
         // outermost context.
-        let client = McpClient::new(url.to_string(), headers)
+        let client = McpClient::new(url.to_string(), headers, user_agent)
             .await
             .map_err(|e| {
                 BuilderError::McpInitError(format!(
@@ -266,10 +281,14 @@ impl McpManager {
         server_name: &str,
         url: &str,
         headers: &HashMap<String, String>,
+        user_agent: &str,
     ) -> Result<usize, BuilderError> {
         info!("  Connecting to SSE server at: {}", url);
 
-        match self.try_connect_sse(server_name, url, headers).await {
+        match self
+            .try_connect_sse(server_name, url, headers, user_agent)
+            .await
+        {
             Ok(tools_count) => {
                 info!("  SSE connection successful");
                 Ok(tools_count)
@@ -295,14 +314,15 @@ impl McpManager {
         server_name: &str,
         url: &str,
         headers: &HashMap<String, String>,
+        user_agent: &str,
     ) -> Result<usize, BuilderError> {
         debug!("  Creating SSE client for: {}", url);
 
-        let transport = crate::mcp::sse::SseTransport::connect(url, headers)
+        let transport = crate::mcp::sse::SseTransport::connect(url, headers, user_agent)
             .await
             .map_err(BuilderError::SseTransport)?;
 
-        let client = McpClient::from_transport(transport, url.to_string())
+        let client = McpClient::from_transport(transport, url.to_string(), user_agent)
             .await
             .map_err(|e| {
                 BuilderError::McpInitError(format!(
@@ -340,11 +360,15 @@ impl McpManager {
         cmd: &[String],
         args: &[String],
         env: &HashMap<String, String>,
+        user_agent: &str,
     ) -> Result<usize, BuilderError> {
         info!("  Spawning STDIO server: {:?} {:?}", cmd, args);
 
         // This is more likely to work as rmcp has good STDIO support
-        match self.try_connect_stdio(server_name, cmd, args, env).await {
+        match self
+            .try_connect_stdio(server_name, cmd, args, env, user_agent)
+            .await
+        {
             Ok(tools_count) => {
                 info!("  STDIO connection successful");
                 Ok(tools_count)
@@ -364,6 +388,7 @@ impl McpManager {
         cmd: &[String],
         args: &[String],
         env: &HashMap<String, String>,
+        user_agent: &str,
     ) -> Result<usize, BuilderError> {
         use rmcp::transport::TokioChildProcess;
         use tokio::process::Command;
@@ -393,13 +418,14 @@ impl McpManager {
                 BuilderError::McpInitError(format!("Failed to spawn MCP server process: {e}"))
             })?;
 
-        let client = McpClient::from_transport(transport, format!("stdio://{server_name}"))
-            .await
-            .map_err(|e| {
-                BuilderError::McpInitError(format!(
-                    "Failed to establish STDIO MCP connection to '{server_name}': {e}"
-                ))
-            })?;
+        let client =
+            McpClient::from_transport(transport, format!("stdio://{server_name}"), user_agent)
+                .await
+                .map_err(|e| {
+                    BuilderError::McpInitError(format!(
+                        "Failed to establish STDIO MCP connection to '{server_name}': {e}"
+                    ))
+                })?;
 
         info!("  STDIO connection established, discovering tools");
 
@@ -1001,6 +1027,53 @@ mod tests {
     // Connection Status Tests
     // ========================================
 
+    /// A server-level `user_agent` replaces the manager-wide identity for
+    /// that server alone; its neighbour still announces `[mcp].user_agent`.
+    #[tokio::test]
+    async fn server_level_user_agent_replaces_the_global_one_for_that_server() {
+        use crate::mcp::client::tests::{RecordingMcpServer, announced_client};
+
+        let tagged = RecordingMcpServer::start().await;
+        let plain = RecordingMcpServer::start().await;
+        let http = |url: &str, user_agent: Option<&str>| McpServerConfig::HttpStreamable {
+            url: url.to_owned(),
+            headers: HashMap::new(),
+            description: None,
+            headers_from_request: HashMap::new(),
+            scratchpad: HashMap::new(),
+            user_agent: user_agent.map(|token| McpUserAgent::new(token).unwrap()),
+        };
+        let config = McpConfig {
+            servers: HashMap::from([
+                (
+                    "tagged".to_owned(),
+                    http(&tagged.url, Some("aura-prod-us/1")),
+                ),
+                ("plain".to_owned(), http(&plain.url, None)),
+            ]),
+            user_agent: McpUserAgent::new("aura/0.0.0").unwrap(),
+            ..Default::default()
+        };
+
+        McpManager::initialize_from_config(&config).await.unwrap();
+
+        let handshake = tagged.initialize();
+        assert_eq!(
+            handshake.header_values("user-agent"),
+            vec!["aura-prod-us/1"]
+        );
+        assert_eq!(
+            announced_client(&handshake),
+            ("aura-prod-us".to_owned(), "1".to_owned())
+        );
+        let handshake = plain.initialize();
+        assert_eq!(handshake.header_values("user-agent"), vec!["aura/0.0.0"]);
+        assert_eq!(
+            announced_client(&handshake),
+            ("aura".to_owned(), "0.0.0".to_owned())
+        );
+    }
+
     /// An unreachable HTTP-streamable server must be recorded as `Failed`, not
     /// as a connected zero-tool server. This is the regression guard for the
     /// bug where transport failures were swallowed into `Ok(0)` and logged as
@@ -1018,11 +1091,12 @@ mod tests {
                 description: None,
                 headers_from_request: HashMap::new(),
                 scratchpad: HashMap::new(),
+                user_agent: None,
             },
         );
         let config = McpConfig {
-            sanitize_schemas: true,
             servers,
+            ..Default::default()
         };
 
         let manager = McpManager::initialize_from_config(&config)
@@ -1092,11 +1166,12 @@ mod tests {
                 description: None,
                 headers_from_request: HashMap::new(),
                 scratchpad: HashMap::new(),
+                user_agent: None,
             },
         );
         let config = McpConfig {
-            sanitize_schemas: true,
             servers,
+            ..Default::default()
         };
 
         let manager = McpManager::initialize_from_config(&config).await.unwrap();

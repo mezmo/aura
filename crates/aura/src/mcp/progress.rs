@@ -21,7 +21,7 @@
 use rmcp::{
     ClientHandler,
     handler::client::progress::ProgressDispatcher,
-    model::ProgressNotificationParam,
+    model::{ClientInfo, Implementation, ProgressNotificationParam},
     service::{NotificationContext, RoleClient},
 };
 use std::sync::Arc;
@@ -42,7 +42,7 @@ use crate::request_progress::{self, ProgressNotification};
 /// ```ignore
 /// // Create handler with shared request ID reference
 /// let current_request_id = Arc::new(RwLock::new(None));
-/// let handler = ProgressEnabledHandler::new(current_request_id.clone());
+/// let handler = ProgressEnabledHandler::new(current_request_id.clone(), "aura/0.1.0");
 /// let client = serve_client(handler.clone(), transport).await?;
 ///
 /// // Set request ID before tool execution
@@ -60,6 +60,8 @@ pub struct ProgressEnabledHandler {
     logged_orphaned_warning: Arc<AtomicBool>,
     /// Counter for orphaned progress notifications (for diagnostics)
     orphaned_count: Arc<AtomicU64>,
+    /// This client's MCP `clientInfo`.
+    client_info: ClientInfo,
 }
 
 impl std::fmt::Debug for ProgressEnabledHandler {
@@ -72,12 +74,20 @@ impl std::fmt::Debug for ProgressEnabledHandler {
 }
 
 impl ProgressEnabledHandler {
-    pub fn new(current_request_id: Arc<RwLock<Option<String>>>) -> Self {
+    /// `user_agent` is the same `product/version` token sent as the HTTP
+    /// `User-Agent` header; the handshake announces it split into
+    /// `clientInfo.name` and `clientInfo.version`, the shape MCP servers
+    /// expect there.
+    pub fn new(current_request_id: Arc<RwLock<Option<String>>>, user_agent: &str) -> Self {
         Self {
             progress_dispatcher: ProgressDispatcher::new(),
             current_request_id,
             logged_orphaned_warning: Arc::new(AtomicBool::new(false)),
             orphaned_count: Arc::new(AtomicU64::new(0)),
+            client_info: ClientInfo {
+                client_info: implementation_from_user_agent(user_agent),
+                ..ClientInfo::default()
+            },
         }
     }
 
@@ -98,7 +108,32 @@ impl ProgressEnabledHandler {
     }
 }
 
+/// The product page announced as `clientInfo.websiteUrl`, which MCP servers
+/// that track clients link back to.
+const AURA_WEBSITE_URL: &str = "https://www.mezmo.com/aura";
+
+/// Split a `product/version` user-agent token into MCP `clientInfo`. A token
+/// with no version part names the product alone and reports the running crate
+/// version, so a bare deployment tag still carries a real version.
+fn implementation_from_user_agent(user_agent: &str) -> Implementation {
+    let (name, version) = user_agent.split_once('/').unwrap_or((user_agent, ""));
+    let version = match version.trim() {
+        "" => env!("CARGO_PKG_VERSION"),
+        version => version,
+    };
+    Implementation {
+        name: name.trim().to_owned(),
+        version: version.to_owned(),
+        website_url: Some(AURA_WEBSITE_URL.to_owned()),
+        ..Implementation::default()
+    }
+}
+
 impl ClientHandler for ProgressEnabledHandler {
+    fn get_info(&self) -> ClientInfo {
+        self.client_info.clone()
+    }
+
     /// Handle progress notifications from the MCP server
     ///
     /// This method is called when the server sends `notifications/progress` messages.
@@ -174,7 +209,28 @@ mod tests {
 
     fn create_test_handler() -> ProgressEnabledHandler {
         let current_request_id = Arc::new(RwLock::new(None));
-        ProgressEnabledHandler::new(current_request_id)
+        ProgressEnabledHandler::new(current_request_id, "test/0")
+    }
+
+    /// A `product/version` token lands as separate name and version fields.
+    #[test]
+    fn handshake_info_splits_the_user_agent_into_name_and_version() {
+        let handler = ProgressEnabledHandler::new(Arc::new(RwLock::new(None)), "aura/1.2.3");
+        let info = handler.get_info().client_info;
+        assert_eq!(info.name, "aura");
+        assert_eq!(info.version, "1.2.3");
+        assert_eq!(info.website_url.as_deref(), Some(AURA_WEBSITE_URL));
+    }
+
+    /// A bare product name still reports the version that is actually running.
+    #[test]
+    fn handshake_info_falls_back_to_the_crate_version() {
+        for token in ["mezmo-aura", "mezmo-aura/", " mezmo-aura / "] {
+            let handler = ProgressEnabledHandler::new(Arc::new(RwLock::new(None)), token);
+            let info = handler.get_info().client_info;
+            assert_eq!(info.name, "mezmo-aura", "token {token:?}");
+            assert_eq!(info.version, env!("CARGO_PKG_VERSION"), "token {token:?}");
+        }
     }
 
     #[test]
@@ -195,7 +251,7 @@ mod tests {
     #[tokio::test]
     async fn test_handler_with_request_id() {
         let current_request_id = Arc::new(RwLock::new(Some("req_test_123".to_string())));
-        let handler = ProgressEnabledHandler::new(current_request_id.clone());
+        let handler = ProgressEnabledHandler::new(current_request_id.clone(), "test/0");
 
         // Verify request ID is accessible
         let req_id = handler.current_request_id.read().await;
@@ -205,7 +261,7 @@ mod tests {
     #[tokio::test]
     async fn test_handler_request_id_changes() {
         let current_request_id = Arc::new(RwLock::new(None));
-        let handler = ProgressEnabledHandler::new(current_request_id.clone());
+        let handler = ProgressEnabledHandler::new(current_request_id.clone(), "test/0");
 
         // Initially no request ID
         {

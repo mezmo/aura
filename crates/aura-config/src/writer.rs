@@ -210,7 +210,7 @@ fn ensure_table<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::McpServerConfig;
+    use crate::config::{McpServerConfig, McpUserAgent};
     use crate::load_config_from_str;
     use std::collections::HashMap;
 
@@ -232,6 +232,7 @@ model = "claude-3-sonnet-20240229"
             env: HashMap::new(),
             description: None,
             scratchpad: HashMap::new(),
+            user_agent: None,
         }
     }
 
@@ -242,6 +243,7 @@ model = "claude-3-sonnet-20240229"
             description: Some("Example server".to_owned()),
             headers_from_request: HashMap::new(),
             scratchpad: HashMap::new(),
+            user_agent: None,
         }
     }
 
@@ -272,6 +274,7 @@ model = "claude-3-sonnet-20240229"
                     description: None,
                     headers_from_request: HashMap::new(),
                     scratchpad: HashMap::new(),
+                    user_agent: None,
                 },
             ),
         ];
@@ -432,6 +435,7 @@ url = "https://old.example.com/mcp"
                 "*".to_owned(),
                 crate::ScratchpadToolEntry { min_tokens: 5120 },
             )]),
+            user_agent: None,
         };
         let updated = upsert_mcp_server_in_str(BASE_CONFIG, "srv", &server).unwrap();
         let config = load_config_from_str(&updated).expect("written config must parse");
@@ -454,6 +458,7 @@ url = "https://old.example.com/mcp"
                 "authorization".to_owned(),
             )]),
             scratchpad: HashMap::new(),
+            user_agent: None,
         };
         let updated = upsert_mcp_server_in_str(BASE_CONFIG, "srv", &server).unwrap();
         let config = load_config_from_str(&updated).expect("config must parse");
@@ -473,6 +478,29 @@ url = "https://old.example.com/mcp"
             }
             other => panic!("expected http_streamable, got {other:?}"),
         }
+    }
+
+    /// A server-level identity is written when set and leaves no key behind
+    /// when it is not, so the loader falls back to `[mcp].user_agent`.
+    #[test]
+    fn round_trips_server_user_agent_through_loader() {
+        let mut server = stdio_server();
+        let updated = upsert_mcp_server_in_str(BASE_CONFIG, "srv", &server).unwrap();
+        assert!(!updated.contains("user_agent"), "{updated}");
+
+        let McpServerConfig::Stdio { user_agent, .. } = &mut server else {
+            unreachable!("stdio_server() builds a stdio server");
+        };
+        *user_agent = Some(McpUserAgent::new("aura-kb/1").unwrap());
+        let updated = upsert_mcp_server_in_str(BASE_CONFIG, "srv", &server).unwrap();
+        let config = load_config_from_str(&updated).expect("config must parse");
+        assert_eq!(
+            config.mcp.unwrap().servers["srv"]
+                .user_agent()
+                .map(McpUserAgent::as_str),
+            Some("aura-kb/1"),
+            "{updated}"
+        );
     }
 
     #[test]

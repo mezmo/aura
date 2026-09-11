@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::pin::Pin;
 
 use futures::{Stream, StreamExt};
-use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
+use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, USER_AGENT};
 use rmcp::service::{RxJsonRpcMessage, TxJsonRpcMessage};
 use rmcp::{RoleClient, transport::Transport};
 use sse_stream::{Error as SseError, Sse};
@@ -102,13 +102,23 @@ impl SseTransport {
     /// 3. Read SSE events until the `endpoint` event is received
     /// 4. Resolve the message endpoint URL
     /// 5. Return a connected `SseTransport`
+    ///
+    /// `user_agent` is sent as the HTTP `User-Agent` header on the stream GET
+    /// and every message POST; a `User-Agent` entry in `headers` replaces it.
     pub async fn connect(
         url: &str,
         headers: &HashMap<String, String>,
+        user_agent: &str,
     ) -> Result<Self, SseTransportError> {
         let sse_endpoint = url::Url::parse(url)?;
 
         let mut header_map = HeaderMap::new();
+        match HeaderValue::from_str(user_agent) {
+            Ok(value) => {
+                header_map.insert(USER_AGENT, value);
+            }
+            Err(_) => warn!("Skipping invalid MCP user agent {user_agent:?}"),
+        }
         for (key, value) in headers {
             match (
                 HeaderName::from_bytes(key.as_bytes()),

@@ -593,16 +593,116 @@ fn validate_llm_api_key(llm: &LlmConfig, location: &str) -> Result<(), crate::Co
 }
 
 /// MCP servers configuration
-#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct McpConfig {
     pub servers: HashMap<String, McpServerConfig>,
     /// Enable OpenAI-compatible tool schema sanitization (default: true)
     #[serde(default = "default_sanitize_schemas")]
     pub sanitize_schemas: bool,
+    /// Client identity, as a `product/version` token.
+    #[serde(default = "default_mcp_user_agent")]
+    pub user_agent: McpUserAgent,
+}
+
+impl Default for McpConfig {
+    fn default() -> Self {
+        Self {
+            servers: HashMap::new(),
+            sanitize_schemas: default_sanitize_schemas(),
+            user_agent: default_mcp_user_agent(),
+        }
+    }
 }
 
 fn default_sanitize_schemas() -> bool {
     true
+}
+
+/// `aura/<version>`, the identity MCP servers see unless `[mcp].user_agent`
+/// replaces it.
+pub fn default_mcp_user_agent() -> McpUserAgent {
+    McpUserAgent(format!("aura/{}", env!("CARGO_PKG_VERSION")))
+}
+
+/// A `product/version` token naming an MCP client.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String")]
+pub struct McpUserAgent(String);
+
+impl McpUserAgent {
+    /// Parse a token, trimming surrounding whitespace. Rejects an empty or
+    /// whitespace-only value, a missing product part such as `/1.0`, and any
+    /// character outside printable ASCII, since those either announce an
+    /// empty client name or cannot travel in an HTTP header.
+    pub fn new(token: impl Into<String>) -> Result<Self, String> {
+        let token = token.into();
+        let trimmed = token.trim();
+        let product = trimmed.split('/').next().unwrap_or_default().trim();
+        if product.is_empty() {
+            return Err(format!(
+                "MCP user_agent must be a non-empty product/version token, got {token:?}"
+            ));
+        }
+        if let Some(bad) = trimmed
+            .chars()
+            .find(|c| !(c.is_ascii_graphic() || *c == ' '))
+        {
+            return Err(format!(
+                "MCP user_agent must be printable ASCII, got {token:?} containing {bad:?}"
+            ));
+        }
+        Ok(Self(trimmed.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for McpUserAgent {
+    type Error = String;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl std::ops::Deref for McpUserAgent {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl AsRef<str> for McpUserAgent {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for McpUserAgent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl PartialEq<str> for McpUserAgent {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
+    }
+}
+
+impl PartialEq<&str> for McpUserAgent {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
+}
+
+impl PartialEq<String> for McpUserAgent {
+    fn eq(&self, other: &String) -> bool {
+        self.0 == *other
+    }
 }
 
 /// Individual MCP server configuration
@@ -621,6 +721,9 @@ pub enum McpServerConfig {
         /// Per-tool scratchpad interception thresholds (glob-matched on tool name).
         #[serde(default)]
         scratchpad: HashMap<String, ScratchpadToolEntry>,
+        /// Client identity for this server alone.
+        #[serde(default)]
+        user_agent: Option<McpUserAgent>,
     },
     #[serde(rename = "http_streamable")]
     HttpStreamable {
@@ -634,6 +737,9 @@ pub enum McpServerConfig {
         /// Per-tool scratchpad interception thresholds (glob-matched on tool name).
         #[serde(default)]
         scratchpad: HashMap<String, ScratchpadToolEntry>,
+        /// Client identity for this server alone.
+        #[serde(default)]
+        user_agent: Option<McpUserAgent>,
     },
     #[serde(rename = "sse")]
     Sse {
@@ -647,6 +753,9 @@ pub enum McpServerConfig {
         /// Per-tool scratchpad interception thresholds (glob-matched on tool name).
         #[serde(default)]
         scratchpad: HashMap<String, ScratchpadToolEntry>,
+        /// Client identity for this server alone.
+        #[serde(default)]
+        user_agent: Option<McpUserAgent>,
     },
 }
 
@@ -657,6 +766,14 @@ impl McpServerConfig {
             McpServerConfig::Stdio { scratchpad, .. } => scratchpad,
             McpServerConfig::HttpStreamable { scratchpad, .. } => scratchpad,
             McpServerConfig::Sse { scratchpad, .. } => scratchpad,
+        }
+    }
+
+    pub fn user_agent(&self) -> Option<&McpUserAgent> {
+        match self {
+            McpServerConfig::Stdio { user_agent, .. }
+            | McpServerConfig::HttpStreamable { user_agent, .. }
+            | McpServerConfig::Sse { user_agent, .. } => user_agent.as_ref(),
         }
     }
 

@@ -296,13 +296,14 @@ mod tests {
                 description: None,
                 headers_from_request,
                 scratchpad: HashMap::new(),
+                user_agent: None,
             },
         );
 
         AgentRuntimeConfig {
             mcp: Some(McpConfig {
-                sanitize_schemas: true,
                 servers,
+                ..McpConfig::default()
             }),
             ..AgentRuntimeConfig::default()
         }
