@@ -1431,6 +1431,10 @@ mod tests {
             headers: std::collections::HashMap::new(),
             headers_from_request: std::collections::HashMap::new(),
             tool_headers_from_response: aura_config::ToolHeaderMappings::default(),
+            delivery: aura_config::WebhookDelivery::Sync,
+            poll_url: None,
+            poll_interval_secs: 10,
+            poll_request_timeout_secs: 30,
         });
         let req = chat_request_with_stream(None);
 

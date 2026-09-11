@@ -57,6 +57,16 @@ impl HitlRuntime {
         hmac: Option<&WebhookHmac>,
         req_headers: Option<&HashMap<String, String>>,
     ) -> Self {
+        assert!(
+            !matches!(
+                &config.route,
+                DecisionRouteConfig::Webhook {
+                    delivery: aura_config::WebhookDelivery::Poll,
+                    ..
+                }
+            ),
+            "`hitl.route.delivery = \"poll\"` is not enabled in this build; use `delivery = \"sync\"`"
+        );
         let route = match &config.route {
             DecisionRouteConfig::Webhook {
                 url,
@@ -64,6 +74,7 @@ impl HitlRuntime {
                 headers,
                 headers_from_request,
                 tool_headers_from_response,
+                ..
             } => {
                 let signing = match hmac {
                     None => EgressSigning::Disabled,
@@ -695,10 +706,11 @@ pub struct PlaintextWebhookUrlError {
 }
 
 /// Boot-time guard: with an HMAC secret configured, a plaintext `http://`
-/// webhook URL must fail startup, not the first approval request. Call this
-/// for every `[hitl]` config once the secret has been loaded; the request-time
-/// `Misconfigured` rejection inside [`WebhookClient`] acts as defense in
-/// depth for paths that skip startup validation.
+/// webhook URL must fail startup, not the first approval request — and the
+/// poll status endpoint (`poll_url`, when configured) is held to the same
+/// rule. Call this for every `[hitl]` config once the secret has been loaded;
+/// the request-time `Misconfigured` rejection inside [`WebhookClient`] acts
+/// as defense in depth for paths that skip startup validation.
 pub fn validate_webhook_signing_config(
     config: &HitlConfig,
     hmac: Option<&WebhookHmac>,
@@ -712,6 +724,13 @@ pub fn validate_webhook_signing_config(
                 url: url.as_str().to_string(),
             })
         }
+        // A None poll_url resolves to `url`, already checked above.
+        DecisionRouteConfig::Webhook {
+            poll_url: Some(poll_url),
+            ..
+        } if poll_url.as_str().starts_with("http://") => Err(PlaintextWebhookUrlError {
+            url: poll_url.as_str().to_string(),
+        }),
         DecisionRouteConfig::Webhook { .. } | DecisionRouteConfig::Conversational { .. } => Ok(()),
     }
 }
@@ -1618,6 +1637,67 @@ mod tests {
             validate_webhook_signing_config(&conversational, Some(&hmac)).unwrap();
         }
 
+        #[test]
+        fn boot_validation_rejects_plaintext_poll_url_only_with_secret() {
+            use super::super::validate_webhook_signing_config;
+
+            let poll_route = |url: &str, poll_url: Option<&str>| aura_config::HitlConfig {
+                require_approval: vec![],
+                park: aura_config::ParkConfig::default(),
+                route: aura_config::DecisionRouteConfig::Webhook {
+                    url: aura_config::WebhookUrl::new(url).unwrap(),
+                    timeout_secs: 300,
+                    headers: HashMap::new(),
+                    headers_from_request: HashMap::new(),
+                    tool_headers_from_response: aura_config::ToolHeaderMappings::default(),
+                    delivery: aura_config::WebhookDelivery::Poll,
+                    poll_url: poll_url.map(|u| aura_config::WebhookUrl::new(u).unwrap()),
+                    poll_interval_secs: 10,
+                    poll_request_timeout_secs: 30,
+                },
+            };
+            let hmac = test_hmac();
+
+            let err = validate_webhook_signing_config(
+                &poll_route(
+                    "https://approvals.example.com/aura",
+                    Some("http://status.example.com/aura"),
+                ),
+                Some(&hmac),
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains("plaintext http://"));
+            assert!(err.to_string().contains("http://status.example.com/aura"));
+
+            let err = validate_webhook_signing_config(
+                &poll_route(
+                    "http://approvals.example.com/aura",
+                    Some("https://status.example.com/aura"),
+                ),
+                Some(&hmac),
+            )
+            .unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("http://approvals.example.com/aura")
+            );
+
+            validate_webhook_signing_config(
+                &poll_route(
+                    "https://approvals.example.com/aura",
+                    Some("http://status.example.com/aura"),
+                ),
+                None,
+            )
+            .unwrap();
+
+            validate_webhook_signing_config(
+                &poll_route("https://approvals.example.com/aura", None),
+                Some(&hmac),
+            )
+            .unwrap();
+        }
+
         fn webhook_config(
             url: &str,
             tool_headers_from_response: aura_config::ToolHeaderMappings,
@@ -1631,6 +1711,10 @@ mod tests {
                     headers: HashMap::new(),
                     headers_from_request: HashMap::new(),
                     tool_headers_from_response,
+                    delivery: aura_config::WebhookDelivery::Sync,
+                    poll_url: None,
+                    poll_interval_secs: 10,
+                    poll_request_timeout_secs: 30,
                 },
             }
         }
