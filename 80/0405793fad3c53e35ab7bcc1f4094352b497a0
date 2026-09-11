@@ -1,1 +1,1 @@
-slice=B2 from=b0a336ef sel=whole at-rest lifetime + file-mode docs; also removes the ADR's config-acceptance paragraph (true only at C; C restores the ADR verbatim)
+slice=B2 from=8671afca round=2 replay nightly-rebase
