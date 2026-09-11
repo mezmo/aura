@@ -29,6 +29,7 @@ use crate::hitl::{ApprovalDecision, DecisionId, ParkedApproval, ResolveError};
 #[cfg(test)]
 pub(crate) use fault_store::FaultInjectingStore;
 pub use file::{FileApprovalStore, FileSkillInvocationStore};
+pub(crate) use file::{private_dir, write_private};
 pub use memory::{InMemoryApprovalStore, InMemoryEventBus, InMemorySkillInvocationStore};
 pub use record::{DecisionRecord, InvalidRecord, OriginRecord, ParkedApprovalRecord, ScopeRecord};
 pub use skill_record::{
@@ -65,7 +66,7 @@ pub enum SessionStoreError {
 pub trait ApprovalStore: Send + Sync {
     /// Persist a parked approval, keyed by its `DecisionId`. Backends with
     /// native expiry set the entry's TTL from `expires_at`; the file store
-    /// keeps it until `remove`.
+    /// unlinks an expired entry on its next poll scan.
     async fn register(&self, parked: ParkedApproval) -> Result<(), SessionStoreError>;
 
     /// Look up a parked approval.
@@ -97,6 +98,10 @@ pub trait ApprovalStore: Send + Sync {
         &self,
         request_id: &str,
     ) -> Result<Vec<ParkedApproval>, SessionStoreError>;
+
+    /// List every parked approval that is undecided and non-expired
+    /// (`expires_at > now`). No ordering guarantee.
+    async fn list_pending(&self) -> Result<Vec<ParkedApproval>, SessionStoreError>;
 }
 
 /// Distinct skill-invocation records one session may hold.
