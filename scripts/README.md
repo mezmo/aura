@@ -10,11 +10,13 @@ Release and install helpers.
 | [`bump-homebrew-tap.sh`](bump-homebrew-tap.sh) | Bump `mezmo/homebrew-tap` formulae to a released version |
 | [`set-version.sh`](set-version.sh) | Set the workspace and crate versions in `Cargo.toml` |
 | [`next-version.mjs`](next-version.mjs) | Print the version semantic-release would release next |
+| [`check-release-baseline.sh`](check-release-baseline.sh) | Reject a channel prerelease of a version `main` already released |
 | [`sync-release-downloads.sh`](sync-release-downloads.sh) | Snapshot cumulative release-asset download totals into PostHog |
 | [`sync-cloudsmith-downloads.sh`](sync-cloudsmith-downloads.sh) | Snapshot cumulative Cloudsmith package download totals into PostHog |
 | [`sync-docker-downloads.sh`](sync-docker-downloads.sh) | Snapshot cumulative Docker Hub pull totals into PostHog |
 | [`sync-docker-dvp-reports.sh`](sync-docker-dvp-reports.sh) | Snapshot Docker Verified Publisher pulls per tag into PostHog |
 | [`lib/posthog-snapshot.sh`](lib/posthog-snapshot.sh) | Shared machinery the snapshot scripts source |
+| [`tests/`](tests) | Shell test suites, run by `make test-scripts` |
 
 `BRANCH_NAME` selects the release channel; see
 [the release channels design note](../docs/design/release-channels.md).
@@ -380,9 +382,39 @@ command runs; semantic-release's logging goes to stderr, leaving stdout as the
 version alone.
 
 `BRANCH_NAME` selects the branch to analyse. A channel branch is analysed
-against the whole channel branch list, so a prerelease derives its version from
-the last release on `main` (`0.2.0-nightly.1`); any other branch on its own,
-which is what makes a feature branch under test releasable.
+against the whole channel branch list so it resolves as a prerelease
+(`0.2.0-nightly.1`); any other branch on its own, which is what makes a feature
+branch under test releasable.
+
+A prerelease's base version comes from the tags reachable from its own branch,
+not from `main`; see
+[the release channels design note](../docs/design/release-channels.md) for what
+follows from that.
+
+## `check-release-baseline.sh`
+
+```
+check-release-baseline.sh [main-ref]
+```
+
+Reports whether `HEAD` can reach the latest release tag on `main-ref`
+(default `main`).
+
+| Exit | Meaning |
+| --- | --- |
+| 0 | `HEAD` reaches it, or `main-ref` carries no stable tag |
+| 10 | `HEAD` is behind that tag — merge the sync pull request |
+| other | the check could not run; not a verdict |
+
+The `Compute Release Version` stage runs it on `nightly` and `beta`. Exit 10
+clears `NEXT_RELEASE_VERSION` and marks the build unstable; any other non-zero
+fails the stage, so a broken check never reads as a releasable branch.
+
+## Tests
+
+`scripts/tests/*.test.sh` hold the shell suites, run by `make test-scripts` and
+by the `make test` hook. Each builds throwaway git repositories under `mktemp`,
+so they need no network and no fixtures.
 
 ## `set-version.sh`
 
