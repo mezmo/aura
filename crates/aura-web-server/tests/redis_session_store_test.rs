@@ -366,7 +366,7 @@ async fn approval_resolve_removes_the_parked_record() {
     approvals.register(parked).await.unwrap();
 
     approvals
-        .resolve(&id, ApprovalDecision::Approved)
+        .resolve(&id, ApprovalDecision::Approved.into())
         .await
         .unwrap();
 
@@ -390,6 +390,16 @@ async fn approval_resolve_records_decision_readable_cross_instance() {
     common::resolve_records_readable_decision(&instance_a, &instance_b).await;
 }
 
+/// The decision record keeps identity and decision together across
+/// instances.
+#[tokio::test]
+async fn approval_resolve_records_identity_readable_cross_instance() {
+    let config = test_config(60);
+    let instance_a = connect(&config).await.approvals();
+    let instance_b = connect(&config).await.approvals();
+    common::resolve_records_identity_with_the_decision(&instance_a, &instance_b).await;
+}
+
 /// The decision record's TTL keeps a margin past the parked record's.
 #[tokio::test]
 async fn decision_record_outlives_parked_record_ttl() {
@@ -398,7 +408,7 @@ async fn decision_record_outlives_parked_record_ttl() {
     let id = parked.request.decision_id;
     approvals.register(parked).await.unwrap();
     approvals
-        .resolve(&id, ApprovalDecision::Approved)
+        .resolve(&id, ApprovalDecision::Approved.into())
         .await
         .unwrap();
 
@@ -406,7 +416,7 @@ async fn decision_record_outlives_parked_record_ttl() {
 
     assert_eq!(
         approvals.decision(&id).await.unwrap(),
-        Some(ApprovalDecision::Approved)
+        Some(ApprovalDecision::Approved.into())
     );
 }
 
@@ -496,7 +506,7 @@ async fn approval_cancel_request_returns_cleared_set() {
     approvals.register(decided).await.unwrap();
     approvals.register(keep).await.unwrap();
     approvals
-        .resolve(&decided_id, ApprovalDecision::Approved)
+        .resolve(&decided_id, ApprovalDecision::Approved.into())
         .await
         .unwrap();
 
@@ -511,7 +521,7 @@ async fn approval_cancel_request_returns_cleared_set() {
     assert!(approvals.get(&keep_id).await.unwrap().is_some());
     assert_eq!(
         approvals
-            .resolve(&undecided_id, ApprovalDecision::Approved)
+            .resolve(&undecided_id, ApprovalDecision::Approved.into())
             .await,
         Err(ResolveError::NotFound),
         "a cleared ticket resolves NotFound"
@@ -555,7 +565,7 @@ async fn approval_cancel_request_returns_cleared_set() {
     );
     assert_eq!(
         approvals
-            .resolve(&late_id, ApprovalDecision::Approved)
+            .resolve(&late_id, ApprovalDecision::Approved.into())
             .await,
         Err(ResolveError::NotFound),
         "the second cancel GETDEL'd the late ticket"
@@ -747,7 +757,9 @@ async fn approval_expires_with_its_record_ttl() {
 
     assert!(approvals.get(&id).await.unwrap().is_none());
     assert_eq!(
-        approvals.resolve(&id, ApprovalDecision::Approved).await,
+        approvals
+            .resolve(&id, ApprovalDecision::Approved.into())
+            .await,
         Err(ResolveError::NotFound)
     );
 }
@@ -1127,7 +1139,7 @@ async fn approval_parked_on_one_instance_wakes_when_resolved_on_another() {
     let handle = instance_a.register(request, Duration::from_secs(30)).await;
 
     instance_b
-        .resolve(&id, ApprovalDecision::Approved)
+        .resolve(&id, ApprovalDecision::Approved.into())
         .await
         .expect("resolve through the other instance succeeds");
 
@@ -1157,7 +1169,7 @@ async fn store_only_resolve_wakes_parking_instance_via_poll() {
     // Resolve against the store alone — no registry, no publish.
     store_b
         .approvals()
-        .resolve(&id, ApprovalDecision::Approved)
+        .resolve(&id, ApprovalDecision::Approved.into())
         .await
         .expect("store resolve succeeds");
 
