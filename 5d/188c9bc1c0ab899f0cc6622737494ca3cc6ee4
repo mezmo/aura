@@ -1,1 +1,1 @@
-slice=B1 from=7946b7a2 sel=whole transport errors w/o url; test notify arity 2->1 (B2 restores None)
+slice=B1 from=3f01922d round=2 replay nightly-rebase
