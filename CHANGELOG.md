@@ -1,5 +1,202 @@
 ## Changelog
 
+## [0.2.16](https://github.com/mezmo/aura/compare/v0.2.15...v0.2.16) (2026-09-11)
+
+
+### Bug Fixes
+
+* **anthropic**: update max tokens for new models [636aae3](https://github.com/mezmo/aura/commit/636aae3deab6c06fd9666fd6e6ab827450e73236) - Dan Hable [#317](https://github.com/mezmo/aura/issues/317)
+
+* **ci**: close three holes in the cloudsmith snapshot [de8d817](https://github.com/mezmo/aura/commit/de8d817a788939bf71e9e4786db2086837ca4e4a) - Justin Gross [#648](https://github.com/mezmo/aura/issues/648)
+
+* **ci**: parse report csv with quotes, and gate on the shared helper [92df86f](https://github.com/mezmo/aura/commit/92df86f40a5d3767ee441f98a34b2713cfad344e) - Justin Gross [#647](https://github.com/mezmo/aura/issues/647)
+
+* **ci**: withhold credentials and scope the cloudsmith read-back [e09c3e9](https://github.com/mezmo/aura/commit/e09c3e9a290d4c9ea93a7d945235f8eae7b118a2) - Justin Gross [#667](https://github.com/mezmo/aura/issues/667) [#667](https://github.com/mezmo/aura/issues/667) [#648](https://github.com/mezmo/aura/issues/648)
+
+* **cli**: leave live token counters alone on mid-stream replay [74d34eb](https://github.com/mezmo/aura/commit/74d34eb61a66ce0cc9025e2b9ccd6d92829def87) - Tony Rogers [#630](https://github.com/mezmo/aura/issues/630)
+
+* **cli**: let /mcp add edit an agent loaded from a directory [41d939c](https://github.com/mezmo/aura/commit/41d939ccb45aa3908b2b7c9148209a49da80664f) - Eric Lake
+
+* **cli**: make the /mcp add agent pick deliberate [6687ac4](https://github.com/mezmo/aura/commit/6687ac41b31d3047fbb5c57b43eabd7e893a8704) - Eric Lake
+
+* **cli**: persist cache-read tokens in the conversation usage ledger [b9edf15](https://github.com/mezmo/aura/commit/b9edf15266d07863bf4d0db67bd73565fb457806) - Tony Rogers [#630](https://github.com/mezmo/aura/issues/630)
+
+* **cli**: reseed ledger totals on every event-log replay [12fb469](https://github.com/mezmo/aura/commit/12fb469a3f62e9d9994487e4d2ea0feaae56d751) - Tony Rogers [#630](https://github.com/mezmo/aura/issues/630)
+
+* **config**: follow symlinks when rewriting a config file [15d537a](https://github.com/mezmo/aura/commit/15d537aa20823d9c22127e560a80c629725ac78d) - Eric Lake
+
+* **hitl**: derive approval cancellation events from the cleared set [6455f55](https://github.com/mezmo/aura/commit/6455f55692037d9357c32dfb1281be4b69222940) - Mike Shearer
+
+* **hitl**: run the cancellation sweep as its own task [e60ff2b](https://github.com/mezmo/aura/commit/e60ff2b51833251618a382334bbbbc406f8f7917) - Mike Shearer
+
+* **orchestration**: carry the parked row and scope check in rehydrate [d1c1312](https://github.com/mezmo/aura/commit/d1c1312b587f9f97ee2c2cf830a13f20cef6c58d) - Mike Shearer [#271](https://github.com/mezmo/aura/issues/271)
+
+* **session-store**: close cancel-sweep races found in adversarial review [d420684](https://github.com/mezmo/aura/commit/d420684dd9cd7243379da5ca81fba9ecb6c30aa8) - Mike Shearer
+
+* **session-store**: probe both store directories for writes [93010bc](https://github.com/mezmo/aura/commit/93010bce859477160c95bae695052184da563341) - Mike Shearer [#271](https://github.com/mezmo/aura/issues/271)
+
+* **session-store**: refuse expired tickets on the memory backend [f459d7b](https://github.com/mezmo/aura/commit/f459d7bc40b2dce92c6305e4e075e9cf6f20a4ee) - Mike Shearer [#271](https://github.com/mezmo/aura/issues/271)
+
+* **session-store**: skip corrupt sweep records per id [add92dd](https://github.com/mezmo/aura/commit/add92dd844bed0f57107471586d5796669f9a1f2) - Mike Shearer
+
+* **session-store**: state the silent skip for wrong-typed sweep keys [2de5166](https://github.com/mezmo/aura/commit/2de5166cb20eac92c4c14e425244eb61edc75352) - Mike Shearer
+
+* **session-store**: stop failing remove on a record it already deleted [ead1c9c](https://github.com/mezmo/aura/commit/ead1c9c61eef5113024e1a7c7d03475e0a43e809) - Mike Shearer [#271](https://github.com/mezmo/aura/issues/271)
+
+* **web-server**: take aura.usage cache split from aggregated usage [f6ca83a](https://github.com/mezmo/aura/commit/f6ca83a844503e11d71d02d0bb5227dd0b3f3283) - Tony Rogers [#630](https://github.com/mezmo/aura/issues/630)
+
+
+
+### Build System
+
+* **deps**: update rig fork with prompt caching support [f61a7fc](https://github.com/mezmo/aura/commit/f61a7fc22c75c1bfec3e7c7af2e929ea0ff66c9d) - Tony Rogers [mezmo/rig#12](https://github.com/mezmo/rig/issues/12) [#630](https://github.com/mezmo/aura/issues/630)
+
+* drop lto and codegen-units from the release profile [bef2a00](https://github.com/mezmo/aura/commit/bef2a007369d709690ba78ca043d03365da41c81) - Mike Shearer [#668](https://github.com/mezmo/aura/issues/668)
+
+
+
+### Code Refactoring
+
+* **hitl**: share the run owner id between gate and park sweep [5adc0a6](https://github.com/mezmo/aura/commit/5adc0a658cdd78256a56f6a927e7b049b694f5c4) - Mike Shearer [#271](https://github.com/mezmo/aura/issues/271)
+
+* **mcp**: consolidate MCP client code into mcp/ module [84059ff](https://github.com/mezmo/aura/commit/84059ffcc5b56d5f3192fcbfe77af6ffd7e0c385) - Dan Hable
+
+* **orchestration**: arm the park guard with an AtomicBool [469bbe0](https://github.com/mezmo/aura/commit/469bbe0280dd9b413651e2b9101d0fc2b261fc54) - Mike Shearer [#271](https://github.com/mezmo/aura/issues/271)
+
+* **orchestration**: keep tool traces in memory only [2966021](https://github.com/mezmo/aura/commit/29660211451dd13879c0a92089bfe91bac064a25) - Tony Rogers [#636](https://github.com/mezmo/aura/issues/636) [#637](https://github.com/mezmo/aura/issues/637)
+
+* **orchestration**: remove the prompt journal [6f514cf](https://github.com/mezmo/aura/commit/6f514cfe22528181514f04b334cbfc2470b6e5f4) - Tony Rogers [#637](https://github.com/mezmo/aura/issues/637)
+
+* **session-store**: rename ticket identifiers to approvals [fdeed4d](https://github.com/mezmo/aura/commit/fdeed4db2c14af2dcd1189e9c997bdd062991a61) - Mike Shearer [#271](https://github.com/mezmo/aura/issues/271)
+
+
+
+### Continuous Integration
+
+* add temporary push trigger for docker snapshot testing [846be1e](https://github.com/mezmo/aura/commit/846be1e0f3b76f9dce858b78d8c3baa624740715) - Justin Gross [#647](https://github.com/mezmo/aura/issues/647)
+
+* add temporary push trigger for snapshot testing [4a96f96](https://github.com/mezmo/aura/commit/4a96f96ab3372d82719f2f3242903e2770f4ab04) - Justin Gross [#648](https://github.com/mezmo/aura/issues/648)
+
+* add temporary push trigger for snapshot testing [52cfa74](https://github.com/mezmo/aura/commit/52cfa74da99e3a7b84364429a17d482bd1e6a949) - Justin Gross [#558](https://github.com/mezmo/aura/issues/558)
+
+* check the download total in the read-back [bb1596c](https://github.com/mezmo/aura/commit/bb1596cce64ae17ce94ba93d3a8f26810bc9b115) - Justin Gross [#558](https://github.com/mezmo/aura/issues/558)
+
+* give every batch its own probe [71875d7](https://github.com/mezmo/aura/commit/71875d7eb0cbaa3a1a789eec58bbf11c40c7fa57) - Justin Gross [#558](https://github.com/mezmo/aura/issues/558)
+
+* give ingestion ten minutes to settle [b01cbe6](https://github.com/mezmo/aura/commit/b01cbe692ce6eeb35fb58063826e2a0df8342f39) - Justin Gross [#558](https://github.com/mezmo/aura/issues/558)
+
+* probe every batch and report packages added mid-collection [1450474](https://github.com/mezmo/aura/commit/14504741a9dde59c96cd9b6cc6fc6b34a5710f61) - Justin Gross [#648](https://github.com/mezmo/aura/issues/648)
+
+* prove each run wrote, with a per-run probe event [24bac5d](https://github.com/mezmo/aura/commit/24bac5d18a0a9a586bb112e9fb03e30d1f76745d) - Justin Gross [#648](https://github.com/mezmo/aura/issues/648)
+
+* prove each run wrote, with a per-run probe event [9272b6e](https://github.com/mezmo/aura/commit/9272b6e5fbde46848c2bee5b137f6e9acb1213ea) - Justin Gross [#558](https://github.com/mezmo/aura/issues/558)
+
+* remove the temporary push trigger [bbd8566](https://github.com/mezmo/aura/commit/bbd8566e83740d6d6aea3180651f4273b829347a) - Justin Gross [#647](https://github.com/mezmo/aura/issues/647)
+
+* remove the temporary push trigger [c0705c2](https://github.com/mezmo/aura/commit/c0705c22204ccae7ffd57895e8a34b481f2258d8) - Justin Gross [#648](https://github.com/mezmo/aura/issues/648)
+
+* remove the temporary push trigger [962b0e2](https://github.com/mezmo/aura/commit/962b0e2b3b00eab6a03fe02a8cd6959de33ed0c0) - Justin Gross [#558](https://github.com/mezmo/aura/issues/558)
+
+* restrict pull requests into main and back-merge it to channels [8b77492](https://github.com/mezmo/aura/commit/8b77492f74af61cc9911152a5bf6c3a692dbd4f6) - Jacob Hull
+
+* run manual dispatches only from the default branch [f23452a](https://github.com/mezmo/aura/commit/f23452a87c5009a90ed2825afa3817baa7b770a0) - Justin Gross [#648](https://github.com/mezmo/aura/issues/648)
+
+* run manual dispatches only from the default branch [dae547e](https://github.com/mezmo/aura/commit/dae547e2d89b2c3f85d1879332fe4ad03c06e775) - Justin Gross [#558](https://github.com/mezmo/aura/issues/558)
+
+* scope the download total to this run's packages [4214f45](https://github.com/mezmo/aura/commit/4214f4517ac6e198464219bb86304d4fce14ff86) - Justin Gross [#648](https://github.com/mezmo/aura/issues/648)
+
+* snapshot cloudsmith download totals to posthog [6518eb9](https://github.com/mezmo/aura/commit/6518eb9d7b8fb753e1b2abaaedfa6a4807d104ab) - Justin Gross [#648](https://github.com/mezmo/aura/issues/648)
+
+* snapshot github release download totals to posthog [61c9854](https://github.com/mezmo/aura/commit/61c985450ee9354c999ec0bedf05a01d98218e68) - Justin Gross [#558](https://github.com/mezmo/aura/issues/558)
+
+* treat an uningested read-back as pending, not malformed [efc0b11](https://github.com/mezmo/aura/commit/efc0b11ace6b6494f904b7230733280505d89c5b) - Justin Gross [#648](https://github.com/mezmo/aura/issues/648)
+
+* treat an uningested read-back as pending, not malformed [7c5210a](https://github.com/mezmo/aura/commit/7c5210ad1ce04497a269238235e0f55941377106) - Justin Gross [#558](https://github.com/mezmo/aura/issues/558)
+
+* validate the snapshot date and scope the read-back [70a8835](https://github.com/mezmo/aura/commit/70a883533794bbeda8b8c026c6eb6ce10f810d39) - Justin Gross [#558](https://github.com/mezmo/aura/issues/558)
+
+* withhold posthog credentials from pull request runs [38f9ba4](https://github.com/mezmo/aura/commit/38f9ba4c55f630d31e65ee88abc983c7e863880d) - Justin Gross [#558](https://github.com/mezmo/aura/issues/558)
+
+
+
+### Documentation
+
+* document prompt_caching in the reference config [d45dbce](https://github.com/mezmo/aura/commit/d45dbce2011de01b89ccc79f163f3952d52e1fde) - Tony Rogers [#630](https://github.com/mezmo/aura/issues/630)
+
+* move prompt-caching behavior notes off data definitions [3043e52](https://github.com/mezmo/aura/commit/3043e52928b875e00e4863987d159310d7321d3c) - Tony Rogers [#630](https://github.com/mezmo/aura/issues/630)
+
+* **readme**: link integration rows to demo videos [61b9cf8](https://github.com/mezmo/aura/commit/61b9cf8a2b73d1754723efcfab350c02b4c82e80) - Mike Shearer
+
+* **session-store**: declare the cleared-set cancel_request contract [a30b817](https://github.com/mezmo/aura/commit/a30b817a2ffdf95ecb58eb0831434c4e369c98c7) - Mike Shearer [#271](https://github.com/mezmo/aura/issues/271)
+
+* **session-store**: state the cancel_request contract without mechanisms [3c1627a](https://github.com/mezmo/aura/commit/3c1627a3adc1bcb6ac938fceef9d03216aef3d01) - Mike Shearer [#271](https://github.com/mezmo/aura/issues/271)
+
+* state when the download counters are actually read [aacd7b0](https://github.com/mezmo/aura/commit/aacd7b0e838ba702f508d55dc8d2278020ef583f) - Justin Gross [#558](https://github.com/mezmo/aura/issues/558)
+
+
+
+### Features
+
+* **agent**: enable prompt caching and report cache usage [c0cf4a2](https://github.com/mezmo/aura/commit/c0cf4a22c97bab9e83a0399c5a6d2328a7793e31) - Tony Rogers [#630](https://github.com/mezmo/aura/issues/630)
+
+* **ci**: record docker pulls per tag [c677997](https://github.com/mezmo/aura/commit/c677997ba892ad1c655ce914450b1ab91dac4f90) - Justin Gross [#647](https://github.com/mezmo/aura/issues/647)
+
+* **ci**: record who pulls, not just how many pulls [b14566e](https://github.com/mezmo/aura/commit/b14566e080f462101657e1a9353ec3cfee05d8e9) - Justin Gross [#647](https://github.com/mezmo/aura/issues/647)
+
+* **ci**: snapshot docker hub pull totals, on shared snapshot machinery [80258cb](https://github.com/mezmo/aura/commit/80258cb42296605ced32c51d8989c5a1e2ec7fa6) - Justin Gross [#647](https://github.com/mezmo/aura/issues/647)
+
+* **ci**: snapshot docker verified publisher reports into posthog [ea56f3c](https://github.com/mezmo/aura/commit/ea56f3c554bbd89edafa74d0a59588b08e0357d8) - Justin Gross [#647](https://github.com/mezmo/aura/issues/647)
+
+* **cli**: surface cached prompt tokens in the status line [b20c7ca](https://github.com/mezmo/aura/commit/b20c7ca57f0c8a2ecef70c0f9b1bda5319f5cb9c) - Tony Rogers [#630](https://github.com/mezmo/aura/issues/630)
+
+* **config**: add prompt_caching flag for anthropic and bedrock llms [fac4e29](https://github.com/mezmo/aura/commit/fac4e291e15ededf429e3071c2f703bec47b3d6a) - Tony Rogers [#630](https://github.com/mezmo/aura/issues/630)
+
+* **hitl**: add the recorded-decisions consult seam [b849c30](https://github.com/mezmo/aura/commit/b849c303eef98c049f2dac6080f4751346a3e5b1) - Mike Shearer [#271](https://github.com/mezmo/aura/issues/271)
+
+* **instance-id**: add instance id to governance catalog and hitl wire [f21f4b5](https://github.com/mezmo/aura/commit/f21f4b5bd2f444190fda6210b2bdd0cdd7122c85) - Dan Hable [#495](https://github.com/mezmo/aura/issues/495)
+
+* **instance-id**: add stable per-agent instance identity [a184abc](https://github.com/mezmo/aura/commit/a184abc25b9330ec845ce7dedb9558e1e22444cc) - Dan Hable [#495](https://github.com/mezmo/aura/issues/495)
+
+* **instance-id**: expose instance id in governance info, repl, and api [59e1ac7](https://github.com/mezmo/aura/commit/59e1ac760cc7c6798ee3fa5948589a308955a52a) - Dan Hable [#495](https://github.com/mezmo/aura/issues/495)
+
+* **mcp**: add linear to the blessed mcp catalog [ff32249](https://github.com/mezmo/aura/commit/ff32249e586f482dcfcbd51a1fc7976daa49fc5e) - Mike Shearer
+
+* **orchestration**: add the blocked task state and park arm [ec5b02b](https://github.com/mezmo/aura/commit/ec5b02b1d9807bb7b7f50ec55fd60a845c7e1aae) - Mike Shearer [#271](https://github.com/mezmo/aura/issues/271)
+
+* **orchestration**: add the park commit machinery and guard [5da2fb2](https://github.com/mezmo/aura/commit/5da2fb24290cf0536c739b33fad17d698d091cff) - Mike Shearer [#271](https://github.com/mezmo/aura/issues/271)
+
+* **orchestration**: add the parked-run checkpoint schema [4b3ab9a](https://github.com/mezmo/aura/commit/4b3ab9ada9e6ea9d542d466f77e0c9dd04f9765c) - Mike Shearer [#271](https://github.com/mezmo/aura/issues/271)
+
+* **orchestration**: reify a parked run and continue it [11a5ddc](https://github.com/mezmo/aura/commit/11a5ddc2ed6260e03a29c68165bd685b347b78ca) - Mike Shearer [#271](https://github.com/mezmo/aura/issues/271)
+
+* **session-store**: add the file-backed approval store [7eb6f78](https://github.com/mezmo/aura/commit/7eb6f781f617a002c143bd0e3d1ce6ade8d8380d) - Mike Shearer [#271](https://github.com/mezmo/aura/issues/271)
+
+* **telemetry**: export prompt-cache token counts to openinference [6f22b11](https://github.com/mezmo/aura/commit/6f22b115852a44b1b388e401053f71b17b1f57fd) - Tony Rogers [#630](https://github.com/mezmo/aura/issues/630)
+
+
+
+### Miscellaneous
+
+* Merge branch 'main' into nightly [27206eb](https://github.com/mezmo/aura/commit/27206ebddc31b7453e3e268598f4043101ce4d00) - GitHub
+
+* Merge pull request #679 from mezmo/nightly [33bc1cc](https://github.com/mezmo/aura/commit/33bc1cc3c48df248b5345a3b1d69c03005e09eb7) - GitHub [#679](https://github.com/mezmo/aura/issues/679)
+
+
+
+### Tests
+
+* move tool event assertions from integration to unit tests [5a5efba](https://github.com/mezmo/aura/commit/5a5efba014081aa59ebc31d6d745b680d1dec1ba) - Jacob Hull
+
+* **orchestration**: add the stubbed-model rig and ungated smoke test [f43a74f](https://github.com/mezmo/aura/commit/f43a74fcbd3bc4a3e893604e3b4144400f978c5a) - Mike Shearer [#271](https://github.com/mezmo/aura/issues/271)
+
+* **orchestration**: pin the scope-borrow refusals with explicit arms [723cfa6](https://github.com/mezmo/aura/commit/723cfa6ed4c0209c2c713ac9ff0a33feb139d2fc) - Mike Shearer [#271](https://github.com/mezmo/aura/issues/271)
+
+* **session-store**: trim the sweep pin proxy to its assertions [aa53bf1](https://github.com/mezmo/aura/commit/aa53bf134b27a6ee9d89188f8612702e225fdf47) - Mike Shearer [#271](https://github.com/mezmo/aura/issues/271)
+
+* **web-server**: add cache_usage to the final-item test helper [bc1aa37](https://github.com/mezmo/aura/commit/bc1aa379413aff5dfe8abded874b388178a2df84) - Tony Rogers [#630](https://github.com/mezmo/aura/issues/630)
+
+* **web-server**: share the approval store battery across backends [3373b8f](https://github.com/mezmo/aura/commit/3373b8fa715efe1c29be9d40e8c09a75e23ff9e2) - Mike Shearer [#271](https://github.com/mezmo/aura/issues/271)
+
 ## [0.2.15](https://github.com/mezmo/aura/compare/v0.2.14...v0.2.15) (2026-09-03)
 
 
