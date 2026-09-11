@@ -26,7 +26,8 @@ fn generate_tool_call_id(task_id: usize, tool_name: &str) -> String {
 /// Tool wrapper that emits events to a `ToolCallObserver`.
 ///
 /// This wrapper provides real-time visibility into tool execution by emitting
-/// `ToolEvent::CallStarted` when a tool begins execution and
+/// `ToolEvent::CallStarted` when a tool call is requested,
+/// `ToolEvent::CallExecuting` once it has cleared every pre-call gate, and
 /// `ToolEvent::CallCompleted` when it finishes.
 ///
 /// Events are emitted to a broadcast channel that the orchestrator can
@@ -42,6 +43,19 @@ pub struct ObserverWrapper {
 impl ObserverWrapper {
     pub fn new(observer: ToolCallObserver, task_id: usize) -> Self {
         Self { observer, task_id }
+    }
+}
+
+/// The tool call ID this wrapper stashed in `transform_args`, from either the
+/// wrapper's own extracted object or the array `ComposedWrapper` collects.
+fn observer_tool_call_id(extracted: Option<&Value>) -> Option<&str> {
+    let v = extracted?;
+    if let Some(arr) = v.as_array() {
+        arr.iter()
+            .find_map(|item| item.get("observer_tool_call_id"))
+            .and_then(|v| v.as_str())
+    } else {
+        v.get("observer_tool_call_id").and_then(|v| v.as_str())
     }
 }
 
@@ -80,6 +94,17 @@ impl ToolWrapper for ObserverWrapper {
         error
     }
 
+    fn on_execute(&self, ctx: &ToolCallContext, extracted: Option<&Value>) {
+        let Some(tool_call_id) = observer_tool_call_id(extracted) else {
+            return;
+        };
+        self.observer.emit(ToolEvent::call_executing(
+            tool_call_id,
+            &ctx.tool_name,
+            &ctx.tool_initiator_id,
+        ));
+    }
+
     async fn on_complete(
         &self,
         ctx: &ToolCallContext,
@@ -87,34 +112,34 @@ impl ToolWrapper for ObserverWrapper {
         result: Result<&str, &str>,
         duration_ms: u64,
     ) {
-        // Extract tool_call_id from the extracted data
-        let tool_call_id = extracted
-            .and_then(|v| {
-                // Handle both direct object and array from ComposedWrapper
-                if let Some(arr) = v.as_array() {
-                    // Find the object with observer_tool_call_id
-                    arr.iter()
-                        .find_map(|item| item.get("observer_tool_call_id"))
-                        .and_then(|v| v.as_str())
-                } else {
-                    v.get("observer_tool_call_id").and_then(|v| v.as_str())
-                }
-            })
-            .unwrap_or_else(|| {
-                // Fallback: generate a new ID (shouldn't happen in normal flow)
-                tracing::warn!(
-                    "observer_tool_call_id not found in extracted data for {}",
-                    ctx.tool_name
-                );
-                "unknown"
-            });
+        let tool_call_id = observer_tool_call_id(extracted).unwrap_or_else(|| {
+            // Fallback: generate a new ID (shouldn't happen in normal flow)
+            tracing::warn!(
+                "observer_tool_call_id not found in extracted data for {}",
+                ctx.tool_name
+            );
+            "unknown"
+        });
 
         // Emit CallCompleted event (full output — truncation happens at SSE handler layer)
         let event = match result {
-            Ok(output) => ToolEvent::call_completed_success(tool_call_id, output, duration_ms),
+            Ok(output) => ToolEvent::call_completed_success(
+                tool_call_id,
+                &ctx.tool_name,
+                &ctx.tool_initiator_id,
+                output,
+                duration_ms,
+            ),
             Err(err) => {
                 let retry_hint = RetryHint::from_error_message(err);
-                ToolEvent::call_completed_error(tool_call_id, err, Some(retry_hint), duration_ms)
+                ToolEvent::call_completed_error(
+                    tool_call_id,
+                    &ctx.tool_name,
+                    &ctx.tool_initiator_id,
+                    err,
+                    Some(retry_hint),
+                    duration_ms,
+                )
             }
         };
 
@@ -217,7 +242,24 @@ mod tests {
             _ => panic!("Expected CallStarted event"),
         }
 
-        // Call on_complete (should emit CallCompleted)
+        // Call on_execute (should emit CallExecuting for the same call)
+        wrapper.on_execute(&ctx, result.extracted.as_ref());
+
+        let event = rx.recv().await.unwrap();
+        match event {
+            ToolEvent::CallExecuting {
+                tool_call_id,
+                tool_name,
+                tool_initiator_id,
+            } => {
+                assert!(tool_call_id.contains("task42"));
+                assert_eq!(tool_name, "test_tool");
+                assert_eq!(tool_initiator_id, "worker");
+            }
+            _ => panic!("Expected CallExecuting event"),
+        }
+
+        // Call on_complete (should emit CallCompleted carrying the tool identity)
         wrapper
             .on_complete(&ctx, result.extracted.as_ref(), Ok("success"), 100)
             .await;
@@ -225,15 +267,29 @@ mod tests {
         let event = rx.recv().await.unwrap();
         match event {
             ToolEvent::CallCompleted {
+                tool_name,
+                tool_initiator_id,
                 duration_ms,
                 result,
                 ..
             } => {
+                assert_eq!(tool_name, "test_tool");
+                assert_eq!(tool_initiator_id, "worker");
                 assert_eq!(duration_ms, 100);
                 assert!(result.is_success());
             }
             _ => panic!("Expected CallCompleted event"),
         }
+    }
+
+    #[test]
+    fn test_on_execute_without_extracted_emits_nothing() {
+        let (observer, rx) = ToolCallObserver::new(8);
+        let wrapper = ObserverWrapper::new(observer, 0);
+
+        wrapper.on_execute(&ToolCallContext::new("test_tool"), None);
+
+        assert!(rx.is_empty());
     }
 
     #[tokio::test]

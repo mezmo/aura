@@ -349,6 +349,17 @@ pub trait ToolWrapper: Send + Sync {
         Ok(PreCallOutcome::Proceed { overrides: None })
     }
 
+    /// Hook called once the call is committed to run: after every
+    /// `pre_call` returned `Proceed`, immediately before the inner tool
+    /// is invoked. Not called when `validate_args` or `pre_call` rejects
+    /// or short-circuits, so this is the first point at which a call is
+    /// known to execute — a gated call reaches it only after approval.
+    ///
+    /// # Arguments
+    /// * `ctx` - Context about the current tool call
+    /// * `extracted` - Data extracted during `transform_args`
+    fn on_execute(&self, _ctx: &ToolCallContext, _extracted: Option<&Value>) {}
+
     /// Async hook called after tool completion (success or failure).
     ///
     /// Use this for async side effects like:
@@ -569,6 +580,8 @@ where
                 }
             };
 
+            wrapper.on_execute(&ctx, extracted.as_ref());
+
             // Call inner tool in a spawned task to isolate panics.
             // Propagate the current span so mcp.tool_call nests under execute_tool.
             let inner_clone = inner.clone();
@@ -786,6 +799,12 @@ impl ToolWrapper for ComposedWrapper {
             }
         }
         Ok(PreCallOutcome::Proceed { overrides })
+    }
+
+    fn on_execute(&self, ctx: &ToolCallContext, extracted: Option<&Value>) {
+        for wrapper in &self.wrappers {
+            wrapper.on_execute(ctx, extracted);
+        }
     }
 
     async fn transform_output(
@@ -1091,6 +1110,59 @@ mod tests {
         assert!(
             !ran.load(Ordering::SeqCst),
             "inner tool must not run when pre_call short-circuits"
+        );
+    }
+
+    struct RecordExecute(Arc<std::sync::atomic::AtomicBool>);
+
+    #[async_trait]
+    impl ToolWrapper for RecordExecute {
+        fn on_execute(&self, _ctx: &ToolCallContext, _extracted: Option<&Value>) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn on_execute_runs_after_pre_call_proceeds() {
+        use std::sync::atomic::Ordering;
+
+        let executed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let composed = ComposedWrapper::new(vec![
+            Arc::new(RecordExecute(executed.clone())) as Arc<dyn ToolWrapper>
+        ]);
+        let wrapped = WrappedTool::new(
+            RecordingInner {
+                ran: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            },
+            Arc::new(composed) as Arc<dyn ToolWrapper>,
+        );
+
+        wrapped.call(serde_json::json!({})).await.unwrap();
+
+        assert!(executed.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn on_execute_skipped_when_pre_call_short_circuits() {
+        use std::sync::atomic::Ordering;
+
+        let executed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let composed = ComposedWrapper::new(vec![
+            Arc::new(ShortCircuitPreCall) as Arc<dyn ToolWrapper>,
+            Arc::new(RecordExecute(executed.clone())) as Arc<dyn ToolWrapper>,
+        ]);
+        let wrapped = WrappedTool::new(
+            RecordingInner {
+                ran: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            },
+            Arc::new(composed) as Arc<dyn ToolWrapper>,
+        );
+
+        wrapped.call(serde_json::json!({})).await.unwrap();
+
+        assert!(
+            !executed.load(Ordering::SeqCst),
+            "on_execute must not run for a call the gate short-circuited"
         );
     }
 
