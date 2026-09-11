@@ -87,6 +87,17 @@ Make targets are composed from modular includes under `.makefiles/` (rust, docke
 | `make docker-test`     | Run the Docker build's lint/test stage         |
 | `make start` / `make stop` | Start/stop the Docker Compose setup        |
 
+### Docker image features
+
+The release image compiles `aura` and `aura-web-server` with no optional
+cargo features. The `CARGO_FEATURES` build arg (a comma-separated cargo
+feature list) enables them for both binaries, for example the Redis/Valkey
+session store a multi-instance deployment needs:
+
+```bash
+docker build --build-arg CARGO_FEATURES=session-store-redis --target release -t aura:redis .
+```
+
 ## Testing
 
 ### Unit Tests
