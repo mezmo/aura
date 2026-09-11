@@ -62,11 +62,29 @@ impl HitlRuntime {
         req_headers: Option<&HashMap<String, String>>,
     ) -> Self {
         let route = match &config.route {
-            DecisionRouteConfig::Webhook { timeout_secs, .. } => DecisionRoute::Webhook {
-                client: webhook_client_from_config(&config.route, hmac, req_headers)
-                    .expect("the webhook arm of the route config builds a client"),
-                timeout: Duration::from_secs(*timeout_secs),
-            },
+            DecisionRouteConfig::Webhook {
+                timeout_secs,
+                headers_from_request,
+                ..
+            } => {
+                let client = webhook_client_from_config(&config.route, hmac, req_headers)
+                    .expect("the webhook arm of the route config builds a client");
+                // Request-scoped egress capture: `client.headers` already
+                // carries the resolved values for THIS request; the strict
+                // check turns a mapped destination with no usable value into
+                // the error that closes the park arm's registration. The
+                // parked rows copy the client's map — never re-resolve.
+                let egress_capture = crate::webhook_utils::check_egress_capture(
+                    client.resolved_headers(),
+                    headers_from_request,
+                );
+                DecisionRoute::Webhook {
+                    client,
+                    registry: pending_approvals.clone(),
+                    timeout: Duration::from_secs(*timeout_secs),
+                    egress_capture,
+                }
+            }
             DecisionRouteConfig::Conversational { timeout_secs } => DecisionRoute::Conversational {
                 registry: pending_approvals.clone(),
                 timeout: Duration::from_secs(*timeout_secs),
@@ -235,10 +253,17 @@ pub enum DecisionRoute {
         registry: PendingApprovals,
         timeout: Duration,
     },
-    /// Unattended: one synchronous HTTP round-trip to a webhook.
+    /// Unattended: one synchronous HTTP round-trip to a webhook, or — under
+    /// poll delivery — the park arm registering into `registry`, with the
+    /// reconciler driving the decision.
     Webhook {
         client: WebhookClient,
+        /// The shared approval registry the park arm registers into.
+        registry: PendingApprovals,
         timeout: Duration,
+        /// The request-scoped egress-capture verdict for this client's
+        /// resolved headers.
+        egress_capture: Result<(), crate::webhook_utils::EgressCaptureError>,
     },
 }
 
@@ -301,13 +326,13 @@ async fn webhook_round_trip<T>(
 
 /// The live-path guard for poll delivery: a poll-mode client's synchronous
 /// decision legs must not fire the sync POST, whose ack would be misread as
-/// a decision. Every decision on a poll route fails closed here until the
-/// park arm takes config-gated calls; the agent-callable `request_approval`
-/// tool path always lands here.
+/// a decision. Config-gated calls are intercepted by the park arm before
+/// reaching here; this guards the agent-callable `request_approval` tool
+/// path, which bypasses it.
 fn poll_delivery_guard(client: &WebhookClient) -> Result<(), ApprovalError> {
     if client.poll.is_some() {
         Err(ApprovalError::Misconfigured(
-            "poll delivery has no live decision path".to_string(),
+            "poll delivery parks; the live decision path is unavailable".to_string(),
         ))
     } else {
         Ok(())
@@ -315,6 +340,55 @@ fn poll_delivery_guard(client: &WebhookClient) -> Result<(), ApprovalError> {
 }
 
 impl DecisionRoute {
+    /// The park arm's inputs: the approval registry to register against and
+    /// the decision window the route timeout bounds. `Some` for the
+    /// conversational route and for a webhook route with poll delivery,
+    /// `None` for sync delivery — whose decision returns on the POST
+    /// response itself. The client's poll settings are the one delivery
+    /// marker; this switch must not grow a second one.
+    pub(crate) fn park_registry(&self) -> Option<(&PendingApprovals, Duration)> {
+        match self {
+            Self::Conversational { registry, timeout } => Some((registry, *timeout)),
+            Self::Webhook {
+                client,
+                registry,
+                timeout,
+                ..
+            } => client.poll_delivery().then_some((registry, *timeout)),
+        }
+    }
+
+    /// The park arm's egress headers: the client's request-scoped resolved
+    /// map, which parked rows copy in before `register_durable`. `Err`
+    /// closes the registration — a mapped destination with no usable
+    /// resolved value and no valid static fallback. The conversational arm
+    /// has no webhook egress and always yields an empty map.
+    pub(crate) fn park_egress(
+        &self,
+    ) -> Result<std::borrow::Cow<'_, HeaderMap>, &crate::webhook_utils::EgressCaptureError> {
+        match self {
+            Self::Conversational { .. } => Ok(std::borrow::Cow::Owned(HeaderMap::new())),
+            Self::Webhook {
+                client,
+                egress_capture,
+                ..
+            } => match egress_capture {
+                Ok(()) => Ok(std::borrow::Cow::Borrowed(client.resolved_headers())),
+                Err(err) => Err(err),
+            },
+        }
+    }
+
+    /// Whether the route's identity mapping demands approver identity on an
+    /// approved call — the reify-side rule that blocks a recorded approval
+    /// carrying none. The conversational route has no identity source.
+    pub(crate) fn requires_identity(&self) -> bool {
+        match self {
+            Self::Conversational { .. } => false,
+            Self::Webhook { client, .. } => client.requires_identity(),
+        }
+    }
+
     /// Obtain a decision for a config-gated call, carrying any captured
     /// approver header overrides on the approved arm.
     ///
@@ -334,7 +408,9 @@ impl DecisionRoute {
                 let outcome = self.decide_inner(request, cancel).await?;
                 Ok(GateDecision::without_overrides(outcome))
             }
-            Self::Webhook { client, timeout } => {
+            Self::Webhook {
+                client, timeout, ..
+            } => {
                 poll_delivery_guard(client)?;
                 webhook_round_trip(
                     &request,
@@ -404,9 +480,9 @@ impl DecisionRoute {
                 // Cancellation deliberately does not — a disconnected request
                 // must not execute a buffered approval.
                 if matches!(outcome, ApprovalOutcome::TimedOut { .. })
-                    && let Some(decision) = registry.recorded_decision(&decision_id).await
+                    && let Some(resolved) = registry.recorded_decision(&decision_id).await
                 {
-                    outcome = ApprovalOutcome::Decided(decision);
+                    outcome = ApprovalOutcome::Decided(resolved.decision());
                 }
 
                 let completed_event =
@@ -419,7 +495,9 @@ impl DecisionRoute {
 
                 Ok(outcome)
             }
-            Self::Webhook { client, timeout } => {
+            Self::Webhook {
+                client, timeout, ..
+            } => {
                 poll_delivery_guard(client)?;
                 webhook_round_trip(
                     &request,
@@ -508,9 +586,11 @@ impl WebhookReply {
 
 /// One poll attempt's answer ([`WebhookClient::poll_decision`]).
 ///
-/// Pending is an outcome, not an error: a 404/204 or an unrecognized 200
-/// body only means "keep polling", so the caller can loop without catching.
-#[derive(Debug)]
+/// Pending is an outcome, not an error: the caller can loop without
+/// catching.
+///
+/// Manual `Debug`: the response headers may carry approver identity, so
+/// their values never render — names only.
 pub(crate) enum PollOutcome {
     /// 200 with a strictly-parsed, signature-verified decision; response
     /// headers ride along for approver-identity capture by the caller.
@@ -518,13 +598,53 @@ pub(crate) enum PollOutcome {
         decision: ApprovalDecision,
         response_headers: HeaderMap,
     },
-    /// 404, 204, or a 200 whose body does not parse as
-    /// [`ApprovalDecisionWire`] (a pending-shaped body we don't
-    /// recognize): keep polling.
+    /// Keep polling: 404/204, a pending status, or a 200 body outside
+    /// the status envelope (the full contract sits at the poll match).
     NotYet,
 }
 
+impl std::fmt::Debug for PollOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Decided {
+                decision,
+                response_headers,
+            } => f
+                .debug_struct("Decided")
+                .field("decision", decision)
+                .field(
+                    "response_header_names",
+                    &response_headers
+                        .keys()
+                        .map(reqwest::header::HeaderName::as_str)
+                        .collect::<Vec<_>>(),
+                )
+                .finish(),
+            Self::NotYet => f.write_str("NotYet"),
+        }
+    }
+}
+
 impl WebhookClient {
+    /// The one delivery marker: whether poll settings are present. The park
+    /// switch (`park_registry`) and the config fingerprint's delivery
+    /// projection both read this — no second delivery flag exists.
+    pub(crate) fn poll_delivery(&self) -> bool {
+        self.poll.is_some()
+    }
+
+    /// Whether the configured `tool_headers_from_response` mapping demands
+    /// approver identity on an approved decision.
+    pub(crate) fn requires_identity(&self) -> bool {
+        !self.tool_header_mappings.is_empty()
+    }
+
+    /// The resolved operator headers this client applies to every request —
+    /// for poll delivery, also the at-rest egress values parked rows carry.
+    pub(crate) fn resolved_headers(&self) -> &HeaderMap {
+        &self.headers
+    }
+
     /// Builds an unsigned client. Deliberately does NOT read the environment
     /// (so constructing one in a test never races env-mutating tests):
     /// production construction goes through [`HitlRuntime::from_config`],
@@ -632,6 +752,21 @@ impl WebhookClient {
         builder
     }
 
+    /// Overlay one parked row's resolved egress headers onto a request
+    /// builder. `RequestBuilder::headers` replaces per name, so a row value
+    /// supersedes the shared client's fallback for this POST only — the
+    /// client itself is never mutated.
+    fn apply_row_headers(
+        &self,
+        builder: reqwest::RequestBuilder,
+        row_headers: Option<&HeaderMap>,
+    ) -> reqwest::RequestBuilder {
+        match row_headers {
+            Some(row) => builder.headers(row.clone()),
+            None => builder,
+        }
+    }
+
     /// Resolve a decision without its response headers: the route-wide path,
     /// which never captures approver identity.
     async fn request_approval(
@@ -682,22 +817,29 @@ impl WebhookClient {
     /// Build the approval-request POST: the serialized wire view — HMAC-signed
     /// with the `X-Aura-*` headers under context `approval-request:{decision_id}`
     /// when a secret is configured — with operator headers and the per-attempt
-    /// `timeout` applied. The caller owns `send()` and the response, which the
-    /// legs read differently: the sync decision leg parses a decision off it,
-    /// while the poll ack leg ([`Self::notify`]) never reads the body.
+    /// `timeout` applied. `row_headers` (the parked row's own resolved values,
+    /// reconciler path only) overlay the client's per-name AFTER them, so a
+    /// row value replaces the shared client's fallback for that one POST;
+    /// signature headers are applied last and can never be displaced. The
+    /// caller owns `send()` and the response, which the legs read differently:
+    /// the sync decision leg parses a decision off it, while the poll ack leg
+    /// ([`Self::notify`]) never reads the body.
     fn build_approval_post(
         &self,
         request: &ApprovalRequest,
         timeout: Duration,
+        row_headers: Option<&HeaderMap>,
     ) -> Result<reqwest::RequestBuilder, ApprovalError> {
         // Serialize the wire view, not the domain request: it keeps `scope` /
         // `origin` as the flat `aura_events` DTOs instead of leaking Rust enum
         // variant names onto the webhook contract.
         let wire = ApprovalRequestWire::from(request);
         let Some(hmac) = self.egress_hmac()? else {
-            return Ok(self
-                .apply_operator_headers(self.client.post(self.url.as_str()).json(&wire))
-                .timeout(timeout));
+            let builder = self.apply_row_headers(
+                self.apply_operator_headers(self.client.post(self.url.as_str()).json(&wire)),
+                row_headers,
+            );
+            return Ok(builder.timeout(timeout));
         };
 
         // Signing requires the exact bytes that go on the wire, so serialize
@@ -709,10 +851,13 @@ impl WebhookClient {
         let headers = hmac
             .sign(&egress_context, &body)
             .map_err(|e| ApprovalError::Signing(e.to_string()))?;
-        let mut post = self.apply_operator_headers(
-            self.client
-                .post(self.url.as_str())
-                .header(reqwest::header::CONTENT_TYPE, "application/json"),
+        let mut post = self.apply_row_headers(
+            self.apply_operator_headers(
+                self.client
+                    .post(self.url.as_str())
+                    .header(reqwest::header::CONTENT_TYPE, "application/json"),
+            ),
+            row_headers,
         );
         for (name, value) in headers.into_pairs() {
             post = post.header(name, value);
@@ -735,7 +880,7 @@ impl WebhookClient {
         request: &ApprovalRequest,
         timeout: Duration,
     ) -> Result<WebhookReply, ApprovalError> {
-        let post = self.build_approval_post(request, timeout)?;
+        let post = self.build_approval_post(request, timeout, None)?;
         match post.send().await {
             Err(e) if e.is_timeout() => Ok(WebhookReply::TimedOut { waited: timeout }),
             Err(e) => Err(e.into()),
@@ -799,17 +944,24 @@ impl WebhookClient {
     /// recorded the row but the 2xx never came back — faults on every
     /// tick until the human decides.
     ///
-    /// A timeout is a transport fault, not a decision-shaped outcome — the
-    /// reconciler simply retries on the next tick. The response body is
-    /// dropped unread, so each attempt is its own connection.
-    pub(crate) async fn notify(&self, request: &ApprovalRequest) -> Result<(), ApprovalError> {
+    /// `row_headers` are the parked approval's own resolved egress values,
+    /// overlaid per name onto the client's operator headers for this POST —
+    /// per-row override, not client state. A timeout is a transport fault,
+    /// not a decision-shaped outcome — the reconciler simply retries on the
+    /// next tick. The response body is dropped unread, so each attempt is
+    /// its own connection.
+    pub(crate) async fn notify(
+        &self,
+        request: &ApprovalRequest,
+        row_headers: Option<&HeaderMap>,
+    ) -> Result<(), ApprovalError> {
         let Some(poll) = &self.poll else {
             return Err(ApprovalError::Misconfigured(
                 "notify is the poll-delivery ack leg, but this client has no poll settings"
                     .to_string(),
             ));
         };
-        let post = self.build_approval_post(request, poll.request_timeout)?;
+        let post = self.build_approval_post(request, poll.request_timeout, row_headers)?;
         match post.send().await {
             Err(e) => Err(e.into()),
             Ok(resp) => {
@@ -1252,6 +1404,46 @@ mod tests {
         );
     }
 
+    /// The park switch, built the production way (`HitlRuntime::from_config`
+    /// over the `[hitl]` config): conversational and webhook-poll park, and
+    /// webhook-sync keeps the live decision path.
+    #[test]
+    fn park_registry_follows_delivery() {
+        fn webhook_route(delivery: aura_config::WebhookDelivery) -> DecisionRoute {
+            let config = aura_config::HitlConfig {
+                require_approval: vec![],
+                park: aura_config::ParkConfig::default(),
+                route: aura_config::DecisionRouteConfig::Webhook {
+                    url: aura_config::WebhookUrl::new("https://approvals.example.com/").unwrap(),
+                    timeout_secs: 60,
+                    headers: std::collections::HashMap::new(),
+                    headers_from_request: std::collections::HashMap::new(),
+                    tool_headers_from_response: aura_config::ToolHeaderMappings::default(),
+                    delivery,
+                    poll_url: None,
+                    poll_interval_secs: 10,
+                    poll_request_timeout_secs: 30,
+                },
+            };
+            let runtime =
+                super::HitlRuntime::from_config(&config, &PendingApprovals::new(), None, None);
+            std::sync::Arc::try_unwrap(runtime.route)
+                .ok()
+                .expect("test-owned route")
+        }
+
+        let (_, conv) = conv_route(Duration::from_secs(60));
+        let (_, got) = conv.park_registry().expect("conversational parks");
+        assert_eq!(got, Duration::from_secs(60));
+
+        let sync = webhook_route(aura_config::WebhookDelivery::Sync);
+        assert!(sync.park_registry().is_none(), "webhook sync does not park");
+
+        let poll = webhook_route(aura_config::WebhookDelivery::Poll);
+        let (_, got) = poll.park_registry().expect("webhook poll parks");
+        assert_eq!(got, Duration::from_secs(60));
+    }
+
     #[tokio::test(start_paused = true)]
     async fn conversational_decide_approved() {
         let (registry, route) = conv_route(Duration::from_secs(60));
@@ -1274,7 +1466,7 @@ mod tests {
         loop {
             tokio::task::yield_now().await;
             if registry
-                .resolve(&decision_id, ApprovalDecision::Approved)
+                .resolve(&decision_id, ApprovalDecision::Approved.into())
                 .await
                 .is_ok()
             {
@@ -1315,7 +1507,8 @@ mod tests {
                     &decision_id,
                     ApprovalDecision::Denied {
                         reason: Some("too risky".into()),
-                    },
+                    }
+                    .into(),
                 )
                 .await
                 .is_ok()
@@ -1359,7 +1552,7 @@ mod tests {
         }
         assert_eq!(
             registry
-                .resolve(&decision_id, ApprovalDecision::Approved)
+                .resolve(&decision_id, ApprovalDecision::Approved.into())
                 .await,
             Err(ResolveError::NotFound),
             "late decisions for timed-out approvals must be rejected as expired",
@@ -1421,7 +1614,7 @@ mod tests {
         loop {
             tokio::task::yield_now().await;
             if registry
-                .resolve(&decision_id, ApprovalDecision::Approved)
+                .resolve(&decision_id, ApprovalDecision::Approved.into())
                 .await
                 .is_ok()
             {
@@ -1494,7 +1687,7 @@ mod tests {
         // An approver reacting to `Requested` immediately must find the
         // record already parked — resolving here may not race registration.
         registry
-            .resolve(&decision_id, ApprovalDecision::Approved)
+            .resolve(&decision_id, ApprovalDecision::Approved.into())
             .await
             .expect("record must be resolvable once Requested is observable");
 
@@ -1519,14 +1712,16 @@ mod tests {
         use super::super::super::decision::{
             AgentScope, ApprovalDecision, ApprovalOrigin, CancelReason, DecisionId,
         };
-        use super::super::super::protocol::{ApprovalRequest, PROTOCOL_VERSION};
+        use super::super::super::protocol::{
+            ApprovalRequest, PROTOCOL_VERSION, PollDecisionWire, PollStatusWire,
+        };
         use super::super::super::signing::{
             PrimarySecret, SIGNATURE_HEADER, SigningContext, TIMESTAMP_HEADER, Tolerance,
             WebhookHmac, authorize_ingress,
         };
         use super::super::{
-            ApprovalError, ApprovalOutcome, EgressSigning, GateDecision, PollOutcome, PollSettings,
-            WebhookClient, build_webhook_client,
+            ApprovalError, ApprovalOutcome, EgressSigning, GateDecision, PendingApprovals,
+            PollOutcome, PollSettings, WebhookClient, build_webhook_client,
         };
         use crate::approver_headers::CaptureError;
 
@@ -2494,7 +2689,9 @@ mod tests {
                 let (url, accepted) = stalled_receiver().await;
                 let route = super::super::DecisionRoute::Webhook {
                     client: loopback_client(&url, EgressSigning::Disabled, user_mapping()),
+                    registry: PendingApprovals::new(),
                     timeout: Duration::from_secs(300),
+                    egress_capture: Ok(()),
                 };
                 let cancel = crate::request_cancellation::RequestCancelToken::unbound();
                 let request = test_request(DecisionId::generate());
@@ -2537,7 +2734,9 @@ mod tests {
             .await;
             let route = super::super::DecisionRoute::Webhook {
                 client: loopback_client(&url, EgressSigning::Disabled, user_mapping()),
+                registry: PendingApprovals::new(),
                 timeout: Duration::from_secs(300),
+                egress_capture: Ok(()),
             };
 
             let decision = route
@@ -2599,7 +2798,7 @@ mod tests {
             let client =
                 loopback_poll_client(&url, EgressSigning::Disabled, &url, Duration::from_secs(5));
             client
-                .notify(&test_request(decision_id))
+                .notify(&test_request(decision_id), None)
                 .await
                 .expect("a 2xx ack must resolve Ok");
 
@@ -2624,7 +2823,7 @@ mod tests {
             let client =
                 loopback_poll_client(&url, EgressSigning::Disabled, &url, Duration::from_secs(5));
             let err = client
-                .notify(&test_request(DecisionId::generate()))
+                .notify(&test_request(DecisionId::generate()), None)
                 .await
                 .expect_err("a 503 ack must fault");
             assert!(
@@ -2644,7 +2843,7 @@ mod tests {
             let client =
                 loopback_poll_client(&url, EgressSigning::Disabled, &url, Duration::from_secs(5));
             client
-                .notify(&test_request(DecisionId::generate()))
+                .notify(&test_request(DecisionId::generate()), None)
                 .await
                 .expect("a 409 ack must resolve Ok: the receiver holding the row is the ack");
         }
@@ -2663,7 +2862,7 @@ mod tests {
                 Duration::from_millis(200),
             );
             let err = client
-                .notify(&test_request(DecisionId::generate()))
+                .notify(&test_request(DecisionId::generate()), None)
                 .await
                 .expect_err("a stalled ack must fault");
             assert!(
@@ -2680,7 +2879,7 @@ mod tests {
             let client =
                 loopback_poll_client(url, EgressSigning::Disabled, url, Duration::from_secs(1));
             let err = client
-                .notify(&test_request(DecisionId::generate()))
+                .notify(&test_request(DecisionId::generate()), None)
                 .await
                 .expect_err("a refused connection must fault");
             let rendered = err.to_string();
@@ -2704,7 +2903,7 @@ mod tests {
                 Duration::from_secs(5),
             );
             client
-                .notify(&test_request(decision_id))
+                .notify(&test_request(decision_id), None)
                 .await
                 .expect("a signed ack must resolve Ok");
 
@@ -2745,7 +2944,7 @@ mod tests {
                     });
                 assert!(
                     matches!(outcome, PollOutcome::NotYet),
-                    "{status}: expected NotYet, got {outcome:?}"
+                    "expected NotYet, got {outcome:?}"
                 );
             }
         }
@@ -2840,10 +3039,162 @@ mod tests {
             let outcome = client
                 .poll_decision(decision_id)
                 .await
-                .expect("a pending-shaped body must not fault");
+                .expect("an out-of-envelope body must not fault");
             assert!(
                 matches!(outcome, PollOutcome::NotYet),
                 "expected NotYet, got {outcome:?}"
+            );
+        }
+
+        /// The receiver's undecided answer: a 200 carrying the status
+        /// envelope with `pending`.
+        #[tokio::test]
+        async fn poll_decision_envelope_pending_is_not_yet() {
+            let (url, _received) =
+                one_shot_receiver(vec![], r#"{"status":"pending"}"#.to_string()).await;
+
+            let client =
+                loopback_poll_client(&url, EgressSigning::Disabled, &url, Duration::from_secs(5));
+            let outcome = client
+                .poll_decision(DecisionId::generate())
+                .await
+                .expect("a pending envelope must not fault");
+            assert!(
+                matches!(outcome, PollOutcome::NotYet),
+                "expected NotYet, got {outcome:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn poll_decision_envelope_approved_resolves() {
+            let (url, _received) =
+                one_shot_receiver(vec![], r#"{"status":"approved"}"#.to_string()).await;
+
+            let client =
+                loopback_poll_client(&url, EgressSigning::Disabled, &url, Duration::from_secs(5));
+            let outcome = client
+                .poll_decision(DecisionId::generate())
+                .await
+                .expect("an approved envelope must resolve");
+            assert!(
+                matches!(
+                    outcome,
+                    PollOutcome::Decided {
+                        decision: ApprovalDecision::Approved,
+                        ..
+                    }
+                ),
+                "expected Decided(Approved), got {outcome:?}"
+            );
+        }
+
+        /// A denial's reason rides the envelope into the decision.
+        #[tokio::test]
+        async fn poll_decision_envelope_denied_carries_reason() {
+            let (url, _received) = one_shot_receiver(
+                vec![],
+                r#"{"status":"denied","reason":"quota exceeded"}"#.to_string(),
+            )
+            .await;
+
+            let client =
+                loopback_poll_client(&url, EgressSigning::Disabled, &url, Duration::from_secs(5));
+            let outcome = client
+                .poll_decision(DecisionId::generate())
+                .await
+                .expect("a denied envelope must resolve");
+            match outcome {
+                PollOutcome::Decided {
+                    decision: ApprovalDecision::Denied { reason },
+                    ..
+                } => assert_eq!(reason.as_deref(), Some("quota exceeded")),
+                other => panic!("expected Decided(Denied), got {other:?}"),
+            }
+        }
+
+        /// The envelope is additive-field tolerant: a receiver decorating a
+        /// decided body must not silently expire the approval.
+        #[tokio::test]
+        async fn poll_decision_envelope_tolerates_unknown_fields_on_decided() {
+            let (url, _received) = one_shot_receiver(
+                vec![],
+                r#"{"status":"approved","reason":null,"decided_by":"policy-x"}"#.to_string(),
+            )
+            .await;
+
+            let client =
+                loopback_poll_client(&url, EgressSigning::Disabled, &url, Duration::from_secs(5));
+            let outcome = client
+                .poll_decision(DecisionId::generate())
+                .await
+                .expect("an approved envelope with extra fields must resolve");
+            assert!(
+                matches!(
+                    outcome,
+                    PollOutcome::Decided {
+                        decision: ApprovalDecision::Approved,
+                        ..
+                    }
+                ),
+                "expected Decided(Approved), got {outcome:?}"
+            );
+        }
+
+        /// The serde matrix for the status envelope: every status parses
+        /// with the reason present, absent, and null; an unknown status
+        /// value fails the parse (which the poll leg treats as not-yet).
+        #[test]
+        fn poll_wire_parses_the_status_envelope_matrix() {
+            for status in ["pending", "approved", "denied"] {
+                for reason in [None, Some("null"), Some("\"policy: auto-approve\"")] {
+                    let body = match reason {
+                        None => format!(r#"{{"status":"{status}"}}"#),
+                        Some("null") => format!(r#"{{"status":"{status}","reason":null}}"#),
+                        Some(value) => format!(r#"{{"status":"{status}","reason":{value}}}"#),
+                    };
+                    let wire: PollDecisionWire = serde_json::from_str(&body)
+                        .unwrap_or_else(|e| panic!("{body} must parse: {e}"));
+                    let expected = match status {
+                        "pending" => PollStatusWire::Pending,
+                        "approved" => PollStatusWire::Approved,
+                        _ => PollStatusWire::Denied,
+                    };
+                    assert_eq!(wire.status, expected, "body: {body}");
+                    assert_eq!(
+                        wire.reason.as_deref(),
+                        reason
+                            .filter(|r| *r != "null")
+                            .map(|_| "policy: auto-approve"),
+                        "body: {body}"
+                    );
+                }
+            }
+            assert!(
+                serde_json::from_str::<PollDecisionWire>(r#"{"status":"revoked"}"#).is_err(),
+                "an unknown status value must fail the parse"
+            );
+        }
+
+        /// The poll outcome's Debug renders response-header names only.
+        #[test]
+        fn poll_outcome_debug_prints_names_not_values() {
+            let mut response_headers = reqwest::header::HeaderMap::new();
+            response_headers.insert(
+                reqwest::header::HeaderName::from_static("x-approver-id"),
+                reqwest::header::HeaderValue::from_str("approver-dave-sentinel").unwrap(),
+            );
+            let outcome = PollOutcome::Decided {
+                decision: ApprovalDecision::Approved,
+                response_headers,
+            };
+            let rendered = format!("{outcome:?}");
+            assert!(
+                rendered.contains("x-approver-id"),
+                "names render: {rendered}"
+            );
+            assert!(
+                !rendered.contains("approver-dave-sentinel"),
+                "identity values must never render: {rendered}"
             );
         }
 
@@ -2921,7 +3272,9 @@ mod tests {
                     &url,
                     Duration::from_secs(5),
                 ),
+                registry: PendingApprovals::new(),
                 timeout: Duration::from_secs(300),
+                egress_capture: Ok(()),
             };
             let cancel = crate::request_cancellation::RequestCancelToken::unbound();
 
@@ -3021,7 +3374,9 @@ mod tests {
                 super::build_webhook_client(),
                 aura_config::WebhookUrl::new("http://127.0.0.1:9").unwrap(),
             ),
+            registry: PendingApprovals::new(),
             timeout: std::time::Duration::from_secs(1),
+            egress_capture: Ok(()),
         };
         let request = ApprovalRequest {
             version: PROTOCOL_VERSION,
@@ -3367,7 +3722,9 @@ mod tests {
 
         let route = super::DecisionRoute::Webhook {
             client,
+            registry: PendingApprovals::new(),
             timeout: std::time::Duration::from_secs(5),
+            egress_capture: Ok(()),
         };
         let cancel = crate::request_cancellation::RequestCancelToken::unbound();
         let result = route.decide(make_approval_request(), &cancel).await;
@@ -3393,7 +3750,9 @@ mod tests {
 
         let route = super::DecisionRoute::Webhook {
             client,
+            registry: PendingApprovals::new(),
             timeout: std::time::Duration::from_secs(5),
+            egress_capture: Ok(()),
         };
         let cancel = crate::request_cancellation::RequestCancelToken::unbound();
         let result = route.decide(make_approval_request(), &cancel).await;
@@ -3432,7 +3791,9 @@ mod tests {
         // Capture 1: the bare constructor (no headers configured).
         let bare = super::DecisionRoute::Webhook {
             client: super::WebhookClient::new(super::build_webhook_client(), url.clone()),
+            registry: PendingApprovals::new(),
             timeout: std::time::Duration::from_secs(5),
+            egress_capture: Ok(()),
         };
         let result = bare.decide(request.clone(), &cancel).await;
         assert!(result.is_ok(), "bare client should get a decision");
@@ -3446,7 +3807,9 @@ mod tests {
                 url,
                 reqwest::header::HeaderMap::new(),
             ),
+            registry: PendingApprovals::new(),
             timeout: std::time::Duration::from_secs(5),
+            egress_capture: Ok(()),
         };
         let result = with_empty.decide(request, &cancel).await;
         assert!(result.is_ok(), "empty-headers client should get a decision");

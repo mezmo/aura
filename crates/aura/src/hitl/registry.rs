@@ -33,7 +33,9 @@ use crate::session_store::{
     Subscription,
 };
 
-use super::decision::{ApprovalDecision, AwaitingDecision, DecisionId, Timestamp};
+use super::decision::{
+    ApprovalDecision, AwaitingDecision, DecisionId, ResolvedDecision, Timestamp,
+};
 use super::protocol::ApprovalRequest;
 
 /// Bus topic carrying the decision for one parked approval.
@@ -73,12 +75,17 @@ impl WakeEntry {
 }
 
 /// The serializable record of a parked approval. Carries everything needed to
-/// re-render and re-validate the approval after a restart.
+/// re-render and re-validate the approval after a restart — and, under poll
+/// delivery, the resolved egress headers its notify POST authenticates with.
 #[derive(Clone)]
 pub struct ParkedApproval {
     pub request: ApprovalRequest,
     pub registered_at: Timestamp,
     pub expires_at: Timestamp,
+    /// Resolved egress headers (`headers_from_request` overlaying the static
+    /// headers) for this row's notify POST. Values are credentials at rest:
+    /// the storage projection's Debug prints names only.
+    pub egress_headers: Option<reqwest::header::HeaderMap>,
 }
 
 /// Why a [`PendingApprovals::resolve`] could not complete.
@@ -129,6 +136,7 @@ impl PendingApprovals {
             registered_at: now,
             expires_at: now
                 + chrono::Duration::from_std(timeout).expect("approval timeout fits in chrono"),
+            egress_headers: None,
         };
 
         // Subscribe before the store insert: once `store.register` returns,
@@ -182,16 +190,19 @@ impl PendingApprovals {
         self.0.store.register(parked).await
     }
 
-    /// Resolve a parked approval: durably record the decision in the store
-    /// (at most once per `DecisionId`) and publish it on the bus, waking the
-    /// parked await wherever it lives.
+    /// Resolve a parked approval: durably record the decision — and the
+    /// approver identity captured alongside it, as one carrier — in the store
+    /// (at most once per `DecisionId`), and publish the credential-free
+    /// decision on the bus, waking the parked await wherever it lives.
     pub async fn resolve(
         &self,
         id: &DecisionId,
-        decision: ApprovalDecision,
+        resolved: ResolvedDecision,
     ) -> Result<(), ResolveError> {
-        self.0.store.resolve(id, decision.clone()).await?;
-        let payload = serde_json::to_vec(&decision).expect("ApprovalDecision serializes to JSON");
+        self.0.store.resolve(id, resolved.clone()).await?;
+        // Identity never rides the bus: the payload is the decision alone.
+        let payload =
+            serde_json::to_vec(&resolved.decision()).expect("ApprovalDecision serializes to JSON");
         if let Err(err) = self
             .0
             .bus
@@ -213,10 +224,11 @@ impl PendingApprovals {
         self.0.store.get(id).await
     }
 
-    /// The durably recorded decision for an already-resolved approval, if
-    /// any. A store fault reads as "no recorded decision" (logged), so
-    /// callers keep their fail-closed shape.
-    pub async fn recorded_decision(&self, id: &DecisionId) -> Option<ApprovalDecision> {
+    /// The decision durably recorded for an already-resolved approval —
+    /// decision and captured identity together — if any. A store fault reads
+    /// as "no recorded decision" (logged), so callers keep their fail-closed
+    /// shape.
+    pub async fn recorded_decision(&self, id: &DecisionId) -> Option<ResolvedDecision> {
         match self.0.store.decision(id).await {
             Ok(decision) => decision,
             Err(err) => {
@@ -322,7 +334,7 @@ async fn wake_on_decision(
                     return;
                 };
                 match inner.store.decision(&id).await {
-                    Ok(Some(decision)) => decision,
+                    Ok(Some(resolved)) => resolved.decision(),
                     Ok(None) => continue,
                     Err(err) => {
                         warn!(
@@ -399,7 +411,7 @@ mod tests {
         let cancel = RequestCancelToken::unbound();
 
         registry
-            .resolve(&id, ApprovalDecision::Approved)
+            .resolve(&id, ApprovalDecision::Approved.into())
             .await
             .expect("resolve succeeds");
 
@@ -422,7 +434,8 @@ mod tests {
                 &id,
                 ApprovalDecision::Denied {
                     reason: Some("not safe".into()),
-                },
+                }
+                .into(),
             )
             .await
             .expect("resolve succeeds");
@@ -440,7 +453,9 @@ mod tests {
         let registry = PendingApprovals::new();
         let unknown = DecisionId::generate();
         assert_eq!(
-            registry.resolve(&unknown, ApprovalDecision::Approved).await,
+            registry
+                .resolve(&unknown, ApprovalDecision::Approved.into())
+                .await,
             Err(ResolveError::NotFound)
         );
     }
@@ -453,11 +468,13 @@ mod tests {
         let _handle = registry.register(req, Duration::from_secs(60)).await;
 
         registry
-            .resolve(&id, ApprovalDecision::Approved)
+            .resolve(&id, ApprovalDecision::Approved.into())
             .await
             .expect("first resolve succeeds");
         assert_eq!(
-            registry.resolve(&id, ApprovalDecision::Approved).await,
+            registry
+                .resolve(&id, ApprovalDecision::Approved.into())
+                .await,
             Err(ResolveError::NotFound)
         );
     }
@@ -472,7 +489,9 @@ mod tests {
         registry.remove(&id).await;
 
         assert_eq!(
-            registry.resolve(&id, ApprovalDecision::Approved).await,
+            registry
+                .resolve(&id, ApprovalDecision::Approved.into())
+                .await,
             Err(ResolveError::NotFound)
         );
     }
@@ -488,7 +507,9 @@ mod tests {
         drop(handle);
 
         assert_eq!(
-            registry.resolve(&id, ApprovalDecision::Approved).await,
+            registry
+                .resolve(&id, ApprovalDecision::Approved.into())
+                .await,
             Ok(())
         );
     }
@@ -510,7 +531,7 @@ mod tests {
             .await
             .expect("publish succeeds");
         registry
-            .resolve(&id, ApprovalDecision::Approved)
+            .resolve(&id, ApprovalDecision::Approved.into())
             .await
             .expect("resolve succeeds");
 
@@ -565,13 +586,15 @@ mod tests {
             ApprovalOutcome::Cancelled(CancelReason::SenderDropped)
         );
         assert_eq!(
-            registry.resolve(&id_a, ApprovalDecision::Approved).await,
+            registry
+                .resolve(&id_a, ApprovalDecision::Approved.into())
+                .await,
             Err(ResolveError::NotFound),
             "cancelled approval must be gone from the store too",
         );
 
         registry
-            .resolve(&id_b, ApprovalDecision::Approved)
+            .resolve(&id_b, ApprovalDecision::Approved.into())
             .await
             .expect("unrelated entry survives");
         assert_eq!(
@@ -647,7 +670,7 @@ mod tests {
         let handle = parker.register(req, Duration::from_secs(60)).await;
 
         resolver
-            .resolve(&id, ApprovalDecision::Approved)
+            .resolve(&id, ApprovalDecision::Approved.into())
             .await
             .expect("resolve succeeds");
 
@@ -681,7 +704,8 @@ mod tests {
                 &id,
                 ApprovalDecision::Denied {
                     reason: Some("nope".into()),
-                },
+                }
+                .into(),
             )
             .await
             .expect("resolve succeeds");
@@ -710,13 +734,150 @@ mod tests {
         let handle = instance_a.register(req, Duration::from_secs(60)).await;
 
         instance_b
-            .resolve(&id, ApprovalDecision::Approved)
+            .resolve(&id, ApprovalDecision::Approved.into())
             .await
             .expect("resolve on the other instance succeeds");
 
         assert_eq!(
             handle.outcome(&cancel).await,
             ApprovalOutcome::Decided(ApprovalDecision::Approved)
+        );
+    }
+
+    /// Identity captured at resolve time persists in the SAME resolve: the
+    /// store read-back carries the decision AND the identity together, and
+    /// the wake (the conversational consumer) sees the credential-free
+    /// decision only.
+    #[tokio::test]
+    async fn resolve_persists_identity_with_the_decision() {
+        let registry = PendingApprovals::new();
+        let cancel = RequestCancelToken::unbound();
+        let req = test_request("req-identity");
+        let id = req.decision_id;
+        let handle = registry.register(req, Duration::from_secs(60)).await;
+
+        let identity = crate::approver_headers::ApproverHeaders::from_pairs([(
+            "x-forwarded-user".to_owned(),
+            "alice".to_owned(),
+        )])
+        .unwrap();
+        registry
+            .resolve(&id, ResolvedDecision::approved(Some(identity)))
+            .await
+            .expect("resolve succeeds");
+
+        let recorded = registry
+            .recorded_decision(&id)
+            .await
+            .expect("the decision is recorded");
+        match recorded {
+            ResolvedDecision::Approved {
+                identity: Some(got),
+            } => {
+                assert_eq!(
+                    got.captured_names().collect::<Vec<_>>(),
+                    ["x-forwarded-user"]
+                );
+            }
+            other => panic!("expected Approved with identity, got {other:?}"),
+        }
+        // The wake carries the decision alone.
+        assert_eq!(
+            handle.outcome(&cancel).await,
+            ApprovalOutcome::Decided(ApprovalDecision::Approved)
+        );
+    }
+
+    /// Two competing resolves under concurrency: exactly one wins, and the
+    /// stored pair is the winner's decision AND identity — a losing resolver
+    /// cannot overwrite either half.
+    #[tokio::test]
+    async fn competing_resolves_keep_the_winning_decision_and_identity_together() {
+        let store: Arc<dyn ApprovalStore> = Arc::new(InMemoryApprovalStore::new());
+        let registry = PendingApprovals::with_backend(store, Arc::new(InMemoryEventBus::new()));
+        let req = test_request("req-competing");
+        let id = req.decision_id;
+        registry
+            .register_durable(ParkedApproval {
+                request: req,
+                registered_at: chrono::Utc::now(),
+                expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+                egress_headers: None,
+            })
+            .await
+            .unwrap();
+
+        let alice_pair = |v: &str| {
+            std::collections::BTreeMap::from([("x-forwarded-user".to_owned(), v.to_owned())])
+        };
+        let (a, b) = tokio::join!(
+            registry.resolve(
+                &id,
+                ResolvedDecision::approved(Some(
+                    crate::approver_headers::ApproverHeaders::from_pairs(alice_pair("alice"))
+                        .unwrap(),
+                )),
+            ),
+            registry.resolve(
+                &id,
+                ResolvedDecision::approved(Some(
+                    crate::approver_headers::ApproverHeaders::from_pairs(alice_pair("mallory"))
+                        .unwrap(),
+                )),
+            ),
+        );
+        let winners = usize::from(a.is_ok()) + usize::from(b.is_ok());
+        assert_eq!(winners, 1, "exactly one resolver wins: {a:?} / {b:?}");
+
+        match registry.recorded_decision(&id).await.expect("recorded") {
+            ResolvedDecision::Approved {
+                identity: Some(got),
+            } => {
+                // The surviving identity is exactly one resolver's pair —
+                // decision and identity won their race together.
+                let stored = got.to_pair_map();
+                assert!(
+                    stored == alice_pair("alice") || stored == alice_pair("mallory"),
+                    "the winner's identity is stored whole, got {stored:?}"
+                );
+            }
+            other => panic!("expected Approved with identity, got {other:?}"),
+        }
+    }
+
+    /// The decision bus publishes only the credential-free decision: the
+    /// payload on the approval topic is exactly the serialized
+    /// `ApprovalDecision`, with no identity field or value.
+    #[tokio::test]
+    async fn decision_bus_payload_is_credential_free() {
+        let store: Arc<dyn ApprovalStore> = Arc::new(InMemoryApprovalStore::new());
+        let bus: Arc<dyn EventBus> = Arc::new(InMemoryEventBus::new());
+        let registry = PendingApprovals::with_backend(store, bus.clone());
+        let req = test_request("req-bus");
+        let id = req.decision_id;
+        let _handle = registry.register(req, Duration::from_secs(60)).await;
+        let mut sub = bus.subscribe(&approval_topic(&id)).await.unwrap();
+        let identity = crate::approver_headers::ApproverHeaders::from_pairs([(
+            "x-forwarded-user".to_owned(),
+            "alice-sentinel".to_owned(),
+        )])
+        .unwrap();
+        registry
+            .resolve(&id, ResolvedDecision::approved(Some(identity)))
+            .await
+            .expect("resolve succeeds");
+
+        let payload = tokio::time::timeout(Duration::from_secs(1), sub.next())
+            .await
+            .expect("the bus wake arrives")
+            .expect("stream open");
+        let json: serde_json::Value =
+            serde_json::from_slice(&payload).expect("the payload is the serialized decision");
+        assert_eq!(json, serde_json::json!("Approved"));
+        let text = String::from_utf8_lossy(&payload).to_string();
+        assert!(
+            !text.contains("alice-sentinel") && !text.contains("x-forwarded-user"),
+            "the bus payload must be credential-free, got: {text}"
         );
     }
 }

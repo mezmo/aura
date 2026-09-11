@@ -13,7 +13,8 @@
 //! - `resolve` refuses past the approval's `expires_at`, uniformly with an
 //!   unknown id.
 //! - `resolve` *moves* the approval into the decision file rather than deleting
-//!   it: `get` returns the approval before and after the decision, `decision`
+//!   it, minus its egress headers (a decided id is never notified again):
+//!   `get` returns the approval before and after the decision, `decision`
 //!   returns the recorded decision, and both are retained until `remove`.
 //! - At-most-once `resolve` is the `File::create_new` claim on the decision
 //!   file: `AlreadyExists` reads as `NotFound`.
@@ -52,7 +53,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::task::{JoinError, spawn_blocking};
 
-use crate::hitl::{ApprovalDecision, DecisionId, ParkedApproval, ResolveError};
+use crate::hitl::{DecisionId, ParkedApproval, ResolveError, ResolvedDecision};
 
 use super::{ApprovalStore, DecisionRecord, ParkedApprovalRecord, SessionStoreError};
 
@@ -171,13 +172,13 @@ impl Inner {
     fn resolve_sync(
         &self,
         id: &DecisionId,
-        decision: ApprovalDecision,
+        decision: ResolvedDecision,
     ) -> Result<(), ResolveError> {
         let _guard = self.lock();
         let id = canonical_id(id).map_err(ResolveError::Store)?;
 
         // Reading the approval before claiming avoids claiming unknown ids.
-        let record = match fs::read(self.approval_path(&id)) {
+        let mut record = match fs::read(self.approval_path(&id)) {
             Ok(bytes) => serde_json::from_slice::<ParkedApprovalRecord>(&bytes)
                 .map_err(|e| ResolveError::Store(decode_err(e)))?,
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
@@ -189,6 +190,7 @@ impl Inner {
         if chrono::Utc::now() > record.expires_at {
             return Err(ResolveError::NotFound);
         }
+        record.egress_headers = None;
         let payload = serde_json::to_vec(&ResolvedEntry {
             approval: record,
             decision: DecisionRecord::from(&decision),
@@ -231,13 +233,15 @@ impl Inner {
     fn decision_sync(
         &self,
         id: &DecisionId,
-    ) -> Result<Option<ApprovalDecision>, SessionStoreError> {
+    ) -> Result<Option<ResolvedDecision>, SessionStoreError> {
         let _guard = self.lock();
         let id = canonical_id(id)?;
         match fs::read(self.decision_path(&id)) {
             Ok(bytes) => {
                 let entry: ResolvedEntry = serde_json::from_slice(&bytes).map_err(decode_err)?;
-                Ok(Some(ApprovalDecision::from(entry.decision)))
+                ResolvedDecision::try_from(entry.decision)
+                    .map(Some)
+                    .map_err(decode_err)
             }
             Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(err) => Err(request_err(err)),
@@ -431,7 +435,7 @@ impl ApprovalStore for FileApprovalStore {
     async fn resolve(
         &self,
         id: &DecisionId,
-        decision: ApprovalDecision,
+        decision: ResolvedDecision,
     ) -> Result<(), ResolveError> {
         let inner = Arc::clone(&self.inner);
         let id = *id;
@@ -443,7 +447,7 @@ impl ApprovalStore for FileApprovalStore {
     async fn decision(
         &self,
         id: &DecisionId,
-    ) -> Result<Option<ApprovalDecision>, SessionStoreError> {
+    ) -> Result<Option<ResolvedDecision>, SessionStoreError> {
         let inner = Arc::clone(&self.inner);
         let id = *id;
         spawn_blocking(move || inner.decision_sync(&id))
