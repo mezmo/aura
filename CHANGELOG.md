@@ -1,5 +1,48 @@
 ## Changelog
 
+## [0.2.17](https://github.com/mezmo/aura/compare/v0.2.16...v0.2.17) (2026-09-11)
+
+
+### Bug Fixes
+
+* **cli**: judge compaction by context-window fill, not billed spend [1cb0b3a](https://github.com/mezmo/aura/commit/1cb0b3af92a108f50bd89bdea77c0147a39fcd59) - Tony Rogers
+
+* **cli**: keep the context window across turns in orchestration mode [8941bf7](https://github.com/mezmo/aura/commit/8941bf7b692312a615241f76c04a8b0c1e0825cb) - Tony Rogers
+
+* **cli**: record only the coordinator's context reading for replay [adb88df](https://github.com/mezmo/aura/commit/adb88dfc44f81922ca257054983df8b0bb6ba31e) - Tony Rogers
+
+* **docker**: expand cargo_features once, note shared-feature rule [070a01a](https://github.com/mezmo/aura/commit/070a01a1b40f0d3baaa3ac2bb8589e85f03c12be) - Tony Rogers
+
+* **logging**: cut long console lines on a char boundary [49a17f8](https://github.com/mezmo/aura/commit/49a17f84d9cac965fd88d3d3beed039971119852) - Mike Shearer [#609](https://github.com/mezmo/aura/issues/609)
+
+* **orchestration**: read conversation context from the first inner turn [12ff8cd](https://github.com/mezmo/aura/commit/12ff8cdf8a31dded85efd22443c0a808a21ce379) - Tony Rogers
+
+* **orchestration**: replay blank assistant turns with a placeholder [0babb27](https://github.com/mezmo/aura/commit/0babb2732b7f85e4d3bb14094da0de1fca2c3f8a) - Mike Shearer [#590](https://github.com/mezmo/aura/issues/590)
+
+* **orchestration**: report conversation context once per turn [caa07fc](https://github.com/mezmo/aura/commit/caa07fc8238a35e9d37cc05d3dcb3b141aacf906) - Tony Rogers
+
+* **orchestration**: skip the conversation reading on correction attempts [a850bf1](https://github.com/mezmo/aura/commit/a850bf118ea412372878a20d357e7060701042ff) - Tony Rogers
+
+
+
+### Features
+
+* **cli**: show the coordinator's context in orchestrated conversations [700f56f](https://github.com/mezmo/aura/commit/700f56fc79fc970e51082a39c7b03b164c6c0348) - Tony Rogers
+
+* **docker**: add cargo_features build arg to the release image [055125d](https://github.com/mezmo/aura/commit/055125dd3158fdf5240d4243b5155ece89077824) - Tony Rogers
+
+
+
+### Miscellaneous
+
+* Merge branch 'nightly' into main [0b80e4b](https://github.com/mezmo/aura/commit/0b80e4b36aaf7b29a34a66099ee761cbc9819da2) - GitHub
+
+
+
+### Style
+
+* **orchestration**: drop the call-params field comment [58a660a](https://github.com/mezmo/aura/commit/58a660aae7f3ac9f9a10740632ed88168b41ea54) - Tony Rogers
+
 ## [0.2.16](https://github.com/mezmo/aura/compare/v0.2.15...v0.2.16) (2026-09-11)
 
 
