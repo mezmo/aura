@@ -1,1 +1,1 @@
-slice=A from=(new) sel=refusal.diff temporary refusal: AuraConfig::validate error + HitlRuntime::from_config assert (code-constructed configs); B1's C5 replay drops the assert when the real guard lands; C restores config.rs verbatim
+slice=A from=96e943a0 round=2 replay nightly-rebase
