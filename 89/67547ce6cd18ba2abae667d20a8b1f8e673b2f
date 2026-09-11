@@ -1,0 +1,1 @@
+slice=A from=bc6a9509 sel=memory.rs:1 C14 nightly-only test deletion; memory.rs:0 (C7-touched) goes to B2, e2e hunks to C
