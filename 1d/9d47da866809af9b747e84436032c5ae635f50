@@ -1,1 +1,1 @@
-slice=A from=05be31a8 sel=whole C1 config surface
+slice=A from=1a3c7e0a round=2 replay nightly-rebase
