@@ -1,1 +1,1 @@
-slice=B1 from=661bca12 sel=whole C5 reconciler + spawn; config.rs conflict resolved (zero-interval before refusal); drops A's from_config assert (real guard lands here); guard wording neutralized until B2 activates the park arm
+slice=B1 from=329274a8 round=2 replay nightly-rebase
