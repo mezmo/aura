@@ -22,7 +22,7 @@ use tokio::process::{Child, Command};
 
 use aura::hitl::{
     AgentScope, ApprovalDecision, ApprovalItem, ApprovalOrigin, ApprovalRequest, DecisionId,
-    PROTOCOL_VERSION, ParkedApproval, ResolveError,
+    PROTOCOL_VERSION, ParkedApproval, ResolveError, ResolvedDecision,
 };
 use aura::session_store::{ApprovalStore, ParkedApprovalRecord};
 
@@ -48,6 +48,7 @@ pub fn make_parked(request_id: &str, ttl: Duration) -> ParkedApproval {
         },
         registered_at: now,
         expires_at: now + chrono::Duration::from_std(ttl).unwrap(),
+        egress_headers: None,
     }
 }
 
@@ -80,11 +81,13 @@ pub async fn resolve_is_at_most_once(
     instance_a.register(parked).await.unwrap();
 
     instance_b
-        .resolve(&id, ApprovalDecision::Approved)
+        .resolve(&id, ApprovalDecision::Approved.into())
         .await
         .expect("first resolve wins");
     assert_eq!(
-        instance_a.resolve(&id, ApprovalDecision::Approved).await,
+        instance_a
+            .resolve(&id, ApprovalDecision::Approved.into())
+            .await,
         Err(ResolveError::NotFound)
     );
 }
@@ -99,8 +102,8 @@ pub async fn concurrent_resolves_have_exactly_one_winner(
     instance_a.register(parked).await.unwrap();
 
     let (a, b) = tokio::join!(
-        instance_a.resolve(&id, ApprovalDecision::Approved),
-        instance_b.resolve(&id, ApprovalDecision::Approved),
+        instance_a.resolve(&id, ApprovalDecision::Approved.into()),
+        instance_b.resolve(&id, ApprovalDecision::Approved.into()),
     );
     let winners = usize::from(a.is_ok()) + usize::from(b.is_ok());
     assert_eq!(winners, 1, "exactly one resolver must win: {a:?} / {b:?}");
@@ -119,21 +122,81 @@ pub async fn resolve_records_readable_decision(
     let denied = ApprovalDecision::Denied {
         reason: Some("not now".to_string()),
     };
-    instance_b.resolve(&id, denied.clone()).await.unwrap();
+    instance_b
+        .resolve(&id, denied.clone().into())
+        .await
+        .unwrap();
 
     assert_eq!(
         instance_a.decision(&id).await.unwrap(),
-        Some(denied.clone())
+        Some(ResolvedDecision::from(denied.clone()))
     );
     assert_eq!(
-        instance_a.resolve(&id, ApprovalDecision::Approved).await,
+        instance_a
+            .resolve(&id, ApprovalDecision::Approved.into())
+            .await,
         Err(ResolveError::NotFound)
     );
-    assert_eq!(instance_a.decision(&id).await.unwrap(), Some(denied));
+    assert_eq!(
+        instance_a.decision(&id).await.unwrap(),
+        Some(ResolvedDecision::from(denied))
+    );
     assert_eq!(
         instance_a.decision(&DecisionId::generate()).await.unwrap(),
         None
     );
+}
+
+/// Identity captured at resolve time persists in the SAME decision record:
+/// the read-back carries the decision AND the identity together, from any
+/// instance.
+pub async fn resolve_records_identity_with_the_decision(
+    instance_a: &Arc<dyn ApprovalStore>,
+    instance_b: &Arc<dyn ApprovalStore>,
+) {
+    let parked = make_parked("req-identity", Duration::from_secs(60));
+    let id = parked.request.decision_id;
+    instance_a.register(parked).await.unwrap();
+
+    let identity =
+        aura::hitl::ResolvedDecision::approved(Some(unidentity(&[("x-forwarded-user", "alice")])));
+    instance_b.resolve(&id, identity).await.unwrap();
+
+    match instance_a.decision(&id).await.unwrap().expect("recorded") {
+        aura::hitl::ResolvedDecision::Approved {
+            identity: Some(got),
+        } => {
+            assert_eq!(
+                got.captured_names().collect::<Vec<_>>(),
+                ["x-forwarded-user"],
+                "the identity reads back with the decision, from the other instance",
+            );
+        }
+        other => panic!("expected Approved with identity, got {other:?}"),
+    }
+}
+
+fn unidentity(pairs: &[(&str, &str)]) -> aura::approver_headers::ApproverHeaders {
+    // The carrier's constructor is crate-private; build through the record's
+    // storage projection instead, the path any resolver's identity takes.
+    let map: std::collections::BTreeMap<String, String> = pairs
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+        .collect();
+    let record_json = serde_json::json!({
+        "approved": true,
+        "reason": null,
+        "decided_at": chrono::Utc::now(),
+        "identity": map,
+    });
+    let record: aura::session_store::DecisionRecord =
+        serde_json::from_value(record_json).expect("a decision record with identity");
+    match aura::hitl::ResolvedDecision::try_from(record).expect("the record restores") {
+        aura::hitl::ResolvedDecision::Approved { identity } => {
+            identity.expect("the restored approval carries the identity")
+        }
+        other => panic!("expected an approval, got {other:?}"),
+    }
 }
 
 /// A removed ticket no longer resolves.
@@ -145,7 +208,9 @@ pub async fn remove_makes_resolve_not_found(instance: &Arc<dyn ApprovalStore>) {
     instance.remove(&id).await.unwrap();
 
     assert_eq!(
-        instance.resolve(&id, ApprovalDecision::Approved).await,
+        instance
+            .resolve(&id, ApprovalDecision::Approved.into())
+            .await,
         Err(ResolveError::NotFound)
     );
 }
@@ -187,7 +252,7 @@ pub async fn list_pending_returns_only_live_undecided(
     instance_a.register(resolved).await.unwrap();
     instance_a.register(live).await.unwrap();
     instance_b
-        .resolve(&resolved_id, ApprovalDecision::Approved)
+        .resolve(&resolved_id, ApprovalDecision::Approved.into())
         .await
         .unwrap();
 

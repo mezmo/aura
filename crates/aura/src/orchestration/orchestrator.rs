@@ -574,15 +574,13 @@ impl Orchestrator {
             .hitl
             .as_ref()
             .filter(|hitl| hitl.park_enabled)
-            .and_then(|hitl| match &*hitl.route {
-                crate::hitl::DecisionRoute::Conversational { registry, .. } => {
-                    Some(ParkGuard::new(
-                        registry.clone(),
-                        run_id_str.clone(),
-                        agent_config.request_id.clone().unwrap_or_default(),
-                    ))
-                }
-                crate::hitl::DecisionRoute::Webhook { .. } => None,
+            .and_then(|hitl| {
+                let (registry, _) = hitl.route.park_registry()?;
+                Some(ParkGuard::new(
+                    registry.clone(),
+                    run_id_str.clone(),
+                    agent_config.request_id.clone().unwrap_or_default(),
+                ))
             });
         let default_turn_depth = agent_config
             .agent
@@ -878,14 +876,12 @@ impl Orchestrator {
                 worker_config.agent.name.clone(),
                 worker_config.instance_id.clone(),
             );
-            // The park arm needs the store-bearing route; webhook deployments
-            // keep the live decision path.
-            if let (
-                Some(cell),
-                Some(guard),
-                crate::hitl::DecisionRoute::Conversational { registry, .. },
-            ) = (park_cell, self.park_guard.as_ref(), &*hitl.route)
-            {
+            // The park arm needs the park-capable route's registry.
+            if let (Some(cell), Some(guard), Some((registry, _))) = (
+                park_cell,
+                self.park_guard.as_ref(),
+                hitl.route.park_registry(),
+            ) {
                 gate = gate.with_park(registry.clone(), cell.clone(), Arc::clone(guard));
             }
             if let Some(recorded) = recorded {
@@ -1061,15 +1057,13 @@ impl Orchestrator {
         })
     }
 
-    /// `[hitl.park].enabled` on the conversational route.
+    /// `[hitl.park].enabled` on a park-capable route: conversational, or
+    /// webhook with poll delivery.
     fn park_enabled(&self) -> bool {
-        self.agent_config.hitl.as_ref().is_some_and(|hitl| {
-            hitl.park_enabled
-                && matches!(
-                    &*hitl.route,
-                    crate::hitl::DecisionRoute::Conversational { .. }
-                )
-        })
+        self.agent_config
+            .hitl
+            .as_ref()
+            .is_some_and(|hitl| hitl.park_enabled && hitl.route.park_registry().is_some())
     }
 
     /// The worker approval scope stamped on a task's approvals — the same
@@ -1107,7 +1101,7 @@ impl Orchestrator {
         let Some(hitl) = self.agent_config.hitl.clone() else {
             return;
         };
-        let crate::hitl::DecisionRoute::Conversational { registry, .. } = &*hitl.route else {
+        let Some((registry, _)) = hitl.route.park_registry() else {
             return;
         };
         let scope = self.worker_scope(task_id, worker_name).await;
@@ -4079,7 +4073,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
         // Step 5: the consumed decisions leave the store with the task.
         if let Some(hitl) = self.agent_config.hitl.clone()
-            && let crate::hitl::DecisionRoute::Conversational { registry, .. } = &*hitl.route
+            && let Some((registry, _)) = hitl.route.park_registry()
         {
             for call in &continuation.pending {
                 registry.remove(&call.decision_id).await;
@@ -5178,8 +5172,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
         let Some(hitl) = self.agent_config.hitl.clone() else {
             return Err("run parked without the HITL runtime configured".into());
         };
-        let crate::hitl::DecisionRoute::Conversational { registry, timeout } = &*hitl.route else {
-            return Err("run parked without the conversational route".into());
+        let Some((registry, timeout)) = hitl.route.park_registry() else {
+            return Err("run parked without a park-capable route".into());
         };
         let (run_id, session_id) = {
             let p = self.persistence.lock().await;
@@ -5218,7 +5212,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             registry,
             memory_dir: &memory_dir,
             config: &self.agent_config,
-            decision_window: *timeout,
+            decision_window: timeout,
         };
 
         match super::park::commit_from_run_state(&inputs).await {
@@ -5274,7 +5268,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         let Some(hitl) = self.agent_config.hitl.clone() else {
             return;
         };
-        let crate::hitl::DecisionRoute::Conversational { registry, .. } = &*hitl.route else {
+        let Some((registry, _)) = hitl.route.park_registry() else {
             return;
         };
         let request_id = self.agent_config.request_id.clone().unwrap_or_default();
@@ -7362,34 +7356,51 @@ mod tests {
         );
     }
 
-    /// `park_enabled` requires the flag AND the conversational route — the
-    /// webhook arm of park mode is out of V1 scope.
+    /// A `[hitl.route]` webhook arm with the given delivery, for the
+    /// park-activation tests.
+    fn webhook_route_config(
+        delivery: aura_config::WebhookDelivery,
+    ) -> aura_config::DecisionRouteConfig {
+        aura_config::DecisionRouteConfig::Webhook {
+            url: aura_config::WebhookUrl::new("https://approvals.example.com/").unwrap(),
+            timeout_secs: 5,
+            headers: std::collections::HashMap::new(),
+            headers_from_request: std::collections::HashMap::new(),
+            tool_headers_from_response: aura_config::ToolHeaderMappings::default(),
+            delivery,
+            poll_url: None,
+            poll_interval_secs: 10,
+            poll_request_timeout_secs: 30,
+        }
+    }
+
+    /// `park_enabled` requires the flag AND a park-capable route: the
+    /// conversational route and the webhook route under poll delivery park;
+    /// the webhook route under sync delivery keeps the live decision path.
     #[tokio::test]
-    async fn park_enabled_requires_flag_and_conversational_route() {
+    async fn park_enabled_requires_flag_and_park_capable_route() {
         use aura_config::GlobPattern;
 
-        fn config(park_enabled: bool, conversational: bool) -> AgentRuntimeConfig {
-            let mut config = AgentRuntimeConfig::default();
-            let route = if conversational {
-                crate::hitl::DecisionRoute::Conversational {
-                    registry: crate::hitl::PendingApprovals::new(),
-                    timeout: Duration::from_secs(60),
-                }
-            } else {
-                crate::hitl::DecisionRoute::Webhook {
-                    client: crate::hitl::WebhookClient::new(
-                        reqwest::Client::new(),
-                        aura_config::WebhookUrl::new("https://approvals.example.com/").unwrap(),
-                    ),
-                    timeout: Duration::from_secs(5),
-                }
+        fn config(
+            park_enabled: bool,
+            route: aura_config::DecisionRouteConfig,
+        ) -> AgentRuntimeConfig {
+            let hitl = aura_config::HitlConfig {
+                require_approval: vec![GlobPattern::new("kubectl_*").unwrap()],
+                park: aura_config::ParkConfig {
+                    enabled: park_enabled,
+                },
+                route,
             };
-            config.hitl = Some(crate::hitl::HitlRuntime {
-                patterns: Arc::from([GlobPattern::new("kubectl_*").unwrap()]),
-                route: Arc::new(route),
-                park_enabled,
-            });
-            config
+            AgentRuntimeConfig {
+                hitl: Some(crate::hitl::HitlRuntime::from_config(
+                    &hitl,
+                    &crate::hitl::PendingApprovals::new(),
+                    None,
+                    None,
+                )),
+                ..AgentRuntimeConfig::default()
+            }
         }
 
         let no_hitl = Orchestrator::new(AgentRuntimeConfig::default())
@@ -7397,14 +7408,112 @@ mod tests {
             .unwrap();
         assert!(!no_hitl.park_enabled(), "no [hitl] table: park off");
 
-        let off = Orchestrator::new(config(false, true)).await.unwrap();
+        let off = Orchestrator::new(config(
+            false,
+            aura_config::DecisionRouteConfig::Conversational { timeout_secs: 60 },
+        ))
+        .await
+        .unwrap();
         assert!(!off.park_enabled(), "flag off: park off");
 
-        let on = Orchestrator::new(config(true, true)).await.unwrap();
+        let on = Orchestrator::new(config(
+            true,
+            aura_config::DecisionRouteConfig::Conversational { timeout_secs: 60 },
+        ))
+        .await
+        .unwrap();
         assert!(on.park_enabled(), "flag on + conversational: park on");
 
-        let webhook = Orchestrator::new(config(true, false)).await.unwrap();
-        assert!(!webhook.park_enabled(), "webhook route: park off");
+        let sync = Orchestrator::new(config(
+            true,
+            webhook_route_config(aura_config::WebhookDelivery::Sync),
+        ))
+        .await
+        .unwrap();
+        assert!(!sync.park_enabled(), "webhook sync route: park off");
+
+        let poll = Orchestrator::new(config(
+            true,
+            webhook_route_config(aura_config::WebhookDelivery::Poll),
+        ))
+        .await
+        .unwrap();
+        assert!(poll.park_enabled(), "webhook poll route: park on");
+    }
+
+    /// Run-level activation: a webhook route with poll delivery
+    /// arms the park guard, enables park, and the commit path publishes the
+    /// checkpoint. The reconciler flow itself is the poller's.
+    #[tokio::test]
+    async fn webhook_poll_route_parks_and_commits_the_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let hitl = aura_config::HitlConfig {
+            require_approval: vec![aura_config::GlobPattern::new("kubectl_*").unwrap()],
+            park: aura_config::ParkConfig { enabled: true },
+            route: webhook_route_config(aura_config::WebhookDelivery::Poll),
+        };
+        let store = Arc::new(crate::session_store::InMemoryApprovalStore::new());
+        let registry = crate::hitl::PendingApprovals::with_backend(
+            store,
+            Arc::new(crate::session_store::InMemoryEventBus::new()),
+        );
+        let config = AgentRuntimeConfig {
+            hitl: Some(crate::hitl::HitlRuntime::from_config(
+                &hitl, &registry, None, None,
+            )),
+            memory_dir: Some(dir.path().to_string_lossy().into_owned()),
+            session_id: Some("poll-sess".to_string()),
+            request_id: Some(format!("req_poll_{}", uuid::Uuid::new_v4().simple())),
+            ..AgentRuntimeConfig::default()
+        };
+        let orchestrator = Orchestrator::new(config).await.unwrap();
+
+        assert!(orchestrator.park_enabled(), "poll delivery parks");
+        assert!(orchestrator.park_guard.is_some(), "the park guard arms");
+
+        let run_id = orchestrator.persistence.lock().await.run_id().to_string();
+        let (plan, records, pending) = awaiting_plan_with_parked_calls(&registry, &run_id).await;
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(32);
+
+        let chat_history = vec![rig::completion::Message::user("deploy the service")];
+        orchestrator
+            .park_run(
+                "deploy the service",
+                &chat_history,
+                &[],
+                None,
+                1,
+                2_500,
+                &[],
+                &plan,
+                &records,
+                &event_tx,
+            )
+            .await
+            .expect("the park commit succeeds under poll delivery");
+
+        let document_path = dir
+            .path()
+            .join("poll-sess")
+            .join("parked")
+            .join(format!("{run_id}.json"));
+        assert!(
+            document_path.try_exists().unwrap(),
+            "the checkpoint publishes under poll delivery"
+        );
+        let document = crate::orchestration::park::load_parked_run(&document_path)
+            .await
+            .unwrap();
+        let expected_ids: Vec<String> = pending.iter().map(|c| c.decision_id.to_string()).collect();
+        assert_eq!(document.awaiting_decision_ids(), expected_ids);
+        match tokio::time::timeout(std::time::Duration::from_millis(50), event_rx.recv()).await {
+            Ok(Some(Ok(StreamItem::OrchestratorEvent(
+                crate::orchestration::OrchestratorEvent::RunParked { decision_ids, .. },
+            )))) => {
+                assert_eq!(decision_ids, expected_ids, "both calls are outstanding");
+            }
+            other => panic!("expected the RunParked event, got {other:?}"),
+        }
     }
 
     /// The orphan cleanup: every pending decision id is removed from the
@@ -7460,6 +7569,7 @@ mod tests {
                     },
                     registered_at: now,
                     expires_at: now + chrono::Duration::seconds(60),
+                    egress_headers: None,
                 })
                 .await
                 .expect("durable register succeeds");
@@ -7592,6 +7702,7 @@ mod tests {
                     },
                     registered_at: now,
                     expires_at: now + chrono::Duration::hours(1),
+                    egress_headers: None,
                 })
                 .await
                 .unwrap();
@@ -7725,7 +7836,10 @@ mod tests {
         let (plan, records, pending) = awaiting_plan_with_parked_calls(&registry, &run_id).await;
         for call in &pending {
             registry
-                .resolve(&call.decision_id, crate::hitl::ApprovalDecision::Approved)
+                .resolve(
+                    &call.decision_id,
+                    crate::hitl::ApprovalDecision::Approved.into(),
+                )
                 .await
                 .unwrap();
         }
@@ -7886,7 +8000,7 @@ mod tests {
         let decided = pending[0].decision_id;
         let sibling = pending[1].decision_id;
         registry
-            .resolve(&decided, crate::hitl::ApprovalDecision::Approved)
+            .resolve(&decided, crate::hitl::ApprovalDecision::Approved.into())
             .await
             .unwrap();
 
@@ -8361,11 +8475,39 @@ mod tests {
             .join("\n")
     }
 
+    fn conversational_route(registry: &PendingApprovals) -> Arc<crate::hitl::DecisionRoute> {
+        Arc::new(crate::hitl::DecisionRoute::Conversational {
+            registry: registry.clone(),
+            timeout: Duration::from_secs(3600),
+        })
+    }
+
+    /// A webhook route under poll delivery, built the production way; the
+    /// resume path never reaches its unroutable url.
+    fn poll_webhook_route(registry: &PendingApprovals) -> Arc<crate::hitl::DecisionRoute> {
+        let config = aura_config::HitlConfig {
+            require_approval: vec![],
+            park: aura_config::ParkConfig { enabled: true },
+            route: aura_config::DecisionRouteConfig::Webhook {
+                url: aura_config::WebhookUrl::new("http://127.0.0.1:9").unwrap(),
+                timeout_secs: 3600,
+                headers: std::collections::HashMap::new(),
+                headers_from_request: std::collections::HashMap::new(),
+                tool_headers_from_response: aura_config::ToolHeaderMappings::default(),
+                delivery: aura_config::WebhookDelivery::Poll,
+                poll_url: None,
+                poll_interval_secs: 10,
+                poll_request_timeout_secs: 30,
+            },
+        };
+        crate::hitl::HitlRuntime::from_config(&config, registry, None, None).route
+    }
+
     /// A park-mode orchestrator over a file-backed approval store (the park
     /// contract's backend: `get` returns the approval before and after the
-    /// decision), sharing the given registry.
+    /// decision), gating `echo_tool` on `route`.
     async fn file_backed_park_orchestrator(
-        registry: &PendingApprovals,
+        route: Arc<crate::hitl::DecisionRoute>,
         memory_dir: &std::path::Path,
         session_id: &str,
     ) -> (Orchestrator, String) {
@@ -8385,10 +8527,7 @@ mod tests {
         let config = AgentRuntimeConfig {
             hitl: Some(crate::hitl::HitlRuntime {
                 patterns: Arc::from([aura_config::GlobPattern::new("echo_tool").unwrap()]),
-                route: Arc::new(crate::hitl::DecisionRoute::Conversational {
-                    registry: registry.clone(),
-                    timeout: Duration::from_secs(3600),
-                }),
+                route,
                 park_enabled: true,
             }),
             memory_dir: Some(memory_dir.to_string_lossy().into_owned()),
@@ -8447,6 +8586,7 @@ mod tests {
     /// disk, and drive the continuation with `resume_turns`. Returns the
     /// task outcome plus the handles the proofs assert through.
     async fn park_then_resume(
+        route_for: fn(&PendingApprovals) -> Arc<crate::hitl::DecisionRoute>,
         decision: ApprovalDecision,
         resume_turns: Vec<ScriptedTurn>,
     ) -> (
@@ -8462,7 +8602,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (registry, store) = file_store_registry(&dir.path().join("approvals"));
         let (orchestrator, run_id) =
-            file_backed_park_orchestrator(&registry, dir.path(), "loop-sess").await;
+            file_backed_park_orchestrator(route_for(&registry), dir.path(), "loop-sess").await;
         let (event_tx, _event_rx) = tokio::sync::mpsc::channel(64);
 
         let (park_model, park_invocations) =
@@ -8501,7 +8641,10 @@ mod tests {
             .expect("the park commit succeeds");
         drop(orchestrator);
 
-        registry.resolve(&decision_id, decision).await.unwrap();
+        registry
+            .resolve(&decision_id, decision.into())
+            .await
+            .unwrap();
 
         let document_path = dir
             .path()
@@ -8554,7 +8697,7 @@ mod tests {
         };
 
         let (orchestrator2, _run_id2) =
-            file_backed_park_orchestrator(&registry, dir.path(), "loop-sess").await;
+            file_backed_park_orchestrator(route_for(&registry), dir.path(), "loop-sess").await;
         let (resume_model, resume_invocations) = gated_worker_override(resume_turns);
         let params = TaskExecutionParams {
             task_description: "apply the manifest",
@@ -8584,6 +8727,37 @@ mod tests {
         )
     }
 
+    /// The same loop on a webhook route under poll delivery: the resume
+    /// consumes the recorded decision and removes the row, as the
+    /// conversational route does.
+    #[tokio::test]
+    async fn full_loop_on_a_poll_route_removes_the_consumed_row() {
+        let _serial = WORKER_OVERRIDE_LOCK.lock().await;
+
+        let (outcome, _model, _resumed, _parked, _document, store, decision_id, _dir) =
+            park_then_resume(
+                poll_webhook_route,
+                ApprovalDecision::Approved,
+                vec![ScriptedTurn::tool_calls(vec![ScriptedToolCall::new(
+                    "call_final",
+                    "submit_result",
+                    serde_json::json!({
+                        "summary": "applied the manifest",
+                        "result": "applied successfully to prod",
+                        "confidence": "high",
+                    }),
+                )])],
+            )
+            .await;
+
+        let outcome = outcome.expect("the resumed task completes");
+        assert!(matches!(outcome, TaskOutcome::Completed(_)));
+        assert!(
+            store.get(&decision_id).await.unwrap().is_none(),
+            "the consumed decision is removed on the poll route"
+        );
+    }
+
     /// FULL LOOP, zero human input: the scripted worker parks, the document
     /// publishes, in-memory state drops, the store holds the approval, and
     /// the rehydrated continuation completes the task — the tool running
@@ -8604,6 +8778,7 @@ mod tests {
             decision_id,
             _dir,
         ) = park_then_resume(
+            conversational_route,
             ApprovalDecision::Approved,
             vec![ScriptedTurn::tool_calls(vec![ScriptedToolCall::new(
                 "call_final",
@@ -8693,13 +8868,14 @@ mod tests {
         let args = serde_json::json!({ "namespace": "prod" });
         recorded.push(
             CallKey::new(1, "kubectl_apply", &args),
-            ApprovalDecision::Approved,
+            ApprovalDecision::Approved.into(),
         );
         recorded.push(
             CallKey::new(1, "kubectl_apply", &args),
             ApprovalDecision::Denied {
                 reason: Some("no".to_string()),
-            },
+            }
+            .into(),
         );
 
         let taken = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -8725,12 +8901,12 @@ mod tests {
             "two decisions consumed exactly once each: {taken:?}"
         );
         assert!(
-            matches!(taken[0].1, ApprovalDecision::Approved),
+            matches!(taken[0].1, crate::hitl::ResolvedDecision::Approved { .. }),
             "recorded order holds across consumers: the approval is consumed first"
         );
         assert!(matches!(
             &taken[1].1,
-            ApprovalDecision::Denied {
+            crate::hitl::ResolvedDecision::Denied {
                 reason: Some(reason),
             } if reason == "no"
         ));
@@ -8826,6 +9002,7 @@ mod tests {
             _decision_id,
             _dir,
         ) = park_then_resume(
+            conversational_route,
             ApprovalDecision::Denied {
                 reason: Some("too risky".to_string()),
             },

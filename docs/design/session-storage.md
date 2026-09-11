@@ -24,7 +24,13 @@ feature, and `RedisSessionStore`/`RedisTaskStore`
 event bus) is implemented:** `RedisApprovalStore` persists approvals as
 `ParkedApprovalRecord` (`aura::session_store::record`, the round-trippable storage
 projection — the domain types stay deliberately unserializable), and
-`RedisEventBus` carries decision wakes over pub/sub (§6.1). **Phase 4 (A2A
+`RedisEventBus` carries decision wakes over pub/sub (§6.1). Both storage
+records carry optional at-rest fields: resolved egress
+header values on `ParkedApprovalRecord` (poll delivery) and approver
+identity on `DecisionRecord` - additive serde (absence = uncaptured), with
+names-only `Debug` on both so no header value reaches logs (ADR
+`2026-08-13-approver-identity-forwarding.md`, `design/hitl.md` "Storage
+records"). **Phase 4 (A2A
 streaming/cancel over the bus) is implemented:** `BusBridgedExecutor` and the
 `subscribe_to_task` bus relay (`crates/aura-web-server/src/a2a/bus_bridge.rs`,
 §6.2) fan execution events out over `a2a:task:{id}` and route cancels over

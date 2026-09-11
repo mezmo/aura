@@ -11,7 +11,7 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aura::hitl::{ApprovalDecision, ResolveError};
+use aura::hitl::{ApprovalDecision, ResolveError, ResolvedDecision};
 use aura::session_store::{
     ApprovalStore, FileApprovalStore, InMemoryApprovalStore, ParkedApprovalRecord,
     SessionStoreError,
@@ -63,6 +63,21 @@ async fn file_battery_resolve_records_readable_decision() {
     let dir = tempfile::tempdir().unwrap();
     let (instance_a, instance_b) = file_pair(&dir);
     common::resolve_records_readable_decision(&instance_a, &instance_b).await;
+}
+
+#[tokio::test]
+async fn file_battery_resolve_records_identity_with_the_decision() {
+    let dir = tempfile::tempdir().unwrap();
+    let (instance_a, instance_b) = file_pair(&dir);
+    common::resolve_records_identity_with_the_decision(&instance_a, &instance_b).await;
+}
+
+#[tokio::test]
+async fn memory_battery_resolve_records_identity_with_the_decision() {
+    let instance_a: std::sync::Arc<dyn aura::session_store::ApprovalStore> =
+        std::sync::Arc::new(aura::session_store::InMemoryApprovalStore::new());
+    let instance_b = std::sync::Arc::clone(&instance_a);
+    common::resolve_records_identity_with_the_decision(&instance_a, &instance_b).await;
 }
 
 #[tokio::test]
@@ -184,7 +199,7 @@ async fn expired_resolve_is_not_found_and_approval_is_retained() {
     store.register(parked).await.unwrap();
 
     assert_eq!(
-        store.resolve(&id, ApprovalDecision::Approved).await,
+        store.resolve(&id, ApprovalDecision::Approved.into()).await,
         Err(ResolveError::NotFound)
     );
     assert_eq!(store.decision(&id).await.unwrap(), None);
@@ -214,7 +229,7 @@ async fn approval_and_decision_are_retained_until_remove() {
     );
 
     store
-        .resolve(&id, ApprovalDecision::Approved)
+        .resolve(&id, ApprovalDecision::Approved.into())
         .await
         .unwrap();
 
@@ -230,31 +245,34 @@ async fn approval_and_decision_are_retained_until_remove() {
     );
     assert_eq!(
         store.decision(&id).await.unwrap(),
-        Some(ApprovalDecision::Approved)
+        Some(ResolvedDecision::from(ApprovalDecision::Approved))
     );
 
     store.remove(&id).await.unwrap();
     assert!(store.get(&id).await.unwrap().is_none());
     assert_eq!(store.decision(&id).await.unwrap(), None);
     assert_eq!(
-        store.resolve(&id, ApprovalDecision::Approved).await,
+        store.resolve(&id, ApprovalDecision::Approved.into()).await,
         Err(ResolveError::NotFound)
     );
 }
 
 /// §2.5: `resolve` moves the approval into the decision file rather than
 /// deleting it — on disk the approval file is gone and the decision file
-/// carries both the approval record and the decision.
+/// carries the approval record, minus its egress headers, and the decision.
 #[tokio::test]
 async fn resolve_moves_the_approval_into_the_decision_file() {
     let dir = tempfile::tempdir().unwrap();
     let store = FileApprovalStore::open(dir.path()).unwrap();
-    let parked = make_parked("req-move", Duration::from_secs(60));
+    let mut parked = make_parked("req-move", Duration::from_secs(60));
+    let mut egress = reqwest::header::HeaderMap::new();
+    egress.insert("x-tenant-egress", "tenant-secret".parse().unwrap());
+    parked.egress_headers = Some(egress);
     let id = parked.request.decision_id;
     store.register(parked).await.unwrap();
 
     store
-        .resolve(&id, ApprovalDecision::Approved)
+        .resolve(&id, ApprovalDecision::Approved.into())
         .await
         .unwrap();
 
@@ -265,12 +283,16 @@ async fn resolve_moves_the_approval_into_the_decision_file() {
             .exists()
     );
     let decision_path = dir.path().join("decisions").join(format!("{id}.json"));
-    let on_disk: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(decision_path).unwrap()).unwrap();
+    let raw = std::fs::read_to_string(decision_path).unwrap();
+    let on_disk: serde_json::Value = serde_json::from_str(&raw).unwrap();
     assert_eq!(on_disk["approval"]["decision_id"], id.to_string());
     assert_eq!(on_disk["approval"]["request_id"], "req-move");
     assert_eq!(on_disk["decision"]["approved"], true);
     assert_eq!(on_disk["decision"]["reason"], serde_json::Value::Null);
+    assert!(
+        !raw.contains("tenant-secret"),
+        "egress credential survived resolve"
+    );
 }
 
 /// An expired undecided approval leaves the store on the scan that finds
@@ -316,7 +338,7 @@ async fn store_directories_and_files_are_owner_only() {
     );
 
     store
-        .resolve(&id, ApprovalDecision::Approved)
+        .resolve(&id, ApprovalDecision::Approved.into())
         .await
         .unwrap();
     assert_eq!(
@@ -339,7 +361,7 @@ async fn list_pending_removes_an_approval_file_that_already_has_a_decision() {
     let approval_bytes = std::fs::read(&approval_path).unwrap();
 
     store
-        .resolve(&id, ApprovalDecision::Approved)
+        .resolve(&id, ApprovalDecision::Approved.into())
         .await
         .unwrap();
     assert!(!approval_path.exists(), "resolve unlinks the approval file");
@@ -394,7 +416,7 @@ async fn list_pending_keeps_the_approval_file_behind_an_incomplete_decision() {
         "the torn decision file reads as a decode error"
     );
     assert_eq!(
-        store.resolve(&id, ApprovalDecision::Approved).await,
+        store.resolve(&id, ApprovalDecision::Approved.into()).await,
         Err(ResolveError::NotFound),
         "the torn file still holds the at-most-once claim"
     );
@@ -409,7 +431,7 @@ async fn list_pending_keeps_the_approval_file_behind_an_incomplete_decision() {
     let pending = store.list_pending().await.unwrap();
     assert_eq!(pending.len(), 1, "the row is pending again");
     store
-        .resolve(&id, ApprovalDecision::Approved)
+        .resolve(&id, ApprovalDecision::Approved.into())
         .await
         .expect("a fresh resolve lands");
     assert!(!approval_path.exists(), "resolve unlinks the approval file");
@@ -429,7 +451,7 @@ async fn cancel_request_removes_only_undecided_matching_approvals() {
     let decided_id = decided.request.decision_id;
     store.register(decided).await.unwrap();
     store
-        .resolve(&decided_id, ApprovalDecision::Approved)
+        .resolve(&decided_id, ApprovalDecision::Approved.into())
         .await
         .unwrap();
     let other = make_parked("req-other", Duration::from_secs(60));
@@ -447,7 +469,7 @@ async fn cancel_request_removes_only_undecided_matching_approvals() {
     );
     assert_eq!(
         store.decision(&decided_id).await.unwrap(),
-        Some(ApprovalDecision::Approved)
+        Some(ResolvedDecision::from(ApprovalDecision::Approved))
     );
     assert!(store.get(&other_id).await.unwrap().is_some());
 }
@@ -467,7 +489,7 @@ async fn cancel_request_sweeps_a_stale_decided_approval_without_returning_it() {
     let residue = serde_json::to_vec(&ParkedApprovalRecord::from(&decided)).unwrap();
     store.register(decided).await.unwrap();
     store
-        .resolve(&decided_id, ApprovalDecision::Approved)
+        .resolve(&decided_id, ApprovalDecision::Approved.into())
         .await
         .unwrap();
 
@@ -499,7 +521,7 @@ async fn cancel_request_sweeps_a_stale_decided_approval_without_returning_it() {
     );
     assert_eq!(
         store.decision(&decided_id).await.unwrap(),
-        Some(ApprovalDecision::Approved),
+        Some(ResolvedDecision::from(ApprovalDecision::Approved)),
         "the recorded decision is retained"
     );
 }
@@ -562,7 +584,7 @@ async fn list_pending_skips_a_stale_decided_approval() {
     let residue = serde_json::to_vec(&ParkedApprovalRecord::from(&decided)).unwrap();
     store.register(decided).await.unwrap();
     store
-        .resolve(&decided_id, ApprovalDecision::Approved)
+        .resolve(&decided_id, ApprovalDecision::Approved.into())
         .await
         .unwrap();
 
@@ -610,12 +632,12 @@ async fn resolve_succeeds_when_the_approval_file_cannot_be_removed() {
     }
 
     store
-        .resolve(&id, ApprovalDecision::Approved)
+        .resolve(&id, ApprovalDecision::Approved.into())
         .await
         .expect("resolve commits without the approval removal");
     assert_eq!(
         store.decision(&id).await.unwrap(),
-        Some(ApprovalDecision::Approved)
+        Some(ResolvedDecision::from(ApprovalDecision::Approved))
     );
     let restored = store
         .get(&id)
@@ -624,7 +646,7 @@ async fn resolve_succeeds_when_the_approval_file_cannot_be_removed() {
         .expect("approval record survives the failed removal");
     assert_eq!(restored.request.decision_id, id);
     assert_eq!(
-        store.resolve(&id, ApprovalDecision::Approved).await,
+        store.resolve(&id, ApprovalDecision::Approved.into()).await,
         Err(ResolveError::NotFound)
     );
 }
@@ -648,12 +670,12 @@ async fn state_survives_reopening_the_store() {
 
     let reopened = FileApprovalStore::open(dir.path()).unwrap();
     reopened
-        .resolve(&id, ApprovalDecision::Approved)
+        .resolve(&id, ApprovalDecision::Approved.into())
         .await
         .expect("resolve after reopen");
     assert_eq!(
         reopened.decision(&id).await.unwrap(),
-        Some(ApprovalDecision::Approved)
+        Some(ResolvedDecision::from(ApprovalDecision::Approved))
     );
 }
 

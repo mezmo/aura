@@ -1206,9 +1206,11 @@ pub async fn resolve_approval(
         }
     };
     let decision = aura::hitl::ApprovalDecision::from(body);
+    // The conversational ingress has no identity source: the decision
+    // resolves uncaptured.
     match state
         .pending_approvals
-        .resolve(&decision_id, decision)
+        .resolve(&decision_id, aura::hitl::ResolvedDecision::from(decision))
         .await
     {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
