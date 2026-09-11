@@ -1,0 +1,1 @@
+slice=C from=(new) sel=config.rs+ADR taken from b0a336ef enable commit = exact reverse of A's refusal (validate + from_config assert) + C7's config flip + C11's config comment + the ADR acceptance paragraph
