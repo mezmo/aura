@@ -14,7 +14,9 @@ administrative and remain outstanding.
 
 - Three `semantic-release` branches: permanent `main` (release → `X.Y.Z`) and
   `nightly` (prerelease `nightly`), plus a per-cycle `beta` (prerelease `beta`).
-  `nightly` and `beta` derive their base version from the last release on `main`.
+  `nightly` and `beta` derive their base version from the highest tag **reachable
+  from their own history**, so the `main →` back-merge is what advances them past
+  a stable release.
 - One `release.config.js` selects **plugins, exec commands, and Docker tags by
   channel**, derived from `BRANCH_NAME`. `semantic-release` computes the version and
   publishes; no versioning logic is hand-rolled.
@@ -185,10 +187,28 @@ The Cut commit must descend from the latest `main` tag; do not re-merge
 `nightly → beta` during a cycle (it would pull in features landed after the cut).
 
 `.github/workflows/sync-main.yml` proposes the `main →` back-merges as pull
-requests. It leaves an open one alone, respects a closed one, never overwrites
-a sync branch carrying commits `main` lacks, and skips `beta` once that branch
-is contained in `main`. Deleting `beta` and the Stabilize `beta → nightly`
-back-merge stay manual.
+requests, on a schedule and whenever a release is published. It moves an open
+one forward as `main` advances, respects a closed one, never overwrites a sync
+branch carrying commits `main` lacks, and skips `beta` once that branch is
+contained in `main`.
+Deleting `beta` and the Stabilize `beta → nightly` back-merge stay manual.
+
+**Sync is a release-correctness requirement.**
+`semantic-release` reads each branch's tags with `git tag --merged`, and
+`normalize.prerelease` takes the base version from that list alone — it never
+consults the release branch. A channel missing `main`'s release commit therefore
+keeps numbering from the tag before it: after `main` releases `0.2.17`, an
+unsynced `nightly` builds `0.2.17-nightly.1`, a prerelease of a shipped version,
+and the moving `nightly` tag lands on an image that sorts below `latest`. The
+tag rides the `[skip ci]` version commit, so a sync opened between the promotion
+merge and that commit carries `main`'s source without its tag and does not
+resolve this.
+
+`scripts/check-release-baseline.sh` is the backstop. The `Compute Release
+Version` stage runs it on `nightly` and `beta` and refuses to release a branch
+that cannot reach `main`'s latest release tag. Reachability rather than a
+version comparison, because a channel that takes a `feat` while behind
+computes a version above the stable release and would otherwise pass.
 
 `.github/workflows/pr-target-branch.yml` fails a pull request into `main` whose
 head is not `nightly`, `beta`, or `hotfix/*`. Both files have to exist on
@@ -289,6 +309,8 @@ Recovery rules:
   against the full channel branch list so a prerelease computes a prerelease version.
 - `scripts/bump-homebrew-tap.sh` — exits for prerelease versions as its first action,
   before any credential/network use (§3).
+- `scripts/check-release-baseline.sh` — skips a channel release whose base version
+  `main` has already shipped (§5).
 - `scripts/set-version.sh`, `.makefiles/rust.mk` (`build-binaries-*`,
   `release-artifacts`) — unchanged, reused per channel.
 - `.makefiles/commitlint.mk` — lints a branch against its base (`nightly` by default,
@@ -299,7 +321,7 @@ Recovery rules:
 - `.github/workflows/pr-target-branch.yml` — fails pull requests into `main`
   from outside the promotion and hotfix branches (§5).
 - `.github/workflows/sync-main.yml` — proposes the `main →` channel back-merges
-  as pull requests (§5).
+  as pull requests, on a schedule and on `release: published` (§5).
 
 ## 11. Related docs
 

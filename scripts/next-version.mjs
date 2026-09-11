@@ -21,9 +21,10 @@ const configured = branches.map((branch) => {
   return typeof branch === 'string' ? branch : branch.name
 })
 
-// A channel branch is analysed against the whole list so a prerelease derives
-// from the last release on main; any other branch on its own, which is what
-// makes a feature branch under test releasable.
+// A channel branch is analysed against the whole list so it resolves as a
+// prerelease; any other branch on its own, which is what makes a feature
+// branch under test releasable. A prerelease's base version comes from the
+// tags reachable from the branch itself — see docs/design/release-channels.md.
 const options = {
   dryRun: true,
   ci: false,
