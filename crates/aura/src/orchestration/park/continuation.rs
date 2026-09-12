@@ -199,10 +199,13 @@ impl ResumingDocumentHandle {
 /// must still match the stored approval, or the resume is a mismatch. The
 /// approval must be a park-retained one: park mode requires the file-backed
 /// store, whose `get` returns the approval before and after the decision.
+/// The caller injects `now`: the decision window's expired row is evaluated
+/// against the caller's clock, not the wall clock at read time.
 #[allow(dead_code)] // P45 resume endpoint consumes the rehydrate entry points
 pub(crate) async fn load_recorded_decisions(
     store: &PendingApprovals,
     doc: &ParkedRun,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Result<(Arc<RecordedDecisions>, Vec<DecisionId>), RehydrateError> {
     let recorded = Arc::new(RecordedDecisions::default());
     let mut decision_ids = Vec::new();
@@ -226,7 +229,7 @@ pub(crate) async fn load_recorded_decisions(
                 .await
                 .map_err(|e| RehydrateError::Store(e.to_string()))?;
             let Some(parked) = parked else {
-                if chrono::Utc::now() > expires_at {
+                if now > expires_at {
                     return Err(RehydrateError::Expired);
                 }
                 return Err(RehydrateError::Mismatch(format!(
@@ -283,7 +286,7 @@ pub(crate) async fn load_recorded_decisions(
                 // No decision yet: expired past the window (the 2.6 expired
                 // row outranks parked), still parked otherwise — collected
                 // so the 409 body can carry every outstanding id.
-                if chrono::Utc::now() > expires_at {
+                if now > expires_at {
                     return Err(RehydrateError::Expired);
                 }
                 outstanding.push(call.decision_id);
@@ -470,7 +473,7 @@ mod tests {
             decision_id,
             serde_json::json!({ "namespace": "stage" }),
         )]);
-        let err = load_recorded_decisions(&registry, &mismatched)
+        let err = load_recorded_decisions(&registry, &mismatched, chrono::Utc::now())
             .await
             .unwrap_err();
         assert!(
@@ -481,7 +484,9 @@ mod tests {
 
         // The matching shape: the entry consumes at the resume gate.
         let doc = parked_run(vec![pending_call(decision_id, args.clone())]);
-        let (recorded, ids) = load_recorded_decisions(&registry, &doc).await.unwrap();
+        let (recorded, ids) = load_recorded_decisions(&registry, &doc, chrono::Utc::now())
+            .await
+            .unwrap();
         assert_eq!(ids, vec![decision_id]);
         assert_eq!(
             recorded.take(&CallKey::new(3, "kubectl_apply", &args)),
@@ -513,6 +518,7 @@ mod tests {
         let err = load_recorded_decisions(
             &registry,
             &parked_run(vec![pending_call(vanished, args.clone())]),
+            chrono::Utc::now(),
         )
         .await
         .unwrap_err();
@@ -524,6 +530,7 @@ mod tests {
         let err = load_recorded_decisions(
             &registry,
             &parked_run(vec![pending_call(undecided, args.clone())]),
+            chrono::Utc::now(),
         )
         .await
         .unwrap_err();
@@ -538,13 +545,17 @@ mod tests {
         // row.
         let mut doc = parked_run(vec![pending_call(undecided, args.clone())]);
         doc.expires_at = (chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
-        let err = load_recorded_decisions(&registry, &doc).await.unwrap_err();
+        let err = load_recorded_decisions(&registry, &doc, chrono::Utc::now())
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("expired"), "got: {err}");
 
         // A row the store already swept past the window is expired, not a
         // mismatch.
         doc.plan.tasks[0].pending = Some(vec![pending_call(vanished, args)]);
-        let err = load_recorded_decisions(&registry, &doc).await.unwrap_err();
+        let err = load_recorded_decisions(&registry, &doc, chrono::Utc::now())
+            .await
+            .unwrap_err();
         assert!(matches!(err, RehydrateError::Expired), "got: {err}");
     }
 
@@ -567,6 +578,7 @@ mod tests {
         let err = load_recorded_decisions(
             &registry,
             &parked_run(vec![pending_call(decision_id, args.clone())]),
+            chrono::Utc::now(),
         )
         .await
         .unwrap_err();
@@ -583,6 +595,7 @@ mod tests {
         let err = load_recorded_decisions(
             &registry,
             &parked_run(vec![pending_call(decision_id, args.clone())]),
+            chrono::Utc::now(),
         )
         .await
         .unwrap_err();
@@ -597,6 +610,7 @@ mod tests {
         let err = load_recorded_decisions(
             &registry,
             &parked_run(vec![pending_call(decision_id, serde_json::json!({}))]),
+            chrono::Utc::now(),
         )
         .await
         .unwrap_err();
@@ -623,7 +637,9 @@ mod tests {
             .unwrap();
 
         let doc = parked_run(vec![pending_call(decision_id, args.clone())]);
-        let (recorded, ids) = load_recorded_decisions(&registry, &doc).await.unwrap();
+        let (recorded, ids) = load_recorded_decisions(&registry, &doc, chrono::Utc::now())
+            .await
+            .unwrap();
         assert_eq!(ids, vec![decision_id]);
         assert_eq!(
             recorded.take(&CallKey::new(3, "kubectl_apply", &args)),
