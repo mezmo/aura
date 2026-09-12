@@ -486,6 +486,12 @@ impl rig::tool::Tool for RecordingTool {
     type Args = FreeformArgs;
     type Output = String;
 
+    // The registered name, so `with_name` renames the tool everywhere rig
+    // resolves it — the toolset key, not just the streamed definition.
+    fn name(&self) -> String {
+        self.registered_name.clone()
+    }
+
     async fn definition(&self, _prompt: String) -> rig::completion::ToolDefinition {
         rig::completion::ToolDefinition {
             name: self.name(),

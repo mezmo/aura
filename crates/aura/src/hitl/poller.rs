@@ -1277,6 +1277,7 @@ mod tests {
                 memory_dir: memory_dir.to_str().unwrap(),
                 config: &crate::config::AgentRuntimeConfig::default(),
                 decision_window: Duration::from_secs(300),
+                identity_hash: None,
             };
             crate::orchestration::commit_from_run_state(&inputs)
                 .await

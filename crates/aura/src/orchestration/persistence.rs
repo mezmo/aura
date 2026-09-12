@@ -278,6 +278,19 @@ pub struct ExecutionPersistence {
 }
 
 impl ExecutionPersistence {
+    /// Validate a session-id path component for the persistence layout.
+    fn validate_session_path(session_id: &Option<String>) -> io::Result<()> {
+        if let Some(sid) = session_id
+            && (sid.is_empty() || sid.contains('/') || sid.contains('\\') || sid.contains(".."))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Invalid session_id for persistence path: {sid:?}"),
+            ));
+        }
+        Ok(())
+    }
+
     /// Create new persistence manager with unique run ID.
     ///
     /// Creates the run directory and a `latest` symlink.
@@ -289,14 +302,7 @@ impl ExecutionPersistence {
         let base_path = base_path.as_ref().to_path_buf();
 
         // Validate session_id to prevent path traversal
-        if let Some(ref sid) = session_id
-            && (sid.is_empty() || sid.contains('/') || sid.contains('\\') || sid.contains(".."))
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("Invalid session_id for persistence path: {:?}", sid),
-            ));
-        }
+        Self::validate_session_path(&session_id)?;
 
         // Compute effective base: with session namespace or flat
         let effective_base = if let Some(ref sid) = session_id {
@@ -336,6 +342,55 @@ impl ExecutionPersistence {
             run_id,
             session_id,
             current_iteration: 1,
+            enabled: true,
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            drain_notify: Arc::new(Notify::new()),
+            tool_traces: Arc::new(StdMutex::new(HashMap::new())),
+        })
+    }
+
+    /// Bind persistence to an existing run instead of minting a fresh run
+    /// id: the resume segment continues the checkpointed run under its
+    /// original `(run_id, session_id)`, so worker scopes, park commits, and
+    /// artifact paths keep addressing the same run. The iteration carries
+    /// the checkpoint's, so artifact paths continue the run's own sequence.
+    /// The run directory is created if absent (a pruned history keeps
+    /// receiving the segment's writes); the `latest` symlink is left alone —
+    /// a resumed run is not a new run, and nothing re-orders the session.
+    pub async fn resume<P: AsRef<Path>>(
+        base_path: P,
+        session_id: Option<String>,
+        run_id: &str,
+        iteration: usize,
+    ) -> io::Result<Self> {
+        let base_path = base_path.as_ref().to_path_buf();
+        Self::validate_session_path(&session_id)?;
+        if !is_safe_path_component(run_id) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Invalid run_id for persistence path: {run_id:?}"),
+            ));
+        }
+        uuid::Uuid::parse_str(run_id).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Invalid run_id for persistence path: {e}"),
+            )
+        })?;
+
+        let effective_base = if let Some(ref sid) = session_id {
+            base_path.join(sid)
+        } else {
+            base_path.clone()
+        };
+        let run_path = effective_base.join(run_id);
+        fs::create_dir_all(&run_path).await?;
+
+        Ok(Self {
+            base_path: run_path,
+            run_id: run_id.to_string(),
+            session_id,
+            current_iteration: iteration,
             enabled: true,
             in_flight: Arc::new(AtomicUsize::new(0)),
             drain_notify: Arc::new(Notify::new()),
