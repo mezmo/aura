@@ -15,8 +15,7 @@ pub(crate) use commit::{
 // endpoint consumes them in production.
 #[allow(unused_imports)]
 pub(crate) use continuation::{
-    RehydrateError, ResumeContext, ResumingDocumentHandle, TaskContinuation,
-    load_recorded_decisions, replace_tool_result,
+    RehydrateError, ResumingDocumentHandle, load_recorded_decisions, replace_tool_result,
 };
 #[allow(unused_imports)]
 pub(crate) use document::{

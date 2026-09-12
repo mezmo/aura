@@ -33,7 +33,6 @@ impl RecordedDecisions {
     /// for a key, appending to that key's recorded-order queue so two
     /// same-turn calls with identical arguments keep their own decisions.
     /// Wired by the orchestrator continuation.
-    #[allow(dead_code)]
     pub(crate) fn push(&self, key: CallKey, decision: ResolvedDecision) {
         self.entries
             .lock()
@@ -45,7 +44,6 @@ impl RecordedDecisions {
 
     /// Mark a task's continuation as in-flight (`on = true`) or clear it. A
     /// miss for a strict task is a resume fault; a miss otherwise re-parks.
-    #[allow(dead_code)]
     pub(crate) fn set_strict(&self, task_id: usize, on: bool) {
         let mut strict = self.strict_tasks.lock().expect("recorded-decisions lock");
         if on {
@@ -109,7 +107,6 @@ impl RecordedDecisions {
     /// on every exit path (normal return, `?`-early-return, error, and panic
     /// unwind) regardless of the recorder's own lifetime. Wired by the
     /// orchestrator continuation (P44 commit 3).
-    #[allow(dead_code)]
     pub(crate) fn strict_guard(self: &Arc<Self>, task_id: usize) -> StrictGuard {
         self.set_strict(task_id, true);
         StrictGuard {
@@ -153,7 +150,6 @@ impl CallKey {
 /// convert a model-issued re-park into a resume fault. Constructed via
 /// [`RecordedDecisions::strict_guard`]. Wired by the orchestrator
 /// continuation (P44 commit 3).
-#[allow(dead_code)]
 pub(crate) struct StrictGuard {
     recorded: Arc<RecordedDecisions>,
     task_id: usize,
