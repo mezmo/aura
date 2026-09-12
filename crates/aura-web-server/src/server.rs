@@ -303,6 +303,16 @@ fn hitl_route_vs_server_window_warning(
     None
 }
 
+/// Refuse park mode on the memory backend: park-mode checkpoints and
+/// approval tickets must outlive the process for any resume to exist.
+#[expect(unused_variables, reason = "todo!() body; filled by P45")]
+fn refuse_park_on_memory_backend(
+    configs: &[aura_config::Config],
+    backend: aura_config::SessionStoreBackend,
+) -> Result<(), std::io::Error> {
+    todo!()
+}
+
 /// Serve until SIGINT/SIGTERM, then drain in-flight streams and flush spans.
 pub async fn serve(args: ServerArgs) -> std::io::Result<()> {
     let result = run(args).await;
@@ -397,6 +407,8 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
         )));
     }
     info!("Session store backend: {}", session_store.backend());
+
+    refuse_park_on_memory_backend(&configs_arc, session_store.backend())?;
 
     // HITL webhook HMAC (AURA_HITL_WEBHOOK_SECRET*): fail startup loud on a
     // misconfiguration instead of silently serving unsigned, unverified
@@ -518,9 +530,16 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
             "/v1/approvals/{decision_id}",
             post(handlers::resolve_approval),
         )
+        .route(
+            "/v1/sessions/{session_id}/runs/{run_id}",
+            post(handlers::resume_run),
+        )
         .layer(axum::extract::Extension(handlers::IngressHmac(
             ingress_hmac,
         )))
+        .layer(axum::extract::Extension(handlers::ResumeClaims(Arc::new(
+            aura::orchestration::ResumeClaimTable::new(),
+        ))))
         .layer(TraceLayer::new_for_http())
         .layer(middleware::from_fn_with_state(
             app_state.clone(),

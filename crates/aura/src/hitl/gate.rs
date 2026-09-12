@@ -805,7 +805,10 @@ mod tests {
         async fn webhook_poll_route_parks_the_gated_call() {
             let config = aura_config::HitlConfig {
                 require_approval: vec![aura_config::GlobPattern::new("kubectl_*").unwrap()],
-                park: aura_config::ParkConfig { enabled: true },
+                park: aura_config::ParkConfig {
+                    enabled: true,
+                    bind_identity: false,
+                },
                 route: aura_config::DecisionRouteConfig::Webhook {
                     url: WebhookUrl::new("http://127.0.0.1:9").unwrap(),
                     timeout_secs: 60,
@@ -886,7 +889,10 @@ mod tests {
                 Arc::new(crate::session_store::InMemoryApprovalStore::new());
             let config = aura_config::HitlConfig {
                 require_approval: vec![aura_config::GlobPattern::new("kubectl_*").unwrap()],
-                park: aura_config::ParkConfig { enabled: true },
+                park: aura_config::ParkConfig {
+                    enabled: true,
+                    bind_identity: false,
+                },
                 route: aura_config::DecisionRouteConfig::Webhook {
                     url: WebhookUrl::new("https://approvals.example.com/hook").unwrap(),
                     timeout_secs: 60,

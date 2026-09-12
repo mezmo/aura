@@ -385,6 +385,7 @@ mod tests {
             },
             executed: vec![],
             config_fingerprint: "f".to_string(),
+            identity_hash: None,
         };
 
         let dest = publish(&document, &parked_dir, run_id).await.unwrap();
@@ -442,6 +443,7 @@ mod tests {
             },
             executed: vec![],
             config_fingerprint: "f".to_string(),
+            identity_hash: None,
         };
 
         let tmp = parked_dir.join(format!(".{run_id}.tmp"));

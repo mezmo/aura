@@ -8,11 +8,12 @@ use aura::{
 use aura_events::{AgentInfo, ServerInfo};
 use axum::Json;
 use axum::body::Body;
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use chrono::Utc;
+use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
@@ -25,6 +26,9 @@ use crate::streaming::{
     TurnContext, collect_stream_to_completion, process_sse_stream_full,
 };
 use crate::types::*;
+use aura::orchestration::{
+    BlockingEntry, ResumeClaimTable, ResumeRefusal, ResumeRunId, ResumeSessionId, SegmentResult,
+};
 
 /// RAII guard for request-scoped subscriptions. Ensures cleanup even on panic.
 struct RequestResourceGuard {
@@ -1342,6 +1346,101 @@ fn error_response(
         .into_response()
 }
 
+// -------------------------------------------------------------------------
+// Resume endpoint (P45): `POST /v1/sessions/{session_id}/runs/{run_id}`
+// -------------------------------------------------------------------------
+
+/// The shared per-run resume claim table, carried as a request extension.
+#[derive(Clone)]
+pub struct ResumeClaims(pub Arc<ResumeClaimTable>);
+
+/// The segment state token on the resume success body.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "lowercase")]
+#[allow(dead_code)] // P45 skeleton: constructed when the handler body lands
+enum ResumeRunState {
+    Completed,
+    Parked,
+}
+
+/// The resume success body.
+#[derive(Debug, Serialize)]
+#[allow(dead_code)] // P45 skeleton: constructed when the handler body lands
+struct ResumeRunResponse {
+    session_id: String,
+    run_id: String,
+    state: ResumeRunState,
+    turns: Vec<ChatMessage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    blocking: Option<Vec<BlockingEntry>>,
+}
+
+impl ResumeRunResponse {
+    #[allow(dead_code)] // P45 skeleton: called when the handler body lands
+    fn from_segment(session: &ResumeSessionId, run: &ResumeRunId, segment: SegmentResult) -> Self {
+        let (state, turns, blocking) = match segment {
+            SegmentResult::Completed { turns } => (ResumeRunState::Completed, turns, None),
+            SegmentResult::Parked { turns, blocking } => {
+                (ResumeRunState::Parked, turns, Some(blocking))
+            }
+        };
+        Self {
+            session_id: session.to_string(),
+            run_id: run.to_string(),
+            state,
+            turns: continuation_turns(turns.as_slice()),
+            blocking,
+        }
+    }
+}
+
+/// Project the segment's conversation turns to the chat-completion message
+/// objects the `turns` array carries — the same objects
+/// `/v1/chat/completions` uses.
+#[expect(unused_variables, reason = "todo!() body; filled by P45")]
+#[allow(dead_code)] // P45 skeleton: called when the handler body lands
+fn continuation_turns(turns: &[aura::Message]) -> Vec<ChatMessage> {
+    todo!()
+}
+
+/// Project an evaluation refusal to its HTTP answer: a detail-less 404 for
+/// the two not-found rows, the one 409 shape for conflict rows, and the
+/// shared error envelope for faults.
+#[allow(dead_code)] // P45 skeleton: called when the handler body lands
+fn refusal_response(refusal: ResumeRefusal) -> Response {
+    match refusal {
+        ResumeRefusal::DocumentAbsent | ResumeRefusal::IdentityMismatch => {
+            StatusCode::NOT_FOUND.into_response()
+        }
+        ResumeRefusal::Conflict(row) => (StatusCode::CONFLICT, Json(row)).into_response(),
+        ResumeRefusal::Fault(diagnostic) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            diagnostic.to_string(),
+            "internal_error",
+        ),
+    }
+}
+
+/// Resume a parked run: evaluate the checkpoint against the config and the
+/// store, claim the run, and execute one segment — the decided approvals'
+/// next agent turns — to completion or the next approval-required park.
+///
+/// `POST /v1/sessions/{session_id}/runs/{run_id}`
+#[tracing::instrument(
+    name = "resume_run",
+    skip(state, claims, headers),
+    fields(otel.kind = "server")
+)]
+#[expect(unused_variables, reason = "todo!() body; filled by P45")]
+pub async fn resume_run(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Extension(claims): axum::extract::Extension<ResumeClaims>,
+    headers: HeaderMap,
+    Path((session_raw, run_raw)): Path<(String, String)>,
+) -> Response {
+    todo!()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1365,6 +1464,7 @@ mod tests {
     fn make_test_config() -> aura_config::Config {
         aura_config::Config {
             memory_dir: None,
+            identity_header: None,
             mcp: None,
             vector_stores: vec![],
             tools: None,

@@ -7489,6 +7489,7 @@ mod tests {
                 require_approval: vec![GlobPattern::new("kubectl_*").unwrap()],
                 park: aura_config::ParkConfig {
                     enabled: park_enabled,
+                    bind_identity: false,
                 },
                 route,
             };
@@ -7549,7 +7550,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let hitl = aura_config::HitlConfig {
             require_approval: vec![aura_config::GlobPattern::new("kubectl_*").unwrap()],
-            park: aura_config::ParkConfig { enabled: true },
+            park: aura_config::ParkConfig {
+                enabled: true,
+                bind_identity: false,
+            },
             route: webhook_route_config(aura_config::WebhookDelivery::Poll),
         };
         let store = Arc::new(crate::session_store::InMemoryApprovalStore::new());
@@ -8589,7 +8593,10 @@ mod tests {
     fn poll_webhook_route(registry: &PendingApprovals) -> Arc<crate::hitl::DecisionRoute> {
         let config = aura_config::HitlConfig {
             require_approval: vec![],
-            park: aura_config::ParkConfig { enabled: true },
+            park: aura_config::ParkConfig {
+                enabled: true,
+                bind_identity: false,
+            },
             route: aura_config::DecisionRouteConfig::Webhook {
                 url: aura_config::WebhookUrl::new("http://127.0.0.1:9").unwrap(),
                 timeout_secs: 3600,
