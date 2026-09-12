@@ -6,6 +6,7 @@ mod continuation;
 mod document;
 mod guard;
 mod recorded_decisions;
+pub(crate) mod resume;
 
 pub(crate) use commit::{
     ParkCommitInputs, cancel_run_approvals, commit_from_run_state, run_owner_id,

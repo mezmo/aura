@@ -15,6 +15,10 @@ pub struct Config {
     /// legacy fallback.
     #[serde(default)]
     pub memory_dir: Option<String>,
+    /// Name of the HTTP request header whose value identifies the caller for
+    /// park-resume identity binding.
+    #[serde(default)]
+    pub identity_header: Option<String>,
     pub mcp: Option<McpConfig>,
     /// Vector stores for RAG - optional, defaults to empty
     #[serde(default)]
@@ -406,6 +410,8 @@ impl Config {
             }
         }
 
+        self.validate_identity_binding()?;
+
         // Scratchpad validation
         self.validate_scratchpad()?;
 
@@ -458,6 +464,18 @@ impl Config {
         }
 
         Ok(())
+    }
+
+    /// Identity binding is only coherent with a header to hash: reject
+    /// `bind_identity = true` without a top-level `identity_header`.
+    fn validate_identity_binding(&self) -> Result<(), crate::ConfigError> {
+        let Some(hitl) = &self.hitl else {
+            return Ok(());
+        };
+        if !hitl.park.bind_identity {
+            return Ok(());
+        }
+        require_identity_header_for_binding(true, self.identity_header.as_deref())
     }
 
     /// Validate that the effective `memory_dir` (if set) is writable.
@@ -558,6 +576,15 @@ fn no_inner_bound_warning(
     } else {
         None
     }
+}
+
+/// Reject `bind_identity` without an `identity_header` to hash.
+#[expect(unused_variables, reason = "todo!() body; filled by P45")]
+fn require_identity_header_for_binding(
+    bind_identity: bool,
+    identity_header: Option<&str>,
+) -> Result<(), crate::ConfigError> {
+    todo!()
 }
 
 /// Warn when the inactivity window cannot fire before the per-call budget.
@@ -1637,6 +1664,9 @@ pub struct ParkConfig {
     /// Park mode on or off (default off).
     #[serde(default)]
     pub enabled: bool,
+    /// Bind each run's checkpoint to the caller's identity-header hash.
+    #[serde(default)]
+    pub bind_identity: bool,
 }
 
 /// `[hitl.route]` table. The `Webhook` variant cannot parse without a valid
