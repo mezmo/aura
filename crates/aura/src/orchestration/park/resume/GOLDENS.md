@@ -21,7 +21,7 @@ records:
 ## Scope of the claim
 
 Green goldens prove the wire artifacts (status + complete body values) are
-unchanged. They prove nothing downstream of the wire: no side-effect
+unchanged. They prove nothing downstream of the wire — no side-effect
 ordering, no broker events, no restart behavior, except where a frame
 asserts an adjacent observable (row 6's rename-back, row 7's untouched
 document and ticket). A green suite is not an endorsement of the fill's
@@ -42,8 +42,8 @@ internals.
 | 9a. ticket missing INSIDE the window → 409 mismatch | whole 409 body | `missing_ticket_inside_the_window_refuses_with_the_mismatch_row` (aura). Document expiry 2099; the side is clock-choice independent. |
 | 9b. ticket missing PAST expires_at → 409 expired (not mismatch) | whole 409 body | `missing_ticket_past_the_window_refuses_with_the_expired_row` (aura). Document expiry 2000; blocking carries the pre-sweep re-derivation. |
 | 10. any pending undecided → 409 parked, blocking [{decision_id, tool, expires_at}] | whole 409 body | `undecided_calls_answer_the_parked_row_with_the_outstanding_set` (aura). |
-| B. completed 200 | full 200 body, composite | `all_decided_grant_runs_the_segment_to_completion` (aura: segment turns, exact rig wire values) + `completed_segment_projects_the_full_200_body` (web: `from_segment` envelope, exact JSON — fails at `continuation_turns` today). |
-| B. parked-with-new-blocking 200 | segment half | `re_park_mid_segment_carries_turns_and_the_new_blocking_entry` (aura): turns pinned exactly; the fresh decision id and expiry are location-normalized after an audited shape check (one entry, one UUID, one RFC 3339 stamp). |
+| B. completed 200 | full 200 body, composite | `all_decided_grant_runs_the_segment_to_completion` (aura: segment turns as exact rig wire values) + `completed_segment_projects_the_full_200_body` (web: `from_segment` envelope, exact JSON — fails at `continuation_turns` today). |
+| B. parked-with-new-blocking 200 | segment half | `re_park_mid_segment_carries_turns_and_the_new_blocking_entry` (aura): turns pinned exactly, with the fresh decision id and expiry location-normalized after an audited shape check (one entry, one UUID, one RFC 3339 stamp). |
 | C. claim race | observable race frame | `concurrent_evaluations_admit_one_grant_and_refuse_the_loser_with_running` (aura): `tokio::join!`, exactly one grant, the loser's whole running-row body, either side winning. |
 | D. blocking-population narrow reading | pinned by the bodies themselves | running/interrupted/config_changed/mismatch frames each pin `"blocking": []`; rename-back/parked/expired frames pin non-empty sets. The reading is enforced by literals, not prose. |
 | —. stage order (first match wins) | ordering frame | `interrupted_outranks_expired` (aura): both conditions hold, the interrupted body wins. |

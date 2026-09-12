@@ -56,7 +56,7 @@ Each stage returns its own small fault enum (`LocateFault`,
 `IdentityFault`, `AdmitFault`, `FingerprintFault`, `ConsultFault`, plus
 `ClaimResumeFault` in `claim.rs`, shared by `check_claim` and
 `authorize`), and each converts into `ResumeRefusal` through a private
-`From` impl. A stage's fault type therefore admits only its own rows: row
+`From` impl. A stage's fault type admits only its own rows: row
 purity is structural. The stage sequence itself is the body's — the types
 do not pin it; the Layer-2 golden tests do. `ResumeRefusal`'s declaration
 order mirrors the table for rendering.
@@ -251,8 +251,8 @@ snapshot-derived turns: full fidelity). Completed segments' turns are
 reassembled from provider-agnostic stream items that drop the `call_id`
 (`collect_segment_turns`), and nothing in the `SegmentResult::Completed`
 surface — stream-derived `SegmentTurns` only — supports re-deriving it
-without widening the seam beyond the card's files. The projection therefore
-falls back to the stream item's own id, the same value the live SSE stream
+without widening the seam beyond the card's files. The projection falls
+back to the stream item's own id, the same value the live SSE stream
 emits for the same call (never null, never fabricated); the loss is real
 only for providers where the responses-API-style `call_id` differs from the
 item id. This is the recorded spec gap for Gate U.
