@@ -666,10 +666,13 @@ mod tests {
             config_fingerprint(&AgentRuntimeConfig::default()),
         )
         .unwrap();
-        let (recorded, ids) =
-            crate::orchestration::park::load_recorded_decisions(&registry, &document)
-                .await
-                .unwrap();
+        let (recorded, ids) = crate::orchestration::park::load_recorded_decisions(
+            &registry,
+            &document,
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
         assert_eq!(ids, vec![decided]);
         assert_eq!(
             recorded.take(&crate::orchestration::CallKey::new(

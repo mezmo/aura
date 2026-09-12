@@ -18,7 +18,9 @@ use crate::hitl::{DecisionId, PendingApprovals};
 use crate::request_cancellation::RequestId;
 
 use super::super::RecordedDecisions;
-use super::super::document::ParkedRun;
+use super::super::commit::{cancel_run_approvals, config_fingerprint};
+use super::super::continuation::{RehydrateError, load_recorded_decisions};
+use super::super::document::{ParkedRun, load_parked_run};
 use super::claim::{
     ClaimResumeFault, ResumeClaimTable, ResumeDocuments, ResumeLease, ResumeRunId, ResumeSessionId,
     ValidatedResumePath,
@@ -395,76 +397,198 @@ impl ResumeGrant {
     }
 }
 
-/// Locate and load whichever checkpoint name exists for the run.
-#[expect(unused_variables, reason = "todo!() body; filled by P45")]
+/// Locate and load whichever checkpoint name exists for the run: the parked
+/// name first, the resuming name only when the parked name is absent. A
+/// present-but-unreadable document faults instead of reading as absent, so a
+/// corrupt checkpoint can never answer the not-found row.
 async fn locate_checkpoint(docs: &ResumeDocuments) -> Result<LocatedCheckpoint, LocateFault> {
-    todo!()
+    match load_parked_run(docs.parked()).await {
+        Ok(document) => return Ok(LocatedCheckpoint::Parked { document }),
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            return Err(LocateFault::Fault(Diagnostic::new(format!(
+                "the parked checkpoint {} could not be read: {e}",
+                docs.parked().display()
+            ))));
+        }
+        Err(_) => {}
+    }
+    match load_parked_run(docs.resuming()).await {
+        Ok(document) => Ok(LocatedCheckpoint::Resuming { document }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(LocateFault::Absent),
+        Err(e) => Err(LocateFault::Fault(Diagnostic::new(format!(
+            "the resuming checkpoint {} could not be read: {e}",
+            docs.resuming().display()
+        )))),
+    }
 }
 
 /// Compare the checkpoint's stored identity hash against the presented
-/// header, resolving the configured binding first.
-#[expect(unused_variables, reason = "todo!() body; filled by P45")]
+/// header, resolving the configured binding first. Binding off admits every
+/// caller; binding on refuses the detail-less row for a missing header, a
+/// stored hash that differs, and — failing closed — a document that carries
+/// no stored hash at all.
 fn check_identity(
     stored: Option<IdentityHash>,
     bind_identity: bool,
     presented_identity: Option<&str>,
 ) -> Result<(), IdentityFault> {
-    todo!()
+    match IdentityBindingState::resolve(bind_identity, presented_identity) {
+        IdentityBindingState::Unbound => Ok(()),
+        // Binding configured with no presented header fails closed: the
+        // caller cannot be attributed, so the run answers the not-found row.
+        IdentityBindingState::BoundMissingHeader => Err(IdentityFault::Mismatch),
+        IdentityBindingState::Bound(presented) => {
+            if stored.as_ref() == Some(&presented) {
+                Ok(())
+            } else {
+                Err(IdentityFault::Mismatch)
+            }
+        }
+    }
 }
 
-/// Reject a run another evaluation already holds.
-#[expect(unused_variables, reason = "todo!() body; filled by P45")]
+/// Reject a run another evaluation already holds; a race lost later, at the
+/// claim itself, surfaces through `authorize` and maps to the same row.
 fn check_claim(claims: &ResumeClaimTable, run: &ResumeRunId) -> Result<(), ClaimResumeFault> {
-    todo!()
+    if claims.is_live(run) {
+        Err(ClaimResumeFault::Live)
+    } else {
+        Ok(())
+    }
 }
 
 /// Apply the interrupted and rename-back rows, yielding the parked document
-/// the content rows evaluate.
-#[expect(unused_variables, reason = "todo!() body; filled by P45")]
+/// the content rows evaluate. Non-empty executed tombstones refuse as
+/// interrupted under either name; an empty resuming document is renamed back
+/// to its parked name under the claim lock before the content rows run.
 async fn admit(
     located: LocatedCheckpoint,
     docs: &ResumeDocuments,
     claims: &ResumeClaimTable,
 ) -> Result<ParkedRun, AdmitFault> {
-    todo!()
+    match located {
+        LocatedCheckpoint::Parked { document } => {
+            if document.executed.is_empty() {
+                Ok(document)
+            } else {
+                Err(AdmitFault::Interrupted)
+            }
+        }
+        LocatedCheckpoint::Resuming { document } => {
+            if !document.executed.is_empty() {
+                // The dead resume's document stays exactly as found: the
+                // interrupted row refuses, and no rename hides the evidence.
+                return Err(AdmitFault::Interrupted);
+            }
+            claims
+                .rename_back_to_parked(docs)
+                .await
+                .map_err(AdmitFault::Fault)?;
+            Ok(document)
+        }
+    }
 }
 
 /// Compare the checkpoint's fingerprint against the rebuilt configuration.
-#[expect(unused_variables, reason = "todo!() body; filled by P45")]
+/// The check runs before the consult, so a drifted config refuses with zero
+/// tool invocations and no consumed-decision cleanup.
 fn check_fingerprint(
     document: &ParkedRun,
     config: &AgentRuntimeConfig,
 ) -> Result<(), FingerprintFault> {
-    todo!()
+    if document.config_fingerprint == config_fingerprint(config) {
+        Ok(())
+    } else {
+        Err(FingerprintFault::Drift)
+    }
 }
 
 /// Consult the store's recorded decisions for every pending call, applying
 /// the mismatch, expired, and parked rows; an expired ticket swept by a
-/// remote TTL reads as expired, never as a mismatch.
-#[expect(unused_variables, reason = "todo!() body; filled by P45")]
+/// remote TTL reads as expired, never as a mismatch. The rehydrate error's
+/// raw payloads are wrapped in `Diagnostic` here, at the consult boundary:
+/// the wrapped text is the mismatch row's detail, verbatim.
 async fn consult_decisions(
     document: &ParkedRun,
     store: &PendingApprovals,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<Arc<RecordedDecisions>, ConsultFault> {
-    todo!()
+    match load_recorded_decisions(store, document, now).await {
+        Ok((recorded, _consumed_ids)) => Ok(recorded),
+        Err(RehydrateError::Mismatch(detail)) => {
+            Err(ConsultFault::Mismatch(Diagnostic::new(detail)))
+        }
+        Err(RehydrateError::Parked { .. }) => {
+            let blocking = project_blocking(document, store, now)
+                .await
+                .map_err(ConsultFault::Fault)?;
+            Err(ConsultFault::Parked(blocking))
+        }
+        Err(RehydrateError::Expired) => {
+            // The remote TTL swept the ticket: the expired row outranks the
+            // mismatch row and carries the pre-sweep blocking list.
+            let blocking = project_blocking(document, store, now)
+                .await
+                .map_err(ConsultFault::Fault)?;
+            Err(ConsultFault::Expired(blocking))
+        }
+        Err(RehydrateError::Store(detail)) | Err(RehydrateError::Document(detail)) => {
+            Err(ConsultFault::Fault(Diagnostic::new(detail)))
+        }
+        Err(err @ (RehydrateError::NotFound | RehydrateError::ConfigChanged)) => {
+            // Structurally unreachable: the document was located and
+            // fingerprint-checked before the consult. Refuse loudly rather
+            // than invent a row.
+            Err(ConsultFault::Fault(Diagnostic::new(format!(
+                "the recorded-decisions consult reported an unreachable condition: {err}"
+            ))))
+        }
+    }
 }
 
 /// Project the run's outstanding parked calls onto blocking entries. The
 /// expired and parked rows are unreachable without at least one outstanding
-/// call, so an empty projection is a fault, not an empty body.
-#[expect(unused_variables, reason = "todo!() body; filled by P45")]
+/// call, so an empty projection is a fault, not an empty body. Outstanding
+/// means undecided in the store: a call decided since the park commit is
+/// settled and blocks nobody, while a ticket a remote TTL swept is still
+/// outstanding — the expired row's pre-sweep list. Every entry carries the
+/// document's window stamp, the bound the human decision was held to.
 async fn project_blocking(
     document: &ParkedRun,
     store: &PendingApprovals,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<NonEmptyBlocking, Diagnostic> {
-    todo!()
+    let expires_at = chrono::DateTime::parse_from_rfc3339(&document.expires_at)
+        .map_err(|e| Diagnostic::new(format!("bad expiry stamp on the parked document: {e}")))?
+        .with_timezone(&chrono::Utc);
+    let mut entries = Vec::new();
+    for node in &document.plan.tasks {
+        let crate::orchestration::types::TaskStatus::AwaitingApproval = node.status else {
+            continue;
+        };
+        let Some(pending) = &node.pending else {
+            continue;
+        };
+        for call in pending {
+            if store.recorded_decision(&call.decision_id).await.is_none() {
+                entries.push(BlockingEntry {
+                    decision_id: call.decision_id,
+                    tool: ParkedToolName::new(call.tool_name.as_str()),
+                    expires_at,
+                });
+            }
+        }
+    }
+    NonEmptyBlocking::try_new(entries).map_err(|EmptyBlocking| {
+        Diagnostic::new(format!(
+            "the blocking projection found no outstanding parked calls as of {now}"
+        ))
+    })
 }
 
 /// Take the claim and rename the parked document to its resuming name as
-/// one step, then assemble the grant.
-#[expect(unused_variables, reason = "todo!() body; filled by P45")]
+/// one step, then assemble the grant. A claim lost to a concurrent
+/// evaluation between `check_claim` and here maps to the running row.
 async fn authorize(
     docs: &ResumeDocuments,
     claims: &ResumeClaimTable,
@@ -472,16 +596,95 @@ async fn authorize(
     document: ParkedRun,
     recorded: Arc<RecordedDecisions>,
 ) -> Result<ResumeGrant, ClaimResumeFault> {
-    todo!()
+    let lease = claims.claim_and_resume(docs).await?;
+    Ok(ResumeGrant {
+        lease,
+        documents: docs.clone(),
+        document,
+        recorded,
+        session: evaluation_path.session.clone(),
+        run: evaluation_path.run.clone(),
+    })
 }
 
 /// Evaluate a run against the ordered table and either authorize the
-/// claim-and-segment or refuse with the first matching row.
-#[expect(unused_variables, reason = "todo!() body; filled by P45")]
+/// claim-and-segment or refuse with the first matching row. An expired
+/// refusal tears the run down before rendering: the checkpoint is unlinked
+/// and the run's undecided tickets are swept under the bundle's request id,
+/// so the row the client sees matches the state left behind.
 pub async fn evaluate_resume(
     evaluation: ResumeEvaluation<'_>,
 ) -> Result<ResumeGrant, ResumeRefusal> {
-    todo!()
+    let ResumeEvaluation {
+        path,
+        memory_dir,
+        config,
+        store,
+        claims,
+        bind_identity,
+        presented_identity,
+        request_id,
+        now,
+    } = evaluation;
+    let docs = ResumeDocuments::for_path(&path, memory_dir);
+
+    let located = locate_checkpoint(&docs).await?;
+
+    // The stored hash is parsed before the comparison, so a malformed stamp
+    // faults instead of silently mismatching.
+    let stored = match &located {
+        LocatedCheckpoint::Parked { document } | LocatedCheckpoint::Resuming { document } => {
+            match document.identity_hash.as_deref() {
+                Some(raw) => Some(IdentityHash::from_stored(raw).map_err(IdentityFault::Fault)?),
+                None => None,
+            }
+        }
+    };
+    check_identity(stored, bind_identity, presented_identity)?;
+
+    check_claim(claims, &path.run)?;
+
+    let document = admit(located, &docs, claims).await?;
+
+    check_fingerprint(&document, config)?;
+
+    let recorded = match consult_decisions(&document, store, now).await {
+        Ok(recorded) => recorded,
+        Err(ConsultFault::Expired(blocking)) => {
+            let parked_path = docs.parked().to_path_buf();
+            let parked_display = parked_path.display().to_string();
+            let removed = tokio::task::spawn_blocking(move || std::fs::remove_file(&parked_path))
+                .await
+                .map_err(|e| {
+                    ResumeRefusal::Fault(Diagnostic::new(format!(
+                        "the expired checkpoint's unlink task did not complete: {e}"
+                    )))
+                })?;
+            match removed {
+                Ok(()) => {}
+                // Already gone: the teardown stays idempotent for a retried
+                // resume of the same expired run.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(ResumeRefusal::Fault(Diagnostic::new(format!(
+                        "unlinking the expired checkpoint {parked_display} failed: {e}"
+                    ))));
+                }
+            }
+            if let Err(e) = cancel_run_approvals(store, &path.run.to_string(), &request_id).await {
+                return Err(ResumeRefusal::Fault(Diagnostic::new(format!(
+                    "the approval sweep for the expired run did not complete: {e}"
+                ))));
+            }
+            return Err(ResumeRefusal::Conflict(ResumeConflictRow::expired(
+                blocking,
+            )));
+        }
+        Err(fault) => return Err(fault.into()),
+    };
+
+    let grant = authorize(&docs, claims, &path, document, recorded).await?;
+    Ok(grant)
 }
 
 /// The turns of one executed segment, in order; never empty.
