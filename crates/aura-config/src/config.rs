@@ -579,12 +579,24 @@ fn no_inner_bound_warning(
 }
 
 /// Reject `bind_identity` without an `identity_header` to hash.
-#[expect(unused_variables, reason = "todo!() body; filled by P45")]
 fn require_identity_header_for_binding(
     bind_identity: bool,
     identity_header: Option<&str>,
 ) -> Result<(), crate::ConfigError> {
-    todo!()
+    if !bind_identity {
+        return Ok(());
+    }
+    // An empty header name can never match a presented request header, so it
+    // would silently unbind every checkpoint — refused like a missing name.
+    let Some(_) = identity_header.filter(|name| !name.is_empty()) else {
+        return Err(crate::ConfigError::Validation(
+            "`[hitl.park].bind_identity = true` requires the top-level `identity_header` to be \
+             set: identity binding hashes the presented header's value and has nothing to hash \
+             without it"
+                .to_string(),
+        ));
+    };
+    Ok(())
 }
 
 /// Warn when the inactivity window cannot fire before the per-call budget.
