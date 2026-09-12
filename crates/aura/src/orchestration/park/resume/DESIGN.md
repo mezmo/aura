@@ -40,6 +40,7 @@ everything with behavior. The public surface lives in
 | `SegmentTurns` | A segment — completed or parked — carries at least one turn | An empty `turns` array on the 200 body |
 | `SegmentResult` | A segment ends completed or parked, never both | A success body with `blocking` on a completed segment |
 | `SegmentError` | Mid-segment faults are distinct from refusals | A resume fault rendering as an evaluation verdict |
+| `PeekOutcome` | The substitution pre-flight's verdict per decided call: the recorded entry exists and is executable — a denial never needs identity, an approval under an identity-demanding route must carry it | A pre-flight that consumes; a consumption assumed from a passed pre-flight |
 | `evaluate_resume` | First matching row wins; each stage's fault type admits only its own rows (row purity is structural); the stage sequence is the body's | A verdict from a foreign stage's fault type; sequence drift, which the Layer-2 golden tests pin |
 | `run_segment` | One call = one segment; atomic data, no mid-segment streaming | Partial streaming of a segment's turns |
 
@@ -254,5 +255,72 @@ surface — stream-derived `SegmentTurns` only — supports re-deriving it
 without widening the seam beyond the card's files. The projection falls
 back to the stream item's own id, the same value the live SSE stream
 emits for the same call (never null, never fabricated); the loss is real
-only for providers where the responses-API-style `call_id` differs from the
-item id. This is the recorded spec gap for Gate U.
+only for providers where the responses-API-style `call_id` differs from
+the item id. This is the recorded spec gap for Gate U.
+
+## The P45 correction fold (dispatch unit B1, 2026-09-12)
+
+The Gate M live leg proved the resume mechanics and failed the core
+acceptance bullet: a resumed segment holding a recorded APPROVAL
+returned 200 `completed` without executing the call —
+`drive_resume_segment` re-streamed the checkpointed `current_prompt`
+unchanged, the worker acted on the stale park placeholder, and the
+placeholder forbids re-issue. The fold lifts `resume_task`'s proven
+substitution sequence into the production segment driver.
+
+What changed, per awaiting node, before the continuation streams (the
+plan of record's fix contract):
+
+- **The substitution prelude** (`drive_resume_segment`): the strict guard
+  arms for the task; every decided call pre-flights non-consumingly
+  through `RecordedDecisions::peek` (entry presence plus the identity
+  rule, `requires_identity` from the route — the same source the gate's
+  `recorded_pre_call` consults); a `Missing` or `IdentityBlocked` peek
+  is a fatal `SegmentError` before any tombstone or invocation. Each
+  decided call then tombstones through the resuming document's
+  `append_executed_and_publish` (durable — the `interrupted` row's
+  once-only evidence), invokes through the worker's gated pipeline
+  (`call_tool`: `recorded_pre_call` consumes the decision — approved
+  executes once under the recorded identity, denied short-circuits with
+  the live denial text and never executes), and `replace_tool_result`
+  swaps the real outcome for the placeholder in `current_prompt`, keyed
+  by `PendingCall.call_id`. The strict guard drops before streaming, so
+  a genuinely new gated call afterward re-parks through the live arm. An
+  ordinary execution `Err` out of `call_tool` is result text for the
+  model (the live loop's raw Err-branch rendering); the bookkeeping
+  faults — the pre-flight blocks, the tombstone write, a replace miss —
+  stay fatal, distinguished by where the error arises, never by
+  string-matching on error text.
+- **The consumed-subset re-park cleanup**: the consumed set derives from
+  the recorded set's before/after presence per call (a peek around each
+  invocation), never from a passed pre-flight. A re-park removes only
+  the actually-consumed subset from the store, after the commit
+  published (`commit_from_run_state` + `mark_published`), so untouched
+  sibling nodes keep their recorded approvals; completion keeps removing
+  the consult-loaded set, where consumed equals loaded.
+- **R2's outcome turns**: per decided call, the segment's turns gain the
+  assistant tool-call turn plus the tool-result turn — keyed by the
+  original call id (`ToolCall.id` with `call_id: null`; `ToolResult.id`
+  with `call_id: None`), carrying the outcome in its wire rendering
+  (JSON-quoted on the Ok and denial paths, raw on the execution-Err
+  path) — ahead of the node's continuation turns, in segment order.
+  The envelope is unchanged, and the placeholder appears nowhere in a
+  decided resume's context or turns.
+
+Type → rule map update: the `PeekOutcome` row added to the table above —
+the fold's one new seam (landed as dispatch unit B0), with the fault
+mapping owned by the prelude and pinned by the A3 frames' diagnostics.
+
+### Timeout audit note (directive 5; codex-verified) — plan of record, verbatim
+
+No configuration strands a parked run before its decisions expire: no
+idle-park reaper exists; checkpoint expiry is the earliest surviving
+UNDECIDED approval's `expires_at`, decided entries bypass the
+calculation, fallback `now + decision_window` (commit.rs:97-110,
+146-150); the resume stream runs `Duration::MAX` plus the inactivity
+collector; the HTTP 120-second timeout is A2A-only (server.rs:594). Two
+liveness limits are documented, not fixed: (a) a hung first provider
+response holds the claim, so later resumes answer 409 `running` with no
+expiry-based release (`check_claim` precedes the consult,
+evaluate.rs:677-683); (b) the substitution's `call_tool` executions run
+before the stream starts, outside `per_call_timeout`.
