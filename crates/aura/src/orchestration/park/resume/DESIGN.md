@@ -13,6 +13,7 @@ everything with behavior. The public surface lives in
 | `claim.rs` | Path-segment parse types, checkpoint document locations, the per-run claim table and its lease |
 | `evaluate.rs` | Presented-identity resolution, blocking entries (plain and non-empty), the refusal rows, the ordered evaluation stages, the grant, the segment seam |
 | `mod.rs` | Re-exports; the `#![allow(dead_code)]` slice for the skeleton |
+| `orchestrator.rs` (outside this directory, by ruling) | The segment entry `Orchestrator::run_resume_segment`: the segment loop `run_segment` delegates to — run-id binding, continuation streaming, re-park commit, completion teardown |
 
 ## Type → business rule → forbidden invalid state
 
@@ -128,24 +129,39 @@ Two duties ride on specific stages:
 | `ResumeDocuments::parked`/`resuming`, `Diagnostic::new`, `IdentityHash::from_stored`, `ParkedToolName::new`, `ResumeConflictRow` row constructors | `pub(crate)` | in-crate stages and the handler-side projections |
 | `config_fingerprint`, `parked_document_dir` | `pub(crate)` in `park::commit`, reached as `super::super::commit::*` | `check_fingerprint`, `ResumeDocuments::for_path` |
 | `RecordedDecisions`, `ParkedRun` | `pub(crate)` types behind private `ResumeGrant` fields | the in-crate segment runner; opaque to the web server |
+| `ResumeGrant::checkpoint`/`recorded_decisions`/`consumed_decisions`/`documents` | `pub(crate)` accessors over the private fields | the orchestrator's segment entry |
+| `Orchestrator::run_resume_segment` | `pub(super)` associated fn on the orchestrator (no blanket visibility opening) | `run_segment`, which is a thin delegation |
+| `Orchestrator::for_resume_segment`, `drive_resume_segment`, `collect_segment_turns`, the segment helpers | private to `orchestrator.rs` | the entry only |
+| `ExecutionPersistence::resume` | `pub` constructor in `persistence.rs` | `for_resume_segment`: seeds the checkpoint's existing `(run_id, session_id, iteration)` instead of minting a fresh run id |
+| `ParkCommitInputs::identity_hash` | `pub(crate)` field on the park commit inputs | the park path (write side of `bind_identity`); a re-park passes the checkpoint's stored value through |
 | `ResumeGrant::session_id`/`run_id` | `pub` accessors | the endpoint's 200 body |
 | `ResumeRunResponse`, `ResumeRunState`, `refusal_response`, `continuation_turns`, `from_segment` | private in `handlers.rs` under per-item `#[allow(dead_code)]` | wired when the handler body lands |
 | Test-only accessors | none added | existing `#[cfg(test)]` accessors in the park module are untouched |
 
 The `#![allow(dead_code)]` at `resume/mod.rs` covers exactly the new module;
-the per-item `#[allow(dead_code)]` markers in `handlers.rs` cover exactly
+with every body landed it survives for three structural survivors only —
+the grant's Drop-held lease, `FingerprintFault::Fault` (stage-shape
+symmetry; the fingerprint stage cannot fault), and the goldens' TempDir
+kept alive for cleanup — and is not removable at the handler fill. The
+per-item `#[allow(dead_code)]` markers in `handlers.rs` cover exactly
 the five not-yet-wired projections. Existing allows in `continuation.rs`
 (:51, :124, :202), `document.rs` (:226), and `park/mod.rs` (:15) are
 untouched, per the card.
 
 ## Residual risks
 
-- **Identity-hash write side is unplumbed.** `ParkedRun.identity_hash` is
-  read by the evaluation, but `build_document` writes `None`: populating it
-  at park commit requires an identity hash on `ParkCommitInputs`, whose
-  construction lives in `orchestrator.rs` — outside this card's scope.
-  Until it lands, `bind_identity = true` fails every resume of a
-  None-hash document closed (404 row), which is safe but useless.
+- **Identity-hash write side.** `ParkCommitInputs::identity_hash` and
+  `build_document`'s parameter are landed: a re-park passes the checkpoint's
+  stored hash through, so a bound run stays bound across segments, and the
+  `None` form keeps the v1 wire unchanged (the round-trip calibration stays
+  green). The ORIGINAL park's `Some` branch — hashing the presented identity
+  header at park time when `[hitl.park].bind_identity` is configured — is
+  not yet reachable: the runtime `AgentRuntimeConfig` carries neither the
+  bind flag nor the presented header value, and the ruled scope keeps
+  `hitl/route.rs` free of a `HitlRuntime` extension. Until that threading
+  lands, the live park path commits `None`, and `bind_identity = true`
+  fails every resume of a None-hash document closed (404 row), which is
+  safe but useless.
 - **Expired row's blocking list is a re-derivation, not the consult's
   output.** `load_recorded_decisions` returns `RehydrateError::Expired`
   without the outstanding set; `project_blocking` re-derives it from the
@@ -194,8 +210,16 @@ untouched, per the card.
 | `park/resume/evaluate.rs` | `project_blocking` — filled |
 | `park/resume/evaluate.rs` | `authorize` — filled |
 | `park/resume/evaluate.rs` | `evaluate_resume` — filled |
-| `park/resume/evaluate.rs:744` | `run_segment` |
+| `park/resume/evaluate.rs:744` | `run_segment` — filled (thin delegation to `Orchestrator::run_resume_segment`) |
 | `aura-config/src/config.rs:587` | `require_identity_header_for_binding` |
 | `aura-web-server/src/server.rs:312` | `refuse_park_on_memory_backend` |
 | `aura-web-server/src/handlers.rs:1403` | `continuation_turns` |
 | `aura-web-server/src/handlers.rs:1441` | `resume_run` (handler dispatch) |
+
+With `run_segment` filled, the resume-module inventory is closed: every
+`park/resume/` row above is filled. The remaining rows (`aura-config`,
+`aura-web-server`) belong to the config-validation and handler units and
+stay open here until their own fills land. The unit also landed the
+identity-hash write side with no new holes: `ParkCommitInputs::identity_hash`
+(commit.rs) and `build_document`'s matching parameter (document.rs) are
+implemented bodies, and the orchestrator's segment entry carries none.

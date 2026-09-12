@@ -41,6 +41,7 @@
 //! - `IterationComplete` - when the post-execute coordinator decision completes
 //! - `Synthesizing` - when task results are being consolidated for the coordinator
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -62,14 +63,18 @@ use super::tools::{InspectToolParamsTool, ListToolsTool, ReadArtifactTool};
 
 use super::config::OrchestrationConfig;
 use super::events::OrchestratorEvent;
+use super::park::resume::{
+    BlockingEntry, Diagnostic, EmptyBlocking, EmptySegment, NonEmptyBlocking, ParkedToolName,
+    ResumeGrant, SegmentError, SegmentResult, SegmentTurns,
+};
 use super::park::{
-    ParkGuard, ParkedTaskRecord, ParkedTaskRecords, RecordedDecisions, ResumeContext,
-    TaskContinuation,
+    ParkCommitInputs, ParkGuard, ParkedRun, ParkedTaskRecord, ParkedTaskRecords, RecordedDecisions,
+    ResumeContext, RunStateForPark, TaskContinuation, commit_from_run_state,
 };
 use super::persistence::ExecutionPersistence;
 use super::types::{
     BlockedCell, CellOutcome, FailedTaskRecord, FailureCategory, FailureSummary, IterationContext,
-    IterationOutcome, IterationTimings, ParkSnapshot, PendingCall, Plan, PlanningResponse,
+    IterationOutcome, IterationTimings, ParkSnapshot, PendingCall, Plan, PlanningResponse, Task,
     TaskState, TaskStatus,
 };
 
@@ -185,6 +190,100 @@ fn apply_worker_skills_override(
             crate::config::WorkerSkills::Override(skills) => skills.clone(),
         };
     }
+}
+
+/// The re-park commit's plan: the checkpoint's tasks reconstructed with
+/// their committed states, so the commit starts from what the run had and
+/// only the segment's own outcomes overwrite nodes.
+fn segment_plan(checkpoint: &ParkedRun) -> Plan {
+    let mut plan = Plan::new(checkpoint.query.clone());
+    plan.steps = checkpoint.plan.steps.clone();
+    for node in &checkpoint.plan.tasks {
+        let mut task = Task::new(
+            node.task_id,
+            node.description.clone(),
+            node.rationale.clone(),
+        );
+        task.dependencies = node.dependencies.clone();
+        task.worker = node.worker.clone();
+        task.state = match node.status {
+            TaskStatus::AwaitingApproval => TaskState::AwaitingApproval {
+                pending: node.pending.clone().unwrap_or_default(),
+            },
+            TaskStatus::Complete => TaskState::Complete {
+                result: node.result.clone().unwrap_or_default(),
+            },
+            TaskStatus::Failed => TaskState::Failed {
+                error: node.error.clone().unwrap_or_default(),
+                category: node.failure_category.unwrap_or_default(),
+            },
+            TaskStatus::Pending | TaskStatus::Running => TaskState::Pending,
+        };
+        plan.add_task(task);
+    }
+    plan
+}
+
+/// The turns a parked segment produced: rig appends each turn's assistant
+/// message to the streamed history, so the assistant messages beyond the
+/// checkpoint's history are exactly this segment's turns — at full wire
+/// fidelity, which the stream's own items cannot restore for a tool call's
+/// provider call_id.
+fn segment_turns_since(
+    checkpoint: &ParkedRun,
+    task_id: usize,
+    snapshot: &ParkSnapshot,
+) -> Result<Vec<rig::completion::Message>, SegmentError> {
+    let prior = checkpoint
+        .plan
+        .tasks
+        .iter()
+        .find(|n| n.task_id == task_id)
+        .and_then(|n| n.history.as_ref().map(Vec::len))
+        .ok_or_else(|| {
+            SegmentError::Continuation(Diagnostic::new(format!(
+                "awaiting task {task_id} carries no history in the checkpoint"
+            )))
+        })?;
+    let Some(tail) = snapshot.history.get(prior..) else {
+        return Err(SegmentError::Continuation(Diagnostic::new(format!(
+            "the parked snapshot for task {task_id} carries {} history messages, fewer than \
+             the checkpoint's {prior}",
+            snapshot.history.len()
+        ))));
+    };
+    Ok(tail
+        .iter()
+        .filter(|m| matches!(m, rig::completion::Message::Assistant { .. }))
+        .cloned()
+        .collect())
+}
+
+/// Flush one accumulated turn (text plus tool calls) into the segment's
+/// turn list; empty accumulators produce nothing.
+fn flush_segment_turn(
+    text: &mut String,
+    calls: &mut Vec<rig::message::ToolCall>,
+    turns: &mut Vec<rig::completion::Message>,
+) {
+    if text.is_empty() && calls.is_empty() {
+        return;
+    }
+    let mut pieces = Vec::<rig::message::AssistantContent>::new();
+    if !text.is_empty() {
+        pieces.push(rig::message::AssistantContent::Text(rig::message::Text {
+            text: std::mem::take(text),
+        }));
+    }
+    pieces.extend(
+        calls
+            .drain(..)
+            .map(rig::message::AssistantContent::ToolCall),
+    );
+    turns.push(rig::completion::Message::Assistant {
+        id: None,
+        content: rig::OneOrMany::many(pieces).expect("turn carries content"),
+    });
 }
 
 /// Spawns a task that monitors for external cancellation or timeout,
@@ -544,10 +643,6 @@ impl Orchestrator {
             None
         };
 
-        // Tool call observer for real-time streaming. The _rx receiver is consumed
-        // by spawn_tool_event_forwarder in factory.rs when the stream starts.
-        let (tool_call_observer, _rx) = ToolCallObserver::new(32);
-
         // Initialize execution persistence for debugging and retry intelligence.
         let effective_memory_dir = agent_config.effective_memory_dir();
         let persistence = if let Some(memory_dir) = effective_memory_dir {
@@ -565,6 +660,85 @@ impl Orchestrator {
             tracing::info!("Orchestrator: Persistence disabled (no memory_dir configured)");
             Arc::new(Mutex::new(ExecutionPersistence::disabled()))
         };
+
+        Ok(Self::assemble(agent_config, orchestration_config, mcp_manager, persistence).await)
+    }
+
+    /// Bind an orchestrator to a checkpointed run for one resume segment.
+    /// Persistence is seeded with the checkpoint's existing
+    /// `(run_id, session_id)` instead of minting a fresh run id, so
+    /// everything the segment stamps — worker approval scopes, a re-park's
+    /// tickets and commit, the guard's sweep — names the run the checkpoint
+    /// belongs to and the next resume's consult matches it.
+    async fn for_resume_segment(
+        grant: &ResumeGrant,
+        config: &AgentRuntimeConfig,
+    ) -> Result<Self, SegmentError> {
+        let fault = |message: String| SegmentError::Continuation(Diagnostic::new(message));
+        let orchestration_config = config.orchestration.clone().unwrap_or_default();
+
+        // Initialize MCP manager (shared across coordinator and all workers via Arc)
+        let mcp_manager = if let Some(ref mcp_config) = config.mcp {
+            Some(Arc::new(
+                McpManager::initialize_from_config(mcp_config)
+                    .await
+                    .map_err(|e| {
+                        fault(format!(
+                            "the resume segment's MCP connections failed to initialize: {e}"
+                        ))
+                    })?,
+            ))
+        } else {
+            None
+        };
+
+        let checkpoint = grant.checkpoint();
+        let Some(memory_dir) = config.effective_memory_dir().map(str::to_string) else {
+            return Err(fault(
+                "the resume segment has no memory_dir configured; the checkpoint cannot bind \
+                 to a run"
+                    .to_string(),
+            ));
+        };
+        let persistence = Arc::new(Mutex::new(
+            ExecutionPersistence::resume(
+                memory_dir,
+                checkpoint.session_id.clone(),
+                &checkpoint.run_id,
+                checkpoint.iteration,
+            )
+            .await
+            .map_err(|e| {
+                fault(format!(
+                    "the resume segment could not bind persistence to run {}: {e}",
+                    checkpoint.run_id
+                ))
+            })?,
+        ));
+
+        Ok(Self::assemble(
+            config.clone(),
+            orchestration_config,
+            mcp_manager,
+            persistence,
+        )
+        .await)
+    }
+
+    /// Shared constructor tail of [`Self::new`] and
+    /// [`Self::for_resume_segment`]: the observer, the orchestrator id, and
+    /// the park guard — armed under the persistence-bound run id, so a
+    /// resume-bound orchestrator sweeps and re-parks against the
+    /// checkpointed run.
+    async fn assemble(
+        agent_config: AgentRuntimeConfig,
+        orchestration_config: OrchestrationConfig,
+        mcp_manager: Option<Arc<McpManager>>,
+        persistence: Arc<Mutex<ExecutionPersistence>>,
+    ) -> Self {
+        // Tool call observer for real-time streaming. The _rx receiver is consumed
+        // by spawn_tool_event_forwarder in factory.rs when the stream starts.
+        let (tool_call_observer, _rx) = ToolCallObserver::new(32);
 
         let orchestrator_id = uuid::Uuid::new_v4().to_string();
 
@@ -595,7 +769,7 @@ impl Orchestrator {
             orchestration_config.max_plan_parse_retries,
         );
 
-        Ok(Self {
+        Self {
             orchestrator_id,
             config: orchestration_config,
             agent_config,
@@ -605,7 +779,7 @@ impl Orchestrator {
             usage_state: crate::UsageState::new(),
             outer_budget: None,
             park_guard,
-        })
+        }
     }
 
     /// Create a worker agent for task execution.
@@ -4086,6 +4260,428 @@ Assign tasks to the worker whose tools best match the required operations."#,
         }))
     }
 
+    // ====================================================================
+    // Resume segment: the endpoint's production segment driver (P45)
+    // ====================================================================
+
+    /// Execute one resume segment for a granted run: the decided approvals'
+    /// next agent turns, until the run completes or a new approval-required
+    /// call parks. This is the implementing side of the resume module's
+    /// `run_segment`. The grant's claim lease releases when the segment
+    /// ends, and the returned data is the terminal segment — atomic, with no
+    /// streaming to the client mid-segment.
+    pub(super) async fn run_resume_segment(
+        grant: ResumeGrant,
+        config: &AgentRuntimeConfig,
+        headers: &HashMap<String, String>,
+    ) -> Result<SegmentResult, SegmentError> {
+        // The endpoint rebuilds the orchestrator from config plus this
+        // request's headers, so `[hitl.route] headers_from_request`-style
+        // MCP mappings resolve against the resume caller.
+        let mut config = config.clone();
+        if let Some(ref mut mcp_config) = config.mcp {
+            crate::rig_builder::resolve_mcp_headers_in(mcp_config, Some(headers));
+        }
+        let orchestrator = Self::for_resume_segment(&grant, &config).await?;
+        orchestrator.drive_resume_segment(grant).await
+    }
+
+    /// Drive the granted run's segment: each awaiting node's checkpointed
+    /// conversation streams with the recorded decisions armed at the gate —
+    /// the model re-issues the gated call and the gate applies its recorded
+    /// decision — until every node completes or a node re-parks. On
+    /// completion the resuming document is deleted and the consumed
+    /// decisions leave the store; on a re-park the publish-then-unlink
+    /// commit supersedes the resuming shadow with the refreshed checkpoint,
+    /// stamped with the checkpoint's own run id. The grant is held for the
+    /// whole segment so the claim lease outlives every await.
+    async fn drive_resume_segment(self, grant: ResumeGrant) -> Result<SegmentResult, SegmentError> {
+        let fault = |message: String| SegmentError::Continuation(Diagnostic::new(message));
+        let Some(hitl) = self.agent_config.hitl.clone() else {
+            return Err(fault(
+                "the resume segment requires the HITL runtime".to_string(),
+            ));
+        };
+        let Some((registry, decision_window)) = hitl.route.park_registry() else {
+            return Err(fault(
+                "the resume segment requires a park-capable decision route".to_string(),
+            ));
+        };
+        let Some(memory_dir) = self.agent_config.effective_memory_dir().map(str::to_string) else {
+            return Err(fault(
+                "the resume segment has no memory_dir configured; no checkpoint can be written"
+                    .to_string(),
+            ));
+        };
+
+        let checkpoint = grant.checkpoint().clone();
+        let recorded = grant.recorded_decisions().clone();
+        let documents = grant.documents().clone();
+
+        // The re-park commit starts from the checkpoint's plan; driven nodes
+        // overwrite their own state as the segment runs. Every awaiting
+        // node's park record the commit needs is seeded from the checkpoint,
+        // and a re-parked node's record is overwritten with the fresh
+        // snapshot before the commit runs.
+        let mut plan = segment_plan(&checkpoint);
+        let mut records = ParkedTaskRecords::new();
+        for node in checkpoint
+            .plan
+            .tasks
+            .iter()
+            .filter(|n| matches!(n.status, TaskStatus::AwaitingApproval))
+        {
+            let attempt = node.attempt.ok_or_else(|| {
+                fault(format!(
+                    "awaiting task {} carries no attempt in the checkpoint",
+                    node.task_id
+                ))
+            })?;
+            let history = node.history.clone().ok_or_else(|| {
+                fault(format!(
+                    "awaiting task {} carries no history in the checkpoint",
+                    node.task_id
+                ))
+            })?;
+            let current_prompt = node.current_prompt.clone().ok_or_else(|| {
+                fault(format!(
+                    "awaiting task {} carries no tool-result prompt in the checkpoint",
+                    node.task_id
+                ))
+            })?;
+            records.insert(
+                node.task_id,
+                ParkedTaskRecord {
+                    attempt,
+                    snapshot: ParkSnapshot {
+                        history,
+                        current_prompt,
+                    },
+                },
+            );
+        }
+        let mut turns = Vec::new();
+
+        for node in checkpoint
+            .plan
+            .tasks
+            .iter()
+            .filter(|n| matches!(n.status, TaskStatus::AwaitingApproval))
+        {
+            let task_id = node.task_id;
+            let worker_name = node.worker.as_deref();
+            let ParkedTaskRecord { attempt, snapshot } = records
+                .get(&task_id)
+                .expect("every awaiting node was seeded with a park record")
+                .clone();
+            let ParkSnapshot {
+                history,
+                current_prompt,
+            } = snapshot;
+
+            let Some(park) = self.worker_park(task_id, attempt) else {
+                return Err(fault(
+                    "cannot resume a segment without park mode enabled".to_string(),
+                ));
+            };
+            let AgentWithPreamble {
+                agent: worker,
+                submit_result_decision,
+                ..
+            } = self
+                .create_worker(
+                    task_id,
+                    attempt,
+                    worker_name,
+                    Some(&park.cell),
+                    Some(&recorded),
+                )
+                .await
+                .map_err(|e| {
+                    fault(format!(
+                        "the resume worker for task {task_id} failed to build: {e}"
+                    ))
+                })?;
+
+            let park_registration = crate::streaming_request_hook::ParkCellRegistration::new(
+                &park.key,
+                park.cell.clone(),
+            );
+            let (stream, _cancel_tx, _usage_state) = worker
+                .inner
+                .stream_chat_message_with_timeout(
+                    current_prompt,
+                    history,
+                    worker.max_depth,
+                    Duration::MAX,
+                    &park.key,
+                    worker.scratchpad_budget.clone(),
+                    worker.client_tool_names.clone(),
+                )
+                .await;
+            let srd = submit_result_decision.clone();
+            let stream_result = Self::collect_segment_turns(
+                stream,
+                &self.usage_state,
+                self.config.stream_inactivity_timeout_secs(),
+                worker.scratchpad_budget.as_ref(),
+                move || {
+                    let srd = srd.clone();
+                    Box::pin(async move { srd.lock().await.is_some() })
+                },
+            )
+            .await;
+            drop(park_registration);
+
+            // Same cell contract as the live path: the cell is the source of
+            // truth after any stream end, the park cancel's Err included.
+            match park.cell.outcome() {
+                CellOutcome::Blocked { pending } => {
+                    let snapshot = park
+                        .cell
+                        .snapshot()
+                        .expect("cell outcome Blocked implies a captured snapshot");
+                    // The parked node's turns come from the snapshot at full
+                    // wire fidelity; the stream collector's assembly drops a
+                    // tool call's provider call_id.
+                    turns.extend(segment_turns_since(&checkpoint, task_id, &snapshot)?);
+                    let task = plan
+                        .get_task_mut(task_id)
+                        .expect("the segment plan carries the checkpoint's task ids");
+                    task.state = TaskState::AwaitingApproval {
+                        pending: pending.clone(),
+                    };
+                    records.insert(task_id, ParkedTaskRecord { attempt, snapshot });
+
+                    let inputs = ParkCommitInputs {
+                        state: RunStateForPark {
+                            run_id: &checkpoint.run_id,
+                            session_id: checkpoint.session_id.as_deref(),
+                            query: &checkpoint.query,
+                            chat_history: &checkpoint.chat_history,
+                            coordinator_conversation: &checkpoint.coordinator_conversation,
+                            routing_decision: checkpoint.routing_decision.as_ref(),
+                            iteration: checkpoint.iteration,
+                            planning_ms: checkpoint.planning_ms,
+                            failure_history: &checkpoint.failure_history,
+                        },
+                        plan: &plan,
+                        records: &records,
+                        registry,
+                        memory_dir: &memory_dir,
+                        config: &self.agent_config,
+                        decision_window,
+                        // The checkpoint's binding rides forward: the
+                        // re-parked document compares against the same
+                        // identity the original park bound.
+                        identity_hash: checkpoint.identity_hash.clone(),
+                    };
+                    let commit = commit_from_run_state(&inputs)
+                        .await
+                        .map_err(|e| fault(format!("the re-park commit failed: {e}")))?;
+                    if let Some(ref guard) = self.park_guard {
+                        guard.mark_published();
+                    }
+
+                    let expires_at = chrono::DateTime::parse_from_rfc3339(&commit.expires_at)
+                        .map_err(|e| {
+                            fault(format!("the re-park commit stamped a bad expiry: {e}"))
+                        })?
+                        .with_timezone(&chrono::Utc);
+                    let mut blocking = Vec::new();
+                    for task in &plan.tasks {
+                        let Some(pending) = commit.refreshed.pending_by_task.get(&task.id) else {
+                            continue;
+                        };
+                        for call in pending {
+                            blocking.push(BlockingEntry {
+                                decision_id: call.decision_id,
+                                tool: ParkedToolName::new(call.tool_name.as_str()),
+                                expires_at,
+                            });
+                        }
+                    }
+                    let blocking =
+                        NonEmptyBlocking::try_new(blocking).map_err(|EmptyBlocking| {
+                            fault("the re-park committed with no outstanding calls".to_string())
+                        })?;
+                    let turns = SegmentTurns::try_new(turns).map_err(|EmptySegment| {
+                        fault("the re-parked segment carried no turns".to_string())
+                    })?;
+                    return Ok(SegmentResult::Parked { turns, blocking });
+                }
+                CellOutcome::Orphaned { pending } => {
+                    self.cancel_parked_approvals(task_id, worker_name, &pending)
+                        .await;
+                    let underlying = match stream_result.as_ref() {
+                        Err(e) => format!(" Underlying error: {e}"),
+                        Ok(_) => String::new(),
+                    };
+                    return Err(fault(format!(
+                        "the resume stream ended before the parked approval snapshot was \
+                         captured for task {task_id}; {} pending approval(s) cancelled.\
+                         {underlying}",
+                        pending.len()
+                    )));
+                }
+                CellOutcome::Normal => {
+                    let (node_turns, content) = stream_result.map_err(|e| {
+                        fault(format!("the resume stream for task {task_id} failed: {e}"))
+                    })?;
+                    turns.extend(node_turns);
+                    let structured = submit_result_decision.lock().await.take();
+                    let result = structured.map(|output| output.result).unwrap_or(content);
+                    let task = plan
+                        .get_task_mut(task_id)
+                        .expect("the segment plan carries the checkpoint's task ids");
+                    task.state = TaskState::Complete { result };
+                }
+            }
+        }
+
+        // Every awaiting node completed: the checkpoint is the record only
+        // until the segment ends — delete the resuming document (the
+        // manifest is the record), then release the consumed decisions from
+        // the store, whose file backend retains them until removed.
+        let resuming = documents.resuming().to_path_buf();
+        let removed = tokio::task::spawn_blocking(move || std::fs::remove_file(&resuming))
+            .await
+            .map_err(|e| fault(format!("the checkpoint unlink task did not complete: {e}")))?;
+        match removed {
+            Ok(()) => {}
+            // Already gone: the deletion stays idempotent.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(fault(format!(
+                    "deleting the resuming checkpoint {} failed: {e}",
+                    documents.resuming().display()
+                )));
+            }
+        }
+        for id in grant.consumed_decisions() {
+            registry.remove(id).await;
+        }
+
+        let turns = SegmentTurns::try_new(turns)
+            .map_err(|EmptySegment| fault("the completed segment carried no turns".to_string()))?;
+        Ok(SegmentResult::Completed { turns })
+    }
+
+    /// Collect the segment's turns from one continuation stream: the
+    /// assistant messages the worker produced plus the loop's final text,
+    /// with the inactivity guarding and per-turn usage tallying the other
+    /// stream loops apply. A turn's boundary is the usage item rig emits at
+    /// each turn's Final chunk.
+    async fn collect_segment_turns(
+        mut stream: std::pin::Pin<
+            Box<dyn futures::Stream<Item = Result<StreamItem, StreamError>> + Send>,
+        >,
+        usage_state: &crate::UsageState,
+        inactivity_secs: u64,
+        scratchpad_budget: Option<&scratchpad::ContextBudget>,
+        decision_ready: impl Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>,
+    ) -> Result<(Vec<rig::completion::Message>, String), Box<dyn std::error::Error + Send + Sync>>
+    {
+        use crate::provider_agent::StreamedAssistantContent;
+        use crate::provider_agent::StreamedUserContent;
+        use futures::StreamExt;
+
+        let mut turns = Vec::new();
+        let mut text = String::new();
+        let mut calls = Vec::new();
+        let mut content = String::new();
+        let mut tally = TurnTally::default();
+        let mut deadline = crate::inactivity::InactivityDeadline::new_disarmed(
+            Duration::from_secs(inactivity_secs),
+        );
+        loop {
+            let item = tokio::select! {
+                biased;
+                _ = deadline.expired() => {
+                    return Err(deadline.stall_error("Resume segment"));
+                }
+                item = stream.next() => item,
+            };
+            let Some(item) = item else {
+                break;
+            };
+            let liveness = liveness_of(&item);
+            match liveness {
+                Liveness::ToolFinished => deadline.resume(),
+                _ => deadline.touch(),
+            }
+            match item {
+                Ok(StreamItem::StreamAssistantItem(StreamedAssistantContent::Text(t))) => {
+                    text.push_str(&t);
+                }
+                Ok(StreamItem::StreamAssistantItem(StreamedAssistantContent::ToolCall(tc))) => {
+                    // The provider-agnostic item carries no provider call_id,
+                    // so a parked node re-derives its turns from the park
+                    // snapshot instead of this assembly.
+                    let arguments: serde_json::Value = serde_json::from_str(&tc.arguments)
+                        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                            format!(
+                                "segment turn for {} carries unparseable arguments: {e}",
+                                tc.name
+                            )
+                            .into()
+                        })?;
+                    calls.push(rig::message::ToolCall {
+                        id: tc.id,
+                        call_id: None,
+                        function: rig::message::ToolFunction {
+                            name: tc.name,
+                            arguments,
+                        },
+                        signature: None,
+                        additional_params: None,
+                    });
+                }
+                Ok(StreamItem::TurnUsage(turn, cache)) => {
+                    tally.record(&turn, cache, usage_state);
+                    if let Some(budget) = scratchpad_budget {
+                        budget.set_estimated_used(turn.input_tokens, turn.output_tokens);
+                    }
+                    flush_segment_turn(&mut text, &mut calls, &mut turns);
+                }
+                Ok(StreamItem::Final(info)) => {
+                    let unrecorded = tally.reconcile(&info.usage);
+                    if unrecorded.input_tokens > 0 || unrecorded.output_tokens > 0 {
+                        tracing::warn!(
+                            "Resume segment: {} input / {} output tokens reached the provider \
+                             without a TurnUsage item; billing reconciled, occupancy may \
+                             understate the final turn",
+                            unrecorded.input_tokens,
+                            unrecorded.output_tokens
+                        );
+                        usage_state
+                            .accumulate_usage(unrecorded.input_tokens, unrecorded.output_tokens);
+                    }
+                    content = info.content;
+                    break;
+                }
+                Ok(StreamItem::StreamUserItem(StreamedUserContent::ToolResult(ref tr))) => {
+                    if decision_ready().await {
+                        if let Some(Ok(StreamItem::TurnUsage(turn, cache))) = stream.next().await {
+                            tally.record(&turn, cache, usage_state);
+                            if let Some(budget) = scratchpad_budget {
+                                budget.set_estimated_used(turn.input_tokens, turn.output_tokens);
+                            }
+                            flush_segment_turn(&mut text, &mut calls, &mut turns);
+                        }
+                        break;
+                    }
+                    tracing::debug!("Resume segment: tool result received (id={})", tr.id);
+                }
+                Err(e) => return Err(e),
+                _ => {}
+            }
+        }
+        // A stream that ended without a Final item still produced its turns.
+        flush_segment_turn(&mut text, &mut calls, &mut turns);
+        Ok((turns, content))
+    }
+
     /// Persist a single worker execution attempt to the persistence store.
     #[allow(clippy::too_many_arguments)]
     async fn persist_worker_execution(
@@ -5213,6 +5809,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             memory_dir: &memory_dir,
             config: &self.agent_config,
             decision_window: timeout,
+            identity_hash: None,
         };
 
         match super::park::commit_from_run_state(&inputs).await {

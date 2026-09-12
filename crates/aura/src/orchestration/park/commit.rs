@@ -28,6 +28,11 @@ pub(crate) struct ParkCommitInputs<'a> {
     pub config: &'a AgentRuntimeConfig,
     /// Decision window stamped on a document with no surviving ticket.
     pub decision_window: std::time::Duration,
+    /// Hex sha256 of the bound identity header's value, stamped into the
+    /// document the resume side compares against; `None` when identity
+    /// binding is not configured. A re-park passes the checkpoint's stored
+    /// value through so the binding survives the segment.
+    pub identity_hash: Option<String>,
 }
 
 /// The refreshed awaiting set: per-task pending calls still parked —
@@ -134,6 +139,7 @@ pub(crate) async fn commit_from_run_state(
         memory_dir,
         config,
         decision_window,
+        identity_hash,
     } = inputs;
 
     let refreshed = refresh_awaiting(plan, registry).await?;
@@ -151,6 +157,7 @@ pub(crate) async fn commit_from_run_state(
         &refreshed.pending_by_task,
         expires_at.clone(),
         config_fingerprint(config),
+        identity_hash.clone(),
     )?;
     let parked_dir = parked_document_dir(memory_dir, state.session_id);
     publish(&document, &parked_dir, state.run_id).await?;
@@ -662,6 +669,7 @@ mod tests {
             &refreshed.pending_by_task,
             (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
             config_fingerprint(&AgentRuntimeConfig::default()),
+            None,
         )
         .unwrap();
         let (recorded, ids) = crate::orchestration::park::load_recorded_decisions(

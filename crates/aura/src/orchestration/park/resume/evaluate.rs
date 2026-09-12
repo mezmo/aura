@@ -379,6 +379,9 @@ pub struct ResumeGrant {
     documents: ResumeDocuments,
     document: ParkedRun,
     recorded: Arc<RecordedDecisions>,
+    /// The decided approvals the consult consumed; the segment removes them
+    /// from the store on completion (the file backend's retention contract).
+    consumed: Vec<DecisionId>,
     session: ResumeSessionId,
     run: ResumeRunId,
 }
@@ -394,6 +397,30 @@ impl ResumeGrant {
     #[must_use]
     pub fn run_id(&self) -> &ResumeRunId {
         &self.run
+    }
+
+    /// The checkpoint document the grant was evaluated from.
+    #[must_use]
+    pub(crate) fn checkpoint(&self) -> &ParkedRun {
+        &self.document
+    }
+
+    /// The run's recorded decisions behind the `Arc` the gate holds.
+    #[must_use]
+    pub(crate) fn recorded_decisions(&self) -> &Arc<RecordedDecisions> {
+        &self.recorded
+    }
+
+    /// The decided approvals the consult consumed from the store.
+    #[must_use]
+    pub(crate) fn consumed_decisions(&self) -> &[DecisionId] {
+        &self.consumed
+    }
+
+    /// The run's two checkpoint paths under its session's parked directory.
+    #[must_use]
+    pub(crate) fn documents(&self) -> &ResumeDocuments {
+        &self.documents
     }
 }
 
@@ -512,9 +539,9 @@ async fn consult_decisions(
     document: &ParkedRun,
     store: &PendingApprovals,
     now: chrono::DateTime<chrono::Utc>,
-) -> Result<Arc<RecordedDecisions>, ConsultFault> {
+) -> Result<(Arc<RecordedDecisions>, Vec<DecisionId>), ConsultFault> {
     match load_recorded_decisions(store, document, now).await {
-        Ok((recorded, _consumed_ids)) => Ok(recorded),
+        Ok((recorded, consumed)) => Ok((recorded, consumed)),
         Err(RehydrateError::Mismatch(detail)) => {
             Err(ConsultFault::Mismatch(Diagnostic::new(detail)))
         }
@@ -595,6 +622,7 @@ async fn authorize(
     evaluation_path: &ValidatedResumePath,
     document: ParkedRun,
     recorded: Arc<RecordedDecisions>,
+    consumed: Vec<DecisionId>,
 ) -> Result<ResumeGrant, ClaimResumeFault> {
     let lease = claims.claim_and_resume(docs).await?;
     Ok(ResumeGrant {
@@ -602,6 +630,7 @@ async fn authorize(
         documents: docs.clone(),
         document,
         recorded,
+        consumed,
         session: evaluation_path.session.clone(),
         run: evaluation_path.run.clone(),
     })
@@ -648,7 +677,7 @@ pub async fn evaluate_resume(
 
     check_fingerprint(&document, config)?;
 
-    let recorded = match consult_decisions(&document, store, now).await {
+    let (recorded, consumed) = match consult_decisions(&document, store, now).await {
         Ok(recorded) => recorded,
         Err(ConsultFault::Expired(blocking)) => {
             let parked_path = docs.parked().to_path_buf();
@@ -683,7 +712,7 @@ pub async fn evaluate_resume(
         Err(fault) => return Err(fault.into()),
     };
 
-    let grant = authorize(&docs, claims, &path, document, recorded).await?;
+    let grant = authorize(&docs, claims, &path, document, recorded, consumed).await?;
     Ok(grant)
 }
 
@@ -734,12 +763,13 @@ pub enum SegmentError {
 
 /// Execute one segment for a granted run: the decided approvals' next agent
 /// turns, until the run completes or a new approval-required call parks. The
-/// segment is atomic data — no streaming to the client mid-segment.
-#[expect(unused_variables, reason = "todo!() body; filled by P45")]
+/// segment is atomic data — no streaming to the client mid-segment. The
+/// orchestrator entry is the implementing seam; this wrapper keeps the
+/// endpoint's call surface in the resume module.
 pub async fn run_segment(
     grant: ResumeGrant,
     config: &AgentRuntimeConfig,
     headers: &HashMap<String, String>,
 ) -> Result<SegmentResult, SegmentError> {
-    todo!()
+    crate::orchestration::Orchestrator::run_resume_segment(grant, config, headers).await
 }
