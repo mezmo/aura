@@ -17,17 +17,18 @@ use crate::hitl::{
     PROTOCOL_VERSION, ParkedApproval, PendingApprovals, ResolvedDecision,
 };
 use crate::orchestration::test_rig::{
-    ECHO_TOOL_RESULT, RecordingTool, ScriptedCompletionModel, ScriptedToolCall, ScriptedTurn,
-    WORKER_OVERRIDE_SERIAL, WorkerOverride, echo_tool_result_wire, install_worker_overrides,
+    ECHO_TOOL_RESULT, FreeformArgs, RecordingTool, ScriptedCompletionModel, ScriptedToolCall,
+    ScriptedTurn, WORKER_OVERRIDE_SERIAL, WorkerOverride, echo_tool_result_wire,
+    install_worker_overrides,
 };
 use crate::orchestration::{
-    OrchestrationConfig, PendingCall, TaskIdentity, TaskStatus, WorkerConfig,
+    CallKey, OrchestrationConfig, PendingCall, TaskIdentity, TaskStatus, WorkerConfig,
 };
 use crate::session_store::ApprovalStore;
 
 use super::super::commit::{config_fingerprint, parked_document_dir, publish};
 use super::super::document::{
-    PARKED_DOCUMENT_SUFFIX, ParkedPlan, ParkedRun, ParkedTaskNode, SCHEMA_VERSION,
+    PARKED_DOCUMENT_SUFFIX, ParkedPlan, ParkedRun, ParkedTaskNode, SCHEMA_VERSION, load_parked_run,
 };
 use super::super::{RESUMING_DOCUMENT_SUFFIX, run_owner_id};
 use super::*;
@@ -79,6 +80,9 @@ const PARK_SENTINEL: &str =
     "This tool call is parked pending human approval. It has not run. Do not retry.";
 /// The recorded denial's reason, fixed so every expected denial text is literal.
 const DENIAL_REASON: &str = "the prod namespace is off limits";
+/// The error `FailingTool` fails every invocation with, fixed so the parity
+/// frame's expected error rendering is a literal.
+const TOOL_FAILURE: &str = "the apply command failed: the cluster is unreachable";
 /// A decision window far from any test clock, so the expired/mismatch side
 /// does not depend on which clock the consult reads.
 const FUTURE_STAMP: &str = "2099-01-01T00:00:00Z";
@@ -109,6 +113,21 @@ struct World {
 }
 
 fn world() -> World {
+    world_over_hitl(|registry| crate::hitl::HitlRuntime {
+        patterns: Arc::from([aura_config::GlobPattern::new("kubectl_*").unwrap()]),
+        route: Arc::new(crate::hitl::DecisionRoute::Conversational {
+            registry: registry.clone(),
+            timeout: Duration::from_secs(3600),
+        }),
+        park_enabled: true,
+    })
+}
+
+/// Build a world over the caller's HITL runtime: the default world speaks
+/// the conversational route; the identity frames swap in a poll-delivery
+/// webhook whose `tool_headers_from_response` mapping arms the reify-side
+/// identity rule.
+fn world_over_hitl(hitl: impl FnOnce(&PendingApprovals) -> crate::hitl::HitlRuntime) -> World {
     let dir = tempfile::tempdir().expect("temp memory root");
     std::fs::create_dir_all(dir.path().join("approvals")).expect("approval dir");
     let store = Arc::new(
@@ -136,14 +155,7 @@ fn world() -> World {
         },
     );
     let config = AgentRuntimeConfig {
-        hitl: Some(crate::hitl::HitlRuntime {
-            patterns: Arc::from([aura_config::GlobPattern::new("kubectl_*").unwrap()]),
-            route: Arc::new(crate::hitl::DecisionRoute::Conversational {
-                registry: registry.clone(),
-                timeout: Duration::from_secs(3600),
-            }),
-            park_enabled: true,
-        }),
+        hitl: Some(hitl(&registry)),
         memory_dir: Some(memory_dir.clone()),
         session_id: Some(SESSION.to_string()),
         request_id: Some(REQUEST_ID.to_string()),
@@ -162,6 +174,40 @@ fn world() -> World {
         config,
         claims: ResumeClaimTable::new(),
     }
+}
+
+/// The identity-rule world: the same store and worker surface over a route
+/// whose reify-side rule "approved calls must carry identity" is armed —
+/// poll delivery keeps the park seam live (`park_registry` holds), the
+/// response mapping demands identity (`requires_identity` is true), and
+/// the route is built the production way (`HitlRuntime::from_config`). The
+/// webhook host is unreachable and never consulted: a recorded hit
+/// short-circuits at the gate consult, so the URL only names the shape.
+fn identity_world() -> World {
+    world_over_hitl(|registry| {
+        let config = aura_config::HitlConfig {
+            require_approval: vec![aura_config::GlobPattern::new("kubectl_*").unwrap()],
+            park: aura_config::ParkConfig {
+                enabled: true,
+                bind_identity: false,
+            },
+            route: aura_config::DecisionRouteConfig::Webhook {
+                url: aura_config::WebhookUrl::new("https://approvals.example.com/hook").unwrap(),
+                timeout_secs: 3600,
+                headers: HashMap::new(),
+                headers_from_request: HashMap::new(),
+                tool_headers_from_response: crate::approver_headers::tests::mappings(&[(
+                    "x-forwarded-user",
+                    "x-approver-id",
+                )]),
+                delivery: aura_config::WebhookDelivery::Poll,
+                poll_url: None,
+                poll_interval_secs: 10,
+                poll_request_timeout_secs: 30,
+            },
+        };
+        crate::hitl::HitlRuntime::from_config(&config, registry, None, None)
+    })
 }
 
 /// The worker-scoped approval for the document's pending call; `run` selects
@@ -271,6 +317,65 @@ fn denial_text() -> String {
 /// JSON-serializes tool outputs, so a plain string arrives JSON-quoted.
 fn tool_wire(text: &str) -> String {
     serde_json::to_string(text).expect("a plain string serializes")
+}
+
+/// The failing tool's error as the chain delivers it to the model: the live
+/// multi-turn loop renders a tool-server error as its `to_string`, raw text
+/// rather than the JSON-quoted form a successful output takes — the
+/// tool-result rendering the substitution must mirror for an execution
+/// `Err` (sync parity). The prefixes are the tool-server round trip's own
+/// (`Toolset error: ` over the toolset's and the server's re-wrapped
+/// `ToolCallError: ` layers over the tool's), with the doubling collapsed
+/// by `ToolError`'s verbatim-prefix rule.
+fn tool_failure_wire() -> String {
+    format!("Toolset error: ToolCallError: ToolCallError: ToolCallError: {TOOL_FAILURE}")
+}
+
+/// A minimal gated tool under the decided call's name whose invocation
+/// always fails: it records the call like `RecordingTool`, then returns an
+/// ordinary execution `Err` through the same worker wrapper chain and
+/// tool-server path — the staging vehicle for the tool-failure parity
+/// frame.
+struct FailingTool {
+    invocations: Arc<Mutex<Vec<Value>>>,
+}
+
+impl FailingTool {
+    fn new(invocations: Arc<Mutex<Vec<Value>>>) -> Self {
+        Self { invocations }
+    }
+}
+
+impl rig::tool::Tool for FailingTool {
+    const NAME: &'static str = "failing_apply";
+
+    type Error = rig::tool::ToolError;
+    type Args = FreeformArgs;
+    type Output = String;
+
+    // The registered name is the decided call's tool, so the substitution's
+    // invocation resolves this tool exactly as it resolves the real one.
+    fn name(&self) -> String {
+        TOOL.to_string()
+    }
+
+    async fn definition(&self, _prompt: String) -> rig::completion::ToolDefinition {
+        rig::completion::ToolDefinition {
+            name: self.name(),
+            description: "Test stand-in: records the call and fails it.".to_string(),
+            parameters: json!({ "type": "object", "properties": {} }),
+        }
+    }
+
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        self.invocations
+            .lock()
+            .expect("failing-tool invocation log")
+            .push(Value::Object(args.fields));
+        Err(rig::tool::ToolError::ToolCallError(
+            TOOL_FAILURE.to_string().into(),
+        ))
+    }
 }
 
 /// The checkpointed worker prompt carrying one tool result for `call_id`: the
@@ -429,6 +534,42 @@ fn parked_document_path(world: &World) -> std::path::PathBuf {
 fn resuming_document_path(world: &World) -> std::path::PathBuf {
     parked_document_dir(&world.memory_dir, Some(SESSION))
         .join(format!("{RUN}{RESUMING_DOCUMENT_SUFFIX}"))
+}
+
+/// Stage the tombstone write's failure: a read-only leftover at the temp
+/// path `append_executed_and_publish` writes before renaming onto the
+/// resuming document, so the temp open fails `EACCES` and the tombstone
+/// publish faults. Directory permissions alone cannot stage this — the
+/// write tightens its parent to owner-writable first (`private_dir`) — so
+/// the read-only leftover is the filesystem-permission vehicle that holds
+/// on macOS and Linux alike.
+fn stage_unwritable_tombstone_tmp(world: &World) {
+    let tmp = resuming_document_path(world)
+        .with_file_name(format!(".{RUN}{RESUMING_DOCUMENT_SUFFIX}.tmp"));
+    std::fs::write(&tmp, b"read-only leftover").expect("stage the tombstone temp leftover");
+    let mut permissions = std::fs::metadata(&tmp)
+        .expect("the staged leftover states")
+        .permissions();
+    permissions.set_readonly(true);
+    std::fs::set_permissions(&tmp, permissions).expect("make the leftover read-only");
+}
+
+/// Load the resuming document as the segment left it on disk — the surface
+/// the tombstone assertions read (the once-only evidence the interrupted
+/// row keys on, and its absence on the pre-tombstone faults).
+async fn resuming_document(world: &World) -> ParkedRun {
+    load_parked_run(&resuming_document_path(world))
+        .await
+        .expect("the claimed run's resuming document reads")
+}
+
+/// The diagnostic of a segment fault — the one `SegmentError` variant every
+/// fault frame pins its own row's message on. The exhaustive match fails to
+/// compile the day a second variant lands, so the pins get re-examined then.
+fn continuation_diagnostic(fault: &SegmentError) -> &Diagnostic {
+    match fault {
+        SegmentError::Continuation(diagnostic) => diagnostic,
+    }
 }
 
 fn matching_fingerprint(world: &World) -> String {
@@ -1693,6 +1834,332 @@ async fn denied_call_steers_without_executing_and_rides_the_denial_pair() {
         }
         other => panic!("expected a completed segment, got {other:?}"),
     }
+}
+
+// ====================================================================
+// Correction fold, A3: fault and parity rows (fix-contract steps 2-5)
+// ====================================================================
+
+/// PARITY — tool-failure-becomes-result-text (fix-contract step 4, second
+/// sentence): when the substitution's `call_tool` returns an ordinary
+/// execution `Err`, that error becomes the tool-result text for the model
+/// — the same raw rendering the live chain's loop delivers — and the
+/// segment completes, never faulting. The staging vehicle: `FailingTool`,
+/// a gated tool under the decided call's name whose invocation always
+/// fails. The completed turns carry the R2 pair keyed by the original call
+/// id with the error text as the tool result, ahead of the scripted final
+/// turn; no success is fabricated and no placeholder survives.
+#[tokio::test]
+async fn tool_failure_becomes_result_text_and_the_segment_completes() {
+    let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
+    let world = world();
+    let invocations = Arc::new(Mutex::new(Vec::new()));
+    install_worker_overrides(vec![WorkerOverride {
+        model: ScriptedCompletionModel::new(vec![ScriptedTurn::text(FINAL_TEXT)]),
+        extra_tools: vec![Box::new(FailingTool::new(invocations.clone()))],
+    }]);
+    register_decided(&world).await;
+    publish_document(&world, &sentinel_document(&world)).await;
+
+    let grant = evaluate_resume(evaluation(&world, false, None))
+        .await
+        .expect("the all-decided run grants");
+    let segment = run_segment(grant, &world.config, &HashMap::new())
+        .await
+        .expect("an execution failure is result text, never a segment fault");
+    let SegmentResult::Completed { turns } = segment else {
+        panic!("expected a completed segment, got {segment:?}")
+    };
+    {
+        let log = invocations.lock().expect("failing-tool invocation log");
+        assert_eq!(
+            log.len(),
+            1,
+            "the decided call executes exactly once and fails; zero invocations \
+             recorded: the substitution prelude does not exist"
+        );
+        assert_eq!(
+            log[0],
+            call_args(),
+            "the single invocation carries the recorded call's arguments"
+        );
+    }
+    let serialized = serde_json::to_value(turns.as_slice()).expect("turns serialize");
+    assert_eq!(
+        serialized,
+        json!([
+            decided_call_turn(),
+            decided_result_turn(&tool_failure_wire()),
+            {
+                "role": "assistant",
+                "id": null,
+                "content": [{ "text": FINAL_TEXT }],
+            },
+        ]),
+        "the completed segment carries the outcome pair holding the error \
+         text, keyed by the original call id, ahead of the final turn"
+    );
+    assert!(
+        !serialized.to_string().contains(ECHO_TOOL_RESULT)
+            && !serialized.to_string().contains(PARK_SENTINEL),
+        "no fabricated success and no placeholder on the wire"
+    );
+}
+
+/// FAULT — strict-miss fatal (fix-contract step 2, first half): the decided
+/// entry missing at substitution time is a fatal `SegmentError` BEFORE any
+/// tombstone write or tool invocation. Staging: the grant is taken against
+/// the decided fixture, then the decision leaves both surfaces a pre-flight
+/// may consult — the store ticket is removed (`registry.remove`) and the
+/// grant's in-memory recorded entry is taken — so the substitution peeks
+/// nothing for the call.
+#[tokio::test]
+async fn decided_entry_missing_at_substitution_time_is_fatal_before_the_tombstone() {
+    let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
+    let world = world();
+    let invocations = Arc::new(Mutex::new(Vec::new()));
+    install_worker_overrides(vec![WorkerOverride {
+        model: ScriptedCompletionModel::new(vec![ScriptedTurn::text(FINAL_TEXT)]),
+        extra_tools: vec![Box::new(
+            RecordingTool::new(invocations.clone()).with_name(TOOL),
+        )],
+    }]);
+    register_decided(&world).await;
+    publish_document(&world, &sentinel_document(&world)).await;
+
+    let grant = evaluate_resume(evaluation(&world, false, None))
+        .await
+        .expect("the all-decided run grants against the decided fixture");
+    world.registry.remove(&decision()).await;
+    assert!(
+        grant
+            .recorded_decisions()
+            .take(&CallKey::new(3, TOOL, &call_args()))
+            .is_some(),
+        "the staged fixture really held the decided entry"
+    );
+
+    let fault = run_segment(grant, &world.config, &HashMap::new())
+        .await
+        .expect_err("a decided entry missing at substitution time is fatal");
+    assert_eq!(
+        continuation_diagnostic(&fault).as_ref(),
+        "resume mismatch: decided call kubectl_apply of task 3 is missing from the \
+         recorded set",
+        "the fault's diagnostic identifies the strict miss"
+    );
+    assert!(
+        invocations.lock().expect("tool invocation log").is_empty(),
+        "the fault precedes any tool invocation"
+    );
+    let resuming = resuming_document(&world).await;
+    assert!(
+        resuming.executed.is_empty(),
+        "no tombstone: the fault precedes the tombstone write"
+    );
+}
+
+/// FAULT — identity-block fatal, approvals only (fix-contract step 2,
+/// second half): a decided APPROVED call whose recorded identity is
+/// missing where the route demands identity (the poll-200 capture failed
+/// closed) is a fatal `SegmentError` before any tombstone or invocation.
+/// Staged over `identity_world` — a poll-delivery webhook route whose
+/// response mapping arms the reify-side identity rule — with an approval
+/// recorded without identity. The pinned diagnostic is the gate's own
+/// wording for the block (`gate.rs`), so the pre-flight and the consult
+/// speak one rule.
+#[tokio::test]
+async fn approved_without_required_identity_is_fatal_before_the_tombstone() {
+    let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
+    let world = identity_world();
+    let invocations = Arc::new(Mutex::new(Vec::new()));
+    install_worker_overrides(vec![WorkerOverride {
+        model: ScriptedCompletionModel::new(vec![ScriptedTurn::text(FINAL_TEXT)]),
+        extra_tools: vec![Box::new(
+            RecordingTool::new(invocations.clone()).with_name(TOOL),
+        )],
+    }]);
+    register_decided(&world).await;
+    publish_document(&world, &sentinel_document(&world)).await;
+
+    let grant = evaluate_resume(evaluation(&world, false, None))
+        .await
+        .expect("the all-decided run grants");
+    let fault = run_segment(grant, &world.config, &HashMap::new())
+        .await
+        .expect_err("an approval missing the identity the route demands is fatal");
+    assert_eq!(
+        continuation_diagnostic(&fault).as_ref(),
+        "resume mismatch: approved call is missing required approver identity",
+        "the fault's diagnostic identifies the identity block"
+    );
+    assert!(
+        invocations.lock().expect("tool invocation log").is_empty(),
+        "the fault precedes any tool invocation"
+    );
+    let resuming = resuming_document(&world).await;
+    assert!(
+        resuming.executed.is_empty(),
+        "no tombstone: the fault precedes the tombstone write"
+    );
+}
+
+/// The identity-block asymmetry pin: the same identity-demanding route
+/// never blocks a DENIAL — denials need no identity, so the recorded
+/// denial steers with its normal outcome (Completed, live denial text on
+/// the wire keyed by the original call id, zero invocations), never the
+/// identity fault. Stands alone from the approval fault above so each
+/// fails at its own named point.
+#[tokio::test]
+async fn denied_without_identity_steers_normally_under_the_identity_route() {
+    let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
+    let world = identity_world();
+    let invocations = Arc::new(Mutex::new(Vec::new()));
+    install_worker_overrides(vec![WorkerOverride {
+        model: ScriptedCompletionModel::new(vec![ScriptedTurn::text(FINAL_TEXT)]),
+        extra_tools: vec![Box::new(
+            RecordingTool::new(invocations.clone()).with_name(TOOL),
+        )],
+    }]);
+    register_denied(&world).await;
+    publish_document(&world, &sentinel_document(&world)).await;
+
+    let grant = evaluate_resume(evaluation(&world, false, None))
+        .await
+        .expect("the all-decided run grants");
+    let segment = run_segment(grant, &world.config, &HashMap::new())
+        .await
+        .expect("a denial needs no identity: the segment steers, never faults");
+    let SegmentResult::Completed { turns } = segment else {
+        panic!("expected a completed segment, got {segment:?}")
+    };
+    assert!(
+        invocations.lock().expect("tool invocation log").is_empty(),
+        "the denied call never executes"
+    );
+    let serialized = serde_json::to_value(turns.as_slice()).expect("turns serialize");
+    assert_eq!(
+        serialized,
+        json!([
+            decided_call_turn(),
+            decided_result_turn(&tool_wire(&denial_text())),
+            {
+                "role": "assistant",
+                "id": null,
+                "content": [{ "text": FINAL_TEXT }],
+            },
+        ]),
+        "the denial rides its normal steer outcome — the outcome pair keyed \
+         by the original call id, ahead of the final turn"
+    );
+    assert!(
+        !serialized.to_string().contains(PARK_SENTINEL),
+        "the park placeholder must not survive a decided resume"
+    );
+}
+
+/// FAULT — tombstone-failure fatal (fix-contract step 3): a failing
+/// `append_executed_and_publish` is fatal before the invocation. Staged by
+/// `stage_unwritable_tombstone_tmp` — a read-only leftover at the
+/// tombstone write's temp path, the filesystem-permission mechanism that
+/// survives the write's own parent-directory tightening. The pinned
+/// diagnostic is the proven sequence's own wording (`resume_task`), with
+/// the standard `EACCES` text.
+#[tokio::test]
+async fn failing_tombstone_write_is_fatal_before_the_invocation() {
+    let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
+    let world = world();
+    let invocations = Arc::new(Mutex::new(Vec::new()));
+    install_worker_overrides(vec![WorkerOverride {
+        model: ScriptedCompletionModel::new(vec![ScriptedTurn::text(FINAL_TEXT)]),
+        extra_tools: vec![Box::new(
+            RecordingTool::new(invocations.clone()).with_name(TOOL),
+        )],
+    }]);
+    register_decided(&world).await;
+    publish_document(&world, &sentinel_document(&world)).await;
+
+    let grant = evaluate_resume(evaluation(&world, false, None))
+        .await
+        .expect("the all-decided run grants");
+    stage_unwritable_tombstone_tmp(&world);
+    let fault = run_segment(grant, &world.config, &HashMap::new())
+        .await
+        .expect_err("a failing tombstone write is fatal");
+    assert_eq!(
+        continuation_diagnostic(&fault).as_ref(),
+        "resume tombstone write for call call_apply_1 failed: Permission denied (os error 13)",
+        "the fault's diagnostic identifies the tombstone write failure"
+    );
+    assert!(
+        invocations.lock().expect("tool invocation log").is_empty(),
+        "the tombstone precedes the invocation, so the fault precedes it too"
+    );
+    let resuming = resuming_document(&world).await;
+    assert!(
+        resuming.executed.is_empty(),
+        "the failed write published no tombstone"
+    );
+}
+
+/// FAULT — replace-miss fatal (fix-contract step 5): a checkpointed
+/// `current_prompt` with NO tool-result slot for the call id makes
+/// `replace_tool_result` miss, which is fatal. The fixture is the pre-A1
+/// bare-prompt shape — `parked_document`'s `Message::user("tool results")`.
+/// Per the contract's ordering (tombstone, then invoke, then replace) the
+/// invocation HAS happened and the tombstone IS written: exactly one
+/// invocation, and the resuming document's executed list carries the call
+/// id. Note this leaves the run in the designed interrupted state — the
+/// next resume answers 409 `interrupted` on the once-only evidence.
+#[tokio::test]
+async fn replace_miss_is_fatal_after_the_tombstone_and_the_invocation() {
+    let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
+    let world = world();
+    let invocations = Arc::new(Mutex::new(Vec::new()));
+    install_worker_overrides(vec![WorkerOverride {
+        model: ScriptedCompletionModel::new(vec![ScriptedTurn::text(FINAL_TEXT)]),
+        extra_tools: vec![Box::new(
+            RecordingTool::new(invocations.clone()).with_name(TOOL),
+        )],
+    }]);
+    register_decided(&world).await;
+    publish_document(
+        &world,
+        &parked_document(FUTURE_STAMP, matching_fingerprint(&world), None, Vec::new()),
+    )
+    .await;
+
+    let grant = evaluate_resume(evaluation(&world, false, None))
+        .await
+        .expect("the all-decided run grants");
+    let fault = run_segment(grant, &world.config, &HashMap::new())
+        .await
+        .expect_err("a prompt with no tool-result slot for the call id is fatal");
+    assert_eq!(
+        continuation_diagnostic(&fault).as_ref(),
+        "continuation prompt has no tool result for call call_apply_1",
+        "the fault's diagnostic identifies the replace miss"
+    );
+    {
+        let log = invocations.lock().expect("tool invocation log");
+        assert_eq!(
+            log.len(),
+            1,
+            "exactly one invocation: the tombstone and the invocation both \
+             preceded the replace fault"
+        );
+        assert_eq!(
+            log[0].arguments,
+            call_args(),
+            "the single invocation carries the recorded call's arguments"
+        );
+    }
+    let resuming = resuming_document(&world).await;
+    assert_eq!(
+        resuming.executed,
+        vec![CALL_ID.to_string()],
+        "the tombstone IS written: the once-only evidence the interrupted row keys on"
+    );
 }
 
 /// The wire serializers the golden literals embed, calibrated against the
