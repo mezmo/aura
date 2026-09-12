@@ -319,8 +319,9 @@ pub(crate) struct WorkerOverride {
 static WORKER_OVERRIDES: OnceLock<Mutex<VecDeque<WorkerOverride>>> = OnceLock::new();
 
 /// Queue worker-model overrides. FIFO: the *n*-th worker build after this
-/// call consumes the *n*-th override. Tests that use the seam must serialize
-/// against each other — the queue is process-global.
+/// call consumes the *n*-th override. Tests that use the seam must hold
+/// [`WORKER_OVERRIDE_SERIAL`] for the duration of the test — the queue is
+/// process-global.
 pub(crate) fn install_worker_overrides(overrides: Vec<WorkerOverride>) {
     let queue = WORKER_OVERRIDES.get_or_init(|| Mutex::new(VecDeque::new()));
     queue
@@ -328,6 +329,12 @@ pub(crate) fn install_worker_overrides(overrides: Vec<WorkerOverride>) {
         .expect("worker-override lock")
         .extend(overrides);
 }
+
+/// One lock every worker-override consumer holds for the duration of its
+/// test: the queue is process-global, so parallel consumers would pop each
+/// other's scripted models.
+pub(crate) static WORKER_OVERRIDE_SERIAL: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
 
 /// Pop the next override, if one is queued. Consumed by the orchestrator's
 /// cfg(test) prelude in `build_worker_provider_agent`.

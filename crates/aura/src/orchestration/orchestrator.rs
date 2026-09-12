@@ -9067,7 +9067,9 @@ mod tests {
     /// Serializes the override-using tests: the override queue is
     /// process-global, and two parallel installs could cross-consume each
     /// other's scripted workers. Async-aware so the guard may cross awaits.
-    static WORKER_OVERRIDE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    /// Shared with the resume goldens via `test_rig`, so every queue
+    /// consumer serializes against ONE lock.
+    use test_rig::WORKER_OVERRIDE_SERIAL as WORKER_OVERRIDE_LOCK;
 
     /// A park-mode orchestrator whose `operations` worker is built through
     /// the override seam: the gate glob matches the stub tool, and the
