@@ -72,23 +72,32 @@ impl RecordedDecisions {
             .and_then(VecDeque::pop_front)
     }
 
-    /// The resume substitution's non-consuming pre-flight (fix-contract
-    /// step 2): inspect the decision a later [`RecordedDecisions::take`]
-    /// on `key` would consume — the front of the key's queue — and leave
-    /// the set unchanged. The identity rule mirrors the gate's
-    /// `recorded_pre_call`: an approval recorded without identity blocks
-    /// only when the route requires it (`requires_identity`); a denial
-    /// never needs identity. A [`PeekOutcome::Missing`] or
-    /// [`PeekOutcome::IdentityBlocked`] is a fatal `SegmentError` at the
-    /// call site (fold unit B1 owns the fault mapping). Wired by the
-    /// substitution prelude (fold unit B1).
-    pub(crate) fn peek(&self, key: &CallKey, requires_identity: bool) -> PeekOutcome {
+    /// The resume substitution's non-consuming, positional pre-flight
+    /// (fix-contract step 2): inspect the decision the key's queue holds
+    /// at `position` — position 0 is the front a later
+    /// [`RecordedDecisions::take`] pops next — and leave the set
+    /// unchanged. Same-key duplicate calls (identical tool and
+    /// arguments, distinct call ids) share one queue; the calls in
+    /// document order pair with its entries front-to-back, so the i-th
+    /// same-key call pre-flights against position i. The identity rule
+    /// mirrors the gate's `recorded_pre_call`: an approval recorded
+    /// without identity blocks only when the route requires it
+    /// (`requires_identity`); a denial never needs identity. A
+    /// [`PeekOutcome::Missing`] or [`PeekOutcome::IdentityBlocked`] is a
+    /// fatal `SegmentError` at the call site; the substitution prelude
+    /// in `drive_resume_segment` owns the fault mapping.
+    pub(crate) fn peek_at(
+        &self,
+        key: &CallKey,
+        position: usize,
+        requires_identity: bool,
+    ) -> PeekOutcome {
         match self
             .entries
             .lock()
             .expect("recorded-decisions lock")
             .get(key)
-            .and_then(VecDeque::front)
+            .and_then(|queue| queue.get(position))
         {
             None => PeekOutcome::Missing,
             Some(ResolvedDecision::Denied { .. }) => PeekOutcome::Ready,
@@ -100,6 +109,20 @@ impl RecordedDecisions {
                 }
             }
         }
+    }
+
+    /// The key's queue depth: how many recorded decisions remain under
+    /// the key. The substitution prelude reads it around each
+    /// invocation; a drop of exactly one is that call's decision being
+    /// consumed, so the consumed set derives from the recorded set's
+    /// own before/after state (fix-contract step 6) — never from a
+    /// passed pre-flight.
+    pub(crate) fn depth(&self, key: &CallKey) -> usize {
+        self.entries
+            .lock()
+            .expect("recorded-decisions lock")
+            .get(key)
+            .map_or(0, VecDeque::len)
     }
 
     /// Arm a drop guard that holds `task_id` strict until the guard is
@@ -122,7 +145,7 @@ impl RecordedDecisions {
 /// and canonical; a test pins that. The separator byte (`0x00`) keeps the tool
 /// name and the arguments from aliasing across names that end where another
 /// begins.
-#[derive(Debug, Hash, PartialEq, Eq)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub(crate) struct CallKey {
     task_id: usize,
     tool_name: String,
@@ -161,10 +184,10 @@ impl Drop for StrictGuard {
     }
 }
 
-/// The pre-flight verdict [`RecordedDecisions::peek`] returns for one
-/// decided call: whether the entry the resume's substitution would
-/// consume exists and is executable. Wired by the substitution prelude
-/// (fold unit B1).
+/// The pre-flight verdict [`RecordedDecisions::peek_at`] returns for
+/// one decided call at its key-position: whether the entry the
+/// resume's substitution would consume exists and is executable.
+/// Wired by the substitution prelude in `drive_resume_segment`.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum PeekOutcome {
     /// The front decision exists and may run: a denial, or an approval
@@ -226,12 +249,16 @@ mod tests {
         );
     }
 
-    /// A peek against an empty set misses.
+    /// A peek against an empty set misses — at any position.
     #[test]
-    fn peek_missing_on_an_empty_set() {
+    fn peek_at_missing_on_an_empty_set() {
         let recorded = RecordedDecisions::default();
         assert_eq!(
-            recorded.peek(&key(1, "kubectl_apply", &serde_json::json!({"n": 1})), true),
+            recorded.peek_at(
+                &key(1, "kubectl_apply", &serde_json::json!({"n": 1})),
+                0,
+                true
+            ),
             PeekOutcome::Missing
         );
     }
@@ -240,7 +267,7 @@ mod tests {
     /// peek ready — the denial even under an identity-requiring route,
     /// since a denial never executes and so never needs identity.
     #[test]
-    fn peek_ready_for_an_approval_and_for_a_denial() {
+    fn peek_at_ready_for_an_approval_and_for_a_denial() {
         let recorded = RecordedDecisions::default();
         let args = serde_json::json!({"namespace": "prod"});
         recorded.push(
@@ -259,12 +286,12 @@ mod tests {
         );
 
         assert_eq!(
-            recorded.peek(&key(1, "kubectl_apply", &args), true),
+            recorded.peek_at(&key(1, "kubectl_apply", &args), 0, true),
             PeekOutcome::Ready,
             "an approval with identity is ready under an identity route",
         );
         assert_eq!(
-            recorded.peek(&key(2, "kubectl_delete", &args), true),
+            recorded.peek_at(&key(2, "kubectl_delete", &args), 0, true),
             PeekOutcome::Ready,
             "a denial needs no identity even when the route requires it",
         );
@@ -274,7 +301,7 @@ mod tests {
     /// recorded without identity blocks a requiring route and peeks ready
     /// when the route demands none.
     #[test]
-    fn peek_identity_rule_keys_off_route_demand() {
+    fn peek_at_identity_rule_keys_off_route_demand() {
         let recorded = RecordedDecisions::default();
         let args = serde_json::json!({"namespace": "prod"});
         recorded.push(
@@ -284,12 +311,12 @@ mod tests {
         let probe = key(1, "kubectl_apply", &args);
 
         assert_eq!(
-            recorded.peek(&probe, true),
+            recorded.peek_at(&probe, 0, true),
             PeekOutcome::IdentityBlocked,
             "an identity-less approval blocks when the route requires it",
         );
         assert_eq!(
-            recorded.peek(&probe, false),
+            recorded.peek_at(&probe, 0, false),
             PeekOutcome::Ready,
             "the same approval is ready when the route demands no identity",
         );
@@ -300,7 +327,7 @@ mod tests {
     /// reports on the first, and the subsequent take still returns it in
     /// recorded order.
     #[test]
-    fn peek_reads_the_front_and_does_not_consume() {
+    fn peek_at_reads_the_front_and_does_not_consume() {
         let recorded = RecordedDecisions::default();
         let args = serde_json::json!({"namespace": "prod"});
         recorded.push(
@@ -314,7 +341,7 @@ mod tests {
         let probe = key(1, "kubectl_apply", &args);
 
         assert_eq!(
-            recorded.peek(&probe, true),
+            recorded.peek_at(&probe, 0, true),
             PeekOutcome::IdentityBlocked,
             "the peek reports on the first recorded decision, like take",
         );
@@ -324,9 +351,121 @@ mod tests {
             "the peek did not consume: take still returns the front entry",
         );
         assert_eq!(
-            recorded.peek(&probe, true),
+            recorded.peek_at(&probe, 0, true),
             PeekOutcome::Ready,
             "the next peek reports on the second decision (a denial)",
+        );
+    }
+
+    /// Same-key duplicate calls pair with the queue front-to-back,
+    /// positionally: with an identity-less approval recorded first and a
+    /// denial second, position 0 sees the approval (blocked under an
+    /// identity route) while position 1 sees the denial (ready) — and
+    /// neither peek consumes, since a later take still returns the front
+    /// approval. A front-only peek would pass the second entry unseen.
+    #[test]
+    fn peek_at_pairs_same_key_positions_in_recorded_order() {
+        let recorded = RecordedDecisions::default();
+        let args = serde_json::json!({"namespace": "prod"});
+        recorded.push(
+            key(1, "kubectl_apply", &args),
+            ApprovalDecision::Approved.into(),
+        );
+        recorded.push(
+            key(1, "kubectl_apply", &args),
+            ApprovalDecision::Denied { reason: None }.into(),
+        );
+        let probe = key(1, "kubectl_apply", &args);
+
+        assert_eq!(
+            recorded.peek_at(&probe, 0, true),
+            PeekOutcome::IdentityBlocked,
+            "position 0 reports on the first recorded decision",
+        );
+        assert_eq!(
+            recorded.peek_at(&probe, 1, true),
+            PeekOutcome::Ready,
+            "position 1 reports on the second recorded decision (a denial, \
+             which never needs identity)",
+        );
+        assert_eq!(
+            recorded.take(&probe),
+            Some(ResolvedDecision::from(ApprovalDecision::Approved)),
+            "neither positional peek consumed: take still returns the front entry",
+        );
+    }
+
+    /// A position past the key's depth is a miss even when earlier
+    /// positions pair: a queue holding one entry cannot pre-flight the
+    /// second same-key call ready.
+    #[test]
+    fn peek_at_beyond_the_queue_misses() {
+        let recorded = RecordedDecisions::default();
+        let args = serde_json::json!({"namespace": "prod"});
+        recorded.push(
+            key(1, "kubectl_apply", &args),
+            ResolvedDecision::approved(Some(crate::approver_headers::tests::captured_overrides(
+                "authorization",
+                "tok",
+            ))),
+        );
+        let probe = key(1, "kubectl_apply", &args);
+
+        assert_eq!(
+            recorded.peek_at(&probe, 0, true),
+            PeekOutcome::Ready,
+            "position 0 pairs with the single recorded entry",
+        );
+        assert_eq!(
+            recorded.peek_at(&probe, 1, true),
+            PeekOutcome::Missing,
+            "position 1 has no entry to pair with",
+        );
+        assert_eq!(
+            recorded.peek_at(&probe, 2, false),
+            PeekOutcome::Missing,
+            "every position past the depth misses, whatever the identity demand",
+        );
+    }
+
+    /// `depth` counts the key's remaining queue: it starts at the number
+    /// of recorded decisions, drops by one per `take`, and reads zero for
+    /// an exhausted or unknown key. The consumed derivation reads it
+    /// around each invocation and treats a drop of exactly one as the
+    /// call's own consumption.
+    #[test]
+    fn depth_tracks_consumption_per_key() {
+        let recorded = RecordedDecisions::default();
+        let args = serde_json::json!({"namespace": "prod"});
+        recorded.push(
+            key(1, "kubectl_apply", &args),
+            ApprovalDecision::Approved.into(),
+        );
+        recorded.push(
+            key(1, "kubectl_apply", &args),
+            ApprovalDecision::Denied { reason: None }.into(),
+        );
+        let probe = key(1, "kubectl_apply", &args);
+        let other = key(2, "kubectl_delete", &args);
+
+        assert_eq!(recorded.depth(&probe), 2, "both same-key decisions count");
+        assert_eq!(
+            recorded.depth(&other),
+            0,
+            "a key with no recorded decision has depth zero"
+        );
+        assert!(recorded.take(&probe).is_some());
+        assert_eq!(recorded.depth(&probe), 1, "one take drops the depth by one");
+        assert!(recorded.take(&probe).is_some());
+        assert_eq!(recorded.depth(&probe), 0, "the queue is exhausted");
+        assert!(
+            recorded.take(&probe).is_none(),
+            "a take past the depth consumes nothing"
+        );
+        assert_eq!(
+            recorded.depth(&probe),
+            0,
+            "a take past the depth leaves the depth unchanged"
         );
     }
 

@@ -40,7 +40,7 @@ everything with behavior. The public surface lives in
 | `SegmentTurns` | A segment — completed or parked — carries at least one turn | An empty `turns` array on the 200 body |
 | `SegmentResult` | A segment ends completed or parked, never both | A success body with `blocking` on a completed segment |
 | `SegmentError` | Mid-segment faults are distinct from refusals | A resume fault rendering as an evaluation verdict |
-| `PeekOutcome` | The substitution pre-flight's verdict per decided call: the recorded entry exists and is executable — a denial never needs identity, an approval under an identity-demanding route must carry it | A pre-flight that consumes; a consumption assumed from a passed pre-flight |
+| `PeekOutcome` | The substitution pre-flight's verdict per decided call at its key-position (same-key duplicate calls pair with their key's FIFO queue front-to-back): the entry exists and is executable — a denial never needs identity, an approval under an identity-demanding route must carry it | A pre-flight that consumes; a consumption assumed from a passed pre-flight |
 | `evaluate_resume` | First matching row wins; each stage's fault type admits only its own rows (row purity is structural); the stage sequence is the body's | A verdict from a foreign stage's fault type; sequence drift, which the Layer-2 golden tests pin |
 | `run_segment` | One call = one segment; atomic data, no mid-segment streaming | Partial streaming of a segment's turns |
 
@@ -272,13 +272,24 @@ segment driver.
 What changed, per awaiting node, before the continuation streams (the
 plan of record's fix contract):
 
-- **The substitution prelude** (`drive_resume_segment`): the strict guard
-  arms for the task; every decided call pre-flights non-consumingly
-  through `RecordedDecisions::peek` (entry presence plus the identity
-  rule, `requires_identity` from the route — the same source the gate's
-  `recorded_pre_call` consults); a `Missing` or `IdentityBlocked` peek
-  is a fatal `SegmentError` before any tombstone or invocation. Each
-  decided call then tombstones through the resuming document's
+- **The substitution prelude** (`drive_resume_segment`): the seeding
+  loop validates every awaiting node's payload and faults a node whose
+  pending list is absent or empty before any worker build — such a
+  node has nothing to substitute, and streaming its checkpointed prompt
+  would carry the stale placeholder past the prelude (the park paths
+  never write one legitimately: the gate registers every parked call
+  durably before the park commits). The strict guard then arms for the
+  task; the COMPLETE pending sequence pre-flights non-consumingly
+  through `RecordedDecisions::peek_at`, positionally — same-key
+  duplicate calls (identical tool and arguments, distinct call ids)
+  share one FIFO queue, and the calls in document order pair with its
+  entries front-to-back, so the i-th same-key call validates against
+  queue position i (the identity rule rides the same peek:
+  `requires_identity` from the route — the same source the gate's
+  `recorded_pre_call` consults). A `Missing` or `IdentityBlocked`
+  verdict at any position is a fatal `SegmentError` before any
+  tombstone or invocation, naming the faulting call. Each decided call
+  then tombstones through the resuming document's
   `append_executed_and_publish` (durable — the `interrupted` row's
   once-only evidence), invokes through the worker's gated pipeline
   (`call_tool`: `recorded_pre_call` consumes the decision — approved
@@ -293,12 +304,14 @@ plan of record's fix contract):
   stay fatal, distinguished by where the error arises, never by
   string-matching on error text.
 - **The consumed-subset re-park cleanup**: the consumed set derives from
-  the recorded set's before/after presence per call (a peek around each
-  invocation), never from a passed pre-flight. A re-park removes only
-  the actually-consumed subset from the store, after the commit
-  published (`commit_from_run_state` + `mark_published`), so untouched
-  sibling nodes keep their recorded approvals; completion keeps removing
-  the consult-loaded set, where consumed equals loaded.
+  each call's key's queue depth around that call's own invocation
+  (`RecordedDecisions::depth` before and after — a drop of exactly one
+  is that call's decision being consumed, duplicates included), never
+  from a passed pre-flight. A re-park removes only the actually-consumed
+  subset from the store, after the commit published
+  (`commit_from_run_state` + `mark_published`), so untouched sibling
+  nodes keep their recorded approvals; completion keeps removing the
+  consult-loaded set, where consumed equals loaded.
 - **R2's outcome turns**: per decided call, the segment's turns gain the
   assistant tool-call turn plus the tool-result turn — keyed by the
   original call id (`ToolCall.id` with `call_id: null`; `ToolResult.id`
@@ -311,6 +324,10 @@ plan of record's fix contract):
 Type → rule map update: the `PeekOutcome` row added to the table above —
 the fold's one new seam (landed as dispatch unit B0), with the fault
 mapping owned by the prelude and pinned by the A3 frames' diagnostics.
+The Gate A round-1 repair extended the seam without adding a new type:
+`peek_at` pairs same-key duplicate calls with their key's FIFO queue
+positionally, and `depth` carries the per-call consumed derivation the
+re-park cleanup reads.
 
 ### Timeout audit note (directive 5; codex-verified) — plan of record, verbatim
 

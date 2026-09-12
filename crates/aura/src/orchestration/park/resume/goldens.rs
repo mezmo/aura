@@ -19,7 +19,7 @@ use crate::hitl::{
 use crate::orchestration::test_rig::{
     ECHO_TOOL_RESULT, FreeformArgs, RecordingTool, ScriptedCompletionModel, ScriptedToolCall,
     ScriptedTurn, WORKER_OVERRIDE_SERIAL, WorkerOverride, echo_tool_result_wire,
-    install_worker_overrides,
+    install_worker_overrides, take_worker_override,
 };
 use crate::orchestration::{
     CallKey, OrchestrationConfig, PendingCall, TaskIdentity, TaskStatus, WorkerConfig,
@@ -43,6 +43,13 @@ const OTHER_RUN: &str = "0199c0de-9999-7000-8000-00000000dead";
 const DECISION: &str = "0199c0de-4545-7000-8000-000000000042";
 const TOOL: &str = "kubectl_apply";
 const CALL_ID: &str = "call_apply_1";
+/// The second same-key duplicate call's decision id: identical tool and
+/// arguments to the first call's, a distinct decision the human records
+/// separately.
+const DECISION_2: &str = "0199c0de-4545-7000-8000-000000000043";
+/// The second same-key duplicate call's id: the slot its own sentinel
+/// occupies and its own R2 pair rides under.
+const CALL_ID_2: &str = "call_apply_2";
 /// The pending call's arguments, fixed so every expected body is literal.
 fn call_args() -> Value {
     json!({ "namespace": "prod" })
@@ -91,6 +98,11 @@ const REQUEST_ID: &str = "req_golden_p45";
 
 fn decision() -> DecisionId {
     DecisionId::parse(DECISION).expect("golden decision id parses")
+}
+
+/// The second same-key duplicate call's decision id.
+fn decision_2() -> DecisionId {
+    DecisionId::parse(DECISION_2).expect("golden decision id parses")
 }
 
 /// Node B's decision id.
@@ -302,6 +314,55 @@ async fn register_denied(world: &World) {
         .expect("record the denial");
 }
 
+/// Register both same-key duplicate tickets — two distinct decision ids
+/// over the same task, tool, and arguments — undecided.
+async fn register_undecided_duplicate_pair(world: &World) {
+    for id in [decision(), decision_2()] {
+        world
+            .registry
+            .register_durable(worker_approval(id, RUN))
+            .await
+            .expect("register the duplicate-pair approval");
+    }
+}
+
+/// Register both same-key duplicate tickets and record approvals on
+/// them: the fixture the same-key duplicate lifecycle drives.
+async fn register_decided_duplicate_pair(world: &World) {
+    register_undecided_duplicate_pair(world).await;
+    for id in [decision(), decision_2()] {
+        world
+            .registry
+            .resolve(&id, ApprovalDecision::Approved.into())
+            .await
+            .expect("record the duplicate-pair approval");
+    }
+}
+
+/// Register both same-key duplicate tickets over the identity world,
+/// recording the FIRST approval with its captured identity and the
+/// SECOND without: the positional pre-flight must pair the identity-less
+/// approval with the second call, a front-only peek would pass it.
+async fn register_duplicate_pair_second_without_identity(world: &World) {
+    register_undecided_duplicate_pair(world).await;
+    world
+        .registry
+        .resolve(
+            &decision(),
+            ResolvedDecision::approved(Some(crate::approver_headers::tests::captured_overrides(
+                "x-forwarded-user",
+                "tok",
+            ))),
+        )
+        .await
+        .expect("record the first duplicate's approval with identity");
+    world
+        .registry
+        .resolve(&decision_2(), ApprovalDecision::Approved.into())
+        .await
+        .expect("record the second duplicate's approval without identity");
+}
+
 /// The live denial text the gate's denial feedback produces for the recorded
 /// reason — the wording the gate's own tests pin. A denied call
 /// short-circuits with this text, so it is what the resumed worker must see
@@ -408,6 +469,26 @@ fn sentinel_prompt_for(call_id: &str) -> rig::completion::Message {
     tool_result_prompt(call_id, &tool_wire(PARK_SENTINEL))
 }
 
+/// The checkpointed prompt carrying the sentinel for each given pending
+/// call id — the slot shape a live park leaves for two calls parked out
+/// of one worker turn: one message, one tool result per parked call.
+fn sentinel_prompt_for_calls(call_ids: &[&str]) -> rig::completion::Message {
+    let wire = tool_wire(PARK_SENTINEL);
+    let results = call_ids
+        .iter()
+        .map(|call_id| {
+            rig::message::UserContent::ToolResult(rig::message::ToolResult {
+                id: (*call_id).to_string(),
+                call_id: None,
+                content: rig::OneOrMany::one(rig::message::ToolResultContent::text(wire.clone())),
+            })
+        })
+        .collect::<Vec<_>>();
+    rig::completion::Message::User {
+        content: rig::OneOrMany::many(results).expect("the prompt carries a tool result"),
+    }
+}
+
 /// The standard one-call checkpoint with its sentinel prompt: the document a
 /// decided resume drives, over the matching fingerprint. The awaiting node's
 /// prompt carries the placeholder keyed by the pending call id, so a fill's
@@ -450,6 +531,36 @@ fn two_node_sentinel_document(world: &World) -> ParkedRun {
             call_id: CALL_ID_B.to_string(),
         }]),
     });
+    document
+}
+
+/// The same-key duplicate-call checkpoint: one awaiting node (task 3)
+/// holding TWO pending calls with identical tool and arguments but
+/// distinct call ids and decision ids — the shape one worker turn
+/// leaves when it issues the same gated call twice. Both slots carry
+/// the sentinel, one per call id.
+fn duplicate_key_document(world: &World) -> ParkedRun {
+    let mut document = parked_document(FUTURE_STAMP, matching_fingerprint(world), None, Vec::new());
+    let node = document
+        .plan
+        .tasks
+        .first_mut()
+        .expect("the skeleton carries one awaiting node");
+    node.current_prompt = Some(sentinel_prompt_for_calls(&[CALL_ID, CALL_ID_2]));
+    node.pending = Some(vec![
+        PendingCall {
+            decision_id: decision(),
+            tool_name: TOOL.to_string(),
+            arguments: call_args(),
+            call_id: CALL_ID.to_string(),
+        },
+        PendingCall {
+            decision_id: decision_2(),
+            tool_name: TOOL.to_string(),
+            arguments: call_args(),
+            call_id: CALL_ID_2.to_string(),
+        },
+    ]);
     document
 }
 
@@ -2159,6 +2270,413 @@ async fn replace_miss_is_fatal_after_the_tombstone_and_the_invocation() {
         resuming.executed,
         vec![CALL_ID.to_string()],
         "the tombstone IS written: the once-only evidence the interrupted row keys on"
+    );
+}
+
+// ====================================================================
+// Correction fold, Gate A round-1 fixes: the same-key duplicate lifecycle
+// and the structural fault rows
+// ====================================================================
+
+/// Same-key duplicate lifecycle (Gate A round-1, finding 1): one
+/// awaiting node with TWO pending calls — identical tool and arguments,
+/// distinct call ids and decision ids — both tickets decided approved.
+/// The calls pair with their key's FIFO queue positionally, so both
+/// execute exactly once in order, both R2 pairs ride the wire keyed by
+/// their OWN call ids, and the mid-segment re-park removes BOTH consumed
+/// ids from the store (a front-only consumed derivation under-records
+/// the first call's decision and leaks its store row). Resume 2 mirrors
+/// the two-resume lifecycle shape: the fresh call drives through the
+/// substitution and the segment completes.
+#[tokio::test]
+async fn same_key_duplicate_calls_execute_once_each_and_a_re_park_removes_both_consumed_ids() {
+    let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
+    let world = world();
+    let apply_invocations = Arc::new(Mutex::new(Vec::new()));
+    let fresh_invocations = Arc::new(Mutex::new(Vec::new()));
+    // Per-resume install, as the lifecycle frames document: the override
+    // queue is take-once and process-global.
+    install_worker_overrides(vec![
+        // Resume 1: the node's continuation issues a new gated call.
+        WorkerOverride {
+            model: ScriptedCompletionModel::new(vec![ScriptedTurn::tool_calls(vec![
+                ScriptedToolCall::new(FRESH_CALL_ID, NEW_TOOL, json!({ "namespace": "stage" }))
+                    .with_call_id(NEW_CALL_ID),
+            ])]),
+            extra_tools: vec![
+                Box::new(RecordingTool::new(apply_invocations.clone()).with_name(TOOL)),
+                Box::new(RecordingTool::new(fresh_invocations.clone()).with_name(NEW_TOOL)),
+            ],
+        },
+    ]);
+    register_decided_duplicate_pair(&world).await;
+    publish_document(&world, &duplicate_key_document(&world)).await;
+
+    let grant = evaluate_resume(evaluation(&world, false, None))
+        .await
+        .expect("the all-decided duplicate-pair run grants");
+    let segment = run_segment(grant, &world.config, &HashMap::new())
+        .await
+        .expect("the node's continuation re-parks and ends the first segment");
+    {
+        let apply_log = apply_invocations.lock().expect("apply invocation log");
+        assert_eq!(
+            apply_log.len(),
+            2,
+            "both duplicate calls execute exactly once through the substitution"
+        );
+        assert_eq!(
+            apply_log[0].arguments,
+            call_args(),
+            "the first invocation carries the recorded call's arguments"
+        );
+        assert_eq!(
+            apply_log[1].arguments,
+            call_args(),
+            "the second invocation carries the same recorded arguments"
+        );
+    }
+    let (turns, blocking) = match segment {
+        SegmentResult::Parked { turns, blocking } => (turns, blocking),
+        other => panic!("expected a re-parked segment, got {other:?}"),
+    };
+    let mut body = json!({
+        "turns": serde_json::to_value(turns.as_slice()).expect("turns serialize"),
+        "blocking":
+            serde_json::to_value(blocking.as_slice()).expect("blocking serializes"),
+    });
+    normalize_fresh_parking(&mut body);
+    assert_eq!(
+        body,
+        json!({
+            "turns": [
+                decided_call_turn(),
+                decided_result_turn(&echo_tool_result_wire()),
+                decided_call_turn_for(CALL_ID_2, TOOL, &call_args()),
+                decided_result_turn_for(CALL_ID_2, &echo_tool_result_wire()),
+                {
+                    "role": "assistant",
+                    "id": null,
+                    "content": [
+                        {
+                            "id": FRESH_CALL_ID,
+                            "call_id": NEW_CALL_ID,
+                            "function":
+                                { "name": NEW_TOOL, "arguments": { "namespace": "stage" } },
+                            "signature": null,
+                            "additional_params": null,
+                        },
+                    ],
+                },
+            ],
+            "blocking": [
+                {
+                    "decision_id": "<fresh decision id>",
+                    "tool": NEW_TOOL,
+                    "expires_at": "<fresh expiry>",
+                },
+            ],
+        }),
+        "the re-parked segment carries BOTH duplicate pairs, each keyed by \
+         its own call id, ahead of the gated assistant turn"
+    );
+    // The re-park removes BOTH consumed ids: the per-call depth derivation
+    // must record each duplicate's own decision, never only the first's.
+    assert!(
+        world
+            .registry
+            .try_parked(&decision())
+            .await
+            .expect("the store reads")
+            .is_none(),
+        "the first duplicate's consumed decision is removed from the store"
+    );
+    assert!(
+        world
+            .registry
+            .try_parked(&decision_2())
+            .await
+            .expect("the store reads")
+            .is_none(),
+        "the second duplicate's consumed decision is removed from the store"
+    );
+    let undecided = world
+        .store
+        .list_pending()
+        .await
+        .expect("the store lists its undecided approvals");
+    assert_eq!(
+        undecided.len(),
+        1,
+        "exactly the fresh ticket remains undecided, found ids {:?}",
+        undecided
+            .iter()
+            .map(|ticket| ticket.request.decision_id.to_string())
+            .collect::<Vec<_>>()
+    );
+    let fresh_ticket = &undecided[0];
+    assert_eq!(
+        fresh_ticket.request.request_id,
+        run_owner_id(RUN),
+        "the fresh ticket is registered under the original bound run's owner id"
+    );
+    let AgentScope::Worker { run_id, task, .. } = &fresh_ticket.request.scope else {
+        panic!(
+            "the fresh ticket carries a worker scope: {:?}",
+            fresh_ticket.request.scope
+        )
+    };
+    assert_eq!(
+        &run_id.to_string(),
+        RUN,
+        "the fresh ticket's scope names the ORIGINAL bound run id"
+    );
+    assert_eq!(
+        task.task_id, 3,
+        "the fresh ticket names the duplicate node's task"
+    );
+    let fresh_decision = fresh_ticket.request.decision_id;
+
+    world
+        .registry
+        .resolve(&fresh_decision, ApprovalDecision::Approved.into())
+        .await
+        .expect("record the fresh approval");
+    install_worker_overrides(vec![
+        // Resume 2: the fresh call's substitution, then a final turn.
+        WorkerOverride {
+            model: ScriptedCompletionModel::new(vec![ScriptedTurn::text(FINAL_TEXT)]),
+            extra_tools: vec![Box::new(
+                RecordingTool::new(fresh_invocations.clone()).with_name(NEW_TOOL),
+            )],
+        },
+    ]);
+
+    let grant = evaluate_resume(evaluation(&world, false, None))
+        .await
+        .expect("the re-published checkpoint grants the second resume");
+    let segment = run_segment(grant, &world.config, &HashMap::new())
+        .await
+        .expect("the second segment completes");
+    let turns = match segment {
+        SegmentResult::Completed { turns } => turns,
+        other => panic!("expected the second segment to complete, got {other:?}"),
+    };
+    {
+        let fresh_log = fresh_invocations.lock().expect("fresh invocation log");
+        assert_eq!(
+            fresh_log.len(),
+            1,
+            "the fresh call executes exactly once through the substitution"
+        );
+        assert_eq!(
+            fresh_log[0].arguments,
+            json!({ "namespace": "stage" }),
+            "the single invocation carries the fresh call's arguments"
+        );
+    }
+    assert_eq!(
+        apply_invocations
+            .lock()
+            .expect("apply invocation log")
+            .len(),
+        2,
+        "neither duplicate call is re-executed on the second resume"
+    );
+    let serialized = serde_json::to_value(turns.as_slice()).expect("turns serialize");
+    assert_eq!(
+        serialized,
+        json!([
+            decided_call_turn_for(FRESH_CALL_ID, NEW_TOOL, &json!({ "namespace": "stage" })),
+            decided_result_turn_for(FRESH_CALL_ID, &echo_tool_result_wire()),
+            { "role": "assistant", "id": null, "content": [{ "text": FINAL_TEXT }] },
+        ]),
+        "the completed segment carries the fresh pair keyed by the fresh \
+         call's id — resume 1's pairs rode the duplicate calls' own ids"
+    );
+    assert!(
+        !serialized.to_string().contains(PARK_SENTINEL),
+        "the placeholder appears nowhere in the serialized turns"
+    );
+    for id in [decision(), decision_2(), fresh_decision] {
+        assert!(
+            world
+                .registry
+                .try_parked(&id)
+                .await
+                .expect("the store reads")
+                .is_none(),
+            "completion leaves none of the duplicate pair's or the fresh ticket's rows"
+        );
+    }
+}
+
+/// FAULT — second-entry-missing (Gate A round-1, finding 1): with two
+/// same-key pending calls, a recorded queue one entry short of the
+/// pending sequence faults the segment at the missing position — the
+/// SECOND call — before any tombstone or invocation, with the
+/// strict-miss wording naming the faulting call's tool and task
+/// (byte-identical to the single-call frame's literal: the duplicates
+/// share tool and task). Staging mirrors the strict-miss frame: the
+/// grant is taken against the both-decided fixture, then the queue is
+/// left one entry short for two calls — the second ticket leaves the
+/// store (`registry.remove`) and one entry leaves the recorded queue
+/// (`take` under the shared key).
+#[tokio::test]
+async fn second_same_key_entry_missing_is_fatal_before_the_tombstone() {
+    let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
+    let world = world();
+    let invocations = Arc::new(Mutex::new(Vec::new()));
+    install_worker_overrides(vec![WorkerOverride {
+        model: ScriptedCompletionModel::new(vec![ScriptedTurn::text(FINAL_TEXT)]),
+        extra_tools: vec![Box::new(
+            RecordingTool::new(invocations.clone()).with_name(TOOL),
+        )],
+    }]);
+    register_decided_duplicate_pair(&world).await;
+    publish_document(&world, &duplicate_key_document(&world)).await;
+
+    let grant = evaluate_resume(evaluation(&world, false, None))
+        .await
+        .expect("the all-decided duplicate-pair run grants");
+    world.registry.remove(&decision_2()).await;
+    assert!(
+        grant
+            .recorded_decisions()
+            .take(&CallKey::new(3, TOOL, &call_args()))
+            .is_some(),
+        "the staged fixture really held the duplicate entries"
+    );
+
+    let fault = run_segment(grant, &world.config, &HashMap::new())
+        .await
+        .expect_err("a recorded queue too shallow for the pending sequence is fatal");
+    assert_eq!(
+        continuation_diagnostic(&fault).as_ref(),
+        "resume mismatch: decided call kubectl_apply of task 3 is missing from the \
+         recorded set",
+        "the fault's diagnostic identifies the strict miss at the second position"
+    );
+    assert!(
+        invocations.lock().expect("tool invocation log").is_empty(),
+        "the fault precedes any tool invocation"
+    );
+    let resuming = resuming_document(&world).await;
+    assert!(
+        resuming.executed.is_empty(),
+        "no tombstone: the fault precedes the tombstone write"
+    );
+}
+
+/// FAULT — second-entry-identity-blocked (Gate A round-1, finding 1,
+/// approvals only): with two same-key pending calls under the identity
+/// route, an approval recorded WITHOUT identity at the queue's second
+/// position faults the segment at that position — a front-only
+/// pre-flight would have passed it — with the gate's own identity
+/// wording, before any tombstone or invocation.
+#[tokio::test]
+async fn second_same_key_entry_identity_blocked_is_fatal_before_the_tombstone() {
+    let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
+    let world = identity_world();
+    let invocations = Arc::new(Mutex::new(Vec::new()));
+    install_worker_overrides(vec![WorkerOverride {
+        model: ScriptedCompletionModel::new(vec![ScriptedTurn::text(FINAL_TEXT)]),
+        extra_tools: vec![Box::new(
+            RecordingTool::new(invocations.clone()).with_name(TOOL),
+        )],
+    }]);
+    register_duplicate_pair_second_without_identity(&world).await;
+    publish_document(&world, &duplicate_key_document(&world)).await;
+
+    let grant = evaluate_resume(evaluation(&world, false, None))
+        .await
+        .expect("the all-decided duplicate-pair run grants");
+    let fault = run_segment(grant, &world.config, &HashMap::new())
+        .await
+        .expect_err("an identity-less approval at the second position is fatal");
+    assert_eq!(
+        continuation_diagnostic(&fault).as_ref(),
+        "resume mismatch: approved call is missing required approver identity",
+        "the fault's diagnostic identifies the identity block at the second position"
+    );
+    assert!(
+        invocations.lock().expect("tool invocation log").is_empty(),
+        "the fault precedes any tool invocation"
+    );
+    let resuming = resuming_document(&world).await;
+    assert!(
+        resuming.executed.is_empty(),
+        "no tombstone: the fault precedes the tombstone write"
+    );
+}
+
+/// FAULT — pending-absent structural (Gate A round-1, finding 2): an
+/// awaiting node whose pending list is ABSENT — the consult skips such
+/// nodes, so the run still grants — faults the segment in the driver's
+/// seeding loop, beside the attempt/history/prompt checks, before any
+/// worker build: a node without pending calls has nothing to
+/// substitute, and streaming its checkpointed prompt would carry the
+/// stale park placeholder past the prelude. The queued worker override
+/// is still queued after the fault — no build consumed it, so no worker
+/// streamed — and the scripted model's request log is empty. A node
+/// with an EMPTY pending list faults on the same row: the seeding
+/// check rejects absent and empty alike.
+#[tokio::test]
+async fn awaiting_node_without_pending_calls_faults_the_segment_before_any_worker_builds() {
+    let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
+    let world = world();
+    let invocations = Arc::new(Mutex::new(Vec::new()));
+    let model = ScriptedCompletionModel::new(vec![ScriptedTurn::text(FINAL_TEXT)]);
+    let requests = model.requests();
+    install_worker_overrides(vec![WorkerOverride {
+        model,
+        extra_tools: vec![Box::new(
+            RecordingTool::new(invocations.clone()).with_name(TOOL),
+        )],
+    }]);
+    register_decided_b(&world).await;
+    // The mixed checkpoint: the malformed awaiting node (task 3, pending
+    // absent) rides ahead of the genuinely decided node B.
+    let mut document = two_node_sentinel_document(&world);
+    let node_a = document
+        .plan
+        .tasks
+        .first_mut()
+        .expect("the two-node fixture carries node A first");
+    node_a.pending = None;
+    publish_document(&world, &document).await;
+
+    let grant = evaluate_resume(evaluation(&world, false, None))
+        .await
+        .expect("the decided sibling grants the malformed run");
+    let fault = run_segment(grant, &world.config, &HashMap::new())
+        .await
+        .expect_err("an awaiting node without pending calls faults the segment");
+    assert_eq!(
+        continuation_diagnostic(&fault).as_ref(),
+        "awaiting task 3 carries no pending calls in the checkpoint",
+        "the fault's diagnostic identifies the pending-absent node"
+    );
+    assert!(
+        invocations.lock().expect("tool invocation log").is_empty(),
+        "no invocation ran"
+    );
+    assert!(
+        requests
+            .lock()
+            .expect("scripted-model request log")
+            .is_empty(),
+        "no worker streamed: the scripted model was never consulted"
+    );
+    assert!(
+        take_worker_override().is_some(),
+        "no worker build consumed the queued override: the fault precedes \
+         every build"
+    );
+    let resuming = resuming_document(&world).await;
+    assert!(
+        resuming.executed.is_empty(),
+        "no tombstone: the fault precedes the tombstone write"
     );
 }
 
