@@ -135,7 +135,7 @@ Two duties ride on specific stages:
 | `ExecutionPersistence::resume` | `pub` constructor in `persistence.rs` | `for_resume_segment`: seeds the checkpoint's existing `(run_id, session_id, iteration)` instead of minting a fresh run id |
 | `ParkCommitInputs::identity_hash` | `pub(crate)` field on the park commit inputs | the park path (write side of `bind_identity`); a re-park passes the checkpoint's stored value through |
 | `ResumeGrant::session_id`/`run_id` | `pub` accessors | the endpoint's 200 body |
-| `ResumeRunResponse`, `ResumeRunState`, `refusal_response`, `continuation_turns`, `from_segment` | private in `handlers.rs` under per-item `#[allow(dead_code)]` | wired when the handler body lands |
+| `ResumeRunResponse`, `ResumeRunState`, `refusal_response`, `continuation_turns`, `from_segment` | private in `handlers.rs`; their skeleton `#[allow(dead_code)]` markers were swept when `resume_run` landed | the handler body (filled) |
 | Test-only accessors | none added | existing `#[cfg(test)]` accessors in the park module are untouched |
 
 The `#![allow(dead_code)]` at `resume/mod.rs` covers exactly the new module;
@@ -143,8 +143,9 @@ with every body landed it survives for three structural survivors only —
 the grant's Drop-held lease, `FingerprintFault::Fault` (stage-shape
 symmetry; the fingerprint stage cannot fault), and the goldens' TempDir
 kept alive for cleanup — and is not removable at the handler fill. The
-per-item `#[allow(dead_code)]` markers in `handlers.rs` cover exactly
-the five not-yet-wired projections. Existing allows in `continuation.rs`
+per-item `#[allow(dead_code)]` markers in `handlers.rs` covered exactly the
+five then-not-wired projections and were swept when the handler body
+landed. Existing allows in `continuation.rs`
 (:51, :124, :202), `document.rs` (:226), and `park/mod.rs` (:15) are
 untouched, per the card.
 
@@ -211,15 +212,27 @@ untouched, per the card.
 | `park/resume/evaluate.rs` | `authorize` — filled |
 | `park/resume/evaluate.rs` | `evaluate_resume` — filled |
 | `park/resume/evaluate.rs:744` | `run_segment` — filled (thin delegation to `Orchestrator::run_resume_segment`) |
-| `aura-config/src/config.rs:587` | `require_identity_header_for_binding` |
-| `aura-web-server/src/server.rs:312` | `refuse_park_on_memory_backend` |
-| `aura-web-server/src/handlers.rs:1403` | `continuation_turns` |
-| `aura-web-server/src/handlers.rs:1441` | `resume_run` (handler dispatch) |
+| `aura-config/src/config.rs:587` | `require_identity_header_for_binding` — filled |
+| `aura-web-server/src/server.rs:312` | `refuse_park_on_memory_backend` — filled |
+| `aura-web-server/src/handlers.rs:1403` | `continuation_turns` — filled |
+| `aura-web-server/src/handlers.rs:1441` | `resume_run` (handler dispatch) — filled |
 
-With `run_segment` filled, the resume-module inventory is closed: every
-`park/resume/` row above is filled. The remaining rows (`aura-config`,
-`aura-web-server`) belong to the config-validation and handler units and
-stay open here until their own fills land. The unit also landed the
+With the handler unit filled, this closes the card's hole inventory: every
+row above is filled, and a grep for `todo!(` over the changed files returns
+only this DESIGN.md prose. The unit also landed the
 identity-hash write side with no new holes: `ParkCommitInputs::identity_hash`
 (commit.rs) and `build_document`'s matching parameter (document.rs) are
 implemented bodies, and the orchestrator's segment entry carries none.
+
+**Completed-arm tool-call fidelity (recorded at the handler fill).**
+`continuation_turns` renders the wire `tool_calls[].id` from the rig call's
+provider `call_id` when the turn carries one (the parked arm's
+snapshot-derived turns: full fidelity). Completed segments' turns are
+reassembled from provider-agnostic stream items that drop the `call_id`
+(`collect_segment_turns`), and nothing in the `SegmentResult::Completed`
+surface — stream-derived `SegmentTurns` only — supports re-deriving it
+without widening the seam beyond the card's files. The projection therefore
+falls back to the stream item's own id, the same value the live SSE stream
+emits for the same call (never null, never fabricated); the loss is real
+only for providers where the responses-API-style `call_id` differs from the
+item id. This is the recorded spec gap for Gate U.
