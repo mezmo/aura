@@ -74,6 +74,37 @@ impl RecordedDecisions {
             .and_then(VecDeque::pop_front)
     }
 
+    /// The resume substitution's non-consuming pre-flight (fix-contract
+    /// step 2): inspect the decision a later [`RecordedDecisions::take`]
+    /// on `key` would consume — the front of the key's queue — and leave
+    /// the set unchanged. The identity rule mirrors the gate's
+    /// `recorded_pre_call`: an approval recorded without identity blocks
+    /// only when the route requires it (`requires_identity`); a denial
+    /// never needs identity. A [`PeekOutcome::Missing`] or
+    /// [`PeekOutcome::IdentityBlocked`] is a fatal `SegmentError` at the
+    /// call site (fold unit B1 owns the fault mapping). Wired by the
+    /// substitution prelude (fold unit B1).
+    #[allow(dead_code)]
+    pub(crate) fn peek(&self, key: &CallKey, requires_identity: bool) -> PeekOutcome {
+        match self
+            .entries
+            .lock()
+            .expect("recorded-decisions lock")
+            .get(key)
+            .and_then(VecDeque::front)
+        {
+            None => PeekOutcome::Missing,
+            Some(ResolvedDecision::Denied { .. }) => PeekOutcome::Ready,
+            Some(ResolvedDecision::Approved { identity }) => {
+                if identity.is_none() && requires_identity {
+                    PeekOutcome::IdentityBlocked
+                } else {
+                    PeekOutcome::Ready
+                }
+            }
+        }
+    }
+
     /// Arm a drop guard that holds `task_id` strict until the guard is
     /// dropped, then clears it. Holds a clone of the `Arc` so the clear runs
     /// on every exit path (normal return, `?`-early-return, error, and panic
@@ -135,6 +166,23 @@ impl Drop for StrictGuard {
     }
 }
 
+/// The pre-flight verdict [`RecordedDecisions::peek`] returns for one
+/// decided call: whether the entry the resume's substitution would
+/// consume exists and is executable. Wired by the substitution prelude
+/// (fold unit B1).
+#[allow(dead_code)]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PeekOutcome {
+    /// The front decision exists and may run: a denial, or an approval
+    /// whose recorded identity satisfies the route's demand.
+    Ready,
+    /// No decision is recorded under the key.
+    Missing,
+    /// The front decision is an approval recorded without identity while
+    /// the route requires it (record-then-block).
+    IdentityBlocked,
+}
+
 #[cfg(test)]
 mod tests {
     use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -181,6 +229,110 @@ mod tests {
         assert!(
             recorded.take(&probe).is_none(),
             "third take exhausts the queue"
+        );
+    }
+
+    /// A peek against an empty set misses.
+    #[test]
+    fn peek_missing_on_an_empty_set() {
+        let recorded = RecordedDecisions::default();
+        assert_eq!(
+            recorded.peek(&key(1, "kubectl_apply", &serde_json::json!({"n": 1})), true),
+            PeekOutcome::Missing
+        );
+    }
+
+    /// An approval carrying its identity and a denial without one both
+    /// peek ready — the denial even under an identity-requiring route,
+    /// since a denial never executes and so never needs identity.
+    #[test]
+    fn peek_ready_for_an_approval_and_for_a_denial() {
+        let recorded = RecordedDecisions::default();
+        let args = serde_json::json!({"namespace": "prod"});
+        recorded.push(
+            key(1, "kubectl_apply", &args),
+            ResolvedDecision::approved(Some(crate::approver_headers::tests::captured_overrides(
+                "authorization",
+                "tok",
+            ))),
+        );
+        recorded.push(
+            key(2, "kubectl_delete", &args),
+            ApprovalDecision::Denied {
+                reason: Some("too risky".to_string()),
+            }
+            .into(),
+        );
+
+        assert_eq!(
+            recorded.peek(&key(1, "kubectl_apply", &args), true),
+            PeekOutcome::Ready,
+            "an approval with identity is ready under an identity route",
+        );
+        assert_eq!(
+            recorded.peek(&key(2, "kubectl_delete", &args), true),
+            PeekOutcome::Ready,
+            "a denial needs no identity even when the route requires it",
+        );
+    }
+
+    /// The identity rule keys off the route's demand: the same approval
+    /// recorded without identity blocks a requiring route and peeks ready
+    /// when the route demands none.
+    #[test]
+    fn peek_identity_rule_keys_off_route_demand() {
+        let recorded = RecordedDecisions::default();
+        let args = serde_json::json!({"namespace": "prod"});
+        recorded.push(
+            key(1, "kubectl_apply", &args),
+            ApprovalDecision::Approved.into(),
+        );
+        let probe = key(1, "kubectl_apply", &args);
+
+        assert_eq!(
+            recorded.peek(&probe, true),
+            PeekOutcome::IdentityBlocked,
+            "an identity-less approval blocks when the route requires it",
+        );
+        assert_eq!(
+            recorded.peek(&probe, false),
+            PeekOutcome::Ready,
+            "the same approval is ready when the route demands no identity",
+        );
+    }
+
+    /// The peek reads the queue front — the decision a later `take` would
+    /// pop — and never consumes: with two decisions on one key the peek
+    /// reports on the first, and the subsequent take still returns it in
+    /// recorded order.
+    #[test]
+    fn peek_reads_the_front_and_does_not_consume() {
+        let recorded = RecordedDecisions::default();
+        let args = serde_json::json!({"namespace": "prod"});
+        recorded.push(
+            key(1, "kubectl_apply", &args),
+            ApprovalDecision::Approved.into(),
+        );
+        recorded.push(
+            key(1, "kubectl_apply", &args),
+            ApprovalDecision::Denied { reason: None }.into(),
+        );
+        let probe = key(1, "kubectl_apply", &args);
+
+        assert_eq!(
+            recorded.peek(&probe, true),
+            PeekOutcome::IdentityBlocked,
+            "the peek reports on the first recorded decision, like take",
+        );
+        assert_eq!(
+            recorded.take(&probe),
+            Some(ResolvedDecision::from(ApprovalDecision::Approved)),
+            "the peek did not consume: take still returns the front entry",
+        );
+        assert_eq!(
+            recorded.peek(&probe, true),
+            PeekOutcome::Ready,
+            "the next peek reports on the second decision (a denial)",
         );
     }
 
