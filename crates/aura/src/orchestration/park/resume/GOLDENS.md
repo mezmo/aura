@@ -42,12 +42,16 @@ internals.
 | 9a. ticket missing INSIDE the window → 409 mismatch | whole 409 body | `missing_ticket_inside_the_window_refuses_with_the_mismatch_row` (aura). Document expiry 2099; the side is clock-choice independent. |
 | 9b. ticket missing PAST expires_at → 409 expired (not mismatch) | whole 409 body | `missing_ticket_past_the_window_refuses_with_the_expired_row` (aura). Document expiry 2000; blocking carries the pre-sweep re-derivation. |
 | 10. any pending undecided → 409 parked, blocking [{decision_id, tool, expires_at}] | whole 409 body | `undecided_calls_answer_the_parked_row_with_the_outstanding_set` (aura). |
-| B. completed 200 | full 200 body, composite | `all_decided_grant_runs_the_segment_to_completion` (aura: segment turns as exact rig wire values) + `completed_segment_projects_the_full_200_body` (web: `from_segment` envelope, exact JSON — fails at `continuation_turns` today). |
-| B. parked-with-new-blocking 200 | segment half | `re_park_mid_segment_carries_turns_and_the_new_blocking_entry` (aura): turns pinned exactly, with the fresh decision id and expiry location-normalized after an audited shape check (a single entry carrying a UUID and an RFC 3339 stamp). |
+| P58 ruled: approved executes once, sync-transparent | invocation pin + whole turns array | `approved_call_executes_once_and_rides_the_outcome_pair` (aura): exactly one RecordingTool invocation carrying the recorded arguments; the completed turns are the outcome-bearing pair — the assistant tool-call turn plus the tool-result turn holding the tool's real result, keyed by the original call id — ahead of the scripted final turn. |
+| P58 ruled: denied steers with reason, sync-transparent | zero invocations + whole continuation context + whole turns array | `denied_call_steers_without_executing_and_rides_the_denial_pair` (aura): zero invocations; the continuation request's chat history pins the live denial text and its reason verbatim in place of the placeholder; the wire pair carries the live denial text keyed by the original call id; the segment completes with the scripted final turn (the worker adapts; no fabricated result). |
+| P58 ruled: the placeholder never survives a decided resume | golden-greppable absence | both P58 frames assert the sentinel appears nowhere in the serialized turns, and the denial frame also in the continuation context (the fix contract's item 10). |
+| R2: outcome-bearing turns on the 200 payload | the pair's wire shape, per decided call | `all_decided_grant_runs_the_segment_to_completion` + `re_park_mid_segment_carries_turns_and_the_new_blocking_entry` flipped to the pair-ahead shape (rows B below); `outcome_pair_and_sentinel_literals_match_the_wire_serializers` (aura) grounds the pair and sentinel literals against the implemented serializers, passing on arrival. |
+| B. completed 200 | full 200 body, composite | `all_decided_grant_runs_the_segment_to_completion` (aura: segment turns as exact rig wire values — the R2 outcome-bearing pair ahead of the final turn, over the sentinel-carrying checkpoint) + `completed_segment_projects_the_full_200_body` (web: `from_segment` envelope, exact JSON). |
+| B. parked-with-new-blocking 200 | segment half | `re_park_mid_segment_carries_turns_and_the_new_blocking_entry` (aura): turns pinned exactly — the R2 outcome-bearing pair ahead of the gated assistant turn, over the sentinel-carrying checkpoint — with the fresh decision id and expiry location-normalized after an audited shape check (a single entry carrying a UUID and an RFC 3339 stamp). |
 | C. claim race | observable race frame | `concurrent_evaluations_admit_one_grant_and_refuse_the_loser_with_running` (aura): `tokio::join!`, exactly one grant, the loser's whole running-row body, either side winning. |
 | D. blocking-population narrow reading | pinned by the bodies themselves | running/interrupted/config_changed/mismatch frames each pin `"blocking": []`; rename-back/parked/expired frames pin non-empty sets. The reading is enforced by literals, not prose. |
 | —. stage order (first match wins) | ordering frame | `interrupted_outranks_expired` (aura): both conditions hold, the interrupted body wins. |
-| —. wire serializer calibration | literal grounding | `blocking_entry_and_turn_literals_match_the_wire_serializers` (aura) — the one test that passes on arrival: it pins `BlockingEntry`'s and rig's implemented serializers against the literals the frames embed. |
+| —. wire serializer calibration | literal grounding | `blocking_entry_and_turn_literals_match_the_wire_serializers` (aura) and `outcome_pair_and_sentinel_literals_match_the_wire_serializers` (aura) — the tests that pass on arrival: they pin `BlockingEntry`'s and rig's implemented serializers against the literals the frames embed, including the R2 pair, the sentinel prompt, and the JSON-quoted wire forms of the sentinel and the live denial text. |
 
 ## Exclusions (not covered here, with owners)
 
@@ -67,9 +71,24 @@ internals.
 - The mismatch/expired row details pin today's `load_recorded_decisions`
   prose wrapped at the consult boundary; a wording change is a golden
   update, visible by design.
-- The re-parked segment's turns are exactly the gated assistant turn (the
-  DESIGN.md parked-arm reading); a fill that appends further turns fails the
+- The re-parked segment's turns are the R2 outcome-bearing pair per decided
+  call, then the gated assistant turn (superseding the earlier
+  parked-arm-only reading); a fill that drops or reorders the pair fails the
   frame and must be reconciled with the panel.
+- The outcome pair's wire shape: the assistant tool-call turn carries the
+  original call id in `ToolCall.id` with `call_id: null` (the checkpoint
+  records no provider call id), and the tool-result turn carries the same id
+  in `ToolResult.id` (the contract's "PendingCall.call_id matches
+  ToolResult.id"); the tool-result text is the chain's JSON-quoted wire
+  form. Grounded by the outcome-pair calibration test above.
+- The denial literals mirror the gate's denial-feedback wording ("Tool call
+  blocked by human approval denial: {reason}. Do not execute this action."),
+  pinned by the gate's own unit tests; a wording change is a golden update,
+  visible by design.
+- The decided-resume fixtures stage the awaiting node's prompt as a live park
+  leaves it: one sentinel tool result keyed by the pending call id, in its
+  JSON-quoted wire form. A fill whose `replace_tool_result` misses that slot
+  faults the resume — the pin working.
 - `run_segment` consumes the `test_rig` worker-override queue for its
   continuation's worker builds, so the segment frames run scripted models.
 - The handler resolves the resume config from `AppState.configs`; the

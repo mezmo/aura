@@ -17,8 +17,8 @@ use crate::hitl::{
     PROTOCOL_VERSION, ParkedApproval, PendingApprovals,
 };
 use crate::orchestration::test_rig::{
-    RecordingTool, ScriptedCompletionModel, ScriptedToolCall, ScriptedTurn, WORKER_OVERRIDE_SERIAL,
-    WorkerOverride, install_worker_overrides,
+    ECHO_TOOL_RESULT, RecordingTool, ScriptedCompletionModel, ScriptedToolCall, ScriptedTurn,
+    WORKER_OVERRIDE_SERIAL, WorkerOverride, echo_tool_result_wire, install_worker_overrides,
 };
 use crate::orchestration::{
     OrchestrationConfig, PendingCall, TaskIdentity, TaskStatus, WorkerConfig,
@@ -49,6 +49,14 @@ fn call_args() -> Value {
 const NEW_TOOL: &str = "kubectl_delete";
 const NEW_CALL_ID: &str = "call_id_0";
 const FINAL_TEXT: &str = "approved and applied";
+/// The park placeholder the gate stamps as a parked call's tool result —
+/// mirrored here because the gate keeps its sentinel private; the gate's
+/// own tests pin the same wording. A decided resume must replace it, so it
+/// may appear nowhere in the resumed context or on the wire.
+const PARK_SENTINEL: &str =
+    "This tool call is parked pending human approval. It has not run. Do not retry.";
+/// The recorded denial's reason, fixed so every expected denial text is literal.
+const DENIAL_REASON: &str = "the prod namespace is off limits";
 /// A decision window far from any test clock, so the expired/mismatch side
 /// does not depend on which clock the consult reads.
 const FUTURE_STAMP: &str = "2099-01-01T00:00:00Z";
@@ -172,6 +180,78 @@ async fn register_decided(world: &World) {
         .expect("record the approval");
 }
 
+/// Register the pending call's ticket and record a reasoned denial on it.
+async fn register_denied(world: &World) {
+    register_undecided(world).await;
+    world
+        .registry
+        .resolve(
+            &decision(),
+            ApprovalDecision::Denied {
+                reason: Some(DENIAL_REASON.to_string()),
+            }
+            .into(),
+        )
+        .await
+        .expect("record the denial");
+}
+
+/// The live denial text the gate's denial feedback produces for the recorded
+/// reason — the wording the gate's own tests pin. A denied call
+/// short-circuits with this text, so it is what the resumed worker must see
+/// in place of the placeholder.
+fn denial_text() -> String {
+    format!(
+        "Tool call blocked by human approval denial: {DENIAL_REASON}. \
+         Do not execute this action."
+    )
+}
+
+/// A plain tool-output string as the chain delivers it to the model: rig
+/// JSON-serializes tool outputs, so a plain string arrives JSON-quoted.
+fn tool_wire(text: &str) -> String {
+    serde_json::to_string(text).expect("a plain string serializes")
+}
+
+/// The checkpointed worker prompt carrying one tool result for `call_id`: the
+/// message shape a live park leaves as the awaiting node's `current_prompt`,
+/// and the wire shape the R2 tool-result turn reuses.
+fn tool_result_prompt(call_id: &str, wire: &str) -> rig::completion::Message {
+    rig::completion::Message::User {
+        content: rig::OneOrMany::one(rig::message::UserContent::ToolResult(
+            rig::message::ToolResult {
+                id: call_id.to_string(),
+                call_id: None,
+                content: rig::OneOrMany::one(rig::message::ToolResultContent::text(
+                    wire.to_string(),
+                )),
+            },
+        )),
+    }
+}
+
+/// The awaiting node's checkpointed prompt as a live park leaves it: the
+/// sentinel tool result for the pending call — the placeholder the
+/// substitution prelude must replace before the worker ever streams it.
+fn sentinel_prompt() -> rig::completion::Message {
+    tool_result_prompt(CALL_ID, &tool_wire(PARK_SENTINEL))
+}
+
+/// The standard one-call checkpoint with its sentinel prompt: the document a
+/// decided resume drives, over the matching fingerprint. The awaiting node's
+/// prompt carries the placeholder keyed by the pending call id, so a fill's
+/// `replace_tool_result` has the slot the contract requires.
+fn sentinel_document(world: &World) -> ParkedRun {
+    let mut document = parked_document(FUTURE_STAMP, matching_fingerprint(world), None, Vec::new());
+    let node = document
+        .plan
+        .tasks
+        .first_mut()
+        .expect("the skeleton carries one awaiting node");
+    node.current_prompt = Some(sentinel_prompt());
+    document
+}
+
 /// A checkpoint document as a park commit writes it: one awaiting node with
 /// its captured conversation, the fixed pending call, and the given window,
 /// fingerprint, identity binding, and executed tombstones.
@@ -282,6 +362,42 @@ fn entry(decision_id: DecisionId, tool: &str, expires_at: &str) -> Value {
         "decision_id": decision_id.to_string(),
         "tool": tool,
         "expires_at": expires_at,
+    })
+}
+
+/// The assistant tool-call turn R2 prepends per decided call: the decided
+/// call re-issued on the wire, keyed by the original call id (the id the
+/// checkpoint records on the pending call; the provider's own call id did
+/// not survive the park).
+fn decided_call_turn() -> Value {
+    json!({
+        "role": "assistant",
+        "id": null,
+        "content": [
+            {
+                "id": CALL_ID,
+                "call_id": null,
+                "function": { "name": TOOL, "arguments": call_args() },
+                "signature": null,
+                "additional_params": null,
+            },
+        ],
+    })
+}
+
+/// The tool-result turn R2 prepends per decided call: the substitution's
+/// outcome in the chain's wire form, keyed by the original call id (the
+/// contract's "PendingCall.call_id matches ToolResult.id").
+fn decided_result_turn(wire: &str) -> Value {
+    json!({
+        "role": "user",
+        "content": [
+            {
+                "type": "toolresult",
+                "id": CALL_ID,
+                "content": [{ "type": "text", "text": wire }],
+            },
+        ],
     })
 }
 
@@ -701,22 +817,24 @@ async fn concurrent_evaluations_admit_one_grant_and_refuse_the_loser_with_runnin
     }
 }
 
-/// The all-decided grant runs the segment to completion: the decided call's
-/// continuation produces the final assistant turn, and no blocking set.
+/// The all-decided grant runs the segment to completion: the decided call
+/// executes through the substitution, and the completed segment's turns
+/// carry its outcome-bearing pair — the assistant tool-call turn plus the
+/// tool-result turn holding the real result, keyed by the original call id
+/// — ahead of the continuation's final assistant turn, and no blocking set.
 #[tokio::test]
 async fn all_decided_grant_runs_the_segment_to_completion() {
     let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
     let world = world();
+    let invocations = Arc::new(Mutex::new(Vec::new()));
     install_worker_overrides(vec![WorkerOverride {
         model: ScriptedCompletionModel::new(vec![ScriptedTurn::text(FINAL_TEXT)]),
-        extra_tools: vec![],
+        extra_tools: vec![Box::new(
+            RecordingTool::new(invocations.clone()).with_name(TOOL),
+        )],
     }]);
     register_decided(&world).await;
-    publish_document(
-        &world,
-        &parked_document(FUTURE_STAMP, matching_fingerprint(&world), None, vec![]),
-    )
-    .await;
+    publish_document(&world, &sentinel_document(&world)).await;
 
     let grant = evaluate_resume(evaluation(&world, false, None))
         .await
@@ -729,13 +847,16 @@ async fn all_decided_grant_runs_the_segment_to_completion() {
             assert_eq!(
                 serde_json::to_value(turns.as_slice()).expect("turns serialize"),
                 json!([
+                    decided_call_turn(),
+                    decided_result_turn(&echo_tool_result_wire()),
                     {
                         "role": "assistant",
                         "id": null,
                         "content": [{ "text": FINAL_TEXT }],
                     },
                 ]),
-                "the completed segment carries the continuation's turns"
+                "the completed segment carries the outcome-bearing pair keyed by \
+                 the original call id, ahead of the continuation's turns"
             );
         }
         other => panic!("expected a completed segment, got {other:?}"),
@@ -743,29 +864,28 @@ async fn all_decided_grant_runs_the_segment_to_completion() {
 }
 
 /// A segment whose continuation issues a newly gated call re-parks: the
-/// turns run up to the park, and the blocking set names the new call. The
-/// fresh decision id and expiry are location-normalized after an audited
-/// shape check; everything else is the literal wire value.
+/// decided call executes through the substitution and its outcome-bearing
+/// pair rides ahead of the gated assistant turn, and the blocking set names
+/// the new call. The fresh decision id and expiry are location-normalized
+/// after an audited shape check; everything else is the literal wire value.
 #[tokio::test]
 async fn re_park_mid_segment_carries_turns_and_the_new_blocking_entry() {
     let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
     let world = world();
+    let apply_invocations = Arc::new(Mutex::new(Vec::new()));
     let invocations = Arc::new(Mutex::new(Vec::new()));
     install_worker_overrides(vec![WorkerOverride {
         model: ScriptedCompletionModel::new(vec![ScriptedTurn::tool_calls(vec![
             ScriptedToolCall::new("call_0", NEW_TOOL, json!({ "namespace": "stage" }))
                 .with_call_id(NEW_CALL_ID),
         ])]),
-        extra_tools: vec![Box::new(
-            RecordingTool::new(invocations).with_name(NEW_TOOL),
-        )],
+        extra_tools: vec![
+            Box::new(RecordingTool::new(apply_invocations.clone()).with_name(TOOL)),
+            Box::new(RecordingTool::new(invocations).with_name(NEW_TOOL)),
+        ],
     }]);
     register_decided(&world).await;
-    publish_document(
-        &world,
-        &parked_document(FUTURE_STAMP, matching_fingerprint(&world), None, vec![]),
-    )
-    .await;
+    publish_document(&world, &sentinel_document(&world)).await;
 
     let grant = evaluate_resume(evaluation(&world, false, None))
         .await
@@ -773,6 +893,19 @@ async fn re_park_mid_segment_carries_turns_and_the_new_blocking_entry() {
     let segment = run_segment(grant, &world.config, &HashMap::new())
         .await
         .expect("the segment re-parks");
+    let apply_log = apply_invocations.lock().expect("apply invocation log");
+    assert_eq!(
+        apply_log.len(),
+        1,
+        "the decided call executes exactly once before the re-park; zero invocations \
+         recorded: the substitution prelude does not exist"
+    );
+    assert_eq!(
+        apply_log[0].arguments,
+        call_args(),
+        "the single invocation carries the recorded call's arguments"
+    );
+    drop(apply_log);
     match segment {
         SegmentResult::Parked { turns, blocking } => {
             let mut body = json!({
@@ -785,6 +918,8 @@ async fn re_park_mid_segment_carries_turns_and_the_new_blocking_entry() {
                 body,
                 json!({
                     "turns": [
+                        decided_call_turn(),
+                        decided_result_turn(&echo_tool_result_wire()),
                         {
                             "role": "assistant",
                             "id": null,
@@ -885,6 +1020,154 @@ async fn re_park_registers_the_fresh_ticket_under_the_original_bound_run_id() {
     );
 }
 
+/// A recorded approval executes exactly once through the worker's gated
+/// pipeline, and the completed segment's turns carry the outcome-bearing
+/// pair — the assistant tool-call turn for the decided call plus the
+/// tool-result turn holding the tool's real result, keyed by the original
+/// call id — ahead of the continuation's final assistant turn. The park
+/// placeholder appears nowhere on the wire.
+#[tokio::test]
+async fn approved_call_executes_once_and_rides_the_outcome_pair() {
+    let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
+    let world = world();
+    let invocations = Arc::new(Mutex::new(Vec::new()));
+    install_worker_overrides(vec![WorkerOverride {
+        model: ScriptedCompletionModel::new(vec![ScriptedTurn::text(FINAL_TEXT)]),
+        extra_tools: vec![Box::new(
+            RecordingTool::new(invocations.clone()).with_name(TOOL),
+        )],
+    }]);
+    register_decided(&world).await;
+    publish_document(&world, &sentinel_document(&world)).await;
+
+    let grant = evaluate_resume(evaluation(&world, false, None))
+        .await
+        .expect("the all-decided run grants");
+    let segment = run_segment(grant, &world.config, &HashMap::new())
+        .await
+        .expect("the segment completes");
+    match segment {
+        SegmentResult::Completed { turns } => {
+            let log = invocations.lock().expect("tool invocation log");
+            assert_eq!(
+                log.len(),
+                1,
+                "the approved call executes exactly once; zero invocations recorded: \
+                 the substitution prelude does not exist"
+            );
+            assert_eq!(
+                log[0].arguments,
+                call_args(),
+                "the single invocation carries the recorded call's arguments"
+            );
+            assert_eq!(
+                log[0].result, ECHO_TOOL_RESULT,
+                "the single invocation returns the tool's real result"
+            );
+            drop(log);
+
+            let serialized = serde_json::to_value(turns.as_slice()).expect("turns serialize");
+            assert_eq!(
+                serialized,
+                json!([
+                    decided_call_turn(),
+                    decided_result_turn(&echo_tool_result_wire()),
+                    {
+                        "role": "assistant",
+                        "id": null,
+                        "content": [{ "text": FINAL_TEXT }],
+                    },
+                ]),
+                "the completed segment's turns carry the outcome-bearing pair keyed \
+                 by the original call id, ahead of the final turn"
+            );
+            assert!(
+                !serialized.to_string().contains(PARK_SENTINEL),
+                "the park placeholder must not survive a decided resume"
+            );
+        }
+        other => panic!("expected a completed segment, got {other:?}"),
+    }
+}
+
+/// A recorded denial steers: the call never executes, the live denial text
+/// and its reason ride the continuation context verbatim in place of the
+/// placeholder, and the wire carries the outcome-bearing pair holding the
+/// live denial text, keyed by the original call id, ahead of the scripted
+/// final turn — the worker adapts; no result is fabricated.
+#[tokio::test]
+async fn denied_call_steers_without_executing_and_rides_the_denial_pair() {
+    let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
+    let world = world();
+    let invocations = Arc::new(Mutex::new(Vec::new()));
+    let model = ScriptedCompletionModel::new(vec![ScriptedTurn::text(FINAL_TEXT)]);
+    let requests = model.requests();
+    install_worker_overrides(vec![WorkerOverride {
+        model,
+        extra_tools: vec![Box::new(
+            RecordingTool::new(invocations.clone()).with_name(TOOL),
+        )],
+    }]);
+    register_denied(&world).await;
+    publish_document(&world, &sentinel_document(&world)).await;
+
+    let grant = evaluate_resume(evaluation(&world, false, None))
+        .await
+        .expect("the all-decided run grants");
+    let segment = run_segment(grant, &world.config, &HashMap::new())
+        .await
+        .expect("the segment completes");
+    match segment {
+        SegmentResult::Completed { turns } => {
+            assert!(
+                invocations.lock().expect("tool invocation log").is_empty(),
+                "the denied call never executes"
+            );
+
+            let recorded = requests.lock().expect("scripted-model request log").clone();
+            assert_eq!(
+                recorded.len(),
+                1,
+                "the continuation is exactly one model turn"
+            );
+            let context = serde_json::to_value(&recorded[0].chat_history)
+                .expect("the continuation context serializes");
+            assert_eq!(
+                context,
+                json!([
+                    { "role": "user", "content": [{ "type": "text", "text": "apply it" }] },
+                    decided_result_turn(&tool_wire(&denial_text())),
+                ]),
+                "the worker's context carries the live denial text and its reason \
+                 verbatim, in place of the placeholder"
+            );
+
+            let serialized = serde_json::to_value(turns.as_slice()).expect("turns serialize");
+            assert_eq!(
+                serialized,
+                json!([
+                    decided_call_turn(),
+                    decided_result_turn(&tool_wire(&denial_text())),
+                    {
+                        "role": "assistant",
+                        "id": null,
+                        "content": [{ "text": FINAL_TEXT }],
+                    },
+                ]),
+                "the denial rides the outcome-bearing pair on the wire, keyed by \
+                 the original call id, ahead of the final turn"
+            );
+            assert!(
+                !serialized.to_string().contains(PARK_SENTINEL)
+                    && !context.to_string().contains(PARK_SENTINEL),
+                "the park placeholder must not survive a decided resume's context \
+                 or wire"
+            );
+        }
+        other => panic!("expected a completed segment, got {other:?}"),
+    }
+}
+
 /// The wire serializers the golden literals embed, calibrated against the
 /// implemented types: the blocking-entry object and the rig assistant turn.
 #[test]
@@ -910,5 +1193,58 @@ fn blocking_entry_and_turn_literals_match_the_wire_serializers() {
             "content": [{ "text": FINAL_TEXT }],
         }),
         "the segment-turn wire object the 200 goldens embed"
+    );
+}
+
+/// The wire serializers the R2 outcome-turn and sentinel literals embed,
+/// calibrated against the implemented rig types: the decided call's
+/// assistant tool-call turn, the tool-result turn over the chain's wire
+/// form, the sentinel prompt the decided-resume fixtures stage, and the
+/// JSON-quoted wire forms of the sentinel and the live denial text.
+#[test]
+fn outcome_pair_and_sentinel_literals_match_the_wire_serializers() {
+    let call_turn = rig::completion::Message::Assistant {
+        id: None,
+        content: rig::OneOrMany::one(rig::message::AssistantContent::ToolCall(
+            rig::message::ToolCall {
+                id: CALL_ID.to_string(),
+                call_id: None,
+                function: rig::message::ToolFunction {
+                    name: TOOL.to_string(),
+                    arguments: call_args(),
+                },
+                signature: None,
+                additional_params: None,
+            },
+        )),
+    };
+    assert_eq!(
+        serde_json::to_value(&call_turn).expect("the call turn serializes"),
+        decided_call_turn(),
+        "the assistant tool-call turn literal the R2 frames embed"
+    );
+
+    let result_turn = tool_result_prompt(CALL_ID, &echo_tool_result_wire());
+    assert_eq!(
+        serde_json::to_value(&result_turn).expect("the result turn serializes"),
+        decided_result_turn(&echo_tool_result_wire()),
+        "the tool-result turn literal the R2 frames embed"
+    );
+
+    assert_eq!(
+        serde_json::to_value(sentinel_prompt()).expect("the sentinel prompt serializes"),
+        decided_result_turn(&tool_wire(PARK_SENTINEL)),
+        "the sentinel prompt the fixtures stage, on the tool-result wire"
+    );
+    assert_eq!(
+        tool_wire(PARK_SENTINEL),
+        "\"This tool call is parked pending human approval. It has not run. Do not retry.\"",
+        "the sentinel's wire form is the JSON-quoted string the chain delivers"
+    );
+    assert_eq!(
+        tool_wire(&denial_text()),
+        "\"Tool call blocked by human approval denial: the prod namespace is off limits. \
+         Do not execute this action.\"",
+        "the denial's wire form is the JSON-quoted live denial text"
     );
 }
