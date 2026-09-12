@@ -181,8 +181,8 @@ untouched, per the card.
 
 | Location | Hole |
 | --- | --- |
-| `park/resume/claim.rs:189` | `ResumeClaimTable::rename_back_to_parked` |
-| `park/resume/claim.rs:199` | `ResumeClaimTable::claim_and_resume` |
+| `park/resume/claim.rs` | `ResumeClaimTable::rename_back_to_parked` — filled |
+| `park/resume/claim.rs` | `ResumeClaimTable::claim_and_resume` — filled |
 | `park/resume/evaluate.rs:401` | `locate_checkpoint` |
 | `park/resume/evaluate.rs:412` | `check_identity` |
 | `park/resume/evaluate.rs:418` | `check_claim` |
