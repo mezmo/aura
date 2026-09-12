@@ -80,6 +80,7 @@ impl RigBuilder {
         } else {
             None
         };
+        let identity_header = self.config.identity_header.clone();
         let agent = AgentSettings {
             name: self.config.agent.name.clone(),
             system_prompt: self.config.agent.system_prompt.clone(),
@@ -112,6 +113,7 @@ impl RigBuilder {
             }),
             park_bind_identity,
             presented_identity,
+            identity_header,
             instance_id: crate::instance_id::instance_id(&self.config.agent).to_string(),
             ..Default::default()
         }

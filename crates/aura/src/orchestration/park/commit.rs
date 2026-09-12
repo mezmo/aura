@@ -299,6 +299,7 @@ pub(crate) fn config_fingerprint(config: &AgentRuntimeConfig) -> String {
             "llm": serde_json::to_value(&config.llm).ok(),
             "mcp_filter": &config.agent.mcp_filter,
         },
+        "identity_header": &config.identity_header,
         "workers": config
             .orchestration
             .as_ref()
