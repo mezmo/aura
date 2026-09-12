@@ -11,7 +11,7 @@ everything with behavior. The public surface lives in
 | File | Concern |
 | --- | --- |
 | `claim.rs` | Path-segment parse types, checkpoint document locations, the per-run claim table and its lease |
-| `evaluate.rs` | Identity binding, blocking entries, the refusal rows, the ordered evaluation stages, the grant, the segment seam |
+| `evaluate.rs` | Presented-identity resolution, blocking entries (plain and non-empty), the refusal rows, the ordered evaluation stages, the grant, the segment seam |
 | `mod.rs` | Re-exports; the `#![allow(dead_code)]` slice for the skeleton |
 
 ## Type → business rule → forbidden invalid state
@@ -25,20 +25,21 @@ everything with behavior. The public surface lives in
 | `ResumeClaimTable` | At most one live in-process resume claim per run | Two simultaneous claims for one run inside this process |
 | `ResumeLease` | A segment's claim lives exactly as long as the holder's scope | A claim that outlives its segment (released on drop) |
 | `MalformedId` | Malformed path segments answer 404 before any read; the reason is diagnostic-only | A caller branching on the rejection reason |
-| `IdentityHash` | The binding comparison is hash-to-hex, both sides produced by hashing/parsing 64 hex chars | A raw header value stored or compared as if it were the hash |
-| `IdentityBindingState` | Binding off ⇒ no identity; binding on ⇒ a presented hash or a missing header, each distinct | The `Option<IdentityHash>` ambiguity where "binding off" and "header absent" collapse |
+| `IdentityHash` | The binding comparison is hash-to-hex, both sides produced by hashing/parsing 64 hex chars; comparison-only, never serialized | A raw header value stored or compared as if it were the hash; a credential proxy on the wire |
+| `IdentityBindingState` | Binding off ⇒ no identity; binding on ⇒ a presented hash or a missing header, each distinct; resolved inside the evaluation from the bundle's raw inputs, never supplied | The `Option<IdentityHash>` ambiguity where "binding off" and "header absent" collapse; a resolved state contradicting its config's bind flag |
 | `BlockingEntry` | One outstanding parked call renders `{decision_id, tool, expires_at}` | A blocking row without a typed decision id or expiry |
+| `NonEmptyBlocking` | The `parked` and `expired` (pre-sweep) rows and the parked segment each carry at least one outstanding call; serializes as the plain JSON array | An empty `blocking` array where the spec promises entries |
 | `ParkedToolName` | The tool label on a blocking row is its own type, not a bare string colliding with other strings | Cross-crate name collision with `aura::ToolName` (the broker event key) |
 | `Diagnostic` | Human text that no caller branches on (rule-5 escape hatch) | Wire/control-flow decisions made on prose |
 | `ConflictCode` | The six not-ready codes, declared in evaluation order | A code outside `running…parked`; out-of-order rendering |
 | `ResumeConflictRow` | One 409 shape `{code, detail, blocking}` for every not-ready row | Six divergent 409 body shapes; a conflict row without its code |
 | `ResumeRefusal` | The evaluation's refusal rows in card order; two detail-less rows, then conflicts, then faults | A verdict outside the table; a 404 row carrying detail |
-| `ResumeEvaluation` | One bundle per request: path, documents, config, store, claim table, identity, clock | A stage reading a request facet the bundle does not carry |
+| `ResumeEvaluation` | One bundle per request: path, the parked-dir input, config, store, claim table, the bind flag, the presented identity, request id, clock | A stage reading a request facet the bundle does not carry; documents or a resolved binding state constructed independently of their inputs |
 | `ResumeGrant` | All-decided ⇒ authorization; the grant is the only door to `run_segment` | A segment running on an unevaluated or refused run |
 | `SegmentTurns` | A segment — completed or parked — carries at least one turn | An empty `turns` array on the 200 body |
 | `SegmentResult` | A segment ends completed or parked, never both | A success body with `blocking` on a completed segment |
 | `SegmentError` | Mid-segment faults are distinct from refusals | A resume fault rendering as an evaluation verdict |
-| `evaluate_resume` | First matching row wins; row order is the stage pipeline's order | Out-of-order evaluation: each stage's error type admits only its own rows, so stage N cannot emit stage M's verdict |
+| `evaluate_resume` | First matching row wins; each stage's fault type admits only its own rows (row purity is structural); the stage sequence is the body's | A verdict from a foreign stage's fault type; sequence drift, which the Layer-2 golden tests pin |
 | `run_segment` | One call = one segment; atomic data, no mid-segment streaming | Partial streaming of a segment's turns |
 
 ## How the evaluation order is encoded
@@ -51,11 +52,19 @@ everything with behavior. The public surface lives in
 `authorize` (row 10).
 
 Each stage returns its own small fault enum (`LocateFault`,
-`IdentityFault`, `ClaimFault`, `AdmitFault`, `FingerprintFault`,
-`ConsultFault`), and each converts into `ResumeRefusal` through a private
-`From` impl. A stage therefore cannot produce another row's verdict — the
-order is structural, not a comment. `ResumeRefusal`'s declaration order
-mirrors the table for rendering.
+`IdentityFault`, `AdmitFault`, `FingerprintFault`, `ConsultFault`, plus
+`ClaimResumeFault` in `claim.rs`, shared by `check_claim` and
+`authorize`), and each converts into `ResumeRefusal` through a private
+`From` impl. A stage's fault type therefore admits only its own rows: row
+purity is structural. The stage sequence itself is the body's — the types
+do not pin it; the Layer-2 golden tests do. `ResumeRefusal`'s declaration
+order mirrors the table for rendering.
+
+`authorize` returns `ClaimResumeFault` directly (no second claim-failure
+enum): its `From` impl maps `Live` — a claim lost to a concurrent
+evaluation between `check_claim` and `authorize` — to
+`ResumeRefusal::Conflict(ResumeConflictRow::running())`, so a lost claim
+race renders 409 `running`, never the 500 fault sink.
 
 Two duties ride on specific stages:
 
@@ -66,14 +75,53 @@ Two duties ride on specific stages:
   document's `expires_at` is the expired row (a remote TTL had swept it), a
   missing ticket inside the window is the mismatch row. `project_blocking`
   re-derives the outstanding set from the document so the expired row can
-  carry the pre-sweep blocking list.
+  carry the pre-sweep blocking list; it returns `NonEmptyBlocking`, so an
+  empty re-derivation faults loudly instead of rendering an empty body.
+
+## Recorded readings
+
+- **Blocking population.** Blocking entries are consult-derived only: the
+  `parked` row, and the `expired` row's pre-sweep list. The read-side
+  refusal rows (`running`, `interrupted`, `config_changed`, `mismatch`)
+  render an empty list. Justification: a polling client cannot act on
+  approvals for a run it cannot claim, and the card's acceptance exercises
+  blocking only on `parked` and `expired`. Revisit-able at U(endpoint) if
+  the broad reading (populating from the document on the read-side rows) is
+  wanted.
+- **Cross-call precedence.** The consult resolves first-hit-in-call-order:
+  the first pending call whose row fires decides the verdict, even where a
+  later call would have fired a different row. The ruled exception: an
+  expired redis ticket is deleted by the remote TTL, so a missing ticket
+  past `expires_at` reads expired, not mismatch.
+- **Expired row's side effect.** `evaluate_resume` owns the expired row's
+  unlink-checkpoint and sweep-approvals side effect, post-consult,
+  pre-render: `project_blocking` has produced the pre-sweep blocking list
+  by then, and the sweep (`park::commit::cancel_run_approvals`) publishes
+  its broker events under the bundle's `request_id`.
+- **Parked-arm turns.** `SegmentResult::Parked` carries `SegmentTurns`
+  (non-empty) like the completed arm: the continuation's first gated
+  assistant turn always exists, so a zero-turn park is unreachable in
+  production. If ever observed it surfaces as a loud fault (residual risks
+  below), never as a silent empty body.
+
+## Fill-unit duties (in-crate; recorded, not yet applied)
+
+- **Thread the injected clock into `load_recorded_decisions`.** The helper
+  reads `chrono::Utc::now()` internally today, so the expired, mismatch,
+  and parked rows would ignore the bundle's `now`; the fill unit threads
+  `now` through the consult.
+- **Wrap `RehydrateError`'s raw payloads in `Diagnostic` at the consult
+  boundary.** `Mismatch(String)`, `Store(String)`, and `Document(String)`
+  predate the card; the consult converts them where they enter
+  `ConsultFault`, so no raw string crosses into a wire-relevant row.
 
 ## Visibility / seam table
 
 | Seam | Visibility | Consumer |
 | --- | --- | --- |
 | `park::resume` re-exports | `pub use` at `orchestration/mod.rs` | `aura-web-server` (`aura::orchestration::*`) |
-| Stage fns, `LocatedCheckpoint`, `*Fault` enums | private to `evaluate.rs` | the fill unit only |
+| Payload types reachable through re-exported carriers | `pub use` at both hops (`park::resume`, `orchestration`) | `aura-web-server`, which must be able to name every type in a re-exported signature: `Diagnostic` (`ResumeRefusal::Fault`), `ParkedToolName` (`BlockingEntry::tool`), `SegmentTurns`/`EmptySegment` (`SegmentResult`, `SegmentTurns::try_new`), `NonEmptyBlocking`/`EmptyBlocking` (`SegmentResult::Parked`, `try_new`), `SegmentError` (`run_segment`). Checked and excluded — named in no re-exported signature: `IdentityHash` (comparison-only since the binding state went private), `ResumeLease` (private `ResumeGrant` field), `IdentityBindingState` (private) |
+| Stage fns, `LocatedCheckpoint`, the `*Fault` enums (private to `evaluate.rs`; `ClaimResumeFault` in `claim.rs`) | private / `pub(crate)` | the fill unit only |
 | `ResumeClaimTable::is_live`, `rename_back_to_parked`, `claim_and_resume` | `pub(crate)` | in-crate evaluation stages |
 | `ResumeDocuments::parked`/`resuming`, `Diagnostic::new`, `IdentityHash::from_stored`, `ParkedToolName::new`, `ResumeConflictRow` row constructors | `pub(crate)` | in-crate stages and the handler-side projections |
 | `config_fingerprint`, `parked_document_dir` | `pub(crate)` in `park::commit`, reached as `super::super::commit::*` | `check_fingerprint`, `ResumeDocuments::for_path` |
@@ -84,7 +132,7 @@ Two duties ride on specific stages:
 
 The `#![allow(dead_code)]` at `resume/mod.rs` covers exactly the new module;
 the per-item `#[allow(dead_code)]` markers in `handlers.rs` cover exactly
-the four not-yet-wired projections. Existing allows in `continuation.rs`
+the five not-yet-wired projections. Existing allows in `continuation.rs`
 (:51, :124, :202), `document.rs` (:226), and `park/mod.rs` (:15) are
 untouched, per the card.
 
@@ -96,10 +144,17 @@ untouched, per the card.
   construction lives in `orchestrator.rs` — outside this card's scope.
   Until it lands, `bind_identity = true` fails every resume of a
   None-hash document closed (404 row), which is safe but useless.
-- **Expired row's blocking list needs a pre-sweep re-derivation.**
-  `load_recorded_decisions` returns `RehydrateError::Expired` without the
-  outstanding set; the fill unit must project the blocking list before the
-  unlink-and-sweep, or re-derive it from the document.
+- **Expired row's blocking list is a re-derivation, not the consult's
+  output.** `load_recorded_decisions` returns `RehydrateError::Expired`
+  without the outstanding set; `project_blocking` re-derives it from the
+  document pre-sweep and returns `NonEmptyBlocking`, so an empty
+  re-derivation — an expired row with nothing outstanding — surfaces as a
+  500 fault. If that fault is ever observed, the expired row's
+  reachability assumption is wrong; stop and re-derive the row's semantics.
+- **A zero-turn park is a loud fault, by design.** The continuation's first
+  gated assistant turn always exists, so `SegmentTurns::try_new` cannot
+  reject a real park; a re-park carrying zero turns fails the segment
+  (500) rather than rendering an empty `turns` array.
 - **Claim-lock discipline is a fill-unit obligation.** The table uses a
   `std::sync::Mutex` so `ResumeLease::drop` can release without a runtime.
   The rename-under-lock holes must acquire the guard inside a
@@ -111,10 +166,10 @@ untouched, per the card.
   credential proxy; if the threat model includes a timing oracle over the
   resume endpoint, swap the derived `PartialEq` for a constant-time compare
   in the fill unit.
-- **`load_recorded_decisions` returns raw `String` diagnostics**
-  (`Mismatch(String)`). `ResumeConflictRow::mismatch` wraps them in
-  `Diagnostic`, which is fine for the wire, but the underlying variant
-  still invites branching on prose elsewhere.
+- **`RehydrateError` still carries raw `String` payloads** for its
+  non-resume consumers. The resume consult wraps them in `Diagnostic` at
+  the boundary (duty above), so prose never crosses into a wire-relevant
+  row untyped; elsewhere the raw strings remain the known escape hatch.
 - **Anchor drift found:** the card's orientation says the chat-completion
   message types live under `streaming/`; they live in
   `aura-web-server/src/types.rs` (`ChatMessage`, `ChatMessageToolCall`,
@@ -128,17 +183,17 @@ untouched, per the card.
 | --- | --- |
 | `park/resume/claim.rs:189` | `ResumeClaimTable::rename_back_to_parked` |
 | `park/resume/claim.rs:199` | `ResumeClaimTable::claim_and_resume` |
-| `park/resume/evaluate.rs:367` | `locate_checkpoint` |
-| `park/resume/evaluate.rs:376` | `check_identity` |
-| `park/resume/evaluate.rs:382` | `check_claim` |
-| `park/resume/evaluate.rs:393` | `admit` |
-| `park/resume/evaluate.rs:402` | `check_fingerprint` |
-| `park/resume/evaluate.rs:414` | `consult_decisions` |
-| `park/resume/evaluate.rs:424` | `project_blocking` |
-| `park/resume/evaluate.rs:437` | `authorize` |
-| `park/resume/evaluate.rs:446` | `evaluate_resume` |
-| `park/resume/evaluate.rs:503` | `run_segment` |
+| `park/resume/evaluate.rs:401` | `locate_checkpoint` |
+| `park/resume/evaluate.rs:412` | `check_identity` |
+| `park/resume/evaluate.rs:418` | `check_claim` |
+| `park/resume/evaluate.rs:429` | `admit` |
+| `park/resume/evaluate.rs:438` | `check_fingerprint` |
+| `park/resume/evaluate.rs:450` | `consult_decisions` |
+| `park/resume/evaluate.rs:462` | `project_blocking` |
+| `park/resume/evaluate.rs:475` | `authorize` |
+| `park/resume/evaluate.rs:484` | `evaluate_resume` |
+| `park/resume/evaluate.rs:541` | `run_segment` |
 | `aura-config/src/config.rs:587` | `require_identity_header_for_binding` |
 | `aura-web-server/src/server.rs:312` | `refuse_park_on_memory_backend` |
-| `aura-web-server/src/handlers.rs:1401` | `continuation_turns` |
-| `aura-web-server/src/handlers.rs:1439` | `resume_run` (handler dispatch) |
+| `aura-web-server/src/handlers.rs:1403` | `continuation_turns` |
+| `aura-web-server/src/handlers.rs:1441` | `resume_run` (handler dispatch) |

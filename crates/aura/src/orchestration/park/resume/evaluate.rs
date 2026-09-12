@@ -15,11 +15,12 @@ use sha2::{Digest, Sha256};
 
 use crate::config::AgentRuntimeConfig;
 use crate::hitl::{DecisionId, PendingApprovals};
+use crate::request_cancellation::RequestId;
 
 use super::super::RecordedDecisions;
 use super::super::document::ParkedRun;
 use super::claim::{
-    ResumeClaimTable, ResumeDocuments, ResumeLease, ResumeRunId, ResumeSessionId,
+    ClaimResumeFault, ResumeClaimTable, ResumeDocuments, ResumeLease, ResumeRunId, ResumeSessionId,
     ValidatedResumePath,
 };
 
@@ -47,9 +48,8 @@ impl std::fmt::Display for Diagnostic {
 }
 
 /// Hex sha256 over one identity header's value; construction is by hashing
-/// only.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(transparent)]
+/// only. Comparison-only: the hash never reaches the wire.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IdentityHash(String);
 
 impl IdentityHash {
@@ -72,9 +72,12 @@ impl IdentityHash {
     }
 }
 
-/// The identity-binding side of one resume request.
+/// The identity-binding side of one resume request, resolved inside the
+/// evaluation from the configured bind flag and the presented header. The
+/// type is private to this module, so a resolved state contradicting its
+/// config cannot be constructed, only derived.
 #[derive(Debug, Clone)]
-pub enum IdentityBindingState {
+enum IdentityBindingState {
     /// Identity binding is not configured.
     Unbound,
     /// Binding is configured and the request presented no identity header.
@@ -86,7 +89,7 @@ pub enum IdentityBindingState {
 impl IdentityBindingState {
     /// Resolve the configured binding against the presented header value.
     #[must_use]
-    pub fn resolve(bind_identity: bool, presented: Option<&str>) -> Self {
+    fn resolve(bind_identity: bool, presented: Option<&str>) -> Self {
         match (bind_identity, presented) {
             (false, _) => Self::Unbound,
             (true, None) => Self::BoundMissingHeader,
@@ -118,6 +121,34 @@ pub struct BlockingEntry {
     pub decision_id: DecisionId,
     pub tool: ParkedToolName,
     pub expires_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// The blocking entries of a body where at least one outstanding call is
+/// mandatory: the `parked` and `expired` conflict rows and the parked
+/// segment. Serializes as the plain JSON array.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct NonEmptyBlocking(Vec<BlockingEntry>);
+
+/// A mandatory blocking set was built from no entries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EmptyBlocking;
+
+impl NonEmptyBlocking {
+    /// Take the blocking entries, rejecting an empty set.
+    pub fn try_new(entries: Vec<BlockingEntry>) -> Result<Self, EmptyBlocking> {
+        if entries.is_empty() {
+            Err(EmptyBlocking)
+        } else {
+            Ok(Self(entries))
+        }
+    }
+
+    /// The entries in row order.
+    #[must_use]
+    pub fn as_slice(&self) -> &[BlockingEntry] {
+        &self.0
+    }
 }
 
 /// The not-ready codes, declared in evaluation order.
@@ -187,21 +218,21 @@ impl ResumeConflictRow {
         }
     }
 
-    pub(crate) fn expired(blocking: Vec<BlockingEntry>) -> Self {
+    pub(crate) fn expired(blocking: NonEmptyBlocking) -> Self {
         Self {
             code: ConflictCode::Expired,
             detail: Diagnostic::new(
                 "the decision window closed before every pending call was decided",
             ),
-            blocking,
+            blocking: blocking.0,
         }
     }
 
-    pub(crate) fn parked(blocking: Vec<BlockingEntry>) -> Self {
+    pub(crate) fn parked(blocking: NonEmptyBlocking) -> Self {
         Self {
             code: ConflictCode::Parked,
             detail: Diagnostic::new("calls still await a decision"),
-            blocking,
+            blocking: blocking.0,
         }
     }
 }
@@ -234,12 +265,6 @@ enum IdentityFault {
     Fault(Diagnostic),
 }
 
-/// Why the claim check failed.
-enum ClaimFault {
-    Live,
-    Fault(Diagnostic),
-}
-
 /// Why admitting the checkpoint failed.
 enum AdmitFault {
     Interrupted,
@@ -255,8 +280,8 @@ enum FingerprintFault {
 /// Why the recorded-decisions consult failed.
 enum ConsultFault {
     Mismatch(Diagnostic),
-    Expired(Vec<BlockingEntry>),
-    Parked(Vec<BlockingEntry>),
+    Expired(NonEmptyBlocking),
+    Parked(NonEmptyBlocking),
     Fault(Diagnostic),
 }
 
@@ -278,11 +303,13 @@ impl From<IdentityFault> for ResumeRefusal {
     }
 }
 
-impl From<ClaimFault> for ResumeRefusal {
-    fn from(fault: ClaimFault) -> Self {
+impl From<ClaimResumeFault> for ResumeRefusal {
+    fn from(fault: ClaimResumeFault) -> Self {
         match fault {
-            ClaimFault::Live => Self::Conflict(ResumeConflictRow::running()),
-            ClaimFault::Fault(diagnostic) => Self::Fault(diagnostic),
+            // A claim lost to a concurrent evaluation is the running row,
+            // never the fault sink: the spec fixes 409 for a live claim.
+            ClaimResumeFault::Live => Self::Conflict(ResumeConflictRow::running()),
+            ClaimResumeFault::Io(diagnostic) => Self::Fault(diagnostic),
         }
     }
 }
@@ -328,11 +355,18 @@ enum LocatedCheckpoint {
 /// Everything one resume evaluation reads.
 pub struct ResumeEvaluation<'a> {
     pub path: ValidatedResumePath,
-    pub documents: ResumeDocuments,
+    /// The memory root the run's two checkpoint names derive from.
+    pub memory_dir: &'a str,
     pub config: &'a AgentRuntimeConfig,
     pub store: &'a PendingApprovals,
     pub claims: &'a ResumeClaimTable,
-    pub identity: IdentityBindingState,
+    /// The `[hitl.park]` bind flag, resolved by the caller from the parsed
+    /// config: the runtime `HitlRuntime` does not carry it.
+    pub bind_identity: bool,
+    /// The presented identity header's raw value, before any hashing.
+    pub presented_identity: Option<&'a str>,
+    /// The request id the run's sweep events publish under.
+    pub request_id: RequestId,
     pub now: chrono::DateTime<chrono::Utc>,
 }
 
@@ -367,18 +401,20 @@ async fn locate_checkpoint(docs: &ResumeDocuments) -> Result<LocatedCheckpoint, 
     todo!()
 }
 
-/// Compare the checkpoint's stored identity hash against the request's.
+/// Compare the checkpoint's stored identity hash against the presented
+/// header, resolving the configured binding first.
 #[expect(unused_variables, reason = "todo!() body; filled by P45")]
 fn check_identity(
     stored: Option<IdentityHash>,
-    presented: &IdentityBindingState,
+    bind_identity: bool,
+    presented_identity: Option<&str>,
 ) -> Result<(), IdentityFault> {
     todo!()
 }
 
 /// Reject a run another evaluation already holds.
 #[expect(unused_variables, reason = "todo!() body; filled by P45")]
-fn check_claim(claims: &ResumeClaimTable, run: &ResumeRunId) -> Result<(), ClaimFault> {
+fn check_claim(claims: &ResumeClaimTable, run: &ResumeRunId) -> Result<(), ClaimResumeFault> {
     todo!()
 }
 
@@ -414,13 +450,15 @@ async fn consult_decisions(
     todo!()
 }
 
-/// Project the run's outstanding parked calls onto blocking entries.
+/// Project the run's outstanding parked calls onto blocking entries. The
+/// expired and parked rows are unreachable without at least one outstanding
+/// call, so an empty projection is a fault, not an empty body.
 #[expect(unused_variables, reason = "todo!() body; filled by P45")]
 async fn project_blocking(
     document: &ParkedRun,
     store: &PendingApprovals,
     now: chrono::DateTime<chrono::Utc>,
-) -> Result<Vec<BlockingEntry>, Diagnostic> {
+) -> Result<NonEmptyBlocking, Diagnostic> {
     todo!()
 }
 
@@ -433,7 +471,7 @@ async fn authorize(
     evaluation_path: &ValidatedResumePath,
     document: ParkedRun,
     recorded: Arc<RecordedDecisions>,
-) -> Result<ResumeGrant, Diagnostic> {
+) -> Result<ResumeGrant, ClaimResumeFault> {
     todo!()
 }
 
@@ -479,7 +517,7 @@ pub enum SegmentResult {
     },
     Parked {
         turns: SegmentTurns,
-        blocking: Vec<BlockingEntry>,
+        blocking: NonEmptyBlocking,
     },
 }
 

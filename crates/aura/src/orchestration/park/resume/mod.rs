@@ -15,6 +15,7 @@ pub use claim::{
     ValidatedResumePath,
 };
 pub use evaluate::{
-    BlockingEntry, ConflictCode, IdentityBindingState, ResumeConflictRow, ResumeEvaluation,
-    ResumeGrant, ResumeRefusal, SegmentResult, evaluate_resume, run_segment,
+    BlockingEntry, ConflictCode, Diagnostic, EmptyBlocking, EmptySegment, NonEmptyBlocking,
+    ParkedToolName, ResumeConflictRow, ResumeEvaluation, ResumeGrant, ResumeRefusal, SegmentError,
+    SegmentResult, SegmentTurns, evaluate_resume, run_segment,
 };
