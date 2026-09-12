@@ -102,9 +102,8 @@ impl HitlApprovalWrapper {
 
     /// Arm the recorded-decisions consult: a glob-matched call checks the
     /// run's recorded decisions before the park arm. `None` (the default)
-    /// leaves the live path byte-identical. Wired by the orchestrator
-    /// continuation (P44 commit 3).
-    #[allow(dead_code)]
+    /// leaves the live path byte-identical. Wired by the orchestrator's
+    /// worker build for the resume segment (P45 fold, B1).
     #[must_use]
     pub(crate) fn with_recorded_decisions(mut self, recorded: Arc<RecordedDecisions>) -> Self {
         self.recorded_decisions = Some(recorded);
