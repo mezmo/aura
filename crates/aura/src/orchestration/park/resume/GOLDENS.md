@@ -48,6 +48,9 @@ internals.
 | R2: outcome-bearing turns on the 200 payload | the pair's wire shape, per decided call | `all_decided_grant_runs_the_segment_to_completion` + `re_park_mid_segment_carries_turns_and_the_new_blocking_entry` flipped to the pair-ahead shape (rows B below); `outcome_pair_and_sentinel_literals_match_the_wire_serializers` (aura) grounds the pair and sentinel literals against the implemented serializers, passing on arrival. |
 | B. completed 200 | full 200 body, composite | `all_decided_grant_runs_the_segment_to_completion` (aura: segment turns as exact rig wire values — the R2 outcome-bearing pair ahead of the final turn, over the sentinel-carrying checkpoint) + `completed_segment_projects_the_full_200_body` (web: `from_segment` envelope, exact JSON). |
 | B. parked-with-new-blocking 200 | segment half | `re_park_mid_segment_carries_turns_and_the_new_blocking_entry` (aura): turns pinned exactly — the R2 outcome-bearing pair ahead of the gated assistant turn, over the sentinel-carrying checkpoint — with the fresh decision id and expiry location-normalized after an audited shape check (a single entry carrying a UUID and an RFC 3339 stamp). |
+| Correction fold, fix-contract steps 6+8: the consumed set derives from the recorded set's before/after state, and a re-park removes only the actually-consumed subset after the commit publishes — untouched sibling nodes keep their recorded approvals | store-side pins across a two-resume lifecycle + the second resume's whole turns array | `consumed_subset_re_park_preserves_the_sibling_and_completes_on_the_second_resume` (aura): a two-node checkpoint (both decided) — resume 1 drives node A only (its decided call executes once, the continuation's new gated call re-parks, node B is not driven), then asserts node A's original decision is gone from the store, node B's decided ticket survives untouched (`try_parked` + the recorded approval), and exactly one fresh undecided ticket exists under the original bound run id (`list_pending` over the file store); resume 2 over the re-published checkpoint drives both nodes — the fresh and sibling calls each execute exactly once with their own arguments, the turns carry each decided call's R2 pair in segment order keyed by its own original call id, completion removes the fresh and sibling tickets together, and the placeholder appears nowhere. |
+| Correction fold, fix-contract step 7: the strict guard drops before streaming, so a post-substitution new gated call (absent from the recorded set) re-parks through the LIVE arm and never faults as a strict miss; it re-arms on the next resume | whole both-resume chain — each segment's turns and blocking, no Err anywhere | `post_substitution_new_call_re_parks_through_the_live_arm_not_a_strict_miss` (aura): resume 1's parked segment carries the original pair keyed by the original call id ahead of the gated assistant turn (the A1 re-park pin; fresh decision id and expiry location-normalized) and resolves Ok — a strict-miss fault would fail the frame's own expect; resume 2 substitutes the fresh call and completes, its turns carrying the fresh pair keyed by the fresh call's id. |
+| —. run-id binding on the re-parked fresh ticket | the fresh ticket's owner id and worker scope | `re_park_registers_the_fresh_ticket_under_the_original_bound_run_id` (aura) — the seam unit's one authorized golden addition, whose manifest row this file owed (the gap ruled into the A2 unit). Its fixture carries the sentinel document and a RecordingTool for the decided tool (the board-owner repair ruling, logged on the card): without them the B1 fill's substitution would fault for fixture reasons — a missing ToolResult slot to replace, a missing tool to invoke. The frame's pin is the run-id binding only; execution-count assertions live in the P58 and lifecycle frames. |
 | C. claim race | observable race frame | `concurrent_evaluations_admit_one_grant_and_refuse_the_loser_with_running` (aura): `tokio::join!`, exactly one grant, the loser's whole running-row body, either side winning. |
 | D. blocking-population narrow reading | pinned by the bodies themselves | running/interrupted/config_changed/mismatch frames each pin `"blocking": []`; rename-back/parked/expired frames pin non-empty sets. The reading is enforced by literals, not prose. |
 | —. stage order (first match wins) | ordering frame | `interrupted_outranks_expired` (aura): both conditions hold, the interrupted body wins. |
@@ -91,5 +94,25 @@ internals.
   faults the resume — the pin working.
 - `run_segment` consumes the `test_rig` worker-override queue for its
   continuation's worker builds, so the segment frames run scripted models.
+- The two-resume lifecycle frames install their worker overrides per resume,
+  never up front: the queue is take-once and process-global, and a frame
+  failing mid-lifecycle must not leak the resumes it never drove into the
+  next consumer's builds. Resume 1 consumes one override (the segment
+  returns at the first re-park, so later awaiting nodes are not driven);
+  resume 2 consumes one per driven node, in plan order (node A's build, then
+  node B's).
+- The re-parked fresh call's pending id is the rig tool-call id the park's
+  `take_current_call_id` stashed (`call_0` in the scripts) — not the
+  scripted provider call id, which rides only the gated assistant turn's
+  wire (`call_id_0`). The fresh call's R2 pair keys by that pending id with
+  `call_id: null`, the same reading as the original-park pair.
+- Resume 1's parked-200 blocking derives from the commit's refreshed
+  `pending_by_task`, which retains decided siblings for the resume consult,
+  so node B's decided entry can ride the list alongside the fresh one. The
+  lifecycle frame selects the fresh entry by tool name (exactly one entry
+  names the newly gated tool) and pins the outstanding set on the store
+  (`list_pending`), not on the wire list; whether the parked-200 blocking
+  should be outstanding-only — the 409 rows' narrow reading — is a B1 /
+  U(endpoint) reconciliation point, deliberately not pinned here.
 - The handler resolves the resume config from `AppState.configs`; the
   handler frames supply exactly one config.
