@@ -9,6 +9,8 @@
 
 pub(crate) mod claim;
 pub(crate) mod evaluate;
+#[cfg(test)]
+mod goldens;
 
 pub use claim::{
     MalformedId, ResumeClaimTable, ResumeDocuments, ResumeRunId, ResumeSessionId,
