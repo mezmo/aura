@@ -126,7 +126,7 @@ Two duties ride on specific stages:
 | Payload types reachable through re-exported carriers | `pub use` at both hops (`park::resume`, `orchestration`) | `aura-web-server`, which must be able to name every type in a re-exported signature: `Diagnostic` (`ResumeRefusal::Fault`), `ParkedToolName` (`BlockingEntry::tool`), `SegmentTurns`/`EmptySegment` (`SegmentResult`, `SegmentTurns::try_new`), `NonEmptyBlocking`/`EmptyBlocking` (`SegmentResult::Parked`, `try_new`), `SegmentError` (`run_segment`). Checked and excluded — named in no re-exported signature: `IdentityHash` (comparison-only since the binding state went private), `ResumeLease` (private `ResumeGrant` field), `IdentityBindingState` (private) |
 | Stage fns, `LocatedCheckpoint`, the `*Fault` enums (private to `evaluate.rs`; `ClaimResumeFault` in `claim.rs`) | private / `pub(crate)` | the fill unit only |
 | `ResumeClaimTable::is_live`, `rename_back_to_parked`, `claim_and_resume` | `pub(crate)` | in-crate evaluation stages |
-| `ResumeDocuments::parked`/`resuming`, `Diagnostic::new`, `IdentityHash::from_stored`, `ParkedToolName::new`, `ResumeConflictRow` row constructors | `pub(crate)` | in-crate stages and the handler-side projections |
+| `ResumeDocuments::parked`/`resuming`, `Diagnostic::new`, `IdentityHash::from_stored`, `IdentityHash::into_inner`, `ParkedToolName::new`, `ResumeConflictRow` row constructors | `pub(crate)` | in-crate stages and the handler-side projections; `into_inner` hands the hashed digest to `ParkCommitInputs` at the live park site |
 | `config_fingerprint`, `parked_document_dir` | `pub(crate)` in `park::commit`, reached as `super::super::commit::*` | `check_fingerprint`, `ResumeDocuments::for_path` |
 | `RecordedDecisions`, `ParkedRun` | `pub(crate)` types behind private `ResumeGrant` fields | the in-crate segment runner; opaque to the web server |
 | `ResumeGrant::checkpoint`/`recorded_decisions`/`consumed_decisions`/`documents` | `pub(crate)` accessors over the private fields | the orchestrator's segment entry |
@@ -151,18 +151,20 @@ untouched, per the card.
 
 ## Residual risks
 
-- **Identity-hash write side.** `ParkCommitInputs::identity_hash` and
-  `build_document`'s parameter are landed: a re-park passes the checkpoint's
-  stored hash through, so a bound run stays bound across segments, and the
-  `None` form keeps the v1 wire unchanged (the round-trip calibration stays
-  green). The ORIGINAL park's `Some` branch — hashing the presented identity
-  header at park time when `[hitl.park].bind_identity` is configured — is
-  not yet reachable: the runtime `AgentRuntimeConfig` carries neither the
-  bind flag nor the presented header value, and the ruled scope keeps
-  `hitl/route.rs` free of a `HitlRuntime` extension. Until that threading
-  lands, the live park path commits `None`, and `bind_identity = true`
-  fails every resume of a None-hash document closed (404 row), which is
-  safe but useless.
+- **Identity-hash write side — resolved.** The ruled threading has landed:
+  `AgentRuntimeConfig` carries `park_bind_identity` plus the request's
+  `presented_identity` value, both projected by `RigBuilder::to_agent_config`
+  from the parsed config (`[hitl.park].bind_identity` is the provenance; no
+  `HitlRuntime` extension). `to_agent_config` extracts the top-level
+  `identity_header`'s value from the request headers while the flag is on
+  (case-insensitive lookup, like every other request-header read). The live
+  park site (`Orchestrator::park_run`) hashes that value with
+  `IdentityHash::hash_value` — the same hex-sha256 function the resume side
+  uses; nothing re-implemented — and passes `Some(hash)` into
+  `ParkCommitInputs`. Binding off parks `None` (v1 wire unchanged), and
+  binding on without a presented header also parks `None`, which the resume
+  side refuses — the same fail-closed reading it gives a missing header. A
+  re-park still passes the checkpoint's stored hash through unchanged.
 - **Expired row's blocking list is a re-derivation, not the consult's
   output.** `load_recorded_decisions` returns `RehydrateError::Expired`
   without the outstanding set; `project_blocking` re-derives it from the
