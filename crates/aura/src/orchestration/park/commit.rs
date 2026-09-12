@@ -263,7 +263,8 @@ pub(crate) fn parked_document_dir(memory_dir: &str, session_id: Option<&str>) ->
 
 /// Fingerprint the configuration a resume must not drift from: the HITL
 /// gating surface (globs, route, park flag), the agent's model and tool
-/// filter, and the per-worker model and tool configuration.
+/// filter, the per-worker model and tool configuration, and the bound
+/// identity header's NAME.
 ///
 /// The webhook route's projection carries `"delivery"` derived from the
 /// client's poll marker — the same source `park_registry` reads; no second
