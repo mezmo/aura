@@ -8732,10 +8732,13 @@ mod tests {
             serde_json::to_value(Some(routing_decision)).unwrap(),
             "the routing decision survives the round trip"
         );
-        let (recorded, consumed_ids) =
-            crate::orchestration::park::load_recorded_decisions(&registry, &document)
-                .await
-                .unwrap();
+        let (recorded, consumed_ids) = crate::orchestration::park::load_recorded_decisions(
+            &registry,
+            &document,
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
         assert_eq!(consumed_ids, vec![decision_id]);
 
         let node = document

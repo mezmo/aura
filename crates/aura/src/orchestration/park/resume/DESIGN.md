@@ -104,15 +104,17 @@ Two duties ride on specific stages:
   production. If ever observed it surfaces as a loud fault (residual risks
   below), never as a silent empty body.
 
-## Fill-unit duties (in-crate; recorded, not yet applied)
+## Fill-unit duties (in-crate; applied by the evaluate fill)
 
 - **Thread the injected clock into `load_recorded_decisions`.** The helper
-  reads `chrono::Utc::now()` internally today, so the expired, mismatch,
-  and parked rows would ignore the bundle's `now`; the fill unit threads
-  `now` through the consult.
+  read `chrono::Utc::now()` internally, so the expired, mismatch, and
+  parked rows would have ignored the bundle's `now`; the fill unit threads
+  `now` through the consult, and the helper's other callers (its own tests,
+  the commit test, the orchestrator loop test) pass `Utc::now()` where they
+  hold no clock.
 - **Wrap `RehydrateError`'s raw payloads in `Diagnostic` at the consult
   boundary.** `Mismatch(String)`, `Store(String)`, and `Document(String)`
-  predate the card; the consult converts them where they enter
+  predate the card; `consult_decisions` converts them where they enter
   `ConsultFault`, so no raw string crosses into a wire-relevant row.
 
 ## Visibility / seam table
@@ -183,16 +185,16 @@ untouched, per the card.
 | --- | --- |
 | `park/resume/claim.rs` | `ResumeClaimTable::rename_back_to_parked` — filled |
 | `park/resume/claim.rs` | `ResumeClaimTable::claim_and_resume` — filled |
-| `park/resume/evaluate.rs:401` | `locate_checkpoint` |
-| `park/resume/evaluate.rs:412` | `check_identity` |
-| `park/resume/evaluate.rs:418` | `check_claim` |
-| `park/resume/evaluate.rs:429` | `admit` |
-| `park/resume/evaluate.rs:438` | `check_fingerprint` |
-| `park/resume/evaluate.rs:450` | `consult_decisions` |
-| `park/resume/evaluate.rs:462` | `project_blocking` |
-| `park/resume/evaluate.rs:475` | `authorize` |
-| `park/resume/evaluate.rs:484` | `evaluate_resume` |
-| `park/resume/evaluate.rs:541` | `run_segment` |
+| `park/resume/evaluate.rs` | `locate_checkpoint` — filled |
+| `park/resume/evaluate.rs` | `check_identity` — filled |
+| `park/resume/evaluate.rs` | `check_claim` — filled |
+| `park/resume/evaluate.rs` | `admit` — filled |
+| `park/resume/evaluate.rs` | `check_fingerprint` — filled |
+| `park/resume/evaluate.rs` | `consult_decisions` — filled |
+| `park/resume/evaluate.rs` | `project_blocking` — filled |
+| `park/resume/evaluate.rs` | `authorize` — filled |
+| `park/resume/evaluate.rs` | `evaluate_resume` — filled |
+| `park/resume/evaluate.rs:744` | `run_segment` |
 | `aura-config/src/config.rs:587` | `require_identity_header_for_binding` |
 | `aura-web-server/src/server.rs:312` | `refuse_park_on_memory_backend` |
 | `aura-web-server/src/handlers.rs:1403` | `continuation_turns` |
