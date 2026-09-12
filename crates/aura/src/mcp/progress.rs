@@ -29,7 +29,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
-use crate::request_progress::{self, ProgressNotification};
+use crate::request_progress::{self, Progress, ProgressNotification};
 
 /// A custom ClientHandler that routes progress notifications to request-scoped channels.
 ///
@@ -122,9 +122,12 @@ impl ClientHandler for ProgressEnabledHandler {
             // Build notification for request-scoped broker
             let notification = ProgressNotification {
                 progress_token: params.progress_token.clone(),
-                progress: params.progress,
-                total: params.total,
+                progress: Progress {
+                    current: params.progress,
+                    total: params.total,
+                },
                 message: params.message.clone(),
+                agent: None,
             };
 
             if let Some(ref req_id) = request_id {

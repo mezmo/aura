@@ -5,6 +5,7 @@
 //! in web services or other applications that need to build agents
 //! programmatically.
 
+pub mod agent_events;
 pub mod approval_event_broker;
 pub mod approver_headers;
 pub mod bedrock_embedding;
@@ -100,7 +101,7 @@ pub use mcp::{InFlightRequests, McpManager, ProgressEnabledHandler};
 pub use rag_tools::{AutoIngest, VectorIngestTool};
 pub use request_cancellation::{RequestCancellation, RequestId};
 pub use request_progress::{
-    ProgressNotification, RequestProgressBroker, global as request_progress_global,
+    Progress, ProgressNotification, RequestProgressBroker, global as request_progress_global,
     subscribe as request_progress_subscribe, unsubscribe as request_progress_unsubscribe,
 };
 pub use rmcp::model::{NumberOrString, ProgressToken};
@@ -113,7 +114,7 @@ pub use streaming_request_hook::{ResponseContent, StreamingRequestHook, UsageSta
 pub use tool_call_observer::{RetryHint, ToolCallObserver, ToolEvent, ToolOutcome};
 pub use tool_error_detection::{DetectedToolError, ToolResultStatus, detect_tool_error};
 pub use tool_event_broker::{
-    ToolCallId, ToolEventBroker, ToolLifecycleEvent, ToolName, ToolUsageEvent,
+    TokenUsage, ToolCallId, ToolEventBroker, ToolLifecycleEvent, ToolName, ToolUsageEvent,
     global as tool_event_global, peek_tool_call_id, pop_tool_call_id, publish_tool_start,
     publish_tool_usage, push_tool_call_id, subscribe as tool_event_subscribe, tool_usage_subscribe,
     tool_usage_unsubscribe, unsubscribe as tool_event_unsubscribe,
