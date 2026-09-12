@@ -17,8 +17,8 @@ use crate::hitl::{
     PROTOCOL_VERSION, ParkedApproval, PendingApprovals,
 };
 use crate::orchestration::test_rig::{
-    RecordingTool, ScriptedCompletionModel, ScriptedToolCall, ScriptedTurn, WorkerOverride,
-    install_worker_overrides,
+    RecordingTool, ScriptedCompletionModel, ScriptedToolCall, ScriptedTurn, WORKER_OVERRIDE_SERIAL,
+    WorkerOverride, install_worker_overrides,
 };
 use crate::orchestration::{
     OrchestrationConfig, PendingCall, TaskIdentity, TaskStatus, WorkerConfig,
@@ -492,6 +492,7 @@ async fn empty_resuming_document_renames_back_and_answers_the_parked_row() {
 #[tokio::test]
 async fn concurrent_rename_back_losers_answer_the_parked_row_not_a_fault() {
     let world = world();
+    let _race_gate = world.claims.arm_rename_back_race();
     register_undecided(&world).await;
     stage_resuming_document(
         &world,
@@ -704,6 +705,7 @@ async fn concurrent_evaluations_admit_one_grant_and_refuse_the_loser_with_runnin
 /// continuation produces the final assistant turn, and no blocking set.
 #[tokio::test]
 async fn all_decided_grant_runs_the_segment_to_completion() {
+    let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
     let world = world();
     install_worker_overrides(vec![WorkerOverride {
         model: ScriptedCompletionModel::new(vec![ScriptedTurn::text(FINAL_TEXT)]),
@@ -746,6 +748,7 @@ async fn all_decided_grant_runs_the_segment_to_completion() {
 /// shape check; everything else is the literal wire value.
 #[tokio::test]
 async fn re_park_mid_segment_carries_turns_and_the_new_blocking_entry() {
+    let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
     let world = world();
     let invocations = Arc::new(Mutex::new(Vec::new()));
     install_worker_overrides(vec![WorkerOverride {
@@ -821,6 +824,7 @@ async fn re_park_mid_segment_carries_turns_and_the_new_blocking_entry() {
 /// stamp `run:<fresh>` here and fail the frame.
 #[tokio::test]
 async fn re_park_registers_the_fresh_ticket_under_the_original_bound_run_id() {
+    let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
     let world = world();
     let invocations = Arc::new(Mutex::new(Vec::new()));
     install_worker_overrides(vec![WorkerOverride {
