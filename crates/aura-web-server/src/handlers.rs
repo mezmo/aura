@@ -1380,9 +1380,11 @@ impl ResumeRunResponse {
     fn from_segment(session: &ResumeSessionId, run: &ResumeRunId, segment: SegmentResult) -> Self {
         let (state, turns, blocking) = match segment {
             SegmentResult::Completed { turns } => (ResumeRunState::Completed, turns, None),
-            SegmentResult::Parked { turns, blocking } => {
-                (ResumeRunState::Parked, turns, Some(blocking))
-            }
+            SegmentResult::Parked { turns, blocking } => (
+                ResumeRunState::Parked,
+                turns,
+                Some(blocking.as_slice().to_vec()),
+            ),
         };
         Self {
             session_id: session.to_string(),
