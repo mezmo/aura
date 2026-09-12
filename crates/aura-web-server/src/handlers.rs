@@ -2866,4 +2866,137 @@ url = "http://127.0.0.1:9"
             assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
         }
     }
+
+    /// Whole-frame goldens for the resume endpoint's wire surfaces (P45
+    /// layer 2): the handler's bare 404 frames and the 200-body projection.
+    /// The evaluation rows' frames live beside the pipeline in
+    /// `aura::orchestration::park::resume::goldens`; `GOLDENS.md` there maps
+    /// every row to its fixture and records the exclusions.
+    mod resume_goldens {
+        use super::*;
+
+        fn resume_claims() -> axum::extract::Extension<ResumeClaims> {
+            axum::extract::Extension(ResumeClaims(Arc::new(ResumeClaimTable::new())))
+        }
+
+        fn config_with_memory_dir(memory_dir: &str) -> aura_config::Config {
+            aura_config::Config {
+                memory_dir: Some(memory_dir.to_string()),
+                ..make_test_config()
+            }
+        }
+
+        async fn body_bytes(response: Response) -> Bytes {
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("response body reads")
+        }
+
+        async fn bare_404(response: Response) {
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            assert!(
+                body_bytes(response).await.is_empty(),
+                "the 404 frame carries no body"
+            );
+        }
+
+        /// A malformed session segment answers the bare 404 frame. The
+        /// memory root is a regular file, so any filesystem read would
+        /// surface as a fault, never as this 404.
+        #[tokio::test]
+        async fn malformed_session_id_answers_bare_404_without_reading_the_filesystem() {
+            let obstructed = tempfile::tempdir().expect("temp dir");
+            let memory_file = obstructed.path().join("memory-not-a-dir");
+            std::fs::write(&memory_file, "not a directory").expect("obstruct the memory root");
+            let state = make_state(vec![config_with_memory_dir(
+                memory_file.to_str().expect("UTF-8 path"),
+            )]);
+
+            let response = resume_run(
+                State(state),
+                resume_claims(),
+                HeaderMap::new(),
+                Path((
+                    "../escape".to_string(),
+                    "0199c0de-4545-7000-8000-000000000045".to_string(),
+                )),
+            )
+            .await;
+
+            bare_404(response).await;
+        }
+
+        /// A malformed run segment answers the same bare 404 frame.
+        #[tokio::test]
+        async fn malformed_run_id_answers_bare_404_without_reading_the_filesystem() {
+            let obstructed = tempfile::tempdir().expect("temp dir");
+            let memory_file = obstructed.path().join("memory-not-a-dir");
+            std::fs::write(&memory_file, "not a directory").expect("obstruct the memory root");
+            let state = make_state(vec![config_with_memory_dir(
+                memory_file.to_str().expect("UTF-8 path"),
+            )]);
+
+            let response = resume_run(
+                State(state),
+                resume_claims(),
+                HeaderMap::new(),
+                Path(("sess-p45".to_string(), "not-a-uuid".to_string())),
+            )
+            .await;
+
+            bare_404(response).await;
+        }
+
+        /// A run with no checkpoint under either name answers the bare 404
+        /// frame through the full handler path.
+        #[tokio::test]
+        async fn missing_checkpoint_answers_bare_404() {
+            let empty = tempfile::tempdir().expect("temp memory root");
+            let state = make_state(vec![config_with_memory_dir(
+                empty.path().to_str().expect("UTF-8 path"),
+            )]);
+
+            let response = resume_run(
+                State(state),
+                resume_claims(),
+                HeaderMap::new(),
+                Path((
+                    "sess-p45".to_string(),
+                    "0199c0de-4545-7000-8000-000000000045".to_string(),
+                )),
+            )
+            .await;
+
+            bare_404(response).await;
+        }
+
+        /// The completed segment projects the complete 200 body: the
+        /// chat-completion turn objects, the lowercase state token, and no
+        /// blocking member.
+        #[tokio::test]
+        async fn completed_segment_projects_the_full_200_body() {
+            let session = ResumeSessionId::parse("sess-p45").expect("golden session parses");
+            let run = ResumeRunId::parse("0199c0de-4545-7000-8000-000000000045")
+                .expect("golden run parses");
+            let turns = aura::orchestration::SegmentTurns::try_new(vec![aura::Message::assistant(
+                "approved and applied",
+            )])
+            .expect("one turn");
+
+            let body =
+                ResumeRunResponse::from_segment(&session, &run, SegmentResult::Completed { turns });
+
+            assert_eq!(
+                serde_json::to_value(&body).expect("the 200 body serializes"),
+                serde_json::json!({
+                    "session_id": "sess-p45",
+                    "run_id": "0199c0de-4545-7000-8000-000000000045",
+                    "state": "completed",
+                    "turns": [
+                        { "role": "assistant", "content": "approved and applied" },
+                    ],
+                }),
+            );
+        }
+    }
 }
