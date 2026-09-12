@@ -154,9 +154,10 @@ symmetry; the fingerprint stage cannot fault), and the goldens' TempDir
 kept alive for cleanup — and is not removable at the handler fill. The
 per-item `#[allow(dead_code)]` markers in `handlers.rs` covered exactly the
 five then-not-wired projections and were swept when the handler body
-landed. Existing allows in `continuation.rs`
-(:51, :124, :202), `document.rs` (:226), and `park/mod.rs` (:15) are
-untouched, per the card.
+landed. Of the pre-existing allows, `continuation.rs` :51 and :124,
+`document.rs` (:233), and `park/mod.rs` (:16) are untouched, per the
+card; continuation.rs :202's marker was swept at the gate-a fold when
+`load_recorded_decisions` gained its production caller.
 
 ## Residual risks
 

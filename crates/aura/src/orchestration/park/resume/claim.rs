@@ -194,7 +194,8 @@ impl ResumeClaimTable {
             // no guard is ever held across an await.
             let _live = live.lock().expect("resume claim lock");
             std::fs::rename(&resuming, &parked).or_else(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
+                if e.kind() == std::io::ErrorKind::NotFound && parked.try_exists().unwrap_or(false)
+                {
                     // A concurrent evaluation won the rename-back under the
                     // lock; the document is already at its parked name and
                     // evaluation proceeds against the in-memory document.

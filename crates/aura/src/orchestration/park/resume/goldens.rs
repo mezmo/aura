@@ -485,6 +485,45 @@ async fn empty_resuming_document_renames_back_and_answers_the_parked_row() {
     );
 }
 
+/// Two evaluations racing the rename-back of the same crashed resuming
+/// document: the claim lock serializes the renames, the loser's ENOENT
+/// proceeds against the already-restored parked name, and both answer the
+/// parked row - no fault.
+#[tokio::test]
+async fn concurrent_rename_back_losers_answer_the_parked_row_not_a_fault() {
+    let world = world();
+    register_undecided(&world).await;
+    stage_resuming_document(
+        &world,
+        &parked_document(FUTURE_STAMP, matching_fingerprint(&world), None, vec![]),
+    )
+    .await;
+
+    let (first, second) = tokio::join!(
+        evaluate_resume(evaluation(&world, false, None)),
+        evaluate_resume(evaluation(&world, false, None)),
+    );
+    for outcome in [first, second] {
+        let refusal = outcome.expect_err("undecided calls answer the parked row");
+        assert_conflict(
+            refusal,
+            json!({
+                "code": "parked",
+                "detail": "calls still await a decision",
+                "blocking": [entry(decision(), TOOL, FUTURE_STAMP)],
+            }),
+        );
+    }
+    assert!(
+        parked_document_path(&world).exists(),
+        "the parked name exists for whichever evaluation renamed it back"
+    );
+    assert!(
+        !resuming_document_path(&world).exists(),
+        "the resuming name is gone"
+    );
+}
+
 /// A parked document whose fingerprint no longer matches the rebuilt config
 /// answers the config-changed row and leaves the checkpoint and its ticket
 /// untouched.
