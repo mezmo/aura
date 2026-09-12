@@ -5,7 +5,11 @@
 //! park-module's [`super::continuation::ResumingDocumentHandle`], which stays
 //! the append-and-publish surface of the resuming document itself.
 
-#![allow(dead_code)] // P45 skeleton: the fill unit removes this slice as bodies land
+// Covers three structural survivors of the filled module: the grant's
+// Drop-held lease, `FingerprintFault::Fault` (stage-shape symmetry — the
+// fingerprint stage cannot fault), and the goldens' TempDir kept alive for
+// cleanup. Not removable at the handler fill either.
+#![allow(dead_code)]
 
 pub(crate) mod claim;
 pub(crate) mod evaluate;

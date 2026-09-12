@@ -151,7 +151,9 @@ pub(crate) struct RunStateForPark<'a> {
 /// Build the checkpoint from the run's current state. `pending_by_task`
 /// narrows each awaiting node to the calls still awaiting a decision, and an
 /// awaiting node without a park record is an error: a checkpoint that cannot
-/// resume must not be written.
+/// resume must not be written. `identity_hash` carries the hex sha256 of the
+/// bound identity header's value; `None` serializes nothing, so the v1 wire
+/// form is unchanged for runs parked without identity binding.
 pub(crate) fn build_document(
     state: &RunStateForPark<'_>,
     plan: &Plan,
@@ -159,6 +161,7 @@ pub(crate) fn build_document(
     pending_by_task: &std::collections::HashMap<usize, Vec<PendingCall>>,
     expires_at: String,
     config_fingerprint: String,
+    identity_hash: Option<String>,
 ) -> io::Result<ParkedRun> {
     let mut tasks = Vec::with_capacity(plan.tasks.len());
     for t in &plan.tasks {
@@ -220,7 +223,7 @@ pub(crate) fn build_document(
         },
         executed: Vec::new(),
         config_fingerprint,
-        identity_hash: None,
+        identity_hash,
     })
 }
 
@@ -325,6 +328,7 @@ mod tests {
             &pending_by_task,
             "2026-09-02T15:00:00+00:00".to_string(),
             "fingerprint".to_string(),
+            None,
         )
         .unwrap();
 
@@ -385,6 +389,7 @@ mod tests {
             &pending_by_task,
             "2026-09-02T15:00:00+00:00".to_string(),
             "fingerprint".to_string(),
+            None,
         )
         .unwrap();
 
@@ -415,6 +420,7 @@ mod tests {
             &std::collections::HashMap::new(),
             "2026-09-02T15:00:00+00:00".to_string(),
             "fingerprint".to_string(),
+            None,
         )
         .unwrap_err();
         assert!(err.to_string().contains("task 0"), "{err}");

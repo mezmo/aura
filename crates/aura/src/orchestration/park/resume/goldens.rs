@@ -774,6 +774,74 @@ async fn re_park_mid_segment_carries_turns_and_the_new_blocking_entry() {
     }
 }
 
+/// The scope-run-id audit on a mid-segment re-park: the fresh ticket the
+/// re-parking segment registers must name the ORIGINAL bound run id — the
+/// owner id the sweeps key on and the worker scope stamped on the request —
+/// so the next resume's consult matches it. This is the pin for the
+/// segment's run-id binding: an orchestrator minting a fresh run id would
+/// stamp `run:<fresh>` here and fail the frame.
+#[tokio::test]
+async fn re_park_registers_the_fresh_ticket_under_the_original_bound_run_id() {
+    let world = world();
+    let invocations = Arc::new(Mutex::new(Vec::new()));
+    install_worker_overrides(vec![WorkerOverride {
+        model: ScriptedCompletionModel::new(vec![ScriptedTurn::tool_calls(vec![
+            ScriptedToolCall::new("call_0", NEW_TOOL, json!({ "namespace": "stage" }))
+                .with_call_id(NEW_CALL_ID),
+        ])]),
+        extra_tools: vec![Box::new(
+            RecordingTool::new(invocations).with_name(NEW_TOOL),
+        )],
+    }]);
+    register_decided(&world).await;
+    publish_document(
+        &world,
+        &parked_document(FUTURE_STAMP, matching_fingerprint(&world), None, vec![]),
+    )
+    .await;
+
+    let grant = evaluate_resume(evaluation(&world, false, None))
+        .await
+        .expect("the all-decided run grants");
+    let segment = run_segment(grant, &world.config, &HashMap::new())
+        .await
+        .expect("the segment re-parks");
+    assert!(
+        matches!(segment, SegmentResult::Parked { .. }),
+        "the freshly gated call re-parks: {segment:?}"
+    );
+
+    // The re-park registers exactly one undecided ticket under the run's
+    // owner id; the decided original is not in the cleared set.
+    let cleared = world.registry.cancel_request(&run_owner_id(RUN)).await;
+    assert_eq!(
+        cleared.len(),
+        1,
+        "the re-park registers one fresh ticket under the original run's owner id"
+    );
+    let fresh = &cleared[0];
+    assert_eq!(
+        fresh.request.request_id,
+        run_owner_id(RUN),
+        "the fresh ticket's owner id names the ORIGINAL bound run id"
+    );
+    let AgentScope::Worker { run_id, task, .. } = &fresh.request.scope else {
+        panic!(
+            "the fresh ticket carries a worker scope: {:?}",
+            fresh.request.scope
+        );
+    };
+    assert_eq!(
+        &run_id.to_string(),
+        RUN,
+        "the fresh ticket's scope names the ORIGINAL bound run id"
+    );
+    assert_eq!(
+        task.task_id, 3,
+        "the fresh ticket names the checkpoint node's task"
+    );
+}
+
 /// The wire serializers the golden literals embed, calibrated against the
 /// implemented types: the blocking-entry object and the rig assistant turn.
 #[test]
