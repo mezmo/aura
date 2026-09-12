@@ -16,9 +16,9 @@ use std::sync::Arc;
 // `crate::config::*` paths keep resolving after the structs moved out. These
 // are the single source of truth — `aura` no longer defines its own copies.
 pub use aura_config::{
-    AgentSettings, EmbeddingConfig, LlmConfig, McpConfig, McpServerConfig, OrchestrationConfig,
-    ReasoningEffort, SkillConfig, SkillName, TodoToolsConfig, ToolsConfig, VectorStoreConfig,
-    VectorStoreType, glob_match,
+    AgentSettings, EmbeddingConfig, LlmConfig, McpConfig, McpServerConfig, McpUserAgent,
+    OrchestrationConfig, ReasoningEffort, SkillConfig, SkillName, TodoToolsConfig, ToolsConfig,
+    VectorStoreConfig, VectorStoreType, default_mcp_user_agent, glob_match,
 };
 
 /// Type alias for tool context factory function.

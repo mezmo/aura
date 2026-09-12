@@ -3,7 +3,7 @@
 use anyhow::{Context, Result};
 use futures::{StreamExt, stream::BoxStream};
 use reqwest;
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue, USER_AGENT};
 use rmcp::{
     RoleClient,
     model::{
@@ -388,13 +388,17 @@ impl McpClient {
     ///
     /// This is the transport-agnostic constructor used by both HTTP streamable
     /// and legacy SSE transports.
-    pub(crate) async fn from_transport<T>(transport: T, server_url: String) -> Result<Self>
+    pub(crate) async fn from_transport<T>(
+        transport: T,
+        server_url: String,
+        user_agent: &str,
+    ) -> Result<Self>
     where
         T: rmcp::transport::Transport<RoleClient> + Send + 'static,
         T::Error: std::error::Error + Send + Sync + 'static,
     {
         let current_http_request_id = Arc::new(RwLock::new(None));
-        let handler = ProgressEnabledHandler::new(Arc::clone(&current_http_request_id));
+        let handler = ProgressEnabledHandler::new(Arc::clone(&current_http_request_id), user_agent);
 
         let client = serve_client(handler, transport)
             .await
@@ -408,13 +412,23 @@ impl McpClient {
         })
     }
 
+    /// `user_agent` is sent as the HTTP `User-Agent` header and, split into
+    /// name and version, as the handshake's `clientInfo`. A `User-Agent` entry
+    /// in `forwarded_headers` replaces the header for that server alone.
     pub async fn new(
         server_url: String,
         forwarded_headers: &HashMap<String, String>,
+        user_agent: &str,
     ) -> Result<Self> {
         info!("Creating streamable HTTP MCP client for: {}", server_url);
 
         let mut header_map = HeaderMap::new();
+        match HeaderValue::from_str(user_agent) {
+            Ok(value) => {
+                header_map.insert(USER_AGENT, value);
+            }
+            Err(_) => warn!("Skipping invalid MCP user agent {user_agent:?}"),
+        }
         if !forwarded_headers.is_empty() {
             debug!("Adding {} headers to MCP client", forwarded_headers.len());
             for (key, value) in forwarded_headers {
@@ -451,7 +465,7 @@ impl McpClient {
             },
         );
 
-        let client = match Self::from_transport(transport, server_url.clone()).await {
+        let client = match Self::from_transport(transport, server_url.clone(), user_agent).await {
             Ok(client) => client,
             Err(e) => {
                 // Surface the real HTTP status when the transport captured one,
@@ -1204,10 +1218,72 @@ pub(crate) mod tests {
         headers: &HashMap<String, String>,
     ) -> (RecordingMcpServer, McpClient) {
         let server = RecordingMcpServer::start().await;
-        let client = McpClient::new(server.url.clone(), headers)
+        let client = McpClient::new(server.url.clone(), headers, "test/0")
             .await
             .expect("the loopback server completes the handshake");
         (server, client)
+    }
+
+    /// The `clientInfo` name and version a recorded `initialize` request announced.
+    pub(crate) fn announced_client(request: &RecordedRequest) -> (String, String) {
+        let body = serde_json::from_str::<Value>(&request.body_text())
+            .expect("initialize carries a JSON body");
+        let info = &body["params"]["clientInfo"];
+        let field = |key: &str| {
+            info[key]
+                .as_str()
+                .unwrap_or_else(|| panic!("clientInfo.{key} is a string"))
+                .to_owned()
+        };
+        (field("name"), field("version"))
+    }
+
+    /// One configured token identifies the client on both layers a server
+    /// might track: verbatim in the HTTP `User-Agent` header, and split into
+    /// name and version in the MCP `clientInfo`.
+    #[tokio::test]
+    async fn handshake_announces_the_user_agent_on_both_layers() {
+        let server = RecordingMcpServer::start().await;
+        McpClient::new(server.url.clone(), &HashMap::new(), "mezmo-aura/prod")
+            .await
+            .expect("the loopback server completes the handshake");
+
+        let initialize = server.initialize();
+        assert_eq!(
+            initialize.header_values("user-agent"),
+            vec!["mezmo-aura/prod"]
+        );
+        assert_eq!(
+            announced_client(&initialize),
+            ("mezmo-aura".to_owned(), "prod".to_owned())
+        );
+        assert!(
+            initialize
+                .body_text()
+                .contains(r#""websiteUrl":"https://www.mezmo.com/aura""#),
+            "body was: {}",
+            initialize.body_text()
+        );
+    }
+
+    /// A per-server `User-Agent` header wins the header for that server, while the handshake keeps announcing the configured identity.
+    #[tokio::test]
+    async fn per_server_user_agent_header_overrides_the_configured_one() {
+        let server = RecordingMcpServer::start().await;
+        let headers = HashMap::from([("User-Agent".to_owned(), "proxy-friendly/2".to_owned())]);
+        McpClient::new(server.url.clone(), &headers, "aura/0.0.0")
+            .await
+            .expect("the loopback server completes the handshake");
+
+        let initialize = server.initialize();
+        assert_eq!(
+            initialize.header_values("user-agent"),
+            vec!["proxy-friendly/2"]
+        );
+        assert_eq!(
+            announced_client(&initialize),
+            ("aura".to_owned(), "0.0.0".to_owned())
+        );
     }
 
     fn no_args() -> HashMap<String, Value> {

@@ -1,6 +1,10 @@
 #[cfg(test)]
 mod tests {
-    use crate::{ReasoningEffort, config::McpServerConfig, load_config_from_str};
+    use crate::{
+        ReasoningEffort,
+        config::{McpServerConfig, McpUserAgent, default_mcp_user_agent},
+        load_config_from_str,
+    };
 
     const TEST_CONFIG: &str = r#"
 [[vector_stores]]
@@ -2227,5 +2231,91 @@ max_extraction_tokens = 4000
         // No workers configured at all is fine.
         let orch = crate::OrchestrationConfig::default();
         assert!(orch.validate_worker_names().is_ok());
+    }
+
+    #[test]
+    fn mcp_user_agent_defaults_to_aura_and_version() {
+        let config = load_config_from_str(TEST_CONFIG).unwrap();
+        let mcp = config.mcp.expect("TEST_CONFIG declares [mcp.servers]");
+        assert_eq!(mcp.user_agent, default_mcp_user_agent());
+        assert_eq!(
+            default_mcp_user_agent(),
+            format!("aura/{}", env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    #[test]
+    fn mcp_user_agent_is_overridable() {
+        let toml = format!("{TEST_CONFIG}\n[mcp]\nuser_agent = \"mezmo-aura/prod\"\n");
+        let config = load_config_from_str(&toml).unwrap();
+        assert_eq!(config.mcp.unwrap().user_agent, "mezmo-aura/prod");
+    }
+
+    #[test]
+    fn server_user_agent_is_absent_unless_configured() {
+        let config = load_config_from_str(TEST_CONFIG).unwrap();
+        let servers = config.mcp.unwrap().servers;
+        assert_eq!(servers["mezmo"].user_agent(), None);
+        assert_eq!(servers["bedrock_kb"].user_agent(), None);
+    }
+
+    #[test]
+    fn server_user_agent_is_read_on_every_transport() {
+        let toml = format!(
+            r#"{TEST_CONFIG}
+[mcp.servers.tagged_http]
+transport = "http_streamable"
+url = "http://localhost:8081/mcp"
+user_agent = "aura-prod-us/1"
+
+[mcp.servers.tagged_stdio]
+transport = "stdio"
+cmd = ["npx"]
+user_agent = "aura-kb/1"
+
+[mcp.servers.tagged_sse]
+transport = "sse"
+url = "http://localhost:8082/sse"
+user_agent = "aura-legacy/1"
+"#
+        );
+        let servers = load_config_from_str(&toml).unwrap().mcp.unwrap().servers;
+        let tagged = |name: &str| servers[name].user_agent().map(McpUserAgent::as_str);
+        assert_eq!(tagged("tagged_http"), Some("aura-prod-us/1"));
+        assert_eq!(tagged("tagged_stdio"), Some("aura-kb/1"));
+        assert_eq!(tagged("tagged_sse"), Some("aura-legacy/1"));
+    }
+
+    /// An identity that would announce an empty client name or could not
+    /// travel in an HTTP header is refused when the config loads, rather than
+    /// silently defeating client tracking at connect time.
+    #[test]
+    fn mcp_user_agent_rejects_unusable_tokens() {
+        for token in [
+            "",
+            "   ",
+            "/1.0",
+            " / ",
+            "aura\u{e9}/1",
+            "aura/1\nx",
+            "aura\t/1",
+        ] {
+            let err = McpUserAgent::new(token).expect_err(&format!("token {token:?}"));
+            assert!(err.contains("MCP user_agent"), "{err}");
+        }
+        let toml = format!("{TEST_CONFIG}\n[mcp]\nuser_agent = \"\"\n");
+        let err = load_config_from_str(&toml).unwrap_err().to_string();
+        assert!(err.contains("non-empty product/version token"), "{err}");
+        let toml = format!(
+            "{TEST_CONFIG}\n[mcp.servers.bad]\ntransport = \"stdio\"\ncmd = [\"x\"]\nuser_agent = \"caf\u{e9}/1\"\n"
+        );
+        let err = load_config_from_str(&toml).unwrap_err().to_string();
+        assert!(err.contains("printable ASCII"), "{err}");
+    }
+
+    #[test]
+    fn mcp_user_agent_trims_surrounding_whitespace() {
+        assert_eq!(McpUserAgent::new("  aura/1  ").unwrap(), "aura/1");
+        assert_eq!(McpUserAgent::new("aura").unwrap(), "aura");
     }
 }
