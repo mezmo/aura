@@ -81,6 +81,15 @@ Two duties ride on specific stages:
 
 ## Recorded readings
 
+- **Fingerprint identity scope.** The `identity_header` NAME is inside the
+  config fingerprint (rev 7 section 2.7 enumerates it), so renaming the
+  bound header between park and resume refuses the resume as
+  `config_changed`. The `park_bind_identity` FLAG is deliberately outside
+  the fingerprint: adding it would answer `config_changed` for every
+  in-flight checkpoint written by a previous binary at upgrade; a mid-run
+  flag flip is instead absorbed by binding resolution (off→on fails closed
+  on None-hash checkpoints; on→on with a presented header admits only
+  matching hashes).
 - **Blocking population.** Blocking entries are consult-derived only: the
   `parked` row, and the `expired` row's pre-sweep list. The read-side
   refusal rows (`running`, `interrupted`, `config_changed`, `mismatch`)
@@ -151,6 +160,14 @@ untouched, per the card.
 
 ## Residual risks
 
+- **`completed` is not whole-run completion until the U(endpoint) ruling.**
+  The segment drives `AwaitingApproval` nodes only; a checkpoint whose plan
+  also carries never-started `Pending` siblings (a run that parked before a
+  dependent task dispatched) resumes, executes the awaiting node, deletes
+  the checkpoint, and answers `state: "completed"` while the Pending task's
+  plan is discarded. Production-reachable for multi-task runs. The card's
+  owner rules at U(endpoint) whether the segment must drive Pending
+  successors or refuse `completed` while Pending nodes remain.
 - **Identity-hash write side — resolved.** The ruled threading has landed:
   `AgentRuntimeConfig` carries `park_bind_identity` plus the request's
   `presented_identity` value, both projected by `RigBuilder::to_agent_config`

@@ -130,9 +130,8 @@ pub struct BlockingEntry {
     pub expires_at: chrono::DateTime<chrono::Utc>,
 }
 
-/// The blocking entries of a body where at least one outstanding call is
-/// mandatory: the `parked` and `expired` conflict rows and the parked
-/// segment. Serializes as the plain JSON array.
+/// The blocking entries of a body that must carry at least one outstanding
+/// call. Serializes as the plain JSON array.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 pub struct NonEmptyBlocking(Vec<BlockingEntry>);
@@ -384,8 +383,7 @@ pub struct ResumeGrant {
     documents: ResumeDocuments,
     document: ParkedRun,
     recorded: Arc<RecordedDecisions>,
-    /// The decided approvals the consult consumed; the segment removes them
-    /// from the store on completion (the file backend's retention contract).
+    /// The decided approvals the consult consumed from the store.
     consumed: Vec<DecisionId>,
     session: ResumeSessionId,
     run: ResumeRunId,

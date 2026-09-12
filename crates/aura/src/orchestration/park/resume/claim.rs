@@ -193,11 +193,18 @@ impl ResumeClaimTable {
             // serialized against `claim_and_resume`'s insert-and-rename, and
             // no guard is ever held across an await.
             let _live = live.lock().expect("resume claim lock");
-            std::fs::rename(&resuming, &parked).map_err(|e| {
-                Diagnostic::new(format!(
-                    "renaming the resuming checkpoint {} back to its parked name failed: {e}",
-                    resuming.display()
-                ))
+            std::fs::rename(&resuming, &parked).or_else(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    // A concurrent evaluation won the rename-back under the
+                    // lock; the document is already at its parked name and
+                    // evaluation proceeds against the in-memory document.
+                    Ok(())
+                } else {
+                    Err(Diagnostic::new(format!(
+                        "renaming the resuming checkpoint {} back to its parked name failed: {e}",
+                        resuming.display()
+                    )))
+                }
             })
         })
         .await

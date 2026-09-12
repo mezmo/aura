@@ -201,7 +201,6 @@ impl ResumingDocumentHandle {
 /// store, whose `get` returns the approval before and after the decision.
 /// The caller injects `now`: the decision window's expired row is evaluated
 /// against the caller's clock, not the wall clock at read time.
-#[allow(dead_code)] // P45 resume endpoint consumes the rehydrate entry points
 pub(crate) async fn load_recorded_decisions(
     store: &PendingApprovals,
     doc: &ParkedRun,
