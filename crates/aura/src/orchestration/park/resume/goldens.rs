@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use crate::config::AgentRuntimeConfig;
 use crate::hitl::{
     AgentScope, ApprovalDecision, ApprovalItem, ApprovalOrigin, ApprovalRequest, DecisionId,
-    PROTOCOL_VERSION, ParkedApproval, PendingApprovals,
+    PROTOCOL_VERSION, ParkedApproval, PendingApprovals, ResolvedDecision,
 };
 use crate::orchestration::test_rig::{
     ECHO_TOOL_RESULT, RecordingTool, ScriptedCompletionModel, ScriptedToolCall, ScriptedTurn,
@@ -23,6 +23,7 @@ use crate::orchestration::test_rig::{
 use crate::orchestration::{
     OrchestrationConfig, PendingCall, TaskIdentity, TaskStatus, WorkerConfig,
 };
+use crate::session_store::ApprovalStore;
 
 use super::super::commit::{config_fingerprint, parked_document_dir, publish};
 use super::super::document::{
@@ -45,10 +46,31 @@ const CALL_ID: &str = "call_apply_1";
 fn call_args() -> Value {
     json!({ "namespace": "prod" })
 }
+
+/// Node B's pending call's arguments: fixed, and distinct from node A's.
+fn call_args_b() -> Value {
+    json!({ "namespace": "prod", "replicas": 3 })
+}
 /// The newly gated call a re-parking segment issues.
 const NEW_TOOL: &str = "kubectl_delete";
 const NEW_CALL_ID: &str = "call_id_0";
+/// The rig tool-call id the scripted new gated call carries — and so the
+/// call id the park stamps on the fresh pending call (`take_current_call_id`
+/// stashes the rig id, not the provider call id) and the key the fresh
+/// call's R2 pair rides under on the next resume.
+const FRESH_CALL_ID: &str = "call_0";
 const FINAL_TEXT: &str = "approved and applied";
+/// Node B's decision id — the second awaiting node's pending call, fixed so
+/// the two-node fixture's expected store state is literal.
+const DECISION_B: &str = "0199c0de-4545-7000-8000-000000000044";
+/// Node B's gated tool: a distinct name matching the same `kubectl_*` gate.
+const TOOL_B: &str = "kubectl_scale";
+/// Node B's pending call id, the slot its sentinel occupies.
+const CALL_ID_B: &str = "call_scale_1";
+/// Node A's continuation text on the second resume.
+const A_DONE: &str = "applied and settled";
+/// Node B's continuation text on the second resume.
+const B_DONE: &str = "scaled and settled";
 /// The park placeholder the gate stamps as a parked call's tool result —
 /// mirrored here because the gate keeps its sentinel private; the gate's
 /// own tests pin the same wording. A decided resume must replace it, so it
@@ -67,12 +89,20 @@ fn decision() -> DecisionId {
     DecisionId::parse(DECISION).expect("golden decision id parses")
 }
 
+/// Node B's decision id.
+fn decision_b() -> DecisionId {
+    DecisionId::parse(DECISION_B).expect("golden decision id parses")
+}
+
 /// A parked-mode config over a file-backed approval store: the fingerprint
 /// every matching document carries, and the worker surface the segment
 /// frames' continuation rebuilds.
 struct World {
     dir: tempfile::TempDir,
     memory_dir: String,
+    /// The file approval store behind the registry, held for the store-side
+    /// pins a lifecycle frame reads directly (`list_pending`).
+    store: Arc<crate::session_store::FileApprovalStore>,
     registry: PendingApprovals,
     config: AgentRuntimeConfig,
     claims: ResumeClaimTable,
@@ -81,10 +111,12 @@ struct World {
 fn world() -> World {
     let dir = tempfile::tempdir().expect("temp memory root");
     std::fs::create_dir_all(dir.path().join("approvals")).expect("approval dir");
-    let store = crate::session_store::FileApprovalStore::open(dir.path().join("approvals"))
-        .expect("file approval store");
+    let store = Arc::new(
+        crate::session_store::FileApprovalStore::open(dir.path().join("approvals"))
+            .expect("file approval store"),
+    );
     let registry = PendingApprovals::with_backend(
-        Arc::new(store),
+        store.clone(),
         Arc::new(crate::session_store::InMemoryEventBus::new()),
     );
     let memory_dir = dir.path().join("memory").to_string_lossy().into_owned();
@@ -125,6 +157,7 @@ fn world() -> World {
     World {
         dir,
         memory_dir,
+        store,
         registry,
         config,
         claims: ResumeClaimTable::new(),
@@ -134,6 +167,19 @@ fn world() -> World {
 /// The worker-scoped approval for the document's pending call; `run` selects
 /// which run the approval names (the mismatch fixture borrows another run's).
 fn worker_approval(decision_id: DecisionId, run: &str) -> ParkedApproval {
+    node_approval(decision_id, run, 3, TOOL, &call_args())
+}
+
+/// The worker-scoped approval for one checkpoint node's pending call: the
+/// node's own task id, tool, and arguments (the two-node fixture's second
+/// node differs from the first in all three).
+fn node_approval(
+    decision_id: DecisionId,
+    run: &str,
+    task_id: usize,
+    tool: &str,
+    args: &Value,
+) -> ParkedApproval {
     ParkedApproval {
         request: ApprovalRequest {
             version: PROTOCOL_VERSION,
@@ -142,7 +188,7 @@ fn worker_approval(decision_id: DecisionId, run: &str) -> ParkedApproval {
             request_id: run_owner_id(RUN),
             scope: AgentScope::Worker {
                 run_id: run.parse().expect("golden run id parses"),
-                task: TaskIdentity::new(3, None),
+                task: TaskIdentity::new(task_id, None),
                 session_id: None,
             },
             origin: ApprovalOrigin::ConfigGate {
@@ -150,8 +196,8 @@ fn worker_approval(decision_id: DecisionId, run: &str) -> ParkedApproval {
                 agent_name: "test-agent".to_string(),
             },
             items: vec![ApprovalItem {
-                tool_name: TOOL.to_string(),
-                arguments: call_args(),
+                tool_name: tool.to_string(),
+                arguments: args.clone(),
                 tool_call_intent: None,
             }],
         },
@@ -178,6 +224,20 @@ async fn register_decided(world: &World) {
         .resolve(&decision(), ApprovalDecision::Approved.into())
         .await
         .expect("record the approval");
+}
+
+/// Register node B's ticket and record an approval on it.
+async fn register_decided_b(world: &World) {
+    world
+        .registry
+        .register_durable(node_approval(decision_b(), RUN, 4, TOOL_B, &call_args_b()))
+        .await
+        .expect("register node B's approval");
+    world
+        .registry
+        .resolve(&decision_b(), ApprovalDecision::Approved.into())
+        .await
+        .expect("record node B's approval");
 }
 
 /// Register the pending call's ticket and record a reasoned denial on it.
@@ -234,7 +294,13 @@ fn tool_result_prompt(call_id: &str, wire: &str) -> rig::completion::Message {
 /// sentinel tool result for the pending call — the placeholder the
 /// substitution prelude must replace before the worker ever streams it.
 fn sentinel_prompt() -> rig::completion::Message {
-    tool_result_prompt(CALL_ID, &tool_wire(PARK_SENTINEL))
+    sentinel_prompt_for(CALL_ID)
+}
+
+/// The checkpointed prompt carrying the sentinel for the given pending call
+/// id — the slot a fill's `replace_tool_result` keys on, one per parked call.
+fn sentinel_prompt_for(call_id: &str) -> rig::completion::Message {
+    tool_result_prompt(call_id, &tool_wire(PARK_SENTINEL))
 }
 
 /// The standard one-call checkpoint with its sentinel prompt: the document a
@@ -249,6 +315,36 @@ fn sentinel_document(world: &World) -> ParkedRun {
         .first_mut()
         .expect("the skeleton carries one awaiting node");
     node.current_prompt = Some(sentinel_prompt());
+    document
+}
+
+/// The two-node checkpoint: node A (task 3, the standard sentinel fixture)
+/// plus a second awaiting node B (task 4) on the same worker, with its own
+/// decision id, call id, a distinct `kubectl_*` tool, its own fixed
+/// arguments, and its own sentinel prompt — the fixture the consumed-subset
+/// lifecycle drives across two resumes.
+fn two_node_sentinel_document(world: &World) -> ParkedRun {
+    let mut document = sentinel_document(world);
+    document.plan.tasks.push(ParkedTaskNode {
+        task_id: 4,
+        description: "Gated scale".to_string(),
+        dependencies: vec![],
+        worker: Some("operations".to_string()),
+        rationale: String::new(),
+        status: TaskStatus::AwaitingApproval,
+        result: None,
+        error: None,
+        failure_category: None,
+        attempt: Some(1),
+        history: Some(vec![rig::completion::Message::user("scale it")]),
+        current_prompt: Some(sentinel_prompt_for(CALL_ID_B)),
+        pending: Some(vec![PendingCall {
+            decision_id: decision_b(),
+            tool_name: TOOL_B.to_string(),
+            arguments: call_args_b(),
+            call_id: CALL_ID_B.to_string(),
+        }]),
+    });
     document
 }
 
@@ -370,14 +466,21 @@ fn entry(decision_id: DecisionId, tool: &str, expires_at: &str) -> Value {
 /// checkpoint records on the pending call; the provider's own call id did
 /// not survive the park).
 fn decided_call_turn() -> Value {
+    decided_call_turn_for(CALL_ID, TOOL, &call_args())
+}
+
+/// The pair's call turn keyed by an arbitrary pending call id — the shape a
+/// RE-parked call's pair rides under on the next resume, where the recorded
+/// call id is the park's own stamp, not the original fixture's.
+fn decided_call_turn_for(call_id: &str, tool: &str, args: &Value) -> Value {
     json!({
         "role": "assistant",
         "id": null,
         "content": [
             {
-                "id": CALL_ID,
+                "id": call_id,
                 "call_id": null,
-                "function": { "name": TOOL, "arguments": call_args() },
+                "function": { "name": tool, "arguments": args },
                 "signature": null,
                 "additional_params": null,
             },
@@ -389,12 +492,17 @@ fn decided_call_turn() -> Value {
 /// outcome in the chain's wire form, keyed by the original call id (the
 /// contract's "PendingCall.call_id matches ToolResult.id").
 fn decided_result_turn(wire: &str) -> Value {
+    decided_result_turn_for(CALL_ID, wire)
+}
+
+/// The pair's result turn keyed by an arbitrary pending call id.
+fn decided_result_turn_for(call_id: &str, wire: &str) -> Value {
     json!({
         "role": "user",
         "content": [
             {
                 "type": "toolresult",
-                "id": CALL_ID,
+                "id": call_id,
                 "content": [{ "type": "text", "text": wire }],
             },
         ],
@@ -962,21 +1070,24 @@ async fn re_park_registers_the_fresh_ticket_under_the_original_bound_run_id() {
     let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
     let world = world();
     let invocations = Arc::new(Mutex::new(Vec::new()));
+    // The decided tool's recording registration and the sentinel prompt are
+    // the board-owner repair (logged on the card): without them the B1
+    // fill's substitution would fault for fixture reasons — a missing
+    // ToolResult slot to replace, a missing tool to invoke. The frame pins
+    // the run-id binding only; execution assertions live elsewhere.
+    let apply_invocations = Arc::new(Mutex::new(Vec::new()));
     install_worker_overrides(vec![WorkerOverride {
         model: ScriptedCompletionModel::new(vec![ScriptedTurn::tool_calls(vec![
-            ScriptedToolCall::new("call_0", NEW_TOOL, json!({ "namespace": "stage" }))
+            ScriptedToolCall::new(FRESH_CALL_ID, NEW_TOOL, json!({ "namespace": "stage" }))
                 .with_call_id(NEW_CALL_ID),
         ])]),
-        extra_tools: vec![Box::new(
-            RecordingTool::new(invocations).with_name(NEW_TOOL),
-        )],
+        extra_tools: vec![
+            Box::new(RecordingTool::new(apply_invocations).with_name(TOOL)),
+            Box::new(RecordingTool::new(invocations).with_name(NEW_TOOL)),
+        ],
     }]);
     register_decided(&world).await;
-    publish_document(
-        &world,
-        &parked_document(FUTURE_STAMP, matching_fingerprint(&world), None, vec![]),
-    )
-    .await;
+    publish_document(&world, &sentinel_document(&world)).await;
 
     let grant = evaluate_resume(evaluation(&world, false, None))
         .await
@@ -1017,6 +1128,422 @@ async fn re_park_registers_the_fresh_ticket_under_the_original_bound_run_id() {
     assert_eq!(
         task.task_id, 3,
         "the fresh ticket names the checkpoint node's task"
+    );
+}
+
+/// The two-node consumed-subset lifecycle (fix-contract steps 6 and 8): a
+/// checkpoint with TWO awaiting nodes, both decided. Resume 1 drives node A
+/// only — its decided call executes once through the substitution, the
+/// continuation's new gated call re-parks, and the segment returns Parked at
+/// the first re-park, so node B is not driven. The re-park must remove ONLY
+/// the actually-consumed subset, after the commit published: node A's
+/// original decision is gone from the store, node B's decided ticket
+/// survives untouched, and exactly one fresh undecided ticket exists under
+/// the original bound run id. Resume 2, over the re-published checkpoint,
+/// drives both nodes — node A's fresh call executes once through the
+/// substitution and completes, then node B's decided call executes exactly
+/// once with its own arguments and completes. The completed turns carry
+/// each decided call's R2 outcome pair in segment order, keyed by its own
+/// original call id; completion removes the fresh and sibling tickets
+/// together; the placeholder appears nowhere.
+#[tokio::test]
+async fn consumed_subset_re_park_preserves_the_sibling_and_completes_on_the_second_resume() {
+    let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
+    let world = world();
+    let apply_invocations = Arc::new(Mutex::new(Vec::new()));
+    let fresh_invocations = Arc::new(Mutex::new(Vec::new()));
+    let scale_invocations = Arc::new(Mutex::new(Vec::new()));
+    // Overrides install per resume, not up front: the queue is take-once and
+    // process-global, so a frame that fails mid-lifecycle must not leak the
+    // resumes it never drove into the next consumer's builds.
+    install_worker_overrides(vec![
+        // Resume 1, node A: the continuation issues a new gated call.
+        WorkerOverride {
+            model: ScriptedCompletionModel::new(vec![ScriptedTurn::tool_calls(vec![
+                ScriptedToolCall::new(FRESH_CALL_ID, NEW_TOOL, json!({ "namespace": "stage" }))
+                    .with_call_id(NEW_CALL_ID),
+            ])]),
+            extra_tools: vec![
+                Box::new(RecordingTool::new(apply_invocations.clone()).with_name(TOOL)),
+                Box::new(RecordingTool::new(fresh_invocations.clone()).with_name(NEW_TOOL)),
+            ],
+        },
+    ]);
+    register_decided(&world).await;
+    register_decided_b(&world).await;
+    publish_document(&world, &two_node_sentinel_document(&world)).await;
+
+    let grant = evaluate_resume(evaluation(&world, false, None))
+        .await
+        .expect("the all-decided two-node run grants");
+    let segment = run_segment(grant, &world.config, &HashMap::new())
+        .await
+        .expect("node A's continuation re-parks and ends the first segment");
+    {
+        let apply_log = apply_invocations.lock().expect("apply invocation log");
+        assert_eq!(
+            apply_log.len(),
+            1,
+            "node A's decided call executes exactly once before the re-park; zero \
+             invocations recorded / node A's decision never consumed: the substitution \
+             prelude does not exist"
+        );
+        assert_eq!(
+            apply_log[0].arguments,
+            call_args(),
+            "the single invocation carries the recorded call's arguments"
+        );
+    }
+    let blocking = match segment {
+        SegmentResult::Parked { blocking, .. } => blocking,
+        other => panic!("expected the first segment to re-park, got {other:?}"),
+    };
+    // The fresh entry is the newly gated tool's; a retained decided sibling
+    // may ride the same list (the commit's refreshed pending keeps decided
+    // calls for the resume consult), so the shape audit is by tool name and
+    // the outstanding set is pinned on the store below, not on the wire.
+    let fresh: Vec<_> = blocking
+        .as_slice()
+        .iter()
+        .filter(|entry| entry.tool.as_ref() == NEW_TOOL)
+        .collect();
+    assert_eq!(
+        fresh.len(),
+        1,
+        "exactly one fresh blocking entry names the newly gated tool: {:?}",
+        blocking.as_slice()
+    );
+    let fresh_decision = fresh[0].decision_id;
+
+    // The consumed-subset pin (step 8): only node A's consumed decision is
+    // removed, after the commit published; node B's decided ticket survives
+    // untouched.
+    assert!(
+        world
+            .registry
+            .try_parked(&decision())
+            .await
+            .expect("the store reads")
+            .is_none(),
+        "node A's consumed decision is removed from the store"
+    );
+    let sibling = world
+        .registry
+        .try_parked(&decision_b())
+        .await
+        .expect("the store reads")
+        .expect("node B's decided ticket survives the sibling re-park");
+    assert_eq!(
+        sibling.request.items[0].arguments,
+        call_args_b(),
+        "node B's ticket is untouched by the sibling re-park"
+    );
+    assert_eq!(
+        world.registry.recorded_decision(&decision_b()).await,
+        Some(ResolvedDecision::from(ApprovalDecision::Approved)),
+        "node B's approval is still the recorded one"
+    );
+    // Exactly one fresh undecided ticket, under the original bound run id.
+    let undecided = world
+        .store
+        .list_pending()
+        .await
+        .expect("the store lists its undecided approvals");
+    assert_eq!(
+        undecided.len(),
+        1,
+        "exactly one undecided ticket remains, found ids {:?}",
+        undecided
+            .iter()
+            .map(|ticket| ticket.request.decision_id.to_string())
+            .collect::<Vec<_>>()
+    );
+    let fresh_ticket = &undecided[0];
+    assert_eq!(
+        fresh_ticket.request.decision_id, fresh_decision,
+        "the undecided ticket is the freshly gated call"
+    );
+    assert_eq!(
+        fresh_ticket.request.request_id,
+        run_owner_id(RUN),
+        "the fresh ticket is registered under the original bound run's owner id"
+    );
+    let AgentScope::Worker { run_id, task, .. } = &fresh_ticket.request.scope else {
+        panic!(
+            "the fresh ticket carries a worker scope: {:?}",
+            fresh_ticket.request.scope
+        )
+    };
+    assert_eq!(
+        &run_id.to_string(),
+        RUN,
+        "the fresh ticket's scope names the ORIGINAL bound run id"
+    );
+    assert_eq!(task.task_id, 3, "the fresh ticket names node A's task");
+
+    world
+        .registry
+        .resolve(&fresh_decision, ApprovalDecision::Approved.into())
+        .await
+        .expect("record the fresh approval");
+
+    // Resume 2 drives both awaiting nodes in plan order: node A's build
+    // first, then node B's — one override per build, in that order.
+    install_worker_overrides(vec![
+        // Resume 2, node A: the fresh call's substitution, then a final turn.
+        WorkerOverride {
+            model: ScriptedCompletionModel::new(vec![ScriptedTurn::text(A_DONE)]),
+            extra_tools: vec![Box::new(
+                RecordingTool::new(fresh_invocations.clone()).with_name(NEW_TOOL),
+            )],
+        },
+        // Resume 2, node B: its decided call's substitution, then a final turn.
+        WorkerOverride {
+            model: ScriptedCompletionModel::new(vec![ScriptedTurn::text(B_DONE)]),
+            extra_tools: vec![Box::new(
+                RecordingTool::new(scale_invocations.clone()).with_name(TOOL_B),
+            )],
+        },
+    ]);
+
+    let grant = evaluate_resume(evaluation(&world, false, None))
+        .await
+        .expect("the re-published checkpoint grants the second resume");
+    let segment = run_segment(grant, &world.config, &HashMap::new())
+        .await
+        .expect("the second segment completes");
+    let turns = match segment {
+        SegmentResult::Completed { turns } => turns,
+        other => panic!("expected the second segment to complete, got {other:?}"),
+    };
+    {
+        let fresh_log = fresh_invocations.lock().expect("fresh invocation log");
+        assert_eq!(
+            fresh_log.len(),
+            1,
+            "node A's fresh call executes exactly once through the substitution"
+        );
+        assert_eq!(
+            fresh_log[0].arguments,
+            json!({ "namespace": "stage" }),
+            "the fresh invocation carries the fresh call's arguments"
+        );
+    }
+    {
+        let scale_log = scale_invocations.lock().expect("scale invocation log");
+        assert_eq!(
+            scale_log.len(),
+            1,
+            "node B's decided call executes exactly once on the second resume"
+        );
+        assert_eq!(
+            scale_log[0].arguments,
+            call_args_b(),
+            "node B's invocation carries its own recorded arguments"
+        );
+        assert_eq!(
+            scale_log[0].result, ECHO_TOOL_RESULT,
+            "node B's invocation returns the tool's real result"
+        );
+    }
+    assert_eq!(
+        apply_invocations
+            .lock()
+            .expect("apply invocation log")
+            .len(),
+        1,
+        "node A's original call is not re-executed on the second resume"
+    );
+    let serialized = serde_json::to_value(turns.as_slice()).expect("turns serialize");
+    assert_eq!(
+        serialized,
+        json!([
+            decided_call_turn_for(FRESH_CALL_ID, NEW_TOOL, &json!({ "namespace": "stage" })),
+            decided_result_turn_for(FRESH_CALL_ID, &echo_tool_result_wire()),
+            { "role": "assistant", "id": null, "content": [{ "text": A_DONE }] },
+            decided_call_turn_for(CALL_ID_B, TOOL_B, &call_args_b()),
+            decided_result_turn_for(CALL_ID_B, &echo_tool_result_wire()),
+            { "role": "assistant", "id": null, "content": [{ "text": B_DONE }] },
+        ]),
+        "the completed segment carries each decided call's R2 outcome pair in \
+         segment order, keyed by its own original call id, around the per-node \
+         final turns"
+    );
+    assert!(
+        !serialized.to_string().contains(PARK_SENTINEL),
+        "the placeholder appears nowhere in the serialized turns"
+    );
+    assert!(
+        world
+            .registry
+            .try_parked(&decision_b())
+            .await
+            .expect("the store reads")
+            .is_none(),
+        "node B's ticket is removed on completion"
+    );
+    assert!(
+        world
+            .registry
+            .try_parked(&fresh_decision)
+            .await
+            .expect("the store reads")
+            .is_none(),
+        "the fresh ticket is removed on completion"
+    );
+}
+
+/// Guard release across the resume chain (fix-contract step 7): the strict
+/// guard the substitution arms must be dropped before the continuation
+/// streams, so a genuinely new gated call — one absent from the recorded
+/// set — re-parks through the LIVE arm and never faults as a strict miss,
+/// and re-arms correctly on the next resume, whose substitution consumes
+/// the fresh decision and completes. The chain's wire: each resume's turns
+/// carry the right outcome pair keyed by the right call id, and no Err
+/// surfaces anywhere.
+#[tokio::test]
+async fn post_substitution_new_call_re_parks_through_the_live_arm_not_a_strict_miss() {
+    let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
+    let world = world();
+    let apply_invocations = Arc::new(Mutex::new(Vec::new()));
+    let fresh_invocations = Arc::new(Mutex::new(Vec::new()));
+    // Per-resume install, as the lifecycle frame documents: no override the
+    // frame never drives may leak into another consumer's builds.
+    install_worker_overrides(vec![
+        // Resume 1: the decided call's substitution, then a new gated call.
+        WorkerOverride {
+            model: ScriptedCompletionModel::new(vec![ScriptedTurn::tool_calls(vec![
+                ScriptedToolCall::new(FRESH_CALL_ID, NEW_TOOL, json!({ "namespace": "stage" }))
+                    .with_call_id(NEW_CALL_ID),
+            ])]),
+            extra_tools: vec![
+                Box::new(RecordingTool::new(apply_invocations.clone()).with_name(TOOL)),
+                Box::new(RecordingTool::new(fresh_invocations.clone()).with_name(NEW_TOOL)),
+            ],
+        },
+    ]);
+    register_decided(&world).await;
+    publish_document(&world, &sentinel_document(&world)).await;
+
+    let grant = evaluate_resume(evaluation(&world, false, None))
+        .await
+        .expect("the all-decided run grants");
+    let segment = run_segment(grant, &world.config, &HashMap::new())
+        .await
+        .expect(
+            "the continuation re-parks through the live arm; a strict-miss fault \
+                 here is the failure this frame exists to catch",
+        );
+    {
+        let apply_log = apply_invocations.lock().expect("apply invocation log");
+        assert_eq!(
+            apply_log.len(),
+            1,
+            "the decided call executes exactly once before the re-park; zero \
+             invocations recorded: the substitution prelude does not exist"
+        );
+    }
+    let (turns, blocking) = match segment {
+        SegmentResult::Parked { turns, blocking } => (turns, blocking),
+        other => panic!("expected a re-parked segment, got {other:?}"),
+    };
+    let fresh_decision = blocking
+        .as_slice()
+        .iter()
+        .find(|entry| entry.tool.as_ref() == NEW_TOOL)
+        .expect("the new blocking entry names the newly gated tool")
+        .decision_id;
+    let mut body = json!({
+        "turns": serde_json::to_value(turns.as_slice()).expect("turns serialize"),
+        "blocking":
+            serde_json::to_value(blocking.as_slice()).expect("blocking serializes"),
+    });
+    normalize_fresh_parking(&mut body);
+    assert_eq!(
+        body,
+        json!({
+            "turns": [
+                decided_call_turn(),
+                decided_result_turn(&echo_tool_result_wire()),
+                {
+                    "role": "assistant",
+                    "id": null,
+                    "content": [
+                        {
+                            "id": FRESH_CALL_ID,
+                            "call_id": NEW_CALL_ID,
+                            "function":
+                                { "name": NEW_TOOL, "arguments": { "namespace": "stage" } },
+                            "signature": null,
+                            "additional_params": null,
+                        },
+                    ],
+                },
+            ],
+            "blocking": [
+                {
+                    "decision_id": "<fresh decision id>",
+                    "tool": NEW_TOOL,
+                    "expires_at": "<fresh expiry>",
+                },
+            ],
+        }),
+        "the re-parked segment carries the original pair keyed by the original \
+         call id, ahead of the gated assistant turn; the fresh decision id and \
+         expiry are location-normalized"
+    );
+
+    world
+        .registry
+        .resolve(&fresh_decision, ApprovalDecision::Approved.into())
+        .await
+        .expect("record the fresh approval");
+    install_worker_overrides(vec![
+        // Resume 2: the fresh call's substitution, then a final turn.
+        WorkerOverride {
+            model: ScriptedCompletionModel::new(vec![ScriptedTurn::text(FINAL_TEXT)]),
+            extra_tools: vec![Box::new(
+                RecordingTool::new(fresh_invocations.clone()).with_name(NEW_TOOL),
+            )],
+        },
+    ]);
+    let grant = evaluate_resume(evaluation(&world, false, None))
+        .await
+        .expect("the re-published checkpoint grants the second resume");
+    let segment = run_segment(grant, &world.config, &HashMap::new())
+        .await
+        .expect("the re-armed guard consumes the fresh decision; the segment completes");
+    let turns = match segment {
+        SegmentResult::Completed { turns } => turns,
+        other => panic!("expected a completed segment, got {other:?}"),
+    };
+    {
+        let fresh_log = fresh_invocations.lock().expect("fresh invocation log");
+        assert_eq!(
+            fresh_log.len(),
+            1,
+            "the fresh call executes exactly once through the substitution"
+        );
+        assert_eq!(
+            fresh_log[0].arguments,
+            json!({ "namespace": "stage" }),
+            "the single invocation carries the fresh call's arguments"
+        );
+    }
+    let serialized = serde_json::to_value(turns.as_slice()).expect("turns serialize");
+    assert_eq!(
+        serialized,
+        json!([
+            decided_call_turn_for(FRESH_CALL_ID, NEW_TOOL, &json!({ "namespace": "stage" })),
+            decided_result_turn_for(FRESH_CALL_ID, &echo_tool_result_wire()),
+            { "role": "assistant", "id": null, "content": [{ "text": FINAL_TEXT }] },
+        ]),
+        "the completed segment carries the fresh call's outcome pair keyed by \
+         the fresh call's id — resume 1's pair rode the original call id"
+    );
+    assert!(
+        !serialized.to_string().contains(PARK_SENTINEL),
+        "the placeholder appears nowhere in the serialized turns"
     );
 }
 
