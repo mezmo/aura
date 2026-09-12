@@ -1323,8 +1323,8 @@ async fn re_park_registers_the_fresh_ticket_under_the_original_bound_run_id() {
     let world = world();
     let invocations = Arc::new(Mutex::new(Vec::new()));
     // The decided tool's recording registration and the sentinel prompt are
-    // the board-owner repair (logged on the card): without them the B1
-    // fill's substitution would fault for fixture reasons — a missing
+    // the board-owner repair (logged on the card): without them the
+    // substitution prelude would fault for fixture reasons — a missing
     // ToolResult slot to replace, a missing tool to invoke. The frame pins
     // the run-id binding only; execution assertions live elsewhere.
     let apply_invocations = Arc::new(Mutex::new(Vec::new()));
@@ -2656,6 +2656,70 @@ async fn awaiting_node_without_pending_calls_faults_the_segment_before_any_worke
         continuation_diagnostic(&fault).as_ref(),
         "awaiting task 3 carries no pending calls in the checkpoint",
         "the fault's diagnostic identifies the pending-absent node"
+    );
+    assert!(
+        invocations.lock().expect("tool invocation log").is_empty(),
+        "no invocation ran"
+    );
+    assert!(
+        requests
+            .lock()
+            .expect("scripted-model request log")
+            .is_empty(),
+        "no worker streamed: the scripted model was never consulted"
+    );
+    assert!(
+        take_worker_override().is_some(),
+        "no worker build consumed the queued override: the fault precedes \
+         every build"
+    );
+    let resuming = resuming_document(&world).await;
+    assert!(
+        resuming.executed.is_empty(),
+        "no tombstone: the fault precedes the tombstone write"
+    );
+}
+
+/// FAULT — pending-EMPTY structural (Gate A round-1, finding 2's other
+/// half): an awaiting node whose pending list is present but EMPTY faults
+/// on the same seeding-loop row as the absent case, before any worker
+/// build — a node with nothing to substitute must never stream its
+/// checkpointed prompt.
+#[tokio::test]
+async fn awaiting_node_with_an_empty_pending_list_faults_before_any_worker_builds() {
+    let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
+    let world = world();
+    let invocations = Arc::new(Mutex::new(Vec::new()));
+    let model = ScriptedCompletionModel::new(vec![ScriptedTurn::text(FINAL_TEXT)]);
+    let requests = model.requests();
+    install_worker_overrides(vec![WorkerOverride {
+        model,
+        extra_tools: vec![Box::new(
+            RecordingTool::new(invocations.clone()).with_name(TOOL),
+        )],
+    }]);
+    register_decided_b(&world).await;
+    // The mixed checkpoint: the malformed awaiting node (task 3, pending
+    // present but empty) rides ahead of the genuinely decided node B.
+    let mut document = two_node_sentinel_document(&world);
+    let node_a = document
+        .plan
+        .tasks
+        .first_mut()
+        .expect("the two-node fixture carries node A first");
+    node_a.pending = Some(Vec::new());
+    publish_document(&world, &document).await;
+
+    let grant = evaluate_resume(evaluation(&world, false, None))
+        .await
+        .expect("the decided sibling grants the malformed run");
+    let fault = run_segment(grant, &world.config, &HashMap::new())
+        .await
+        .expect_err("an awaiting node with an empty pending list faults the segment");
+    assert_eq!(
+        continuation_diagnostic(&fault).as_ref(),
+        "awaiting task 3 carries an empty pending list in the checkpoint",
+        "the fault's diagnostic identifies the pending-empty node"
     );
     assert!(
         invocations.lock().expect("tool invocation log").is_empty(),
