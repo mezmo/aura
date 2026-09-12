@@ -61,6 +61,11 @@ impl IdentityHash {
         Self(hex::encode(Sha256::digest(value.as_bytes())))
     }
 
+    /// Take the stored form: the 64-char lowercase hex digest.
+    pub(crate) fn into_inner(self) -> String {
+        self.0
+    }
+
     /// Parse a stored hash, rejecting anything that is not 64 hex
     /// characters.
     pub(crate) fn from_stored(raw: &str) -> Result<Self, Diagnostic> {

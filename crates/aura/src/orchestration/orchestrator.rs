@@ -63,6 +63,7 @@ use super::tools::{InspectToolParamsTool, ListToolsTool, ReadArtifactTool};
 
 use super::config::OrchestrationConfig;
 use super::events::OrchestratorEvent;
+use super::park::resume::evaluate::IdentityHash;
 use super::park::resume::{
     BlockingEntry, Diagnostic, EmptyBlocking, EmptySegment, NonEmptyBlocking, ParkedToolName,
     ResumeGrant, SegmentError, SegmentResult, SegmentTurns,
@@ -5791,6 +5792,19 @@ Assign tasks to the worker whose tools best match the required operations."#,
             .into());
         };
 
+        // The write side of `[hitl.park].bind_identity`: the checkpoint
+        // stores the presented header's hash, which is what the resume
+        // evaluation compares against. Binding on with no presented value
+        // commits no hash, and the resume side refuses such a document —
+        // the same fail-closed reading the resume path gives a missing
+        // header.
+        let identity_hash = self
+            .agent_config
+            .presented_identity
+            .as_deref()
+            .filter(|_| self.agent_config.park_bind_identity)
+            .map(|value| IdentityHash::hash_value(value).into_inner());
+
         let inputs = super::park::ParkCommitInputs {
             state: super::park::RunStateForPark {
                 run_id: &run_id,
@@ -5809,7 +5823,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             memory_dir: &memory_dir,
             config: &self.agent_config,
             decision_window: timeout,
-            identity_hash: None,
+            identity_hash,
         };
 
         match super::park::commit_from_run_state(&inputs).await {
@@ -8428,6 +8442,184 @@ mod tests {
             );
         }
         drop(orchestrator);
+    }
+
+    /// The identity-binding round trip end to end: a park under
+    /// `[hitl.park].bind_identity` stamps the presented header's hash into
+    /// the checkpoint, the resume evaluation admits the same header, and
+    /// refuses a differing one with the detail-less not-found row.
+    #[tokio::test]
+    async fn bound_park_stamps_the_identity_hash_and_resume_enforces_it() {
+        use crate::orchestration::park::resume::{
+            ResumeClaimTable, ResumeEvaluation, ResumeRefusal, ValidatedResumePath, evaluate_resume,
+        };
+
+        const SESSION: &str = "bind-sess";
+        const IDENTITY: &str = "identity-alice-token";
+
+        let dir = tempfile::tempdir().unwrap();
+        // The file backend: the resume consult rehydrates each recorded
+        // decision from the stored approval, which the file store keeps
+        // readable after resolve and the memory store does not.
+        let approval_dir = dir.path().join("approvals");
+        std::fs::create_dir_all(&approval_dir).unwrap();
+        let registry = crate::hitl::PendingApprovals::with_backend(
+            Arc::new(crate::session_store::FileApprovalStore::open(&approval_dir).unwrap()),
+            Arc::new(crate::session_store::InMemoryEventBus::new()),
+        );
+        let memory_dir = dir.path().to_string_lossy().into_owned();
+        // One bound configuration shapes both sides: the park commits under
+        // it, and the resume evaluation fingerprint-checks against a rebuild
+        // of it.
+        let bound_config = || AgentRuntimeConfig {
+            hitl: Some(crate::hitl::HitlRuntime {
+                patterns: Arc::from([aura_config::GlobPattern::new("kubectl_*").unwrap()]),
+                route: Arc::new(crate::hitl::DecisionRoute::Conversational {
+                    registry: registry.clone(),
+                    timeout: Duration::from_secs(3600),
+                }),
+                park_enabled: true,
+            }),
+            memory_dir: Some(memory_dir.clone()),
+            session_id: Some(SESSION.to_string()),
+            request_id: Some(format!("req_bind_{}", uuid::Uuid::new_v4().simple())),
+            park_bind_identity: true,
+            presented_identity: Some(IDENTITY.to_string()),
+            ..AgentRuntimeConfig::default()
+        };
+
+        let orchestrator = Orchestrator::new(bound_config()).await.unwrap();
+        let run_id = orchestrator.persistence.lock().await.run_id().to_string();
+
+        // The awaiting plan with its two durably parked approvals, scoped to
+        // this run's gated task: the resume consult refuses approvals whose
+        // stored scope names another run, another task, or a non-worker
+        // scope shape.
+        let mut plan = Plan::new("Deploy");
+        plan.add_task(Task::new(0, "Facts", "r"));
+        plan.add_task(Task::new(1, "Gated apply", "r").with_dependency(0));
+        plan.get_task_mut(0).unwrap().complete("facts");
+
+        let registered_at = chrono::Utc::now();
+        let mut pending = Vec::new();
+        for tool in ["kubectl_apply", "kubectl_delete"] {
+            let decision_id = TestDecisionId::generate();
+            registry
+                .register_durable(crate::hitl::ParkedApproval {
+                    request: crate::hitl::ApprovalRequest {
+                        version: crate::hitl::PROTOCOL_VERSION,
+                        instance_id: "test-instance".to_string(),
+                        decision_id,
+                        request_id: format!("run:{run_id}"),
+                        scope: crate::hitl::AgentScope::Worker {
+                            run_id: run_id.parse().expect("run id parses"),
+                            task: crate::orchestration::TaskIdentity::new(1, None),
+                            session_id: None,
+                        },
+                        origin: crate::hitl::ApprovalOrigin::ConfigGate {
+                            matched_pattern: "kubectl_*".to_string(),
+                            agent_name: "test-agent".to_string(),
+                        },
+                        items: vec![crate::hitl::ApprovalItem {
+                            tool_name: tool.to_string(),
+                            arguments: serde_json::json!({ "namespace": "prod" }),
+                            tool_call_intent: None,
+                        }],
+                    },
+                    registered_at,
+                    expires_at: registered_at + chrono::Duration::hours(1),
+                    egress_headers: None,
+                })
+                .await
+                .unwrap();
+            pending.push(TestPendingCall {
+                decision_id,
+                tool_name: tool.to_string(),
+                arguments: serde_json::json!({ "namespace": "prod" }),
+                call_id: format!("call_{}", pending.len()),
+            });
+        }
+        mark_awaiting(&mut plan, 1, pending.clone());
+
+        let mut records = ParkedTaskRecords::new();
+        records.insert(
+            1,
+            crate::orchestration::park::ParkedTaskRecord {
+                attempt: 1,
+                snapshot: crate::orchestration::ParkSnapshot {
+                    history: vec![rig::completion::Message::user("apply it")],
+                    current_prompt: rig::completion::Message::user("tool results"),
+                },
+            },
+        );
+
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(32);
+
+        let chat_history = vec![rig::completion::Message::user("deploy the service")];
+        orchestrator
+            .park_run(
+                "deploy the service",
+                &chat_history,
+                &[],
+                None,
+                1,
+                2_500,
+                &[],
+                &plan,
+                &records,
+                &event_tx,
+            )
+            .await
+            .expect("the bound park commits");
+
+        let document_path = dir
+            .path()
+            .join(SESSION)
+            .join("parked")
+            .join(format!("{run_id}.json"));
+        let document = crate::orchestration::park::load_parked_run(&document_path)
+            .await
+            .unwrap();
+        assert_eq!(
+            document.identity_hash,
+            Some(IdentityHash::hash_value(IDENTITY).into_inner()),
+            "the park stamps the presented header's hash"
+        );
+
+        let claims = ResumeClaimTable::new();
+        let resume_config = bound_config();
+        let evaluation = |presented: Option<&'static str>| ResumeEvaluation {
+            path: ValidatedResumePath::parse(SESSION, &run_id).expect("path validates"),
+            memory_dir: &memory_dir,
+            config: &resume_config,
+            store: &registry,
+            claims: &claims,
+            bind_identity: true,
+            presented_identity: presented,
+            request_id: format!("req_resume_{}", uuid::Uuid::new_v4().simple()),
+            now: chrono::Utc::now(),
+        };
+
+        let differing = evaluate_resume(evaluation(Some("identity-mallory-token"))).await;
+        assert!(
+            matches!(differing, Err(ResumeRefusal::IdentityMismatch)),
+            "a differing header answers the detail-less not-found row: {differing:?}"
+        );
+
+        for call in &pending {
+            registry
+                .resolve(
+                    &call.decision_id,
+                    crate::hitl::ApprovalDecision::Approved.into(),
+                )
+                .await
+                .unwrap();
+        }
+        let granted = evaluate_resume(evaluation(Some(IDENTITY)))
+            .await
+            .expect("the matching header is admitted");
+        assert_eq!(granted.run_id().to_string(), run_id);
+        assert_eq!(granted.session_id().to_string(), SESSION);
     }
 
     #[tokio::test]
