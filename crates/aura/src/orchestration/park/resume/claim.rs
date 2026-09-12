@@ -181,22 +181,78 @@ impl ResumeClaimTable {
     /// Rename the run's resuming document back to its parked name while
     /// holding the claim lock, so a concurrent evaluation cannot observe the
     /// half-renamed pair.
-    #[expect(unused_variables, reason = "todo!() body; filled by P45")]
     pub(crate) async fn rename_back_to_parked(
         &self,
         docs: &ResumeDocuments,
     ) -> Result<(), Diagnostic> {
-        todo!()
+        let parked = docs.parked().to_path_buf();
+        let resuming = docs.resuming().to_path_buf();
+        let live = Arc::clone(&self.live);
+        tokio::task::spawn_blocking(move || -> Result<(), Diagnostic> {
+            // The std guard lives only inside this closure: the rename is
+            // serialized against `claim_and_resume`'s insert-and-rename, and
+            // no guard is ever held across an await.
+            let _live = live.lock().expect("resume claim lock");
+            std::fs::rename(&resuming, &parked).map_err(|e| {
+                Diagnostic::new(format!(
+                    "renaming the resuming checkpoint {} back to its parked name failed: {e}",
+                    resuming.display()
+                ))
+            })
+        })
+        .await
+        .map_err(|e| Diagnostic::new(format!("the rename-back task did not complete: {e}")))?
     }
 
     /// Insert the claim and rename the parked document to its resuming name
     /// as one step under the claim lock: either both happen or neither does.
-    #[expect(unused_variables, reason = "todo!() body; filled by P45")]
     pub(crate) async fn claim_and_resume(
         &self,
         docs: &ResumeDocuments,
     ) -> Result<ResumeLease, ClaimResumeFault> {
-        todo!()
+        // The documents derive from a validated path (`for_path`), so the
+        // parked name's stem is the validated run id: the claim keys on the
+        // same run whose document the rename moves.
+        let raw_run = docs
+            .parked()
+            .file_stem()
+            .and_then(std::ffi::OsStr::to_str)
+            .expect("the claim documents carry the validated run id as their stem");
+        let run =
+            ResumeRunId::parse(raw_run).expect("the stem of a validated document name re-parses");
+        let parked = docs.parked().to_path_buf();
+        let resuming = docs.resuming().to_path_buf();
+        let live = Arc::clone(&self.live);
+        let lease_live = Arc::clone(&self.live);
+        tokio::task::spawn_blocking(move || -> Result<ResumeLease, ClaimResumeFault> {
+            // One acquisition covers check, insert, rename, and rollback: a
+            // second caller's insert observes the live claim before any
+            // rename, and a failed rename rolls the insert back, so the
+            // claim and the document name move together or not at all.
+            let mut live = live.lock().expect("resume claim lock");
+            if !live.insert(run.run_id()) {
+                return Err(ClaimResumeFault::Live);
+            }
+            match std::fs::rename(&parked, &resuming) {
+                Ok(()) => Ok(ResumeLease {
+                    live: lease_live,
+                    run,
+                }),
+                Err(e) => {
+                    live.remove(&run.run_id());
+                    Err(ClaimResumeFault::Io(Diagnostic::new(format!(
+                        "renaming the parked checkpoint {} to its resuming name failed: {e}",
+                        parked.display()
+                    ))))
+                }
+            }
+        })
+        .await
+        .map_err(|e| {
+            ClaimResumeFault::Io(Diagnostic::new(format!(
+                "the claim task did not complete: {e}"
+            )))
+        })?
     }
 }
 
