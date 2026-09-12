@@ -83,6 +83,13 @@ pub use tools::wait_for::{StopReason, WaitForError, WaitForOutput, WaitForTool};
 pub use tools::{SubmitResultDecision, SubmitResultOutput, SubmitResultTool};
 
 pub(crate) use park::{CallKey, ParkGuard, RecordedDecisions, run_owner_id};
+// The resume endpoint's surfaces: consumed by aura-web-server's resume
+// handler (P45).
+pub use park::resume::{
+    BlockingEntry, ConflictCode, IdentityBindingState, MalformedId, ResumeClaimTable,
+    ResumeConflictRow, ResumeDocuments, ResumeEvaluation, ResumeGrant, ResumeRefusal, ResumeRunId,
+    ResumeSessionId, SegmentResult, ValidatedResumePath, evaluate_resume, run_segment,
+};
 // The sentinel leak guard drives the commit and the resuming document
 // from the reconciler side of the crate.
 #[cfg(test)]

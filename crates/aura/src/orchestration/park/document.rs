@@ -116,6 +116,9 @@ pub(crate) struct ParkedRun {
     #[serde(default)]
     pub executed: Vec<String>,
     pub config_fingerprint: String,
+    /// Hex sha256 of the bound identity header's value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_hash: Option<String>,
 }
 
 impl ParkedRun {
@@ -217,6 +220,7 @@ pub(crate) fn build_document(
         },
         executed: Vec::new(),
         config_fingerprint,
+        identity_hash: None,
     })
 }
 
