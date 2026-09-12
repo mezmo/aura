@@ -1406,44 +1406,83 @@ impl ResumeRunResponse {
 /// falls back to the stream item's own id — the same value the live SSE
 /// stream emits for the same call, never a fabricated one. Reasoning and
 /// image content have no chat-completion slot and are skipped.
+///
+/// Outcome pairs (R2): per decided call the segment carries the assistant
+/// tool-call turn followed by the tool-result turn, ahead of the
+/// continuation turns, in segment order, both halves keyed by the original
+/// call id — the rig id the park recorded on the pending call, with
+/// `call_id: None` on both. The call turn projects through the tool-call
+/// arm above, its wire `tool_calls[].id` landing on that same original
+/// call id via the `call_id` fallback. The result turn is a user-role
+/// `ToolResult` turn, which projects to a `role: "tool"` message:
+/// `tool_call_id` is the `ToolResult`'s `id` and `content` is the result's
+/// text verbatim, so the pair rides the wire keyed consistently on one id.
+/// A user turn with non-ToolResult content (plain text) does not occur on
+/// the segment surface and stays skipped.
 fn continuation_turns(turns: &[aura::Message]) -> Vec<ChatMessage> {
     let mut projected = Vec::with_capacity(turns.len());
     for turn in turns {
-        // The segment surface carries assistant turns only: both
-        // `SegmentResult` arms construct `Message::Assistant` turns.
-        let aura::Message::Assistant { content, .. } = turn else {
-            continue;
-        };
-        let mut text = String::new();
-        let mut tool_calls = Vec::new();
-        for piece in content.iter() {
-            match piece {
-                aura::AssistantContent::Text(t) => {
-                    if !text.is_empty() {
-                        text.push('\n');
+        match turn {
+            aura::Message::Assistant { content, .. } => {
+                let mut text = String::new();
+                let mut tool_calls = Vec::new();
+                for piece in content.iter() {
+                    match piece {
+                        aura::AssistantContent::Text(t) => {
+                            if !text.is_empty() {
+                                text.push('\n');
+                            }
+                            text.push_str(&t.text);
+                        }
+                        aura::AssistantContent::ToolCall(call) => {
+                            tool_calls.push(ChatMessageToolCall {
+                                id: call.call_id.clone().unwrap_or_else(|| call.id.clone()),
+                                call_type: TOOL_CALL_FUNCTION_TYPE.to_string(),
+                                function: ChatMessageFunctionCall {
+                                    name: call.function.name.clone(),
+                                    arguments: call.function.arguments.to_string(),
+                                },
+                            });
+                        }
+                        aura::AssistantContent::Reasoning(_) | aura::AssistantContent::Image(_) => {
+                        }
                     }
-                    text.push_str(&t.text);
                 }
-                aura::AssistantContent::ToolCall(call) => {
-                    tool_calls.push(ChatMessageToolCall {
-                        id: call.call_id.clone().unwrap_or_else(|| call.id.clone()),
-                        call_type: TOOL_CALL_FUNCTION_TYPE.to_string(),
-                        function: ChatMessageFunctionCall {
-                            name: call.function.name.clone(),
-                            arguments: call.function.arguments.to_string(),
-                        },
+                projected.push(ChatMessage {
+                    role: Role::Assistant,
+                    content: (!text.is_empty()).then_some(text),
+                    tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
+                    tool_call_id: None,
+                    name: None,
+                });
+            }
+            aura::Message::User { content } => {
+                for piece in content.iter() {
+                    let aura::UserContent::ToolResult(result) = piece else {
+                        continue;
+                    };
+                    let mut text = String::new();
+                    for result_piece in result.content.iter() {
+                        match result_piece {
+                            aura::ToolResultContent::Text(t) => {
+                                if !text.is_empty() {
+                                    text.push('\n');
+                                }
+                                text.push_str(&t.text);
+                            }
+                            aura::ToolResultContent::Image(_) => {}
+                        }
+                    }
+                    projected.push(ChatMessage {
+                        role: Role::Tool,
+                        content: (!text.is_empty()).then_some(text),
+                        tool_calls: None,
+                        tool_call_id: Some(result.id.clone()),
+                        name: None,
                     });
                 }
-                aura::AssistantContent::Reasoning(_) | aura::AssistantContent::Image(_) => {}
             }
         }
-        projected.push(ChatMessage {
-            role: Role::Assistant,
-            content: (!text.is_empty()).then_some(text),
-            tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
-            tool_call_id: None,
-            name: None,
-        });
     }
     projected
 }
@@ -3129,6 +3168,142 @@ url = "http://127.0.0.1:9"
                     "state": "completed",
                     "turns": [
                         { "role": "assistant", "content": "approved and applied" },
+                    ],
+                }),
+            );
+        }
+
+        /// The original call id both halves of an R2 outcome pair key on:
+        /// the pending call's id the park recorded (`ToolCall.id`), which is
+        /// also the rig id the assistant turn's wire `tool_calls[].id`
+        /// falls back to.
+        const CALL_ID: &str = "call_apply_1";
+        /// The decided call's tool, fixed so every expected body is literal.
+        const TOOL: &str = "kubectl_apply";
+        /// The continuation's final assistant text turn, fixed so every
+        /// expected body is literal.
+        const FINAL_TEXT: &str = "approved and applied";
+        /// A real tool result in the chain's wire form: the rig tool server
+        /// JSON-quotes a plain string output, and the result turn carries
+        /// that rendering verbatim.
+        const RESULT_WIRE: &str = "\"applied successfully\"";
+        /// The live denial text in the chain's wire form — the gate's denial
+        /// arm, JSON-quoted like every Ok-path tool result.
+        const DENIAL_WIRE: &str = "\"Tool call blocked by human approval denial: the prod namespace is off limits. \
+             Do not execute this action.\"";
+
+        /// The assistant tool-call turn of an R2 outcome pair: the decided
+        /// call re-issued with `call_id: None`, keyed by the original call id.
+        fn decided_call_turn() -> aura::Message {
+            aura::Message::Assistant {
+                id: None,
+                content: aura::OneOrMany::one(aura::AssistantContent::tool_call(
+                    CALL_ID,
+                    TOOL,
+                    serde_json::json!({ "namespace": "prod" }),
+                )),
+            }
+        }
+
+        /// The tool-result turn of an R2 outcome pair: the outcome's wire
+        /// text, keyed by the original call id (`ToolResult.id`, with
+        /// `call_id: None`).
+        fn decided_result_turn(result_wire: &str) -> aura::Message {
+            aura::Message::User {
+                content: aura::OneOrMany::one(aura::UserContent::tool_result(
+                    CALL_ID,
+                    aura::OneOrMany::one(aura::ToolResultContent::text(result_wire)),
+                )),
+            }
+        }
+
+        /// A completed segment carrying an R2 outcome pair over the tool's
+        /// real result projects the full 200 body: the assistant tool-call
+        /// turn, the tool message keyed by the same original call id with
+        /// the result text verbatim, then the final assistant turn — in
+        /// segment order.
+        #[tokio::test]
+        async fn completed_segment_with_outcome_pair_projects_the_full_200_body() {
+            let session = ResumeSessionId::parse("sess-p45").expect("golden session parses");
+            let run = ResumeRunId::parse("0199c0de-4545-7000-8000-000000000045")
+                .expect("golden run parses");
+            let turns = aura::orchestration::SegmentTurns::try_new(vec![
+                decided_call_turn(),
+                decided_result_turn(RESULT_WIRE),
+                aura::Message::assistant(FINAL_TEXT),
+            ])
+            .expect("three turns");
+
+            let body =
+                ResumeRunResponse::from_segment(&session, &run, SegmentResult::Completed { turns });
+
+            assert_eq!(
+                serde_json::to_value(&body).expect("the 200 body serializes"),
+                serde_json::json!({
+                    "session_id": "sess-p45",
+                    "run_id": "0199c0de-4545-7000-8000-000000000045",
+                    "state": "completed",
+                    "turns": [
+                        {
+                            "role": "assistant",
+                            "tool_calls": [
+                                {
+                                    "id": CALL_ID,
+                                    "type": "function",
+                                    "function": {
+                                        "name": TOOL,
+                                        "arguments": "{\"namespace\":\"prod\"}",
+                                    },
+                                },
+                            ],
+                        },
+                        { "role": "tool", "tool_call_id": CALL_ID, "content": RESULT_WIRE },
+                        { "role": "assistant", "content": FINAL_TEXT },
+                    ],
+                }),
+            );
+        }
+
+        /// A completed segment whose decided call was denied projects the
+        /// same full 200 body with the live denial text verbatim in the
+        /// tool message — the fold's deny path.
+        #[tokio::test]
+        async fn completed_segment_with_denial_outcome_pair_projects_the_full_200_body() {
+            let session = ResumeSessionId::parse("sess-p45").expect("golden session parses");
+            let run = ResumeRunId::parse("0199c0de-4545-7000-8000-000000000045")
+                .expect("golden run parses");
+            let turns = aura::orchestration::SegmentTurns::try_new(vec![
+                decided_call_turn(),
+                decided_result_turn(DENIAL_WIRE),
+                aura::Message::assistant(FINAL_TEXT),
+            ])
+            .expect("three turns");
+
+            let body =
+                ResumeRunResponse::from_segment(&session, &run, SegmentResult::Completed { turns });
+
+            assert_eq!(
+                serde_json::to_value(&body).expect("the 200 body serializes"),
+                serde_json::json!({
+                    "session_id": "sess-p45",
+                    "run_id": "0199c0de-4545-7000-8000-000000000045",
+                    "state": "completed",
+                    "turns": [
+                        {
+                            "role": "assistant",
+                            "tool_calls": [
+                                {
+                                    "id": CALL_ID,
+                                    "type": "function",
+                                    "function": {
+                                        "name": TOOL,
+                                        "arguments": "{\"namespace\":\"prod\"}",
+                                    },
+                                },
+                            ],
+                        },
+                        { "role": "tool", "tool_call_id": CALL_ID, "content": DENIAL_WIRE },
+                        { "role": "assistant", "content": FINAL_TEXT },
                     ],
                 }),
             );
