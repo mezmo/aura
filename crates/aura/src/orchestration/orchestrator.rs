@@ -69,8 +69,9 @@ use super::park::resume::{
     ResumeGrant, SegmentError, SegmentResult, SegmentTurns,
 };
 use super::park::{
-    ParkCommitInputs, ParkGuard, ParkedRun, ParkedTaskRecord, ParkedTaskRecords, RecordedDecisions,
-    ResumeContext, RunStateForPark, TaskContinuation, commit_from_run_state,
+    CallKey, ParkCommitInputs, ParkGuard, ParkedRun, ParkedTaskRecord, ParkedTaskRecords,
+    PeekOutcome, RecordedDecisions, ResumeContext, ResumingDocumentHandle, RunStateForPark,
+    TaskContinuation, commit_from_run_state, replace_tool_result,
 };
 use super::persistence::ExecutionPersistence;
 use super::types::{
@@ -285,6 +286,45 @@ fn flush_segment_turn(
         id: None,
         content: rig::OneOrMany::many(pieces).expect("turn carries content"),
     });
+}
+
+/// The assistant tool-call turn R2 prepends per decided call: the decided
+/// call re-issued on the wire, keyed by the original call id — the park
+/// records `ToolCall.id` as the pending call's id, and the provider's own
+/// call id did not survive the checkpoint.
+fn decided_call_turn(call: &PendingCall) -> rig::completion::Message {
+    rig::completion::Message::Assistant {
+        id: None,
+        content: rig::OneOrMany::one(rig::message::AssistantContent::ToolCall(
+            rig::message::ToolCall {
+                id: call.call_id.clone(),
+                call_id: None,
+                function: rig::message::ToolFunction {
+                    name: call.tool_name.clone(),
+                    arguments: call.arguments.clone(),
+                },
+                signature: None,
+                additional_params: None,
+            },
+        )),
+    }
+}
+
+/// The tool-result turn R2 prepends per decided call: the substitution's
+/// outcome in the chain's wire form, keyed by the original call id — the
+/// same slot the checkpointed placeholder occupied.
+fn decided_result_turn(call: &PendingCall, wire: &str) -> rig::completion::Message {
+    rig::completion::Message::User {
+        content: rig::OneOrMany::one(rig::message::UserContent::ToolResult(
+            rig::message::ToolResult {
+                id: call.call_id.clone(),
+                call_id: None,
+                content: rig::OneOrMany::one(rig::message::ToolResultContent::text(
+                    wire.to_string(),
+                )),
+            },
+        )),
+    }
 }
 
 /// Spawns a task that monitors for external cancellation or timeout,
@@ -4363,6 +4403,17 @@ Assign tasks to the worker whose tools best match the required operations."#,
         }
         let mut turns = Vec::new();
 
+        // The substitution prelude's segment-level inputs: the resuming
+        // document every tombstone appends through, and the route's
+        // identity demand — the same source the gate's `recorded_pre_call`
+        // consults. The consumed accumulator holds the decided calls this
+        // segment actually consumed; a re-park removes only that subset.
+        let document_handle = ResumingDocumentHandle::open(documents.resuming())
+            .await
+            .map_err(|e| fault(format!("opening the resuming document failed: {e}")))?;
+        let requires_identity = hitl.route.requires_identity();
+        let mut consumed = Vec::new();
+
         for node in checkpoint
             .plan
             .tasks
@@ -4377,7 +4428,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 .clone();
             let ParkSnapshot {
                 history,
-                current_prompt,
+                mut current_prompt,
             } = snapshot;
 
             let Some(park) = self.worker_park(task_id, attempt) else {
@@ -4403,6 +4454,98 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         "the resume worker for task {task_id} failed to build: {e}"
                     ))
                 })?;
+
+            // The substitution prelude: per decided call, pre-flight the
+            // recorded set, tombstone, invoke through the gated pipeline,
+            // and swap the real outcome for the checkpointed placeholder,
+            // before the continuation ever streams. Every pending call of
+            // an awaiting node is decided — the grant's consult refused the
+            // resume otherwise.
+            let pending = node.pending.as_deref().unwrap_or_default();
+            {
+                let strict = recorded.strict_guard(task_id);
+                // Pre-flight, non-consuming: a missing entry or an
+                // unsatisfiable identity rule is fatal before any
+                // tombstone or invocation.
+                for call in pending {
+                    match recorded.peek(
+                        &CallKey::new(task_id, &call.tool_name, &call.arguments),
+                        requires_identity,
+                    ) {
+                        PeekOutcome::Ready => {}
+                        PeekOutcome::Missing => {
+                            return Err(fault(format!(
+                                "resume mismatch: decided call {} of task {task_id} \
+                                 is missing from the recorded set",
+                                call.tool_name
+                            )));
+                        }
+                        PeekOutcome::IdentityBlocked => {
+                            return Err(fault(
+                                "resume mismatch: approved call is missing required \
+                                 approver identity"
+                                    .to_string(),
+                            ));
+                        }
+                    }
+                }
+                for call in pending {
+                    let key = CallKey::new(task_id, &call.tool_name, &call.arguments);
+                    // Consumption derives from the recorded set's
+                    // before/after presence around the invocation, never
+                    // from the passed pre-flight.
+                    let present_before =
+                        matches!(recorded.peek(&key, requires_identity), PeekOutcome::Ready);
+                    // The tombstone precedes the invocation: a crash after
+                    // this write shows the call as executed, never re-asks
+                    // the human.
+                    document_handle
+                        .append_executed_and_publish(&call.call_id)
+                        .await
+                        .map_err(|e| {
+                            fault(format!(
+                                "resume tombstone write for call {} failed: {e}",
+                                call.call_id
+                            ))
+                        })?;
+                    // The gated pipeline consumes the decision: approved
+                    // executes once under the recorded identity; denied
+                    // short-circuits with the live denial text and never
+                    // executes.
+                    let wire = match worker
+                        .inner
+                        .call_tool(&call.tool_name, &call.arguments.to_string())
+                        .await
+                    {
+                        Ok(wire) => wire,
+                        // An execution failure is result text for the
+                        // model (sync parity): the live loop's Err branch
+                        // renders the error raw, where the Ok path delivers
+                        // the JSON-quoted form. Bookkeeping faults stay
+                        // fatal above — distinguished by where they arise.
+                        Err(e) => e.to_string(),
+                    };
+                    if present_before
+                        && matches!(recorded.peek(&key, requires_identity), PeekOutcome::Missing)
+                    {
+                        consumed.push(call.decision_id);
+                    }
+                    if !replace_tool_result(&mut current_prompt, &call.call_id, &wire) {
+                        return Err(fault(format!(
+                            "continuation prompt has no tool result for call {}",
+                            call.call_id
+                        )));
+                    }
+                    // R2's outcome-bearing pair rides ahead of the node's
+                    // continuation turns, keyed by the original call id.
+                    turns.push(decided_call_turn(call));
+                    turns.push(decided_result_turn(call, &wire));
+                }
+                // The strict guard drops before streaming, so a genuinely
+                // new gated call afterward re-parks through the live arm
+                // rather than faulting as a strict miss.
+                drop(strict);
+            }
 
             let park_registration = crate::streaming_request_hook::ParkCellRegistration::new(
                 &park.key,
@@ -4482,6 +4625,12 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         .map_err(|e| fault(format!("the re-park commit failed: {e}")))?;
                     if let Some(ref guard) = self.park_guard {
                         guard.mark_published();
+                    }
+                    // A re-park removes only the actually-consumed subset
+                    // from the store, after the commit published, so
+                    // untouched sibling nodes keep their recorded approvals.
+                    for id in &consumed {
+                        registry.remove(id).await;
                     }
 
                     let expires_at = chrono::DateTime::parse_from_rfc3339(&commit.expires_at)
