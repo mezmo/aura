@@ -230,7 +230,6 @@ pub(crate) fn build_document(
 /// Load a checkpoint document from `path`, rejecting unknown schema
 /// versions. The read runs on the blocking pool. Used by the park commit's
 /// tests and by the resume path's [`super::continuation::ResumingDocumentHandle::open`].
-#[allow(dead_code)] // P45 resume endpoint consumes the rehydrate entry points
 pub(crate) async fn load_parked_run(path: &Path) -> io::Result<ParkedRun> {
     let display = path.display().to_string();
     let path = path.to_path_buf();
