@@ -132,6 +132,21 @@ struct WorkerPark {
     key: String,
 }
 
+/// One validated awaiting node the resume segment drives: the node's
+/// identity and its pending calls, which the driver's seeding loop checks
+/// non-empty before any worker build. The park record rides in
+/// `ParkedTaskRecords`, keyed by task id; this bundle carries what the
+/// drive loop reads per node.
+struct AwaitingNode {
+    task_id: usize,
+    worker: Option<String>,
+    /// The node's decided pending calls, non-empty by construction —
+    /// an awaiting node without pending calls faults the seeding
+    /// loop, so the substitution prelude can never face a node whose
+    /// checkpointed placeholder it has no call to replace.
+    pending: Vec<PendingCall>,
+}
+
 /// Named return type for `create_*` coordinator/worker methods.
 ///
 /// Replaces bare `(Agent, String)` tuples where the `String` was the preamble
@@ -4212,35 +4227,49 @@ Assign tasks to the worker whose tools best match the required operations."#,
         // overwrite their own state as the segment runs. Every awaiting
         // node's park record the commit needs is seeded from the checkpoint,
         // and a re-parked node's record is overwritten with the fresh
-        // snapshot before the commit runs.
+        // snapshot before the commit runs. A node whose pending calls are
+        // absent or empty faults here, beside the other payload checks and
+        // before any worker build: the park paths never write such a node
+        // (the gate registers every parked call durably before the commit),
+        // and streaming it would carry the stale placeholder past the
+        // substitution with no call to replace it for.
         let mut plan = segment_plan(&checkpoint);
         let mut records = ParkedTaskRecords::new();
+        let mut awaiting = Vec::new();
         for node in checkpoint
             .plan
             .tasks
             .iter()
             .filter(|n| matches!(n.status, TaskStatus::AwaitingApproval))
         {
+            let task_id = node.task_id;
             let attempt = node.attempt.ok_or_else(|| {
                 fault(format!(
-                    "awaiting task {} carries no attempt in the checkpoint",
-                    node.task_id
+                    "awaiting task {task_id} carries no attempt in the checkpoint"
                 ))
             })?;
             let history = node.history.clone().ok_or_else(|| {
                 fault(format!(
-                    "awaiting task {} carries no history in the checkpoint",
-                    node.task_id
+                    "awaiting task {task_id} carries no history in the checkpoint"
                 ))
             })?;
             let current_prompt = node.current_prompt.clone().ok_or_else(|| {
                 fault(format!(
-                    "awaiting task {} carries no tool-result prompt in the checkpoint",
-                    node.task_id
+                    "awaiting task {task_id} carries no tool-result prompt in the checkpoint"
                 ))
             })?;
+            let pending = node.pending.clone().ok_or_else(|| {
+                fault(format!(
+                    "awaiting task {task_id} carries no pending calls in the checkpoint"
+                ))
+            })?;
+            if pending.is_empty() {
+                return Err(fault(format!(
+                    "awaiting task {task_id} carries an empty pending list in the checkpoint"
+                )));
+            }
             records.insert(
-                node.task_id,
+                task_id,
                 ParkedTaskRecord {
                     attempt,
                     snapshot: ParkSnapshot {
@@ -4249,6 +4278,11 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     },
                 },
             );
+            awaiting.push(AwaitingNode {
+                task_id,
+                worker: node.worker.clone(),
+                pending,
+            });
         }
         let mut turns = Vec::new();
 
@@ -4263,14 +4297,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
         let requires_identity = hitl.route.requires_identity();
         let mut consumed = Vec::new();
 
-        for node in checkpoint
-            .plan
-            .tasks
-            .iter()
-            .filter(|n| matches!(n.status, TaskStatus::AwaitingApproval))
-        {
+        for node in awaiting {
             let task_id = node.task_id;
             let worker_name = node.worker.as_deref();
+            let pending = node.pending;
             let ParkedTaskRecord { attempt, snapshot } = records
                 .get(&task_id)
                 .expect("every awaiting node was seeded with a park record")
@@ -4304,23 +4334,42 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     ))
                 })?;
 
-            // The substitution prelude: per decided call, pre-flight the
-            // recorded set, tombstone, invoke through the gated pipeline,
-            // and swap the real outcome for the checkpointed placeholder,
-            // before the continuation ever streams. Every pending call of
-            // an awaiting node is decided — the grant's consult refused the
-            // resume otherwise.
-            let pending = node.pending.as_deref().unwrap_or_default();
+            // The substitution prelude: pre-flight the COMPLETE pending
+            // sequence against the recorded set, then per decided call,
+            // tombstone, invoke through the gated pipeline, and swap the
+            // real outcome for the checkpointed placeholder — all before
+            // the continuation ever streams. Every pending call of an
+            // awaiting node is decided — the grant's consult refused the
+            // resume otherwise. Same-key duplicate calls (identical tool
+            // and arguments, distinct call ids) share one FIFO queue: the
+            // calls in document order pair with the queue's entries
+            // front-to-back, positionally, and consumption is tracked per
+            // call by the key's queue depth around that call's own
+            // invocation.
             {
                 let strict = recorded.strict_guard(task_id);
-                // Pre-flight, non-consuming: a missing entry or an
-                // unsatisfiable identity rule is fatal before any
-                // tombstone or invocation.
-                for call in pending {
-                    match recorded.peek(
-                        &CallKey::new(task_id, &call.tool_name, &call.arguments),
-                        requires_identity,
-                    ) {
+                // The per-call key-position pairs, derived from document
+                // order alone: the i-th call under a key is that key's
+                // position i.
+                let keyed: Vec<(CallKey, usize)> = {
+                    let mut next_position: HashMap<CallKey, usize> = HashMap::new();
+                    pending
+                        .iter()
+                        .map(|call| {
+                            let key = CallKey::new(task_id, &call.tool_name, &call.arguments);
+                            let position = next_position.entry(key.clone()).or_insert(0);
+                            let at = *position;
+                            *position += 1;
+                            (key, at)
+                        })
+                        .collect()
+                };
+                // Pre-flight, non-consuming and positional: a miss or an
+                // unsatisfiable identity rule at ANY position is fatal
+                // before any tombstone or invocation, naming the faulting
+                // call.
+                for (call, (key, position)) in pending.iter().zip(&keyed) {
+                    match recorded.peek_at(key, *position, requires_identity) {
                         PeekOutcome::Ready => {}
                         PeekOutcome::Missing => {
                             return Err(fault(format!(
@@ -4338,13 +4387,12 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         }
                     }
                 }
-                for call in pending {
-                    let key = CallKey::new(task_id, &call.tool_name, &call.arguments);
-                    // Consumption derives from the recorded set's
-                    // before/after presence around the invocation, never
-                    // from the passed pre-flight.
-                    let present_before =
-                        matches!(recorded.peek(&key, requires_identity), PeekOutcome::Ready);
+                for (call, (key, _position)) in pending.iter().zip(&keyed) {
+                    // Consumption derives from the key's queue depth
+                    // around this call's own invocation — a drop of
+                    // exactly one is this call's decision being consumed —
+                    // never from the passed pre-flight.
+                    let depth_before = recorded.depth(key);
                     // The tombstone precedes the invocation: a crash after
                     // this write shows the call as executed, never re-asks
                     // the human.
@@ -4374,9 +4422,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         // fatal above — distinguished by where they arise.
                         Err(e) => e.to_string(),
                     };
-                    if present_before
-                        && matches!(recorded.peek(&key, requires_identity), PeekOutcome::Missing)
-                    {
+                    if recorded.depth(key) + 1 == depth_before {
                         consumed.push(call.decision_id);
                     }
                     if !replace_tool_result(&mut current_prompt, &call.call_id, &wire) {
