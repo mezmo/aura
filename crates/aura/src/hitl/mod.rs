@@ -47,7 +47,8 @@ pub use protocol::{ApprovalDecisionWire, ApprovalItem, ApprovalRequest, PROTOCOL
 pub use registry::{ParkedApproval, PendingApprovals, ResolveError};
 pub use route::{
     ApprovalError, DecisionRoute, HitlRuntime, PlaintextWebhookUrlError, WebhookClient,
-    cleartext_capture_warning, validate_webhook_signing_config, warn_on_cleartext_capture,
+    approver_forwarding_summary, cleartext_capture_warning, validate_webhook_signing_config,
+    warn_on_cleartext_capture,
 };
 pub use signing::{
     ConfigError, PrimarySecret, SIGNATURE_HEADER, SignedHeaders, SigningContext, TIMESTAMP_HEADER,

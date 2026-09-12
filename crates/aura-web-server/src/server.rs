@@ -425,6 +425,11 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
                 },
             )?;
             aura::hitl::warn_on_cleartext_capture(hitl);
+            if let Some(summary) = aura::hitl::approver_forwarding_summary(hitl) {
+                for line in summary.lines() {
+                    info!("{line}");
+                }
+            }
         }
     }
 

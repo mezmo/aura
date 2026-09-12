@@ -463,7 +463,7 @@ substitute the approver's identity onto that one gated call instead.
 mode = "webhook"
 url = "https://approvals.example.com/hook"
 headers_from_request = { "authorization" = "authorization" }   # PR #490, unrelated
-# outbound MCP header name -> webhook response header name
+# keys: outbound MCP tool header names; values: webhook response header names
 tool_headers_from_response = { "authorization" = "x-approver-token" }
 ```
 
@@ -486,7 +486,16 @@ When `tool_headers_from_response` is non-empty:
   case-insensitively and taking the first value on a repeat. One missing name
   fails the whole capture.
 - A capture failure resolves the approval to an error: the gated call fails
-  with a message naming every missing header, never a value.
+  with a message naming both sides of every missing mapping, the webhook
+  response header as the one absent, never a value, e.g. `approver identity
+  capture failed: webhook response missing header "x-approver-token" (mapped
+  to tool header "authorization")`. The approval request sent to the webhook
+  does not advertise which response headers will be read; the mapping in
+  config is the contract the webhook author must meet.
+- Unlike `headers_from_request`, whose static `headers` entries silently
+  serve as fallback when a mapped inbound header is absent, capture here
+  fails closed: forwarding nothing would run the call under the wrong
+  identity.
 - A denied, timed-out, or cancelled decision captures nothing, because there
   is no decision to capture from.
 
@@ -499,13 +508,19 @@ Capture does not require `https://`. A webhook route with
 `tool_headers_from_response` configured over plain `http://` is usable and
 unsigned. A deployment that terminates TLS ahead of the process is a
 legitimate topology, but the route is never silent: each binary's startup logs
-one warning per `[hitl]` config naming the exposure, alongside the boot-time
-HMAC-signing check (`warn_on_cleartext_capture`). In the CLI the warning also
-reaches stderr, since its default tracing subscriber is a no-op without
-`log_file`. The webhook client itself never logs this warning; only the
-boot-time call does, and the log line carries the webhook's scheme and host
-only. The one rule `https://` still enforces is unchanged: an HMAC secret
-configured over `http://` is a misconfiguration and fails closed at boot.
+the cleartext-capture warning per `[hitl]` config naming the exposure, plus
+one boot line per mapping stating the forwarding direction (`approver
+forwarding summary`), alongside the boot-time signing validation
+(`validate_webhook_signing_config`) and the cleartext warning's emitter
+(`warn_on_cleartext_capture`). In the CLI both lines also reach stderr, since
+its default tracing subscriber is a no-op without `log_file`. The webhook
+client itself never logs these lines; only the boot-time call does, and every
+log line carries the webhook's scheme and host only. The one rule `https://`
+still enforces is unchanged: an HMAC secret configured over `http://` is a
+misconfiguration and fails closed at boot. Note the boundary of that
+signature: HMAC verification covers the webhook body only. The mapped
+response headers are read from the response as delivered, outside that
+signature.
 
 ### Transport support
 
@@ -532,7 +547,10 @@ re-enters `pre_call` and the gate mints a fresh `DecisionId` per call.
 `execute_mcp_tool` stamps the outbound header NAMES an override applied
 (sorted, comma-joined, never the values) on the `mcp.tool_call` span as
 `applied_headers`. Event-level audit uses the capture failure's error text,
-which names every missing header. No missing-header failure reaches the wire.
+which names both sides of every missing mapping. A capture failure also logs
+one `aura::hitl` warn quoting that text with the decision id, so the failure
+is visible under the default console filter. No missing-header failure
+reaches the wire.
 No `aura-events` wire type changes: under fail-closed semantics a capture
 success stamp would be degenerate, so the existing `Errored` outcome already
 carries the full audit signal.

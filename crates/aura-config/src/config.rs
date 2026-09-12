@@ -1482,7 +1482,10 @@ pub enum DecisionRouteConfig {
         /// Outbound header name → inbound request header name mapping.
         #[serde(default)]
         headers_from_request: HashMap<String, String>,
-        /// Outbound MCP header name → webhook approval-response header name.
+        /// Forward the approver's identity onto gated tool calls. TOML keys
+        /// are outbound MCP tool header names; TOML values are webhook
+        /// approval-response header names. Every value-side header must be
+        /// present on an approved response or the gated call fails closed.
         #[serde(default, skip_serializing_if = "ToolHeaderMappings::is_empty")]
         tool_headers_from_response: ToolHeaderMappings,
     },
@@ -1499,12 +1502,12 @@ pub const RESERVED_TOOL_HEADER_NAMES: [&str; 6] = [
     "transfer-encoding",
 ];
 
-/// Validated `tool_headers_from_response` mapping: outbound MCP header
-/// name → webhook approval-response header name, both sides lowercased.
-/// Syntactically invalid header names, duplicates after lowercasing, and
-/// reserved transport-owned names (see [`RESERVED_TOOL_HEADER_NAMES`])
-/// are rejected at construction, so downstream code never holds an
-/// unvalidated map.
+/// Validated `tool_headers_from_response` mapping: TOML keys are outbound
+/// MCP tool header names; TOML values are webhook approval-response header
+/// names, both sides lowercased. Syntactically invalid header names,
+/// duplicates after lowercasing, and reserved transport-owned names (see
+/// [`RESERVED_TOOL_HEADER_NAMES`]) are rejected at construction, so
+/// downstream code never holds an unvalidated map.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct ToolHeaderMappings(HashMap<String, String>);
 
