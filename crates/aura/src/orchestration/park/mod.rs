@@ -23,7 +23,7 @@ pub(crate) use document::{
     PARKED_DOCUMENT_SUFFIX, ParkedRun, RESUMING_DOCUMENT_SUFFIX, RunStateForPark, load_parked_run,
 };
 pub(crate) use guard::ParkGuard;
-pub(crate) use recorded_decisions::{CallKey, RecordedDecisions};
+pub(crate) use recorded_decisions::{CallKey, PeekOutcome, RecordedDecisions};
 
 use std::collections::HashMap;
 
