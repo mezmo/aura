@@ -10,6 +10,11 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
+#[cfg(test)]
+use std::sync::{
+    Barrier,
+    atomic::{AtomicBool, Ordering},
+};
 
 use crate::config::SessionId;
 use crate::orchestration::persistence::is_safe_path_component;
@@ -157,9 +162,28 @@ pub(crate) enum ClaimResumeFault {
 
 /// Process-local registry of live resume claims: at most one resume per run
 /// inside this process.
-#[derive(Debug, Default)]
 pub struct ResumeClaimTable {
     live: Arc<Mutex<HashSet<RunId>>>,
+    #[cfg(test)]
+    race_gate: Arc<RaceGate>,
+}
+
+impl std::fmt::Debug for ResumeClaimTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResumeClaimTable")
+            .field("live", &self.live)
+            .finish()
+    }
+}
+
+impl Default for ResumeClaimTable {
+    fn default() -> Self {
+        Self {
+            live: Arc::new(Mutex::new(HashSet::new())),
+            #[cfg(test)]
+            race_gate: Arc::new(RaceGate::new()),
+        }
+    }
 }
 
 impl ResumeClaimTable {
@@ -178,6 +202,17 @@ impl ResumeClaimTable {
             .contains(&run.run_id())
     }
 
+    /// Arm this table's rename-back rendezvous for the concurrent golden:
+    /// exactly two `rename_back_to_parked` arrivals must occur while the
+    /// returned guard is alive, or they hold.
+    #[cfg(test)]
+    pub(crate) fn arm_rename_back_race(&self) -> RaceGateGuard {
+        self.race_gate.armed.store(true, Ordering::SeqCst);
+        RaceGateGuard {
+            gate: Arc::clone(&self.race_gate),
+        }
+    }
+
     /// Rename the run's resuming document back to its parked name while
     /// holding the claim lock, so a concurrent evaluation cannot observe the
     /// half-renamed pair.
@@ -188,7 +223,11 @@ impl ResumeClaimTable {
         let parked = docs.parked().to_path_buf();
         let resuming = docs.resuming().to_path_buf();
         let live = Arc::clone(&self.live);
+        #[cfg(test)]
+        let race_gate = Arc::clone(&self.race_gate);
         tokio::task::spawn_blocking(move || -> Result<(), Diagnostic> {
+            #[cfg(test)]
+            race_gate.meet();
             // The std guard lives only inside this closure: the rename is
             // serialized against `claim_and_resume`'s insert-and-rename, and
             // no guard is ever held across an await.
@@ -278,5 +317,48 @@ impl Drop for ResumeLease {
             .lock()
             .expect("resume claim lock")
             .remove(&self.run.run_id());
+    }
+}
+
+/// Deterministic rendezvous for the concurrent rename-back golden. Arming
+/// is scoped to ONE claim table (the armed test's world), so the parallel
+/// test harness cannot pair an unrelated table's rename with the barrier.
+/// With the gate armed, both of that table's rename-back closures hold past
+/// `locate_checkpoint` before either contends the claim lock, so the
+/// loser's ENOENT path is exercised on every run instead of by scheduling
+/// luck. Arming obliges exactly two rename-back arrivals while held.
+#[cfg(test)]
+pub(crate) struct RaceGate {
+    armed: AtomicBool,
+    barrier: Barrier,
+}
+
+#[cfg(test)]
+impl RaceGate {
+    pub(crate) fn new() -> Self {
+        Self {
+            armed: AtomicBool::new(false),
+            barrier: Barrier::new(2),
+        }
+    }
+
+    fn meet(&self) {
+        if self.armed.load(Ordering::SeqCst) {
+            self.barrier.wait();
+        }
+    }
+}
+
+/// Disarms the rendezvous on drop, so a panicking test cannot leave the
+/// gate armed for whichever test reuses the thread next.
+#[cfg(test)]
+pub(crate) struct RaceGateGuard {
+    gate: Arc<RaceGate>,
+}
+
+#[cfg(test)]
+impl Drop for RaceGateGuard {
+    fn drop(&mut self) {
+        self.gate.armed.store(false, Ordering::SeqCst);
     }
 }
