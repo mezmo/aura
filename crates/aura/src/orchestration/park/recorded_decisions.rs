@@ -84,7 +84,6 @@ impl RecordedDecisions {
     /// [`PeekOutcome::IdentityBlocked`] is a fatal `SegmentError` at the
     /// call site (fold unit B1 owns the fault mapping). Wired by the
     /// substitution prelude (fold unit B1).
-    #[allow(dead_code)]
     pub(crate) fn peek(&self, key: &CallKey, requires_identity: bool) -> PeekOutcome {
         match self
             .entries
@@ -170,7 +169,6 @@ impl Drop for StrictGuard {
 /// decided call: whether the entry the resume's substitution would
 /// consume exists and is executable. Wired by the substitution prelude
 /// (fold unit B1).
-#[allow(dead_code)]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum PeekOutcome {
     /// The front decision exists and may run: a denial, or an approval

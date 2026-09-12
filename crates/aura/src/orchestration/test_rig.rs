@@ -152,8 +152,10 @@ impl ScriptedToolCall {
         }
     }
 
-    /// Set the provider-side `call_id` (what the park gate records on a
-    /// pending call and what the continuation's sentinel replacement keys on).
+    /// Set the provider-side `call_id` (the id that rides the streamed
+    /// tool-call wire). The park gate records the rig `ToolCall.id` on a
+    /// pending call (`take_current_call_id` stashes the rig id), and that
+    /// recorded id is what the continuation's sentinel replacement keys on.
     pub(crate) fn with_call_id(mut self, call_id: impl Into<String>) -> Self {
         self.call_id = Some(call_id.into());
         self
