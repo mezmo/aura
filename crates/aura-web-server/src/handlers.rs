@@ -27,7 +27,8 @@ use crate::streaming::{
 };
 use crate::types::*;
 use aura::orchestration::{
-    BlockingEntry, ResumeClaimTable, ResumeRefusal, ResumeRunId, ResumeSessionId, SegmentResult,
+    BlockingEntry, ResumeClaimTable, ResumeEvaluation, ResumeRefusal, ResumeRunId, ResumeSessionId,
+    SegmentError, SegmentResult, ValidatedResumePath, evaluate_resume, run_segment,
 };
 
 /// RAII guard for request-scoped subscriptions. Ensures cleanup even on panic.
@@ -1348,6 +1349,9 @@ fn error_response(
 // Resume endpoint (P45): `POST /v1/sessions/{session_id}/runs/{run_id}`
 // -------------------------------------------------------------------------
 
+/// OpenAI's tool-call type discriminant on the chat-completions wire.
+const TOOL_CALL_FUNCTION_TYPE: &str = "function";
+
 /// The shared per-run resume claim table, carried as a request extension.
 #[derive(Clone)]
 pub struct ResumeClaims(pub Arc<ResumeClaimTable>);
@@ -1355,7 +1359,6 @@ pub struct ResumeClaims(pub Arc<ResumeClaimTable>);
 /// The segment state token on the resume success body.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "lowercase")]
-#[allow(dead_code)] // P45 skeleton: constructed when the handler body lands
 enum ResumeRunState {
     Completed,
     Parked,
@@ -1363,7 +1366,6 @@ enum ResumeRunState {
 
 /// The resume success body.
 #[derive(Debug, Serialize)]
-#[allow(dead_code)] // P45 skeleton: constructed when the handler body lands
 struct ResumeRunResponse {
     session_id: String,
     run_id: String,
@@ -1374,7 +1376,6 @@ struct ResumeRunResponse {
 }
 
 impl ResumeRunResponse {
-    #[allow(dead_code)] // P45 skeleton: called when the handler body lands
     fn from_segment(session: &ResumeSessionId, run: &ResumeRunId, segment: SegmentResult) -> Self {
         let (state, turns, blocking) = match segment {
             SegmentResult::Completed { turns } => (ResumeRunState::Completed, turns, None),
@@ -1397,16 +1398,59 @@ impl ResumeRunResponse {
 /// Project the segment's conversation turns to the chat-completion message
 /// objects the `turns` array carries — the same objects
 /// `/v1/chat/completions` uses.
-#[expect(unused_variables, reason = "todo!() body; filled by P45")]
-#[allow(dead_code)] // P45 skeleton: called when the handler body lands
+///
+/// Tool-call fidelity: the wire `tool_calls[].id` prefers the rig call's
+/// provider `call_id`, which a parked segment's snapshot-derived turns carry
+/// at full fidelity. A completed segment's turns are reassembled from
+/// provider-agnostic stream items that drop the `call_id`, so the wire id
+/// falls back to the stream item's own id — the same value the live SSE
+/// stream emits for the same call, never a fabricated one. Reasoning and
+/// image content have no chat-completion slot and are skipped.
 fn continuation_turns(turns: &[aura::Message]) -> Vec<ChatMessage> {
-    todo!()
+    let mut projected = Vec::with_capacity(turns.len());
+    for turn in turns {
+        // The segment surface carries assistant turns only: both
+        // `SegmentResult` arms construct `Message::Assistant` turns.
+        let aura::Message::Assistant { content, .. } = turn else {
+            continue;
+        };
+        let mut text = String::new();
+        let mut tool_calls = Vec::new();
+        for piece in content.iter() {
+            match piece {
+                aura::AssistantContent::Text(t) => {
+                    if !text.is_empty() {
+                        text.push('\n');
+                    }
+                    text.push_str(&t.text);
+                }
+                aura::AssistantContent::ToolCall(call) => {
+                    tool_calls.push(ChatMessageToolCall {
+                        id: call.call_id.clone().unwrap_or_else(|| call.id.clone()),
+                        call_type: TOOL_CALL_FUNCTION_TYPE.to_string(),
+                        function: ChatMessageFunctionCall {
+                            name: call.function.name.clone(),
+                            arguments: call.function.arguments.to_string(),
+                        },
+                    });
+                }
+                aura::AssistantContent::Reasoning(_) | aura::AssistantContent::Image(_) => {}
+            }
+        }
+        projected.push(ChatMessage {
+            role: Role::Assistant,
+            content: (!text.is_empty()).then_some(text),
+            tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
+            tool_call_id: None,
+            name: None,
+        });
+    }
+    projected
 }
 
 /// Project an evaluation refusal to its HTTP answer: a detail-less 404 for
 /// the two not-found rows, the one 409 shape for conflict rows, and the
 /// shared error envelope for faults.
-#[allow(dead_code)] // P45 skeleton: called when the handler body lands
 fn refusal_response(refusal: ResumeRefusal) -> Response {
     match refusal {
         ResumeRefusal::DocumentAbsent | ResumeRefusal::IdentityMismatch => {
@@ -1431,14 +1475,105 @@ fn refusal_response(refusal: ResumeRefusal) -> Response {
     skip(state, claims, headers),
     fields(otel.kind = "server")
 )]
-#[expect(unused_variables, reason = "todo!() body; filled by P45")]
 pub async fn resume_run(
     State(state): State<Arc<AppState>>,
     axum::extract::Extension(claims): axum::extract::Extension<ResumeClaims>,
     headers: HeaderMap,
     Path((session_raw, run_raw)): Path<(String, String)>,
 ) -> Response {
-    todo!()
+    // Both path segments validate before anything else: a malformed segment
+    // answers the bare 404 without a single filesystem read.
+    let Ok(path) = ValidatedResumePath::parse(&session_raw, &run_raw) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    // The run's config from the parsed startup configs: single-config
+    // servers pass through, multi-config servers need DEFAULT_AGENT — the
+    // resume path carries no model field to select with.
+    let config = if state.configs.len() == 1 {
+        Some(&state.configs[0])
+    } else {
+        let default_agent = state.default_agent.as_deref();
+        default_agent.and_then(|agent| {
+            state
+                .configs
+                .iter()
+                .find(|c| c.agent.alias.as_deref().unwrap_or(&c.agent.name) == agent)
+        })
+    };
+    let Some(config) = config else {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "no configuration can serve this resume: multi-agent servers must set DEFAULT_AGENT",
+            "internal_error",
+        );
+    };
+
+    // Binding is a parsed-config flag; the presented header is read only
+    // when it is on. Binding on without a configured header name (unreachable
+    // past load-time validation) presents nothing and fails closed below.
+    let bind_identity = config
+        .hitl
+        .as_ref()
+        .is_some_and(|hitl| hitl.park.bind_identity);
+    let presented_identity = if bind_identity {
+        config
+            .identity_header
+            .as_deref()
+            .and_then(|name| headers.get(name))
+            .and_then(|value| value.to_str().ok())
+    } else {
+        None
+    };
+
+    // Pure config projection — no skill discovery, no filesystem access.
+    let builder = RigBuilder::new(config.clone(), state.pending_approvals.clone())
+        .with_hitl_hmac(state.hitl_webhook_hmac.clone());
+    let agent_config = builder.get_agent_config();
+    let Some(memory_dir) = agent_config.effective_memory_dir() else {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the resume configuration has no memory_dir; no checkpoint can exist",
+            "internal_error",
+        );
+    };
+
+    let evaluation = ResumeEvaluation {
+        path,
+        memory_dir,
+        config: &agent_config,
+        store: &state.pending_approvals,
+        claims: &claims.0,
+        bind_identity,
+        presented_identity,
+        request_id: format!("req_{}", Uuid::new_v4().simple()),
+        now: chrono::Utc::now(),
+    };
+    let grant = match evaluate_resume(evaluation).await {
+        Ok(grant) => grant,
+        Err(refusal) => return refusal_response(refusal),
+    };
+
+    let session_id = grant.session_id().clone();
+    let run_id = grant.run_id().clone();
+    let headers_map: HashMap<String, String> = headers
+        .iter()
+        .filter_map(|(k, v)| v.to_str().ok().map(|val| (k.to_string(), val.to_string())))
+        .collect();
+    match run_segment(grant, &agent_config, &headers_map).await {
+        Ok(segment) => {
+            let body = ResumeRunResponse::from_segment(&session_id, &run_id, segment);
+            (StatusCode::OK, Json(body)).into_response()
+        }
+        Err(SegmentError::Continuation(diagnostic)) => {
+            refusal_response(ResumeRefusal::Fault(diagnostic))
+        }
+        Err(_) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "unexpected resume segment error",
+            "internal_error",
+        ),
+    }
 }
 
 #[cfg(test)]

@@ -304,12 +304,38 @@ fn hitl_route_vs_server_window_warning(
 
 /// Refuse park mode on the memory backend: park-mode checkpoints and
 /// approval tickets must outlive the process for any resume to exist.
-#[expect(unused_variables, reason = "todo!() body; filled by P45")]
 fn refuse_park_on_memory_backend(
     configs: &[aura_config::Config],
     backend: aura_config::SessionStoreBackend,
 ) -> Result<(), std::io::Error> {
-    todo!()
+    if backend != aura_config::SessionStoreBackend::Memory {
+        return Ok(());
+    }
+    for config in configs {
+        let Some(hitl) = &config.hitl else {
+            continue;
+        };
+        if !hitl.park.enabled {
+            continue;
+        }
+        let agent = config.agent.alias.as_deref().unwrap_or(&config.agent.name);
+        error!(
+            "agent '{agent}': [hitl] park mode requires a restart-durable session store, but \
+             AURA_SESSION_STORE is 'memory'; parked checkpoints and approval tickets would die \
+             with the process, so no resume could ever succeed. Set AURA_SESSION_STORE=file (or \
+             redis)"
+        );
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "agent '{agent}': [hitl] park mode requires a restart-durable session store, but \
+                 AURA_SESSION_STORE is 'memory'; parked checkpoints and approval tickets would \
+                 die with the process, so no resume could ever succeed. Set \
+                 AURA_SESSION_STORE=file (or redis)"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Serve until SIGINT/SIGTERM, then drain in-flight streams and flush spans.
