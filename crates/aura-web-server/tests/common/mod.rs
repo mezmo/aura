@@ -7,9 +7,18 @@
 //! store. For networked backends they are separate connections to the same
 //! server; for single-process backends they are two handles to the same
 //! store, which is that backend's deployment shape.
+//!
+//! Each test binary includes a subset of this module, so unused items here
+//! are normal; `dead_code` is allowed for that reason.
 
-use std::sync::Arc;
+#![allow(dead_code)]
+
+use std::path::PathBuf;
+use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+use tokio::process::{Child, Command};
 
 use aura::hitl::{
     AgentScope, ApprovalDecision, ApprovalItem, ApprovalOrigin, ApprovalRequest, DecisionId,
@@ -163,4 +172,209 @@ pub async fn cancel_request_removes_only_matching(instance: &Arc<dyn ApprovalSto
     assert_eq!(cleared[0].request.decision_id, cancel_id);
     assert!(instance.get(&cancel_id).await.unwrap().is_none());
     assert!(instance.get(&keep_id).await.unwrap().is_some());
+}
+
+/// The poll reconciler's scan source: `list_pending` returns exactly the
+/// parked, undecided tickets — a resolved sibling is never listed.
+pub async fn list_pending_returns_only_live_undecided(
+    instance_a: &Arc<dyn ApprovalStore>,
+    instance_b: &Arc<dyn ApprovalStore>,
+) {
+    let resolved = make_parked("req-poll-resolved", Duration::from_secs(60));
+    let resolved_id = resolved.request.decision_id;
+    let live = make_parked("req-poll-live", Duration::from_secs(60));
+    let live_id = live.request.decision_id;
+    instance_a.register(resolved).await.unwrap();
+    instance_a.register(live).await.unwrap();
+    instance_b
+        .resolve(&resolved_id, ApprovalDecision::Approved)
+        .await
+        .unwrap();
+
+    let pending = instance_a.list_pending().await.unwrap();
+
+    let ids: Vec<DecisionId> = pending.iter().map(|p| p.request.decision_id).collect();
+    assert_eq!(ids, [live_id], "exactly the undecided ticket is listed");
+}
+
+pub async fn list_pending_empty_store_returns_empty(instance: &Arc<dyn ApprovalStore>) {
+    assert!(instance.list_pending().await.unwrap().is_empty());
+}
+
+/// Expired tickets are never listed, even where the backend retains them
+/// (the file store keeps them until remove; Redis floors the record TTL).
+pub async fn list_pending_excludes_expired(
+    instance_a: &Arc<dyn ApprovalStore>,
+    instance_b: &Arc<dyn ApprovalStore>,
+) {
+    let mut expired = make_parked("req-poll-expired", Duration::from_secs(60));
+    expired.expires_at = chrono::Utc::now() - chrono::Duration::seconds(1);
+    let live = make_parked("req-poll-live", Duration::from_secs(60));
+    let live_id = live.request.decision_id;
+    instance_a.register(expired).await.unwrap();
+    instance_a.register(live).await.unwrap();
+
+    let pending = instance_b.list_pending().await.unwrap();
+
+    let ids: Vec<DecisionId> = pending.iter().map(|p| p.request.decision_id).collect();
+    assert_eq!(ids, [live_id], "the expired ticket must not be listed");
+}
+
+// ---------------------------------------------------------------------------
+// A spawned aura-web-server for integration suites
+// ---------------------------------------------------------------------------
+
+/// How long a spawned server has to answer `/health` before the spawn
+/// retries once on a fresh port.
+pub const HEALTH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// A freshly spawned `aura-web-server`, bound to its own port and reading a
+/// config generated for exactly one test case. Killed and its config file
+/// removed on drop.
+pub struct AuraServer {
+    port: u16,
+    child: Child,
+    config_path: PathBuf,
+    /// Accumulated stderr, drained continuously so the child's pipe never
+    /// blocks; read back to explain a health-check timeout.
+    stderr_log: Arc<Mutex<String>>,
+}
+
+impl AuraServer {
+    pub fn base_url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.port)
+    }
+
+    /// Spawn `aura-web-server` against `config_toml` (config file named
+    /// `{config_prefix}{uuid}.toml`) with `extra_env` applied to the child,
+    /// waiting until it answers `/health`. `free_port`'s bind-then-drop
+    /// leaves a window for another process to grab the port; one retry on a
+    /// fresh port covers that.
+    pub async fn start(
+        config_toml: &str,
+        config_prefix: &str,
+        extra_env: &[(&str, String)],
+    ) -> Self {
+        match Self::try_start(config_toml, config_prefix, extra_env).await {
+            Ok(server) => server,
+            Err(failed) => {
+                let log = failed.stderr_log.lock().expect("stderr log mutex").clone();
+                eprintln!(
+                    "aura-web-server on port {} never answered /health within {HEALTH_TIMEOUT:?}; \
+                     retrying once on a fresh port. stderr:\n{log}",
+                    failed.port
+                );
+                failed.stop().await;
+                match Self::try_start(config_toml, config_prefix, extra_env).await {
+                    Ok(server) => server,
+                    Err(failed) => {
+                        let log = failed.stderr_log.lock().expect("stderr log mutex").clone();
+                        let port = failed.port;
+                        failed.stop().await;
+                        panic!(
+                            "aura-web-server never answered /health, on a fresh port either; \
+                             last tried port {port}; stderr:\n{log}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// One spawn-and-wait attempt. `Err` carries the (still-running) server
+    /// so the caller can log its stderr and stop it before retrying.
+    async fn try_start(
+        config_toml: &str,
+        config_prefix: &str,
+        extra_env: &[(&str, String)],
+    ) -> Result<Self, Self> {
+        let port = free_port();
+        let config_path =
+            std::env::temp_dir().join(format!("{config_prefix}{}.toml", uuid::Uuid::new_v4()));
+        std::fs::write(&config_path, config_toml).expect("write generated test config");
+
+        let mut child = Command::new(env!("CARGO_BIN_EXE_aura-web-server"))
+            .env("CONFIG_PATH", &config_path)
+            .env("HOST", "127.0.0.1")
+            .env("PORT", port.to_string())
+            .env("RUST_LOG", "warn")
+            .envs(extra_env.iter().map(|(k, v)| (*k, v.clone())))
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn aura-web-server (did `cargo build -p aura-web-server` succeed?)");
+
+        let stderr_log = Arc::new(Mutex::new(String::new()));
+        let stderr = child.stderr.take().expect("stderr was piped");
+        let log_sink = Arc::clone(&stderr_log);
+        tokio::spawn(async move {
+            let mut reader = tokio::io::BufReader::new(stderr);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                use tokio::io::AsyncBufReadExt;
+                if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                    break;
+                }
+                let mut log = log_sink.lock().expect("stderr log mutex");
+                log.push_str(line.trim_end_matches('\n'));
+                log.push('\n');
+            }
+        });
+
+        let server = Self {
+            port,
+            child,
+            config_path,
+            stderr_log,
+        };
+        if server.is_healthy_within(HEALTH_TIMEOUT).await {
+            Ok(server)
+        } else {
+            Err(server)
+        }
+    }
+
+    async fn is_healthy_within(&self, timeout: Duration) -> bool {
+        let client = reqwest::Client::new();
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if let Ok(resp) = client
+                .get(format!("{}/health", self.base_url()))
+                .send()
+                .await
+                && resp.status().is_success()
+            {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    /// Kill the child and await its exit, reaping the process, then remove its generated config file. Call this explicitly at test end; `Drop`'s `start_kill` is only the fallback for a test that panics.
+    pub async fn stop(mut self) {
+        let _ = self.child.kill().await;
+        let _ = std::fs::remove_file(&self.config_path);
+    }
+}
+
+impl Drop for AuraServer {
+    fn drop(&mut self) {
+        let _ = self.child.start_kill();
+        let _ = std::fs::remove_file(&self.config_path);
+    }
+}
+
+/// An OS-assigned free port, read and released before the caller uses it.
+/// The bind-then-drop race is the standard tolerance for test-local ports.
+pub fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("bind ephemeral port")
+        .local_addr()
+        .expect("local addr")
+        .port()
 }

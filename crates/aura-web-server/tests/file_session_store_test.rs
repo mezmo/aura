@@ -79,6 +79,27 @@ async fn file_battery_cancel_request_removes_only_matching() {
     common::cancel_request_removes_only_matching(&instance_a).await;
 }
 
+#[tokio::test]
+async fn file_battery_list_pending_returns_only_live_undecided() {
+    let dir = tempfile::tempdir().unwrap();
+    let (instance_a, instance_b) = file_pair(&dir);
+    common::list_pending_returns_only_live_undecided(&instance_a, &instance_b).await;
+}
+
+#[tokio::test]
+async fn file_battery_list_pending_empty_store_returns_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    let (instance_a, _) = file_pair(&dir);
+    common::list_pending_empty_store_returns_empty(&instance_a).await;
+}
+
+#[tokio::test]
+async fn file_battery_list_pending_excludes_expired() {
+    let dir = tempfile::tempdir().unwrap();
+    let (instance_a, instance_b) = file_pair(&dir);
+    common::list_pending_excludes_expired(&instance_a, &instance_b).await;
+}
+
 // ---------------------------------------------------------------------------
 // Shared battery vs the memory backend (uniform contract, no Docker)
 // ---------------------------------------------------------------------------
@@ -117,6 +138,24 @@ async fn memory_battery_remove_makes_resolve_not_found() {
 async fn memory_battery_cancel_request_removes_only_matching() {
     let (instance_a, _) = memory_pair();
     common::cancel_request_removes_only_matching(&instance_a).await;
+}
+
+#[tokio::test]
+async fn memory_battery_list_pending_returns_only_live_undecided() {
+    let (instance_a, instance_b) = memory_pair();
+    common::list_pending_returns_only_live_undecided(&instance_a, &instance_b).await;
+}
+
+#[tokio::test]
+async fn memory_battery_list_pending_empty_store_returns_empty() {
+    let (instance_a, _) = memory_pair();
+    common::list_pending_empty_store_returns_empty(&instance_a).await;
+}
+
+#[tokio::test]
+async fn memory_battery_list_pending_excludes_expired() {
+    let (instance_a, instance_b) = memory_pair();
+    common::list_pending_excludes_expired(&instance_a, &instance_b).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -234,6 +273,148 @@ async fn resolve_moves_the_approval_into_the_decision_file() {
     assert_eq!(on_disk["decision"]["reason"], serde_json::Value::Null);
 }
 
+/// An expired undecided approval leaves the store on the scan that finds
+/// it, so no credential outlives the decision window.
+#[tokio::test]
+async fn list_pending_unlinks_expired_approval_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = FileApprovalStore::open(dir.path()).unwrap();
+    let mut expired = make_parked("req-expired", Duration::from_secs(60));
+    expired.expires_at = chrono::Utc::now() - chrono::Duration::seconds(1);
+    let id = expired.request.decision_id;
+    store.register(expired).await.unwrap();
+
+    assert!(store.list_pending().await.unwrap().is_empty());
+    assert!(
+        !dir.path()
+            .join("approvals")
+            .join(format!("{id}.json"))
+            .exists(),
+        "the expired approval file was unlinked"
+    );
+}
+
+/// Rows hold credentials, so the store's directories and files are
+/// readable by the owner only.
+#[cfg(unix)]
+#[tokio::test]
+async fn store_directories_and_files_are_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let store = FileApprovalStore::open(dir.path()).unwrap();
+    let parked = make_parked("req-mode", Duration::from_secs(60));
+    let id = parked.request.decision_id;
+    store.register(parked).await.unwrap();
+    let mode =
+        |path: std::path::PathBuf| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+
+    assert_eq!(mode(dir.path().join("approvals")), 0o700);
+    assert_eq!(mode(dir.path().join("decisions")), 0o700);
+    assert_eq!(
+        mode(dir.path().join("approvals").join(format!("{id}.json"))),
+        0o600
+    );
+
+    store
+        .resolve(&id, ApprovalDecision::Approved)
+        .await
+        .unwrap();
+    assert_eq!(
+        mode(dir.path().join("decisions").join(format!("{id}.json"))),
+        0o600
+    );
+}
+
+/// An approval file left behind after its decision was written (the unlink
+/// in `resolve` is best-effort) is neither returned nor kept: the pending
+/// scan removes it, so the row's credentials do not outlive the decision.
+#[tokio::test]
+async fn list_pending_removes_an_approval_file_that_already_has_a_decision() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = FileApprovalStore::open(dir.path()).unwrap();
+    let parked = make_parked("req-residue", Duration::from_secs(60));
+    let id = parked.request.decision_id;
+    store.register(parked).await.unwrap();
+    let approval_path = dir.path().join("approvals").join(format!("{id}.json"));
+    let approval_bytes = std::fs::read(&approval_path).unwrap();
+
+    store
+        .resolve(&id, ApprovalDecision::Approved)
+        .await
+        .unwrap();
+    assert!(!approval_path.exists(), "resolve unlinks the approval file");
+    std::fs::write(&approval_path, &approval_bytes).unwrap();
+
+    let pending = store.list_pending().await.unwrap();
+
+    assert_eq!(pending.len(), 0, "a decided id is never pending");
+    assert!(
+        !approval_path.exists(),
+        "the scan removes the decided approval residue"
+    );
+    assert!(
+        dir.path()
+            .join("decisions")
+            .join(format!("{id}.json"))
+            .exists(),
+        "the decision record is untouched"
+    );
+}
+
+/// A decision file that does not decode (a write interrupted before its
+/// sync) marks the id as claimed but not recoverable from that file: the
+/// scan neither returns the row nor removes the approval file, which stays
+/// the only intact record and still answers `get`.
+#[tokio::test]
+async fn list_pending_keeps_the_approval_file_behind_an_incomplete_decision() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = FileApprovalStore::open(dir.path()).unwrap();
+    let parked = make_parked("req-torn", Duration::from_secs(60));
+    let id = parked.request.decision_id;
+    store.register(parked).await.unwrap();
+    let approval_path = dir.path().join("approvals").join(format!("{id}.json"));
+    let decision_path = dir.path().join("decisions").join(format!("{id}.json"));
+    std::fs::write(&decision_path, b"{\"approval\":").unwrap();
+
+    let pending = store.list_pending().await.unwrap();
+
+    assert_eq!(pending.len(), 0, "a claimed id is never pending");
+    assert!(approval_path.exists(), "the intact approval file is kept");
+    let got = store
+        .get(&id)
+        .await
+        .unwrap()
+        .expect("the approval still reads");
+    assert_eq!(got.request.decision_id, id);
+    assert!(
+        matches!(
+            store.decision(&id).await,
+            Err(SessionStoreError::Decode { .. })
+        ),
+        "the torn decision file reads as a decode error"
+    );
+    assert_eq!(
+        store.resolve(&id, ApprovalDecision::Approved).await,
+        Err(ResolveError::NotFound),
+        "the torn file still holds the at-most-once claim"
+    );
+    assert!(
+        approval_path.exists(),
+        "a refused resolve leaves the approval"
+    );
+
+    // Recovery: clearing the torn file returns the row to the pending set
+    // and lets a fresh resolve land.
+    std::fs::remove_file(&decision_path).unwrap();
+    let pending = store.list_pending().await.unwrap();
+    assert_eq!(pending.len(), 1, "the row is pending again");
+    store
+        .resolve(&id, ApprovalDecision::Approved)
+        .await
+        .expect("a fresh resolve lands");
+    assert!(!approval_path.exists(), "resolve unlinks the approval file");
+}
+
 /// §2.5: `cancel_request` removes undecided approvals by owner id and
 /// returns exactly the cleared set; a decided approval of the same owner and
 /// an undecided approval of another owner survive.
@@ -349,6 +530,57 @@ async fn cancel_request_skips_an_undecodable_approval_file() {
     assert!(corrupt.exists(), "the undecodable file is left in place");
 }
 
+#[tokio::test]
+async fn list_pending_skips_an_undecodable_approval_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = FileApprovalStore::open(dir.path()).unwrap();
+    let parked = make_parked("req-poll-corrupt", Duration::from_secs(60));
+    let id = parked.request.decision_id;
+    store.register(parked).await.unwrap();
+    let corrupt = dir.path().join("approvals").join("corrupt.json");
+    std::fs::write(&corrupt, b"not json").unwrap();
+
+    let pending = store.list_pending().await.unwrap();
+
+    let ids: Vec<_> = pending.iter().map(|p| p.request.decision_id).collect();
+    assert_eq!(ids, [id], "the corrupt file must not fail the scan");
+    assert!(corrupt.exists(), "the undecodable file is left in place");
+}
+
+/// The residue of resolve's best-effort approval unlink — a stale approval
+/// file whose decision file exists — never re-enters the reconciler's scan:
+/// the recorded decision owns the outcome.
+#[tokio::test]
+async fn list_pending_skips_a_stale_decided_approval() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = FileApprovalStore::open(dir.path()).unwrap();
+    let live = make_parked("req-poll-live", Duration::from_secs(60));
+    let live_id = live.request.decision_id;
+    store.register(live).await.unwrap();
+    let decided = make_parked("req-poll-residue", Duration::from_secs(60));
+    let decided_id = decided.request.decision_id;
+    let residue = serde_json::to_vec(&ParkedApprovalRecord::from(&decided)).unwrap();
+    store.register(decided).await.unwrap();
+    store
+        .resolve(&decided_id, ApprovalDecision::Approved)
+        .await
+        .unwrap();
+
+    // Resolve's approval unlink failed: put the residue back.
+    std::fs::write(
+        dir.path()
+            .join("approvals")
+            .join(format!("{decided_id}.json")),
+        residue,
+    )
+    .unwrap();
+
+    let pending = store.list_pending().await.unwrap();
+
+    let ids: Vec<_> = pending.iter().map(|p| p.request.decision_id).collect();
+    assert_eq!(ids, [live_id], "the decided residue must not be listed");
+}
+
 /// A read-only `approvals/` directory must not fail `resolve`: the decision
 /// write and its sync are the commit, and the approval removal past them is
 /// best-effort — the stale approval remains, `get` still returns the record,
@@ -437,29 +669,19 @@ impl Drop for Restore<'_> {
     }
 }
 
-/// A read-only store directory must fail `open`, not the first approval:
-/// readiness keys on construction and ping, so an unwritable path rejects
-/// the server at startup.
-#[cfg(unix)]
+/// A regular file where a store directory belongs must fail `open`, so an
+/// unusable path rejects the server at startup rather than the first
+/// approval.
 #[tokio::test]
-async fn open_fails_when_a_store_directory_is_not_writable() {
-    use std::os::unix::fs::PermissionsExt;
-
+async fn open_fails_when_a_store_directory_is_obstructed() {
     let dir = tempfile::tempdir().unwrap();
     drop(FileApprovalStore::open(dir.path()).unwrap());
     let approvals = dir.path().join("approvals");
-    std::fs::set_permissions(&approvals, std::fs::Permissions::from_mode(0o500)).unwrap();
-    let _restore = Restore(&approvals);
-
-    let probe = approvals.join(".write-probe");
-    if std::fs::write(&probe, b"x").is_ok() {
-        let _ = std::fs::remove_file(&probe);
-        eprintln!("skipping: process bypasses directory permissions (running as root?)");
-        return;
-    }
+    std::fs::remove_dir_all(&approvals).unwrap();
+    std::fs::write(&approvals, b"obstruction").unwrap();
 
     let err = match FileApprovalStore::open(dir.path()) {
-        Ok(_) => panic!("open must refuse an unwritable store directory"),
+        Ok(_) => panic!("open must refuse an obstructed store directory"),
         Err(err) => err,
     };
     assert!(
