@@ -349,8 +349,8 @@ impl RaceGate {
     }
 }
 
-/// Disarms the rendezvous on drop, so a panicking test cannot leave the
-/// gate armed for whichever test reuses the thread next.
+/// Disarms the rendezvous on drop, so a panicking test unwinds with the
+/// gate disarmed and the armed flag cannot outlive the test body.
 #[cfg(test)]
 pub(crate) struct RaceGateGuard {
     gate: Arc<RaceGate>,
