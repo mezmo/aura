@@ -2063,8 +2063,8 @@ async fn denied_without_identity_steers_normally_under_the_identity_route() {
 /// `stage_unwritable_tombstone_tmp` — a read-only leftover at the
 /// tombstone write's temp path, the filesystem-permission mechanism that
 /// survives the write's own parent-directory tightening. The pinned
-/// diagnostic is the proven sequence's own wording (`resume_task`), with
-/// the standard `EACCES` text.
+/// diagnostic is the proven sequence's own wording, with the standard
+/// `EACCES` text.
 #[tokio::test]
 async fn failing_tombstone_write_is_fatal_before_the_invocation() {
     let _serial = WORKER_OVERRIDE_SERIAL.lock().await;

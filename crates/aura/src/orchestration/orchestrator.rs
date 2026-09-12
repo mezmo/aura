@@ -70,8 +70,8 @@ use super::park::resume::{
 };
 use super::park::{
     CallKey, ParkCommitInputs, ParkGuard, ParkedRun, ParkedTaskRecord, ParkedTaskRecords,
-    PeekOutcome, RecordedDecisions, ResumeContext, ResumingDocumentHandle, RunStateForPark,
-    TaskContinuation, commit_from_run_state, replace_tool_result,
+    PeekOutcome, RecordedDecisions, ResumingDocumentHandle, RunStateForPark, commit_from_run_state,
+    replace_tool_result,
 };
 use super::persistence::ExecutionPersistence;
 use super::types::{
@@ -3546,9 +3546,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                             task_context: &task_context,
                             worker_name: worker_name.as_deref(),
                         };
-                        let result = self
-                            .execute_task(task_id, &params, Some(event_tx), None, None)
-                            .await;
+                        let result = self.execute_task(task_id, &params, Some(event_tx)).await;
                         let duration_ms = start_time.elapsed().as_millis() as u64;
                         (task_id, result, duration_ms, worker_name, task_desc)
                     },
@@ -3788,10 +3786,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         }
     }
 
-    /// Execute a single task using a worker agent. `continuation` carries a
-    /// parked task's checkpointed conversation (the resume path) and `resume`
-    /// the recorded decisions + resuming document it drives; both are `None`
-    /// on the live path.
+    /// Execute a single task using a worker agent.
     #[tracing::instrument(
         name = "orchestration.worker",
         skip_all,
@@ -3806,27 +3801,12 @@ Assign tasks to the worker whose tools best match the required operations."#,
         task_id: usize,
         params: &TaskExecutionParams<'_>,
         event_tx: Option<&tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>>,
-        continuation: Option<&TaskContinuation>,
-        resume: Option<&ResumeContext>,
     ) -> Result<TaskOutcome, StreamError> {
         let TaskExecutionParams {
             task_description,
             task_context,
             worker_name,
         } = params;
-
-        // The resume path: the checkpointed conversation drives everything,
-        // so the live prompt-building and retry loop below do not apply.
-        if let (Some(continuation), Some(resume)) = (continuation, resume) {
-            return self
-                .resume_task(task_id, *worker_name, continuation, resume, event_tx)
-                .await;
-        }
-        if continuation.is_some() != resume.is_some() {
-            return Err("task resume state is incomplete: continuation and \
-                        resume context must be provided together"
-                .into());
-        }
 
         {
             let span = tracing::Span::current();
@@ -4168,182 +4148,6 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 structured_output: None,
             }))
         }
-    }
-
-    /// The continuation arm (design doc sections 2.7–2.8): finish a parked
-    /// task from its checkpoint. Rebuilds the worker for the recorded
-    /// attempt with the run's recorded decisions at the gate, tombstones and
-    /// invokes each pending call in recorded order through the wrapper
-    /// chain, replaces the checkpointed sentinel tool results with the real
-    /// ones, then hands the conversation back to the normal multi-turn loop
-    /// via `stream_chat`. Consumed decisions are removed from the store
-    /// after the task completes. The task execution record is not re-persisted
-    /// here: the resuming document's executed list is the resume's record.
-    async fn resume_task(
-        &self,
-        task_id: usize,
-        worker_name: Option<&str>,
-        continuation: &TaskContinuation,
-        resume: &ResumeContext,
-        event_tx: Option<&tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>>,
-    ) -> Result<TaskOutcome, StreamError> {
-        let attempt = continuation.attempt;
-        let Some(park) = self.worker_park(task_id, attempt) else {
-            return Err("cannot resume a task without park mode enabled".into());
-        };
-
-        let AgentWithPreamble {
-            agent: worker,
-            preamble: _,
-            escalation_flag: _,
-            submit_result_decision,
-        } = self
-            .create_worker(
-                task_id,
-                attempt,
-                worker_name,
-                Some(&park.cell),
-                Some(&resume.recorded),
-            )
-            .await?;
-
-        let mut current_prompt = continuation.current_prompt.clone();
-        // Strict arm: a continuation invocation that misses the recorded set
-        // is a resume fault, never a fresh park. The drop guard clears the
-        // task's entry on every exit path (error, panic, and the normal drop
-        // after the last pending call, before the loop resumes).
-        let strict = resume.recorded.strict_guard(task_id);
-        for call in &continuation.pending {
-            // The tombstone precedes the invocation: a crash after this
-            // write shows the call as executed, never re-asks the human.
-            resume
-                .document
-                .append_executed_and_publish(&call.call_id)
-                .await
-                .map_err(|e| -> StreamError {
-                    format!(
-                        "resume tombstone write for call {} failed: {e}",
-                        call.call_id
-                    )
-                    .into()
-                })?;
-            let wire = worker
-                .inner
-                .call_tool(&call.tool_name, &call.arguments.to_string())
-                .await
-                .map_err(|e| -> StreamError {
-                    format!("resume invocation of {} failed: {e}", call.tool_name).into()
-                })?;
-            if !super::park::replace_tool_result(&mut current_prompt, &call.call_id, &wire) {
-                return Err(format!(
-                    "continuation prompt has no tool result for call {}",
-                    call.call_id
-                )
-                .into());
-            }
-        }
-        drop(strict);
-
-        // stream_chat(current_prompt, history): the normal multi-turn loop,
-        // to submit_result or depth exhaustion — park-aware, so a
-        // model-issued gated call re-parks through the live arm.
-        let srd = submit_result_decision.clone();
-        let park_registration =
-            crate::streaming_request_hook::ParkCellRegistration::new(&park.key, park.cell.clone());
-        let (stream, _cancel_tx, _usage_state) = worker
-            .inner
-            .stream_chat_message_with_timeout(
-                current_prompt,
-                continuation.history.clone(),
-                worker.max_depth,
-                Duration::MAX,
-                &park.key,
-                worker.scratchpad_budget.clone(),
-                worker.client_tool_names.clone(),
-            )
-            .await;
-        let stream_result = Self::drive_forward_loop(
-            stream,
-            &self.usage_state,
-            self.config.stream_inactivity_timeout_secs(),
-            worker.scratchpad_budget.as_ref(),
-            "Worker resume",
-            event_tx,
-            worker_name.map(|name| StreamContext {
-                task_id,
-                worker_id: name,
-            }),
-            || {
-                let srd = srd.clone();
-                Box::pin(async move { srd.lock().await.is_some() })
-            },
-        )
-        .await;
-        drop(park_registration);
-
-        // Same cell contract as the live path: the cell is the source of
-        // truth after any stream end.
-        match park.cell.outcome() {
-            CellOutcome::Blocked { pending } => {
-                let snapshot = park
-                    .cell
-                    .snapshot()
-                    .expect("cell outcome Blocked implies a captured snapshot");
-                return Ok(TaskOutcome::Blocked {
-                    pending,
-                    attempt,
-                    snapshot,
-                });
-            }
-            CellOutcome::Orphaned { pending } => {
-                self.cancel_parked_approvals(task_id, worker_name, &pending)
-                    .await;
-                let underlying = match stream_result.as_ref() {
-                    Err(e) => format!(" Underlying error: {e}"),
-                    Ok(_) => String::new(),
-                };
-                return Err(format!(
-                    "Worker resume stream ended before the parked approval snapshot \
-                     was captured for task {task_id}; {} pending approval(s) \
-                     cancelled.{underlying}",
-                    pending.len()
-                )
-                .into());
-            }
-            CellOutcome::Normal => {}
-        }
-
-        let raw_response = match stream_result {
-            Ok(run) => run.response.content,
-            Err(e) => {
-                return Err(format!("Worker resume failed for task {task_id}: {e}").into());
-            }
-        };
-        let structured = submit_result_decision.lock().await.take();
-        let (result, structured_output) = match structured {
-            Some(output) => (
-                output.result,
-                Some(super::types::StructuredTaskOutput {
-                    summary: output.summary,
-                    confidence: output.confidence,
-                }),
-            ),
-            None => (raw_response, None),
-        };
-
-        // Step 5: the consumed decisions leave the store with the task.
-        if let Some(hitl) = self.agent_config.hitl.clone()
-            && let Some((registry, _)) = hitl.route.park_registry()
-        {
-            for call in &continuation.pending {
-                registry.remove(&call.decision_id).await;
-            }
-        }
-
-        Ok(TaskOutcome::Completed(TaskExecutionResult {
-            result,
-            structured_output,
-        }))
     }
 
     // ====================================================================
@@ -9413,9 +9217,7 @@ mod tests {
             worker_name: Some("operations"),
         };
         let (event_tx, _event_rx) = tokio::sync::mpsc::channel(32);
-        let result = orchestrator
-            .execute_task(0, &params, Some(&event_tx), None, None)
-            .await;
+        let result = orchestrator.execute_task(0, &params, Some(&event_tx)).await;
 
         assert_orphaned(result, &store, &mut events, 1, "MaxDepthError").await;
         assert!(
@@ -9455,9 +9257,7 @@ mod tests {
             worker_name: Some("operations"),
         };
         let (event_tx, _event_rx) = tokio::sync::mpsc::channel(32);
-        let result = orchestrator
-            .execute_task(0, &params, Some(&event_tx), None, None)
-            .await;
+        let result = orchestrator.execute_task(0, &params, Some(&event_tx)).await;
 
         assert_orphaned(
             result,
@@ -9486,70 +9286,11 @@ mod tests {
     use crate::orchestration::persistence_wrapper::{PersistenceWrapper, PersistenceWrapperParams};
     use crate::tool_wrapper::ToolCallContext;
 
-    /// The denial feedback the gate produces, quoted for the wire (rig
-    /// JSON-serializes tool outputs). Mirrors `approval_result_to_pre_call`'s
-    /// denial arm in `gate.rs` verbatim.
-    fn denial_feedback_wire(reason: &str) -> String {
-        serde_json::to_string(&format!(
-            "Tool call blocked by human approval denial: {reason}. Do not execute this action."
-        ))
-        .expect("a plain string serializes")
-    }
-
-    /// The tool-result text carried by a chat-history message, decoded —
-    /// assertions compare the actual content, not a serialization level.
-    fn tool_result_text(message: &rig::completion::Message) -> String {
-        let rig::completion::Message::User { content } = message else {
-            return String::new();
-        };
-        content
-            .iter()
-            .filter_map(|item| match item {
-                rig::message::UserContent::ToolResult(tr) => Some(
-                    tr.content
-                        .iter()
-                        .map(|c| match c {
-                            rig::message::ToolResultContent::Text(t) => t.text.clone(),
-                            rig::message::ToolResultContent::Image(_) => String::new(),
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                ),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
     fn conversational_route(registry: &PendingApprovals) -> Arc<crate::hitl::DecisionRoute> {
         Arc::new(crate::hitl::DecisionRoute::Conversational {
             registry: registry.clone(),
             timeout: Duration::from_secs(3600),
         })
-    }
-
-    /// A webhook route under poll delivery, built the production way; the
-    /// resume path never reaches its unroutable url.
-    fn poll_webhook_route(registry: &PendingApprovals) -> Arc<crate::hitl::DecisionRoute> {
-        let config = aura_config::HitlConfig {
-            require_approval: vec![],
-            park: aura_config::ParkConfig {
-                enabled: true,
-                bind_identity: false,
-            },
-            route: aura_config::DecisionRouteConfig::Webhook {
-                url: aura_config::WebhookUrl::new("http://127.0.0.1:9").unwrap(),
-                timeout_secs: 3600,
-                headers: std::collections::HashMap::new(),
-                headers_from_request: std::collections::HashMap::new(),
-                tool_headers_from_response: aura_config::ToolHeaderMappings::default(),
-                delivery: aura_config::WebhookDelivery::Poll,
-                poll_url: None,
-                poll_interval_secs: 10,
-                poll_request_timeout_secs: 30,
-            },
-        };
-        crate::hitl::HitlRuntime::from_config(&config, registry, None, None).route
     }
 
     /// A park-mode orchestrator over a file-backed approval store (the park
@@ -9620,53 +9361,36 @@ mod tests {
         }
     }
 
-    /// Open is `pub(crate)` through the park module; this thin wrapper keeps
-    /// the test honest about the error type while staying inside the crate.
-    async fn open_resuming_document(
-        path: &std::path::Path,
-    ) -> crate::orchestration::park::ResumingDocumentHandle {
-        crate::orchestration::park::ResumingDocumentHandle::open(path)
-            .await
-            .expect("the published document opens")
-    }
+    /// The park-commit round trip over a live park, without any resume
+    /// driver: the scripted worker parks its gated call (the inner tool
+    /// never runs at park time), the commit publishes the checkpoint, and
+    /// the replan state — iteration, planning latency, the coordinator
+    /// conversation, the routed decision — re-derives from the on-disk
+    /// document alone. A decided approval then rehydrates from the store
+    /// under its own id, the consult the resume grant builds on.
+    #[tokio::test]
+    async fn park_commit_round_trips_the_replan_state_over_disk() {
+        let _serial = WORKER_OVERRIDE_LOCK.lock().await;
 
-    /// The shared full-loop harness: park over the file-backed store, drop
-    /// the in-memory state, record `decision` in the store, rehydrate from
-    /// disk, and drive the continuation with `resume_turns`. Returns the
-    /// task outcome plus the handles the proofs assert through.
-    async fn park_then_resume(
-        route_for: fn(&PendingApprovals) -> Arc<crate::hitl::DecisionRoute>,
-        decision: ApprovalDecision,
-        resume_turns: Vec<ScriptedTurn>,
-    ) -> (
-        Result<TaskOutcome, StreamError>,
-        test_rig::ScriptedCompletionModel,
-        Arc<std::sync::Mutex<Vec<test_rig::ToolInvocation>>>,
-        Arc<std::sync::Mutex<Vec<test_rig::ToolInvocation>>>,
-        Arc<crate::orchestration::park::ResumingDocumentHandle>,
-        Arc<dyn crate::session_store::ApprovalStore>,
-        crate::hitl::DecisionId,
-        tempfile::TempDir,
-    ) {
         let dir = tempfile::tempdir().unwrap();
-        let (registry, store) = file_store_registry(&dir.path().join("approvals"));
+        let (registry, _store) = file_store_registry(&dir.path().join("approvals"));
         let (orchestrator, run_id) =
-            file_backed_park_orchestrator(route_for(&registry), dir.path(), "loop-sess").await;
+            file_backed_park_orchestrator(conversational_route(&registry), dir.path(), "loop-sess")
+                .await;
         let (event_tx, _event_rx) = tokio::sync::mpsc::channel(64);
 
-        let (park_model, park_invocations) =
+        let (_park_model, park_invocations) =
             gated_worker_override(vec![ScriptedTurn::tool_calls(vec![ScriptedToolCall::new(
                 "call_apply_1",
                 test_rig::ECHO_TOOL_NAME,
                 serde_json::json!({"namespace": "prod"}),
             )])]);
-        let _ = park_model;
 
         let mut plan = Plan::new("Deploy");
         plan.add_task(Task::new(0, "Gated apply", "r").with_worker("operations"));
         let (_compute_ms, park_records) = orchestrator.execute(&mut plan, &event_tx).await.unwrap();
         let TaskState::AwaitingApproval { pending } = &plan.tasks[0].state else {
-            unreachable!("the fixture task is awaiting")
+            unreachable!("the fixture task is awaiting");
         };
         let decision_id = pending[0].decision_id;
 
@@ -9690,10 +9414,10 @@ mod tests {
             .expect("the park commit succeeds");
         drop(orchestrator);
 
-        registry
-            .resolve(&decision_id, decision.into())
-            .await
-            .unwrap();
+        assert!(
+            park_invocations.lock().unwrap().is_empty(),
+            "the gated action did not run at park time"
+        );
 
         let document_path = dir
             .path()
@@ -9721,193 +9445,22 @@ mod tests {
             serde_json::to_value(Some(routing_decision)).unwrap(),
             "the routing decision survives the round trip"
         );
-        let (recorded, consumed_ids) = crate::orchestration::park::load_recorded_decisions(
+
+        registry
+            .resolve(&decision_id, ApprovalDecision::Approved.into())
+            .await
+            .unwrap();
+        let (_recorded, consumed_ids) = crate::orchestration::park::load_recorded_decisions(
             &registry,
             &document,
             chrono::Utc::now(),
         )
         .await
         .unwrap();
-        assert_eq!(consumed_ids, vec![decision_id]);
-
-        let node = document
-            .plan
-            .tasks
-            .iter()
-            .find(|t| t.status == TaskStatus::AwaitingApproval)
-            .expect("the awaiting node is in the document");
-        let continuation = TaskContinuation {
-            attempt: node.attempt.expect("the recorded attempt"),
-            history: node.history.clone().expect("the captured history"),
-            current_prompt: node.current_prompt.clone().expect("the sentinel prompt"),
-            pending: node.pending.clone().expect("the pending calls"),
-        };
-        let document_handle = Arc::new(open_resuming_document(&document_path).await);
-        let resume_ctx = ResumeContext {
-            recorded,
-            document: Arc::clone(&document_handle),
-        };
-
-        let (orchestrator2, _run_id2) =
-            file_backed_park_orchestrator(route_for(&registry), dir.path(), "loop-sess").await;
-        let (resume_model, resume_invocations) = gated_worker_override(resume_turns);
-        let params = TaskExecutionParams {
-            task_description: "apply the manifest",
-            task_context: &None,
-            worker_name: Some("operations"),
-        };
-        let (event_tx2, _event_rx2) = tokio::sync::mpsc::channel(64);
-        let outcome = orchestrator2
-            .execute_task(
-                0,
-                &params,
-                Some(&event_tx2),
-                Some(&continuation),
-                Some(&resume_ctx),
-            )
-            .await;
-
-        (
-            outcome,
-            resume_model,
-            resume_invocations,
-            park_invocations,
-            document_handle,
-            store,
-            decision_id,
-            dir,
-        )
-    }
-
-    /// The same loop on a webhook route under poll delivery: the resume
-    /// consumes the recorded decision and removes the row, as the
-    /// conversational route does.
-    #[tokio::test]
-    async fn full_loop_on_a_poll_route_removes_the_consumed_row() {
-        let _serial = WORKER_OVERRIDE_LOCK.lock().await;
-
-        let (outcome, _model, _resumed, _parked, _document, store, decision_id, _dir) =
-            park_then_resume(
-                poll_webhook_route,
-                ApprovalDecision::Approved,
-                vec![ScriptedTurn::tool_calls(vec![ScriptedToolCall::new(
-                    "call_final",
-                    "submit_result",
-                    serde_json::json!({
-                        "summary": "applied the manifest",
-                        "result": "applied successfully to prod",
-                        "confidence": "high",
-                    }),
-                )])],
-            )
-            .await;
-
-        let outcome = outcome.expect("the resumed task completes");
-        assert!(matches!(outcome, TaskOutcome::Completed(_)));
-        assert!(
-            store.get(&decision_id).await.unwrap().is_none(),
-            "the consumed decision is removed on the poll route"
-        );
-    }
-
-    /// FULL LOOP, zero human input: the scripted worker parks, the document
-    /// publishes, in-memory state drops, the store holds the approval, and
-    /// the rehydrated continuation completes the task — the tool running
-    /// exactly once with the recorded arguments, the executed tombstone
-    /// landing, the consumed decision removed, and no sentinel surviving in
-    /// the resumed conversation.
-    #[tokio::test]
-    async fn full_loop_park_rehydrate_and_resume_completes() {
-        let _serial = WORKER_OVERRIDE_LOCK.lock().await;
-
-        let (
-            outcome,
-            resume_model,
-            resume_invocations,
-            park_invocations,
-            document_handle,
-            store,
-            decision_id,
-            _dir,
-        ) = park_then_resume(
-            conversational_route,
-            ApprovalDecision::Approved,
-            vec![ScriptedTurn::tool_calls(vec![ScriptedToolCall::new(
-                "call_final",
-                "submit_result",
-                serde_json::json!({
-                    "summary": "applied the manifest",
-                    "result": "applied successfully to prod",
-                    "confidence": "high",
-                }),
-            )])],
-        )
-        .await;
-
-        // The replan state survived the round trip and the task completes
-        // with the injected tool result flowing through submit_result.
-        let outcome = outcome.expect("the resumed task completes");
-        let TaskOutcome::Completed(execution) = outcome else {
-            panic!("the resumed task must complete");
-        };
         assert_eq!(
-            execution
-                .structured_output
-                .as_ref()
-                .map(|s| s.summary.as_str()),
-            Some("applied the manifest"),
-            "the submit_result structured output flows through"
-        );
-
-        // The tool ran exactly once, with the recorded arguments — on the
-        // resume side only.
-        assert_eq!(
-            resume_invocations.lock().unwrap().len(),
-            1,
-            "exactly one resumed invocation"
-        );
-        assert_eq!(
-            resume_invocations.lock().unwrap()[0].arguments,
-            serde_json::json!({"namespace": "prod"})
-        );
-        assert!(
-            park_invocations.lock().unwrap().is_empty(),
-            "the gated action did not run at park time"
-        );
-
-        // The tombstone published: the resuming document's executed list is
-        // non-empty and terminal.
-        let executed = document_handle.executed().await;
-        assert_eq!(executed, vec!["call_apply_1".to_string()]);
-        let resuming: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(document_handle.publish_path()).unwrap())
-                .unwrap();
-        assert_eq!(resuming["executed"][0], "call_apply_1");
-
-        // The consumed decision left the store.
-        assert!(
-            store.get(&decision_id).await.unwrap().is_none(),
-            "the consumed decision is removed"
-        );
-
-        // No sentinel remains in the resumed conversation: the resume turn's
-        // prompt carries the real tool result in the wire form.
-        let requests = resume_model.requests();
-        let requests = requests.lock().unwrap();
-        assert_eq!(requests.len(), 1, "the resume turn is the only model turn");
-        let last = requests[0]
-            .chat_history
-            .iter()
-            .last()
-            .expect("the prompt is in the history");
-        let tool_text = tool_result_text(last);
-        assert!(
-            tool_text.contains(&test_rig::echo_tool_result_wire()),
-            "the resumed prompt must carry the tool result wire text: {tool_text}"
-        );
-        assert!(
-            !tool_text.contains("parked pending human approval"),
-            "no sentinel may survive the sentinel replacement: {tool_text}"
+            consumed_ids,
+            vec![decision_id],
+            "the decided approval rehydrates from the store under its own id"
         );
     }
 
@@ -10035,71 +9588,5 @@ mod tests {
             CallKey::new(1, test_rig::ECHO_TOOL_NAME, &second.args),
             "the recorded call digests to the same key after re-entering the chain"
         );
-    }
-
-    /// DENIAL PARITY: a denial recorded in the store produces the live
-    /// path's denial feedback string as the tool result, byte-identical to
-    /// the gate's denial arm, and the inner tool never runs.
-    #[tokio::test]
-    async fn denial_parity_the_recorded_denial_produces_the_live_denial_feedback() {
-        let _serial = WORKER_OVERRIDE_LOCK.lock().await;
-
-        let (
-            outcome,
-            resume_model,
-            resume_invocations,
-            park_invocations,
-            _document_handle,
-            _store,
-            _decision_id,
-            _dir,
-        ) = park_then_resume(
-            conversational_route,
-            ApprovalDecision::Denied {
-                reason: Some("too risky".to_string()),
-            },
-            vec![ScriptedTurn::tool_calls(vec![ScriptedToolCall::new(
-                "call_final",
-                "submit_result",
-                serde_json::json!({
-                    "summary": "blocked, moving on",
-                    "result": "the apply was denied; reporting back",
-                    "confidence": "low",
-                }),
-            )])],
-        )
-        .await;
-
-        let outcome = outcome.expect("the resumed task completes");
-        let TaskOutcome::Completed(execution) = outcome else {
-            panic!("the resumed task must complete even on a denial");
-        };
-        assert_eq!(
-            execution.result, "the apply was denied; reporting back",
-            "the worker continues past the denial"
-        );
-
-        // The denial feedback reached the model's prompt in the wire form,
-        // identical to the live path's denial arm — and no tool invocation
-        // happened on either side.
-        let requests = resume_model.requests();
-        let requests = requests.lock().unwrap();
-        assert_eq!(requests.len(), 1, "the resume turn is the only model turn");
-        let last = requests[0]
-            .chat_history
-            .iter()
-            .last()
-            .expect("the prompt is in the history");
-        let tool_text = tool_result_text(last);
-        assert!(
-            tool_text.contains(&denial_feedback_wire("too risky")),
-            "the denial feedback must appear in the resumed prompt verbatim: {tool_text}"
-        );
-        assert!(
-            !tool_text.contains("parked pending human approval"),
-            "no sentinel may survive the sentinel replacement: {tool_text}"
-        );
-        assert!(resume_invocations.lock().unwrap().is_empty());
-        assert!(park_invocations.lock().unwrap().is_empty());
     }
 }

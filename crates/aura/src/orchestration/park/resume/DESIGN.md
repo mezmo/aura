@@ -265,8 +265,9 @@ acceptance bullet: a resumed segment holding a recorded APPROVAL
 returned 200 `completed` without executing the call —
 `drive_resume_segment` re-streamed the checkpointed `current_prompt`
 unchanged, the worker acted on the stale park placeholder, and the
-placeholder forbids re-issue. The fold lifts `resume_task`'s proven
-substitution sequence into the production segment driver.
+placeholder forbids re-issue. The fold lifts the proven substitution
+sequence from the retired test-only continuation arm into the production
+segment driver.
 
 What changed, per awaiting node, before the continuation streams (the
 plan of record's fix contract):

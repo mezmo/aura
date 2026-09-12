@@ -1,6 +1,5 @@
-//! The continuation surfaces: the checkpointed worker conversation a resume
-//! drives, the per-run resuming-document handle, and the typed rehydrate
-//! errors.
+//! The continuation surfaces: the per-run resuming-document handle and the
+//! typed rehydrate errors.
 //!
 //! Distinct-owner note (P44 frontier finding): [`ResumingDocumentHandle`] is
 //! the park-module's per-run handle for appending tombstones to a resuming
@@ -17,38 +16,8 @@ use crate::hitl::{DecisionId, PendingApprovals};
 use crate::orchestration::park::document::{ParkedRun, RESUMING_DOCUMENT_SUFFIX, load_parked_run};
 use crate::orchestration::park::recorded_decisions::{CallKey, RecordedDecisions};
 use crate::orchestration::persistence::is_safe_path_component;
-use crate::orchestration::types::PendingCall;
-
-/// One parked task's continuation payload: the recorded attempt, the
-/// conversation captured when the worker parked, and the calls awaiting a
-/// decision in recorded order. Built by the resume path from a checkpoint
-/// document (and so carries the restored coordinator-facing state's
-/// worker-side half).
-#[derive(Debug, Clone)]
-pub(crate) struct TaskContinuation {
-    /// The worker attempt that blocked; the resume rebuilds the worker for
-    /// the same attempt number.
-    pub attempt: usize,
-    /// Everything before the final worker turn.
-    pub history: Vec<Message>,
-    /// The final worker turn's aggregated tool-result prompt, still carrying
-    /// one sentinel per parked call id.
-    pub current_prompt: Message,
-    /// The parked calls, in the order the continuation invokes them.
-    pub pending: Vec<PendingCall>,
-}
-
-/// Everything the continuation arm needs besides the checkpoint itself: the
-/// run's recorded decisions (behind the `Arc` the gate already holds) and the
-/// resuming document every tombstone appends through.
-#[derive(Clone)]
-pub(crate) struct ResumeContext {
-    pub recorded: Arc<RecordedDecisions>,
-    pub document: Arc<ResumingDocumentHandle>,
-}
 
 /// Why a run could not rehydrate, mapped to the section 2.6 condition rows.
-#[allow(dead_code)] // P45 resume endpoint consumes the rehydrate entry points
 #[derive(Debug)]
 pub(crate) enum RehydrateError {
     /// Condition row "not found": no checkpoint document exists for the run.
@@ -69,11 +38,14 @@ pub(crate) enum RehydrateError {
     /// all-decided resume never sees this.
     Parked {
         outstanding: Vec<DecisionId>,
+        #[allow(dead_code)] // the refusal re-derives expiry from the blocking projection
         expires_at: chrono::DateTime<chrono::Utc>,
     },
     /// Condition row "config_changed": the fingerprint no longer matches the
     /// rebuilt configuration. Checked by the resume endpoint against a
     /// header-resolved config entry point (P45 adoption).
+    #[allow(dead_code)]
+    // reserved: the fingerprint row is enforced structurally ahead of the consult
     ConfigChanged,
     /// Condition row carried as a store fault: the approval store failed
     /// mid-read.
@@ -121,7 +93,6 @@ impl ResumingDocumentHandle {
     /// Load the parked document at `path` and arm the handle. Appends publish
     /// to the sibling `{run_id}.resuming.json`; the parked document itself is
     /// left untouched.
-    #[allow(dead_code)] // P45 resume endpoint consumes the rehydrate entry points
     pub(crate) async fn open(path: &Path) -> Result<Self, RehydrateError> {
         let document = match load_parked_run(path).await {
             Ok(document) => document,
@@ -358,6 +329,7 @@ mod tests {
         PROTOCOL_VERSION, ParkedApproval, ResolvedDecision,
     };
     use crate::orchestration::park::document::{ParkedPlan, ParkedTaskNode, SCHEMA_VERSION};
+    use crate::orchestration::types::PendingCall;
     use crate::orchestration::types::TaskStatus;
 
     fn parked_run(pending: Vec<PendingCall>) -> ParkedRun {
