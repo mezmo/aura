@@ -21,9 +21,9 @@ records:
 ## Scope of the claim
 
 Green goldens prove the wire artifacts (status + complete body values) are
-unchanged. They prove nothing about side-effect ordering or broker events
-downstream of the wire, and nothing about restart behavior, except where a frame
-asserts an adjacent observable (row 6's rename-back, row 7's untouched
+unchanged. Downstream of the wire they are silent: side-effect ordering,
+broker events, and restart behavior all stay out of scope, except where a
+frame asserts an adjacent observable (row 6's rename-back, row 7's untouched
 document and ticket). A green suite is not an endorsement of the fill's
 internals.
 
