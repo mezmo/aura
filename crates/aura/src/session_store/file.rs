@@ -426,11 +426,11 @@ impl ApprovalStore for FileApprovalStore {
             .map_err(join_err)?
     }
 
+    #[expect(unused_variables, reason = "fill layer consumes the id")]
     async fn mark_acknowledged(
         &self,
         id: &DecisionId,
     ) -> Result<AcknowledgeOutcome, SessionStoreError> {
-        let _ = id;
         todo!("conditional acknowledgment transition (fill layer)")
     }
 

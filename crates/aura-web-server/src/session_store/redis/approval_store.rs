@@ -166,11 +166,11 @@ impl ApprovalStore for RedisApprovalStore {
         pipe.query_async::<()>(&mut conn).await.map_err(request_err)
     }
 
+    #[expect(unused_variables, reason = "fill layer consumes the id")]
     async fn mark_acknowledged(
         &self,
         id: &DecisionId,
     ) -> Result<AcknowledgeOutcome, SessionStoreError> {
-        let _ = id;
         todo!("conditional acknowledgment transition (fill layer)")
     }
 
