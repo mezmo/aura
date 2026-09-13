@@ -5550,9 +5550,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
         let mut plan = initial_plan;
         let mut failure_history: Vec<FailedTaskRecord> = seed.failure_history;
         // Only the iteration that executes the restored plan may skip the
-        // known-failed ids; a replan assigns fresh task ids that must not
-        // collide with restored ones, so the set retires with the plan it
-        // describes.
+        // known-failed ids. A replan flattens a fresh plan whose task ids
+        // restart at zero — colliding with the restored ids — so the set
+        // retires with the plan it describes rather than muting the
+        // replacement plan's own failures.
         let mut known_failed = seed.known_failed_tasks;
         // Planning latency for the next iteration. The first iteration uses the
         // initial planning call; replanned iterations inherit the prior
