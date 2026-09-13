@@ -1734,6 +1734,7 @@ async fn all_decided_grant_runs_the_segment_to_completion() {
 #[tokio::test]
 async fn re_park_mid_segment_carries_turns_and_the_new_blocking_entry() {
     let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
+    let _drain = OverrideDrain;
     let world = world();
     let apply_invocations = Arc::new(Mutex::new(Vec::new()));
     let invocations = Arc::new(Mutex::new(Vec::new()));
@@ -1823,6 +1824,7 @@ async fn re_park_mid_segment_carries_turns_and_the_new_blocking_entry() {
 #[tokio::test]
 async fn re_park_registers_the_fresh_ticket_under_the_original_bound_run_id() {
     let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
+    let _drain = OverrideDrain;
     let world = world();
     let invocations = Arc::new(Mutex::new(Vec::new()));
     // The decided tool's recording registration and the sentinel prompt are
@@ -2586,6 +2588,7 @@ async fn tool_failure_becomes_result_text_and_the_segment_completes() {
 #[tokio::test]
 async fn decided_entry_missing_at_substitution_time_is_fatal_before_the_tombstone() {
     let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
+    let _drain = OverrideDrain;
     let world = world();
     let invocations = Arc::new(Mutex::new(Vec::new()));
     install_worker_overrides(vec![WorkerOverride {
@@ -2641,6 +2644,7 @@ async fn decided_entry_missing_at_substitution_time_is_fatal_before_the_tombston
 #[tokio::test]
 async fn approved_without_required_identity_is_fatal_before_the_tombstone() {
     let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
+    let _drain = OverrideDrain;
     let world = identity_world();
     let invocations = Arc::new(Mutex::new(Vec::new()));
     install_worker_overrides(vec![WorkerOverride {
@@ -2744,6 +2748,7 @@ async fn denied_without_identity_steers_normally_under_the_identity_route() {
 #[tokio::test]
 async fn failing_tombstone_write_is_fatal_before_the_invocation() {
     let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
+    let _drain = OverrideDrain;
     let world = world();
     let invocations = Arc::new(Mutex::new(Vec::new()));
     install_worker_overrides(vec![WorkerOverride {
@@ -2795,6 +2800,7 @@ async fn failing_tombstone_write_is_fatal_before_the_invocation() {
 #[tokio::test]
 async fn tool_result_less_prompt_refuses_at_preflight_before_any_tombstone() {
     let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
+    let _drain = OverrideDrain;
     let world = world();
     let invocations = Arc::new(Mutex::new(Vec::new()));
     let model = ScriptedCompletionModel::new(vec![ScriptedTurn::text(FINAL_TEXT)]);
@@ -2860,6 +2866,7 @@ async fn tool_result_less_prompt_refuses_at_preflight_before_any_tombstone() {
 #[tokio::test]
 async fn empty_call_id_on_node_b_refuses_the_whole_segment_before_any_tombstone() {
     let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
+    let _drain = OverrideDrain;
     let world = world();
     let apply_invocations = Arc::new(Mutex::new(Vec::new()));
     let scale_invocations = Arc::new(Mutex::new(Vec::new()));
@@ -3187,6 +3194,7 @@ async fn same_key_duplicate_calls_execute_once_each_and_a_re_park_removes_both_c
 #[tokio::test]
 async fn second_same_key_entry_missing_is_fatal_before_the_tombstone() {
     let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
+    let _drain = OverrideDrain;
     let world = world();
     let invocations = Arc::new(Mutex::new(Vec::new()));
     install_worker_overrides(vec![WorkerOverride {
@@ -3239,6 +3247,7 @@ async fn second_same_key_entry_missing_is_fatal_before_the_tombstone() {
 #[tokio::test]
 async fn second_same_key_entry_identity_blocked_is_fatal_before_the_tombstone() {
     let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
+    let _drain = OverrideDrain;
     let world = identity_world();
     let invocations = Arc::new(Mutex::new(Vec::new()));
     install_worker_overrides(vec![WorkerOverride {
@@ -3286,6 +3295,7 @@ async fn second_same_key_entry_identity_blocked_is_fatal_before_the_tombstone() 
 #[tokio::test]
 async fn awaiting_node_without_pending_calls_faults_the_segment_before_any_worker_builds() {
     let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
+    let _drain = OverrideDrain;
     let world = world();
     let invocations = Arc::new(Mutex::new(Vec::new()));
     let model = ScriptedCompletionModel::new(vec![ScriptedTurn::text(FINAL_TEXT)]);
@@ -3350,6 +3360,7 @@ async fn awaiting_node_without_pending_calls_faults_the_segment_before_any_worke
 #[tokio::test]
 async fn awaiting_node_with_an_empty_pending_list_faults_before_any_worker_builds() {
     let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
+    let _drain = OverrideDrain;
     let world = world();
     let invocations = Arc::new(Mutex::new(Vec::new()));
     let model = ScriptedCompletionModel::new(vec![ScriptedTurn::text(FINAL_TEXT)]);
@@ -3645,6 +3656,7 @@ async fn pivot_denied_pair_steers_without_executing_and_completes() {
 #[tokio::test]
 async fn re_parked_turns_start_after_the_rebuilt_history_with_no_replayed_reconstruction() {
     let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
+    let _drain = OverrideDrain;
     let world = world();
     let pivot_invocations = Arc::new(Mutex::new(Vec::new()));
     let fresh_invocations = Arc::new(Mutex::new(Vec::new()));
