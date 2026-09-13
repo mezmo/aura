@@ -2154,7 +2154,11 @@ async fn approved_call_executes_once_and_rides_the_outcome_pair() {
 /// and its reason ride the continuation context verbatim in place of the
 /// placeholder, and the wire carries the outcome-bearing pair holding the
 /// live denial text, keyed by the original call id, ahead of the scripted
-/// final turn — the worker adapts; no result is fabricated.
+/// final turn — the worker adapts; no result is fabricated. The context
+/// also carries the decided call's assistant tool call — synthesized by
+/// the reconstruction (P45 stage 3: the fixture's history, like every
+/// single-call sentinel fixture's, never captured it), the pairing
+/// providers require ahead of every tool result.
 #[tokio::test]
 async fn denied_call_steers_without_executing_and_rides_the_denial_pair() {
     let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
@@ -2196,10 +2200,12 @@ async fn denied_call_steers_without_executing_and_rides_the_denial_pair() {
                 context,
                 json!([
                     { "role": "user", "content": [{ "type": "text", "text": "apply it" }] },
+                    decided_call_turn(),
                     decided_result_turn(&tool_wire(&denial_text())),
                 ]),
-                "the worker's context carries the live denial text and its reason \
-                 verbatim, in place of the placeholder"
+                "the worker's context carries the decided call's assistant tool call \
+                 (synthesized by the reconstruction) ahead of the live denial text \
+                 and its reason verbatim, in place of the placeholder"
             );
 
             let serialized = serde_json::to_value(turns.as_slice()).expect("turns serialize");
@@ -2494,22 +2500,29 @@ async fn failing_tombstone_write_is_fatal_before_the_invocation() {
     );
 }
 
-/// FAULT — replace-miss fatal (fix-contract step 5): a checkpointed
-/// `current_prompt` with NO tool-result slot for the call id makes
-/// `replace_tool_result` miss, which is fatal. The fixture is the pre-A1
-/// bare-prompt shape — `parked_document`'s `Message::user("tool results")`.
-/// Per the contract's ordering (tombstone, then invoke, then replace) the
-/// invocation HAS happened and the tombstone IS written: exactly one
-/// invocation, and the resuming document's executed list carries the call
-/// id. Note this leaves the run in the designed interrupted state — the
-/// next resume answers 409 `interrupted` on the once-only evidence.
+/// FAULT — prompt-shape refusal at the segment preflight: a checkpointed
+/// `current_prompt` with NO tool result at all — the pre-A1 bare-prompt
+/// shape, `parked_document`'s `Message::user("tool results")`, a
+/// checkpoint no park producer writes — is refused by the segment-wide
+/// preflight, fatally, with the node-attributed `NotAToolResultPrompt`
+/// diagnostic, BEFORE any tombstone or invocation across the whole
+/// segment. This retires the fold's after-tombstone replace-miss fatal
+/// (the reconstruction wiring removed the replace whose miss it pinned:
+/// the preflight now refuses the malformed shape the old frame staged,
+/// before the first tombstone instead of after the invocation); the
+/// interrupted-state semantics for post-tombstone crashes stay pinned by
+/// `executed_tombstones_refuse_with_the_interrupted_row`. The queued
+/// worker override is still queued after the refusal — no worker build
+/// consumed it, so no worker streamed.
 #[tokio::test]
-async fn replace_miss_is_fatal_after_the_tombstone_and_the_invocation() {
+async fn tool_result_less_prompt_refuses_at_preflight_before_any_tombstone() {
     let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
     let world = world();
     let invocations = Arc::new(Mutex::new(Vec::new()));
+    let model = ScriptedCompletionModel::new(vec![ScriptedTurn::text(FINAL_TEXT)]);
+    let requests = model.requests();
     install_worker_overrides(vec![WorkerOverride {
-        model: ScriptedCompletionModel::new(vec![ScriptedTurn::text(FINAL_TEXT)]),
+        model,
         extra_tools: vec![Box::new(
             RecordingTool::new(invocations.clone()).with_name(TOOL),
         )],
@@ -2526,31 +2539,117 @@ async fn replace_miss_is_fatal_after_the_tombstone_and_the_invocation() {
         .expect("the all-decided run grants");
     let fault = run_segment(grant, &world.config, &HashMap::new())
         .await
-        .expect_err("a prompt with no tool-result slot for the call id is fatal");
+        .expect_err("a tool-result-less prompt is refused at the segment preflight");
     assert_eq!(
         continuation_diagnostic(&fault).as_ref(),
-        "continuation prompt has no tool result for call call_apply_1",
-        "the fault's diagnostic identifies the replace miss"
+        "awaiting node 0: the parked snapshot's current prompt is not the tool-result \
+         message the park producers write",
+        "the fault's diagnostic identifies the prompt-shape refusal, named to its node"
     );
-    {
-        let log = invocations.lock().expect("tool invocation log");
-        assert_eq!(
-            log.len(),
-            1,
-            "exactly one invocation: the tombstone and the invocation both \
-             preceded the replace fault"
-        );
-        assert_eq!(
-            log[0].arguments,
-            call_args(),
-            "the single invocation carries the recorded call's arguments"
-        );
-    }
+    assert!(
+        invocations.lock().expect("tool invocation log").is_empty(),
+        "the refusal precedes every invocation across the segment"
+    );
     let resuming = resuming_document(&world).await;
+    assert!(
+        resuming.executed.is_empty(),
+        "the refusal precedes the FIRST tombstone: no once-only evidence exists"
+    );
+    assert!(
+        requests
+            .lock()
+            .expect("scripted-model request log")
+            .is_empty(),
+        "no worker streamed: the refusal precedes every worker build"
+    );
+    assert!(
+        take_worker_override().is_some(),
+        "no worker build consumed the queued override: the refusal precedes \
+         every build"
+    );
+}
+
+/// FAULT — the segment door (the reconstruction wiring's all-or-nothing
+/// preflight, integration): a TWO-awaiting-node checkpoint where node A is
+/// fully valid and node B's pending call carries an EMPTY call id — the
+/// shape the gate's park arm records when the stream hook observed no
+/// tool-call id — is refused at the segment-wide preflight with the
+/// node-attributed `EmptyCallId` diagnostic naming node B, and NOTHING
+/// runs: node A's valid input must not execute first (the per-node hazard
+/// the segment door exists to close), so ZERO invocations and ZERO
+/// tombstones across the whole segment, and no worker ever builds or
+/// streams.
+#[tokio::test]
+async fn empty_call_id_on_node_b_refuses_the_whole_segment_before_any_tombstone() {
+    let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
+    let world = world();
+    let apply_invocations = Arc::new(Mutex::new(Vec::new()));
+    let scale_invocations = Arc::new(Mutex::new(Vec::new()));
+    let model = ScriptedCompletionModel::new(vec![ScriptedTurn::text(FINAL_TEXT)]);
+    let requests = model.requests();
+    install_worker_overrides(vec![WorkerOverride {
+        model,
+        extra_tools: vec![
+            Box::new(RecordingTool::new(apply_invocations.clone()).with_name(TOOL)),
+            Box::new(RecordingTool::new(scale_invocations.clone()).with_name(TOOL_B)),
+        ],
+    }]);
+    register_decided(&world).await;
+    register_decided_b(&world).await;
+    // The mixed checkpoint: node A (task 3) fully valid, node B (task 4)
+    // carrying one pending call whose call id is empty — everything else
+    // about both nodes is the shape a live park writes.
+    let mut document = two_node_sentinel_document(&world);
+    let node_b = document
+        .plan
+        .tasks
+        .last_mut()
+        .expect("the two-node fixture carries node B last");
+    node_b
+        .pending
+        .as_mut()
+        .expect("node B carries pending calls")[0]
+        .call_id = String::new();
+    publish_document(&world, &document).await;
+
+    let grant = evaluate_resume(evaluation(&world, false, None))
+        .await
+        .expect("the all-decided two-node run grants");
+    let fault = run_segment(grant, &world.config, &HashMap::new())
+        .await
+        .expect_err("node B's empty call id refuses the whole segment");
     assert_eq!(
-        resuming.executed,
-        vec![CALL_ID.to_string()],
-        "the tombstone IS written: the once-only evidence the interrupted row keys on"
+        continuation_diagnostic(&fault).as_ref(),
+        "awaiting node 1: pending call member 0 carries an empty call id",
+        "the refusal is node-attributed and names the faulting member"
+    );
+    assert!(
+        apply_invocations
+            .lock()
+            .expect("apply invocation log")
+            .is_empty()
+            && scale_invocations
+                .lock()
+                .expect("scale invocation log")
+                .is_empty(),
+        "ZERO invocations across the segment: node A's valid input never executed"
+    );
+    let resuming = resuming_document(&world).await;
+    assert!(
+        resuming.executed.is_empty(),
+        "ZERO tombstones across the segment: the refusal precedes the first one"
+    );
+    assert!(
+        requests
+            .lock()
+            .expect("scripted-model request log")
+            .is_empty(),
+        "no worker streamed: the refusal precedes every worker build"
+    );
+    assert!(
+        take_worker_override().is_some(),
+        "no worker build consumed the queued override: the refusal precedes \
+         every build"
     );
 }
 
@@ -3028,8 +3127,9 @@ async fn awaiting_node_with_an_empty_pending_list_faults_before_any_worker_build
 // ====================================================================
 // Reconstruction direction (R5, ruled 2026-09-12): the pivot frames over
 // the Gate M deny-leg producer shape. They pin the post-reconstruction
-// spec and stay red on the fold's replace-miss fatal until Stage 3
-// lands the context builder.
+// spec; the P45 stage-3 wiring (the segment preflight, keyed resolution,
+// and rebuild_context) flipped them green, unedited, retiring the fold's
+// replace-miss fatal they were red on.
 // ====================================================================
 
 /// The pivot shape, both calls approved: the reconstruction must drive
@@ -3226,6 +3326,120 @@ async fn pivot_denied_pair_steers_without_executing_and_completes() {
         &tool_wire(&denial_text()),
     )
     .await;
+}
+
+/// The re-park turn boundary after reconstruction (the stage-3 wiring's
+/// boundary fix): the turns a re-parking segment reports for the re-parked
+/// node start STRICTLY AFTER the history the continuation actually
+/// streamed from — the rebuilt input, including the SYNTHESIZED turn the
+/// reconstruction appended for the second (slotless) call, is never
+/// re-emitted as segment turns — and the re-park commit's refreshed
+/// blocking names the fresh decision. Modeled on
+/// `re_park_mid_segment_carries_turns_and_the_new_blocking_entry`, over
+/// the pivot fixture: the rebuilt history carries the synthesized second
+/// call's turn beyond the checkpoint's recorded length, so a boundary
+/// sliced at the CHECKPOINT's length would replay it here.
+#[tokio::test]
+async fn re_parked_turns_start_after_the_rebuilt_history_with_no_replayed_reconstruction() {
+    let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
+    let world = world();
+    let pivot_invocations = Arc::new(Mutex::new(Vec::new()));
+    let fresh_invocations = Arc::new(Mutex::new(Vec::new()));
+    install_worker_overrides(vec![WorkerOverride {
+        model: ScriptedCompletionModel::new(vec![ScriptedTurn::tool_calls(vec![
+            ScriptedToolCall::new(FRESH_CALL_ID, NEW_TOOL, json!({ "namespace": "stage" }))
+                .with_call_id(NEW_CALL_ID),
+        ])]),
+        extra_tools: vec![
+            Box::new(RecordingTool::new(pivot_invocations.clone()).with_name(TOOL)),
+            Box::new(RecordingTool::new(pivot_invocations.clone()).with_name(TOOL_B)),
+            Box::new(RecordingTool::new(fresh_invocations).with_name(NEW_TOOL)),
+        ],
+    }]);
+    register_decided_pivot_pair(
+        &world,
+        ApprovalDecision::Approved,
+        ApprovalDecision::Approved,
+    )
+    .await;
+    publish_document(&world, &pivot_two_call_document(&world)).await;
+
+    let grant = evaluate_resume(evaluation(&world, false, None))
+        .await
+        .expect("the all-decided pivot run grants");
+    let segment = run_segment(grant, &world.config, &HashMap::new())
+        .await
+        .expect("the pivot segment re-parks on the fresh gated call");
+    {
+        let log = pivot_invocations.lock().expect("pivot invocation log");
+        assert_eq!(
+            log.len(),
+            2,
+            "both pivot calls execute exactly once through the substitution, in \
+             document order"
+        );
+        assert_eq!(
+            log[0].arguments,
+            call_args(),
+            "the first invocation is the first (sentinel-bearing) call"
+        );
+        assert_eq!(
+            log[1].arguments,
+            call_args_b(),
+            "the second invocation is the second (slotless) call"
+        );
+    }
+    let (turns, blocking) = match segment {
+        SegmentResult::Parked { turns, blocking } => (turns, blocking),
+        other => panic!("expected a re-parked segment, got {other:?}"),
+    };
+    let mut body = json!({
+        "turns": serde_json::to_value(turns.as_slice()).expect("turns serialize"),
+        "blocking":
+            serde_json::to_value(blocking.as_slice()).expect("blocking serializes"),
+    });
+    normalize_fresh_parking(&mut body);
+    assert_eq!(
+        body,
+        json!({
+            "turns": [
+                decided_call_turn(),
+                decided_result_turn(&echo_tool_result_wire()),
+                decided_call_turn_for(PIVOT_CALL_ID_2, TOOL_B, &call_args_b()),
+                decided_result_turn_for(PIVOT_CALL_ID_2, &echo_tool_result_wire()),
+                {
+                    "role": "assistant",
+                    "id": null,
+                    "content": [
+                        {
+                            "id": FRESH_CALL_ID,
+                            "call_id": NEW_CALL_ID,
+                            "function":
+                                { "name": NEW_TOOL, "arguments": { "namespace": "stage" } },
+                            "signature": null,
+                            "additional_params": null,
+                        },
+                    ],
+                },
+            ],
+            "blocking": [
+                {
+                    "decision_id": "<fresh decision id>",
+                    "tool": NEW_TOOL,
+                    "expires_at": "<fresh expiry>",
+                },
+            ],
+        }),
+        "the re-parked turns are the two decided pairs and the gated turn ONLY: \
+         the rebuilt input — the synthesized second call's turn included — is \
+         not replayed as segment turns; the turns start strictly after the \
+         rebuilt history"
+    );
+    let serialized = serde_json::to_value(turns.as_slice()).expect("turns serialize");
+    assert!(
+        !serialized.to_string().contains(PARK_SENTINEL),
+        "the placeholder appears nowhere in the serialized turns"
+    );
 }
 
 /// The wire serializers the golden literals embed, calibrated against the
