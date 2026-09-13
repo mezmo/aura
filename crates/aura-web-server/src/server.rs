@@ -496,18 +496,24 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
         args.host, args.port
     );
 
-    // Poll delivery: one reconciler per poll-mode agent config, holding its
-    // own webhook client built from the same route config the per-request
+    // Poll delivery: one reconciler per park-capable agent config, holding
+    // its own webhook client built from the same route config the per-request
     // routes use, and the ingress registry's store. Each loop stops when the
     // shutdown token cancels (phase 1).
     //
-    // Boot guard: two poll-mode configs whose agent settings produce the
+    // Boot guard: two park-capable configs whose agent settings produce the
     // same effective instance id would each spawn a reconciler claiming
     // the same pending rows in one process, breaking the single-writer
     // posture the poller documents — refuse at boot, the same loud config
     // error as the plaintext-http-with-secret refusal. In-process only: a
     // cross-process same-id deployment (active/standby) must fence
     // reconciler leadership externally.
+    //
+    // Cross-comment (see `PollReconciler::from_config`): the "can spawn a
+    // reconciler" predicate is `can_park` — the marker split (P56 ruling 1)
+    // moved it off `poll_delivery()`, so a sync-parkable duplicate config
+    // cannot reopen the two-reconcilers-one-id hole. This guard must move
+    // with any future eligibility change.
     let mut reconcilers = Vec::new();
     let mut claims = Vec::new();
     for config in configs_arc.iter() {
@@ -694,9 +700,9 @@ fn reconciler_id_conflicts(claims: &[(String, String)]) -> Option<((String, Stri
 }
 
 /// The scan sees only configs `PollReconciler::from_config` arms (the
-/// spawn loop claims no others), so a non-poll config sharing an id never
-/// reaches it; that gating is pinned by the poller's
-/// `from_config_gates_on_poll_delivery`.
+/// spawn loop claims no others), so a non-park-capable config sharing an id
+/// never reaches it; that gating is pinned by the poller's `can_park` key
+/// (cross-comment at `PollReconciler::from_config`).
 #[cfg(test)]
 mod reconciler_boot_guard_tests {
     use super::reconciler_id_conflicts;

@@ -28,7 +28,7 @@ use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
-use aura_config::{DecisionRouteConfig, HitlConfig, ToolHeaderMappings, WebhookDelivery};
+use aura_config::{DecisionRouteConfig, HitlConfig, ToolHeaderMappings};
 
 use super::decision::{ApprovalDecision, DecisionId, ResolvedDecision};
 use super::registry::{PendingApprovals, ResolveError};
@@ -54,9 +54,9 @@ pub struct PollReconciler {
 impl PollReconciler {
     /// Build the reconciler for a `[hitl]` config, or `None` for every
     /// configuration the reconciler does not drive: the conversational arm,
-    /// and the webhook arm under sync delivery. The client is built by the
-    /// same construction [`super::route::HitlRuntime::from_config`] uses, so
-    /// the reconciler's notify/poll legs carry the exact wire shape of the
+    /// and any webhook arm that cannot park. The client is built by the same
+    /// construction [`super::route::HitlRuntime::from_config`] uses, so the
+    /// reconciler's notify/poll legs carry the exact wire shape of the
     /// per-request routes. Its operator headers are the static set only —
     /// `headers_from_request` values are per-row: each parked approval
     /// carries its own request-scoped resolved values, which the notify
@@ -69,8 +69,15 @@ impl PollReconciler {
         store: Arc<dyn ApprovalStore>,
         registry: &PendingApprovals,
     ) -> Option<Self> {
+        let client = webhook_client_from_config(&config.route, hmac, None)?;
+        // Cross-comment (see the server boot guard in aura-web-server): this
+        // is the "can spawn a reconciler" predicate, keyed on `can_park` per
+        // the P56 marker split (ruling 1). The boot guard's duplicate-id scan
+        // sees exactly the configs this arms, so the two must move together.
+        if !client.can_park() {
+            return None;
+        }
         let DecisionRouteConfig::Webhook {
-            delivery: WebhookDelivery::Poll,
             poll_interval_secs,
             tool_headers_from_response,
             ..
@@ -79,7 +86,7 @@ impl PollReconciler {
             return None;
         };
         Some(Self {
-            client: webhook_client_from_config(&config.route, hmac, None)?,
+            client,
             store,
             registry: registry.clone(),
             instance_id,
@@ -260,6 +267,7 @@ mod tests {
                 poll_url: None,
                 poll_interval_secs: 1,
                 poll_request_timeout_secs: 30,
+                receiver_wait_timeout_secs: 900,
             },
         }
     }
@@ -793,6 +801,7 @@ mod tests {
                     poll_url: None,
                     poll_interval_secs: 10,
                     poll_request_timeout_secs: 30,
+                    receiver_wait_timeout_secs: 900,
                 },
             }
         }

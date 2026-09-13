@@ -266,12 +266,12 @@ pub(crate) fn parked_document_dir(memory_dir: &str, session_id: Option<&str>) ->
 /// filter, the per-worker model and tool configuration, and the bound
 /// identity header's NAME.
 ///
-/// The webhook route's projection carries `"delivery"` derived from the
-/// client's poll marker — the same source `park_registry` reads; no second
-/// delivery flag exists. Poll tuning (poll_url, interval, per-attempt
-/// timeout) is deliberately fingerprint-COMPATIBLE, and no credential value
-/// (headers, secrets) enters the projection; resume-side enforcement is a
-/// one-way bump on change.
+/// The webhook route's projection carries the two delivery markers split
+/// from the old poll marker — `decide_live` and `park`, the same sources
+/// `park_registry` and the reconciler spawn read. Poll tuning (poll_url,
+/// interval, per-attempt timeout) is deliberately fingerprint-COMPATIBLE,
+/// and no credential value (headers, secrets) enters the projection;
+/// resume-side enforcement is a one-way bump on change.
 pub(crate) fn config_fingerprint(config: &AgentRuntimeConfig) -> String {
     let hitl = config.hitl.as_ref();
     let route = hitl.map(|h| match &*h.route {
@@ -284,7 +284,8 @@ pub(crate) fn config_fingerprint(config: &AgentRuntimeConfig) -> String {
         } => json!({
             "kind": "webhook",
             "timeout_secs": timeout.as_secs(),
-            "delivery": if client.poll_delivery() { "poll" } else { "sync" },
+            "decide_live": client.can_decide_live(),
+            "park": client.can_park(),
         }),
     });
     let source = json!({
@@ -949,6 +950,7 @@ mod tests {
                 poll_url: poll_url.map(|u| WebhookUrl::new(u).unwrap()),
                 poll_interval_secs,
                 poll_request_timeout_secs,
+                receiver_wait_timeout_secs: 900,
             }
         }
 
