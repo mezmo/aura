@@ -534,6 +534,15 @@ async fn park(receiver: &MockGovernanceReceiver, server: &AuraServer, store_root
         "the parked approval record must persist the resolved egress value at \
          rest, got: {approval_record}"
     );
+    // The 207 is the receiver's acknowledgment, so the row is BORN
+    // acknowledged - asserted while still pending, before any resolution
+    // could rewrite the record.
+    assert!(
+        approval_record.contains("\"acknowledgment\":\"acknowledged\"")
+            || approval_record.contains("\"acknowledgment\": \"acknowledged\""),
+        "a 207-born row must persist the acknowledged state while pending, \
+         got: {approval_record}"
+    );
 
     // The gate's decision-ask POST, authenticated with the resolved egress
     // value and naming the parked decision id.
@@ -639,6 +648,19 @@ async fn poll_flow_parks_and_resolves_with_the_run_still_parked() {
         "the egress value outlived resolve, got: {decision_record}"
     );
 
+    // No re-POST may appear at any point in the flow: the count is
+    // re-taken after the pending-poll interval AND after resolution, so
+    // a reconciler that re-POSTs while pending cannot pass.
+    let posts_after = receiver
+        .requests()
+        .iter()
+        .filter(|captured| captured.starts_with("POST "))
+        .count();
+    assert_eq!(
+        posts_after, 1,
+        "still exactly one POST after the pending polls and the resolution"
+    );
+
     server.stop().await;
 }
 
@@ -676,13 +698,36 @@ async fn restart_resolves_the_parked_approval_on_a_rebooted_server() {
         "the parked approval row must survive the process death"
     );
 
-    // The decision lands at the receiver while no server is running.
-    receiver.set_decided();
-
-    // Reboot onto the SAME store and config: the first tick reads the
-    // now-decided status endpoint and resolves — a born-acknowledged row
-    // never re-posts its request, so no duplicate POST occurs.
+    // Reboot onto the SAME store and config while the receiver is STILL
+    // PENDING: the rebooted reconciler's polls must read the pinned 207
+    // status, and the persisted acknowledged state - not the reboot - is
+    // what keeps the row from being re-POSTed.
+    let gets_before_reboot = receiver
+        .requests()
+        .iter()
+        .filter(|captured| captured.starts_with("GET /status"))
+        .count();
     let second_boot = spawn_rig_server(&receiver, &store_root, instance_id).await;
+    wait_for_request_count(
+        &receiver,
+        gets_before_reboot + 1,
+        "the rebooted reconciler polls the pinned status while pending",
+        |captured| captured.starts_with("GET /status"),
+    )
+    .await;
+    let posts_pending = receiver
+        .requests()
+        .iter()
+        .filter(|captured| captured.starts_with("POST "))
+        .count();
+    assert_eq!(
+        posts_pending, 1,
+        "no re-POST across the reboot while the row is still pending"
+    );
+
+    // The decision lands; the next poll resolves - a born-acknowledged row
+    // never re-posts its request, so no duplicate POST occurs.
+    receiver.set_decided();
     let decision_record = wait_for_decision_file_within(&store_root, FIRST_TICK_BUDGET).await;
     assert!(
         decision_record.contains(IDENTITY_VALUE),
