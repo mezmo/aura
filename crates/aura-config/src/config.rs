@@ -444,6 +444,23 @@ impl Config {
             }
         }
 
+        // The route timeouts feed `chrono::Duration::from_std` at the
+        // gate (a panic path on overflow): bound them here so that
+        // conversion is a justified invariant, not a user-config panic.
+        if let Some(hitl) = &self.hitl {
+            let route_timeout_secs = match &hitl.route {
+                DecisionRouteConfig::Webhook { timeout_secs, .. }
+                | DecisionRouteConfig::Conversational { timeout_secs, .. } => *timeout_secs,
+            };
+            if route_timeout_secs > WEBHOOK_TIMEOUT_SECS_BOUND {
+                return Err(crate::ConfigError::Validation(format!(
+                    "`hitl.route.timeout_secs` = {route_timeout_secs} exceeds the representable \
+                     bound of {WEBHOOK_TIMEOUT_SECS_BOUND}s (chrono's i64-millisecond ceiling); \
+                     reduce it below that bound"
+                )));
+            }
+        }
+
         if let (Some(hitl), Some(orch)) = (
             &self.hitl,
             self.orchestration.as_ref().filter(|o| o.enabled),
@@ -1648,6 +1665,42 @@ mode = "conversational"
         );
     }
 
+    /// A webhook route timeout above chrono's i64-millisecond ceiling is
+    /// refused at load, so the gate's `chrono::Duration::from_std` conversion
+    /// is a justified invariant rather than a user-config panic.
+    #[test]
+    fn validate_rejects_webhook_timeout_over_chrono_ceiling() {
+        let err = crate::load_config_from_str(&poll_config_toml(
+            false,
+            "timeout_secs = 9223372036854776",
+        ))
+        .expect_err("a webhook timeout above chrono's ceiling must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("hitl.route.timeout_secs") && msg.contains("9223372036854775"),
+            "error must name the key and the bound: {msg}"
+        );
+    }
+
+    /// The conversational route timeout feeds the same chrono
+    /// conversion; it carries the same bound.
+    #[test]
+    fn validate_rejects_conversational_timeout_over_chrono_ceiling() {
+        let err = crate::load_config_from_str(
+            "[agent]\nname = \"Test\"\nsystem_prompt = \"test\"\n\n\
+             [agent.llm]\nprovider = \"openai\"\napi_key = \"test\"\nmodel = \"gpt-4o\"\n\n\
+             [hitl]\nrequire_approval = [\"kubectl_*\"]\n\n\
+             [hitl.route]\nmode = \"conversational\"\n\
+             timeout_secs = 9223372036854776\n",
+        )
+        .expect_err("a conversational timeout above chrono's ceiling must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("hitl.route.timeout_secs") && msg.contains("9223372036854775"),
+            "error must name the key and the bound: {msg}"
+        );
+    }
+
     /// `tool_headers_from_response` (approver identity) stays allowed with
     /// poll delivery.
     #[test]
@@ -2055,6 +2108,12 @@ fn default_conversational_timeout_secs() -> u64 {
 fn default_webhook_timeout_secs() -> u64 {
     300
 }
+
+/// The whole-second ceiling on a webhook route timeout: chrono's `Duration`
+/// is i64 milliseconds, so `chrono::Duration::from_std(Duration::from_secs(n))`
+/// succeeds only while `n * 1000 <= i64::MAX`. Values above this bound would
+/// panic at the gate's `from_std` conversion, so they are refused at load.
+const WEBHOOK_TIMEOUT_SECS_BOUND: u64 = (i64::MAX / 1000) as u64;
 
 fn default_poll_interval_secs() -> u64 {
     10

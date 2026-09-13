@@ -207,71 +207,18 @@ impl HitlApprovalWrapper {
         };
 
         // The store's own register, not the registry's park-anyway one: a
-        // fault fails the call closed.
-        let parked = ParkedApproval {
+        // fault fails the call closed. `Requested` goes out here (the park
+        // arm is the first publish for this decision).
+        self.park_register(
+            park,
             request,
-            registered_at: now,
             expires_at,
             authority,
             egress_headers,
-            acknowledgment: AcknowledgmentState::RequiresNotification,
-        };
-        if let Err(err) = park.registry.register_durable(parked.clone()).await {
-            tracing::warn!(
-                decision_id = %decision_id,
-                error = %err,
-                "park-mode approval register failed; failing the gated call closed",
-            );
-            return Err(ToolError::ToolCallError(
-                format!("tool call blocked: approval store register failed: {err}").into(),
-            ));
-        }
-
-        let call_id = park.cell.take_current_call_id().unwrap_or_else(|| {
-            tracing::warn!(
-                decision_id = %decision_id,
-                tool_name = %ctx.tool_name,
-                "parked call has no tool-call id; recording an empty call_id",
-            );
-            String::new()
-        });
-        let call = PendingCall {
-            decision_id,
-            tool_name: ctx.tool_name.clone(),
-            arguments: args.clone(),
-            call_id,
-        };
-        // The guard sees the parked call now, so a run dropped before the
-        // task returns still sweeps this ticket.
-        park.guard.record(std::slice::from_ref(&call));
-
-        // The lifecycle pair goes to the live request's broker, not the owner id.
-        crate::approval_event_broker::publish(
-            &self.request_id,
-            crate::approval_event_broker::ApprovalLifecycleEvent::Requested(
-                (&parked.request).into(),
-            ),
+            AcknowledgmentState::RequiresNotification,
+            true,
         )
-        .await;
-        crate::approval_event_broker::publish(
-            &self.request_id,
-            crate::approval_event_broker::ApprovalLifecycleEvent::Pending(super::events::pending(
-                &parked.request,
-                &parked.expires_at,
-            )),
-        )
-        .await;
-
-        park.cell.push(call);
-        tracing::info!(
-            decision_id = %decision_id,
-            tool_name = %ctx.tool_name,
-            "parked gated call awaiting human decision",
-        );
-
-        Ok(PreCallOutcome::ShortCircuit {
-            output: PARK_SENTINEL.to_string(),
-        })
+        .await
     }
 
     /// The 207 bridge: re-enter park registration with the posted
@@ -323,20 +270,48 @@ impl HitlApprovalWrapper {
         // registers acknowledged and the reconciler never re-POSTs it
         // (ruling 3(ii)). Expiry anchors at gate entry: the threaded deadline
         // is already gate-entry-anchored, so the elapsed sync wait consumed
-        // the decision budget rather than extending it.
+        // the decision budget rather than extending it. `Requested` is NOT
+        // re-published (it went out at gate entry, ruling 3(i)).
+        self.park_register(
+            park,
+            request,
+            expires_at,
+            egress_headers,
+            AcknowledgmentState::Acknowledged,
+            false,
+        )
+        .await
+    }
+
+    /// The shared park-registration choreography both park paths call: build
+    /// the durable row, register it, recover the call id, update the guard
+    /// and cell, and publish the lifecycle transition. The caller supplies the
+    /// fully-minted `request` (decision-id provenance and request-id mint
+    /// source) plus the ack state; `publish_requested` selects whether the
+    /// `Requested` event goes out (the 207 bridge skips it — already
+    /// published at gate entry).
+    async fn park_register(
+        &self,
+        park: &ParkContext,
+        request: ApprovalRequest,
+        expires_at: chrono::DateTime<chrono::Utc>,
+        egress_headers: Option<reqwest::header::HeaderMap>,
+        acknowledgment: AcknowledgmentState,
+        publish_requested: bool,
+    ) -> Result<PreCallOutcome, ToolError> {
         let parked = ParkedApproval {
             request,
             registered_at: chrono::Utc::now(),
             expires_at,
             egress_headers,
-            acknowledgment: AcknowledgmentState::Acknowledged,
+            acknowledgment,
         };
         let decision_id = parked.request.decision_id;
         if let Err(err) = park.registry.register_durable(parked.clone()).await {
             tracing::warn!(
                 decision_id = %decision_id,
                 error = %err,
-                "207 bridge approval register failed; failing the gated call closed",
+                "park-mode approval register failed; failing the gated call closed",
             );
             return Err(ToolError::ToolCallError(
                 format!("tool call blocked: approval store register failed: {err}").into(),
@@ -367,10 +342,15 @@ impl HitlApprovalWrapper {
         // task returns still sweeps this ticket.
         park.guard.record(std::slice::from_ref(&call));
 
-        // The standard park-lifecycle transition, on the live request's
-        // broker: `Requested` is NOT re-published (it went out at gate entry,
-        // ruling 3(i)) and no ApprovalOutcome is attached (that type is
-        // terminal; a pending park is not).
+        if publish_requested {
+            crate::approval_event_broker::publish(
+                &self.request_id,
+                crate::approval_event_broker::ApprovalLifecycleEvent::Requested(
+                    (&parked.request).into(),
+                ),
+            )
+            .await;
+        }
         crate::approval_event_broker::publish(
             &self.request_id,
             crate::approval_event_broker::ApprovalLifecycleEvent::Pending(super::events::pending(
@@ -383,7 +363,7 @@ impl HitlApprovalWrapper {
         tracing::info!(
             decision_id = %decision_id,
             tool_name = %call.tool_name,
-            "207 parked the gated call; the receiver already acknowledged it",
+            "parked gated call awaiting human decision",
         );
         park.cell.push(call);
 
@@ -468,6 +448,9 @@ impl HitlApprovalWrapper {
         let cancel =
             crate::request_cancellation::RequestCancellation::token_for_id(&self.request_id)
                 .unwrap_or_else(crate::request_cancellation::RequestCancelToken::unbound);
+        // Validated at load (aura-config `validate`): the webhook route
+        // timeout is bounded to chrono's i64-millisecond ceiling, so this
+        // conversion cannot overflow.
         let expires_at = chrono::Utc::now()
             + chrono::Duration::from_std(self.route.timeout())
                 .expect("approval timeout fits in chrono");
@@ -1428,8 +1411,6 @@ mod tests {
             };
             let expires_at = chrono::Utc::now() + chrono::Duration::seconds(60);
 
-            // The bridge body is a todo!() hole: this panics until the fill
-            // layer lands it.
             let outcome = gate
                 .park_207_bridge(gate.park.as_ref().unwrap(), request, expires_at)
                 .await

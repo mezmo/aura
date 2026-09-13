@@ -12,7 +12,7 @@
 use std::sync::Arc;
 
 use reqwest::Client;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::config::AppConfig;
 
@@ -43,12 +43,14 @@ pub enum ApprovalResponse {
 /// Semantically equivalent to `aura::hitl::ApprovalDecisionWire` — kept
 /// here so the CLI doesn't pull in the `aura` crate for one struct. The
 /// server deserializes with `ApprovalDecisionWire`, which uses
-/// `#[serde(deny_unknown_fields)]`; this struct serializes the same
-/// `approved` + optional `reason` shape.
-#[derive(Debug, Serialize)]
+/// `#[serde(deny_unknown_fields)]`; this struct serializes and deserializes
+/// the same `approved` + optional `reason` shape, rejecting unknown fields
+/// (a `status` envelope or a `pending` field) on the parse leg.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ApprovalDecisionBody {
     approved: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
 }
 
@@ -63,6 +65,18 @@ impl From<ApprovalResponse> for ApprovalDecisionBody {
                 approved: false,
                 reason,
             },
+        }
+    }
+}
+
+impl From<ApprovalDecisionBody> for ApprovalResponse {
+    fn from(body: ApprovalDecisionBody) -> Self {
+        if body.approved {
+            ApprovalResponse::Approved
+        } else {
+            ApprovalResponse::Denied {
+                reason: body.reason,
+            }
         }
     }
 }
@@ -203,6 +217,52 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&denied_no_reason).unwrap(),
             json!({ "approved": false })
+        );
+    }
+
+    /// The parse leg of the mirror: a pinned `{approved, reason}` body
+    /// parses to the matching decision, while a body with unknown fields or a
+    /// `status` envelope fails to parse (mirroring `deny_unknown_fields` on
+    /// the server's `ApprovalDecisionWire`).
+    #[test]
+    fn approval_decision_body_parses_the_pinned_shape() {
+        let approved: ApprovalDecisionBody =
+            serde_json::from_value(json!({ "approved": true })).unwrap();
+        assert!(matches!(
+            ApprovalResponse::from(approved),
+            ApprovalResponse::Approved
+        ));
+
+        let denied: ApprovalDecisionBody =
+            serde_json::from_value(json!({ "approved": false, "reason": "quota exceeded" }))
+                .unwrap();
+        match ApprovalResponse::from(denied) {
+            ApprovalResponse::Denied { reason } => {
+                assert_eq!(reason.as_deref(), Some("quota exceeded"));
+            }
+            other => panic!("expected Denied, got {other:?}"),
+        }
+
+        let denied_no_reason: ApprovalDecisionBody =
+            serde_json::from_value(json!({ "approved": false })).unwrap();
+        match ApprovalResponse::from(denied_no_reason) {
+            ApprovalResponse::Denied { reason } => assert!(reason.is_none()),
+            other => panic!("expected Denied, got {other:?}"),
+        }
+
+        let unknown_field = serde_json::from_value::<ApprovalDecisionBody>(
+            json!({ "approved": true, "pending": true }),
+        );
+        assert!(
+            unknown_field.is_err(),
+            "an unknown field must fail the parse"
+        );
+
+        let status_envelope =
+            serde_json::from_value::<ApprovalDecisionBody>(json!({ "status": "approved" }));
+        assert!(
+            status_envelope.is_err(),
+            "a status envelope must fail the parse"
         );
     }
 }
