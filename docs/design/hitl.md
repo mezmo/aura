@@ -323,9 +323,9 @@ rows carry a TTL of the remaining decision window instead.
 
 Registration-closed semantics: a mapped destination with no usable resolved
 value (request header absent, no explicit valid static fallback) fails the
-capture at route construction, and the park arm fails the gated call closed,
-leaving no approval row and blocking every downstream effect: no pending
-event, no blocked-cell entry, and no notify POST.
+capture at route construction, and the park arm fails the gated call closed.
+No approval row is written, no pending event or blocked-cell entry appears,
+and the receiver is never notified.
 Notify is egress auth with no later reify checkpoint, so an undeliverable
 registration must not exist. The exception: an explicitly configured **valid
 static fallback** keeps the existing resolution semantics and parks with the
