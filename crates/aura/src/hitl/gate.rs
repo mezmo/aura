@@ -1142,6 +1142,117 @@ mod tests {
                 other => panic!("expected Blocked, got {other:?}"),
             }
         }
+
+        /// The 207 bridge registers the parked row in the acknowledged state
+        /// (born notified), preserving the posted decision_id, minting the
+        /// request id from the run owner (so request teardown never sweeps
+        /// it), and anchoring expiry at the gate-entry deadline.
+        #[tokio::test]
+        async fn bridge_registers_acknowledged_row_with_run_owner_id() {
+            let store: Arc<dyn crate::session_store::ApprovalStore> =
+                Arc::new(crate::session_store::InMemoryApprovalStore::new());
+            let registry = PendingApprovals::with_backend(
+                store.clone(),
+                Arc::new(crate::session_store::InMemoryEventBus::new()),
+            );
+            let route = conv_route_over(registry.clone(), Duration::from_secs(60));
+            let cell = Arc::new(crate::orchestration::BlockedCell::default());
+            let gate = parked_gate(&registry, &route, "req-bridge", &cell);
+
+            let decision_id = DecisionId::generate();
+            let request = ApprovalRequest {
+                version: PROTOCOL_VERSION,
+                instance_id: "test-instance".to_string(),
+                decision_id,
+                request_id: "http-request-id".to_string(),
+                scope: worker_scope(),
+                origin: ApprovalOrigin::ConfigGate {
+                    matched_pattern: "kubectl_*".to_string(),
+                    agent_name: "test-agent".to_string(),
+                },
+                items: vec![],
+            };
+            let expires_at = chrono::Utc::now() + chrono::Duration::seconds(60);
+
+            // The bridge body is a todo!() hole: this panics until the fill
+            // layer lands it.
+            let outcome = gate
+                .park_207_bridge(gate.park.as_ref().unwrap(), request, expires_at)
+                .await
+                .expect("the bridge registers the parked row");
+            assert!(
+                matches!(outcome, PreCallOutcome::ShortCircuit { .. }),
+                "the bridge short-circuits the call with the park sentinel"
+            );
+
+            let parked = store
+                .get(&decision_id)
+                .await
+                .unwrap()
+                .expect("the bridge parked the row");
+            assert_eq!(
+                parked.request.request_id, "run:0191e8c0-1111-7000-8000-000000000042",
+                "the parked row's request id is minted from the run owner, not the HTTP request id"
+            );
+            assert_eq!(
+                parked.acknowledgment,
+                AcknowledgmentState::Acknowledged,
+                "the 207 is the receiver's ack: the row is born notified"
+            );
+            assert_eq!(
+                parked.request.decision_id, decision_id,
+                "the posted decision id is preserved"
+            );
+        }
+
+        /// The parked row's expiry anchors at gate entry, not at the park:
+        /// the bridge registers the row with the gate-entry deadline it was
+        /// handed, so the elapsed sync wait consumes the decision budget
+        /// rather than extending it.
+        #[tokio::test]
+        async fn bridge_anchors_expiry_at_gate_entry_not_at_the_park() {
+            let store: Arc<dyn crate::session_store::ApprovalStore> =
+                Arc::new(crate::session_store::InMemoryApprovalStore::new());
+            let registry = PendingApprovals::with_backend(
+                store.clone(),
+                Arc::new(crate::session_store::InMemoryEventBus::new()),
+            );
+            let route = conv_route_over(registry.clone(), Duration::from_secs(60));
+            let cell = Arc::new(crate::orchestration::BlockedCell::default());
+            let gate = parked_gate(&registry, &route, "req-bridge-expiry", &cell);
+
+            let decision_id = DecisionId::generate();
+            let request = ApprovalRequest {
+                version: PROTOCOL_VERSION,
+                instance_id: "test-instance".to_string(),
+                decision_id,
+                request_id: "http-request-id".to_string(),
+                scope: worker_scope(),
+                origin: ApprovalOrigin::ConfigGate {
+                    matched_pattern: "kubectl_*".to_string(),
+                    agent_name: "test-agent".to_string(),
+                },
+                items: vec![],
+            };
+            // A gate-entry deadline captured 30s ago: the sync wait consumed
+            // 30s of a 60s budget, so the parked row must carry THIS
+            // deadline, not a fresh now+60s.
+            let expires_at = chrono::Utc::now() - chrono::Duration::seconds(30);
+
+            gate.park_207_bridge(gate.park.as_ref().unwrap(), request, expires_at)
+                .await
+                .expect("the bridge registers the parked row");
+
+            let parked = store
+                .get(&decision_id)
+                .await
+                .unwrap()
+                .expect("the bridge parked the row");
+            assert_eq!(
+                parked.expires_at, expires_at,
+                "the parked row's expiry is the gate-entry deadline, not gate-entry+timeout"
+            );
+        }
     }
 
     // ====================================================================
