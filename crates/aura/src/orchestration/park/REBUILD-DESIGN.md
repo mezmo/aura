@@ -1,7 +1,7 @@
 # P45 stage 2 design record — the provider-valid context builder (R5)
 
 Layer 1 typed-holes unit for the reconstruction direction: real
-signatures, real derives, `todo!()` bodies for the three functions with
+signatures, real derives, `todo!()` bodies for the five functions with
 behavior. The type surface lives in `orchestration/park/rebuild.rs` and
 is re-exported flat from the park module; nothing consumes it yet —
 P45 stage 2b fills the bodies (its unit frames pin the behavior), and
@@ -10,7 +10,10 @@ P45 stage 3 points the substitution prelude at the builder, retiring
 reify-flow plan (stage 2), the ruled sketch's frontier review (R5), and
 the Stage 1 pivot frames in `park/resume/goldens.rs`
 (`pivot_two_call_document` and `assert_paired_outcome`), which are the
-spec this surface must serve.
+spec this surface must serve. This revision folds the two-seat design
+panel's FAIL verdict (ledger at the end): keyed pairing, the preflight
+prompt witness, the segment-level door, the split error surfaces, and
+the scoped invariant are the panel's repairs.
 
 ## The two construction phases (wire timing)
 
@@ -18,155 +21,183 @@ The bundle cannot be built in one step, because its two inputs exist at
 different times: the node's pending calls are on the checkpoint the
 evaluation read, but an outcome wire exists only after the segment
 invokes the decided call (an approved call's wire is its execution
-result; a denial short-circuits without one). The refusal the plan
-demands — an empty `call_id` must refuse the segment BEFORE any
-invocation, not per-node (the gate's park arm can stamp an empty id when
-the stream hook observed no tool-call id, and a per-node preflight would
-let node A execute before node B's empty id surfaces) — therefore
-attaches to the CALL side, parsed before any invocation:
+result; a denial short-circuits without one). Both refusals the plan
+demands therefore attach to the PREFLIGHT, which runs before any
+tombstone or invocation:
 
-1. **Preflight.** The prelude runs `ValidatedCalls::try_new` for every
-   awaiting node before any tombstone or invocation. This constructor is
-   the bundle's fallible constructor: validation lives here (empty
-   list, any member's empty call id, a shared id), and the error enum is
-   complete in the unit.
-2. **Resolution.** After a node's invocations produce its wires,
-   `ValidatedCalls::resolve` pairs each call with the i-th outcome,
-   positionally in document order — wrong pairing order is
-   unrepresentable by construction, not checked at pair time. A count
-   other than one-per-call is the only fault left, a wiring-bug guard.
+1. **Preflight, segment-wide.** `SegmentPreflight::try_new` takes every
+   awaiting node's input (`NodePreflightInput`: the pending-call list
+   and the snapshot prompt) and validates them together — per node, the
+   call checks (empty list, empty call id, empty tool name, duplicate
+   ids) plus the prompt-shape check (`ToolResultPrompt::try_new`). The
+   constructor yields the per-node validated halves only when EVERY
+   node validated; the first fault names its node and refuses the whole
+   segment. `ValidatedCalls::try_new` is private to the module, so the
+   segment constructor is the only door — no bundle exists for any node
+   unless every node validated, literally by construction.
+2. **Resolution, keyed.** After a node's invocations produce its wires,
+   `ValidatedCalls::resolve` pairs each call with the outcome keyed to
+   the call's OWN id — pairing by identity, not position. An outcome
+   keyed outside the bundle, a key used twice, and a call left without
+   its outcome are all refused; the surviving caller obligation is one
+   outcome per bundle call, keyed by the validated calls' own ids.
 
-`ResolvedCallBundle` is constructible by no path but `resolve`, so
-`rebuild_context`'s input is valid by construction: there is no type for
-a half-resolved or mispaired bundle.
+`ResolvedCallBundle` is constructible by no path but `resolve`, and
+`rebuild_context` consumes the bundle plus the prompt witness — so the
+builder is TOTAL: every failure mode lives at the preflight or the
+resolution, both before the continuation streams and both before any
+invocation can be half-spent.
 
 ## Type → business rule → forbidden invalid state
 
 | Type | Business rule | Invalid state made unrepresentable |
 | --- | --- | --- |
-| `CallId` | A rebuilt tool result and its assistant call key on the pending call's own id; the gate's park arm can stamp an empty id, and an empty id keys nothing | An empty (hence unkeyable) call id reaching any reconstruction slot |
-| `OutcomeWire` | The outcome a decided call's tool result carries is the chain's own wire rendering (Ok JSON-quoted, execution Err raw, denial the live text); the builder carries it verbatim | A re-rendered, double-encoded outcome; a bare string travelling where the wire rendering rule applies |
-| `ValidatedCall` | One bundle member is the checkpoint's own record (decision, tool, arguments) with the id validated; tool and arguments ride verbatim — the consult's mismatch row already refuses a record that diverges from the approval the human saw | A member whose id was never checked; a member missing its decision linkage |
-| `ValidatedCalls` | The bundle is per awaiting node, ordered in document order, non-empty, ids unique within the node; the segment-wide preflight parses every node's list before any invocation | A bundle for a node that never parked calls; node A executing before node B's empty id surfaces; ambiguous id-keyed pairing |
-| `ResolvedCall` | Each call travels paired with its own outcome wire — pairing is construction, not an operation on two parallel lists | A call and an outcome pairing in the wrong order; an outcome applicable to another call's slot |
-| `ResolvedCallBundle` | The builder's input is valid by construction | Handing the builder a mispaired, half-resolved, or empty bundle |
-| `RebuildError` | Why a bundle could not be built or a context rebuilt; payloads are `Diagnostic`s no caller branches on | A caller branching on error prose; a raw string crossing the boundary |
-| `RebuiltContext` | Every tool result in the combined context is preceded by the assistant tool call keyed to the same id; the captured history is otherwise byte-preserved | An orphaned tool result (providers reject it); a silently restructured turn boundary |
-| `rebuild_context` | Per-node reconstruction from the snapshot plus the resolved bundle, pure; total over its inputs except the one named second failure mode | A rebuild that consults the store, the clock, or anything but its two inputs |
+| `CallId` | A rebuilt tool result, its assistant call, and its outcome wire all key on the pending call's own id; the gate's park arm can stamp an empty id, and an empty id keys nothing | An empty (hence unkeyable) call id reaching any reconstruction slot or pairing key |
+| `OutcomeWire` | The outcome a decided call's tool result carries is the chain's own wire rendering; `OutcomeWire::new` is the only door onto it | A bare `String` reaching resolution without passing the named constructor (the no-double-encoding rule itself travels by convention and audit, not by the type) |
+| `ValidatedCall` | One bundle member is the checkpoint's own record (decision, tool, arguments) with the id and tool name validated | A member whose id was never checked; an empty tool name reaching synthesis |
+| `ValidatedCalls` | The per-node call side: ordered in document order, non-empty, ids unique, tool names non-empty; a transition state consumed by `resolve` | A bundle for a node that never parked calls; same-node duplicate ids; a cloned transition state resolving twice |
+| `NodePreflightInput` | One node's preflight input pairs its call list with its own prompt | A prompt attributed to another node's calls |
+| `ToolResultPrompt` | The prompt witness: the snapshot prompt validated as the tool-result user message — the only shape the rebuild can carry outcomes in — validated at preflight, where it is knowable before any tombstone or invocation | A non-tool-result prompt reaching the builder; the shape check hiding inside the builder as a runtime failure |
+| `ValidatedNode` | The per-node half: validated calls plus the prompt witness, built only when every node validated | A half surviving another node's refusal |
+| `SegmentPreflight` | The segment-level door: every awaiting node validated together, or nothing | A bundle existing for node A while node B's invalid input has not surfaced — the per-node preflight's hazard |
+| `ResolvedCall` | Pairing by identity: each call travels with the outcome keyed to its own id — resolution pairs, callers cannot | A call and an outcome pairing in the wrong order; parallel-list mispairing |
+| `ResolvedCallBundle` | The builder's input is valid by construction; constructible only through `resolve` | Handing the builder a mispaired or half-resolved bundle |
+| `PreflightError` / `ResolveError` | Why the preflight or the resolution refused; payloads are `Diagnostic`s no caller branches on | A caller branching on error prose; a raw string crossing the boundary |
+| `RebuiltContext` | Every BUNDLE-KEYED tool result is preceded by the assistant tool call of the same id; the captured history is otherwise byte-preserved, extras included; non-bundle extras inherit the producer's pairing (the trust boundary) | An orphaned BUNDLE result; a silently restructured turn boundary |
+| `rebuild_context` | Total, pure reconstruction from three validated-by-construction inputs; no failure mode of its own | A rebuild that can fail after the preflight cleared; a rebuild consulting anything but its inputs |
 
-## The builder's second failure mode (named for the panel)
+## The prompt-shape witness (the former "second failure mode")
 
-The dispatch's default is a total builder; this unit claims the one
-genuine exception. The bundle is validated, but the SNAPSHOT is not:
-nothing between the deserialized checkpoint document and the builder
-checks the prompt's shape. Both park producers — today's sentinel
-producer and the stage 4 parked-control-outcome producer (whose
-mechanism spec is still owed) — aggregate tool results into a USER
-message; rig's `Message` is two-variant, so "not the tool-result prompt"
-is exactly "an Assistant prompt". A non-user `current_prompt` is
-reachable only through a malformed or tampered document, and the builder
-refuses it (`RebuildError::NotAToolResultPrompt`) rather than
-restructuring — moving a non-user prompt into the history would silently
-reshape the context that stage 3's turn-boundary rework slices, papering
-over a producer or document violation. The alternative — a validated
-borrow wrapper (`ToolResultPrompt<'a>` constructed fallibly at the call
-site, builder total) — has the same observable and moves the check to
-the caller; it was rejected for one-call simplicity, and is the first
-panel question below.
+The original skeleton kept one failure mode inside the builder: a
+snapshot prompt that is not the tool-result user message (rig's
+`Message` is two-variant, so this is exactly "an Assistant prompt",
+reachable only through a malformed checkpoint document — both park
+producers, today's sentinel producer and the stage 4
+parked-control-outcome producer, aggregate tool results into a USER
+message). The panel's repair hoists the check to the preflight, where
+it is knowable before any tombstone or invocation:
+`ToolResultPrompt::try_new` is the fallible witness constructor, its
+refusal (`PreflightError::NotAToolResultPrompt`) fires before any tool
+runs, and `rebuild_context` requires the witness and is therefore
+total. The rejected alternatives, recorded: total-with-restructure
+(moving a non-user prompt into the history would silently reshape the
+context the stage 3 turn-boundary rework slices) and the broader
+fallible validated-snapshot of seat 1's finding S1-2 (rejected — it
+adds a malformed-document-only failure mode for no production gain; the
+scoping of the rebuild invariant to bundle-keyed results was chosen
+instead). The binding condition on stage 4's mechanism spec stands:
+keep `current_prompt` a tool-result user message, or the preflight
+refuses — loudly, before any invocation.
+
+## Stage 2b frame obligations (from the repair round)
+
+- **One-turn synthesis.** Where the park missed more than one of a
+  node's calls, the synthesized calls append as ONE assistant turn
+  carrying all of them — the producer's same-completion shape, which
+  genuine sibling captures also produce. A stage 2b frame must pin this
+  (an N>1 synthesis frame), not just per-call presence.
+- **Keyed-pairing caller obligation.** `resolve` refuses unknown ids,
+  duplicate keys, and calls left without outcomes; the surviving caller
+  obligation is exactly one outcome per bundle call, keyed by the
+  validated calls' own ids (taken from `ValidatedCall::call_id` before
+  `resolve` consumes the list).
 
 ## Visibility / seam table
 
 | Seam | Visibility | Consumer |
 | --- | --- | --- |
-| `park/mod.rs` re-export block | `#[allow(unused_imports)] pub(crate) use rebuild::{…}` — every type named in a re-exported signature, per the panel-ruled re-export completeness | P45 stage 3's prelude (`orchestrator.rs`); the marker sweeps at wiring |
-| `ValidatedCalls::try_new`, `ValidatedCalls::resolve`, `rebuild_context` | `pub(crate)` | the prelude; the stage 2b frames |
-| `OutcomeWire::new`; `ValidatedCall` accessors; `as_slice` on all three bundle types; `RebuiltContext::history`/`current_prompt`/`into_parts` | `pub(crate)` | the prelude; the stage 2b frames (`into_parts` feeds the continuation stream call in the stage 3 parameter order: prompt, then history) |
-| `CallId`, `ValidatedCall`, `ResolvedCall` construction | none — module-internal, after validation | stage 2b bodies only |
-| `RebuildError` → segment fault | `Display` only; no `From` into `SegmentError` in this unit | the prelude renders `RebuildError` into `SegmentError::Continuation` via its `Diagnostic` |
+| `park/mod.rs` re-export block | `#[allow(unused_imports)] pub(crate) use rebuild::{…}` — every type THIS UNIT introduces and names in a `pub(crate)` signature. `Diagnostic` is deliberately absent: it is `park::resume`'s type, already re-exported through resume's block and `orchestration`, and re-exporting it here would give it duplicate provenance; the completeness claim is scoped accordingly rather than the re-export widened | P45 stage 3's prelude (`orchestrator.rs`); the marker sweeps at wiring |
+| `ValidatedCalls::try_new` | module-PRIVATE — the segment constructor is the only door | stage 2b bodies only |
+| `ToolResultPrompt::try_new`, `SegmentPreflight::try_new`, `ValidatedCalls::resolve`, `rebuild_context` | `pub(crate)` | the prelude; the stage 2b frames |
+| `as_slice` | on the three types that have it: `ValidatedCalls`, `ResolvedCallBundle`, `SegmentPreflight` | inspection (frames and prelude) |
+| `NodePreflightInput::new`; `ValidatedNode::calls`/`prompt`/`into_parts`; `ValidatedCall` accessors; `ResolvedCall::call`/`wire`; `RebuiltContext::history`/`current_prompt`/`into_parts`; `OutcomeWire::new`; `AsRef` on `CallId`/`OutcomeWire`/`ToolResultPrompt` | `pub(crate)` | the prelude; the stage 2b frames (`into_parts` feeds the continuation stream call in the stage 3 parameter order: prompt, then history) |
+| `PreflightError`/`ResolveError` → segment fault | `Display` only; no `From` into `SegmentError` in this unit | the prelude renders them into `SegmentError::Continuation` via their `Diagnostic`s |
 | `#![allow(dead_code)]` on the module | sweep with the re-export marker at wiring | — |
 
 ## Residual risks
 
-- **Both producers must stay accepted (ruled risk).** The builder keys on
-  call ids only — never on sentinel text — and replaces-or-appends, so
-  it accepts today's sentinel-slot snapshots AND the stage 4 producer's
-  control-boundary snapshots. The binding condition: stage 4's mechanism
-  spec must keep `current_prompt` a tool-result user message (the
-  sentinel slot may vanish, the message shape may not), or the named
-  second failure mode fires as designed — loudly, not silently.
+- **Both producers must stay accepted (ruled risk).** The builder keys
+  on call ids only — never on sentinel text — and replaces-or-appends,
+  so it accepts today's sentinel-slot snapshots AND the stage 4
+  producer's control-boundary snapshots. The binding condition: stage
+  4's mechanism spec must keep `current_prompt` a tool-result user
+  message, or the preflight refuses (`NotAToolResultPrompt`) — loudly,
+  and since the hoist, before any tombstone or invocation.
 - **The provider-ordering assumption (ruled risk).** Every provider the
   chain speaks requires a tool result to FOLLOW its own assistant tool
-  call; the builder guarantees it by construction — synthesized calls
-  append AFTER the snapshot's captured messages (document order among
-  themselves), and every appended result follows its call. Reused
-  captured calls are never moved. A provider that rejected a
-  same-turn-later ordering would need a different builder; none is known.
-- **Extra non-bundle results are preserved, not dropped.** A re-park's
-  fresh snapshot carries the prior resume's outcomes as tool results for
-  ids outside the new bundle (the A2 lifecycle shape). The builder keeps
-  them verbatim — they are model-visible truth — so the goldens'
-  "no extras" pins hold for the single-resume fixtures by fixture shape,
-  not by builder dropping.
+  call; the builder guarantees it by construction for bundle-keyed
+  results — synthesized calls append AFTER the snapshot's captured
+  messages (one assistant turn for all of a node's missing calls), and
+  every appended result follows its call. Reused captured calls are
+  never moved. A provider that rejected a same-turn-later ordering
+  would need a different builder; none is known.
+- **The extras trust boundary (corrected, S2-3).** A prior resume's
+  outcomes riding a re-parked snapshot live in that snapshot's HISTORY
+  — byte-preservation covers them, and the rebuild invariant does not
+  re-verify their pairing. Tool results carried by the PROMPT for ids
+  outside the bundle are the stage 4 producer's shape (today's producer
+  writes prompt slots only for parked calls); they are preserved
+  verbatim, their pairing the producer's. The goldens' "no extras" pins
+  hold by fixture shape, not by the builder dropping anything.
 - **Duplicate sentinel slots for one bundle id are collapsed.** The
   producers write one slot per parked call; a document with two slots
   for one id is malformed but not refused — the 2b rule is
   first-slot-replaced, later-duplicates-collapsed, holding the
   "exactly one result per call" invariant.
-- **Empty `tool_name` is not validated here.** Both producers stamp it
-  from the registered tool's definition (`ctx.tool_name`, gate.rs) —
-  and the wrapper chain resolves a tool BY name before the gate ever
-  sees the call, so an empty name has no upstream path. The consult's
-  mismatch row cannot catch emptiness (the store's approval item and
-  the document's pending call carry the same `ctx.tool_name`, so an
-  empty name would agree, not diverge). If the pipeline guarantee ever
-  broke, the builder would synthesize an assistant tool call with an
-  empty function name; the panel may prefer an explicit refusal
-  (question 6).
-- **`OutcomeCountMismatch` is a wiring-bug guard**, unreachable when the
-  prelude invokes each call exactly once and collects in document order.
-  If it ever fires, the segment drive has a pairing defect; stop and
-  fix the drive, not the count check.
+- **The resolution faults are wiring-bug guards.** `UnknownOutcomeId`,
+  `DuplicateOutcomeId`, and `MissingOutcome` (the keyed pairing's
+  decomposition of the earlier count-mismatch fault) are unreachable
+  when the prelude invokes each call exactly once and keys its outcomes
+  by the validated calls' own ids. If one ever fires, the segment drive
+  has a pairing defect; stop and fix the drive, not the check.
+- **Empty `tool_name` is refused at the preflight.** The invocation
+  pipeline's name-lookup guarantee (a tool is resolved BY name before
+  the gate ever sees the call) stands as defense-in-depth context; the
+  preflight refusal now closes the synthesis surface by construction
+  regardless.
 
 ## Hole inventory (`todo!()` over the unit)
 
 | Location | Hole |
 | --- | --- |
-| `park/rebuild.rs` | `ValidatedCalls::try_new` — the validations: empty list, per-member empty call id, duplicate ids; members built from the calls' own records |
-| `park/rebuild.rs` | `ValidatedCalls::resolve` — positional pairing, one-per-call count check |
-| `park/rebuild.rs` | `rebuild_context` — the reconstruction: per-call presence check and synthesis in the history, replace-or-append (with duplicate-slot collapse) in the prompt, byte-preservation elsewhere |
+| `park/rebuild.rs` | `ValidatedCalls::try_new` — the call checks: empty list, per-member empty call id, per-member empty tool name, duplicate ids |
+| `park/rebuild.rs` | `ToolResultPrompt::try_new` — the prompt-shape check |
+| `park/rebuild.rs` | `SegmentPreflight::try_new` — the all-or-nothing loop over every node's input |
+| `park/rebuild.rs` | `ValidatedCalls::resolve` — keyed pairing: unknown id, duplicate key, missing outcome |
+| `park/rebuild.rs` | `rebuild_context` — the reconstruction: per-call presence check, one-turn synthesis, replace-or-append with duplicate-slot collapse, byte-preservation |
 
-Trivial accessors, constructors of validated newtypes, and
-`RebuildError`'s `Display` are implemented per the skeleton-unit rules;
-the three holes above are the whole behavior surface stage 2b owns.
+Trivial accessors, `NodePreflightInput::new`, `ValidatedNode::into_parts`,
+`SegmentPreflight::into_nodes`, `RebuiltContext::into_parts`, and both
+`Display` impls are implemented per the skeleton-unit rules; the five
+holes above are the whole behavior surface stage 2b owns.
 
-## Questions for the design panel
+## Panel ledger
 
-1. **Two-phase construction vs one fallible constructor over paired
-   members.** The wire-timing argument forces the call-side validation
-   ahead of invocations; the alternative (a single constructor taking
-   calls + wires, called after invocations) cannot refuse an empty call
-   id segment-wide before any tool runs. Is the phase split the right
-   cost, or should the preflight validation live outside the bundle (a
-   `ValidatedCalls`-shaped type owned by the prelude) with the bundle
-   single-phase?
-2. **The builder's second failure mode.** Refuse a non-tool-result
-   prompt (chosen), restructure total-with-move (rejected — silent turn
-   reshaping), or move the check into a validated borrow wrapper so the
-   builder's signature is total? Same observable in all three; which
-   home does the panel want?
-3. **Preserve-extras reading.** Confirm the preserve-verbatim rule for
-   non-bundle tool results against the A2 two-resume lifecycle frames —
-   the alternative (dropping ids outside the bundle) would delete a
-   prior resume's genuine outcomes from a re-parked context.
-4. **`OutcomeWire` as a newtype vs a bare `String` on the member.** The
-   newtype's rule is "pre-rendered, carried verbatim, never re-rendered"
-   — the double-encoding guard. Is the wrapper earning its width?
-5. **`Diagnostic` payloads on `RebuildError`** (the rule-5 escape hatch,
-   mirroring `RehydrateError`'s planned wrapping): the stage 2b frames
-   will pin the wordings; confirm no caller should branch on the
-   variants themselves beyond rendering.
-6. **Empty `tool_name`:** refuse it in `try_new` (a fourth validation,
-   variant `EmptyToolName`), or trust the invocation pipeline's
-   name-lookup guarantee as recorded in the residual risks? The unit
-   trusts the guarantee; an explicit refusal is defensible if the panel
-   wants the synthesis surface closed by construction.
+Two-seat design panel over the stage-2a skeleton (commit b9b18570):
+seat 1 `rust-reviewer` (openai/gpt-5.6-sol), seat 2
+`frontier-reviewer` (Kimi-K3); author GLM-5.3-Fast (both seats differ
+from the author's family). Verdict FAIL on both seats — seat 1: 4
+BLOCKING + 1 MINOR; seat 2: 2 BLOCKING + 4 MINOR. The board owner's
+dispositions below are the repair contract this revision lands.
+
+| Seat | Finding | Severity | Disposition | Repair |
+| --- | --- | --- | --- | --- |
+| S1 (rust-reviewer, gpt-5.6-sol) | S1-1: positional pairing in `resolve` is a latent mispairing hazard (iterator order, not identity, pairs calls with wires) | BLOCKING | ACCEPT — pairing by identity | 1: `resolve` takes `(CallId, OutcomeWire)`; unknown/duplicate/missing refusals; type-map row updated to identity |
+| S1 | S1-2: the malformed-document surface (prompt shape, tool name) demands a validated-snapshot input | BLOCKING | Split — the fallible validated-snapshot sub-repair REJECTED (adds a malformed-document-only failure mode for no production gain); the scoping of the rebuild invariant to bundle-keyed results adopted instead. The prompt-shape and empty-tool-name checks DID land at preflight, via S2-1 and S1-4 | 6 (scoping) + 2 (witness) + 5 (tool name) |
+| S1 | S1-3: one `RebuildError` spans two operations (construction and resolution), and the builder carries an error type it should not have | BLOCKING | ACCEPT — split per operation; builder total | 3: `PreflightError` / `ResolveError`; `rebuild_context` returns `RebuiltContext` directly |
+| S1 | S1-4: an empty tool name would synthesize a provider-invalid assistant call | BLOCKING | ACCEPT in part — preflight refusal adopted; the validated `ToolName` threaded through production `PendingCall` REJECTED (stage scope) | 5: `PreflightError::EmptyToolName`, checked alongside `EmptyCallId` |
+| S1 | S1-5: `Clone` on the transition-state `ValidatedCalls` lets a validated list resolve twice | MINOR | ACCEPT | 7: `Clone` removed |
+| S2 (frontier-reviewer, Kimi-K3) | S2-1: the prompt-shape check inside the builder is a hoistable failure mode — validate at preflight (knowable before any tombstone/invocation) and make the builder total via a witness | BLOCKING | ACCEPT | 2: `ToolResultPrompt` witness, `NotAToolResultPrompt` to the preflight surface, `rebuild_context` total |
+| S2 | S2-2: per-node validation lets node A execute before node B's invalid input surfaces — the refusal must be segment-level and all-or-nothing | BLOCKING | ACCEPT | 4: `SegmentPreflight` door; `ValidatedCalls::try_new` module-private |
+| S2 | S2-3: the record misplaces the A2 lifecycle extras — prior outcomes ride the fresh snapshot's HISTORY (byte-preservation's job), not the prompt; prompt-carried extras are stage 4's shape | MINOR | ACCEPT | 6: invariant scoped to bundle-keyed results; trust boundary named; record corrected |
+| S2 | S2-4: seam-table drift — the `as_slice` row over-claims; `Diagnostic` contradicts the re-export-completeness claim | MINOR | ACCEPT — `as_slice` row names its three types; the completeness claim reworded to this unit's own types (re-exporting `Diagnostic` rejected as duplicate provenance) | 8 |
+| S2 | S2-5: the positional-pairing claim needs at least a wording fix; structurally, keyed pairing is the real repair | MINOR | ACCEPT — this seat's wording-only option SUPERSEDED by S1-1's keyed repair; the sub-finding (one-turn synthesis shape + honest caller-obligation statement) adopted | 1 + 10 |
+| S2 | S2-6: the `OutcomeWire` type-map row over-claims — the type cannot enforce the no-double-encoding rule | MINOR | ACCEPT — reworded to the constructor-door half; the encoding rule travels by convention + audit | 9 |
+
+Marker health after repair: the five `todo!()` holes
+(`ValidatedCalls::try_new`, `ToolResultPrompt::try_new`,
+`SegmentPreflight::try_new`, `ValidatedCalls::resolve`,
+`rebuild_context`) each carry
+`#[expect(unused_variables, reason = "todo!() body; filled by P45 stage 2b")]`;
+the module's `#![allow(dead_code)]` and the re-export's
+`#[allow(unused_imports)]` keep their stage-3 sweep notes.
