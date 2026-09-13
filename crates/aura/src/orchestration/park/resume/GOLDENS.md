@@ -224,17 +224,17 @@ internals.
   the continuation prompt) belong to the later wire-level R6 unit.
 - The Stage-6 frames install their worker overrides per resume, in
   build order, under a drop guard (`OverrideDrain`) that drains the
-  queue on scope exit, unwind included: a pre-failing frame fails
-  mid-test by design — under the pre-Stage-6 segment the sibling's and
-  replacement's builds never happen — and an undrained leak would ride
-  the next consumer's first worker build (the queue is take-once and
-  process-global). The guard is what keeps the rest of the suite
-  isolation-clean while these frames sit red.
-- The re-plan frame's pin is deliberately disjunctive (a replacement or
-  retried task's worker ran OR a final answer landed): the choice
-  between re-planning and answering is the coordinator's, and the
-  ruling demands the loop continue, not a particular continuation. Its
-  failure shape is the SoftFailure no-`submit_result` continuation —
-  the one failure shape whose today-behavior is "the segment just
-  ends", matching the named point; a stream-error failure faults
-  today's segment instead.
+  queue on scope exit, unwind included: while the frames were staged
+  red, the pre-Stage-6 segment never built the sibling's or
+  replacement's workers, and an undrained leak would ride the next
+  consumer's first worker build (the queue is take-once and
+  process-global). The guard stays for regressions: any mid-test panic
+  skips an end-of-test drain, staged or not.
+- The re-plan frame's continuation leg is deliberately disjunctive (a
+  replacement or retried task's worker ran OR a final answer landed):
+  the choice between re-planning and answering is the coordinator's,
+  and the ruling demands the loop continue, not a particular
+  continuation. Its decision-context pins (the plan-state line carrying
+  the failed node; the failure-history line under the resumed
+  iteration) are exact and carry the load; a stream-error failure
+  faults the segment instead of soft-failing.

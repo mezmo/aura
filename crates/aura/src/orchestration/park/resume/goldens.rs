@@ -1771,12 +1771,14 @@ async fn re_park_registers_the_fresh_ticket_under_the_original_bound_run_id() {
 /// survives untouched, and exactly one fresh undecided ticket exists under
 /// the original bound run id. Resume 2, over the re-published checkpoint,
 /// drives both nodes — node A's fresh call executes once through the
-/// substitution and completes, then node B's decided call executes exactly
-/// once with its own arguments and completes — and the coordinator
-/// continuation finishes the run (R6): the completed turns are the two
-/// nodes' natural final turns plus the scripted coordinator tail; the R2
-/// pairs ride the RE-PARKED segment only. Completion removes the fresh and
-/// sibling tickets together; the placeholder appears nowhere.
+/// substitution, then node B's decided call executes exactly once with its
+/// own arguments — and the coordinator continuation finishes the run (R6):
+/// the completed turns are the two nodes' natural final turns plus the
+/// scripted coordinator tail; the R2 pairs ride the RE-PARKED segment only.
+/// Both scripts end without submit_result, so each node lands in the
+/// loop's soft-failure shape; this frame pins executions, turns, and
+/// cleanup, not node state. Completion removes the fresh and sibling
+/// tickets together; the placeholder appears nowhere.
 #[tokio::test]
 async fn consumed_subset_re_park_preserves_the_sibling_and_completes_on_the_second_resume() {
     let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
@@ -3616,13 +3618,14 @@ fn serialized_turns(turns: &[rig::completion::Message]) -> Vec<String> {
         .collect()
 }
 
-/// A red frame's own panic must not leak its undriven worker overrides
-/// into the next consumer's builds: the queue is take-once and
-/// process-global, and a pre-failing frame fails mid-test by design, so
-/// an end-of-test drain never runs on the red path. Drains on drop,
-/// unwind included; instantiate right after installing. Drains the
-/// coordinator queue beside the worker queue — a frame that never reached
-/// its continuation entry leaves the coordinator override unconsumed too.
+/// A frame's own panic must not leak its undriven worker overrides into
+/// the next consumer's builds: the queues are take-once and
+/// process-global, and a frame that fails mid-test — a regression, or a
+/// staged red while its fill is pending — never reaches an end-of-test
+/// drain. Drains on drop, unwind included; instantiate right after
+/// installing. Drains the coordinator queue beside the worker queue — a
+/// frame that never reached its continuation entry leaves the
+/// coordinator override unconsumed too.
 struct OverrideDrain;
 
 impl Drop for OverrideDrain {
@@ -3752,8 +3755,8 @@ async fn coordinator_resumes_after_awaiting_nodes_and_drives_never_started_sibli
     // Per-resume install, in build order: the awaiting node's worker
     // first (the substitution machinery builds it), then the sibling's
     // (a build only the resumed coordinator loop can make). The drain
-    // guard keeps a red frame's panic from leaking the sibling's
-    // undriven override into another consumer's builds.
+    // guard keeps a panicking frame from leaking the sibling's undriven
+    // override into another consumer's builds.
     let _drain = OverrideDrain;
     install_worker_overrides(vec![
         WorkerOverride {
