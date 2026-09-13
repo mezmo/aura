@@ -3310,5 +3310,112 @@ url = "http://127.0.0.1:9"
                 }),
             );
         }
+
+        // ====================================================================
+        // Stage 6 pre-failing frames (the R6 natural-finish ruling,
+        // 2026-09-12): the completed arm's 200 body carries the run's
+        // NATURAL turns only — the outcome packages live inside the
+        // reconstructed worker histories, and the prepended R2 outcome
+        // pairs come off the wire. Red on arrival at their named points
+        // by design; the coordinator-loop fill flips them and rewrites
+        // the R2-pair frames above, which pin today's shape. The parked
+        // arm's envelope is unchanged by R6.
+        // ====================================================================
+
+        /// The approve-path continuation's interim natural turn, ahead of
+        /// the final text: R6 lets the completed body carry the run's
+        /// natural turns, multi-message.
+        const APPROVE_INTERIM_TEXT: &str = "the apply finished; verifying the rollout";
+
+        /// The deny-path continuation's first natural adaptation turn:
+        /// the worker acknowledges the denial as it re-plans.
+        const DENIAL_ADAPTATION_TEXT: &str = "understood; the prod namespace stays untouched";
+
+        /// The deny-path continuation's final natural turn: the run's
+        /// final answer without the blocked apply.
+        const DENIAL_FINAL_TEXT: &str =
+            "nothing was applied; awaiting a namespace you will approve";
+
+        /// STAGE 6 (R6 natural-finish), pre-failing: a completed segment
+        /// over one approved decided call — carrying today's segment
+        /// surface, the R2 outcome pair ahead of the natural continuation
+        /// turns (the shape the frames above pin and the aura-side
+        /// pipeline frames prove the segment produces) — must reach the
+        /// wire as the run's natural turns only: no assistant tool-call
+        /// turn for the decided call and no role:tool turn keyed by the
+        /// original call id, because the outcome package now lives inside
+        /// the reconstructed worker history. The natural continuation
+        /// turns ride in segment order, multi-message allowed, and the
+        /// envelope keys are unchanged. Red today at the named point:
+        /// the pair rides the body.
+        #[tokio::test]
+        async fn completed_approve_segment_carries_natural_turns_without_the_outcome_pair() {
+            let session = ResumeSessionId::parse("sess-p45").expect("golden session parses");
+            let run = ResumeRunId::parse("0199c0de-4545-7000-8000-000000000045")
+                .expect("golden run parses");
+            let turns = aura::orchestration::SegmentTurns::try_new(vec![
+                decided_call_turn(),
+                decided_result_turn(RESULT_WIRE),
+                aura::Message::assistant(APPROVE_INTERIM_TEXT),
+                aura::Message::assistant(FINAL_TEXT),
+            ])
+            .expect("four turns");
+
+            let body =
+                ResumeRunResponse::from_segment(&session, &run, SegmentResult::Completed { turns });
+
+            assert_eq!(
+                serde_json::to_value(&body).expect("the 200 body serializes"),
+                serde_json::json!({
+                    "session_id": "sess-p45",
+                    "run_id": "0199c0de-4545-7000-8000-000000000045",
+                    "state": "completed",
+                    "turns": [
+                        { "role": "assistant", "content": APPROVE_INTERIM_TEXT },
+                        { "role": "assistant", "content": FINAL_TEXT },
+                    ],
+                }),
+            );
+        }
+
+        /// STAGE 6 (R6 natural-finish), pre-failing: the denial variant —
+        /// a completed segment over one denied decided call (the denial
+        /// pair ahead of the worker's natural adaptation turns on today's
+        /// segment surface) must reach the wire as the adaptation turns
+        /// only: no tool-message turn carrying the denial text keyed by
+        /// the call id and no assistant tool-call turn for the decided
+        /// call, because the denial package now lives inside the
+        /// reconstructed worker history. The natural adaptation turns
+        /// ride in segment order and the envelope keys are unchanged.
+        /// Red today at the named point: the denial pair rides the body.
+        #[tokio::test]
+        async fn completed_deny_segment_carries_natural_turns_without_the_denial_pair() {
+            let session = ResumeSessionId::parse("sess-p45").expect("golden session parses");
+            let run = ResumeRunId::parse("0199c0de-4545-7000-8000-000000000045")
+                .expect("golden run parses");
+            let turns = aura::orchestration::SegmentTurns::try_new(vec![
+                decided_call_turn(),
+                decided_result_turn(DENIAL_WIRE),
+                aura::Message::assistant(DENIAL_ADAPTATION_TEXT),
+                aura::Message::assistant(DENIAL_FINAL_TEXT),
+            ])
+            .expect("four turns");
+
+            let body =
+                ResumeRunResponse::from_segment(&session, &run, SegmentResult::Completed { turns });
+
+            assert_eq!(
+                serde_json::to_value(&body).expect("the 200 body serializes"),
+                serde_json::json!({
+                    "session_id": "sess-p45",
+                    "run_id": "0199c0de-4545-7000-8000-000000000045",
+                    "state": "completed",
+                    "turns": [
+                        { "role": "assistant", "content": DENIAL_ADAPTATION_TEXT },
+                        { "role": "assistant", "content": DENIAL_FINAL_TEXT },
+                    ],
+                }),
+            );
+        }
     }
 }
