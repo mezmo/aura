@@ -375,6 +375,7 @@ mod tests {
             expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
             authority: crate::hitl::ApprovalAuthority::WebhookPoll,
             egress_headers: None,
+            acknowledgment: crate::hitl::AcknowledgmentState::RequiresNotification,
         }
     }
 

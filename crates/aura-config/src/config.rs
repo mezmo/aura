@@ -415,26 +415,32 @@ impl Config {
         // Scratchpad validation
         self.validate_scratchpad()?;
 
+        // Park-capable routes carry poll settings: poll delivery always
+        // parks, and sync delivery parks under the adaptive contract when the
+        // park arm is armed. Both are validated the same way.
         if let Some(hitl) = &self.hitl
             && let DecisionRouteConfig::Webhook {
-                delivery: WebhookDelivery::Poll,
+                delivery,
                 poll_interval_secs,
                 ..
             } = &hitl.route
         {
-            if !hitl.park.enabled {
-                return Err(crate::ConfigError::Validation(
-                    "`hitl.route.delivery = \"poll\"` requires `hitl.park.enabled = true`: \
-                     poll approvals may be long-lived and requests are never held open"
-                        .to_string(),
-                ));
-            }
-            if *poll_interval_secs == 0 {
-                return Err(crate::ConfigError::Validation(
-                    "`hitl.route.poll_interval_secs` must be greater than zero: \
-                     the poll reconciler ticks on this interval"
-                        .to_string(),
-                ));
+            let park_capable = matches!(delivery, WebhookDelivery::Poll) || hitl.park.enabled;
+            if park_capable {
+                if !hitl.park.enabled {
+                    return Err(crate::ConfigError::Validation(
+                        "`hitl.route.delivery = \"poll\"` requires `hitl.park.enabled = true`: \
+                         poll approvals may be long-lived and requests are never held open"
+                            .to_string(),
+                    ));
+                }
+                if *poll_interval_secs == 0 {
+                    return Err(crate::ConfigError::Validation(
+                        "`hitl.route.poll_interval_secs` must be greater than zero: \
+                         the poll reconciler ticks on this interval"
+                            .to_string(),
+                    ));
+                }
             }
         }
 
@@ -643,14 +649,14 @@ fn hitl_timeout_conflict_warning(hitl: &HitlConfig, per_call_timeout_secs: u64) 
 /// actual value, only the operator-configured `receiver_wait_timeout_secs`.
 #[expect(
     dead_code,
-    reason = "wired into Config::validate in Layer 2; the signature is the surface"
+    reason = "wired into Config::validate by the fill layer; the signature is the surface"
 )]
 #[expect(
     unused_variables,
-    reason = "the comparison is Layer 2; the parameter is the surface"
+    reason = "the comparison is the fill layer's; the parameter is the surface"
 )]
 fn hitl_timeout_alignment_warning(hitl: &HitlConfig) -> Option<String> {
-    todo!("timeout-alignment guidance (Layer 2)")
+    todo!("timeout-alignment guidance (fill layer)")
 }
 
 fn validate_llm_api_key(llm: &LlmConfig, location: &str) -> Result<(), crate::ConfigError> {

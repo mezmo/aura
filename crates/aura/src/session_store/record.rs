@@ -17,8 +17,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::SessionId;
 use crate::hitl::{
-    AgentScope, ApprovalAuthority, ApprovalItem, ApprovalOrigin, ApprovalRequest, DecisionId,
-    ParkedApproval, ResolvedDecision, Timestamp,
+use crate::hitl::{
+    AcknowledgmentState, AgentScope, ApprovalAuthority, ApprovalItem, ApprovalOrigin,
+    ApprovalRequest, DecisionId, ParkedApproval, ResolvedDecision, Timestamp,
 };
 use crate::orchestration::{RunId, TaskIdentity};
 
@@ -48,6 +49,13 @@ pub struct ParkedApprovalRecord {
     /// poll-delivery egress capture existed, decoding to `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub egress_headers: Option<BTreeMap<String, String>>,
+    /// Durable acknowledgment state. Additive: absent on rows stored before
+    /// the 207 bridge existed, decoding to `RequiresNotification`.
+    #[serde(
+        default,
+        skip_serializing_if = "AcknowledgmentState::is_requires_notification"
+    )]
+    pub acknowledgment: AcknowledgmentState,
 }
 
 /// The names of an optional pair map, for names-only Debug rendering.
@@ -69,6 +77,7 @@ impl std::fmt::Debug for ParkedApprovalRecord {
             .field("expires_at", &self.expires_at)
             .field("authority", &self.authority)
             .field("egress_header_names", &pair_names(&self.egress_headers))
+            .field("acknowledgment", &self.acknowledgment)
             .finish()
     }
 }
@@ -209,6 +218,7 @@ impl From<&ParkedApproval> for ParkedApprovalRecord {
                 .egress_headers
                 .as_ref()
                 .map(crate::webhook_utils::header_map_to_pairs),
+            acknowledgment: parked.acknowledgment,
         }
     }
 }
@@ -239,6 +249,7 @@ impl TryFrom<ParkedApprovalRecord> for ParkedApproval {
             expires_at: record.expires_at,
             authority: record.authority,
             egress_headers,
+            acknowledgment: record.acknowledgment,
         })
     }
 }
@@ -357,6 +368,7 @@ mod tests {
             expires_at: now + chrono::Duration::seconds(60),
             authority: ApprovalAuthority::WebhookPoll,
             egress_headers: None,
+            acknowledgment: AcknowledgmentState::RequiresNotification,
         }
     }
 

@@ -240,6 +240,7 @@ mod tests {
             expires_at: now + chrono::Duration::seconds(60),
             authority: ApprovalAuthority::WebhookPoll,
             egress_headers: None,
+            acknowledgment: crate::hitl::AcknowledgmentState::RequiresNotification,
         }
     }
 

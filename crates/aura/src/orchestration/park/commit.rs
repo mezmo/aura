@@ -266,12 +266,12 @@ pub(crate) fn parked_document_dir(memory_dir: &str, session_id: Option<&str>) ->
 /// filter, the per-worker model and tool configuration, and the bound
 /// identity header's NAME.
 ///
-/// The webhook route's projection carries the two delivery markers split
-/// from the old poll marker — `decide_live` and `park`, the same sources
-/// `park_registry` and the reconciler spawn read. Poll tuning (poll_url,
-/// interval, per-attempt timeout) is deliberately fingerprint-COMPATIBLE,
-/// and no credential value (headers, secrets) enters the projection;
-/// resume-side enforcement is a one-way bump on change.
+/// The webhook route's projection carries the two delivery markers —
+/// `decide_live` and `park`, the same sources `park_registry` and the
+/// reconciler spawn read. Poll tuning (poll_url, interval, per-attempt
+/// timeout) is deliberately fingerprint-COMPATIBLE, and no credential value
+/// (headers, secrets) enters the projection; resume-side enforcement is a
+/// one-way bump on change.
 pub(crate) fn config_fingerprint(config: &AgentRuntimeConfig) -> String {
     let hitl = config.hitl.as_ref();
     let route = hitl.map(|h| match &*h.route {
@@ -360,6 +360,7 @@ mod tests {
             expires_at,
             authority: crate::hitl::ApprovalAuthority::WebhookPoll,
             egress_headers: None,
+            acknowledgment: crate::hitl::AcknowledgmentState::RequiresNotification,
         }
     }
 
@@ -610,6 +611,7 @@ mod tests {
                 expires_at: now + chrono::Duration::hours(1),
                 authority: crate::hitl::ApprovalAuthority::WebhookPoll,
                 egress_headers: None,
+                acknowledgment: crate::hitl::AcknowledgmentState::RequiresNotification,
             })
             .await
             .unwrap();
@@ -917,7 +919,7 @@ mod tests {
                         }
                         DecisionRouteConfig::Webhook { .. } => {
                             let client =
-                                crate::hitl::webhook_client_from_config(&route, None, None)
+                                crate::hitl::webhook_client_from_config(&route, None, None, false)
                                     .expect("a webhook route config builds a client");
                             crate::hitl::DecisionRoute::Webhook {
                                 client,

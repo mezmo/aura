@@ -77,10 +77,11 @@ impl From<ApprovalDecisionWire> for ApprovalDecision {
     }
 }
 
-/// Wire form of one status-poll answer under the post-#78 GET contract: the
-/// `{ "approved": bool, "reason": ... }` shape shared with the POST. Pending
-/// is status-code-carried (207), never a body field (ruling 6); unknown
-/// fields are rejected.
+/// Wire form of one status-poll answer: the `{ "approved": bool, "reason": ... }`
+/// shape shared with the POST. Pending is status-code-carried (207), never a
+/// body field; unknown fields are rejected. Re-cut to the pinned shape; the
+/// poll leg's parse lands in the fill layer, so the lib never constructs it.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PollDecisionWire {

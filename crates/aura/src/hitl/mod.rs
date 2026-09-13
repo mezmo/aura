@@ -88,7 +88,7 @@ pub use gate::HitlApprovalWrapper;
 pub use outcome::ApprovalAuthority;
 pub use poller::{PollReconciler, PollerHandle};
 pub use protocol::{ApprovalDecisionWire, ApprovalItem, ApprovalRequest, PROTOCOL_VERSION};
-pub use registry::{ParkedApproval, PendingApprovals, ResolveError};
+pub use registry::{AcknowledgmentState, ParkedApproval, PendingApprovals, ResolveError};
 // Re-exported so config-fingerprint tests construct the poll client the
 // production way.
 #[cfg(test)]
