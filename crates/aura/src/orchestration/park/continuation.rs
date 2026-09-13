@@ -10,6 +10,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+// `Message` reaches the module only through `replace_tool_result`, which the
+// P45 stage-3 wiring retired to `#[cfg(test)]`; Stage 7 reaps both.
+#[cfg(test)]
 use rig::completion::Message;
 
 use crate::hitl::{DecisionId, PendingApprovals};
@@ -285,8 +288,11 @@ pub(crate) async fn load_recorded_decisions(
 /// Replace the sentinel tool result for `call_id` in `current_prompt` with
 /// `wire` — the result text as the loop delivers it to the model (rig
 /// JSON-serializes tool outputs, so a plain string arrives JSON-quoted).
-/// Returns whether an entry was replaced; the continuation fails the resume
-/// when none was, so no sentinel can survive into the resumed conversation.
+/// Returns whether an entry was replaced. Test-only since the stage-3
+/// reconstruction wiring: the segment preflight plus `rebuild_context`
+/// rebuild the continuation context, so no production path reaches here;
+/// Stage 7 reaps this together with its marker.
+#[cfg(test)]
 pub(crate) fn replace_tool_result(current_prompt: &mut Message, call_id: &str, wire: &str) -> bool {
     let Message::User { content } = current_prompt else {
         return false;

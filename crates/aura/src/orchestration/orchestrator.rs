@@ -69,9 +69,9 @@ use super::park::resume::{
     ResumeGrant, SegmentError, SegmentResult, SegmentTurns,
 };
 use super::park::{
-    CallKey, ParkCommitInputs, ParkGuard, ParkedRun, ParkedTaskRecord, ParkedTaskRecords,
-    PeekOutcome, RecordedDecisions, ResumingDocumentHandle, RunStateForPark, commit_from_run_state,
-    replace_tool_result,
+    CallId, CallKey, NodePreflightInput, OutcomeWire, ParkCommitInputs, ParkGuard, ParkedRun,
+    ParkedTaskRecord, ParkedTaskRecords, PeekOutcome, RecordedDecisions, ResumingDocumentHandle,
+    RunStateForPark, SegmentPreflight, commit_from_run_state, rebuild_context,
 };
 use super::persistence::ExecutionPersistence;
 use super::types::{
@@ -243,29 +243,36 @@ fn segment_plan(checkpoint: &ParkedRun) -> Plan {
 
 /// The turns a parked segment produced: rig appends each turn's assistant
 /// message to the streamed history, so the assistant messages beyond the
-/// checkpoint's history are exactly this segment's turns — at full wire
-/// fidelity, which the stream's own items cannot restore for a tool call's
-/// provider call_id.
+/// history the continuation ACTUALLY streamed from are exactly this
+/// segment's turns — at full wire fidelity, which the stream's own items
+/// cannot restore for a tool call's provider call_id. The boundary is the
+/// rebuilt history's length (`streamed_from`), not the checkpoint's
+/// recorded length: the reconstruction may have appended a synthesized
+/// assistant turn the checkpoint never recorded, and slicing at the
+/// checkpoint's length would replay that reconstructed input as a segment
+/// turn. The checkpoint's own no-history row still faults.
 fn segment_turns_since(
     checkpoint: &ParkedRun,
     task_id: usize,
+    streamed_from: usize,
     snapshot: &ParkSnapshot,
 ) -> Result<Vec<rig::completion::Message>, SegmentError> {
-    let prior = checkpoint
+    if checkpoint
         .plan
         .tasks
         .iter()
         .find(|n| n.task_id == task_id)
-        .and_then(|n| n.history.as_ref().map(Vec::len))
-        .ok_or_else(|| {
-            SegmentError::Continuation(Diagnostic::new(format!(
-                "awaiting task {task_id} carries no history in the checkpoint"
-            )))
-        })?;
-    let Some(tail) = snapshot.history.get(prior..) else {
+        .and_then(|n| n.history.as_ref())
+        .is_none()
+    {
+        return Err(SegmentError::Continuation(Diagnostic::new(format!(
+            "awaiting task {task_id} carries no history in the checkpoint"
+        ))));
+    }
+    let Some(tail) = snapshot.history.get(streamed_from..) else {
         return Err(SegmentError::Continuation(Diagnostic::new(format!(
             "the parked snapshot for task {task_id} carries {} history messages, fewer than \
-             the checkpoint's {prior}",
+             the {streamed_from} history messages the continuation streamed from",
             snapshot.history.len()
         ))));
     };
@@ -4297,7 +4304,26 @@ Assign tasks to the worker whose tools best match the required operations."#,
         let requires_identity = hitl.route.requires_identity();
         let mut consumed = Vec::new();
 
-        for node in awaiting {
+        // The segment-wide preflight: every awaiting node's pending calls
+        // and snapshot prompt validate TOGETHER, or nothing runs — the
+        // all-or-nothing door. A refusal fires here, before ANY tombstone
+        // or invocation across the whole segment, carrying the
+        // node-attributed diagnostic; the per-node halves it yields are
+        // what the drive loop resolves and rebuilds from.
+        let preflight_inputs: Vec<NodePreflightInput<'_>> = awaiting
+            .iter()
+            .map(|node| {
+                let record = records
+                    .get(&node.task_id)
+                    .expect("every awaiting node was seeded with a park record");
+                NodePreflightInput::new(&node.pending, &record.snapshot.current_prompt)
+            })
+            .collect();
+        let validated_nodes = SegmentPreflight::try_new(&preflight_inputs)
+            .map_err(|refusal| fault(refusal.to_string()))?
+            .into_nodes();
+
+        for (node, validated) in awaiting.into_iter().zip(validated_nodes) {
             let task_id = node.task_id;
             let worker_name = node.worker.as_deref();
             let pending = node.pending;
@@ -4305,10 +4331,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 .get(&task_id)
                 .expect("every awaiting node was seeded with a park record")
                 .clone();
-            let ParkSnapshot {
-                history,
-                mut current_prompt,
-            } = snapshot;
+            let ParkSnapshot { history, .. } = snapshot;
 
             let Some(park) = self.worker_park(task_id, attempt) else {
                 return Err(fault(
@@ -4336,16 +4359,25 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
             // The substitution prelude: pre-flight the COMPLETE pending
             // sequence against the recorded set, then per decided call,
-            // tombstone, invoke through the gated pipeline, and swap the
-            // real outcome for the checkpointed placeholder — all before
-            // the continuation ever streams. Every pending call of an
-            // awaiting node is decided — the grant's consult refused the
-            // resume otherwise. Same-key duplicate calls (identical tool
-            // and arguments, distinct call ids) share one FIFO queue: the
-            // calls in document order pair with the queue's entries
-            // front-to-back, positionally, and consumption is tracked per
-            // call by the key's queue depth around that call's own
-            // invocation.
+            // tombstone, invoke through the gated pipeline, and collect the
+            // keyed outcome pairs — all before the continuation ever
+            // streams. Every pending call of an awaiting node is decided —
+            // the grant's consult refused the resume otherwise. Same-key
+            // duplicate calls (identical tool and arguments, distinct call
+            // ids) share one FIFO queue: the calls in document order pair
+            // with the queue's entries front-to-back, positionally, and
+            // consumption is tracked per call by the key's queue depth
+            // around that call's own invocation. The outcomes key to the
+            // VALIDATED calls' own ids — taken from `ValidatedCall` before
+            // `resolve` consumes the list (the resolve caller obligation)
+            // — and the total `rebuild_context` then rebuilds the node's
+            // continuation context from the resolved bundle and the prompt
+            // witness the segment preflight validated.
+            let (calls, prompt_witness) = validated.into_parts();
+            // One outcome per bundle call, keyed by the validated calls'
+            // own ids (the resolve caller obligation) — the ids are cloned
+            // off `ValidatedCall` before `resolve` consumes the list.
+            let mut outcomes: Vec<(CallId, OutcomeWire)> = Vec::new();
             {
                 let strict = recorded.strict_guard(task_id);
                 // The per-call key-position pairs, derived from document
@@ -4387,7 +4419,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         }
                     }
                 }
-                for (call, (key, _position)) in pending.iter().zip(&keyed) {
+                for ((call, (key, _position)), validated_call) in
+                    pending.iter().zip(&keyed).zip(calls.as_slice())
+                {
                     // Consumption derives from the key's queue depth
                     // around this call's own invocation — a drop of
                     // exactly one is this call's decision being consumed —
@@ -4425,22 +4459,33 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     if recorded.depth(key) + 1 == depth_before {
                         consumed.push(call.decision_id);
                     }
-                    if !replace_tool_result(&mut current_prompt, &call.call_id, &wire) {
-                        return Err(fault(format!(
-                            "continuation prompt has no tool result for call {}",
-                            call.call_id
-                        )));
-                    }
                     // R2's outcome-bearing pair rides ahead of the node's
                     // continuation turns, keyed by the original call id.
                     turns.push(decided_call_turn(call));
                     turns.push(decided_result_turn(call, &wire));
+                    outcomes.push((validated_call.call_id().clone(), OutcomeWire::new(wire)));
                 }
                 // The strict guard drops before streaming, so a genuinely
                 // new gated call afterward re-parks through the live arm
                 // rather than faulting as a strict miss.
                 drop(strict);
             }
+
+            // Resolution pairs by identity, then the total rebuild: the
+            // bundle is valid by construction, so `rebuild_context` cannot
+            // fail — the streamed context carries every bundle call's tool
+            // result preceded by the assistant tool call of the same id
+            // (synthesized where the checkpoint's history missed it), and
+            // no sentinel slot survives.
+            let bundle = calls.resolve(outcomes).map_err(|e| fault(e.to_string()))?;
+            let rebuilt = rebuild_context(&history, prompt_witness, &bundle);
+            let (current_prompt, rebuilt_history) = rebuilt.into_parts();
+            // The turn boundary the re-park arm slices from: the rebuilt
+            // history is what the continuation ACTUALLY streams from, and
+            // it can be longer than the checkpoint's recorded history (the
+            // synthesized turn appended) — slicing at the checkpoint's
+            // length would replay reconstructed input as segment turns.
+            let streamed_from = rebuilt_history.len();
 
             let park_registration = crate::streaming_request_hook::ParkCellRegistration::new(
                 &park.key,
@@ -4450,7 +4495,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 .inner
                 .stream_chat_message_with_timeout(
                     current_prompt,
-                    history,
+                    rebuilt_history,
                     worker.max_depth,
                     Duration::MAX,
                     &park.key,
@@ -4482,8 +4527,16 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         .expect("cell outcome Blocked implies a captured snapshot");
                     // The parked node's turns come from the snapshot at full
                     // wire fidelity; the stream collector's assembly drops a
-                    // tool call's provider call_id.
-                    turns.extend(segment_turns_since(&checkpoint, task_id, &snapshot)?);
+                    // tool call's provider call_id. The slice boundary is
+                    // the history the continuation actually streamed from
+                    // — the rebuilt history, which the reconstruction may
+                    // have lengthened past the checkpoint's record.
+                    turns.extend(segment_turns_since(
+                        &checkpoint,
+                        task_id,
+                        streamed_from,
+                        &snapshot,
+                    )?);
                     let task = plan
                         .get_task_mut(task_id)
                         .expect("the segment plan carries the checkpoint's task ids");

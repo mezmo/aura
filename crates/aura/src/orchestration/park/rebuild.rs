@@ -45,15 +45,18 @@
 //! shape, are preserved verbatim.
 //!
 //! This stage-2b unit fills the five behavior bodies (the frames in the
-//! test module below pin them); the module is unwired (P45 stage 3 points
-//! the substitution prelude at it; the plan's stage 7 reaps
+//! test module below pin them); P45 stage 3 wired the substitution prelude
+//! to this module (the plan's stage 7 reaps
 //! `continuation::replace_tool_result` last), and the design record —
 //! including the repair-round panel ledger and the stage-2b coverage
 //! manifest — is `REBUILD-DESIGN.md` beside this module.
 
-#![allow(dead_code)] // unwired: P45 stage 3 wires the builder into the
-// substitution prelude; sweep this allow together with the re-export's
-// unused-imports marker in park/mod.rs when the wiring lands
+// The wiring consumes the construction path, but the inspection accessors
+// (`ValidatedCall`'s, `ValidatedNode`'s, `SegmentPreflight::as_slice`,
+// `RebuiltContext`'s) are frame-only surfaces: the production path takes
+// the values by inference and `into_*`, never the getters, so the module
+// dead-code allow stays for them.
+#![allow(dead_code)]
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
