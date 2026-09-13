@@ -29,8 +29,9 @@ pub(crate) use guard::ParkGuard;
 // import marker sweeps with the module's dead-code allow at wiring.
 #[allow(unused_imports)]
 pub(crate) use rebuild::{
-    CallId, OutcomeWire, RebuildError, RebuiltContext, ResolvedCall, ResolvedCallBundle,
-    ValidatedCall, ValidatedCalls, rebuild_context,
+    CallId, NodePreflightInput, OutcomeWire, PreflightError, RebuiltContext, ResolveError,
+    ResolvedCall, ResolvedCallBundle, SegmentPreflight, ToolResultPrompt, ValidatedCall,
+    ValidatedCalls, ValidatedNode, rebuild_context,
 };
 pub(crate) use recorded_decisions::{CallKey, PeekOutcome, RecordedDecisions};
 
