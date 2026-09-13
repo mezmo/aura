@@ -314,6 +314,29 @@ fn segment_turns_since(
         .collect())
 }
 
+/// One driven node's decided-call pairs, held back until the segment's
+/// outcome is known: `at` is the offset in the segment turns where that
+/// node's own turns begin, so the pairs can land directly ahead of them.
+struct DeferredPairs {
+    at: usize,
+    turns: Vec<rig::completion::Message>,
+}
+
+/// Fold the held pairs into the segment turns, each block at its own
+/// offset. Only a Parked segment calls this: a Completed segment's turns
+/// are the run's natural turns, pair-free — the outcome packages live
+/// inside the rebuilt histories the continuations streamed from. Blocks
+/// arrive in increasing offset order (one per driven node, pushed in
+/// drive order), so folding from the last keeps every earlier offset
+/// valid.
+fn splice_deferred_pairs(turns: &mut Vec<rig::completion::Message>, blocks: Vec<DeferredPairs>) {
+    for block in blocks.into_iter().rev() {
+        for (offset, turn) in block.turns.into_iter().enumerate() {
+            turns.insert(block.at + offset, turn);
+        }
+    }
+}
+
 /// Flush one accumulated turn (text plus tool calls) into the segment's
 /// turn list; empty accumulators produce nothing.
 fn flush_segment_turn(
@@ -3729,6 +3752,20 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         if let Some(t) = plan.get_task_mut(task_id) {
                             t.state = TaskState::AwaitingApproval { pending };
                         }
+                        // The parked worker's snapshot turns join the wave's
+                        // task-id merge — at full wire fidelity, like every
+                        // wave turn — so a parked task keeps its wave
+                        // position instead of trailing every completed turn
+                        // of every later wave.
+                        wave_turns.push((
+                            task_id,
+                            snapshot
+                                .history
+                                .iter()
+                                .filter(|m| matches!(m, rig::completion::Message::Assistant { .. }))
+                                .cloned()
+                                .collect(),
+                        ));
                         park_records.insert(task_id, ParkedTaskRecord { attempt, snapshot });
                         tracing::warn!(
                             "Task {} ('{}') blocked awaiting approval after {}ms",
@@ -4402,6 +4439,12 @@ Assign tasks to the worker whose tools best match the required operations."#,
             });
         }
         let mut turns = Vec::new();
+        // Every driven node's decided-call pairs, deferred until the
+        // segment's outcome is known: a Parked segment carries each node's
+        // pairs ahead of that node's own turns (its gated turn when it
+        // re-parked, its continuation turns when it completed), while a
+        // Completed segment carries none.
+        let mut pair_blocks: Vec<DeferredPairs> = Vec::new();
 
         // The substitution prelude's segment-level inputs: the resuming
         // document every tombstone appends through, and the route's
@@ -4442,11 +4485,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 .expect("every awaiting node was seeded with a park record")
                 .clone();
             let ParkSnapshot { history, .. } = snapshot;
-            // The node's R2 outcome pairs. They ride the segment turns only
-            // when the node re-parks (ahead of its gated turn); a completed
-            // segment's turns are the run's natural turns — the outcome
-            // packages already live inside the rebuilt history the
-            // continuation streamed from.
+            // The node's R2 outcome pairs, collected per decided call and
+            // deferred: whether they ride the segment turns is a SEGMENT
+            // outcome, not a node outcome — a completed node's pairs ride
+            // too when a sibling re-parks the segment.
             let mut pair_turns = Vec::new();
 
             let Some(park) = self.worker_park(task_id, attempt) else {
@@ -4648,7 +4690,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     // continuation actually streamed from — the rebuilt
                     // history, which the reconstruction may have lengthened
                     // past the checkpoint's record.
-                    turns.extend(pair_turns);
+                    pair_blocks.push(DeferredPairs {
+                        at: turns.len(),
+                        turns: pair_turns,
+                    });
                     turns.extend(segment_turns_since(
                         &checkpoint,
                         task_id,
@@ -4663,6 +4708,19 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     };
                     records.insert(task_id, ParkedTaskRecord { attempt, snapshot });
 
+                    // The published history is the checkpoint's own plus this
+                    // drive's newly observed failures — the same derivation
+                    // the completion path's collector applies, over the same
+                    // known-failed set, stamped with the iteration the
+                    // restored plan executes under. The next resume seeds its
+                    // known-failed ids from the published plan, so a failure
+                    // dropped here would never be recorded.
+                    let mut failure_history = checkpoint.failure_history.clone();
+                    failure_history.extend(Self::collect_iteration_failures(
+                        &plan,
+                        checkpoint.iteration + 1,
+                        &known_failed,
+                    ));
                     let inputs = ParkCommitInputs {
                         state: RunStateForPark {
                             run_id: &checkpoint.run_id,
@@ -4673,7 +4731,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                             routing_decision: checkpoint.routing_decision.as_ref(),
                             iteration: checkpoint.iteration,
                             planning_ms: checkpoint.planning_ms,
-                            failure_history: &checkpoint.failure_history,
+                            failure_history: &failure_history,
                         },
                         plan: &plan,
                         records: &records,
@@ -4721,6 +4779,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         NonEmptyBlocking::try_new(blocking).map_err(|EmptyBlocking| {
                             fault("the re-park committed with no outstanding calls".to_string())
                         })?;
+                    splice_deferred_pairs(&mut turns, pair_blocks);
                     let turns = SegmentTurns::try_new(turns).map_err(|EmptySegment| {
                         fault("the re-parked segment carried no turns".to_string())
                     })?;
@@ -4744,6 +4803,13 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     let (node_turns, content) = stream_result.map_err(|e| {
                         fault(format!("the resume stream for task {task_id} failed: {e}"))
                     })?;
+                    // The completed node's pairs ride only if the SEGMENT
+                    // parks; the block's offset keeps them ahead of this
+                    // node's own continuation turns, their document order.
+                    pair_blocks.push(DeferredPairs {
+                        at: turns.len(),
+                        turns: pair_turns,
+                    });
                     turns.extend(node_turns);
                     let structured = submit_result_decision.lock().await.take();
                     let task = plan
@@ -4785,6 +4851,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         {
             ContinuationOutcome::Completed => {}
             ContinuationOutcome::ReParked { blocking } => {
+                splice_deferred_pairs(&mut turns, pair_blocks);
                 let turns = SegmentTurns::try_new(turns).map_err(|EmptySegment| {
                     fault("the re-parked segment carried no turns".to_string())
                 })?;
@@ -5668,25 +5735,11 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 "Iteration {} parked at quiescence; skipping post-execute coordinator call",
                 iteration
             );
-            // A parked task's turns come from its captured snapshot at full
-            // wire fidelity — the stream collector's assembly drops a tool
-            // call's provider call_id, and the segment's re-park report
-            // keys on the gated turn exactly as the park recorded it.
-            for task in &plan.tasks {
-                let TaskState::AwaitingApproval { .. } = task.state else {
-                    continue;
-                };
-                if let Some(record) = park_records.get(&task.id) {
-                    worker_turns.extend(
-                        record
-                            .snapshot
-                            .history
-                            .iter()
-                            .filter(|m| matches!(m, rig::completion::Message::Assistant { .. }))
-                            .cloned(),
-                    );
-                }
-            }
+            // A parked task's turns entered its wave's task-id merge inside
+            // `execute`, from its captured snapshot at full wire fidelity —
+            // the stream collector's assembly drops a tool call's provider
+            // call_id, and the segment's re-park report keys on the gated
+            // turn exactly as the park recorded it.
             let conversation = coordinator_state.conversation.clone();
             let routing_decision = coordinator_state.routing_decision.lock().await.clone();
             let result = self

@@ -3374,18 +3374,14 @@ url = "http://127.0.0.1:9"
         const DENIAL_FINAL_TEXT: &str =
             "nothing was applied; awaiting a namespace you will approve";
 
-        /// STAGE 6 (R6 natural-finish), pre-failing: a completed segment
-        /// over one approved decided call — carrying today's segment
-        /// surface, the R2 outcome pair ahead of the natural continuation
-        /// turns (the shape the frames above pin and the aura-side
-        /// pipeline frames prove the segment produces) — must reach the
-        /// wire as the run's natural turns only: no assistant tool-call
-        /// turn for the decided call and no role:tool turn keyed by the
-        /// original call id, because the outcome package now lives inside
-        /// the reconstructed worker history. The natural continuation
-        /// turns ride in segment order, multi-message allowed, and the
-        /// envelope keys are unchanged. Red today at the named point:
-        /// the pair rides the body.
+        /// A completed segment's 200 body carries the run's natural turns
+        /// only: an R2 outcome pair riding the segment surface ahead of the
+        /// natural continuation turns comes off the wire entirely, both
+        /// halves — no assistant tool-call turn for the decided call and no
+        /// role:tool turn keyed by the original call id — because the
+        /// outcome package lives inside the reconstructed worker history.
+        /// The natural continuation turns ride in segment order,
+        /// multi-message allowed, and the envelope keys are unchanged.
         #[tokio::test]
         async fn completed_approve_segment_carries_natural_turns_without_the_outcome_pair() {
             let session = ResumeSessionId::parse("sess-p45").expect("golden session parses");
@@ -3416,16 +3412,14 @@ url = "http://127.0.0.1:9"
             );
         }
 
-        /// STAGE 6 (R6 natural-finish), pre-failing: the denial variant —
-        /// a completed segment over one denied decided call (the denial
-        /// pair ahead of the worker's natural adaptation turns on today's
-        /// segment surface) must reach the wire as the adaptation turns
-        /// only: no tool-message turn carrying the denial text keyed by
+        /// The denial variant of the completed body's natural-turns-only
+        /// rule: a denial pair riding the segment surface ahead of the
+        /// worker's natural adaptation turns comes off the wire, both
+        /// halves — no tool-message turn carrying the denial text keyed by
         /// the call id and no assistant tool-call turn for the decided
-        /// call, because the denial package now lives inside the
-        /// reconstructed worker history. The natural adaptation turns
-        /// ride in segment order and the envelope keys are unchanged.
-        /// Red today at the named point: the denial pair rides the body.
+        /// call — because the denial package lives inside the
+        /// reconstructed worker history. The natural adaptation turns ride
+        /// in segment order and the envelope keys are unchanged.
         #[tokio::test]
         async fn completed_deny_segment_carries_natural_turns_without_the_denial_pair() {
             let session = ResumeSessionId::parse("sess-p45").expect("golden session parses");
