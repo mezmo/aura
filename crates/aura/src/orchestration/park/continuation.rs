@@ -10,11 +10,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-// `Message` reaches the module only through `replace_tool_result`, which the
-// P45 stage-3 wiring retired to `#[cfg(test)]`; Stage 7 reaps both.
-#[cfg(test)]
-use rig::completion::Message;
-
 use crate::hitl::{DecisionId, PendingApprovals};
 use crate::orchestration::park::document::{ParkedRun, RESUMING_DOCUMENT_SUFFIX, load_parked_run};
 use crate::orchestration::park::recorded_decisions::{CallKey, RecordedDecisions};
@@ -39,11 +34,7 @@ pub(crate) enum RehydrateError {
     /// decision inside the decision window. The resume endpoint answers
     /// 409 `parked` with the outstanding ids and `expires_at`; an
     /// all-decided resume never sees this.
-    Parked {
-        outstanding: Vec<DecisionId>,
-        #[allow(dead_code)] // the refusal re-derives expiry from the blocking projection
-        expires_at: chrono::DateTime<chrono::Utc>,
-    },
+    Parked { outstanding: Vec<DecisionId> },
     /// Condition row "config_changed": the fingerprint no longer matches the
     /// rebuilt configuration. Checked by the resume endpoint against a
     /// header-resolved config entry point (P45 adoption).
@@ -64,7 +55,7 @@ impl std::fmt::Display for RehydrateError {
             Self::NotFound => write!(f, "no checkpoint document for the run"),
             Self::Expired => write!(f, "the run's decision window has expired"),
             Self::Mismatch(detail) => write!(f, "resume mismatch: {detail}"),
-            Self::Parked { outstanding, .. } => write!(
+            Self::Parked { outstanding } => write!(
                 f,
                 "{} approval(s) still await a decision inside the window",
                 outstanding.len()
@@ -276,38 +267,10 @@ pub(crate) async fn load_recorded_decisions(
         }
     }
     if !outstanding.is_empty() {
-        return Err(RehydrateError::Parked {
-            outstanding,
-            expires_at,
-        });
+        return Err(RehydrateError::Parked { outstanding });
     }
 
     Ok((recorded, decision_ids))
-}
-
-/// Replace the sentinel tool result for `call_id` in `current_prompt` with
-/// `wire` — the result text as the loop delivers it to the model (rig
-/// JSON-serializes tool outputs, so a plain string arrives JSON-quoted).
-/// Returns whether an entry was replaced. Test-only since the stage-3
-/// reconstruction wiring: the segment preflight plus `rebuild_context`
-/// rebuild the continuation context, so no production path reaches here;
-/// Stage 7 reaps this together with its marker.
-#[cfg(test)]
-pub(crate) fn replace_tool_result(current_prompt: &mut Message, call_id: &str, wire: &str) -> bool {
-    let Message::User { content } = current_prompt else {
-        return false;
-    };
-    let mut replaced = false;
-    for item in content.iter_mut() {
-        if let rig::message::UserContent::ToolResult(tr) = item
-            && tr.id == call_id
-        {
-            tr.content =
-                rig::OneOrMany::one(rig::message::ToolResultContent::text(wire.to_string()));
-            replaced = true;
-        }
-    }
-    replaced
 }
 
 /// The directory a document lives in, or `None` for a bare file name whose
@@ -513,7 +476,7 @@ mod tests {
         .await
         .unwrap_err();
         match err {
-            RehydrateError::Parked { outstanding, .. } => {
+            RehydrateError::Parked { outstanding } => {
                 assert_eq!(outstanding, vec![undecided]);
             }
             other => panic!("expected Parked with the outstanding id, got: {other}"),
@@ -622,60 +585,6 @@ mod tests {
         assert_eq!(
             recorded.take(&CallKey::new(3, "kubectl_apply", &args)),
             Some(ResolvedDecision::from(ApprovalDecision::Approved))
-        );
-    }
-
-    /// The sentinel replacement: matching call ids swap in the wire result;
-    /// an absent call id reports false so the continuation fails instead of
-    /// shipping a sentinel back to the model.
-    #[test]
-    fn replace_tool_result_swaps_only_the_matching_call() {
-        let mut prompt = Message::User {
-            content: rig::OneOrMany::many(vec![
-                rig::message::UserContent::Text(rig::message::Text {
-                    text: "context".to_string(),
-                }),
-                rig::message::UserContent::ToolResult(rig::message::ToolResult {
-                    id: "call_a".to_string(),
-                    call_id: None,
-                    content: rig::OneOrMany::one(rig::message::ToolResultContent::text("sentinel")),
-                }),
-                rig::message::UserContent::ToolResult(rig::message::ToolResult {
-                    id: "call_b".to_string(),
-                    call_id: None,
-                    content: rig::OneOrMany::one(rig::message::ToolResultContent::text("sentinel")),
-                }),
-            ])
-            .unwrap(),
-        };
-
-        assert!(replace_tool_result(&mut prompt, "call_a", "\"applied\""));
-        let Message::User { content } = &prompt else {
-            unreachable!()
-        };
-        for item in content.iter() {
-            let rig::message::UserContent::ToolResult(tr) = item else {
-                continue;
-            };
-            let text = tr
-                .content
-                .iter()
-                .map(|c| match c {
-                    rig::message::ToolResultContent::Text(t) => t.text.clone(),
-                    rig::message::ToolResultContent::Image(_) => "[image]".to_string(),
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            if tr.id == "call_a" {
-                assert_eq!(text, "\"applied\"");
-            } else {
-                assert_eq!(text, "sentinel", "siblings are untouched");
-            }
-        }
-
-        assert!(
-            !replace_tool_result(&mut prompt, "call_missing", "\"x\""),
-            "an unknown call id must not silently succeed"
         );
     }
 

@@ -219,6 +219,19 @@ markers swept by hand (`grep -n "expect(unused_variables"` over
 the module's `#![allow(dead_code)]` and the re-export's
 `#[allow(unused_imports)]` keep their stage-3 sweep notes.
 
+Marker health after stage 7 (the reap): the module-wide
+`#![allow(dead_code)]` is gone — the grep-proven-dead accessors
+(`ValidatedCall::tool_name`/`arguments`/`decision_id`,
+`ValidatedNode::calls`/`prompt`, `SegmentPreflight::as_slice`: zero
+callers anywhere) were deleted outright, and the two frame-only
+survivors (`RebuiltContext::history`/`current_prompt`) carry per-item
+`#[allow(dead_code)]` markers naming the reason. `park/mod.rs`'s re-export
+markers split the same way: the production-named rebuild re-export and the
+whole document block are unmarked, `load_recorded_decisions` keeps its
+marker (park-tree golden suites are its only re-export consumers), and
+`RehydrateError` left the re-export (no path consumers).
+`continuation::replace_tool_result` was deleted with its unit frame.
+
 ## Stage 2b coverage manifest (frames → surface)
 
 Every frame lives in `rebuild.rs`'s test module; builder frames assert

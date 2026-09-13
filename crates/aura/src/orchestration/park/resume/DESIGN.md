@@ -289,20 +289,24 @@ plan of record's fix contract):
   `recorded_pre_call` consults). A `Missing` or `IdentityBlocked`
   verdict at any position is a fatal `SegmentError` before any
   tombstone or invocation, naming the faulting call. Each decided call
-  then tombstones through the resuming document's
+  then   tombstones through the resuming document's
   `append_executed_and_publish` (durable — the `interrupted` row's
   once-only evidence), invokes through the worker's gated pipeline
   (`call_tool`: `recorded_pre_call` consumes the decision — approved
   executes once under the recorded identity, denied short-circuits with
-  the live denial text and never executes), and `replace_tool_result`
-  swaps the real outcome for the placeholder in `current_prompt`, keyed
-  by `PendingCall.call_id`. The strict guard drops before streaming, so
-  a genuinely new gated call afterward re-parks through the live arm. An
-  ordinary execution `Err` out of `call_tool` is result text for the
-  model (the live loop's raw Err-branch rendering); the bookkeeping
-  faults — the pre-flight blocks, the tombstone write, a replace miss —
-  stay fatal, distinguished by where the error arises, never by
-  string-matching on error text.
+  the live denial text and never executes), and the segment preflight's
+  validated halves — the calls resolved by identity against the outcome
+  wires keyed to their own ids — feed the total `rebuild_context`, which
+  rebuilds the node's `(history, current_prompt)` so every bundle call's
+  tool result is preceded by its own assistant tool call and no sentinel
+  slot survives (the reconstruction direction, R5; the design record is
+  `REBUILD-DESIGN.md` in the park module). The strict guard drops before
+  streaming, so a genuinely new gated call afterward re-parks through the
+  live arm. An ordinary execution `Err` out of `call_tool` is result text
+  for the model (the live loop's raw Err-branch rendering); the
+  bookkeeping faults — the pre-flight blocks, the tombstone write, the
+  segment-preflight and resolution refusals — stay fatal, distinguished
+  by where the error arises, never by string-matching on error text.
 - **The consumed-subset re-park cleanup**: the consumed set derives from
   each call's key's queue depth around that call's own invocation
   (`RecordedDecisions::depth` before and after — a drop of exactly one
