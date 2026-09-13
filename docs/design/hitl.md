@@ -323,8 +323,9 @@ rows carry a TTL of the remaining decision window instead.
 
 Registration-closed semantics: a mapped destination with no usable resolved
 value (request header absent, no explicit valid static fallback) fails the
-capture at route construction, and the park arm fails the gated call closed —
-no approval row, no pending event, no blocked-cell entry, no notify POST.
+capture at route construction, and the park arm fails the gated call closed,
+leaving no approval row and blocking every downstream effect: no pending
+event, no blocked-cell entry, and no notify POST.
 Notify is egress auth with no later reify checkpoint, so an undeliverable
 registration must not exist. The exception: an explicitly configured **valid
 static fallback** keeps the existing resolution semantics and parks with the
@@ -355,8 +356,9 @@ intent worth keeping; an unauthenticated egress registration is not.
 `ResolvedDecision` (`hitl::decision`) is the storage/domain carrier every
 decision-bearing API moves as a unit: `ApprovalStore::resolve`/`decision`,
 `PendingApprovals::resolve`/`recorded_decision`, and `RecordedDecisions`.
-`ApprovalDecision` alone survives only where identity has no meaning: the bus
-payload, the conversational wake, and the projected outcomes.
+`ApprovalDecision` alone survives only where identity has no meaning, namely
+the bus payload and the conversational wake, as well as the outcomes
+projected into events.
 
 ## Where cross-request state lives
 
