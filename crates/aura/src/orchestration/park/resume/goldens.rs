@@ -101,6 +101,11 @@ const SIBLING_DONE: &str = "deployed and settled";
 const FAILED_TEXT: &str = "the apply failed: the cluster rejected the manifest";
 /// The replacement task's final turn text.
 const REPLACEMENT_DONE: &str = "recovered and settled";
+/// The mixed wave's completing sibling's marker — the text riding its
+/// submit_result turn, the wave frames' order pin for that sibling.
+const WAVE_SIBLING_DONE: &str = "checks done and settled";
+/// The follow-up wave sibling's marker — the same shape, second wave.
+const FOLLOWUP_DONE: &str = "the follow-up verified the rollout";
 /// The restored-failure fixture's already-failed node — the task the
 /// checkpoint recorded as Failed before the park, its description the
 /// seeded failure history carries.
@@ -660,6 +665,75 @@ fn sibling_pending_document(world: &World) -> ParkedRun {
     document
 }
 
+/// One bare Pending sibling node — exactly the shape `build_document`
+/// writes for a never-started task: no attempt, history, prompt, or
+/// pending calls.
+fn pending_sibling_node(
+    task_id: usize,
+    description: &str,
+    dependencies: Vec<usize>,
+) -> ParkedTaskNode {
+    ParkedTaskNode {
+        task_id,
+        description: description.to_string(),
+        dependencies,
+        worker: Some("operations".to_string()),
+        rationale: String::new(),
+        status: TaskStatus::Pending,
+        result: None,
+        error: None,
+        failure_category: None,
+        attempt: None,
+        history: None,
+        current_prompt: None,
+        pending: None,
+    }
+}
+
+/// The parking-sibling checkpoint: the standard one-awaiting-node fixture
+/// plus one never-started Pending sibling (task 5) — the fixture the
+/// loop-re-park pair-retention frame drives, the sibling's scripted
+/// worker issuing a gated call that re-parks the resumed run.
+fn sibling_parks_document(world: &World) -> ParkedRun {
+    let mut document = sentinel_document(world);
+    document.plan.tasks.push(pending_sibling_node(
+        5,
+        "Run the post-apply deployment checks",
+        vec![],
+    ));
+    document
+}
+
+/// The mixed-wave checkpoint: the standard fixture plus a completing
+/// sibling (task 1) and a parking sibling (task 0) — plan order
+/// deliberately REVERSED against the task-id merge, so the wave frames
+/// pin the merge's sort, not the workers' build order.
+fn sibling_wave_document(world: &World) -> ParkedRun {
+    let mut document = sentinel_document(world);
+    document
+        .plan
+        .tasks
+        .push(pending_sibling_node(1, "Run the deploy checks", vec![]));
+    document
+        .plan
+        .tasks
+        .push(pending_sibling_node(0, "Watch the gated rollout", vec![]));
+    document
+}
+
+/// The follow-up-wave checkpoint: the mixed-wave fixture plus one more
+/// sibling (task 2) dependent on the completing sibling (task 1) — the
+/// second wave a later runnable task forms after the mixed first wave.
+fn sibling_followup_wave_document(world: &World) -> ParkedRun {
+    let mut document = sibling_wave_document(world);
+    document.plan.tasks.push(pending_sibling_node(
+        2,
+        "Verify the rollout landed",
+        vec![1],
+    ));
+    document
+}
+
 /// The goal-distinct checkpoint: query and `plan.goal` deliberately
 /// different strings, everything else the standard sentinel fixture —
 /// the fixture the goal-restoration frame drives.
@@ -973,6 +1047,54 @@ fn decided_result_turn_for(call_id: &str, wire: &str) -> Value {
                 "type": "toolresult",
                 "id": call_id,
                 "content": [{ "type": "text", "text": wire }],
+            },
+        ],
+    })
+}
+
+/// A completing worker's natural submit_result turn: the marker text
+/// streams ahead of the tool call in the same turn (the live
+/// submit_result decision short-circuit ends the stream one item past
+/// the tool result, so a trailing text turn is never requested).
+fn submit_result_turn(marker: &str, call: &str, summary: &str, result: &str) -> Value {
+    json!({
+        "role": "assistant",
+        "id": null,
+        "content": [
+            { "text": marker },
+            {
+                "id": call,
+                "call_id": null,
+                "function": {
+                    "name": "submit_result",
+                    "arguments": {
+                        "confidence": "high",
+                        "result": result,
+                        "summary": summary,
+                    },
+                },
+                "signature": null,
+                "additional_params": null,
+            },
+        ],
+    })
+}
+
+/// The gated assistant turn a parking worker's snapshot carries: the
+/// freshly issued call at full wire fidelity — the rig id and the
+/// provider call id both keyed by the scripted call, exactly the drive
+/// loop's re-park pin's gated-turn shape.
+fn fresh_gated_turn() -> Value {
+    json!({
+        "role": "assistant",
+        "id": null,
+        "content": [
+            {
+                "id": FRESH_CALL_ID,
+                "call_id": NEW_CALL_ID,
+                "function": { "name": NEW_TOOL, "arguments": { "namespace": "stage" } },
+                "signature": null,
+                "additional_params": null,
             },
         ],
     })
@@ -1562,6 +1684,7 @@ async fn concurrent_evaluations_admit_one_grant_and_refuse_the_loser_with_runnin
 #[tokio::test]
 async fn all_decided_grant_runs_the_segment_to_completion() {
     let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
+    let _drain = OverrideDrain;
     let world = world();
     let invocations = Arc::new(Mutex::new(Vec::new()));
     install_worker_overrides(vec![WorkerOverride {
@@ -1784,6 +1907,7 @@ async fn re_park_registers_the_fresh_ticket_under_the_original_bound_run_id() {
 #[tokio::test]
 async fn consumed_subset_re_park_preserves_the_sibling_and_completes_on_the_second_resume() {
     let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
+    let _drain = OverrideDrain;
     let world = world();
     let apply_invocations = Arc::new(Mutex::new(Vec::new()));
     let fresh_invocations = Arc::new(Mutex::new(Vec::new()));
@@ -2041,6 +2165,7 @@ async fn consumed_subset_re_park_preserves_the_sibling_and_completes_on_the_seco
 #[tokio::test]
 async fn post_substitution_new_call_re_parks_through_the_live_arm_not_a_strict_miss() {
     let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
+    let _drain = OverrideDrain;
     let world = world();
     let apply_invocations = Arc::new(Mutex::new(Vec::new()));
     let fresh_invocations = Arc::new(Mutex::new(Vec::new()));
@@ -2197,6 +2322,7 @@ async fn post_substitution_new_call_re_parks_through_the_live_arm_not_a_strict_m
 #[tokio::test]
 async fn approved_call_executes_once_and_rides_the_outcome_pair() {
     let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
+    let _drain = OverrideDrain;
     let world = world();
     let invocations = Arc::new(Mutex::new(Vec::new()));
     install_worker_overrides(vec![WorkerOverride {
@@ -2275,6 +2401,7 @@ async fn approved_call_executes_once_and_rides_the_outcome_pair() {
 #[tokio::test]
 async fn denied_call_steers_without_executing_and_rides_the_denial_pair() {
     let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
+    let _drain = OverrideDrain;
     let world = world();
     let invocations = Arc::new(Mutex::new(Vec::new()));
     let model = ScriptedCompletionModel::new(vec![ScriptedTurn::text(FINAL_TEXT)]);
@@ -2370,6 +2497,7 @@ async fn denied_call_steers_without_executing_and_rides_the_denial_pair() {
 #[tokio::test]
 async fn tool_failure_becomes_result_text_and_the_segment_completes() {
     let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
+    let _drain = OverrideDrain;
     let world = world();
     let invocations = Arc::new(Mutex::new(Vec::new()));
     let model = ScriptedCompletionModel::new(vec![ScriptedTurn::text(FINAL_TEXT)]);
@@ -2820,6 +2948,7 @@ async fn empty_call_id_on_node_b_refuses_the_whole_segment_before_any_tombstone(
 #[tokio::test]
 async fn same_key_duplicate_calls_execute_once_each_and_a_re_park_removes_both_consumed_ids() {
     let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
+    let _drain = OverrideDrain;
     let world = world();
     let apply_invocations = Arc::new(Mutex::new(Vec::new()));
     let fresh_invocations = Arc::new(Mutex::new(Vec::new()));
@@ -3296,6 +3425,7 @@ async fn awaiting_node_with_an_empty_pending_list_faults_before_any_worker_build
 #[tokio::test]
 async fn pivot_approved_pair_executes_once_each_in_document_order_and_completes() {
     let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
+    let _drain = OverrideDrain;
     let world = world();
     // One shared invocation log across both tools: the entry order over
     // the distinct arguments pins document order.
@@ -3378,6 +3508,7 @@ async fn pivot_approved_pair_executes_once_each_in_document_order_and_completes(
 #[tokio::test]
 async fn pivot_approve_then_deny_executes_only_the_approved_call_and_steers_the_second() {
     let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
+    let _drain = OverrideDrain;
     let world = world();
     let invocations = Arc::new(Mutex::new(Vec::new()));
     let model = ScriptedCompletionModel::new(vec![ScriptedTurn::text(FINAL_TEXT)]);
@@ -3446,6 +3577,7 @@ async fn pivot_approve_then_deny_executes_only_the_approved_call_and_steers_the_
 #[tokio::test]
 async fn pivot_denied_pair_steers_without_executing_and_completes() {
     let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
+    let _drain = OverrideDrain;
     let world = world();
     let invocations = Arc::new(Mutex::new(Vec::new()));
     let model = ScriptedCompletionModel::new(vec![ScriptedTurn::text(FINAL_TEXT)]);
@@ -4167,6 +4299,656 @@ async fn segment_plan_restores_the_checkpoint_goal_not_the_query() {
         republished.query, CHECKPOINT_QUERY,
         "the query field stays the raw query — goal and query are distinct fields"
     );
+}
+
+// ====================================================================
+// Phase A frontier review round 1 (findings 1-3): the pair-retention,
+// failure-history, and wave-ordering repairs on the PARKED arm. The
+// frames pin the re-parked segment's whole turns array (every decided
+// pair consumed in the segment rides it, each node's pairs ahead of
+// that node's own turns; parked wave turns merge by task id) and the
+// re-published checkpoint's failure history (the original plus the
+// drive's newly observed failures). The completed arm's pair-free shape
+// stays pinned by the frames above.
+// ====================================================================
+
+/// A completed node's decided pairs survive a sibling's early re-park
+/// (finding 2): node A completes through its decided call and node B's
+/// continuation re-parks the segment in the drive loop, and the parked
+/// turns carry BOTH nodes' pairs — A's ahead of A's own continuation
+/// turns (document order), B's ahead of B's gated turn — with the fresh
+/// blocking entry naming B's newly gated call.
+#[tokio::test]
+async fn a_completed_nodes_pairs_ride_the_early_re_park() {
+    let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
+    let _drain = OverrideDrain;
+    let world = world();
+    let apply_invocations = Arc::new(Mutex::new(Vec::new()));
+    let scale_invocations = Arc::new(Mutex::new(Vec::new()));
+    let fresh_invocations = Arc::new(Mutex::new(Vec::new()));
+    // Build order: node A first, then node B.
+    install_worker_overrides(vec![
+        WorkerOverride {
+            model: ScriptedCompletionModel::new(vec![
+                ScriptedTurn::tool_calls(vec![ScriptedToolCall::new(
+                    "call_sub_a",
+                    "submit_result",
+                    json!({
+                        "summary": "apply done",
+                        "result": "applied cleanly",
+                        "confidence": "high",
+                    }),
+                )])
+                .with_text(A_DONE),
+            ]),
+            extra_tools: vec![Box::new(
+                RecordingTool::new(apply_invocations.clone()).with_name(TOOL),
+            )],
+        },
+        WorkerOverride {
+            model: ScriptedCompletionModel::new(vec![ScriptedTurn::tool_calls(vec![
+                ScriptedToolCall::new(FRESH_CALL_ID, NEW_TOOL, json!({ "namespace": "stage" }))
+                    .with_call_id(NEW_CALL_ID),
+            ])]),
+            extra_tools: vec![
+                Box::new(RecordingTool::new(scale_invocations.clone()).with_name(TOOL_B)),
+                Box::new(RecordingTool::new(fresh_invocations.clone()).with_name(NEW_TOOL)),
+            ],
+        },
+    ]);
+    register_decided(&world).await;
+    register_decided_b(&world).await;
+    publish_document(&world, &two_node_sentinel_document(&world)).await;
+
+    let grant = evaluate_resume(evaluation(&world, false, None))
+        .await
+        .expect("the all-decided two-node run grants");
+    let segment = run_segment(grant, &world.config, &HashMap::new())
+        .await
+        .expect("node B's continuation re-parks the segment");
+    {
+        let apply_log = apply_invocations.lock().expect("apply invocation log");
+        assert_eq!(
+            apply_log.len(),
+            1,
+            "node A's decided call executes exactly once"
+        );
+        assert_eq!(apply_log[0].arguments, call_args());
+    }
+    {
+        let scale_log = scale_invocations.lock().expect("scale invocation log");
+        assert_eq!(
+            scale_log.len(),
+            1,
+            "node B's decided call executes exactly once"
+        );
+        assert_eq!(scale_log[0].arguments, call_args_b());
+    }
+    {
+        let fresh_log = fresh_invocations.lock().expect("fresh invocation log");
+        assert!(fresh_log.is_empty(), "the newly gated call never executes");
+    }
+    match segment {
+        SegmentResult::Parked { turns, blocking } => {
+            let mut body = json!({
+                "turns": serde_json::to_value(turns.as_slice()).expect("turns serialize"),
+                "blocking":
+                    serde_json::to_value(blocking.as_slice()).expect("blocking serializes"),
+            });
+            normalize_fresh_parking(&mut body);
+            assert_eq!(
+                body,
+                json!({
+                    "turns": [
+                        decided_call_turn(),
+                        decided_result_turn(&echo_tool_result_wire()),
+                        submit_result_turn(A_DONE, "call_sub_a", "apply done", "applied cleanly"),
+                        decided_call_turn_for(CALL_ID_B, TOOL_B, &call_args_b()),
+                        decided_result_turn_for(CALL_ID_B, &echo_tool_result_wire()),
+                        fresh_gated_turn(),
+                    ],
+                    "blocking": [
+                        {
+                            "decision_id": "<fresh decision id>",
+                            "tool": NEW_TOOL,
+                            "expires_at": "<fresh expiry>",
+                        },
+                    ],
+                }),
+                "the parked turns carry BOTH nodes' pairs — A's ahead of A's \
+                 continuation turns, B's ahead of B's gated turn — and the \
+                 fresh blocking entry names B's newly gated call"
+            );
+        }
+        other => panic!("expected a re-parked segment, got {other:?}"),
+    }
+}
+
+/// An early re-park publishes the drive loop's newly observed failures
+/// (finding 1): node A soft-fails its continuation (no submit_result)
+/// and node B re-parks, and the re-published checkpoint's failure
+/// history carries the checkpoint's own history PLUS A's failure, stamped
+/// with the iteration the restored plan executes under — the same
+/// derivation the completion path's collector applies. Resume 2 then
+/// drives B to completion, and A's failure-history entry appears EXACTLY
+/// ONCE in the coordinator's decision context, under the resumed
+/// iteration: never dropped, never re-recorded.
+#[tokio::test]
+async fn an_early_re_park_publishes_the_drive_loops_new_failures() {
+    let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
+    let _drain = OverrideDrain;
+    let world = world();
+    let apply_invocations = Arc::new(Mutex::new(Vec::new()));
+    let scale_invocations = Arc::new(Mutex::new(Vec::new()));
+    let fresh_invocations = Arc::new(Mutex::new(Vec::new()));
+    // Resume 1, build order: node A (soft-fails its continuation), then
+    // node B (its continuation's new gated call re-parks the segment).
+    install_worker_overrides(vec![
+        WorkerOverride {
+            model: ScriptedCompletionModel::new(vec![ScriptedTurn::text(FAILED_TEXT)]),
+            extra_tools: vec![Box::new(
+                RecordingTool::new(apply_invocations.clone()).with_name(TOOL),
+            )],
+        },
+        WorkerOverride {
+            model: ScriptedCompletionModel::new(vec![ScriptedTurn::tool_calls(vec![
+                ScriptedToolCall::new(FRESH_CALL_ID, NEW_TOOL, json!({ "namespace": "stage" }))
+                    .with_call_id(NEW_CALL_ID),
+            ])]),
+            extra_tools: vec![
+                Box::new(RecordingTool::new(scale_invocations.clone()).with_name(TOOL_B)),
+                Box::new(RecordingTool::new(fresh_invocations.clone()).with_name(NEW_TOOL)),
+            ],
+        },
+    ]);
+    register_decided(&world).await;
+    register_decided_b(&world).await;
+    publish_document(&world, &two_node_sentinel_document(&world)).await;
+
+    let grant = evaluate_resume(evaluation(&world, false, None))
+        .await
+        .expect("the all-decided two-node run grants");
+    let segment = run_segment(grant, &world.config, &HashMap::new())
+        .await
+        .expect("node B's continuation re-parks the segment");
+    let blocking = match segment {
+        SegmentResult::Parked { blocking, .. } => blocking,
+        other => panic!("expected a re-parked segment, got {other:?}"),
+    };
+    let fresh: Vec<_> = blocking
+        .as_slice()
+        .iter()
+        .filter(|entry| entry.tool.as_ref() == NEW_TOOL)
+        .collect();
+    assert_eq!(
+        fresh.len(),
+        1,
+        "exactly one fresh blocking entry: {blocking:?}"
+    );
+    let fresh_decision = fresh[0].decision_id;
+
+    // The published history: the checkpoint's own (empty) plus A's
+    // soft failure, under the resumed iteration — the iteration the
+    // restored plan executes under, matching the completion path's
+    // stamp for the same transition.
+    let republished = load_parked_run(&parked_document_path(&world))
+        .await
+        .expect("the re-park re-published the checkpoint under the parked name");
+    assert_eq!(
+        republished.failure_history.len(),
+        1,
+        "the published history carries exactly the drive's one new failure"
+    );
+    let record = &republished.failure_history[0];
+    assert_eq!(record.description, "Gated apply");
+    assert_eq!(record.error, FAILED_TEXT);
+    assert_eq!(record.iteration, 2);
+    assert_eq!(record.worker.as_deref(), Some("operations"));
+    assert_eq!(record.category, FailureCategory::SoftFailure);
+    let node_a = republished
+        .plan
+        .tasks
+        .iter()
+        .find(|node| node.task_id == 3)
+        .expect("the published plan carries node A");
+    assert!(
+        node_a.status == TaskStatus::Failed,
+        "node A landed in the loop's soft-failure shape: {:?}",
+        node_a.status
+    );
+    assert_eq!(node_a.error.as_deref(), Some(FAILED_TEXT));
+    assert_eq!(node_a.failure_category, Some(FailureCategory::SoftFailure));
+
+    // Resume 2: approve the fresh call, drive node B to completion, and
+    // read the coordinator's decision context — A's entry rides exactly
+    // once, under the resumed iteration.
+    world
+        .registry
+        .resolve(&fresh_decision, ApprovalDecision::Approved.into())
+        .await
+        .expect("record the fresh approval");
+    install_worker_overrides(vec![WorkerOverride {
+        model: ScriptedCompletionModel::new(vec![
+            ScriptedTurn::tool_calls(vec![ScriptedToolCall::new(
+                "call_sub_b",
+                "submit_result",
+                json!({
+                    "summary": "scale done",
+                    "result": "scaled cleanly",
+                    "confidence": "high",
+                }),
+            )])
+            .with_text(B_DONE),
+        ]),
+        extra_tools: vec![Box::new(
+            RecordingTool::new(fresh_invocations.clone()).with_name(NEW_TOOL),
+        )],
+    }]);
+    let coordinator = ScriptedCompletionModel::new(vec![coordinator_direct_turn()]);
+    let coordinator_requests = coordinator.requests();
+    install_coordinator_overrides(vec![CoordinatorOverride { model: coordinator }]);
+
+    let grant = evaluate_resume(evaluation(&world, false, None))
+        .await
+        .expect("the re-published checkpoint grants the second resume");
+    let segment = run_segment(grant, &world.config, &HashMap::new())
+        .await
+        .expect("the second segment completes");
+    assert!(
+        matches!(segment, SegmentResult::Completed { .. }),
+        "the second segment completes: {segment:?}"
+    );
+    {
+        let fresh_log = fresh_invocations.lock().expect("fresh invocation log");
+        assert_eq!(fresh_log.len(), 1, "the fresh call executes exactly once");
+        assert_eq!(fresh_log[0].arguments, json!({ "namespace": "stage" }));
+    }
+    let recorded = coordinator_requests
+        .lock()
+        .expect("coordinator request log")
+        .clone();
+    assert_eq!(
+        recorded.len(),
+        1,
+        "the resumed loop makes exactly one continuation call"
+    );
+    let prompt = continuation_prompt(&recorded[0]);
+    let resumed_line = format!(
+        "- Iteration 2: \"Gated apply\" (worker: operations) — [soft_failure] {FAILED_TEXT}"
+    );
+    assert_eq!(
+        prompt.matches(&resumed_line).count(),
+        1,
+        "A's failure-history entry appears EXACTLY once, under the resumed \
+         iteration: {prompt}"
+    );
+    assert!(
+        !prompt.contains("- Iteration 1: \"Gated apply\""),
+        "A's failure is never recorded under the parked iteration: {prompt}"
+    );
+    assert!(
+        prompt.contains(&format!(
+            "- Task 3: Gated apply → failed [soft_failure]: {FAILED_TEXT}"
+        )),
+        "node A stays visible to the decision context as failed plan state: {prompt}"
+    );
+    assert!(
+        prompt.contains("- Task 4: Gated scale (confidence: high)"),
+        "node B completed through the loop's success semantics: {prompt}"
+    );
+}
+
+/// A completed awaiting node's decided pairs ride a LOOP re-park too
+/// (finding 2): node A completes through its decided call, the
+/// continuation drives a never-started sibling whose gated call
+/// re-parks the resumed run, and the parked turns carry A's pair ahead
+/// of A's own continuation turns, then the sibling's gated turn.
+#[tokio::test]
+async fn a_completed_nodes_pairs_ride_the_loop_re_park() {
+    let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
+    let _drain = OverrideDrain;
+    let world = world();
+    let apply_invocations = Arc::new(Mutex::new(Vec::new()));
+    let fresh_invocations = Arc::new(Mutex::new(Vec::new()));
+    // Build order: node A first (the drive loop), then the sibling's (a
+    // build only the resumed coordinator loop can make).
+    install_worker_overrides(vec![
+        WorkerOverride {
+            model: ScriptedCompletionModel::new(vec![
+                ScriptedTurn::tool_calls(vec![ScriptedToolCall::new(
+                    "call_sub_a",
+                    "submit_result",
+                    json!({
+                        "summary": "apply done",
+                        "result": "applied cleanly",
+                        "confidence": "high",
+                    }),
+                )])
+                .with_text(A_DONE),
+            ]),
+            extra_tools: vec![Box::new(
+                RecordingTool::new(apply_invocations.clone()).with_name(TOOL),
+            )],
+        },
+        WorkerOverride {
+            model: ScriptedCompletionModel::new(vec![ScriptedTurn::tool_calls(vec![
+                ScriptedToolCall::new(FRESH_CALL_ID, NEW_TOOL, json!({ "namespace": "stage" }))
+                    .with_call_id(NEW_CALL_ID),
+            ])]),
+            extra_tools: vec![Box::new(
+                RecordingTool::new(fresh_invocations.clone()).with_name(NEW_TOOL),
+            )],
+        },
+    ]);
+    // The continuation builds its coordinator before the loop; the park
+    // path skips the coordinator call, so the script is never consumed
+    // by a request.
+    install_coordinator_overrides(vec![CoordinatorOverride {
+        model: ScriptedCompletionModel::new(vec![coordinator_direct_turn()]),
+    }]);
+    register_decided(&world).await;
+    publish_document(&world, &sibling_parks_document(&world)).await;
+
+    let grant = evaluate_resume(evaluation(&world, false, None))
+        .await
+        .expect("the all-decided run grants");
+    let segment = run_segment(grant, &world.config, &HashMap::new())
+        .await
+        .expect("the sibling's gated call re-parks the resumed run");
+    {
+        let apply_log = apply_invocations.lock().expect("apply invocation log");
+        assert_eq!(
+            apply_log.len(),
+            1,
+            "node A's decided call executes exactly once"
+        );
+    }
+    {
+        let fresh_log = fresh_invocations.lock().expect("fresh invocation log");
+        assert!(
+            fresh_log.is_empty(),
+            "the sibling's gated call never executes"
+        );
+    }
+    match segment {
+        SegmentResult::Parked { turns, blocking } => {
+            let mut body = json!({
+                "turns": serde_json::to_value(turns.as_slice()).expect("turns serialize"),
+                "blocking":
+                    serde_json::to_value(blocking.as_slice()).expect("blocking serializes"),
+            });
+            normalize_fresh_parking(&mut body);
+            assert_eq!(
+                body,
+                json!({
+                    "turns": [
+                        decided_call_turn(),
+                        decided_result_turn(&echo_tool_result_wire()),
+                        submit_result_turn(A_DONE, "call_sub_a", "apply done", "applied cleanly"),
+                        fresh_gated_turn(),
+                    ],
+                    "blocking": [
+                        {
+                            "decision_id": "<fresh decision id>",
+                            "tool": NEW_TOOL,
+                            "expires_at": "<fresh expiry>",
+                        },
+                    ],
+                }),
+                "the parked turns carry A's pair ahead of A's continuation \
+                 turns, then the parking sibling's gated turn"
+            );
+        }
+        other => panic!("expected a re-parked segment, got {other:?}"),
+    }
+}
+
+/// A parked sibling's snapshot turns join their ORIGINATING wave's
+/// task-id merge (finding 3): in a wave where task 0 parks and task 1
+/// completes, task 0's gated turn precedes task 1's completion turn —
+/// the parked turns keep their wave position instead of trailing every
+/// completed turn of every wave. The sibling nodes sit in the plan in
+/// REVERSE id order, so the pin exercises the merge's task-id sort, not
+/// the workers' build order. Node A's pair and turns ride ahead of the
+/// wave (A completed in the drive loop).
+#[tokio::test]
+async fn parked_wave_turns_merge_into_their_wave_by_task_id() {
+    let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
+    let _drain = OverrideDrain;
+    let world = world();
+    let apply_invocations = Arc::new(Mutex::new(Vec::new()));
+    let fresh_invocations = Arc::new(Mutex::new(Vec::new()));
+    // Build order: node A (drive loop), then the wave's tasks in plan
+    // order — the completing sibling (task 1) ahead of the parking one
+    // (task 0), reverse of the id merge the frame pins.
+    install_worker_overrides(vec![
+        WorkerOverride {
+            model: ScriptedCompletionModel::new(vec![
+                ScriptedTurn::tool_calls(vec![ScriptedToolCall::new(
+                    "call_sub_a",
+                    "submit_result",
+                    json!({
+                        "summary": "apply done",
+                        "result": "applied cleanly",
+                        "confidence": "high",
+                    }),
+                )])
+                .with_text(A_DONE),
+            ]),
+            extra_tools: vec![Box::new(
+                RecordingTool::new(apply_invocations.clone()).with_name(TOOL),
+            )],
+        },
+        WorkerOverride {
+            model: ScriptedCompletionModel::new(vec![
+                ScriptedTurn::tool_calls(vec![ScriptedToolCall::new(
+                    "call_sub_w",
+                    "submit_result",
+                    json!({
+                        "summary": "checks done",
+                        "result": "checks passed",
+                        "confidence": "high",
+                    }),
+                )])
+                .with_text(WAVE_SIBLING_DONE),
+            ]),
+            extra_tools: vec![],
+        },
+        WorkerOverride {
+            model: ScriptedCompletionModel::new(vec![ScriptedTurn::tool_calls(vec![
+                ScriptedToolCall::new(FRESH_CALL_ID, NEW_TOOL, json!({ "namespace": "stage" }))
+                    .with_call_id(NEW_CALL_ID),
+            ])]),
+            extra_tools: vec![Box::new(
+                RecordingTool::new(fresh_invocations.clone()).with_name(NEW_TOOL),
+            )],
+        },
+    ]);
+    install_coordinator_overrides(vec![CoordinatorOverride {
+        model: ScriptedCompletionModel::new(vec![coordinator_direct_turn()]),
+    }]);
+    register_decided(&world).await;
+    publish_document(&world, &sibling_wave_document(&world)).await;
+
+    let grant = evaluate_resume(evaluation(&world, false, None))
+        .await
+        .expect("the all-decided run grants");
+    let segment = run_segment(grant, &world.config, &HashMap::new())
+        .await
+        .expect("the parking sibling re-parks the resumed run");
+    {
+        let fresh_log = fresh_invocations.lock().expect("fresh invocation log");
+        assert!(
+            fresh_log.is_empty(),
+            "the parked sibling's gated call never executes"
+        );
+    }
+    match segment {
+        SegmentResult::Parked { turns, blocking } => {
+            let mut body = json!({
+                "turns": serde_json::to_value(turns.as_slice()).expect("turns serialize"),
+                "blocking":
+                    serde_json::to_value(blocking.as_slice()).expect("blocking serializes"),
+            });
+            normalize_fresh_parking(&mut body);
+            assert_eq!(
+                body,
+                json!({
+                    "turns": [
+                        decided_call_turn(),
+                        decided_result_turn(&echo_tool_result_wire()),
+                        submit_result_turn(A_DONE, "call_sub_a", "apply done", "applied cleanly"),
+                        fresh_gated_turn(),
+                        submit_result_turn(
+                            WAVE_SIBLING_DONE,
+                            "call_sub_w",
+                            "checks done",
+                            "checks passed",
+                        ),
+                    ],
+                    "blocking": [
+                        {
+                            "decision_id": "<fresh decision id>",
+                            "tool": NEW_TOOL,
+                            "expires_at": "<fresh expiry>",
+                        },
+                    ],
+                }),
+                "the parked sibling's gated turn precedes the higher-id \
+                 completing sibling's turn — the parked turns joined their \
+                 wave's task-id merge, and node A's pair rides ahead of the \
+                 wave"
+            );
+        }
+        other => panic!("expected a re-parked segment, got {other:?}"),
+    }
+}
+
+/// A later runnable wave stays AFTER the earlier wave's parked turns
+/// (finding 3): task 2, dependent on the completing task 1, forms the
+/// second wave once task 1 lands, and its turn rides after the whole
+/// mixed first wave — the parked task 0's turns included.
+#[tokio::test]
+async fn a_followup_wave_stays_after_the_earlier_waves_parked_turns() {
+    let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
+    let _drain = OverrideDrain;
+    let world = world();
+    let apply_invocations = Arc::new(Mutex::new(Vec::new()));
+    let fresh_invocations = Arc::new(Mutex::new(Vec::new()));
+    install_worker_overrides(vec![
+        WorkerOverride {
+            model: ScriptedCompletionModel::new(vec![
+                ScriptedTurn::tool_calls(vec![ScriptedToolCall::new(
+                    "call_sub_a",
+                    "submit_result",
+                    json!({
+                        "summary": "apply done",
+                        "result": "applied cleanly",
+                        "confidence": "high",
+                    }),
+                )])
+                .with_text(A_DONE),
+            ]),
+            extra_tools: vec![Box::new(
+                RecordingTool::new(apply_invocations.clone()).with_name(TOOL),
+            )],
+        },
+        WorkerOverride {
+            model: ScriptedCompletionModel::new(vec![
+                ScriptedTurn::tool_calls(vec![ScriptedToolCall::new(
+                    "call_sub_w",
+                    "submit_result",
+                    json!({
+                        "summary": "checks done",
+                        "result": "checks passed",
+                        "confidence": "high",
+                    }),
+                )])
+                .with_text(WAVE_SIBLING_DONE),
+            ]),
+            extra_tools: vec![],
+        },
+        WorkerOverride {
+            model: ScriptedCompletionModel::new(vec![ScriptedTurn::tool_calls(vec![
+                ScriptedToolCall::new(FRESH_CALL_ID, NEW_TOOL, json!({ "namespace": "stage" }))
+                    .with_call_id(NEW_CALL_ID),
+            ])]),
+            extra_tools: vec![Box::new(
+                RecordingTool::new(fresh_invocations.clone()).with_name(NEW_TOOL),
+            )],
+        },
+        WorkerOverride {
+            model: ScriptedCompletionModel::new(vec![
+                ScriptedTurn::tool_calls(vec![ScriptedToolCall::new(
+                    "call_sub_f",
+                    "submit_result",
+                    json!({
+                        "summary": "follow-up done",
+                        "result": "follow-up verified",
+                        "confidence": "high",
+                    }),
+                )])
+                .with_text(FOLLOWUP_DONE),
+            ]),
+            extra_tools: vec![],
+        },
+    ]);
+    install_coordinator_overrides(vec![CoordinatorOverride {
+        model: ScriptedCompletionModel::new(vec![coordinator_direct_turn()]),
+    }]);
+    register_decided(&world).await;
+    publish_document(&world, &sibling_followup_wave_document(&world)).await;
+
+    let grant = evaluate_resume(evaluation(&world, false, None))
+        .await
+        .expect("the all-decided run grants");
+    let segment = run_segment(grant, &world.config, &HashMap::new())
+        .await
+        .expect("the parking sibling re-parks the resumed run after the follow-up wave");
+    match segment {
+        SegmentResult::Parked { turns, blocking } => {
+            let mut body = json!({
+                "turns": serde_json::to_value(turns.as_slice()).expect("turns serialize"),
+                "blocking":
+                    serde_json::to_value(blocking.as_slice()).expect("blocking serializes"),
+            });
+            normalize_fresh_parking(&mut body);
+            assert_eq!(
+                body,
+                json!({
+                    "turns": [
+                        decided_call_turn(),
+                        decided_result_turn(&echo_tool_result_wire()),
+                        submit_result_turn(A_DONE, "call_sub_a", "apply done", "applied cleanly"),
+                        fresh_gated_turn(),
+                        submit_result_turn(
+                            WAVE_SIBLING_DONE,
+                            "call_sub_w",
+                            "checks done",
+                            "checks passed",
+                        ),
+                        submit_result_turn(
+                            FOLLOWUP_DONE,
+                            "call_sub_f",
+                            "follow-up done",
+                            "follow-up verified",
+                        ),
+                    ],
+                    "blocking": [
+                        {
+                            "decision_id": "<fresh decision id>",
+                            "tool": NEW_TOOL,
+                            "expires_at": "<fresh expiry>",
+                        },
+                    ],
+                }),
+                "the follow-up wave's turn rides after the whole mixed first \
+                 wave — the parked task 0's gated turn included, not after \
+                 it in append order"
+            );
+        }
+        other => panic!("expected a re-parked segment, got {other:?}"),
+    }
 }
 
 /// The wire serializers the golden literals embed, calibrated against the
