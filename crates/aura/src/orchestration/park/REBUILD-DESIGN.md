@@ -57,7 +57,7 @@ invocation can be half-spent.
 | `ValidatedCall` | One bundle member is the checkpoint's own record (decision, tool, arguments) with the id and tool name validated | A member whose id was never checked; an empty tool name reaching synthesis |
 | `ValidatedCalls` | The per-node call side: ordered in document order, non-empty, ids unique, tool names non-empty; a transition state consumed by `resolve` | A bundle for a node that never parked calls; same-node duplicate ids; a cloned transition state resolving twice |
 | `NodePreflightInput` | One node's preflight input pairs its call list with its own prompt | A prompt attributed to another node's calls |
-| `ToolResultPrompt` | The prompt witness: the snapshot prompt validated as the tool-result user message — the only shape the rebuild can carry outcomes in — validated at preflight, where it is knowable before any tombstone or invocation | A non-tool-result prompt reaching the builder; the shape check hiding inside the builder as a runtime failure |
+| `ToolResultPrompt` | The prompt witness: the snapshot prompt validated as the tool-result user message — a `User` message carrying at least one tool result, the only shape the rebuild can carry outcomes in — validated at preflight, where it is knowable before any tombstone or invocation | A non-tool-result prompt reaching the builder — an assistant prompt, or a user prompt with no tool result at all; the shape check hiding inside the builder as a runtime failure |
 | `ValidatedNode` | The per-node half: validated calls plus the prompt witness, built only when every node validated | A half surviving another node's refusal |
 | `SegmentPreflight` | The segment-level door: every awaiting node validated together, or nothing | A bundle existing for node A while node B's invalid input has not surfaced — the per-node preflight's hazard |
 | `ResolvedCall` | Pairing by identity: each call travels with the outcome keyed to its own id — resolution pairs, callers cannot | A call and an outcome pairing in the wrong order; parallel-list mispairing |
@@ -88,6 +88,20 @@ scoping of the rebuild invariant to bundle-keyed results was chosen
 instead). The binding condition on stage 4's mechanism spec stands:
 keep `current_prompt` a tool-result user message, or the preflight
 refuses — loudly, before any invocation.
+
+**Gate A tightening (the first fix round's blocking finding):** the
+witness check is not merely the `User` variant — a `User` message
+carrying NO tool result at all also refuses
+(`PreflightError::NotAToolResultPrompt`). Rationale: the live park
+ALWAYS writes the gate-tripping call's sentinel tool result, so a
+tool-result-less `current_prompt` is a checkpoint no producer writes —
+refusing it at the preflight, before any tombstone or invocation, is
+the honest row, and it is the same condition the binding rule above
+places on the stage-4 producer. A `User` prompt mixing text and tool
+results passes, and the builder preserves the text item verbatim (the
+verbatim-extras rule; the
+`mixed_text_and_tool_result_prompt_passes_and_the_text_rides_verbatim`
+frame pins it).
 
 ## Stage 2b frame obligations (from the repair round)
 
@@ -121,7 +135,9 @@ refuses — loudly, before any invocation.
   so it accepts today's sentinel-slot snapshots AND the stage 4
   producer's control-boundary snapshots. The binding condition: stage
   4's mechanism spec must keep `current_prompt` a tool-result user
-  message, or the preflight refuses (`NotAToolResultPrompt`) — loudly,
+  message — carrying at least one tool result, which the Gate-A
+  witness now enforces: a tool-result-less user prompt refuses too —
+  or the preflight refuses (`NotAToolResultPrompt`) — loudly,
   and since the hoist, before any tombstone or invocation.
 - **The provider-ordering assumption (ruled risk).** Every provider the
   chain speaks requires a tool result to FOLLOW its own assistant tool
@@ -215,18 +231,22 @@ messages — whole-context pins, not substring probes.
 | `two_slot_shape_replaces_both_slots_in_place_and_keeps_the_history_byte_identical` | FRAME 2: both sentinel slots replaced in place; reused captured calls never move; history byte-identical; nothing synthesized |
 | `every_rebuilt_tool_result_is_preceded_by_its_own_call_and_answers_once` | FRAME 3, the pairing invariant over both shapes: every tool result preceded by an assistant call keyed to the same id; ids issued once, answered exactly once |
 | `three_call_pivot_groups_both_missing_calls_into_one_appended_turn_in_document_order` | FRAME 4, the panel's one-turn-synthesis obligation (S2-5): N>1 missing calls land in ONE appended assistant turn, in document order |
-| `extras_outside_the_bundle_ride_verbatim_in_history_and_prompt` | FRAME 5, the extras trust boundary (S2-3): a prior resume's paired call+result rides the history byte-preserved; a non-bundle prompt result keeps the snapshot's position and bytes |
+| `extras_outside_the_bundle_ride_verbatim_in_history_and_prompt` | FRAME 5, the extras trust boundary (S2-3), asserted per Gate A over ONE rebuild carrying BOTH extra kinds: the whole rebuilt context (history and prompt together, one assertion) — the prior resume's paired call+result rides the history byte-preserved; a non-bundle prompt result keeps the snapshot's position and bytes |
 | `empty_call_id_refuses_the_segment_preflight` | FRAME 6a: `PreflightError::EmptyCallId`, wording pinned (`awaiting node 0: pending call member 0 carries an empty call id`) |
 | `empty_tool_name_refuses_the_segment_preflight` | FRAME 6b: `PreflightError::EmptyToolName`, wording pinned — the S1-4 synthesis-surface closure |
 | `duplicate_call_ids_refuse_the_segment_preflight` | FRAME 6c: `PreflightError::DuplicateCallId`, wording pinned (`awaiting node 0: two pending calls share the call id call_apply_1`) |
-| `empty_pending_list_refuses_the_segment_preflight` | FRAME 6d: `PreflightError::EmptyCalls` (unreachable in the wired flow; the bundle's non-empty guarantee is structural) |
-| `assistant_prompt_refuses_the_segment_preflight` | FRAME 6e: `PreflightError::NotAToolResultPrompt` — the S2-1 hoist, before any tombstone or invocation |
+| `empty_pending_list_refuses_the_segment_preflight` | FRAME 6d: `PreflightError::EmptyCalls`, wording pinned node-attributed (`awaiting node 0: the pending call list parsed to no calls`) — unreachable in the wired flow; the bundle's non-empty guarantee is structural |
+| `assistant_prompt_refuses_the_segment_preflight` | FRAME 6e: `PreflightError::NotAToolResultPrompt` — the S2-1 hoist, before any tombstone or invocation; wording pinned node-attributed |
 | `one_nodes_invalid_input_refuses_the_whole_segment_at_the_door` | FRAME 7, the segment door's all-or-nothing property (S2-2): node B's fault refuses the whole segment though node A alone validates; the diagnostic names the node (`awaiting node 1: …`) |
 | `out_of_order_outcomes_still_pair_by_id` | FRAME 8a: keyed pairing (S1-1) — outcomes out of order still pair by identity; the bundle keeps document order |
 | `outcome_keyed_outside_the_bundle_refuses` | FRAME 8b: `ResolveError::UnknownOutcomeId`, wording pinned |
 | `duplicate_outcome_keys_refuse` | FRAME 8c: `ResolveError::DuplicateOutcomeId`, wording pinned |
 | `call_left_without_its_outcome_refuses` | FRAME 8d: `ResolveError::MissingOutcome`, wording pinned (names the abandoned call and its tool) |
 | `rebuilt_context_survives_the_rig_message_serialization_round_trip` | FRAME 9: provider-bound wire acceptance at the reachable seam — every rebuilt message JSON round-trips identical, sentinel-free (see the exclusion row) |
+| `a_non_sentinel_slot_for_a_bundle_id_is_replaced_by_id_and_its_old_text_gone` | GATE A (blocking): id-only replacement — a slot carrying NON-sentinel content (a stale real result) is replaced by call id, the old text gone; an implementation keying on sentinel text fails here |
+| `duplicate_slots_for_one_bundle_id_collapse_to_one_replaced_result_at_the_first_slot` | GATE A (blocking): duplicate-slot collapse — the first slot for one bundle id is replaced with its wire where it sat, the later duplicate is collapsed out, exactly one result per id survives |
+| `text_only_user_prompt_refuses_the_segment_preflight` | GATE A (blocking): the tightened witness — a User prompt with NO tool result (the pre-A1 bare-text shape) refuses `NotAToolResultPrompt`, node-attributed |
+| `mixed_text_and_tool_result_prompt_passes_and_the_text_rides_verbatim` | GATE A (blocking): the tightened witness's accepting edge — a User prompt mixing text and a tool result passes, and the builder preserves the text item verbatim |
 
 ### Exclusions
 
@@ -236,3 +256,33 @@ messages — whole-context pins, not substring probes.
 | Reverse-capture builder shape (a later bundle call captured while an earlier one is missed) | Unreachable from both producers: calls issue in turn order, and the snapshot captures a completion's assistant turn all-or-nothing, so a missed call is always later in document order than a captured one — replace-in-place plus append therefore always yields bundle document order. Pinned by construction reasoning, not a frame. | The stage-4 producer's mechanism spec carries the binding condition |
 | The three Stage-1 pivot goldens stay red (`pivot_approved_pair…`, `pivot_approve_then_deny…`, `pivot_denied_pair…`, all on `call_scale_2`) | By design: they pin the WIRED substitution, which stage 3's prelude rework delivers; stage 2b fills and frames the builder only. Post-2b full-lib suite: 1299 passed (1283 + 16 frames), exactly these 3 red. | P45 stage 3 flips them |
 | `#![allow(dead_code)]` on the module; `#[allow(unused_imports)]` on the park/mod.rs re-export | Survivors by design: the module stays unwired until stage 3 points the substitution prelude at it. | P45 stage 3 sweeps both at wiring |
+
+### Gate A fix round (first review)
+
+Reviewer verdict FAIL, 2 BLOCKING + 2 MINOR; all four accepted and
+repaired. (1) BLOCKING — the witness now requires the `User` message to
+carry at least one tool result (the tightening recorded in the
+prompt-shape section; a tool-result-less prompt is a checkpoint no
+producer writes). (2) BLOCKING — two new pin frames close the
+id-only-replacement and duplicate-slot-collapse coverage gaps; the
+builder's behavior was already correct, the coverage was not. (3)
+MINOR — the preserve-extras frame now asserts the whole rebuilt context
+(history and prompt together) over ONE rebuild carrying both extra
+kinds. (4) MINOR — uniform node attribution: every preflight fault,
+`EmptyCalls` and `NotAToolResultPrompt` included, is re-diagnosed at
+the segment door with `awaiting node {n}: ...`. To make the
+attribution expressible, those two variants were completed to carry
+`Diagnostic` payloads — variant names and refusal kinds unchanged: no
+unit variant can carry the attributed wording the frames pin through
+`refusal.to_string()`, and nothing outside this module matches on them
+(the module stays unwired until stage 3).
+
+### Stage-3 obligation (from Gate A)
+
+When the prelude wires this module, fixtures that drive segments with
+bare-text prompts — `parked_document`'s `Message::user("tool
+results")` shape, staged by the failing-tombstone and replace-miss
+frames — must be made faithful (a sentinel prompt) or re-rowed,
+because the tightened preflight refuses them first. The refusal is the
+designed behavior for a checkpoint no producer writes; the fixtures,
+not the witness, carry that fix.

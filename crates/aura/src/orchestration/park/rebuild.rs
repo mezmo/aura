@@ -168,7 +168,9 @@ impl ValidatedCalls {
     /// share (id-keyed pairing would be ambiguous).
     fn try_new(calls: &[PendingCall]) -> Result<Self, PreflightError> {
         if calls.is_empty() {
-            return Err(PreflightError::EmptyCalls);
+            return Err(PreflightError::EmptyCalls(Diagnostic::new(
+                "the pending call list parsed to no calls",
+            )));
         }
         if let Some((member, _)) = calls
             .iter()
@@ -268,24 +270,42 @@ impl ValidatedCalls {
 }
 
 /// The tool-result-prompt witness: a snapshot prompt validated to be
-/// the user message that carries tool results — the only shape both
-/// park producers write, and the only one [`rebuild_context`] can
-/// carry outcomes in. Constructed fallibly at PREFLIGHT, where the
-/// shape is knowable before any tombstone or invocation; the builder
-/// requires the witness, so it is total.
+/// the user message that carries tool results — a `User` message with
+/// at least one tool-result item — the only shape both park producers
+/// write, and the only one [`rebuild_context`] can carry outcomes in.
+/// Constructed fallibly at PREFLIGHT, where the shape is knowable
+/// before any tombstone or invocation; the builder requires the
+/// witness, so it is total.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ToolResultPrompt(Message);
 
 impl ToolResultPrompt {
-    /// Validate a snapshot prompt as the tool-result user message. The
-    /// refusal, [`PreflightError::NotAToolResultPrompt`], is reachable
-    /// only through a malformed checkpoint document, and fires before
-    /// any tombstone or invocation — never inside the builder, and
-    /// never as a silent restructuring of the turn boundary.
+    /// Validate a snapshot prompt as the tool-result user message: a
+    /// `User` message carrying at least one tool result. Both
+    /// refusals — an assistant prompt, and a user prompt with no tool
+    /// result at all — are shapes no producer writes: the live park
+    /// always stamps the gate-tripping call's sentinel, so a
+    /// tool-result-less `current_prompt` is a checkpoint no producer
+    /// produces. The refusal,
+    /// [`PreflightError::NotAToolResultPrompt`], is reachable only
+    /// through a malformed checkpoint document, and fires before any
+    /// tombstone or invocation — never inside the builder, and never
+    /// as a silent restructuring of the turn boundary.
     pub(crate) fn try_new(prompt: &Message) -> Result<Self, PreflightError> {
         match prompt {
-            Message::User { .. } => Ok(Self(prompt.clone())),
-            Message::Assistant { .. } => Err(PreflightError::NotAToolResultPrompt),
+            Message::User { content }
+                if content
+                    .iter()
+                    .any(|item| matches!(item, rig::message::UserContent::ToolResult(_))) =>
+            {
+                Ok(Self(prompt.clone()))
+            }
+            Message::User { .. } | Message::Assistant { .. } => {
+                Err(PreflightError::NotAToolResultPrompt(Diagnostic::new(
+                    "the parked snapshot's current prompt is not the tool-result message \
+                     the park producers write",
+                )))
+            }
         }
     }
 }
@@ -366,21 +386,10 @@ impl SegmentPreflight {
     pub(crate) fn try_new(nodes: &[NodePreflightInput<'_>]) -> Result<Self, PreflightError> {
         let mut validated = Vec::with_capacity(nodes.len());
         for (node, input) in nodes.iter().enumerate() {
-            let calls = ValidatedCalls::try_new(input.calls).map_err(|fault| match fault {
-                PreflightError::EmptyCallId(detail) => PreflightError::EmptyCallId(
-                    Diagnostic::new(format!("awaiting node {node}: {detail}")),
-                ),
-                PreflightError::DuplicateCallId(detail) => PreflightError::DuplicateCallId(
-                    Diagnostic::new(format!("awaiting node {node}: {detail}")),
-                ),
-                PreflightError::EmptyToolName(detail) => PreflightError::EmptyToolName(
-                    Diagnostic::new(format!("awaiting node {node}: {detail}")),
-                ),
-                fault @ (PreflightError::EmptyCalls | PreflightError::NotAToolResultPrompt) => {
-                    fault
-                }
-            })?;
-            let prompt = ToolResultPrompt::try_new(input.prompt)?;
+            let calls =
+                ValidatedCalls::try_new(input.calls).map_err(|fault| fault.named_to_node(node))?;
+            let prompt = ToolResultPrompt::try_new(input.prompt)
+                .map_err(|fault| fault.named_to_node(node))?;
             validated.push(ValidatedNode { calls, prompt });
         }
         Ok(Self { nodes: validated })
@@ -399,16 +408,18 @@ impl SegmentPreflight {
     }
 }
 
-/// Why the segment preflight refused. Payloads are [`Diagnostic`]s —
-/// human text no caller branches on; the preflight's consumer renders
-/// them into its fatal fault, and the stage-2b frames pin the wordings.
+/// Why the segment preflight refused. Every variant carries one
+/// [`Diagnostic`] — human text no caller branches on; the preflight's
+/// consumer renders them into its fatal fault, and the stage-2b frames
+/// pin the wordings.
 #[derive(Debug, Clone)]
 pub(crate) enum PreflightError {
-    /// A node's call list parsed to no members. Unreachable in the
-    /// wired flow — the seeding loop faults an awaiting node with an
-    /// absent or empty pending list before the preflight runs — kept so
-    /// the bundle types cannot be empty.
-    EmptyCalls,
+    /// A node's call list parsed to no members. The diagnostic is
+    /// named to its node at the segment door; no caller branches on the
+    /// text. Unreachable in the wired flow — the seeding loop faults an
+    /// awaiting node with an absent or empty pending list before the
+    /// preflight runs — kept so the bundle types cannot be empty.
+    EmptyCalls(Diagnostic),
     /// A member carries an empty call id: the shape the gate's park arm
     /// records when the stream hook observed no tool-call id. The
     /// diagnostic names the member; no caller branches on it.
@@ -423,25 +434,41 @@ pub(crate) enum PreflightError {
     /// diagnostic names the member; no caller branches on it.
     EmptyToolName(Diagnostic),
     /// A node's snapshot prompt is not the tool-result user message
-    /// both park producers write — reachable only through a malformed
-    /// checkpoint document. Refused at the preflight, before any
+    /// both park producers write: an assistant prompt, or a user prompt
+    /// carrying no tool result at all — the live park always stamps the
+    /// gate-tripping call's sentinel, so a tool-result-less
+    /// `current_prompt` is a checkpoint no producer writes. The
+    /// diagnostic is named to its node at the segment door; no caller
+    /// branches on the text. Reachable only through a malformed
+    /// checkpoint document; refused at the preflight, before any
     /// tombstone or invocation, never restructured inside the builder.
-    NotAToolResultPrompt,
+    NotAToolResultPrompt(Diagnostic),
 }
 
 impl fmt::Display for PreflightError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::EmptyCalls => {
-                f.write_str("the awaiting node's pending call list parsed to no calls")
-            }
-            Self::EmptyCallId(detail)
+            Self::EmptyCalls(detail)
+            | Self::EmptyCallId(detail)
             | Self::DuplicateCallId(detail)
-            | Self::EmptyToolName(detail) => write!(f, "{detail}"),
-            Self::NotAToolResultPrompt => f.write_str(
-                "the parked snapshot's current prompt is not the tool-result message \
-                 the park producers write",
-            ),
+            | Self::EmptyToolName(detail)
+            | Self::NotAToolResultPrompt(detail) => write!(f, "{detail}"),
+        }
+    }
+}
+
+impl PreflightError {
+    /// Name a per-node fault to its node: the segment door validates
+    /// every awaiting node together, so a diagnostic a caller renders
+    /// must say which node refused. Private: only the door re-diagnoses.
+    fn named_to_node(self, node: usize) -> Self {
+        let named = |detail: Diagnostic| Diagnostic::new(format!("awaiting node {node}: {detail}"));
+        match self {
+            Self::EmptyCalls(detail) => Self::EmptyCalls(named(detail)),
+            Self::EmptyCallId(detail) => Self::EmptyCallId(named(detail)),
+            Self::DuplicateCallId(detail) => Self::DuplicateCallId(named(detail)),
+            Self::EmptyToolName(detail) => Self::EmptyToolName(named(detail)),
+            Self::NotAToolResultPrompt(detail) => Self::NotAToolResultPrompt(named(detail)),
         }
     }
 }
@@ -840,6 +867,14 @@ mod tests {
         }
     }
 
+    /// A user text item — non-tool-result content a prompt may carry
+    /// alongside its tool results.
+    fn text_item(text: &str) -> rig::message::UserContent {
+        rig::message::UserContent::Text(rig::message::Text {
+            text: text.to_string(),
+        })
+    }
+
     /// The preflight's refusal for the given nodes — the door's `Err` half,
     /// taken without relying on a `Debug` impl the door does not carry.
     fn preflight_refusal(nodes: &[NodePreflightInput<'_>]) -> PreflightError {
@@ -1127,9 +1162,12 @@ mod tests {
     }
 
     /// FRAME 5 (preserve extras): tool results for ids OUTSIDE the bundle
-    /// inherit their producer's pairing — a prior resume's paired call and
-    /// result ride the history byte-preserved, and a non-bundle result in
-    /// the prompt keeps its position and bytes.
+    /// inherit their producer's pairing. ONE rebuild carries BOTH extra
+    /// kinds — a prior resume's paired call and result in the history, a
+    /// non-bundle result in the prompt — and the WHOLE rebuilt context
+    /// (history and prompt together) is asserted in one pass, so an
+    /// interaction that reshapes the history only when prompt extras
+    /// exist cannot hide behind a split assertion.
     #[test]
     fn extras_outside_the_bundle_ride_verbatim_in_history_and_prompt() {
         let history = vec![
@@ -1138,39 +1176,103 @@ mod tests {
             tool_result_prompt(vec![result_slot(CALL_PRIOR, WIRE_PRIOR)]),
             tool_call_turn(vec![assistant_tool_call(CALL_A, TOOL_A, &args_a())]),
         ];
+        let prompt = tool_result_prompt(vec![
+            result_slot(CALL_EXTRA, WIRE_EXTRA),
+            sentinel_slot(CALL_A),
+        ]);
+        let context = rebuilt(&history, &prompt, &[pending_a()], &[(CALL_A, WIRE_A)]);
 
-        let context = rebuilt(
-            &history,
-            &tool_result_prompt(vec![sentinel_slot(CALL_A)]),
-            &[pending_a()],
-            &[(CALL_A, WIRE_A)],
-        );
-        assert_eq!(
-            context.history(),
-            history.as_slice(),
-            "the prior resume's paired call and result ride the rebuilt history \
-             verbatim; nothing is synthesized"
-        );
-
-        let context = rebuilt(
-            &history,
-            &tool_result_prompt(vec![
-                result_slot(CALL_EXTRA, WIRE_EXTRA),
-                sentinel_slot(CALL_A),
-            ]),
-            &[pending_a()],
-            &[(CALL_A, WIRE_A)],
-        );
         let expected_prompt = tool_result_prompt(vec![
             result_slot(CALL_EXTRA, WIRE_EXTRA),
             result_slot(CALL_A, WIRE_A),
         ]);
         assert_eq!(
+            (context.history(), context.current_prompt()),
+            (history.as_slice(), &expected_prompt),
+            "the whole rebuilt context over one rebuild: the prior resume's \
+             paired call and result ride the history byte-preserved (nothing is \
+             synthesized), and the non-bundle prompt result keeps the snapshot's \
+             position and bytes while the bundle slot is replaced in place"
+        );
+    }
+
+    /// FRAME (Gate A, id-only replacement): a slot for a bundle id whose
+    /// content is NOT the sentinel — a stale real result an earlier turn
+    /// recorded — is replaced BY CALL ID: the old text is gone, the
+    /// call's own outcome wire rides the slot. An implementation keying
+    /// on sentinel text instead of id fails here.
+    #[test]
+    fn a_non_sentinel_slot_for_a_bundle_id_is_replaced_by_id_and_its_old_text_gone() {
+        let history = vec![
+            Message::user("apply it"),
+            tool_call_turn(vec![assistant_tool_call(CALL_A, TOOL_A, &args_a())]),
+        ];
+        let stale = "\"a stale result an earlier turn recorded\"";
+        let prompt = tool_result_prompt(vec![result_slot(CALL_A, stale)]);
+        let context = rebuilt(&history, &prompt, &[pending_a()], &[(CALL_A, WIRE_A)]);
+
+        assert_eq!(
+            context.history(),
+            history.as_slice(),
+            "the captured call is reused; nothing is synthesized"
+        );
+        let expected_prompt = tool_result_prompt(vec![result_slot(CALL_A, WIRE_A)]);
+        assert_eq!(
             context.current_prompt(),
             &expected_prompt,
-            "the non-bundle result keeps the snapshot's position and bytes; the \
-             bundle slot is replaced in place"
+            "replacement keys on the call id, not the sentinel text: the stale \
+             result is gone and the call's own outcome rides the slot"
         );
+        let serialized =
+            serde_json::to_string(context.current_prompt()).expect("the rebuilt prompt serializes");
+        assert!(
+            !serialized.contains(stale),
+            "the replaced slot's old text survives nowhere"
+        );
+    }
+
+    /// FRAME (Gate A, duplicate-slot collapse): two slots for ONE bundle
+    /// id — a malformed document the producers do not write, held to the
+    /// collapse rule — the FIRST slot is replaced with the call's wire
+    /// where it sat, the later duplicate is collapsed out, and exactly
+    /// one result for the id survives.
+    #[test]
+    fn duplicate_slots_for_one_bundle_id_collapse_to_one_replaced_result_at_the_first_slot() {
+        let history = vec![
+            Message::user("apply it"),
+            tool_call_turn(vec![
+                assistant_tool_call(CALL_A, TOOL_A, &args_a()),
+                assistant_tool_call(CALL_B, TOOL_B, &args_b()),
+            ]),
+        ];
+        let prompt = tool_result_prompt(vec![
+            sentinel_slot(CALL_A),
+            sentinel_slot(CALL_B),
+            sentinel_slot(CALL_A),
+        ]);
+        let context = rebuilt(
+            &history,
+            &prompt,
+            &[pending_a(), pending_b()],
+            &[(CALL_A, WIRE_A), (CALL_B, WIRE_B)],
+        );
+
+        assert_eq!(
+            context.history(),
+            history.as_slice(),
+            "the duplicate-slot shape synthesizes nothing: both calls are captured"
+        );
+        let expected_prompt = tool_result_prompt(vec![
+            result_slot(CALL_A, WIRE_A),
+            result_slot(CALL_B, WIRE_B),
+        ]);
+        assert_eq!(
+            context.current_prompt(),
+            &expected_prompt,
+            "the first slot for the id is replaced where it sat, the later \
+             duplicate is collapsed, and exactly one result per id survives"
+        );
+        assert_pairing_invariant(&context);
     }
 
     /// FRAME 6a: an empty call id — the gate's park arm's stamp when the
@@ -1239,24 +1341,27 @@ mod tests {
 
     /// FRAME 6d: an empty pending list refuses — unreachable in the wired
     /// flow (the seeding loop faults it earlier), kept so the bundle types
-    /// cannot be empty.
+    /// cannot be empty. The refusal is named to its node like every other
+    /// preflight fault.
     #[test]
     fn empty_pending_list_refuses_the_segment_preflight() {
         let prompt = tool_result_prompt(vec![sentinel_slot(CALL_A)]);
         let refusal = preflight_refusal(&[NodePreflightInput::new(&[], &prompt)]);
         assert!(
-            matches!(refusal, PreflightError::EmptyCalls),
+            matches!(refusal, PreflightError::EmptyCalls(_)),
             "the refusal variant: {refusal:?}"
         );
         assert_eq!(
             refusal.to_string(),
-            "the awaiting node's pending call list parsed to no calls"
+            "awaiting node 0: the pending call list parsed to no calls",
+            "the refusal is named to its node"
         );
     }
 
     /// FRAME 6e: a snapshot prompt that is not the tool-result user message
     /// — an assistant message, reachable only through a malformed document
-    /// — refuses the preflight before any tombstone or invocation.
+    /// — refuses the preflight before any tombstone or invocation, named
+    /// to its node like every other preflight fault.
     #[test]
     fn assistant_prompt_refuses_the_segment_preflight() {
         let assistant_prompt = Message::Assistant {
@@ -1270,13 +1375,70 @@ mod tests {
         let refusal =
             preflight_refusal(&[NodePreflightInput::new(&[pending_a()], &assistant_prompt)]);
         assert!(
-            matches!(refusal, PreflightError::NotAToolResultPrompt),
+            matches!(refusal, PreflightError::NotAToolResultPrompt(_)),
             "the refusal variant: {refusal:?}"
         );
         assert_eq!(
             refusal.to_string(),
-            "the parked snapshot's current prompt is not the tool-result message \
-             the park producers write"
+            "awaiting node 0: the parked snapshot's current prompt is not the \
+             tool-result message the park producers write",
+            "the refusal is named to its node"
+        );
+    }
+
+    /// FRAME (Gate A, witness tightening): a User prompt carrying NO tool
+    /// result at all — the pre-A1 bare-text shape, a checkpoint no
+    /// producer writes (the live park always stamps the gate-tripping
+    /// call's sentinel) — refuses the preflight, named to its node.
+    #[test]
+    fn text_only_user_prompt_refuses_the_segment_preflight() {
+        let refusal = preflight_refusal(&[NodePreflightInput::new(
+            &[pending_a()],
+            &Message::user("tool results"),
+        )]);
+        assert!(
+            matches!(refusal, PreflightError::NotAToolResultPrompt(_)),
+            "the refusal variant: {refusal:?}"
+        );
+        assert_eq!(
+            refusal.to_string(),
+            "awaiting node 0: the parked snapshot's current prompt is not the \
+             tool-result message the park producers write",
+            "a text-only user message is not the tool-result prompt any \
+             producer writes"
+        );
+    }
+
+    /// FRAME (Gate A, witness tightening): a User prompt mixing text and a
+    /// tool result passes the preflight — both producers can aggregate
+    /// content alongside results — and the builder preserves the text
+    /// item verbatim, replacing only the bundle call's slot.
+    #[test]
+    fn mixed_text_and_tool_result_prompt_passes_and_the_text_rides_verbatim() {
+        let history = vec![
+            Message::user("apply it"),
+            tool_call_turn(vec![assistant_tool_call(CALL_A, TOOL_A, &args_a())]),
+        ];
+        let prompt = tool_result_prompt(vec![
+            text_item("here is what ran so far"),
+            sentinel_slot(CALL_A),
+        ]);
+        let context = rebuilt(&history, &prompt, &[pending_a()], &[(CALL_A, WIRE_A)]);
+
+        assert_eq!(
+            context.history(),
+            history.as_slice(),
+            "the captured call is reused; nothing is synthesized"
+        );
+        let expected_prompt = tool_result_prompt(vec![
+            text_item("here is what ran so far"),
+            result_slot(CALL_A, WIRE_A),
+        ]);
+        assert_eq!(
+            context.current_prompt(),
+            &expected_prompt,
+            "the text item rides verbatim in its position; the bundle slot is \
+             replaced in place"
         );
     }
 
