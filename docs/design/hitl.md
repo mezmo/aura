@@ -321,11 +321,10 @@ decision envelope without the row's egress headers, `list_pending` unlinks
 expired undecided rows, and a resume removes the envelopes it consumed. Redis
 rows carry a TTL of the remaining decision window instead.
 
-Registration-closed semantics: a mapped destination with no usable resolved
-value (request header absent, no explicit valid static fallback) fails the
-capture at route construction, and the park arm fails the gated call closed.
-No approval row is written, no pending event or blocked-cell entry appears,
-and the receiver is never notified.
+Registration-closed semantics: when a mapped destination resolves to no
+usable value (request header absent, no explicit valid static fallback), the
+park arm closes the gated call as failed at route construction. No approval
+row exists afterwards, so nothing reaches the client or the receiver.
 Notify is egress auth with no later reify checkpoint, so an undeliverable
 registration must not exist. The exception: an explicitly configured **valid
 static fallback** keeps the existing resolution semantics and parks with the
