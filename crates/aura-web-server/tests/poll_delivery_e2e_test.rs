@@ -49,8 +49,9 @@ use common::AuraServer;
 
 const CHAT_TIMEOUT: Duration = Duration::from_secs(90);
 
-/// The reboot's resolve must land within ~two poll intervals of the health
-/// check — a reconciler that only resolves on tick N > 1 fails this budget.
+/// The post-decide resolve must land within ~two poll intervals of the
+/// receiver's decision — a reconciler that only resolves on tick N > 1
+/// fails this budget.
 const FIRST_TICK_BUDGET: Duration = Duration::from_secs(3);
 /// Wall-clock budget for one reconciler side effect (a run of status GETs,
 /// the durable resolve). `poll_interval_secs` is 1, so this tolerates ~20
@@ -664,11 +665,11 @@ async fn poll_flow_parks_and_resolves_with_the_run_still_parked() {
     server.stop().await;
 }
 
-/// Restart: park (one decision-ask POST, 207), kill the server, decide at
-/// the receiver, reboot onto the same store — the rebooted server's first
-/// tick reads the decided status and resolves durably, docking the approver
-/// identity, without re-posting a request the decision already answered (the
-/// row is born acknowledged).
+/// Restart: park (one decision-ask POST, 207), kill the server, reboot onto
+/// the same store while the receiver is STILL pending — the rebooted server
+/// polls the pinned 207 status without re-posting (the row's persisted
+/// acknowledged state survives the reboot) — then the receiver decides and
+/// the next poll resolves durably, docking the approver identity.
 #[tokio::test]
 async fn restart_resolves_the_parked_approval_on_a_rebooted_server() {
     ensure_unsigned_mode();
