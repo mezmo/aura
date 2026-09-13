@@ -35,7 +35,7 @@ use super::registry::{PendingApprovals, ResolveError};
 use super::route::{PollOutcome, WebhookClient, webhook_client_from_config};
 use super::signing::WebhookHmac;
 use crate::approver_headers::ApproverHeaders;
-use crate::session_store::ApprovalStore;
+use crate::session_store::{AcknowledgeOutcome, ApprovalStore};
 
 /// The poll-delivery reconciler for one process: a private webhook client,
 /// the shared approval store it scans, the ingress registry it resolves
@@ -204,9 +204,27 @@ impl PollReconciler {
                     .await
                 {
                     Ok(()) => {
-                        todo!(
-                            "mark the row acknowledged via ApprovalStore::mark_acknowledged (fill layer)"
-                        )
+                        match self.store.mark_acknowledged(&id).await {
+                            Ok(AcknowledgeOutcome::Acknowledged) => {}
+                            // The row resolved, was cancelled, or was
+                            // removed while the notify was in flight: it no
+                            // longer needs notification, so there is
+                            // nothing left to mark — the same benign race
+                            // the ingress 404 is.
+                            Ok(AcknowledgeOutcome::Missing) => debug!(
+                                decision_id = %id,
+                                "acknowledged row left the store while the notify \
+                                 was in flight"
+                            ),
+                            // The marker stays unset, so the next tick
+                            // re-POSTs — at-least-once, idempotent by
+                            // decision id at the receiver.
+                            Err(err) => warn!(
+                                decision_id = %id,
+                                error = %err,
+                                "acknowledgment mark failed; the row re-notifies next tick"
+                            ),
+                        }
                     }
                     Err(err) => {
                         warn!(
