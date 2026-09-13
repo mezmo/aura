@@ -8,9 +8,11 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use tokio::sync::broadcast;
 
-use crate::hitl::{DecisionId, ParkedApproval, ResolveError, ResolvedDecision, Timestamp};
+use crate::hitl::{
+    AcknowledgmentState, DecisionId, ParkedApproval, ResolveError, ResolvedDecision, Timestamp,
+};
 
-use super::{ApprovalStore, EventBus, SessionStoreError, Subscription};
+use super::{AcknowledgeOutcome, ApprovalStore, EventBus, SessionStoreError, Subscription};
 
 /// Buffered payloads per topic before slow subscribers start lagging.
 const TOPIC_CAPACITY: usize = 64;
@@ -57,6 +59,20 @@ impl ApprovalStore for InMemoryApprovalStore {
     async fn register(&self, parked: ParkedApproval) -> Result<(), SessionStoreError> {
         self.lock().insert(parked.request.decision_id, parked);
         Ok(())
+    }
+
+    async fn mark_acknowledged(
+        &self,
+        id: &DecisionId,
+    ) -> Result<AcknowledgeOutcome, SessionStoreError> {
+        let mut entries = self.lock();
+        match entries.get_mut(id) {
+            Some(parked) => {
+                parked.acknowledgment = AcknowledgmentState::Acknowledged;
+                Ok(AcknowledgeOutcome::Acknowledged)
+            }
+            None => Ok(AcknowledgeOutcome::Missing),
+        }
     }
 
     async fn get(&self, id: &DecisionId) -> Result<Option<ParkedApproval>, SessionStoreError> {

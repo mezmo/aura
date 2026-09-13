@@ -25,7 +25,10 @@ use crate::tool_wrapper::{PreCallOutcome, ToolCallContext, ToolWrapper};
 const PARK_SENTINEL: &str =
     "This tool call is parked pending human approval. It has not run. Do not retry.";
 
-/// Park-arm state.
+/// Park-arm state: the authorization. An armed `ParkContext` authorizes
+/// `AskMode::ParkArmed` for THIS invocation; `[hitl.park].enabled` is only
+/// the capability that makes the arm available. Single-agent and
+/// `request_approval` never arm one.
 struct ParkContext {
     /// Registry over the approval store.
     registry: PendingApprovals,
@@ -266,13 +269,17 @@ impl HitlApprovalWrapper {
     /// run owner, does not re-publish `Requested` (already published at gate
     /// entry), and registers the row in the acknowledged state (the 207 is
     /// the receiver's ack; the reconciler never re-POSTs it).
+    #[expect(
+        unused_variables,
+        unused_mut,
+        reason = "the fill layer removes this marker by hand"
+    )]
     async fn park_207_bridge(
         &self,
         park: &ParkContext,
-        request: ApprovalRequest,
+        mut request: ApprovalRequest,
         expires_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<PreCallOutcome, ToolError> {
-        let _ = (park, &request, expires_at);
         todo!("207 bridge registration (fill layer)")
     }
 }
@@ -341,18 +348,23 @@ impl ToolWrapper for HitlApprovalWrapper {
         let cancel =
             crate::request_cancellation::RequestCancellation::token_for_id(&self.request_id)
                 .unwrap_or_else(crate::request_cancellation::RequestCancelToken::unbound);
+        // The gate-entry deadline is captured before the POST, so a parked
+        // row's expiry anchors at gate entry and the elapsed sync wait
+        // consumes the decision budget.
+        let expires_at = chrono::Utc::now()
+            + chrono::Duration::from_std(self.route.timeout())
+                .expect("approval timeout fits in chrono");
         match self
             .route
-            .decide_for_gate(request, &cancel, AskMode::Hold)
+            .decide_for_gate(request, &cancel, AskMode::Hold, expires_at)
             .await
         {
             Ok(GateDecision::Pending {
                 request,
                 expires_at,
             }) => {
-                // The 207 bridge: re-enter park registration. Only reachable on
-                // a park-armed ask; the fill layer wires the ParkArmed mode
-                // into the park-armed branch above.
+                // The 207 bridge: re-enter park registration with the posted
+                // decision id and the gate-entry deadline.
                 let park = self.park.as_ref().ok_or_else(|| {
                     ToolError::ToolCallError(
                         "tool call blocked: 207 on a route without a park arm"
@@ -362,29 +374,55 @@ impl ToolWrapper for HitlApprovalWrapper {
                 })?;
                 self.park_207_bridge(park, request, expires_at).await
             }
-            other => approval_result_to_pre_call(other),
+            Ok(GateDecision::Approved { overrides }) => {
+                approval_result_to_pre_call(Ok(TerminalGateDecision::Approved { overrides }))
+            }
+            Ok(GateDecision::Denied { reason }) => {
+                approval_result_to_pre_call(Ok(TerminalGateDecision::Denied { reason }))
+            }
+            Ok(GateDecision::TimedOut { .. }) => {
+                approval_result_to_pre_call(Ok(TerminalGateDecision::TimedOut))
+            }
+            Ok(GateDecision::Cancelled(_)) => {
+                approval_result_to_pre_call(Ok(TerminalGateDecision::Cancelled))
+            }
+            Err(e) => approval_result_to_pre_call(Err(e)),
         }
     }
 }
 
-/// Map a gate-scoped decision to a pre-call outcome. The pending arm is
-/// handled by the gate's registration path ([`HitlApprovalWrapper::park_207_bridge`])
-/// before this conversion, so it never reaches here.
+/// A terminal gate decision: [`GateDecision`] without the
+/// [`GateDecision::Pending`] bridge signal. The caller's exhaustive match
+/// routes a pending decision to the 207 bridge before this conversion, so the
+/// terminal mapping never sees one.
+enum TerminalGateDecision {
+    Approved {
+        overrides: Option<crate::approver_headers::ApproverHeaders>,
+    },
+    Denied {
+        reason: Option<String>,
+    },
+    TimedOut,
+    Cancelled,
+}
+
+/// Map a terminal gate decision to a pre-call outcome. The pending arm is
+/// absent from this surface by construction: the caller routes a pending
+/// decision to the 207 bridge before this conversion.
 fn approval_result_to_pre_call(
-    result: Result<GateDecision, ApprovalError>,
+    result: Result<TerminalGateDecision, ApprovalError>,
 ) -> Result<PreCallOutcome, ToolError> {
     match result {
-        Ok(GateDecision::Approved { overrides }) => Ok(PreCallOutcome::Proceed { overrides }),
-        Ok(GateDecision::Denied { reason }) => Ok(denial_outcome(reason)),
-        Ok(GateDecision::TimedOut { .. }) => Err(ToolError::ToolCallError(
+        Ok(TerminalGateDecision::Approved { overrides }) => {
+            Ok(PreCallOutcome::Proceed { overrides })
+        }
+        Ok(TerminalGateDecision::Denied { reason }) => Ok(denial_outcome(reason)),
+        Ok(TerminalGateDecision::TimedOut) => Err(ToolError::ToolCallError(
             "tool call denied: approval timed out".to_string().into(),
         )),
-        Ok(GateDecision::Cancelled(_)) => Err(ToolError::ToolCallError(
+        Ok(TerminalGateDecision::Cancelled) => Err(ToolError::ToolCallError(
             "tool call denied: approval cancelled".to_string().into(),
         )),
-        Ok(GateDecision::Pending { .. }) => {
-            unreachable!("pending is routed to the 207 bridge before this conversion")
-        }
         Err(e) => Err(ToolError::ToolCallError(
             format!("tool call blocked: approval channel error: {e}").into(),
         )),
@@ -436,7 +474,6 @@ mod tests {
 
     use aura_config::WebhookUrl;
 
-    use super::super::decision::CancelReason;
     use super::super::route::{WebhookClient, build_webhook_client};
     use super::*;
 
@@ -504,7 +541,8 @@ mod tests {
     #[test]
     fn approval_result_mapping_proceeds_only_on_approval() {
         assert_eq!(
-            approval_result_to_pre_call(Ok(GateDecision::Approved { overrides: None })).unwrap(),
+            approval_result_to_pre_call(Ok(TerminalGateDecision::Approved { overrides: None }))
+                .unwrap(),
             PreCallOutcome::Proceed { overrides: None }
         );
     }
@@ -515,7 +553,7 @@ mod tests {
         let captured = crate::approver_headers::tests::captured_overrides("authorization", "tok");
 
         assert_eq!(
-            approval_result_to_pre_call(Ok(GateDecision::Approved {
+            approval_result_to_pre_call(Ok(TerminalGateDecision::Approved {
                 overrides: Some(captured.clone()),
             }))
             .unwrap(),
@@ -529,7 +567,7 @@ mod tests {
     /// mapping short-circuits the call with the denial reason.
     #[test]
     fn approval_result_mapping_denial_is_feedback_not_error() {
-        let outcome = approval_result_to_pre_call(Ok(GateDecision::Denied {
+        let outcome = approval_result_to_pre_call(Ok(TerminalGateDecision::Denied {
             reason: Some("too risky".to_string()),
         }))
         .unwrap();
@@ -1389,24 +1427,19 @@ mod tests {
 
     #[test]
     fn approval_result_mapping_timeout_cancel_and_channel_fault_are_errors() {
-        let timed_out = approval_result_to_pre_call(Ok(GateDecision::TimedOut {
-            waited: Duration::from_secs(1),
-        }))
-        .unwrap_err()
-        .to_string();
+        let timed_out = approval_result_to_pre_call(Ok(TerminalGateDecision::TimedOut))
+            .unwrap_err()
+            .to_string();
         assert!(timed_out.contains("approval timed out"));
 
-        let cancelled = approval_result_to_pre_call(Ok(GateDecision::Cancelled(
-            CancelReason::ClientDisconnected,
-        )))
-        .unwrap_err()
-        .to_string();
+        let cancelled = approval_result_to_pre_call(Ok(TerminalGateDecision::Cancelled))
+            .unwrap_err()
+            .to_string();
         assert!(cancelled.contains("approval cancelled"));
 
-        let sender_dropped =
-            approval_result_to_pre_call(Ok(GateDecision::Cancelled(CancelReason::SenderDropped)))
-                .unwrap_err()
-                .to_string();
+        let sender_dropped = approval_result_to_pre_call(Ok(TerminalGateDecision::Cancelled))
+            .unwrap_err()
+            .to_string();
         assert!(sender_dropped.contains("approval cancelled"));
 
         let channel_fault =

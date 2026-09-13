@@ -37,7 +37,10 @@ const WEBHOOK_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 pub struct HitlRuntime {
     pub patterns: Arc<[GlobPattern]>,
     pub route: Arc<DecisionRoute>,
-    /// `[hitl.park].enabled`.
+    /// `[hitl.park].enabled`: the capability. It provisions park support on
+    /// this config (poll settings present, reconciler eligible); it does not
+    /// by itself authorize any invocation to park — an armed `ParkContext`
+    /// does that.
     pub park_enabled: bool,
 }
 
@@ -406,6 +409,17 @@ impl DecisionRoute {
         }
     }
 
+    /// The decision window (route timeout) bounding every decision this route
+    /// produces. The gate captures the absolute gate-entry deadline from it
+    /// before the POST, so a parked row's expiry anchors at gate entry and the
+    /// elapsed sync wait consumes the decision budget.
+    pub(crate) fn timeout(&self) -> Duration {
+        match self {
+            Self::Conversational { timeout, .. } => *timeout,
+            Self::Webhook { timeout, .. } => *timeout,
+        }
+    }
+
     /// The park arm's egress headers: the client's request-scoped resolved
     /// map, which parked rows copy in before `register_durable`. `Err`
     /// closes the registration — a mapped destination with no usable
@@ -450,6 +464,7 @@ impl DecisionRoute {
         request: ApprovalRequest,
         cancel: &crate::request_cancellation::RequestCancelToken,
         mode: AskMode,
+        expires_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<GateDecision, ApprovalError> {
         stamp_decision_id(request.decision_id);
         match self {
@@ -465,7 +480,7 @@ impl DecisionRoute {
                     &request,
                     cancel,
                     Instant::now(),
-                    client.request_approval_for_gate(&request, *timeout, mode),
+                    client.request_approval_for_gate(&request, *timeout, mode, expires_at),
                     || GateDecision::Cancelled(super::decision::CancelReason::ClientDisconnected),
                     GateDecision::to_outcome,
                 )
@@ -608,7 +623,8 @@ pub(crate) enum AskMode {
     Hold,
     /// `response_type=poll`: the POST answers immediately. An instant 200 is
     /// a machine decision (decide live); a 207 parks. The park-armed
-    /// orchestration ask.
+    /// orchestration ask. Authorized only by an armed `ParkContext`; a
+    /// park-enabled config alone never infers it.
     #[expect(
         dead_code,
         reason = "wired by the fill layer's park-armed orchestration ask"
@@ -847,6 +863,7 @@ impl WebhookClient {
         request: &ApprovalRequest,
         timeout: Duration,
         mode: AskMode,
+        expires_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<GateDecision, ApprovalError> {
         match self
             .request_approval_with_headers(request, timeout, mode)
@@ -866,14 +883,10 @@ impl WebhookClient {
                 };
                 Ok(GateDecision::Approved { overrides })
             }
-            WebhookReply::Pending => {
-                let expires_at = chrono::Utc::now()
-                    + chrono::Duration::from_std(timeout).expect("approval timeout fits in chrono");
-                Ok(GateDecision::Pending {
-                    request: request.clone(),
-                    expires_at,
-                })
-            }
+            WebhookReply::Pending => Ok(GateDecision::Pending {
+                request: request.clone(),
+                expires_at,
+            }),
             other => Ok(GateDecision::without_overrides(other.into_outcome()?)),
         }
     }
@@ -1195,9 +1208,9 @@ impl WebhookClient {
             }
             None => body,
         };
-        // The 200 body is the pinned `{approved, reason}` shape; the decision
-        // mapping (approved -> Approved, !approved -> Denied(reason), a body
-        // outside the shape -> NotYet) is the fill layer's.
+        // The 200 body is the pinned `{approved, reason}` shape: approved ->
+        // Approved, !approved -> Denied(reason), a body outside the shape ->
+        // NotYet.
         let _ = (verified, response_headers);
         todo!("GET 200 body decision mapping (fill layer)")
     }
@@ -2583,6 +2596,7 @@ mod tests {
                     &test_request(decision_id),
                     Duration::from_secs(5),
                     AskMode::Hold,
+                    chrono::Utc::now() + chrono::Duration::seconds(300),
                 )
                 .await
                 .expect("signed gate round trip succeeds");
@@ -2766,6 +2780,7 @@ mod tests {
                         &test_request(DecisionId::generate()),
                         timeout,
                         AskMode::Hold,
+                        chrono::Utc::now() + chrono::Duration::seconds(300),
                     )
                     .await;
 
@@ -2838,7 +2853,15 @@ mod tests {
                             }
                         }
                     } else {
-                        match route.decide_for_gate(request, &cancel, AskMode::Hold).await {
+                        match route
+                            .decide_for_gate(
+                                request,
+                                &cancel,
+                                AskMode::Hold,
+                                chrono::Utc::now() + chrono::Duration::seconds(300),
+                            )
+                            .await
+                        {
                             Ok(GateDecision::Cancelled(CancelReason::ClientDisconnected)) => {}
                             other => {
                                 panic!("route_wide={route_wide}: expected Cancelled, got {other:?}")
@@ -2873,7 +2896,12 @@ mod tests {
             };
 
             let decision = route
-                .decide_for_gate(test_request(DecisionId::generate()), &cancel, AskMode::Hold)
+                .decide_for_gate(
+                    test_request(DecisionId::generate()),
+                    &cancel,
+                    AskMode::Hold,
+                    chrono::Utc::now() + chrono::Duration::seconds(300),
+                )
                 .await
                 .expect("cancellation is an outcome, not a channel fault");
 
@@ -3396,6 +3424,7 @@ mod tests {
                             test_request(DecisionId::generate()),
                             &cancel,
                             AskMode::Hold,
+                            chrono::Utc::now() + chrono::Duration::seconds(300),
                         )
                         .await
                         .expect_err("the live gate path must fail closed"),

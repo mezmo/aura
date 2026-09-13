@@ -55,6 +55,17 @@ pub enum SessionStoreError {
     Decode { reason: String },
 }
 
+/// The outcome of a conditional acknowledgment transition on a parked row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcknowledgeOutcome {
+    /// The row was still pending; its acknowledgment state is now
+    /// `Acknowledged`.
+    Acknowledged,
+    /// No still-pending row matched the id: unknown, already resolved, or
+    /// cancelled/removed while the notify was in flight. Nothing was created.
+    Missing,
+}
+
 /// Durable storage for parked conversational HITL approvals, over the
 /// serializable [`ParkedApproval`] record.
 #[async_trait]
@@ -63,6 +74,15 @@ pub trait ApprovalStore: Send + Sync {
     /// native expiry set the entry's TTL from `expires_at`; the file store
     /// unlinks an expired entry on its next poll scan.
     async fn register(&self, parked: ParkedApproval) -> Result<(), SessionStoreError>;
+
+    /// Conditionally mark a still-pending row's acknowledgment state as
+    /// acknowledged. Updates only a row that is still pending (undecided and
+    /// not removed); never recreates a row. Returns an explicit outcome for a
+    /// row that is missing (unknown, resolved, or cancelled).
+    async fn mark_acknowledged(
+        &self,
+        id: &DecisionId,
+    ) -> Result<AcknowledgeOutcome, SessionStoreError>;
 
     /// Look up a parked approval.
     async fn get(&self, id: &DecisionId) -> Result<Option<ParkedApproval>, SessionStoreError>;

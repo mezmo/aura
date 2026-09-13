@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 
-use super::{ApprovalStore, InMemoryApprovalStore, SessionStoreError};
+use super::{AcknowledgeOutcome, ApprovalStore, InMemoryApprovalStore, SessionStoreError};
 use crate::hitl::{DecisionId, ParkedApproval, ResolveError, ResolvedDecision};
 
 /// Delegates to an in-memory store; each `fail_*` flag makes that operation
@@ -41,6 +41,13 @@ impl ApprovalStore for FaultInjectingStore {
             });
         }
         self.inner.register(parked).await
+    }
+
+    async fn mark_acknowledged(
+        &self,
+        id: &DecisionId,
+    ) -> Result<AcknowledgeOutcome, SessionStoreError> {
+        self.inner.mark_acknowledged(id).await
     }
 
     async fn get(&self, id: &DecisionId) -> Result<Option<ParkedApproval>, SessionStoreError> {

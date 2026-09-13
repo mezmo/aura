@@ -204,7 +204,9 @@ impl PollReconciler {
                     .await
                 {
                     Ok(()) => {
-                        todo!("mark the row acknowledged (fill layer)")
+                        todo!(
+                            "mark the row acknowledged via ApprovalStore::mark_acknowledged (fill layer)"
+                        )
                     }
                     Err(err) => {
                         warn!(
