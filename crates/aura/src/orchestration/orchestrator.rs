@@ -71,7 +71,7 @@ use super::park::resume::{
 use super::park::{
     CallId, CallKey, NodePreflightInput, OutcomeWire, ParkCommitInputs, ParkGuard, ParkedRun,
     ParkedTaskRecord, ParkedTaskRecords, PeekOutcome, RecordedDecisions, ResumingDocumentHandle,
-    RunStateForPark, SegmentPreflight, commit_from_run_state, rebuild_context,
+    RunStateForPark, SegmentPreflight, commit_from_run_state, load_parked_run, rebuild_context,
 };
 use super::persistence::ExecutionPersistence;
 use super::types::{
@@ -111,6 +111,11 @@ struct TaskExecutionParams<'a> {
 struct TaskExecutionResult {
     result: String,
     structured_output: Option<super::types::StructuredTaskOutput>,
+    /// The worker's assistant turns, at the stream's turn boundaries — what
+    /// a resumed coordinator loop's segment turns carry for this task. A
+    /// parked task carries none here: its turns come from the park snapshot
+    /// at full wire fidelity instead.
+    turns: Vec<rig::completion::Message>,
 }
 
 /// The outcome of one worker task.
@@ -147,6 +152,15 @@ struct AwaitingNode {
     pending: Vec<PendingCall>,
 }
 
+/// How the resumed coordinator continuation ended: the loop answered (the
+/// segment completes) or a newly gated call re-parked through
+/// run_iteration's park path (the segment parks with the re-derived
+/// blocking set).
+enum ContinuationOutcome {
+    Completed,
+    ReParked { blocking: NonEmptyBlocking },
+}
+
 /// Named return type for `create_*` coordinator/worker methods.
 ///
 /// Replaces bare `(Agent, String)` tuples where the `String` was the preamble
@@ -173,6 +187,16 @@ struct CoordinatorState {
     preamble: String,
     conversation: Vec<rig::completion::Message>,
     routing_decision: super::tools::routing_tools::RoutingDecision,
+}
+
+/// What the plan-execute-continue loop is seeded with: a fresh run starts
+/// at iteration zero with no failures; a resumed continuation seeds the
+/// checkpoint's iteration, planning latency, and failure history so the
+/// loop continues the checkpointed run rather than restarting it.
+struct LoopSeed {
+    iteration: usize,
+    planning_ms: u64,
+    failure_history: Vec<FailedTaskRecord>,
 }
 
 /// Bundled coordinator tools for `build_agent_with_tools`.
@@ -692,6 +716,10 @@ struct ForwardedRun {
     /// Provider-reported usage of the loop's last turn — context-window
     /// occupancy, as opposed to `response.usage`'s loop total.
     last_turn: rig::completion::Usage,
+    /// The run's assistant turns, one per turn boundary (`TurnUsage`), the
+    /// same boundary rule `collect_segment_turns` applies — a resumed
+    /// coordinator loop's worker turns ride the completed segment's.
+    turns: Vec<rig::completion::Message>,
 }
 
 /// Replay an assistant turn as conversation history.
@@ -1420,6 +1448,11 @@ impl Orchestrator {
         let emit_scratchpad_events = scratchpad::emit_scratchpad_tool_events_enabled();
         let mut content = String::new();
         let mut tally = TurnTally::default();
+        // The pending segment turn: streamed text plus tool calls, flushed
+        // at the turn boundary (`TurnUsage`) — collect_segment_turns' rule.
+        let mut turn_text = String::new();
+        let mut turn_calls = Vec::new();
+        let mut turns = Vec::new();
         // Set only by the Final arm, whose reported loop total supersedes
         // the per-turn sum as the response's authoritative usage.
         let mut final_total: Option<Usage> = None;
@@ -1459,6 +1492,38 @@ impl Orchestrator {
                 // must resume explicitly.
                 Liveness::ToolFinished => deadline.resume(),
                 _ => deadline.touch(),
+            }
+            // Segment-turn accumulation: every assistant item of the
+            // pending turn feeds it, forwarded or not — the boundary rule
+            // is the TurnUsage flush below, not the forwarding policy.
+            match &item {
+                Ok(StreamItem::StreamAssistantItem(StreamedAssistantContent::Text(t))) => {
+                    turn_text.push_str(t);
+                }
+                Ok(StreamItem::StreamAssistantItem(StreamedAssistantContent::ToolCall(tc))) => {
+                    let arguments: serde_json::Value = serde_json::from_str(&tc.arguments)
+                        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                            format!(
+                                "segment turn for {} carries unparseable arguments: {e}",
+                                tc.name
+                            )
+                            .into()
+                        })?;
+                    turn_calls.push(rig::message::ToolCall {
+                        id: tc.id.clone(),
+                        // The provider-agnostic item carries no provider
+                        // call_id; a parked node re-derives its turns from
+                        // the park snapshot at full fidelity instead.
+                        call_id: None,
+                        function: rig::message::ToolFunction {
+                            name: tc.name.clone(),
+                            arguments,
+                        },
+                        signature: None,
+                        additional_params: None,
+                    });
+                }
+                _ => {}
             }
             let body = async {
                 match item {
@@ -1549,6 +1614,7 @@ impl Orchestrator {
                         if let Some(budget) = scratchpad_budget {
                             budget.set_estimated_used(turn.input_tokens, turn.output_tokens);
                         }
+                        flush_segment_turn(&mut turn_text, &mut turn_calls, &mut turns);
                     }
                     Err(e) => return Err(e),
                     Ok(StreamItem::StreamUserItem(StreamedUserContent::ToolResult(ref tr))) => {
@@ -1576,6 +1642,7 @@ impl Orchestrator {
                             {
                                 tally.record(&turn, cache, usage_state);
                             }
+                            flush_segment_turn(&mut turn_text, &mut turn_calls, &mut turns);
                             return Ok(LoopStep::End);
                         }
                     }
@@ -1597,6 +1664,8 @@ impl Orchestrator {
                 deadline.suspend();
             }
         }
+        // A stream that ended without a Final item still produced its turns.
+        flush_segment_turn(&mut turn_text, &mut turn_calls, &mut turns);
 
         Ok(ForwardedRun {
             response: CompletionResponse {
@@ -1604,6 +1673,7 @@ impl Orchestrator {
                 usage: final_total.unwrap_or(tally.total),
             },
             last_turn: tally.last,
+            turns,
         })
     }
 
@@ -2930,6 +3000,51 @@ Assign tasks to the worker whose tools best match the required operations."#,
             skill_tools: crate::skill_tool::SkillToolset::new(&self.agent_config.agent.skills),
         };
 
+        let model_name = self.agent_config.llm.model_name().to_string();
+
+        // Test-only model injection (park/reify rig): a queued override
+        // builds this coordinator from a scripted model, registered through
+        // the same toolset a live coordinator receives — the routing tools
+        // included, so a scripted coordinator routes exactly like a live
+        // one. No override queued: unchanged behavior.
+        #[cfg(test)]
+        if let Some(coordinator_override) =
+            crate::orchestration::test_rig::take_coordinator_override()
+        {
+            let (llm_provider, llm_model) = self.agent_config.llm.model_info();
+            let agent = Self::build_agent_with_tools(
+                coordinator_override.model,
+                &preamble,
+                temperature,
+                self.agent_config.llm.additional_params(),
+                self.agent_config.llm.max_tokens(),
+                llm_provider,
+                llm_model,
+                coordinator_tools,
+            );
+            return Ok(AgentWithPreamble {
+                agent: Agent {
+                    inner: ProviderAgent::Scripted(agent),
+                    model: model_name,
+                    max_depth: PLANNING_COORDINATOR_MAX_DEPTH,
+                    mcp_manager: None,
+                    fallback_tool_parsing: false,
+                    fallback_tool_names: vec![],
+                    context_window: self.agent_config.llm.context_window(),
+                    scratchpad_budget: None,
+                    client_tool_names: Default::default(),
+                    turn_nudge: None,
+                    system_prompt: preamble.clone(),
+                    invocation_parameters: crate::logging::llm_invocation_parameters(
+                        &self.agent_config.llm,
+                    ),
+                },
+                preamble,
+                escalation_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                submit_result_decision: Arc::new(Mutex::new(None)),
+            });
+        }
+
         let provider_agent = self
             .build_provider_agent_with_tools(
                 &preamble,
@@ -2939,8 +3054,6 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 coordinator_tools,
             )
             .await?;
-
-        let model_name = self.agent_config.llm.model_name().to_string();
 
         // Coordinator depth budget allows recon + read_artifact + routing within one
         // stream_and_collect call. The decision_ready early-exit is the primary guard;
@@ -3494,12 +3607,15 @@ Assign tasks to the worker whose tools best match the required operations."#,
         &self,
         plan: &mut Plan,
         event_tx: &tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>,
-    ) -> Result<(u64, ParkedTaskRecords), StreamError> {
+    ) -> Result<(u64, ParkedTaskRecords, Vec<rig::completion::Message>), StreamError> {
         use futures::StreamExt;
         use futures::stream::FuturesUnordered;
 
         let mut task_compute_ms: u64 = 0;
         let mut park_records: ParkedTaskRecords = ParkedTaskRecords::new();
+        // The iteration's worker turns: buffered per wave, emitted in task-id
+        // order so parallel completion order cannot reorder the segment.
+        let mut worker_turns = Vec::new();
         while !plan.is_finished() {
             // Collect ready tasks with their context and worker assignment
             // Tuple: (task_id, description, context, worker_name)
@@ -3578,6 +3694,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 .collect();
 
             // Collect results as they complete and update plan
+            let mut wave_turns: Vec<(usize, Vec<rig::completion::Message>)> = Vec::new();
             while let Some((task_id, result, duration_ms, worker_name, task_desc)) =
                 futures.next().await
             {
@@ -3593,6 +3710,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                             .await;
                         let result_for_event = final_result.clone();
                         let success = exec_result.structured_output.is_some();
+                        wave_turns.push((task_id, exec_result.turns));
                         if let Some(t) = plan.get_task_mut(task_id) {
                             if success {
                                 t.complete(final_result);
@@ -3692,9 +3810,13 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     }
                 }
             }
+            wave_turns.sort_by_key(|(task_id, _)| *task_id);
+            for (_, task_turns) in wave_turns {
+                worker_turns.extend(task_turns);
+            }
         }
 
-        Ok((task_compute_ms, park_records))
+        Ok((task_compute_ms, park_records, worker_turns))
     }
 
     /// Collect failed tasks from this iteration into failure records.
@@ -4045,17 +4167,20 @@ Assign tasks to the worker whose tools best match the required operations."#,
             }
 
             // Detect context overflow and other errors — don't retry hard errors
-            let result = match stream_result {
-                Ok(r) => Ok(r.response.content),
+            let (result, run_turns) = match stream_result {
+                Ok(r) => (Ok(r.response.content), r.turns),
                 Err(e) if is_context_overflow_error(e.as_ref()) => {
                     let suggestion = context_overflow_suggestion("worker");
-                    Err(format!(
-                        "Worker context limit exceeded for task {}. {}",
-                        task_id, suggestion
+                    (
+                        Err(format!(
+                            "Worker context limit exceeded for task {}. {}",
+                            task_id, suggestion
+                        )
+                        .into()),
+                        Vec::new(),
                     )
-                    .into())
                 }
-                Err(e) => Err(e),
+                Err(e) => (Err(e), Vec::new()),
             };
 
             // Check escalation flag (duplicate call loop)
@@ -4095,6 +4220,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                                     summary: output.summary,
                                     confidence: output.confidence,
                                 }),
+                                turns: run_turns,
                             }));
                         }
                         None if is_final_attempt => {
@@ -4117,6 +4243,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                             return Ok(TaskOutcome::Completed(TaskExecutionResult {
                                 result: raw_response,
                                 structured_output: None,
+                                turns: run_turns,
                             }));
                         }
                         None => {
@@ -4170,6 +4297,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             Ok(TaskOutcome::Completed(TaskExecutionResult {
                 result: last_raw_response,
                 structured_output: None,
+                turns: Vec::new(),
             }))
         }
     }
@@ -4203,7 +4331,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
     /// Drive the granted run's segment: each awaiting node's checkpointed
     /// conversation streams with the recorded decisions armed at the gate —
     /// the model re-issues the gated call and the gate applies its recorded
-    /// decision — until every node completes or a node re-parks. On
+    /// decision — until every node completes or a node re-parks. With every
+    /// node complete, the segment re-enters the coordinator iteration loop
+    /// over the checkpoint's restored state, which drives never-started
+    /// siblings and answers or re-parks on a newly gated call. On
     /// completion the resuming document is deleted and the consumed
     /// decisions leave the store; on a re-park the publish-then-unlink
     /// commit supersedes the resuming shadow with the refreshed checkpoint,
@@ -4334,6 +4465,12 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 .expect("every awaiting node was seeded with a park record")
                 .clone();
             let ParkSnapshot { history, .. } = snapshot;
+            // The node's R2 outcome pairs. They ride the segment turns only
+            // when the node re-parks (ahead of its gated turn); a completed
+            // segment's turns are the run's natural turns — the outcome
+            // packages already live inside the rebuilt history the
+            // continuation streamed from.
+            let mut pair_turns = Vec::new();
 
             let Some(park) = self.worker_park(task_id, attempt) else {
                 return Err(fault(
@@ -4461,10 +4598,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     if recorded.depth(key) + 1 == depth_before {
                         consumed.push(call.decision_id);
                     }
-                    // R2's outcome-bearing pair rides ahead of the node's
-                    // continuation turns, keyed by the original call id.
-                    turns.push(decided_call_turn(call));
-                    turns.push(decided_result_turn(call, &wire));
+                    // The R2 outcome-bearing pair, keyed by the original
+                    // call id — merged into the turns only on a re-park.
+                    pair_turns.push(decided_call_turn(call));
+                    pair_turns.push(decided_result_turn(call, &wire));
                     outcomes.push((validated_call.call_id().clone(), OutcomeWire::new(wire)));
                 }
                 // The strict guard drops before streaming, so a genuinely
@@ -4527,12 +4664,14 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         .cell
                         .snapshot()
                         .expect("cell outcome Blocked implies a captured snapshot");
-                    // The parked node's turns come from the snapshot at full
-                    // wire fidelity; the stream collector's assembly drops a
-                    // tool call's provider call_id. The slice boundary is
-                    // the history the continuation actually streamed from
-                    // — the rebuilt history, which the reconstruction may
-                    // have lengthened past the checkpoint's record.
+                    // The re-parked node's turns: its outcome pairs ahead of
+                    // the snapshot's gated turn, at full wire fidelity — the
+                    // stream collector's assembly drops a tool call's
+                    // provider call_id. The slice boundary is the history the
+                    // continuation actually streamed from — the rebuilt
+                    // history, which the reconstruction may have lengthened
+                    // past the checkpoint's record.
+                    turns.extend(pair_turns);
                     turns.extend(segment_turns_since(
                         &checkpoint,
                         task_id,
@@ -4639,10 +4778,36 @@ Assign tasks to the worker whose tools best match the required operations."#,
             }
         }
 
-        // Every awaiting node completed: the checkpoint is the record only
-        // until the segment ends — delete the resuming document (the
-        // manifest is the record), then release the consumed decisions from
-        // the store, whose file backend retains them until removed.
+        // Every awaiting node reached Normal: re-enter the coordinator
+        // iteration loop over the checkpoint's restored state. The run is
+        // not finished until the loop answers or a newly gated call parks
+        // again — the segment's terminal arm is the loop's, not the last
+        // worker's.
+        match self
+            .resume_coordinator_continuation(
+                &checkpoint,
+                plan,
+                &documents,
+                registry,
+                &consumed,
+                &mut turns,
+            )
+            .await?
+        {
+            ContinuationOutcome::Completed => {}
+            ContinuationOutcome::ReParked { blocking } => {
+                let turns = SegmentTurns::try_new(turns).map_err(|EmptySegment| {
+                    fault("the re-parked segment carried no turns".to_string())
+                })?;
+                return Ok(SegmentResult::Parked { turns, blocking });
+            }
+        }
+
+        // Every awaiting node completed and the continuation finished: the
+        // checkpoint is the record only until the segment ends — delete the
+        // resuming document (the manifest is the record), then release the
+        // consumed decisions from the store, whose file backend retains
+        // them until removed.
         let resuming = documents.resuming().to_path_buf();
         let removed = tokio::task::spawn_blocking(move || std::fs::remove_file(&resuming))
             .await
@@ -4665,6 +4830,126 @@ Assign tasks to the worker whose tools best match the required operations."#,
         let turns = SegmentTurns::try_new(turns)
             .map_err(|EmptySegment| fault("the completed segment carried no turns".to_string()))?;
         Ok(SegmentResult::Completed { turns })
+    }
+
+    /// Re-enter the coordinator iteration loop after every awaiting node
+    /// reached [`CellOutcome::Normal`] (the R6 natural-finish ruling): the
+    /// coordinator's conversation, the run's chat history, iteration,
+    /// planning latency, and failure history restore from the checkpoint,
+    /// and the loop continues — driving never-started siblings, re-planning
+    /// past failures, and finishing its turn naturally. A newly gated call
+    /// re-parks through `run_iteration`'s park path; the re-published
+    /// checkpoint under the parked name is the park signal, and the
+    /// blocking set re-derives from that document exactly as the drive
+    /// loop's re-park derives its own.
+    async fn resume_coordinator_continuation(
+        &self,
+        checkpoint: &ParkedRun,
+        plan: Plan,
+        documents: &super::park::resume::ResumeDocuments,
+        registry: &crate::hitl::PendingApprovals,
+        consumed: &[crate::hitl::DecisionId],
+        turns: &mut Vec<rig::completion::Message>,
+    ) -> Result<ContinuationOutcome, SegmentError> {
+        let fault = |message: String| SegmentError::Continuation(Diagnostic::new(message));
+        // Restore the coordinator exactly as run_orchestration creates it,
+        // with the checkpoint's conversation as the starting state: the
+        // conversation's growth past the restore point is the
+        // coordinator's natural tail.
+        let routing_toolset = RoutingToolSet::new();
+        let routing_decision = routing_toolset.decision.clone();
+        let AgentWithPreamble {
+            agent: coordinator,
+            preamble,
+            ..
+        } = self
+            .create_coordinator(routing_toolset, true)
+            .await
+            .map_err(|e| fault(format!("the resumed coordinator failed to build: {e}")))?;
+        let restored_len = checkpoint.coordinator_conversation.len();
+        let mut coordinator_state = CoordinatorState {
+            agent: coordinator,
+            preamble,
+            conversation: checkpoint.coordinator_conversation.clone(),
+            routing_decision,
+        };
+
+        // The segment is atomic to the client: no SSE stream consumes the
+        // loop's events, so the channel closes at birth and every send the
+        // loop makes is a no-op.
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel::<Result<StreamItem, StreamError>>(1);
+        drop(event_rx);
+
+        let (_final_answer, worker_turns) = self
+            .run_orchestration_loop(
+                &checkpoint.query,
+                plan,
+                checkpoint.chat_history.clone(),
+                &mut coordinator_state,
+                event_tx,
+                Instant::now(),
+                LoopSeed {
+                    iteration: checkpoint.iteration,
+                    planning_ms: checkpoint.planning_ms,
+                    failure_history: checkpoint.failure_history.clone(),
+                },
+            )
+            .await
+            .map_err(|e| fault(format!("the resumed coordinator loop failed: {e}")))?;
+
+        // The completed segment's turns: the workers' natural turns (the
+        // drive loop's continuations, then the loop-driven workers'), then
+        // the coordinator's natural tail — the assistant turns the
+        // restored conversation grew by. A coordinator call that errored
+        // appended no assistant message (run_iteration's Err arm completes
+        // with the raw task results), so the turns carry what exists.
+        turns.extend(worker_turns);
+        turns.extend(
+            coordinator_state.conversation[restored_len..]
+                .iter()
+                .filter(|m| matches!(m, rig::completion::Message::Assistant { .. }))
+                .cloned(),
+        );
+
+        // A mid-loop re-park published a fresh checkpoint under the parked
+        // name (run_iteration's park path; the publish unlinked the resuming
+        // document). Nothing published means the loop answered.
+        let parked = documents.parked().to_path_buf();
+        let re_parked = tokio::task::spawn_blocking(move || parked.exists())
+            .await
+            .map_err(|e| fault(format!("the re-park probe task did not complete: {e}")))?;
+        if !re_parked {
+            return Ok(ContinuationOutcome::Completed);
+        }
+        let republished = load_parked_run(documents.parked())
+            .await
+            .map_err(|e| fault(format!("loading the re-published checkpoint failed: {e}")))?;
+        // The consumed subset leaves the store only now, after the commit
+        // published — untouched sibling decisions survive, as on the drive
+        // loop's re-park path.
+        for id in consumed {
+            registry.remove(id).await;
+        }
+        let expires_at = chrono::DateTime::parse_from_rfc3339(&republished.expires_at)
+            .map_err(|e| fault(format!("the re-park commit stamped a bad expiry: {e}")))?
+            .with_timezone(&chrono::Utc);
+        let mut blocking = Vec::new();
+        for node in &republished.plan.tasks {
+            let super::types::TaskStatus::AwaitingApproval = node.status else {
+                continue;
+            };
+            for call in node.pending.iter().flatten() {
+                blocking.push(BlockingEntry {
+                    decision_id: call.decision_id,
+                    tool: ParkedToolName::new(call.tool_name.as_str()),
+                    expires_at,
+                });
+            }
+        }
+        let blocking = NonEmptyBlocking::try_new(blocking).map_err(|EmptyBlocking| {
+            fault("the re-park committed with no outstanding calls".to_string())
+        })?;
+        Ok(ContinuationOutcome::ReParked { blocking })
     }
 
     /// Collect the segment's turns from one continuation stream: the
@@ -5117,7 +5402,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             .await?;
         let initial_planning_ms = planning_start.elapsed().as_millis() as u64;
 
-        let result = match response {
+        let result: Result<String, StreamError> = match response {
             PlanningResponse::Direct {
                 response,
                 routing_rationale,
@@ -5171,16 +5456,22 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 )
                 .await;
 
-                self.run_orchestration_loop(
-                    query,
-                    plan,
-                    chat_history,
-                    &mut coordinator_state,
-                    event_tx,
-                    orchestration_start,
-                    initial_planning_ms,
-                )
-                .await
+                let (final_answer, _worker_turns) = self
+                    .run_orchestration_loop(
+                        query,
+                        plan,
+                        chat_history,
+                        &mut coordinator_state,
+                        event_tx,
+                        orchestration_start,
+                        LoopSeed {
+                            iteration: 0,
+                            planning_ms: initial_planning_ms,
+                            failure_history: Vec::new(),
+                        },
+                    )
+                    .await?;
+                Ok(final_answer)
             }
         };
 
@@ -5201,6 +5492,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
     /// `run_iteration`: a replan request is refused, with raw task results
     /// returned, once `max_planning_cycles` or the outer time budget
     /// (`budget_exhausted`) is spent.
+    ///
+    /// Returns the final answer plus every iteration's worker assistant
+    /// turns — the segment turns a resumed continuation reports (a live
+    /// caller discards them; its SSE stream carried them already).
     #[allow(clippy::too_many_arguments)]
     async fn run_orchestration_loop(
         &self,
@@ -5210,17 +5505,18 @@ Assign tasks to the worker whose tools best match the required operations."#,
         coordinator_state: &mut CoordinatorState,
         event_tx: tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>,
         orchestration_start: Instant,
-        initial_planning_ms: u64,
-    ) -> Result<String, StreamError> {
-        let mut iteration = 0;
+        seed: LoopSeed,
+    ) -> Result<(String, Vec<rig::completion::Message>), StreamError> {
+        let mut iteration = seed.iteration;
         let mut previous_context: Option<IterationContext> = None;
         let mut plan = initial_plan;
-        let mut failure_history: Vec<FailedTaskRecord> = Vec::new();
+        let mut failure_history: Vec<FailedTaskRecord> = seed.failure_history;
         // Planning latency for the next iteration. The first iteration uses the
         // initial planning call; replanned iterations inherit the prior
         // iteration's continuation-decision latency (that call produced the
         // plan being executed).
-        let mut planning_ms = initial_planning_ms;
+        let mut planning_ms = seed.planning_ms;
+        let mut worker_turns = Vec::new();
 
         let final_result = loop {
             iteration += 1;
@@ -5236,6 +5532,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     orchestration_start,
                     planning_ms,
                     &mut failure_history,
+                    &mut worker_turns,
                 )
                 .await?
             {
@@ -5252,7 +5549,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             }
         };
 
-        Ok(final_result)
+        Ok((final_result, worker_turns))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5282,6 +5579,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         orchestration_start: Instant,
         planning_ms: u64,
         failure_history: &mut Vec<FailedTaskRecord>,
+        worker_turns: &mut Vec<rig::completion::Message>,
     ) -> Result<IterationOutcome, StreamError> {
         let elapsed = orchestration_start.elapsed().as_secs_f64();
         // Execution span: plan ready → continuation-prompt entrypoint. Covers
@@ -5316,13 +5614,15 @@ Assign tasks to the worker whose tools best match the required operations."#,
         // ----------------------------------------------------------------
         // EXECUTE: Run workers on tasks (parallel when possible)
         // ----------------------------------------------------------------
-        let (task_compute_ms, park_records) = match self.execute(&mut plan, event_tx).await {
-            Ok(result) => result,
-            Err(e) => {
-                self.write_run_manifest(&plan, iteration, None).await;
-                return Err(e);
-            }
-        };
+        let (task_compute_ms, park_records, iteration_worker_turns) =
+            match self.execute(&mut plan, event_tx).await {
+                Ok(result) => result,
+                Err(e) => {
+                    self.write_run_manifest(&plan, iteration, None).await;
+                    return Err(e);
+                }
+            };
+        worker_turns.extend(iteration_worker_turns);
         let new_failure_start = failure_history.len();
         failure_history.extend(Self::collect_iteration_failures(&plan, iteration));
         let this_iteration_failures = &failure_history[new_failure_start..];
@@ -5362,6 +5662,25 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 "Iteration {} parked at quiescence; skipping post-execute coordinator call",
                 iteration
             );
+            // A parked task's turns come from its captured snapshot at full
+            // wire fidelity — the stream collector's assembly drops a tool
+            // call's provider call_id, and the segment's re-park report
+            // keys on the gated turn exactly as the park recorded it.
+            for task in &plan.tasks {
+                let TaskState::AwaitingApproval { .. } = task.state else {
+                    continue;
+                };
+                if let Some(record) = park_records.get(&task.id) {
+                    worker_turns.extend(
+                        record
+                            .snapshot
+                            .history
+                            .iter()
+                            .filter(|m| matches!(m, rig::completion::Message::Assistant { .. }))
+                            .cloned(),
+                    );
+                }
+            }
             let conversation = coordinator_state.conversation.clone();
             let routing_decision = coordinator_state.routing_decision.lock().await.clone();
             let result = self
@@ -8098,12 +8417,17 @@ mod tests {
         mark_awaiting(&mut plan, 1, vec![parked_call("kubectl_apply")]);
 
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(32);
-        let (compute_ms, park_records) = orchestrator.execute(&mut plan, &event_tx).await.unwrap();
+        let (compute_ms, park_records, worker_turns) =
+            orchestrator.execute(&mut plan, &event_tx).await.unwrap();
 
         assert_eq!(compute_ms, 0, "no worker ran");
         assert!(
             park_records.is_empty(),
             "no park record exists for a pre-marked awaiting plan"
+        );
+        assert!(
+            worker_turns.is_empty(),
+            "no worker streamed, so no worker turns exist"
         );
         assert!(matches!(
             plan.tasks[1].state,
@@ -9911,7 +10235,8 @@ mod tests {
 
         let mut plan = Plan::new("Deploy");
         plan.add_task(Task::new(0, "Gated apply", "r").with_worker("operations"));
-        let (_compute_ms, park_records) = orchestrator.execute(&mut plan, &event_tx).await.unwrap();
+        let (_compute_ms, park_records, _worker_turns) =
+            orchestrator.execute(&mut plan, &event_tx).await.unwrap();
         let TaskState::AwaitingApproval { pending } = &plan.tasks[0].state else {
             unreachable!("the fixture task is awaiting");
         };

@@ -121,7 +121,6 @@ impl ScriptedTurn {
     }
 
     /// Attach text alongside this turn's tool calls.
-    #[allow(dead_code)] // reserved: text+tool-call turn scripts, not yet consumed
     pub(crate) fn with_text(mut self, text: impl Into<String>) -> Self {
         self.text = Some(text.into());
         self
@@ -343,6 +342,38 @@ pub(crate) static WORKER_OVERRIDE_SERIAL: tokio::sync::Mutex<()> =
 pub(crate) fn take_worker_override() -> Option<WorkerOverride> {
     let queue = WORKER_OVERRIDES.get_or_init(|| Mutex::new(VecDeque::new()));
     queue.lock().expect("worker-override lock").pop_front()
+}
+
+/// One queued coordinator-model override: the scripted model the next
+/// `create_coordinator` build builds the coordinator from. The
+/// coordinator's toolset (routing, recon, read_artifact) is its own — an
+/// override carries the model only, unlike a worker override's extra
+/// tools.
+pub(crate) struct CoordinatorOverride {
+    pub(crate) model: ScriptedCompletionModel,
+}
+
+/// Take-once coordinator-override queue, mirroring the worker queue: a
+/// test installs one override per coordinator build it will drive.
+static COORDINATOR_OVERRIDES: OnceLock<Mutex<VecDeque<CoordinatorOverride>>> = OnceLock::new();
+
+/// Queue coordinator-model overrides. FIFO: the *n*-th `create_coordinator`
+/// build after this call consumes the *n*-th override. Consumers hold
+/// [`WORKER_OVERRIDE_SERIAL`] for the duration of the test — both queues
+/// are process-global.
+pub(crate) fn install_coordinator_overrides(overrides: Vec<CoordinatorOverride>) {
+    let queue = COORDINATOR_OVERRIDES.get_or_init(|| Mutex::new(VecDeque::new()));
+    queue
+        .lock()
+        .expect("coordinator-override lock")
+        .extend(overrides);
+}
+
+/// Pop the next coordinator override, if one is queued. Consumed by the
+/// orchestrator's cfg(test) prelude in `create_coordinator`.
+pub(crate) fn take_coordinator_override() -> Option<CoordinatorOverride> {
+    let queue = COORDINATOR_OVERRIDES.get_or_init(|| Mutex::new(VecDeque::new()));
+    queue.lock().expect("coordinator-override lock").pop_front()
 }
 
 /// Adapter presenting a boxed dynamic tool as a concrete [`rig::tool::Tool`]
