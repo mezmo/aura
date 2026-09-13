@@ -499,13 +499,15 @@ ApprovalCompleted { decision_id, outcome, duration_ms, scope }   // outcome incl
                                                                  // timeout/cancelled
 ```
 
-`aura.approval_pending` emits only on the conversational route. It is the
-attended prompt: `decision_id` is the resolution handle, `expires_at` lets a
-client render a countdown. The webhook route never emits the attended prompt;
-its asks emit the requested/completed bookends (an instant-200 machine
-decision is a requested-completed pair with no park), and a 207 park emits
-the standard park-lifecycle transitions - pending included - exactly like any
-durable park, with completion firing when the reconciler resolves the row.
+`aura.approval_pending` — the attended SSE prompt — emits only on the
+conversational route: `decision_id` is the resolution handle, and `expires_at`
+lets a client render a countdown. The webhook route never emits that attended
+prompt. Its client-visible bookends stay approval_requested/approval_completed
+(an instant-200 machine decision is exactly that pair, with no park). A 207
+park instead emits the internal park-lifecycle transitions, pending included,
+exactly like any durable park — a lifecycle state distinct from the attended
+SSE event; client-visible completion fires when the reconciler resolves the
+row.
 
 ```text
 POST /v1/approvals/{decision_id}
