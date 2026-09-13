@@ -238,6 +238,10 @@ pub struct RequestSetup {
     pub request_id: String,
     /// OpenAI-compatible `user` field, for the `user.id` span attribute.
     pub user_id: Option<String>,
+    /// Hex sha256 of the configured identity header's presented value, for
+    /// the `identity.hash` span attribute. `None` when no `identity_header`
+    /// is configured or the request presented none.
+    pub identity_hash: Option<String>,
     /// Request `metadata` serialized as a JSON object string, for the
     /// `metadata` span attribute.
     pub metadata_json: Option<String>,
@@ -355,6 +359,19 @@ pub async fn prepare_request(
         .filter(|m| !m.is_empty())
         .and_then(|m| serde_json::to_string(m).ok());
 
+    // The logging consumer of the server-wide `identity_header`: hash the
+    // presented value for the request span, independent of park binding.
+    let identity_hash = config
+        .identity_header
+        .as_deref()
+        .and_then(|name| {
+            req_headers_map
+                .iter()
+                .find(|(key, _)| key.to_lowercase() == name.to_lowercase())
+                .map(|(_, value)| value.as_str())
+        })
+        .map(aura::logging::identity_hash);
+
     Ok(RequestSetup {
         query,
         chat_history,
@@ -367,6 +384,7 @@ pub async fn prepare_request(
         has_client_tools,
         request_id,
         user_id,
+        identity_hash,
         metadata_json,
         tools_json,
     })
@@ -545,6 +563,7 @@ pub async fn execute_completion(
         has_client_tools: _,
         request_id: _,
         user_id,
+        identity_hash,
         metadata_json,
         tools_json,
     } = setup;
@@ -584,6 +603,7 @@ pub async fn execute_completion(
         session_id: chat_session_id.clone(),
         query: config.query_for_otel,
         user_id,
+        identity_hash,
         metadata_json,
         invocation_parameters,
         tools_json,
@@ -1840,6 +1860,7 @@ mod tests {
             has_client_tools: false,
             request_id: request_id.clone(),
             user_id: None,
+            identity_hash: None,
             metadata_json: None,
             tools_json: vec![],
         };

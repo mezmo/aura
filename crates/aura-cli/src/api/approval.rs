@@ -135,6 +135,13 @@ impl ApprovalPoster {
         }
     }
 
+    /// The approval ingress URL for one decision id, for rendering the
+    /// `run_parked` approval links.
+    #[must_use]
+    pub fn approval_url(&self, decision_id: &str) -> String {
+        self.config.approvals_url(decision_id)
+    }
+
     /// POST a decision to `/v1/approvals/{decision_id}`.
     ///
     /// Returns `Ok(PostOutcome)` for HTTP-level success (204 →

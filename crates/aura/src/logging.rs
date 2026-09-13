@@ -129,6 +129,20 @@ pub const ATTR_LLM_TOKEN_PROMPT_CACHE_WRITE: &str = "llm.token_count.prompt_deta
 pub const ATTR_LLM_INVOCATION_PARAMETERS: &str = "llm.invocation_parameters";
 /// End-user identifier from the request.
 pub const ATTR_USER_ID: &str = "user.id";
+/// Hex sha256 of the configured identity header's presented value. Recorded
+/// on the request span so runs and approvals can be attributed without aura
+/// holding an identity of its own; `None` when no `identity_header` is
+/// configured or the request presented none.
+pub const ATTR_IDENTITY_HASH: &str = "identity.hash";
+
+/// Hash one presented identity-header value to its 64-char lowercase hex
+/// sha256 digest, the same form the park checkpoint stores and the resume
+/// path compares. The raw value never leaves this call.
+#[must_use]
+pub fn identity_hash(value: &str) -> String {
+    use sha2::Digest;
+    hex::encode(sha2::Sha256::digest(value.as_bytes()))
+}
 /// Caller-supplied request metadata as a JSON object string.
 pub const ATTR_METADATA: &str = "metadata";
 /// Aura release that produced the trace.

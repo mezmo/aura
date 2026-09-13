@@ -8,6 +8,13 @@ use crate::api::stream::{StreamHandler, StreamResult, process_stream};
 use crate::api::types::{Message, ToolDefinition};
 use crate::config::AppConfig;
 
+/// The outcome of a resume POST: either the resumed run's streamed result, or
+/// a refusal (409) with its status and body.
+pub enum ResumeOutcome {
+    Streamed(StreamResult),
+    Refused { status: u16, body: String },
+}
+
 /// HTTP/SSE backend — connects to an aura-web-server via HTTP.
 ///
 /// This wraps the existing `ChatClient` + `process_stream` pattern.
@@ -44,6 +51,31 @@ impl HttpBackend {
         session_id: &str,
     ) -> Result<(String, Option<(u64, u64)>)> {
         self.client.summarize(text, session_id).await
+    }
+
+    /// POST to the resume endpoint and, on a 200, stream the resumed run's
+    /// SSE through `handler`. A non-200 (a 409 refusal) is returned as
+    /// [`ResumeOutcome::Refused`] with the status and body so the caller can
+    /// surface the refusal reason.
+    pub async fn stream_resume(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        cancel: Arc<AtomicBool>,
+        handler: &mut impl StreamHandler,
+    ) -> Result<ResumeOutcome> {
+        let response = self.client.send_resume(session_id, run_id).await?;
+        if response.status() == reqwest::StatusCode::OK {
+            let result = process_stream(response, cancel, handler).await?;
+            Ok(ResumeOutcome::Streamed(result))
+        } else {
+            let status = response.status().as_u16();
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "<no body>".to_string());
+            Ok(ResumeOutcome::Refused { status, body })
+        }
     }
 
     pub async fn list_models(&self) -> Result<Vec<String>> {

@@ -792,6 +792,7 @@ mod tests {
                 park: aura_config::ParkConfig {
                     enabled: true,
                     bind_identity: false,
+                    ..Default::default()
                 },
                 route: aura_config::DecisionRouteConfig::Webhook {
                     url: WebhookUrl::new("http://127.0.0.1:9").unwrap(),
@@ -871,6 +872,7 @@ mod tests {
                 park: aura_config::ParkConfig {
                     enabled: true,
                     bind_identity: false,
+                    ..Default::default()
                 },
                 route: aura_config::DecisionRouteConfig::Webhook {
                     url: WebhookUrl::new("https://approvals.example.com/hook").unwrap(),

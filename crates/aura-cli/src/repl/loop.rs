@@ -3413,6 +3413,69 @@ impl StreamHandler for ReplStreamHandler {
                         fields,
                     });
                 }
+                event_names::TASK_BLOCKED => {
+                    let tool_call_id = get_str(val, "tool_call_id");
+                    crate::ui::prompt::finalize_orch_tool_blocked(&tool_call_id);
+                }
+                event_names::RUN_PARKED => {
+                    let run_id = get_str(val, "run_id");
+                    let expires_at = get_str(val, "expires_at");
+                    let decision_ids: Vec<String> = val
+                        .get("decision_ids")
+                        .or_else(|| val.get("data").and_then(|d| d.get("decision_ids")))
+                        .and_then(|a| a.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str().map(str::to_string))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+
+                    flush_live_reasoning(&self.live_reasoning);
+                    flush_all_worker_reasoning(&self.live_worker_reasoning);
+
+                    println!(
+                        "{}  {}",
+                        "⏸ Run parked".themed(AuraStyle::Warning),
+                        format!("(expires {expires_at})").themed(AuraStyle::Muted),
+                    );
+                    crate::ui::prompt::increment_orch_scrollback();
+
+                    if !run_id.is_empty() {
+                        println!(
+                            "  {} {}",
+                            "run:".themed(AuraStyle::Muted),
+                            run_id.clone().themed(AuraStyle::Primary),
+                        );
+                        crate::ui::prompt::increment_orch_scrollback();
+                    }
+
+                    for id in &decision_ids {
+                        let link = self
+                            .approval_poster
+                            .as_ref()
+                            .map(|p| p.approval_url(id))
+                            .unwrap_or_else(|| id.clone());
+                        println!(
+                            "  {} {}",
+                            "approve:".themed(AuraStyle::Muted),
+                            link.themed(AuraStyle::Primary),
+                        );
+                        crate::ui::prompt::increment_orch_scrollback();
+                    }
+
+                    if !run_id.is_empty() {
+                        println!(
+                            "  {} {}",
+                            "resume:".themed(AuraStyle::Muted),
+                            format!("/resume {run_id}").themed(AuraStyle::Primary),
+                        );
+                        crate::ui::prompt::increment_orch_scrollback();
+                    }
+
+                    println!();
+                    crate::ui::prompt::increment_orch_scrollback();
+                }
                 _ => {}
             }
         } // drop _term lock

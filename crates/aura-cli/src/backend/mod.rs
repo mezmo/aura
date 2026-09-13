@@ -92,6 +92,29 @@ impl Backend {
         }
     }
 
+    /// POST to the resume endpoint and, on a 200, stream the resumed run's
+    /// SSE through `handler`. A non-200 refusal is returned as
+    /// [`http::ResumeOutcome::Refused`]. Park-resume is an HTTP-only flow
+    /// (park mode requires the web server), so the direct backend has no arm.
+    pub async fn stream_resume(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        cancel: Arc<AtomicBool>,
+        handler: &mut impl StreamHandler,
+    ) -> Result<http::ResumeOutcome> {
+        match self {
+            Self::Http(http) => {
+                http.stream_resume(session_id, run_id, cancel, handler)
+                    .await
+            }
+            #[cfg(feature = "standalone-cli")]
+            Self::Direct(_) => Err(anyhow::anyhow!(
+                "park-resume is not available in standalone mode"
+            )),
+        }
+    }
+
     /// Fetch available model IDs.
     pub async fn list_models(&self) -> Result<Vec<String>> {
         match self {

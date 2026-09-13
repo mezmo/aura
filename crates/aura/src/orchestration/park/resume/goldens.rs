@@ -248,6 +248,7 @@ fn identity_world() -> World {
             park: aura_config::ParkConfig {
                 enabled: true,
                 bind_identity: false,
+                ..Default::default()
             },
             route: aura_config::DecisionRouteConfig::Webhook {
                 url: aura_config::WebhookUrl::new("https://approvals.example.com/hook").unwrap(),

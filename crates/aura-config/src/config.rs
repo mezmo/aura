@@ -1322,6 +1322,37 @@ mode = "conversational"
         assert!(!hitl.park.enabled);
     }
 
+    #[test]
+    fn hitl_park_ttl_defaults_to_one_hour() {
+        let toml = r#"
+require_approval = []
+
+[route]
+mode = "conversational"
+
+[park]
+enabled = true
+"#;
+        let hitl: HitlConfig = toml::from_str(toml).unwrap();
+        assert_eq!(hitl.park.park_ttl_secs, 3600);
+    }
+
+    #[test]
+    fn hitl_park_ttl_parses_custom_value() {
+        let toml = r#"
+require_approval = []
+
+[route]
+mode = "conversational"
+
+[park]
+enabled = true
+park_ttl = 120
+"#;
+        let hitl: HitlConfig = toml::from_str(toml).unwrap();
+        assert_eq!(hitl.park.park_ttl_secs, 120);
+    }
+
     /// A `[hitl]` config TOML with a webhook route carrying `route_lines`.
     fn hitl_toml(route_lines: &str) -> String {
         format!(
@@ -1671,14 +1702,30 @@ pub struct HitlConfig {
 }
 
 /// `[hitl.park]` config table.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParkConfig {
     /// Park mode on or off (default off).
     #[serde(default)]
     pub enabled: bool,
+    /// How long a parked approval stays decidable, in seconds. Bounds the
+    /// decision window: a decision POSTed after this TTL is refused, and an
+    /// undecided call past it reports `expired` at resume. `0` is refused at
+    /// validation — a park with no decision window can never be approved.
+    #[serde(default = "default_park_ttl_secs", rename = "park_ttl")]
+    pub park_ttl_secs: u64,
     /// Bind each run's checkpoint to the caller's identity-header hash.
     #[serde(default)]
     pub bind_identity: bool,
+}
+
+impl Default for ParkConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            park_ttl_secs: default_park_ttl_secs(),
+            bind_identity: false,
+        }
+    }
 }
 
 /// `[hitl.route]` table. The `Webhook` variant cannot parse without a valid
@@ -1852,6 +1899,10 @@ fn is_default_poll_interval_secs(value: &u64) -> bool {
 
 fn default_poll_request_timeout_secs() -> u64 {
     30
+}
+
+fn default_park_ttl_secs() -> u64 {
+    3600
 }
 
 fn is_default_poll_request_timeout_secs(value: &u64) -> bool {

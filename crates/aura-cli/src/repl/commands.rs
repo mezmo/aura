@@ -2,7 +2,8 @@ use crate::theme::{AuraStyle, Themed};
 use rustyline::Editor;
 use rustyline::history::DefaultHistory;
 use std::io::{self, Write};
-use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::api::types::DisplayEvent;
 use crate::backend::Backend;
@@ -408,6 +409,54 @@ pub(crate) fn handle_resume(
         }
     }
     new_initial_input
+}
+
+/// Minimal stream handler for `/resume-run`: echoes the resumed run's text
+/// deltas so the final answer renders, without the full REPL task tree. The
+/// full task-tree rendering of a resumed segment is the wire gate's surface.
+struct ResumeStreamHandler;
+
+impl crate::api::stream::StreamHandler for ResumeStreamHandler {
+    fn on_token(&mut self, token: &str) {
+        print!("{token}");
+        let _ = io::stdout().flush();
+    }
+}
+
+/// Handle the `/resume-run <run_id> [session_id]` command: POST to the resume
+/// endpoint and, on a 200, stream the resumed run's SSE; on a 409, surface the
+/// refusal body. `session_id` defaults to the current conversation's id.
+pub(crate) fn handle_resume_run(
+    args: &str,
+    conv_store: &Option<ConversationStore>,
+    rt: &tokio::runtime::Runtime,
+    backend: &Backend,
+) {
+    let mut parts = args.split_whitespace();
+    let Some(run_id) = parts.next() else {
+        println!("Usage: /resume-run <run_id> [session_id]");
+        return;
+    };
+    let session_id = parts.next().map(str::to_string).unwrap_or_else(|| {
+        conv_store
+            .as_ref()
+            .map(|s| s.uuid.clone())
+            .unwrap_or_else(|| "default".to_string())
+    });
+
+    let cancel = Arc::new(AtomicBool::new(false));
+    let mut handler = ResumeStreamHandler;
+    match rt.block_on(backend.stream_resume(&session_id, run_id, cancel, &mut handler)) {
+        Ok(crate::backend::http::ResumeOutcome::Streamed(_)) => {
+            println!();
+        }
+        Ok(crate::backend::http::ResumeOutcome::Refused { status, body }) => {
+            println!("resume refused ({status}): {body}");
+        }
+        Err(e) => {
+            println!("resume failed: {e:#}");
+        }
+    }
 }
 
 /// Handle the `/model` or `/model <filter>` command.

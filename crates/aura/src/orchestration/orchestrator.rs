@@ -8483,6 +8483,7 @@ mod tests {
                 park: aura_config::ParkConfig {
                     enabled: park_enabled,
                     bind_identity: false,
+                    ..Default::default()
                 },
                 route,
             };
@@ -8546,6 +8547,7 @@ mod tests {
             park: aura_config::ParkConfig {
                 enabled: true,
                 bind_identity: false,
+                ..Default::default()
             },
             route: webhook_route_config(aura_config::WebhookDelivery::Poll),
         };

@@ -154,6 +154,14 @@ pub(crate) const COMMANDS: &[Command] = &[
         mid_stream: MidStream::Defer,
     },
     Command {
+        name: "/resume-run",
+        description: "Resume a parked run's execution stream",
+        usage_hint: Some("<run_id> [session_id]"),
+        handler: cmd_resume_run,
+        validate: None,
+        mid_stream: MidStream::Defer,
+    },
+    Command {
         name: "/rename",
         description: "Rename the current conversation",
         usage_hint: Some("<name>"),
@@ -295,6 +303,11 @@ fn cmd_resume(ctx: &mut CommandContext, args: &str) -> CommandOutcome {
         Some(new_input) => CommandOutcome::Reinject(new_input),
         None => CommandOutcome::Handled,
     }
+}
+
+fn cmd_resume_run(ctx: &mut CommandContext, args: &str) -> CommandOutcome {
+    commands::handle_resume_run(args, ctx.conv_store, ctx.rt, ctx.backend);
+    CommandOutcome::Handled
 }
 
 fn cmd_rename(ctx: &mut CommandContext, args: &str) -> CommandOutcome {

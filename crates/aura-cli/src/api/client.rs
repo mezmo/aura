@@ -119,6 +119,21 @@ impl ChatClient {
         Ok(response)
     }
 
+    /// POST to the resume endpoint and return the raw response without
+    /// status-checking: a 200 carries the resumed run's SSE stream, while a
+    /// 409 carries a JSON refusal body the caller must surface. The caller
+    /// decides which it is.
+    pub async fn send_resume(&self, session_id: &str, run_id: &str) -> Result<reqwest::Response> {
+        self.build_request(
+            reqwest::Method::POST,
+            &self.config.resume_url(session_id, run_id),
+            Some(session_id),
+        )
+        .send()
+        .await
+        .context("Failed to connect to API for resume")
+    }
+
     /// Ask the LLM for a short one-line summary/title of the given text.
     /// Returns the summary string and optional (prompt_tokens, completion_tokens).
     pub async fn summarize(

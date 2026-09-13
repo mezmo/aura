@@ -27,6 +27,10 @@ pub struct StreamOtelContext {
     pub query: String,
     /// OpenAI-compatible `user` field from the request.
     pub user_id: Option<String>,
+    /// Hex sha256 of the configured identity header's presented value, for
+    /// the `identity.hash` span attribute. `None` when no `identity_header`
+    /// is configured or the request presented none.
+    pub identity_hash: Option<String>,
     /// Request `metadata` map serialized as a JSON object string.
     pub metadata_json: Option<String>,
     /// `llm.invocation_parameters` JSON for the effective LLM config.
@@ -68,6 +72,13 @@ impl StreamOtelContext {
         );
         if let Some(user_id) = &self.user_id {
             aura::logging::set_span_attribute(&span, aura::logging::ATTR_USER_ID, user_id.clone());
+        }
+        if let Some(identity_hash) = &self.identity_hash {
+            aura::logging::set_span_attribute(
+                &span,
+                aura::logging::ATTR_IDENTITY_HASH,
+                identity_hash.clone(),
+            );
         }
         if let Some(metadata) = &self.metadata_json {
             aura::logging::set_span_attribute(

@@ -65,9 +65,10 @@ pub use super::event_replay::{
 pub(crate) use super::orchestrator::overwrite_orch_task_header_unlocked;
 pub use super::orchestrator::{
     ActiveOrchTool, OrchLastToolInfo, clear_agent_reasoning, clear_orch_task_tools,
-    current_orch_scrollback, finalize_orch_tool, increment_orch_scrollback,
-    increment_orch_scrollback_wrapped, overwrite_orch_task_header, record_tool_progress_token,
-    register_orch_tool, reset_orch_tools, set_agent_reasoning, set_orch_tool_progress_by_token,
+    current_orch_scrollback, finalize_orch_tool, finalize_orch_tool_blocked,
+    increment_orch_scrollback, increment_orch_scrollback_wrapped, overwrite_orch_task_header,
+    record_tool_progress_token, register_orch_tool, reset_orch_tools, set_agent_reasoning,
+    set_orch_tool_progress_by_token,
 };
 
 // Re-export from mid_stream.rs

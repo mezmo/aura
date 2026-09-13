@@ -4,6 +4,7 @@
 
 use std::collections::BTreeMap;
 use std::io::{self, Write};
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
@@ -512,17 +513,35 @@ fn upgrade_last_tool_to_mid(task_id: &str) {
 /// live keeps the cursor-math correct for the next tool by incrementing
 /// `ORCH_SCROLLBACK_COUNTER` for each appended line.
 pub fn finalize_orch_tool(tool_id: &str, duration_ms: Option<u64>, result: Option<&str>) {
-    let tool = if let Ok(mut guard) = ACTIVE_ORCH_TOOLS.lock() {
-        let idx = guard.iter().position(|t| t.tool_id == tool_id);
-        idx.map(|i| guard.remove(i))
-    } else {
-        None
+    let Some(tool) = take_active_tool(tool_id) else {
+        return;
     };
-
-    let Some(tool) = tool else { return };
-
     let ms = duration_ms.unwrap_or_else(|| tool.start_time.elapsed().as_millis() as u64);
-    let dur_str = format_orch_duration_ms(ms);
+    let final_text = format!("completed in {}", format_orch_duration_ms(ms));
+    finalize_tool_with_text(tool, &final_text, result);
+}
+
+/// Close a tool's live duration ticker on `task_blocked`: the call is no
+/// longer running — it is parked awaiting a decision — so the running line is
+/// replaced with a terminal `blocked` marker instead of a duration.
+pub fn finalize_orch_tool_blocked(tool_id: &str) {
+    let Some(tool) = take_active_tool(tool_id) else {
+        return;
+    };
+    finalize_tool_with_text(tool, "blocked", None);
+}
+
+/// Remove one tool from the active set by id, returning it for finalization.
+fn take_active_tool(tool_id: &str) -> Option<Arc<ActiveOrchTool>> {
+    let mut guard = ACTIVE_ORCH_TOOLS.lock().ok()?;
+    let idx = guard.iter().position(|t| t.tool_id == tool_id)?;
+    Some(guard.remove(idx))
+}
+
+/// Shared finalization: overwrite the bullet/duration lines in place with the
+/// given `final_text` and, when `result` is non-empty in expanded mode, append
+/// the tool output below the fields tree.
+fn finalize_tool_with_text(tool: Arc<ActiveOrchTool>, final_text: &str, result: Option<&str>) {
     let total_scrollback = ORCH_SCROLLBACK_COUNTER.load(Ordering::Relaxed);
     let bullet_color = crate::ui::state::task_color_for(if tool.top_level {
         "__orchestrator__"
@@ -554,8 +573,6 @@ pub fn finalize_orch_tool(tool_id: &str, duration_ms: Option<u64>, result: Optio
         (TREE_MID_BULLET, TREE_MID_DURATION)
     };
 
-    let completed_text = format!("completed in {dur_str}");
-
     let expanded = EXPANDED_OUTPUT.load(Ordering::Relaxed);
     let result_text = result.filter(|t| !t.is_empty());
     let will_print_result = expanded && result_text.is_some();
@@ -565,7 +582,7 @@ pub fn finalize_orch_tool(tool_id: &str, duration_ms: Option<u64>, result: Optio
         && let Ok(mut guard) = ORCH_LAST_TOOL_LINES.lock()
         && let Some(info) = guard.get_mut(&tool.task_id)
     {
-        info.duration_text = completed_text.clone();
+        info.duration_text = final_text.to_string();
         info.has_content_below = has_content_below;
     }
 
@@ -598,7 +615,7 @@ pub fn finalize_orch_tool(tool_id: &str, duration_ms: Option<u64>, result: Optio
             "{}{} {}",
             d_prefix.themed(AuraStyle::Connector),
             dur_connector.themed(AuraStyle::Connector),
-            completed_text.as_str().themed(AuraStyle::Muted),
+            final_text.themed(AuraStyle::Muted),
         );
         let _ = execute!(stdout, cursor::RestorePosition);
         let _ = stdout.flush();
