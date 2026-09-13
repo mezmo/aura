@@ -1279,13 +1279,7 @@ impl WebhookClient {
                 return Ok(PollOutcome::NotYet);
             }
         };
-        let decision = if wire.approved {
-            ApprovalDecision::Approved
-        } else {
-            ApprovalDecision::Denied {
-                reason: wire.reason,
-            }
-        };
+        let decision = ApprovalDecision::from(wire);
         Ok(PollOutcome::Decided {
             decision,
             response_headers,

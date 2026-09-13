@@ -231,6 +231,7 @@ impl HitlApprovalWrapper {
         park: &ParkContext,
         mut request: ApprovalRequest,
         expires_at: chrono::DateTime<chrono::Utc>,
+        started: std::time::Instant,
     ) -> Result<PreCallOutcome, ToolError> {
         // Park is worker-only, as in `park_pre_call`: the scope carries the
         // run identity the parked row's request id is minted from.
@@ -272,15 +273,43 @@ impl HitlApprovalWrapper {
         // is already gate-entry-anchored, so the elapsed sync wait consumed
         // the decision budget rather than extending it. `Requested` is NOT
         // re-published (it went out at gate entry, ruling 3(i)).
-        self.park_register(
-            park,
-            request,
-            expires_at,
-            egress_headers,
-            AcknowledgmentState::Acknowledged,
-            false,
-        )
-        .await
+        let decision_id = request.decision_id;
+        let scope = request.scope.clone();
+        match self
+            .park_register(
+                park,
+                request,
+                expires_at,
+                egress_headers,
+                AcknowledgmentState::Acknowledged,
+                false,
+            )
+            .await
+        {
+            Ok(outcome) => Ok(outcome),
+            Err(err) => {
+                // The `Requested` event already went out at gate entry (the
+                // webhook round trip publishes it before the POST), so a
+                // registration fault here must still terminalize the decision
+                // with an error `Completed` event — the same infrastructure-
+                // failure shape the route's channel faults use — or the
+                // published `Requested` has no terminal. No pending
+                // transition, no blocked-cell entry, no park row.
+                crate::approval_event_broker::publish(
+                    &self.request_id,
+                    crate::approval_event_broker::ApprovalLifecycleEvent::Completed(
+                        super::events::completed_error(
+                            decision_id,
+                            err.to_string(),
+                            &scope,
+                            started.elapsed(),
+                        ),
+                    ),
+                )
+                .await;
+                Err(err)
+            }
+        }
     }
 
     /// The shared park-registration choreography both park paths call: build
@@ -454,6 +483,10 @@ impl HitlApprovalWrapper {
         let expires_at = chrono::Utc::now()
             + chrono::Duration::from_std(self.route.timeout())
                 .expect("approval timeout fits in chrono");
+        // The gate-entry instant, captured before the POST: the bridge's
+        // error `Completed` event measures its duration from here, matching
+        // the deadline anchoring.
+        let started = std::time::Instant::now();
         match self
             .route
             .decide_for_gate(request, &cancel, mode, expires_at)
@@ -472,7 +505,8 @@ impl HitlApprovalWrapper {
                             .into(),
                     )
                 })?;
-                self.park_207_bridge(park, request, expires_at).await
+                self.park_207_bridge(park, request, expires_at, started)
+                    .await
             }
             Ok(GateDecision::Approved { overrides }) => {
                 approval_result_to_pre_call(Ok(TerminalGateDecision::Approved { overrides }))
@@ -808,11 +842,13 @@ mod tests {
 
         /// A one-shot scripted receiver: accepts one POST, captures its raw
         /// text to the channel, and replies with the given status, headers,
-        /// and body.
+        /// and body after `delay` (an artificial wait modeling a receiver
+        /// that holds the POST before answering).
         async fn scripted_receiver(
             status: &'static str,
             headers: Vec<(String, String)>,
             body: String,
+            delay: Duration,
         ) -> (String, mpsc::Receiver<String>) {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let url = format!("http://{}", listener.local_addr().unwrap());
@@ -820,6 +856,9 @@ mod tests {
             tokio::spawn(async move {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let captured = crate::hitl::read_full_request(&mut socket).await;
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
                 let mut response = format!(
                     "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n\
                      content-length: {}\r\nconnection: close\r\n",
@@ -1073,6 +1112,7 @@ mod tests {
                 "200 OK",
                 vec![("x-approver-id".to_string(), "alice".to_string())],
                 r#"{"approved":true}"#.to_string(),
+                Duration::ZERO,
             )
             .await;
 
@@ -1255,7 +1295,8 @@ mod tests {
         /// asserts exactly one POST.
         #[tokio::test]
         async fn armed_webhook_parks_on_207_with_run_owner_id() {
-            let (url, mut rx) = scripted_receiver("207 Multi-Status", vec![], String::new()).await;
+            let (url, mut rx) =
+                scripted_receiver("207 Multi-Status", vec![], String::new(), Duration::ZERO).await;
             let store = Arc::new(crate::session_store::InMemoryApprovalStore::new());
             let registry = PendingApprovals::with_backend(
                 store.clone(),
@@ -1326,7 +1367,8 @@ mod tests {
         /// value, and the 207-parked row carries it.
         #[tokio::test]
         async fn armed_webhook_parks_on_207_with_static_fallback_egress() {
-            let (url, mut rx) = scripted_receiver("207 Multi-Status", vec![], String::new()).await;
+            let (url, mut rx) =
+                scripted_receiver("207 Multi-Status", vec![], String::new(), Duration::ZERO).await;
             let store = Arc::new(crate::session_store::InMemoryApprovalStore::new());
             let registry = PendingApprovals::with_backend(
                 store.clone(),
@@ -1380,113 +1422,159 @@ mod tests {
             assert!(rx.try_recv().is_err(), "exactly one POST");
         }
 
-        /// The 207 bridge registers the parked row in the acknowledged state
-        /// (born notified), preserving the posted decision_id, minting the
-        /// request id from the run owner (so request teardown never sweeps
-        /// it), and anchoring expiry at the gate-entry deadline.
+        /// A durable-registration fault after the 207 (the store errors in
+        /// `park_register`) still terminalizes the decision: the `Requested`
+        /// event already went out at gate entry, so the bridge emits exactly
+        /// ONE error `Completed` event before failing the call closed — no
+        /// pending transition, no blocked-cell entry, no park row.
         #[tokio::test]
-        async fn bridge_registers_acknowledged_row_with_run_owner_id() {
+        async fn bridge_register_fault_emits_one_error_completed_and_no_park() {
+            let request_id = format!("req_bridge_fail_{}", uuid::Uuid::new_v4().simple());
+            let mut events = crate::approval_event_broker::subscribe(&request_id).await;
+            let (url, mut rx) =
+                scripted_receiver("207 Multi-Status", vec![], String::new(), Duration::ZERO).await;
             let store: Arc<dyn crate::session_store::ApprovalStore> =
-                Arc::new(crate::session_store::InMemoryApprovalStore::new());
+                Arc::new(crate::session_store::FaultInjectingStore::failing_register());
             let registry = PendingApprovals::with_backend(
                 store.clone(),
                 Arc::new(crate::session_store::InMemoryEventBus::new()),
             );
-            let route = conv_route_over(registry.clone(), Duration::from_secs(60));
+            let (_, route) = poll_route_with_mapping(
+                &registry,
+                Some(&req_headers(&[(
+                    "x-incoming-auth",
+                    "Bearer request-scoped",
+                )])),
+                Default::default(),
+                &url,
+            );
             let cell = Arc::new(crate::orchestration::BlockedCell::default());
-            let gate = parked_gate(&registry, &route, "req-bridge", &cell);
+            let gate = parked_gate(&registry, &route, &request_id, &cell);
 
-            let decision_id = DecisionId::generate();
-            let request = ApprovalRequest {
-                version: PROTOCOL_VERSION,
-                instance_id: "test-instance".to_string(),
-                decision_id,
-                request_id: "http-request-id".to_string(),
-                scope: worker_scope(),
-                origin: ApprovalOrigin::ConfigGate {
-                    matched_pattern: "kubectl_*".to_string(),
-                    agent_name: "test-agent".to_string(),
-                },
-                items: vec![],
-            };
-            let expires_at = chrono::Utc::now() + chrono::Duration::seconds(60);
-
-            let outcome = gate
-                .park_207_bridge(gate.park.as_ref().unwrap(), request, expires_at)
+            let err = gate
+                .pre_call(
+                    &serde_json::json!({ "namespace": "prod" }),
+                    &ToolCallContext::new("kubectl_apply"),
+                )
                 .await
-                .expect("the bridge registers the parked row");
+                .expect_err("a register fault after the 207 must fail the call closed");
             assert!(
-                matches!(outcome, PreCallOutcome::ShortCircuit { .. }),
-                "the bridge short-circuits the call with the park sentinel"
+                err.to_string().contains("approval store register failed"),
+                "error must name the register fault, got: {err}"
             );
 
-            let parked = store
-                .get(&decision_id)
-                .await
-                .unwrap()
-                .expect("the bridge parked the row");
-            assert_eq!(
-                parked.request.request_id, "run:0191e8c0-1111-7000-8000-000000000042",
-                "the parked row's request id is minted from the run owner, not the HTTP request id"
+            // One Requested (published at gate entry), then exactly one
+            // error Completed; no Pending transition.
+            match tokio::time::timeout(Duration::from_secs(1), events.recv()).await {
+                Ok(Some(crate::approval_event_broker::ApprovalLifecycleEvent::Requested(_))) => {}
+                other => panic!("expected Requested, got {other:?}"),
+            }
+            match tokio::time::timeout(Duration::from_secs(1), events.recv()).await {
+                Ok(Some(crate::approval_event_broker::ApprovalLifecycleEvent::Completed(
+                    completed,
+                ))) => assert!(
+                    matches!(
+                        completed.outcome,
+                        aura_events::ApprovalOutcomeWire::Errored { .. }
+                    ),
+                    "the terminal event is an infrastructure-failure outcome, got {:?}",
+                    completed.outcome
+                ),
+                other => panic!("expected error Completed, got {other:?}"),
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), events.recv())
+                    .await
+                    .is_err(),
+                "no further event (no Pending transition) may be published"
             );
-            assert_eq!(
-                parked.acknowledgment,
-                AcknowledgmentState::Acknowledged,
-                "the 207 is the receiver's ack: the row is born notified"
+
+            assert!(cell.is_empty(), "no blocked-cell entry may exist");
+            assert!(
+                store.list_pending().await.unwrap().is_empty(),
+                "no park row may exist"
             );
-            assert_eq!(
-                parked.request.decision_id, decision_id,
-                "the posted decision id is preserved"
+
+            let captured = rx.recv().await.unwrap();
+            assert!(
+                captured.starts_with("POST "),
+                "the armed ask POSTs: {captured}"
             );
+            assert!(rx.try_recv().is_err(), "exactly one POST");
+
+            crate::approval_event_broker::unsubscribe(&request_id).await;
         }
 
-        /// The parked row's expiry anchors at gate entry, not at the park:
-        /// the bridge registers the row with the gate-entry deadline it was
-        /// handed, so the elapsed sync wait consumes the decision budget
-        /// rather than extending it.
+        /// The parked row's expiry anchors at gate entry, not at the park: a
+        /// short artificial wait before the receiver's 207 makes the POST
+        /// round trip consume decision budget, and the parked row must still
+        /// carry the deadline captured BEFORE the POST (gate entry + timeout),
+        /// not a fresh park-time deadline. Driven through the gate interface
+        /// so a regression that moves deadline capture after the POST is
+        /// caught.
         #[tokio::test]
-        async fn bridge_anchors_expiry_at_gate_entry_not_at_the_park() {
+        async fn delayed_207_parks_with_expiry_anchored_at_gate_entry() {
+            let (url, mut rx) = scripted_receiver(
+                "207 Multi-Status",
+                vec![],
+                String::new(),
+                Duration::from_secs(1),
+            )
+            .await;
             let store: Arc<dyn crate::session_store::ApprovalStore> =
                 Arc::new(crate::session_store::InMemoryApprovalStore::new());
             let registry = PendingApprovals::with_backend(
                 store.clone(),
                 Arc::new(crate::session_store::InMemoryEventBus::new()),
             );
-            let route = conv_route_over(registry.clone(), Duration::from_secs(60));
+            let (_, route) = poll_route_with_mapping(
+                &registry,
+                Some(&req_headers(&[(
+                    "x-incoming-auth",
+                    "Bearer request-scoped",
+                )])),
+                Default::default(),
+                &url,
+            );
             let cell = Arc::new(crate::orchestration::BlockedCell::default());
-            let gate = parked_gate(&registry, &route, "req-bridge-expiry", &cell);
+            let gate = parked_gate(&registry, &route, "req-delayed-207", &cell);
 
-            let decision_id = DecisionId::generate();
-            let request = ApprovalRequest {
-                version: PROTOCOL_VERSION,
-                instance_id: "test-instance".to_string(),
-                decision_id,
-                request_id: "http-request-id".to_string(),
-                scope: worker_scope(),
-                origin: ApprovalOrigin::ConfigGate {
-                    matched_pattern: "kubectl_*".to_string(),
-                    agent_name: "test-agent".to_string(),
-                },
-                items: vec![],
+            let timeout = chrono::Duration::seconds(60);
+            let gate_entry = chrono::Utc::now();
+            gate.pre_call(
+                &serde_json::json!({ "namespace": "prod" }),
+                &ToolCallContext::new("kubectl_apply"),
+            )
+            .await
+            .expect("a delayed 207 parks through the bridge");
+
+            cell.snapshot_if_pending(&[], &rig::completion::Message::user("results"));
+            let decision_id = match cell.outcome() {
+                crate::orchestration::CellOutcome::Blocked { pending } => pending[0].decision_id,
+                other => panic!("expected Blocked, got {other:?}"),
             };
-            // A gate-entry deadline captured 30s ago: the sync wait consumed
-            // 30s of a 60s budget, so the parked row must carry THIS
-            // deadline, not a fresh now+60s.
-            let expires_at = chrono::Utc::now() - chrono::Duration::seconds(30);
-
-            gate.park_207_bridge(gate.park.as_ref().unwrap(), request, expires_at)
-                .await
-                .expect("the bridge registers the parked row");
-
             let parked = store
                 .get(&decision_id)
                 .await
                 .unwrap()
-                .expect("the bridge parked the row");
-            assert_eq!(
-                parked.expires_at, expires_at,
-                "the parked row's expiry is the gate-entry deadline, not gate-entry+timeout"
+                .expect("ticket parked");
+            // The expiry is gate entry + timeout, within a tolerance far
+            // smaller than the receiver's 1s wait: if the deadline were
+            // captured after the POST, the wait would push it ~1s later.
+            let expected = gate_entry + timeout;
+            let drift_ms = (parked.expires_at - expected).num_milliseconds().abs();
+            assert!(
+                drift_ms < 500,
+                "the parked row's expiry anchors at gate entry, not at the park; \
+                 drift {drift_ms}ms"
             );
+
+            let captured = rx.recv().await.unwrap();
+            assert!(
+                captured.starts_with("POST "),
+                "the armed ask POSTs: {captured}"
+            );
+            assert!(rx.try_recv().is_err(), "exactly one POST");
         }
     }
 
