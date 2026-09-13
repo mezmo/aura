@@ -62,7 +62,11 @@ const MAX_PENDING_TOOL_IDS: usize = 256;
 // Park cells (park mode)
 // ============================================================================
 
-/// Cancel reason the hook stamps when a parked call ends the worker stream.
+/// The park reason the hook's own log line names when a parked call ends
+/// the worker stream. Never stamped on the cancel signal: the hook's
+/// `CancelSignal` is a clone whose reason slot is clone-local, so the
+/// loop's `Err` reads `<no reason given>` regardless — the park is
+/// identified by the blocked cell.
 pub(crate) const PARK_CANCEL_REASON: &str = "parked";
 
 /// Blocked cells of the worker streams in park mode, keyed by the per-stream
@@ -495,6 +499,18 @@ where
         async move {
             // Checked before the client-tool, cancel, and timeout checks: a
             // waiting parked call must get its snapshot whatever else is true.
+            // The snapshot lands first (capture before cancel, always), then
+            // the stream is TRULY cancelled: the hard flag goes up so the
+            // fork's post-hook `is_cancelled` check yields the park Err
+            // BEFORE the next `stream_completion` — no model call ever runs
+            // over a parked call's sentinel (R7: the sentinel is capture-side
+            // bookkeeping, never model-visible truth). The reason is carried
+            // by this log line and by the blocked cell, not by
+            // `cancel_with_reason`: the hook receives a `CancelSignal` CLONE
+            // whose `Arc` shares only the hard flag — the reason `OnceLock`
+            // is clone-local, so a stamp here never reaches the loop's Err
+            // (it reads `<no reason given>` either way), and before this
+            // change the missing `cancel()` made the branch fully inert.
             if let Some(cell) = park_cell_for(&self.request_id)
                 && cell.snapshot_if_pending(history, prompt)
             {
@@ -503,7 +519,7 @@ where
                     "Parked approval pending — cancelling stream (reason: {})",
                     PARK_CANCEL_REASON
                 );
-                cancel_sig.cancel_with_reason(PARK_CANCEL_REASON);
+                cancel_sig.cancel();
                 return;
             }
             // If a passthrough tool was called this turn, do not initiate

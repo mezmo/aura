@@ -9375,6 +9375,428 @@ mod tests {
     }
 
     // ====================================================================
+    // Park control boundary (R7 / P45 stage 4b): the hook's park branch
+    // hard-cancels after the capture, so no completion ever runs over a
+    // parked call's sentinel. Mike's two confirmed assumptions (ruled
+    // 2026-09-12) are pinned here: (1) a parked call never executes its
+    // tool; (2) no model call after a park — the approval is recorded
+    // (register + cell push), the batch drains (gated siblings register,
+    // ungated siblings execute), and the TRUE cancel fires before the
+    // next `stream_completion`.
+    // ====================================================================
+
+    /// The park sentinel literal, duplicated from the gate's private
+    /// constant the way the resume goldens embed it: under R7 it is
+    /// capture-side bookkeeping (it rides the snapshot's prompt slot,
+    /// never a model request), which is exactly what the frames below pin.
+    const R7_PARK_SENTINEL: &str =
+        "This tool call is parked pending human approval. It has not run. Do not retry.";
+
+    /// The `(id, text)` pairs of a captured snapshot prompt's tool
+    /// results, in slot order — the capture shape the frames pin. Panics
+    /// on any non-tool-result item or a non-User prompt, both of which
+    /// would refuse the stage 2 preflight witness anyway.
+    fn prompt_tool_result_slots(prompt: &rig::completion::Message) -> Vec<(String, String)> {
+        let rig::completion::Message::User { content } = prompt else {
+            panic!("the captured prompt must be the tool-result user message");
+        };
+        content
+            .iter()
+            .map(|item| match item {
+                rig::message::UserContent::ToolResult(tr) => {
+                    let text = tr
+                        .content
+                        .iter()
+                        .map(|c| match c {
+                            rig::message::ToolResultContent::Text(t) => t.text.clone(),
+                            _ => "[non-text tool result]".to_string(),
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    (tr.id.clone(), text)
+                }
+                other => panic!("unexpected non-tool-result prompt item: {other:?}"),
+            })
+            .collect()
+    }
+
+    /// R7: NO MODEL CALL AFTER A PARK. The script carries a second turn
+    /// that would answer after the gated call's tool result, but the
+    /// hook's park branch (snapshot first, then the TRUE cancel) stops
+    /// the loop before the next `stream_completion`. Under the pre-R7
+    /// inert `cancel_with_reason` this completion ran over the sentinel —
+    /// the live re-drive the Gate M deny leg caught pivoting to a
+    /// variant call.
+    #[tokio::test]
+    async fn no_completion_runs_after_a_park_and_the_sentinel_never_reaches_the_model() {
+        let _serial = WORKER_OVERRIDE_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let (orchestrator, store, _registry, _request_id) =
+            override_park_orchestrator(dir.path(), 4).await;
+
+        let (model, gated_invocations) = gated_worker_override(vec![
+            ScriptedTurn::tool_calls(vec![
+                ScriptedToolCall::new(
+                    "call_0",
+                    test_rig::ECHO_TOOL_NAME,
+                    serde_json::json!({"namespace": "prod"}),
+                )
+                .with_call_id("call_id_0"),
+            ]),
+            // Would answer after the tool result — under the hard park
+            // cancel it is never served; serving it would prove the
+            // completion after the park still runs.
+            ScriptedTurn::text("applied the manifest to prod"),
+        ]);
+
+        let mut plan = Plan::new("Deploy");
+        plan.add_task(Task::new(0, "Gated apply", "r").with_worker("operations"));
+        let params = TaskExecutionParams {
+            task_description: "apply the manifest",
+            task_context: &None,
+            worker_name: Some("operations"),
+        };
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(32);
+        let result = orchestrator.execute_task(0, &params, Some(&event_tx)).await;
+
+        // The park is recorded (register + cell push) and terminal for the
+        // attempt; the gated action never executed (ruled assumption 1).
+        let TaskOutcome::Blocked {
+            pending,
+            attempt,
+            snapshot,
+        } = result.expect("a parked call blocks the task")
+        else {
+            unreachable!("the parked task's outcome is Blocked");
+        };
+        assert_eq!(attempt, 1, "the park is terminal for the attempt");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].call_id, "call_0");
+        assert!(
+            gated_invocations.lock().unwrap().is_empty(),
+            "a parked call never executes its tool"
+        );
+        assert!(
+            store.get(&pending[0].decision_id).await.unwrap().is_some(),
+            "the park recorded its approval durably before the cancel"
+        );
+
+        // THE headline pins: exactly one model request, and the sentinel
+        // appears in no captured request payload — capture-side
+        // bookkeeping, never model-visible truth.
+        let request_log = model.requests();
+        let requests = request_log.lock().expect("request log");
+        assert_eq!(
+            requests.len(),
+            1,
+            "the completion after the parking batch must never run"
+        );
+        for request in requests.iter() {
+            for message in request.chat_history.iter() {
+                let payload =
+                    serde_json::to_string(message).expect("a captured request message serializes");
+                assert!(
+                    !payload.contains(R7_PARK_SENTINEL),
+                    "the sentinel must never reach a model request: {payload}"
+                );
+            }
+        }
+        drop(requests);
+
+        // The sentinel rides the SNAPSHOT's prompt instead — the resume's
+        // replaceable slot, keyed by the parked call's own id.
+        let slots = prompt_tool_result_slots(&snapshot.current_prompt);
+        assert_eq!(slots.len(), 1, "one sentinel slot for the parked call");
+        assert_eq!(slots[0].0, "call_0");
+        assert!(slots[0].1.contains(R7_PARK_SENTINEL));
+    }
+
+    /// R7 + the sibling ruling: TWO gated calls in ONE assistant message
+    /// both register and both park (the batch drains under the cancel),
+    /// the stream ends after one batch, and the captured snapshot's
+    /// prompt carries one sentinel slot PER parked call — the
+    /// same-completion capture shape.
+    #[tokio::test]
+    async fn one_message_two_gated_calls_both_park_and_the_snapshot_carries_a_slot_per_call() {
+        let _serial = WORKER_OVERRIDE_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let (orchestrator, store, _registry, _request_id) =
+            override_park_orchestrator(dir.path(), 4).await;
+
+        // No second turn: the stream must end after the one batch. A
+        // second scripted turn would surface as a second request (and
+        // then script exhaustion) if the cancel were still inert.
+        let (model, gated_invocations) =
+            gated_worker_override(vec![ScriptedTurn::tool_calls(vec![
+                ScriptedToolCall::new(
+                    "call_a",
+                    test_rig::ECHO_TOOL_NAME,
+                    serde_json::json!({"namespace": "prod"}),
+                )
+                .with_call_id("call_id_a"),
+                ScriptedToolCall::new(
+                    "call_b",
+                    test_rig::ECHO_TOOL_NAME,
+                    serde_json::json!({"namespace": "stage"}),
+                )
+                .with_call_id("call_id_b"),
+            ])]);
+
+        let mut plan = Plan::new("Deploy");
+        plan.add_task(Task::new(0, "Gated apply", "r").with_worker("operations"));
+        let params = TaskExecutionParams {
+            task_description: "apply the manifest",
+            task_context: &None,
+            worker_name: Some("operations"),
+        };
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(32);
+        let result = orchestrator.execute_task(0, &params, Some(&event_tx)).await;
+
+        let TaskOutcome::Blocked {
+            pending,
+            attempt,
+            snapshot,
+        } = result.expect("both gated calls park the task")
+        else {
+            unreachable!("the parked task's outcome is Blocked");
+        };
+        assert_eq!(attempt, 1);
+        assert_eq!(pending.len(), 2, "both same-message calls registered");
+        assert_eq!(pending[0].call_id, "call_a");
+        assert_eq!(pending[1].call_id, "call_b");
+        assert_ne!(
+            pending[0].decision_id, pending[1].decision_id,
+            "each parked call owns its own approval"
+        );
+        for call in &pending {
+            assert!(
+                store.get(&call.decision_id).await.unwrap().is_some(),
+                "both approvals are recorded durably in the store"
+            );
+        }
+        assert!(
+            gated_invocations.lock().unwrap().is_empty(),
+            "neither parked call executed its tool"
+        );
+
+        // The stream ended after the one batch: no completion followed.
+        let request_log = model.requests();
+        let requests = request_log.lock().expect("request log");
+        assert_eq!(requests.len(), 1, "the stream ends after one batch");
+        drop(requests);
+
+        // The capture shape: one sentinel slot PER parked call, keyed by
+        // each call's own id.
+        let slots = prompt_tool_result_slots(&snapshot.current_prompt);
+        assert_eq!(slots.len(), 2, "one sentinel slot per parked call");
+        assert_eq!(slots[0].0, "call_a");
+        assert_eq!(slots[1].0, "call_b");
+        assert!(slots[0].1.contains(R7_PARK_SENTINEL));
+        assert!(slots[1].1.contains(R7_PARK_SENTINEL));
+
+        // The assistant turn carrying BOTH calls is in the captured
+        // history — the pairing the stage 2 builder reconstructs from.
+        let captured_call_ids: Vec<String> = snapshot
+            .history
+            .iter()
+            .filter_map(|m| match m {
+                rig::completion::Message::Assistant { content, .. } => Some(content),
+                _ => None,
+            })
+            .flat_map(|content| {
+                content.iter().filter_map(|item| match item {
+                    rig::message::AssistantContent::ToolCall(tc) => Some(tc.id.clone()),
+                    _ => None,
+                })
+            })
+            .collect();
+        assert_eq!(
+            captured_call_ids,
+            vec!["call_a".to_string(), "call_b".to_string()],
+            "the assistant turn with both gated calls is captured in the history"
+        );
+    }
+
+    /// R7 + the sibling ruling, mixed batch: one scripted turn issues a
+    /// GATED call then an UNGATED sibling. The gated one parks; the
+    /// ungated one EXECUTES (the batch drains in script order); the
+    /// captured prompt carries the sentinel slot and the real result, in
+    /// batch order.
+    #[tokio::test]
+    async fn a_mixed_batch_parks_the_gated_call_and_executes_the_ungated_sibling() {
+        let _serial = WORKER_OVERRIDE_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let (orchestrator, _store, _registry, _request_id) =
+            override_park_orchestrator(dir.path(), 4).await;
+
+        // Both invocation logs are observed, so the install is inline
+        // (`gated_worker_override` hides the setup tool's log).
+        let model = test_rig::ScriptedCompletionModel::new(vec![ScriptedTurn::tool_calls(vec![
+            ScriptedToolCall::new(
+                "call_g",
+                test_rig::ECHO_TOOL_NAME,
+                serde_json::json!({"namespace": "prod"}),
+            )
+            .with_call_id("call_id_g"),
+            ScriptedToolCall::new("call_u", "setup_tool", serde_json::json!({"step": 1})),
+        ])]);
+        let gated_invocations: Arc<std::sync::Mutex<Vec<test_rig::ToolInvocation>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let ungated_invocations: Arc<std::sync::Mutex<Vec<test_rig::ToolInvocation>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        test_rig::install_worker_overrides(vec![test_rig::WorkerOverride {
+            model: model.clone(),
+            extra_tools: vec![
+                Box::new(
+                    test_rig::RecordingTool::new(Arc::clone(&ungated_invocations))
+                        .with_name("setup_tool"),
+                ) as Box<dyn rig::tool::ToolDyn>,
+                Box::new(test_rig::RecordingTool::new(Arc::clone(&gated_invocations)))
+                    as Box<dyn rig::tool::ToolDyn>,
+            ],
+        }]);
+
+        let mut plan = Plan::new("Deploy");
+        plan.add_task(Task::new(0, "Gated apply", "r").with_worker("operations"));
+        let params = TaskExecutionParams {
+            task_description: "apply the manifest",
+            task_context: &None,
+            worker_name: Some("operations"),
+        };
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(32);
+        let result = orchestrator.execute_task(0, &params, Some(&event_tx)).await;
+
+        let TaskOutcome::Blocked {
+            pending,
+            attempt,
+            snapshot,
+        } = result.expect("the mixed batch parks the task")
+        else {
+            unreachable!("the parked task's outcome is Blocked");
+        };
+        assert_eq!(attempt, 1);
+        assert_eq!(pending.len(), 1, "only the gated call parked");
+        assert_eq!(pending[0].call_id, "call_g");
+        assert!(
+            gated_invocations.lock().unwrap().is_empty(),
+            "the gated call never executed its tool"
+        );
+        // The ungated sibling EXECUTED — the batch drains past the park.
+        let ungated = ungated_invocations.lock().unwrap();
+        assert_eq!(ungated.len(), 1, "the ungated sibling executed once");
+        assert_eq!(ungated[0].arguments, serde_json::json!({"step": 1}));
+        assert_eq!(ungated[0].result, test_rig::ECHO_TOOL_RESULT);
+        drop(ungated);
+
+        // No completion after the parking batch.
+        let request_log = model.requests();
+        assert_eq!(
+            request_log.lock().expect("request log").len(),
+            1,
+            "the stream ends after one batch"
+        );
+
+        // The capture shape, in batch order: the sentinel slot first
+        // (the gated call), then the sibling's real result.
+        let slots = prompt_tool_result_slots(&snapshot.current_prompt);
+        assert_eq!(
+            slots.len(),
+            2,
+            "the captured prompt carries the sentinel slot and the real result"
+        );
+        assert_eq!(slots[0].0, "call_g");
+        assert!(slots[0].1.contains(R7_PARK_SENTINEL));
+        assert_eq!(slots[1].0, "call_u");
+        assert_eq!(slots[1].1, test_rig::echo_tool_result_wire());
+    }
+
+    /// R7 + the retry ruling: a Blocked cell is terminal for the attempt —
+    /// the cell read precedes the no-`submit_result` retry arm, so the
+    /// attempt loop runs ONCE. Two queued overrides: the second is never
+    /// consumed (no second worker build, no second model request); it is
+    /// drained back here so a passing frame leaves the process-global
+    /// queue clean.
+    #[tokio::test]
+    async fn a_blocked_cell_never_re_drives_the_worker_attempt_loop() {
+        let _serial = WORKER_OVERRIDE_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let (orchestrator, _store, _registry, _request_id) =
+            override_park_orchestrator(dir.path(), 4).await;
+
+        // Attempt 1 parks on its gated call. A retry (the no-submit_result
+        // arm) would build a second worker from the second override and
+        // issue it at least one request.
+        let gated_tool = |invocations: &Arc<std::sync::Mutex<Vec<test_rig::ToolInvocation>>>| {
+            Box::new(test_rig::RecordingTool::new(Arc::clone(invocations)))
+                as Box<dyn rig::tool::ToolDyn>
+        };
+        let model_one =
+            test_rig::ScriptedCompletionModel::new(vec![ScriptedTurn::tool_calls(vec![
+                ScriptedToolCall::new(
+                    "call_0",
+                    test_rig::ECHO_TOOL_NAME,
+                    serde_json::json!({"namespace": "prod"}),
+                )
+                .with_call_id("call_id_0"),
+            ])]);
+        let model_two = test_rig::ScriptedCompletionModel::new(Vec::new());
+        let invocations_one: Arc<std::sync::Mutex<Vec<test_rig::ToolInvocation>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let invocations_two: Arc<std::sync::Mutex<Vec<test_rig::ToolInvocation>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        test_rig::install_worker_overrides(vec![
+            test_rig::WorkerOverride {
+                model: model_one.clone(),
+                extra_tools: vec![gated_tool(&invocations_one)],
+            },
+            test_rig::WorkerOverride {
+                model: model_two.clone(),
+                extra_tools: vec![gated_tool(&invocations_two)],
+            },
+        ]);
+
+        let mut plan = Plan::new("Deploy");
+        plan.add_task(Task::new(0, "Gated apply", "r").with_worker("operations"));
+        let params = TaskExecutionParams {
+            task_description: "apply the manifest",
+            task_context: &None,
+            worker_name: Some("operations"),
+        };
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(32);
+        let result = orchestrator.execute_task(0, &params, Some(&event_tx)).await;
+
+        let TaskOutcome::Blocked { attempt, .. } = result.expect("the parked call blocks the task")
+        else {
+            unreachable!("the parked task's outcome is Blocked");
+        };
+        assert_eq!(
+            attempt, 1,
+            "the park outcome is terminal: the attempt loop runs once"
+        );
+        assert_eq!(
+            model_one.requests().lock().expect("request log").len(),
+            1,
+            "attempt 1 drove exactly one worker stream"
+        );
+        assert!(
+            model_two.requests().lock().expect("request log").is_empty(),
+            "no second worker build ever issued a model request"
+        );
+
+        // The queue still holds the unconsumed second override — exactly
+        // one worker was built — and draining it keeps the process-global
+        // queue clean for the next consumer.
+        assert!(
+            test_rig::take_worker_override().is_some(),
+            "the second override must still be queued (no second build)"
+        );
+        assert!(
+            test_rig::take_worker_override().is_none(),
+            "exactly one override was consumed by the one attempt"
+        );
+    }
+
+    // ====================================================================
     // Reify and continuation proofs (P44 commit 3)
     // ====================================================================
 
