@@ -509,10 +509,10 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
     // reconciler leadership externally.
     //
     // Cross-comment (see `PollReconciler::from_config`): the "can spawn a
-    // reconciler" predicate is `can_park` — the marker split (P56 ruling 1)
-    // moved it off `poll_delivery()`, so a sync-parkable duplicate config
-    // cannot reopen the two-reconcilers-one-id hole. This guard must move
-    // with any future eligibility change.
+    // reconciler" predicate is `can_park` — the marker split moved it off
+    // `poll_delivery()`, so a sync-parkable duplicate config cannot reopen
+    // the two-reconcilers-one-id hole. This guard must move with any future
+    // eligibility change.
     let mut reconcilers = Vec::new();
     let mut claims = Vec::new();
     for config in configs_arc.iter() {

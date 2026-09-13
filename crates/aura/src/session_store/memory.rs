@@ -239,6 +239,7 @@ mod tests {
             registered_at: now,
             expires_at: now + chrono::Duration::seconds(60),
             egress_headers: None,
+            acknowledgment: crate::hitl::AcknowledgmentState::RequiresNotification,
         }
     }
 

@@ -23,6 +23,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures::StreamExt;
+use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 use tokio::task::AbortHandle;
 use tokio::time::Instant;
@@ -74,6 +75,28 @@ impl WakeEntry {
     }
 }
 
+/// Whether a parked row still needs its notify POST, or was acknowledged by
+/// the receiver at registration (the 207 bridge: the 207 IS the receiver's
+/// ack, so the reconciler never re-POSTs it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AcknowledgmentState {
+    /// The receiver has not been notified; the reconciler must POST.
+    #[default]
+    RequiresNotification,
+    /// The receiver acknowledged at registration; the reconciler must never
+    /// re-POST this row.
+    AcknowledgedAtRegistration,
+}
+
+impl AcknowledgmentState {
+    /// Whether the reconciler must still notify this row.
+    #[must_use]
+    pub fn is_requires_notification(&self) -> bool {
+        matches!(self, Self::RequiresNotification)
+    }
+}
+
 /// The serializable record of a parked approval. Carries everything needed to
 /// re-render and re-validate the approval after a restart — and, under poll
 /// delivery, the resolved egress headers its notify POST authenticates with.
@@ -86,6 +109,10 @@ pub struct ParkedApproval {
     /// headers) for this row's notify POST. Values are credentials at rest:
     /// the storage projection's Debug prints names only.
     pub egress_headers: Option<reqwest::header::HeaderMap>,
+    /// Durable acknowledgment/provenance state, written atomically with
+    /// registration. The 207 bridge constructs only the acknowledged state;
+    /// the reconciler reads this, never a process-local set alone.
+    pub acknowledgment: AcknowledgmentState,
 }
 
 /// Why a [`PendingApprovals::resolve`] could not complete.
@@ -137,6 +164,7 @@ impl PendingApprovals {
             expires_at: now
                 + chrono::Duration::from_std(timeout).expect("approval timeout fits in chrono"),
             egress_headers: None,
+            acknowledgment: AcknowledgmentState::RequiresNotification,
         };
 
         // Subscribe before the store insert: once `store.register` returns,
@@ -803,6 +831,7 @@ mod tests {
                 registered_at: chrono::Utc::now(),
                 expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
                 egress_headers: None,
+                acknowledgment: AcknowledgmentState::RequiresNotification,
             })
             .await
             .unwrap();

@@ -49,6 +49,7 @@ pub fn make_parked(request_id: &str, ttl: Duration) -> ParkedApproval {
         registered_at: now,
         expires_at: now + chrono::Duration::from_std(ttl).unwrap(),
         egress_headers: None,
+        acknowledgment: aura::hitl::AcknowledgmentState::RequiresNotification,
     }
 }
 

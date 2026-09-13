@@ -10,17 +10,17 @@
 //! durably through the same [`PendingApprovals::resolve`] path the
 //! ingress handler uses without re-posting the request. The reconciler
 //! never terminalizes an approval — expiry stays fail-closed at resolve
-//! time — and its notified markers are in-memory only, self-pruning when
-//! an id leaves `list_pending`.
+//! time — and its notified marker is the durable acknowledgment state on
+//! each row, so a row acknowledged at registration (the 207 bridge) is
+//! never re-POSTed across restarts.
 //!
 //! HA posture: single-writer — parked documents are pod-local, so two
 //! instances' reconcilers never see each other's runs. Notify delivery is
-//! at-least-once: a crash between a 2xx ack and the marker being observed
-//! produces one duplicate, idempotent by `decision_id` at the receiver.
-//! Poll-claim is exactly-once within an instance; a shared-store,
+//! at-least-once: a crash between a 2xx ack and the durable acknowledgment
+//! mark produces one duplicate, idempotent by `decision_id` at the
+//! receiver. Poll-claim is exactly-once within an instance; a shared-store,
 //! multi-instance deployment has no cross-instance claim guarantee.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -30,7 +30,7 @@ use tracing::{debug, warn};
 
 use aura_config::{DecisionRouteConfig, HitlConfig, ToolHeaderMappings};
 
-use super::decision::{ApprovalDecision, DecisionId, ResolvedDecision};
+use super::decision::{ApprovalDecision, ResolvedDecision};
 use super::registry::{PendingApprovals, ResolveError};
 use super::route::{PollOutcome, WebhookClient, webhook_client_from_config};
 use super::signing::WebhookHmac;
@@ -69,11 +69,11 @@ impl PollReconciler {
         store: Arc<dyn ApprovalStore>,
         registry: &PendingApprovals,
     ) -> Option<Self> {
-        let client = webhook_client_from_config(&config.route, hmac, None)?;
+        let client = webhook_client_from_config(&config.route, hmac, None, config.park.enabled)?;
         // Cross-comment (see the server boot guard in aura-web-server): this
-        // is the "can spawn a reconciler" predicate, keyed on `can_park` per
-        // the P56 marker split (ruling 1). The boot guard's duplicate-id scan
-        // sees exactly the configs this arms, so the two must move together.
+        // is the "can spawn a reconciler" predicate, keyed on `can_park`. The
+        // boot guard's duplicate-id scan sees exactly the configs this arms,
+        // so the two must move together.
         if !client.can_park() {
             return None;
         }
@@ -111,18 +111,17 @@ impl PollReconciler {
     async fn run(self, token: CancellationToken) {
         let mut tick = tokio::time::interval(self.interval);
         tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        let mut notified = HashSet::new();
         loop {
             tokio::select! {
                 () = token.cancelled() => break,
-                _ = tick.tick() => self.tick(&mut notified).await,
+                _ = tick.tick() => self.tick().await,
             }
         }
     }
 
-    /// One reconcile pass. The notified set self-prunes first: an id that
-    /// left `list_pending` (resolved, cancelled, expired) needs no marker.
-    async fn tick(&self, notified: &mut HashSet<DecisionId>) {
+    /// One reconcile pass. The notified-tracking reads the persisted
+    /// acknowledgment state on each row, never a process-local set alone.
+    async fn tick(&self) {
         let pending = match self.store.list_pending().await {
             Ok(pending) => pending,
             Err(err) => {
@@ -130,11 +129,6 @@ impl PollReconciler {
                 return;
             }
         };
-        notified.retain(|id| {
-            pending
-                .iter()
-                .any(|parked| parked.request.decision_id == *id)
-        });
 
         for parked in pending {
             if parked.request.instance_id != self.instance_id {
@@ -201,14 +195,16 @@ impl PollReconciler {
                     "approval poll failed; retrying next tick"
                 ),
             }
-            if !notified.contains(&id) {
+            // A row acknowledged at registration (the 207 bridge) is never
+            // re-POSTed; the persisted state is the source of truth.
+            if parked.acknowledgment.is_requires_notification() {
                 match self
                     .client
                     .notify(&parked.request, parked.egress_headers.as_ref())
                     .await
                 {
                     Ok(()) => {
-                        notified.insert(id);
+                        todo!("mark the row acknowledged (fill layer)")
                     }
                     Err(err) => {
                         warn!(
@@ -244,10 +240,10 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio::sync::mpsc;
 
-    use super::super::decision::{AgentScope, ApprovalDecision, ApprovalOrigin};
+    use super::super::decision::{AgentScope, ApprovalDecision, ApprovalOrigin, DecisionId};
     use super::super::protocol::{ApprovalItem, ApprovalRequest, PROTOCOL_VERSION};
     use super::super::read_full_request;
-    use super::super::registry::ParkedApproval;
+    use super::super::registry::{AcknowledgmentState, ParkedApproval};
     use super::*;
     use crate::session_store::{FileApprovalStore, InMemoryApprovalStore};
 
@@ -316,6 +312,7 @@ mod tests {
                 registered_at: chrono::Utc::now(),
                 expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
                 egress_headers: None,
+                acknowledgment: AcknowledgmentState::RequiresNotification,
             })
             .await
             .expect("pending approval registers");
@@ -385,9 +382,8 @@ mod tests {
         ])
         .await;
         let reconciler = reconciler_with(store.clone(), &url);
-        let mut notified = HashSet::new();
 
-        reconciler.tick(&mut notified).await;
+        reconciler.tick().await;
         let first = rx.recv().await.unwrap();
         assert!(
             first.starts_with("GET "),
@@ -403,7 +399,7 @@ mod tests {
             "the notify attempt follows the read: {same_tick}"
         );
 
-        reconciler.tick(&mut notified).await;
+        reconciler.tick().await;
         assert!(rx.recv().await.unwrap().starts_with("GET "));
         let retried = rx.recv().await.unwrap();
         assert!(
@@ -411,7 +407,7 @@ mod tests {
             "an unacked id retries the POST: {retried}"
         );
 
-        reconciler.tick(&mut notified).await;
+        reconciler.tick().await;
         let marked = rx.recv().await.unwrap();
         assert!(
             marked.starts_with("GET "),
@@ -443,13 +439,12 @@ mod tests {
         ])
         .await;
         let reconciler = reconciler_with(store.clone(), &url);
-        let mut notified = HashSet::new();
 
-        reconciler.tick(&mut notified).await;
+        reconciler.tick().await;
         assert!(rx.recv().await.unwrap().starts_with("GET "));
         assert!(rx.recv().await.unwrap().starts_with("POST "));
 
-        reconciler.tick(&mut notified).await;
+        reconciler.tick().await;
         assert!(rx.recv().await.unwrap().starts_with("GET "));
 
         assert_eq!(
@@ -471,9 +466,8 @@ mod tests {
         ])
         .await;
         let reconciler = reconciler_with(store.clone(), &url);
-        let mut notified = HashSet::new();
 
-        reconciler.tick(&mut notified).await;
+        reconciler.tick().await;
         let out_of_envelope = rx.recv().await.unwrap();
         assert!(out_of_envelope.starts_with("GET "));
         assert!(rx.recv().await.unwrap().starts_with("POST "));
@@ -499,9 +493,8 @@ mod tests {
         ])
         .await;
         let reconciler = reconciler_with(store.clone(), &url);
-        let mut notified = HashSet::new();
 
-        reconciler.tick(&mut notified).await;
+        reconciler.tick().await;
         let first_read = rx.recv().await.unwrap();
         assert!(
             first_read.starts_with("GET "),
@@ -514,7 +507,7 @@ mod tests {
             "an approving ack body must never mint a decision"
         );
 
-        reconciler.tick(&mut notified).await;
+        reconciler.tick().await;
         assert!(rx.recv().await.unwrap().starts_with("GET "));
         assert_eq!(
             store_decision(&store, &id).await,
@@ -538,9 +531,8 @@ mod tests {
         ])
         .await;
         let reconciler = reconciler_with(store.clone(), &url);
-        let mut notified = HashSet::new();
 
-        reconciler.tick(&mut notified).await;
+        reconciler.tick().await;
         let first = rx.recv().await.unwrap();
         assert!(first.starts_with("GET "));
         assert!(
@@ -554,7 +546,7 @@ mod tests {
             "the notify belongs to the own-instance row only"
         );
 
-        reconciler.tick(&mut notified).await;
+        reconciler.tick().await;
         assert!(rx.recv().await.unwrap().starts_with("GET "));
 
         assert_eq!(
@@ -633,6 +625,7 @@ mod tests {
                     registered_at: chrono::Utc::now(),
                     expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
                     egress_headers: None,
+                    acknowledgment: AcknowledgmentState::RequiresNotification,
                 })
                 .await
                 .expect("pending approval parks durably");
@@ -851,6 +844,7 @@ mod tests {
                     registered_at: chrono::Utc::now(),
                     expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
                     egress_headers: Some(headers),
+                    acknowledgment: AcknowledgmentState::RequiresNotification,
                 })
                 .await
                 .expect("pending approval registers");
@@ -970,18 +964,17 @@ mod tests {
             ])
             .await;
             let reconciler = reconciler_from(&config, Arc::clone(&reader), &url);
-            let mut notified = HashSet::new();
 
-            reconciler.tick(&mut notified).await;
+            reconciler.tick().await;
             let _first = rx.recv().await.unwrap();
             let second = rx.recv().await.unwrap();
             let _third = rx.recv().await.unwrap();
             let fourth = rx.recv().await.unwrap();
-            reconciler.tick(&mut notified).await;
+            reconciler.tick().await;
             let _fifth = rx.recv().await.unwrap();
             let sixth = rx.recv().await.unwrap();
             let _seventh = rx.recv().await.unwrap();
-            reconciler.tick(&mut notified).await;
+            reconciler.tick().await;
             let _eighth = rx.recv().await.unwrap();
             let _ninth = rx.recv().await.unwrap();
 
@@ -1034,9 +1027,8 @@ mod tests {
             )])
             .await;
             let reconciler = reconciler_from(&config, store.clone(), &url);
-            let mut notified = HashSet::new();
 
-            reconciler.tick(&mut notified).await;
+            reconciler.tick().await;
             let poll = rx.recv().await.unwrap();
             assert!(poll.starts_with("GET "), "the status read: {poll}");
             assert!(
@@ -1080,9 +1072,8 @@ mod tests {
             )])
             .await;
             let reconciler = reconciler_from(&config, store.clone(), &url);
-            let mut notified = HashSet::new();
 
-            reconciler.tick(&mut notified).await;
+            reconciler.tick().await;
             let _poll = rx.recv().await.unwrap();
 
             assert_eq!(
@@ -1130,6 +1121,7 @@ mod tests {
                     registered_at: chrono::Utc::now(),
                     expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
                     egress_headers: Some(egress),
+                    acknowledgment: AcknowledgmentState::RequiresNotification,
                 })
                 .await
                 .unwrap();
@@ -1157,7 +1149,6 @@ mod tests {
             ])
             .await;
             let reconciler = reconciler_over(&config, store.clone(), &url, &registry);
-            let mut notified = HashSet::new();
 
             let subscriber = tracing_subscriber::fmt()
                 .with_writer(Arc::clone(&log_buf))
@@ -1166,10 +1157,10 @@ mod tests {
                 .finish();
             let notify = {
                 let _log_guard = tracing::subscriber::set_default(subscriber);
-                reconciler.tick(&mut notified).await;
+                reconciler.tick().await;
                 let _read = rx.recv().await.unwrap();
                 let notify = rx.recv().await.unwrap();
-                reconciler.tick(&mut notified).await;
+                reconciler.tick().await;
                 let _decided = rx.recv().await.unwrap();
                 notify
             };
