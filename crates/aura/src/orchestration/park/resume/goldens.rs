@@ -50,12 +50,18 @@ const DECISION_2: &str = "0199c0de-4545-7000-8000-000000000043";
 /// The second same-key duplicate call's id: the slot its own sentinel
 /// occupies and its own R2 pair rides under.
 const CALL_ID_2: &str = "call_apply_2";
+/// The pivot fixture's second call's decision id.
+const PIVOT_DECISION_2: &str = "0199c0de-4545-7000-8000-000000000046";
+/// The pivot fixture's second call's call id.
+const PIVOT_CALL_ID_2: &str = "call_scale_2";
 /// The pending call's arguments, fixed so every expected body is literal.
 fn call_args() -> Value {
     json!({ "namespace": "prod" })
 }
 
-/// Node B's pending call's arguments: fixed, and distinct from node A's.
+/// The second call's pending arguments — node B's in the two-node fixture,
+/// and the pivot fixture's second call's — fixed, and distinct from the
+/// first call's.
 fn call_args_b() -> Value {
     json!({ "namespace": "prod", "replicas": 3 })
 }
@@ -71,7 +77,9 @@ const FINAL_TEXT: &str = "approved and applied";
 /// Node B's decision id — the second awaiting node's pending call, fixed so
 /// the two-node fixture's expected store state is literal.
 const DECISION_B: &str = "0199c0de-4545-7000-8000-000000000044";
-/// Node B's gated tool: a distinct name matching the same `kubectl_*` gate.
+/// A second gated tool, a distinct name matching the same `kubectl_*` gate —
+/// node B's tool in the two-node fixture, and the pivot fixture's second
+/// call's tool.
 const TOOL_B: &str = "kubectl_scale";
 /// Node B's pending call id, the slot its sentinel occupies.
 const CALL_ID_B: &str = "call_scale_1";
@@ -103,6 +111,11 @@ fn decision() -> DecisionId {
 /// The second same-key duplicate call's decision id.
 fn decision_2() -> DecisionId {
     DecisionId::parse(DECISION_2).expect("golden decision id parses")
+}
+
+/// The pivot fixture's second call's decision id.
+fn decision_pivot_2() -> DecisionId {
+    DecisionId::parse(PIVOT_DECISION_2).expect("golden decision id parses")
 }
 
 /// Node B's decision id.
@@ -339,6 +352,40 @@ async fn register_decided_duplicate_pair(world: &World) {
     }
 }
 
+/// Register the pivot fixture's two tickets — the first call's standard
+/// ticket through the shared undecided helper, plus the second call's
+/// own, riding the SAME node's task under its distinct tool — and record
+/// the given decision on each: the pivot frames choose the pair's
+/// verdicts (approve/approve, approve/deny, deny/deny).
+async fn register_decided_pivot_pair(
+    world: &World,
+    first: ApprovalDecision,
+    second: ApprovalDecision,
+) {
+    register_undecided(world).await;
+    world
+        .registry
+        .register_durable(node_approval(
+            decision_pivot_2(),
+            RUN,
+            3,
+            TOOL_B,
+            &call_args_b(),
+        ))
+        .await
+        .expect("register the pivot pair's second approval");
+    world
+        .registry
+        .resolve(&decision(), first.into())
+        .await
+        .expect("record the pivot pair's first decision");
+    world
+        .registry
+        .resolve(&decision_pivot_2(), second.into())
+        .await
+        .expect("record the pivot pair's second decision");
+}
+
 /// Register both same-key duplicate tickets over the identity world,
 /// recording the FIRST approval with its captured identity and the
 /// SECOND without: the positional pre-flight must pair the identity-less
@@ -489,6 +536,32 @@ fn sentinel_prompt_for_calls(call_ids: &[&str]) -> rig::completion::Message {
     }
 }
 
+/// The assistant tool call a checkpointed history carries for one gated
+/// call: keyed by the pending call id — the provider call id did not
+/// survive the park — carrying the recorded tool and arguments.
+fn assistant_tool_call(call_id: &str, tool: &str, args: &Value) -> rig::message::AssistantContent {
+    rig::message::AssistantContent::ToolCall(rig::message::ToolCall {
+        id: call_id.to_string(),
+        call_id: None,
+        function: rig::message::ToolFunction {
+            name: tool.to_string(),
+            arguments: args.clone(),
+        },
+        signature: None,
+        additional_params: None,
+    })
+}
+
+/// The assistant turn carrying the given tool calls: the history message a
+/// live park captures for the completion that issued the gated calls — one
+/// message, one tool call per call that completion issued.
+fn tool_call_turn(calls: Vec<rig::message::AssistantContent>) -> rig::completion::Message {
+    rig::completion::Message::Assistant {
+        id: None,
+        content: rig::OneOrMany::many(calls).expect("the turn carries a tool call"),
+    }
+}
+
 /// The standard one-call checkpoint with its sentinel prompt: the document a
 /// decided resume drives, over the matching fingerprint. The awaiting node's
 /// prompt carries the placeholder keyed by the pending call id, so a fill's
@@ -536,9 +609,12 @@ fn two_node_sentinel_document(world: &World) -> ParkedRun {
 
 /// The same-key duplicate-call checkpoint: one awaiting node (task 3)
 /// holding TWO pending calls with identical tool and arguments but
-/// distinct call ids and decision ids — the shape one worker turn
-/// leaves when it issues the same gated call twice. Both slots carry
-/// the sentinel, one per call id.
+/// distinct call ids and decision ids — the shape one worker turn leaves
+/// when it issues the same gated call twice. The history carries the
+/// assistant turn that issued BOTH calls (the genuine same-completion
+/// shape the producer can write: one message, one tool call per gated
+/// call that completion issued), and the current_prompt carries both
+/// sentinel slots, one per call id.
 fn duplicate_key_document(world: &World) -> ParkedRun {
     let mut document = parked_document(FUTURE_STAMP, matching_fingerprint(world), None, Vec::new());
     let node = document
@@ -546,6 +622,13 @@ fn duplicate_key_document(world: &World) -> ParkedRun {
         .tasks
         .first_mut()
         .expect("the skeleton carries one awaiting node");
+    node.history = Some(vec![
+        rig::completion::Message::user("apply it"),
+        tool_call_turn(vec![
+            assistant_tool_call(CALL_ID, TOOL, &call_args()),
+            assistant_tool_call(CALL_ID_2, TOOL, &call_args()),
+        ]),
+    ]);
     node.current_prompt = Some(sentinel_prompt_for_calls(&[CALL_ID, CALL_ID_2]));
     node.pending = Some(vec![
         PendingCall {
@@ -559,6 +642,46 @@ fn duplicate_key_document(world: &World) -> ParkedRun {
             tool_name: TOOL.to_string(),
             arguments: call_args(),
             call_id: CALL_ID_2.to_string(),
+        },
+    ]);
+    document
+}
+
+/// The pivot checkpoint (the Gate M deny-leg producer shape): one
+/// awaiting node (task 3) carrying TWO pending calls on DIFFERENT tools —
+/// the standard first call plus the variant call the re-driven worker
+/// pivoted to after the park — its own decision, recorded separately from
+/// the first call's — which gated and parked too. The history
+/// captures the turn that issued the FIRST call only, and the
+/// current_prompt carries the sentinel for the FIRST call only: the live
+/// park never writes a sentinel slot for a pending call whose tool call
+/// the snapshot missed, so the second call's outcome has no checkpointed
+/// placeholder to replace — the reconstruction must carry it from the
+/// pending record alone.
+fn pivot_two_call_document(world: &World) -> ParkedRun {
+    let mut document = parked_document(FUTURE_STAMP, matching_fingerprint(world), None, Vec::new());
+    let node = document
+        .plan
+        .tasks
+        .first_mut()
+        .expect("the skeleton carries one awaiting node");
+    node.history = Some(vec![
+        rig::completion::Message::user("apply it"),
+        tool_call_turn(vec![assistant_tool_call(CALL_ID, TOOL, &call_args())]),
+    ]);
+    node.current_prompt = Some(sentinel_prompt());
+    node.pending = Some(vec![
+        PendingCall {
+            decision_id: decision(),
+            tool_name: TOOL.to_string(),
+            arguments: call_args(),
+            call_id: CALL_ID.to_string(),
+        },
+        PendingCall {
+            decision_id: decision_pivot_2(),
+            tool_name: TOOL_B.to_string(),
+            arguments: call_args_b(),
+            call_id: PIVOT_CALL_ID_2.to_string(),
         },
     ]);
     document
@@ -800,6 +923,164 @@ fn normalize_fresh_parking(body: &mut Value) {
     chrono::DateTime::parse_from_rfc3339(&fresh_expiry).expect("the fresh expiry is RFC 3339");
     fresh_entry["decision_id"] = json!("<fresh decision id>");
     fresh_entry["expires_at"] = json!("<fresh expiry>");
+}
+
+/// The ids of every tool result the reconstructed context carries, in
+/// context order — the outcomes the model receives, keyed by pending call
+/// id. The pivot frames pin the exact sequence: no extras, no duplicates,
+/// no missing ids, in document order.
+fn context_tool_result_ids(context: &rig::OneOrMany<rig::completion::Message>) -> Vec<String> {
+    let mut ids = Vec::new();
+    for message in context.iter() {
+        if let rig::completion::Message::User { content } = message {
+            for item in content.iter() {
+                if let rig::message::UserContent::ToolResult(tool_result) = item {
+                    ids.push(tool_result.id.clone());
+                }
+            }
+        }
+    }
+    ids
+}
+
+/// Assert one pending call's outcome pairing in the reconstructed context
+/// the continuation streams from: the model must receive exactly one tool
+/// result keyed to this call's OWN id, carrying this call's outcome
+/// verbatim, and an assistant tool call keyed to the same id must precede
+/// it — the pairing invariant the context builder normalizes (no orphaned
+/// results, no missing calls; providers reject a result without its
+/// call). The paired call must also name the pending call's tool and carry
+/// its recorded arguments, so a builder cannot pair a result with the
+/// wrong call.
+fn assert_paired_outcome(
+    context: &rig::OneOrMany<rig::completion::Message>,
+    call_id: &str,
+    tool: &str,
+    args: &Value,
+    wire: &str,
+) {
+    let mut calls = Vec::<(usize, String, Value)>::new();
+    let mut results = Vec::<(usize, String)>::new();
+    let mut ordinal = 0usize;
+    for message in context.iter() {
+        if let rig::completion::Message::Assistant { content, .. } = message {
+            for item in content.iter() {
+                if let rig::message::AssistantContent::ToolCall(tool_call) = item
+                    && tool_call.id == call_id
+                {
+                    calls.push((
+                        ordinal,
+                        tool_call.function.name.clone(),
+                        tool_call.function.arguments.clone(),
+                    ));
+                }
+                ordinal += 1;
+            }
+        } else if let rig::completion::Message::User { content } = message {
+            for item in content.iter() {
+                if let rig::message::UserContent::ToolResult(tool_result) = item
+                    && tool_result.id == call_id
+                {
+                    let text = tool_result
+                        .content
+                        .iter()
+                        .map(|piece| match piece {
+                            rig::message::ToolResultContent::Text(text) => text.text.clone(),
+                            _ => String::new(),
+                        })
+                        .collect::<String>();
+                    results.push((ordinal, text));
+                }
+                ordinal += 1;
+            }
+        }
+    }
+    assert_eq!(
+        results.len(),
+        1,
+        "the reconstructed context carries exactly one tool result keyed to {call_id}"
+    );
+    let (result_at, result_text) = &results[0];
+    // The pairing invariant: an assistant tool call keyed to the same id
+    // precedes the result. Call ids can appear ahead of the pair point in
+    // the captured history too, so the claim is the LAST call ahead of the
+    // result — the one this result answers.
+    let Some((_, paired_tool, paired_args)) = calls.iter().rfind(|(at, _, _)| at < result_at)
+    else {
+        panic!(
+            "the reconstructed context carries no assistant tool call keyed to \
+             {call_id} ahead of its tool result — the builder must pair every \
+             result with its call, synthesizing the call the checkpoint's \
+             history missed"
+        );
+    };
+    assert_eq!(
+        paired_tool, tool,
+        "the paired assistant tool call keyed to {call_id} names the pending call's tool"
+    );
+    assert_eq!(
+        paired_args, args,
+        "the paired assistant tool call keyed to {call_id} carries the pending call's \
+         recorded arguments"
+    );
+    assert_eq!(
+        result_text, wire,
+        "the tool result keyed to {call_id} carries this call's own outcome verbatim"
+    );
+}
+
+/// The pivot frames' shared continuation pins: the segment streamed
+/// exactly one continuation request, whose context carries exactly the
+/// two pending calls' outcomes — keyed to their own call ids, in document
+/// order, each preceded by its matching assistant tool call (the second
+/// call's call present only by the builder's synthesis) — with the two
+/// expected outcome wires as given; no sentinel survives into the
+/// reconstructed context; and completion removed both pivot decisions
+/// from the store.
+async fn assert_pivot_continuation(
+    world: &World,
+    requests: &Arc<Mutex<Vec<rig::completion::CompletionRequest>>>,
+    first_wire: &str,
+    second_wire: &str,
+) {
+    let recorded = requests.lock().expect("scripted-model request log").clone();
+    assert_eq!(
+        recorded.len(),
+        1,
+        "the continuation streams exactly one request"
+    );
+    let context = &recorded[0].chat_history;
+    assert_eq!(
+        context_tool_result_ids(context),
+        [CALL_ID, PIVOT_CALL_ID_2],
+        "the model receives exactly the two pending calls' outcomes, keyed to \
+         their own call ids, in document order"
+    );
+    assert_paired_outcome(context, CALL_ID, TOOL, &call_args(), first_wire);
+    assert_paired_outcome(
+        context,
+        PIVOT_CALL_ID_2,
+        TOOL_B,
+        &call_args_b(),
+        second_wire,
+    );
+    let serialized_context =
+        serde_json::to_value(context).expect("the continuation context serializes");
+    assert!(
+        !serialized_context.to_string().contains(PARK_SENTINEL),
+        "the placeholder does not survive into the reconstructed context"
+    );
+    for id in [decision(), decision_pivot_2()] {
+        assert!(
+            world
+                .registry
+                .try_parked(&id)
+                .await
+                .expect("the store reads")
+                .is_none(),
+            "completion removes both pivot decisions from the store"
+        );
+    }
 }
 
 /// The empty-memory-root frame answers the detail-less not-found verdict.
@@ -2742,6 +3023,209 @@ async fn awaiting_node_with_an_empty_pending_list_faults_before_any_worker_build
         resuming.executed.is_empty(),
         "no tombstone: the fault precedes the tombstone write"
     );
+}
+
+// ====================================================================
+// Reconstruction direction (R5, ruled 2026-09-12): the pivot frames over
+// the Gate M deny-leg producer shape. They pin the post-reconstruction
+// spec and stay red on the fold's replace-miss fatal until Stage 3
+// lands the context builder.
+// ====================================================================
+
+/// The pivot shape, both calls approved: the reconstruction must drive
+/// BOTH gated calls from the pending records — the sentinel-bearing
+/// first call AND the slotless second — executing each exactly once in
+/// document order, and complete the segment with no sentinel text
+/// surviving into the continuation. Each outcome rides in the
+/// reconstructed context keyed to its OWN call id, preceded by its
+/// matching assistant tool call — the second call's assistant call is
+/// present only by the builder's synthesis (the checkpoint's history
+/// never captured it).
+#[tokio::test]
+async fn pivot_approved_pair_executes_once_each_in_document_order_and_completes() {
+    let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
+    let world = world();
+    // One shared invocation log across both tools: the entry order over
+    // the distinct arguments pins document order.
+    let invocations = Arc::new(Mutex::new(Vec::new()));
+    let model = ScriptedCompletionModel::new(vec![ScriptedTurn::text(FINAL_TEXT)]);
+    let requests = model.requests();
+    install_worker_overrides(vec![WorkerOverride {
+        model,
+        extra_tools: vec![
+            Box::new(RecordingTool::new(invocations.clone()).with_name(TOOL)),
+            Box::new(RecordingTool::new(invocations.clone()).with_name(TOOL_B)),
+        ],
+    }]);
+    register_decided_pivot_pair(
+        &world,
+        ApprovalDecision::Approved,
+        ApprovalDecision::Approved,
+    )
+    .await;
+    publish_document(&world, &pivot_two_call_document(&world)).await;
+
+    let grant = evaluate_resume(evaluation(&world, false, None))
+        .await
+        .expect("the all-decided pivot run grants");
+    let segment = run_segment(grant, &world.config, &HashMap::new())
+        .await
+        .expect("the pivot segment completes");
+    let turns = match segment {
+        SegmentResult::Completed { turns } => turns,
+        other => panic!("expected a completed segment, got {other:?}"),
+    };
+    {
+        let log = invocations.lock().expect("tool invocation log");
+        assert_eq!(
+            log.len(),
+            2,
+            "both pivot calls execute exactly once, in document order"
+        );
+        assert_eq!(
+            log[0].arguments,
+            call_args(),
+            "the first invocation is the first (sentinel-bearing) call, with its \
+             recorded arguments"
+        );
+        assert_eq!(
+            log[1].arguments,
+            call_args_b(),
+            "the second invocation is the second (slotless) call, reconstructed \
+             from the pending record alone"
+        );
+    }
+    let serialized = serde_json::to_value(turns.as_slice()).expect("turns serialize");
+    assert!(
+        !serialized.to_string().contains(PARK_SENTINEL),
+        "the placeholder appears nowhere in the serialized turns"
+    );
+    assert_pivot_continuation(
+        &world,
+        &requests,
+        &echo_tool_result_wire(),
+        &echo_tool_result_wire(),
+    )
+    .await;
+}
+
+/// The pivot shape, first call approved and second denied: the approved
+/// call executes exactly once, the denied call never executes, and the
+/// live denial text with its reason is what the model sees for the
+/// second call — reconstructed into the continuation with no
+/// checkpointed slot to replace. The denial rides in the tool result
+/// keyed to the SECOND call's own id, preceded by its synthesized
+/// assistant tool call — not merely somewhere in the context. The
+/// segment completes.
+#[tokio::test]
+async fn pivot_approve_then_deny_executes_only_the_approved_call_and_steers_the_second() {
+    let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
+    let world = world();
+    let invocations = Arc::new(Mutex::new(Vec::new()));
+    let model = ScriptedCompletionModel::new(vec![ScriptedTurn::text(FINAL_TEXT)]);
+    let requests = model.requests();
+    install_worker_overrides(vec![WorkerOverride {
+        model,
+        extra_tools: vec![
+            Box::new(RecordingTool::new(invocations.clone()).with_name(TOOL)),
+            Box::new(RecordingTool::new(invocations.clone()).with_name(TOOL_B)),
+        ],
+    }]);
+    register_decided_pivot_pair(
+        &world,
+        ApprovalDecision::Approved,
+        ApprovalDecision::Denied {
+            reason: Some(DENIAL_REASON.to_string()),
+        },
+    )
+    .await;
+    publish_document(&world, &pivot_two_call_document(&world)).await;
+
+    let grant = evaluate_resume(evaluation(&world, false, None))
+        .await
+        .expect("the all-decided pivot run grants");
+    let segment = run_segment(grant, &world.config, &HashMap::new())
+        .await
+        .expect("the pivot segment completes");
+    assert!(
+        matches!(segment, SegmentResult::Completed { .. }),
+        "the segment completes: {segment:?}"
+    );
+    {
+        let log = invocations.lock().expect("tool invocation log");
+        assert_eq!(
+            log.len(),
+            1,
+            "exactly one invocation: the approved first call, never the denied second"
+        );
+        assert_eq!(
+            log[0].arguments,
+            call_args(),
+            "the single invocation carries the approved call's recorded arguments"
+        );
+    }
+    assert_pivot_continuation(
+        &world,
+        &requests,
+        &echo_tool_result_wire(),
+        &tool_wire(&denial_text()),
+    )
+    .await;
+}
+
+/// The pivot shape, both calls denied — the Gate M deny leg: ZERO tool
+/// invocations, both denial texts delivered to the model, each keyed to
+/// its OWN call id (the two denials share their reason, so only
+/// id-keyed pairing distinguishes them) and each preceded by its
+/// matching assistant tool call — the second call's call present only by
+/// the builder's synthesis. The segment completes.
+#[tokio::test]
+async fn pivot_denied_pair_steers_without_executing_and_completes() {
+    let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
+    let world = world();
+    let invocations = Arc::new(Mutex::new(Vec::new()));
+    let model = ScriptedCompletionModel::new(vec![ScriptedTurn::text(FINAL_TEXT)]);
+    let requests = model.requests();
+    install_worker_overrides(vec![WorkerOverride {
+        model,
+        extra_tools: vec![
+            Box::new(RecordingTool::new(invocations.clone()).with_name(TOOL)),
+            Box::new(RecordingTool::new(invocations.clone()).with_name(TOOL_B)),
+        ],
+    }]);
+    register_decided_pivot_pair(
+        &world,
+        ApprovalDecision::Denied {
+            reason: Some(DENIAL_REASON.to_string()),
+        },
+        ApprovalDecision::Denied {
+            reason: Some(DENIAL_REASON.to_string()),
+        },
+    )
+    .await;
+    publish_document(&world, &pivot_two_call_document(&world)).await;
+
+    let grant = evaluate_resume(evaluation(&world, false, None))
+        .await
+        .expect("the all-decided pivot run grants");
+    let segment = run_segment(grant, &world.config, &HashMap::new())
+        .await
+        .expect("the pivot segment completes");
+    assert!(
+        matches!(segment, SegmentResult::Completed { .. }),
+        "the segment completes: {segment:?}"
+    );
+    assert!(
+        invocations.lock().expect("tool invocation log").is_empty(),
+        "neither denied call executes: zero invocations"
+    );
+    assert_pivot_continuation(
+        &world,
+        &requests,
+        &tool_wire(&denial_text()),
+        &tool_wire(&denial_text()),
+    )
+    .await;
 }
 
 /// The wire serializers the golden literals embed, calibrated against the
