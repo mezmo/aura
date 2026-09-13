@@ -78,6 +78,16 @@ attendance detection.
 - **Route A (webhook), unattended.** One synchronous HTTP round-trip. The gate
   posts the approval request to a configured service and blocks up to a timeout;
   the decision comes back in the response body.
+
+  *Amendment (2026-09-13, card P56):* the receiver's authorize contract changed
+  (governance 4.7.0, PRs #76 and #78) and Route A is now adaptive. Every
+  authorize POST sends `response_type` explicitly. Hold asks send `sync` and a
+  207 there is a protocol violation that fails closed with no denial recorded.
+  Park-armed asks send `poll`: an instant 200 applies the machine decision
+  in-request; a 207 parks the call through the 207 bridge (run-owner request
+  id, born acknowledged, gate-entry-anchored expiry) and the reconciler polls
+  the pinned GET contract - 200 `{approved, reason}` decided, 207 pending, 404
+  unknown. Pending is status-code-carried; no response body ever carries it.
 - **Route B (conversational), attended.** The open SSE stream carries the prompt
   down to the client; the tool call parks in-process on a oneshot channel while
   the original stream stays open; the decision returns as a separate
