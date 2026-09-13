@@ -27,7 +27,9 @@ use std::sync::LazyLock;
 
 use async_trait::async_trait;
 use aura::hitl::{DecisionId, ParkedApproval, ResolveError, ResolvedDecision};
-use aura::session_store::{ApprovalStore, DecisionRecord, ParkedApprovalRecord, SessionStoreError};
+use aura::session_store::{
+    AcknowledgeOutcome, ApprovalStore, DecisionRecord, ParkedApprovalRecord, SessionStoreError,
+};
 use redis::AsyncCommands;
 use redis::aio::ConnectionManager;
 
@@ -162,6 +164,14 @@ impl ApprovalStore for RedisApprovalStore {
         pipe.expire(&req_key, (ttl + REQ_INDEX_TTL_MARGIN_SECS) as i64)
             .ignore();
         pipe.query_async::<()>(&mut conn).await.map_err(request_err)
+    }
+
+    async fn mark_acknowledged(
+        &self,
+        id: &DecisionId,
+    ) -> Result<AcknowledgeOutcome, SessionStoreError> {
+        let _ = id;
+        todo!("conditional acknowledgment transition (fill layer)")
     }
 
     async fn get(&self, id: &DecisionId) -> Result<Option<ParkedApproval>, SessionStoreError> {

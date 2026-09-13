@@ -76,18 +76,19 @@ impl WakeEntry {
     }
 }
 
-/// Whether a parked row still needs its notify POST, or was acknowledged by
-/// the receiver at registration (the 207 bridge: the 207 IS the receiver's
-/// ack, so the reconciler never re-POSTs it).
+/// Whether a parked row still needs its notify POST, or was already
+/// acknowledged by the receiver. A row is acknowledged either at registration
+/// (the 207 bridge: the 207 IS the receiver's ack) or after a successful
+/// notify POST; either way the reconciler never re-POSTs it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AcknowledgmentState {
     /// The receiver has not been notified; the reconciler must POST.
     #[default]
     RequiresNotification,
-    /// The receiver acknowledged at registration; the reconciler must never
-    /// re-POST this row.
-    AcknowledgedAtRegistration,
+    /// The receiver has acknowledged; the reconciler must never re-POST this
+    /// row.
+    Acknowledged,
 }
 
 impl AcknowledgmentState {
@@ -114,9 +115,10 @@ pub struct ParkedApproval {
     /// headers) for this row's notify POST. Values are credentials at rest:
     /// the storage projection's Debug prints names only.
     pub egress_headers: Option<reqwest::header::HeaderMap>,
-    /// Durable acknowledgment/provenance state, written atomically with
-    /// registration. The 207 bridge constructs only the acknowledged state;
-    /// the reconciler reads this, never a process-local set alone.
+    /// Durable acknowledgment state, written atomically with registration
+    /// and updated by the reconciler's post-notify mark. The 207 bridge
+    /// constructs the acknowledged state; the reconciler reads this, never a
+    /// process-local set alone.
     pub acknowledgment: AcknowledgmentState,
 }
 
