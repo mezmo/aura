@@ -41,7 +41,7 @@
 //! - `IterationComplete` - when the post-execute coordinator decision completes
 //! - `Synthesizing` - when task results are being consolidated for the coordinator
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -76,8 +76,8 @@ use super::park::{
 use super::persistence::ExecutionPersistence;
 use super::types::{
     BlockedCell, CellOutcome, FailedTaskRecord, FailureCategory, FailureSummary, IterationContext,
-    IterationOutcome, IterationTimings, ParkSnapshot, PendingCall, Plan, PlanningResponse, Task,
-    TaskState, TaskStatus,
+    IterationOutcome, IterationTimings, ParkSnapshot, PendingCall, Plan, PlanningResponse,
+    StructuredTaskOutput, Task, TaskState, TaskStatus,
 };
 
 // ============================================================================
@@ -192,11 +192,16 @@ struct CoordinatorState {
 /// What the plan-execute-continue loop is seeded with: a fresh run starts
 /// at iteration zero with no failures; a resumed continuation seeds the
 /// checkpoint's iteration, planning latency, and failure history so the
-/// loop continues the checkpointed run rather than restarting it.
+/// loop continues the checkpointed run rather than restarting it. The
+/// known-failed task ids ride along for the same reason: the restored
+/// plan's pre-existing failures are already in the seeded history, and
+/// the iteration that executes the restored plan must not record them
+/// again under the resumed iteration.
 struct LoopSeed {
     iteration: usize,
     planning_ms: u64,
     failure_history: Vec<FailedTaskRecord>,
+    known_failed_tasks: HashSet<usize>,
 }
 
 /// Bundled coordinator tools for `build_agent_with_tools`.
@@ -3776,12 +3781,18 @@ Assign tasks to the worker whose tools best match the required operations."#,
     }
 
     /// Collect failed tasks from this iteration into failure records.
+    /// Collect this iteration's failures from the plan, skipping the task
+    /// ids that were already Failed when their plan arrived (`known_failed`
+    /// carries the restored plan's pre-existing failures for the resumed
+    /// continuation; a fresh run passes an empty set).
     fn collect_iteration_failures(
         plan: &Plan,
         iteration: usize,
+        known_failed: &HashSet<usize>,
     ) -> Vec<super::types::FailedTaskRecord> {
         plan.tasks
             .iter()
+            .filter(|t| !known_failed.contains(&t.id))
             .filter_map(|t| match &t.state {
                 TaskState::Failed { error, category } => Some(super::types::FailedTaskRecord {
                     description: t.description.clone(),
@@ -4329,6 +4340,17 @@ Assign tasks to the worker whose tools best match the required operations."#,
         // and streaming it would carry the stale placeholder past the
         // substitution with no call to replace it for.
         let mut plan = segment_plan(&checkpoint);
+        // The restored plan's already-failed tasks, snapshotted before the
+        // drive loop's own outcomes touch the plan: their failures are the
+        // checkpoint's own history (seeded into the continuation loop
+        // below), so only tasks that fail during this segment may be
+        // recorded again.
+        let known_failed: HashSet<usize> = plan
+            .tasks
+            .iter()
+            .filter(|t| matches!(t.state, TaskState::Failed { .. }))
+            .map(|t| t.id)
+            .collect();
         let mut records = ParkedTaskRecords::new();
         let mut awaiting = Vec::new();
         for node in checkpoint
@@ -4724,11 +4746,22 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     })?;
                     turns.extend(node_turns);
                     let structured = submit_result_decision.lock().await.take();
-                    let result = structured.map(|output| output.result).unwrap_or(content);
                     let task = plan
                         .get_task_mut(task_id)
                         .expect("the segment plan carries the checkpoint's task ids");
-                    task.state = TaskState::Complete { result };
+                    task.structured_output =
+                        structured.as_ref().map(|output| StructuredTaskOutput {
+                            summary: output.summary.clone(),
+                            confidence: output.confidence,
+                        });
+                    // The live loop's completion rule: a worker that never
+                    // called submit_result soft-fails, so the resumed
+                    // coordinator loop sees the failure and can re-plan
+                    // instead of a fabricated completion.
+                    match structured {
+                        Some(output) => task.complete(output.result),
+                        None => task.fail(content, FailureCategory::SoftFailure),
+                    }
                 }
             }
         }
@@ -4742,6 +4775,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             .resume_coordinator_continuation(
                 &checkpoint,
                 plan,
+                known_failed,
                 &documents,
                 registry,
                 &consumed,
@@ -4797,10 +4831,12 @@ Assign tasks to the worker whose tools best match the required operations."#,
     /// checkpoint under the parked name is the park signal, and the
     /// blocking set re-derives from that document exactly as the drive
     /// loop's re-park derives its own.
+    #[allow(clippy::too_many_arguments)]
     async fn resume_coordinator_continuation(
         &self,
         checkpoint: &ParkedRun,
         plan: Plan,
+        known_failed_tasks: HashSet<usize>,
         documents: &super::park::resume::ResumeDocuments,
         registry: &crate::hitl::PendingApprovals,
         consumed: &[crate::hitl::DecisionId],
@@ -4847,6 +4883,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     iteration: checkpoint.iteration,
                     planning_ms: checkpoint.planning_ms,
                     failure_history: checkpoint.failure_history.clone(),
+                    known_failed_tasks,
                 },
             )
             .await
@@ -5423,6 +5460,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                             iteration: 0,
                             planning_ms: initial_planning_ms,
                             failure_history: Vec::new(),
+                            known_failed_tasks: HashSet::new(),
                         },
                     )
                     .await?;
@@ -5466,6 +5504,11 @@ Assign tasks to the worker whose tools best match the required operations."#,
         let mut previous_context: Option<IterationContext> = None;
         let mut plan = initial_plan;
         let mut failure_history: Vec<FailedTaskRecord> = seed.failure_history;
+        // Only the iteration that executes the restored plan may skip the
+        // known-failed ids; a replan assigns fresh task ids that must not
+        // collide with restored ones, so the set retires with the plan it
+        // describes.
+        let mut known_failed = seed.known_failed_tasks;
         // Planning latency for the next iteration. The first iteration uses the
         // initial planning call; replanned iterations inherit the prior
         // iteration's continuation-decision latency (that call produced the
@@ -5486,6 +5529,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     &event_tx,
                     orchestration_start,
                     planning_ms,
+                    &known_failed,
                     &mut failure_history,
                     &mut worker_turns,
                 )
@@ -5500,6 +5544,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     plan = new_plan;
                     previous_context = pc;
                     planning_ms = next_planning_ms;
+                    known_failed.clear();
                 }
             }
         };
@@ -5533,6 +5578,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         event_tx: &tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>,
         orchestration_start: Instant,
         planning_ms: u64,
+        known_failed: &HashSet<usize>,
         failure_history: &mut Vec<FailedTaskRecord>,
         worker_turns: &mut Vec<rig::completion::Message>,
     ) -> Result<IterationOutcome, StreamError> {
@@ -5579,7 +5625,11 @@ Assign tasks to the worker whose tools best match the required operations."#,
             };
         worker_turns.extend(iteration_worker_turns);
         let new_failure_start = failure_history.len();
-        failure_history.extend(Self::collect_iteration_failures(&plan, iteration));
+        failure_history.extend(Self::collect_iteration_failures(
+            &plan,
+            iteration,
+            known_failed,
+        ));
         let this_iteration_failures = &failure_history[new_failure_start..];
 
         // Drain in-flight persistence writes before reading back artifacts.
