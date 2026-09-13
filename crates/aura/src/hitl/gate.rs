@@ -269,18 +269,117 @@ impl HitlApprovalWrapper {
     /// run owner, does not re-publish `Requested` (already published at gate
     /// entry), and registers the row in the acknowledged state (the 207 is
     /// the receiver's ack; the reconciler never re-POSTs it).
-    #[expect(
-        unused_variables,
-        unused_mut,
-        reason = "the fill layer removes this marker by hand"
-    )]
     async fn park_207_bridge(
         &self,
         park: &ParkContext,
         mut request: ApprovalRequest,
         expires_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<PreCallOutcome, ToolError> {
-        todo!("207 bridge registration (fill layer)")
+        // Park is worker-only, as in `park_pre_call`: the scope carries the
+        // run identity the parked row's request id is minted from.
+        let AgentScope::Worker { run_id, .. } = &self.scope else {
+            return Err(ToolError::ToolCallError(
+                "tool call blocked: park mode requires an orchestration worker scope"
+                    .to_string()
+                    .into(),
+            ));
+        };
+
+        // Egress capture, resolved the same way `park_pre_call` resolves it:
+        // a mapped destination with no usable value closes the registration
+        // before anything persists.
+        let egress_headers = match self.route.park_egress() {
+            Ok(headers) => (!headers.is_empty()).then(|| headers.into_owned()),
+            Err(err) => {
+                tracing::warn!(
+                    decision_id = %request.decision_id,
+                    error = %err,
+                    "207 bridge webhook egress capture failed; failing the gated call closed",
+                );
+                return Err(ToolError::ToolCallError(
+                    format!("tool call blocked: {err}").into(),
+                ));
+            }
+        };
+
+        // Governance already knows the decision id from the POST, so the
+        // original decision id is kept; only the request id is re-minted from
+        // the run owner, so the request-teardown sweeps that cancel by the
+        // live HTTP request id cannot sweep this ticket (the run's own sweep
+        // passes the same run owner id).
+        request.request_id = run_owner_id(&run_id.to_string());
+
+        // Born notified: the 207 IS the receiver's acknowledgment, so the row
+        // registers acknowledged and the reconciler never re-POSTs it
+        // (ruling 3(ii)). Expiry anchors at gate entry: the threaded deadline
+        // is already gate-entry-anchored, so the elapsed sync wait consumed
+        // the decision budget rather than extending it.
+        let parked = ParkedApproval {
+            request,
+            registered_at: chrono::Utc::now(),
+            expires_at,
+            egress_headers,
+            acknowledgment: AcknowledgmentState::Acknowledged,
+        };
+        let decision_id = parked.request.decision_id;
+        if let Err(err) = park.registry.register_durable(parked.clone()).await {
+            tracing::warn!(
+                decision_id = %decision_id,
+                error = %err,
+                "207 bridge approval register failed; failing the gated call closed",
+            );
+            return Err(ToolError::ToolCallError(
+                format!("tool call blocked: approval store register failed: {err}").into(),
+            ));
+        }
+
+        let first_item = parked.request.items.first();
+        let tool_name = first_item
+            .map(|item| item.tool_name.clone())
+            .unwrap_or_default();
+        let call_id = park.cell.take_current_call_id().unwrap_or_else(|| {
+            tracing::warn!(
+                decision_id = %decision_id,
+                tool_name = %tool_name,
+                "parked call has no tool-call id; recording an empty call_id",
+            );
+            String::new()
+        });
+        let call = PendingCall {
+            decision_id,
+            tool_name,
+            arguments: first_item
+                .map(|item| item.arguments.clone())
+                .unwrap_or(Value::Null),
+            call_id,
+        };
+        // The guard sees the parked call now, so a run dropped before the
+        // task returns still sweeps this ticket.
+        park.guard.record(std::slice::from_ref(&call));
+
+        // The standard park-lifecycle transition, on the live request's
+        // broker: `Requested` is NOT re-published (it went out at gate entry,
+        // ruling 3(i)) and no ApprovalOutcome is attached (that type is
+        // terminal; a pending park is not).
+        crate::approval_event_broker::publish(
+            &self.request_id,
+            crate::approval_event_broker::ApprovalLifecycleEvent::Pending(super::events::pending(
+                &parked.request,
+                &parked.expires_at,
+            )),
+        )
+        .await;
+
+        tracing::info!(
+            decision_id = %decision_id,
+            tool_name = %call.tool_name,
+            "207 parked the gated call; the receiver already acknowledged it",
+        );
+        park.cell.push(call);
+
+        Ok(PreCallOutcome::ShortCircuit {
+            output: PARK_SENTINEL.to_string(),
+        })
     }
 }
 
