@@ -262,6 +262,7 @@ fn identity_world() -> World {
                 poll_url: None,
                 poll_interval_secs: 10,
                 poll_request_timeout_secs: 30,
+                receiver_wait_timeout_secs: 900,
             },
         };
         crate::hitl::HitlRuntime::from_config(&config, registry, None, None)
