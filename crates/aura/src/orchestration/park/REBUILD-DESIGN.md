@@ -194,10 +194,45 @@ dispositions below are the repair contract this revision lands.
 | S2 | S2-5: the positional-pairing claim needs at least a wording fix; structurally, keyed pairing is the real repair | MINOR | ACCEPT — this seat's wording-only option SUPERSEDED by S1-1's keyed repair; the sub-finding (one-turn synthesis shape + honest caller-obligation statement) adopted | 1 + 10 |
 | S2 | S2-6: the `OutcomeWire` type-map row over-claims — the type cannot enforce the no-double-encoding rule | MINOR | ACCEPT — reworded to the constructor-door half; the encoding rule travels by convention + audit | 9 |
 
-Marker health after repair: the five `todo!()` holes
+Marker health after stage 2b: the five behavior holes
 (`ValidatedCalls::try_new`, `ToolResultPrompt::try_new`,
 `SegmentPreflight::try_new`, `ValidatedCalls::resolve`,
-`rebuild_context`) each carry
-`#[expect(unused_variables, reason = "todo!() body; filled by P45 stage 2b")]`;
+`rebuild_context`) are FILLED, their `#[expect(unused_variables)]`
+markers swept by hand (`grep -n "expect(unused_variables"` over
+`rebuild.rs` returns nothing; every filled body uses every parameter);
 the module's `#![allow(dead_code)]` and the re-export's
 `#[allow(unused_imports)]` keep their stage-3 sweep notes.
+
+## Stage 2b coverage manifest (frames → surface)
+
+Every frame lives in `rebuild.rs`'s test module; builder frames assert
+the complete rebuilt `(history, current_prompt)` sequence as exact rig
+messages — whole-context pins, not substring probes.
+
+| Frame | Surface covered |
+| --- | --- |
+| `pivot_shape_appends_one_synthesized_turn_and_carries_both_results_in_document_order` | FRAME 1, the full happy path: one-turn synthesis from the pending call's own record (tool + arguments verbatim), sentinel slot replaced in place, missing result appended in document order, captured history byte-preserved, sentinel nowhere |
+| `two_slot_shape_replaces_both_slots_in_place_and_keeps_the_history_byte_identical` | FRAME 2: both sentinel slots replaced in place; reused captured calls never move; history byte-identical; nothing synthesized |
+| `every_rebuilt_tool_result_is_preceded_by_its_own_call_and_answers_once` | FRAME 3, the pairing invariant over both shapes: every tool result preceded by an assistant call keyed to the same id; ids issued once, answered exactly once |
+| `three_call_pivot_groups_both_missing_calls_into_one_appended_turn_in_document_order` | FRAME 4, the panel's one-turn-synthesis obligation (S2-5): N>1 missing calls land in ONE appended assistant turn, in document order |
+| `extras_outside_the_bundle_ride_verbatim_in_history_and_prompt` | FRAME 5, the extras trust boundary (S2-3): a prior resume's paired call+result rides the history byte-preserved; a non-bundle prompt result keeps the snapshot's position and bytes |
+| `empty_call_id_refuses_the_segment_preflight` | FRAME 6a: `PreflightError::EmptyCallId`, wording pinned (`awaiting node 0: pending call member 0 carries an empty call id`) |
+| `empty_tool_name_refuses_the_segment_preflight` | FRAME 6b: `PreflightError::EmptyToolName`, wording pinned — the S1-4 synthesis-surface closure |
+| `duplicate_call_ids_refuse_the_segment_preflight` | FRAME 6c: `PreflightError::DuplicateCallId`, wording pinned (`awaiting node 0: two pending calls share the call id call_apply_1`) |
+| `empty_pending_list_refuses_the_segment_preflight` | FRAME 6d: `PreflightError::EmptyCalls` (unreachable in the wired flow; the bundle's non-empty guarantee is structural) |
+| `assistant_prompt_refuses_the_segment_preflight` | FRAME 6e: `PreflightError::NotAToolResultPrompt` — the S2-1 hoist, before any tombstone or invocation |
+| `one_nodes_invalid_input_refuses_the_whole_segment_at_the_door` | FRAME 7, the segment door's all-or-nothing property (S2-2): node B's fault refuses the whole segment though node A alone validates; the diagnostic names the node (`awaiting node 1: …`) |
+| `out_of_order_outcomes_still_pair_by_id` | FRAME 8a: keyed pairing (S1-1) — outcomes out of order still pair by identity; the bundle keeps document order |
+| `outcome_keyed_outside_the_bundle_refuses` | FRAME 8b: `ResolveError::UnknownOutcomeId`, wording pinned |
+| `duplicate_outcome_keys_refuse` | FRAME 8c: `ResolveError::DuplicateOutcomeId`, wording pinned |
+| `call_left_without_its_outcome_refuses` | FRAME 8d: `ResolveError::MissingOutcome`, wording pinned (names the abandoned call and its tool) |
+| `rebuilt_context_survives_the_rig_message_serialization_round_trip` | FRAME 9: provider-bound wire acceptance at the reachable seam — every rebuilt message JSON round-trips identical, sentinel-free (see the exclusion row) |
+
+### Exclusions
+
+| Exclusion | Reason | Owner |
+| --- | --- | --- |
+| Bedrock request-encode (frame 9's preferred form) | No reachable seam exists. The pinned rig fork (mezmo/rig @ 097d08d6) implements the encode — `TryFrom<RigMessage> for aws_bedrock::Message`, consumed by `CompletionRequest::messages()` — behind `pub(crate)` visibility in `rig_bedrock::types`, unreachable from aura; the only public path is `CompletionModel::completion`, which needs an AWS client and the network. aura itself carries no encode seam (`builder.rs`/`orchestrator.rs` construct rig agents; the encode happens inside the fork at request time), and no repo test round-trips rig Messages into a provider request shape. Per the fill-unit rules no fake seam was invented: the frame asserts the rig Message serde round-trip instead — the same serializer the resume goldens' wire-calibration frame (`outcome_pair_and_sentinel_literals_match_the_wire_serializers`) grounds its literals against. | The encode belongs to the rig fork; end-to-end provider acceptance lands with P45 stage 3's prelude wiring, which speaks through rig's Completion trait |
+| Reverse-capture builder shape (a later bundle call captured while an earlier one is missed) | Unreachable from both producers: calls issue in turn order, and the snapshot captures a completion's assistant turn all-or-nothing, so a missed call is always later in document order than a captured one — replace-in-place plus append therefore always yields bundle document order. Pinned by construction reasoning, not a frame. | The stage-4 producer's mechanism spec carries the binding condition |
+| The three Stage-1 pivot goldens stay red (`pivot_approved_pair…`, `pivot_approve_then_deny…`, `pivot_denied_pair…`, all on `call_scale_2`) | By design: they pin the WIRED substitution, which stage 3's prelude rework delivers; stage 2b fills and frames the builder only. Post-2b full-lib suite: 1299 passed (1283 + 16 frames), exactly these 3 red. | P45 stage 3 flips them |
+| `#![allow(dead_code)]` on the module; `#[allow(unused_imports)]` on the park/mod.rs re-export | Survivors by design: the module stays unwired until stage 3 points the substitution prelude at it. | P45 stage 3 sweeps both at wiring |
