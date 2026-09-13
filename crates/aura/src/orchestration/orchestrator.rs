@@ -8470,8 +8470,10 @@ mod tests {
     }
 
     /// `park_enabled` requires the flag AND a park-capable route: the
-    /// conversational route and the webhook route under poll delivery park;
-    /// the webhook route under sync delivery keeps the live decision path.
+    /// conversational route parks, and the webhook route parks under poll
+    /// delivery or under sync delivery with the flag on (the adaptive
+    /// contract); sync delivery with the flag off keeps only the live
+    /// decision path.
     #[tokio::test]
     async fn park_enabled_requires_flag_and_park_capable_route() {
         use aura_config::GlobPattern;
@@ -8520,13 +8522,27 @@ mod tests {
         .unwrap();
         assert!(on.park_enabled(), "flag on + conversational: park on");
 
-        let sync = Orchestrator::new(config(
+        let sync_park = Orchestrator::new(config(
             true,
             webhook_route_config(aura_config::WebhookDelivery::Sync),
         ))
         .await
         .unwrap();
-        assert!(!sync.park_enabled(), "webhook sync route: park off");
+        assert!(
+            sync_park.park_enabled(),
+            "webhook sync route with park enabled: park on"
+        );
+
+        let sync_hold = Orchestrator::new(config(
+            false,
+            webhook_route_config(aura_config::WebhookDelivery::Sync),
+        ))
+        .await
+        .unwrap();
+        assert!(
+            !sync_hold.park_enabled(),
+            "webhook sync route with park disabled: park off"
+        );
 
         let poll = Orchestrator::new(config(
             true,

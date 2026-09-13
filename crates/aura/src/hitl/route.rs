@@ -2706,11 +2706,13 @@ mod tests {
                 Parse,
                 Unverified,
                 CaptureFailed(&'static str),
+                Pending,
+                ProtocolViolation,
             }
 
             let identity = || ("x-approver-id".to_owned(), "alice".to_owned());
             let approved = || r#"{"approved":true}"#.to_owned();
-            let cases: Vec<(&str, Reply, EgressSigning, bool, Expected)> = vec![
+            let cases: Vec<(&str, Reply, EgressSigning, bool, AskMode, Expected)> = vec![
                 (
                     "an unsigned approval carrying the mapped header",
                     Reply::Respond {
@@ -2720,6 +2722,7 @@ mod tests {
                     },
                     EgressSigning::Disabled,
                     true,
+                    AskMode::Hold,
                     Expected::ApprovedWithOverrides,
                 ),
                 (
@@ -2731,6 +2734,7 @@ mod tests {
                     },
                     EgressSigning::Disabled,
                     true,
+                    AskMode::Hold,
                     Expected::CaptureFailed("x-forwarded-user"),
                 ),
                 (
@@ -2742,6 +2746,7 @@ mod tests {
                     },
                     EgressSigning::Disabled,
                     true,
+                    AskMode::Hold,
                     Expected::Denied("not today"),
                 ),
                 (
@@ -2753,6 +2758,7 @@ mod tests {
                     },
                     EgressSigning::Disabled,
                     false,
+                    AskMode::Hold,
                     Expected::ApprovedWithoutOverrides,
                 ),
                 (
@@ -2764,6 +2770,7 @@ mod tests {
                     },
                     EgressSigning::Disabled,
                     true,
+                    AskMode::Hold,
                     Expected::BadStatus(503),
                 ),
                 (
@@ -2775,6 +2782,7 @@ mod tests {
                     },
                     EgressSigning::Disabled,
                     true,
+                    AskMode::Hold,
                     Expected::Parse,
                 ),
                 (
@@ -2786,6 +2794,7 @@ mod tests {
                     },
                     EgressSigning::Enabled(test_hmac()),
                     true,
+                    AskMode::Hold,
                     Expected::Unverified,
                 ),
                 (
@@ -2793,11 +2802,48 @@ mod tests {
                     Reply::Stall,
                     EgressSigning::Disabled,
                     true,
+                    AskMode::Hold,
                     Expected::TimedOut,
+                ),
+                (
+                    "a park-armed ask's instant 200 machine decision resolves in-request",
+                    Reply::Respond {
+                        status: "200 OK",
+                        headers: vec![identity()],
+                        body: approved(),
+                    },
+                    EgressSigning::Disabled,
+                    true,
+                    AskMode::ParkArmed,
+                    Expected::ApprovedWithOverrides,
+                ),
+                (
+                    "a park-armed ask's 207 parks (pending) rather than deciding",
+                    Reply::Respond {
+                        status: "207 Multi-Status",
+                        headers: vec![],
+                        body: String::new(),
+                    },
+                    EgressSigning::Disabled,
+                    true,
+                    AskMode::ParkArmed,
+                    Expected::Pending,
+                ),
+                (
+                    "a 207 on a sync (hold) ask is a protocol violation",
+                    Reply::Respond {
+                        status: "207 Multi-Status",
+                        headers: vec![],
+                        body: r#"{"approved":false}"#.to_owned(),
+                    },
+                    EgressSigning::Disabled,
+                    true,
+                    AskMode::Hold,
+                    Expected::ProtocolViolation,
                 ),
             ];
 
-            for (case, reply, signing, mapped, expected) in cases {
+            for (case, reply, signing, mapped, mode, expected) in cases {
                 let (url, timeout) = match reply {
                     Reply::Respond {
                         status,
@@ -2822,7 +2868,7 @@ mod tests {
                     .request_approval_for_gate(
                         &test_request(DecisionId::generate()),
                         timeout,
-                        AskMode::Hold,
+                        mode,
                         chrono::Utc::now() + chrono::Duration::seconds(300),
                     )
                     .await;
@@ -2854,6 +2900,8 @@ mod tests {
                     }
                     (Expected::Parse, Err(ApprovalError::Parse(_))) => {}
                     (Expected::Unverified, Err(ApprovalError::ResponseUnverified(_))) => {}
+                    (Expected::Pending, Ok(GateDecision::Pending { .. })) => {}
+                    (Expected::ProtocolViolation, Err(ApprovalError::ProtocolViolation(_))) => {}
                     (
                         Expected::CaptureFailed(name),
                         Err(

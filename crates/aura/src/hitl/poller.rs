@@ -612,18 +612,17 @@ mod tests {
 
     /// The restart path through the real production wiring (from_config +
     /// spawn over a persistent file-backed store): boot one reads status
-    /// and notifies; stop the runtime; the reboot's fresh markers
-    /// re-notify the still-undecided row (idempotent by decision id), and
-    /// the next tick's decided poll resolves durably.
+    /// and notifies, marking the row acknowledged durably; after a reboot
+    /// the fresh reconciler reads the persisted acknowledgment and never
+    /// re-POSTs the row, resolving it through the pinned GET alone.
     #[tokio::test]
-    async fn restart_renotifies_the_undecided_row_and_resolves_after_reboot() {
+    async fn restart_does_not_repost_the_acknowledged_row_and_resolves_after_reboot() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().to_path_buf();
         let (url, mut rx) = scripted_receiver(vec![
             poll_pending(),
             ack_ok(),
             poll_pending(),
-            ack_ok(),
             poll_decided(r#"{"approved":true}"#),
         ])
         .await;
@@ -658,10 +657,11 @@ mod tests {
         assert!(notify.starts_with("POST "), "boot one notifies: {notify}");
         handle_a.stop().await;
 
-        // Boot two: a fresh reconciler over the same store root — notified
-        // markers are gone, so the reboot re-notifies the undecided row and
-        // the next tick's poll picks up the decision. Its registry resolves
-        // over the same store, as the ingress handler's would.
+        // Boot two: a fresh reconciler over the same store root — the
+        // acknowledgment boot one's notify persisted is durable, so the
+        // reboot never re-POSTs the row and resolves it through the pinned
+        // GET alone. Its registry resolves over the same store, as the
+        // ingress handler's would.
         let store_b: Arc<dyn ApprovalStore> = Arc::new(FileApprovalStore::open(&path).unwrap());
         let _handle_b = reconciler_with(store_b.clone(), &url).spawn(&shutdown);
         let reread = tokio::time::timeout(Duration::from_secs(5), rx.recv())
@@ -672,13 +672,9 @@ mod tests {
             reread.starts_with("GET "),
             "the reboot reads status: {reread}"
         );
-        let renotify = tokio::time::timeout(Duration::from_secs(5), rx.recv())
-            .await
-            .expect("boot two re-notifies")
-            .unwrap();
         assert!(
-            renotify.starts_with("POST "),
-            "the reboot re-notifies: {renotify}"
+            rx.try_recv().is_err(),
+            "the reboot never re-POSTs the acknowledged row"
         );
 
         let recorded = tokio::time::timeout(Duration::from_secs(5), async {
