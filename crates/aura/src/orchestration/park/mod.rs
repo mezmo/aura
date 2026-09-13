@@ -12,30 +12,31 @@ pub(crate) mod resume;
 pub(crate) use commit::{
     ParkCommitInputs, cancel_run_approvals, commit_from_run_state, run_owner_id,
 };
-// The rehydrate entry points: `ResumingDocumentHandle` drives the resume
-// segment's tombstones in production; `load_recorded_decisions` and
-// `RehydrateError` are consumed through this re-export by commit 3's tests
-// (the resume consult reaches them by module path), so the unused-import
-// marker stays until those consumers name the re-export path.
+// `ResumingDocumentHandle` drives the resume segment's tombstones in
+// production. `load_recorded_decisions` is consumed through this
+// re-export by the park-tree golden suites alone — the module is private
+// outside `park`, and the resume consult reaches it by module path — so
+// its marker stays.
+pub(crate) use continuation::ResumingDocumentHandle;
 #[allow(unused_imports)]
-pub(crate) use continuation::{RehydrateError, ResumingDocumentHandle, load_recorded_decisions};
-#[allow(unused_imports)]
+pub(crate) use continuation::load_recorded_decisions;
 pub(crate) use document::{
     PARKED_DOCUMENT_SUFFIX, ParkedRun, RESUMING_DOCUMENT_SUFFIX, RunStateForPark, load_parked_run,
 };
 pub(crate) use guard::ParkGuard;
 // The provider-valid context builder for the reconstruction direction
-// (P45, R5): the stage-3 wiring points the substitution prelude at it,
-// consuming the construction path by name (`NodePreflightInput`,
-// `SegmentPreflight`, `CallId`, `OutcomeWire`, `rebuild_context`). The
-// remaining re-exported names are reached only through method returns
-// and inference, never by name in production — the stage-2b frames
-// exercise them inside the module — so the unused-import marker stays.
+// (P45, R5): the prelude names `CallId`, `NodePreflightInput`,
+// `OutcomeWire`, `SegmentPreflight`, and `rebuild_context` through this
+// re-export. The rest of the flat list is the design record's
+// completeness surface (REBUILD-DESIGN.md's seam table), reached only by
+// module path and inference — the marker stays for those names.
+pub(crate) use rebuild::{
+    CallId, NodePreflightInput, OutcomeWire, SegmentPreflight, rebuild_context,
+};
 #[allow(unused_imports)]
 pub(crate) use rebuild::{
-    CallId, NodePreflightInput, OutcomeWire, PreflightError, RebuiltContext, ResolveError,
-    ResolvedCall, ResolvedCallBundle, SegmentPreflight, ToolResultPrompt, ValidatedCall,
-    ValidatedCalls, ValidatedNode, rebuild_context,
+    PreflightError, RebuiltContext, ResolveError, ResolvedCall, ResolvedCallBundle,
+    ToolResultPrompt, ValidatedCall, ValidatedCalls, ValidatedNode,
 };
 pub(crate) use recorded_decisions::{CallKey, PeekOutcome, RecordedDecisions};
 
