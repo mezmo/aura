@@ -453,6 +453,12 @@ impl Config {
             tracing::warn!("{msg}");
         }
 
+        if let Some(hitl) = &self.hitl
+            && let Some(msg) = hitl_timeout_alignment_warning(hitl)
+        {
+            tracing::warn!("{msg}");
+        }
+
         if let Some(orch) = self.orchestration.as_ref().filter(|o| o.enabled) {
             let per_call = orch.timeouts.per_call_timeout_secs;
             let inactivity = orch.timeouts.stream_inactivity_timeout_secs;
@@ -647,16 +653,23 @@ fn hitl_timeout_conflict_warning(hitl: &HitlConfig, per_call_timeout_secs: u64) 
 /// timeout: aura would deny as TimedOut while governance decides into the
 /// void. Config guidance, not a hard error — aura cannot see the receiver's
 /// actual value, only the operator-configured `receiver_wait_timeout_secs`.
-#[expect(
-    dead_code,
-    reason = "wired into Config::validate by the fill layer; the signature is the surface"
-)]
-#[expect(
-    unused_variables,
-    reason = "the comparison is the fill layer's; the parameter is the surface"
-)]
 fn hitl_timeout_alignment_warning(hitl: &HitlConfig) -> Option<String> {
-    todo!("timeout-alignment guidance (fill layer)")
+    let DecisionRouteConfig::Webhook {
+        timeout_secs,
+        receiver_wait_timeout_secs,
+        ..
+    } = &hitl.route
+    else {
+        return None;
+    };
+    if timeout_secs > receiver_wait_timeout_secs {
+        return None;
+    }
+    Some(format!(
+        "hitl route timeout ({timeout_secs}s) does not exceed receiver_wait_timeout_secs \
+         ({receiver_wait_timeout_secs}s); aura denies the call as TimedOut while governance \
+         decides into the void — set the route timeout above the receiver's wait timeout"
+    ))
 }
 
 fn validate_llm_api_key(llm: &LlmConfig, location: &str) -> Result<(), crate::ConfigError> {
