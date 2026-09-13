@@ -17,9 +17,10 @@ use crate::hitl::{
     PROTOCOL_VERSION, ParkedApproval, PendingApprovals, ResolvedDecision,
 };
 use crate::orchestration::test_rig::{
-    ECHO_TOOL_RESULT, FreeformArgs, RecordingTool, ScriptedCompletionModel, ScriptedToolCall,
-    ScriptedTurn, WORKER_OVERRIDE_SERIAL, WorkerOverride, echo_tool_result_wire,
-    install_worker_overrides, take_worker_override,
+    CoordinatorOverride, ECHO_TOOL_RESULT, FreeformArgs, RecordingTool, ScriptedCompletionModel,
+    ScriptedToolCall, ScriptedTurn, WORKER_OVERRIDE_SERIAL, WorkerOverride, echo_tool_result_wire,
+    install_coordinator_overrides, install_worker_overrides, take_coordinator_override,
+    take_worker_override,
 };
 use crate::orchestration::{
     CallKey, OrchestrationConfig, PendingCall, TaskIdentity, TaskStatus, WorkerConfig,
@@ -446,14 +447,12 @@ fn tool_wire(text: &str) -> String {
     serde_json::to_string(text).expect("a plain string serializes")
 }
 
-/// The failing tool's error as the chain delivers it to the model: the live
-/// multi-turn loop renders a tool-server error as its `to_string`, raw text
-/// rather than the JSON-quoted form a successful output takes — the
-/// tool-result rendering the substitution must mirror for an execution
-/// `Err` (sync parity). The prefixes are the tool-server round trip's own
-/// (`Toolset error: ` over the toolset's and the server's re-wrapped
-/// `ToolCallError: ` layers over the tool's), with the doubling collapsed
-/// by `ToolError`'s verbatim-prefix rule.
+/// The tool-result text the substitution maps for `FailingTool`'s
+/// ordinary execution `Err`: the `ToolServerError`'s raw `to_string`,
+/// un-JSON-quoted — the Err path renders raw where the Ok path quotes,
+/// and the fixed prefix stack (`Toolset error` wrapping the toolset's
+/// and the boxed `ToolCallError`s) is the byte-stable rendering the
+/// parity pin keys on.
 fn tool_failure_wire() -> String {
     format!("Toolset error: ToolCallError: ToolCallError: ToolCallError: {TOOL_FAILURE}")
 }
@@ -1513,10 +1512,12 @@ async fn concurrent_evaluations_admit_one_grant_and_refuse_the_loser_with_runnin
 }
 
 /// The all-decided grant runs the segment to completion: the decided call
-/// executes through the substitution, and the completed segment's turns
-/// carry its outcome-bearing pair — the assistant tool-call turn plus the
-/// tool-result turn holding the real result, keyed by the original call id
-/// — ahead of the continuation's final assistant turn, and no blocking set.
+/// executes through the substitution, the coordinator continuation
+/// finishes the run naturally over a scripted respond_directly, and the
+/// completed segment's turns are the run's NATURAL turns only — the
+/// continuation's final assistant turn, then the coordinator's scripted
+/// tail (R6: the outcome pair lives inside the rebuilt history the
+/// continuation streamed from, not on the wire).
 #[tokio::test]
 async fn all_decided_grant_runs_the_segment_to_completion() {
     let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
@@ -1527,6 +1528,9 @@ async fn all_decided_grant_runs_the_segment_to_completion() {
         extra_tools: vec![Box::new(
             RecordingTool::new(invocations.clone()).with_name(TOOL),
         )],
+    }]);
+    install_coordinator_overrides(vec![CoordinatorOverride {
+        model: ScriptedCompletionModel::new(vec![coordinator_direct_turn()]),
     }]);
     register_decided(&world).await;
     publish_document(&world, &sentinel_document(&world)).await;
@@ -1542,16 +1546,16 @@ async fn all_decided_grant_runs_the_segment_to_completion() {
             assert_eq!(
                 serde_json::to_value(turns.as_slice()).expect("turns serialize"),
                 json!([
-                    decided_call_turn(),
-                    decided_result_turn(&echo_tool_result_wire()),
                     {
                         "role": "assistant",
                         "id": null,
                         "content": [{ "text": FINAL_TEXT }],
                     },
+                    coordinator_tail_turn(),
                 ]),
-                "the completed segment carries the outcome-bearing pair keyed by \
-                 the original call id, ahead of the continuation's turns"
+                "the completed segment carries the natural continuation turn and the \
+                 coordinator's scripted tail, and nothing else — the R2 pair prepend \
+                 is gone (R6: outcomes live in the rebuilt history)"
             );
         }
         other => panic!("expected a completed segment, got {other:?}"),
@@ -1729,10 +1733,11 @@ async fn re_park_registers_the_fresh_ticket_under_the_original_bound_run_id() {
 /// the original bound run id. Resume 2, over the re-published checkpoint,
 /// drives both nodes — node A's fresh call executes once through the
 /// substitution and completes, then node B's decided call executes exactly
-/// once with its own arguments and completes. The completed turns carry
-/// each decided call's R2 outcome pair in segment order, keyed by its own
-/// original call id; completion removes the fresh and sibling tickets
-/// together; the placeholder appears nowhere.
+/// once with its own arguments and completes — and the coordinator
+/// continuation finishes the run (R6): the completed turns are the two
+/// nodes' natural final turns plus the scripted coordinator tail; the R2
+/// pairs ride the RE-PARKED segment only. Completion removes the fresh and
+/// sibling tickets together; the placeholder appears nowhere.
 #[tokio::test]
 async fn consumed_subset_re_park_preserves_the_sibling_and_completes_on_the_second_resume() {
     let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
@@ -1875,7 +1880,9 @@ async fn consumed_subset_re_park_preserves_the_sibling_and_completes_on_the_seco
         .expect("record the fresh approval");
 
     // Resume 2 drives both awaiting nodes in plan order: node A's build
-    // first, then node B's — one override per build, in that order.
+    // first, then node B's — one override per build, in that order. The
+    // continuation's coordinator finishes the run over a scripted
+    // respond_directly (R6 natural finish).
     install_worker_overrides(vec![
         // Resume 2, node A: the fresh call's substitution, then a final turn.
         WorkerOverride {
@@ -1892,6 +1899,9 @@ async fn consumed_subset_re_park_preserves_the_sibling_and_completes_on_the_seco
             )],
         },
     ]);
+    install_coordinator_overrides(vec![CoordinatorOverride {
+        model: ScriptedCompletionModel::new(vec![coordinator_direct_turn()]),
+    }]);
 
     let grant = evaluate_resume(evaluation(&world, false, None))
         .await
@@ -1945,16 +1955,13 @@ async fn consumed_subset_re_park_preserves_the_sibling_and_completes_on_the_seco
     assert_eq!(
         serialized,
         json!([
-            decided_call_turn_for(FRESH_CALL_ID, NEW_TOOL, &json!({ "namespace": "stage" })),
-            decided_result_turn_for(FRESH_CALL_ID, &echo_tool_result_wire()),
             { "role": "assistant", "id": null, "content": [{ "text": A_DONE }] },
-            decided_call_turn_for(CALL_ID_B, TOOL_B, &call_args_b()),
-            decided_result_turn_for(CALL_ID_B, &echo_tool_result_wire()),
             { "role": "assistant", "id": null, "content": [{ "text": B_DONE }] },
+            coordinator_tail_turn(),
         ]),
-        "the completed segment carries each decided call's R2 outcome pair in \
-         segment order, keyed by its own original call id, around the per-node \
-         final turns"
+        "the completed segment carries the two nodes' natural final turns in \
+         segment order, then the coordinator's scripted tail — the R2 pair \
+         prepends are gone (R6: outcomes live in the rebuilt histories)"
     );
     assert!(
         !serialized.to_string().contains(PARK_SENTINEL),
@@ -2094,6 +2101,9 @@ async fn post_substitution_new_call_re_parks_through_the_live_arm_not_a_strict_m
             )],
         },
     ]);
+    install_coordinator_overrides(vec![CoordinatorOverride {
+        model: ScriptedCompletionModel::new(vec![coordinator_direct_turn()]),
+    }]);
     let grant = evaluate_resume(evaluation(&world, false, None))
         .await
         .expect("the re-published checkpoint grants the second resume");
@@ -2121,12 +2131,12 @@ async fn post_substitution_new_call_re_parks_through_the_live_arm_not_a_strict_m
     assert_eq!(
         serialized,
         json!([
-            decided_call_turn_for(FRESH_CALL_ID, NEW_TOOL, &json!({ "namespace": "stage" })),
-            decided_result_turn_for(FRESH_CALL_ID, &echo_tool_result_wire()),
             { "role": "assistant", "id": null, "content": [{ "text": FINAL_TEXT }] },
+            coordinator_tail_turn(),
         ]),
-        "the completed segment carries the fresh call's outcome pair keyed by \
-         the fresh call's id — resume 1's pair rode the original call id"
+        "the completed segment's turns are the natural continuation turn and the \
+         scripted coordinator tail — the fresh call's pair rode the RE-PARKED \
+         segment under its own id; the completed turns are natural only (R6)"
     );
     assert!(
         !serialized.to_string().contains(PARK_SENTINEL),
@@ -2135,11 +2145,12 @@ async fn post_substitution_new_call_re_parks_through_the_live_arm_not_a_strict_m
 }
 
 /// A recorded approval executes exactly once through the worker's gated
-/// pipeline, and the completed segment's turns carry the outcome-bearing
-/// pair — the assistant tool-call turn for the decided call plus the
-/// tool-result turn holding the tool's real result, keyed by the original
-/// call id — ahead of the continuation's final assistant turn. The park
-/// placeholder appears nowhere on the wire.
+/// pipeline, the real result reaches the model in the reconstructed
+/// context (the outcome package the rebuilt history carries — the R2
+/// wire pair rides the RE-PARKED segment only, R6), and the coordinator
+/// continuation finishes the run over a scripted respond_directly: the
+/// completed turns are the continuation's final turn plus the scripted
+/// tail. The park placeholder appears nowhere on the wire.
 #[tokio::test]
 async fn approved_call_executes_once_and_rides_the_outcome_pair() {
     let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
@@ -2150,6 +2161,9 @@ async fn approved_call_executes_once_and_rides_the_outcome_pair() {
         extra_tools: vec![Box::new(
             RecordingTool::new(invocations.clone()).with_name(TOOL),
         )],
+    }]);
+    install_coordinator_overrides(vec![CoordinatorOverride {
+        model: ScriptedCompletionModel::new(vec![coordinator_direct_turn()]),
     }]);
     register_decided(&world).await;
     publish_document(&world, &sentinel_document(&world)).await;
@@ -2184,16 +2198,16 @@ async fn approved_call_executes_once_and_rides_the_outcome_pair() {
             assert_eq!(
                 serialized,
                 json!([
-                    decided_call_turn(),
-                    decided_result_turn(&echo_tool_result_wire()),
                     {
                         "role": "assistant",
                         "id": null,
                         "content": [{ "text": FINAL_TEXT }],
                     },
+                    coordinator_tail_turn(),
                 ]),
-                "the completed segment's turns carry the outcome-bearing pair keyed \
-                 by the original call id, ahead of the final turn"
+                "the completed segment's turns are the natural continuation turn and \
+                 the scripted coordinator tail — the outcome pair lives inside the \
+                 rebuilt history, not on the wire (R6)"
             );
             assert!(
                 !serialized.to_string().contains(PARK_SENTINEL),
@@ -2206,13 +2220,15 @@ async fn approved_call_executes_once_and_rides_the_outcome_pair() {
 
 /// A recorded denial steers: the call never executes, the live denial text
 /// and its reason ride the continuation context verbatim in place of the
-/// placeholder, and the wire carries the outcome-bearing pair holding the
-/// live denial text, keyed by the original call id, ahead of the scripted
-/// final turn — the worker adapts; no result is fabricated. The context
-/// also carries the decided call's assistant tool call — synthesized by
-/// the reconstruction (P45 stage 3: the fixture's history, like every
-/// single-call sentinel fixture's, never captured it), the pairing
-/// providers require ahead of every tool result.
+/// placeholder (the rebuilt history's outcome package — the R2 wire pair
+/// rides the RE-PARKED segment only, R6), and the coordinator continuation
+/// finishes the run over a scripted respond_directly — the completed turns
+/// are the continuation's final turn plus the scripted tail; the worker
+/// adapts; no result is fabricated. The context also carries the decided
+/// call's assistant tool call — synthesized by the reconstruction (P45
+/// stage 3: the fixture's history, like every single-call sentinel
+/// fixture's, never captured it), the pairing providers require ahead of
+/// every tool result.
 #[tokio::test]
 async fn denied_call_steers_without_executing_and_rides_the_denial_pair() {
     let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
@@ -2225,6 +2241,9 @@ async fn denied_call_steers_without_executing_and_rides_the_denial_pair() {
         extra_tools: vec![Box::new(
             RecordingTool::new(invocations.clone()).with_name(TOOL),
         )],
+    }]);
+    install_coordinator_overrides(vec![CoordinatorOverride {
+        model: ScriptedCompletionModel::new(vec![coordinator_direct_turn()]),
     }]);
     register_denied(&world).await;
     publish_document(&world, &sentinel_document(&world)).await;
@@ -2266,16 +2285,16 @@ async fn denied_call_steers_without_executing_and_rides_the_denial_pair() {
             assert_eq!(
                 serialized,
                 json!([
-                    decided_call_turn(),
-                    decided_result_turn(&tool_wire(&denial_text())),
                     {
                         "role": "assistant",
                         "id": null,
                         "content": [{ "text": FINAL_TEXT }],
                     },
+                    coordinator_tail_turn(),
                 ]),
-                "the denial rides the outcome-bearing pair on the wire, keyed by \
-                 the original call id, ahead of the final turn"
+                "the completed segment's turns are the natural continuation turn and \
+                 the scripted coordinator tail — the denial package lives inside the \
+                 rebuilt history, not on the wire (R6)"
             );
             assert!(
                 !serialized.to_string().contains(PARK_SENTINEL)
@@ -2298,17 +2317,26 @@ async fn denied_call_steers_without_executing_and_rides_the_denial_pair() {
 /// — the same raw rendering the live chain's loop delivers — and the
 /// segment completes, never faulting. The staging vehicle: `FailingTool`,
 /// a gated tool under the decided call's name whose invocation always
-/// fails. The completed turns carry the R2 pair keyed by the original call
-/// id with the error text as the tool result, ahead of the scripted final
-/// turn; no success is fabricated and no placeholder survives.
+/// fails. The error text reaches the model in the reconstructed context,
+/// pinned by exact equality: the rebuilt history's outcome package
+/// carries the raw error rendering verbatim, so a refactor cannot
+/// fabricate success text silently (the R2 wire pair rides the RE-PARKED
+/// segment only, R6), and the coordinator continuation finishes the run
+/// over a scripted respond_directly; no success is fabricated and no
+/// placeholder survives.
 #[tokio::test]
 async fn tool_failure_becomes_result_text_and_the_segment_completes() {
     let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
     let world = world();
     let invocations = Arc::new(Mutex::new(Vec::new()));
+    let model = ScriptedCompletionModel::new(vec![ScriptedTurn::text(FINAL_TEXT)]);
+    let requests = model.requests();
     install_worker_overrides(vec![WorkerOverride {
-        model: ScriptedCompletionModel::new(vec![ScriptedTurn::text(FINAL_TEXT)]),
+        model,
         extra_tools: vec![Box::new(FailingTool::new(invocations.clone()))],
+    }]);
+    install_coordinator_overrides(vec![CoordinatorOverride {
+        model: ScriptedCompletionModel::new(vec![coordinator_direct_turn()]),
     }]);
     register_decided(&world).await;
     publish_document(&world, &sentinel_document(&world)).await;
@@ -2336,20 +2364,39 @@ async fn tool_failure_becomes_result_text_and_the_segment_completes() {
             "the single invocation carries the recorded call's arguments"
         );
     }
+    let recorded = requests.lock().expect("scripted-model request log").clone();
+    assert_eq!(
+        recorded.len(),
+        1,
+        "the continuation is exactly one model turn"
+    );
+    let context = serde_json::to_value(&recorded[0].chat_history)
+        .expect("the continuation context serializes");
+    assert_eq!(
+        context,
+        json!([
+            { "role": "user", "content": [{ "type": "text", "text": "apply it" }] },
+            decided_call_turn(),
+            decided_result_turn(&tool_failure_wire()),
+        ]),
+        "the REBUILT worker history carries the raw error rendering verbatim — \
+         the execution Err becomes the tool-result text the substitution maps, \
+         never fabricated success"
+    );
     let serialized = serde_json::to_value(turns.as_slice()).expect("turns serialize");
     assert_eq!(
         serialized,
         json!([
-            decided_call_turn(),
-            decided_result_turn(&tool_failure_wire()),
             {
                 "role": "assistant",
                 "id": null,
                 "content": [{ "text": FINAL_TEXT }],
             },
+            coordinator_tail_turn(),
         ]),
-        "the completed segment carries the outcome pair holding the error \
-         text, keyed by the original call id, ahead of the final turn"
+        "the completed segment's turns are the natural continuation turn and the \
+         scripted coordinator tail — the error text rides the rebuilt history's \
+         outcome package, not the wire (R6)"
     );
     assert!(
         !serialized.to_string().contains(ECHO_TOOL_RESULT)
@@ -2458,10 +2505,12 @@ async fn approved_without_required_identity_is_fatal_before_the_tombstone() {
 
 /// The identity-block asymmetry pin: the same identity-demanding route
 /// never blocks a DENIAL — denials need no identity, so the recorded
-/// denial steers with its normal outcome (Completed, live denial text on
-/// the wire keyed by the original call id, zero invocations), never the
-/// identity fault. Stands alone from the approval fault above so each
-/// fails at its own named point.
+/// denial steers with its normal outcome (Completed, live denial text in
+/// the rebuilt history's outcome package, the wire pair itself riding the
+/// RE-PARKED segment only per R6, zero invocations, the coordinator
+/// continuation finishing the run over a scripted respond_directly),
+/// never the identity fault. Stands alone from the approval fault above
+/// so each fails at its own named point.
 #[tokio::test]
 async fn denied_without_identity_steers_normally_under_the_identity_route() {
     let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
@@ -2472,6 +2521,9 @@ async fn denied_without_identity_steers_normally_under_the_identity_route() {
         extra_tools: vec![Box::new(
             RecordingTool::new(invocations.clone()).with_name(TOOL),
         )],
+    }]);
+    install_coordinator_overrides(vec![CoordinatorOverride {
+        model: ScriptedCompletionModel::new(vec![coordinator_direct_turn()]),
     }]);
     register_denied(&world).await;
     publish_document(&world, &sentinel_document(&world)).await;
@@ -2493,16 +2545,16 @@ async fn denied_without_identity_steers_normally_under_the_identity_route() {
     assert_eq!(
         serialized,
         json!([
-            decided_call_turn(),
-            decided_result_turn(&tool_wire(&denial_text())),
             {
                 "role": "assistant",
                 "id": null,
                 "content": [{ "text": FINAL_TEXT }],
             },
+            coordinator_tail_turn(),
         ]),
-        "the denial rides its normal steer outcome — the outcome pair keyed \
-         by the original call id, ahead of the final turn"
+        "the denial steers to its normal outcome — the natural continuation turn \
+         and the scripted coordinator tail, the denial package riding the rebuilt \
+         history (R6)"
     );
     assert!(
         !serialized.to_string().contains(PARK_SENTINEL),
@@ -2885,6 +2937,9 @@ async fn same_key_duplicate_calls_execute_once_each_and_a_re_park_removes_both_c
             )],
         },
     ]);
+    install_coordinator_overrides(vec![CoordinatorOverride {
+        model: ScriptedCompletionModel::new(vec![coordinator_direct_turn()]),
+    }]);
 
     let grant = evaluate_resume(evaluation(&world, false, None))
         .await
@@ -2921,12 +2976,12 @@ async fn same_key_duplicate_calls_execute_once_each_and_a_re_park_removes_both_c
     assert_eq!(
         serialized,
         json!([
-            decided_call_turn_for(FRESH_CALL_ID, NEW_TOOL, &json!({ "namespace": "stage" })),
-            decided_result_turn_for(FRESH_CALL_ID, &echo_tool_result_wire()),
             { "role": "assistant", "id": null, "content": [{ "text": FINAL_TEXT }] },
+            coordinator_tail_turn(),
         ]),
-        "the completed segment carries the fresh pair keyed by the fresh \
-         call's id — resume 1's pairs rode the duplicate calls' own ids"
+        "the completed segment's turns are the natural continuation turn and the \
+         scripted coordinator tail — resume 1's duplicate pairs rode the re-parked \
+         segment under their own ids; the completed turns are natural only (R6)"
     );
     assert!(
         !serialized.to_string().contains(PARK_SENTINEL),
@@ -3211,6 +3266,12 @@ async fn pivot_approved_pair_executes_once_each_in_document_order_and_completes(
             Box::new(RecordingTool::new(invocations.clone()).with_name(TOOL_B)),
         ],
     }]);
+    // The coordinator continuation finishes the run (R6): scripted
+    // respond_directly, so the completing segment never reaches an
+    // unscripted provider.
+    install_coordinator_overrides(vec![CoordinatorOverride {
+        model: ScriptedCompletionModel::new(vec![coordinator_direct_turn()]),
+    }]);
     register_decided_pivot_pair(
         &world,
         ApprovalDecision::Approved,
@@ -3285,6 +3346,12 @@ async fn pivot_approve_then_deny_executes_only_the_approved_call_and_steers_the_
             Box::new(RecordingTool::new(invocations.clone()).with_name(TOOL_B)),
         ],
     }]);
+    // The coordinator continuation finishes the run (R6): scripted
+    // respond_directly, so the completing segment never reaches an
+    // unscripted provider.
+    install_coordinator_overrides(vec![CoordinatorOverride {
+        model: ScriptedCompletionModel::new(vec![coordinator_direct_turn()]),
+    }]);
     register_decided_pivot_pair(
         &world,
         ApprovalDecision::Approved,
@@ -3346,6 +3413,12 @@ async fn pivot_denied_pair_steers_without_executing_and_completes() {
             Box::new(RecordingTool::new(invocations.clone()).with_name(TOOL)),
             Box::new(RecordingTool::new(invocations.clone()).with_name(TOOL_B)),
         ],
+    }]);
+    // The coordinator continuation finishes the run (R6): scripted
+    // respond_directly, so the completing segment never reaches an
+    // unscripted provider.
+    install_coordinator_overrides(vec![CoordinatorOverride {
+        model: ScriptedCompletionModel::new(vec![coordinator_direct_turn()]),
     }]);
     register_decided_pivot_pair(
         &world,
@@ -3508,7 +3581,9 @@ fn serialized_turns(turns: &[rig::completion::Message]) -> Vec<String> {
 /// into the next consumer's builds: the queue is take-once and
 /// process-global, and a pre-failing frame fails mid-test by design, so
 /// an end-of-test drain never runs on the red path. Drains on drop,
-/// unwind included; instantiate right after installing.
+/// unwind included; instantiate right after installing. Drains the
+/// coordinator queue beside the worker queue — a frame that never reached
+/// its continuation entry leaves the coordinator override unconsumed too.
 struct OverrideDrain;
 
 impl Drop for OverrideDrain {
@@ -3516,7 +3591,41 @@ impl Drop for OverrideDrain {
         while take_worker_override().is_some() {
             // drained
         }
+        while take_coordinator_override().is_some() {
+            // drained
+        }
     }
+}
+
+/// The scripted coordinator's deterministic final answer — the turn text
+/// every completing frame's coordinator script carries, so the natural
+/// tail rides the completed turns as a literal.
+const COORD_FINAL_ANSWER: &str = "the resumed run is complete";
+
+/// The scripted coordinator turn every completing frame installs: one
+/// respond_directly decision whose turn text is the final answer — the
+/// deterministic natural finish (R6), routed through the real routing
+/// toolset exactly like a live coordinator.
+fn coordinator_direct_turn() -> ScriptedTurn {
+    ScriptedTurn::tool_calls(vec![ScriptedToolCall::new(
+        "call_route",
+        "respond_directly",
+        json!({
+            "response": COORD_FINAL_ANSWER,
+            "routing_rationale": "the resumed run's tasks are done",
+        }),
+    )])
+    .with_text(COORD_FINAL_ANSWER)
+}
+
+/// The coordinator tail turn every completed-segment pin embeds: the
+/// scripted final answer as the natural last turn.
+fn coordinator_tail_turn() -> Value {
+    json!({
+        "role": "assistant",
+        "id": null,
+        "content": [{ "text": COORD_FINAL_ANSWER }],
+    })
 }
 
 /// Whether an assistant turn carrying non-empty text rides strictly
@@ -3615,14 +3724,24 @@ async fn coordinator_resumes_after_awaiting_nodes_and_drives_never_started_sibli
                         "result": "deployed cleanly",
                         "confidence": "high",
                     }),
-                )]),
-                ScriptedTurn::text(SIBLING_DONE),
+                )])
+                // The marker rides the submit_result turn's own text:
+                // the decision short-circuit ends the stream one item
+                // past the submit_result tool result, so a trailing
+                // text turn is never requested (board-owner repair
+                // ruling).
+                .with_text(SIBLING_DONE),
             ]),
             extra_tools: vec![Box::new(
                 RecordingTool::new(probe_invocations.clone()).with_name(PROBE_TOOL),
             )],
         },
     ]);
+    // The coordinator continuation (R6): scripted respond_directly, the
+    // deterministic natural finish.
+    install_coordinator_overrides(vec![CoordinatorOverride {
+        model: ScriptedCompletionModel::new(vec![coordinator_direct_turn()]),
+    }]);
     register_decided(&world).await;
     publish_document(&world, &sibling_pending_document(&world)).await;
 
@@ -3738,6 +3857,11 @@ async fn resumed_coordinator_replans_when_a_resumed_worker_fails() {
             )],
         },
     ]);
+    // The coordinator continuation (R6): scripted respond_directly — the
+    // re-plan pin's final-answer leg.
+    install_coordinator_overrides(vec![CoordinatorOverride {
+        model: ScriptedCompletionModel::new(vec![coordinator_direct_turn()]),
+    }]);
     register_decided(&world).await;
     publish_document(&world, &sentinel_document(&world)).await;
 
