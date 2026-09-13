@@ -637,6 +637,22 @@ fn hitl_timeout_conflict_warning(hitl: &HitlConfig, per_call_timeout_secs: u64) 
     }
 }
 
+/// Warn when aura's route timeout does not exceed the receiver's sync-wait
+/// timeout: aura would deny as TimedOut while governance decides into the
+/// void. Config guidance, not a hard error — aura cannot see the receiver's
+/// actual value, only the operator-configured `receiver_wait_timeout_secs`.
+#[expect(
+    dead_code,
+    reason = "wired into Config::validate in Layer 2; the signature is the surface"
+)]
+#[expect(
+    unused_variables,
+    reason = "the comparison is Layer 2; the parameter is the surface"
+)]
+fn hitl_timeout_alignment_warning(hitl: &HitlConfig) -> Option<String> {
+    todo!("timeout-alignment guidance (Layer 2)")
+}
+
 fn validate_llm_api_key(llm: &LlmConfig, location: &str) -> Result<(), crate::ConfigError> {
     match llm {
         LlmConfig::OpenAI { api_key, .. }
@@ -1178,6 +1194,7 @@ mod tests {
                 poll_url: None,
                 poll_interval_secs: default_poll_interval_secs(),
                 poll_request_timeout_secs: default_poll_request_timeout_secs(),
+                receiver_wait_timeout_secs: default_receiver_wait_timeout_secs(),
             },
         };
         assert!(hitl_timeout_conflict_warning(&hitl, 0).is_none());
@@ -1215,6 +1232,7 @@ mod tests {
                 poll_url: None,
                 poll_interval_secs: default_poll_interval_secs(),
                 poll_request_timeout_secs: default_poll_request_timeout_secs(),
+                receiver_wait_timeout_secs: default_receiver_wait_timeout_secs(),
             },
         };
         assert!(hitl_timeout_conflict_warning(&hitl, 60).is_none());
@@ -1235,6 +1253,7 @@ mod tests {
                 poll_url: None,
                 poll_interval_secs: default_poll_interval_secs(),
                 poll_request_timeout_secs: default_poll_request_timeout_secs(),
+                receiver_wait_timeout_secs: default_receiver_wait_timeout_secs(),
             },
         };
         let msg = hitl_timeout_conflict_warning(&hitl, 60).unwrap();
@@ -1257,6 +1276,7 @@ mod tests {
                 poll_url: None,
                 poll_interval_secs: default_poll_interval_secs(),
                 poll_request_timeout_secs: default_poll_request_timeout_secs(),
+                receiver_wait_timeout_secs: default_receiver_wait_timeout_secs(),
             },
         };
         let msg = hitl_timeout_conflict_warning(&hitl, 60).unwrap();
@@ -1726,6 +1746,16 @@ pub enum DecisionRouteConfig {
             skip_serializing_if = "is_default_poll_request_timeout_secs"
         )]
         poll_request_timeout_secs: u64,
+        /// The receiver's `response_type=sync` wait timeout in seconds
+        /// (~15 min). Aura's route timeout must exceed it, or aura denies as
+        /// TimedOut while governance decides into the void. Config guidance,
+        /// not a hard error — aura cannot see the receiver's actual value,
+        /// only what the operator configures here.
+        #[serde(
+            default = "default_receiver_wait_timeout_secs",
+            skip_serializing_if = "is_default_receiver_wait_timeout_secs"
+        )]
+        receiver_wait_timeout_secs: u64,
     },
 }
 
@@ -1856,6 +1886,14 @@ fn default_poll_request_timeout_secs() -> u64 {
 
 fn is_default_poll_request_timeout_secs(value: &u64) -> bool {
     *value == default_poll_request_timeout_secs()
+}
+
+fn default_receiver_wait_timeout_secs() -> u64 {
+    900
+}
+
+fn is_default_receiver_wait_timeout_secs(value: &u64) -> bool {
+    *value == default_receiver_wait_timeout_secs()
 }
 
 /// A validated webhook URL.

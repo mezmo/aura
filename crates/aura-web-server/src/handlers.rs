@@ -1796,6 +1796,7 @@ mod tests {
             poll_url: None,
             poll_interval_secs: 10,
             poll_request_timeout_secs: 30,
+            receiver_wait_timeout_secs: 900,
         });
         let req = chat_request_with_stream(None);
 

@@ -1352,8 +1352,9 @@ impl Orchestrator {
         })
     }
 
-    /// `[hitl.park].enabled` on a park-capable route: conversational, or
-    /// webhook with poll delivery.
+    /// `[hitl.park].enabled` on a park-capable route: conversational, or a
+    /// webhook route that can park (`can_park` — poll delivery, and sync
+    /// delivery under the adaptive contract).
     fn park_enabled(&self) -> bool {
         self.agent_config
             .hitl
@@ -8464,6 +8465,7 @@ mod tests {
             poll_url: None,
             poll_interval_secs: 10,
             poll_request_timeout_secs: 30,
+            receiver_wait_timeout_secs: 900,
         }
     }
 

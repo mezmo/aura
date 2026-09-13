@@ -17,7 +17,7 @@ use reqwest::header::HeaderMap;
 use super::decision::{ApprovalDecision, ApprovalOutcome, DecisionId};
 use super::events;
 use super::protocol::{
-    ApprovalDecisionWire, ApprovalRequest, ApprovalRequestWire, PollDecisionWire, PollStatusWire,
+    ApprovalDecisionWire, ApprovalRequest, ApprovalRequestWire, PollDecisionWire,
 };
 use super::registry::PendingApprovals;
 use super::signing::{SigningContext, VerifiedBody, WebhookHmac, authorize_ingress};
@@ -177,6 +177,13 @@ pub enum ApprovalError {
     /// application-time failures cannot be mislabeled as capture failures.
     #[error("{0}")]
     CaptureFailed(#[from] crate::approver_headers::CaptureError),
+    /// A 207 arrived on a path that never receives one (hold route,
+    /// single-agent, request_approval): the agreed contract never 207s on
+    /// sync. Fail closed, never a denial.
+    #[error(
+        "approval webhook returned 207 on a sync path, which the agreed contract never does: {0}"
+    )]
+    ProtocolViolation(String),
 }
 
 impl From<reqwest::Error> for ApprovalError {
@@ -206,6 +213,17 @@ pub enum GateDecision {
         waited: Duration,
     },
     Cancelled(super::decision::CancelReason),
+    /// The receiver answered 207 (human needed) on a park-capable decide leg:
+    /// the bridge parks the run rather than deciding. Carries the
+    /// governance-known decision id, the parked row's request id minted from
+    /// the run owner, the expiry anchored at gate entry, and the born-notified
+    /// marker (the 207 is the receiver's ack; the reconciler never re-POSTs).
+    Pending {
+        decision_id: DecisionId,
+        request_id: String,
+        expires_at: chrono::DateTime<chrono::Utc>,
+        born_notified: bool,
+    },
 }
 
 impl GateDecision {
@@ -236,6 +254,9 @@ impl GateDecision {
             }),
             Self::TimedOut { waited } => ApprovalOutcome::TimedOut { waited: *waited },
             Self::Cancelled(reason) => ApprovalOutcome::Cancelled(*reason),
+            Self::Pending { .. } => {
+                todo!("pending has no terminal outcome; the park arm consumes it (Layer 2)")
+            }
         }
     }
 }
@@ -324,28 +345,28 @@ async fn webhook_round_trip<T>(
     result
 }
 
-/// The live-path guard for poll delivery: a poll-mode client's synchronous
-/// decision legs must not fire the sync POST, whose ack would be misread as
-/// a decision. Config-gated calls are intercepted by the park arm before
-/// reaching here; this guards the agent-callable `request_approval` tool
-/// path, which bypasses it.
-fn poll_delivery_guard(client: &WebhookClient) -> Result<(), ApprovalError> {
-    if client.poll.is_some() {
-        Err(ApprovalError::Misconfigured(
-            "poll delivery parks; the live decision path is unavailable".to_string(),
-        ))
-    } else {
+/// The live-path guard: a route that cannot decide live (poll delivery)
+/// must not fire the sync POST, whose ack would be misread as a decision.
+/// Config-gated calls are intercepted by the park arm before reaching here;
+/// this guards the agent-callable `request_approval` tool path, which
+/// bypasses it.
+fn decide_live_guard(client: &WebhookClient) -> Result<(), ApprovalError> {
+    if client.can_decide_live() {
         Ok(())
+    } else {
+        Err(ApprovalError::Misconfigured(
+            "this route cannot decide live; the live decision path is unavailable".to_string(),
+        ))
     }
 }
 
 impl DecisionRoute {
     /// The park arm's inputs: the approval registry to register against and
     /// the decision window the route timeout bounds. `Some` for the
-    /// conversational route and for a webhook route with poll delivery,
-    /// `None` for sync delivery — whose decision returns on the POST
-    /// response itself. The client's poll settings are the one delivery
-    /// marker; this switch must not grow a second one.
+    /// conversational route and for a webhook route that can park (poll
+    /// delivery, and sync delivery under the adaptive contract), `None` for
+    /// a hold route that never parks. The client's park marker is the one
+    /// delivery switch; the live-decision marker is its sibling.
     pub(crate) fn park_registry(&self) -> Option<(&PendingApprovals, Duration)> {
         match self {
             Self::Conversational { registry, timeout } => Some((registry, *timeout)),
@@ -354,7 +375,7 @@ impl DecisionRoute {
                 registry,
                 timeout,
                 ..
-            } => client.poll_delivery().then_some((registry, *timeout)),
+            } => client.can_park().then_some((registry, *timeout)),
         }
     }
 
@@ -411,7 +432,7 @@ impl DecisionRoute {
             Self::Webhook {
                 client, timeout, ..
             } => {
-                poll_delivery_guard(client)?;
+                decide_live_guard(client)?;
                 webhook_round_trip(
                     &request,
                     cancel,
@@ -498,7 +519,7 @@ impl DecisionRoute {
             Self::Webhook {
                 client, timeout, ..
             } => {
-                poll_delivery_guard(client)?;
+                decide_live_guard(client)?;
                 webhook_round_trip(
                     &request,
                     cancel,
@@ -572,14 +593,30 @@ enum WebhookReply {
     TimedOut {
         waited: Duration,
     },
+    /// The receiver answered 207 (human needed) on a park-capable decide leg:
+    /// the bridge parks rather than deciding. Only the gate path consumes it;
+    /// the route-wide path maps it to a protocol violation.
+    #[expect(
+        dead_code,
+        reason = "constructed by the 207 detection that lands in Layer 2"
+    )]
+    Pending {
+        decision_id: DecisionId,
+    },
 }
 
 impl WebhookReply {
-    /// Project to the route-wide outcome, dropping the response headers.
-    fn into_outcome(self) -> ApprovalOutcome {
+    /// Project to the route-wide outcome, dropping the response headers. A
+    /// pending reply has no route-wide outcome — the route-wide path (the
+    /// single-agent and `request_approval` surfaces) never receives a 207, so
+    /// one arriving is a protocol violation, never a denial.
+    fn into_outcome(self) -> Result<ApprovalOutcome, ApprovalError> {
         match self {
-            Self::Decided { decision, .. } => ApprovalOutcome::Decided(decision),
-            Self::TimedOut { waited } => ApprovalOutcome::TimedOut { waited },
+            Self::Decided { decision, .. } => Ok(ApprovalOutcome::Decided(decision)),
+            Self::TimedOut { waited } => Ok(ApprovalOutcome::TimedOut { waited }),
+            Self::Pending { .. } => Err(ApprovalError::ProtocolViolation(
+                "receiver answered 207 on a sync path; this build cannot park here".to_string(),
+            )),
         }
     }
 }
@@ -598,8 +635,8 @@ pub(crate) enum PollOutcome {
         decision: ApprovalDecision,
         response_headers: HeaderMap,
     },
-    /// Keep polling: 404/204, a pending status, or a 200 body outside
-    /// the status envelope (the full contract sits at the poll match).
+    /// Keep polling: 404/204, a 207 pending, or a 200 body outside the
+    /// pinned decision shape (the full contract sits at the poll match).
     NotYet,
 }
 
@@ -626,11 +663,21 @@ impl std::fmt::Debug for PollOutcome {
 }
 
 impl WebhookClient {
-    /// The one delivery marker: whether poll settings are present. The park
-    /// switch (`park_registry`) and the config fingerprint's delivery
-    /// projection both read this — no second delivery flag exists.
-    pub(crate) fn poll_delivery(&self) -> bool {
-        self.poll.is_some()
+    /// Whether the route can decide live: the POST response carries the
+    /// decision directly (sync delivery). Poll delivery's POST is an ack, so
+    /// its decision comes from the status GET instead. One of the two
+    /// delivery markers split from the old `poll_delivery()` (ruling 1).
+    pub(crate) fn can_decide_live(&self) -> bool {
+        todo!("delivery-marker split: decide-live capability (Layer 2)")
+    }
+
+    /// Whether the route can park on a 207: poll delivery parks and polls,
+    /// and sync delivery parks on 207 under the adaptive contract
+    /// (sync-with-park). The park switch (`park_registry`), the reconciler
+    /// spawn, and the config fingerprint's delivery projection all read this
+    /// — the sibling of `can_decide_live`.
+    pub(crate) fn can_park(&self) -> bool {
+        todo!("delivery-marker split: park capability (Layer 2)")
     }
 
     /// Whether the configured `tool_headers_from_response` mapping demands
@@ -736,7 +783,10 @@ impl WebhookClient {
                 };
                 Ok(GateDecision::Approved { overrides })
             }
-            other => Ok(GateDecision::without_overrides(other.into_outcome())),
+            WebhookReply::Pending { .. } => {
+                todo!("park registration on a 207 (Layer 2)")
+            }
+            other => Ok(GateDecision::without_overrides(other.into_outcome()?)),
         }
     }
 
@@ -774,10 +824,9 @@ impl WebhookClient {
         request: &ApprovalRequest,
         timeout: Duration,
     ) -> Result<ApprovalOutcome, ApprovalError> {
-        Ok(self
-            .request_approval_with_headers(request, timeout)
+        self.request_approval_with_headers(request, timeout)
             .await?
-            .into_outcome())
+            .into_outcome()
     }
 
     /// Resolve the signing state for one webhook leg. A misconfigured signing
@@ -983,9 +1032,10 @@ impl WebhookClient {
     /// context `approval-request:{decision_id}` (the receiver recomputes with
     /// the id from the query param), and a 200 response must verify under
     /// `approval-decision:{decision_id}` with the same ingress primitive the
-    /// sync response leg uses. A decided 200 carries the receiver's
-    /// `{ "status": ... }` envelope; `pending` and any body outside the
-    /// envelope keep the caller polling (the latter logs a warn).
+    /// sync response leg uses. A decided 200 carries the receiver's pinned
+    /// `{ "approved": bool, "reason": ... }` shape (post-#78); pending is
+    /// status-code-carried (207), and any 200 body outside the shape keeps
+    /// the caller polling (the latter logs a warn).
     pub(crate) async fn poll_decision(
         &self,
         decision_id: DecisionId,
@@ -1044,37 +1094,34 @@ impl WebhookClient {
             None => body,
         };
         match serde_json::from_slice::<PollDecisionWire>(&verified) {
-            Ok(wire) => match wire.status {
-                PollStatusWire::Pending => Ok(PollOutcome::NotYet),
-                PollStatusWire::Approved => {
-                    if let Some(reason) = wire.reason.as_deref() {
-                        tracing::debug!(
-                            decision_id = %decision_id,
-                            reason,
-                            "approve-side reason discarded; the decision model carries none"
-                        );
-                    }
-                    Ok(PollOutcome::Decided {
-                        decision: ApprovalDecision::Approved,
-                        response_headers,
-                    })
+            Ok(wire) if wire.approved => {
+                if let Some(reason) = wire.reason.as_deref() {
+                    tracing::debug!(
+                        decision_id = %decision_id,
+                        reason,
+                        "approve-side reason discarded; the decision model carries none"
+                    );
                 }
-                PollStatusWire::Denied => Ok(PollOutcome::Decided {
-                    decision: ApprovalDecision::Denied {
-                        reason: wire.reason,
-                    },
+                Ok(PollOutcome::Decided {
+                    decision: ApprovalDecision::Approved,
                     response_headers,
-                }),
-            },
+                })
+            }
+            Ok(wire) => Ok(PollOutcome::Decided {
+                decision: ApprovalDecision::Denied {
+                    reason: wire.reason,
+                },
+                response_headers,
+            }),
             Err(e) => {
-                // A body outside the status envelope keeps the poll alive —
-                // a pending read must never become a terminal denial — but
-                // with the envelope typed it now implies receiver schema
-                // drift or a proxy answering in the path, so it warns.
+                // A body outside the pinned `{approved, reason}` shape keeps
+                // the poll alive — a pending read must never become a terminal
+                // denial — but with the shape typed it now implies receiver
+                // schema drift or a proxy answering in the path, so it warns.
                 tracing::warn!(
                     decision_id = %decision_id,
                     error = %e,
-                    "poll 200 body is not a valid decision envelope: \
+                    "poll 200 body is not a valid decision shape: \
                      receiver schema drift or a proxy in the path"
                 );
                 Ok(PollOutcome::NotYet)
@@ -1423,6 +1470,7 @@ mod tests {
                     poll_url: None,
                     poll_interval_secs: 10,
                     poll_request_timeout_secs: 30,
+                    receiver_wait_timeout_secs: 900,
                 },
             };
             let runtime =
@@ -1712,9 +1760,7 @@ mod tests {
         use super::super::super::decision::{
             AgentScope, ApprovalDecision, ApprovalOrigin, CancelReason, DecisionId,
         };
-        use super::super::super::protocol::{
-            ApprovalRequest, PROTOCOL_VERSION, PollDecisionWire, PollStatusWire,
-        };
+        use super::super::super::protocol::{ApprovalRequest, PROTOCOL_VERSION, PollDecisionWire};
         use super::super::super::signing::{
             PrimarySecret, SIGNATURE_HEADER, SigningContext, TIMESTAMP_HEADER, Tolerance,
             WebhookHmac, authorize_ingress,
@@ -2115,6 +2161,7 @@ mod tests {
                     poll_url: poll_url.map(|u| aura_config::WebhookUrl::new(u).unwrap()),
                     poll_interval_secs: 10,
                     poll_request_timeout_secs: 30,
+                    receiver_wait_timeout_secs: 900,
                 },
             };
             let hmac = test_hmac();
@@ -2176,6 +2223,7 @@ mod tests {
                     poll_url: None,
                     poll_interval_secs: 10,
                     poll_request_timeout_secs: 30,
+                    receiver_wait_timeout_secs: 900,
                 },
             }
         }
@@ -2773,6 +2821,7 @@ mod tests {
                     poll_url: poll_url.map(|u| aura_config::WebhookUrl::new(u).unwrap()),
                     poll_interval_secs: 10,
                     poll_request_timeout_secs: 30,
+                    receiver_wait_timeout_secs: 900,
                 },
             }
         }
@@ -3140,26 +3189,22 @@ mod tests {
             );
         }
 
-        /// The serde matrix for the status envelope: every status parses
-        /// with the reason present, absent, and null; an unknown status
-        /// value fails the parse (which the poll leg treats as not-yet).
+        /// The serde matrix for the pinned `{approved, reason}` shape: every
+        /// approved value parses with the reason present, absent, and null;
+        /// an unknown field fails the parse (which the poll leg treats as
+        /// not-yet).
         #[test]
-        fn poll_wire_parses_the_status_envelope_matrix() {
-            for status in ["pending", "approved", "denied"] {
+        fn poll_wire_parses_the_authorize_shape_matrix() {
+            for approved in [true, false] {
                 for reason in [None, Some("null"), Some("\"policy: auto-approve\"")] {
                     let body = match reason {
-                        None => format!(r#"{{"status":"{status}"}}"#),
-                        Some("null") => format!(r#"{{"status":"{status}","reason":null}}"#),
-                        Some(value) => format!(r#"{{"status":"{status}","reason":{value}}}"#),
+                        None => format!(r#"{{"approved":{approved}}}"#),
+                        Some("null") => format!(r#"{{"approved":{approved},"reason":null}}"#),
+                        Some(value) => format!(r#"{{"approved":{approved},"reason":{value}}}"#),
                     };
                     let wire: PollDecisionWire = serde_json::from_str(&body)
                         .unwrap_or_else(|e| panic!("{body} must parse: {e}"));
-                    let expected = match status {
-                        "pending" => PollStatusWire::Pending,
-                        "approved" => PollStatusWire::Approved,
-                        _ => PollStatusWire::Denied,
-                    };
-                    assert_eq!(wire.status, expected, "body: {body}");
+                    assert_eq!(wire.approved, approved, "body: {body}");
                     assert_eq!(
                         wire.reason.as_deref(),
                         reason
@@ -3170,8 +3215,9 @@ mod tests {
                 }
             }
             assert!(
-                serde_json::from_str::<PollDecisionWire>(r#"{"status":"revoked"}"#).is_err(),
-                "an unknown status value must fail the parse"
+                serde_json::from_str::<PollDecisionWire>(r#"{"approved":true,"status":"x"}"#)
+                    .is_err(),
+                "an unknown field must fail the parse"
             );
         }
 

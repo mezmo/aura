@@ -342,6 +342,9 @@ fn approval_result_to_pre_call(
         Ok(GateDecision::Cancelled(_)) => Err(ToolError::ToolCallError(
             "tool call denied: approval cancelled".to_string().into(),
         )),
+        Ok(GateDecision::Pending { .. }) => {
+            todo!("re-enter the park registration arm with the minted ApprovalRequest (Layer 2)")
+        }
         Err(e) => Err(ToolError::ToolCallError(
             format!("tool call blocked: approval channel error: {e}").into(),
         )),
@@ -803,6 +806,7 @@ mod tests {
                     poll_url: None,
                     poll_interval_secs: 10,
                     poll_request_timeout_secs: 30,
+                    receiver_wait_timeout_secs: 900,
                 },
             };
             let store: Arc<dyn crate::session_store::ApprovalStore> =
@@ -885,6 +889,7 @@ mod tests {
                     poll_url: None,
                     poll_interval_secs: 10,
                     poll_request_timeout_secs: 30,
+                    receiver_wait_timeout_secs: 900,
                 },
             };
             let runtime =
@@ -1111,6 +1116,7 @@ mod tests {
                     poll_url: None,
                     poll_interval_secs: 10,
                     poll_request_timeout_secs: 30,
+                    receiver_wait_timeout_secs: 900,
                 },
             };
             let client =
