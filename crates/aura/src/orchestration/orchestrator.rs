@@ -8697,6 +8697,7 @@ mod tests {
                     expires_at: now + chrono::Duration::seconds(60),
                     authority: crate::hitl::ApprovalAuthority::WebhookPoll,
                     egress_headers: None,
+                    acknowledgment: crate::hitl::AcknowledgmentState::RequiresNotification,
                 })
                 .await
                 .expect("durable register succeeds");
@@ -8834,6 +8835,7 @@ mod tests {
                     expires_at: now + chrono::Duration::hours(1),
                     authority: crate::hitl::ApprovalAuthority::WebhookPoll,
                     egress_headers: None,
+                    acknowledgment: crate::hitl::AcknowledgmentState::RequiresNotification,
                 })
                 .await
                 .unwrap();
@@ -9051,6 +9053,7 @@ mod tests {
                     registered_at,
                     expires_at: registered_at + chrono::Duration::hours(1),
                     egress_headers: None,
+                    acknowledgment: crate::hitl::AcknowledgmentState::RequiresNotification,
                 })
                 .await
                 .unwrap();

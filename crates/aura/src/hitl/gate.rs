@@ -15,8 +15,8 @@ use serde_json::Value;
 use super::decision::{AgentScope, ApprovalOrigin, DecisionId};
 use super::outcome::ApprovalAuthority;
 use super::protocol::{ApprovalItem, ApprovalRequest, PROTOCOL_VERSION};
-use super::registry::{ParkedApproval, PendingApprovals};
-use super::route::{ApprovalError, DecisionRoute, GateDecision};
+use super::registry::{AcknowledgmentState, ParkedApproval, PendingApprovals};
+use super::route::{ApprovalError, AskMode, DecisionRoute, GateDecision};
 use crate::orchestration::{
     BlockedCell, CallKey, ParkGuard, PendingCall, RecordedDecisions, run_owner_id,
 };
@@ -245,6 +245,7 @@ impl HitlApprovalWrapper {
             expires_at,
             authority,
             egress_headers,
+            acknowledgment: AcknowledgmentState::RequiresNotification,
         };
         if let Err(err) = park.registry.register_durable(parked.clone()).await {
             tracing::warn!(
@@ -294,6 +295,21 @@ impl HitlApprovalWrapper {
         Ok(PreCallOutcome::ShortCircuit {
             output: PARK_SENTINEL.to_string(),
         })
+    }
+
+    /// The 207 bridge: re-enter park registration with the posted
+    /// `decision_id` (preserved on `request`). Mints the request id from the
+    /// run owner, does not re-publish `Requested` (already published at gate
+    /// entry), and registers the row in the acknowledged state (the 207 is
+    /// the receiver's ack; the reconciler never re-POSTs it).
+    async fn park_207_bridge(
+        &self,
+        park: &ParkContext,
+        request: ApprovalRequest,
+        expires_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<PreCallOutcome, ToolError> {
+        let _ = (park, &request, expires_at);
+        todo!("207 bridge registration (fill layer)")
     }
 }
 
@@ -370,16 +386,40 @@ impl ToolWrapper for HitlApprovalWrapper {
         // events find the run, since rig calls this off it.
         let decision = match self.run() {
             Some(run) => {
-                crate::run_context::with_run(run, self.route.decide_for_gate(request, &cancel))
-                    .await
+                crate::run_context::with_run(
+                    run,
+                    self.route
+                        .decide_for_gate(request, &cancel, AskMode::Hold),
+                )
+                .await
             }
-            None => self.route.decide_for_gate(request, &cancel).await,
+            None => self.route.decide_for_gate(request, &cancel, AskMode::Hold).await,
         };
-        approval_result_to_pre_call(decision)
+        match decision {
+            Ok(GateDecision::Pending {
+                request,
+                expires_at,
+            }) => {
+                // The 207 bridge: re-enter park registration. Only reachable on
+                // a park-armed ask; the fill layer wires the ParkArmed mode
+                // into the park-armed branch above.
+                let park = self.park.as_ref().ok_or_else(|| {
+                    ToolError::ToolCallError(
+                        "tool call blocked: 207 on a route without a park arm"
+                            .to_string()
+                            .into(),
+                    )
+                })?;
+                self.park_207_bridge(park, request, expires_at).await
+            }
+            other => approval_result_to_pre_call(other),
+        }
     }
 }
 
-/// Map a gate-scoped decision to a pre-call outcome.
+/// Map a gate-scoped decision to a pre-call outcome. The pending arm is
+/// handled by the gate's registration path ([`HitlApprovalWrapper::park_207_bridge`])
+/// before this conversion, so it never reaches here.
 fn approval_result_to_pre_call(
     result: Result<GateDecision, ApprovalError>,
 ) -> Result<PreCallOutcome, ToolError> {
@@ -393,7 +433,7 @@ fn approval_result_to_pre_call(
             "tool call denied: approval cancelled".to_string().into(),
         )),
         Ok(GateDecision::Pending { .. }) => {
-            todo!("re-enter the park registration arm with the minted ApprovalRequest (Layer 2)")
+            unreachable!("pending is routed to the 207 bridge before this conversion")
         }
         Err(e) => Err(ToolError::ToolCallError(
             format!("tool call blocked: approval channel error: {e}").into(),
@@ -1208,7 +1248,7 @@ mod tests {
                 },
             };
             let client =
-                crate::hitl::webhook_client_from_config(&config.route, None, None).unwrap();
+                crate::hitl::webhook_client_from_config(&config.route, None, None, false).unwrap();
             Arc::new(DecisionRoute::Webhook {
                 client,
                 registry: PendingApprovals::new(),
