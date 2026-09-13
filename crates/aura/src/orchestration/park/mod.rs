@@ -12,21 +12,25 @@ pub(crate) mod resume;
 pub(crate) use commit::{
     ParkCommitInputs, cancel_run_approvals, commit_from_run_state, run_owner_id,
 };
-// The rehydrate entry points: consumed by commit 3's tests; the P45 resume
-// endpoint consumes them in production.
+// The rehydrate entry points: `ResumingDocumentHandle` drives the resume
+// segment's tombstones in production; `load_recorded_decisions` and
+// `RehydrateError` are consumed through this re-export by commit 3's tests
+// (the resume consult reaches them by module path), so the unused-import
+// marker stays until those consumers name the re-export path.
 #[allow(unused_imports)]
-pub(crate) use continuation::{
-    RehydrateError, ResumingDocumentHandle, load_recorded_decisions, replace_tool_result,
-};
+pub(crate) use continuation::{RehydrateError, ResumingDocumentHandle, load_recorded_decisions};
 #[allow(unused_imports)]
 pub(crate) use document::{
     PARKED_DOCUMENT_SUFFIX, ParkedRun, RESUMING_DOCUMENT_SUFFIX, RunStateForPark, load_parked_run,
 };
 pub(crate) use guard::ParkGuard;
 // The provider-valid context builder for the reconstruction direction
-// (P45, R5): unwired until P45 stage 3 points the substitution prelude
-// at it; re-exported now so the wiring changes no paths. The unused-
-// import marker sweeps with the module's dead-code allow at wiring.
+// (P45, R5): the stage-3 wiring points the substitution prelude at it,
+// consuming the construction path by name (`NodePreflightInput`,
+// `SegmentPreflight`, `CallId`, `OutcomeWire`, `rebuild_context`). The
+// remaining re-exported names are reached only through method returns
+// and inference, never by name in production — the stage-2b frames
+// exercise them inside the module — so the unused-import marker stays.
 #[allow(unused_imports)]
 pub(crate) use rebuild::{
     CallId, NodePreflightInput, OutcomeWire, PreflightError, RebuiltContext, ResolveError,
