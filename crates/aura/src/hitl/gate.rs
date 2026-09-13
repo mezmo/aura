@@ -769,6 +769,10 @@ mod tests {
         use std::sync::Arc;
         use std::time::Duration;
 
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+        use tokio::sync::mpsc;
+
         use super::*;
         use crate::session_store::ApprovalStore;
 
@@ -817,6 +821,37 @@ mod tests {
                     request_id.to_string(),
                 ),
             )
+        }
+
+        /// A one-shot scripted receiver: accepts one POST, captures its raw
+        /// text to the channel, and replies with the given status, headers,
+        /// and body.
+        async fn scripted_receiver(
+            status: &'static str,
+            headers: Vec<(String, String)>,
+            body: String,
+        ) -> (String, mpsc::Receiver<String>) {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let (tx, rx) = mpsc::channel(1);
+            tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let captured = crate::hitl::read_full_request(&mut socket).await;
+                let mut response = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n\
+                     content-length: {}\r\nconnection: close\r\n",
+                    body.len()
+                );
+                for (name, value) in &headers {
+                    response.push_str(&format!("{name}: {value}\r\n"));
+                }
+                response.push_str("\r\n");
+                response.push_str(&body);
+                socket.write_all(response.as_bytes()).await.ok();
+                socket.shutdown().await.ok();
+                tx.send(captured).await.ok();
+            });
+            (url, rx)
         }
 
         #[tokio::test]
@@ -1045,14 +1080,19 @@ mod tests {
             assert!(store.get(&decision_id).await.unwrap().is_none());
         }
 
-        /// A webhook route with poll delivery parks the gated call. The
-        /// route is wired the production way
-        /// ([`crate::hitl::HitlRuntime::from_config`] over a poll config) so
-        /// the client carries the poll marker; the park arm registers into
-        /// the shared registry without consulting the unreachable webhook.
-        /// The reconciler flow itself is the poller's.
+        /// An armed park-capable webhook route asks FIRST: one POST with
+        /// `response_type=poll`, and an instant 200 machine decision applies
+        /// in-request — `Proceed` with the captured overrides, no park
+        /// document, no reconciler tick.
         #[tokio::test]
-        async fn webhook_poll_route_parks_the_gated_call() {
+        async fn armed_webhook_asks_poll_and_applies_the_instant_decision() {
+            let (url, mut rx) = scripted_receiver(
+                "200 OK",
+                vec![("x-approver-id".to_string(), "alice".to_string())],
+                r#"{"approved":true}"#.to_string(),
+            )
+            .await;
+
             let config = aura_config::HitlConfig {
                 require_approval: vec![aura_config::GlobPattern::new("kubectl_*").unwrap()],
                 park: aura_config::ParkConfig {
@@ -1060,12 +1100,15 @@ mod tests {
                     bind_identity: false,
                 },
                 route: aura_config::DecisionRouteConfig::Webhook {
-                    url: WebhookUrl::new("http://127.0.0.1:9").unwrap(),
+                    url: WebhookUrl::new(&url).unwrap(),
                     timeout_secs: 60,
                     headers: std::collections::HashMap::new(),
                     headers_from_request: std::collections::HashMap::new(),
-                    tool_headers_from_response: aura_config::ToolHeaderMappings::default(),
-                    delivery: aura_config::WebhookDelivery::Poll,
+                    tool_headers_from_response: crate::approver_headers::tests::mappings(&[(
+                        "x-forwarded-user",
+                        "x-approver-id",
+                    )]),
+                    delivery: aura_config::WebhookDelivery::Sync,
                     poll_url: None,
                     poll_interval_secs: 10,
                     poll_request_timeout_secs: 30,
@@ -1081,49 +1124,49 @@ mod tests {
             let runtime = crate::hitl::HitlRuntime::from_config(&config, &registry, None, None);
             assert!(
                 runtime.route.park_registry().is_some(),
-                "the poll route arms the park arm"
+                "the armed route can park"
             );
 
             let cell = Arc::new(crate::orchestration::BlockedCell::default());
             cell.set_current_call_id(Some("call_poll".to_string()));
-            let gate = parked_gate(&registry, &runtime.route, "req-poll-park", &cell);
+            let gate = parked_gate(&registry, &runtime.route, "req-poll-ask", &cell);
 
-            let args = serde_json::json!({ "namespace": "prod" });
             let outcome = gate
-                .pre_call(&args, &ToolCallContext::new("kubectl_apply"))
+                .pre_call(
+                    &serde_json::json!({ "namespace": "prod" }),
+                    &ToolCallContext::new("kubectl_apply"),
+                )
                 .await
                 .unwrap();
-            assert_eq!(
-                outcome,
-                PreCallOutcome::ShortCircuit {
-                    output: super::PARK_SENTINEL.to_string()
-                },
-                "a gated call parks under poll delivery"
-            );
 
-            // The registration landed in the shared store under the
-            // run-scoped owner.
-            cell.snapshot_if_pending(&[], &rig::completion::Message::user("results"));
-            match cell.outcome() {
-                crate::orchestration::CellOutcome::Blocked { pending } => {
-                    assert_eq!(pending.len(), 1);
-                    let parked = store
-                        .get(&pending[0].decision_id)
-                        .await
-                        .unwrap()
-                        .expect("ticket parked in the store");
-                    assert_eq!(
-                        parked.authority,
-                        ApprovalAuthority::WebhookPoll,
-                        "a poll park stamps the poll authority"
-                    );
-                    assert_eq!(
-                        parked.request.request_id,
-                        "run:0191e8c0-1111-7000-8000-000000000042"
-                    );
-                }
-                other => panic!("expected Blocked, got {other:?}"),
+            // The instant 200 machine decision applies in-request with the
+            // captured override — never a park document.
+            match outcome {
+                PreCallOutcome::Proceed {
+                    overrides: Some(overrides),
+                } => assert_eq!(
+                    overrides.captured_names().collect::<Vec<_>>(),
+                    vec!["x-forwarded-user"]
+                ),
+                other => panic!("expected Proceed with overrides, got {other:?}"),
             }
+            assert!(
+                store.list_pending().await.unwrap().is_empty(),
+                "no park document may exist"
+            );
+            assert!(cell.is_empty(), "no blocked-cell entry may exist");
+
+            // The wire ask carried response_type=poll, exactly once.
+            let captured = rx.recv().await.unwrap();
+            assert!(
+                captured.starts_with("POST "),
+                "the armed ask POSTs: {captured}"
+            );
+            assert!(
+                captured.contains("response_type=poll"),
+                "the ask sends response_type=poll: {captured}"
+            );
+            assert!(rx.try_recv().is_err(), "exactly one POST");
         }
 
         /// A poll webhook config with `headers_from_request`, built the
@@ -1132,6 +1175,7 @@ mod tests {
             registry: &PendingApprovals,
             req_headers: Option<&std::collections::HashMap<String, String>>,
             static_headers: std::collections::HashMap<String, String>,
+            url: &str,
         ) -> (
             Arc<dyn crate::session_store::ApprovalStore>,
             Arc<DecisionRoute>,
@@ -1145,7 +1189,7 @@ mod tests {
                     bind_identity: false,
                 },
                 route: aura_config::DecisionRouteConfig::Webhook {
-                    url: WebhookUrl::new("https://approvals.example.com/hook").unwrap(),
+                    url: WebhookUrl::new(url).unwrap(),
                     timeout_secs: 60,
                     headers: static_headers,
                     headers_from_request: std::collections::HashMap::from([(
@@ -1185,7 +1229,12 @@ mod tests {
                 store.clone(),
                 Arc::new(crate::session_store::InMemoryEventBus::new()),
             );
-            let (_, route) = poll_route_with_mapping(&registry, None, Default::default());
+            let (_, route) = poll_route_with_mapping(
+                &registry,
+                None,
+                Default::default(),
+                "https://approvals.example.com/hook",
+            );
             let cell = Arc::new(crate::orchestration::BlockedCell::default());
             let gate = parked_gate(&registry, &route, &request_id, &cell);
 
@@ -1216,11 +1265,14 @@ mod tests {
             crate::approval_event_broker::unsubscribe(&request_id).await;
         }
 
-        /// The successful capture copies the request-scoped resolved values
-        /// onto the parked row: the row carries THIS request's credential,
-        /// the input the reconciler will notify with.
+        /// A 207 on the armed ask bridges into park registration: the parked
+        /// row is born notified (acknowledged), its request id minted from
+        /// the run owner (so request teardown never sweeps it), and it
+        /// carries the request-scoped resolved egress headers. The mock
+        /// asserts exactly one POST.
         #[tokio::test]
-        async fn egress_capture_lands_on_the_parked_row() {
+        async fn armed_webhook_parks_on_207_with_run_owner_id() {
+            let (url, mut rx) = scripted_receiver("207 Multi-Status", vec![], String::new()).await;
             let store = Arc::new(crate::session_store::InMemoryApprovalStore::new());
             let registry = PendingApprovals::with_backend(
                 store.clone(),
@@ -1233,6 +1285,7 @@ mod tests {
                     "Bearer request-scoped",
                 )])),
                 Default::default(),
+                &url,
             );
             let cell = Arc::new(crate::orchestration::BlockedCell::default());
             let gate = parked_gate(&registry, &route, "req-egress-ok", &cell);
@@ -1242,7 +1295,7 @@ mod tests {
                 &ToolCallContext::new("kubectl_apply"),
             )
             .await
-            .expect("a resolvable mapping parks normally");
+            .expect("a 207 parks through the bridge");
 
             cell.snapshot_if_pending(&[], &rig::completion::Message::user("results"));
             match cell.outcome() {
@@ -1252,6 +1305,15 @@ mod tests {
                         .await
                         .unwrap()
                         .expect("ticket parked");
+                    assert_eq!(
+                        parked.request.request_id, "run:0191e8c0-1111-7000-8000-000000000042",
+                        "the parked row's request id is minted from the run owner"
+                    );
+                    assert_eq!(
+                        parked.acknowledgment,
+                        AcknowledgmentState::Acknowledged,
+                        "the 207 is the receiver's ack: the row is born notified"
+                    );
                     let row = parked.egress_headers.as_ref().expect("row egress headers");
                     assert_eq!(
                         row.get("authorization").unwrap(),
@@ -1261,13 +1323,27 @@ mod tests {
                 }
                 other => panic!("expected Blocked, got {other:?}"),
             }
+
+            // Exactly one POST: the 207 is the ack, the reconciler never
+            // re-POSTs.
+            let captured = rx.recv().await.unwrap();
+            assert!(
+                captured.starts_with("POST "),
+                "the armed ask POSTs: {captured}"
+            );
+            assert!(
+                captured.contains("response_type=poll"),
+                "the ask sends response_type=poll: {captured}"
+            );
+            assert!(rx.try_recv().is_err(), "exactly one POST");
         }
 
-        /// An explicit valid static fallback keeps the existing resolution
-        /// semantics: the absent request header resolves to the static value
-        /// and the row parks with it.
+        /// A static fallback keeps the egress resolution open under the
+        /// adaptive ask: the absent request header resolves to the static
+        /// value, and the 207-parked row carries it.
         #[tokio::test]
-        async fn static_fallback_keeps_registration_open() {
+        async fn armed_webhook_parks_on_207_with_static_fallback_egress() {
+            let (url, mut rx) = scripted_receiver("207 Multi-Status", vec![], String::new()).await;
             let store = Arc::new(crate::session_store::InMemoryApprovalStore::new());
             let registry = PendingApprovals::with_backend(
                 store.clone(),
@@ -1280,6 +1356,7 @@ mod tests {
                     "authorization".to_string(),
                     "Bearer static-fallback".to_string(),
                 )]),
+                &url,
             );
             let cell = Arc::new(crate::orchestration::BlockedCell::default());
             let gate = parked_gate(&registry, &route, "req-egress-fallback", &cell);
@@ -1289,7 +1366,7 @@ mod tests {
                 &ToolCallContext::new("kubectl_apply"),
             )
             .await
-            .expect("a static fallback keeps the registration open");
+            .expect("a 207 parks through the bridge");
 
             cell.snapshot_if_pending(&[], &rig::completion::Message::user("results"));
             match cell.outcome() {
@@ -1311,6 +1388,13 @@ mod tests {
                 }
                 other => panic!("expected Blocked, got {other:?}"),
             }
+
+            let captured = rx.recv().await.unwrap();
+            assert!(
+                captured.starts_with("POST "),
+                "the armed ask POSTs: {captured}"
+            );
+            assert!(rx.try_recv().is_err(), "exactly one POST");
         }
 
         /// The 207 bridge registers the parked row in the acknowledged state

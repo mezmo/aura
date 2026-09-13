@@ -1440,6 +1440,46 @@ mod tests {
         assert!(msg.contains("120s"));
     }
 
+    #[test]
+    fn test_hitl_timeout_alignment_warns_when_route_timeout_does_not_exceed_receiver() {
+        let webhook = |timeout_secs: u64, receiver_wait_timeout_secs: u64| HitlConfig {
+            require_approval: vec![],
+            park: ParkConfig::default(),
+            route: DecisionRouteConfig::Webhook {
+                url: WebhookUrl::new("http://localhost:9999").unwrap(),
+                timeout_secs,
+                headers: HashMap::new(),
+                headers_from_request: HashMap::new(),
+                tool_headers_from_response: ToolHeaderMappings::default(),
+                delivery: WebhookDelivery::default(),
+                poll_url: None,
+                poll_interval_secs: default_poll_interval_secs(),
+                poll_request_timeout_secs: default_poll_request_timeout_secs(),
+                receiver_wait_timeout_secs,
+            },
+        };
+
+        // 300 < 900: aura would deny as TimedOut while governance still decides.
+        assert!(hitl_timeout_alignment_warning(&webhook(300, 900)).is_some());
+
+        // Equality is still a misalignment: the route timeout must exceed the
+        // receiver's wait timeout.
+        assert!(hitl_timeout_alignment_warning(&webhook(900, 900)).is_some());
+
+        // 1200 > 900: the route outlives the receiver's wait, no warning.
+        assert!(hitl_timeout_alignment_warning(&webhook(1200, 900)).is_none());
+    }
+
+    #[test]
+    fn test_hitl_timeout_alignment_conversational_variant_is_none() {
+        let hitl = HitlConfig {
+            require_approval: vec![],
+            park: ParkConfig::default(),
+            route: DecisionRouteConfig::Conversational { timeout_secs: 120 },
+        };
+        assert!(hitl_timeout_alignment_warning(&hitl).is_none());
+    }
+
     // -------------------------------------------------------------------
     // [hitl.park]
     // -------------------------------------------------------------------
