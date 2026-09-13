@@ -2685,6 +2685,7 @@ async fn approved_without_required_identity_is_fatal_before_the_tombstone() {
 #[tokio::test]
 async fn denied_without_identity_steers_normally_under_the_identity_route() {
     let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
+    let _drain = OverrideDrain;
     let world = identity_world();
     let invocations = Arc::new(Mutex::new(Vec::new()));
     install_worker_overrides(vec![WorkerOverride {
