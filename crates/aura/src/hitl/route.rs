@@ -16,7 +16,9 @@ use reqwest::header::HeaderMap;
 
 use super::decision::{ApprovalDecision, ApprovalOutcome, DecisionId};
 use super::events;
-use super::protocol::{ApprovalDecisionWire, ApprovalRequest, ApprovalRequestWire};
+use super::protocol::{
+    ApprovalDecisionWire, ApprovalRequest, ApprovalRequestWire, PollDecisionWire,
+};
 use super::registry::PendingApprovals;
 use super::signing::{SigningContext, VerifiedBody, WebhookHmac, authorize_ingress};
 use crate::approval_event_broker::{self, ApprovalLifecycleEvent};
@@ -646,13 +648,11 @@ impl AskMode {
 
     /// Whether the POST response carries the decision directly. A poll-ask
     /// (`ParkArmed`) does decide live: its instant 200 is a machine decision.
-    #[expect(dead_code, reason = "the fill layer's ask methods read this")]
     pub(crate) fn can_decide_live(self) -> bool {
         matches!(self, Self::Hold | Self::ParkArmed)
     }
 
     /// Whether a 207 on this ask parks rather than violating protocol.
-    #[expect(dead_code, reason = "the fill layer's ask methods read this")]
     pub(crate) fn can_park(self) -> bool {
         matches!(self, Self::ParkArmed)
     }
@@ -687,10 +687,6 @@ enum WebhookReply {
     /// The receiver answered 207 (human needed) on a park-capable decide leg:
     /// the bridge parks rather than deciding. Only the gate path consumes it;
     /// the route-wide path maps it to a protocol violation.
-    #[expect(
-        dead_code,
-        reason = "constructed by the 207 detection in the fill layer"
-    )]
     Pending,
 }
 
@@ -703,9 +699,11 @@ impl WebhookReply {
         match self {
             Self::Decided { decision, .. } => Ok(ApprovalOutcome::Decided(decision)),
             Self::TimedOut { waited } => Ok(ApprovalOutcome::TimedOut { waited }),
-            Self::Pending => {
-                todo!("207 on the route-wide path is a protocol violation (fill layer)")
-            }
+            Self::Pending => Err(ApprovalError::ProtocolViolation(
+                "a pending reply reached a terminal-only path: a 207 parks through the gate \
+                 bridge, it never projects to a terminal outcome"
+                    .to_string(),
+            )),
         }
     }
 }
@@ -720,8 +718,6 @@ impl WebhookReply {
 pub(crate) enum PollOutcome {
     /// 200 with a strictly-parsed, signature-verified decision; response
     /// headers ride along for approver-identity capture by the caller.
-    /// Constructed by the poll leg's parse, which lands in the fill layer.
-    #[allow(dead_code)]
     Decided {
         decision: ApprovalDecision,
         response_headers: HeaderMap,
@@ -1040,12 +1036,38 @@ impl WebhookClient {
         timeout: Duration,
         mode: AskMode,
     ) -> Result<WebhookReply, ApprovalError> {
+        // This leg is a decision attempt: it parses the response body into a
+        // decision. An ack-only ask (`Notify`) has its own leg that never
+        // reads a body — routing it here would let a chatty receiver mint a
+        // decision out of a pure ack.
+        if !mode.can_decide_live() {
+            return Err(ApprovalError::Misconfigured(
+                "the ack-only notify ask never resolves a decision; it has no decision-bearing \
+                 POST"
+                    .to_string(),
+            ));
+        }
         let post = self.build_approval_post(request, timeout, None, mode)?;
         match post.send().await {
             Err(e) if e.is_timeout() => Ok(WebhookReply::TimedOut { waited: timeout }),
             Err(e) => Err(e.into()),
             Ok(resp) => {
                 let status = resp.status();
+                // Pending is status-code-carried (ruling 6): branch on 207
+                // before any body is read, verified, or parsed — a 207 body is
+                // never trusted. The park-armed ask parks on it; every other
+                // ask on this leg is a sync ask, and sync never 207s under the
+                // agreed contract — fail loud, never record a denial.
+                if status == reqwest::StatusCode::MULTI_STATUS {
+                    if mode.can_park() {
+                        return Ok(WebhookReply::Pending);
+                    }
+                    return Err(ApprovalError::ProtocolViolation(format!(
+                        "receiver answered 207 (pending) to a response_type={} ask that cannot \
+                         park; the agreed contract never answers 207 on a sync ask",
+                        mode.response_type()
+                    )));
+                }
                 if !status.is_success() {
                     return Err(ApprovalError::BadStatus {
                         status: status.as_u16(),
@@ -1211,8 +1233,33 @@ impl WebhookClient {
         // The 200 body is the pinned `{approved, reason}` shape: approved ->
         // Approved, !approved -> Denied(reason), a body outside the shape ->
         // NotYet.
-        let _ = (verified, response_headers);
-        todo!("GET 200 body decision mapping (fill layer)")
+        let wire = match serde_json::from_slice::<PollDecisionWire>(&verified) {
+            Ok(wire) => wire,
+            Err(error) => {
+                // Strict key-dispatch (ruling 5): the legacy `{status}`
+                // envelope, a hybrid, or any shapeless body is outside the
+                // pinned contract — warn and keep polling, never fault the
+                // channel over a body the pinned receiver never sends.
+                tracing::warn!(
+                    decision_id = %decision_id,
+                    error = %error,
+                    "poll status body is outside the pinned {{approved, reason}} shape; \
+                     keeping the approval pending"
+                );
+                return Ok(PollOutcome::NotYet);
+            }
+        };
+        let decision = if wire.approved {
+            ApprovalDecision::Approved
+        } else {
+            ApprovalDecision::Denied {
+                reason: wire.reason,
+            }
+        };
+        Ok(PollOutcome::Decided {
+            decision,
+            response_headers,
+        })
     }
 }
 
