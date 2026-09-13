@@ -531,13 +531,15 @@ fn tool_result_prompt(call_id: &str, wire: &str) -> rig::completion::Message {
 
 /// The awaiting node's checkpointed prompt as a live park leaves it: the
 /// sentinel tool result for the pending call — the placeholder the
-/// substitution prelude must replace before the worker ever streams it.
+/// reconstruction removes from the rebuilt context before the worker
+/// ever streams it.
 fn sentinel_prompt() -> rig::completion::Message {
     sentinel_prompt_for(CALL_ID)
 }
 
 /// The checkpointed prompt carrying the sentinel for the given pending call
-/// id — the slot a fill's `replace_tool_result` keys on, one per parked call.
+/// id — one placeholder slot per parked call, the slot the rebuild
+/// replaces in place.
 fn sentinel_prompt_for(call_id: &str) -> rig::completion::Message {
     tool_result_prompt(call_id, &tool_wire(PARK_SENTINEL))
 }
@@ -590,8 +592,8 @@ fn tool_call_turn(calls: Vec<rig::message::AssistantContent>) -> rig::completion
 
 /// The standard one-call checkpoint with its sentinel prompt: the document a
 /// decided resume drives, over the matching fingerprint. The awaiting node's
-/// prompt carries the placeholder keyed by the pending call id, so a fill's
-/// `replace_tool_result` has the slot the contract requires.
+/// prompt carries the placeholder keyed by the pending call id — the
+/// tool-result user message the segment preflight's witness requires.
 fn sentinel_document(world: &World) -> ParkedRun {
     let mut document = parked_document(FUTURE_STAMP, matching_fingerprint(world), None, Vec::new());
     let node = document
@@ -1701,10 +1703,10 @@ async fn re_park_registers_the_fresh_ticket_under_the_original_bound_run_id() {
     let world = world();
     let invocations = Arc::new(Mutex::new(Vec::new()));
     // The decided tool's recording registration and the sentinel prompt are
-    // the board-owner repair (logged on the card): without them the
-    // substitution prelude would fault for fixture reasons — a missing
-    // ToolResult slot to replace, a missing tool to invoke. The frame pins
-    // the run-id binding only; execution assertions live elsewhere.
+    // the board-owner repair (logged on the card): without them the segment
+    // would fault for fixture reasons — a prompt the preflight witness
+    // refuses, a missing tool to invoke. The frame pins the run-id binding
+    // only; execution assertions live elsewhere.
     let apply_invocations = Arc::new(Mutex::new(Vec::new()));
     install_worker_overrides(vec![WorkerOverride {
         model: ScriptedCompletionModel::new(vec![ScriptedTurn::tool_calls(vec![

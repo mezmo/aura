@@ -124,8 +124,8 @@ internals.
   and the total `rebuild_context` rebuilds the continuation context, so the
   rebuilt context also carries each decided call's assistant tool call —
   synthesized where the fixture's history never captured it — ahead of
-  every tool result. `replace_tool_result` is `#[cfg(test)]`-retired until
-  Stage 7 reaps it.
+  every tool result. The retired slot-swap helper (`replace_tool_result`)
+  was deleted at Stage 7, with its unit frame.
 - The duplicate fixture stages the genuine same-completion two-call park
   (the producer CAN write two sentinel slots when one completion issues both
   gated calls): the node's history carries the assistant turn with both tool
@@ -139,10 +139,10 @@ internals.
   continuation request: the model's context carries exactly the pending
   calls' tool results, keyed to their own call ids in document order, each
   preceded by its matching assistant tool call — the pairing the Stage 2
-  builder must normalize (no orphaned results, no missing calls). The
+  builder must normalize (no orphaned results, no missing calls).   The
   frames stayed red on the fold's replace-miss fatal until the Stage 3
   reconstruction wiring landed (this change's commit; all three flipped green
-  unedited), and `replace_tool_result` reaps in Stage 7.
+  unedited); the retired slot-swap helper was reaped at Stage 7.
 - `run_segment` consumes the `test_rig` worker-override queue for its
   continuation's worker builds and the coordinator-override queue for the
   resumed coordinator loop's build, so the segment frames run scripted
@@ -177,9 +177,11 @@ internals.
   `resume mismatch: approved call is missing required approver identity`),
   the tombstone failure (the proven sequence's wording over the standard
   `EACCES` text, `resume tombstone write for call call_apply_1 failed:
-  Permission denied (os error 13)`), and the replace miss (the proven
-  sequence's wording, `continuation prompt has no tool result for call
-  call_apply_1`). A fill wording these differently flips the frames and
+  Permission denied (os error 13)`), and the segment preflight's
+  prompt-shape refusal (`awaiting node 0: the parked snapshot's current
+  prompt is not the tool-result message the park producers write` — the
+  row that retired the fold's replace-miss fatal; see the manifest row
+  above). A fill wording these differently flips the frames and
   must be reconciled with the panel, not hand-accepted.
 - The parity frame pins the error rendering the live multi-turn loop
   delivers for a tool-server failure — the `ToolServerError`'s raw

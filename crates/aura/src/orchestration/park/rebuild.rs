@@ -46,17 +46,10 @@
 //!
 //! This stage-2b unit fills the five behavior bodies (the frames in the
 //! test module below pin them); P45 stage 3 wired the substitution prelude
-//! to this module (the plan's stage 7 reaps
-//! `continuation::replace_tool_result` last), and the design record —
-//! including the repair-round panel ledger and the stage-2b coverage
-//! manifest — is `REBUILD-DESIGN.md` beside this module.
-
-// The wiring consumes the construction path, but the inspection accessors
-// (`ValidatedCall`'s, `ValidatedNode`'s, `SegmentPreflight::as_slice`,
-// `RebuiltContext`'s) are frame-only surfaces: the production path takes
-// the values by inference and `into_*`, never the getters, so the module
-// dead-code allow stays for them.
-#![allow(dead_code)]
+//! to this module (the stage 7 reap then deleted the retired slot-swap
+//! helper from `continuation`, with its unit frame), and the design
+//! record — including the repair-round panel ledger and the stage-2b
+//! coverage manifest — is `REBUILD-DESIGN.md` beside this module.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -129,24 +122,6 @@ impl ValidatedCall {
     #[must_use]
     pub(crate) fn call_id(&self) -> &CallId {
         &self.call_id
-    }
-
-    /// The gated tool's recorded name, validated non-empty.
-    #[must_use]
-    pub(crate) fn tool_name(&self) -> &str {
-        &self.tool_name
-    }
-
-    /// The transformed arguments the gate recorded.
-    #[must_use]
-    pub(crate) fn arguments(&self) -> &Value {
-        &self.arguments
-    }
-
-    /// The decision the call's outcome resolves against.
-    #[must_use]
-    pub(crate) fn decision_id(&self) -> DecisionId {
-        self.decision_id
     }
 }
 
@@ -348,18 +323,6 @@ pub(crate) struct ValidatedNode {
 }
 
 impl ValidatedNode {
-    /// The node's validated calls, in document order.
-    #[must_use]
-    pub(crate) fn calls(&self) -> &ValidatedCalls {
-        &self.calls
-    }
-
-    /// The node's validated prompt witness.
-    #[must_use]
-    pub(crate) fn prompt(&self) -> &ToolResultPrompt {
-        &self.prompt
-    }
-
     /// Take the half apart for the drive: the calls to resolve, the
     /// witness the builder consumes.
     #[must_use]
@@ -396,12 +359,6 @@ impl SegmentPreflight {
             validated.push(ValidatedNode { calls, prompt });
         }
         Ok(Self { nodes: validated })
-    }
-
-    /// The validated halves, in input order.
-    #[must_use]
-    pub(crate) fn as_slice(&self) -> &[ValidatedNode] {
-        &self.nodes
     }
 
     /// Take the halves for the drive, in input order.
@@ -570,14 +527,18 @@ pub(crate) struct RebuiltContext {
 
 impl RebuiltContext {
     /// The rebuilt history: the snapshot's captured messages in order,
-    /// with the synthesized assistant turn appended.
+    /// with the synthesized assistant turn appended. Frame-only: the
+    /// production path takes the context apart through `into_parts`.
+    #[allow(dead_code)]
     #[must_use]
     pub(crate) fn history(&self) -> &[Message] {
         &self.history
     }
 
     /// The rebuilt prompt: the snapshot's prompt with every bundle
-    /// call's tool result in place.
+    /// call's tool result in place. Frame-only: the production path
+    /// takes the context apart through `into_parts`.
+    #[allow(dead_code)]
     #[must_use]
     pub(crate) fn current_prompt(&self) -> &Message {
         &self.current_prompt
