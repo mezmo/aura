@@ -391,6 +391,121 @@ impl HitlApprovalWrapper {
             output: PARK_SENTINEL.to_string(),
         })
     }
+
+    /// The adaptive decide leg: a webhook route whose client can park (poll
+    /// delivery, and sync delivery under the adaptive contract). Only this
+    /// route shape asks first when the park arm is armed; the conversational
+    /// route parks without a webhook ask (the attended seam, untouched), and
+    /// a hold-only webhook route keeps `park_pre_call`'s park-capability
+    /// error.
+    fn park_capable_webhook(&self) -> bool {
+        match &*self.route {
+            DecisionRoute::Webhook { client, .. } => client.can_park(),
+            DecisionRoute::Conversational { .. } => false,
+        }
+    }
+
+    /// The park-armed entry: the adaptive poll-ask (Ruling A). Asks the
+    /// receiver FIRST with [`AskMode::ParkArmed`] (`response_type=poll`): an
+    /// instant 200 is a machine decision and applies in-request through the
+    /// terminal mapping — no park document, no reconciler tick; a 207 is
+    /// "human needed" and bridges into park registration (born notified; the
+    /// reconciler's GET leg resolves it). Egress capture is resolved before
+    /// any POST, the same fail-closed verdict the park arm registers under.
+    async fn park_armed_pre_call(
+        &self,
+        matched: &str,
+        args: &Value,
+        ctx: &ToolCallContext,
+    ) -> Result<PreCallOutcome, ToolError> {
+        if let Err(err) = self.route.park_egress() {
+            tracing::warn!(
+                tool_name = %ctx.tool_name,
+                error = %err,
+                "park-armed webhook egress capture failed; failing the gated call closed",
+            );
+            return Err(ToolError::ToolCallError(
+                format!("tool call blocked: {err}").into(),
+            ));
+        }
+        self.ask_route_pre_call(AskMode::ParkArmed, matched, args, ctx)
+            .await
+    }
+
+    /// The one decide leg both live asks share: the unarmed hold ask
+    /// ([`AskMode::Hold`], the sync-hold round trip) and the park-armed
+    /// adaptive ask ([`AskMode::ParkArmed`], the poll-ask) differ only in the
+    /// mode. The terminal arms convert through the shared
+    /// [`approval_result_to_pre_call`] mapping; a pending reply (207 = human
+    /// needed) bridges into park registration. The request rides the live
+    /// request id — the bridge re-mints the parked row's id from the run
+    /// owner — and the gate-entry deadline is captured before the POST, so a
+    /// parked row's expiry anchors at gate entry and the elapsed wait
+    /// consumes the decision budget.
+    async fn ask_route_pre_call(
+        &self,
+        mode: AskMode,
+        matched: &str,
+        args: &Value,
+        ctx: &ToolCallContext,
+    ) -> Result<PreCallOutcome, ToolError> {
+        let request = ApprovalRequest {
+            version: PROTOCOL_VERSION,
+            instance_id: self.instance_id.clone(),
+            decision_id: DecisionId::generate(),
+            request_id: self.request_id.clone(),
+            scope: self.scope.clone(),
+            origin: ApprovalOrigin::ConfigGate {
+                matched_pattern: matched.to_string(),
+                agent_name: self.agent_name.clone(),
+            },
+            items: vec![ApprovalItem {
+                tool_name: ctx.tool_name.clone(),
+                arguments: args.clone(),
+                tool_call_intent: ctx.tool_call_intent.clone(),
+            }],
+        };
+        let cancel =
+            crate::request_cancellation::RequestCancellation::token_for_id(&self.request_id)
+                .unwrap_or_else(crate::request_cancellation::RequestCancelToken::unbound);
+        let expires_at = chrono::Utc::now()
+            + chrono::Duration::from_std(self.route.timeout())
+                .expect("approval timeout fits in chrono");
+        match self
+            .route
+            .decide_for_gate(request, &cancel, mode, expires_at)
+            .await
+        {
+            Ok(GateDecision::Pending {
+                request,
+                expires_at,
+            }) => {
+                // The 207 bridge: re-enter park registration with the posted
+                // decision id and the gate-entry deadline.
+                let park = self.park.as_ref().ok_or_else(|| {
+                    ToolError::ToolCallError(
+                        "tool call blocked: 207 on a route without a park arm"
+                            .to_string()
+                            .into(),
+                    )
+                })?;
+                self.park_207_bridge(park, request, expires_at).await
+            }
+            Ok(GateDecision::Approved { overrides }) => {
+                approval_result_to_pre_call(Ok(TerminalGateDecision::Approved { overrides }))
+            }
+            Ok(GateDecision::Denied { reason }) => {
+                approval_result_to_pre_call(Ok(TerminalGateDecision::Denied { reason }))
+            }
+            Ok(GateDecision::TimedOut { .. }) => {
+                approval_result_to_pre_call(Ok(TerminalGateDecision::TimedOut))
+            }
+            Ok(GateDecision::Cancelled(_)) => {
+                approval_result_to_pre_call(Ok(TerminalGateDecision::Cancelled))
+            }
+            Err(e) => approval_result_to_pre_call(Err(e)),
+        }
+    }
 }
 
 #[async_trait]
@@ -436,67 +551,23 @@ impl ToolWrapper for HitlApprovalWrapper {
             }
         }
         if let Some(park) = &self.park {
+            // Authorization split (Ruling A): the armed arm ALONE authorizes
+            // the adaptive poll-ask, and only for a worker on a park-capable
+            // webhook decide leg. ASK FIRST: an instant 200 applies
+            // in-request with no park; a 207 parks through the bridge. The
+            // conversational seam keeps `park_pre_call`, as does every other
+            // armed shape (which also keeps its fail-closed errors for a
+            // non-worker scope or a hold-only route).
+            if matches!(self.scope, AgentScope::Worker { .. }) && self.park_capable_webhook() {
+                return self.park_armed_pre_call(matched, args, ctx).await;
+            }
             return self.park_pre_call(park, matched, args, ctx).await;
         }
-        let request = ApprovalRequest {
-            version: PROTOCOL_VERSION,
-            instance_id: self.instance_id.clone(),
-            decision_id: DecisionId::generate(),
-            request_id: self.request_id.clone(),
-            scope: self.scope.clone(),
-            origin: ApprovalOrigin::ConfigGate {
-                matched_pattern: matched.to_string(),
-                agent_name: self.agent_name.clone(),
-            },
-            items: vec![ApprovalItem {
-                tool_name: ctx.tool_name.clone(),
-                arguments: args.clone(),
-                tool_call_intent: ctx.tool_call_intent.clone(),
-            }],
-        };
-        let cancel =
-            crate::request_cancellation::RequestCancellation::token_for_id(&self.request_id)
-                .unwrap_or_else(crate::request_cancellation::RequestCancelToken::unbound);
-        // The gate-entry deadline is captured before the POST, so a parked
-        // row's expiry anchors at gate entry and the elapsed sync wait
-        // consumes the decision budget.
-        let expires_at = chrono::Utc::now()
-            + chrono::Duration::from_std(self.route.timeout())
-                .expect("approval timeout fits in chrono");
-        match self
-            .route
-            .decide_for_gate(request, &cancel, AskMode::Hold, expires_at)
+        // The live hold ask: an unarmed invocation — single-agent, or a
+        // park-enabled config whose invocation carries no arm — asks
+        // `AskMode::Hold` (`response_type=sync`) and never parks.
+        self.ask_route_pre_call(AskMode::Hold, matched, args, ctx)
             .await
-        {
-            Ok(GateDecision::Pending {
-                request,
-                expires_at,
-            }) => {
-                // The 207 bridge: re-enter park registration with the posted
-                // decision id and the gate-entry deadline.
-                let park = self.park.as_ref().ok_or_else(|| {
-                    ToolError::ToolCallError(
-                        "tool call blocked: 207 on a route without a park arm"
-                            .to_string()
-                            .into(),
-                    )
-                })?;
-                self.park_207_bridge(park, request, expires_at).await
-            }
-            Ok(GateDecision::Approved { overrides }) => {
-                approval_result_to_pre_call(Ok(TerminalGateDecision::Approved { overrides }))
-            }
-            Ok(GateDecision::Denied { reason }) => {
-                approval_result_to_pre_call(Ok(TerminalGateDecision::Denied { reason }))
-            }
-            Ok(GateDecision::TimedOut { .. }) => {
-                approval_result_to_pre_call(Ok(TerminalGateDecision::TimedOut))
-            }
-            Ok(GateDecision::Cancelled(_)) => {
-                approval_result_to_pre_call(Ok(TerminalGateDecision::Cancelled))
-            }
-            Err(e) => approval_result_to_pre_call(Err(e)),
-        }
     }
 }
 
