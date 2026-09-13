@@ -5,6 +5,7 @@ mod commit;
 mod continuation;
 mod document;
 mod guard;
+mod rebuild;
 mod recorded_decisions;
 pub(crate) mod resume;
 
@@ -22,6 +23,15 @@ pub(crate) use document::{
     PARKED_DOCUMENT_SUFFIX, ParkedRun, RESUMING_DOCUMENT_SUFFIX, RunStateForPark, load_parked_run,
 };
 pub(crate) use guard::ParkGuard;
+// The provider-valid context builder for the reconstruction direction
+// (P45, R5): unwired until P45 stage 3 points the substitution prelude
+// at it; re-exported now so the wiring changes no paths. The unused-
+// import marker sweeps with the module's dead-code allow at wiring.
+#[allow(unused_imports)]
+pub(crate) use rebuild::{
+    CallId, OutcomeWire, RebuildError, RebuiltContext, ResolvedCall, ResolvedCallBundle,
+    ValidatedCall, ValidatedCalls, rebuild_context,
+};
 pub(crate) use recorded_decisions::{CallKey, PeekOutcome, RecordedDecisions};
 
 use std::collections::HashMap;
