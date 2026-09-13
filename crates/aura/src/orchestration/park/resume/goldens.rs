@@ -22,6 +22,7 @@ use crate::orchestration::test_rig::{
     install_coordinator_overrides, install_worker_overrides, take_coordinator_override,
     take_worker_override,
 };
+use crate::orchestration::types::{FailedTaskRecord, FailureCategory};
 use crate::orchestration::{
     CallKey, OrchestrationConfig, PendingCall, TaskIdentity, TaskStatus, WorkerConfig,
 };
@@ -100,6 +101,13 @@ const SIBLING_DONE: &str = "deployed and settled";
 const FAILED_TEXT: &str = "the apply failed: the cluster rejected the manifest";
 /// The replacement task's final turn text.
 const REPLACEMENT_DONE: &str = "recovered and settled";
+/// The restored-failure fixture's already-failed node — the task the
+/// checkpoint recorded as Failed before the park, its description the
+/// seeded failure history carries.
+const RESTORED_FAILURE_DESC: &str = "Watch the rollout";
+/// The restored failure's error text — the literal the history-line pins
+/// key on.
+const RESTORED_FAILURE_ERROR: &str = "the rollout stalled: the pod never went ready";
 /// The goal-distinct fixture's raw query — the same literal every
 /// standard fixture's document carries.
 const CHECKPOINT_QUERY: &str = "Deploy the service";
@@ -657,6 +665,37 @@ fn distinct_goal_document(world: &World) -> ParkedRun {
     let mut document = sentinel_document(world);
     document.query = CHECKPOINT_QUERY.to_string();
     document.plan.goal = CHECKPOINT_GOAL.to_string();
+    document
+}
+
+/// The restored-failure checkpoint: the standard one-awaiting-node fixture
+/// plus one node that already FAILED before the park (task 6), with the
+/// checkpoint's failure history carrying that failure under the parked
+/// iteration — the fixture the failure-history frame drives.
+fn restored_failure_document(world: &World) -> ParkedRun {
+    let mut document = sentinel_document(world);
+    document.failure_history = vec![FailedTaskRecord {
+        description: RESTORED_FAILURE_DESC.to_string(),
+        error: RESTORED_FAILURE_ERROR.to_string(),
+        iteration: 1,
+        worker: Some("operations".to_string()),
+        category: FailureCategory::AgentTimeout,
+    }];
+    document.plan.tasks.push(ParkedTaskNode {
+        task_id: 6,
+        description: RESTORED_FAILURE_DESC.to_string(),
+        dependencies: vec![],
+        worker: Some("operations".to_string()),
+        rationale: String::new(),
+        status: TaskStatus::Failed,
+        result: None,
+        error: Some(RESTORED_FAILURE_ERROR.to_string()),
+        failure_category: Some(FailureCategory::AgentTimeout),
+        attempt: None,
+        history: None,
+        current_prompt: None,
+        pending: None,
+    });
     document
 }
 
@@ -3653,31 +3692,56 @@ fn coordinator_answered_after(turns: &[rig::completion::Message], marker: &str) 
     })
 }
 
+/// The rendered continuation prompt from a scripted coordinator request:
+/// rig folds the call's prompt into the request's trailing user turn, so
+/// the last user message's text is the decision context the coordinator
+/// actually received.
+fn continuation_prompt(request: &rig::completion::CompletionRequest) -> String {
+    request
+        .chat_history
+        .iter()
+        .filter_map(|message| match message {
+            rig::completion::Message::User { content } => Some(
+                content
+                    .iter()
+                    .filter_map(|item| match item {
+                        rig::message::UserContent::Text(text) => Some(text.text.clone()),
+                        _ => None,
+                    })
+                    .collect::<String>(),
+            ),
+            _ => None,
+        })
+        .last()
+        .expect("the continuation request carries its prompt as a user turn")
+}
+
 // ====================================================================
-// Stage 6 pre-failing frames (coordinator-loop resumption, the R6
-// natural-finish ruling, plus the segment_plan goal restoration). Red on
-// arrival at their named points by design; the Stage-6 wiring flips
-// them. The frames script WORKER builds only — the coordinator's build
-// path consumes no override — so the coordinator's answer text stays
-// unpinned and the restoration pin is the loop-level outcome.
+// Stage 6 coordinator-loop frames (the R6 natural-finish ruling, plus
+// the segment_plan goal restoration): a decided resume re-enters the
+// coordinator iteration loop over the checkpoint's restored state —
+// driving never-started siblings, re-planning past worker failures,
+// restoring the stored plan goal, and carrying restored failures into
+// the loop's history exactly once. Coordinators stay scripted through
+// the dedicated override queue; the pins live at the loop level (probe
+// invocations, decision-context prompts, re-published checkpoints,
+// cleanup).
 // ====================================================================
 
-/// STAGE 6 (R6 natural-finish), pre-failing: a checkpoint with one
-/// awaiting node (its single gated call decided approved, sentinel and
-/// registered ticket staged the faithful producer way) plus one
-/// never-started Pending sibling. The resume must resume the
-/// COORDINATOR ITERATION LOOP — restore the coordinator conversation,
-/// routing, iteration, and failure history from the checkpoint and
-/// continue through plan_with_routing — not just re-enter the executor:
-/// after the approved call executes exactly once through the
-/// substitution, the never-started sibling RUNS, and the run completes
-/// with the coordinator's natural final-answer turns beyond the last
-/// worker turn. Completion still deletes the checkpoint and removes the
+/// STAGE 6 (R6 natural-finish): a checkpoint with one awaiting node
+/// (its single gated call decided approved, sentinel and registered
+/// ticket staged the faithful producer way) plus one never-started
+/// Pending sibling. The resume must resume the COORDINATOR ITERATION
+/// LOOP — restore the coordinator conversation, routing, iteration,
+/// and failure history from the checkpoint and continue through
+/// plan_with_routing — not just re-enter the executor: after the
+/// approved call executes exactly once through the substitution, the
+/// never-started sibling RUNS, and the run completes with the
+/// coordinator's natural final-answer turns beyond the last worker
+/// turn. Completion still deletes the checkpoint and removes the
 /// consumed decisions. Both workers' continuations call the real
 /// `submit_result` (registered through `add_all_tools`), so both nodes
-/// carry the loop's SUCCESS semantics. Red today at the named point:
-/// the segment ends after the awaiting node — the sibling never runs
-/// and no coordinator turn occurs.
+/// carry the loop's SUCCESS semantics.
 #[tokio::test]
 async fn coordinator_resumes_after_awaiting_nodes_and_drives_never_started_siblings_to_completion()
 {
@@ -3806,17 +3870,19 @@ async fn coordinator_resumes_after_awaiting_nodes_and_drives_never_started_sibli
     );
 }
 
-/// STAGE 6 (R6 natural-finish), pre-failing: an awaiting node whose
-/// resumed worker FAILS — the continuation streams a failure report
-/// without calling `submit_result`, the SoftFailure shape the normal
-/// execution loop already defines (the `structured_output.is_none()`
-/// branch). The resumed coordinator loop must re-plan: its conversation
-/// extends past the checkpoint's restored state and either a
-/// replacement (or retried) task's worker runs or a final answer lands;
-/// the run completes either way. The approved call still executed
-/// exactly once — the failure is downstream of the execution. Red today
-/// at the named point: the failure text becomes the node's result and
-/// the segment just ends — no coordinator turn, no re-plan.
+/// STAGE 6 (R6 natural-finish): an awaiting node whose resumed worker
+/// FAILS — the continuation streams a failure report without calling
+/// `submit_result`, the SoftFailure shape the normal execution loop
+/// already defines (the `structured_output.is_none()` branch). The
+/// resumed node maps through that same rule, so the coordinator loop
+/// actually SEES the failure: the continuation request the coordinator
+/// receives carries the node as a FAILED task in the plan state and a
+/// failure-history entry under the RESUMED iteration. The loop then
+/// continues past it — a replacement (or retried) task's worker runs or
+/// a final answer lands; the choice is the coordinator's, the ruling
+/// demands the continuation, not a particular one. The approved call
+/// still executed exactly once — the failure is downstream of the
+/// execution.
 #[tokio::test]
 async fn resumed_coordinator_replans_when_a_resumed_worker_fails() {
     let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
@@ -3858,10 +3924,13 @@ async fn resumed_coordinator_replans_when_a_resumed_worker_fails() {
         },
     ]);
     // The coordinator continuation (R6): scripted respond_directly — the
-    // re-plan pin's final-answer leg.
-    install_coordinator_overrides(vec![CoordinatorOverride {
-        model: ScriptedCompletionModel::new(vec![coordinator_direct_turn()]),
-    }]);
+    // re-plan pin's final-answer leg. The model is cloned before the
+    // install so the frame can read the request log the consumed
+    // override recorded — the loop's decision context is the pin's
+    // subject.
+    let coordinator = ScriptedCompletionModel::new(vec![coordinator_direct_turn()]);
+    let coordinator_requests = coordinator.requests();
+    install_coordinator_overrides(vec![CoordinatorOverride { model: coordinator }]);
     register_decided(&world).await;
     publish_document(&world, &sentinel_document(&world)).await;
 
@@ -3890,10 +3959,36 @@ async fn resumed_coordinator_replans_when_a_resumed_worker_fails() {
             .any(|s| s.contains(FAILED_TEXT)),
         "the failed worker's report rode the segment turns"
     );
-    // The re-plan pin is deliberately disjunctive: the choice between
-    // re-planning into a worker build and answering directly is the
-    // coordinator's; the ruling demands the loop continue, not a
-    // particular continuation.
+    // The load-bearing re-plan pin: the failure reached the loop's
+    // decision context. The continuation request the coordinator
+    // received carries the failed node as plan state and records the
+    // failure under the resumed iteration (the checkpoint parked at
+    // iteration 1; the resumed loop executes iteration 2).
+    let recorded = coordinator_requests
+        .lock()
+        .expect("coordinator request log")
+        .clone();
+    assert_eq!(
+        recorded.len(),
+        1,
+        "the resumed loop makes exactly one continuation call"
+    );
+    let prompt = continuation_prompt(&recorded[0]);
+    assert!(
+        prompt.contains(&format!(
+            "- Task 3: Gated apply → failed [soft_failure]: {FAILED_TEXT}"
+        )),
+        "the loop's decision context carries the failed node as plan state: {prompt}"
+    );
+    assert!(
+        prompt.contains(&format!(
+            "- Iteration 2: \"Gated apply\" (worker: operations) — [soft_failure] {FAILED_TEXT}"
+        )),
+        "the failure history records the failure under the RESUMED iteration: {prompt}"
+    );
+    // The loop-continuation leg: the coordinator actually continued past
+    // the failure — a replacement build or a final answer, whichever it
+    // chose.
     let probe_count = probe_invocations
         .lock()
         .expect("replacement probe invocation log")
@@ -3901,7 +3996,7 @@ async fn resumed_coordinator_replans_when_a_resumed_worker_fails() {
     let answered = coordinator_answered_after(turns.as_slice(), FAILED_TEXT);
     assert!(
         probe_count == 1 || answered,
-        "the resumed coordinator re-plans past the failure: a replacement (or \
+        "the resumed coordinator continues past the failure: a replacement (or \
          retried) task's worker ran (probe invocations: {probe_count}) OR a \
          final-answer turn follows the failure report ({answered}); neither \
          happened — the segment ended with no coordinator turn"
@@ -3921,14 +4016,112 @@ async fn resumed_coordinator_replans_when_a_resumed_worker_fails() {
     );
 }
 
-/// STAGE 6, pre-failing: `segment_plan` must restore the CHECKPOINT's
-/// `plan.goal`, not rebuild the plan from the raw query. The fixture
-/// makes query and goal deliberately different strings; the honest
-/// observable is the re-published checkpoint's own `plan.goal` — the
-/// run-level projection of the segment plan's goal through the re-park
-/// commit (`build_document` stamps `plan.goal`), so a goal=query
-/// reconstruction writes the query back into the checkpoint. Red today
-/// at the named point: the re-published goal IS the query.
+/// STAGE 6: a checkpoint with one pre-existing Failed node plus one
+/// awaiting node resumes, the awaiting node completes, and the failure
+/// history the coordinator's continuation request carries holds the
+/// restored failure EXACTLY ONCE — under the parked iteration, never
+/// re-recorded under the resumed one. The restored node stays visible
+/// as failed plan state; what must not happen is the duplication that
+/// paints the restored failure as a fresh one (and a repeated-failure
+/// pattern the resumed run never observed).
+#[tokio::test]
+async fn restored_failures_are_not_re_recorded_under_the_resumed_iteration() {
+    let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
+    let world = world();
+    let apply_invocations = Arc::new(Mutex::new(Vec::new()));
+    let _drain = OverrideDrain;
+    install_worker_overrides(vec![WorkerOverride {
+        model: ScriptedCompletionModel::new(vec![
+            ScriptedTurn::tool_calls(vec![ScriptedToolCall::new(
+                "call_sub_a",
+                "submit_result",
+                json!({
+                    "summary": "apply done",
+                    "result": "applied cleanly",
+                    "confidence": "high",
+                }),
+            )]),
+            ScriptedTurn::text(A_DONE),
+        ]),
+        extra_tools: vec![Box::new(
+            RecordingTool::new(apply_invocations.clone()).with_name(TOOL),
+        )],
+    }]);
+    let coordinator = ScriptedCompletionModel::new(vec![coordinator_direct_turn()]);
+    let coordinator_requests = coordinator.requests();
+    install_coordinator_overrides(vec![CoordinatorOverride { model: coordinator }]);
+    register_decided(&world).await;
+    publish_document(&world, &restored_failure_document(&world)).await;
+
+    let grant = evaluate_resume(evaluation(&world, false, None))
+        .await
+        .expect("the all-decided run grants");
+    let segment = run_segment(grant, &world.config, &HashMap::new())
+        .await
+        .expect("the resumed run completes");
+    assert!(
+        matches!(segment, SegmentResult::Completed { .. }),
+        "the segment completes: {segment:?}"
+    );
+    {
+        let apply_log = apply_invocations.lock().expect("apply invocation log");
+        assert_eq!(
+            apply_log.len(),
+            1,
+            "the awaiting node's decided call executes exactly once through the \
+             substitution before its completion"
+        );
+    }
+    let recorded = coordinator_requests
+        .lock()
+        .expect("coordinator request log")
+        .clone();
+    assert_eq!(
+        recorded.len(),
+        1,
+        "the resumed loop makes exactly one continuation call"
+    );
+    let prompt = continuation_prompt(&recorded[0]);
+    let restored_line = format!(
+        "- Iteration 1: \"{RESTORED_FAILURE_DESC}\" (worker: operations) — [agent_timeout] \
+         {RESTORED_FAILURE_ERROR}"
+    );
+    assert_eq!(
+        prompt.matches(&restored_line).count(),
+        1,
+        "the restored failure rides the history exactly once, under the parked \
+         iteration: {prompt}"
+    );
+    assert!(
+        !prompt.contains(&format!("- Iteration 2: \"{RESTORED_FAILURE_DESC}\"")),
+        "the restored failure is not re-recorded under the resumed iteration: {prompt}"
+    );
+    assert!(
+        !prompt.contains("OBSERVED PATTERNS"),
+        "no repeated-failure pattern renders for a failure the resumed run did not \
+         observe: {prompt}"
+    );
+    assert!(
+        prompt.contains(&format!(
+            "- Task 6: {RESTORED_FAILURE_DESC} → failed [agent_timeout]: {RESTORED_FAILURE_ERROR}"
+        )),
+        "the restored node stays visible to the decision context as failed plan \
+         state: {prompt}"
+    );
+    assert!(
+        prompt.contains("- Task 3: Gated apply (confidence: high)"),
+        "the awaiting node completed through the loop's success semantics, structured \
+         output and all: {prompt}"
+    );
+}
+
+/// STAGE 6: `segment_plan` must restore the CHECKPOINT's `plan.goal`,
+/// not rebuild the plan from the raw query. The fixture makes query and
+/// goal deliberately different strings; the honest observable is the
+/// re-published checkpoint's own `plan.goal` — the run-level projection
+/// of the segment plan's goal through the re-park commit
+/// (`build_document` stamps `plan.goal`), so a goal=query
+/// reconstruction writes the query back into the checkpoint.
 #[tokio::test]
 async fn segment_plan_restores_the_checkpoint_goal_not_the_query() {
     let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
