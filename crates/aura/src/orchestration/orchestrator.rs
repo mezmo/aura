@@ -211,9 +211,11 @@ fn apply_worker_skills_override(
 
 /// The re-park commit's plan: the checkpoint's tasks reconstructed with
 /// their committed states, so the commit starts from what the run had and
-/// only the segment's own outcomes overwrite nodes.
+/// only the segment's own outcomes overwrite nodes. The goal is the
+/// checkpoint's stored `plan.goal`, not the raw query: the planner's goal
+/// is the run's record of intent, and a re-park must carry it forward.
 fn segment_plan(checkpoint: &ParkedRun) -> Plan {
-    let mut plan = Plan::new(checkpoint.query.clone());
+    let mut plan = Plan::new(checkpoint.plan.goal.clone());
     plan.steps = checkpoint.plan.steps.clone();
     for node in &checkpoint.plan.tasks {
         let mut task = Task::new(
