@@ -53,7 +53,9 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::task::{JoinError, spawn_blocking};
 
-use crate::hitl::{DecisionId, ParkedApproval, ResolveError, ResolvedDecision};
+use crate::hitl::{
+    AcknowledgmentState, DecisionId, ParkedApproval, ResolveError, ResolvedDecision,
+};
 
 use super::{
     AcknowledgeOutcome, ApprovalStore, DecisionRecord, ParkedApprovalRecord, SessionStoreError,
@@ -151,6 +153,38 @@ impl Inner {
         let payload = serde_json::to_vec(&ParkedApprovalRecord::from(&parked))
             .expect("approval record serializes to JSON");
         publish(&self.approval_path(&id), &payload)
+    }
+
+    fn mark_acknowledged_sync(
+        &self,
+        id: &DecisionId,
+    ) -> Result<AcknowledgeOutcome, SessionStoreError> {
+        let _guard = self.lock();
+        let id = canonical_id(id)?;
+        let path = self.approval_path(&id);
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            // No approval file: unknown, resolved, removed, or cancelled all
+            // read as `Missing`; a missing row is never recreated.
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                return Ok(AcknowledgeOutcome::Missing);
+            }
+            Err(err) => return Err(request_err(err)),
+        };
+        // resolve writes the decision before its best-effort approval unlink,
+        // so a decision file here marks an already-decided id: the row is no
+        // longer pending, and the stale approval file is left untouched.
+        if self.decision_path(&id).try_exists().map_err(request_err)? {
+            return Ok(AcknowledgeOutcome::Missing);
+        }
+        // Read-modify-write on the persisted record: only `acknowledgment`
+        // changes; every other field round-trips unchanged.
+        let mut record: ParkedApprovalRecord =
+            serde_json::from_slice(&bytes).map_err(decode_err)?;
+        record.acknowledgment = AcknowledgmentState::Acknowledged;
+        let payload = serde_json::to_vec(&record).expect("approval record serializes to JSON");
+        publish(&path, &payload)?;
+        Ok(AcknowledgeOutcome::Acknowledged)
     }
 
     fn get_sync(&self, id: &DecisionId) -> Result<Option<ParkedApproval>, SessionStoreError> {
@@ -426,12 +460,15 @@ impl ApprovalStore for FileApprovalStore {
             .map_err(join_err)?
     }
 
-    #[expect(unused_variables, reason = "fill layer consumes the id")]
     async fn mark_acknowledged(
         &self,
         id: &DecisionId,
     ) -> Result<AcknowledgeOutcome, SessionStoreError> {
-        todo!("conditional acknowledgment transition (fill layer)")
+        let inner = Arc::clone(&self.inner);
+        let id = *id;
+        spawn_blocking(move || inner.mark_acknowledged_sync(&id))
+            .await
+            .map_err(join_err)?
     }
 
     async fn get(&self, id: &DecisionId) -> Result<Option<ParkedApproval>, SessionStoreError> {
