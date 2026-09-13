@@ -373,13 +373,15 @@ async fn webhook_round_trip<T>(
     result
 }
 
-/// The live-path guard: a Hold ask requires the sync-hold path (delivery =
-/// Sync), whose POST response carries the decision; a ParkArmed ask requires
-/// a park-capable route. Either fires a POST whose response the mode reads as
-/// a decision or a park trigger.
+/// The live-path guard: a Hold ask is admissible on ANY delivery config
+/// (Ruling A) — it sends `response_type=sync` regardless of the configured
+/// mode, and a 207 there fails closed as a protocol violation; a ParkArmed
+/// ask requires a park-capable route; the ack-only Notify ask never decides
+/// live. Either fires a POST whose response the mode reads as a decision or a
+/// park trigger.
 fn decide_live_guard(client: &WebhookClient, mode: AskMode) -> Result<(), ApprovalError> {
     let available = match mode {
-        AskMode::Hold => client.can_decide_live(),
+        AskMode::Hold => true,
         AskMode::ParkArmed => client.can_park(),
         AskMode::Notify => false,
     };
@@ -718,7 +720,7 @@ pub(crate) enum PollOutcome {
         decision: ApprovalDecision,
         response_headers: HeaderMap,
     },
-    /// Keep polling: 404/204, a 207 pending, or a 200 body outside the
+    /// Keep polling: 404, a 207 pending, or a 200 body outside the
     /// pinned decision shape (the full contract sits at the poll match).
     NotYet,
 }
@@ -1195,14 +1197,11 @@ impl WebhookClient {
             .await?;
 
         // The status contract is exact: 200 carries (or withholds) a
-        // decision, 207/404/204 mean pending. Any other status, including
-        // other 2xx codes, is a channel fault rather than an invented
-        // pending.
+        // decision, 207/404 mean pending. Any other status, including other
+        // 2xx codes, is a channel fault rather than an invented pending.
         match resp.status() {
             reqwest::StatusCode::OK => {}
-            reqwest::StatusCode::MULTI_STATUS
-            | reqwest::StatusCode::NOT_FOUND
-            | reqwest::StatusCode::NO_CONTENT => {
+            reqwest::StatusCode::MULTI_STATUS | reqwest::StatusCode::NOT_FOUND => {
                 return Ok(PollOutcome::NotYet);
             }
             other => {
@@ -3178,28 +3177,32 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn poll_decision_404_and_204_are_pending() {
-            for status in ["404 Not Found", "204 No Content"] {
-                let (url, _received) =
-                    one_shot_receiver_with_status(status, vec![], String::new()).await;
+        async fn poll_decision_404_is_pending_and_204_is_a_channel_fault() {
+            // 404 stays not-yet.
+            let (url, _received) =
+                one_shot_receiver_with_status("404 Not Found", vec![], String::new()).await;
+            let client =
+                loopback_poll_client(&url, EgressSigning::Disabled, &url, Duration::from_secs(5));
+            let outcome = client
+                .poll_decision(DecisionId::generate())
+                .await
+                .expect("a 404 must not fault");
+            assert!(matches!(outcome, PollOutcome::NotYet), "got {outcome:?}");
 
-                let client = loopback_poll_client(
-                    &url,
-                    EgressSigning::Disabled,
-                    &url,
-                    Duration::from_secs(5),
-                );
-                let outcome = client
-                    .poll_decision(DecisionId::generate())
-                    .await
-                    .unwrap_or_else(|err| {
-                        panic!("{status}: a pending status must not fault: {err:?}")
-                    });
-                assert!(
-                    matches!(outcome, PollOutcome::NotYet),
-                    "expected NotYet, got {outcome:?}"
-                );
-            }
+            // 204 is outside the pinned 200/207/404 contract: it faults as a
+            // channel error, never an invented pending.
+            let (url, _received) =
+                one_shot_receiver_with_status("204 No Content", vec![], String::new()).await;
+            let client =
+                loopback_poll_client(&url, EgressSigning::Disabled, &url, Duration::from_secs(5));
+            let err = client
+                .poll_decision(DecisionId::generate())
+                .await
+                .expect_err("a 204 must fault as a channel error");
+            assert!(
+                matches!(err, ApprovalError::BadStatus { status: 204 }),
+                "expected BadStatus(204), got {err:?}"
+            );
         }
 
         /// The full signed round trip: the GET is signed over its empty body
@@ -3484,13 +3487,22 @@ mod tests {
             );
         }
 
-        /// Poll delivery must fail closed on the live synchronous decision
-        /// paths — `decide` and `decide_for_gate` — without touching the
-        /// webhook: the ack a sync POST receives is not a decision.
+        /// A hold ask is admissible on ANY webhook delivery config (Ruling A):
+        /// it sends `response_type=sync` regardless of the configured delivery
+        /// mode, and a 207 there is the loud protocol violation — never a
+        /// Misconfigured rejection, never a denial.
         #[tokio::test]
-        async fn poll_delivery_live_decision_paths_fail_closed_without_http() {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let url = format!("http://{}", listener.local_addr().unwrap());
+        async fn hold_ask_on_poll_delivery_sends_sync_and_207_is_a_protocol_violation() {
+            let cancel = crate::request_cancellation::RequestCancelToken::unbound();
+
+            // The route-wide path (the single-agent and request_approval
+            // surfaces).
+            let (url, received) = one_shot_receiver_with_status(
+                "207 Multi-Status",
+                vec![],
+                r#"{"approved":false}"#.to_string(),
+            )
+            .await;
             let route = super::super::DecisionRoute::Webhook {
                 client: loopback_poll_client(
                     &url,
@@ -3502,39 +3514,57 @@ mod tests {
                 timeout: Duration::from_secs(300),
                 egress_capture: Ok(()),
             };
-            let cancel = crate::request_cancellation::RequestCancelToken::unbound();
-
-            for (route_wide, decision) in [
-                (
-                    false,
-                    route
-                        .decide_for_gate(
-                            test_request(DecisionId::generate()),
-                            &cancel,
-                            AskMode::Hold,
-                            chrono::Utc::now() + chrono::Duration::seconds(300),
-                        )
-                        .await
-                        .expect_err("the live gate path must fail closed"),
-                ),
-                (
-                    true,
-                    route
-                        .decide(test_request(DecisionId::generate()), &cancel)
-                        .await
-                        .expect_err("the live route-wide path must fail closed"),
-                ),
-            ] {
-                assert!(
-                    matches!(decision, ApprovalError::Misconfigured(_)),
-                    "route_wide={route_wide}: expected Misconfigured, got {decision:?}"
-                );
-            }
-
-            let rogue = tokio::time::timeout(Duration::from_millis(200), listener.accept()).await;
+            let decision = route
+                .decide(test_request(DecisionId::generate()), &cancel)
+                .await
+                .expect_err("a 207 on a hold ask must fail closed");
             assert!(
-                rogue.is_err(),
-                "the live decision paths must not touch the webhook server"
+                matches!(decision, ApprovalError::ProtocolViolation(_)),
+                "expected ProtocolViolation, got {decision:?}"
+            );
+            let captured = received.await.unwrap();
+            assert!(
+                captured.request_line.contains("response_type=sync"),
+                "a hold ask on a poll-delivery config must send response_type=sync: {}",
+                captured.request_line
+            );
+
+            // The gate path (`decide_for_gate` with `AskMode::Hold`).
+            let (url, received) = one_shot_receiver_with_status(
+                "207 Multi-Status",
+                vec![],
+                r#"{"approved":false}"#.to_string(),
+            )
+            .await;
+            let route = super::super::DecisionRoute::Webhook {
+                client: loopback_poll_client(
+                    &url,
+                    EgressSigning::Disabled,
+                    &url,
+                    Duration::from_secs(5),
+                ),
+                registry: PendingApprovals::new(),
+                timeout: Duration::from_secs(300),
+                egress_capture: Ok(()),
+            };
+            let decision = route
+                .decide_for_gate(
+                    test_request(DecisionId::generate()),
+                    &cancel,
+                    AskMode::Hold,
+                    chrono::Utc::now() + chrono::Duration::seconds(300),
+                )
+                .await
+                .expect_err("a 207 on a hold gate ask must fail closed");
+            assert!(
+                matches!(decision, ApprovalError::ProtocolViolation(_)),
+                "expected ProtocolViolation, got {decision:?}"
+            );
+            let captured = received.await.unwrap();
+            assert!(
+                captured.request_line.contains("response_type=sync"),
+                "a hold gate ask on a poll-delivery config must send response_type=sync: {}",
+                captured.request_line
             );
         }
 
@@ -3548,7 +3578,7 @@ mod tests {
             // Explicit poll_url override wins over the route url.
             let (post_url, post_rx) = one_shot_receiver(vec![], String::new()).await;
             let (override_url, override_rx) =
-                one_shot_receiver_with_status("204 No Content", vec![], String::new()).await;
+                one_shot_receiver_with_status("404 Not Found", vec![], String::new()).await;
             let runtime = HitlRuntime::from_config(
                 &poll_config(&post_url, Some(&override_url)),
                 &crate::hitl::PendingApprovals::new(),
@@ -3575,7 +3605,7 @@ mod tests {
 
             // A None poll_url polls the route url itself.
             let (url, rx) =
-                one_shot_receiver_with_status("204 No Content", vec![], String::new()).await;
+                one_shot_receiver_with_status("404 Not Found", vec![], String::new()).await;
             let runtime = HitlRuntime::from_config(
                 &poll_config(&url, None),
                 &crate::hitl::PendingApprovals::new(),
