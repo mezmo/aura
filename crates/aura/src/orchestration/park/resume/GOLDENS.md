@@ -71,6 +71,10 @@ internals.
 | D. blocking-population narrow reading | pinned by the bodies themselves | running/interrupted/config_changed/mismatch frames each pin `"blocking": []`; rename-back/parked/expired frames pin non-empty sets. The reading is enforced by literals, not prose. |
 | —. stage order (first match wins) | ordering frame | `interrupted_outranks_expired` (aura): both conditions hold, the interrupted body wins. |
 | —. wire serializer calibration | literal grounding | `blocking_entry_and_turn_literals_match_the_wire_serializers` (aura) and `outcome_pair_and_sentinel_literals_match_the_wire_serializers` (aura) — the tests that pass on arrival: they pin `BlockingEntry`'s and rig's implemented serializers against the literals the frames embed, including the R2 pair, the sentinel prompt, and the JSON-quoted wire forms of the sentinel and the live denial text. |
+| Stage 6 (R6 natural-finish ruling), pre-failing: the resume must resume the COORDINATOR ITERATION LOOP — restore the coordinator conversation, routing, iteration, and failure history from the checkpoint and continue through plan_with_routing — not just re-enter the executor: after the awaiting node's approved call executes exactly once, a never-started Pending sibling RUNS, the run completes with the coordinator's natural final-answer turns beyond the last worker turn, and completion still deletes the checkpoint and removes the consumed decisions | sibling probe invocation + approved-call invocation count + final-answer PRESENCE beyond the sibling's last turn + on-disk checkpoint deletion + store cleanup | `coordinator_resumes_after_awaiting_nodes_and_drives_never_started_siblings_to_completion` (aura): the sentinel fixture plus one bare Pending sibling (task 5, the shape `build_document` writes for a never-started node); both workers' continuations call the real `submit_result` (registered through `add_all_tools`) so both nodes carry the loop's SUCCESS semantics. RED today at the named point: the segment ends after the awaiting node — the sibling never runs (zero probe invocations) and no coordinator turn occurs. |
+| Stage 6 (R6), pre-failing: a resumed worker's failure must reach the coordinator loop — it re-plans (a replacement or retried task's worker runs OR a final answer lands) and the run completes; the approved call still executed exactly once | approved-call count + the disjunctive re-plan pin (replacement probe invocation == 1 OR an assistant text turn after the failure report) + completion + cleanup | `resumed_coordinator_replans_when_a_resumed_worker_fails` (aura): the failure is the SoftFailure shape the normal loop already defines — the continuation streams the failure report without calling `submit_result`. A stream-error failure cannot be the shape: today's segment FAULTS on it (`the resume stream for task … failed`) rather than ending. RED today: the failure text becomes the node's result and the segment just ends — no coordinator turn. |
+| Stage 6, pre-failing: `segment_plan` must restore the CHECKPOINT's `plan.goal`, not rebuild the plan from the raw query | the re-published checkpoint's `plan.goal` (and `query`, unchanged) | `segment_plan_restores_the_checkpoint_goal_not_the_query` (aura): query and goal are deliberately different strings; the continuation re-parks on a fresh gated call and the frame loads the re-published parked document — the run-level projection of the segment plan's goal through the re-park commit (`build_document` stamps `plan.goal`). RED today at goal=query: the re-published goal IS the query. The prompt-level observables (a re-plan prompt or final answer echoing the goal) belong to the later wire-level R6 unit. |
+| Stage 6, completion-path grant-cleanup audit (verify-then-maybe-pin) | verification only — nothing to pin | Audited for this unit: the only completion-path cleanup site is the `grant.consumed_decisions()` loop after the resuming-document unlink. `ResumeGrant.consumed` is the consult's decided-consumed list (`load_recorded_decisions`), the consult refuses while any pending call is undecided, and a Completed segment drove every awaiting node to Normal — so the completion-path removal set coincides with the actually-consumed set; the re-park path removes the per-invocation accumulator instead. NO completion-path site removes all loaded ids — the vet finding was pre-fixed by the F1 positional repair. The remaining `registry.remove` sites are the conversational route's timeout arm, the Orphaned-fault cancel, the expired-refusal sweep, and tests. |
 
 ## Exclusions (not covered here, with owners)
 
@@ -194,5 +198,37 @@ internals.
   path (`.{run}.resuming.json.tmp`, the name `append_executed_and_publish`
   derives). Directory-permission staging cannot work: the write tightens
   its parent to owner-writable (`private_dir`) before opening the temp
-  file, so only the read-only leftover at the temp path itself faults the
+  file, so only a read-only leftover at the temp path itself faults the
   write.
+- The Stage-6 frames script WORKER builds only (the awaiting node's, the
+  sibling's, the replacement's): no override seam exists on the
+  coordinator's build path (`create_coordinator` /
+  `build_provider_agent_with_tools` consume no `test_rig` override), so
+  the resumed coordinator's model is unscripted and its final-answer
+  TEXT is unpinned — the frames pin presence (an assistant text turn
+  beyond the last worker turn) and loop-level outcomes (the
+  sibling/replacement worker builds ran). The
+  restored-state-drives-continuation pin is indirect by the same
+  boundary: the loop cannot drive the sibling without the restored
+  plan/routing/iteration state. A Stage-6 fill that routes the resume
+  coordinator through the worker-override queue changes the queue
+  contract these frames install against and must be reconciled with the
+  panel, not hand-accepted; the request-level restoration pins (the
+  checkpoint's coordinator conversation riding the continuation prompt)
+  belong to the later wire-level R6 unit.
+- The Stage-6 frames install their worker overrides per resume, in
+  build order, under a drop guard (`OverrideDrain`) that drains the
+  queue on scope exit, unwind included: a pre-failing frame fails
+  mid-test by design — under the pre-Stage-6 segment the sibling's and
+  replacement's builds never happen — and an undrained leak would ride
+  the next consumer's first worker build (the queue is take-once and
+  process-global). The guard is what keeps the rest of the suite
+  isolation-clean while these frames sit red.
+- The re-plan frame's pin is deliberately disjunctive (a replacement or
+  retried task's worker ran OR a final answer landed): the choice
+  between re-planning and answering is the coordinator's, and the
+  ruling demands the loop continue, not a particular continuation. Its
+  failure shape is the SoftFailure no-`submit_result` continuation —
+  the one failure shape whose today-behavior is "the segment just
+  ends", matching the named point; a stream-error failure faults
+  today's segment instead.

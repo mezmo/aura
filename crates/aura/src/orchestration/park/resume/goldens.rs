@@ -87,6 +87,25 @@ const CALL_ID_B: &str = "call_scale_1";
 const A_DONE: &str = "applied and settled";
 /// Node B's continuation text on the second resume.
 const B_DONE: &str = "scaled and settled";
+/// The sibling/replacement probe's registered name — ungated by
+/// construction, so a driven task leaves run-level evidence without
+/// touching the park machinery.
+const PROBE_TOOL: &str = "deploy_probe";
+/// The never-started sibling's final turn text — the wire marker the
+/// coordinator-loop frame keys its final-answer-presence scan on.
+const SIBLING_DONE: &str = "deployed and settled";
+/// The failed resumed worker's final report — the marker the re-plan
+/// frame keys its disjunctive scan on.
+const FAILED_TEXT: &str = "the apply failed: the cluster rejected the manifest";
+/// The replacement task's final turn text.
+const REPLACEMENT_DONE: &str = "recovered and settled";
+/// The goal-distinct fixture's raw query — the same literal every
+/// standard fixture's document carries.
+const CHECKPOINT_QUERY: &str = "Deploy the service";
+/// The goal-distinct fixture's stored plan goal — deliberately a
+/// different string than the query, so a goal=query reconstruction
+/// cannot pass as a restoration.
+const CHECKPOINT_GOAL: &str = "Ship the payments service to production with zero downtime";
 /// The park placeholder the gate stamps as a parked call's tool result —
 /// mirrored here because the gate keeps its sentinel private; the gate's
 /// own tests pin the same wording. A decided resume must replace it, so it
@@ -604,6 +623,41 @@ fn two_node_sentinel_document(world: &World) -> ParkedRun {
             call_id: CALL_ID_B.to_string(),
         }]),
     });
+    document
+}
+
+/// The sibling-carrying checkpoint: the standard one-awaiting-node
+/// fixture plus one never-started Pending sibling (task 5) on the same
+/// worker — stored bare, exactly the shape `build_document` writes for a
+/// Pending node (no attempt, history, prompt, or pending calls). The
+/// fixture the coordinator-loop frame drives.
+fn sibling_pending_document(world: &World) -> ParkedRun {
+    let mut document = sentinel_document(world);
+    document.plan.tasks.push(ParkedTaskNode {
+        task_id: 5,
+        description: "Run the post-apply deployment checks".to_string(),
+        dependencies: vec![],
+        worker: Some("operations".to_string()),
+        rationale: String::new(),
+        status: TaskStatus::Pending,
+        result: None,
+        error: None,
+        failure_category: None,
+        attempt: None,
+        history: None,
+        current_prompt: None,
+        pending: None,
+    });
+    document
+}
+
+/// The goal-distinct checkpoint: query and `plan.goal` deliberately
+/// different strings, everything else the standard sentinel fixture —
+/// the fixture the goal-restoration frame drives.
+fn distinct_goal_document(world: &World) -> ParkedRun {
+    let mut document = sentinel_document(world);
+    document.query = CHECKPOINT_QUERY.to_string();
+    document.plan.goal = CHECKPOINT_GOAL.to_string();
     document
 }
 
@@ -3439,6 +3493,357 @@ async fn re_parked_turns_start_after_the_rebuilt_history_with_no_replayed_recons
     assert!(
         !serialized.to_string().contains(PARK_SENTINEL),
         "the placeholder appears nowhere in the serialized turns"
+    );
+}
+
+/// Each turn in its wire form, for marker scans over the segment turns.
+fn serialized_turns(turns: &[rig::completion::Message]) -> Vec<String> {
+    turns
+        .iter()
+        .map(|message| serde_json::to_string(message).expect("turn serializes"))
+        .collect()
+}
+
+/// A red frame's own panic must not leak its undriven worker overrides
+/// into the next consumer's builds: the queue is take-once and
+/// process-global, and a pre-failing frame fails mid-test by design, so
+/// an end-of-test drain never runs on the red path. Drains on drop,
+/// unwind included; instantiate right after installing.
+struct OverrideDrain;
+
+impl Drop for OverrideDrain {
+    fn drop(&mut self) {
+        while take_worker_override().is_some() {
+            // drained
+        }
+    }
+}
+
+/// Whether an assistant turn carrying non-empty text rides strictly
+/// after the last turn containing `marker` — the presence pin for the
+/// coordinator's natural final-answer turns (the R6 natural-finish
+/// ruling): the later wire-level unit pins the envelope; here only
+/// existence beyond the last worker turn is pinned. Panics when no turn
+/// carries the marker: the marker is the fixture's own scripted text,
+/// so its absence is a wire-shape break, not a negative answer.
+fn coordinator_answered_after(turns: &[rig::completion::Message], marker: &str) -> bool {
+    let serialized = serialized_turns(turns);
+    let Some(at) = serialized.iter().rposition(|s| s.contains(marker)) else {
+        panic!("the segment turns carry the turn marked `{marker}`: {serialized:?}");
+    };
+    turns.iter().skip(at + 1).any(|message| {
+        matches!(
+            message,
+            rig::completion::Message::Assistant { content, .. }
+                if content.iter().any(|item| matches!(
+                    item,
+                    rig::message::AssistantContent::Text(text)
+                        if !text.text.trim().is_empty()
+                ))
+        )
+    })
+}
+
+// ====================================================================
+// Stage 6 pre-failing frames (coordinator-loop resumption, the R6
+// natural-finish ruling, plus the segment_plan goal restoration). Red on
+// arrival at their named points by design; the Stage-6 wiring flips
+// them. The frames script WORKER builds only — the coordinator's build
+// path consumes no override — so the coordinator's answer text stays
+// unpinned and the restoration pin is the loop-level outcome.
+// ====================================================================
+
+/// STAGE 6 (R6 natural-finish), pre-failing: a checkpoint with one
+/// awaiting node (its single gated call decided approved, sentinel and
+/// registered ticket staged the faithful producer way) plus one
+/// never-started Pending sibling. The resume must resume the
+/// COORDINATOR ITERATION LOOP — restore the coordinator conversation,
+/// routing, iteration, and failure history from the checkpoint and
+/// continue through plan_with_routing — not just re-enter the executor:
+/// after the approved call executes exactly once through the
+/// substitution, the never-started sibling RUNS, and the run completes
+/// with the coordinator's natural final-answer turns beyond the last
+/// worker turn. Completion still deletes the checkpoint and removes the
+/// consumed decisions. Both workers' continuations call the real
+/// `submit_result` (registered through `add_all_tools`), so both nodes
+/// carry the loop's SUCCESS semantics. Red today at the named point:
+/// the segment ends after the awaiting node — the sibling never runs
+/// and no coordinator turn occurs.
+#[tokio::test]
+async fn coordinator_resumes_after_awaiting_nodes_and_drives_never_started_siblings_to_completion()
+{
+    let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
+    let world = world();
+    let apply_invocations = Arc::new(Mutex::new(Vec::new()));
+    let probe_invocations = Arc::new(Mutex::new(Vec::new()));
+    // Per-resume install, in build order: the awaiting node's worker
+    // first (the substitution machinery builds it), then the sibling's
+    // (a build only the resumed coordinator loop can make). The drain
+    // guard keeps a red frame's panic from leaking the sibling's
+    // undriven override into another consumer's builds.
+    let _drain = OverrideDrain;
+    install_worker_overrides(vec![
+        WorkerOverride {
+            model: ScriptedCompletionModel::new(vec![
+                ScriptedTurn::tool_calls(vec![ScriptedToolCall::new(
+                    "call_sub_a",
+                    "submit_result",
+                    json!({
+                        "summary": "apply done",
+                        "result": "applied cleanly",
+                        "confidence": "high",
+                    }),
+                )]),
+                ScriptedTurn::text(A_DONE),
+            ]),
+            extra_tools: vec![Box::new(
+                RecordingTool::new(apply_invocations.clone()).with_name(TOOL),
+            )],
+        },
+        WorkerOverride {
+            model: ScriptedCompletionModel::new(vec![
+                ScriptedTurn::tool_calls(vec![ScriptedToolCall::new(
+                    "call_probe_b",
+                    PROBE_TOOL,
+                    json!({ "environment": "prod" }),
+                )]),
+                ScriptedTurn::tool_calls(vec![ScriptedToolCall::new(
+                    "call_sub_b",
+                    "submit_result",
+                    json!({
+                        "summary": "deploy checks done",
+                        "result": "deployed cleanly",
+                        "confidence": "high",
+                    }),
+                )]),
+                ScriptedTurn::text(SIBLING_DONE),
+            ]),
+            extra_tools: vec![Box::new(
+                RecordingTool::new(probe_invocations.clone()).with_name(PROBE_TOOL),
+            )],
+        },
+    ]);
+    register_decided(&world).await;
+    publish_document(&world, &sibling_pending_document(&world)).await;
+
+    let grant = evaluate_resume(evaluation(&world, false, None))
+        .await
+        .expect("the all-decided run grants");
+    let segment = run_segment(grant, &world.config, &HashMap::new())
+        .await
+        .expect("the resumed run drives to completion");
+    let turns = match segment {
+        SegmentResult::Completed { turns } => turns,
+        other => panic!("expected a completed segment, got {other:?}"),
+    };
+    {
+        let apply_log = apply_invocations.lock().expect("apply invocation log");
+        assert_eq!(
+            apply_log.len(),
+            1,
+            "the approved call executes exactly once through the substitution"
+        );
+        assert_eq!(
+            apply_log[0].arguments,
+            call_args(),
+            "the single invocation carries the recorded call's arguments"
+        );
+    }
+    {
+        let probe_log = probe_invocations
+            .lock()
+            .expect("sibling probe invocation log");
+        assert_eq!(
+            probe_log.len(),
+            1,
+            "the never-started sibling RUNS under the resumed coordinator loop; zero \
+             invocations recorded: the segment ended after the awaiting node and no \
+             coordinator turn occurred"
+        );
+        assert_eq!(
+            probe_log[0].arguments,
+            json!({ "environment": "prod" }),
+            "the sibling's invocation carries its scripted arguments"
+        );
+    }
+    assert!(
+        coordinator_answered_after(turns.as_slice(), SIBLING_DONE),
+        "an assistant final-answer turn follows the sibling's last turn — the \
+         coordinator finishes its turn naturally after the workers (R6): {:?}",
+        serialized_turns(turns.as_slice())
+    );
+    assert!(
+        !parked_document_path(&world).exists() && !resuming_document_path(&world).exists(),
+        "completion deletes the checkpoint under both its names"
+    );
+    assert!(
+        world
+            .registry
+            .try_parked(&decision())
+            .await
+            .expect("the store reads")
+            .is_none(),
+        "completion removes the consumed decision from the store"
+    );
+}
+
+/// STAGE 6 (R6 natural-finish), pre-failing: an awaiting node whose
+/// resumed worker FAILS — the continuation streams a failure report
+/// without calling `submit_result`, the SoftFailure shape the normal
+/// execution loop already defines (the `structured_output.is_none()`
+/// branch). The resumed coordinator loop must re-plan: its conversation
+/// extends past the checkpoint's restored state and either a
+/// replacement (or retried) task's worker runs or a final answer lands;
+/// the run completes either way. The approved call still executed
+/// exactly once — the failure is downstream of the execution. Red today
+/// at the named point: the failure text becomes the node's result and
+/// the segment just ends — no coordinator turn, no re-plan.
+#[tokio::test]
+async fn resumed_coordinator_replans_when_a_resumed_worker_fails() {
+    let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
+    let world = world();
+    let apply_invocations = Arc::new(Mutex::new(Vec::new()));
+    let probe_invocations = Arc::new(Mutex::new(Vec::new()));
+    // Per-resume install, in build order: the failing node's worker
+    // first, then the replacement's (a build only a coordinator re-plan
+    // can make), under the red-safe drain guard.
+    let _drain = OverrideDrain;
+    install_worker_overrides(vec![
+        WorkerOverride {
+            model: ScriptedCompletionModel::new(vec![ScriptedTurn::text(FAILED_TEXT)]),
+            extra_tools: vec![Box::new(
+                RecordingTool::new(apply_invocations.clone()).with_name(TOOL),
+            )],
+        },
+        WorkerOverride {
+            model: ScriptedCompletionModel::new(vec![
+                ScriptedTurn::tool_calls(vec![ScriptedToolCall::new(
+                    "call_probe_r",
+                    PROBE_TOOL,
+                    json!({ "environment": "prod" }),
+                )]),
+                ScriptedTurn::tool_calls(vec![ScriptedToolCall::new(
+                    "call_sub_r",
+                    "submit_result",
+                    json!({
+                        "summary": "recovered",
+                        "result": "recovered and applied",
+                        "confidence": "high",
+                    }),
+                )]),
+                ScriptedTurn::text(REPLACEMENT_DONE),
+            ]),
+            extra_tools: vec![Box::new(
+                RecordingTool::new(probe_invocations.clone()).with_name(PROBE_TOOL),
+            )],
+        },
+    ]);
+    register_decided(&world).await;
+    publish_document(&world, &sentinel_document(&world)).await;
+
+    let grant = evaluate_resume(evaluation(&world, false, None))
+        .await
+        .expect("the all-decided run grants");
+    let segment = run_segment(grant, &world.config, &HashMap::new())
+        .await
+        .expect("the resumed run completes after the worker failure");
+    let turns = match segment {
+        SegmentResult::Completed { turns } => turns,
+        other => panic!("expected a completed segment, got {other:?}"),
+    };
+    {
+        let apply_log = apply_invocations.lock().expect("apply invocation log");
+        assert_eq!(
+            apply_log.len(),
+            1,
+            "the approved call executes exactly once — the failure is downstream of \
+             the execution"
+        );
+    }
+    assert!(
+        serialized_turns(turns.as_slice())
+            .iter()
+            .any(|s| s.contains(FAILED_TEXT)),
+        "the failed worker's report rode the segment turns"
+    );
+    // The re-plan pin is deliberately disjunctive: the choice between
+    // re-planning into a worker build and answering directly is the
+    // coordinator's; the ruling demands the loop continue, not a
+    // particular continuation.
+    let probe_count = probe_invocations
+        .lock()
+        .expect("replacement probe invocation log")
+        .len();
+    let answered = coordinator_answered_after(turns.as_slice(), FAILED_TEXT);
+    assert!(
+        probe_count == 1 || answered,
+        "the resumed coordinator re-plans past the failure: a replacement (or \
+         retried) task's worker ran (probe invocations: {probe_count}) OR a \
+         final-answer turn follows the failure report ({answered}); neither \
+         happened — the segment ended with no coordinator turn"
+    );
+    assert!(
+        !parked_document_path(&world).exists() && !resuming_document_path(&world).exists(),
+        "completion deletes the checkpoint under both its names"
+    );
+    assert!(
+        world
+            .registry
+            .try_parked(&decision())
+            .await
+            .expect("the store reads")
+            .is_none(),
+        "completion removes the consumed decision from the store"
+    );
+}
+
+/// STAGE 6, pre-failing: `segment_plan` must restore the CHECKPOINT's
+/// `plan.goal`, not rebuild the plan from the raw query. The fixture
+/// makes query and goal deliberately different strings; the honest
+/// observable is the re-published checkpoint's own `plan.goal` — the
+/// run-level projection of the segment plan's goal through the re-park
+/// commit (`build_document` stamps `plan.goal`), so a goal=query
+/// reconstruction writes the query back into the checkpoint. Red today
+/// at the named point: the re-published goal IS the query.
+#[tokio::test]
+async fn segment_plan_restores_the_checkpoint_goal_not_the_query() {
+    let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
+    let world = world();
+    let _drain = OverrideDrain;
+    install_worker_overrides(vec![WorkerOverride {
+        model: ScriptedCompletionModel::new(vec![ScriptedTurn::tool_calls(vec![
+            ScriptedToolCall::new(FRESH_CALL_ID, NEW_TOOL, json!({ "namespace": "stage" }))
+                .with_call_id(NEW_CALL_ID),
+        ])]),
+        extra_tools: vec![
+            Box::new(RecordingTool::new(Arc::new(Mutex::new(Vec::new()))).with_name(TOOL)),
+            Box::new(RecordingTool::new(Arc::new(Mutex::new(Vec::new()))).with_name(NEW_TOOL)),
+        ],
+    }]);
+    register_decided(&world).await;
+    publish_document(&world, &distinct_goal_document(&world)).await;
+
+    let grant = evaluate_resume(evaluation(&world, false, None))
+        .await
+        .expect("the all-decided run grants");
+    let segment = run_segment(grant, &world.config, &HashMap::new())
+        .await
+        .expect("the continuation re-parks on the fresh gated call");
+    assert!(
+        matches!(segment, SegmentResult::Parked { .. }),
+        "the goal fixture's continuation re-parks: {segment:?}"
+    );
+    let republished = load_parked_run(&parked_document_path(&world))
+        .await
+        .expect("the re-park re-published the checkpoint under the parked name");
+    assert_eq!(
+        republished.plan.goal, CHECKPOINT_GOAL,
+        "the re-published checkpoint carries the CHECKPOINT's plan goal — the \
+         segment plan must restore the stored goal, not rebuild from the raw query"
+    );
+    assert_eq!(
+        republished.query, CHECKPOINT_QUERY,
+        "the query field stays the raw query — goal and query are distinct fields"
     );
 }
 
