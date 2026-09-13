@@ -69,7 +69,9 @@ use tokio::task::{JoinError, spawn_blocking};
 
 use crate::hitl::{DecisionId, ParkedApproval, ResolveError, ResolvedDecision};
 
-use super::{ApprovalStore, DecisionRecord, ParkedApprovalRecord, SessionStoreError};
+use super::{
+    AcknowledgeOutcome, ApprovalStore, DecisionRecord, ParkedApprovalRecord, SessionStoreError,
+};
 
 pub use skill_store::FileSkillInvocationStore;
 
@@ -483,6 +485,14 @@ impl ApprovalStore for FileApprovalStore {
         spawn_blocking(move || inner.register_sync(parked))
             .await
             .map_err(join_err)?
+    }
+
+    async fn mark_acknowledged(
+        &self,
+        id: &DecisionId,
+    ) -> Result<AcknowledgeOutcome, SessionStoreError> {
+        let _ = id;
+        todo!("conditional acknowledgment transition (fill layer)")
     }
 
     async fn get(&self, id: &DecisionId) -> Result<Option<ParkedApproval>, SessionStoreError> {
