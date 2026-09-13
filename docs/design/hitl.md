@@ -30,7 +30,20 @@ of `POST /v1/approvals/{id}`.
 
 ### Route A: webhook (unattended)
 
-One synchronous HTTP round-trip. The decision comes back in the response body.
+Adaptive since the 2026-09-13 receiver contract (P56; governance 4.7.0
+with PRs #76 and #78): every authorize POST carries an explicit
+`response_type`. A hold ask sends `sync` and blocks up to
+`timeout_secs`; a 207 on a hold ask is a protocol violation and fails
+closed without recording a denial. A park-armed ask sends `poll`: an
+instant 200 is a machine decision applied in-request (no park
+document, no reconciler tick); a 207 means a human is needed and parks
+the call through the 207 bridge - the parked row mints its request id
+from the run owner so request-teardown sweeps cannot cancel it, is
+born acknowledged (the 207 is the receiver's acknowledgment; the
+reconciler never re-POSTs it), and its expiry anchors at gate entry.
+The reconciler then polls the pinned GET contract: 200
+`{approved, reason}` decided, 207 pending, 404 unknown; pending is
+carried by the status code alone and never trusted from a body.
 
 ```mermaid
 sequenceDiagram
@@ -39,9 +52,19 @@ sequenceDiagram
     participant W as webhook svc
     C->>S: POST /v1/chat/completions
     Note over S: agent loop hits gate
-    S->>W: POST approval request
-    W-->>S: {"approved": true} (one round-trip, blocks <= timeout_secs)
-    Note over S: tool executes / denied
+    S->>W: POST approval request ?response_type=poll (park-armed)
+    alt machine decision
+        W-->>S: 200 {"approved": true}
+        Note over S: applied in-request, no park document
+    else human needed
+        W-->>S: 207
+        Note over S: 207 bridge parks (run-owner id, born acknowledged)
+        loop until decided or expiry (anchored at gate entry)
+            S->>W: GET authorize status
+            W-->>S: 207 pending / 404 unknown
+        end
+        W-->>S: 200 {"approved": false, "reason": ...}
+    end
     S-->>C: SSE approval_requested ... approval_completed ... tool result
 ```
 
@@ -224,6 +247,14 @@ pub struct ParkedApproval {
                                              //   captured at request-scoped route
                                              //   construction; the reconciler's notify
                                              //   authenticates with the row's own values
+    pub acknowledgment: AcknowledgmentState, // durable notification state: a row born
+                                             //   from a 207 is Acknowledged (the 207 is
+                                             //   the receiver's ack) and is never
+                                             //   re-POSTed, across restarts; a row from
+                                             //   fresh registration RequiresNotification
+                                             //   until the reconciler's notify acks and
+                                             //   marks it via the store's conditional
+                                             //   transition
 }
 
 impl PendingApprovals {
@@ -469,7 +500,11 @@ ApprovalCompleted { decision_id, outcome, duration_ms, scope }   // outcome incl
 
 `aura.approval_pending` emits only on the conversational route. It is the
 attended prompt: `decision_id` is the resolution handle, `expires_at` lets a
-client render a countdown. The webhook route keeps the requested/completed pair.
+client render a countdown. The webhook route never emits the attended prompt;
+its asks emit the requested/completed bookends (an instant-200 machine
+decision is a requested-completed pair with no park), and a 207 park emits
+the standard park-lifecycle transitions - pending included - exactly like any
+durable park, with completion firing when the reconciler resolves the row.
 
 ```text
 POST /v1/approvals/{decision_id}
