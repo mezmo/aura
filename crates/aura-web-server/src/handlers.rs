@@ -1378,10 +1378,14 @@ struct ResumeRunResponse {
 impl ResumeRunResponse {
     fn from_segment(session: &ResumeSessionId, run: &ResumeRunId, segment: SegmentResult) -> Self {
         let (state, turns, blocking) = match segment {
-            SegmentResult::Completed { turns } => (ResumeRunState::Completed, turns, None),
+            SegmentResult::Completed { turns } => (
+                ResumeRunState::Completed,
+                natural_turns(turns.as_slice()),
+                None,
+            ),
             SegmentResult::Parked { turns, blocking } => (
                 ResumeRunState::Parked,
-                turns,
+                continuation_turns(turns.as_slice()),
                 Some(blocking.as_slice().to_vec()),
             ),
         };
@@ -1389,15 +1393,14 @@ impl ResumeRunResponse {
             session_id: session.to_string(),
             run_id: run.to_string(),
             state,
-            turns: continuation_turns(turns.as_slice()),
+            turns,
             blocking,
         }
     }
 }
 
-/// Project the segment's conversation turns to the chat-completion message
-/// objects the `turns` array carries — the same objects
-/// `/v1/chat/completions` uses.
+/// Project one segment turn to the chat-completion message object(s) the
+/// `turns` array carries — the same objects `/v1/chat/completions` uses.
 ///
 /// Tool-call fidelity: the wire `tool_calls[].id` prefers the rig call's
 /// provider `call_id`, which a parked segment's snapshot-derived turns carry
@@ -1405,86 +1408,166 @@ impl ResumeRunResponse {
 /// provider-agnostic stream items that drop the `call_id`, so the wire id
 /// falls back to the stream item's own id — the same value the live SSE
 /// stream emits for the same call, never a fabricated one. Reasoning and
-/// image content have no chat-completion slot and are skipped.
-///
-/// Outcome pairs (R2): per decided call the segment carries the assistant
-/// tool-call turn followed by the tool-result turn, ahead of the
-/// continuation turns, in segment order, both halves keyed by the original
-/// call id — the rig id the park recorded on the pending call, with
-/// `call_id: None` on both. The call turn projects through the tool-call
-/// arm above, its wire `tool_calls[].id` landing on that same original
-/// call id via the `call_id` fallback. The result turn is a user-role
-/// `ToolResult` turn, which projects to a `role: "tool"` message:
-/// `tool_call_id` is the `ToolResult`'s `id` and `content` is the result's
-/// text verbatim, so the pair rides the wire keyed consistently on one id.
-/// A user turn with non-ToolResult content (plain text) does not occur on
-/// the segment surface and stays skipped.
-fn continuation_turns(turns: &[aura::Message]) -> Vec<ChatMessage> {
-    let mut projected = Vec::with_capacity(turns.len());
-    for turn in turns {
-        match turn {
-            aura::Message::Assistant { content, .. } => {
+/// image content have no chat-completion slot and are skipped. A user
+/// turn's `ToolResult` pieces each project to a `role: "tool"` message
+/// keyed by the result's `id` with the result's text verbatim; a user
+/// turn with non-ToolResult content (plain text) does not occur on the
+/// segment surface and stays skipped.
+fn project_turn(turn: &aura::Message, projected: &mut Vec<ChatMessage>) {
+    match turn {
+        aura::Message::Assistant { content, .. } => {
+            let mut text = String::new();
+            let mut tool_calls = Vec::new();
+            for piece in content.iter() {
+                match piece {
+                    aura::AssistantContent::Text(t) => {
+                        if !text.is_empty() {
+                            text.push('\n');
+                        }
+                        text.push_str(&t.text);
+                    }
+                    aura::AssistantContent::ToolCall(call) => {
+                        tool_calls.push(ChatMessageToolCall {
+                            id: call.call_id.clone().unwrap_or_else(|| call.id.clone()),
+                            call_type: TOOL_CALL_FUNCTION_TYPE.to_string(),
+                            function: ChatMessageFunctionCall {
+                                name: call.function.name.clone(),
+                                arguments: call.function.arguments.to_string(),
+                            },
+                        });
+                    }
+                    aura::AssistantContent::Reasoning(_) | aura::AssistantContent::Image(_) => {}
+                }
+            }
+            projected.push(ChatMessage {
+                role: Role::Assistant,
+                content: (!text.is_empty()).then_some(text),
+                tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
+                tool_call_id: None,
+                name: None,
+            });
+        }
+        aura::Message::User { content } => {
+            for piece in content.iter() {
+                let aura::UserContent::ToolResult(result) = piece else {
+                    continue;
+                };
                 let mut text = String::new();
-                let mut tool_calls = Vec::new();
-                for piece in content.iter() {
-                    match piece {
-                        aura::AssistantContent::Text(t) => {
+                for result_piece in result.content.iter() {
+                    match result_piece {
+                        aura::ToolResultContent::Text(t) => {
                             if !text.is_empty() {
                                 text.push('\n');
                             }
                             text.push_str(&t.text);
                         }
-                        aura::AssistantContent::ToolCall(call) => {
-                            tool_calls.push(ChatMessageToolCall {
-                                id: call.call_id.clone().unwrap_or_else(|| call.id.clone()),
-                                call_type: TOOL_CALL_FUNCTION_TYPE.to_string(),
-                                function: ChatMessageFunctionCall {
-                                    name: call.function.name.clone(),
-                                    arguments: call.function.arguments.to_string(),
-                                },
-                            });
-                        }
-                        aura::AssistantContent::Reasoning(_) | aura::AssistantContent::Image(_) => {
-                        }
+                        aura::ToolResultContent::Image(_) => {}
                     }
                 }
                 projected.push(ChatMessage {
-                    role: Role::Assistant,
+                    role: Role::Tool,
                     content: (!text.is_empty()).then_some(text),
-                    tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
-                    tool_call_id: None,
+                    tool_calls: None,
+                    tool_call_id: Some(result.id.clone()),
                     name: None,
                 });
             }
-            aura::Message::User { content } => {
-                for piece in content.iter() {
-                    let aura::UserContent::ToolResult(result) = piece else {
-                        continue;
-                    };
-                    let mut text = String::new();
-                    for result_piece in result.content.iter() {
-                        match result_piece {
-                            aura::ToolResultContent::Text(t) => {
-                                if !text.is_empty() {
-                                    text.push('\n');
-                                }
-                                text.push_str(&t.text);
-                            }
-                            aura::ToolResultContent::Image(_) => {}
-                        }
-                    }
-                    projected.push(ChatMessage {
-                        role: Role::Tool,
-                        content: (!text.is_empty()).then_some(text),
-                        tool_calls: None,
-                        tool_call_id: Some(result.id.clone()),
-                        name: None,
-                    });
-                }
-            }
         }
     }
+}
+
+/// Project the parked segment's turns to the `turns` array through
+/// [`project_turn`] in segment order.
+///
+/// Outcome pairs (R2): the re-parked arm's turns carry, per decided call,
+/// the assistant tool-call turn followed by the tool-result turn ahead of
+/// the gated turn — the only arm the segment driver merges pairs into —
+/// both halves keyed by the original call id: the rig id the park
+/// recorded on the pending call, with `call_id: None` on both. The call
+/// turn projects through the tool-call arm of [`project_turn`], its wire
+/// `tool_calls[].id` landing on that same original call id via the
+/// `call_id` fallback. The result turn is a user-role `ToolResult` turn,
+/// which projects to a `role: "tool"` message: `tool_call_id` is the
+/// `ToolResult`'s `id` and `content` is the result's text verbatim, so
+/// the pair rides the wire keyed consistently on one id.
+fn continuation_turns(turns: &[aura::Message]) -> Vec<ChatMessage> {
+    let mut projected = Vec::with_capacity(turns.len());
+    for turn in turns {
+        project_turn(turn, &mut projected);
+    }
     projected
+}
+
+/// Project the completed segment's turns — the run's natural turns only
+/// (the R6 wire shape): worker tool-call turns and the coordinator's
+/// tail ride verbatim through [`project_turn`] in segment order, and the
+/// synthesized outcome pairs come off the wire entirely, both halves,
+/// because the outcome packages live inside the reconstructed worker
+/// histories the continuations streamed from.
+///
+/// The completed surface carries assistant turns only, so a user turn on
+/// it can only be an outcome pair's result half. A pair is recognized
+/// structurally — an assistant turn that is nothing but tool calls,
+/// immediately followed by a user turn that is nothing but the tool
+/// results keyed to the same wire ids — and both halves are dropped. A
+/// natural worker tool-call turn has no result half following it, is
+/// never a pair, and rides verbatim.
+fn natural_turns(turns: &[aura::Message]) -> Vec<ChatMessage> {
+    let mut projected = Vec::with_capacity(turns.len());
+    let mut index = 0;
+    while index < turns.len() {
+        if let Some(call_ids) = outcome_pair_call_ids(&turns[index])
+            && turns
+                .get(index + 1)
+                .and_then(outcome_pair_result_ids)
+                .is_some_and(|result_ids| result_ids == call_ids)
+        {
+            index += 2;
+            continue;
+        }
+        project_turn(&turns[index], &mut projected);
+        index += 1;
+    }
+    projected
+}
+
+/// The wire ids an outcome pair's assistant half keys on, when the turn
+/// is one: an assistant turn that is nothing but tool calls keys by those
+/// calls' wire ids — `call_id`, falling back to the call's own id, the
+/// same keying [`project_turn`] renders. Any other turn is not a pair
+/// half.
+fn outcome_pair_call_ids(turn: &aura::Message) -> Option<Vec<&str>> {
+    let aura::Message::Assistant { content, .. } = turn else {
+        return None;
+    };
+    content
+        .iter()
+        .map(|piece| match piece {
+            aura::AssistantContent::ToolCall(call) => {
+                Some(call.call_id.as_deref().unwrap_or(call.id.as_str()))
+            }
+            aura::AssistantContent::Text(_)
+            | aura::AssistantContent::Reasoning(_)
+            | aura::AssistantContent::Image(_) => None,
+        })
+        .collect()
+}
+
+/// The wire ids an outcome pair's tool-result half keys on, when the turn
+/// is one: a user turn that is nothing but tool results keys by the
+/// results' own ids — the original call ids the park recorded. Any other
+/// turn is not a pair half.
+fn outcome_pair_result_ids(turn: &aura::Message) -> Option<Vec<&str>> {
+    let aura::Message::User { content } = turn else {
+        return None;
+    };
+    content
+        .iter()
+        .map(|piece| match piece {
+            aura::UserContent::ToolResult(result) => Some(result.id.as_str()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Project an evaluation refusal to its HTTP answer: a detail-less 404 for
@@ -3217,22 +3300,25 @@ url = "http://127.0.0.1:9"
             }
         }
 
-        /// A completed segment carrying an R2 outcome pair over the tool's
-        /// real result projects the full 200 body: the assistant tool-call
-        /// turn, the tool message keyed by the same original call id with
-        /// the result text verbatim, then the final assistant turn — in
-        /// segment order.
+        /// A completed segment's natural worker tool turns ride the wire
+        /// verbatim: the continuation's tool-call turn — the stream
+        /// collector's assembly shape, a lone tool call keyed by its own
+        /// id with `call_id: None`, exactly the fields an outcome pair's
+        /// call half wears — projects to its assistant message with
+        /// `tool_calls` keyed by that id, ahead of the final text, in
+        /// segment order. No result half follows a natural worker call
+        /// turn (the worker's tool results stay inside its own loop), so
+        /// nothing pairs it and nothing strips it.
         #[tokio::test]
-        async fn completed_segment_with_outcome_pair_projects_the_full_200_body() {
+        async fn completed_segment_carries_natural_worker_tool_turns_verbatim() {
             let session = ResumeSessionId::parse("sess-p45").expect("golden session parses");
             let run = ResumeRunId::parse("0199c0de-4545-7000-8000-000000000045")
                 .expect("golden run parses");
             let turns = aura::orchestration::SegmentTurns::try_new(vec![
                 decided_call_turn(),
-                decided_result_turn(RESULT_WIRE),
                 aura::Message::assistant(FINAL_TEXT),
             ])
-            .expect("three turns");
+            .expect("two turns");
 
             let body =
                 ResumeRunResponse::from_segment(&session, &run, SegmentResult::Completed { turns });
@@ -3257,52 +3343,6 @@ url = "http://127.0.0.1:9"
                                 },
                             ],
                         },
-                        { "role": "tool", "tool_call_id": CALL_ID, "content": RESULT_WIRE },
-                        { "role": "assistant", "content": FINAL_TEXT },
-                    ],
-                }),
-            );
-        }
-
-        /// A completed segment whose decided call was denied projects the
-        /// same full 200 body with the live denial text verbatim in the
-        /// tool message — the fold's deny path.
-        #[tokio::test]
-        async fn completed_segment_with_denial_outcome_pair_projects_the_full_200_body() {
-            let session = ResumeSessionId::parse("sess-p45").expect("golden session parses");
-            let run = ResumeRunId::parse("0199c0de-4545-7000-8000-000000000045")
-                .expect("golden run parses");
-            let turns = aura::orchestration::SegmentTurns::try_new(vec![
-                decided_call_turn(),
-                decided_result_turn(DENIAL_WIRE),
-                aura::Message::assistant(FINAL_TEXT),
-            ])
-            .expect("three turns");
-
-            let body =
-                ResumeRunResponse::from_segment(&session, &run, SegmentResult::Completed { turns });
-
-            assert_eq!(
-                serde_json::to_value(&body).expect("the 200 body serializes"),
-                serde_json::json!({
-                    "session_id": "sess-p45",
-                    "run_id": "0199c0de-4545-7000-8000-000000000045",
-                    "state": "completed",
-                    "turns": [
-                        {
-                            "role": "assistant",
-                            "tool_calls": [
-                                {
-                                    "id": CALL_ID,
-                                    "type": "function",
-                                    "function": {
-                                        "name": TOOL,
-                                        "arguments": "{\"namespace\":\"prod\"}",
-                                    },
-                                },
-                            ],
-                        },
-                        { "role": "tool", "tool_call_id": CALL_ID, "content": DENIAL_WIRE },
                         { "role": "assistant", "content": FINAL_TEXT },
                     ],
                 }),
@@ -3310,14 +3350,14 @@ url = "http://127.0.0.1:9"
         }
 
         // ====================================================================
-        // Stage 6 pre-failing frames (the R6 natural-finish ruling,
-        // 2026-09-12): the completed arm's 200 body carries the run's
-        // NATURAL turns only — the outcome packages live inside the
-        // reconstructed worker histories, and the prepended R2 outcome
-        // pairs come off the wire. Red on arrival at their named points
-        // by design; the coordinator-loop fill flips them and rewrites
-        // the R2-pair frames above, which pin today's shape. The parked
-        // arm's envelope is unchanged by R6.
+        // Stage 6 frames (the R6 natural-finish ruling, 2026-09-12): the
+        // completed arm's 200 body carries the run's NATURAL turns only —
+        // the outcome packages live inside the reconstructed worker
+        // histories, and the prepended R2 outcome pairs come off the wire.
+        // Flipped by the coordinator-loop fill, which rewrote the
+        // approve-path R2-pair frame into the natural-tool-turn pin above
+        // and deleted its denial twin. The parked arm's envelope is
+        // unchanged by R6.
         // ====================================================================
 
         /// The approve-path continuation's interim natural turn, ahead of
