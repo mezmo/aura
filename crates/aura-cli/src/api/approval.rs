@@ -171,3 +171,38 @@ impl ApprovalPoster {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{ApprovalDecisionBody, ApprovalResponse};
+
+    /// The CLI wire mirror serializes the pinned `{approved, reason}` shape
+    /// byte-identically to `aura::hitl::ApprovalDecisionWire`: no `status`
+    /// envelope, no `pending` field. An approval carries only `approved:
+    /// true`; a denial carries `approved: false` plus an optional reason.
+    #[test]
+    fn approval_decision_body_serializes_the_pinned_shape() {
+        let approved = ApprovalDecisionBody::from(ApprovalResponse::Approved);
+        assert_eq!(
+            serde_json::to_value(&approved).unwrap(),
+            json!({ "approved": true })
+        );
+
+        let denied = ApprovalDecisionBody::from(ApprovalResponse::Denied {
+            reason: Some("quota exceeded".to_string()),
+        });
+        assert_eq!(
+            serde_json::to_value(&denied).unwrap(),
+            json!({ "approved": false, "reason": "quota exceeded" })
+        );
+
+        let denied_no_reason =
+            ApprovalDecisionBody::from(ApprovalResponse::Denied { reason: None });
+        assert_eq!(
+            serde_json::to_value(&denied_no_reason).unwrap(),
+            json!({ "approved": false })
+        );
+    }
+}

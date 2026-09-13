@@ -380,7 +380,7 @@ mod tests {
             ("503 Service Unavailable", String::new()),
             poll_pending(),
             ack_ok(),
-            poll_decided(r#"{"status":"approved"}"#),
+            poll_decided(r#"{"approved":true}"#),
         ])
         .await;
         let reconciler = reconciler_with(store.clone(), &url);
@@ -437,7 +437,7 @@ mod tests {
         let (url, mut rx) = scripted_receiver(vec![
             poll_pending(),
             ("503 Service Unavailable", String::new()),
-            poll_decided(r#"{"status":"approved"}"#),
+            poll_decided(r#"{"approved":true}"#),
         ])
         .await;
         let reconciler = reconciler_with(store.clone(), &url);
@@ -490,8 +490,8 @@ mod tests {
         let id = park_pending(&store, INSTANCE_ID).await;
         let (url, mut rx) = scripted_receiver(vec![
             poll_pending(),
-            poll_decided(r#"{"status":"approved"}"#), // the approving ack body
-            poll_decided(r#"{"status":"approved"}"#),
+            poll_decided(r#"{"approved":true}"#), // the approving ack body
+            poll_decided(r#"{"approved":true}"#),
         ])
         .await;
         let reconciler = reconciler_with(store.clone(), &url);
@@ -529,7 +529,7 @@ mod tests {
         let (url, mut rx) = scripted_receiver(vec![
             poll_pending(),
             ack_ok(),
-            poll_decided(r#"{"status":"approved"}"#),
+            poll_decided(r#"{"approved":true}"#),
         ])
         .await;
         let reconciler = reconciler_with(store.clone(), &url);
@@ -606,7 +606,7 @@ mod tests {
             ack_ok(),
             poll_pending(),
             ack_ok(),
-            poll_decided(r#"{"status":"approved"}"#),
+            poll_decided(r#"{"approved":true}"#),
         ])
         .await;
 
@@ -689,6 +689,79 @@ mod tests {
         );
 
         shutdown.cancel();
+    }
+
+    /// A row born notified (acknowledgment = `Acknowledged`, as the 207
+    /// bridge registers it) is never re-POSTed: the reconciler reads the
+    /// persisted state and skips the notify, polling only.
+    #[tokio::test]
+    async fn born_notified_row_is_never_reposted() {
+        let store: Arc<dyn ApprovalStore> = Arc::new(InMemoryApprovalStore::new());
+        let request = parked_request(DecisionId::generate(), INSTANCE_ID);
+        store
+            .register(ParkedApproval {
+                request,
+                registered_at: chrono::Utc::now(),
+                expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+                egress_headers: None,
+                acknowledgment: AcknowledgmentState::Acknowledged,
+            })
+            .await
+            .expect("a born-notified row registers");
+
+        let (url, mut rx) = scripted_receiver(vec![poll_pending()]).await;
+        let reconciler = reconciler_with(store.clone(), &url);
+
+        reconciler.tick().await;
+        let read = rx.recv().await.unwrap();
+        assert!(
+            read.starts_with("GET "),
+            "the born-notified row polls: {read}"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "no notify POST may follow the read of a born-notified row"
+        );
+    }
+
+    /// A born-notified row stays un-reposted across a simulated restart: a
+    /// fresh reconciler over the same file store reads the persisted
+    /// acknowledgment state and still never POSTs.
+    #[tokio::test]
+    async fn born_notified_row_survives_a_restart_without_a_repost() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        let store_a: Arc<dyn ApprovalStore> = Arc::new(FileApprovalStore::open(&path).unwrap());
+        let request = parked_request(DecisionId::generate(), INSTANCE_ID);
+        store_a
+            .register(ParkedApproval {
+                request,
+                registered_at: chrono::Utc::now(),
+                expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+                egress_headers: None,
+                acknowledgment: AcknowledgmentState::Acknowledged,
+            })
+            .await
+            .expect("a born-notified row registers");
+
+        let (url, mut rx) = scripted_receiver(vec![poll_pending(), poll_pending()]).await;
+
+        let reconciler_a = reconciler_with(store_a.clone(), &url);
+        reconciler_a.tick().await;
+        let read = rx.recv().await.unwrap();
+        assert!(read.starts_with("GET "), "boot one polls: {read}");
+        assert!(rx.try_recv().is_err(), "no POST on boot one");
+
+        // A fresh reconciler over the same store root (the restart).
+        let store_b: Arc<dyn ApprovalStore> = Arc::new(FileApprovalStore::open(&path).unwrap());
+        let reconciler_b = reconciler_with(store_b.clone(), &url);
+        reconciler_b.tick().await;
+        let read = rx.recv().await.unwrap();
+        assert!(
+            read.starts_with("GET "),
+            "boot two polls, never POSTs: {read}"
+        );
+        assert!(rx.try_recv().is_err(), "no POST on boot two");
     }
 
     /// The handle stops the loop cleanly: no tick is cut mid-request and
@@ -961,8 +1034,8 @@ mod tests {
                 ("204 No Content", vec![], ""),
                 // Tick 3: both rows resolve on the read alone. Two
                 // connections.
-                ("200 OK", vec![], r#"{"status":"approved"}"#),
-                ("200 OK", vec![], r#"{"status":"approved"}"#),
+                ("200 OK", vec![], r#"{"approved":true}"#),
+                ("200 OK", vec![], r#"{"approved":true}"#),
             ])
             .await;
             let reconciler = reconciler_from(&config, Arc::clone(&reader), &url);
@@ -1025,7 +1098,7 @@ mod tests {
             let (url, mut rx) = scripted_receiver_with_headers(vec![(
                 "200 OK",
                 vec![("x-approver-id", IDENTITY_SENTINEL)],
-                r#"{"status":"approved"}"#,
+                r#"{"approved":true}"#,
             )])
             .await;
             let reconciler = reconciler_from(&config, store.clone(), &url);
@@ -1067,12 +1140,9 @@ mod tests {
             let store: Arc<dyn ApprovalStore> = Arc::new(InMemoryApprovalStore::new());
             let id = park_row(&store, EGRESS_ALPHA).await;
             let config = poll_config_with(HashMap::new(), true);
-            let (url, mut rx) = scripted_receiver_with_headers(vec![(
-                "200 OK",
-                vec![],
-                r#"{"status":"approved"}"#,
-            )])
-            .await;
+            let (url, mut rx) =
+                scripted_receiver_with_headers(vec![("200 OK", vec![], r#"{"approved":true}"#)])
+                    .await;
             let reconciler = reconciler_from(&config, store.clone(), &url);
 
             reconciler.tick().await;
@@ -1146,7 +1216,7 @@ mod tests {
                 (
                     "200 OK",
                     vec![("x-approver-id", IDENTITY)],
-                    r#"{"status":"approved"}"#,
+                    r#"{"approved":true}"#,
                 ),
             ])
             .await;

@@ -3120,7 +3120,7 @@ mod tests {
         async fn poll_decision_200_signed_decision_resolves_and_get_signature_verifies() {
             let hmac = test_hmac();
             let decision_id = DecisionId::generate();
-            let response_body = r#"{"status":"approved"}"#.to_string();
+            let response_body = r#"{"approved":true}"#.to_string();
             let mut response_headers = signed_response_headers(&hmac, decision_id, &response_body);
             response_headers.push(("x-approver-id".to_owned(), "alice".to_owned()));
             let (url, received) = one_shot_receiver(response_headers, response_body).await;
@@ -3208,36 +3208,37 @@ mod tests {
             );
         }
 
-        /// The receiver's undecided answer: a 200 carrying the status
-        /// envelope with `pending`.
+        /// Pending is status-code-carried, never body-carried: a 207 answer
+        /// keeps the approval alive without any body parse.
         #[tokio::test]
-        async fn poll_decision_envelope_pending_is_not_yet() {
+        async fn poll_decision_207_pending_is_not_yet() {
             let (url, _received) =
-                one_shot_receiver(vec![], r#"{"status":"pending"}"#.to_string()).await;
+                one_shot_receiver_with_status("207 Multi-Status", vec![], String::new()).await;
 
             let client =
                 loopback_poll_client(&url, EgressSigning::Disabled, &url, Duration::from_secs(5));
             let outcome = client
                 .poll_decision(DecisionId::generate())
                 .await
-                .expect("a pending envelope must not fault");
+                .expect("a 207 pending must not fault");
             assert!(
                 matches!(outcome, PollOutcome::NotYet),
                 "expected NotYet, got {outcome:?}"
             );
         }
 
+        /// A 200 `{approved: true}` body resolves to Approved.
         #[tokio::test]
-        async fn poll_decision_envelope_approved_resolves() {
+        async fn poll_decision_200_approved_resolves() {
             let (url, _received) =
-                one_shot_receiver(vec![], r#"{"status":"approved"}"#.to_string()).await;
+                one_shot_receiver(vec![], r#"{"approved":true}"#.to_string()).await;
 
             let client =
                 loopback_poll_client(&url, EgressSigning::Disabled, &url, Duration::from_secs(5));
             let outcome = client
                 .poll_decision(DecisionId::generate())
                 .await
-                .expect("an approved envelope must resolve");
+                .expect("an approved body must resolve");
             assert!(
                 matches!(
                     outcome,
@@ -3250,12 +3251,13 @@ mod tests {
             );
         }
 
-        /// A denial's reason rides the envelope into the decision.
+        /// A 200 `{approved: false, reason}` body resolves to Denied carrying
+        /// the reason.
         #[tokio::test]
-        async fn poll_decision_envelope_denied_carries_reason() {
+        async fn poll_decision_200_denied_carries_reason() {
             let (url, _received) = one_shot_receiver(
                 vec![],
-                r#"{"status":"denied","reason":"quota exceeded"}"#.to_string(),
+                r#"{"approved":false,"reason":"quota exceeded"}"#.to_string(),
             )
             .await;
 
@@ -3264,7 +3266,7 @@ mod tests {
             let outcome = client
                 .poll_decision(DecisionId::generate())
                 .await
-                .expect("a denied envelope must resolve");
+                .expect("a denied body must resolve");
             match outcome {
                 PollOutcome::Decided {
                     decision: ApprovalDecision::Denied { reason },
@@ -3274,13 +3276,14 @@ mod tests {
             }
         }
 
-        /// The envelope is additive-field tolerant: a receiver decorating a
-        /// decided body must not silently expire the approval.
+        /// The pinned shape is strict: a 200 body carrying unknown fields is
+        /// outside the contract and stays not-yet (the receiver never
+        /// serializes anything beyond `{approved, reason}`).
         #[tokio::test]
-        async fn poll_decision_envelope_tolerates_unknown_fields_on_decided() {
+        async fn poll_decision_200_unknown_fields_stay_not_yet() {
             let (url, _received) = one_shot_receiver(
                 vec![],
-                r#"{"status":"approved","reason":null,"decided_by":"policy-x"}"#.to_string(),
+                r#"{"approved":true,"decided_by":"policy-x"}"#.to_string(),
             )
             .await;
 
@@ -3289,16 +3292,10 @@ mod tests {
             let outcome = client
                 .poll_decision(DecisionId::generate())
                 .await
-                .expect("an approved envelope with extra fields must resolve");
+                .expect("an out-of-shape body must not fault");
             assert!(
-                matches!(
-                    outcome,
-                    PollOutcome::Decided {
-                        decision: ApprovalDecision::Approved,
-                        ..
-                    }
-                ),
-                "expected Decided(Approved), got {outcome:?}"
+                matches!(outcome, PollOutcome::NotYet),
+                "expected NotYet, got {outcome:?}"
             );
         }
 
@@ -3339,7 +3336,7 @@ mod tests {
         #[tokio::test]
         async fn poll_decision_unverified_200_fails_closed() {
             let (url, _received) =
-                one_shot_receiver(vec![], r#"{"status":"approved"}"#.to_string()).await;
+                one_shot_receiver(vec![], r#"{"approved":true}"#.to_string()).await;
 
             let client = loopback_poll_client(
                 &url,
@@ -3363,7 +3360,7 @@ mod tests {
         #[tokio::test]
         async fn poll_decision_unsigned_mode_resolves_decision_and_garbage_stays_pending() {
             let (url, _received) =
-                one_shot_receiver(vec![], r#"{"status":"denied","reason":"no"}"#.to_string()).await;
+                one_shot_receiver(vec![], r#"{"approved":false,"reason":"no"}"#.to_string()).await;
             let client =
                 loopback_poll_client(&url, EgressSigning::Disabled, &url, Duration::from_secs(5));
             match client
@@ -3505,6 +3502,103 @@ mod tests {
                 "got: {}",
                 received.request_line
             );
+        }
+
+        /// A 207 on the notify leg is delivered: the ack-only POST never
+        /// reads the body, and 207 is the receiver's "human needed" signal —
+        /// the notify already fired, so it acks.
+        #[tokio::test]
+        async fn notify_207_is_delivered() {
+            let (url, _received) =
+                one_shot_receiver_with_status("207 Multi-Status", vec![], String::new()).await;
+
+            let client =
+                loopback_poll_client(&url, EgressSigning::Disabled, &url, Duration::from_secs(5));
+            client
+                .notify(&test_request(DecisionId::generate()), None)
+                .await
+                .expect("a 207 ack must resolve Ok: the notify already fired");
+        }
+
+        /// A 207 on the route-wide sync path (hold route, single-agent, and
+        /// the request_approval tool) is a protocol violation under the
+        /// agreed contract: sync never 207s. The call fails closed with the
+        /// loud ProtocolViolation error, never a denial.
+        #[tokio::test]
+        async fn sync_207_is_a_protocol_violation_not_a_denial() {
+            let (url, _received) = one_shot_receiver_with_status(
+                "207 Multi-Status",
+                vec![],
+                r#"{"approved":false}"#.to_string(),
+            )
+            .await;
+
+            let client = loopback_client(&url, EgressSigning::Disabled, user_mapping());
+            let err = client
+                .request_approval(
+                    &test_request(DecisionId::generate()),
+                    Duration::from_secs(5),
+                )
+                .await
+                .expect_err("a 207 on sync must fail closed");
+            assert!(
+                matches!(err, ApprovalError::ProtocolViolation(_)),
+                "expected ProtocolViolation, got {err:?}"
+            );
+        }
+
+        /// The capability split: park-eligibility keys off `poll.is_some()`
+        /// (poll delivery, and sync under the adaptive contract), while
+        /// live-decision keys off `delivery == Sync`. A hold route (sync,
+        /// park disabled) decides live but never parks; a park-enabled sync
+        /// route does both; a poll route parks but never decides live.
+        #[test]
+        fn capability_cells_split_decide_live_from_can_park() {
+            fn client(delivery: aura_config::WebhookDelivery, park_enabled: bool) -> WebhookClient {
+                let config = aura_config::HitlConfig {
+                    require_approval: vec![],
+                    park: aura_config::ParkConfig {
+                        enabled: park_enabled,
+                        bind_identity: false,
+                    },
+                    route: aura_config::DecisionRouteConfig::Webhook {
+                        url: aura_config::WebhookUrl::new("https://approvals.example.com/")
+                            .unwrap(),
+                        timeout_secs: 60,
+                        headers: std::collections::HashMap::new(),
+                        headers_from_request: std::collections::HashMap::new(),
+                        tool_headers_from_response: aura_config::ToolHeaderMappings::default(),
+                        delivery,
+                        poll_url: None,
+                        poll_interval_secs: 10,
+                        poll_request_timeout_secs: 30,
+                        receiver_wait_timeout_secs: 900,
+                    },
+                };
+                super::super::webhook_client_from_config(&config.route, None, None, park_enabled)
+                    .expect("a webhook config builds a client")
+            }
+
+            let sync_hold = client(aura_config::WebhookDelivery::Sync, false);
+            assert!(
+                sync_hold.can_decide_live(),
+                "a sync hold route decides live"
+            );
+            assert!(!sync_hold.can_park(), "a sync hold route never parks");
+
+            let sync_park = client(aura_config::WebhookDelivery::Sync, true);
+            assert!(
+                sync_park.can_decide_live(),
+                "a park-enabled sync route decides live"
+            );
+            assert!(
+                sync_park.can_park(),
+                "a park-enabled sync route parks on 207"
+            );
+
+            let poll = client(aura_config::WebhookDelivery::Poll, true);
+            assert!(!poll.can_decide_live(), "a poll route never decides live");
+            assert!(poll.can_park(), "a poll route parks");
         }
     }
 
