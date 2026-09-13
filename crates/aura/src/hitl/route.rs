@@ -627,10 +627,6 @@ pub(crate) enum AskMode {
     /// a machine decision (decide live); a 207 parks. The park-armed
     /// orchestration ask. Authorized only by an armed `ParkContext`; a
     /// park-enabled config alone never infers it.
-    #[expect(
-        dead_code,
-        reason = "wired by the fill layer's park-armed orchestration ask"
-    )]
     ParkArmed,
     /// `response_type=poll`, ack-only: the notify leg for an already-parked
     /// row. The response body is never read as a decision.
