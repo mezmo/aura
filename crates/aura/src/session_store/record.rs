@@ -195,31 +195,75 @@ impl TryFrom<DecisionRecord> for ResolvedDecision {
 }
 
 /// The terminal half of a stored resolved entry: a decided approval, or a
-/// durable timeout. Tagged so a stored `TimedOut { deadline }` round-trips
-/// without fabricating a denial.
+/// durable timeout.
 ///
-/// Untagged over two disjoint wire shapes: the decided form is exactly the
-/// shipped `DecisionRecord` (whose required `approved`/`decided_at` fields a
-/// timeout row never carries, and whose optional fields a timeout row never
-/// produces), so the shipped format decodes unchanged while a timed-out row
-/// falls through to its own `deadline`-required shape.
+/// EXPLICITLY tagged (`kind`), with unknown fields denied: a record
+/// carrying both decided fields and a `deadline` FAILS decode instead of
+/// falling through to a variant — no untagged first-variant-wins hazard,
+/// and no compatibility fallback (the park terminal format is unshipped).
+/// The decided arm carries exactly the shipped decision fields; the
+/// external approve/deny wire is a separate surface and does not change.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(untagged)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum TerminalRecord {
-    /// A decision won: the shipped decision wire shape.
-    Decided(DecisionRecord),
-    /// The row's own deadline passed strictly with no decision: durable and
-    /// terminal, never an approval and never a denial.
+    /// A decision won: the shipped decision fields, tagged `decided`.
+    Decided {
+        approved: bool,
+        reason: Option<String>,
+        decided_at: Timestamp,
+        /// Approver identity captured off the poll-200 (lowercased outbound
+        /// header name → value), persisted in the same record as the
+        /// decision. Additive within the arm: absent on records stored
+        /// before identity docking existed, decoding to `None`
+        /// (uncaptured).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        identity: Option<BTreeMap<String, String>>,
+    },
+    /// The row's own deadline passed strictly with no decision: tagged
+    /// `timed_out`, durable and terminal — never an approval, never a
+    /// denial.
     TimedOut {
         /// The deadline that expired.
         deadline: Timestamp,
     },
 }
 
+impl TerminalRecord {
+    /// The decided arm's fields as the shipped [`DecisionRecord`]; `None`
+    /// on the timeout arm — a timed-out row records no decision.
+    pub(crate) fn into_decision_record(self) -> Option<DecisionRecord> {
+        match self {
+            Self::Decided {
+                approved,
+                reason,
+                decided_at,
+                identity,
+            } => Some(DecisionRecord {
+                approved,
+                reason,
+                decided_at,
+                identity,
+            }),
+            Self::TimedOut { .. } => None,
+        }
+    }
+}
+
 impl std::fmt::Debug for TerminalRecord {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Decided(decision) => f.debug_tuple("Decided").field(decision).finish(),
+            Self::Decided {
+                approved,
+                reason,
+                decided_at,
+                identity,
+            } => f
+                .debug_struct("Decided")
+                .field("approved", approved)
+                .field("reason", reason)
+                .field("decided_at", decided_at)
+                .field("identity_names", &pair_names(identity))
+                .finish(),
             Self::TimedOut { deadline } => f
                 .debug_struct("TimedOut")
                 .field("deadline", deadline)
@@ -230,7 +274,18 @@ impl std::fmt::Debug for TerminalRecord {
 
 impl From<&ResolvedDecision> for TerminalRecord {
     fn from(resolved: &ResolvedDecision) -> Self {
-        Self::Decided(DecisionRecord::from(resolved))
+        let DecisionRecord {
+            approved,
+            reason,
+            decided_at,
+            identity,
+        } = DecisionRecord::from(resolved);
+        Self::Decided {
+            approved,
+            reason,
+            decided_at,
+            identity,
+        }
     }
 }
 
@@ -242,9 +297,18 @@ impl TryFrom<TerminalRecord> for AddressedApproval {
 
     fn try_from(record: TerminalRecord) -> Result<Self, Self::Error> {
         match record {
-            TerminalRecord::Decided(decision) => {
-                ResolvedDecision::try_from(decision).map(AddressedApproval::Decided)
-            }
+            TerminalRecord::Decided {
+                approved,
+                reason,
+                decided_at,
+                identity,
+            } => ResolvedDecision::try_from(DecisionRecord {
+                approved,
+                reason,
+                decided_at,
+                identity,
+            })
+            .map(AddressedApproval::Decided),
             TerminalRecord::TimedOut { deadline } => Ok(AddressedApproval::TimedOut { deadline }),
         }
     }

@@ -11,8 +11,10 @@ repository.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
 # RFC 3339 parse/format for the validated retention-deadline wire type.
-# Parsing and rendering only — no clock feature.
-chrono = { version = "0.4", default-features = false, features = ["serde"] }
+# Parsing, rendering, and the string allocation `to_rfc3339_opts` performs
+# (`alloc`) only — no clock feature. The feature set is complete for
+# isolated `--no-default-features` builds of this crate.
+chrono = { version = "0.4", default-features = false, features = ["serde", "alloc"] }
 
 # Optional: re-export rmcp's ProgressToken for interop with the aura crate.
 # When rmcp is not available, we define compatible local types.

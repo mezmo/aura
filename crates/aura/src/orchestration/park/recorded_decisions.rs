@@ -1,5 +1,5 @@
-//! The recorded-decisions set: decisions already recorded for a run's parked
-//! calls, consumed at most once each at the resume gate.
+//! The recorded-decisions set: the addressed outcomes already recorded for
+//! a run's parked calls, consumed at most once each at the resume gate.
 //!
 //! Vocabulary bounding line: the approval *request* is raised by the park arm;
 //! the *decision* recorded against it is what this set holds. "Ticket" is
@@ -11,9 +11,9 @@ use std::sync::{Arc, Mutex};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::hitl::ResolvedDecision;
+use crate::hitl::{AddressedApproval, ResolvedDecision};
 
-/// Decisions already recorded for this run's parked calls, consumed at most
+/// Outcomes already recorded for this run's parked calls, consumed at most
 /// once each. `strict_tasks` holds the task ids whose continuation is
 /// mid-invocation: a miss for one of those tasks is a resume fault, not a
 /// fresh park. Per task, because sibling continuations run concurrently in
@@ -24,22 +24,24 @@ use crate::hitl::ResolvedDecision;
 /// mismatch) clears the task's entry.
 #[derive(Debug, Default)]
 pub(crate) struct RecordedDecisions {
-    entries: Mutex<HashMap<CallKey, VecDeque<ResolvedDecision>>>,
+    entries: Mutex<HashMap<CallKey, VecDeque<AddressedApproval>>>,
     strict_tasks: Mutex<HashSet<usize>>,
 }
 
 impl RecordedDecisions {
-    /// Record a resolved decision — decision and captured identity together —
-    /// for a key, appending to that key's recorded-order queue so two
-    /// same-turn calls with identical arguments keep their own decisions.
-    /// Wired by the orchestrator continuation.
-    pub(crate) fn push(&self, key: CallKey, decision: ResolvedDecision) {
+    /// Record an addressed outcome — a decided approval with its captured
+    /// identity, or a durable per-call timeout — for a key, appending to
+    /// that key's recorded-order queue so two same-turn calls with
+    /// identical arguments keep their own outcomes. `Decided` preserves the
+    /// recorded decision identity; `TimedOut` rides independently, never
+    /// as a fabricated denial. Wired by the orchestrator continuation.
+    pub(crate) fn push(&self, key: CallKey, outcome: AddressedApproval) {
         self.entries
             .lock()
             .expect("recorded-decisions lock")
             .entry(key)
             .or_default()
-            .push_back(decision);
+            .push_back(outcome);
     }
 
     /// Mark a task's continuation as in-flight (`on = true`) or clear it. A
@@ -62,9 +64,10 @@ impl RecordedDecisions {
             .contains(&task_id)
     }
 
-    /// Consume one resolved decision for a key in recorded order; the next
-    /// call returns the following decision, and an empty queue returns `None`.
-    pub(crate) fn take(&self, key: &CallKey) -> Option<ResolvedDecision> {
+    /// Consume one addressed outcome for a key in recorded order; the next
+    /// call returns the following outcome, and an empty queue returns
+    /// `None`.
+    pub(crate) fn take(&self, key: &CallKey) -> Option<AddressedApproval> {
         self.entries
             .lock()
             .expect("recorded-decisions lock")
@@ -73,7 +76,7 @@ impl RecordedDecisions {
     }
 
     /// The resume substitution's non-consuming, positional pre-flight
-    /// (fix-contract step 2): inspect the decision the key's queue holds
+    /// (fix-contract step 2): inspect the outcome the key's queue holds
     /// at `position` — position 0 is the front a later
     /// [`RecordedDecisions::take`] pops next — and leave the set
     /// unchanged. Same-key duplicate calls (identical tool and
@@ -82,8 +85,10 @@ impl RecordedDecisions {
     /// same-key call pre-flights against position i. The identity rule
     /// mirrors the gate's `recorded_pre_call`: an approval recorded
     /// without identity blocks only when the route requires it
-    /// (`requires_identity`); a denial never needs identity. A
-    /// [`PeekOutcome::Missing`] or [`PeekOutcome::IdentityBlocked`] is a
+    /// (`requires_identity`); a denial and a durable timeout never need
+    /// identity — a timeout is terminal for its call and feeds the exact
+    /// shared timeout feedback at consumption, so it pre-flights ready.
+    /// A [`PeekOutcome::Missing`] or [`PeekOutcome::IdentityBlocked`] is a
     /// fatal `SegmentError` at the call site; the substitution prelude
     /// in `drive_resume_segment` owns the fault mapping.
     pub(crate) fn peek_at(
@@ -100,8 +105,9 @@ impl RecordedDecisions {
             .and_then(|queue| queue.get(position))
         {
             None => PeekOutcome::Missing,
-            Some(ResolvedDecision::Denied { .. }) => PeekOutcome::Ready,
-            Some(ResolvedDecision::Approved { identity }) => {
+            Some(AddressedApproval::TimedOut { .. }) => PeekOutcome::Ready,
+            Some(AddressedApproval::Decided(ResolvedDecision::Denied { .. })) => PeekOutcome::Ready,
+            Some(AddressedApproval::Decided(ResolvedDecision::Approved { identity })) => {
                 if identity.is_none() && requires_identity {
                     PeekOutcome::IdentityBlocked
                 } else {
@@ -211,6 +217,11 @@ mod tests {
         CallKey::new(task_id, tool_name, args)
     }
 
+    /// Wrap a recorded decision as the addressed outcome the queue carries.
+    fn decided(decision: ResolvedDecision) -> AddressedApproval {
+        AddressedApproval::Decided(decision)
+    }
+
     /// Two same-key decisions consume in recorded order; a third take is
     /// `None` (the queue is per-key and exhausted by consumption).
     #[test]
@@ -220,26 +231,29 @@ mod tests {
 
         recorded.push(
             key(1, "kubectl_apply", &args),
-            ApprovalDecision::Approved.into(),
+            decided(ApprovalDecision::Approved.into()),
         );
         recorded.push(
             key(1, "kubectl_apply", &args),
-            ApprovalDecision::Denied {
-                reason: Some("too risky".to_string()),
-            }
-            .into(),
+            decided(
+                ApprovalDecision::Denied {
+                    reason: Some("too risky".to_string()),
+                }
+                .into(),
+            ),
         );
 
         let probe = key(1, "kubectl_apply", &args);
         assert_eq!(
             recorded.take(&probe),
-            Some(ResolvedDecision::from(ApprovalDecision::Approved)),
+            Some(decided(ResolvedDecision::from(ApprovalDecision::Approved))),
             "first take returns the first recorded decision",
         );
         assert_eq!(
-            recorded
-                .take(&probe)
-                .map(|d| matches!(d, ResolvedDecision::Denied { .. })),
+            recorded.take(&probe).map(|outcome| matches!(
+                outcome,
+                AddressedApproval::Decided(ResolvedDecision::Denied { .. })
+            )),
             Some(true),
             "second take returns the second recorded decision, in order",
         );
@@ -272,17 +286,18 @@ mod tests {
         let args = serde_json::json!({"namespace": "prod"});
         recorded.push(
             key(1, "kubectl_apply", &args),
-            ResolvedDecision::approved(Some(crate::approver_headers::tests::captured_overrides(
-                "authorization",
-                "tok",
+            decided(ResolvedDecision::approved(Some(
+                crate::approver_headers::tests::captured_overrides("authorization", "tok"),
             ))),
         );
         recorded.push(
             key(2, "kubectl_delete", &args),
-            ApprovalDecision::Denied {
-                reason: Some("too risky".to_string()),
-            }
-            .into(),
+            decided(
+                ApprovalDecision::Denied {
+                    reason: Some("too risky".to_string()),
+                }
+                .into(),
+            ),
         );
 
         assert_eq!(
@@ -306,7 +321,7 @@ mod tests {
         let args = serde_json::json!({"namespace": "prod"});
         recorded.push(
             key(1, "kubectl_apply", &args),
-            ApprovalDecision::Approved.into(),
+            decided(ApprovalDecision::Approved.into()),
         );
         let probe = key(1, "kubectl_apply", &args);
 
@@ -332,11 +347,11 @@ mod tests {
         let args = serde_json::json!({"namespace": "prod"});
         recorded.push(
             key(1, "kubectl_apply", &args),
-            ApprovalDecision::Approved.into(),
+            decided(ApprovalDecision::Approved.into()),
         );
         recorded.push(
             key(1, "kubectl_apply", &args),
-            ApprovalDecision::Denied { reason: None }.into(),
+            decided(ApprovalDecision::Denied { reason: None }.into()),
         );
         let probe = key(1, "kubectl_apply", &args);
 
@@ -347,7 +362,7 @@ mod tests {
         );
         assert_eq!(
             recorded.take(&probe),
-            Some(ResolvedDecision::from(ApprovalDecision::Approved)),
+            Some(decided(ResolvedDecision::from(ApprovalDecision::Approved))),
             "the peek did not consume: take still returns the front entry",
         );
         assert_eq!(
@@ -369,11 +384,11 @@ mod tests {
         let args = serde_json::json!({"namespace": "prod"});
         recorded.push(
             key(1, "kubectl_apply", &args),
-            ApprovalDecision::Approved.into(),
+            decided(ApprovalDecision::Approved.into()),
         );
         recorded.push(
             key(1, "kubectl_apply", &args),
-            ApprovalDecision::Denied { reason: None }.into(),
+            decided(ApprovalDecision::Denied { reason: None }.into()),
         );
         let probe = key(1, "kubectl_apply", &args);
 
@@ -390,7 +405,7 @@ mod tests {
         );
         assert_eq!(
             recorded.take(&probe),
-            Some(ResolvedDecision::from(ApprovalDecision::Approved)),
+            Some(decided(ResolvedDecision::from(ApprovalDecision::Approved))),
             "neither positional peek consumed: take still returns the front entry",
         );
     }
@@ -404,9 +419,8 @@ mod tests {
         let args = serde_json::json!({"namespace": "prod"});
         recorded.push(
             key(1, "kubectl_apply", &args),
-            ResolvedDecision::approved(Some(crate::approver_headers::tests::captured_overrides(
-                "authorization",
-                "tok",
+            decided(ResolvedDecision::approved(Some(
+                crate::approver_headers::tests::captured_overrides("authorization", "tok"),
             ))),
         );
         let probe = key(1, "kubectl_apply", &args);
@@ -439,11 +453,11 @@ mod tests {
         let args = serde_json::json!({"namespace": "prod"});
         recorded.push(
             key(1, "kubectl_apply", &args),
-            ApprovalDecision::Approved.into(),
+            decided(ApprovalDecision::Approved.into()),
         );
         recorded.push(
             key(1, "kubectl_apply", &args),
-            ApprovalDecision::Denied { reason: None }.into(),
+            decided(ApprovalDecision::Denied { reason: None }.into()),
         );
         let probe = key(1, "kubectl_apply", &args);
         let other = key(2, "kubectl_delete", &args);

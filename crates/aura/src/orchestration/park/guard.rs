@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::hitl::PendingApprovals;
 
 use super::commit::cancel_run_approvals;
+use super::lifetime::RunExecutionScope;
 
 /// The guard's sweep disposition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,6 +26,14 @@ pub(crate) struct ParkGuard {
     run_id: String,
     request_id: String,
     mode: ParkGuardMode,
+    /// The execution scope the guard's deferred work spawns through: a
+    /// clone of the run's ONE scope (the grant's for a resumed segment, the
+    /// initial producer's for a first run), so the guard's tails register
+    /// with the same tracker the supervisor drains before the fence
+    /// releases. `None` only on the unscoped initial constructor the L3
+    /// fill rewires.
+    #[expect(dead_code, reason = "read by the L3 fill's tracked-sweep wiring")]
+    execution_scope: Option<Arc<RunExecutionScope>>,
     published: AtomicBool,
     armed: AtomicBool,
 }
@@ -38,29 +47,33 @@ impl ParkGuard {
             run_id,
             request_id,
             mode: ParkGuardMode::Initial,
+            execution_scope: None,
             published: AtomicBool::new(false),
             armed: AtomicBool::new(false),
         })
     }
 
-    /// Create the guard for a resumed segment: checkpoint-preserving mode.
-    /// A drop never sweeps retained rows — the resumed run's evidence stays
-    /// for the next resume or retention cleanup, whatever ended this
-    /// segment.
-    #[expect(
-        dead_code,
-        reason = "constructed by the L3 fill's resumed-segment guard wiring"
-    )]
-    pub(crate) fn new_resumed(
+    /// Create the guard with its sweep disposition and its execution scope
+    /// TOGETHER — the L3 fill's injection seam. A resumed guard is always
+    /// checkpoint-preserving AND scoped: its deferred sweep and tracked
+    /// work spawn through the same [`RunExecutionScope`] the supervisor,
+    /// driver, and tool contexts hold (cloned from the grant's one scope),
+    /// so a guard tail can neither spawn unregistered nor outlive the
+    /// run's drain.
+    #[expect(dead_code, reason = "constructed by the L3 fill's scoped guard wiring")]
+    pub(crate) fn new_with_execution_scope(
         registry: PendingApprovals,
         run_id: String,
         request_id: String,
+        mode: ParkGuardMode,
+        execution_scope: Arc<RunExecutionScope>,
     ) -> Arc<Self> {
         Arc::new(Self {
             registry,
             run_id,
             request_id,
-            mode: ParkGuardMode::Resumed,
+            mode,
+            execution_scope: Some(execution_scope),
             published: AtomicBool::new(false),
             armed: AtomicBool::new(false),
         })

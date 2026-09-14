@@ -723,8 +723,8 @@ mod tests {
                 "kubectl_apply",
                 &args
             )),
-            Some(crate::hitl::ResolvedDecision::from(
-                crate::hitl::ApprovalDecision::Approved
+            Some(crate::hitl::AddressedApproval::Decided(
+                crate::hitl::ResolvedDecision::from(crate::hitl::ApprovalDecision::Approved)
             )),
             "the early decision is consumed at resume",
         );

@@ -69,9 +69,10 @@ const DECISIONS_DIR: &str = "decisions";
 /// The on-disk shape of a resolved approval: the approval record carried
 /// over from `approvals/` plus the terminal record under the `decision`
 /// key. Field names are a persisted contract shared by every instance
-/// reading the store — rename only with a migration. A decided row's
-/// `decision` value is exactly the shipped `DecisionRecord` shape; a
-/// timed-out row carries `{"deadline": ...}` there instead.
+/// reading the store — rename only with a migration. The `decision` value
+/// is the explicitly tagged terminal record (`kind`: `decided` or
+/// `timed_out`); a value carrying both decided fields and a `deadline`
+/// fails decode instead of falling through to a variant.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct ResolvedEntry {
     approval: ParkedApprovalRecord,
@@ -300,12 +301,12 @@ impl Inner {
         match fs::read(self.decision_path(&id)) {
             Ok(bytes) => {
                 let entry: ResolvedEntry = serde_json::from_slice(&bytes).map_err(decode_err)?;
-                match entry.decision {
+                match entry.decision.into_decision_record() {
                     // A timed-out row records no decision: the timeout
                     // surfaces through read_or_expire's addressed arm,
                     // never as an outcome here.
-                    TerminalRecord::TimedOut { .. } => Ok(None),
-                    TerminalRecord::Decided(decision) => ResolvedDecision::try_from(decision)
+                    None => Ok(None),
+                    Some(decision) => ResolvedDecision::try_from(decision)
                         .map(Some)
                         .map_err(decode_err),
                 }

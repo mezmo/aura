@@ -333,9 +333,14 @@ impl From<ClaimResumeFault> for ResumeRefusal {
     fn from(fault: ClaimResumeFault) -> Self {
         match fault {
             // A claim lost to a concurrent evaluation is the running row,
-            // never the fault sink: the spec fixes 409 for a live claim.
+            // never a fault: the spec fixes 409 for a live claim.
             ClaimResumeFault::Live => Self::Conflict(ResumeConflictRow::running()),
-            ClaimResumeFault::Io(diagnostic) => Self::Fault(diagnostic),
+            // The claim seam's failures classify through the typed rows —
+            // a filesystem availability failure is 503 `reify_unavailable`,
+            // an internal task failure 500 `reify_failed` — never the
+            // undifferentiated fault sink.
+            ClaimResumeFault::Unavailable(diagnostic) => Self::Unavailable(diagnostic),
+            ClaimResumeFault::Internal(diagnostic) => Self::Internal(diagnostic),
         }
     }
 }
@@ -399,11 +404,17 @@ pub struct ResumeEvaluation<'a> {
 }
 
 /// Authorization to execute one segment for a granted run. Owns the run's
-/// reservation lease: the grant is single-use and non-cloneable, and the run
-/// releases when the grant (and every lease reference it handed out) ends.
+/// reservation lease AND its one execution scope: the grant is single-use
+/// and non-cloneable, and the run releases when the grant (and every lease
+/// reference it handed out) ends.
 #[derive(Debug)]
 pub struct ResumeGrant {
     reservation: RunReservationLease,
+    /// The run's ONE resumed execution scope, established when this grant
+    /// was assembled from its reservation. Every consumer — supervisor,
+    /// driver, tool contexts, guard — clones this same `Arc`, so the whole
+    /// resumed execution shares one cancellation token and one tracker.
+    scope: Arc<RunExecutionScope>,
     documents: ResumeDocuments,
     document: ParkedRun,
     recorded: Arc<RecordedDecisions>,
@@ -434,13 +445,15 @@ impl ResumeGrant {
         &self.reservation
     }
 
-    /// The scope the resumed execution runs under: this grant's reservation
-    /// becomes the scope's fence, with the cancellation token and tracker
-    /// riding along. The supervisor seam (S3/S4): the grant keeps ownership
-    /// while the segment borrows the scope.
+    /// The scope the resumed execution runs under: a clone of the grant's
+    /// ONE scope `Arc`, established at conversion — never a fresh token or
+    /// tracker. Two callers share the same cancellation and drain state, so
+    /// a supervisor draining its scope joins every task registered through
+    /// any scope handle the run handed out. The supervisor seam (S3/S4):
+    /// the grant keeps ownership while the segment borrows the scope.
     #[must_use]
     pub fn execution_scope(&self) -> Arc<RunExecutionScope> {
-        RunExecutionScope::new(self.reservation.clone())
+        Arc::clone(&self.scope)
     }
 
     /// The checkpoint document the grant was evaluated from.
@@ -518,7 +531,8 @@ impl ReservedEvaluation {
 /// reserved evaluation's held reservation becomes the grant's fence — the
 /// parked document renames to its resuming name under that same reservation
 /// (the blocking rename tail holding a lease reference), with no ownerless
-/// gap and no second acquisition — and the grant assembles owning it. A
+/// gap and no second acquisition — and the grant assembles owning that same
+/// reservation, establishing its ONE execution scope at conversion. A
 /// refusal upstream drops the carrier, releasing the reservation with no
 /// execution.
 #[expect(
@@ -534,7 +548,7 @@ pub(crate) async fn convert_reserved(
     consumed: Vec<DecisionId>,
 ) -> Result<ResumeGrant, ClaimResumeFault> {
     todo!(
-        "P45 wave fill unit E4: rename parked → resuming under the held reservation (the blocking tail holds a lease reference), then assemble the grant owning that same reservation"
+        "P45 wave fill unit E4: rename parked → resuming under the held reservation (the blocking tail holds a lease reference), then assemble the grant owning that same reservation and its one execution scope"
     )
 }
 
@@ -741,8 +755,13 @@ async fn authorize(
     consumed: Vec<DecisionId>,
 ) -> Result<ResumeGrant, ClaimResumeFault> {
     let reservation = claims.claim_and_resume(docs).await?;
+    // The scope is established exactly once, at grant assembly, over the
+    // same reservation the grant owns — every later consumer clones this
+    // one Arc.
+    let scope = RunExecutionScope::new(reservation.clone());
     Ok(ResumeGrant {
         reservation,
+        scope,
         documents: docs.clone(),
         document,
         recorded,
