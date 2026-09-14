@@ -45,6 +45,7 @@ Workflow:
 2. Query Prometheus for relevant metrics (CPU, memory, error rates).
 3. Inspect workload logs for errors or anomalies.
 4. Provide diagnosis with specific resource names and namespaces.
+5. Unless a different time window is specified, inspect telemetry data over the last 5 minutes by default.
 
 Always specify namespaces explicitly. Prefer read-only operations
 unless the user explicitly requests changes.
