@@ -28,7 +28,9 @@
 use std::sync::LazyLock;
 
 use async_trait::async_trait;
-use aura::hitl::{DecisionId, ParkedApproval, ResolveError, ResolvedDecision};
+use aura::hitl::{
+    ApprovalAuthority, ApprovalRead, DecisionId, ParkedApproval, ResolveError, ResolvedDecision,
+};
 use aura::session_store::{
     AcknowledgeOutcome, ApprovalStore, DecisionRecord, ParkedApprovalRecord, SessionStoreError,
 };
@@ -379,6 +381,20 @@ impl ApprovalStore for RedisApprovalStore {
             }
         }
         Ok(pending)
+    }
+
+    #[expect(
+        unused_variables,
+        reason = "todo!() body; filled by P45 wave fill units"
+    )]
+    async fn read_or_expire(
+        &self,
+        id: &DecisionId,
+        expected_authority: ApprovalAuthority,
+    ) -> Result<ApprovalRead, SessionStoreError> {
+        todo!(
+            "P45 wave fill units: redis is an unsupported park backend; read_or_expire returns the typed unsupported-configuration error, never a faked outcome"
+        )
     }
 }
 

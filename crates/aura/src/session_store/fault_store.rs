@@ -5,7 +5,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use async_trait::async_trait;
 
 use super::{AcknowledgeOutcome, ApprovalStore, InMemoryApprovalStore, SessionStoreError};
-use crate::hitl::{DecisionId, ParkedApproval, ResolveError, ResolvedDecision};
+use crate::hitl::{
+    ApprovalAuthority, ApprovalRead, DecisionId, ParkedApproval, ResolveError, ResolvedDecision,
+};
 
 /// Delegates to an in-memory store; each `fail_*` flag makes that operation
 /// answer `SessionStoreError::Request` (the `*_once` flag fires one time).
@@ -87,5 +89,19 @@ impl ApprovalStore for FaultInjectingStore {
 
     async fn list_pending(&self) -> Result<Vec<ParkedApproval>, SessionStoreError> {
         self.inner.list_pending().await
+    }
+
+    #[expect(
+        unused_variables,
+        reason = "todo!() body; filled by P45 wave fill units"
+    )]
+    async fn read_or_expire(
+        &self,
+        id: &DecisionId,
+        expected_authority: ApprovalAuthority,
+    ) -> Result<ApprovalRead, SessionStoreError> {
+        todo!(
+            "P45 wave fill units E1/E2: the fault double delegates read-or-expire like every other operation"
+        )
     }
 }

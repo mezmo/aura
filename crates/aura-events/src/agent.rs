@@ -208,7 +208,7 @@ pub enum AgentEventPayload {
     RunParked {
         run_id: String,
         decision_ids: Vec<String>,
-        expires_at: String,
+        retention_expires_at: String,
         iteration: usize,
     },
 

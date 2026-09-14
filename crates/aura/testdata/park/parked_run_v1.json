@@ -3,7 +3,7 @@
   "session_id": "sess-golden-0001",
   "run_id": "0191e8c0-aaaa-7000-8000-00000000c0de",
   "parked_at": "2026-09-02T14:03:11.000000+00:00",
-  "expires_at": "2026-09-02T15:03:11.000000+00:00",
+  "retention_expires_at": "2026-09-02T15:03:11Z",
   "query": "Deploy the billing service to production",
   "chat_history": [
     {

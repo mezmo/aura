@@ -24,7 +24,9 @@ use bytes::Bytes;
 use futures::Stream;
 
 use crate::config::SessionId;
-use crate::hitl::{DecisionId, ParkedApproval, ResolveError, ResolvedDecision};
+use crate::hitl::{
+    ApprovalAuthority, ApprovalRead, DecisionId, ParkedApproval, ResolveError, ResolvedDecision,
+};
 
 #[cfg(test)]
 pub(crate) use fault_store::FaultInjectingStore;
@@ -137,6 +139,23 @@ pub trait ApprovalStore: Send + Sync {
             operation: "list_pending",
         })
     }
+
+    /// Read one approval row and, under the same serialization boundary
+    /// [`ApprovalStore::resolve`] and [`ApprovalStore::remove`] hold, expire
+    /// it when its own deadline has passed strictly.
+    ///
+    /// A row parked under a different authority than `expected_authority`
+    /// reads as [`ApprovalRead::Missing`] with no mutation — a validly signed
+    /// local request cannot override governance, and one agent's poller
+    /// cannot consume another's rows. A decision recorded exactly at the
+    /// deadline remains valid; an existing terminal winner is returned
+    /// unchanged. Missing, decode, and I/O failures are errors, never
+    /// outcomes.
+    async fn read_or_expire(
+        &self,
+        id: &DecisionId,
+        expected_authority: ApprovalAuthority,
+    ) -> Result<ApprovalRead, SessionStoreError>;
 }
 
 /// Distinct skill-invocation records one session may hold.

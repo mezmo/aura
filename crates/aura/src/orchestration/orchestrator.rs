@@ -704,7 +704,6 @@ struct StreamCallParams<'a> {
 #[derive(Default)]
 struct TurnTally {
     total: rig::completion::Usage,
-    first: Option<rig::completion::Usage>,
     last: rig::completion::Usage,
 }
 
@@ -723,7 +722,6 @@ impl TurnTally {
             output_tokens: turn.output_tokens,
             total_tokens: turn.total_tokens,
         };
-        self.first.get_or_insert(self.last);
         usage_state.accumulate_usage(turn.input_tokens, turn.output_tokens);
         if let Some(cache) = cache {
             usage_state.store_cache_usage(
@@ -770,24 +768,6 @@ struct ForwardedRun {
     /// same boundary rule `collect_segment_turns` applies — a resumed
     /// coordinator loop's worker turns ride the completed segment's.
     turns: Vec<rig::completion::Message>,
-}
-
-/// Replay an assistant turn as conversation history.
-///
-/// Anthropic-family providers reject a message whose text block is empty
-/// (`messages: text content blocks must be non-empty`), and a turn spent
-/// entirely on reasoning or cut off before any output yields exactly that.
-/// Blank content is replaced with
-/// [`prompt_constants::corrections::EMPTY_ASSISTANT_TURN`] so the correction
-/// call that follows is accepted.
-fn assistant_history_message(content: &str) -> rig::completion::Message {
-    if content.trim().is_empty() {
-        rig::completion::Message::assistant(
-            super::prompt_constants::corrections::EMPTY_ASSISTANT_TURN,
-        )
-    } else {
-        rig::completion::Message::assistant(content)
-    }
 }
 
 /// One guarded step of a deadline-wrapped stream loop.
@@ -1761,7 +1741,6 @@ impl Orchestrator {
             history,
             phase,
             event_tx,
-            ..
         } = params;
         let timeout_secs = self.config.per_call_timeout_secs();
         let stream_future = async {
@@ -1845,7 +1824,6 @@ impl Orchestrator {
             history,
             phase,
             event_tx,
-            context_agent,
         } = params;
         let timeout_secs = self.config.per_call_timeout_secs();
         let inactivity_secs = self.config.stream_inactivity_timeout_secs();
@@ -2011,19 +1989,16 @@ impl Orchestrator {
                     deadline.suspend();
                 }
             }
-            // Report this call's occupancy under the agent id the caller asked
-            // for; callers whose context is scratch pass none. The reading is
-            // the call's first inner turn: later inner turns add the tool
-            // results the coordinator pulled in on the way to its decision
-            // (skill bodies, prior-run listings), which is scratch too.
-            if let (Some(tx), Some(agent_id), Some(first)) = (event_tx, context_agent, tally.first)
-                && first.input_tokens > 0
-            {
+            // Coordinator occupancy under the same agent id single-agent uses,
+            // so clients track one conversation context across both modes. The
+            // last planning cycle runs after the workers, so its event is the
+            // one that lands last.
+            if let Some(tx) = event_tx.filter(|_| tally.last.input_tokens > 0) {
                 let _ = tx
                     .send(Ok(StreamItem::ContextUsage {
-                        agent_id: agent_id.to_string(),
-                        context_tokens: first.input_tokens,
-                        response_tokens: first.output_tokens,
+                        agent_id: COORDINATOR_AGENT_ID.to_string(),
+                        context_tokens: tally.last.input_tokens,
+                        response_tokens: tally.last.output_tokens,
                         context_window: agent.context_window,
                     }))
                     .await;
@@ -2138,7 +2113,6 @@ impl Orchestrator {
                         history: params.history.clone(),
                         phase: params.phase,
                         event_tx: params.event_tx,
-                        context_agent: params.context_agent,
                     },
                     || {
                         let rd = rd.clone();
@@ -2387,7 +2361,7 @@ impl Orchestrator {
             let response_text = response.content.clone();
             coordinator_state
                 .conversation
-                .push(assistant_history_message(&response_text));
+                .push(rig::completion::Message::assistant(&response_text));
 
             {
                 let persistence = self.persistence.lock().await;
@@ -4067,7 +4041,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     super::prompt_constants::corrections::WORKER_SUBMIT_RESULT.to_string();
                 let history = vec![
                     rig::completion::Message::user(base_worker_prompt.clone()),
-                    assistant_history_message(&last_raw_response),
+                    rig::completion::Message::assistant(last_raw_response.clone()),
                 ];
                 (correction, history)
             };
@@ -4101,7 +4075,6 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         history,
                         phase: "Worker task",
                         event_tx,
-                        context_agent: None,
                     },
                     worker_name.map(|name| StreamContext {
                         task_id,
@@ -4775,11 +4748,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         registry.remove(id).await;
                     }
 
-                    let expires_at = chrono::DateTime::parse_from_rfc3339(&commit.expires_at)
-                        .map_err(|e| {
-                            fault(format!("the re-park commit stamped a bad expiry: {e}"))
-                        })?
-                        .with_timezone(&chrono::Utc);
+                    let expires_at = commit.retention_expires_at.as_datetime();
                     let mut blocking = Vec::new();
                     for task in &plan.tasks {
                         let Some(pending) = commit.refreshed.pending_by_task.get(&task.id) else {
@@ -5007,9 +4976,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         for id in consumed {
             registry.remove(id).await;
         }
-        let expires_at = chrono::DateTime::parse_from_rfc3339(&republished.expires_at)
-            .map_err(|e| fault(format!("the re-park commit stamped a bad expiry: {e}")))?
-            .with_timezone(&chrono::Utc);
+        let expires_at = republished.retention_expires_at.as_datetime();
         let mut blocking = Vec::new();
         for node in &republished.plan.tasks {
             let super::types::TaskStatus::AwaitingApproval = node.status else {
@@ -6336,7 +6303,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
                             .iter()
                             .map(ToString::to_string)
                             .collect(),
-                        expires_at: commit.expires_at,
+                        retention_expires_at: commit
+                            .retention_expires_at
+                            .as_datetime()
+                            .to_rfc3339(),
                         iteration,
                     },
                 )
@@ -6822,23 +6792,6 @@ mod tests {
 
         assert_eq!(unrecorded.input_tokens, 0);
         assert_eq!(unrecorded.output_tokens, 0);
-    }
-
-    #[test]
-    fn test_tally_keeps_the_first_turn_as_the_context_reading() {
-        let usage_state = crate::UsageState::new();
-        let mut tally = TurnTally::default();
-        assert_eq!(tally.first, None);
-
-        // Coordinator loads a skill, lists prior runs, then plans: each inner
-        // turn re-sends the growing scratch context.
-        tally.record(&usage(10_741, 58), None, &usage_state);
-        tally.record(&usage(12_763, 127), None, &usage_state);
-        tally.record(&usage(40_112, 1_240), None, &usage_state);
-
-        let first = tally.first.unwrap();
-        assert_eq!((first.input_tokens, first.output_tokens), (10_741, 58));
-        assert_eq!(tally.last.input_tokens, 40_112);
     }
 
     /// A two-worker orchestration run replayed from its Bedrock
@@ -8511,6 +8464,7 @@ mod tests {
                 park: aura_config::ParkConfig {
                     enabled: park_enabled,
                     bind_identity: false,
+                    park_ttl: aura_config::ParkTtl::default(),
                 },
                 route,
             };
@@ -8588,6 +8542,7 @@ mod tests {
             park: aura_config::ParkConfig {
                 enabled: true,
                 bind_identity: false,
+                park_ttl: aura_config::ParkTtl::default(),
             },
             route: webhook_route_config(aura_config::WebhookDelivery::Poll),
         };
@@ -8711,7 +8666,7 @@ mod tests {
                     },
                     registered_at: now,
                     expires_at: now + chrono::Duration::seconds(60),
-                    authority: crate::hitl::ApprovalAuthority::WebhookPoll,
+                    authority: crate::hitl::ApprovalAuthority::Conversational,
                     egress_headers: None,
                     acknowledgment: crate::hitl::AcknowledgmentState::RequiresNotification,
                 })
@@ -8849,7 +8804,7 @@ mod tests {
                     },
                     registered_at: now,
                     expires_at: now + chrono::Duration::hours(1),
-                    authority: crate::hitl::ApprovalAuthority::WebhookPoll,
+                    authority: crate::hitl::ApprovalAuthority::Conversational,
                     egress_headers: None,
                     acknowledgment: crate::hitl::AcknowledgmentState::RequiresNotification,
                 })
@@ -9068,6 +9023,7 @@ mod tests {
                     },
                     registered_at,
                     expires_at: registered_at + chrono::Duration::hours(1),
+                    authority: crate::hitl::ApprovalAuthority::Conversational,
                     egress_headers: None,
                     acknowledgment: crate::hitl::AcknowledgmentState::RequiresNotification,
                 })
@@ -9206,12 +9162,12 @@ mod tests {
         .await
         .unwrap();
         assert!(document.awaiting_decision_ids().is_empty());
-        let expires_at = chrono::DateTime::parse_from_rfc3339(&document.expires_at).unwrap();
+        let expires_at = document.retention_expires_at.as_datetime();
         // The fixture route timeout is one hour.
         assert!(
             expires_at >= before + chrono::Duration::seconds(3600 - 5),
-            "expires_at carries the decision window: {}",
-            document.expires_at
+            "retention_expires_at carries the decision window: {}",
+            expires_at.to_rfc3339()
         );
         match event_rx.recv().await {
             Some(Ok(StreamItem::AgentEvent(event)))
@@ -9219,14 +9175,17 @@ mod tests {
             {
                 let AgentEventPayload::RunParked {
                     decision_ids,
-                    expires_at: stamp,
+                    retention_expires_at: stamp,
                     ..
                 } = event.payload
                 else {
                     unreachable!("guarded above")
                 };
                 assert!(decision_ids.is_empty());
-                assert_eq!(stamp, document.expires_at);
+                assert_eq!(
+                    stamp,
+                    document.retention_expires_at.as_datetime().to_rfc3339()
+                );
             }
             other => panic!("expected a RunParked event, got {other:?}"),
         }

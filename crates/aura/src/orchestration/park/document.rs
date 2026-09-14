@@ -19,6 +19,7 @@ use crate::orchestration::types::{
 };
 
 use super::ParkedTaskRecords;
+use super::retention::RetentionExpiresAt;
 
 /// The checkpoint format version this build writes and accepts.
 pub(crate) const SCHEMA_VERSION: u32 = 1;
@@ -97,8 +98,10 @@ pub(crate) struct ParkedRun {
     pub run_id: String,
     /// RFC 3339 timestamp of the park commit.
     pub parked_at: String,
-    /// RFC 3339 timestamp after which the run's decisions have expired.
-    pub expires_at: String,
+    /// The absolute retention deadline: the instant after which the run's
+    /// parked evidence may be reclaimed, renewed by each successful
+    /// checkpoint publication.
+    pub retention_expires_at: RetentionExpiresAt,
     /// The query that started the run.
     pub query: String,
     /// The external chat history the run was started with.
@@ -159,7 +162,7 @@ pub(crate) fn build_document(
     plan: &Plan,
     records: &ParkedTaskRecords,
     pending_by_task: &std::collections::HashMap<usize, Vec<PendingCall>>,
-    expires_at: String,
+    retention_expires_at: RetentionExpiresAt,
     config_fingerprint: String,
     identity_hash: Option<String>,
 ) -> io::Result<ParkedRun> {
@@ -208,7 +211,7 @@ pub(crate) fn build_document(
         session_id: state.session_id.map(str::to_string),
         run_id: state.run_id.to_string(),
         parked_at: chrono::Utc::now().to_rfc3339(),
-        expires_at,
+        retention_expires_at,
         query: state.query.to_string(),
         chat_history: state.chat_history.to_vec(),
         coordinator_conversation: state.coordinator_conversation.to_vec(),
@@ -262,6 +265,14 @@ mod tests {
     use crate::orchestration::park::ParkedTaskRecord;
 
     const GOLDEN: &str = include_str!("../../../testdata/park/parked_run_v1.json");
+
+    fn retention(stamp: &str) -> RetentionExpiresAt {
+        RetentionExpiresAt::from_datetime(
+            chrono::DateTime::parse_from_rfc3339(stamp)
+                .expect("fixture stamp parses")
+                .with_timezone(&chrono::Utc),
+        )
+    }
 
     fn pending_call(tool: &str, call_id: &str) -> PendingCall {
         PendingCall {
@@ -325,7 +336,7 @@ mod tests {
             &plan,
             &records,
             &pending_by_task,
-            "2026-09-02T15:00:00+00:00".to_string(),
+            retention("2026-09-02T15:00:00+00:00"),
             "fingerprint".to_string(),
             None,
         )
@@ -386,7 +397,7 @@ mod tests {
             &plan,
             &records,
             &pending_by_task,
-            "2026-09-02T15:00:00+00:00".to_string(),
+            retention("2026-09-02T15:00:00+00:00"),
             "fingerprint".to_string(),
             None,
         )
@@ -417,7 +428,7 @@ mod tests {
             &plan,
             &ParkedTaskRecords::new(),
             &std::collections::HashMap::new(),
-            "2026-09-02T15:00:00+00:00".to_string(),
+            retention("2026-09-02T15:00:00+00:00"),
             "fingerprint".to_string(),
             None,
         )

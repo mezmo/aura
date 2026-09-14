@@ -32,6 +32,7 @@ use super::super::commit::{config_fingerprint, parked_document_dir, publish};
 use super::super::document::{
     PARKED_DOCUMENT_SUFFIX, ParkedPlan, ParkedRun, ParkedTaskNode, SCHEMA_VERSION, load_parked_run,
 };
+use super::super::retention::RetentionExpiresAt;
 use super::super::{RESUMING_DOCUMENT_SUFFIX, run_owner_id};
 use super::*;
 
@@ -248,6 +249,7 @@ fn identity_world() -> World {
             park: aura_config::ParkConfig {
                 enabled: true,
                 bind_identity: false,
+                park_ttl: aura_config::ParkTtl::default(),
             },
             route: aura_config::DecisionRouteConfig::Webhook {
                 url: aura_config::WebhookUrl::new("https://approvals.example.com/hook").unwrap(),
@@ -308,6 +310,7 @@ fn node_approval(
         },
         registered_at: chrono::Utc::now(),
         expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+        authority: crate::hitl::ApprovalAuthority::Conversational,
         egress_headers: None,
         acknowledgment: crate::hitl::AcknowledgmentState::RequiresNotification,
     }
@@ -871,7 +874,11 @@ fn parked_document(
         session_id: Some(SESSION.to_string()),
         run_id: RUN.to_string(),
         parked_at: "2026-09-01T00:00:00Z".to_string(),
-        expires_at: expires_at.to_string(),
+        retention_expires_at: RetentionExpiresAt::from_datetime(
+            chrono::DateTime::parse_from_rfc3339(expires_at)
+                .expect("golden fixture stamp parses")
+                .with_timezone(&chrono::Utc),
+        ),
         query: "Deploy the service".to_string(),
         chat_history: vec![rig::completion::Message::user("Deploy the service")],
         coordinator_conversation: vec![],

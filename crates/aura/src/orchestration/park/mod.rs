@@ -5,9 +5,11 @@ mod commit;
 mod continuation;
 mod document;
 mod guard;
+pub(crate) mod lifetime;
 mod rebuild;
 mod recorded_decisions;
 pub(crate) mod resume;
+mod retention;
 
 pub(crate) use commit::{
     ParkCommitInputs, cancel_run_approvals, commit_from_run_state, run_owner_id,

@@ -588,9 +588,7 @@ async fn project_blocking(
     store: &PendingApprovals,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<NonEmptyBlocking, Diagnostic> {
-    let expires_at = chrono::DateTime::parse_from_rfc3339(&document.expires_at)
-        .map_err(|e| Diagnostic::new(format!("bad expiry stamp on the parked document: {e}")))?
-        .with_timezone(&chrono::Utc);
+    let expires_at = document.retention_expires_at.as_datetime();
     let mut entries = Vec::new();
     for node in &document.plan.tasks {
         let crate::orchestration::types::TaskStatus::AwaitingApproval = node.status else {
