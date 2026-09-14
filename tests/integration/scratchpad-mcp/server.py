@@ -232,6 +232,11 @@ def generate_runbook() -> str:
 
 RUNBOOK = generate_runbook()
 
+# The one-line change the edit tests ask for; EDIT_OLD occurs once in RUNBOOK.
+EDIT_OLD = "## Step 3: check service-02"
+EDIT_NEW = "## Step 3: check service-02 (owned by the façade team)"
+EDITED_RUNBOOK = RUNBOOK.replace(EDIT_OLD, EDIT_NEW, 1)
+
 
 # No return annotation: FastMCP would otherwise derive an output schema and
 # wrap the result in structured content, hiding the embedded resource.
@@ -258,9 +263,13 @@ def sp_get_file(path: str = "docs/runbook.md"):
 def sp_write_file(path: str, content: str, message: str = "") -> str:
     """Create or update a text file in the test repository. Reports the
     written size and whether the content is byte-for-byte identical to the
-    file sp_get_file serves."""
-    matches = str(content == RUNBOOK).lower()
-    return f"wrote {len(content.encode())} bytes to {path}; matches_original={matches}"
+    file sp_get_file serves, or to that file with the step 3 heading edited."""
+    matches_original = str(content == RUNBOOK).lower()
+    matches_edited = str(content == EDITED_RUNBOOK).lower()
+    return (
+        f"wrote {len(content.encode())} bytes to {path}; "
+        f"matches_original={matches_original}; matches_edited={matches_edited}"
+    )
 
 
 # ---------------------------------------------------------------------------
