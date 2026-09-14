@@ -96,6 +96,35 @@ fn assert_any_routing_event(events: &[SseEvent]) {
     );
 }
 
+/// Helper to extract all tool calls with their names and arguments from events.
+fn get_tool_calls(events: &[SseEvent]) -> Vec<(String, Value)> {
+    events_by_type(events, event_names::TOOL_CALL_STARTED)
+        .iter()
+        .filter_map(|e| {
+            let json: Value = serde_json::from_str(&e.data).ok()?;
+            let tool_name = json["tool_name"].as_str()?.to_string();
+            let arguments = json.get("arguments").cloned().unwrap_or(Value::Null);
+            Some((tool_name, arguments))
+        })
+        .collect()
+}
+
+/// Helper to extract the telemetry query string from tool arguments.
+fn extract_telemetry_query(arguments: &Value) -> Option<String> {
+    if let Some(s) = arguments.as_str() {
+        if let Ok(json) = serde_json::from_str::<Value>(s) {
+            if let Some(q) = json.get("query").and_then(|v| v.as_str()) {
+                return Some(q.to_string());
+            }
+        }
+        return Some(s.to_string());
+    }
+    if let Some(q) = arguments.get("query").and_then(|v| v.as_str()) {
+        return Some(q.to_string());
+    }
+    None
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -243,6 +272,128 @@ async fn test_sre_workers_use_domain_tools() {
     }
     if has_prom_tool {
         println!("prometheus tools used");
+    }
+
+    // Inspect tool call arguments when telemetry queries are executed
+    let tool_calls = get_tool_calls(&events);
+    for (name, args) in &tool_calls {
+        if name == "prometheus_query" {
+            let query_str = extract_telemetry_query(args).unwrap_or_default();
+            println!("prometheus_query arguments inspected: {query_str}");
+            assert!(
+                !query_str.is_empty(),
+                "prometheus_query argument 'query' should not be empty"
+            );
+        }
+    }
+}
+
+/// Verifies that telemetry investigations without an explicit timeframe
+/// inspect a 5-minute lookback window in query arguments by default.
+///
+/// Query: asks to investigate recent error rates and request count metrics for payment-service in production.
+/// Expected: prometheus_query tool arguments contain a 5-minute lookback interval (e.g. "[5m]" or "5m").
+///
+/// LENIENCY: LLM may answer directly without tool calls.
+#[tokio::test]
+async fn test_sre_telemetry_query_defaults_to_five_minute_window() {
+    let events = orchestration_events(
+        "Query Prometheus metrics to inspect the request rate and error rate for the payment-service workload in production.",
+    )
+    .await;
+
+    let tool_started = events_by_type(&events, event_names::TOOL_CALL_STARTED);
+
+    if tool_started.is_empty() {
+        println!("Note: No tool call events. LLM may have answered directly.");
+        assert_any_routing_event(&events);
+        return;
+    }
+
+    let tool_calls = get_tool_calls(&events);
+    let prom_queries: Vec<String> = tool_calls
+        .iter()
+        .filter(|(name, _)| name == "prometheus_query")
+        .filter_map(|(_, args)| extract_telemetry_query(args))
+        .collect();
+
+    println!("Default window queries: {:?}", prom_queries);
+
+    if !prom_queries.is_empty() {
+        // Inspect telemetry query arguments: verify default 5m lookback window
+        let has_5m_window = prom_queries.iter().any(|q| {
+            q.contains("5m") || q.contains("[5m]") || q.contains("300")
+        });
+        assert!(
+            has_5m_window,
+            "Expected prometheus_query arguments to inspect default 5-minute telemetry window (e.g. '[5m]'), got: {:?}",
+            prom_queries
+        );
+
+        // Ensure the worker did not query an arbitrary wide window by default
+        for q in &prom_queries {
+            assert!(
+                !q.contains("[1h]") && !q.contains("[24h]") && !q.contains("[7d]"),
+                "Telemetry query should not use a wide window when 5m is expected: {q}"
+            );
+        }
+    } else {
+        assert_any_routing_event(&events);
+    }
+}
+
+/// Verifies that an explicit user-requested timeframe is respected in telemetry query
+/// arguments and NOT overwritten by the default 5-minute window.
+///
+/// Query: asks to investigate error rates and request latency for payment-service in production over the last 1 hour.
+/// Expected: prometheus_query tool arguments contain a 1-hour lookback interval (e.g. "[1h]" or "1h")
+/// and do not overwrite it with the 5-minute default.
+///
+/// LENIENCY: LLM may answer directly without tool calls.
+#[tokio::test]
+async fn test_sre_telemetry_query_respects_explicit_override_window() {
+    let events = orchestration_events(
+        "Query Prometheus metrics to inspect the request rate and error rate for the payment-service workload in production over the last 1 hour.",
+    )
+    .await;
+
+    let tool_started = events_by_type(&events, event_names::TOOL_CALL_STARTED);
+
+    if tool_started.is_empty() {
+        println!("Note: No tool call events. LLM may have answered directly.");
+        assert_any_routing_event(&events);
+        return;
+    }
+
+    let tool_calls = get_tool_calls(&events);
+    let prom_queries: Vec<String> = tool_calls
+        .iter()
+        .filter(|(name, _)| name == "prometheus_query")
+        .filter_map(|(_, args)| extract_telemetry_query(args))
+        .collect();
+
+    println!("Override window queries: {:?}", prom_queries);
+
+    if !prom_queries.is_empty() {
+        // Inspect telemetry query arguments: verify user-requested 1h override is used
+        let has_1h_window = prom_queries.iter().any(|q| {
+            q.contains("1h") || q.contains("[1h]") || q.contains("60m") || q.contains("3600")
+        });
+        assert!(
+            has_1h_window,
+            "Expected prometheus_query arguments to reflect user-requested 1-hour lookback window (e.g. '[1h]'), got: {:?}",
+            prom_queries
+        );
+
+        // Verify the 5m default did NOT overwrite the user's explicit 1h request
+        let mistakenly_used_5m = prom_queries.iter().all(|q| q.contains("[5m]") && !q.contains("1h"));
+        assert!(
+            !mistakenly_used_5m,
+            "Telemetry query should not overwrite explicit 1-hour request with default 5m window: {:?}",
+            prom_queries
+        );
+    } else {
+        assert_any_routing_event(&events);
     }
 }
 
