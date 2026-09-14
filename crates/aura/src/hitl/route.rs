@@ -121,10 +121,11 @@ pub enum ApprovalError {
     /// ingress). The decision inside is untrusted and discarded.
     #[error("approval webhook response failed signature verification: {0}")]
     ResponseUnverified(String),
-    /// Approver identity capture failed closed: the approved response was
-    /// missing mapped headers. Names only, never values; the message is
-    /// the event-level audit signal. Wraps only the capture kind, so
-    /// application-time failures cannot be mislabeled as capture failures.
+    /// Approver identity capture failed closed: the approved webhook
+    /// response was missing a mapped response header. Names only, never
+    /// values; the message is the event-level audit signal. Wraps only
+    /// the capture kind, so application-time failures cannot be
+    /// mislabeled as capture failures.
     #[error("{0}")]
     CaptureFailed(#[from] crate::approver_headers::CaptureError),
 }
@@ -518,10 +519,22 @@ impl WebhookClient {
                 let overrides = if self.tool_header_mappings.is_empty() {
                     None
                 } else {
-                    Some(crate::approver_headers::ApproverHeaders::from_captured(
-                        &self.tool_header_mappings,
-                        &response_headers,
-                    )?)
+                    Some(
+                        crate::approver_headers::ApproverHeaders::from_captured(
+                            &self.tool_header_mappings,
+                            &response_headers,
+                        )
+                        .map_err(|err| {
+                            let decision_id = request.decision_id;
+                            tracing::warn!(
+                                target: "aura::hitl",
+                                %decision_id,
+                                "HITL approver header forwarding blocked: {err}; the gated \
+                                 call was not executed"
+                            );
+                            ApprovalError::CaptureFailed(err)
+                        })?,
+                    )
                 };
                 Ok(GateDecision::Approved { overrides })
             }
@@ -738,23 +751,54 @@ pub fn cleartext_capture_warning(config: &HitlConfig) -> Option<String> {
     }
     Some(format!(
         "HITL webhook route {} captures approver response headers over cleartext http, so \
-         this route's tool_headers_from_response values are readable by any network \
-         observer; intended for trusted-gateway or service-to-service deployments",
+         the values captured from these webhook response headers are readable by any \
+         network observer; intended for trusted-gateway or service-to-service \
+         deployments; the route remains enabled",
         redact_to_origin(url.as_str())
     ))
 }
 
-/// `scheme://host[:port]` of `url`, dropping userinfo, path, query, and fragment. These are parts a log line must never carry, since a webhook URL may embed a token in any of them.
+/// The boot-time approver-forwarding summary for `config`, rendered as newline-joined lines (one per `tool_headers_from_response` mapping, sorted by outbound tool header name so the text is deterministic) so a binary with silent default tracing (aura-cli without `log_file`) can print them on a channel it owns, such as stderr. `None` for every configuration with no mapping to summarize; each line carries the redacted origin and both header names of its pair, never the full URL and never any header value.
+pub fn approver_forwarding_summary(config: &HitlConfig) -> Option<String> {
+    let DecisionRouteConfig::Webhook {
+        url,
+        tool_headers_from_response,
+        ..
+    } = &config.route
+    else {
+        return None;
+    };
+    if tool_headers_from_response.is_empty() {
+        return None;
+    }
+    let mut mappings: Vec<_> = tool_headers_from_response.iter().collect();
+    mappings.sort_unstable();
+    let origin = redact_to_origin(url.as_str());
+    Some(
+        mappings
+            .iter()
+            .map(|(outbound, response)| {
+                format!(
+                    "HITL approver identity forwarding on {origin}: tool header \"{outbound}\" \
+                     <- webhook response header \"{response}\""
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
+/// `scheme://host[:port]` of `url`, dropping userinfo, path, query, and fragment. These are parts a log line must never carry, since a webhook URL may embed a token in any of them. Parsing follows the HTTP client's own URL grammar, under which a backslash separates the path on http(s) URLs, so a token hidden behind a backslash is dropped too. An unparsable URL redacts to a constant rather than echoing raw input.
 fn redact_to_origin(url: &str) -> String {
-    let (scheme, rest) = url.split_once("://").unwrap_or(("", url));
-    let authority = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
-    let host_port = authority
-        .rsplit_once('@')
-        .map_or(authority, |(_, host)| host);
-    if scheme.is_empty() {
-        host_port.to_string()
-    } else {
-        format!("{scheme}://{host_port}")
+    match url::Url::parse(url) {
+        Ok(parsed) => {
+            let host = parsed.host_str().unwrap_or_default();
+            match parsed.port() {
+                Some(port) => format!("{}://{host}:{port}", parsed.scheme()),
+                None => format!("{}://{host}", parsed.scheme()),
+            }
+        }
+        Err(_) => "<unparsable webhook url>".to_string(),
     }
 }
 
@@ -1273,7 +1317,7 @@ mod tests {
             ApprovalError, ApprovalOutcome, EgressSigning, GateDecision, WebhookClient,
             build_webhook_client,
         };
-        use crate::approver_headers::CaptureError;
+        use crate::approver_headers::{CaptureError, MissingMapping};
 
         fn test_hmac() -> WebhookHmac {
             WebhookHmac::new(
@@ -1779,7 +1823,7 @@ mod tests {
         fn warn_on_cleartext_capture_warns_once_and_redacts_the_url() {
             let log = captured_warn_log(|| {
                 super::super::warn_on_cleartext_capture(&webhook_config(
-                    "http://token:secret@approvals.example.com:8443/aura/hook?key=shh",
+                    "http://token:secret@approvals.example.com:8443\\private-token?key=shh",
                     user_mapping(),
                 ));
                 super::super::warn_on_cleartext_capture(&webhook_config(
@@ -1792,10 +1836,14 @@ mod tests {
                 "the warning must name the risk, got log: {log}"
             );
             assert!(
+                log.trim_end().ends_with("the route remains enabled"),
+                "the warning must end by saying the route remains enabled, got log: {log}"
+            );
+            assert!(
                 log.contains("http://approvals.example.com:8443"),
                 "the warning must name the origin, got log: {log}"
             );
-            for secret in ["token", "secret", "aura/hook", "key=shh"] {
+            for secret in ["token", "secret", "private-token", "key=shh"] {
                 assert!(
                     !log.contains(secret),
                     "the warning must never carry userinfo, path, or query, got: {log}"
@@ -1811,7 +1859,7 @@ mod tests {
         #[test]
         fn cleartext_capture_warning_redacts_the_url() {
             let warning = super::super::cleartext_capture_warning(&webhook_config(
-                "http://token:secret@approvals.example.com:8443/aura/hook?key=shh",
+                "http://token:secret@approvals.example.com:8443\\private-token?key=shh",
                 user_mapping(),
             ))
             .expect("a mapped cleartext route must warn");
@@ -1820,7 +1868,7 @@ mod tests {
                 warning.contains("http://approvals.example.com:8443"),
                 "the warning must name the origin, got: {warning}"
             );
-            for secret in ["token", "secret", "aura/hook", "key=shh"] {
+            for secret in ["token", "secret", "private-token", "key=shh"] {
                 assert!(
                     !warning.contains(secret),
                     "the warning must never carry userinfo, path, or query, got: {warning}"
@@ -1861,6 +1909,148 @@ mod tests {
             assert!(
                 log.is_empty(),
                 "no map means nothing to warn about, got: {log}"
+            );
+        }
+
+        /// The summary is quiet exactly when nothing is configured to forward: a conversational route and a mapping-less webhook route both return `None`.
+        #[test]
+        fn approver_forwarding_summary_is_none_without_mappings() {
+            assert!(
+                super::super::approver_forwarding_summary(&webhook_config(
+                    "http://approvals.example.com/aura",
+                    aura_config::ToolHeaderMappings::default(),
+                ))
+                .is_none(),
+                "an empty mapping is the legacy path and needs no summary"
+            );
+            let conversational = aura_config::HitlConfig {
+                require_approval: vec![],
+                park: aura_config::ParkConfig::default(),
+                route: aura_config::DecisionRouteConfig::Conversational { timeout_secs: 60 },
+            };
+            assert!(
+                super::super::approver_forwarding_summary(&conversational).is_none(),
+                "a conversational route has no response-header forwarding"
+            );
+        }
+
+        /// One mapping, one line, quoting both names as the capture error does: the summary names the direction so an operator can see the webhook response is the value source.
+        #[test]
+        fn approver_forwarding_summary_renders_one_line_per_mapping() {
+            let summary = super::super::approver_forwarding_summary(&webhook_config(
+                "https://approvals.example.com",
+                user_mapping(),
+            ))
+            .expect("a mapped route must summarize");
+
+            assert_eq!(
+                summary,
+                "HITL approver identity forwarding on https://approvals.example.com: \
+                 tool header \"x-forwarded-user\" <- webhook response header \"x-approver-id\""
+            );
+        }
+
+        /// Several mappings render one line each, sorted by outbound tool header name: the config map's iteration order must not show.
+        #[test]
+        fn approver_forwarding_summary_sorts_lines_by_outbound_name() {
+            let mappings = crate::approver_headers::tests::mappings(&[
+                ("x-tenant", "x-approver-tenant"),
+                ("authorization", "x-approver-token"),
+                ("x-forwarded-user", "x-approver-id"),
+            ]);
+            let summary = super::super::approver_forwarding_summary(&webhook_config(
+                "https://approvals.example.com",
+                mappings,
+            ))
+            .expect("a mapped route must summarize");
+
+            assert_eq!(
+                summary,
+                format!(
+                    "HITL approver identity forwarding on https://approvals.example.com: \
+                     tool header \"authorization\" <- webhook response header \"x-approver-token\"\n\
+                     HITL approver identity forwarding on https://approvals.example.com: \
+                     tool header \"x-forwarded-user\" <- webhook response header \"x-approver-id\"\n\
+                     HITL approver identity forwarding on https://approvals.example.com: \
+                     tool header \"x-tenant\" <- webhook response header \"x-approver-tenant\""
+                )
+            );
+            assert_eq!(summary.lines().count(), 3, "one line per mapping");
+        }
+
+        /// The summary carries the redacted origin and header names only: userinfo, path, and query never appear.
+        #[test]
+        fn approver_forwarding_summary_redacts_the_url() {
+            let summary = super::super::approver_forwarding_summary(&webhook_config(
+                "https://token:secret@approvals.example.com:8443\\private-token?key=shh",
+                user_mapping(),
+            ))
+            .expect("a mapped route must summarize");
+
+            assert!(
+                summary.contains("https://approvals.example.com:8443"),
+                "the summary must name the origin, got: {summary}"
+            );
+            for secret in ["token", "secret", "private-token", "key=shh"] {
+                assert!(
+                    !summary.contains(secret),
+                    "the summary must never carry userinfo, path, or query, got: {summary}"
+                );
+            }
+        }
+
+        /// The one failure-time line an operator sees under the default filter: the capture warn carries the decision id and the both-sides error text, and never a header value. A sync capture scope cannot wrap an await, so the same subscriber is installed as a scoped thread default for the poll.
+        #[tokio::test]
+        async fn gate_capture_failure_warns_with_decision_id_and_names_only() {
+            let decision_id = DecisionId::generate();
+            // The approved response carries the OUTBOUND header's name with a value: a leak would print this value, whose header is not the mapped response one and captures nothing.
+            let (url, _received) = one_shot_receiver(
+                vec![("x-forwarded-user".to_owned(), "alice".to_owned())],
+                r#"{"approved":true}"#.to_owned(),
+            )
+            .await;
+
+            let buf = std::sync::Arc::new(super::CapturedLog(std::sync::Mutex::new(Vec::new())));
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(buf.clone())
+                .with_max_level(tracing::Level::WARN)
+                .with_ansi(false)
+                .finish();
+            let _guard = tracing::subscriber::set_default(subscriber);
+
+            let err = loopback_client(&url, EgressSigning::Disabled, user_mapping())
+                .request_approval_for_gate(&test_request(decision_id), Duration::from_secs(5))
+                .await
+                .expect_err("the approved response lacks the mapped header and must fail closed");
+            drop(_guard);
+            let log = String::from_utf8_lossy(&buf.0.lock().unwrap()).to_string();
+
+            assert!(
+                matches!(err, ApprovalError::CaptureFailed(_)),
+                "expected CaptureFailed, got {err:?}"
+            );
+            assert!(
+                log.contains("aura::hitl"),
+                "the warn must target aura::hitl, got: {log}"
+            );
+            assert!(
+                log.contains("HITL approver header forwarding blocked"),
+                "the warn must fire on the capture-failure path, got: {log}"
+            );
+            assert!(
+                log.contains(&decision_id.to_string()),
+                "the warn must carry the decision id, got: {log}"
+            );
+            assert!(
+                log.contains(
+                    "webhook response missing header \"x-approver-id\" \
+                     (mapped to tool header \"x-forwarded-user\")"
+                ),
+                "the warn must quote the both-sides error text, got: {log}"
+            );
+            assert!(
+                !log.contains("alice"),
+                "the warn must never carry a header value, got: {log}"
             );
         }
 
@@ -2121,11 +2311,18 @@ mod tests {
                         Expected::CaptureFailed(name),
                         Err(
                             ref err @ ApprovalError::CaptureFailed(CaptureError::MissingHeaders {
-                                ref names,
+                                ref missing,
                             }),
                         ),
                     ) => {
-                        assert_eq!(names, &[name.to_owned()], "{case}");
+                        assert_eq!(
+                            missing,
+                            &[MissingMapping {
+                                response_name: "x-approver-id".to_owned(),
+                                outbound_name: name.to_owned(),
+                            }],
+                            "{case}"
+                        );
                         assert!(
                             err.to_string().contains(name),
                             "{case}: the audit message must name the missing header: {err}"

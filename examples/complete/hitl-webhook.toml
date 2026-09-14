@@ -47,6 +47,11 @@ headers = { "x-aura-tenant" = "sre-prod" }
 # service can see who asked. Keys are webhook header names, values are inbound
 # request header names (matched case-insensitively).
 headers_from_request = { "authorization" = "authorization" }
+# Forward the approver's identity onto the gated tool call. Keys are outbound
+# MCP tool header names, values are webhook response header names (matched
+# case-insensitively). Every value-side header must be present on an approved
+# response or the gated call fails closed.
+tool_headers_from_response = { "authorization" = "x-approver-token" }
 
 [mcp]
 sanitize_schemas = true
