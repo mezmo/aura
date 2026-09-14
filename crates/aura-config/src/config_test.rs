@@ -1715,6 +1715,30 @@ context_window = 200000
     }
 
     #[test]
+    fn test_sre_configs_include_telemetry_lookback_guidance() {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let quickstart_path = repo_root.join("quickstart.toml");
+        let quickstart_content = std::fs::read_to_string(&quickstart_path)
+            .unwrap_or_else(|e| panic!("{}: {e}", quickstart_path.display()));
+        assert!(
+            quickstart_content.contains("last 5 minutes"),
+            "quickstart.toml missing 5-minute telemetry lookback policy"
+        );
+
+        let sre_path = repo_root.join("configs/integration-sre-orchestration.toml");
+        let sre_content = std::fs::read_to_string(&sre_path)
+            .unwrap_or_else(|e| panic!("{}: {e}", sre_path.display()));
+        assert!(
+            sre_content.contains("last 5 minutes"),
+            "integration-sre-orchestration.toml missing 5-minute telemetry lookback policy"
+        );
+    }
+
+    #[test]
     fn test_legacy_top_level_llm_produces_migration_error() {
         let legacy_config = r#"
 [llm]
