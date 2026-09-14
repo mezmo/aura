@@ -3,7 +3,13 @@
 Layer 1 of the park/reify dispatch contract: the compile-clean shared type
 surface. Real signatures, real derives, `todo!()` only where behavior lands in
 a named fill unit. Existing code compiles unchanged and every existing suite
-stays green; nothing behavioral moved.
+stays green. Two narrow ACTIVE classification changes ride the surface
+(present since the REPAIR-2/3 error taxonomy, disclosed for the owner): an
+interim claim-rename failure now renders 503 `reify_unavailable` (was an
+undifferentiated 500-class Fault row carrying its diagnostic), and a
+blocking-task join failure renders the safe 500 `reify_failed` row — the
+dispatch contract's client-failure classification, not new behavior. Every
+other interim keeps admission/rename/rollback ordering identical.
 
 Contract (REPAIR-2 corrected the pointer):
 `/Users/mshearer/workspace/aura-session-docs/boards/aura-orchestration-mode/docs/board/plans/2026-09-14-park-reify-dispatch.md`
@@ -70,7 +76,7 @@ Present outcome and a reservation-owning carrier, and the isolated
 | `aura_events::RetentionExpiresAt` (REPAIR-2 F9) | `aura-events/src/retention.rs` | The validated absolute-retention wire stamp, in the dependency location every event surface sees: an RFC 3339 instant by construction — `"not-an-instant"` cannot ride an event or cross decode. Wire key and RFC 3339 rendering preserved | SSE fills consume it as-is |
 | `RunParked.retention_expires_at` | `orchestration/events.rs`, `stream_events.rs`, `aura-events/orchestration.rs` (REPAIR-2 F9) | All three RunParked surfaces carry the validated stamp type; the terminal park event names the retention deadline, not a decision expiry, and never an arbitrary string | SSE fills consume it as-is |
 | `ResumeConflictRow::expired(Vec<BlockingEntry>)` (REPAIR-2 F11) | `park/resume/evaluate.rs` | The expired row never requires an outstanding call: a retention-expired checkpoint with every approval addressed renders the (possibly empty) expired row instead of being unrepresentable. `parked` keeps `NonEmptyBlocking` | E7 (per-call snapshots) |
-| `CheckpointPresence` / `CleanupReservation` / `RunCleanupOutcome` / cleanup seams (REPAIR-2 F11; REPAIR-3 G6) | `park/cleanup.rs` (new) | Cleanup classification is typed and three-way-complete: PRESENT vs confirmed absent vs inaccessible vs corrupt (a healthy checkpoint is never mislabeled, a missing root or unreadable document is NEVER confirmed absence, and a corrupt file is never absent evidence); the reservation-owning `CleanupReservation` carrier binds the run (the lease — the cleanup eligibility) and its checkpoint paths, cloned into the blocking reread/deletion tails so the fence survives the awaiting sweep; deletion is encapsulated evidence-first/checkpoint-last with retain-on-failure for retry. Declared only — nothing is wired into the server | E6 (sweep/orphans), E8 (activation) |
+| `CheckpointPresence` / `CleanupReservation` / `CleanupAdmissionFault` / cleanup seams (REPAIR-2 F11; REPAIR-3 G6; round-3 residue) | `park/cleanup.rs` (new) | Cleanup classification is typed and three-way-complete: PRESENT vs confirmed absent vs inaccessible vs corrupt (a healthy checkpoint is never mislabeled, a missing root or unreadable document is NEVER confirmed absence, and a corrupt file is never absent evidence); the reservation-owning `CleanupReservation` carrier is born ONLY from `acquire(table, path, memory_dir)`, which occupies the run under the shared table (the admission IS the eligibility proof — never a clone of an executing run's lease; a live run answers `CleanupAdmissionFault::Executing`) and derives the checkpoint paths from the SAME validated identity, so fence and paths cannot name different runs; the carrier clones into the blocking reread/deletion tails so the fence survives the awaiting sweep; deletion is encapsulated evidence-first/checkpoint-last with retain-on-failure for retry. Declared only — nothing is wired into the server | E6 (sweep/orphans), E8 (activation) |
 | `CompletionInput` | `aura-web-server/src/handlers.rs` | The completion input is single-use and non-cloneable: a grant that could be duplicated would make the once-only rule a runtime check. Since REPAIR-5 `RequestSetup` owns it; since REPAIR-2 F10 the consumed match produces the common (stream, cancel, usage) tuple in BOTH arms | S2/S3 |
 | `RigBuilder::prepare_agent_config` (hole) | `aura/src/rig_builder.rs` | The production config projection for a request is fallible and distinct from the debug-only `get_agent_config`; resume never uses the debug path | S1 |
 | `OrchestratorFactory::resume_stream_with_timeout` (hole) | `aura/src/orchestration/factory.rs` | Resume enters through the factory, consuming the grant by value and returning the existing stream/cancel/usage tuple — no replayable adapter | S3 |
@@ -394,3 +400,21 @@ Round-2 verification (frontier-reviewer, panel/ROUND-2.md) found 7 BLOCKING
   the interim `Fault` sink; REPAIR-3 G5 classified the CLAIM seams only
   (the reservation transitions round-2 named). The S2/C fills migrate the
   remaining sites, per the F7 disposition.
+
+## Round-3 board-owner residue (2026-09-14)
+
+The round-3 verification seat (three-round cap) confirmed G1-G5 and G7-G8
+closed and returned one blocking residue on G6 plus one documentation
+minor. Per the board's capped-rounds precedent the mechanical residue was
+completed board-owner-executed (logged on the card):
+
+- `CleanupReservation::new` (unchecked lease+paths pairing) is deleted.
+  The carrier is born only from `acquire(table, path, memory_dir)`:
+  table admission is the eligibility proof (a live run answers
+  `CleanupAdmissionFault::Executing`), and the checkpoint paths derive
+  from the same validated identity the admission occupied.
+- The header's identity claim is scoped: two narrow ACTIVE classification
+  changes ride the surface (interim claim-rename failure renders 503
+  `reify_unavailable`; blocking-task join failure renders 500
+  `reify_failed`), the contract's client-failure classification, not new
+  behavior. Recorded for Mike's visibility at U(surface).
