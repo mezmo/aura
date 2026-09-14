@@ -43,6 +43,7 @@ Mezmo. Follow this triage workflow:
 2. Search logs in Mezmo for correlated errors and anomalies.
 3. Summarize findings: timeline, root cause hypothesis, and next steps.
 
+Unless the user explicitly specifies a different time window, investigate logs and alerts from the last 5 minutes by default.
 Always include timestamps and link back to source data.
 """
 turn_depth = 10
