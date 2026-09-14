@@ -789,10 +789,21 @@ impl Orchestrator {
                         )
                     })
                     .unwrap_or(0);
-                let initial_used = scratchpad::estimate_scratchpad_overhead(
-                    &*token_counter,
-                    &[super::config::WORKER_PREAMBLE_TEMPLATE, worker_preamble],
-                ) + mcp_tool_tokens;
+                // `edit` (and its preamble) only pays off with a reachable
+                // tool that takes a `<field>_file` reference.
+                let edit_tool = scratchpad::has_accessible_scratchpad_tool(
+                    &accessible_tools,
+                    worker_filter,
+                    |tool| by_reference_map.contains_tool(tool),
+                );
+                let mut counted_preamble =
+                    vec![super::config::WORKER_PREAMBLE_TEMPLATE, worker_preamble];
+                if edit_tool {
+                    counted_preamble.push(scratchpad::SCRATCHPAD_EDIT_PREAMBLE);
+                }
+                let initial_used =
+                    scratchpad::estimate_scratchpad_overhead(&*token_counter, &counted_preamble)
+                        + mcp_tool_tokens;
 
                 let (iter_dir, read_root) = {
                     let persistence = self.persistence.lock().await;
@@ -807,6 +818,7 @@ impl Orchestrator {
                     read_root: Some(&read_root),
                     scratchpad_tool_map,
                     by_reference_map,
+                    edit_tool,
                     context_window,
                     initial_used,
                     token_counter,
@@ -1014,10 +1026,16 @@ impl Orchestrator {
         // Disable orchestration in worker config to avoid nested orchestration
         worker_config.orchestration = None;
 
-        if worker_config.scratchpad_tools_config.is_some()
+        if let Some(edit_tool) = worker_config
+            .scratchpad_tools_config
+            .as_ref()
+            .map(|sp| sp.edit_tool)
             && let Some(ref mut preamble) = worker_config.preamble_override
         {
             preamble.push_str(scratchpad::SCRATCHPAD_PREAMBLE);
+            if edit_tool {
+                preamble.push_str(scratchpad::SCRATCHPAD_EDIT_PREAMBLE);
+            }
         }
 
         // Workers bypass Agent::build's catalog append (their preamble is the

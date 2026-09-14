@@ -6,7 +6,8 @@
 //! 1. **ScratchpadWrapper** (ToolWrapper) — intercepts flagged tool outputs
 //!    exceeding a size threshold, writes them to disk, returns a summary pointer.
 //! 2. **Scratchpad tools** — eight Rig native tools that read scratchpad files:
-//!    `head`, `slice`, `grep`, `schema`, `get_in`, `iterate_over`, `item_schema`, `read`.
+//!    `head`, `slice`, `grep`, `schema`, `get_in`, `iterate_over`, `item_schema`, `read`;
+//!    plus `edit`, which saves an exact-match replacement as a new file.
 //! 3. **ContextBudget** — tracks estimated token usage to prevent overflow.
 //! 4. **ScratchpadStorage** — file I/O with path validation. Files persist
 //!    alongside orchestration artifacts under `{memory_dir}/.../scratchpad/`
@@ -16,6 +17,7 @@
 
 pub mod arg_reference;
 pub mod context_budget;
+pub mod edit;
 pub mod schema;
 pub mod setup;
 pub mod storage;
@@ -30,6 +32,7 @@ pub use context_budget::{
     ContextBudget, ExtractionLimitExceeded, TiktokenCounter, TokenCounter,
     token_counter_for_provider,
 };
+pub use edit::EditTool;
 pub use setup::{
     ScratchpadBuild, ScratchpadBuildInputs, build_scratchpad, count_mcp_tool_schema_tokens,
     estimate_scratchpad_overhead,
@@ -146,8 +149,9 @@ pub fn has_accessible_scratchpad_tool(
     })
 }
 
-/// Token cost of the 8 scratchpad tool definitions (name + description + params).
-/// Used to seed `ContextBudget::initial_used`.
+/// Token cost of the scratchpad tool definitions (name + description +
+/// params), `edit` included even where it isn't registered — a small
+/// over-count, the safe direction. Used to seed `ContextBudget::initial_used`.
 pub fn scratchpad_tool_schema_tokens(counter: &dyn TokenCounter) -> usize {
     all_tool_definitions()
         .iter()
@@ -184,6 +188,8 @@ pub struct ScratchpadToolsConfig {
     pub scratchpad_tools: HashMap<String, usize>,
     /// Tool argument fields that accept a file reference, per server.
     pub by_reference: ByReferenceMap,
+    /// Whether the `edit` tool is registered.
+    pub edit_tool: bool,
 }
 
 /// Scratchpad usage instructions appended to worker preambles.
@@ -205,6 +211,16 @@ When you see a `[scratchpad: ...]` message instead of direct output, use these t
 **Companion files**: Large structured string values inside JSON (escaped JSON → `.json`, markdown → `.md`) are automatically extracted to companion files. Use `schema` on the companion file to see its structure, then `slice` or `grep` to explore specific sections.
 
 **Strategy**: Use `schema` first to understand structure. For JSON arrays, use `item_schema` to discover fields, then `iterate_over` to extract them. For companion `.md` files, use `schema` to see sections, then `slice` to extract a specific section by line range. Use `get_in` or `grep` for targeted lookups. Avoid `read` unless the file is small.
+"#;
+
+/// Guidance appended after [`SCRATCHPAD_PREAMBLE`] for agents that have the
+/// `edit` tool.
+pub const SCRATCHPAD_EDIT_PREAMBLE: &str = r#"
+## Sending Stored Files Without Retyping
+
+Some tool arguments have a `<field>_file` variant that takes a stored file — a scratchpad file or a run artifact — and sends its exact contents. Use it instead of writing out content you already have. For an intercepted output, use the `[raw: ...]` copy the pointer names.
+
+To send a changed version of a stored file, do not retype it: call **edit** with the exact `old` text (copied from the file, with enough surrounding text to match only once) and its replacement `new`. Each edit saves a new file and returns its name. Edit that file again for further changes, then pass the final name to `<field>_file`.
 "#;
 
 #[cfg(test)]

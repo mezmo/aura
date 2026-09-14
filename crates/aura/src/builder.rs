@@ -236,10 +236,19 @@ impl Agent {
             })
             .unwrap_or(0);
 
-        let initial_used = scratchpad::estimate_scratchpad_overhead(
-            &*token_counter,
-            &[config.effective_preamble()],
-        ) + mcp_tool_tokens;
+        // `edit` (and its preamble) only pays off with a reachable tool that
+        // takes a `<field>_file` reference.
+        let edit_tool =
+            scratchpad::has_accessible_scratchpad_tool(&accessible_tools, filter, |tool| {
+                by_reference_map.contains_tool(tool)
+            });
+        let mut counted_preamble = vec![config.effective_preamble()];
+        if edit_tool {
+            counted_preamble.push(scratchpad::SCRATCHPAD_EDIT_PREAMBLE);
+        }
+        let initial_used =
+            scratchpad::estimate_scratchpad_overhead(&*token_counter, &counted_preamble)
+                + mcp_tool_tokens;
 
         let build = scratchpad::build_scratchpad(scratchpad::ScratchpadBuildInputs {
             sp_cfg: &sp_cfg,
@@ -247,6 +256,7 @@ impl Agent {
             read_root: None,
             scratchpad_tool_map,
             by_reference_map,
+            edit_tool,
             context_window,
             initial_used,
             token_counter,
@@ -274,10 +284,16 @@ impl Agent {
             ])),
             None => build.wrapper,
         });
+        let edit_preamble = if build.tools_config.edit_tool {
+            scratchpad::SCRATCHPAD_EDIT_PREAMBLE
+        } else {
+            ""
+        };
         config.preamble_override = Some(format!(
-            "{}{}",
+            "{}{}{}",
             config.effective_preamble(),
-            scratchpad::SCRATCHPAD_PREAMBLE
+            scratchpad::SCRATCHPAD_PREAMBLE,
+            edit_preamble
         ));
         config.scratchpad_tools_config = Some(build.tools_config);
 
@@ -1084,6 +1100,17 @@ impl Agent {
                     ReadTool::new(s.clone(), b.clone()),
                     n.clone(),
                 ));
+            if scratchpad.edit_tool {
+                tracing::info!("Adding scratchpad edit tool");
+                let resolver = crate::scratchpad::ReferenceResolver::new(
+                    s.clone(),
+                    config.orchestration_persistence.clone(),
+                );
+                builder_state = builder_state.add_tool(NudgedTool::new(
+                    crate::scratchpad::EditTool::new(s.clone(), resolver),
+                    n.clone(),
+                ));
+            }
         }
 
         // Add read_artifact tool when orchestration persistence is available.

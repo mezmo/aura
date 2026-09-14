@@ -24,6 +24,7 @@ pub struct ScratchpadBuildInputs<'a> {
     pub read_root: Option<&'a Path>,
     pub scratchpad_tool_map: HashMap<String, usize>,
     pub by_reference_map: ByReferenceMap,
+    pub edit_tool: bool,
     pub context_window: usize,
     pub initial_used: usize,
     pub token_counter: Arc<dyn TokenCounter>,
@@ -79,6 +80,7 @@ pub async fn build_scratchpad(
         budget: budget.clone(),
         scratchpad_tools: inputs.scratchpad_tool_map,
         by_reference: inputs.by_reference_map,
+        edit_tool: inputs.edit_tool,
     };
 
     Ok(ScratchpadBuild {
@@ -89,7 +91,7 @@ pub async fn build_scratchpad(
     })
 }
 
-/// Estimate tokens consumed by the scratchpad preamble, the 8 scratchpad tool
+/// Estimate tokens consumed by the scratchpad preamble, the scratchpad tool
 /// schemas, and any caller-supplied preamble text (e.g.
 /// `WORKER_PREAMBLE_TEMPLATE` + worker.preamble for orchestration, the
 /// agent's effective preamble for single-agent).
@@ -282,6 +284,7 @@ mod tests {
             read_root: None,
             scratchpad_tool_map: tool_map,
             by_reference_map: Default::default(),
+            edit_tool: false,
             context_window: 128_000,
             initial_used: 1_000,
             token_counter: counter(),

@@ -398,7 +398,7 @@ impl ReferenceResolver {
     /// tools take, confined to the storage read root) or, failing that, as an
     /// artifact filename in the current orchestration run (the same
     /// resolution `read_artifact` uses). The error is a model-facing reason.
-    async fn read(&self, file: &str) -> Result<String, String> {
+    pub(crate) async fn read(&self, file: &str) -> Result<String, String> {
         let path = self
             .storage
             .validate_path(file)

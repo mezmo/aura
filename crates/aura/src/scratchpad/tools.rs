@@ -1735,6 +1735,7 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
         GetInTool::tool_definition(),
         IterateOverTool::tool_definition(),
         ReadTool::tool_definition(),
+        super::edit::EditTool::tool_definition(),
     ]
 }
 
@@ -2962,7 +2963,7 @@ mod tests {
     #[test]
     fn test_all_tool_definitions_count() {
         let defs = all_tool_definitions();
-        assert_eq!(defs.len(), 8, "expected 8 scratchpad tool definitions");
+        assert_eq!(defs.len(), 9, "expected 9 scratchpad tool definitions");
     }
 
     #[tokio::test]
@@ -2983,7 +2984,7 @@ mod tests {
     }
 
     #[test]
-    fn test_is_scratchpad_tool_recognizes_all_eight() {
+    fn test_is_scratchpad_tool_recognizes_every_tool() {
         // Pulls from `all_tool_definitions()` via the cached LazyLock —
         // proves the helper auto-tracks any add/remove of scratchpad tools.
         for def in all_tool_definitions() {
