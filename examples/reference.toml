@@ -66,7 +66,7 @@ description = "Example HTTP MCP server"
 # file name (for an intercepted file, the `.raw` copy the pointer names) or
 # a run artifact filename; the tool receives that file's exact contents as
 # the field. `[]` reaches into arrays of objects. Agents that can reach
-# such a tool also get an `edit` tool: exact-match `old` → `new`
+# such a tool also get an `edit_stored_file` tool: exact-match `old` → `new`
 # replacements on a stored file, saved as a new file to reference, so a
 # changed file costs only the changed text.
 # [mcp.servers.example_http.scratchpad.by_reference]

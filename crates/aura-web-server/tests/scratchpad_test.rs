@@ -792,11 +792,11 @@ async fn single_agent_write_by_reference_sends_the_raw_file_unchanged() {
     );
 }
 
-/// Directive prompt for the edit flow: read, change one heading with `edit`,
+/// Directive prompt for the edit flow: read, change one heading with `edit_stored_file`,
 /// then write the edited file by reference.
 const EDIT_QUERY: &str = "Call sp_get_file to download docs/runbook.md. Its output is saved \
      to the scratchpad and the pointer names a [raw: ...] copy holding the file exactly. Use \
-     the `edit` tool on that raw copy to replace the exact text `## Step 3: check service-02` \
+     the `edit_stored_file` tool on that raw copy to replace the exact text `## Step 3: check service-02` \
      with `## Step 3: check service-02 (owned by the façade team)`. Then call sp_write_file \
      with path docs/runbook.md, message 'edit', and content_file set to the file name the \
      edit returned. Do not type the file content yourself and do not set `content`. \
@@ -814,7 +814,7 @@ fn any_result_contains(events: &[SseEvent], event_name: &str, needle: &str) -> b
         .any(|j| j["result"].as_str().is_some_and(|r| r.contains(needle)))
 }
 
-/// Orchestration: a worker edits one line of a stored file with `edit` and
+/// Orchestration: a worker edits one line of a stored file with `edit_stored_file` and
 /// writes the result by reference. The server receives the file with exactly
 /// that change, while the worker's tool call carries only the reference —
 /// the change cost only the changed text.

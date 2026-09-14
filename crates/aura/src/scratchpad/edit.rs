@@ -1,4 +1,6 @@
-//! `edit`: an exact-match replacement on a stored file, saved as a new file.
+//! `edit_stored_file`: an exact-match replacement on a stored file, saved as
+//! a new file. (Named to stay clear of the `edit` tools many MCP servers
+//! expose, since tools are registered by bare name.)
 //!
 //! Pairs with by-reference arguments: the model changes a stored file by
 //! sending only the changed text, then passes the new file's name to a
@@ -41,7 +43,7 @@ impl EditTool {
 
     pub fn tool_definition() -> ToolDefinition {
         ToolDefinition {
-            name: "edit".to_string(),
+            name: "edit_stored_file".to_string(),
             description: "Replace exact text in a stored file and save the result as a new \
                           file, so a changed file can be sent through a `<field>_file` \
                           argument without retyping it. `old` must match the file exactly \
@@ -90,7 +92,7 @@ pub struct EditArgs {
 }
 
 impl Tool for EditTool {
-    const NAME: &'static str = "edit";
+    const NAME: &'static str = "edit_stored_file";
     type Error = ScratchpadToolError;
     type Args = EditArgs;
     type Output = String;
@@ -539,6 +541,72 @@ mod tests {
         let first = tool.call(args("f.md", "step one", "step 1")).await.unwrap();
         let second = tool.call(args("f.md", "step one", "step 1")).await.unwrap();
         assert_eq!(saved_name(&first), saved_name(&second));
+    }
+
+    /// `str::replace` scans the original, so a `new` that contains `old`
+    /// neither loops nor skews the count or the projected size.
+    #[test]
+    fn replace_all_counts_matches_in_the_original_when_new_contains_old() {
+        let edit = apply_edit("a a a", "a", "ab", true, 1_000).unwrap();
+        assert_eq!(edit.content, "ab ab ab");
+        assert_eq!(edit.replacements, 3);
+        // Projected size: 5 - 3*1 + 3*2 = 8 bytes.
+        assert!(apply_edit("a a a", "a", "ab", true, 7).is_err());
+        assert!(apply_edit("a a a", "a", "ab", true, 8).is_ok());
+    }
+
+    #[test]
+    fn excerpt_is_capped_for_a_long_replacement() {
+        let new: String = (0..50).map(|i| format!("line {i}\n")).collect();
+        let content = format!("head\n{new}tail\n");
+        let excerpt = excerpt(&content, "head\n".len(), &new);
+
+        assert!(
+            excerpt.starts_with("Edited region (lines 2–52 of the new file):"),
+            "{excerpt}"
+        );
+        assert_eq!(excerpt.lines().skip(1).count(), MAX_EXCERPT_LINES);
+    }
+
+    #[tokio::test]
+    async fn edit_reads_run_artifacts() {
+        use crate::orchestration::ExecutionPersistence;
+
+        let tmp = TempDir::new().unwrap();
+        let persistence = ExecutionPersistence::new(tmp.path().join("memory"), None)
+            .await
+            .unwrap();
+        let artifact = persistence
+            .write_tool_output_artifact(0, "writer", 1, "get_file", 0, RUNBOOK)
+            .await
+            .unwrap();
+        let storage = Arc::new(
+            ScratchpadStorage::in_dir(&persistence.run_path().join("iteration-1"))
+                .await
+                .unwrap()
+                .with_read_root(persistence.run_path().to_path_buf()),
+        );
+        let resolver = ReferenceResolver::new(
+            storage.clone(),
+            Some(Arc::new(tokio::sync::Mutex::new(persistence))),
+        );
+        let tool = EditTool::new(storage.clone(), resolver);
+
+        let output = tool
+            .call(args(&artifact, "step one", "step 1"))
+            .await
+            .unwrap();
+
+        let name = saved_name(&output);
+        let stem = artifact.strip_suffix(".txt").expect("artifacts are .txt");
+        assert!(
+            name.starts_with(&format!("{stem}.edit-")) && name.ends_with(".txt"),
+            "{name} should derive from {artifact}"
+        );
+        let edited = tokio::fs::read_to_string(storage.dir().join(name))
+            .await
+            .unwrap();
+        assert_eq!(edited, RUNBOOK.replacen("step one", "step 1", 1));
     }
 
     #[test]

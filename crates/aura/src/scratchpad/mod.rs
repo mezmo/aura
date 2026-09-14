@@ -7,7 +7,7 @@
 //!    exceeding a size threshold, writes them to disk, returns a summary pointer.
 //! 2. **Scratchpad tools** — eight Rig native tools that read scratchpad files:
 //!    `head`, `slice`, `grep`, `schema`, `get_in`, `iterate_over`, `item_schema`, `read`;
-//!    plus `edit`, which saves an exact-match replacement as a new file.
+//!    plus `edit_stored_file`, which saves an exact-match replacement as a new file.
 //! 3. **ContextBudget** — tracks estimated token usage to prevent overflow.
 //! 4. **ScratchpadStorage** — file I/O with path validation. Files persist
 //!    alongside orchestration artifacts under `{memory_dir}/.../scratchpad/`
@@ -132,25 +132,25 @@ pub fn scratchpad_tool_map(
 }
 
 /// True when at least one tool reachable through `mcp_filter` (`None` =
-/// all reachable, empty `Some` = none) satisfies `is_scratchpad_tool` —
+/// all reachable, empty `Some` = none) satisfies `qualifies` —
 /// typically an exact lookup in [`scratchpad_tool_map`] or
 /// [`by_reference_map`] — i.e. there's something for the scratchpad to act on.
 pub fn has_accessible_scratchpad_tool(
     tool_names: &[String],
     mcp_filter: Option<&[String]>,
-    is_scratchpad_tool: impl Fn(&str) -> bool,
+    qualifies: impl Fn(&str) -> bool,
 ) -> bool {
     tool_names.iter().any(|name| {
         let reachable = match mcp_filter {
             None => true,
             Some(filter) => filter.iter().any(|p| glob_match(p, name)),
         };
-        reachable && is_scratchpad_tool(name)
+        reachable && qualifies(name)
     })
 }
 
 /// Token cost of the scratchpad tool definitions (name + description +
-/// params), `edit` included even where it isn't registered — a small
+/// params), `edit_stored_file` included even where it isn't registered — a small
 /// over-count, the safe direction. Used to seed `ContextBudget::initial_used`.
 pub fn scratchpad_tool_schema_tokens(counter: &dyn TokenCounter) -> usize {
     all_tool_definitions()
@@ -188,7 +188,7 @@ pub struct ScratchpadToolsConfig {
     pub scratchpad_tools: HashMap<String, usize>,
     /// Tool argument fields that accept a file reference, per server.
     pub by_reference: ByReferenceMap,
-    /// Whether the `edit` tool is registered.
+    /// Whether the `edit_stored_file` tool is registered.
     pub edit_tool: bool,
 }
 
@@ -214,13 +214,13 @@ When you see a `[scratchpad: ...]` message instead of direct output, use these t
 "#;
 
 /// Guidance appended after [`SCRATCHPAD_PREAMBLE`] for agents that have the
-/// `edit` tool.
+/// `edit_stored_file` tool.
 pub const SCRATCHPAD_EDIT_PREAMBLE: &str = r#"
 ## Sending Stored Files Without Retyping
 
-Some tool arguments have a `<field>_file` variant that takes a stored file — a scratchpad file or a run artifact — and sends its exact contents. Use it instead of writing out content you already have. For an intercepted output, use the `[raw: ...]` copy the pointer names.
+Some tool arguments have a `<field>_file` variant that takes a stored file — a scratchpad file, or in orchestration a run artifact — and sends its exact contents. Use it instead of writing out content you already have. For an intercepted output, use the `[raw: ...]` copy the pointer names.
 
-To send a changed version of a stored file, do not retype it: call **edit** with the exact `old` text (copied from the file, with enough surrounding text to match only once) and its replacement `new`. Each edit saves a new file and returns its name. Edit that file again for further changes, then pass the final name to `<field>_file`.
+To send a changed version of a stored file, do not retype it: call **edit_stored_file** with the exact `old` text (copied from the file, with enough surrounding text to match only once) and its replacement `new`. Each edit saves a new file and returns its name. Edit that file again for further changes, then pass the final name to `<field>_file`.
 "#;
 
 #[cfg(test)]

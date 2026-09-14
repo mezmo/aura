@@ -789,7 +789,7 @@ impl Orchestrator {
                         )
                     })
                     .unwrap_or(0);
-                // `edit` (and its preamble) only pays off with a reachable
+                // `edit_stored_file` (and its preamble) only pays off with a reachable
                 // tool that takes a `<field>_file` reference.
                 let edit_tool = scratchpad::has_accessible_scratchpad_tool(
                     &accessible_tools,

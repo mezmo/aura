@@ -236,7 +236,7 @@ impl Agent {
             })
             .unwrap_or(0);
 
-        // `edit` (and its preamble) only pays off with a reachable tool that
+        // `edit_stored_file` (and its preamble) only pays off with a reachable tool that
         // takes a `<field>_file` reference.
         let edit_tool =
             scratchpad::has_accessible_scratchpad_tool(&accessible_tools, filter, |tool| {
@@ -1064,6 +1064,20 @@ impl Agent {
             tracing::info!(
                 "Adding scratchpad tools (head, slice, grep, schema, item_schema, get_in, iterate_over, read)"
             );
+            // Tools are registered by bare name, so a same-named MCP tool and
+            // scratchpad tool can't both be reached.
+            if let Some(mcp_manager) = mcp_manager.as_deref() {
+                for name in mcp_manager.get_available_tool_names() {
+                    if config.tool_matches_filter(&name)
+                        && crate::scratchpad::is_scratchpad_tool(&name)
+                    {
+                        tracing::warn!(
+                            "MCP tool '{name}' has the same name as a built-in scratchpad tool; \
+                             only one of them can be registered for this agent"
+                        );
+                    }
+                }
+            }
             let s = &scratchpad.storage;
             let b = &scratchpad.budget;
             let n = &config.turn_nudge;
@@ -1101,7 +1115,7 @@ impl Agent {
                     n.clone(),
                 ));
             if scratchpad.edit_tool {
-                tracing::info!("Adding scratchpad edit tool");
+                tracing::info!("Adding scratchpad edit_stored_file tool");
                 let resolver = crate::scratchpad::ReferenceResolver::new(
                     s.clone(),
                     config.orchestration_persistence.clone(),
