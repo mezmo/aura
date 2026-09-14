@@ -20,6 +20,7 @@ use rig::tool::{Tool as RigTool, ToolError};
 use serde_json::{Map, Value};
 use tokio::sync::{Mutex, OnceCell};
 
+use super::context_budget::TokenCounter;
 use super::storage::ScratchpadStorage;
 use crate::config::{McpConfig, glob_match};
 use crate::mcp::MAX_RAW_PAYLOAD_BYTES;
@@ -29,6 +30,25 @@ pub use aura_config::{FieldPath, FieldSegment};
 
 fn reference_key(field: &str) -> String {
     format!("{field}_file")
+}
+
+/// Note appended to a by-reference field's description.
+fn reference_note(reference: &str) -> String {
+    format!("Or set `{reference}` to send a stored file's contents unchanged.")
+}
+
+/// Schema of the `<field>_file` property added beside a by-reference field.
+fn reference_property(field: &str, reference: &str) -> Value {
+    serde_json::json!({
+        "type": "string",
+        "description": format!(
+            "A scratchpad file or run artifact whose exact contents to send as \
+             `{field}`, instead of writing the value out. Takes the file names shown \
+             in `[scratchpad: ...]` and `[raw: ...]` pointers (use the raw copy when \
+             there is one) and artifact filenames. Set `{field}` or `{reference}`, \
+             not both."
+        ),
+    })
 }
 
 /// Server name → tool name → argument fields that accept a file reference.
@@ -54,6 +74,42 @@ impl ByReferenceMap {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Every tool name with reference fields, with those fields (a tool name
+    /// on several servers appears once per server).
+    pub fn tools(&self) -> impl Iterator<Item = (&str, &[FieldPath])> {
+        self.0.values().flat_map(|tools| {
+            tools
+                .iter()
+                .map(|(tool, fields)| (tool.as_str(), fields.as_slice()))
+        })
+    }
+}
+
+/// Tokens that [`add_reference_fields`] adds to the schemas of tools
+/// reachable through `mcp_filter` (`None` = all): each `<field>_file`
+/// property plus the note on its field. Counted per configured field, so a
+/// field a schema lacks is over-counted — the safe direction for seeding the
+/// context budget, which otherwise counts only the servers' own schemas.
+pub fn reference_twin_tokens(
+    counter: &dyn TokenCounter,
+    by_reference: &ByReferenceMap,
+    mcp_filter: Option<&[String]>,
+) -> usize {
+    by_reference
+        .tools()
+        .filter(|(tool, _)| {
+            mcp_filter.is_none_or(|filter| filter.iter().any(|p| glob_match(p, tool)))
+        })
+        .flat_map(|(_, fields)| fields)
+        .map(|path| {
+            let field = path.field();
+            let reference = reference_key(field);
+            counter.count_tokens(&reference)
+                + counter.count_tokens(&reference_property(field, &reference).to_string())
+                + counter.count_tokens(&reference_note(&reference))
+        })
+        .sum()
 }
 
 /// Resolve `[mcp.servers.*.scratchpad.by_reference]` patterns against each
@@ -125,26 +181,14 @@ pub fn add_reference_fields(schema: &mut Value, fields: &[FieldPath]) -> Vec<Fie
             continue;
         };
         if let Some(original) = original.as_object_mut() {
-            let note = format!("Or set `{reference}` to send a stored file's contents unchanged.");
+            let note = reference_note(&reference);
             let description = match original.get("description").and_then(Value::as_str) {
                 Some(existing) => format!("{existing} {note}"),
                 None => note,
             };
             original.insert("description".to_string(), Value::String(description));
         }
-        properties.insert(
-            reference.clone(),
-            serde_json::json!({
-                "type": "string",
-                "description": format!(
-                    "A scratchpad file or run artifact whose exact contents to send as \
-                     `{field}`, instead of writing the value out. Takes the file names shown \
-                     in `[scratchpad: ...]` and `[raw: ...]` pointers (use the raw copy when \
-                     there is one) and artifact filenames. Set `{field}` or `{reference}`, \
-                     not both."
-                ),
-            }),
-        );
+        properties.insert(reference.clone(), reference_property(field, &reference));
         if let Some(required) = object.get_mut("required").and_then(Value::as_array_mut) {
             required.retain(|name| name.as_str() != Some(field));
         }
@@ -451,6 +495,8 @@ where
     type Args = Value;
     type Output = String;
 
+    /// Placeholder the trait requires: registration, events and schemas use
+    /// [`name`](RigTool::name), which is the wrapped tool's name.
     const NAME: &'static str = "arg_reference_tool";
 
     fn name(&self) -> String {
@@ -635,6 +681,50 @@ mod tests {
         assert!(resolved.get("mirror", "create_or_update_file").is_none());
         assert!(resolved.contains_tool("create_or_update_file"));
         assert_eq!(resolved.len(), 1);
+    }
+
+    #[test]
+    fn reference_twin_tokens_counts_reachable_fields_only() {
+        use crate::scratchpad::TiktokenCounter;
+
+        let mcp = McpConfig {
+            servers: HashMap::from([(
+                "github".to_string(),
+                server(&[
+                    ("create_or_update_file", &["content"]),
+                    ("push_files", &["files[].content"]),
+                ]),
+            )]),
+            sanitize_schemas: false,
+        };
+        let tools = HashMap::from([(
+            "github".to_string(),
+            vec![
+                "create_or_update_file".to_string(),
+                "push_files".to_string(),
+            ],
+        )]);
+        let by_reference = by_reference_map(Some(&mcp), &tools);
+        let counter = TiktokenCounter::default_counter();
+
+        let all = reference_twin_tokens(&counter, &by_reference, None);
+        let one = reference_twin_tokens(&counter, &by_reference, Some(&["push_*".to_string()]));
+        let none = reference_twin_tokens(&counter, &by_reference, Some(&[]));
+
+        assert!(one > 0, "a reachable field adds tokens");
+        assert_eq!(all, 2 * one, "each configured field costs the same text");
+        assert_eq!(none, 0);
+
+        // The estimate covers exactly what add_reference_fields inserts.
+        let reference = reference_key("content");
+        let mut schema = write_file_schema();
+        let before = counter.count_tokens(&schema.to_string());
+        add_reference_fields(&mut schema, &paths(&["content"]));
+        let added = counter.count_tokens(&schema.to_string()) - before;
+        assert!(
+            added <= one + counter.count_tokens(&reference),
+            "estimate {one} should cover the {added} tokens actually added"
+        );
     }
 
     // --- add_reference_fields ---

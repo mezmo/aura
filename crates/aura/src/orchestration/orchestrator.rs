@@ -782,6 +782,10 @@ impl Orchestrator {
                             &*token_counter,
                             m.tool_definitions_iter(),
                             worker_filter,
+                        ) + scratchpad::reference_twin_tokens(
+                            &*token_counter,
+                            &by_reference_map,
+                            worker_filter,
                         )
                     })
                     .unwrap_or(0);

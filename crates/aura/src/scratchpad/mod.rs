@@ -24,6 +24,7 @@ pub mod wrapper;
 
 pub use arg_reference::{
     ArgReferenceTool, ByReferenceMap, FieldPath, ReferenceResolver, by_reference_map,
+    reference_twin_tokens,
 };
 pub use context_budget::{
     ContextBudget, ExtractionLimitExceeded, TiktokenCounter, TokenCounter,

@@ -1967,6 +1967,25 @@ push_files = ["files[].content"]
     }
 
     #[test]
+    fn by_reference_without_scratchpad_warns_with_the_server_names() {
+        let config = format!(
+            r#"{BY_REFERENCE_SERVER}
+[mcp.servers.github.scratchpad.by_reference]
+create_or_update_file = ["content"]
+"#
+        );
+        let loaded = load_config_from_str(&config).expect("an inert by_reference still loads");
+        let warning = crate::config::by_reference_without_scratchpad_warning(loaded.mcp.as_ref())
+            .expect("by_reference without scratchpad must warn");
+        assert!(warning.contains("github"), "{warning}");
+
+        let without = load_config_from_str(BY_REFERENCE_SERVER).unwrap();
+        assert!(
+            crate::config::by_reference_without_scratchpad_warning(without.mcp.as_ref()).is_none()
+        );
+    }
+
+    #[test]
     fn scratchpad_by_reference_rejects_malformed_field_path() {
         let config = format!(
             r#"{BY_REFERENCE_SERVER}

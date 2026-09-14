@@ -482,6 +482,9 @@ impl Config {
             .unwrap_or(false);
 
         if !agent_sp_enabled && !any_worker_enabled {
+            if let Some(msg) = by_reference_without_scratchpad_warning(self.mcp.as_ref()) {
+                tracing::warn!("{msg}");
+            }
             return Ok(());
         }
 
@@ -520,6 +523,26 @@ impl Config {
 
         Ok(())
     }
+}
+
+/// Warn when MCP servers list `by_reference` fields that nothing will wire
+/// up: references are only added alongside an enabled scratchpad.
+pub(crate) fn by_reference_without_scratchpad_warning(mcp: Option<&McpConfig>) -> Option<String> {
+    let mut servers: Vec<&str> = mcp?
+        .servers
+        .iter()
+        .filter(|(_, server)| !server.scratchpad().by_reference.is_empty())
+        .map(|(name, _)| name.as_str())
+        .collect();
+    if servers.is_empty() {
+        return None;
+    }
+    servers.sort_unstable();
+    Some(format!(
+        "by_reference fields on MCP server(s) {} have no effect: no agent or worker enables the \
+         scratchpad (`[agent.scratchpad] enabled = true`)",
+        servers.join(", ")
+    ))
 }
 
 /// Warn when both orchestration timeouts are disabled, leaving only the

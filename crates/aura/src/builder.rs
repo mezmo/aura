@@ -232,7 +232,7 @@ impl Agent {
                     &*token_counter,
                     m.tool_definitions_iter(),
                     filter,
-                )
+                ) + scratchpad::reference_twin_tokens(&*token_counter, &by_reference_map, filter)
             })
             .unwrap_or(0);
 

@@ -576,7 +576,10 @@ where
             // Propagate the current span so mcp.tool_call nests under execute_tool.
             // The MCP layer publishes the result's raw payload into
             // `raw_payload`, which `transform_output` then receives on its
-            // context (the rendered output alone can't recover it).
+            // context (the rendered output alone can't recover it). That is a
+            // copy of the embedded resource (at most `MAX_RAW_PAYLOAD_BYTES`)
+            // for every wrapped call returning one, whether or not the
+            // scratchpad keeps it; it is dropped when the call completes.
             let inner_clone = inner.clone();
             let args_clone = clean_args.clone();
             let tool_span = tracing::Span::current();
