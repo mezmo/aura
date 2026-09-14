@@ -806,6 +806,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_write_new_verbatim_leaves_only_the_named_file() {
+        let tmp = TempDir::new().unwrap();
+        let storage = ScratchpadStorage::with_base_dir(tmp.path(), "req-verbatim")
+            .await
+            .unwrap();
+
+        storage
+            .write_new_verbatim("a.edit-0123456789abcdef.md", "body\n")
+            .await
+            .unwrap();
+        storage
+            .write_new_verbatim("a.edit-0123456789abcdef.md", "body\n")
+            .await
+            .expect("identical bytes are reused");
+        let err = storage
+            .write_new_verbatim("a.edit-0123456789abcdef.md", "other\n")
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            storage.list_files().await.unwrap(),
+            ["a.edit-0123456789abcdef.md"],
+            "no temporary files are left behind"
+        );
+        let on_disk = fs::read_to_string(storage.dir().join("a.edit-0123456789abcdef.md"))
+            .await
+            .unwrap();
+        assert_eq!(on_disk, "body\n");
+    }
+
+    #[tokio::test]
     async fn test_raw_copy_is_written_verbatim_beside_the_primary() {
         let tmp = TempDir::new().unwrap();
         let storage = ScratchpadStorage::with_base_dir(tmp.path(), "req-raw")

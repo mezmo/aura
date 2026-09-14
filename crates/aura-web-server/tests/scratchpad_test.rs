@@ -792,6 +792,67 @@ async fn single_agent_write_by_reference_sends_the_raw_file_unchanged() {
     );
 }
 
+/// Directive prompt for the edit flow: read, change one heading with `edit_stored_file`,
+/// then write the edited file by reference.
+const EDIT_QUERY: &str = "Call sp_get_file to download docs/runbook.md. Its output is saved \
+     to the scratchpad and the pointer names a [raw: ...] copy holding the file exactly. Use \
+     the `edit_stored_file` tool on that raw copy to replace the exact text `## Step 3: check service-02` \
+     with `## Step 3: check service-02 (owned by the façade team)`. Then call sp_write_file \
+     with path docs/runbook.md, message 'edit', and content_file set to the file name the \
+     edit returned. Do not type the file content yourself and do not set `content`. \
+     Finally, report exactly what sp_write_file returned.";
+
+/// Marker in `sp_write_file`'s result when the server received the served
+/// file with exactly the requested edit applied.
+const EDIT_MATCHED: &str = "matches_edited=true";
+
+/// True when any event of `event_name` carries a `result` containing `needle`.
+fn any_result_contains(events: &[SseEvent], event_name: &str, needle: &str) -> bool {
+    events_by_type(events, event_name)
+        .iter()
+        .filter_map(|e| serde_json::from_str::<Value>(&e.data).ok())
+        .any(|j| j["result"].as_str().is_some_and(|r| r.contains(needle)))
+}
+
+/// Orchestration: a worker edits one line of a stored file with `edit_stored_file` and
+/// writes the result by reference. The server receives the file with exactly
+/// that change, while the worker's tool call carries only the reference —
+/// the change cost only the changed text.
+#[tokio::test]
+async fn test_edit_then_write_by_reference_sends_only_the_change() {
+    let events = scratchpad_events(EDIT_QUERY).await;
+
+    let write_args: Vec<Value> = events_by_type(&events, orch_event_names::TOOL_CALL_STARTED)
+        .iter()
+        .filter_map(|e| serde_json::from_str::<Value>(&e.data).ok())
+        .filter(|j| j["tool_name"] == "sp_write_file")
+        .map(|j| j["arguments"].clone())
+        .collect();
+    assert_wrote_by_reference(&write_args);
+    assert!(
+        any_result_contains(&events, orch_event_names::TOOL_CALL_COMPLETED, EDIT_MATCHED),
+        "sp_write_file must receive the file with exactly the requested edit ({EDIT_MATCHED})"
+    );
+}
+
+/// Single-agent: same edit flow through `Agent::stream_*`.
+#[tokio::test]
+async fn single_agent_edit_then_write_by_reference_sends_only_the_change() {
+    let events = single_agent_events(EDIT_QUERY).await;
+
+    let write_args: Vec<Value> = events_by_type(&events, event_names::TOOL_REQUESTED)
+        .iter()
+        .filter_map(|e| serde_json::from_str::<Value>(&e.data).ok())
+        .filter(|j| j["tool_name"] == "sp_write_file")
+        .map(|j| j["arguments"].clone())
+        .collect();
+    assert_wrote_by_reference(&write_args);
+    assert!(
+        any_result_contains(&events, event_names::TOOL_COMPLETE, EDIT_MATCHED),
+        "sp_write_file must receive the file with exactly the requested edit ({EDIT_MATCHED})"
+    );
+}
+
 /// Single-agent: when no MCP tool is called at all, the agent still finishes
 /// normally and does NOT emit a stray `aura.scratchpad_usage` event (skip
 /// rule: `tokens_intercepted == 0 && tokens_extracted == 0`).

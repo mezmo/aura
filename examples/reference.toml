@@ -65,7 +65,10 @@ description = "Example HTTP MCP server"
 # string field gets an optional `<field>_file` twin that takes a scratchpad
 # file name (for an intercepted file, the `.raw` copy the pointer names) or
 # a run artifact filename; the tool receives that file's exact contents as
-# the field. `[]` reaches into arrays of objects.
+# the field. `[]` reaches into arrays of objects. Agents that can reach
+# such a tool also get an `edit_stored_file` tool: exact-match `old` → `new`
+# replacements on a stored file, saved as a new file to reference, so a
+# changed file costs only the changed text.
 # [mcp.servers.example_http.scratchpad.by_reference]
 # create_or_update_file = ["content"]
 # push_files = ["files[].content"]
