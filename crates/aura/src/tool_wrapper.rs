@@ -83,6 +83,10 @@ pub struct ToolCallContext {
     pub metadata: Option<Value>,
     /// Agent's authored reasoning for the pending tool call.
     pub tool_call_intent: Option<String>,
+    /// Park-owned execution state for this call: reservation lease,
+    /// cancellation token, and task tracker. `None` keeps the current
+    /// unscoped behavior for every non-park call.
+    pub execution_scope: Option<Arc<crate::orchestration::RunExecutionScope>>,
 }
 
 impl ToolCallContext {
@@ -116,6 +120,18 @@ impl ToolCallContext {
     /// Set custom metadata.
     pub fn with_metadata(mut self, metadata: Value) -> Self {
         self.metadata = Some(metadata);
+        self
+    }
+
+    /// Attach park-owned execution state (reservation lease, cancellation,
+    /// task tracker). Park calls carry the scope so detached work registers
+    /// and fences under it; non-park calls leave it unset.
+    #[must_use]
+    pub fn with_execution_scope(
+        mut self,
+        scope: Arc<crate::orchestration::RunExecutionScope>,
+    ) -> Self {
+        self.execution_scope = Some(scope);
         self
     }
 }

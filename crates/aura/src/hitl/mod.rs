@@ -44,6 +44,7 @@ pub use decision::{
     DecisionId, ResolvedDecision, Timestamp,
 };
 pub(crate) use events::completed_cancelled;
+pub use outcome::{AddressedApproval, ApprovalAuthority, ApprovalRead};
 /// Read one full HTTP/1.1 request (head plus content-length body) off a
 /// test socket, returning the raw text. Shared by the scripted receivers in
 /// the route and poller test modules.

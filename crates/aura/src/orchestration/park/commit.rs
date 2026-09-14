@@ -17,6 +17,7 @@ use super::ParkedTaskRecords;
 use super::document::{
     PARKED_DOCUMENT_SUFFIX, ParkedRun, RESUMING_DOCUMENT_SUFFIX, RunStateForPark, build_document,
 };
+use super::retention::RetentionExpiresAt;
 
 /// The inputs the orchestrator hands the park commit.
 pub(crate) struct ParkCommitInputs<'a> {
@@ -45,11 +46,11 @@ pub(crate) struct RefreshedAwaiting {
     pub decision_ids: Vec<DecisionId>,
 }
 
-/// A completed park commit: the resolved expiry stamp and the refreshed
+/// A completed park commit: the stamped retention deadline and the refreshed
 /// awaiting set.
 pub(crate) struct ParkCommitOutcome {
-    /// RFC 3339 expiry timestamp.
-    pub expires_at: String,
+    /// The retention deadline the published document carries.
+    pub retention_expires_at: RetentionExpiresAt,
     pub refreshed: RefreshedAwaiting,
 }
 
@@ -125,9 +126,9 @@ pub(crate) async fn refresh_awaiting(
 }
 
 /// The whole commit: refresh the awaiting set against the store, build the
-/// document, publish it. `expires_at` is resolved once here so the document
-/// and the caller's terminal event carry the same stamp; a refresh with no
-/// surviving ticket stamps `now + decision_window`.
+/// document, publish it. The retention deadline is resolved once here so the
+/// document and the caller's terminal event carry the same stamp; a refresh
+/// with no surviving ticket stamps `now + decision_window`.
 pub(crate) async fn commit_from_run_state(
     inputs: &ParkCommitInputs<'_>,
 ) -> io::Result<ParkCommitOutcome> {
@@ -143,26 +144,24 @@ pub(crate) async fn commit_from_run_state(
     } = inputs;
 
     let refreshed = refresh_awaiting(plan, registry).await?;
-    let expires_at = refreshed
-        .expires_at
-        .unwrap_or_else(|| {
+    let retention_expires_at =
+        RetentionExpiresAt::from_datetime(refreshed.expires_at.unwrap_or_else(|| {
             chrono::Utc::now()
                 + chrono::Duration::from_std(*decision_window).expect("decision window fits chrono")
-        })
-        .to_rfc3339();
+        }));
     let document = build_document(
         state,
         plan,
         records,
         &refreshed.pending_by_task,
-        expires_at.clone(),
+        retention_expires_at,
         config_fingerprint(config),
         identity_hash.clone(),
     )?;
     let parked_dir = parked_document_dir(memory_dir, state.session_id);
     publish(&document, &parked_dir, state.run_id).await?;
     Ok(ParkCommitOutcome {
-        expires_at,
+        retention_expires_at,
         refreshed,
     })
 }
@@ -318,12 +317,21 @@ mod tests {
 
     use super::*;
     use crate::hitl::{
-        AgentScope, ApprovalItem, ApprovalOrigin, ApprovalRequest, DecisionId, PROTOCOL_VERSION,
-        ParkedApproval, PendingApprovals, ResolveError,
+        AgentScope, ApprovalAuthority, ApprovalItem, ApprovalOrigin, ApprovalRequest, DecisionId,
+        PROTOCOL_VERSION, ParkedApproval, PendingApprovals, ResolveError,
     };
     use crate::orchestration::park::document::{ParkedPlan, SCHEMA_VERSION, load_parked_run};
+    use crate::orchestration::park::retention::RetentionExpiresAt;
     use crate::orchestration::types::Task;
     use crate::session_store::{ApprovalStore, InMemoryApprovalStore, InMemoryEventBus};
+
+    fn fixture_retention() -> RetentionExpiresAt {
+        RetentionExpiresAt::from_datetime(
+            chrono::DateTime::parse_from_rfc3339("2026-09-02T15:00:00+00:00")
+                .expect("fixture stamp parses")
+                .with_timezone(&chrono::Utc),
+        )
+    }
 
     fn conv_registry() -> (PendingApprovals, std::sync::Arc<InMemoryApprovalStore>) {
         let store = std::sync::Arc::new(InMemoryApprovalStore::new());
@@ -358,7 +366,7 @@ mod tests {
             },
             registered_at: chrono::Utc::now(),
             expires_at,
-            authority: crate::hitl::ApprovalAuthority::WebhookPoll,
+            authority: ApprovalAuthority::Conversational,
             egress_headers: None,
             acknowledgment: crate::hitl::AcknowledgmentState::RequiresNotification,
         }
@@ -381,7 +389,7 @@ mod tests {
             session_id: Some("sess".to_string()),
             run_id: run_id.to_string(),
             parked_at: "2026-09-02T14:00:00+00:00".to_string(),
-            expires_at: "2026-09-02T15:00:00+00:00".to_string(),
+            retention_expires_at: fixture_retention(),
             query: "Deploy".to_string(),
             chat_history: vec![],
             coordinator_conversation: vec![],
@@ -439,7 +447,7 @@ mod tests {
             session_id: None,
             run_id: run_id.to_string(),
             parked_at: "2026-09-02T14:00:00+00:00".to_string(),
-            expires_at: "2026-09-02T15:00:00+00:00".to_string(),
+            retention_expires_at: fixture_retention(),
             query: "Deploy".to_string(),
             chat_history: vec![],
             coordinator_conversation: vec![],
@@ -609,7 +617,7 @@ mod tests {
                 },
                 registered_at: now,
                 expires_at: now + chrono::Duration::hours(1),
-                authority: crate::hitl::ApprovalAuthority::WebhookPoll,
+                authority: ApprovalAuthority::Conversational,
                 egress_headers: None,
                 acknowledgment: crate::hitl::AcknowledgmentState::RequiresNotification,
             })
@@ -674,7 +682,7 @@ mod tests {
             &plan,
             &records,
             &refreshed.pending_by_task,
-            (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
+            RetentionExpiresAt::from_datetime(chrono::Utc::now() + chrono::Duration::hours(1)),
             config_fingerprint(&AgentRuntimeConfig::default()),
             None,
         )

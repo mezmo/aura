@@ -54,7 +54,8 @@ use serde::{Deserialize, Serialize};
 use tokio::task::{JoinError, spawn_blocking};
 
 use crate::hitl::{
-    AcknowledgmentState, DecisionId, ParkedApproval, ResolveError, ResolvedDecision,
+    AcknowledgmentState, ApprovalAuthority, ApprovalRead, DecisionId, ParkedApproval, ResolveError,
+    ResolvedDecision,
 };
 
 use super::{
@@ -526,6 +527,20 @@ impl ApprovalStore for FileApprovalStore {
         spawn_blocking(move || inner.list_pending_sync())
             .await
             .map_err(join_err)?
+    }
+
+    #[expect(
+        unused_variables,
+        reason = "todo!() body; filled by P45 wave fill units"
+    )]
+    async fn read_or_expire(
+        &self,
+        id: &DecisionId,
+        expected_authority: ApprovalAuthority,
+    ) -> Result<ApprovalRead, SessionStoreError> {
+        todo!(
+            "P45 wave fill unit E2: file-store read-or-expire under the resolve/remove lock, sampling the injectable clock; expiry becomes the durable tagged TimedOut row"
+        )
     }
 }
 

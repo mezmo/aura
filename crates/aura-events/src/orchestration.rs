@@ -154,7 +154,7 @@ pub enum OrchestrationStreamEvent {
     RunParked {
         run_id: String,
         decision_ids: Vec<String>,
-        expires_at: String,
+        retention_expires_at: String,
         iteration: usize,
         #[serde(flatten)]
         context: EventContext,
@@ -382,14 +382,14 @@ impl OrchestrationStreamEvent {
     pub fn run_parked(
         run_id: impl Into<String>,
         decision_ids: Vec<String>,
-        expires_at: impl Into<String>,
+        retention_expires_at: impl Into<String>,
         iteration: usize,
         context: EventContext,
     ) -> Self {
         Self::RunParked {
             run_id: run_id.into(),
             decision_ids,
-            expires_at: expires_at.into(),
+            retention_expires_at: retention_expires_at.into(),
             iteration,
             context,
         }

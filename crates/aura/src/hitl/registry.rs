@@ -107,9 +107,10 @@ pub struct ParkedApproval {
     pub request: ApprovalRequest,
     pub registered_at: Timestamp,
     pub expires_at: Timestamp,
-    /// The channel this row was parked under. Persisted on the stored record:
-    /// a resolver must present the same authority, so one channel's row can
-    /// never be consumed through another.
+    /// Which channel may address the row: inline registration parks
+    /// `Conversational`, the 207 bridge parks `WebhookPoll`. Resolve and
+    /// read-or-expire check it, so one channel's row can never be consumed
+    /// through another.
     pub authority: ApprovalAuthority,
     /// Resolved egress headers (`headers_from_request` overlaying the static
     /// headers) for this row's notify POST. Values are credentials at rest:

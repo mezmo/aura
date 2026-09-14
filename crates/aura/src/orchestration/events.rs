@@ -121,8 +121,9 @@ pub enum OrchestratorEvent {
         run_id: String,
         /// The decision ids still awaiting a human decision.
         decision_ids: Vec<String>,
-        /// RFC 3339 timestamp after which the decisions expire.
-        expires_at: String,
+        /// RFC 3339 retention deadline the checkpoint carries: the instant
+        /// after which the run's parked evidence may be reclaimed.
+        retention_expires_at: String,
         /// Which iteration the run parked in (1-indexed).
         iteration: usize,
     },

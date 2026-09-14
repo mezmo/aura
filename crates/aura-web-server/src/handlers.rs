@@ -27,8 +27,9 @@ use crate::streaming::{
 };
 use crate::types::*;
 use aura::orchestration::{
-    BlockingEntry, ResumeClaimTable, ResumeEvaluation, ResumeRefusal, ResumeRunId, ResumeSessionId,
-    SegmentError, SegmentResult, ValidatedResumePath, evaluate_resume, run_segment,
+    BlockingEntry, OrchestratorFactory, ResumeClaimTable, ResumeEvaluation, ResumeGrant,
+    ResumeRefusal, ResumeRunId, ResumeSessionId, SegmentError, SegmentResult, ValidatedResumePath,
+    evaluate_resume, run_segment,
 };
 
 /// RAII guard for request-scoped subscriptions. Ensures cleanup even on panic.
@@ -218,12 +219,43 @@ async fn build_agent_for_request(
     Ok(Arc::new(agent))
 }
 
+/// The single-use completion input one request owns: a fresh chat, or the
+/// resume of one granted run. Deliberately not cloneable — a resume grant is
+/// consumed exactly once, and an input that could be duplicated would make
+/// the single-use rule a runtime check instead of a type fact.
+///
+/// The factory in the `Resume` arm stays reusable and never stores the
+/// grant; ownership runs request → input → the spawned completion.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "one input per request, moved once into the spawned completion; \
+              the grant dominates but boxing it would churn the fill-time \
+              consumers for no runtime benefit"
+)]
+pub enum CompletionInput {
+    /// A normal chat completion.
+    Chat {
+        /// The agent built for this request.
+        agent: Arc<dyn StreamingAgent>,
+        /// The user's message.
+        query: String,
+        /// The conversation before the user's message.
+        history: Vec<aura::Message>,
+    },
+    /// Resume a parked run through the normal completion pipeline.
+    Resume {
+        /// The reusable orchestrator factory this deployment builds.
+        factory: Arc<OrchestratorFactory>,
+        /// The owned, single-use resume grant.
+        grant: ResumeGrant,
+    },
+}
+
 /// Shared request setup extracted from the incoming ChatCompletionRequest.
 /// Used by both streaming and non-streaming handlers.
 pub struct RequestSetup {
-    pub query: String,
-    pub chat_history: Vec<aura::Message>,
-    pub streaming_agent: Arc<dyn StreamingAgent>,
+    /// The single-use completion input this request owns.
+    pub completion: CompletionInput,
     pub config: aura_config::Config,
     pub completion_id: String,
     pub model_str: String,
@@ -356,9 +388,11 @@ pub async fn prepare_request(
         .and_then(|m| serde_json::to_string(m).ok());
 
     Ok(RequestSetup {
-        query,
-        chat_history,
-        streaming_agent,
+        completion: CompletionInput::Chat {
+            agent: streaming_agent,
+            query,
+            history: chat_history,
+        },
         config,
         completion_id,
         model_str,
@@ -465,6 +499,21 @@ pub fn build_completion_config(
     let request_id = setup.request_id.clone();
     let fallback_tool_parsing = setup.config.is_fallback_tool_parsing_enabled();
 
+    // The resume arm's provider/model, otel inputs, and message count come
+    // from the factory's resumed stream (S2/S3); only the chat arm is wired.
+    let ((provider_ref, model_ref), message_count, query_for_otel) = match &setup.completion {
+        CompletionInput::Chat {
+            agent,
+            query,
+            history,
+        } => (agent.get_provider_info(), history.len() + 1, query.clone()),
+        CompletionInput::Resume { .. } => todo!(
+            "P45 S2/S3: resume completion entry — provider/model, otel query, and message \
+             count come from the resumed run's factory"
+        ),
+    };
+    let (provider, model) = (provider_ref.to_string(), model_ref.to_string());
+
     let stream_config = StreamConfig::new(
         emit_custom_events,
         emit_reasoning,
@@ -490,10 +539,7 @@ pub fn build_completion_config(
         }
     };
 
-    let (p, m) = setup.streaming_agent.get_provider_info();
-    let (provider, model) = (p.to_string(), m.to_string());
     let response_content = ResponseContent::new();
-    let message_count = setup.chat_history.len() + 1; // +1 for the current query
 
     CompletionConfig {
         request_id,
@@ -506,7 +552,7 @@ pub fn build_completion_config(
         active_requests: data.active_requests.clone(),
         provider,
         model,
-        query_for_otel: setup.query.clone(),
+        query_for_otel,
         message_count,
         response_content,
         pending_approvals: data.pending_approvals.clone(),
@@ -532,11 +578,9 @@ pub async fn execute_completion(
     let invocation_parameters = aura::logging::llm_invocation_parameters(&setup.config.agent.llm);
     let orchestration_enabled = setup.config.orchestration_enabled();
 
-    // Destructure to move chat_history instead of cloning
+    // Destructure to move the owned completion input instead of cloning
     let RequestSetup {
-        query,
-        chat_history,
-        streaming_agent,
+        completion,
         config: _,
         completion_id: _,
         model_str,
@@ -548,6 +592,21 @@ pub async fn execute_completion(
         metadata_json,
         tools_json,
     } = setup;
+
+    // The chat arm yields exactly the agent, query, and history the request
+    // was prepared with; the resume arm enters through the factory's
+    // grant-consuming stream (S2/S3).
+    let (streaming_agent, query, chat_history) = match completion {
+        CompletionInput::Chat {
+            agent,
+            query,
+            history,
+        } => (agent, query, history),
+        CompletionInput::Resume { .. } => todo!(
+            "P45 S2/S3: the factory's resume_stream_with_timeout consumes the grant and \
+             returns the resumed stream"
+        ),
+    };
 
     // Orchestration spawns inside `stream_with_timeout`, so SSE side-channel
     // receivers must be subscribed before stream startup.
@@ -1832,9 +1891,11 @@ mod tests {
             }
         }));
         let setup = RequestSetup {
-            query: "trigger approval".to_string(),
-            chat_history: vec![],
-            streaming_agent: agent,
+            completion: CompletionInput::Chat {
+                agent,
+                query: "trigger approval".to_string(),
+                history: vec![],
+            },
             config: make_test_config(),
             completion_id: "chatcmpl-test".to_string(),
             model_str: "test/fake".to_string(),

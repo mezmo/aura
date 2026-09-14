@@ -17,7 +17,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::SessionId;
 use crate::hitl::{
-use crate::hitl::{
     AcknowledgmentState, AgentScope, ApprovalAuthority, ApprovalItem, ApprovalOrigin,
     ApprovalRequest, DecisionId, ParkedApproval, ResolvedDecision, Timestamp,
 };
@@ -41,8 +40,10 @@ pub struct ParkedApprovalRecord {
     pub items: Vec<ApprovalItem>,
     pub registered_at: Timestamp,
     pub expires_at: Timestamp,
-    /// The channel the row was parked under. Required on every row: absence
-    /// is a decode failure, never a guessed authority.
+    /// The channel the row was parked under; resolve and read-or-expire
+    /// check it, so one channel's row can never be consumed through
+    /// another. Required on every row: absence is a decode failure, never
+    /// a guessed authority.
     pub authority: ApprovalAuthority,
     /// Resolved egress headers the parked row's notify POST authenticates
     /// with (lowercased name → value). Additive: absent on rows stored before
@@ -366,7 +367,7 @@ mod tests {
             },
             registered_at: now,
             expires_at: now + chrono::Duration::seconds(60),
-            authority: ApprovalAuthority::WebhookPoll,
+            authority: ApprovalAuthority::Conversational,
             egress_headers: None,
             acknowledgment: AcknowledgmentState::RequiresNotification,
         }
@@ -539,10 +540,6 @@ mod tests {
     /// failure.
     #[test]
     fn legacy_row_without_egress_headers_is_readable() {
-        // A row from before egress capture existed carries the required
-        // authority (this PR made it required at write) but no
-        // `egress_headers` key at all: the additive field must still
-        // decode to `None`.
         let legacy_json = r#"{
             "version": 1,
             "instance_id": "test-instance",
@@ -553,7 +550,7 @@ mod tests {
             "items": [],
             "registered_at": "2026-08-01T00:00:00Z",
             "expires_at": "2026-08-01T01:00:00Z",
-            "authority": "webhook_poll"
+            "authority": "conversational"
         }"#;
 
         let record: ParkedApprovalRecord = serde_json::from_str(legacy_json).unwrap();

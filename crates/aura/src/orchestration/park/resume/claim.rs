@@ -23,6 +23,7 @@ use crate::orchestration::types::RunId;
 use super::super::commit::parked_document_dir;
 use super::super::document::{PARKED_DOCUMENT_SUFFIX, RESUMING_DOCUMENT_SUFFIX};
 use super::evaluate::Diagnostic;
+use crate::orchestration::park::lifetime::{ReservationFault, RunReservationLease};
 
 /// Why a raw path segment failed validation. Every variant is
 /// diagnostic-only: no caller branches on the reason.
@@ -191,6 +192,24 @@ impl ResumeClaimTable {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Reserve one run under the table's short standard lock: the shared
+    /// occupation every park-owned execution fences on. The lock is held for
+    /// the check-and-insert only — never across an await — and the returned
+    /// lease is shared, so blocking work keeps the fence after an awaiting
+    /// request drops. A second reservation of a live run fails
+    /// [`ReservationFault::Live`].
+    ///
+    /// This is the generalized reservation entry the resume ordering reserves
+    /// through (step 2 of the ownership contract); the claim-and-rename step
+    /// converts the same reservation into a grant with no ownerless gap.
+    #[expect(
+        unused_variables,
+        reason = "todo!() body; filled by P45 wave fill units"
+    )]
+    pub fn reserve(&self, run: &ResumeRunId) -> Result<RunReservationLease, ReservationFault> {
+        todo!("P45 wave fill unit E4: shared reservation table admit under the short standard lock")
     }
 
     /// Whether a live claim holds the run.

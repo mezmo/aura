@@ -21,9 +21,9 @@ pub(crate) enum RehydrateError {
     /// Condition row "not found": no checkpoint document exists for the run.
     NotFound,
     /// Condition row "expired": a pending call has no recorded decision and
-    /// the run is past `expires_at`. A run whose decisions were all recorded
-    /// in time resumes after expiry — the window bounds the decision, not
-    /// the resumer.
+    /// the run is past `retention_expires_at`. A run whose decisions were all
+    /// recorded in time resumes after expiry — the window bounds the
+    /// decision, not the resumer.
     Expired,
     /// Condition row "mismatch": the store and the document disagree — the
     /// stored approval is missing, its scope names another run or task than
@@ -174,11 +174,9 @@ pub(crate) async fn load_recorded_decisions(
     let recorded = Arc::new(RecordedDecisions::default());
     let mut decision_ids = Vec::new();
     let mut outstanding = Vec::new();
-    // The document's expiry stamp is the run's decision window the 2.6
+    // The document's retention stamp is the run's decision window the 2.6
     // expired row is evaluated against.
-    let expires_at = chrono::DateTime::parse_from_rfc3339(&doc.expires_at)
-        .map_err(|e| RehydrateError::Document(format!("bad expiry stamp: {e}")))?
-        .with_timezone(&chrono::Utc);
+    let expires_at = doc.retention_expires_at.as_datetime();
 
     for node in &doc.plan.tasks {
         let crate::orchestration::types::TaskStatus::AwaitingApproval = node.status else {
@@ -294,10 +292,11 @@ mod tests {
 
     use super::*;
     use crate::hitl::{
-        AgentScope, ApprovalDecision, ApprovalItem, ApprovalOrigin, ApprovalRequest,
-        PROTOCOL_VERSION, ParkedApproval, ResolvedDecision,
+        AgentScope, ApprovalAuthority, ApprovalDecision, ApprovalItem, ApprovalOrigin,
+        ApprovalRequest, PROTOCOL_VERSION, ParkedApproval, ResolvedDecision,
     };
     use crate::orchestration::park::document::{ParkedPlan, ParkedTaskNode, SCHEMA_VERSION};
+    use crate::orchestration::park::retention::RetentionExpiresAt;
     use crate::orchestration::types::PendingCall;
     use crate::orchestration::types::TaskStatus;
 
@@ -307,7 +306,9 @@ mod tests {
             session_id: Some("sess".to_string()),
             run_id: "0191e8c0-aaaa-7000-8000-00000000c0de".to_string(),
             parked_at: "2026-09-02T14:00:00+00:00".to_string(),
-            expires_at: (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
+            retention_expires_at: RetentionExpiresAt::from_datetime(
+                chrono::Utc::now() + chrono::Duration::hours(1),
+            ),
             query: "Deploy".to_string(),
             chat_history: vec![],
             coordinator_conversation: vec![],
@@ -373,7 +374,7 @@ mod tests {
             },
             registered_at: chrono::Utc::now(),
             expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
-            authority: crate::hitl::ApprovalAuthority::WebhookPoll,
+            authority: ApprovalAuthority::Conversational,
             egress_headers: None,
             acknowledgment: crate::hitl::AcknowledgmentState::RequiresNotification,
         }
@@ -486,7 +487,8 @@ mod tests {
         // The same undecided call past the document's expiry is the expired
         // row.
         let mut doc = parked_run(vec![pending_call(undecided, args.clone())]);
-        doc.expires_at = (chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
+        doc.retention_expires_at =
+            RetentionExpiresAt::from_datetime(chrono::Utc::now() - chrono::Duration::seconds(1));
         let err = load_recorded_decisions(&registry, &doc, chrono::Utc::now())
             .await
             .unwrap_err();

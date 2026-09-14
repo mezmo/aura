@@ -178,14 +178,6 @@ impl HitlApprovalWrapper {
         let expires_at =
             now + chrono::Duration::from_std(timeout).expect("approval timeout fits in chrono");
         let decision_id = DecisionId::generate();
-        // The row's authority is the route that parked it: conversational
-        // parks inline, and the webhook park arm runs only under poll
-        // delivery (park_registry answers None for a sync client), so the
-        // Webhook arm here is always the poll channel.
-        let authority = match &*self.route {
-            DecisionRoute::Conversational { .. } => ApprovalAuthority::Conversational,
-            DecisionRoute::Webhook { .. } => ApprovalAuthority::WebhookPoll,
-        };
         let request = ApprovalRequest {
             version: PROTOCOL_VERSION,
             instance_id: self.instance_id.clone(),
@@ -208,12 +200,13 @@ impl HitlApprovalWrapper {
 
         // The store's own register, not the registry's park-anyway one: a
         // fault fails the call closed. `Requested` goes out here (the park
-        // arm is the first publish for this decision).
+        // arm is the first publish for this decision). Local ingress parks
+        // the conversational authority.
         self.park_register(
             park,
             request,
             expires_at,
-            authority,
+            ApprovalAuthority::Conversational,
             egress_headers,
             AcknowledgmentState::RequiresNotification,
             true,
@@ -280,6 +273,7 @@ impl HitlApprovalWrapper {
                 park,
                 request,
                 expires_at,
+                ApprovalAuthority::WebhookPoll,
                 egress_headers,
                 AcknowledgmentState::Acknowledged,
                 false,
@@ -316,14 +310,16 @@ impl HitlApprovalWrapper {
     /// the durable row, register it, recover the call id, update the guard
     /// and cell, and publish the lifecycle transition. The caller supplies the
     /// fully-minted `request` (decision-id provenance and request-id mint
-    /// source) plus the ack state; `publish_requested` selects whether the
-    /// `Requested` event goes out (the 207 bridge skips it — already
-    /// published at gate entry).
+    /// source) plus the authority the row is parked under and the ack state;
+    /// `publish_requested` selects whether the `Requested` event goes out
+    /// (the 207 bridge skips it — already published at gate entry).
+    #[allow(clippy::too_many_arguments)]
     async fn park_register(
         &self,
         park: &ParkContext,
         request: ApprovalRequest,
         expires_at: chrono::DateTime<chrono::Utc>,
+        authority: ApprovalAuthority,
         egress_headers: Option<reqwest::header::HeaderMap>,
         acknowledgment: AcknowledgmentState,
         publish_requested: bool,
@@ -332,6 +328,7 @@ impl HitlApprovalWrapper {
             request,
             registered_at: chrono::Utc::now(),
             expires_at,
+            authority,
             egress_headers,
             acknowledgment,
         };
@@ -963,11 +960,6 @@ mod tests {
                         .unwrap()
                         .expect("ticket parked in the store");
                     assert_eq!(
-                        parked.authority,
-                        ApprovalAuthority::Conversational,
-                        "a conversational park stamps the inline authority"
-                    );
-                    assert_eq!(
                         parked.request.request_id,
                         "run:0191e8c0-1111-7000-8000-000000000042"
                     );
@@ -1121,6 +1113,7 @@ mod tests {
                 park: aura_config::ParkConfig {
                     enabled: true,
                     bind_identity: false,
+                    park_ttl: aura_config::ParkTtl::default(),
                 },
                 route: aura_config::DecisionRouteConfig::Webhook {
                     url: WebhookUrl::new(&url).unwrap(),
@@ -1210,6 +1203,7 @@ mod tests {
                 park: aura_config::ParkConfig {
                     enabled: true,
                     bind_identity: false,
+                    park_ttl: aura_config::ParkTtl::default(),
                 },
                 route: aura_config::DecisionRouteConfig::Webhook {
                     url: WebhookUrl::new(url).unwrap(),

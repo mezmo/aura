@@ -2,6 +2,7 @@ use crate::error::ConfigError;
 use crate::lenient_bool;
 use crate::lenient_int;
 use crate::orchestration::OrchestrationConfig;
+use crate::park::ParkTtl;
 use crate::scratchpad::{ScratchpadConfig, ScratchpadToolEntry};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -1936,6 +1937,11 @@ pub struct ParkConfig {
     /// Bind each run's checkpoint to the caller's identity-header hash.
     #[serde(default)]
     pub bind_identity: bool,
+    /// Disk retention age in seconds (`park_ttl`): how long a parked run's
+    /// evidence stays reclaimable. Default one hour; zero is refused at
+    /// parse. Separate from each approval's route timeout.
+    #[serde(default)]
+    pub park_ttl: ParkTtl,
 }
 
 /// `[hitl.route]` table. The `Webhook` variant cannot parse without a valid
