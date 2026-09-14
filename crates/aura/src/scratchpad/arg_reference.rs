@@ -404,7 +404,7 @@ impl ReferenceResolver {
             .validate_path(file)
             .await
             .map_err(|e| e.to_string())?;
-        if let Some(content) = read_bounded(&path).await? {
+        if let Some(content) = read_stored_file(&path, file).await? {
             return Ok(content);
         }
 
@@ -421,6 +421,48 @@ impl ReferenceResolver {
 
         Err("no scratchpad file or artifact by that name".to_string())
     }
+}
+
+/// Read a scratchpad file like [`read_bounded`], but refuse an intercepted
+/// output's rendered file when its raw copy sits beside it: the rendered file
+/// wraps the payload in response text (and may be pretty-printed), so sending
+/// or editing it would silently change the bytes. `token` is the name the
+/// model used, for the suggested replacement.
+async fn read_stored_file(path: &Path, token: &str) -> Result<Option<String>, String> {
+    if let Some(raw) = raw_copy_beside(path).await {
+        let suggestion = match token.rsplit_once('/') {
+            Some((dir, _)) => format!("{dir}/{raw}"),
+            None => raw,
+        };
+        return Err(format!(
+            "this is the rendered tool output, which wraps the payload in response text; \
+             use its raw copy '{suggestion}' instead"
+        ));
+    }
+    read_bounded(path).await
+}
+
+/// Name of the raw copy stored beside the rendered output at `path`, if any:
+/// `{stem}.raw.{ext}` for a rendered `{stem}.{ext}`.
+async fn raw_copy_beside(path: &Path) -> Option<String> {
+    let name = path.file_name()?.to_str()?;
+    if name.contains(".raw.") {
+        return None;
+    }
+    let (stem, _) = name.rsplit_once('.')?;
+    let prefix = format!("{stem}.raw.");
+    let mut entries = tokio::fs::read_dir(path.parent()?).await.ok()?;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let entry_name = entry.file_name().to_string_lossy().into_owned();
+        // The raw copy itself, not an edit of it (`{stem}.raw.edit-<hash>.md`).
+        if entry_name
+            .strip_prefix(&prefix)
+            .is_some_and(|extension| !extension.contains('.'))
+        {
+            return Some(entry_name);
+        }
+    }
+    None
 }
 
 /// Read `path` as UTF-8 text, refusing files over [`MAX_RAW_PAYLOAD_BYTES`]
@@ -956,6 +998,59 @@ mod tests {
         .unwrap();
 
         assert_eq!(resolved, json!({ "content": artifact }));
+    }
+
+    /// The rendered file of an intercepted output carries response text
+    /// around the payload; when its raw copy exists, references must use it.
+    #[tokio::test]
+    async fn resolve_refuses_a_rendered_output_that_has_a_raw_copy() {
+        let tmp = TempDir::new().unwrap();
+        let storage = storage(&tmp).await;
+        tokio::fs::write(
+            storage.dir().join("task_1-w-get-0-ab.txt"),
+            "status line\nbody\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(storage.dir().join("task_1-w-get-0-ab.raw.md"), "body\n")
+            .await
+            .unwrap();
+        tokio::fs::write(
+            storage
+                .dir()
+                .join("task_1-w-get-0-ab.raw.edit-0123456789abcdef.md"),
+            "edited\n",
+        )
+        .await
+        .unwrap();
+        let resolver = ReferenceResolver::new(storage, None);
+
+        let err = resolve_references(
+            json!({ "content_file": "task_1-w-get-0-ab.txt" }),
+            &paths(&["content"]),
+            &resolver,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("use its raw copy 'task_1-w-get-0-ab.raw.md' instead"),
+            "{err}"
+        );
+
+        for (file, content) in [
+            ("task_1-w-get-0-ab.raw.md", "body\n"),
+            ("task_1-w-get-0-ab.raw.edit-0123456789abcdef.md", "edited\n"),
+        ] {
+            let resolved = resolve_references(
+                json!({ "content_file": file }),
+                &paths(&["content"]),
+                &resolver,
+            )
+            .await
+            .unwrap();
+            assert_eq!(resolved, json!({ "content": content }));
+        }
     }
 
     // --- ArgReferenceTool ---
