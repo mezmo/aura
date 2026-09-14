@@ -20,7 +20,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use a2a::{ListTasksRequest, Message, Part, Role, Task, TaskState, TaskStatus};
-use aura::hitl::{ApprovalDecision, ApprovalOutcome, PendingApprovals, ResolveError};
+use aura::hitl::{
+    ApprovalAuthority, ApprovalDecision, ApprovalOutcome, PendingApprovals, ResolveError,
+};
 use aura::request_cancellation::RequestCancelToken;
 use aura::session_store::ParkedApprovalRecord;
 use aura_config::{RedisSessionStoreConfig, SessionStoreBackend};
@@ -366,7 +368,11 @@ async fn approval_resolve_removes_the_parked_record() {
     approvals.register(parked).await.unwrap();
 
     approvals
-        .resolve(&id, ApprovalDecision::Approved.into())
+        .resolve(
+            &id,
+            ApprovalAuthority::Conversational,
+            ApprovalDecision::Approved.into(),
+        )
         .await
         .unwrap();
 
@@ -408,7 +414,11 @@ async fn decision_record_outlives_parked_record_ttl() {
     let id = parked.request.decision_id;
     approvals.register(parked).await.unwrap();
     approvals
-        .resolve(&id, ApprovalDecision::Approved.into())
+        .resolve(
+            &id,
+            ApprovalAuthority::Conversational,
+            ApprovalDecision::Approved.into(),
+        )
         .await
         .unwrap();
 
@@ -506,7 +516,11 @@ async fn approval_cancel_request_returns_cleared_set() {
     approvals.register(decided).await.unwrap();
     approvals.register(keep).await.unwrap();
     approvals
-        .resolve(&decided_id, ApprovalDecision::Approved.into())
+        .resolve(
+            &decided_id,
+            ApprovalAuthority::Conversational,
+            ApprovalDecision::Approved.into(),
+        )
         .await
         .unwrap();
 
@@ -521,7 +535,11 @@ async fn approval_cancel_request_returns_cleared_set() {
     assert!(approvals.get(&keep_id).await.unwrap().is_some());
     assert_eq!(
         approvals
-            .resolve(&undecided_id, ApprovalDecision::Approved.into())
+            .resolve(
+                &undecided_id,
+                ApprovalAuthority::Conversational,
+                ApprovalDecision::Approved.into()
+            )
             .await,
         Err(ResolveError::NotFound),
         "a cleared ticket resolves NotFound"
@@ -565,7 +583,11 @@ async fn approval_cancel_request_returns_cleared_set() {
     );
     assert_eq!(
         approvals
-            .resolve(&late_id, ApprovalDecision::Approved.into())
+            .resolve(
+                &late_id,
+                ApprovalAuthority::Conversational,
+                ApprovalDecision::Approved.into()
+            )
             .await,
         Err(ResolveError::NotFound),
         "the second cancel GETDEL'd the late ticket"
@@ -758,7 +780,11 @@ async fn approval_expires_with_its_record_ttl() {
     assert!(approvals.get(&id).await.unwrap().is_none());
     assert_eq!(
         approvals
-            .resolve(&id, ApprovalDecision::Approved.into())
+            .resolve(
+                &id,
+                ApprovalAuthority::Conversational,
+                ApprovalDecision::Approved.into()
+            )
             .await,
         Err(ResolveError::NotFound)
     );
@@ -1139,7 +1165,11 @@ async fn approval_parked_on_one_instance_wakes_when_resolved_on_another() {
     let handle = instance_a.register(request, Duration::from_secs(30)).await;
 
     instance_b
-        .resolve(&id, ApprovalDecision::Approved.into())
+        .resolve(
+            &id,
+            ApprovalAuthority::Conversational,
+            ApprovalDecision::Approved.into(),
+        )
         .await
         .expect("resolve through the other instance succeeds");
 
@@ -1169,7 +1199,11 @@ async fn store_only_resolve_wakes_parking_instance_via_poll() {
     // Resolve against the store alone — no registry, no publish.
     store_b
         .approvals()
-        .resolve(&id, ApprovalDecision::Approved.into())
+        .resolve(
+            &id,
+            ApprovalAuthority::Conversational,
+            ApprovalDecision::Approved.into(),
+        )
         .await
         .expect("store resolve succeeds");
 

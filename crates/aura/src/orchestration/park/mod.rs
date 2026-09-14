@@ -1,6 +1,7 @@
 //! The park checkpoint (park mode): the document, the commit, the
 //! run-scoped guard, and the resume-side continuation surfaces.
 
+mod cleanup;
 mod commit;
 mod continuation;
 mod document;

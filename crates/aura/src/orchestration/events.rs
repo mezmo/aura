@@ -121,9 +121,10 @@ pub enum OrchestratorEvent {
         run_id: String,
         /// The decision ids still awaiting a human decision.
         decision_ids: Vec<String>,
-        /// RFC 3339 retention deadline the checkpoint carries: the instant
-        /// after which the run's parked evidence may be reclaimed.
-        retention_expires_at: String,
+        /// The validated retention deadline the checkpoint carries: an
+        /// RFC 3339 instant by construction (the wire event renders it;
+        /// `"not-an-instant"` cannot ride this event).
+        retention_expires_at: aura_events::RetentionExpiresAt,
         /// Which iteration the run parked in (1-indexed).
         iteration: usize,
     },

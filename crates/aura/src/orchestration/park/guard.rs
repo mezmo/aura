@@ -7,22 +7,60 @@ use crate::hitl::PendingApprovals;
 
 use super::commit::cancel_run_approvals;
 
+/// The guard's sweep disposition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ParkGuardMode {
+    /// The initial producer: an unpublished drop sweeps the run's parked
+    /// tickets by owner id.
+    Initial,
+    /// A resumed segment: checkpoint-preserving — cancellation never sweeps
+    /// retained rows merely because the segment did not re-park. Retention
+    /// cleanup (E6/E8), not the guard, reclaims expired evidence.
+    Resumed,
+}
+
 /// Arms the unpublished-end sweep once the run has parked a call.
 pub(crate) struct ParkGuard {
     registry: PendingApprovals,
     run_id: String,
     request_id: String,
+    mode: ParkGuardMode,
     published: AtomicBool,
     armed: AtomicBool,
 }
 
 impl ParkGuard {
-    /// Create the guard for a run; inert until the first [`Self::record`].
+    /// Create the guard for an initial producer's run; inert until the
+    /// first [`Self::record`].
     pub(crate) fn new(registry: PendingApprovals, run_id: String, request_id: String) -> Arc<Self> {
         Arc::new(Self {
             registry,
             run_id,
             request_id,
+            mode: ParkGuardMode::Initial,
+            published: AtomicBool::new(false),
+            armed: AtomicBool::new(false),
+        })
+    }
+
+    /// Create the guard for a resumed segment: checkpoint-preserving mode.
+    /// A drop never sweeps retained rows — the resumed run's evidence stays
+    /// for the next resume or retention cleanup, whatever ended this
+    /// segment.
+    #[expect(
+        dead_code,
+        reason = "constructed by the L3 fill's resumed-segment guard wiring"
+    )]
+    pub(crate) fn new_resumed(
+        registry: PendingApprovals,
+        run_id: String,
+        request_id: String,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            registry,
+            run_id,
+            request_id,
+            mode: ParkGuardMode::Resumed,
             published: AtomicBool::new(false),
             armed: AtomicBool::new(false),
         })
@@ -43,6 +81,12 @@ impl ParkGuard {
 
 impl Drop for ParkGuard {
     fn drop(&mut self) {
+        // The resumed guard is checkpoint-preserving: whatever ends the
+        // segment, retained evidence survives for the next resume or the
+        // retention cleanup — only the initial producer sweeps.
+        if self.mode == ParkGuardMode::Resumed {
+            return;
+        }
         // An unpublished drop sweeps the run's parked tickets by owner id; a
         // process crash inside the commit is the one accepted window.
         if self.published.load(Ordering::Acquire) {

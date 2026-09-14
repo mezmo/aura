@@ -10,7 +10,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use aura_config::{
-    DecisionRouteConfig, GlobPattern, HitlConfig, ToolHeaderMappings, WebhookDelivery, WebhookUrl,
+    DecisionRouteConfig, GlobPattern, HitlConfig, ParkTtl, ToolHeaderMappings, WebhookDelivery,
+    WebhookUrl,
 };
 use reqwest::header::HeaderMap;
 
@@ -44,6 +45,11 @@ pub struct HitlRuntime {
     /// by itself authorize any invocation to park — an armed `ParkContext`
     /// does that.
     pub park_enabled: bool,
+    /// The validated `[hitl.park].park_ttl` projected from the parsed
+    /// config: the disk-evidence retention age the park commit's
+    /// publication stamp consumes. Nonzero by construction, so a park
+    /// commit never has to re-derive or re-check it.
+    pub park_ttl: ParkTtl,
 }
 
 impl HitlRuntime {
@@ -102,6 +108,7 @@ impl HitlRuntime {
             patterns: Arc::from(config.require_approval.clone()),
             route: Arc::new(route),
             park_enabled: config.park.enabled,
+            park_ttl: config.park.park_ttl,
         }
     }
 }
@@ -1651,7 +1658,11 @@ mod tests {
         loop {
             tokio::task::yield_now().await;
             if registry
-                .resolve(&decision_id, ApprovalDecision::Approved.into())
+                .resolve(
+                    &decision_id,
+                    crate::hitl::ApprovalAuthority::Conversational,
+                    ApprovalDecision::Approved.into(),
+                )
                 .await
                 .is_ok()
             {
@@ -1690,6 +1701,7 @@ mod tests {
             if registry
                 .resolve(
                     &decision_id,
+                    crate::hitl::ApprovalAuthority::Conversational,
                     ApprovalDecision::Denied {
                         reason: Some("too risky".into()),
                     }
@@ -1737,7 +1749,11 @@ mod tests {
         }
         assert_eq!(
             registry
-                .resolve(&decision_id, ApprovalDecision::Approved.into())
+                .resolve(
+                    &decision_id,
+                    crate::hitl::ApprovalAuthority::Conversational,
+                    ApprovalDecision::Approved.into()
+                )
                 .await,
             Err(ResolveError::NotFound),
             "late decisions for timed-out approvals must be rejected as expired",
@@ -1799,7 +1815,11 @@ mod tests {
         loop {
             tokio::task::yield_now().await;
             if registry
-                .resolve(&decision_id, ApprovalDecision::Approved.into())
+                .resolve(
+                    &decision_id,
+                    crate::hitl::ApprovalAuthority::Conversational,
+                    ApprovalDecision::Approved.into(),
+                )
                 .await
                 .is_ok()
             {
@@ -1872,7 +1892,11 @@ mod tests {
         // An approver reacting to `Requested` immediately must find the
         // record already parked — resolving here may not race registration.
         registry
-            .resolve(&decision_id, ApprovalDecision::Approved.into())
+            .resolve(
+                &decision_id,
+                crate::hitl::ApprovalAuthority::Conversational,
+                ApprovalDecision::Approved.into(),
+            )
             .await
             .expect("record must be resolvable once Requested is observable");
 

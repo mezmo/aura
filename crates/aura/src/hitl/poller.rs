@@ -31,6 +31,7 @@ use tracing::{debug, warn};
 use aura_config::{DecisionRouteConfig, HitlConfig, ToolHeaderMappings};
 
 use super::decision::{ApprovalDecision, ResolvedDecision};
+use super::outcome::ApprovalAuthority;
 use super::registry::{PendingApprovals, ResolveError};
 use super::route::{PollOutcome, WebhookClient, webhook_client_from_config};
 use super::signing::WebhookHmac;
@@ -172,7 +173,11 @@ impl PollReconciler {
                         }
                         other => ResolvedDecision::from(other),
                     };
-                    match self.registry.resolve(&id, resolved).await {
+                    match self
+                        .registry
+                        .resolve(&id, ApprovalAuthority::WebhookPoll, resolved)
+                        .await
+                    {
                         Ok(()) => {}
                         // The ticket expired or was swept between
                         // list_pending and resolve; the decision is
@@ -1366,6 +1371,7 @@ mod tests {
                 memory_dir: memory_dir.to_str().unwrap(),
                 config: &crate::config::AgentRuntimeConfig::default(),
                 decision_window: Duration::from_secs(300),
+                park_ttl: aura_config::ParkTtl::default(),
                 identity_hash: None,
             };
             crate::orchestration::commit_from_run_state(&inputs)

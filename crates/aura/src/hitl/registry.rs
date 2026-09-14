@@ -37,7 +37,7 @@ use crate::session_store::{
 use super::decision::{
     ApprovalDecision, AwaitingDecision, DecisionId, ResolvedDecision, Timestamp,
 };
-use super::outcome::ApprovalAuthority;
+use super::outcome::{ApprovalAuthority, ApprovalRead};
 use super::protocol::ApprovalRequest;
 
 /// Bus topic carrying the decision for one parked approval.
@@ -231,12 +231,22 @@ impl PendingApprovals {
     /// approver identity captured alongside it, as one carrier — in the store
     /// (at most once per `DecisionId`), and publish the credential-free
     /// decision on the bus, waking the parked await wherever it lives.
+    ///
+    /// `expected_authority` is the channel the caller resolves under: the
+    /// local ingress and standalone resolver pass `Conversational`, the
+    /// poller `WebhookPoll`. A row parked under another authority answers
+    /// `NotFound` with no mutation, inside the store's one serialization
+    /// boundary.
     pub async fn resolve(
         &self,
         id: &DecisionId,
+        expected_authority: ApprovalAuthority,
         resolved: ResolvedDecision,
     ) -> Result<(), ResolveError> {
-        self.0.store.resolve(id, resolved.clone()).await?;
+        self.0
+            .store
+            .resolve(id, expected_authority, resolved.clone())
+            .await?;
         // Identity never rides the bus: the payload is the decision alone.
         let payload =
             serde_json::to_vec(&resolved.decision()).expect("ApprovalDecision serializes to JSON");
@@ -259,6 +269,18 @@ impl PendingApprovals {
         id: &DecisionId,
     ) -> Result<Option<ParkedApproval>, SessionStoreError> {
         self.0.store.get(id).await
+    }
+
+    /// Read one approval row and, under the store's serialization boundary,
+    /// expire it when its own deadline has passed strictly: the consult's
+    /// per-member read. Forwards fail-closed — a store fault is an error,
+    /// never an outcome.
+    pub async fn read_or_expire(
+        &self,
+        id: &DecisionId,
+        expected_authority: ApprovalAuthority,
+    ) -> Result<ApprovalRead, SessionStoreError> {
+        self.0.store.read_or_expire(id, expected_authority).await
     }
 
     /// The decision durably recorded for an already-resolved approval —
@@ -448,7 +470,11 @@ mod tests {
         let cancel = RequestCancelToken::unbound();
 
         registry
-            .resolve(&id, ApprovalDecision::Approved.into())
+            .resolve(
+                &id,
+                ApprovalAuthority::Conversational,
+                ApprovalDecision::Approved.into(),
+            )
             .await
             .expect("resolve succeeds");
 
@@ -469,6 +495,7 @@ mod tests {
         registry
             .resolve(
                 &id,
+                ApprovalAuthority::Conversational,
                 ApprovalDecision::Denied {
                     reason: Some("not safe".into()),
                 }
@@ -491,7 +518,11 @@ mod tests {
         let unknown = DecisionId::generate();
         assert_eq!(
             registry
-                .resolve(&unknown, ApprovalDecision::Approved.into())
+                .resolve(
+                    &unknown,
+                    ApprovalAuthority::Conversational,
+                    ApprovalDecision::Approved.into()
+                )
                 .await,
             Err(ResolveError::NotFound)
         );
@@ -505,12 +536,20 @@ mod tests {
         let _handle = registry.register(req, Duration::from_secs(60)).await;
 
         registry
-            .resolve(&id, ApprovalDecision::Approved.into())
+            .resolve(
+                &id,
+                ApprovalAuthority::Conversational,
+                ApprovalDecision::Approved.into(),
+            )
             .await
             .expect("first resolve succeeds");
         assert_eq!(
             registry
-                .resolve(&id, ApprovalDecision::Approved.into())
+                .resolve(
+                    &id,
+                    ApprovalAuthority::Conversational,
+                    ApprovalDecision::Approved.into()
+                )
                 .await,
             Err(ResolveError::NotFound)
         );
@@ -527,7 +566,11 @@ mod tests {
 
         assert_eq!(
             registry
-                .resolve(&id, ApprovalDecision::Approved.into())
+                .resolve(
+                    &id,
+                    ApprovalAuthority::Conversational,
+                    ApprovalDecision::Approved.into()
+                )
                 .await,
             Err(ResolveError::NotFound)
         );
@@ -545,7 +588,11 @@ mod tests {
 
         assert_eq!(
             registry
-                .resolve(&id, ApprovalDecision::Approved.into())
+                .resolve(
+                    &id,
+                    ApprovalAuthority::Conversational,
+                    ApprovalDecision::Approved.into()
+                )
                 .await,
             Ok(())
         );
@@ -568,7 +615,11 @@ mod tests {
             .await
             .expect("publish succeeds");
         registry
-            .resolve(&id, ApprovalDecision::Approved.into())
+            .resolve(
+                &id,
+                ApprovalAuthority::Conversational,
+                ApprovalDecision::Approved.into(),
+            )
             .await
             .expect("resolve succeeds");
 
@@ -624,14 +675,22 @@ mod tests {
         );
         assert_eq!(
             registry
-                .resolve(&id_a, ApprovalDecision::Approved.into())
+                .resolve(
+                    &id_a,
+                    ApprovalAuthority::Conversational,
+                    ApprovalDecision::Approved.into()
+                )
                 .await,
             Err(ResolveError::NotFound),
             "cancelled approval must be gone from the store too",
         );
 
         registry
-            .resolve(&id_b, ApprovalDecision::Approved.into())
+            .resolve(
+                &id_b,
+                ApprovalAuthority::Conversational,
+                ApprovalDecision::Approved.into(),
+            )
             .await
             .expect("unrelated entry survives");
         assert_eq!(
@@ -707,7 +766,11 @@ mod tests {
         let handle = parker.register(req, Duration::from_secs(60)).await;
 
         resolver
-            .resolve(&id, ApprovalDecision::Approved.into())
+            .resolve(
+                &id,
+                ApprovalAuthority::Conversational,
+                ApprovalDecision::Approved.into(),
+            )
             .await
             .expect("resolve succeeds");
 
@@ -739,6 +802,7 @@ mod tests {
         registry
             .resolve(
                 &id,
+                ApprovalAuthority::Conversational,
                 ApprovalDecision::Denied {
                     reason: Some("nope".into()),
                 }
@@ -771,7 +835,11 @@ mod tests {
         let handle = instance_a.register(req, Duration::from_secs(60)).await;
 
         instance_b
-            .resolve(&id, ApprovalDecision::Approved.into())
+            .resolve(
+                &id,
+                ApprovalAuthority::Conversational,
+                ApprovalDecision::Approved.into(),
+            )
             .await
             .expect("resolve on the other instance succeeds");
 
@@ -799,7 +867,11 @@ mod tests {
         )])
         .unwrap();
         registry
-            .resolve(&id, ResolvedDecision::approved(Some(identity)))
+            .resolve(
+                &id,
+                ApprovalAuthority::Conversational,
+                ResolvedDecision::approved(Some(identity)),
+            )
             .await
             .expect("resolve succeeds");
 
@@ -852,6 +924,7 @@ mod tests {
         let (a, b) = tokio::join!(
             registry.resolve(
                 &id,
+                ApprovalAuthority::Conversational,
                 ResolvedDecision::approved(Some(
                     crate::approver_headers::ApproverHeaders::from_pairs(alice_pair("alice"))
                         .unwrap(),
@@ -859,6 +932,7 @@ mod tests {
             ),
             registry.resolve(
                 &id,
+                ApprovalAuthority::Conversational,
                 ResolvedDecision::approved(Some(
                     crate::approver_headers::ApproverHeaders::from_pairs(alice_pair("mallory"))
                         .unwrap(),
@@ -902,7 +976,11 @@ mod tests {
         )])
         .unwrap();
         registry
-            .resolve(&id, ResolvedDecision::approved(Some(identity)))
+            .resolve(
+                &id,
+                ApprovalAuthority::Conversational,
+                ResolvedDecision::approved(Some(identity)),
+            )
             .await
             .expect("resolve succeeds");
 

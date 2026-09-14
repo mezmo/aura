@@ -780,6 +780,7 @@ pub(crate) async fn park_orchestrator_in(
                 timeout: Duration::from_secs(3600),
             }),
             park_enabled: true,
+            park_ttl: aura_config::ParkTtl::default(),
         }),
         memory_dir: Some(memory_dir.to_string_lossy().into_owned()),
         session_id: Some("park-sess".to_string()),
