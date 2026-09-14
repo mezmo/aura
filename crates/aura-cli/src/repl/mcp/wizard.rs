@@ -412,7 +412,7 @@ fn verify_server(
 fn enable_scratchpad(config_path: &Path, server: &mut McpServerConfig) {
     let entry = ScratchpadToolEntry::default();
     let min_tokens = entry.min_tokens;
-    server.scratchpad_mut().insert("*".to_string(), entry);
+    server.scratchpad_mut().tools.insert("*".to_string(), entry);
     if agent_scratchpad_enabled(config_path) {
         println!(
             "\nTool outputs over {min_tokens} tokens will be diverted to the \
@@ -779,7 +779,7 @@ fn collect_catalog(
                 args: args.iter().map(|s| s.to_string()).collect(),
                 env: HashMap::new(),
                 description: Some(entry.description.to_string()),
-                scratchpad: HashMap::new(),
+                scratchpad: Default::default(),
             },
             Vec::new(),
         ),
@@ -822,7 +822,7 @@ fn collect_custom(ctx: &mut CommandContext, config_path: &Path) -> Option<Collec
                 args,
                 env: HashMap::new(),
                 description: None,
-                scratchpad: HashMap::new(),
+                scratchpad: Default::default(),
             },
             Vec::new(),
         )
@@ -886,7 +886,7 @@ fn collect_custom(ctx: &mut CommandContext, config_path: &Path) -> Option<Collec
                 headers,
                 description: None,
                 headers_from_request: HashMap::new(),
-                scratchpad: HashMap::new(),
+                scratchpad: Default::default(),
             }
         };
         (server, secrets)
@@ -910,7 +910,7 @@ fn http_streamable(
         headers,
         description: (!description.is_empty()).then(|| description.to_string()),
         headers_from_request: HashMap::new(),
-        scratchpad: HashMap::new(),
+        scratchpad: Default::default(),
     }
 }
 
@@ -1187,7 +1187,7 @@ mod tests {
                         args: args.iter().map(|s| s.to_string()).collect(),
                         env: HashMap::new(),
                         description: Some(entry.description.to_string()),
-                        scratchpad: HashMap::new(),
+                        scratchpad: Default::default(),
                     },
                     (),
                 ),
@@ -1414,6 +1414,7 @@ mod tests {
         );
         server
             .scratchpad_mut()
+            .tools
             .insert("*".to_string(), ScratchpadToolEntry::default());
         let rendered = aura_config::writer::upsert_mcp_server_in_str("", "srv", &server).unwrap();
         assert!(rendered.contains("min_tokens = 5120"), "{rendered}");

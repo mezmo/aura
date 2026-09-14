@@ -83,6 +83,9 @@ pub struct ToolCallContext {
     pub metadata: Option<Value>,
     /// Agent's authored reasoning for the pending tool call.
     pub tool_call_intent: Option<String>,
+    /// The tool result's embedded-resource text, verbatim and untruncated
+    /// (see [`crate::mcp::raw_payload`]).
+    pub raw_payload: Option<String>,
 }
 
 impl ToolCallContext {
@@ -571,12 +574,17 @@ where
 
             // Call inner tool in a spawned task to isolate panics.
             // Propagate the current span so mcp.tool_call nests under execute_tool.
+            // The MCP layer publishes the result's raw payload into
+            // `raw_payload`, which `transform_output` then receives on its
+            // context (the rendered output alone can't recover it).
             let inner_clone = inner.clone();
             let args_clone = clean_args.clone();
             let tool_span = tracing::Span::current();
+            let raw_payload = crate::mcp::RawPayloadSlot::default();
+            let inner_raw_payload = raw_payload.clone();
             let result_handle = tokio::spawn(tracing::Instrument::instrument(
                 crate::approver_headers::APPROVER_OVERRIDES.scope(approver_overrides, async move {
-                    inner_clone.call(args_clone).await
+                    inner_raw_payload.scope(inner_clone.call(args_clone)).await
                 }),
                 tool_span,
             ));
@@ -593,7 +601,8 @@ where
                     // Supervise the transform + completion hook in a spawned task
                     // so it runs to completion even if the request is cancelled.
                     let wrapper_clone = wrapper.clone();
-                    let ctx_clone = ctx.clone();
+                    let mut ctx_clone = ctx.clone();
+                    ctx_clone.raw_payload = raw_payload.take();
                     let extracted_clone = extracted.clone();
                     let span = tracing::Span::current();
                     let transform_handle = tokio::spawn(tracing::Instrument::instrument(
@@ -1024,6 +1033,117 @@ mod tests {
             self.ran.store(true, std::sync::atomic::Ordering::SeqCst);
             Ok("ran".to_string())
         }
+    }
+
+    /// Inner tool that renders an MCP result the way `McpToolAdaptor` does:
+    /// a status line plus an embedded file resource.
+    #[derive(Clone)]
+    struct FileResourceInner;
+
+    const FILE_RESOURCE_TEXT: &str = "# Runbook\n\n- step one\n";
+
+    impl RigTool for FileResourceInner {
+        const NAME: &'static str = "get_file_contents";
+        type Error = ToolError;
+        type Args = Value;
+        type Output = String;
+
+        async fn definition(&self, _prompt: String) -> rig::completion::ToolDefinition {
+            rig::completion::ToolDefinition {
+                name: Self::NAME.to_string(),
+                description: String::new(),
+                parameters: serde_json::json!({ "type": "object" }),
+            }
+        }
+
+        async fn call(&self, _args: Value) -> Result<String, ToolError> {
+            use rmcp::model::{
+                CallToolResult, Content, RawContent, RawEmbeddedResource, RawTextContent,
+                ResourceContents,
+            };
+            let result = CallToolResult {
+                content: vec![
+                    Content {
+                        raw: RawContent::Text(RawTextContent {
+                            text: "successfully downloaded text file (SHA: abc)".to_string(),
+                            meta: None,
+                        }),
+                        annotations: None,
+                    },
+                    Content {
+                        raw: RawContent::Resource(RawEmbeddedResource {
+                            meta: None,
+                            resource: ResourceContents::TextResourceContents {
+                                uri: "repo://o/r/contents/runbook.md".to_string(),
+                                mime_type: Some("text/markdown".to_string()),
+                                text: FILE_RESOURCE_TEXT.to_string(),
+                                meta: None,
+                            },
+                        }),
+                        annotations: None,
+                    },
+                ],
+                structured_content: None,
+                is_error: None,
+                meta: None,
+            };
+            Ok(crate::mcp::extract_tool_result(result, Self::NAME)
+                .unwrap()
+                .into_prefixed_string())
+        }
+    }
+
+    struct RecordRawPayload(Arc<std::sync::Mutex<Option<Option<String>>>>);
+
+    #[async_trait]
+    impl ToolWrapper for RecordRawPayload {
+        async fn transform_output(
+            &self,
+            output: String,
+            _outcome: &CallOutcome,
+            ctx: &ToolCallContext,
+            _extracted: Option<&Value>,
+        ) -> TransformOutputResult {
+            *self.0.lock().unwrap() = Some(ctx.raw_payload.clone());
+            TransformOutputResult::new(output)
+        }
+    }
+
+    #[tokio::test]
+    async fn transform_output_receives_the_raw_payload_of_the_inner_call() {
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let wrapped = WrappedTool::new(
+            FileResourceInner,
+            Arc::new(RecordRawPayload(seen.clone())) as Arc<dyn ToolWrapper>,
+        );
+
+        let output = wrapped.call(serde_json::json!({})).await.unwrap();
+
+        assert!(
+            output.starts_with("successfully downloaded"),
+            "the rendered output keeps the status line: {output}"
+        );
+        assert_eq!(
+            seen.lock().unwrap().clone(),
+            Some(Some(FILE_RESOURCE_TEXT.to_string())),
+            "transform_output must see the resource text alone"
+        );
+    }
+
+    #[tokio::test]
+    async fn transform_output_sees_no_raw_payload_for_plain_output() {
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let inner = RecordingInner {
+            ran: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        let wrapped = WrappedTool::new(
+            inner,
+            Arc::new(RecordRawPayload(seen.clone())) as Arc<dyn ToolWrapper>,
+        );
+
+        wrapped.call(serde_json::json!({})).await.unwrap();
+
+        assert_eq!(seen.lock().unwrap().clone(), Some(None));
     }
 
     struct RejectingPreCall;

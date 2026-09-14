@@ -152,15 +152,26 @@ fn server_to_table(server: &McpServerConfig) -> Result<toml_edit::Table, ConfigE
         }
     }
     for key in MAP_FIELDS {
-        match table.get_mut(key) {
-            Some(toml_edit::Item::Table(t)) => t.sort_values(),
-            Some(toml_edit::Item::Value(toml_edit::Value::InlineTable(t))) => t.sort_values(),
-            _ => {}
-        }
+        sort_table_like(table.get_mut(key));
+    }
+    // `scratchpad.by_reference` is a map nested inside a map field.
+    if let Some(scratchpad) = table
+        .get_mut("scratchpad")
+        .and_then(toml_edit::Item::as_table_like_mut)
+    {
+        sort_table_like(scratchpad.get_mut("by_reference"));
     }
 
     table.set_implicit(false);
     Ok(table)
+}
+
+fn sort_table_like(item: Option<&mut toml_edit::Item>) {
+    match item {
+        Some(toml_edit::Item::Table(t)) => t.sort_values(),
+        Some(toml_edit::Item::Value(toml_edit::Value::InlineTable(t))) => t.sort_values(),
+        _ => {}
+    }
 }
 
 fn item_is_empty_collection(item: Option<&toml_edit::Item>) -> bool {
@@ -231,7 +242,7 @@ model = "claude-3-sonnet-20240229"
             args: vec![],
             env: HashMap::new(),
             description: None,
-            scratchpad: HashMap::new(),
+            scratchpad: Default::default(),
         }
     }
 
@@ -241,7 +252,7 @@ model = "claude-3-sonnet-20240229"
             headers,
             description: Some("Example server".to_owned()),
             headers_from_request: HashMap::new(),
-            scratchpad: HashMap::new(),
+            scratchpad: Default::default(),
         }
     }
 
@@ -271,7 +282,7 @@ model = "claude-3-sonnet-20240229"
                     headers: HashMap::new(),
                     description: None,
                     headers_from_request: HashMap::new(),
-                    scratchpad: HashMap::new(),
+                    scratchpad: Default::default(),
                 },
             ),
         ];
@@ -428,18 +439,41 @@ url = "https://old.example.com/mcp"
             args: vec![],
             env: HashMap::new(),
             description: None,
-            scratchpad: HashMap::from([(
-                "*".to_owned(),
-                crate::ScratchpadToolEntry { min_tokens: 5120 },
-            )]),
+            scratchpad: crate::ServerScratchpadConfig {
+                tools: HashMap::from([(
+                    "*".to_owned(),
+                    crate::ScratchpadToolEntry { min_tokens: 5120 },
+                )]),
+                by_reference: HashMap::from([
+                    (
+                        "push_files".to_owned(),
+                        vec![crate::FieldPath::parse("files[].content").unwrap()],
+                    ),
+                    (
+                        "create_or_update_file".to_owned(),
+                        vec![crate::FieldPath::parse("content").unwrap()],
+                    ),
+                ]),
+            },
         };
         let updated = upsert_mcp_server_in_str(BASE_CONFIG, "srv", &server).unwrap();
         let config = load_config_from_str(&updated).expect("written config must parse");
         let parsed = &config.mcp.expect("mcp table present").servers["srv"];
         assert_eq!(
-            parsed.scratchpad().get("*").map(|e| e.min_tokens),
+            parsed.scratchpad().tools.get("*").map(|e| e.min_tokens),
             Some(5120),
             "wildcard scratchpad entry must survive the round trip:\n{updated}"
+        );
+        assert_eq!(
+            parsed.scratchpad(),
+            server.scratchpad(),
+            "by_reference entries must survive the round trip:\n{updated}"
+        );
+        let create = updated.find("create_or_update_file").unwrap();
+        let push = updated.find("push_files").unwrap();
+        assert!(
+            create < push,
+            "by_reference keys must be sorted:\n{updated}"
         );
     }
 
@@ -453,7 +487,7 @@ url = "https://old.example.com/mcp"
                 "Authorization".to_owned(),
                 "authorization".to_owned(),
             )]),
-            scratchpad: HashMap::new(),
+            scratchpad: Default::default(),
         };
         let updated = upsert_mcp_server_in_str(BASE_CONFIG, "srv", &server).unwrap();
         let config = load_config_from_str(&updated).expect("config must parse");

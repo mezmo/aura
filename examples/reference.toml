@@ -51,6 +51,25 @@ transport = "http_streamable"
 url = "http://localhost:8081/mcp"
 description = "Example HTTP MCP server"
 
+# ── Scratchpad: large outputs and by-reference arguments ────────────
+# Takes effect with `[agent.scratchpad] enabled = true`, a top-level
+# `memory_dir`, and `[agent.llm].context_window` — see
+# examples/complete/scratchpad-single-agent.toml.
+#
+# Divert large tool outputs to disk instead of the context window. Keys
+# are tool-name globs; the longest match wins.
+# [mcp.servers.example_http.scratchpad]
+# "*" = { min_tokens = 5_120 }
+#
+# Let the model pass a stored file instead of retyping it. Each listed
+# string field gets an optional `<field>_file` twin that takes a scratchpad
+# file name (for an intercepted file, the `.raw` copy the pointer names) or
+# a run artifact filename; the tool receives that file's exact contents as
+# the field. `[]` reaches into arrays of objects.
+# [mcp.servers.example_http.scratchpad.by_reference]
+# create_or_update_file = ["content"]
+# push_files = ["files[].content"]
+
 # ── SSE transport (legacy MCP servers) ──────────────────────────────
 # For MCP servers that use the pre-2025-11-05 SSE protocol.
 # Supports the same headers, headers_from_request, and scratchpad

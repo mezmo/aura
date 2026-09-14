@@ -6,6 +6,8 @@
 //! module.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::fmt;
 
 /// Scratchpad configuration.
 ///
@@ -56,6 +58,103 @@ impl Default for ScratchpadToolEntry {
         Self {
             min_tokens: default_scratchpad_min_tokens(),
         }
+    }
+}
+
+/// Per-server scratchpad settings, configured at `[mcp.servers.<name>.scratchpad]`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ServerScratchpadConfig {
+    /// Tool glob pattern → argument fields that accept a scratchpad file
+    /// reference, from `[mcp.servers.<name>.scratchpad.by_reference]`.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub by_reference: HashMap<String, Vec<FieldPath>>,
+    /// Tool glob pattern → output interception threshold (every other key of
+    /// the table).
+    #[serde(flatten)]
+    pub tools: HashMap<String, ScratchpadToolEntry>,
+}
+
+/// Path to a string field inside a tool's arguments: dot-separated property
+/// names, with `[]` marking a property that holds an array of objects
+/// (`files[].content`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct FieldPath {
+    raw: String,
+    segments: Vec<FieldSegment>,
+}
+
+/// One property step of a [`FieldPath`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct FieldSegment {
+    pub name: String,
+    /// The property holds an array whose items the path continues into.
+    pub array: bool,
+}
+
+impl FieldPath {
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        let invalid = |why: &str| format!("invalid by_reference field path '{raw}': {why}");
+        let mut segments = Vec::new();
+        for part in raw.split('.') {
+            let (name, array) = match part.strip_suffix("[]") {
+                Some(name) => (name, true),
+                None => (part, false),
+            };
+            if name.is_empty() {
+                return Err(invalid("empty property name"));
+            }
+            if name.contains(['[', ']']) {
+                return Err(invalid("`[]` may only follow a property name"));
+            }
+            segments.push(FieldSegment {
+                name: name.to_string(),
+                array,
+            });
+        }
+        if segments.last().is_some_and(|s| s.array) {
+            return Err(invalid(
+                "the last segment must name a string field, not an array",
+            ));
+        }
+        Ok(Self {
+            raw: raw.to_string(),
+            segments,
+        })
+    }
+
+    /// Property steps leading to the object that holds the field.
+    pub fn parents(&self) -> &[FieldSegment] {
+        &self.segments[..self.segments.len() - 1]
+    }
+
+    /// Name of the string field itself.
+    pub fn field(&self) -> &str {
+        &self.segments[self.segments.len() - 1].name
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.raw
+    }
+}
+
+impl TryFrom<String> for FieldPath {
+    type Error = String;
+
+    fn try_from(raw: String) -> Result<Self, Self::Error> {
+        Self::parse(&raw)
+    }
+}
+
+impl From<FieldPath> for String {
+    fn from(path: FieldPath) -> Self {
+        path.raw
+    }
+}
+
+impl fmt::Display for FieldPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.raw)
     }
 }
 
@@ -128,5 +227,40 @@ mod tests {
     fn scratchpad_tool_entry_custom_min_tokens() {
         let entry: ScratchpadToolEntry = toml::from_str("min_tokens = 256").unwrap();
         assert_eq!(entry.min_tokens, 256);
+    }
+
+    #[test]
+    fn field_path_parses_nested_and_array_segments() {
+        let path = FieldPath::parse("changes[].file.body").unwrap();
+        assert_eq!(path.field(), "body");
+        assert_eq!(
+            path.parents(),
+            [
+                FieldSegment {
+                    name: "changes".into(),
+                    array: true
+                },
+                FieldSegment {
+                    name: "file".into(),
+                    array: false
+                },
+            ]
+        );
+        assert_eq!(path.to_string(), "changes[].file.body");
+    }
+
+    #[test]
+    fn field_path_rejects_malformed_paths() {
+        for bad in [
+            "", "a..b", ".a", "a.", "files[]", "a[0].b", "a[].[]", "[].a",
+        ] {
+            assert!(FieldPath::parse(bad).is_err(), "{bad:?} must not parse");
+        }
+    }
+
+    #[test]
+    fn server_scratchpad_config_empty_table_is_default() {
+        let cfg: ServerScratchpadConfig = toml::from_str("").unwrap();
+        assert_eq!(cfg, ServerScratchpadConfig::default());
     }
 }

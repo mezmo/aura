@@ -2,7 +2,7 @@ use crate::error::ConfigError;
 use crate::lenient_bool;
 use crate::lenient_int;
 use crate::orchestration::OrchestrationConfig;
-use crate::scratchpad::{ScratchpadConfig, ScratchpadToolEntry};
+use crate::scratchpad::{ScratchpadConfig, ServerScratchpadConfig};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
@@ -618,9 +618,10 @@ pub enum McpServerConfig {
         env: HashMap<String, String>,
         #[serde(default)]
         description: Option<String>,
-        /// Per-tool scratchpad interception thresholds (glob-matched on tool name).
+        /// Per-tool scratchpad interception thresholds and by-reference
+        /// arguments (both keyed by glob on tool name).
         #[serde(default)]
-        scratchpad: HashMap<String, ScratchpadToolEntry>,
+        scratchpad: ServerScratchpadConfig,
     },
     #[serde(rename = "http_streamable")]
     HttpStreamable {
@@ -631,9 +632,10 @@ pub enum McpServerConfig {
         description: Option<String>,
         #[serde(default)]
         headers_from_request: HashMap<String, String>,
-        /// Per-tool scratchpad interception thresholds (glob-matched on tool name).
+        /// Per-tool scratchpad interception thresholds and by-reference
+        /// arguments (both keyed by glob on tool name).
         #[serde(default)]
-        scratchpad: HashMap<String, ScratchpadToolEntry>,
+        scratchpad: ServerScratchpadConfig,
     },
     #[serde(rename = "sse")]
     Sse {
@@ -644,15 +646,16 @@ pub enum McpServerConfig {
         description: Option<String>,
         #[serde(default)]
         headers_from_request: HashMap<String, String>,
-        /// Per-tool scratchpad interception thresholds (glob-matched on tool name).
+        /// Per-tool scratchpad interception thresholds and by-reference
+        /// arguments (both keyed by glob on tool name).
         #[serde(default)]
-        scratchpad: HashMap<String, ScratchpadToolEntry>,
+        scratchpad: ServerScratchpadConfig,
     },
 }
 
 impl McpServerConfig {
-    /// Get the per-tool scratchpad thresholds for this server.
-    pub fn scratchpad(&self) -> &HashMap<String, ScratchpadToolEntry> {
+    /// Get the scratchpad settings for this server.
+    pub fn scratchpad(&self) -> &ServerScratchpadConfig {
         match self {
             McpServerConfig::Stdio { scratchpad, .. } => scratchpad,
             McpServerConfig::HttpStreamable { scratchpad, .. } => scratchpad,
@@ -660,8 +663,8 @@ impl McpServerConfig {
         }
     }
 
-    /// Get the per-tool scratchpad thresholds for this server, mutably.
-    pub fn scratchpad_mut(&mut self) -> &mut HashMap<String, ScratchpadToolEntry> {
+    /// Get the scratchpad settings for this server, mutably.
+    pub fn scratchpad_mut(&mut self) -> &mut ServerScratchpadConfig {
         match self {
             McpServerConfig::Stdio { scratchpad, .. } => scratchpad,
             McpServerConfig::HttpStreamable { scratchpad, .. } => scratchpad,

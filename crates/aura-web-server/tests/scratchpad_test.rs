@@ -701,6 +701,97 @@ async fn single_agent_turn_depth_bonus_allows_multi_step_exploration() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// By-reference arguments
+// ---------------------------------------------------------------------------
+
+/// Directive prompt: the test proves the reference plumbing, not whether the
+/// model discovers `content_file` on its own.
+const BY_REFERENCE_QUERY: &str = "Call sp_get_file to download docs/runbook.md. Its output \
+     is saved to the scratchpad and the pointer names a [raw: ...] copy holding the file \
+     exactly. Then call sp_write_file with path docs/runbook-copy.md, message 'copy', and \
+     content_file set to that raw copy's file name, so the file is written back unchanged. \
+     Do not type the file content yourself and do not set `content`. Finally, report \
+     exactly what sp_write_file returned.";
+
+/// Marker in `sp_write_file`'s result when the server received the file it
+/// served byte-for-byte.
+const WRITE_MATCHED: &str = "matches_original=true";
+
+/// Assert the model sent `sp_write_file` a `content_file` reference and no
+/// inline `content`, given the arguments of every `sp_write_file` call.
+fn assert_wrote_by_reference(write_args: &[Value]) {
+    assert!(
+        !write_args.is_empty(),
+        "Expected sp_write_file to be called"
+    );
+    let by_reference = write_args
+        .iter()
+        .find(|args| args.get("content_file").is_some())
+        .unwrap_or_else(|| panic!("Expected a content_file reference; got: {write_args:?}"));
+    assert!(
+        by_reference.get("content").is_none(),
+        "The model's arguments must carry only the reference, not the content: {by_reference}"
+    );
+}
+
+/// Orchestration: a worker reads a file (intercepted, with a raw copy) and
+/// writes it back through `content_file`. The MCP server receives the file
+/// byte-for-byte, while the tool call the worker emitted holds only the
+/// reference.
+#[tokio::test]
+async fn test_write_by_reference_sends_the_raw_file_unchanged() {
+    let events = scratchpad_events(BY_REFERENCE_QUERY).await;
+
+    let write_args: Vec<Value> = events_by_type(&events, orch_event_names::TOOL_CALL_STARTED)
+        .iter()
+        .filter_map(|e| serde_json::from_str::<Value>(&e.data).ok())
+        .filter(|j| j["tool_name"] == "sp_write_file")
+        .map(|j| j["arguments"].clone())
+        .collect();
+    assert_wrote_by_reference(&write_args);
+
+    let matched = events_by_type(&events, orch_event_names::TOOL_CALL_COMPLETED)
+        .iter()
+        .filter_map(|e| serde_json::from_str::<Value>(&e.data).ok())
+        .any(|j| {
+            j["result"]
+                .as_str()
+                .is_some_and(|r| r.contains(WRITE_MATCHED))
+        });
+    assert!(
+        matched,
+        "sp_write_file must receive the original file byte-for-byte ({WRITE_MATCHED})"
+    );
+}
+
+/// Single-agent: same flow through `Agent::stream_*`.
+#[tokio::test]
+async fn single_agent_write_by_reference_sends_the_raw_file_unchanged() {
+    let events = single_agent_events(BY_REFERENCE_QUERY).await;
+
+    let write_args: Vec<Value> = events_by_type(&events, event_names::TOOL_REQUESTED)
+        .iter()
+        .filter_map(|e| serde_json::from_str::<Value>(&e.data).ok())
+        .filter(|j| j["tool_name"] == "sp_write_file")
+        .map(|j| j["arguments"].clone())
+        .collect();
+    assert_wrote_by_reference(&write_args);
+
+    let matched = events_by_type(&events, event_names::TOOL_COMPLETE)
+        .iter()
+        .filter_map(|e| serde_json::from_str::<Value>(&e.data).ok())
+        .any(|j| {
+            j["result"]
+                .as_str()
+                .is_some_and(|r| r.contains(WRITE_MATCHED))
+        });
+    assert!(
+        matched,
+        "sp_write_file must receive the original file byte-for-byte ({WRITE_MATCHED})"
+    );
+}
+
 /// Single-agent: when no MCP tool is called at all, the agent still finishes
 /// normally and does NOT emit a stray `aura.scratchpad_usage` event (skip
 /// rule: `tokens_intercepted == 0 && tokens_extracted == 0`).

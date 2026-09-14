@@ -59,3 +59,8 @@ description = "Scratchpad test tools: returns controlled-size datasets for testi
 "sp_get_small_*" = { min_tokens = 99999 }     # High threshold — small tools never intercepted
 "sp_get_boundary_json" = { min_tokens = 125 } # Exact boundary for threshold tests
 "sp_get_nested_json" = { min_tokens = 50 }    # Always intercepted
+"sp_get_file" = { min_tokens = 50 }           # Always intercepted, with a verbatim .raw copy
+
+# Argument fields that accept a scratchpad file reference (`content_file`).
+[mcp.servers.scratchpad-test.scratchpad.by_reference]
+sp_write_file = ["content"]

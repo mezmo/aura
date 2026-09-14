@@ -35,7 +35,7 @@ async fn test_stdio_mcp_connection_and_tool_execution() {
                 args: vec!["stdio".to_string()],
                 env: HashMap::new(),
                 description: Some("Everything MCP server for STDIO testing".to_string()),
-                scratchpad: HashMap::new(),
+                scratchpad: Default::default(),
             },
         )]
         .into_iter()

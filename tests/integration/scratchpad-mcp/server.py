@@ -7,13 +7,16 @@ context budget tracking, and SSE event emission.
 
 6 tools with configurable output sizes to exercise all 8 scratchpad
 exploration tools (head, slice, grep, schema, item_schema, get_in,
-iterate_over, read).
+iterate_over, read), plus a read/write file pair for by-reference
+arguments (sp_get_file, sp_write_file).
 """
 
+import hashlib
 import json
 import math
 
 from fastmcp import FastMCP
+from mcp.types import EmbeddedResource, TextContent, TextResourceContents
 
 mcp = FastMCP("scratchpad-test-mcp")
 
@@ -205,6 +208,59 @@ def sp_get_nested_json(size: int = 0) -> str:
         },
     }
     return json.dumps(output)
+
+
+# ---------------------------------------------------------------------------
+# By-reference arguments
+# ---------------------------------------------------------------------------
+
+
+def generate_runbook() -> str:
+    """Deterministic markdown file with characters that retyping tends to
+    mangle: tabs, trailing spaces, backslashes, quotes, and non-ASCII."""
+    sections = []
+    for i in range(12):
+        sections.append(
+            f"## Step {i + 1}: check service-{i:02d}\n\n"
+            f"- Run `kubectl -n prod-{i % 3} get pods -l app=svc-{i:02d}`\n"
+            f'- Expect "Running" for every pod; note restarts > {i + 2}\t(tab)\n'
+            f"- Escalate to the façade team if p99 exceeds {100 + i * 25}ms  \n"
+            f"- Notes: C:\\runbooks\\svc-{i:02d}.md\n"
+        )
+    return "# Service Recovery Runbook\n\n" + "\n".join(sections)
+
+
+RUNBOOK = generate_runbook()
+
+
+# No return annotation: FastMCP would otherwise derive an output schema and
+# wrap the result in structured content, hiding the embedded resource.
+@mcp.tool()
+def sp_get_file(path: str = "docs/runbook.md"):
+    """Download a text file from the test repository. Returns a status line
+    plus the file as an embedded resource (the shape of GitHub's
+    get_file_contents)."""
+    sha = hashlib.sha1(RUNBOOK.encode()).hexdigest()
+    return [
+        TextContent(type="text", text=f"successfully downloaded text file (SHA: {sha})"),
+        EmbeddedResource(
+            type="resource",
+            resource=TextResourceContents(
+                uri=f"repo://scratchpad-test/contents/{path}",
+                mimeType="text/markdown",
+                text=RUNBOOK,
+            ),
+        ),
+    ]
+
+
+@mcp.tool()
+def sp_write_file(path: str, content: str, message: str = "") -> str:
+    """Create or update a text file in the test repository. Reports the
+    written size and whether the content is byte-for-byte identical to the
+    file sp_get_file serves."""
+    matches = str(content == RUNBOOK).lower()
+    return f"wrote {len(content.encode())} bytes to {path}; matches_original={matches}"
 
 
 # ---------------------------------------------------------------------------

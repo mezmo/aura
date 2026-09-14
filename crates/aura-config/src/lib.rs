@@ -23,7 +23,9 @@ pub use loader::ConfigLoader;
 pub use orchestration::{
     ArtifactsConfig, OrchestrationConfig, TimeoutsConfig, ToolVisibility, WorkerConfig,
 };
-pub use scratchpad::{ScratchpadConfig, ScratchpadToolEntry};
+pub use scratchpad::{
+    FieldPath, FieldSegment, ScratchpadConfig, ScratchpadToolEntry, ServerScratchpadConfig,
+};
 pub use session_store::{
     FileSessionStoreConfig, RedisSessionStoreConfig, SessionStoreBackend, SessionStoreConfig,
 };

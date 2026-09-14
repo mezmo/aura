@@ -131,7 +131,10 @@ impl ToolWrapper for ScratchpadWrapper {
         .replace(['/', '\\', ':', ' '], "_");
 
         // The write is awaited before returning the pointer.
-        let write = self.storage.write_output(&file_id, content).await;
+        let write = self
+            .storage
+            .write_output_with_raw(&file_id, content, ctx.raw_payload.as_deref())
+            .await;
         match write {
             Ok(result) => {
                 let filename = result
@@ -191,6 +194,18 @@ impl ToolWrapper for ScratchpadWrapper {
                         ),
                     };
                     pointer.push_str(&tool_list);
+                }
+
+                if let Some(raw) = &result.raw {
+                    pointer.push_str(&format!(
+                        "\n\n[raw: '{name}' holds the tool's payload byte-for-byte ({lines} lines), \
+                         without the response text around it. Explore it with the same tools; \
+                         to send the content unchanged in a tool argument that has a \
+                         `<field>_file` variant, pass file=\"{name}\" there instead of \
+                         retyping it.]",
+                        name = raw.filename,
+                        lines = raw.line_count,
+                    ));
                 }
 
                 self.budget.record_intercepted(token_count);
@@ -326,6 +341,52 @@ mod tests {
             r1.output, r2.output,
             "identical raw output must produce identical pointer strings so DuplicateCallGuard can detect loops"
         );
+    }
+
+    /// A result with a raw payload (e.g. GitHub `get_file_contents`: status
+    /// line + file resource) gets a verbatim raw copy, and the pointer names
+    /// it so the model can reference the content unchanged.
+    #[tokio::test]
+    async fn test_wrapper_writes_raw_copy_and_names_it_in_pointer() {
+        let tmp = TempDir::new().unwrap();
+        let storage = Arc::new(
+            ScratchpadStorage::with_base_dir(tmp.path(), "req-wrap-raw")
+                .await
+                .unwrap(),
+        );
+        let tools = HashMap::from([("get_file_contents".to_string(), 10)]);
+        let counter = TiktokenCounter::default_counter();
+        let budget = ContextBudget::new(128_000, 0.20, 0, Arc::new(counter));
+        let wrapper = ScratchpadWrapper::new(tools, storage.clone(), budget);
+
+        let file = (0..200)
+            .map(|i| format!("line {i} of the runbook\n"))
+            .collect::<String>();
+        let rendered = format!("successfully downloaded text file (SHA: abc)\n{file}");
+        let mut ctx = ToolCallContext::new("get_file_contents");
+        ctx.task_id = Some(1);
+        ctx.tool_initiator_id = "writer".to_string();
+        ctx.attempt = Some(0);
+        ctx.raw_payload = Some(file.clone());
+
+        let result = wrapper.transform_output(rendered, &ok(), &ctx, None).await;
+
+        let raw_name = storage
+            .list_files()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|f| f.contains(".raw."))
+            .expect("a raw copy must be written");
+        assert!(
+            result.output.contains(&format!("[raw: '{raw_name}'")),
+            "pointer must name the raw copy; got: {}",
+            result.output
+        );
+        let on_disk = tokio::fs::read_to_string(storage.dir().join(&raw_name))
+            .await
+            .unwrap();
+        assert_eq!(on_disk, file);
     }
 
     #[tokio::test]

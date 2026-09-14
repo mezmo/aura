@@ -295,7 +295,7 @@ mod tests {
                 headers: static_headers,
                 description: None,
                 headers_from_request,
-                scratchpad: HashMap::new(),
+                scratchpad: Default::default(),
             },
         );
 

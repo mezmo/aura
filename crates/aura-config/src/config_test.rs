@@ -1907,12 +1907,79 @@ url = "http://localhost:8000/mcp"
         let thresholds = match server {
             McpServerConfig::HttpStreamable { scratchpad, .. }
             | McpServerConfig::Sse { scratchpad, .. }
-            | McpServerConfig::Stdio { scratchpad, .. } => scratchpad,
+            | McpServerConfig::Stdio { scratchpad, .. } => &scratchpad.tools,
         };
         assert_eq!(thresholds.get("*_list_*").unwrap().min_tokens, 512);
         assert_eq!(thresholds.get("foo_get_bar").unwrap().min_tokens, 128);
         // Empty entry should use default
         assert_eq!(thresholds.get("defaults_tool").unwrap().min_tokens, 5_120);
+    }
+
+    const BY_REFERENCE_SERVER: &str = r#"
+[agent]
+name = "Test"
+system_prompt = "Test"
+
+[agent.llm]
+provider = "openai"
+api_key = "test"
+model = "gpt-4o"
+
+[mcp.servers.github]
+transport = "http_streamable"
+url = "http://localhost:8000/mcp"
+
+[mcp.servers.github.scratchpad]
+"get_file_contents" = { min_tokens = 2000 }
+"#;
+
+    #[test]
+    fn scratchpad_by_reference_parses_beside_thresholds() {
+        let config = format!(
+            r#"{BY_REFERENCE_SERVER}
+[mcp.servers.github.scratchpad.by_reference]
+create_or_update_file = ["content"]
+push_files = ["files[].content"]
+"#
+        );
+        let loaded = load_config_from_str(&config).expect("config should parse");
+        let server = &loaded.mcp.as_ref().expect("mcp present").servers["github"];
+        let scratchpad = server.scratchpad();
+
+        assert_eq!(
+            scratchpad.tools.keys().collect::<Vec<_>>(),
+            ["get_file_contents"],
+            "`by_reference` is not a tool pattern"
+        );
+        assert_eq!(scratchpad.tools["get_file_contents"].min_tokens, 2000);
+
+        let create = &scratchpad.by_reference["create_or_update_file"];
+        assert_eq!(create.len(), 1);
+        assert_eq!(create[0].field(), "content");
+        assert!(create[0].parents().is_empty());
+
+        let push = &scratchpad.by_reference["push_files"];
+        assert_eq!(push[0].as_str(), "files[].content");
+        assert_eq!(push[0].field(), "content");
+        assert_eq!(push[0].parents().len(), 1);
+        assert_eq!(push[0].parents()[0].name, "files");
+        assert!(push[0].parents()[0].array);
+    }
+
+    #[test]
+    fn scratchpad_by_reference_rejects_malformed_field_path() {
+        let config = format!(
+            r#"{BY_REFERENCE_SERVER}
+[mcp.servers.github.scratchpad.by_reference]
+push_files = ["files[]"]
+"#
+        );
+        let err = load_config_from_str(&config).expect_err("a path ending in [] must not parse");
+        assert!(
+            err.to_string()
+                .contains("invalid by_reference field path 'files[]'"),
+            "error must name the bad path, got: {err}"
+        );
     }
 
     #[test]

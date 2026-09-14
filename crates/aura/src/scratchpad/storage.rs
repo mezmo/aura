@@ -103,6 +103,15 @@ pub struct WriteResult {
     pub line_count: usize,
     /// Companion files extracted from JSON string values.
     pub companions: Vec<CompanionFile>,
+    /// Verbatim copy of the tool result's raw payload.
+    pub raw: Option<RawCopy>,
+}
+
+/// A file holding a tool result's raw payload byte-for-byte.
+#[derive(Debug, Clone)]
+pub struct RawCopy {
+    pub filename: String,
+    pub line_count: usize,
 }
 
 /// Intermediate representation of a companion file to be written.
@@ -249,6 +258,21 @@ impl ScratchpadStorage {
         tool_call_id: &str,
         content: &str,
     ) -> std::io::Result<WriteResult> {
+        self.write_output_with_raw(tool_call_id, content, None)
+            .await
+    }
+
+    /// [`write_output`](Self::write_output), plus `raw` (the tool result's raw
+    /// payload) written untouched to `{tool_call_id}.raw.{ext}`. The copy is
+    /// skipped when the primary file already holds exactly `raw`; otherwise
+    /// it is what a by-reference argument needs, since the primary file may
+    /// be pretty-printed or carry response text around the payload.
+    pub async fn write_output_with_raw(
+        &self,
+        tool_call_id: &str,
+        content: &str,
+        raw: Option<&str>,
+    ) -> std::io::Result<WriteResult> {
         let (path, format, to_write, parsed) = self.prepare_write(tool_call_id, content);
         let line_count = to_write.lines().count();
         fs::write(&path, &to_write).await?;
@@ -266,11 +290,35 @@ impl ScratchpadStorage {
             vec![]
         };
 
+        let raw = match raw.filter(|raw| *raw != to_write) {
+            Some(raw) => Some(self.write_raw_copy(tool_call_id, raw).await?),
+            None => None,
+        };
+
         Ok(WriteResult {
             path,
             format,
             line_count,
             companions,
+            raw,
+        })
+    }
+
+    async fn write_raw_copy(&self, tool_call_id: &str, raw: &str) -> std::io::Result<RawCopy> {
+        let (format, _) = ContentFormat::detect_and_parse(raw);
+        let filename = format!("{tool_call_id}.raw.{}", format.extension());
+        let path = self.safe_companion_path(&filename).await?;
+        fs::write(&path, raw).await?;
+        let line_count = raw.lines().count();
+        debug!(
+            "Scratchpad raw copy written: {} ({} bytes, {} lines)",
+            path.display(),
+            raw.len(),
+            line_count
+        );
+        Ok(RawCopy {
+            filename,
+            line_count,
         })
     }
 
@@ -635,6 +683,69 @@ mod tests {
         assert_eq!(read_back, "{\n  \"key\": \"value\"\n}");
         assert_eq!(result.line_count, 3);
         assert!(result.companions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_raw_copy_is_written_verbatim_beside_the_primary() {
+        let tmp = TempDir::new().unwrap();
+        let storage = ScratchpadStorage::with_base_dir(tmp.path(), "req-raw")
+            .await
+            .unwrap();
+
+        let file = "# Runbook\n\n- step one\n";
+        let rendered = format!("successfully downloaded text file (SHA: abc)\n{file}");
+        let result = storage
+            .write_output_with_raw("call-raw", &rendered, Some(file))
+            .await
+            .unwrap();
+
+        let raw = result.raw.expect("raw copy differs from the primary");
+        assert_eq!(raw.filename, "call-raw.raw.md");
+        assert_eq!(raw.line_count, 3);
+        let on_disk = fs::read_to_string(storage.dir().join(&raw.filename))
+            .await
+            .unwrap();
+        assert_eq!(on_disk, file, "raw copy must be byte-for-byte");
+    }
+
+    /// The primary file pretty-prints JSON, so compact JSON still gets a
+    /// verbatim raw copy even with no response text around it.
+    #[tokio::test]
+    async fn test_raw_copy_preserves_json_formatting() {
+        let tmp = TempDir::new().unwrap();
+        let storage = ScratchpadStorage::with_base_dir(tmp.path(), "req-raw-json")
+            .await
+            .unwrap();
+
+        let json = r#"{"a":1,"b":[1,2]}"#;
+        let result = storage
+            .write_output_with_raw("call-json", json, Some(json))
+            .await
+            .unwrap();
+
+        let raw = result.raw.expect("pretty-printing changed the bytes");
+        assert_eq!(raw.filename, "call-json.raw.json");
+        let on_disk = fs::read_to_string(storage.dir().join(&raw.filename))
+            .await
+            .unwrap();
+        assert_eq!(on_disk, json);
+    }
+
+    #[tokio::test]
+    async fn test_raw_copy_skipped_when_primary_already_holds_it() {
+        let tmp = TempDir::new().unwrap();
+        let storage = ScratchpadStorage::with_base_dir(tmp.path(), "req-raw-same")
+            .await
+            .unwrap();
+
+        let text = "plain text payload\nline two";
+        let result = storage
+            .write_output_with_raw("call-same", text, Some(text))
+            .await
+            .unwrap();
+
+        assert!(result.raw.is_none());
+        assert_eq!(storage.list_files().await.unwrap(), ["call-same.txt"]);
     }
 
     #[tokio::test]

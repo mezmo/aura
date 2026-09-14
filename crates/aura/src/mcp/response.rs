@@ -8,10 +8,111 @@
 
 use anyhow::Result;
 use base64::Engine;
-use rmcp::model::CallToolResult;
+use rmcp::model::{CallToolResult, Content, RawContent, ResourceContents};
+use std::future::Future;
+use std::sync::{Arc, Mutex};
 use tracing::{debug, info, warn};
 
 const MCP_ERROR_PREFIX: &str = "Tool returned an error: ";
+
+tokio::task_local! {
+    static RAW_PAYLOAD: RawPayloadSlot;
+}
+
+/// Upper bound on a raw payload, in bytes. Well above the rendered-output
+/// resource cap (`MAX_RESOURCE_CONTENT_BYTES`), which the raw copy exists to
+/// get past, while bounding the extra copy held in memory and on disk.
+pub const MAX_RAW_PAYLOAD_BYTES: usize = 1024 * 1024;
+
+/// Receiver for a tool result's [`raw_payload`].
+#[derive(Clone, Default)]
+pub struct RawPayloadSlot(Arc<Mutex<Option<String>>>);
+
+impl RawPayloadSlot {
+    /// Run `fut` with this slot receiving the raw payload of every successful
+    /// text-content result `extract_tool_result` handles inside it (the last
+    /// one wins). Task-locals do not cross `tokio::spawn`, so the extraction
+    /// must run on `fut`'s own task.
+    pub async fn scope<F: Future>(&self, fut: F) -> F::Output {
+        RAW_PAYLOAD.scope(self.clone(), fut).await
+    }
+
+    pub fn take(&self) -> Option<String> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+}
+
+/// Hand `content`'s raw payload to the enclosing [`RawPayloadSlot`], if one
+/// is in scope. Computed only when a slot is listening, since the payload is
+/// a full copy of the resource text.
+fn publish_raw_payload(content: &[Content]) {
+    let _ = RAW_PAYLOAD.try_with(|slot| {
+        let payload = raw_payload(content);
+        *slot.0.lock().unwrap_or_else(|e| e.into_inner()) = payload;
+    });
+}
+
+/// The text of a result's single embedded resource, verbatim and untruncated,
+/// provided every other item is plain text — e.g. GitHub `get_file_contents`
+/// returns a `successfully downloaded text file (SHA: …)` status line plus
+/// the file as an embedded resource. `None` when there is no resource, more
+/// than one, a binary one, one over [`MAX_RAW_PAYLOAD_BYTES`], or any
+/// non-text item alongside it.
+///
+/// The rendered output `extract_tool_result` builds joins every item (and
+/// truncates large resources), so it can't be used as the file content.
+pub fn raw_payload(content: &[Content]) -> Option<String> {
+    let mut payload = None;
+    for item in content {
+        match &item.raw {
+            RawContent::Text(_) => {}
+            RawContent::Resource(res) if payload.is_none() => {
+                payload = Some(resource_text(&res.resource)?);
+            }
+            _ => return None,
+        }
+    }
+    payload
+}
+
+fn is_text_mime(mime_type: Option<&str>) -> bool {
+    mime_type.is_some_and(|m| {
+        m.starts_with("text/")
+            || m == "application/json"
+            || m == "application/xml"
+            || m == "application/yaml"
+    })
+}
+
+/// Untruncated text of a resource; `None` unless it is text, or a text-typed
+/// blob that decodes as UTF-8, of at most [`MAX_RAW_PAYLOAD_BYTES`]. Sizes
+/// are checked before anything is copied or decoded.
+fn resource_text(resource: &ResourceContents) -> Option<String> {
+    let too_large = |bytes: usize| {
+        let over = bytes > MAX_RAW_PAYLOAD_BYTES;
+        if over {
+            debug!("raw payload of ~{bytes} bytes exceeds {MAX_RAW_PAYLOAD_BYTES}; not captured");
+        }
+        over
+    };
+    match resource {
+        ResourceContents::TextResourceContents { text, .. } => {
+            (!too_large(text.len())).then(|| text.clone())
+        }
+        ResourceContents::BlobResourceContents {
+            blob, mime_type, ..
+        } => {
+            // Base64 decodes to at most 3 bytes per 4 characters.
+            if !is_text_mime(mime_type.as_deref()) || too_large(blob.len() / 4 * 3) {
+                return None;
+            }
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(blob)
+                .ok()?;
+            String::from_utf8(bytes).ok()
+        }
+    }
+}
 
 /// JSON-RPC 2.0 error codes that indicate input/schema validation failures.
 const SCHEMA_ERROR_CODES: [i32; 3] = [
@@ -147,13 +248,7 @@ pub fn extract_resource_contents(resource: &rmcp::model::ResourceContents) -> St
             mime_type,
             ..
         } => {
-            let is_text_mime = mime_type.as_deref().is_some_and(|m| {
-                m.starts_with("text/")
-                    || m == "application/json"
-                    || m == "application/xml"
-                    || m == "application/yaml"
-            });
-            if !is_text_mime {
+            if !is_text_mime(mime_type.as_deref()) {
                 return format!(
                     "[Binary resource: {uri} (mime: {})]",
                     mime_type.as_deref().unwrap_or("unknown")
@@ -276,6 +371,10 @@ pub fn extract_tool_result(result: CallToolResult, tool_name: &str) -> Result<Ca
         "Tool '{}' using text content extraction (no structured_content)",
         tool_name
     );
+
+    if !is_error {
+        publish_raw_payload(&result.content);
+    }
 
     let content = result
         .content
@@ -652,6 +751,183 @@ mod tests {
             .into_prefixed_string();
         assert!(extracted.contains("Successfully downloaded file"));
         assert!(extracted.contains("# File Content"));
+    }
+
+    // --- Raw payload capture tests ---
+
+    fn text_item(text: &str) -> Content {
+        Content {
+            raw: RawContent::Text(RawTextContent {
+                text: text.to_string(),
+                meta: None,
+            }),
+            annotations: None,
+        }
+    }
+
+    fn text_resource_item(text: &str) -> Content {
+        Content {
+            raw: RawContent::Resource(RawEmbeddedResource {
+                meta: None,
+                resource: ResourceContents::TextResourceContents {
+                    uri: "repo://owner/repo/contents/runbook.md".to_string(),
+                    mime_type: Some("text/markdown".to_string()),
+                    text: text.to_string(),
+                    meta: None,
+                },
+            }),
+            annotations: None,
+        }
+    }
+
+    fn text_result(content: Vec<Content>, is_error: bool) -> CallToolResult {
+        CallToolResult {
+            content,
+            structured_content: None,
+            is_error: Some(is_error),
+            meta: None,
+        }
+    }
+
+    /// The GitHub `get_file_contents` shape: a status line plus the file as
+    /// an embedded resource. The raw payload is the file alone.
+    #[test]
+    fn raw_payload_is_the_embedded_resource_text_without_the_status_line() {
+        let file = "# Runbook\n\n- step one\n- step two\n";
+        let content = vec![
+            text_item("successfully downloaded text file (SHA: abc123)"),
+            text_resource_item(file),
+        ];
+        assert_eq!(raw_payload(&content).as_deref(), Some(file));
+    }
+
+    /// The rendered output truncates large resources; the raw payload must
+    /// not, or writing it back would corrupt the file.
+    #[test]
+    fn raw_payload_is_not_truncated() {
+        let file = "y".repeat(MAX_RESOURCE_CONTENT_BYTES + 10);
+        let content = vec![text_item("status"), text_resource_item(&file)];
+        assert_eq!(raw_payload(&content).map(|p| p.len()), Some(file.len()));
+    }
+
+    #[test]
+    fn raw_payload_is_none_over_the_size_limit() {
+        let text = "z".repeat(MAX_RAW_PAYLOAD_BYTES + 1);
+        assert_eq!(
+            raw_payload(&[text_item("status"), text_resource_item(&text)]),
+            None
+        );
+
+        let blob = Content {
+            raw: RawContent::Resource(RawEmbeddedResource {
+                meta: None,
+                resource: ResourceContents::BlobResourceContents {
+                    uri: "repo://owner/repo/contents/big.json".to_string(),
+                    mime_type: Some("application/json".to_string()),
+                    blob: base64::engine::general_purpose::STANDARD
+                        .encode("z".repeat(MAX_RAW_PAYLOAD_BYTES + 3)),
+                    meta: None,
+                },
+            }),
+            annotations: None,
+        };
+        assert_eq!(raw_payload(&[blob]), None);
+
+        let at_limit = "z".repeat(MAX_RAW_PAYLOAD_BYTES);
+        assert_eq!(
+            raw_payload(&[text_resource_item(&at_limit)]).map(|p| p.len()),
+            Some(MAX_RAW_PAYLOAD_BYTES)
+        );
+    }
+
+    #[test]
+    fn raw_payload_decodes_text_blobs() {
+        let json_text = r#"{"key": "value"}"#;
+        let content = vec![Content {
+            raw: RawContent::Resource(RawEmbeddedResource {
+                meta: None,
+                resource: ResourceContents::BlobResourceContents {
+                    uri: "repo://owner/repo/contents/data.json".to_string(),
+                    mime_type: Some("application/json".to_string()),
+                    blob: base64::engine::general_purpose::STANDARD.encode(json_text),
+                    meta: None,
+                },
+            }),
+            annotations: None,
+        }];
+        assert_eq!(raw_payload(&content).as_deref(), Some(json_text));
+    }
+
+    #[test]
+    fn raw_payload_is_none_without_exactly_one_text_resource() {
+        assert_eq!(raw_payload(&[text_item("just text")]), None);
+        assert_eq!(
+            raw_payload(&[text_resource_item("a"), text_resource_item("b")]),
+            None,
+            "two resources are ambiguous"
+        );
+        let binary = Content {
+            raw: RawContent::Resource(RawEmbeddedResource {
+                meta: None,
+                resource: ResourceContents::BlobResourceContents {
+                    uri: "repo://owner/repo/contents/image.png".to_string(),
+                    mime_type: Some("image/png".to_string()),
+                    blob: "iVBORw0KGgo=".to_string(),
+                    meta: None,
+                },
+            }),
+            annotations: None,
+        };
+        assert_eq!(raw_payload(&[binary]), None);
+        let link = Content {
+            raw: RawContent::ResourceLink(RawResource {
+                uri: "repo://owner/repo/contents/x.md".to_string(),
+                name: "x.md".to_string(),
+                title: None,
+                description: None,
+                mime_type: None,
+                size: None,
+                icons: None,
+                meta: None,
+            }),
+            annotations: None,
+        };
+        assert_eq!(
+            raw_payload(&[text_resource_item("file"), link]),
+            None,
+            "a non-text item alongside the resource is not a plain status line"
+        );
+    }
+
+    #[tokio::test]
+    async fn extract_tool_result_publishes_raw_payload_into_an_enclosing_slot() {
+        let file = "line 1\nline 2\n";
+        let result = text_result(vec![text_item("status"), text_resource_item(file)], false);
+
+        let slot = RawPayloadSlot::default();
+        let rendered = slot
+            .scope(async { extract_tool_result(result, "get_file").unwrap() })
+            .await;
+
+        assert_eq!(rendered.content(), format!("status\n{file}"));
+        assert_eq!(slot.take().as_deref(), Some(file));
+        assert_eq!(slot.take(), None, "take empties the slot");
+    }
+
+    #[tokio::test]
+    async fn extract_tool_result_does_not_publish_for_error_results() {
+        let result = text_result(vec![text_resource_item("partial")], true);
+        let slot = RawPayloadSlot::default();
+        slot.scope(async { extract_tool_result(result, "get_file").unwrap() })
+            .await;
+        assert_eq!(slot.take(), None);
+    }
+
+    #[test]
+    fn extract_tool_result_without_a_slot_is_unaffected() {
+        let result = text_result(vec![text_item("status"), text_resource_item("x")], false);
+        let outcome = extract_tool_result(result, "get_file").unwrap();
+        assert_eq!(outcome.content(), "status\nx");
     }
 
     // --- CallOutcome tests ---

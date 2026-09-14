@@ -4,8 +4,8 @@
 //! the construction of the budget, storage, wrapper, and tools config.
 
 use super::{
-    ContextBudget, SCRATCHPAD_PREAMBLE, ScratchpadConfig, ScratchpadStorage, ScratchpadToolsConfig,
-    ScratchpadWrapper, TokenCounter, scratchpad_tool_schema_tokens,
+    ByReferenceMap, ContextBudget, SCRATCHPAD_PREAMBLE, ScratchpadConfig, ScratchpadStorage,
+    ScratchpadToolsConfig, ScratchpadWrapper, TokenCounter, scratchpad_tool_schema_tokens,
 };
 use crate::config::glob_match;
 use crate::tool_wrapper::ToolWrapper;
@@ -23,6 +23,7 @@ pub struct ScratchpadBuildInputs<'a> {
     /// `None` confines reads to the scratchpad dir.
     pub read_root: Option<&'a Path>,
     pub scratchpad_tool_map: HashMap<String, usize>,
+    pub by_reference_map: ByReferenceMap,
     pub context_window: usize,
     pub initial_used: usize,
     pub token_counter: Arc<dyn TokenCounter>,
@@ -59,11 +60,12 @@ pub async fn build_scratchpad(
     }
     let storage = Arc::new(storage);
     tracing::info!(
-        "Scratchpad active (dir={}, context_window={}, max_extraction_tokens={}, tool_patterns={})",
+        "Scratchpad active (dir={}, context_window={}, max_extraction_tokens={}, tool_patterns={}, by_reference_tools={})",
         inputs.storage_dir.display(),
         inputs.context_window,
         inputs.sp_cfg.max_extraction_tokens,
         inputs.scratchpad_tool_map.len(),
+        inputs.by_reference_map.len(),
     );
 
     let wrapper: Arc<dyn ToolWrapper> = Arc::new(ScratchpadWrapper::new(
@@ -76,6 +78,7 @@ pub async fn build_scratchpad(
         storage: storage.clone(),
         budget: budget.clone(),
         scratchpad_tools: inputs.scratchpad_tool_map,
+        by_reference: inputs.by_reference_map,
     };
 
     Ok(ScratchpadBuild {
@@ -278,6 +281,7 @@ mod tests {
             storage_dir: tmp.path(),
             read_root: None,
             scratchpad_tool_map: tool_map,
+            by_reference_map: Default::default(),
             context_window: 128_000,
             initial_used: 1_000,
             token_counter: counter(),

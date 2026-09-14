@@ -55,6 +55,15 @@ description = "Kubernetes cluster operations: pods, deployments, services, logs,
 "events_list" = { min_tokens = 1_500 }
 "resources_list" = { min_tokens = 2_500 }
 
+# By-reference arguments: let the model pass a stored file instead of
+# retyping it. Each listed string field gets an optional `<field>_file` twin
+# that takes a scratchpad file name (for an intercepted output, prefer the
+# `.raw` copy the pointer names); the tool receives that file's exact
+# contents as the field. Only useful for write tools, so this stays
+# commented out while the server runs with --read-only.
+# [mcp.servers.kubernetes.scratchpad.by_reference]
+# resources_create_or_update = ["resource"]
+
 [agent]
 name = "Kubernetes Investigator"
 model_owner = "mezmo"

@@ -1017,7 +1017,7 @@ mod tests {
                 headers: HashMap::new(),
                 description: None,
                 headers_from_request: HashMap::new(),
-                scratchpad: HashMap::new(),
+                scratchpad: Default::default(),
             },
         );
         let config = McpConfig {
@@ -1091,7 +1091,7 @@ mod tests {
                 headers: HashMap::new(),
                 description: None,
                 headers_from_request: HashMap::new(),
-                scratchpad: HashMap::new(),
+                scratchpad: Default::default(),
             },
         );
         let config = McpConfig {
