@@ -291,7 +291,7 @@ impl ScratchpadStorage {
         };
 
         let raw = match raw.filter(|raw| *raw != to_write) {
-            Some(raw) => Some(self.write_raw_copy(tool_call_id, raw).await?),
+            Some(raw) => self.write_raw_copy(tool_call_id, raw).await?,
             None => None,
         };
 
@@ -304,22 +304,97 @@ impl ScratchpadStorage {
         })
     }
 
-    async fn write_raw_copy(&self, tool_call_id: &str, raw: &str) -> std::io::Result<RawCopy> {
+    /// Write `content` untouched to `filename` in the scratchpad directory.
+    /// An existing file with the same bytes counts as written; one with
+    /// different bytes is an `AlreadyExists` error, so a file name that has
+    /// been handed out never comes to mean different content.
+    ///
+    /// The file appears complete or not at all: the bytes go to a temporary
+    /// sibling, are synced, and are then hard-linked into place, which also
+    /// never replaces an existing file. A crash mid-write can leave only a
+    /// hidden temporary file behind, never a truncated file under `filename`.
+    pub async fn write_new_verbatim(
+        &self,
+        filename: &str,
+        content: &str,
+    ) -> std::io::Result<PathBuf> {
+        use tokio::io::AsyncWriteExt;
+
+        let path = self.safe_companion_path(filename).await?;
+        let temp = self
+            .safe_companion_path(&format!(
+                ".{filename}.{}.tmp",
+                uuid::Uuid::new_v4().simple()
+            ))
+            .await?;
+        let placed = async {
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp)
+                .await?;
+            file.write_all(content.as_bytes()).await?;
+            file.sync_all().await?;
+            drop(file);
+            match fs::hard_link(&temp, &path).await {
+                // Without hard links a rename is still atomic, but the
+                // existence check before it can race a concurrent writer.
+                Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
+                    if fs::try_exists(&path).await? {
+                        Err(std::io::ErrorKind::AlreadyExists.into())
+                    } else {
+                        fs::rename(&temp, &path).await
+                    }
+                }
+                linked => linked,
+            }
+        }
+        .await;
+        let _ = fs::remove_file(&temp).await;
+
+        match placed {
+            Ok(()) => {
+                debug!(
+                    "Scratchpad file written verbatim: {} ({} bytes)",
+                    path.display(),
+                    content.len()
+                );
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                if fs::read(&path).await? != content.as_bytes() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        format!("a different file named '{filename}' already exists"),
+                    ));
+                }
+            }
+            Err(e) => return Err(e),
+        }
+        Ok(path)
+    }
+
+    /// Write the raw copy through [`write_new_verbatim`](Self::write_new_verbatim),
+    /// so an earlier pointer's raw file is never replaced by different bytes.
+    /// `None` when that name already holds a different payload: the output is
+    /// still saved, it just gets no raw copy.
+    async fn write_raw_copy(
+        &self,
+        tool_call_id: &str,
+        raw: &str,
+    ) -> std::io::Result<Option<RawCopy>> {
         let (format, _) = ContentFormat::detect_and_parse(raw);
         let filename = format!("{tool_call_id}.raw.{}", format.extension());
-        let path = self.safe_companion_path(&filename).await?;
-        fs::write(&path, raw).await?;
-        let line_count = raw.lines().count();
-        debug!(
-            "Scratchpad raw copy written: {} ({} bytes, {} lines)",
-            path.display(),
-            raw.len(),
-            line_count
-        );
-        Ok(RawCopy {
-            filename,
-            line_count,
-        })
+        match self.write_new_verbatim(&filename, raw).await {
+            Ok(_) => Ok(Some(RawCopy {
+                filename,
+                line_count: raw.lines().count(),
+            })),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                warn!("Scratchpad: not writing raw copy: {e}");
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Extract large structured string values from JSON as companion files.
@@ -683,6 +758,51 @@ mod tests {
         assert_eq!(read_back, "{\n  \"key\": \"value\"\n}");
         assert_eq!(result.line_count, 3);
         assert!(result.companions.is_empty());
+    }
+
+    /// A raw copy's name must keep meaning the bytes its pointer promised:
+    /// a later write under the same name with a different payload is
+    /// refused (the output gets no raw copy) instead of replacing it.
+    #[tokio::test]
+    async fn test_raw_copy_is_never_replaced_by_different_bytes() {
+        let tmp = TempDir::new().unwrap();
+        let storage = ScratchpadStorage::with_base_dir(tmp.path(), "req-raw-keep")
+            .await
+            .unwrap();
+        let rendered = "status line\nshared rendered text";
+
+        let first = storage
+            .write_output_with_raw("call-same", rendered, Some("payload one"))
+            .await
+            .unwrap();
+        let second = storage
+            .write_output_with_raw("call-same", rendered, Some("payload two"))
+            .await
+            .unwrap();
+        let again = storage
+            .write_output_with_raw("call-same", rendered, Some("payload one"))
+            .await
+            .unwrap();
+
+        let raw = first.raw.expect("first write gets a raw copy");
+        assert!(
+            second.raw.is_none(),
+            "different bytes must not take the name"
+        );
+        assert_eq!(again.raw.map(|r| r.filename), Some(raw.filename.clone()));
+        let on_disk = fs::read_to_string(storage.dir().join(&raw.filename))
+            .await
+            .unwrap();
+        assert_eq!(on_disk, "payload one");
+        assert!(
+            storage
+                .list_files()
+                .await
+                .unwrap()
+                .iter()
+                .all(|f| !f.ends_with(".tmp")),
+            "no temporary files are left behind"
+        );
     }
 
     #[tokio::test]

@@ -116,8 +116,12 @@ impl ToolWrapper for ScratchpadWrapper {
         // an identical pointer string. The orchestration `DuplicateCallGuard`
         // runs after this wrapper and compares pointer strings; a fresh UUID
         // every call would defeat duplicate detection on intercepted tools.
+        // The raw payload is hashed too: it names the raw copy, and it can
+        // differ between results whose rendered output (which truncates large
+        // resources) is identical.
         let mut hasher = DefaultHasher::new();
         content.hash(&mut hasher);
+        ctx.raw_payload.hash(&mut hasher);
         let content_hash = format!("{:016x}", hasher.finish());
 
         let file_id = format!(
@@ -198,8 +202,9 @@ impl ToolWrapper for ScratchpadWrapper {
 
                 if let Some(raw) = &result.raw {
                     pointer.push_str(&format!(
-                        "\n\n[raw: '{name}' holds the tool's payload byte-for-byte ({lines} lines), \
-                         without the response text around it. Explore it with the same tools; \
+                        "\n\n[raw: '{name}' holds the result's embedded resource byte-for-byte \
+                         ({lines} lines), without the other response text. Explore it with the \
+                         same tools; \
                          to send the content unchanged in a tool argument that has a \
                          `<field>_file` variant, pass file=\"{name}\" there instead of \
                          retyping it.]",
@@ -387,6 +392,47 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(on_disk, file);
+    }
+
+    /// Rendered output truncates large resources, so two results can render
+    /// identically while their raw payloads differ. Each must keep its own
+    /// raw copy under its own name.
+    #[tokio::test]
+    async fn test_wrapper_names_raw_copies_by_their_own_payload() {
+        let tmp = TempDir::new().unwrap();
+        let storage = Arc::new(
+            ScratchpadStorage::with_base_dir(tmp.path(), "req-wrap-raw-names")
+                .await
+                .unwrap(),
+        );
+        let tools = HashMap::from([("get_file_contents".to_string(), 10)]);
+        let counter = TiktokenCounter::default_counter();
+        let budget = ContextBudget::new(128_000, 0.20, 0, Arc::new(counter));
+        let wrapper = ScratchpadWrapper::new(tools, storage.clone(), budget);
+
+        let rendered = (0..200)
+            .map(|i| format!("identical rendered line {i}\n"))
+            .collect::<String>();
+        let mut names = Vec::new();
+        for payload in ["payload A\n", "payload B\n"] {
+            let mut ctx = ToolCallContext::new("get_file_contents");
+            ctx.task_id = Some(1);
+            ctx.tool_initiator_id = "reader".to_string();
+            ctx.attempt = Some(0);
+            ctx.raw_payload = Some(payload.to_string());
+            let result = wrapper
+                .transform_output(rendered.clone(), &ok(), &ctx, None)
+                .await;
+            let start = result.output.find("[raw: '").expect("raw copy named") + "[raw: '".len();
+            let len = result.output[start..].find('\'').unwrap();
+            let name = result.output[start..start + len].to_string();
+            let on_disk = tokio::fs::read_to_string(storage.dir().join(&name))
+                .await
+                .unwrap();
+            assert_eq!(on_disk, payload);
+            names.push(name);
+        }
+        assert_ne!(names[0], names[1]);
     }
 
     #[tokio::test]
