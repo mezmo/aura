@@ -16,6 +16,9 @@
 
 pub mod event_names;
 pub mod orchestration;
+pub mod retention;
+
+pub use retention::{InvalidRetentionStamp, RetentionExpiresAt};
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;

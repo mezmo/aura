@@ -21,8 +21,9 @@ use super::super::RecordedDecisions;
 use super::super::commit::{cancel_run_approvals, config_fingerprint};
 use super::super::continuation::{RehydrateError, load_recorded_decisions};
 use super::super::document::{ParkedRun, load_parked_run};
+use super::super::lifetime::{RunExecutionScope, RunReservationLease};
 use super::claim::{
-    ClaimResumeFault, ResumeClaimTable, ResumeDocuments, ResumeLease, ResumeRunId, ResumeSessionId,
+    ClaimResumeFault, ResumeClaimTable, ResumeDocuments, ResumeRunId, ResumeSessionId,
     ValidatedResumePath,
 };
 
@@ -224,13 +225,17 @@ impl ResumeConflictRow {
         }
     }
 
-    pub(crate) fn expired(blocking: NonEmptyBlocking) -> Self {
+    /// The terminal expired row. `blocking` may be empty: a
+    /// retention-expired checkpoint with every approval addressed is valid
+    /// production evidence and must still render as `expired`, so the row
+    /// never requires an outstanding call.
+    pub(crate) fn expired(blocking: Vec<BlockingEntry>) -> Self {
         Self {
             code: ConflictCode::Expired,
             detail: Diagnostic::new(
                 "the decision window closed before every pending call was decided",
             ),
-            blocking: blocking.0,
+            blocking,
         }
     }
 
@@ -246,7 +251,11 @@ impl ResumeConflictRow {
 /// Why the evaluation refused the resume. Variants are declared in
 /// evaluation order; [`ResumeRefusal::DocumentAbsent`] and
 /// [`ResumeRefusal::IdentityMismatch`] are the detail-less rows, the rest
-/// render as the one conflict shape.
+/// render as the one conflict shape or as one of the typed fault rows.
+///
+/// The typed fault rows carry the diagnostic for server-side logging only;
+/// the endpoint renders their fixed client codes (`reify_failed` /
+/// `reify_unavailable`) and never the diagnostic text.
 #[derive(Debug, Clone)]
 pub enum ResumeRefusal {
     /// No checkpoint document under either name.
@@ -255,7 +264,18 @@ pub enum ResumeRefusal {
     IdentityMismatch,
     /// A not-ready conflict row.
     Conflict(ResumeConflictRow),
-    /// A store, document, or claim fault refused the run before any verdict.
+    /// The stored evidence is invalid — a corrupt or self-contradictory
+    /// checkpoint, document, or record set. 500 `reify_failed`.
+    InvalidEvidence(Diagnostic),
+    /// A known pre-execution I/O availability failure: the evidence could
+    /// not be read, not because it is wrong but because the store was not
+    /// reachable. 503 `reify_unavailable`.
+    Unavailable(Diagnostic),
+    /// An internal fault outside the evidence/availability classes.
+    /// 500 `reify_failed`.
+    Internal(Diagnostic),
+    /// The undifferentiated fault sink the ordered evaluation still fills
+    /// from; the S2/C fills migrate its sites onto the typed rows above.
     Fault(Diagnostic),
 }
 
@@ -344,7 +364,9 @@ impl From<ConsultFault> for ResumeRefusal {
             ConsultFault::Mismatch(diagnostic) => {
                 Self::Conflict(ResumeConflictRow::mismatch(diagnostic))
             }
-            ConsultFault::Expired(blocking) => Self::Conflict(ResumeConflictRow::expired(blocking)),
+            ConsultFault::Expired(blocking) => {
+                Self::Conflict(ResumeConflictRow::expired(blocking.0))
+            }
             ConsultFault::Parked(blocking) => Self::Conflict(ResumeConflictRow::parked(blocking)),
             ConsultFault::Fault(diagnostic) => Self::Fault(diagnostic),
         }
@@ -376,10 +398,12 @@ pub struct ResumeEvaluation<'a> {
     pub now: chrono::DateTime<chrono::Utc>,
 }
 
-/// Authorization to execute one segment for a granted run.
+/// Authorization to execute one segment for a granted run. Owns the run's
+/// reservation lease: the grant is single-use and non-cloneable, and the run
+/// releases when the grant (and every lease reference it handed out) ends.
 #[derive(Debug)]
 pub struct ResumeGrant {
-    lease: ResumeLease,
+    reservation: RunReservationLease,
     documents: ResumeDocuments,
     document: ParkedRun,
     recorded: Arc<RecordedDecisions>,
@@ -400,6 +424,23 @@ impl ResumeGrant {
     #[must_use]
     pub fn run_id(&self) -> &ResumeRunId {
         &self.run
+    }
+
+    /// The reservation fencing this grant's run: the supervisor's lease
+    /// reference, cloned from the grant's own so both share the one
+    /// occupation.
+    #[must_use]
+    pub(crate) fn reservation(&self) -> &RunReservationLease {
+        &self.reservation
+    }
+
+    /// The scope the resumed execution runs under: this grant's reservation
+    /// becomes the scope's fence, with the cancellation token and tracker
+    /// riding along. The supervisor seam (S3/S4): the grant keeps ownership
+    /// while the segment borrows the scope.
+    #[must_use]
+    pub fn execution_scope(&self) -> Arc<RunExecutionScope> {
+        RunExecutionScope::new(self.reservation.clone())
     }
 
     /// The checkpoint document the grant was evaluated from.
@@ -425,6 +466,76 @@ impl ResumeGrant {
     pub(crate) fn documents(&self) -> &ResumeDocuments {
         &self.documents
     }
+}
+
+/// One run's reservation with its re-read checkpoint: the internal carrier
+/// the ordered resume evaluation threads from reserve (step 2) through
+/// re-read/recheck (step 3) and the member consult (step 4) to the
+/// release-or-convert decision (steps 5–6). Dropping the carrier before
+/// conversion releases the reservation with no execution.
+#[derive(Debug)]
+pub(crate) struct ReservedEvaluation {
+    reservation: RunReservationLease,
+    docs: ResumeDocuments,
+    document: ParkedRun,
+}
+
+impl ReservedEvaluation {
+    /// Arm the carrier with the held reservation and the checkpoint as
+    /// re-read under it.
+    pub(crate) fn new(
+        reservation: RunReservationLease,
+        docs: ResumeDocuments,
+        document: ParkedRun,
+    ) -> Self {
+        Self {
+            reservation,
+            docs,
+            document,
+        }
+    }
+
+    /// The checkpoint as re-read under the reservation.
+    #[must_use]
+    pub(crate) fn document(&self) -> &ParkedRun {
+        &self.document
+    }
+
+    /// The reservation fencing the run through the evaluation.
+    #[must_use]
+    pub(crate) fn reservation(&self) -> &RunReservationLease {
+        &self.reservation
+    }
+
+    /// The run's two checkpoint paths.
+    #[must_use]
+    pub(crate) fn documents(&self) -> &ResumeDocuments {
+        &self.docs
+    }
+}
+
+/// Ordered-resume step 6: the consuming authorization/rename transition. The
+/// reserved evaluation's held reservation becomes the grant's fence — the
+/// parked document renames to its resuming name under that same reservation
+/// (the blocking rename tail holding a lease reference), with no ownerless
+/// gap and no second acquisition — and the grant assembles owning it. A
+/// refusal upstream drops the carrier, releasing the reservation with no
+/// execution.
+#[expect(
+    unused_variables,
+    reason = "todo!() body; filled by P45 wave fill units"
+)]
+pub(crate) async fn convert_reserved(
+    claims: &ResumeClaimTable,
+    reserved: ReservedEvaluation,
+    session: ResumeSessionId,
+    run: ResumeRunId,
+    recorded: Arc<RecordedDecisions>,
+    consumed: Vec<DecisionId>,
+) -> Result<ResumeGrant, ClaimResumeFault> {
+    todo!(
+        "P45 wave fill unit E4: rename parked → resuming under the held reservation (the blocking tail holds a lease reference), then assemble the grant owning that same reservation"
+    )
 }
 
 /// Locate and load whichever checkpoint name exists for the run: the parked
@@ -617,6 +728,10 @@ async fn project_blocking(
 /// Take the claim and rename the parked document to its resuming name as
 /// one step, then assemble the grant. A claim lost to a concurrent
 /// evaluation between `check_claim` and here maps to the running row.
+///
+/// Interim shape (until the E4 fill's ordered evaluation): the acquisition
+/// is the one-shot claim; the ordered path reserves at step 2 and converts
+/// through [`convert_reserved`] instead.
 async fn authorize(
     docs: &ResumeDocuments,
     claims: &ResumeClaimTable,
@@ -625,9 +740,9 @@ async fn authorize(
     recorded: Arc<RecordedDecisions>,
     consumed: Vec<DecisionId>,
 ) -> Result<ResumeGrant, ClaimResumeFault> {
-    let lease = claims.claim_and_resume(docs).await?;
+    let reservation = claims.claim_and_resume(docs).await?;
     Ok(ResumeGrant {
-        lease,
+        reservation,
         documents: docs.clone(),
         document,
         recorded,
@@ -707,7 +822,7 @@ pub async fn evaluate_resume(
                 ))));
             }
             return Err(ResumeRefusal::Conflict(ResumeConflictRow::expired(
-                blocking,
+                blocking.0,
             )));
         }
         Err(fault) => return Err(fault.into()),
@@ -773,4 +888,23 @@ pub async fn run_segment(
     headers: &HashMap<String, String>,
 ) -> Result<SegmentResult, SegmentError> {
     crate::orchestration::Orchestrator::run_resume_segment(grant, config, headers).await
+}
+
+/// Drive one segment for a run the SUPERVISOR still owns: the borrowed
+/// form of [`run_segment`]. The supervisor retains the grant across
+/// cancellation — it never moves the grant into a cancellable select arm —
+/// so MCP shutdown, forwarder drain, and tracked-work joins complete under
+/// the grant's own fence before the reservation releases.
+#[expect(
+    unused_variables,
+    reason = "todo!() body; filled by P45 wave fill units"
+)]
+pub async fn run_segment_borrowed(
+    grant: &ResumeGrant,
+    config: &AgentRuntimeConfig,
+    headers: &HashMap<String, String>,
+) -> Result<SegmentResult, SegmentError> {
+    todo!(
+        "P45 wave fill unit S4: the borrowed-grant resume segment — the orchestrator drives the segment without taking grant ownership"
+    )
 }

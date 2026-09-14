@@ -30,7 +30,8 @@ use aura::hitl::{
     ApprovalAuthority, ApprovalRead, DecisionId, ParkedApproval, ResolveError, ResolvedDecision,
 };
 use aura::session_store::{
-    AcknowledgeOutcome, ApprovalStore, DecisionRecord, ParkedApprovalRecord, SessionStoreError,
+    AcknowledgeOutcome, ApprovalStore, DecisionRecord, ParkedApprovalRecord, RetainedApproval,
+    SessionStoreError,
 };
 use redis::AsyncCommands;
 use redis::aio::ConnectionManager;
@@ -188,6 +189,10 @@ impl ApprovalStore for RedisApprovalStore {
     async fn resolve(
         &self,
         id: &DecisionId,
+        // The authority check joins the script's atomic arbitration with the
+        // E-family fills; the signature carries it now so no caller can bolt
+        // a validate-then-resolve race ahead of it.
+        _expected_authority: ApprovalAuthority,
         decision: ResolvedDecision,
     ) -> Result<(), ResolveError> {
         // The script's atomic take is the at-most-once guarantee: exactly one
@@ -392,6 +397,12 @@ impl ApprovalStore for RedisApprovalStore {
     ) -> Result<ApprovalRead, SessionStoreError> {
         todo!(
             "P45 wave fill units: redis is an unsupported park backend; read_or_expire returns the typed unsupported-configuration error, never a faked outcome"
+        )
+    }
+
+    async fn retained_rows(&self) -> Result<Vec<RetainedApproval>, SessionStoreError> {
+        todo!(
+            "P45 wave fill units: redis is an unsupported park backend; the retained scan returns the typed unsupported-operation error"
         )
     }
 }

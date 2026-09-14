@@ -58,9 +58,8 @@ use crate::hitl::{
     ResolvedDecision,
 };
 
-use super::{
-    AcknowledgeOutcome, ApprovalStore, DecisionRecord, ParkedApprovalRecord, SessionStoreError,
-};
+use super::record::TerminalRecord;
+use super::{AcknowledgeOutcome, ApprovalStore, ParkedApprovalRecord, SessionStoreError};
 
 /// Undecided approvals, one `{decision_id}.json` file per approval.
 const APPROVALS_DIR: &str = "approvals";
@@ -68,13 +67,15 @@ const APPROVALS_DIR: &str = "approvals";
 const DECISIONS_DIR: &str = "decisions";
 
 /// The on-disk shape of a resolved approval: the approval record carried
-/// over from `approvals/` plus the recorded decision. Field names are a
-/// persisted contract shared by every instance reading the store — rename
-/// only with a migration.
+/// over from `approvals/` plus the terminal record under the `decision`
+/// key. Field names are a persisted contract shared by every instance
+/// reading the store — rename only with a migration. A decided row's
+/// `decision` value is exactly the shipped `DecisionRecord` shape; a
+/// timed-out row carries `{"deadline": ...}` there instead.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct ResolvedEntry {
     approval: ParkedApprovalRecord,
-    decision: DecisionRecord,
+    decision: TerminalRecord,
 }
 
 /// A file-backed [`ApprovalStore`] over one root directory.
@@ -82,23 +83,42 @@ pub struct FileApprovalStore {
     inner: Arc<Inner>,
 }
 
-/// The shared store state: root directory and operation lock.
+/// The injectable time source the store samples while holding the
+/// operation lock. `Arc<dyn Fn>` so tests can drive the deadline and
+/// timeout arbitration deterministically.
+type StoreClock = Arc<dyn Fn() -> chrono::DateTime<chrono::Utc> + Send + Sync>;
+
+/// The shared store state: root directory, operation lock, and the clock
+/// the resolve/read-or-expire deadline sampling reads.
 struct Inner {
     root: PathBuf,
     lock: Mutex<()>,
+    clock: StoreClock,
 }
 
 impl FileApprovalStore {
     /// Open (or initialize) the store rooted at `root`, creating both
     /// directories and probing them for writes. Fails fast: a store that
     /// cannot hold files must fail at startup, not on the first approval.
+    /// Samples the wall clock.
     pub fn open(root: impl AsRef<Path>) -> Result<Self, SessionStoreError> {
+        Self::open_with_clock(root, Arc::new(chrono::Utc::now))
+    }
+
+    /// Open (or initialize) the store sampling an injected clock: the
+    /// read-or-expire seam the E2 fill arbitrates deadlines and timeouts
+    /// through, under the same lock as resolve and remove.
+    pub fn open_with_clock(
+        root: impl AsRef<Path>,
+        clock: StoreClock,
+    ) -> Result<Self, SessionStoreError> {
         let root = root.as_ref();
         private_dir(&root.join(APPROVALS_DIR)).map_err(connect_err)?;
         private_dir(&root.join(DECISIONS_DIR)).map_err(connect_err)?;
         let inner = Arc::new(Inner {
             root: root.to_path_buf(),
             lock: Mutex::new(()),
+            clock,
         });
         inner.probe_writable_sync().map_err(connect_err)?;
         Ok(Self { inner })
@@ -209,6 +229,10 @@ impl Inner {
     fn resolve_sync(
         &self,
         id: &DecisionId,
+        // The authority check runs under this same lock with the E2 fill;
+        // the signature carries it now so no caller can bolt a
+        // validate-then-resolve race ahead of it.
+        _expected_authority: ApprovalAuthority,
         decision: ResolvedDecision,
     ) -> Result<(), ResolveError> {
         let _guard = self.lock();
@@ -224,13 +248,13 @@ impl Inner {
             }
             Err(err) => return Err(ResolveError::Store(request_err(err))),
         };
-        if chrono::Utc::now() > record.expires_at {
+        if (self.clock)() > record.expires_at {
             return Err(ResolveError::NotFound);
         }
         record.egress_headers = None;
         let payload = serde_json::to_vec(&ResolvedEntry {
             approval: record,
-            decision: DecisionRecord::from(&decision),
+            decision: TerminalRecord::from(&decision),
         })
         .expect("resolved entry serializes to JSON");
 
@@ -276,9 +300,15 @@ impl Inner {
         match fs::read(self.decision_path(&id)) {
             Ok(bytes) => {
                 let entry: ResolvedEntry = serde_json::from_slice(&bytes).map_err(decode_err)?;
-                ResolvedDecision::try_from(entry.decision)
-                    .map(Some)
-                    .map_err(decode_err)
+                match entry.decision {
+                    // A timed-out row records no decision: the timeout
+                    // surfaces through read_or_expire's addressed arm,
+                    // never as an outcome here.
+                    TerminalRecord::TimedOut { .. } => Ok(None),
+                    TerminalRecord::Decided(decision) => ResolvedDecision::try_from(decision)
+                        .map(Some)
+                        .map_err(decode_err),
+                }
             }
             Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(err) => Err(request_err(err)),
@@ -383,7 +413,7 @@ impl Inner {
             Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(err) => return Err(request_err(err)),
         };
-        let now = chrono::Utc::now();
+        let now = (self.clock)();
 
         let mut pending = Vec::new();
         for entry in entries {
@@ -483,11 +513,12 @@ impl ApprovalStore for FileApprovalStore {
     async fn resolve(
         &self,
         id: &DecisionId,
+        expected_authority: ApprovalAuthority,
         decision: ResolvedDecision,
     ) -> Result<(), ResolveError> {
         let inner = Arc::clone(&self.inner);
         let id = *id;
-        spawn_blocking(move || inner.resolve_sync(&id, decision))
+        spawn_blocking(move || inner.resolve_sync(&id, expected_authority, decision))
             .await
             .map_err(|err| ResolveError::Store(join_err(err)))?
     }
@@ -540,6 +571,12 @@ impl ApprovalStore for FileApprovalStore {
     ) -> Result<ApprovalRead, SessionStoreError> {
         todo!(
             "P45 wave fill unit E2: file-store read-or-expire under the resolve/remove lock, sampling the injectable clock; expiry becomes the durable tagged TimedOut row"
+        )
+    }
+
+    async fn retained_rows(&self) -> Result<Vec<super::RetainedApproval>, SessionStoreError> {
+        todo!(
+            "P45 wave fill unit E2: the retained-evidence scan over approvals/ and decisions/ — pending and addressed rows, no unlinking"
         )
     }
 }

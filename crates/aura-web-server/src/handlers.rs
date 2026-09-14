@@ -593,23 +593,9 @@ pub async fn execute_completion(
         tools_json,
     } = setup;
 
-    // The chat arm yields exactly the agent, query, and history the request
-    // was prepared with; the resume arm enters through the factory's
-    // grant-consuming stream (S2/S3).
-    let (streaming_agent, query, chat_history) = match completion {
-        CompletionInput::Chat {
-            agent,
-            query,
-            history,
-        } => (agent, query, history),
-        CompletionInput::Resume { .. } => todo!(
-            "P45 S2/S3: the factory's resume_stream_with_timeout consumes the grant and \
-             returns the resumed stream"
-        ),
-    };
-
-    // Orchestration spawns inside `stream_with_timeout`, so SSE side-channel
-    // receivers must be subscribed before stream startup.
+    // Both completion arms spawn their producers inside this function, so
+    // the SSE side-channel receivers subscribe BEFORE the owned input
+    // matches and either arm starts a producer.
     let delivery_channels = match delivery {
         DeliveryMode::Collect { result_tx } => DeliveryChannels::Collect { result_tx },
         DeliveryMode::Sse {
@@ -625,15 +611,34 @@ pub async fn execute_completion(
         },
     };
 
-    // Create stream with timeout — single path for both Agent and Orchestrator
-    let (stream, cancel_tx, usage_state) = streaming_agent
-        .stream_with_timeout(
-            &query,
-            chat_history,
-            config.timeout_duration,
-            &config.request_id,
-        )
-        .await;
+    // Match the owned input exactly once; both arms produce the common
+    // (stream, cancellation sender, usage state) tuple. The chat arm is
+    // today's producer path exactly; the resume arm enters through the
+    // factory's grant-consuming stream (S3). The callback/telemetry agent
+    // rides alongside: the chat arm's agent, or the reusable factory —
+    // never a replayable adapter holding the grant.
+    let (stream, cancel_tx, usage_state, callback_agent) = match completion {
+        CompletionInput::Chat {
+            agent,
+            query,
+            history,
+        } => {
+            let (stream, cancel_tx, usage_state) = agent
+                .stream_with_timeout(&query, history, config.timeout_duration, &config.request_id)
+                .await;
+            (stream, cancel_tx, usage_state, agent)
+        }
+        CompletionInput::Resume { factory, grant } => {
+            let (stream, cancel_tx, usage_state) = factory
+                .resume_stream_with_timeout(grant, config.timeout_duration, &config.request_id)
+                .await;
+            // The reusable factory is the callback/telemetry agent: it
+            // implements the streaming surface without ever holding the
+            // grant, so no replayable adapter is needed.
+            let callback_agent: Arc<dyn StreamingAgent> = factory;
+            (stream, cancel_tx, usage_state, callback_agent)
+        }
+    };
 
     let response_content = config.response_content.clone();
     let otel_ctx = StreamOtelContext {
@@ -648,7 +653,7 @@ pub async fn execute_completion(
         tools_json,
         message_count: config.message_count,
         response_content: config.response_content,
-        system_prompt: streaming_agent.system_prompt().map(str::to_string),
+        system_prompt: callback_agent.system_prompt().map(str::to_string),
         orchestration_enabled,
     };
     otel_ctx.record_input();
@@ -679,7 +684,7 @@ pub async fn execute_completion(
         } => {
             let callbacks = StreamingCallbacks {
                 request_id: config.request_id.clone(),
-                agent: streaming_agent.clone(),
+                agent: callback_agent.clone(),
                 tool_event_rx,
                 progress_rx,
                 tool_usage_rx,
@@ -1273,10 +1278,14 @@ pub async fn resolve_approval(
     };
     let decision = aura::hitl::ApprovalDecision::from(body);
     // The conversational ingress has no identity source: the decision
-    // resolves uncaptured.
+    // resolves uncaptured, under the conversational authority.
     match state
         .pending_approvals
-        .resolve(&decision_id, aura::hitl::ResolvedDecision::from(decision))
+        .resolve(
+            &decision_id,
+            aura::hitl::ApprovalAuthority::Conversational,
+            aura::hitl::ResolvedDecision::from(decision),
+        )
         .await
     {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
@@ -1633,13 +1642,40 @@ fn outcome_pair_result_ids(turn: &aura::Message) -> Option<Vec<&str>> {
 
 /// Project an evaluation refusal to its HTTP answer: a detail-less 404 for
 /// the two not-found rows, the one 409 shape for conflict rows, and the
-/// shared error envelope for faults.
+/// typed fault rows. The typed rows render their fixed client codes —
+/// `reify_failed` for corrupt/internal, `reify_unavailable` for known
+/// pre-execution I/O availability failures — and carry no diagnostic
+/// detail in the response; the diagnostic logs server-side.
 fn refusal_response(refusal: ResumeRefusal) -> Response {
     match refusal {
         ResumeRefusal::DocumentAbsent | ResumeRefusal::IdentityMismatch => {
             StatusCode::NOT_FOUND.into_response()
         }
         ResumeRefusal::Conflict(row) => (StatusCode::CONFLICT, Json(row)).into_response(),
+        ResumeRefusal::InvalidEvidence(diagnostic) => {
+            tracing::error!("resume refused: invalid evidence: {diagnostic}");
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the paused run could not be restored",
+                "reify_failed",
+            )
+        }
+        ResumeRefusal::Unavailable(diagnostic) => {
+            tracing::warn!("resume refused: approval storage unavailable: {diagnostic}");
+            error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "approval storage is temporarily unavailable; retry the resume",
+                "reify_unavailable",
+            )
+        }
+        ResumeRefusal::Internal(diagnostic) => {
+            tracing::error!("resume refused: internal fault: {diagnostic}");
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the paused run could not be restored",
+                "reify_failed",
+            )
+        }
         ResumeRefusal::Fault(diagnostic) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             diagnostic.to_string(),

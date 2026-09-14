@@ -83,6 +83,10 @@ impl ApprovalStore for InMemoryApprovalStore {
     async fn resolve(
         &self,
         id: &DecisionId,
+        // The authority check runs under this same boundary with the E1/E2
+        // fills; the signature carries it now so no caller can bolt a
+        // validate-then-resolve race ahead of it.
+        _expected_authority: ApprovalAuthority,
         decision: ResolvedDecision,
     ) -> Result<(), ResolveError> {
         // Lock removal provides at-most-once.
@@ -156,6 +160,12 @@ impl ApprovalStore for InMemoryApprovalStore {
     ) -> Result<ApprovalRead, SessionStoreError> {
         todo!(
             "P45 wave fill units E1/E2: memory read-or-expire enforces authority for inline requests without park parity"
+        )
+    }
+
+    async fn retained_rows(&self) -> Result<Vec<super::RetainedApproval>, SessionStoreError> {
+        todo!(
+            "P45 wave fill units E1/E2: the memory backend answers the retained scan with the typed unsupported-operation error — no park parity"
         )
     }
 }
@@ -301,7 +311,13 @@ mod tests {
         store.register(entry).await.unwrap();
 
         assert_eq!(
-            store.resolve(&id, ApprovalDecision::Approved.into()).await,
+            store
+                .resolve(
+                    &id,
+                    ApprovalAuthority::Conversational,
+                    ApprovalDecision::Approved.into()
+                )
+                .await,
             Err(ResolveError::NotFound)
         );
         assert_eq!(store.decision(&id).await.unwrap(), None);

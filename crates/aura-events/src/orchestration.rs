@@ -3,6 +3,7 @@
 //! These events are emitted during orchestrated multi-agent execution to provide
 //! visibility into plan creation, task execution, and synthesis phases.
 
+use crate::retention::RetentionExpiresAt;
 use crate::{format_named_sse, AgentContext, CorrelationContext};
 use serde::{Deserialize, Serialize};
 
@@ -154,7 +155,10 @@ pub enum OrchestrationStreamEvent {
     RunParked {
         run_id: String,
         decision_ids: Vec<String>,
-        retention_expires_at: String,
+        /// The validated retention deadline the checkpoint carries: an
+        /// RFC 3339 instant by construction, so an undecodable stamp can
+        /// never ride the event. The wire key stays `retention_expires_at`.
+        retention_expires_at: RetentionExpiresAt,
         iteration: usize,
         #[serde(flatten)]
         context: EventContext,
@@ -382,14 +386,14 @@ impl OrchestrationStreamEvent {
     pub fn run_parked(
         run_id: impl Into<String>,
         decision_ids: Vec<String>,
-        retention_expires_at: impl Into<String>,
+        retention_expires_at: RetentionExpiresAt,
         iteration: usize,
         context: EventContext,
     ) -> Self {
         Self::RunParked {
             run_id: run_id.into(),
             decision_ids,
-            retention_expires_at: retention_expires_at.into(),
+            retention_expires_at,
             iteration,
             context,
         }

@@ -83,12 +83,20 @@ pub async fn resolve_is_at_most_once(
     instance_a.register(parked).await.unwrap();
 
     instance_b
-        .resolve(&id, ApprovalDecision::Approved.into())
+        .resolve(
+            &id,
+            ApprovalAuthority::Conversational,
+            ApprovalDecision::Approved.into(),
+        )
         .await
         .expect("first resolve wins");
     assert_eq!(
         instance_a
-            .resolve(&id, ApprovalDecision::Approved.into())
+            .resolve(
+                &id,
+                ApprovalAuthority::Conversational,
+                ApprovalDecision::Approved.into()
+            )
             .await,
         Err(ResolveError::NotFound)
     );
@@ -104,8 +112,16 @@ pub async fn concurrent_resolves_have_exactly_one_winner(
     instance_a.register(parked).await.unwrap();
 
     let (a, b) = tokio::join!(
-        instance_a.resolve(&id, ApprovalDecision::Approved.into()),
-        instance_b.resolve(&id, ApprovalDecision::Approved.into()),
+        instance_a.resolve(
+            &id,
+            ApprovalAuthority::Conversational,
+            ApprovalDecision::Approved.into()
+        ),
+        instance_b.resolve(
+            &id,
+            ApprovalAuthority::Conversational,
+            ApprovalDecision::Approved.into()
+        ),
     );
     let winners = usize::from(a.is_ok()) + usize::from(b.is_ok());
     assert_eq!(winners, 1, "exactly one resolver must win: {a:?} / {b:?}");
@@ -125,7 +141,11 @@ pub async fn resolve_records_readable_decision(
         reason: Some("not now".to_string()),
     };
     instance_b
-        .resolve(&id, denied.clone().into())
+        .resolve(
+            &id,
+            ApprovalAuthority::Conversational,
+            denied.clone().into(),
+        )
         .await
         .unwrap();
 
@@ -135,7 +155,11 @@ pub async fn resolve_records_readable_decision(
     );
     assert_eq!(
         instance_a
-            .resolve(&id, ApprovalDecision::Approved.into())
+            .resolve(
+                &id,
+                ApprovalAuthority::Conversational,
+                ApprovalDecision::Approved.into()
+            )
             .await,
         Err(ResolveError::NotFound)
     );
@@ -162,7 +186,10 @@ pub async fn resolve_records_identity_with_the_decision(
 
     let identity =
         aura::hitl::ResolvedDecision::approved(Some(unidentity(&[("x-forwarded-user", "alice")])));
-    instance_b.resolve(&id, identity).await.unwrap();
+    instance_b
+        .resolve(&id, ApprovalAuthority::Conversational, identity)
+        .await
+        .unwrap();
 
     match instance_a.decision(&id).await.unwrap().expect("recorded") {
         aura::hitl::ResolvedDecision::Approved {
@@ -211,7 +238,11 @@ pub async fn remove_makes_resolve_not_found(instance: &Arc<dyn ApprovalStore>) {
 
     assert_eq!(
         instance
-            .resolve(&id, ApprovalDecision::Approved.into())
+            .resolve(
+                &id,
+                ApprovalAuthority::Conversational,
+                ApprovalDecision::Approved.into()
+            )
             .await,
         Err(ResolveError::NotFound)
     );
@@ -254,7 +285,11 @@ pub async fn list_pending_returns_only_live_undecided(
     instance_a.register(resolved).await.unwrap();
     instance_a.register(live).await.unwrap();
     instance_b
-        .resolve(&resolved_id, ApprovalDecision::Approved.into())
+        .resolve(
+            &resolved_id,
+            ApprovalAuthority::Conversational,
+            ApprovalDecision::Approved.into(),
+        )
         .await
         .unwrap();
 

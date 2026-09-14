@@ -25,8 +25,8 @@ pub use orchestration::{
     ArtifactsConfig, OrchestrationConfig, TimeoutsConfig, ToolVisibility, WorkerConfig,
 };
 pub use park::{
-    NonParkingRoute, ParkAdmissionError, ParkRouteAdmission, ParkTtl, ParkTtlZero,
-    RouteTimeoutSecs, validate_park_admission,
+    AdmittedParkRoute, NonParkingRoute, ParkAdmissionError, ParkRouteAdmission, ParkTtl,
+    ParkTtlZero, RouteTimeoutSecs, validate_park_admission,
 };
 pub use scratchpad::{ScratchpadConfig, ScratchpadToolEntry};
 pub use session_store::{

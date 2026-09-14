@@ -17,8 +17,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::SessionId;
 use crate::hitl::{
-    AcknowledgmentState, AgentScope, ApprovalAuthority, ApprovalItem, ApprovalOrigin,
-    ApprovalRequest, DecisionId, ParkedApproval, ResolvedDecision, Timestamp,
+    AcknowledgmentState, AddressedApproval, AgentScope, ApprovalAuthority, ApprovalItem,
+    ApprovalOrigin, ApprovalRequest, DecisionId, ParkedApproval, ResolvedDecision, Timestamp,
 };
 use crate::orchestration::{RunId, TaskIdentity};
 
@@ -190,6 +190,62 @@ impl TryFrom<DecisionRecord> for ResolvedDecision {
             Ok(ResolvedDecision::Denied {
                 reason: record.reason,
             })
+        }
+    }
+}
+
+/// The terminal half of a stored resolved entry: a decided approval, or a
+/// durable timeout. Tagged so a stored `TimedOut { deadline }` round-trips
+/// without fabricating a denial.
+///
+/// Untagged over two disjoint wire shapes: the decided form is exactly the
+/// shipped `DecisionRecord` (whose required `approved`/`decided_at` fields a
+/// timeout row never carries, and whose optional fields a timeout row never
+/// produces), so the shipped format decodes unchanged while a timed-out row
+/// falls through to its own `deadline`-required shape.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub(crate) enum TerminalRecord {
+    /// A decision won: the shipped decision wire shape.
+    Decided(DecisionRecord),
+    /// The row's own deadline passed strictly with no decision: durable and
+    /// terminal, never an approval and never a denial.
+    TimedOut {
+        /// The deadline that expired.
+        deadline: Timestamp,
+    },
+}
+
+impl std::fmt::Debug for TerminalRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Decided(decision) => f.debug_tuple("Decided").field(decision).finish(),
+            Self::TimedOut { deadline } => f
+                .debug_struct("TimedOut")
+                .field("deadline", deadline)
+                .finish(),
+        }
+    }
+}
+
+impl From<&ResolvedDecision> for TerminalRecord {
+    fn from(resolved: &ResolvedDecision) -> Self {
+        Self::Decided(DecisionRecord::from(resolved))
+    }
+}
+
+/// The addressed-outcome carrier out of storage: a decided record restores
+/// to its decision (fail-loud on an undecodable one), and a timed-out row
+/// is the durable `TimedOut` outcome — read-or-expire's addressed arm.
+impl TryFrom<TerminalRecord> for AddressedApproval {
+    type Error = InvalidRecord;
+
+    fn try_from(record: TerminalRecord) -> Result<Self, Self::Error> {
+        match record {
+            TerminalRecord::Decided(decision) => {
+                ResolvedDecision::try_from(decision).map(AddressedApproval::Decided)
+            }
+            TerminalRecord::TimedOut { deadline } => Ok(AddressedApproval::TimedOut { deadline }),
         }
     }
 }

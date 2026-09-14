@@ -94,20 +94,55 @@ impl RouteTimeoutSecs {
     }
 }
 
+/// The admitted parking-route payload: the validated retention age and the
+/// route timeout it dominates. Fields are private so the
+/// `park_ttl >= route.timeout_secs` relation cannot be forged — the only
+/// constructor is the body of [`validate_park_admission`], the one admission
+/// authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdmittedParkRoute {
+    park_ttl: ParkTtl,
+    route_timeout: RouteTimeoutSecs,
+}
+
+impl AdmittedParkRoute {
+    /// Wrap the pair after admission established the relation. Private to
+    /// this module: only [`validate_park_admission`] constructs the
+    /// payload.
+    #[expect(
+        dead_code,
+        reason = "constructed only by validate_park_admission's R1 fill body"
+    )]
+    fn from_admission(park_ttl: ParkTtl, route_timeout: RouteTimeoutSecs) -> Self {
+        Self {
+            park_ttl,
+            route_timeout,
+        }
+    }
+
+    /// The validated `[hitl.park].park_ttl`, proven to cover the route
+    /// timeout.
+    #[must_use]
+    pub fn park_ttl(&self) -> ParkTtl {
+        self.park_ttl
+    }
+
+    /// The route timeout the retention age was proven to cover.
+    #[must_use]
+    pub fn route_timeout(&self) -> RouteTimeoutSecs {
+        self.route_timeout
+    }
+}
+
 /// An admitted route/park combination. The two variants are the whole legal
 /// vocabulary: a webhook-poll parking deployment with orchestration, or a
 /// route that never durable-parks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParkRouteAdmission {
     /// Webhook-poll delivery with park mode and orchestration enabled — the
-    /// only supported durable-park path. Carries the validated retention age
-    /// and the route timeout it dominates, proving the relation held.
-    PollOrchestration {
-        /// The validated `[hitl.park].park_ttl`.
-        park_ttl: ParkTtl,
-        /// The route timeout the retention age must cover.
-        route_timeout: RouteTimeoutSecs,
-    },
+    /// only supported durable-park path. Carries the admitted payload
+    /// proving the retention age covers the route timeout.
+    PollOrchestration(AdmittedParkRoute),
     /// A route that never durable-parks: conversational inline approval or a
     /// held webhook-sync POST.
     NonParking(NonParkingRoute),

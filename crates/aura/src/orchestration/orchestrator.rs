@@ -4746,6 +4746,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         memory_dir: &memory_dir,
                         config: &self.agent_config,
                         decision_window,
+                        park_ttl: hitl.park_ttl,
                         // The checkpoint's binding rides forward: the
                         // re-parked document compares against the same
                         // identity the original park bound.
@@ -6301,6 +6302,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             memory_dir: &memory_dir,
             config: &self.agent_config,
             decision_window: timeout,
+            park_ttl: hitl.park_ttl,
             identity_hash,
         };
 
@@ -6319,10 +6321,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
                             .iter()
                             .map(ToString::to_string)
                             .collect(),
-                        retention_expires_at: commit
-                            .retention_expires_at
-                            .as_datetime()
-                            .to_rfc3339(),
+                        retention_expires_at: aura_events::RetentionExpiresAt::from_datetime(
+                            commit.retention_expires_at.as_datetime(),
+                        ),
                         iteration,
                     },
                 )
@@ -8668,6 +8669,7 @@ mod tests {
                     timeout: Duration::from_secs(60),
                 }),
                 park_enabled: true,
+                park_ttl: aura_config::ParkTtl::default(),
             }),
             request_id: Some(request_id.clone()),
             ..AgentRuntimeConfig::default()
@@ -8783,6 +8785,7 @@ mod tests {
                     timeout: Duration::from_secs(3600),
                 }),
                 park_enabled: true,
+                park_ttl: aura_config::ParkTtl::default(),
             }),
             memory_dir: Some(memory_dir.to_string_lossy().into_owned()),
             session_id: Some("park-sess".to_string()),
@@ -8994,6 +8997,7 @@ mod tests {
                     timeout: Duration::from_secs(3600),
                 }),
                 park_enabled: true,
+                park_ttl: aura_config::ParkTtl::default(),
             }),
             memory_dir: Some(memory_dir.clone()),
             session_id: Some(SESSION.to_string()),
@@ -9127,6 +9131,7 @@ mod tests {
             registry
                 .resolve(
                     &call.decision_id,
+                    crate::hitl::ApprovalAuthority::Conversational,
                     crate::hitl::ApprovalDecision::Approved.into(),
                 )
                 .await
@@ -9148,6 +9153,7 @@ mod tests {
             registry
                 .resolve(
                     &call.decision_id,
+                    crate::hitl::ApprovalAuthority::Conversational,
                     crate::hitl::ApprovalDecision::Approved.into(),
                 )
                 .await
@@ -9198,7 +9204,9 @@ mod tests {
                 assert!(decision_ids.is_empty());
                 assert_eq!(
                     stamp,
-                    document.retention_expires_at.as_datetime().to_rfc3339()
+                    aura_events::RetentionExpiresAt::from_datetime(
+                        document.retention_expires_at.as_datetime()
+                    )
                 );
             }
             other => panic!("expected a RunParked event, got {other:?}"),
@@ -9313,7 +9321,11 @@ mod tests {
         let decided = pending[0].decision_id;
         let sibling = pending[1].decision_id;
         registry
-            .resolve(&decided, crate::hitl::ApprovalDecision::Approved.into())
+            .resolve(
+                &decided,
+                crate::hitl::ApprovalAuthority::Conversational,
+                crate::hitl::ApprovalDecision::Approved.into(),
+            )
             .await
             .unwrap();
 
@@ -9531,6 +9543,7 @@ mod tests {
                     timeout: Duration::from_secs(3600),
                 }),
                 park_enabled: true,
+                park_ttl: aura_config::ParkTtl::default(),
             }),
             memory_dir: Some(memory_dir.to_string_lossy().into_owned()),
             session_id: Some("orphan-sess".to_string()),
@@ -10166,7 +10179,7 @@ mod tests {
     // Reify and continuation proofs (P44 commit 3)
     // ====================================================================
 
-    use crate::hitl::{ApprovalDecision, PendingApprovals};
+    use crate::hitl::{ApprovalAuthority, ApprovalDecision, PendingApprovals};
     use crate::orchestration::CallKey;
     use crate::orchestration::ObserverWrapper;
     use crate::orchestration::duplicate_call_guard::DuplicateCallGuard;
@@ -10206,6 +10219,7 @@ mod tests {
                 patterns: Arc::from([aura_config::GlobPattern::new("echo_tool").unwrap()]),
                 route,
                 park_enabled: true,
+                park_ttl: aura_config::ParkTtl::default(),
             }),
             memory_dir: Some(memory_dir.to_string_lossy().into_owned()),
             session_id: Some(session_id.to_string()),
@@ -10335,7 +10349,11 @@ mod tests {
         );
 
         registry
-            .resolve(&decision_id, ApprovalDecision::Approved.into())
+            .resolve(
+                &decision_id,
+                ApprovalAuthority::Conversational,
+                ApprovalDecision::Approved.into(),
+            )
             .await
             .unwrap();
         let (_recorded, consumed_ids) = crate::orchestration::park::load_recorded_decisions(

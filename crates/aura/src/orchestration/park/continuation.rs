@@ -406,7 +406,11 @@ mod tests {
             .await
             .unwrap();
         registry
-            .resolve(&decision_id, ApprovalDecision::Approved.into())
+            .resolve(
+                &decision_id,
+                ApprovalAuthority::Conversational,
+                ApprovalDecision::Approved.into(),
+            )
             .await
             .unwrap();
 
@@ -576,7 +580,11 @@ mod tests {
             .unwrap();
         // The decision lands after the document was committed.
         registry
-            .resolve(&decision_id, ApprovalDecision::Approved.into())
+            .resolve(
+                &decision_id,
+                ApprovalAuthority::Conversational,
+                ApprovalDecision::Approved.into(),
+            )
             .await
             .unwrap();
 
