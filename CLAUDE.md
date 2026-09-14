@@ -97,6 +97,7 @@ aura/
 - Dependency-aware multi-wave execution with iterative re-planning (`max_planning_cycles`)
 - Three-way routing: direct answer, orchestrated plan, clarification
 - `aura.orchestrator.*` SSE events for real-time visibility (see https://docs.mezmo.com/aura/streaming-api-guide)
+- By-reference handoffs (`orchestration/handoff.rs`): when a scratchpad worker can reach a tool with `by_reference` fields, the coordinator preamble gets `{{handoff_guidance}}` (`prompts/handoff_guidance.md`), continuation prompts use `RESULT_FORWARDING_BY_REFERENCE`, the worker list notes which workers take stored files, and every scratchpad worker gets `SCRATCHPAD_HANDOFF_PREAMBLE` (report stored file names). Bare reference names also resolve to scratchpad files from earlier iterations of the run
 
 ### Unified Binary
 - `aura` is the only shipped executable: interactive client by default, web server behind `aura webserver`
