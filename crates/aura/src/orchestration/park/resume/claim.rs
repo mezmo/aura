@@ -6,10 +6,10 @@
 //! park-module's append-and-publish surface: the table tracks which endpoint
 //! evaluation holds a run, the handle mutates the resuming document.
 
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
+#[cfg(test)]
+use std::sync::Arc;
 #[cfg(test)]
 use std::sync::{
     Barrier,
@@ -23,7 +23,9 @@ use crate::orchestration::types::RunId;
 use super::super::commit::parked_document_dir;
 use super::super::document::{PARKED_DOCUMENT_SUFFIX, RESUMING_DOCUMENT_SUFFIX};
 use super::evaluate::Diagnostic;
-use crate::orchestration::park::lifetime::{ReservationFault, RunReservationLease};
+use crate::orchestration::park::lifetime::{
+    AdmissionFault, ReservationFault, ReservationTable, RunReservationLease,
+};
 
 /// Why a raw path segment failed validation. Every variant is
 /// diagnostic-only: no caller branches on the reason.
@@ -152,19 +154,29 @@ impl ResumeDocuments {
     }
 }
 
-/// Why claiming a run for a resume segment failed.
+/// Why claiming a run for a resume segment failed. The fault arms carry the
+/// typed classification the endpoint rows need — a known filesystem
+/// availability failure vs an internal task failure — with the diagnostic
+/// for server-side logging only.
 #[derive(Debug, Clone)]
 pub(crate) enum ClaimResumeFault {
     /// A live claim already holds the run.
     Live,
-    /// The atomic rename failed; the claim was not taken.
-    Io(Diagnostic),
+    /// A known filesystem availability failure: the transition's rename
+    /// could not be performed. The endpoint's 503 `reify_unavailable` row.
+    Unavailable(Diagnostic),
+    /// An internal fault outside the availability class — e.g. the blocking
+    /// task itself failed to complete. The endpoint's 500 `reify_failed`
+    /// row.
+    Internal(Diagnostic),
 }
 
 /// Process-local registry of live resume claims: at most one resume per run
-/// inside this process.
+/// inside this process. The occupied-run set lives inside the injected
+/// [`ReservationTable`] (admission and lease construction are that table's
+/// one seam — this type holds no path to assemble a lease by hand).
 pub struct ResumeClaimTable {
-    live: Arc<Mutex<HashSet<RunId>>>,
+    reservations: ReservationTable,
     #[cfg(test)]
     race_gate: Arc<RaceGate>,
 }
@@ -172,7 +184,7 @@ pub struct ResumeClaimTable {
 impl std::fmt::Debug for ResumeClaimTable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ResumeClaimTable")
-            .field("live", &self.live)
+            .field("reservations", &self.reservations)
             .finish()
     }
 }
@@ -180,7 +192,7 @@ impl std::fmt::Debug for ResumeClaimTable {
 impl Default for ResumeClaimTable {
     fn default() -> Self {
         Self {
-            live: Arc::new(Mutex::new(HashSet::new())),
+            reservations: ReservationTable::new(),
             #[cfg(test)]
             race_gate: Arc::new(RaceGate::new()),
         }
@@ -215,8 +227,10 @@ impl ResumeClaimTable {
     /// Ordered-resume step 3's rename-back, fenced by the held reservation:
     /// the blocking rename tail holds a lease reference through completion,
     /// so an awaiting request dropping never releases a run whose rename-back
-    /// is in flight. The pre-reservation [`Self::rename_back_to_parked`]
-    /// stays only until the E4 fill's ordered evaluation replaces it.
+    /// is in flight. Only the availability and internal arms can arise here
+    /// — the run is already reserved, so `Live` is impossible. The
+    /// pre-reservation [`Self::rename_back_to_parked`] stays only until the
+    /// E4 fill's ordered evaluation replaces it.
     #[expect(
         unused_variables,
         reason = "todo!() body; filled by P45 wave fill units"
@@ -225,7 +239,7 @@ impl ResumeClaimTable {
         &self,
         reservation: &RunReservationLease,
         docs: &ResumeDocuments,
-    ) -> Result<(), Diagnostic> {
+    ) -> Result<(), ClaimResumeFault> {
         todo!(
             "P45 wave fill unit E4: rename resuming → parked holding a lease reference through the blocking tail"
         )
@@ -234,10 +248,7 @@ impl ResumeClaimTable {
     /// Whether a live claim holds the run.
     #[must_use]
     pub(crate) fn is_live(&self, run: &ResumeRunId) -> bool {
-        self.live
-            .lock()
-            .expect("resume claim lock")
-            .contains(&run.run_id())
+        self.reservations.is_live(run.run_id())
     }
 
     /// Arm this table's rename-back rendezvous for the concurrent golden:
@@ -252,37 +263,40 @@ impl ResumeClaimTable {
     }
 
     /// Rename the run's resuming document back to its parked name while
-    /// holding the claim lock, so a concurrent evaluation cannot observe the
-    /// half-renamed pair.
+    /// holding the table's short standard lock, so a concurrent evaluation
+    /// cannot observe the half-renamed pair.
     pub(crate) async fn rename_back_to_parked(
         &self,
         docs: &ResumeDocuments,
     ) -> Result<(), Diagnostic> {
         let parked = docs.parked().to_path_buf();
         let resuming = docs.resuming().to_path_buf();
-        let live = Arc::clone(&self.live);
+        let reservations = self.reservations.clone();
         #[cfg(test)]
         let race_gate = Arc::clone(&self.race_gate);
         tokio::task::spawn_blocking(move || -> Result<(), Diagnostic> {
             #[cfg(test)]
             race_gate.meet();
-            // The std guard lives only inside this closure: the rename is
-            // serialized against `claim_and_resume`'s insert-and-rename, and
-            // no guard is ever held across an await.
-            let _live = live.lock().expect("resume claim lock");
-            std::fs::rename(&resuming, &parked).or_else(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound && parked.try_exists().unwrap_or(false)
-                {
-                    // A concurrent evaluation won the rename-back under the
-                    // lock; the document is already at its parked name and
-                    // evaluation proceeds against the in-memory document.
-                    Ok(())
-                } else {
-                    Err(Diagnostic::new(format!(
-                        "renaming the resuming checkpoint {} back to its parked name failed: {e}",
-                        resuming.display()
-                    )))
-                }
+            // The table's lock lives only inside this closure: the rename is
+            // serialized against `claim_and_resume`'s insert-and-rename
+            // through the table's one mutual-exclusion seam, and no guard is
+            // ever held across an await.
+            reservations.under_standard_lock(|| {
+                std::fs::rename(&resuming, &parked).or_else(|e| {
+                    if e.kind() == std::io::ErrorKind::NotFound
+                        && parked.try_exists().unwrap_or(false)
+                    {
+                        // A concurrent evaluation won the rename-back under the
+                        // lock; the document is already at its parked name and
+                        // evaluation proceeds against the in-memory document.
+                        Ok(())
+                    } else {
+                        Err(Diagnostic::new(format!(
+                            "renaming the resuming checkpoint {} back to its parked name failed: {e}",
+                            resuming.display()
+                        )))
+                    }
+                })
             })
         })
         .await
@@ -315,34 +329,29 @@ impl ResumeClaimTable {
             ResumeRunId::parse(raw_run).expect("the stem of a validated document name re-parses");
         let parked = docs.parked().to_path_buf();
         let resuming = docs.resuming().to_path_buf();
-        let live = Arc::clone(&self.live);
-        let lease_live = Arc::clone(&self.live);
+        let reservations = self.reservations.clone();
         tokio::task::spawn_blocking(move || -> Result<RunReservationLease, ClaimResumeFault> {
-            // One acquisition covers check, insert, rename, and rollback: a
-            // second caller's insert observes the live claim before any
-            // rename, and a failed rename rolls the insert back, so the
-            // claim and the document name move together or not at all.
-            let mut live = live.lock().expect("resume claim lock");
-            if !live.insert(run.run_id()) {
-                return Err(ClaimResumeFault::Live);
-            }
-            match std::fs::rename(&parked, &resuming) {
-                Ok(()) => Ok(RunReservationLease::admitted(
-                    run.run_id(),
-                    Arc::clone(&lease_live),
-                )),
-                Err(e) => {
-                    live.remove(&run.run_id());
-                    Err(ClaimResumeFault::Io(Diagnostic::new(format!(
-                        "renaming the parked checkpoint {} to its resuming name failed: {e}",
-                        parked.display()
-                    ))))
-                }
-            }
+            // One table admission covers check, insert, rename, and
+            // rollback: a second caller's insert observes the live claim
+            // before any rename, and `admit_with` rolls the occupation back
+            // when the rename fails, so the claim and the document name move
+            // together or not at all — and the lease is born only on the
+            // all-succeeded path.
+            reservations
+                .admit_with(run.run_id(), || std::fs::rename(&parked, &resuming))
+                .map_err(|fault| match fault {
+                    AdmissionFault::Live => ClaimResumeFault::Live,
+                    AdmissionFault::Step(e) => {
+                        ClaimResumeFault::Unavailable(Diagnostic::new(format!(
+                            "renaming the parked checkpoint {} to its resuming name failed: {e}",
+                            parked.display()
+                        )))
+                    }
+                })
         })
         .await
         .map_err(|e| {
-            ClaimResumeFault::Io(Diagnostic::new(format!(
+            ClaimResumeFault::Internal(Diagnostic::new(format!(
                 "the claim task did not complete: {e}"
             )))
         })?

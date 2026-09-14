@@ -7,10 +7,14 @@
 //! standard lock is never held across an await.
 //!
 //! [`RunReservationLease`] wraps one private [`ReservationInner`]: the run
-//! identity plus the table reference exist only behind successful admission,
-//! and the run is released synchronously when the last reference to that one
-//! reservation drops — after the supervisor and every tracked child and file
-//! operation has ended.
+//! identity plus the table reference exist only behind
+//! [`ReservationTable`]'s admission paths, and the run is released
+//! synchronously when the last reference to that one reservation drops —
+//! after the supervisor and every tracked child and file operation has
+//! ended. Admission and lease construction are ONE seam: the lease's
+//! constructor is module-private and reachable only from the table's
+//! check-and-insert, so no crate-visible path can assemble a lease for a
+//! run it never admitted.
 //!
 //! [`RunExecutionScope`] bundles what park-owned execution carries everywhere
 //! — the reservation lease, the cancellation token, and the task tracker —
@@ -61,11 +65,12 @@ pub struct RunReservationLease {
 }
 
 impl RunReservationLease {
-    /// Arm the lease for a run whose admission into `live` already
-    /// succeeded under the table's short standard lock. Crate-private by
-    /// design: only the reservation table's admit and conversion paths
-    /// construct a lease, never a caller assembling one by hand.
-    pub(crate) fn admitted(run: RunId, live: Arc<Mutex<HashSet<RunId>>>) -> Self {
+    /// Arm the lease for a run whose admission into `live` already succeeded
+    /// under the table's short standard lock. PRIVATE: only
+    /// [`ReservationTable`]'s admission paths construct a lease — admission
+    /// and construction are one seam, so no crate-visible surface can
+    /// assemble a lease for a run it never admitted.
+    fn armed(run: RunId, live: Arc<Mutex<HashSet<RunId>>>) -> Self {
         Self {
             inner: Arc::new(ReservationInner { run, live }),
         }
@@ -75,6 +80,89 @@ impl RunReservationLease {
     #[must_use]
     pub fn run_id(&self) -> RunId {
         self.inner.run
+    }
+}
+
+/// The shared occupied-run registry: the table every park-owned execution
+/// reserves through. The set and its lock are private to this module, so the
+/// only paths that can occupy a run or test occupation are the admission
+/// seams below — [`ResumeClaimTable`] and the factory inject this type, not
+/// the raw lock.
+///
+/// [`ResumeClaimTable`]: super::resume::claim::ResumeClaimTable
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ReservationTable {
+    live: Arc<Mutex<HashSet<RunId>>>,
+}
+
+/// Why an admission-with-step failed: the run was already occupied, or the
+/// under-lock step failed and the occupation rolled back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AdmissionFault<E> {
+    /// A live reservation already holds the run; nothing changed.
+    Live,
+    /// The under-lock step failed; the occupation was rolled back and no
+    /// lease exists.
+    Step(E),
+}
+
+impl ReservationTable {
+    /// An empty table.
+    #[must_use]
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether a live reservation holds the run.
+    pub(crate) fn is_live(&self, run: RunId) -> bool {
+        self.live.lock().expect("resume claim lock").contains(&run)
+    }
+
+    /// Occupy `run` under the table's short standard lock — the
+    /// check-and-insert is the whole critical section, never held across an
+    /// await — returning the lease whose final reference releases the run.
+    /// The ONLY plain-admission seam; every [`RunReservationLease`] is born
+    /// here or in [`Self::admit_with`].
+    pub(crate) fn admit(&self, run: RunId) -> Result<RunReservationLease, ReservationFault> {
+        let mut live = self.live.lock().expect("resume claim lock");
+        if live.insert(run) {
+            Ok(RunReservationLease::armed(run, Arc::clone(&self.live)))
+        } else {
+            Err(ReservationFault::Live)
+        }
+    }
+
+    /// Occupy `run`, then run `step` while still holding the table's lock:
+    /// `step` succeeding makes the occupation and its transition (the
+    /// claim-and-rename) move together; `step` failing rolls the occupation
+    /// back, so neither happens. The lease is constructed only on the
+    /// all-succeeded path.
+    pub(crate) fn admit_with<E>(
+        &self,
+        run: RunId,
+        step: impl FnOnce() -> Result<(), E>,
+    ) -> Result<RunReservationLease, AdmissionFault<E>> {
+        let mut live = self.live.lock().expect("resume claim lock");
+        if !live.insert(run) {
+            return Err(AdmissionFault::Live);
+        }
+        match step() {
+            Ok(()) => Ok(RunReservationLease::armed(run, Arc::clone(&self.live))),
+            Err(step_fault) => {
+                live.remove(&run);
+                Err(AdmissionFault::Step(step_fault))
+            }
+        }
+    }
+
+    /// Run `step` while holding the table's short standard lock: the
+    /// mutual-exclusion seam for transitions that must appear atomic
+    /// against [`Self::admit_with`]'s insert-and-step (the interim
+    /// rename-back). Never held across an await — callers run their step
+    /// on the blocking pool.
+    pub(crate) fn under_standard_lock<R>(&self, step: impl FnOnce() -> R) -> R {
+        let _guard = self.live.lock().expect("resume claim lock");
+        step()
     }
 }
 
@@ -103,7 +191,15 @@ pub struct RunExecutionScope {
 }
 
 impl RunExecutionScope {
-    /// Arm a scope over one held reservation.
+    /// Arm a scope over one held reservation. The establishment primitive:
+    /// called ONCE per resumed run when its grant is assembled from the
+    /// reservation (and once per initial park-enabled run); everything
+    /// else receives a clone of that one `Arc` —
+    /// [`ResumeGrant::execution_scope`] never mints a second token or
+    /// tracker for the run.
+    ///
+    /// [`ResumeGrant::execution_scope`]:
+    /// super::resume::evaluate::ResumeGrant::execution_scope
     #[must_use]
     pub fn new(reservation: RunReservationLease) -> Arc<Self> {
         Arc::new(Self {

@@ -10367,14 +10367,16 @@ mod tests {
         let args = serde_json::json!({ "namespace": "prod" });
         recorded.push(
             CallKey::new(1, "kubectl_apply", &args),
-            ApprovalDecision::Approved.into(),
+            crate::hitl::AddressedApproval::Decided(ApprovalDecision::Approved.into()),
         );
         recorded.push(
             CallKey::new(1, "kubectl_apply", &args),
-            ApprovalDecision::Denied {
-                reason: Some("no".to_string()),
-            }
-            .into(),
+            crate::hitl::AddressedApproval::Decided(
+                ApprovalDecision::Denied {
+                    reason: Some("no".to_string()),
+                }
+                .into(),
+            ),
         );
 
         let taken = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -10400,14 +10402,19 @@ mod tests {
             "two decisions consumed exactly once each: {taken:?}"
         );
         assert!(
-            matches!(taken[0].1, crate::hitl::ResolvedDecision::Approved { .. }),
+            matches!(
+                taken[0].1,
+                crate::hitl::AddressedApproval::Decided(
+                    crate::hitl::ResolvedDecision::Approved { .. }
+                )
+            ),
             "recorded order holds across consumers: the approval is consumed first"
         );
         assert!(matches!(
             &taken[1].1,
-            crate::hitl::ResolvedDecision::Denied {
+            crate::hitl::AddressedApproval::Decided(crate::hitl::ResolvedDecision::Denied {
                 reason: Some(reason),
-            } if reason == "no"
+            }) if reason == "no"
         ));
     }
 

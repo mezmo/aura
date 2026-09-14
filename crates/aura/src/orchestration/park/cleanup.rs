@@ -1,4 +1,4 @@
-//! The retention-cleanup surface: confirmed-absence classification, the
+//! The retention-cleanup surface: checkpoint-presence classification, the
 //! encapsulated evidence-first deletion order, and the sweep seam.
 //!
 //! Types and seams only — E6 (retention sweep and orphan classification)
@@ -10,16 +10,20 @@
 
 use std::path::Path;
 
+use super::lifetime::RunReservationLease;
 use super::resume::claim::ResumeDocuments;
 use super::resume::evaluate::Diagnostic;
 use crate::hitl::PendingApprovals;
 
-/// Whether a run's checkpoint is (not) confirmed absent. A missing root or
-/// an unreadable document is never confirmed absence: the sweep retries,
-/// and unowned or corrupt files are reported as operational diagnostics,
-/// never deleted by guessing.
+/// Whether a run's checkpoint is present, confirmed gone, or unreadable. A
+/// missing root or an unreadable document is never confirmed absence: the
+/// sweep retries, and unowned or corrupt files are reported as operational
+/// diagnostics, never deleted by guessing.
 #[derive(Debug, Clone)]
-pub(crate) enum CheckpointAbsence {
+pub(crate) enum CheckpointPresence {
+    /// A healthy checkpoint document exists under one of the two names:
+    /// the run is not absent, and orphan collection does not apply.
+    Present,
     /// No checkpoint under either name: confirmed gone.
     ConfirmedAbsent,
     /// The checkpoint root or document could not be read — absence is NOT
@@ -29,6 +33,35 @@ pub(crate) enum CheckpointAbsence {
     /// run stays, reported as a diagnostic; corrupt evidence is never
     /// treated as absent evidence.
     Corrupt(Diagnostic),
+}
+
+/// One run's reservation-owning cleanup carrier: the lease that binds the
+/// run and carries the cleanup eligibility (only a held reservation may
+/// reread-and-delete), plus the run's two checkpoint paths. `Clone` hands
+/// the SAME fence to the blocking reread/deletion tails, so the
+/// reservation survives even if the awaiting sweep drops.
+#[derive(Debug, Clone)]
+pub(crate) struct CleanupReservation {
+    reservation: RunReservationLease,
+    docs: ResumeDocuments,
+}
+
+impl CleanupReservation {
+    /// Bind one held reservation to the run's checkpoint paths.
+    pub(crate) fn new(reservation: RunReservationLease, docs: ResumeDocuments) -> Self {
+        Self { reservation, docs }
+    }
+
+    /// The reservation fencing this cleanup: the run's identity and its
+    /// cleanup eligibility.
+    pub(crate) fn reservation(&self) -> &RunReservationLease {
+        &self.reservation
+    }
+
+    /// The run's two checkpoint paths.
+    pub(crate) fn documents(&self) -> &ResumeDocuments {
+        &self.docs
+    }
 }
 
 /// The outcome of one expired run's cleanup.
@@ -43,34 +76,38 @@ pub(crate) enum RunCleanupOutcome {
     RetainedForRetry(Diagnostic),
 }
 
-/// Re-read both checkpoint names for the run and classify absence — the
+/// Inspect both checkpoint names for the run and classify presence — the
 /// pre-deletion check the sweep runs under an acquired run reservation,
-/// after re-reading the clock.
+/// after re-reading the clock. The blocking reread tail holds the
+/// carrier's lease reference through the work.
 #[expect(
     unused_variables,
     reason = "todo!() body; filled by P45 wave fill units"
 )]
-pub(crate) async fn confirm_checkpoint_absence(docs: &ResumeDocuments) -> CheckpointAbsence {
+pub(crate) async fn inspect_checkpoint_presence(
+    cleanup: &CleanupReservation,
+) -> CheckpointPresence {
     todo!(
-        "P45 wave fill unit E6: re-read both checkpoint names and classify confirmed absence vs inaccessible vs corrupt"
+        "P45 wave fill unit E6: re-read both checkpoint names under the reservation and classify present vs confirmed absent vs inaccessible vs corrupt"
     )
 }
 
-/// Delete one expired run's evidence under an acquired run reservation,
+/// Delete one expired run's evidence under the carrier's reservation,
 /// strictly past `retention_expires_at` and with no execution active: owned
 /// approval and decision rows first, the checkpoint LAST — so a failure
 /// midway leaves the expired checkpoint to answer `409 expired` and the
-/// next sweep can retry.
+/// next sweep can retry. The blocking deletion tail retains the carrier's
+/// lease reference through the work.
 #[expect(
     unused_variables,
     reason = "todo!() body; filled by P45 wave fill units"
 )]
 pub(crate) async fn delete_expired_run(
+    cleanup: &CleanupReservation,
     registry: &PendingApprovals,
-    docs: &ResumeDocuments,
 ) -> RunCleanupOutcome {
     todo!(
-        "P45 wave fill unit E6: evidence-first, checkpoint-last deletion with retry-on-failure retention"
+        "P45 wave fill unit E6: evidence-first, checkpoint-last deletion with retry-on-failure retention, fenced by the cleanup reservation"
     )
 }
 

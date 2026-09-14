@@ -10,7 +10,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::hitl::{DecisionId, PendingApprovals};
+use crate::hitl::{AddressedApproval, DecisionId, PendingApprovals};
 use crate::orchestration::park::document::{ParkedRun, RESUMING_DOCUMENT_SUFFIX, load_parked_run};
 use crate::orchestration::park::recorded_decisions::{CallKey, RecordedDecisions};
 use crate::orchestration::persistence::is_safe_path_component;
@@ -256,10 +256,13 @@ pub(crate) async fn load_recorded_decisions(
             };
             // The key's task id comes from the awaiting node, the tool name
             // and arguments from the store's approval record. The carrier
-            // keeps the recorded identity with the decision it rode in with.
+            // keeps the recorded identity with the decision it rode in with;
+            // the interim consult records decisions only — the E7 cutover
+            // replaces this read with the authority-aware read-or-expire,
+            // whose addressed arm also carries durable per-call timeouts.
             recorded.push(
                 CallKey::new(node.task_id, &item.tool_name, &item.arguments),
-                resolved,
+                AddressedApproval::Decided(resolved),
             );
             decision_ids.push(call.decision_id);
         }
@@ -437,7 +440,9 @@ mod tests {
         assert_eq!(ids, vec![decision_id]);
         assert_eq!(
             recorded.take(&CallKey::new(3, "kubectl_apply", &args)),
-            Some(ResolvedDecision::from(ApprovalDecision::Approved)),
+            Some(AddressedApproval::Decided(ResolvedDecision::from(
+                ApprovalDecision::Approved
+            ))),
             "the recorded decision is consumable at the resume gate"
         );
         assert!(
@@ -595,7 +600,9 @@ mod tests {
         assert_eq!(ids, vec![decision_id]);
         assert_eq!(
             recorded.take(&CallKey::new(3, "kubectl_apply", &args)),
-            Some(ResolvedDecision::from(ApprovalDecision::Approved))
+            Some(AddressedApproval::Decided(ResolvedDecision::from(
+                ApprovalDecision::Approved
+            )))
         );
     }
 
