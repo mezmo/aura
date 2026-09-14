@@ -16,6 +16,7 @@ use super::decision::{AgentScope, ApprovalOrigin, ApprovalOutcome, DecisionId};
 use super::protocol::{ApprovalItem, ApprovalRequest, PROTOCOL_VERSION};
 use super::registry::{ParkedApproval, PendingApprovals};
 use super::route::{ApprovalError, DecisionRoute, GateDecision};
+use crate::mcp::{ToolName, ToolNamespace};
 use crate::orchestration::{
     BlockedCell, CallKey, ParkGuard, PendingCall, RecordedDecisions, run_owner_id,
 };
@@ -114,13 +115,28 @@ impl HitlApprovalWrapper {
     /// approval tool itself ("request_approval" == RequestApprovalTool::NAME).
     /// Any match gates the call; the returned pattern is only the reported
     /// `origin.matched_pattern`, so pattern order has no effect on gating.
-    fn matched_pattern(&self, tool_name: &str) -> Option<&str> {
+    ///
+    /// Namespace-aware: a pattern containing `:` (e.g. `github:*`) scopes the
+    /// match to `tool_namespace`. `tool_namespace` is `None` for tools with no
+    /// known MCP server (e.g. filesystem or client-side tools), which only patterns
+    ///  without `:` can match.
+    fn matched_pattern(&self, tool_name: &str, tool_namespace: Option<&str>) -> Option<&str> {
         if tool_name == "request_approval" {
             return None;
         }
+
+        let tool_name = ToolName::from(tool_name);
+        let tool_ns = tool_namespace.map(ToolNamespace::from);
         self.patterns
             .iter()
-            .find(|p| p.matches(tool_name))
+            .find(|p| {
+                let mut is_match = tool_name.matches(p.as_str());
+                is_match &= match &tool_ns {
+                    None => !p.as_str().contains(":"),
+                    Some(ns) => ns.matches(p.as_str()),
+                };
+                is_match
+            })
             .map(|p| p.as_str())
     }
 
@@ -172,6 +188,7 @@ impl HitlApprovalWrapper {
             },
             items: vec![ApprovalItem {
                 tool_name: ctx.tool_name.clone(),
+                tool_namespace: ctx.tool_namespace.clone(),
                 arguments: args.clone(),
                 tool_call_intent: ctx.tool_call_intent.clone(),
             }],
@@ -250,7 +267,8 @@ impl ToolWrapper for HitlApprovalWrapper {
         args: &Value,
         ctx: &ToolCallContext,
     ) -> Result<PreCallOutcome, ToolError> {
-        let Some(matched) = self.matched_pattern(&ctx.tool_name) else {
+        let Some(matched) = self.matched_pattern(&ctx.tool_name, ctx.tool_namespace.as_deref())
+        else {
             return Ok(PreCallOutcome::Proceed { overrides: None });
         };
         // Recorded-decisions consult: a resumed worker's gated call may
@@ -304,6 +322,7 @@ impl ToolWrapper for HitlApprovalWrapper {
             },
             items: vec![ApprovalItem {
                 tool_name: ctx.tool_name.clone(),
+                tool_namespace: ctx.tool_namespace.clone(),
                 arguments: args.clone(),
                 tool_call_intent: ctx.tool_call_intent.clone(),
             }],
@@ -365,9 +384,45 @@ mod tests {
             "test-agent".to_string(),
             "test-instance-id".to_string(),
         );
-        assert_eq!(wrapper.matched_pattern("kubectl_apply"), Some("kubectl_*"));
-        assert_eq!(wrapper.matched_pattern("request_approval"), None);
-        assert_eq!(wrapper.matched_pattern("ls"), None);
+        assert_eq!(
+            wrapper.matched_pattern("kubectl_apply", None),
+            Some("kubectl_*")
+        );
+        assert_eq!(wrapper.matched_pattern("request_approval", None), None);
+        assert_eq!(wrapper.matched_pattern("ls", None), None);
+    }
+
+    #[test]
+    fn matched_pattern_is_namespace_aware() {
+        let wrapper = HitlApprovalWrapper::new(
+            Arc::from([GlobPattern::new("github:*").unwrap()]),
+            Arc::new(DecisionRoute::Webhook {
+                client: WebhookClient::new(
+                    build_webhook_client(),
+                    WebhookUrl::new("http://localhost:9").unwrap(),
+                ),
+                timeout: Duration::from_secs(1),
+            }),
+            AgentScope::Single { session_id: None },
+            "t".into(),
+            "test-agent".to_string(),
+            "test-instance-id".to_string(),
+        );
+        assert_eq!(
+            wrapper.matched_pattern("list_repos", Some("github")),
+            Some("github:*"),
+            "a namespace-scoped pattern must match a bare tool name paired with its namespace",
+        );
+        assert_eq!(
+            wrapper.matched_pattern("list_repos", Some("gitlab")),
+            None,
+            "the namespace half of the pattern must still be enforced",
+        );
+        assert_eq!(
+            wrapper.matched_pattern("list_repos", None),
+            None,
+            "a namespace-scoped pattern must not match a tool with no known namespace",
+        );
     }
 
     /// A matching tool whose approval channel is unreachable must fail closed

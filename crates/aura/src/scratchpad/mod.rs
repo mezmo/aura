@@ -36,6 +36,7 @@ pub use tools::{
 pub use wrapper::ScratchpadWrapper;
 
 use crate::config::{McpConfig, glob_match};
+use crate::mcp::{AuraTool, ToolName};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -44,8 +45,8 @@ use std::sync::Arc;
 ///
 /// **Why server-aware resolution?** `[mcp.servers.<name>.scratchpad]`
 /// blocks are scoped to a specific server, but at runtime
-/// `ToolCallContext` only carries the tool's bare name (server identity is
-/// dropped after rig registration). A server-agnostic pattern map would
+/// `ToolCallContext` only carries the tool's bare name and namespace (server
+/// identity is dropped after rig registration). A server-agnostic pattern map would
 /// silently apply Server A's `"*"` to Server B's tools and vice-versa.
 ///
 /// Resolution rule: for each `(server, tool_name)` pair from
@@ -65,7 +66,7 @@ use std::sync::Arc;
 /// support requires plumbing server_name through `tool_definitions`.
 pub fn scratchpad_tool_map(
     mcp: Option<&McpConfig>,
-    tool_names_per_server: &HashMap<String, Vec<String>>,
+    tool_names_per_server: &HashMap<String, Vec<ToolName>>,
 ) -> HashMap<String, usize> {
     let Some(mcp) = mcp else {
         return HashMap::new();
@@ -86,7 +87,7 @@ pub fn scratchpad_tool_map(
             // that matches THIS server's tool.
             let best = patterns
                 .iter()
-                .filter(|(pattern, _)| glob_match(pattern, tool_name))
+                .filter(|(pattern, _)| glob_match(pattern, tool_name.as_str()))
                 .min_by(|(pa, ea), (pb, eb)| {
                     pb.len()
                         .cmp(&pa.len())
@@ -95,7 +96,7 @@ pub fn scratchpad_tool_map(
 
             if let Some((_, entry)) = best {
                 use std::collections::hash_map::Entry;
-                match resolved.entry(tool_name.clone()) {
+                match resolved.entry(tool_name.to_string()) {
                     Entry::Vacant(slot) => {
                         slot.insert(entry.min_tokens);
                     }
@@ -126,19 +127,19 @@ pub fn scratchpad_tool_map(
 /// map — i.e. there's something for the wrapper to intercept. An exact
 /// lookup: `scratchpad_tool_map` is keyed by tool name, not pattern.
 pub fn has_accessible_scratchpad_tool(
-    tool_names: &[String],
+    tools: &[AuraTool],
     mcp_filter: Option<&[String]>,
     scratchpad_tool_map: &HashMap<String, usize>,
 ) -> bool {
     if scratchpad_tool_map.is_empty() {
         return false;
     }
-    tool_names.iter().any(|name| {
+    tools.iter().any(|tool| {
         let reachable = match mcp_filter {
             None => true,
-            Some(filter) => filter.iter().any(|p| glob_match(p, name)),
+            Some(filter) => filter.iter().any(|p| tool.matches(p)),
         };
-        reachable && scratchpad_tool_map.contains_key(name)
+        reachable && scratchpad_tool_map.contains_key(tool.name().as_str())
     })
 }
 
@@ -220,6 +221,19 @@ mod tests {
 
     use crate::config::{McpConfig, McpServerConfig};
 
+    fn tn(name: &str) -> ToolName {
+        ToolName::from(name)
+    }
+
+    fn aura_tool(namespace: &str, name: &str) -> AuraTool {
+        let tool = rmcp::model::Tool::new(
+            name.to_owned(),
+            "test tool".to_owned(),
+            std::sync::Arc::new(serde_json::Map::new()),
+        );
+        AuraTool::new(tool, namespace)
+    }
+
     fn server_with_scratchpad(patterns: &[(&str, usize)]) -> McpServerConfig {
         let scratchpad = patterns
             .iter()
@@ -257,7 +271,7 @@ mod tests {
         let mcp = mcp_with_servers(vec![("github", server_with_scratchpad(&[]))]);
         let tools_per_server = HashMap::from([(
             "github".to_string(),
-            vec!["search_code".to_string(), "list_branches".to_string()],
+            vec![tn("search_code"), tn("list_branches")],
         )]);
         let resolved = scratchpad_tool_map(Some(&mcp), &tools_per_server);
         assert!(resolved.is_empty());
@@ -273,9 +287,9 @@ mod tests {
         let tools_per_server = HashMap::from([(
             "github".to_string(),
             vec![
-                "search_code".to_string(),
-                "list_branches".to_string(),
-                "get_file_contents".to_string(),
+                tn("search_code"),
+                tn("list_branches"),
+                tn("get_file_contents"),
             ],
         )]);
         let resolved = scratchpad_tool_map(Some(&mcp), &tools_per_server);
@@ -294,8 +308,8 @@ mod tests {
             ("mezmo", server_with_scratchpad(&[("*", 5000)])),
         ]);
         let tools_per_server = HashMap::from([
-            ("github".to_string(), vec!["search_code".to_string()]),
-            ("mezmo".to_string(), vec!["list_pipelines".to_string()]),
+            ("github".to_string(), vec![tn("search_code")]),
+            ("mezmo".to_string(), vec![tn("list_pipelines")]),
         ]);
         let resolved = scratchpad_tool_map(Some(&mcp), &tools_per_server);
         // github tool gets github's threshold; mezmo tool gets mezmo's.
@@ -317,9 +331,9 @@ mod tests {
         let tools_per_server = HashMap::from([(
             "k8s".to_string(),
             vec![
-                "k8s_list_service_monitors".to_string(),
-                "k8s_list_namespaces".to_string(),
-                "get_log_histogram".to_string(),
+                tn("k8s_list_service_monitors"),
+                tn("k8s_list_namespaces"),
+                tn("get_log_histogram"),
             ],
         )]);
         let resolved = scratchpad_tool_map(Some(&mcp), &tools_per_server);
@@ -349,10 +363,7 @@ mod tests {
         )]);
         let tools_per_server = HashMap::from([(
             "k8s".to_string(),
-            vec![
-                "k8s_list_namespaces".to_string(),
-                "get_log_histogram".to_string(),
-            ],
+            vec![tn("k8s_list_namespaces"), tn("get_log_histogram")],
         )]);
         let resolved = scratchpad_tool_map(Some(&mcp), &tools_per_server);
         assert_eq!(resolved.get("k8s_list_namespaces"), Some(&512));
@@ -374,8 +385,8 @@ mod tests {
             ("server_b", server_with_scratchpad(&[("*", 5000)])),
         ]);
         let tools_per_server = HashMap::from([
-            ("server_a".to_string(), vec!["list_pipelines".to_string()]),
-            ("server_b".to_string(), vec!["list_pipelines".to_string()]),
+            ("server_a".to_string(), vec![tn("list_pipelines")]),
+            ("server_b".to_string(), vec![tn("list_pipelines")]),
         ]);
         let resolved = scratchpad_tool_map(Some(&mcp), &tools_per_server);
         assert_eq!(
@@ -402,7 +413,7 @@ mod tests {
     #[test]
     fn has_accessible_returns_false_when_map_is_empty() {
         assert!(!has_accessible_scratchpad_tool(
-            &["foo".to_string()],
+            &[aura_tool("mezmo", "foo")],
             None,
             &HashMap::new(),
         ));
@@ -412,7 +423,7 @@ mod tests {
     fn has_accessible_returns_true_when_any_tool_is_keyed() {
         let map = HashMap::from([("foo".to_string(), 256)]);
         assert!(has_accessible_scratchpad_tool(
-            &["foo".to_string(), "bar".to_string()],
+            &[aura_tool("mezmo", "foo"), aura_tool("mezmo", "bar")],
             None,
             &map,
         ));
@@ -424,7 +435,7 @@ mod tests {
         // mcp_filter restricts to `bar_*`, so `foo` is not reachable even
         // though it's in the map.
         assert!(!has_accessible_scratchpad_tool(
-            &["foo".to_string()],
+            &[aura_tool("mezmo", "foo")],
             Some(&["bar_*".to_string()]),
             &map,
         ));
@@ -434,8 +445,26 @@ mod tests {
     fn has_accessible_filter_glob_matches_against_reachable_set() {
         let map = HashMap::from([("foo_get".to_string(), 256)]);
         assert!(has_accessible_scratchpad_tool(
-            &["foo_get".to_string()],
+            &[aura_tool("mezmo", "foo_get")],
             Some(&["foo_*".to_string()]),
+            &map,
+        ));
+    }
+
+    #[test]
+    fn has_accessible_filter_namespace_scoped_pattern() {
+        // Both tools resolve to the same bare-name key; only the
+        // reachability check (via the `k8s:*` filter) should distinguish
+        // them.
+        let map = HashMap::from([("get_pods".to_string(), 256)]);
+        assert!(has_accessible_scratchpad_tool(
+            &[aura_tool("k8s", "get_pods")],
+            Some(&["k8s:*".to_string()]),
+            &map,
+        ));
+        assert!(!has_accessible_scratchpad_tool(
+            &[aura_tool("mezmo", "get_pods")],
+            Some(&["k8s:*".to_string()]),
             &map,
         ));
     }

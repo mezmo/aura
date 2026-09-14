@@ -511,7 +511,7 @@ impl McpProbeDispatcher {
         .find_map(|(tools, clients)| {
             tools
                 .iter()
-                .find(|(_, server_tools)| server_tools.iter().any(|t| t.name == tool))
+                .find(|(_, server_tools)| server_tools.iter().any(|t| t.name().as_str() == tool))
                 .and_then(|(server_name, _)| clients.get(server_name))
         })
     }
@@ -526,7 +526,9 @@ impl ProbeDispatcher for McpProbeDispatcher {
             .ok_or(ProbeSampleError::UnknownTool)?;
         let args = serde_json::Value::Object(probe.args().clone());
         // Probes are liveness checks and never carry approver identity.
-        Ok(execute_mcp_tool(client, tool_name, args, None).await?)
+        // The dispatcher resolves by bare tool name across all servers, so
+        // no single namespace is known here.
+        Ok(execute_mcp_tool(client, tool_name, None, args, None).await?)
     }
 }
 
