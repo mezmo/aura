@@ -305,18 +305,6 @@ impl ScratchpadStorage {
     }
 
     /// Write `content` untouched to `filename` in the scratchpad directory.
-    pub async fn write_verbatim(&self, filename: &str, content: &str) -> std::io::Result<PathBuf> {
-        let path = self.safe_companion_path(filename).await?;
-        fs::write(&path, content).await?;
-        debug!(
-            "Scratchpad file written verbatim: {} ({} bytes)",
-            path.display(),
-            content.len()
-        );
-        Ok(path)
-    }
-
-    /// Write `content` untouched to `filename` in the scratchpad directory.
     /// An existing file with the same bytes counts as written; one with
     /// different bytes is an `AlreadyExists` error, so a file name that has
     /// been handed out never comes to mean different content.

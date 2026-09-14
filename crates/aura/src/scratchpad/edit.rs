@@ -5,8 +5,6 @@
 //! `<field>_file` argument instead of retyping the whole file. The source
 //! file is never modified, so references to it stay valid.
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -14,6 +12,7 @@ use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 use super::arg_reference::ReferenceResolver;
 use super::storage::ScratchpadStorage;
@@ -120,20 +119,27 @@ impl Tool for EditTool {
         let content = self.resolver.read(&args.file).await.map_err(|reason| {
             ScratchpadToolError::InvalidArg(format!("cannot read '{}': {reason}", args.file))
         })?;
-        let edit = apply_edit(&content, &args.old, &args.new, args.replace_all)
-            .map_err(ScratchpadToolError::InvalidArg)?;
         // The result is only useful as a reference, and references refuse
-        // larger files.
-        if edit.content.len() > MAX_RAW_PAYLOAD_BYTES {
-            return Err(ScratchpadToolError::InvalidArg(format!(
-                "the edited file would be {} bytes; stored files are limited to \
-                 {MAX_RAW_PAYLOAD_BYTES} bytes",
-                edit.content.len()
-            )));
-        }
+        // files over `MAX_RAW_PAYLOAD_BYTES`.
+        let edit = apply_edit(
+            &content,
+            &args.old,
+            &args.new,
+            args.replace_all,
+            MAX_RAW_PAYLOAD_BYTES,
+        )
+        .map_err(ScratchpadToolError::InvalidArg)?;
 
         let name = edited_file_name(&args.file, &edit.content);
-        self.storage.write_verbatim(&name, &edit.content).await?;
+        self.storage
+            .write_new_verbatim(&name, &edit.content)
+            .await
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::AlreadyExists => {
+                    ScratchpadToolError::InvalidArg(format!("cannot save the edit: {e}"))
+                }
+                _ => ScratchpadToolError::Io(e),
+            })?;
 
         let replacements = match edit.replacements {
             1 => "1 replacement".to_string(),
@@ -154,40 +160,70 @@ impl Tool for EditTool {
 struct Edit {
     content: String,
     replacements: usize,
-    /// Byte offset of the first replacement (the same in old and new content).
+    /// Byte offset of the first replacement.
     first_at: usize,
 }
 
 /// Replace `old` with `new` in `content`: exactly one occurrence, or every
 /// occurrence with `replace_all`. The error is a model-facing reason.
-fn apply_edit(content: &str, old: &str, new: &str, replace_all: bool) -> Result<Edit, String> {
-    let positions: Vec<usize> = content.match_indices(old).map(|(at, _)| at).collect();
-    let Some(&first_at) = positions.first() else {
+///
+/// The result's size is computed from the match count and checked against
+/// `max_bytes` before anything is built, so an oversized `replace_all` fails
+/// without allocating it. Nothing before the first match changes, so
+/// `first_at` is the same offset in the edited content.
+fn apply_edit(
+    content: &str,
+    old: &str,
+    new: &str,
+    replace_all: bool,
+    max_bytes: usize,
+) -> Result<Edit, String> {
+    let mut matches = content.match_indices(old).map(|(at, _)| at);
+    let Some(first_at) = matches.next() else {
         return Err(no_match_reason(content, old));
     };
-    if positions.len() > 1 && !replace_all {
-        let lines: Vec<String> = positions
+    let mut listed = vec![first_at];
+    let mut count = 1;
+    for at in matches {
+        if listed.len() < MAX_LISTED_MATCHES {
+            listed.push(at);
+        }
+        count += 1;
+    }
+    if count > 1 && !replace_all {
+        let lines: Vec<String> = listed
             .iter()
-            .take(MAX_LISTED_MATCHES)
             .map(|&at| line_of(content, at).to_string())
             .collect();
-        let more = if positions.len() > MAX_LISTED_MATCHES {
+        let more = if count > MAX_LISTED_MATCHES {
             ", …"
         } else {
             ""
         };
         return Err(format!(
-            "`old` occurs {} times (at lines {}{more}); include more surrounding text so it \
-             matches exactly once, or set replace_all to change every occurrence",
-            positions.len(),
+            "`old` occurs {count} times (at lines {}{more}); include more surrounding text so \
+             it matches exactly once, or set replace_all to change every occurrence",
             lines.join(", "),
         ));
     }
 
-    let (content, replacements) = if replace_all {
-        (content.replace(old, new), positions.len())
+    let replacements = if replace_all { count } else { 1 };
+    // Matches don't overlap, so they account for `replacements * old.len()`
+    // bytes of `content`.
+    let size = replacements
+        .checked_mul(new.len())
+        .and_then(|added| (content.len() - replacements * old.len()).checked_add(added));
+    if size.is_none_or(|size| size > max_bytes) {
+        let size = size.map_or_else(|| "too large".to_string(), |s| format!("{s} bytes"));
+        return Err(format!(
+            "the edited file would be {size}; stored files are limited to {max_bytes} bytes"
+        ));
+    }
+
+    let content = if replace_all {
+        content.replace(old, new)
     } else {
-        (content.replacen(old, new, 1), 1)
+        content.replacen(old, new, 1)
     };
     Ok(Edit {
         content,
@@ -242,9 +278,13 @@ fn excerpt(content: &str, at: usize, new: &str) -> String {
     )
 }
 
+/// Length of the content hash in an edited file's name, in hex digits.
+const EDIT_HASH_HEX_LEN: usize = 16;
+
 /// Name for an edited copy of `source`: its base name with an
-/// `.edit-<hash8>` segment before the extension, hashed on the new content so
-/// identical edits produce the same file. An existing `.edit-<hash8>` segment
+/// `.edit-<hash>` segment before the extension, where `<hash>` is the first
+/// [`EDIT_HASH_HEX_LEN`] hex digits of the new content's SHA-256, so
+/// identical edits produce the same file. An existing `.edit-<hash>` segment
 /// is replaced rather than stacked.
 fn edited_file_name(source: &str, content: &str) -> String {
     let base = Path::new(source)
@@ -256,16 +296,17 @@ fn edited_file_name(source: &str, content: &str) -> String {
         _ => (base.clone(), String::new()),
     };
     let stem = match stem.rsplit_once(".edit-") {
-        Some((head, hash)) if hash.len() == 8 && hash.chars().all(|c| c.is_ascii_hexdigit()) => {
+        Some((head, hash))
+            if hash.len() == EDIT_HASH_HEX_LEN && hash.chars().all(|c| c.is_ascii_hexdigit()) =>
+        {
             head.to_string()
         }
         _ => stem,
     };
 
-    let mut hasher = DefaultHasher::new();
-    content.hash(&mut hasher);
-    let hash = format!("{:016x}", hasher.finish());
-    format!("{stem}.edit-{}{extension}", &hash[..8]).replace(['/', '\\', ':', ' '], "_")
+    let hash = hex::encode(Sha256::digest(content.as_bytes()));
+    format!("{stem}.edit-{}{extension}", &hash[..EDIT_HASH_HEX_LEN])
+        .replace(['/', '\\', ':', ' '], "_")
 }
 
 #[cfg(test)]
@@ -451,6 +492,53 @@ mod tests {
         let (tool, _) = tool_with(&tmp, "big.txt", &content).await;
         let err = tool.call(args("big.txt", "y", "zz")).await.unwrap_err();
         assert!(err.to_string().contains("limited to"), "{err}");
+    }
+
+    /// The size check runs on the projected size, before `replace` builds
+    /// the result: a small `max_bytes` rejects a large expansion outright.
+    #[test]
+    fn apply_edit_rejects_an_oversized_result_before_building_it() {
+        let content = "a".repeat(1_000);
+        let err = apply_edit(&content, "a", "bb", true, 1_500)
+            .err()
+            .expect("2000 bytes exceeds a 1500-byte cap");
+        assert!(err.contains("would be 2000 bytes"), "{err}");
+
+        let fits = apply_edit(&content, "a", "bb", true, 2_000).expect("exactly at the cap");
+        assert_eq!(fits.content.len(), 2_000);
+        assert_eq!(fits.replacements, 1_000);
+    }
+
+    /// A name that was handed out must never come to mean different bytes.
+    #[tokio::test]
+    async fn edit_refuses_to_overwrite_a_different_file_with_the_same_name() {
+        let tmp = TempDir::new().unwrap();
+        let (tool, storage) = tool_with(&tmp, "f.md", RUNBOOK).await;
+        let edited = RUNBOOK.replacen("step one", "step 1", 1);
+        let name = edited_file_name("f.md", &edited);
+        tokio::fs::write(storage.dir().join(&name), "someone else's bytes")
+            .await
+            .unwrap();
+
+        let err = tool
+            .call(args("f.md", "step one", "step 1"))
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("already exists"), "{err}");
+        let kept = tokio::fs::read_to_string(storage.dir().join(&name))
+            .await
+            .unwrap();
+        assert_eq!(kept, "someone else's bytes");
+    }
+
+    #[tokio::test]
+    async fn repeating_an_edit_reuses_the_same_file() {
+        let tmp = TempDir::new().unwrap();
+        let (tool, _) = tool_with(&tmp, "f.md", RUNBOOK).await;
+        let first = tool.call(args("f.md", "step one", "step 1")).await.unwrap();
+        let second = tool.call(args("f.md", "step one", "step 1")).await.unwrap();
+        assert_eq!(saved_name(&first), saved_name(&second));
     }
 
     #[test]
