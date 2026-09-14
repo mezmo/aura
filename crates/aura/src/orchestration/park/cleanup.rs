@@ -10,8 +10,8 @@
 
 use std::path::Path;
 
-use super::lifetime::RunReservationLease;
-use super::resume::claim::ResumeDocuments;
+use super::lifetime::ReservationTable;
+use super::resume::claim::{ResumeDocuments, ValidatedResumePath};
 use super::resume::evaluate::Diagnostic;
 use crate::hitl::PendingApprovals;
 
@@ -36,25 +36,50 @@ pub(crate) enum CheckpointPresence {
 }
 
 /// One run's reservation-owning cleanup carrier: the lease that binds the
-/// run and carries the cleanup eligibility (only a held reservation may
-/// reread-and-delete), plus the run's two checkpoint paths. `Clone` hands
+/// run and carries the cleanup eligibility (only an acquired reservation
+/// may reread-and-delete), plus the run's two checkpoint paths derived
+/// from the SAME validated identity the admission occupied. `Clone` hands
 /// the SAME fence to the blocking reread/deletion tails, so the
 /// reservation survives even if the awaiting sweep drops.
 #[derive(Debug, Clone)]
 pub(crate) struct CleanupReservation {
-    reservation: RunReservationLease,
+    reservation: super::lifetime::RunReservationLease,
     docs: ResumeDocuments,
 }
 
+/// Why a run is not cleanup-eligible: the admission itself is the
+/// eligibility proof, so a live occupation (an executing run) is the one
+/// refusal — retention revalidation under the acquired fence is E6's
+/// body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CleanupAdmissionFault {
+    /// A live reservation holds the run: execution is active and cleanup
+    /// must not proceed. Nothing changed.
+    Executing,
+}
+
 impl CleanupReservation {
-    /// Bind one held reservation to the run's checkpoint paths.
-    pub(crate) fn new(reservation: RunReservationLease, docs: ResumeDocuments) -> Self {
-        Self { reservation, docs }
+    /// Acquire the run for cleanup: occupy the run under the shared
+    /// reservation table — the admission IS the eligibility proof, never
+    /// a clone of an executing run's lease — then derive the checkpoint
+    /// paths from the same validated identity, so the fence and the
+    /// paths cannot name different runs. A live run answers
+    /// [`CleanupAdmissionFault::Executing`].
+    pub(crate) fn acquire(
+        table: &ReservationTable,
+        path: &ValidatedResumePath,
+        memory_dir: &str,
+    ) -> Result<Self, CleanupAdmissionFault> {
+        let reservation = table
+            .admit(path.run.run_id())
+            .map_err(|_| CleanupAdmissionFault::Executing)?;
+        let docs = ResumeDocuments::for_path(path, memory_dir);
+        Ok(Self { reservation, docs })
     }
 
     /// The reservation fencing this cleanup: the run's identity and its
     /// cleanup eligibility.
-    pub(crate) fn reservation(&self) -> &RunReservationLease {
+    pub(crate) fn reservation(&self) -> &super::lifetime::RunReservationLease {
         &self.reservation
     }
 
