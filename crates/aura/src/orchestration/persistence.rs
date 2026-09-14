@@ -480,8 +480,12 @@ impl ExecutionPersistence {
 
     /// Get iteration directory path (flat, directly under run dir).
     pub(super) fn iteration_path(&self) -> PathBuf {
-        self.base_path
-            .join(format!("iteration-{}", self.current_iteration))
+        self.iteration_path_for(self.current_iteration)
+    }
+
+    /// Directory of iteration `iteration` of this run.
+    pub(crate) fn iteration_path_for(&self, iteration: usize) -> PathBuf {
+        self.base_path.join(format!("iteration-{iteration}"))
     }
 
     /// Build a dot-namespaced filename for a task attempt artifact.

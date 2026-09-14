@@ -21,7 +21,7 @@ use serde_json::{Map, Value};
 use tokio::sync::{Mutex, OnceCell};
 
 use super::context_budget::TokenCounter;
-use super::storage::ScratchpadStorage;
+use super::storage::{SCRATCHPAD_DIR, ScratchpadStorage};
 use crate::config::{McpConfig, glob_match};
 use crate::mcp::MAX_RAW_PAYLOAD_BYTES;
 use crate::orchestration::ExecutionPersistence;
@@ -395,9 +395,13 @@ impl ReferenceResolver {
     }
 
     /// Read `file` as a scratchpad file token (the names the scratchpad read
-    /// tools take, confined to the storage read root) or, failing that, as an
+    /// tools take, confined to the storage read root); failing that, as an
     /// artifact filename in the current orchestration run (the same
-    /// resolution `read_artifact` uses). The error is a model-facing reason.
+    /// resolution `read_artifact` uses); failing that, for a bare file name,
+    /// as a scratchpad file from an earlier iteration of the run — each
+    /// iteration has its own scratchpad directory, and a stored file reported
+    /// in one iteration is forwarded to workers in the next. The error is a
+    /// model-facing reason.
     pub(crate) async fn read(&self, file: &str) -> Result<String, String> {
         let path = self
             .storage
@@ -416,6 +420,22 @@ impl ReferenceResolver {
                 && let Some(content) = read_bounded(&path).await?
             {
                 return Ok(content);
+            }
+            if is_bare_file_name(file) {
+                for iteration in (0..=persistence.current_iteration()).rev() {
+                    let path = persistence
+                        .iteration_path_for(iteration)
+                        .join(SCRATCHPAD_DIR)
+                        .join(file);
+                    // Containment check only: the path must stay under the
+                    // read root.
+                    if self.storage.relative_ref(&path).await.is_err() {
+                        continue;
+                    }
+                    if let Some(content) = read_stored_file(&path, file).await? {
+                        return Ok(content);
+                    }
+                }
             }
         }
 
@@ -483,6 +503,11 @@ async fn read_bounded(path: &Path) -> Result<Option<String>, String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(describe_read_error(&e)),
     }
+}
+
+/// A plain file name, with no directory part.
+fn is_bare_file_name(file: &str) -> bool {
+    !file.is_empty() && file != "." && file != ".." && !file.contains(['/', '\\'])
 }
 
 fn describe_read_error(e: &std::io::Error) -> String {
@@ -1051,6 +1076,53 @@ mod tests {
             .unwrap();
             assert_eq!(resolved, json!({ "content": content }));
         }
+    }
+
+    /// A stored file reported in one iteration is forwarded by bare name to a
+    /// worker in the next, whose scratchpad directory is a different one.
+    #[tokio::test]
+    async fn resolve_finds_scratchpad_files_from_earlier_iterations() {
+        let tmp = TempDir::new().unwrap();
+        let memory = tmp.path().join("memory");
+        let mut persistence = ExecutionPersistence::new(&memory, None).await.unwrap();
+        let first = persistence.start_new_iteration();
+        let earlier = persistence.iteration_path_for(first).join(SCRATCHPAD_DIR);
+        std::fs::create_dir_all(&earlier).unwrap();
+        std::fs::write(
+            earlier.join("task_0-reader-get-0-ab.raw.md"),
+            "from before\n",
+        )
+        .unwrap();
+
+        let second = persistence.start_new_iteration();
+        let storage = Arc::new(
+            ScratchpadStorage::in_dir(&persistence.iteration_path_for(second))
+                .await
+                .unwrap()
+                .with_read_root(memory.clone()),
+        );
+        let resolver = ReferenceResolver::new(storage, Some(Arc::new(Mutex::new(persistence))));
+
+        let resolved = resolve_references(
+            json!({ "content_file": "task_0-reader-get-0-ab.raw.md" }),
+            &paths(&["content"]),
+            &resolver,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resolved, json!({ "content": "from before\n" }));
+
+        let err = resolve_references(
+            json!({ "content_file": "missing.md" }),
+            &paths(&["content"]),
+            &resolver,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("no scratchpad file or artifact"),
+            "{err}"
+        );
     }
 
     // --- ArgReferenceTool ---

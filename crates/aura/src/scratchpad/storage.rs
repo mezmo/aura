@@ -125,6 +125,10 @@ struct PendingCompanion {
 /// as a companion file.
 const COMPANION_MIN_LINES: usize = 10;
 
+/// Name of the scratchpad directory inside its parent (an orchestration
+/// iteration directory, or `memory_dir` for a single agent).
+pub(crate) const SCRATCHPAD_DIR: &str = "scratchpad";
+
 /// Manages scratchpad file storage for a single request.
 #[derive(Debug, Clone)]
 pub struct ScratchpadStorage {
@@ -140,7 +144,7 @@ impl ScratchpadStorage {
     ///
     /// Creates `{parent}/scratchpad/` for storing intercepted tool outputs.
     pub async fn in_dir(parent: &Path) -> std::io::Result<Self> {
-        let dir = parent.join("scratchpad");
+        let dir = parent.join(SCRATCHPAD_DIR);
         fs::create_dir_all(&dir).await?;
         info!("Scratchpad directory created: {}", dir.display());
         Ok(Self {
