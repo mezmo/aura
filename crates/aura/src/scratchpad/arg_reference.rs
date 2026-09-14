@@ -4,13 +4,14 @@
 //! Configured per tool and field at
 //! `[mcp.servers.<name>.scratchpad.by_reference]`. For each field, the tool
 //! schema gains an optional `<field>_file` sibling, and [`ArgReferenceTool`]
-//! swaps the referenced file's contents into `<field>` right before the inner
-//! tool runs. `ArgReferenceTool` sits *inside* the `WrappedTool` wrapper
-//! chain, so persistence, observer events, the duplicate-call guard and the
-//! HITL gate all see the reference the model sent, not the expanded content.
+//! swaps the referenced file's contents into `<field>` right before the tool
+//! it wraps runs. Whether that is inside or outside the tool wrapper chain —
+//! and so whether wrappers see the reference or the expanded content — is
+//! decided in `Agent::add_mcp_tool`.
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -21,6 +22,7 @@ use tokio::sync::{Mutex, OnceCell};
 
 use super::storage::ScratchpadStorage;
 use crate::config::{McpConfig, glob_match};
+use crate::mcp::MAX_RAW_PAYLOAD_BYTES;
 use crate::orchestration::ExecutionPersistence;
 
 pub use aura_config::{FieldPath, FieldSegment};
@@ -29,50 +31,68 @@ fn reference_key(field: &str) -> String {
     format!("{field}_file")
 }
 
-/// Resolve `[mcp.servers.*.scratchpad.by_reference]` patterns into a flat
-/// `tool_name → fields` map, scoped per server like
-/// [`scratchpad_tool_map`](super::scratchpad_tool_map): a server's patterns
-/// apply only to that server's tools, and the longest matching pattern wins
-/// (equal lengths: the lexicographically smaller pattern). A tool name
-/// exposed by several servers gets the union of their fields.
+/// Server name → tool name → argument fields that accept a file reference.
+#[derive(Debug, Clone, Default)]
+pub struct ByReferenceMap(HashMap<String, HashMap<String, Vec<FieldPath>>>);
+
+impl ByReferenceMap {
+    /// Fields of `server`'s tool `tool` that accept a reference.
+    pub fn get(&self, server: &str, tool: &str) -> Option<&[FieldPath]> {
+        self.0.get(server)?.get(tool).map(Vec::as_slice)
+    }
+
+    /// Whether a tool named `tool` accepts a reference on any server.
+    pub fn contains_tool(&self, tool: &str) -> bool {
+        self.0.values().any(|tools| tools.contains_key(tool))
+    }
+
+    /// Number of (server, tool) pairs with reference fields.
+    pub fn len(&self) -> usize {
+        self.0.values().map(HashMap::len).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// Resolve `[mcp.servers.*.scratchpad.by_reference]` patterns against each
+/// server's tool list; within a server the longest matching pattern wins
+/// (equal lengths: the lexicographically smaller pattern).
+///
+/// Unlike [`scratchpad_tool_map`](super::scratchpad_tool_map), the result
+/// stays keyed by server. A reference makes aura send stored file contents
+/// to the tool's server, so one server's opt-in must never reach a
+/// same-named tool on another.
 pub fn by_reference_map(
     mcp: Option<&McpConfig>,
     tool_names_per_server: &HashMap<String, Vec<String>>,
-) -> HashMap<String, Vec<FieldPath>> {
+) -> ByReferenceMap {
     let Some(mcp) = mcp else {
-        return HashMap::new();
+        return ByReferenceMap::default();
     };
 
-    let mut resolved: HashMap<String, Vec<FieldPath>> = HashMap::new();
+    let mut resolved = HashMap::new();
     for (server_name, tools) in tool_names_per_server {
         let Some(server_cfg) = mcp.servers.get(server_name) else {
             continue;
         };
         let patterns = &server_cfg.scratchpad().by_reference;
-        for tool_name in tools {
-            let best = patterns
-                .iter()
-                .filter(|(pattern, _)| glob_match(pattern, tool_name))
-                .min_by(|(pa, _), (pb, _)| pb.len().cmp(&pa.len()).then(pa.cmp(pb)));
-            let Some((_, fields)) = best.filter(|(_, fields)| !fields.is_empty()) else {
-                continue;
-            };
-            let entry = resolved.entry(tool_name.clone()).or_default();
-            if !entry.is_empty() {
-                tracing::warn!(
-                    "scratchpad: tool '{tool_name}' has by_reference fields on more than one \
-                     server; using the union. Tool-name collisions across servers are \
-                     unusual — verify your MCP server configs."
-                );
-            }
-            for field in fields {
-                if !entry.contains(field) {
-                    entry.push(field.clone());
-                }
-            }
+        let server_tools: HashMap<String, Vec<FieldPath>> = tools
+            .iter()
+            .filter_map(|tool_name| {
+                let (_, fields) = patterns
+                    .iter()
+                    .filter(|(pattern, _)| glob_match(pattern, tool_name))
+                    .min_by(|(pa, _), (pb, _)| pb.len().cmp(&pa.len()).then(pa.cmp(pb)))?;
+                (!fields.is_empty()).then(|| (tool_name.clone(), fields.clone()))
+            })
+            .collect();
+        if !server_tools.is_empty() {
+            resolved.insert(server_name.clone(), server_tools);
         }
     }
-    resolved
+    ByReferenceMap(resolved)
 }
 
 /// Add a `<field>_file` property beside each of `fields` in a tool's
@@ -340,27 +360,42 @@ impl ReferenceResolver {
             .validate_path(file)
             .await
             .map_err(|e| e.to_string())?;
-        match tokio::fs::read_to_string(&path).await {
-            Ok(content) => return Ok(content),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(describe_read_error(&e)),
+        if let Some(content) = read_bounded(&path).await? {
+            return Ok(content);
         }
 
         if let Some(persistence) = &self.persistence {
             let persistence = persistence.lock().await;
-            match persistence.read_artifact(file).await {
-                Ok(content) => return Ok(content),
-                // Not a bare artifact filename, or no such artifact.
-                Err(e)
-                    if matches!(
-                        e.kind(),
-                        std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidInput
-                    ) => {}
-                Err(e) => return Err(describe_read_error(&e)),
+            // `artifact_path` rejects anything but a bare artifact filename.
+            if persistence.is_enabled()
+                && let Ok(path) = persistence.artifact_path(file)
+                && let Some(content) = read_bounded(&path).await?
+            {
+                return Ok(content);
             }
         }
 
         Err("no scratchpad file or artifact by that name".to_string())
+    }
+}
+
+/// Read `path` as UTF-8 text, refusing files over [`MAX_RAW_PAYLOAD_BYTES`]
+/// before reading them; `Ok(None)` when there is no such file.
+async fn read_bounded(path: &Path) -> Result<Option<String>, String> {
+    let size = match tokio::fs::metadata(path).await {
+        Ok(metadata) => metadata.len(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(describe_read_error(&e)),
+    };
+    if size > MAX_RAW_PAYLOAD_BYTES as u64 {
+        return Err(format!(
+            "the file is {size} bytes; references are limited to {MAX_RAW_PAYLOAD_BYTES} bytes"
+        ));
+    }
+    match tokio::fs::read_to_string(path).await {
+        Ok(content) => Ok(Some(content)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(describe_read_error(&e)),
     }
 }
 
@@ -371,8 +406,8 @@ fn describe_read_error(e: &std::io::Error) -> String {
     }
 }
 
-/// Wraps a tool so its configured string fields accept a `<field>_file`
-/// reference (see the module docs).
+/// A tool whose configured string fields also accept a `<field>_file`
+/// reference.
 #[derive(Clone)]
 pub struct ArgReferenceTool<T> {
     inner: T,
@@ -558,13 +593,48 @@ mod tests {
 
         let resolved = by_reference_map(Some(&mcp), &tools);
 
-        assert_eq!(resolved["create_or_update_file"], paths(&["content"]));
-        assert_eq!(resolved["push_files"], paths(&["files[].content"]));
-        assert_eq!(resolved["create_issue"], paths(&["body"]));
+        let fields = |tool| resolved.get("github", tool).map(<[FieldPath]>::to_vec);
+        assert_eq!(fields("create_or_update_file"), Some(paths(&["content"])));
+        assert_eq!(fields("push_files"), Some(paths(&["files[].content"])));
+        assert_eq!(fields("create_issue"), Some(paths(&["body"])));
         assert!(
-            !resolved.contains_key("write_note"),
+            resolved.get("other", "write_note").is_none(),
             "github patterns must not apply to another server's tools"
         );
+        assert_eq!(resolved.len(), 3);
+    }
+
+    /// A reference sends stored content to the tool's own server, so a
+    /// same-named tool on a server that didn't opt in must not get one.
+    #[test]
+    fn by_reference_map_keeps_same_named_tools_on_other_servers_out() {
+        let mcp = McpConfig {
+            servers: HashMap::from([
+                (
+                    "github".to_string(),
+                    server(&[("create_or_update_file", &["content"])]),
+                ),
+                ("mirror".to_string(), server(&[])),
+            ]),
+            sanitize_schemas: false,
+        };
+        let tools = HashMap::from([
+            (
+                "github".to_string(),
+                vec!["create_or_update_file".to_string()],
+            ),
+            (
+                "mirror".to_string(),
+                vec!["create_or_update_file".to_string()],
+            ),
+        ]);
+
+        let resolved = by_reference_map(Some(&mcp), &tools);
+
+        assert!(resolved.get("github", "create_or_update_file").is_some());
+        assert!(resolved.get("mirror", "create_or_update_file").is_none());
+        assert!(resolved.contains_tool("create_or_update_file"));
+        assert_eq!(resolved.len(), 1);
     }
 
     // --- add_reference_fields ---
@@ -749,6 +819,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolve_rejects_a_file_over_the_size_limit() {
+        let tmp = TempDir::new().unwrap();
+        let big = "x".repeat(MAX_RAW_PAYLOAD_BYTES + 1);
+        let resolver = resolver_with_file(&tmp, "big.txt", &big).await;
+
+        let err = resolve_references(
+            json!({ "content_file": "big.txt" }),
+            &paths(&["content"]),
+            &resolver,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("references are limited to"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
     async fn resolve_falls_back_to_current_run_artifacts() {
         let tmp = TempDir::new().unwrap();
         let persistence = ExecutionPersistence::new(tmp.path().join("memory"), None)
@@ -909,5 +999,47 @@ mod tests {
 
         assert_eq!(recorded.lock().unwrap().clone(), Some(args));
         assert_eq!(seen.lock().unwrap()[0]["content"], "exact bytes\n");
+    }
+
+    /// Wrapped *around* the wrapper chain (the HITL-gated placement), a gate's
+    /// `pre_call` sees the bytes that will be sent, not the file name.
+    #[tokio::test]
+    async fn outside_the_wrapper_chain_a_gate_sees_the_expanded_content() {
+        use crate::tool_wrapper::{PreCallOutcome, ToolCallContext, ToolWrapper, WrappedTool};
+
+        struct RecordPreCall(Arc<std::sync::Mutex<Option<Value>>>);
+
+        #[async_trait::async_trait]
+        impl ToolWrapper for RecordPreCall {
+            async fn pre_call(
+                &self,
+                args: &Value,
+                _ctx: &ToolCallContext,
+            ) -> Result<PreCallOutcome, ToolError> {
+                *self.0.lock().unwrap() = Some(args.clone());
+                Ok(PreCallOutcome::Proceed { overrides: None })
+            }
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let gate_saw = Arc::new(std::sync::Mutex::new(None));
+        let inner = WrappedTool::new(
+            RecordingTool { seen: seen.clone() },
+            Arc::new(RecordPreCall(gate_saw.clone())),
+        );
+        let resolver = resolver_with_file(&tmp, "file.raw.md", "exact bytes\n").await;
+        let tool = ArgReferenceTool::new(inner, paths(&["content"]), resolver);
+
+        let definition = tool.definition(String::new()).await;
+        assert!(definition.parameters["properties"]["content_file"].is_object());
+
+        tool.call(json!({ "path": "p", "content_file": "file.raw.md" }))
+            .await
+            .unwrap();
+
+        let expanded = json!({ "path": "p", "content": "exact bytes\n" });
+        assert_eq!(gate_saw.lock().unwrap().clone(), Some(expanded.clone()));
+        assert_eq!(seen.lock().unwrap().as_slice(), [expanded]);
     }
 }

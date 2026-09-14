@@ -741,11 +741,9 @@ impl Orchestrator {
             let has_matching_tool = scratchpad::has_accessible_scratchpad_tool(
                 &accessible_tools,
                 worker_filter,
-                &scratchpad_tool_map,
-            ) || scratchpad::has_accessible_scratchpad_tool(
-                &accessible_tools,
-                worker_filter,
-                &by_reference_map,
+                |tool| {
+                    scratchpad_tool_map.contains_key(tool) || by_reference_map.contains_tool(tool)
+                },
             );
 
             if !has_matching_tool {

@@ -4,7 +4,7 @@
 //! the construction of the budget, storage, wrapper, and tools config.
 
 use super::{
-    ContextBudget, FieldPath, SCRATCHPAD_PREAMBLE, ScratchpadConfig, ScratchpadStorage,
+    ByReferenceMap, ContextBudget, SCRATCHPAD_PREAMBLE, ScratchpadConfig, ScratchpadStorage,
     ScratchpadToolsConfig, ScratchpadWrapper, TokenCounter, scratchpad_tool_schema_tokens,
 };
 use crate::config::glob_match;
@@ -23,7 +23,7 @@ pub struct ScratchpadBuildInputs<'a> {
     /// `None` confines reads to the scratchpad dir.
     pub read_root: Option<&'a Path>,
     pub scratchpad_tool_map: HashMap<String, usize>,
-    pub by_reference_map: HashMap<String, Vec<FieldPath>>,
+    pub by_reference_map: ByReferenceMap,
     pub context_window: usize,
     pub initial_used: usize,
     pub token_counter: Arc<dyn TokenCounter>,
@@ -281,7 +281,7 @@ mod tests {
             storage_dir: tmp.path(),
             read_root: None,
             scratchpad_tool_map: tool_map,
-            by_reference_map: HashMap::new(),
+            by_reference_map: Default::default(),
             context_window: 128_000,
             initial_used: 1_000,
             token_counter: counter(),

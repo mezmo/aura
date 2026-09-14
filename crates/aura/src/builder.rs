@@ -194,15 +194,9 @@ impl Agent {
             .mcp_filter
             .as_deref()
             .or(config.agent.mcp_filter.as_deref());
-        if !scratchpad::has_accessible_scratchpad_tool(
-            &accessible_tools,
-            filter,
-            &scratchpad_tool_map,
-        ) && !scratchpad::has_accessible_scratchpad_tool(
-            &accessible_tools,
-            filter,
-            &by_reference_map,
-        ) {
+        if !scratchpad::has_accessible_scratchpad_tool(&accessible_tools, filter, |tool| {
+            scratchpad_tool_map.contains_key(tool) || by_reference_map.contains_tool(tool)
+        }) {
             tracing::info!(
                 "Single-agent scratchpad enabled but no MCP tool matches a scratchpad threshold \
                  or by_reference entry; skipping"
@@ -926,7 +920,8 @@ impl Agent {
                         );
 
                         // Wrap with tool_wrapper if configured
-                        builder_state = Self::add_mcp_tool(builder_state, tool_adaptor, config);
+                        builder_state =
+                            Self::add_mcp_tool(builder_state, server_name, tool_adaptor, config);
                     }
                 }
             }
@@ -959,7 +954,8 @@ impl Agent {
                             crate::approver_headers::McpTransportKind::Sse,
                         );
 
-                        builder_state = Self::add_mcp_tool(builder_state, tool_adaptor, config);
+                        builder_state =
+                            Self::add_mcp_tool(builder_state, server_name, tool_adaptor, config);
                     }
                 }
             }
@@ -1036,7 +1032,8 @@ impl Agent {
                             crate::approver_headers::McpTransportKind::Stdio,
                         );
 
-                        builder_state = Self::add_mcp_tool(builder_state, tool_adaptor, config);
+                        builder_state =
+                            Self::add_mcp_tool(builder_state, server_name, tool_adaptor, config);
                     }
                 }
             }
@@ -1146,14 +1143,20 @@ impl Agent {
         Ok(builder_state)
     }
 
-    /// Helper to add an MCP tool, optionally wrapping with config.tool_wrapper.
+    /// Helper to add an MCP tool served by `server_name`, optionally wrapping
+    /// with config.tool_wrapper.
     ///
-    /// A tool with `by_reference` fields is first wrapped in
-    /// [`scratchpad::ArgReferenceTool`], *inside* `config.tool_wrapper`, so the
-    /// wrapper chain (persistence, observer, HITL) sees the references the
-    /// model sent rather than the expanded file contents.
+    /// A tool with `by_reference` fields (looked up per server, so a
+    /// same-named tool on another server never gets them) is also wrapped in
+    /// [`scratchpad::ArgReferenceTool`]. It normally goes *inside*
+    /// `config.tool_wrapper`, so the wrapper chain (persistence, observer,
+    /// duplicate guard) records the reference the model sent rather than the
+    /// expanded file. When a `[hitl]` pattern gates the tool it goes
+    /// *outside* instead: an approver must see the bytes that will actually
+    /// be sent, not a file name.
     fn add_mcp_tool<M, T>(
         builder_state: BuilderState<M>,
+        server_name: &str,
         tool: T,
         config: &AgentRuntimeConfig,
     ) -> BuilderState<M>
@@ -1165,22 +1168,35 @@ impl Agent {
             + Clone
             + 'static,
     {
-        if let Some(scratchpad) = &config.scratchpad_tools_config
-            && let Some(fields) = scratchpad.by_reference.get(&tool.name())
-        {
-            let resolver = scratchpad::ReferenceResolver::new(
-                scratchpad.storage.clone(),
-                config.orchestration_persistence.clone(),
-            );
-            let tool = scratchpad::ArgReferenceTool::new(tool, fields.clone(), resolver);
+        let tool_name = tool.name();
+        let Some(scratchpad) = &config.scratchpad_tools_config else {
             return Self::add_wrapped_tool(builder_state, tool, config);
+        };
+        let Some(fields) = scratchpad.by_reference.get(server_name, &tool_name) else {
+            return Self::add_wrapped_tool(builder_state, tool, config);
+        };
+        let resolver = scratchpad::ReferenceResolver::new(
+            scratchpad.storage.clone(),
+            config.orchestration_persistence.clone(),
+        );
+        let hitl_patterns = config.hitl.as_ref().map(|hitl| &*hitl.patterns);
+        match &config.tool_wrapper {
+            Some(wrapper) if hitl_gates_tool(hitl_patterns, &tool_name) => {
+                let wrapped = Self::wrap_tool(tool, wrapper, config);
+                builder_state.add_tool(scratchpad::ArgReferenceTool::new(
+                    wrapped,
+                    fields.to_vec(),
+                    resolver,
+                ))
+            }
+            _ => {
+                let tool = scratchpad::ArgReferenceTool::new(tool, fields.to_vec(), resolver);
+                Self::add_wrapped_tool(builder_state, tool, config)
+            }
         }
-        Self::add_wrapped_tool(builder_state, tool, config)
     }
 
-    /// Add `tool`, wrapped with `config.tool_wrapper` if set, using
-    /// `config.tool_context_factory` (or a default context) for per-call
-    /// context.
+    /// Add `tool`, wrapped with `config.tool_wrapper` if set.
     fn add_wrapped_tool<M, T>(
         builder_state: BuilderState<M>,
         tool: T,
@@ -1194,24 +1210,34 @@ impl Agent {
             + Clone
             + 'static,
     {
-        match (&config.tool_wrapper, &config.tool_context_factory) {
-            (Some(wrapper), Some(ctx_factory)) => {
-                // Wrap with both wrapper and context factory
-                let tool_name = tool.name();
+        match &config.tool_wrapper {
+            Some(wrapper) => builder_state.add_tool(Self::wrap_tool(tool, wrapper, config)),
+            None => builder_state.add_tool(tool),
+        }
+    }
+
+    /// `tool` wrapped with `wrapper`, using `config.tool_context_factory` (or
+    /// a default context) for per-call context.
+    fn wrap_tool<T>(
+        tool: T,
+        wrapper: &Arc<dyn crate::tool_wrapper::ToolWrapper + Send + Sync>,
+        config: &AgentRuntimeConfig,
+    ) -> WrappedTool<T>
+    where
+        T: rig::tool::Tool<Args = serde_json::Value, Output = String, Error = rig::tool::ToolError>
+            + Send
+            + Sync
+            + Clone
+            + 'static,
+    {
+        let tool_name = tool.name();
+        let wrapped = WrappedTool::new(tool, wrapper.clone());
+        match &config.tool_context_factory {
+            Some(ctx_factory) => {
                 let ctx_factory = ctx_factory.clone();
-                let wrapped = WrappedTool::new(tool, wrapper.clone())
-                    .with_context_factory(move |_| ctx_factory(&tool_name));
-                builder_state.add_tool(wrapped)
+                wrapped.with_context_factory(move |_| ctx_factory(&tool_name))
             }
-            (Some(wrapper), None) => {
-                // Wrap with wrapper only (default context)
-                let wrapped = WrappedTool::new(tool, wrapper.clone());
-                builder_state.add_tool(wrapped)
-            }
-            _ => {
-                // No wrapping
-                builder_state.add_tool(tool)
-            }
+            None => wrapped,
         }
     }
 
@@ -2012,8 +2038,27 @@ impl AgentBuilder {
     }
 }
 
+/// Whether any `[hitl]` pattern gates `tool_name`.
+fn hitl_gates_tool(hitl_patterns: Option<&[aura_config::GlobPattern]>, tool_name: &str) -> bool {
+    hitl_patterns.is_some_and(|patterns| patterns.iter().any(|p| p.matches(tool_name)))
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn hitl_gates_tool_follows_the_hitl_patterns() {
+        let patterns = [aura_config::GlobPattern::new("create_*").unwrap()];
+        assert!(super::hitl_gates_tool(
+            Some(&patterns),
+            "create_or_update_file"
+        ));
+        assert!(!super::hitl_gates_tool(
+            Some(&patterns),
+            "get_file_contents"
+        ));
+        assert!(!super::hitl_gates_tool(None, "create_or_update_file"));
+    }
+
     use super::*;
     use crate::scratchpad::TiktokenCounter;
 

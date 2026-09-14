@@ -35,8 +35,8 @@ pub use execution::execute_mcp_tool;
 pub use manager::{ConnectionStatus, McpManager, ServerInfo};
 pub use progress::ProgressEnabledHandler;
 pub use response::{
-    CallOutcome, MAX_TOOL_ERROR_BYTES, RawPayloadSlot, bound_error_content, extract_tool_result,
-    raw_payload,
+    CallOutcome, MAX_RAW_PAYLOAD_BYTES, MAX_TOOL_ERROR_BYTES, RawPayloadSlot, bound_error_content,
+    extract_tool_result, raw_payload,
 };
 pub use sse::SseTransport;
 

@@ -19,8 +19,12 @@ tokio::task_local! {
     static RAW_PAYLOAD: RawPayloadSlot;
 }
 
-/// Receiver for the [`raw_payload`] of a tool result extracted inside
-/// [`RawPayloadSlot::scope`].
+/// Upper bound on a raw payload, in bytes. Well above the rendered-output
+/// resource cap (`MAX_RESOURCE_CONTENT_BYTES`), which the raw copy exists to
+/// get past, while bounding the extra copy held in memory and on disk.
+pub const MAX_RAW_PAYLOAD_BYTES: usize = 1024 * 1024;
+
+/// Receiver for a tool result's [`raw_payload`].
 #[derive(Clone, Default)]
 pub struct RawPayloadSlot(Arc<Mutex<Option<String>>>);
 
@@ -52,7 +56,8 @@ fn publish_raw_payload(content: &[Content]) {
 /// provided every other item is plain text — e.g. GitHub `get_file_contents`
 /// returns a `successfully downloaded text file (SHA: …)` status line plus
 /// the file as an embedded resource. `None` when there is no resource, more
-/// than one, a binary one, or any non-text item alongside it.
+/// than one, a binary one, one over [`MAX_RAW_PAYLOAD_BYTES`], or any
+/// non-text item alongside it.
 ///
 /// The rendered output `extract_tool_result` builds joins every item (and
 /// truncates large resources), so it can't be used as the file content.
@@ -79,15 +84,26 @@ fn is_text_mime(mime_type: Option<&str>) -> bool {
     })
 }
 
-/// Untruncated text of a resource; `None` unless it is text or a text-typed
-/// blob that decodes as UTF-8.
+/// Untruncated text of a resource; `None` unless it is text, or a text-typed
+/// blob that decodes as UTF-8, of at most [`MAX_RAW_PAYLOAD_BYTES`]. Sizes
+/// are checked before anything is copied or decoded.
 fn resource_text(resource: &ResourceContents) -> Option<String> {
+    let too_large = |bytes: usize| {
+        let over = bytes > MAX_RAW_PAYLOAD_BYTES;
+        if over {
+            debug!("raw payload of ~{bytes} bytes exceeds {MAX_RAW_PAYLOAD_BYTES}; not captured");
+        }
+        over
+    };
     match resource {
-        ResourceContents::TextResourceContents { text, .. } => Some(text.clone()),
+        ResourceContents::TextResourceContents { text, .. } => {
+            (!too_large(text.len())).then(|| text.clone())
+        }
         ResourceContents::BlobResourceContents {
             blob, mime_type, ..
         } => {
-            if !is_text_mime(mime_type.as_deref()) {
+            // Base64 decodes to at most 3 bytes per 4 characters.
+            if !is_text_mime(mime_type.as_deref()) || too_large(blob.len() / 4 * 3) {
                 return None;
             }
             let bytes = base64::engine::general_purpose::STANDARD
@@ -792,6 +808,36 @@ mod tests {
         let file = "y".repeat(MAX_RESOURCE_CONTENT_BYTES + 10);
         let content = vec![text_item("status"), text_resource_item(&file)];
         assert_eq!(raw_payload(&content).map(|p| p.len()), Some(file.len()));
+    }
+
+    #[test]
+    fn raw_payload_is_none_over_the_size_limit() {
+        let text = "z".repeat(MAX_RAW_PAYLOAD_BYTES + 1);
+        assert_eq!(
+            raw_payload(&[text_item("status"), text_resource_item(&text)]),
+            None
+        );
+
+        let blob = Content {
+            raw: RawContent::Resource(RawEmbeddedResource {
+                meta: None,
+                resource: ResourceContents::BlobResourceContents {
+                    uri: "repo://owner/repo/contents/big.json".to_string(),
+                    mime_type: Some("application/json".to_string()),
+                    blob: base64::engine::general_purpose::STANDARD
+                        .encode("z".repeat(MAX_RAW_PAYLOAD_BYTES + 3)),
+                    meta: None,
+                },
+            }),
+            annotations: None,
+        };
+        assert_eq!(raw_payload(&[blob]), None);
+
+        let at_limit = "z".repeat(MAX_RAW_PAYLOAD_BYTES);
+        assert_eq!(
+            raw_payload(&[text_resource_item(&at_limit)]).map(|p| p.len()),
+            Some(MAX_RAW_PAYLOAD_BYTES)
+        );
     }
 
     #[test]

@@ -22,7 +22,9 @@ pub mod storage;
 pub mod tools;
 pub mod wrapper;
 
-pub use arg_reference::{ArgReferenceTool, FieldPath, ReferenceResolver, by_reference_map};
+pub use arg_reference::{
+    ArgReferenceTool, ByReferenceMap, FieldPath, ReferenceResolver, by_reference_map,
+};
 pub use context_budget::{
     ContextBudget, ExtractionLimitExceeded, TiktokenCounter, TokenCounter,
     token_counter_for_provider,
@@ -126,24 +128,20 @@ pub fn scratchpad_tool_map(
 }
 
 /// True when at least one tool reachable through `mcp_filter` (`None` =
-/// all reachable, empty `Some` = none) is keyed in a resolved scratchpad
-/// map ([`scratchpad_tool_map`] or [`by_reference_map`]) — i.e. there's
-/// something for the scratchpad to act on. An exact lookup: both maps are
-/// keyed by tool name, not pattern.
-pub fn has_accessible_scratchpad_tool<V>(
+/// all reachable, empty `Some` = none) satisfies `is_scratchpad_tool` —
+/// typically an exact lookup in [`scratchpad_tool_map`] or
+/// [`by_reference_map`] — i.e. there's something for the scratchpad to act on.
+pub fn has_accessible_scratchpad_tool(
     tool_names: &[String],
     mcp_filter: Option<&[String]>,
-    scratchpad_tool_map: &HashMap<String, V>,
+    is_scratchpad_tool: impl Fn(&str) -> bool,
 ) -> bool {
-    if scratchpad_tool_map.is_empty() {
-        return false;
-    }
     tool_names.iter().any(|name| {
         let reachable = match mcp_filter {
             None => true,
             Some(filter) => filter.iter().any(|p| glob_match(p, name)),
         };
-        reachable && scratchpad_tool_map.contains_key(name)
+        reachable && is_scratchpad_tool(name)
     })
 }
 
@@ -183,8 +181,8 @@ pub struct ScratchpadToolsConfig {
     /// longest-match-wins, ties broken by smallest threshold) so per-tool-call
     /// interception is an exact `HashMap::get`.
     pub scratchpad_tools: HashMap<String, usize>,
-    /// Map of bare tool name → argument fields that accept a file reference.
-    pub by_reference: HashMap<String, Vec<FieldPath>>,
+    /// Tool argument fields that accept a file reference, per server.
+    pub by_reference: ByReferenceMap,
 }
 
 /// Scratchpad usage instructions appended to worker preambles.
@@ -409,10 +407,11 @@ mod tests {
 
     #[test]
     fn has_accessible_returns_false_when_map_is_empty() {
+        let map = HashMap::<String, usize>::new();
         assert!(!has_accessible_scratchpad_tool(
             &["foo".to_string()],
             None,
-            &HashMap::<String, usize>::new(),
+            |t| map.contains_key(t),
         ));
     }
 
@@ -422,7 +421,7 @@ mod tests {
         assert!(has_accessible_scratchpad_tool(
             &["foo".to_string(), "bar".to_string()],
             None,
-            &map,
+            |t| map.contains_key(t),
         ));
     }
 
@@ -434,7 +433,7 @@ mod tests {
         assert!(!has_accessible_scratchpad_tool(
             &["foo".to_string()],
             Some(&["bar_*".to_string()]),
-            &map,
+            |t| map.contains_key(t),
         ));
     }
 
@@ -444,7 +443,7 @@ mod tests {
         assert!(has_accessible_scratchpad_tool(
             &["foo_get".to_string()],
             Some(&["foo_*".to_string()]),
-            &map,
+            |t| map.contains_key(t),
         ));
     }
 }
