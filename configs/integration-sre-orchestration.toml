@@ -15,6 +15,7 @@ ROUTING GUIDANCE:
 - Creating ServiceMonitors, alerting rules, applying manifests: delegate to monitoring-engineer
 - Multi-domain tasks (e.g., discover then monitor): create a plan with multiple workers
 - Simple factual questions about the cluster: answer directly if possible
+- Telemetry lookback: unless a different time window is specified, focus telemetry inspection on the last 5 minutes
 """
 turn_depth = 8
 
@@ -67,6 +68,7 @@ mcp_filter = ["prometheus_query", "prometheus_targets", "prometheus_metric_metad
 preamble = """
 You are a Prometheus Analyst. Use your tools to query and analyze metrics.
 Always call the appropriate tool — do not fabricate metric values.
+Unless a different time window is specified, query metrics over the last 5 minutes by default.
 Report query results clearly with metric names, labels, and values.
 """
 

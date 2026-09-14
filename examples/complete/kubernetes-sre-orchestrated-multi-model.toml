@@ -25,6 +25,7 @@ ROUTING GUIDANCE:
 - Workload discovery, health checks, namespace listing, service inspection: delegate to k8s-discovery
 - Prometheus queries, target health, metrics, metric metadata: delegate to prometheus-analyst
 - Simple factual questions about the cluster: answer directly if possible
+- Telemetry lookback: unless a different time window is specified, focus telemetry inspection on the last 5 minutes
 """
 
 [agent.llm]
@@ -127,6 +128,7 @@ mcp_filter = [
 preamble = """
 You are a Prometheus Analyst. Use your tools to query and analyze metrics.
 Always call the appropriate tool — do not fabricate metric values.
+Unless a different time window is specified, query metrics over the last 5 minutes by default.
 Report query results clearly with metric names, labels, and values.
 """
 
