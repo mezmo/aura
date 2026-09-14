@@ -853,6 +853,58 @@ async fn single_agent_edit_then_write_by_reference_sends_only_the_change() {
     );
 }
 
+/// Agent alias declared in `configs/integration-scratchpad-handoff.toml`: a
+/// reader worker that can only download and a writer worker that can only
+/// write, so changing a file forces a handoff between tasks.
+const HANDOFF_AGENT: &str = "scratchpad-handoff";
+
+/// Text from the served runbook's body (every section has it) that the
+/// request below never mentions: finding it in a task description means the
+/// coordinator pasted file contents into the plan.
+const RUNBOOK_BODY_MARKER: &str = "Escalate to the façade team if p99 exceeds";
+
+/// Handoff: the request names only the file and the change — no mention of
+/// references, raw copies or `edit`. The coordinator must route the file
+/// from the reader to the writer by name and pass the change as an exact
+/// edit, so no task description carries the file, the write's arguments
+/// carry only a reference, and the server receives exactly the edited file.
+#[tokio::test]
+async fn test_handoff_passes_the_file_by_name_between_workers() {
+    let events = events_for_model(
+        HANDOFF_AGENT,
+        "In the test repository, change the heading `## Step 3: check service-02` in \
+         docs/runbook.md to `## Step 3: check service-02 (owned by the façade team)` and save \
+         the file back to docs/runbook.md. Report exactly what the save returned.",
+    )
+    .await;
+
+    let descriptions: Vec<String> = events_by_type(&events, orch_event_names::TASK_STARTED)
+        .iter()
+        .filter_map(|e| serde_json::from_str::<Value>(&e.data).ok())
+        .filter_map(|j| j["description"].as_str().map(String::from))
+        .collect();
+    println!("Task descriptions: {descriptions:#?}");
+    assert!(!descriptions.is_empty(), "Expected planned tasks");
+    for description in &descriptions {
+        assert!(
+            !description.contains(RUNBOOK_BODY_MARKER),
+            "A task description carries the file's contents: {description}"
+        );
+    }
+
+    let write_args: Vec<Value> = events_by_type(&events, orch_event_names::TOOL_CALL_STARTED)
+        .iter()
+        .filter_map(|e| serde_json::from_str::<Value>(&e.data).ok())
+        .filter(|j| j["tool_name"] == "sp_write_file")
+        .map(|j| j["arguments"].clone())
+        .collect();
+    assert_wrote_by_reference(&write_args);
+    assert!(
+        any_result_contains(&events, orch_event_names::TOOL_CALL_COMPLETED, EDIT_MATCHED),
+        "sp_write_file must receive the file with exactly the requested edit ({EDIT_MATCHED})"
+    );
+}
+
 /// Single-agent: when no MCP tool is called at all, the agent still finishes
 /// normally and does NOT emit a stray `aura.scratchpad_usage` event (skip
 /// rule: `tokens_intercepted == 0 && tokens_extracted == 0`).

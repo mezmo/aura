@@ -221,6 +221,16 @@ pub const SCRATCHPAD_EDIT_PREAMBLE: &str = r#"
 Some tool arguments have a `<field>_file` variant that takes a stored file — a scratchpad file, or in orchestration a run artifact — and sends its exact contents. Use it instead of writing out content you already have. For an intercepted output, use the `[raw: ...]` copy the pointer names.
 
 To send a changed version of a stored file, do not retype it: call **edit_stored_file** with the exact `old` text (copied from the file, with enough surrounding text to match only once) and its replacement `new`. Each edit saves a new file and returns its name. Edit that file again for further changes, then pass the final name to `<field>_file`.
+
+If your task names a stored file or artifact to send, pass that name to `<field>_file` directly; you do not need to read it first. If it lists exact old → new changes, apply each with **edit_stored_file** and send the resulting file.
+"#;
+
+/// Guidance appended after [`SCRATCHPAD_PREAMBLE`] for every orchestration
+/// worker in a run where some worker can take `<field>_file` references.
+pub const SCRATCHPAD_HANDOFF_PREAMBLE: &str = r#"
+## Reporting Stored Files
+
+Other tasks can send stored files to tools by name instead of copying them. When your result involves a file that another task may need to send or change — for example, a file you downloaded — name the stored file in your result: the `[raw: ...]` copy of an intercepted output, or the file an `edit_stored_file` returned. Stored file names from earlier tasks keep working in later tasks of the same run.
 "#;
 
 #[cfg(test)]

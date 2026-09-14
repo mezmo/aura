@@ -1,0 +1,73 @@
+# Integration test configuration for by-reference handoffs between workers.
+# Used by: compose/scratchpad.yml → compose/scratchpad-test.yml
+#
+# Two workers split the file round trip: `file-reader` can only download
+# (sp_get_file) and `file-writer` can only write (sp_write_file), so a
+# request to change a file forces a handoff between tasks. The coordinator
+# should pass the stored file by name and describe the change as an exact
+# edit, never paste the file into a task description.
+
+memory_dir = "/tmp/aura-scratchpad-handoff-test"
+
+[agent]
+name = "Scratchpad Handoff Test Orchestrator"
+alias = "scratchpad-handoff"
+system_prompt = """
+You coordinate changes to files in a test repository. Report the actual
+tool results you receive — do not fabricate them.
+"""
+turn_depth = 10
+
+[agent.llm]
+provider = "openai"
+api_key = "{{ env.OPENAI_API_KEY }}"
+model = "gpt-5.1"
+temperature = 0.1
+context_window = 128000
+
+[agent.scratchpad]
+enabled = true
+
+[mcp]
+sanitize_schemas = true
+
+[mcp.servers.scratchpad-test]
+transport = "http_streamable"
+url = "http://scratchpad-test-mcp:8083/mcp"
+headers = {}
+description = "Scratchpad test tools: a test repository with a runbook file"
+
+[mcp.servers.scratchpad-test.scratchpad]
+"sp_get_file" = { min_tokens = 50 }           # Always intercepted, with a verbatim .raw copy
+
+# Argument fields that accept a stored file reference (`content_file`).
+[mcp.servers.scratchpad-test.scratchpad.by_reference]
+sp_write_file = ["content"]
+
+[orchestration]
+enabled = true
+# Room for a re-plan, so a stored file reported in one iteration must still
+# resolve for a worker in the next.
+max_planning_cycles = 2
+allow_direct_answers = false
+allow_clarification = false
+
+[orchestration.timeouts]
+per_call_timeout_secs = 120
+stream_inactivity_timeout_secs = 60
+
+[orchestration.worker.file-reader]
+description = "Downloads files from the test repository"
+turn_depth = 8
+mcp_filter = ["sp_get_file"]
+preamble = """
+You download files from the test repository with sp_get_file.
+"""
+
+[orchestration.worker.file-writer]
+description = "Writes files to the test repository"
+turn_depth = 10
+mcp_filter = ["sp_write_file"]
+preamble = """
+You write files to the test repository with sp_write_file.
+"""

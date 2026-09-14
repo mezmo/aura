@@ -30,6 +30,8 @@ When writing task descriptions for `create_plan`, **fully resolve all conversati
 
 Example: Instead of "compute the mean of those numbers", write "compute the mean of 10, 20, 30".
 
+{{handoff_guidance}}
+
 ## Planning Guidelines
 
 When creating plans with `create_plan`, provide an ordered list of **steps**:

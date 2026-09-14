@@ -64,9 +64,10 @@ services:
       # "scratchpad-single").
       - CONFIG_PATH=/app/config/scratchpad
     volumes:
-      # Mount both scratchpad configs into the same directory.
+      # Mount the scratchpad configs into the same directory.
       - ../configs/integration-scratchpad.toml:/app/config/scratchpad/orch.toml:ro
       - ../configs/integration-scratchpad-single-agent.toml:/app/config/scratchpad/single.toml:ro
+      - ../configs/integration-scratchpad-handoff.toml:/app/config/scratchpad/handoff.toml:ro
     depends_on:
       scratchpad-test-mcp:
         condition: service_healthy

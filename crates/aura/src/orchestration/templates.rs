@@ -455,6 +455,7 @@ Do not try to compute results yourself — delegate to workers.";
             agent_system_prompt,
             true,
             false,
+            false,
         );
         let _ = writeln!(out, "{coordinator_preamble}");
 
