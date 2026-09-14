@@ -48,6 +48,30 @@ impl RigBuilder {
         self.to_agent_config(None)
     }
 
+    /// The production config projection for one HTTP request: skill
+    /// discovery, `headers_from_request` resolution, and request/session
+    /// stamping in one fallible step.
+    ///
+    /// The resume path builds its orchestrator through this surface — never
+    /// the debug-only [`Self::get_agent_config`], which skips discovery and
+    /// header resolution. `request_id` is the new HTTP request's id for
+    /// request-scoped events; `session_id` is the request's chat session,
+    /// preserved from the parked run where it matters downstream.
+    #[expect(
+        unused_variables,
+        reason = "todo!() body; filled by P45 wave fill units"
+    )]
+    pub fn prepare_agent_config(
+        &self,
+        req_headers: Option<&HashMap<String, String>>,
+        request_id: &str,
+        session_id: &str,
+    ) -> Result<AgentRuntimeConfig, BuilderError> {
+        todo!(
+            "P45 wave fill unit S1: factor discovery, header resolution, and request/session stamping from the existing build paths"
+        )
+    }
+
     /// Project the parsed `Config` into the runtime `AgentRuntimeConfig`.
     ///
     /// The `[agent]` TOML table is split into `AgentSettings` (the runtime

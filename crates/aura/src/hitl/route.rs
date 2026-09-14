@@ -424,6 +424,21 @@ impl DecisionRoute {
         }
     }
 
+    /// The authority parked rows on this route carry: conversational
+    /// registration answers inline, the 207 bridge parks under the webhook
+    /// poll authority, and a hold route never parks. Resolve and
+    /// read-or-expire check the row's stored authority against this mapping,
+    /// so a row parked by one channel cannot be consumed through another.
+    #[must_use]
+    pub fn park_authority(&self) -> Option<super::outcome::ApprovalAuthority> {
+        match self {
+            Self::Conversational { .. } => Some(super::outcome::ApprovalAuthority::Conversational),
+            Self::Webhook { client, .. } => client
+                .can_park()
+                .then_some(super::outcome::ApprovalAuthority::WebhookPoll),
+        }
+    }
+
     /// The park arm's egress headers: the client's request-scoped resolved
     /// map, which parked rows copy in before `register_durable`. `Err`
     /// closes the registration — a mapped destination with no usable
@@ -3675,6 +3690,7 @@ mod tests {
                     park: aura_config::ParkConfig {
                         enabled: park_enabled,
                         bind_identity: false,
+                        park_ttl: aura_config::ParkTtl::default(),
                     },
                     route: aura_config::DecisionRouteConfig::Webhook {
                         url: aura_config::WebhookUrl::new("https://approvals.example.com/")

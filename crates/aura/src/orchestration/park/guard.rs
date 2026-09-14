@@ -78,8 +78,8 @@ mod tests {
 
     use super::*;
     use crate::hitl::{
-        AgentScope, ApprovalItem, ApprovalOrigin, ApprovalRequest, DecisionId, PROTOCOL_VERSION,
-        ParkedApproval, PendingApprovals,
+        AgentScope, ApprovalAuthority, ApprovalItem, ApprovalOrigin, ApprovalRequest, DecisionId,
+        PROTOCOL_VERSION, ParkedApproval, PendingApprovals,
     };
     use crate::orchestration::{RunId, TaskIdentity, run_owner_id};
     use crate::session_store::{ApprovalStore, InMemoryApprovalStore, InMemoryEventBus};
@@ -125,6 +125,7 @@ mod tests {
             },
             registered_at: chrono::Utc::now(),
             expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+            authority: ApprovalAuthority::Conversational,
             egress_headers: None,
             acknowledgment: crate::hitl::AcknowledgmentState::RequiresNotification,
         }

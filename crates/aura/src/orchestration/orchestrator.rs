@@ -4758,11 +4758,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         registry.remove(id).await;
                     }
 
-                    let expires_at = chrono::DateTime::parse_from_rfc3339(&commit.expires_at)
-                        .map_err(|e| {
-                            fault(format!("the re-park commit stamped a bad expiry: {e}"))
-                        })?
-                        .with_timezone(&chrono::Utc);
+                    let expires_at = commit.retention_expires_at.as_datetime();
                     let mut blocking = Vec::new();
                     for task in &plan.tasks {
                         let Some(pending) = commit.refreshed.pending_by_task.get(&task.id) else {
@@ -4990,9 +4986,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         for id in consumed {
             registry.remove(id).await;
         }
-        let expires_at = chrono::DateTime::parse_from_rfc3339(&republished.expires_at)
-            .map_err(|e| fault(format!("the re-park commit stamped a bad expiry: {e}")))?
-            .with_timezone(&chrono::Utc);
+        let expires_at = republished.retention_expires_at.as_datetime();
         let mut blocking = Vec::new();
         for node in &republished.plan.tasks {
             let super::types::TaskStatus::AwaitingApproval = node.status else {
@@ -6319,7 +6313,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
                             .iter()
                             .map(ToString::to_string)
                             .collect(),
-                        expires_at: commit.expires_at,
+                        retention_expires_at: commit
+                            .retention_expires_at
+                            .as_datetime()
+                            .to_rfc3339(),
                         iteration,
                     },
                 )
@@ -8487,6 +8484,7 @@ mod tests {
                 park: aura_config::ParkConfig {
                     enabled: park_enabled,
                     bind_identity: false,
+                    park_ttl: aura_config::ParkTtl::default(),
                 },
                 route,
             };
@@ -8564,6 +8562,7 @@ mod tests {
             park: aura_config::ParkConfig {
                 enabled: true,
                 bind_identity: false,
+                park_ttl: aura_config::ParkTtl::default(),
             },
             route: webhook_route_config(aura_config::WebhookDelivery::Poll),
         };
@@ -8684,6 +8683,7 @@ mod tests {
                     },
                     registered_at: now,
                     expires_at: now + chrono::Duration::seconds(60),
+                    authority: crate::hitl::ApprovalAuthority::Conversational,
                     egress_headers: None,
                     acknowledgment: crate::hitl::AcknowledgmentState::RequiresNotification,
                 })
@@ -8818,6 +8818,7 @@ mod tests {
                     },
                     registered_at: now,
                     expires_at: now + chrono::Duration::hours(1),
+                    authority: crate::hitl::ApprovalAuthority::Conversational,
                     egress_headers: None,
                     acknowledgment: crate::hitl::AcknowledgmentState::RequiresNotification,
                 })
@@ -9030,6 +9031,7 @@ mod tests {
                     },
                     registered_at,
                     expires_at: registered_at + chrono::Duration::hours(1),
+                    authority: crate::hitl::ApprovalAuthority::Conversational,
                     egress_headers: None,
                     acknowledgment: crate::hitl::AcknowledgmentState::RequiresNotification,
                 })
@@ -9168,21 +9170,24 @@ mod tests {
         .await
         .unwrap();
         assert!(document.awaiting_decision_ids().is_empty());
-        let expires_at = chrono::DateTime::parse_from_rfc3339(&document.expires_at).unwrap();
+        let expires_at = document.retention_expires_at.as_datetime();
         // The fixture route timeout is one hour.
         assert!(
             expires_at >= before + chrono::Duration::seconds(3600 - 5),
-            "expires_at carries the decision window: {}",
-            document.expires_at
+            "retention_expires_at carries the decision window: {}",
+            expires_at.to_rfc3339()
         );
         match event_rx.recv().await {
             Some(Ok(StreamItem::OrchestratorEvent(OrchestratorEvent::RunParked {
                 decision_ids,
-                expires_at: stamp,
+                retention_expires_at: stamp,
                 ..
             }))) => {
                 assert!(decision_ids.is_empty());
-                assert_eq!(stamp, document.expires_at);
+                assert_eq!(
+                    stamp,
+                    document.retention_expires_at.as_datetime().to_rfc3339()
+                );
             }
             other => panic!("expected a RunParked event, got {other:?}"),
         }

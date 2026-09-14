@@ -21,8 +21,8 @@ use std::time::Duration;
 use tokio::process::{Child, Command};
 
 use aura::hitl::{
-    AgentScope, ApprovalDecision, ApprovalItem, ApprovalOrigin, ApprovalRequest, DecisionId,
-    PROTOCOL_VERSION, ParkedApproval, ResolveError, ResolvedDecision,
+    AgentScope, ApprovalAuthority, ApprovalDecision, ApprovalItem, ApprovalOrigin, ApprovalRequest,
+    DecisionId, PROTOCOL_VERSION, ParkedApproval, ResolveError, ResolvedDecision,
 };
 use aura::session_store::{ApprovalStore, ParkedApprovalRecord};
 
@@ -48,6 +48,7 @@ pub fn make_parked(request_id: &str, ttl: Duration) -> ParkedApproval {
         },
         registered_at: now,
         expires_at: now + chrono::Duration::from_std(ttl).unwrap(),
+        authority: ApprovalAuthority::Conversational,
         egress_headers: None,
         acknowledgment: aura::hitl::AcknowledgmentState::RequiresNotification,
     }

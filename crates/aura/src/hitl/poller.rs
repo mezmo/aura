@@ -261,6 +261,7 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::super::decision::{AgentScope, ApprovalDecision, ApprovalOrigin, DecisionId};
+    use super::super::outcome::ApprovalAuthority;
     use super::super::protocol::{ApprovalItem, ApprovalRequest, PROTOCOL_VERSION};
     use super::super::read_full_request;
     use super::super::registry::{AcknowledgmentState, ParkedApproval};
@@ -331,6 +332,7 @@ mod tests {
                 request,
                 registered_at: chrono::Utc::now(),
                 expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+                authority: ApprovalAuthority::WebhookPoll,
                 egress_headers: None,
                 acknowledgment: AcknowledgmentState::RequiresNotification,
             })
@@ -643,6 +645,7 @@ mod tests {
                     request,
                     registered_at: chrono::Utc::now(),
                     expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+                    authority: ApprovalAuthority::WebhookPoll,
                     egress_headers: None,
                     acknowledgment: AcknowledgmentState::RequiresNotification,
                 })
@@ -717,6 +720,7 @@ mod tests {
                 request,
                 registered_at: chrono::Utc::now(),
                 expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+                authority: ApprovalAuthority::WebhookPoll,
                 egress_headers: None,
                 acknowledgment: AcknowledgmentState::Acknowledged,
             })
@@ -752,6 +756,7 @@ mod tests {
                 request,
                 registered_at: chrono::Utc::now(),
                 expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+                authority: ApprovalAuthority::WebhookPoll,
                 egress_headers: None,
                 acknowledgment: AcknowledgmentState::Acknowledged,
             })
@@ -932,6 +937,7 @@ mod tests {
                     request,
                     registered_at: chrono::Utc::now(),
                     expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+                    authority: ApprovalAuthority::WebhookPoll,
                     egress_headers: Some(headers),
                     acknowledgment: AcknowledgmentState::RequiresNotification,
                 })
@@ -1206,6 +1212,7 @@ mod tests {
                     request,
                     registered_at: chrono::Utc::now(),
                     expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+                    authority: ApprovalAuthority::WebhookPoll,
                     egress_headers: Some(egress),
                     acknowledgment: AcknowledgmentState::RequiresNotification,
                 })

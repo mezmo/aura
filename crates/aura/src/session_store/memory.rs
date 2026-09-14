@@ -9,7 +9,8 @@ use bytes::Bytes;
 use tokio::sync::broadcast;
 
 use crate::hitl::{
-    AcknowledgmentState, DecisionId, ParkedApproval, ResolveError, ResolvedDecision, Timestamp,
+    AcknowledgmentState, ApprovalAuthority, ApprovalRead, DecisionId, ParkedApproval, ResolveError,
+    ResolvedDecision, Timestamp,
 };
 
 use super::{AcknowledgeOutcome, ApprovalStore, EventBus, SessionStoreError, Subscription};
@@ -143,6 +144,20 @@ impl ApprovalStore for InMemoryApprovalStore {
             .collect();
         Ok(pending)
     }
+
+    #[expect(
+        unused_variables,
+        reason = "todo!() body; filled by P45 wave fill units"
+    )]
+    async fn read_or_expire(
+        &self,
+        id: &DecisionId,
+        expected_authority: ApprovalAuthority,
+    ) -> Result<ApprovalRead, SessionStoreError> {
+        todo!(
+            "P45 wave fill units E1/E2: memory read-or-expire enforces authority for inline requests without park parity"
+        )
+    }
 }
 
 /// A local `tokio::broadcast` registry keyed by topic. Single-instance pub/sub:
@@ -229,8 +244,8 @@ mod tests {
 
     use super::*;
     use crate::hitl::{
-        AgentScope, ApprovalDecision, ApprovalItem, ApprovalOrigin, ApprovalRequest,
-        PROTOCOL_VERSION,
+        AgentScope, ApprovalAuthority, ApprovalDecision, ApprovalItem, ApprovalOrigin,
+        ApprovalRequest, PROTOCOL_VERSION,
     };
 
     fn parked(request_id: &str) -> ParkedApproval {
@@ -254,6 +269,7 @@ mod tests {
             },
             registered_at: now,
             expires_at: now + chrono::Duration::seconds(60),
+            authority: ApprovalAuthority::Conversational,
             egress_headers: None,
             acknowledgment: crate::hitl::AcknowledgmentState::RequiresNotification,
         }

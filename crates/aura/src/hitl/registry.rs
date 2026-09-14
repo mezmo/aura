@@ -37,6 +37,7 @@ use crate::session_store::{
 use super::decision::{
     ApprovalDecision, AwaitingDecision, DecisionId, ResolvedDecision, Timestamp,
 };
+use super::outcome::ApprovalAuthority;
 use super::protocol::ApprovalRequest;
 
 /// Bus topic carrying the decision for one parked approval.
@@ -106,6 +107,11 @@ pub struct ParkedApproval {
     pub request: ApprovalRequest,
     pub registered_at: Timestamp,
     pub expires_at: Timestamp,
+    /// Which channel may address the row: inline registration parks
+    /// `Conversational`, the 207 bridge parks `WebhookPoll`. Resolve and
+    /// read-or-expire check it, so one channel's row can never be consumed
+    /// through another.
+    pub authority: ApprovalAuthority,
     /// Resolved egress headers (`headers_from_request` overlaying the static
     /// headers) for this row's notify POST. Values are credentials at rest:
     /// the storage projection's Debug prints names only.
@@ -165,6 +171,7 @@ impl PendingApprovals {
             registered_at: now,
             expires_at: now
                 + chrono::Duration::from_std(timeout).expect("approval timeout fits in chrono"),
+            authority: ApprovalAuthority::Conversational,
             egress_headers: None,
             acknowledgment: AcknowledgmentState::RequiresNotification,
         };
@@ -832,6 +839,7 @@ mod tests {
                 request: req,
                 registered_at: chrono::Utc::now(),
                 expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+                authority: ApprovalAuthority::Conversational,
                 egress_headers: None,
                 acknowledgment: AcknowledgmentState::RequiresNotification,
             })

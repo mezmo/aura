@@ -17,8 +17,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::SessionId;
 use crate::hitl::{
-    AcknowledgmentState, AgentScope, ApprovalItem, ApprovalOrigin, ApprovalRequest, DecisionId,
-    ParkedApproval, ResolvedDecision, Timestamp,
+    AcknowledgmentState, AgentScope, ApprovalAuthority, ApprovalItem, ApprovalOrigin,
+    ApprovalRequest, DecisionId, ParkedApproval, ResolvedDecision, Timestamp,
 };
 use crate::orchestration::{RunId, TaskIdentity};
 
@@ -40,6 +40,11 @@ pub struct ParkedApprovalRecord {
     pub items: Vec<ApprovalItem>,
     pub registered_at: Timestamp,
     pub expires_at: Timestamp,
+    /// The channel the row was parked under; resolve and read-or-expire
+    /// check it, so one channel's row can never be consumed through
+    /// another. Required on every row: absence is a decode failure, never
+    /// a guessed authority.
+    pub authority: ApprovalAuthority,
     /// Resolved egress headers the parked row's notify POST authenticates
     /// with (lowercased name → value). Additive: absent on rows stored before
     /// poll-delivery egress capture existed, decoding to `None`.
@@ -71,6 +76,7 @@ impl std::fmt::Debug for ParkedApprovalRecord {
             .field("items", &self.items)
             .field("registered_at", &self.registered_at)
             .field("expires_at", &self.expires_at)
+            .field("authority", &self.authority)
             .field("egress_header_names", &pair_names(&self.egress_headers))
             .field("acknowledgment", &self.acknowledgment)
             .finish()
@@ -208,6 +214,7 @@ impl From<&ParkedApproval> for ParkedApprovalRecord {
             items: request.items.clone(),
             registered_at: parked.registered_at,
             expires_at: parked.expires_at,
+            authority: parked.authority,
             egress_headers: parked
                 .egress_headers
                 .as_ref()
@@ -241,6 +248,7 @@ impl TryFrom<ParkedApprovalRecord> for ParkedApproval {
             },
             registered_at: record.registered_at,
             expires_at: record.expires_at,
+            authority: record.authority,
             egress_headers,
             acknowledgment: record.acknowledgment,
         })
@@ -359,6 +367,7 @@ mod tests {
             },
             registered_at: now,
             expires_at: now + chrono::Duration::seconds(60),
+            authority: ApprovalAuthority::Conversational,
             egress_headers: None,
             acknowledgment: AcknowledgmentState::RequiresNotification,
         }
@@ -495,7 +504,8 @@ mod tests {
             "origin": { "kind": "config_gate", "matched_pattern": "kubectl_*", "agent_name": "t" },
             "items": [],
             "registered_at": "2026-08-01T00:00:00Z",
-            "expires_at": "2026-08-01T01:00:00Z"
+            "expires_at": "2026-08-01T01:00:00Z",
+            "authority": "conversational"
         }"#;
 
         let record: ParkedApprovalRecord = serde_json::from_str(legacy_json).unwrap();

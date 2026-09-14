@@ -83,6 +83,11 @@ pub use tools::wait_for::{StopReason, WaitForError, WaitForOutput, WaitForTool};
 pub use tools::{SubmitResultDecision, SubmitResultOutput, SubmitResultTool};
 
 pub(crate) use park::{CallKey, ParkGuard, RecordedDecisions, run_owner_id};
+// The park-owned execution lifetime: the shared run-reservation fence and
+// the scope detached park work registers under. `RunExecutionScope` rides
+// the public `ToolCallContext` field, so both names are part of the crate's
+// public surface.
+pub use park::lifetime::{RunExecutionScope, RunReservationLease};
 // The resume endpoint's surfaces: consumed by aura-web-server's resume
 // handler (P45). Every type named in a re-exported signature is re-exported
 // with it, so the consumer can name what it receives.

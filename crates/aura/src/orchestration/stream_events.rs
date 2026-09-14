@@ -151,8 +151,9 @@ pub enum OrchestrationStreamEvent {
         run_id: String,
         /// The decision ids still awaiting a human decision.
         decision_ids: Vec<String>,
-        /// RFC 3339 timestamp after which the decisions expire.
-        expires_at: String,
+        /// RFC 3339 retention deadline the checkpoint carries: the instant
+        /// after which the run's parked evidence may be reclaimed.
+        retention_expires_at: String,
         /// Which iteration the run parked in (1-indexed).
         iteration: usize,
         #[serde(flatten)]
@@ -363,14 +364,14 @@ impl OrchestrationStreamEvent {
     pub fn run_parked(
         run_id: impl Into<String>,
         decision_ids: Vec<String>,
-        expires_at: impl Into<String>,
+        retention_expires_at: impl Into<String>,
         iteration: usize,
         context: EventContext,
     ) -> Self {
         Self::RunParked {
             run_id: run_id.into(),
             decision_ids,
-            expires_at: expires_at.into(),
+            retention_expires_at: retention_expires_at.into(),
             iteration,
             context,
         }
@@ -675,7 +676,7 @@ mod tests {
         assert!(sse.contains("\"decision_ids\":["));
         assert!(sse.contains("\"0191e8c0-1111-7000-8000-00000000000a\""));
         assert!(sse.contains("\"0191e8c0-1111-7000-8000-00000000000b\""));
-        assert!(sse.contains("\"expires_at\":\"2026-09-02T15:03:11+00:00\""));
+        assert!(sse.contains("\"retention_expires_at\":\"2026-09-02T15:03:11+00:00\""));
         assert!(sse.contains("\"iteration\":2"));
     }
 
