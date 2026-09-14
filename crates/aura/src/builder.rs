@@ -1154,6 +1154,13 @@ impl Agent {
     /// expanded file. When a `[hitl]` pattern gates the tool it goes
     /// *outside* instead: an approver must see the bytes that will actually
     /// be sent, not a file name.
+    ///
+    /// Known issue: for a gated tool, the approval request carries the
+    /// expanded content in full (up to `MAX_RAW_PAYLOAD_BYTES`), and so do
+    /// the webhook payload, approval events, the parked-approval store and
+    /// the persistence trace. Showing approvers a digest and preview instead,
+    /// and refusing to send unless the file still matches the approved
+    /// digest, is left for a follow-up.
     fn add_mcp_tool<M, T>(
         builder_state: BuilderState<M>,
         server_name: &str,
