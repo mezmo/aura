@@ -46,6 +46,7 @@ mod events;
 mod factory;
 #[cfg(test)]
 mod frame_validation_tests;
+mod handoff;
 mod observer_wrapper;
 mod orchestrator;
 mod overview;

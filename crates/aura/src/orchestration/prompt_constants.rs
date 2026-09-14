@@ -47,6 +47,7 @@ pub mod continuation {
 /// Conditional guidance fragments injected into continuation prompts.
 pub(crate) mod guidance {
     pub const RESULT_FORWARDING: &str = "When creating a follow-up plan, do not re-execute completed tasks. Workers cannot see prior iteration results — if a new task needs data from a completed task above, embed the key values in the task description or include the artifact filename so the worker can call `read_artifact`.\n\n";
+    pub const RESULT_FORWARDING_BY_REFERENCE: &str = "When creating a follow-up plan, do not re-execute completed tasks. Workers cannot see prior iteration results — if a new task needs data from a completed task above, embed the key values in the task description or include the artifact filename so the worker can call `read_artifact`. For file contents, never embed them — original or modified: name the stored file (an artifact filename, or a stored file name a task reported) and give any changes as exact old → new edits.\n\n";
 }
 
 /// Correction messages sent to coordinator/worker when they fail to call

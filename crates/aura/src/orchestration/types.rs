@@ -918,6 +918,7 @@ impl IterationContext {
         max_iterations: usize,
         show_tool_chain: bool,
         content_max_length: usize,
+        by_reference_handoff: bool,
     ) -> String {
         use super::templates::{ContinuationVars, render_continuation_prompt};
 
@@ -1131,7 +1132,13 @@ impl IterationContext {
         let succeeded_str = succeeded.to_string();
         let total_str = total.to_string();
 
-        let reuse_guidance = if has_failed_tasks && succeeded > 0 {
+        // With by-reference handoffs, any follow-up plan may need to pass a
+        // stored file on (even after a clean success), and must name it
+        // rather than paste it; otherwise forwarding guidance is only needed
+        // when retrying around completed work.
+        let reuse_guidance = if by_reference_handoff && succeeded > 0 {
+            super::prompt_constants::guidance::RESULT_FORWARDING_BY_REFERENCE
+        } else if has_failed_tasks && succeeded > 0 {
             super::prompt_constants::guidance::RESULT_FORWARDING
         } else {
             ""
@@ -1628,7 +1635,7 @@ mod tests {
         plan.add_task(task);
 
         let ctx = IterationContext::new(1, plan, None, vec![], HashMap::new());
-        let prompt = ctx.build_continuation_prompt(3, false, 2000);
+        let prompt = ctx.build_continuation_prompt(3, false, 2000, false);
         assert!(prompt.contains("awaiting approval (1 pending call(s))"));
     }
 
@@ -1795,7 +1802,7 @@ mod tests {
         };
 
         let ctx = IterationContext::new(1, plan, Some(fs), vec![], HashMap::new());
-        let prompt = ctx.build_continuation_prompt(3, false, 2000);
+        let prompt = ctx.build_continuation_prompt(3, false, 2000, false);
 
         // Verify key sections are present
         assert!(prompt.contains("ITERATION 1 of 3"));
@@ -1829,7 +1836,7 @@ mod tests {
         plan.add_task(task);
 
         let ctx = IterationContext::new(2, plan, None, vec![], HashMap::new());
-        let prompt = ctx.build_continuation_prompt(3, false, 2000);
+        let prompt = ctx.build_continuation_prompt(3, false, 2000, false);
 
         assert!(prompt.contains("ITERATION 2 of 3"));
         assert!(prompt.contains("COMPLETED TASKS"));
@@ -1858,7 +1865,7 @@ mod tests {
         }];
 
         let ctx = IterationContext::new(1, plan, Some(fs), failures, HashMap::new());
-        let prompt = ctx.build_continuation_prompt(3, false, 2000);
+        let prompt = ctx.build_continuation_prompt(3, false, 2000, false);
 
         assert!(prompt.contains("FAILURE HISTORY:"));
         assert!(prompt.contains("Iteration 1: \"Gather logs\""));
@@ -1897,7 +1904,7 @@ mod tests {
         ];
 
         let ctx = IterationContext::new(2, plan, Some(fs), failures, HashMap::new());
-        let prompt = ctx.build_continuation_prompt(3, false, 2000);
+        let prompt = ctx.build_continuation_prompt(3, false, 2000, false);
 
         assert!(prompt.contains("FAILURE HISTORY:"));
         assert!(prompt.contains("OBSERVED PATTERNS:"));
@@ -1915,7 +1922,7 @@ mod tests {
         plan.add_task(task);
 
         let ctx = IterationContext::new(1, plan, None, vec![], HashMap::new());
-        let prompt = ctx.build_continuation_prompt(3, false, 2000);
+        let prompt = ctx.build_continuation_prompt(3, false, 2000, false);
 
         assert!(prompt.contains("COMPLETED TASKS"));
         // Full result inlined — no truncation when no artifact exists
@@ -1938,7 +1945,7 @@ mod tests {
         plan.add_task(task);
 
         let ctx = IterationContext::new(1, plan, None, vec![], HashMap::new());
-        let prompt = ctx.build_continuation_prompt(3, false, 2000);
+        let prompt = ctx.build_continuation_prompt(3, false, 2000, false);
 
         // The body is truncated but the artifact footer survives.
         assert!(prompt.contains("COMPLETED TASKS"));
@@ -1964,7 +1971,7 @@ mod tests {
         plan.add_task(task);
 
         let ctx = IterationContext::new(1, plan, None, vec![], HashMap::new());
-        let prompt = ctx.build_continuation_prompt(3, false, 2000);
+        let prompt = ctx.build_continuation_prompt(3, false, 2000, false);
 
         assert!(prompt.contains("Found 47 error groups"));
         assert!(prompt.contains("saved to artifact: task-0-sre-iter-1-result.txt"));
@@ -1984,7 +1991,7 @@ mod tests {
         };
         // iteration=2, max=3 → next would be iteration 3 = max, so FINAL ATTEMPT
         let ctx = IterationContext::new(2, plan, Some(fs), vec![], HashMap::new());
-        let prompt = ctx.build_continuation_prompt(3, false, 2000);
+        let prompt = ctx.build_continuation_prompt(3, false, 2000, false);
 
         assert!(prompt.contains("(FINAL ATTEMPT)"));
     }
@@ -2001,9 +2008,30 @@ mod tests {
             gaps: vec![],
         };
         let ctx = IterationContext::new(1, plan, Some(fs), vec![], HashMap::new());
-        let prompt = ctx.build_continuation_prompt(3, false, 2000);
+        let prompt = ctx.build_continuation_prompt(3, false, 2000, false);
 
         assert!(!prompt.contains("FINAL ATTEMPT"));
+    }
+
+    #[test]
+    fn test_continuation_prompt_by_reference_forwarding_guidance() {
+        let marker = "never embed them";
+        let mut all_ok = Plan::new("Goal");
+        let mut t = Task::new(0, "Completed task", "Done");
+        t.complete("Some result");
+        all_ok.add_task(t);
+        let ctx = IterationContext::new(1, all_ok, None, vec![], HashMap::new());
+
+        // With handoffs, shown even after a clean success: a follow-up plan
+        // may need to pass a stored file on.
+        assert!(
+            ctx.build_continuation_prompt(3, false, 2000, true)
+                .contains(marker)
+        );
+        assert!(
+            !ctx.build_continuation_prompt(3, false, 2000, false)
+                .contains(marker)
+        );
     }
 
     #[test]
@@ -2023,7 +2051,7 @@ mod tests {
             gaps: vec![],
         };
         let ctx = IterationContext::new(1, mixed_plan, Some(fs), vec![], HashMap::new());
-        let prompt = ctx.build_continuation_prompt(3, false, 2000);
+        let prompt = ctx.build_continuation_prompt(3, false, 2000, false);
         assert!(
             prompt.contains(guidance_marker),
             "result forwarding guidance should appear on mixed success/failure"
@@ -2035,7 +2063,7 @@ mod tests {
         t.complete("Some result");
         all_ok.add_task(t);
         let ctx = IterationContext::new(1, all_ok, None, vec![], HashMap::new());
-        let prompt = ctx.build_continuation_prompt(3, false, 2000);
+        let prompt = ctx.build_continuation_prompt(3, false, 2000, false);
         assert!(
             !prompt.contains(guidance_marker),
             "result forwarding guidance should NOT appear on clean success"
@@ -2051,7 +2079,7 @@ mod tests {
             gaps: vec![],
         };
         let ctx = IterationContext::new(1, all_fail, Some(fs), vec![], HashMap::new());
-        let prompt = ctx.build_continuation_prompt(3, false, 2000);
+        let prompt = ctx.build_continuation_prompt(3, false, 2000, false);
         assert!(
             !prompt.contains(guidance_marker),
             "result forwarding guidance should NOT appear when all failed"
@@ -2080,7 +2108,7 @@ mod tests {
             gaps: vec!["Task 1 failed".into()],
         };
         let ctx = IterationContext::new(1, plan, Some(fs), vec![], HashMap::new());
-        let prompt = ctx.build_continuation_prompt(3, false, 2000);
+        let prompt = ctx.build_continuation_prompt(3, false, 2000, false);
 
         // All three sections should be present
         assert!(prompt.contains("COMPLETED TASKS"));
@@ -2579,7 +2607,7 @@ mod tests {
             gaps: vec![],
         };
         let ctx = IterationContext::new(1, plan, Some(fs), vec![], HashMap::new());
-        let prompt = ctx.build_continuation_prompt(3, false, 2000);
+        let prompt = ctx.build_continuation_prompt(3, false, 2000, false);
 
         assert!(
             prompt.contains("[agent_timeout]"),
@@ -2608,7 +2636,7 @@ mod tests {
             gaps: vec![],
         };
         let ctx = IterationContext::new(2, plan, Some(fs), failures, HashMap::new());
-        let prompt = ctx.build_continuation_prompt(3, false, 2000);
+        let prompt = ctx.build_continuation_prompt(3, false, 2000, false);
 
         assert!(
             prompt.contains("[agent_error]"),
@@ -2637,7 +2665,7 @@ mod tests {
             gaps: vec![],
         };
         let ctx = IterationContext::new(2, plan, Some(fs), failures, HashMap::new());
-        let prompt = ctx.build_continuation_prompt(3, false, 200);
+        let prompt = ctx.build_continuation_prompt(3, false, 200, false);
 
         assert!(
             prompt.contains("[truncated]"),
@@ -2684,7 +2712,7 @@ mod tests {
             gaps: vec![],
         };
         let ctx = IterationContext::new(3, plan, Some(fs), failures, HashMap::new());
-        let prompt = ctx.build_continuation_prompt(4, false, 2000);
+        let prompt = ctx.build_continuation_prompt(4, false, 2000, false);
 
         assert!(
             !prompt.contains("OBSERVED PATTERNS"),
@@ -2731,7 +2759,7 @@ mod tests {
             gaps: vec![],
         };
         let ctx = IterationContext::new(1, plan, Some(fs), vec![], HashMap::new());
-        let prompt = ctx.build_continuation_prompt(3, false, 2000);
+        let prompt = ctx.build_continuation_prompt(3, false, 2000, false);
 
         assert!(
             prompt.contains("soft_failure"),
@@ -2766,7 +2794,7 @@ mod tests {
             gaps: vec![],
         };
         let ctx = IterationContext::new(1, plan, Some(fs), vec![], HashMap::new());
-        let prompt = ctx.build_continuation_prompt(3, false, 2000);
+        let prompt = ctx.build_continuation_prompt(3, false, 2000, false);
 
         assert!(
             prompt.contains("[soft_failure]"),
@@ -2840,7 +2868,7 @@ mod tests {
             gaps: vec![],
         };
         let ctx = IterationContext::new(3, plan, Some(fs), failures, HashMap::new());
-        let prompt = ctx.build_continuation_prompt(4, false, 2000);
+        let prompt = ctx.build_continuation_prompt(4, false, 2000, false);
 
         assert!(
             prompt.contains("OBSERVED PATTERNS"),
@@ -2866,7 +2894,7 @@ mod tests {
             gaps: vec![],
         };
         let ctx = IterationContext::new(1, plan, Some(fs), vec![], HashMap::new());
-        let prompt = ctx.build_continuation_prompt(3, false, 2000);
+        let prompt = ctx.build_continuation_prompt(3, false, 2000, false);
 
         assert!(
             prompt.contains("[soft_failure]"),
@@ -2919,7 +2947,7 @@ mod tests {
         );
 
         let ctx = IterationContext::new(1, plan, None, vec![], traces);
-        let prompt = ctx.build_continuation_prompt(3, true, 2000);
+        let prompt = ctx.build_continuation_prompt(3, true, 2000, false);
 
         assert!(
             prompt.contains("Tool chain:"),
@@ -2963,7 +2991,7 @@ mod tests {
         );
 
         let ctx = IterationContext::new(1, plan, None, vec![], traces);
-        let prompt = ctx.build_continuation_prompt(3, true, 2000);
+        let prompt = ctx.build_continuation_prompt(3, true, 2000, false);
 
         assert!(
             prompt.contains("Tool chain:"),
@@ -2988,7 +3016,7 @@ mod tests {
         plan.add_task(t);
 
         let ctx_without = IterationContext::new(1, plan.clone(), None, vec![], HashMap::new());
-        let prompt_without = ctx_without.build_continuation_prompt(3, true, 2000);
+        let prompt_without = ctx_without.build_continuation_prompt(3, true, 2000, false);
 
         assert!(
             !prompt_without.contains("Tool chain:"),
@@ -3008,7 +3036,7 @@ mod tests {
         traces.insert(0, vec![make_trace("tool_a", &long_reasoning, 1000, None)]);
 
         let ctx = IterationContext::new(1, plan, None, vec![], traces);
-        let prompt = ctx.build_continuation_prompt(3, true, 2000);
+        let prompt = ctx.build_continuation_prompt(3, true, 2000, false);
 
         assert!(
             prompt.contains("…"),
@@ -3035,7 +3063,7 @@ mod tests {
         traces.insert(0, vec![make_trace("log_search", "searching", 5000, None)]);
 
         let ctx = IterationContext::new(1, plan, None, vec![], traces);
-        let prompt = ctx.build_continuation_prompt(3, true, 2000);
+        let prompt = ctx.build_continuation_prompt(3, true, 2000, false);
 
         let chain_count = prompt.matches("Tool chain:").count();
         assert_eq!(
@@ -3056,7 +3084,7 @@ mod tests {
         traces.insert(0, vec![make_trace("tool_a", "", 1000, None)]);
 
         let ctx = IterationContext::new(1, plan, None, vec![], traces);
-        let prompt = ctx.build_continuation_prompt(3, true, 2000);
+        let prompt = ctx.build_continuation_prompt(3, true, 2000, false);
 
         assert!(
             prompt.contains("tool_a (1.0s)"),
@@ -3077,7 +3105,7 @@ mod tests {
         traces.insert(0, vec![make_trace("only_tool", "single call", 2000, None)]);
 
         let ctx = IterationContext::new(1, plan, None, vec![], traces);
-        let prompt = ctx.build_continuation_prompt(3, true, 2000);
+        let prompt = ctx.build_continuation_prompt(3, true, 2000, false);
 
         assert!(
             prompt.contains("Tool chain: only_tool (2.0s"),

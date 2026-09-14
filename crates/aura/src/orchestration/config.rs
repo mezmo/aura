@@ -71,6 +71,10 @@ pub const ORCHESTRATOR_PREAMBLE_TEMPLATE: &str =
 /// placeholder for user customization.
 pub const WORKER_PREAMBLE_TEMPLATE: &str = include_str!("../prompts/worker_preamble.md");
 
+/// Coordinator preamble section on passing stored files between tasks by
+/// name (`{{handoff_guidance}}`).
+const HANDOFF_GUIDANCE: &str = include_str!("../prompts/handoff_guidance.md");
+
 // ============================================================================
 // Preamble Builders
 // ============================================================================
@@ -82,10 +86,13 @@ pub const WORKER_PREAMBLE_TEMPLATE: &str = include_str!("../prompts/worker_pream
 /// details injected into user message by the planning prompt).
 ///
 /// The `agent_system_prompt` parameter is `[agent].system_prompt` from config.
+/// `include_by_reference_handoff` adds the section on passing stored files
+/// between tasks by name instead of pasting their contents.
 pub fn build_coordinator_preamble(
     agent_system_prompt: &str,
     include_recon_tools: bool,
     include_history_tools: bool,
+    include_by_reference_handoff: bool,
 ) -> String {
     let artifact_tools = if include_history_tools {
         "two **artifact/history tools** (`read_artifact`, `list_prior_runs`)"
@@ -131,7 +138,15 @@ pub fn build_coordinator_preamble(
     let mut preamble = ORCHESTRATOR_PREAMBLE_TEMPLATE
         .replace("{{orchestration_system_prompt}}", agent_system_prompt)
         .replace("{{tools_section}}", &tools_section)
-        .replace("{{recon_guidance}}", recon_guidance);
+        .replace("{{recon_guidance}}", recon_guidance)
+        .replace(
+            "{{handoff_guidance}}",
+            if include_by_reference_handoff {
+                HANDOFF_GUIDANCE
+            } else {
+                ""
+            },
+        );
 
     // AURA_ESCAPE_HATCH=false strips the "Resolve tool gaps" directive for A/B testing
     if !crate::env_flags::bool_env("AURA_ESCAPE_HATCH", true) {
@@ -196,7 +211,7 @@ mod tests {
 
     #[test]
     fn test_coordinator_preamble_injects_agent_system_prompt() {
-        let preamble = build_coordinator_preamble("Focus on thorough testing.", true, false);
+        let preamble = build_coordinator_preamble("Focus on thorough testing.", true, false, false);
 
         // Framework instructions present
         assert!(preamble.contains("respond_directly"));
@@ -209,7 +224,7 @@ mod tests {
 
     #[test]
     fn test_coordinator_preamble_with_empty_system_prompt() {
-        let preamble = build_coordinator_preamble("", true, false);
+        let preamble = build_coordinator_preamble("", true, false, false);
 
         // Framework instructions still present
         assert!(preamble.contains("create_plan"));
@@ -223,11 +238,24 @@ mod tests {
         assert!(ORCHESTRATOR_PREAMBLE_TEMPLATE.contains("{{orchestration_system_prompt}}"));
         assert!(ORCHESTRATOR_PREAMBLE_TEMPLATE.contains("{{tools_section}}"));
         assert!(ORCHESTRATOR_PREAMBLE_TEMPLATE.contains("{{recon_guidance}}"));
+        assert!(ORCHESTRATOR_PREAMBLE_TEMPLATE.contains("{{handoff_guidance}}"));
+    }
+
+    #[test]
+    fn test_coordinator_preamble_handoff_guidance_is_conditional() {
+        let with = build_coordinator_preamble("Test prompt.", false, false, true);
+        assert!(with.contains("## Passing Stored Files Between Tasks"));
+        assert!(with.contains("never paste file contents"));
+        let without = build_coordinator_preamble("Test prompt.", false, false, false);
+        assert!(!without.contains("Passing Stored Files"));
+        for preamble in [&with, &without] {
+            assert!(!preamble.contains("{{handoff_guidance}}"));
+        }
     }
 
     #[test]
     fn test_coordinator_preamble_without_recon_tools() {
-        let preamble = build_coordinator_preamble("Test prompt.", false, false);
+        let preamble = build_coordinator_preamble("Test prompt.", false, false, false);
 
         // Should have routing tools but NOT recon tools
         assert!(preamble.contains("routing tools"));
@@ -241,7 +269,7 @@ mod tests {
 
     #[test]
     fn test_coordinator_preamble_with_recon_tools() {
-        let preamble = build_coordinator_preamble("Test prompt.", true, false);
+        let preamble = build_coordinator_preamble("Test prompt.", true, false, false);
 
         assert!(preamble.contains("reconnaissance tools"));
         assert!(preamble.contains("## Reconnaissance Guidance"));
@@ -250,7 +278,7 @@ mod tests {
 
     #[test]
     fn test_coordinator_preamble_with_history_tools() {
-        let preamble = build_coordinator_preamble("Test prompt.", true, true);
+        let preamble = build_coordinator_preamble("Test prompt.", true, true, false);
 
         assert!(preamble.contains("artifact/history tools"));
         assert!(preamble.contains("list_prior_runs"));
@@ -259,7 +287,7 @@ mod tests {
 
     #[test]
     fn test_coordinator_preamble_without_history_tools() {
-        let preamble = build_coordinator_preamble("Test prompt.", false, false);
+        let preamble = build_coordinator_preamble("Test prompt.", false, false, false);
 
         assert!(preamble.contains("artifact tool"));
         assert!(!preamble.contains("list_prior_runs"));

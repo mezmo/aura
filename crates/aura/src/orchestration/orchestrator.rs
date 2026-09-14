@@ -658,6 +658,8 @@ impl Orchestrator {
         use super::persistence_wrapper::PersistenceWrapper;
         use crate::tool_wrapper::{ComposedWrapper, ToolCallContext, ToolWrapper};
 
+        let by_reference_handoff = self.by_reference_handoff();
+
         // Build base tool wrappers: observer + duplicate guard + persistence
         let (in_flight, drain_notify, iteration, persistence_enabled) = {
             let p = self.persistence.lock().await;
@@ -800,6 +802,9 @@ impl Orchestrator {
                     vec![super::config::WORKER_PREAMBLE_TEMPLATE, worker_preamble];
                 if edit_tool {
                     counted_preamble.push(scratchpad::SCRATCHPAD_EDIT_PREAMBLE);
+                }
+                if by_reference_handoff {
+                    counted_preamble.push(scratchpad::SCRATCHPAD_HANDOFF_PREAMBLE);
                 }
                 let initial_used =
                     scratchpad::estimate_scratchpad_overhead(&*token_counter, &counted_preamble)
@@ -1035,6 +1040,11 @@ impl Orchestrator {
             preamble.push_str(scratchpad::SCRATCHPAD_PREAMBLE);
             if edit_tool {
                 preamble.push_str(scratchpad::SCRATCHPAD_EDIT_PREAMBLE);
+            }
+            // Every scratchpad worker, not just those with reference tools:
+            // a reader must report the stored file a writer will send.
+            if by_reference_handoff {
+                preamble.push_str(scratchpad::SCRATCHPAD_HANDOFF_PREAMBLE);
             }
         }
 
@@ -1750,10 +1760,15 @@ impl Orchestrator {
         max_iterations: usize,
         show_tool_chain: bool,
         content_max_length: usize,
+        by_reference_handoff: bool,
     ) -> String {
         let timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        let base =
-            ctx.build_continuation_prompt(max_iterations, show_tool_chain, content_max_length);
+        let base = ctx.build_continuation_prompt(
+            max_iterations,
+            show_tool_chain,
+            content_max_length,
+            by_reference_handoff,
+        );
         format!("Current time: {timestamp}\n\n{base}")
     }
 
@@ -1891,6 +1906,7 @@ impl Orchestrator {
                 self.config.max_planning_cycles,
                 self.config.show_tool_reasoning_in_continuation(),
                 self.config.result_summary_length(),
+                self.by_reference_handoff(),
             ),
         };
 
@@ -2244,7 +2260,7 @@ Each worker has specialized capabilities. Assign tasks to the most appropriate w
             } else {
                 format!("## {}\n{}\nTools: {}", name, config.description, tool_list)
             };
-            sections.push(section);
+            sections.push(section + &self.stored_files_note(config, &tools));
         }
 
         format!(
@@ -2299,7 +2315,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     name, config.description, tool_section
                 )
             };
-            sections.push(section);
+            sections.push(section + &self.stored_files_note(config, &tools));
         }
 
         format!(
@@ -2469,6 +2485,54 @@ Assign tasks to the worker whose tools best match the required operations."#,
         worker_tools
     }
 
+    /// Tools with by-reference fields, per server.
+    fn by_reference_map(&self) -> scratchpad::ByReferenceMap {
+        let tools_per_server = self
+            .mcp_manager
+            .as_ref()
+            .map(|m| m.tool_names_per_server())
+            .unwrap_or_default();
+        scratchpad::by_reference_map(self.agent_config.mcp.as_ref(), &tools_per_server)
+    }
+
+    /// Whether the coordinator and worker prompts carry the by-reference
+    /// handoff guidance. The generic worker (no named workers) reaches every
+    /// tool under `[agent.scratchpad]`.
+    fn by_reference_handoff(&self) -> bool {
+        let by_reference = self.by_reference_map();
+        let agent_scratchpad = self.agent_config.agent.scratchpad.as_ref();
+        if self.config.workers.is_empty() {
+            let all_tools = self.get_all_tool_names();
+            return super::handoff::by_reference_handoff_enabled(
+                [(None, all_tools.as_slice())],
+                agent_scratchpad,
+                &by_reference,
+            );
+        }
+        let worker_tools = self.resolve_worker_tools();
+        let no_tools = Vec::new();
+        super::handoff::by_reference_handoff_enabled(
+            self.config.workers.iter().map(|(name, worker)| {
+                (
+                    worker.scratchpad.as_ref(),
+                    worker_tools.get(name).unwrap_or(&no_tools).as_slice(),
+                )
+            }),
+            agent_scratchpad,
+            &by_reference,
+        )
+    }
+
+    /// Planning-context note on which of a worker's `tools` take stored files.
+    fn stored_files_note(&self, worker: &super::WorkerConfig, tools: &[String]) -> String {
+        let scratchpad_enabled = worker
+            .scratchpad
+            .as_ref()
+            .or(self.agent_config.agent.scratchpad.as_ref())
+            .is_some_and(|sp| sp.enabled);
+        super::handoff::stored_files_note(tools, scratchpad_enabled, &self.by_reference_map())
+    }
+
     /// Get tool descriptions for full visibility mode.
     ///
     /// Returns a map of tool_name -> description.
@@ -2622,6 +2686,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             self.agent_config.effective_preamble(),
             include_recon_tools,
             include_history_tools,
+            self.by_reference_handoff(),
         );
         if let Some(catalog) =
             crate::skill_tool::render_skill_catalog(&self.agent_config.agent.skills)

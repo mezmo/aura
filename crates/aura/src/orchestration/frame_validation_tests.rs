@@ -257,7 +257,7 @@ fn test_continuation_full_scenario() {
     };
 
     let ctx = IterationContext::new(2, plan, Some(fs), failure_history, traces);
-    let prompt = ctx.build_continuation_prompt(3, true, 2000);
+    let prompt = ctx.build_continuation_prompt(3, true, 2000, false);
 
     // Header
     assert!(
@@ -347,7 +347,7 @@ fn test_continuation_final_attempt_urgency() {
     plan.add_task(t);
 
     let ctx = IterationContext::new(3, plan, None, vec![], HashMap::new());
-    let prompt = ctx.build_continuation_prompt(3, false, 2000);
+    let prompt = ctx.build_continuation_prompt(3, false, 2000, false);
 
     assert!(
         prompt.contains("(FINAL ATTEMPT)"),
@@ -376,7 +376,7 @@ fn test_continuation_mixed_structured_and_raw() {
     plan.add_task(t1);
 
     let ctx = IterationContext::new(1, plan, None, vec![], HashMap::new());
-    let prompt = ctx.build_continuation_prompt(3, false, 2000);
+    let prompt = ctx.build_continuation_prompt(3, false, 2000, false);
 
     // Structured path with no artifact: inlines full result, not summary
     assert!(
@@ -640,7 +640,7 @@ fn test_session_history_multi_run_chronological() {
 #[test]
 fn test_preamble_dynamic_tool_sections_with_persistence() {
     // With history tools (persistence + session_id configured)
-    let preamble_with = build_coordinator_preamble("You are an SRE assistant.", false, true);
+    let preamble_with = build_coordinator_preamble("You are an SRE assistant.", false, true, false);
     assert!(
         preamble_with.contains("read_artifact"),
         "read_artifact in preamble with history"
@@ -651,7 +651,8 @@ fn test_preamble_dynamic_tool_sections_with_persistence() {
     );
 
     // Without history tools
-    let preamble_without = build_coordinator_preamble("You are an SRE assistant.", false, false);
+    let preamble_without =
+        build_coordinator_preamble("You are an SRE assistant.", false, false, false);
     assert!(
         preamble_without.contains("read_artifact"),
         "read_artifact always present"
@@ -747,7 +748,7 @@ fn test_session_history_and_continuation_independent_artifact_refs() {
     plan.add_task(t);
 
     let ctx = IterationContext::new(1, plan, None, vec![], HashMap::new());
-    let continuation = ctx.build_continuation_prompt(3, false, 2000);
+    let continuation = ctx.build_continuation_prompt(3, false, 2000, false);
 
     assert!(
         continuation.contains("task-0-sre-iter-1-result.txt"),
@@ -794,7 +795,7 @@ fn test_continuation_tool_output_artifacts_visible() {
     );
 
     let ctx = IterationContext::new(1, plan, None, vec![], traces);
-    let prompt = ctx.build_continuation_prompt(3, true, 2000);
+    let prompt = ctx.build_continuation_prompt(3, true, 2000, false);
 
     // Tool chain line present
     assert!(prompt.contains("Tool chain:"), "chain line: {}", prompt);
@@ -843,7 +844,7 @@ fn test_continuation_failed_task_no_artifact_refs() {
     );
 
     let ctx = IterationContext::new(1, plan, None, vec![], traces);
-    let prompt = ctx.build_continuation_prompt(3, true, 2000);
+    let prompt = ctx.build_continuation_prompt(3, true, 2000, false);
 
     // Failed tools don't produce artifacts
     assert!(
@@ -878,7 +879,7 @@ fn test_continuation_all_failure_categories() {
         plan.add_task(t);
 
         let ctx = IterationContext::new(1, plan, None, vec![], HashMap::new());
-        let prompt = ctx.build_continuation_prompt(3, true, 2000);
+        let prompt = ctx.build_continuation_prompt(3, true, 2000, false);
 
         assert!(
             prompt.contains(&format!("[{}]", display)),
@@ -905,7 +906,7 @@ fn test_continuation_soft_failure_with_structured_output() {
     plan.add_task(t);
 
     let ctx = IterationContext::new(1, plan, None, vec![], HashMap::new());
-    let prompt = ctx.build_continuation_prompt(3, false, 2000);
+    let prompt = ctx.build_continuation_prompt(3, false, 2000, false);
 
     // SoftFailure with structured output uses the summary path
     assert!(
@@ -931,7 +932,7 @@ fn test_continuation_soft_failure_without_structured_output() {
     plan.add_task(t);
 
     let ctx = IterationContext::new(1, plan, None, vec![], HashMap::new());
-    let prompt = ctx.build_continuation_prompt(3, false, 2000);
+    let prompt = ctx.build_continuation_prompt(3, false, 2000, false);
 
     // SoftFailure without structured output falls back to bracket format
     assert!(
@@ -1055,7 +1056,7 @@ fn test_planning_wrapper_multi_worker_guidelines() {
 
 #[test]
 fn test_preamble_recon_tools_enabled() {
-    let preamble = build_coordinator_preamble("Custom SRE instructions.", true, false);
+    let preamble = build_coordinator_preamble("Custom SRE instructions.", true, false, false);
 
     assert!(
         preamble.contains("list_tools"),
@@ -1077,7 +1078,7 @@ fn test_preamble_recon_tools_enabled() {
 
 #[test]
 fn test_preamble_recon_and_history_tools_combined() {
-    let preamble = build_coordinator_preamble("Domain prompt.", true, true);
+    let preamble = build_coordinator_preamble("Domain prompt.", true, true, false);
 
     assert!(preamble.contains("list_tools"), "recon tool");
     assert!(preamble.contains("inspect_tool_params"), "recon tool");
@@ -1091,7 +1092,7 @@ fn test_preamble_recon_and_history_tools_combined() {
 
 #[test]
 fn test_preamble_empty_system_prompt() {
-    let preamble = build_coordinator_preamble("", false, false);
+    let preamble = build_coordinator_preamble("", false, false, false);
 
     assert!(
         preamble.contains("read_artifact"),
@@ -1132,7 +1133,7 @@ fn test_continuation_running_task_renders_as_blocked() {
     plan.add_task(t0);
 
     let ctx = IterationContext::new(1, plan, None, vec![], HashMap::new());
-    let prompt = ctx.build_continuation_prompt(3, false, 2000);
+    let prompt = ctx.build_continuation_prompt(3, false, 2000, false);
 
     assert!(
         prompt.contains("blocked (dependency failed)"),
@@ -1152,7 +1153,7 @@ fn test_continuation_clean_success_no_failure_sections() {
     plan.add_task(t1);
 
     let ctx = IterationContext::new(1, plan, None, vec![], HashMap::new());
-    let prompt = ctx.build_continuation_prompt(3, false, 2000);
+    let prompt = ctx.build_continuation_prompt(3, false, 2000, false);
 
     assert!(
         prompt.contains("COMPLETED TASKS"),
@@ -1177,7 +1178,7 @@ fn test_continuation_short_result_no_artifact() {
     plan.add_task(t);
 
     let ctx = IterationContext::new(1, plan, None, vec![], HashMap::new());
-    let prompt = ctx.build_continuation_prompt(3, false, 2000);
+    let prompt = ctx.build_continuation_prompt(3, false, 2000, false);
 
     assert!(
         prompt.contains("Short result, no artifact needed"),
@@ -1195,7 +1196,7 @@ fn test_continuation_result_forwarding_absent_when_all_failed() {
     plan.add_task(t);
 
     let ctx = IterationContext::new(1, plan, None, vec![], HashMap::new());
-    let prompt = ctx.build_continuation_prompt(3, false, 2000);
+    let prompt = ctx.build_continuation_prompt(3, false, 2000, false);
 
     assert!(
         !prompt.contains("Workers cannot see prior iteration results"),
@@ -1220,7 +1221,7 @@ fn test_continuation_failure_history_worker_none() {
     }];
 
     let ctx = IterationContext::new(1, plan, None, history, HashMap::new());
-    let prompt = ctx.build_continuation_prompt(3, false, 2000);
+    let prompt = ctx.build_continuation_prompt(3, false, 2000, false);
 
     assert!(prompt.contains("FAILURE HISTORY"), "history present");
     // Should NOT contain "(worker: )" with empty worker
@@ -1273,7 +1274,7 @@ fn test_continuation_multiple_repeated_failure_patterns() {
     ];
 
     let ctx = IterationContext::new(2, plan, None, history, HashMap::new());
-    let prompt = ctx.build_continuation_prompt(3, false, 2000);
+    let prompt = ctx.build_continuation_prompt(3, false, 2000, false);
 
     assert!(
         prompt.contains("OBSERVED PATTERNS"),
@@ -1307,7 +1308,7 @@ fn test_continuation_empty_reasoning_in_tool_chain() {
     );
 
     let ctx = IterationContext::new(1, plan, None, vec![], traces);
-    let prompt = ctx.build_continuation_prompt(3, true, 2000);
+    let prompt = ctx.build_continuation_prompt(3, true, 2000, false);
 
     let chain_line = prompt.lines().find(|l| l.contains("Tool chain:")).unwrap();
     assert!(
@@ -1559,7 +1560,7 @@ fn test_continuation_section_ordering() {
     }];
 
     let ctx = IterationContext::new(1, plan, Some(fs), history, HashMap::new());
-    let prompt = ctx.build_continuation_prompt(3, false, 2000);
+    let prompt = ctx.build_continuation_prompt(3, false, 2000, false);
 
     let completed_pos = prompt.find("COMPLETED TASKS").unwrap();
     let blocked_pos = prompt.find("BLOCKED TASKS").unwrap();
