@@ -26,14 +26,10 @@ use std::sync::OnceLock;
 use tokio::sync::{RwLock, mpsc};
 use tracing::debug;
 
+pub use aura_events::{AgentContext, TokenUsage, ToolCallId, ToolName};
+
 /// Channel capacity for tool events per request
 const EVENT_CHANNEL_CAPACITY: usize = 32;
-
-// Type aliases for tool identifiers - upgrade to newtypes later
-/// The unique ID assigned by the LLM to a specific tool call
-pub type ToolCallId = String;
-/// The name of a tool (e.g., "search", "list_files")
-pub type ToolName = String;
 
 /// Tool lifecycle events routed through the broker.
 ///
@@ -49,6 +45,7 @@ pub enum ToolLifecycleEvent {
         tool_name: ToolName,
         /// The tool arguments as JSON
         arguments: serde_json::Value,
+        agent: Option<AgentContext>,
     },
     /// Emitted from execution context when MCP actually begins.
     /// Provides the progress_token for correlating with aura.progress events.
@@ -56,12 +53,13 @@ pub enum ToolLifecycleEvent {
         tool_id: ToolCallId,
         tool_name: ToolName,
         progress_token: Option<ProgressToken>,
+        agent: Option<AgentContext>,
     },
 }
 
 impl ToolLifecycleEvent {
     /// Get the tool_id regardless of event variant
-    pub fn tool_id(&self) -> &str {
+    pub fn tool_id(&self) -> &ToolCallId {
         match self {
             ToolLifecycleEvent::Requested { tool_id, .. } => tool_id,
             ToolLifecycleEvent::Start { tool_id, .. } => tool_id,
@@ -69,7 +67,7 @@ impl ToolLifecycleEvent {
     }
 
     /// Get the tool_name regardless of event variant
-    pub fn tool_name(&self) -> &str {
+    pub fn tool_name(&self) -> &ToolName {
         match self {
             ToolLifecycleEvent::Requested { tool_name, .. } => tool_name,
             ToolLifecycleEvent::Start { tool_name, .. } => tool_name,
@@ -77,21 +75,11 @@ impl ToolLifecycleEvent {
     }
 }
 
-/// Tool usage event emitted when usage information becomes available.
-///
-/// This associates tool calls with their usage snapshot. When
-/// `on_stream_completion_response_finish` fires, all tools that completed
-/// since the last usage event are grouped together.
 #[derive(Clone, Debug)]
 pub struct ToolUsageEvent {
-    /// Tool IDs that share this usage snapshot
-    pub tool_ids: Vec<String>,
-    /// Prompt tokens (context size at this point)
-    pub prompt_tokens: u64,
-    /// Completion tokens generated
-    pub completion_tokens: u64,
-    /// Total tokens used
-    pub total_tokens: u64,
+    pub tool_ids: Vec<ToolCallId>,
+    pub usage: TokenUsage,
+    pub agent: Option<AgentContext>,
 }
 
 /// Request-scoped tool event broker that routes MCP tool events
@@ -115,7 +103,7 @@ pub struct ToolEventBroker {
     /// Hook pushes when on_tool_call fires, execution peeks when tool starts,
     /// hook pops when on_tool_result fires.
     /// Sequential execution in streaming mode guarantees correct ordering.
-    pending_tool_calls: RwLock<HashMap<String, VecDeque<String>>>,
+    pending_tool_calls: RwLock<HashMap<String, VecDeque<ToolCallId>>>,
 }
 
 impl ToolEventBroker {
@@ -172,7 +160,7 @@ impl ToolEventBroker {
     /// Called when the hook's `on_tool_call` fires. The execution context
     /// will peek this ID when the tool actually starts executing.
     /// FIFO order is guaranteed by sequential tool execution in streaming mode.
-    pub async fn push_tool_call_id(&self, request_id: &str, tool_call_id: impl Into<String>) {
+    pub async fn push_tool_call_id(&self, request_id: &str, tool_call_id: impl Into<ToolCallId>) {
         let mut pending = self.pending_tool_calls.write().await;
         let queue = pending.entry(request_id.to_string()).or_default();
         let tool_call_id = tool_call_id.into();
@@ -194,7 +182,7 @@ impl ToolEventBroker {
     /// This ensures push/pop pairing regardless of tool type.
     ///
     /// Returns `None` if no pending tool_call_id exists.
-    pub async fn peek_tool_call_id(&self, request_id: &str) -> Option<String> {
+    pub async fn peek_tool_call_id(&self, request_id: &str) -> Option<ToolCallId> {
         let pending = self.pending_tool_calls.read().await;
 
         let queue = pending.get(request_id)?;
@@ -220,7 +208,7 @@ impl ToolEventBroker {
     /// This ensures push/pop pairing for ALL tools (MCP and non-MCP).
     ///
     /// Returns `None` if no pending tool_call_id exists.
-    pub async fn pop_tool_call_id(&self, request_id: &str) -> Option<String> {
+    pub async fn pop_tool_call_id(&self, request_id: &str) -> Option<ToolCallId> {
         let mut pending = self.pending_tool_calls.write().await;
 
         let queue = pending.get_mut(request_id)?;
@@ -325,6 +313,7 @@ pub async fn publish_tool_requested(
             tool_id,
             tool_name,
             arguments,
+            agent: None,
         },
     )
     .await
@@ -343,23 +332,24 @@ pub async fn publish_tool_start(
             tool_id,
             tool_name,
             progress_token,
+            agent: None,
         },
     )
     .await
 }
 
 /// Convenience function to push a tool_call_id from hook context.
-pub async fn push_tool_call_id(request_id: &RequestId, tool_call_id: String) {
+pub async fn push_tool_call_id(request_id: &RequestId, tool_call_id: ToolCallId) {
     global().push_tool_call_id(request_id, tool_call_id).await
 }
 
 /// Convenience function to peek at the next tool_call_id (for MCP execution).
-pub async fn peek_tool_call_id(request_id: &RequestId) -> Option<String> {
+pub async fn peek_tool_call_id(request_id: &RequestId) -> Option<ToolCallId> {
     global().peek_tool_call_id(request_id).await
 }
 
 /// Convenience function to pop a tool_call_id (from on_tool_result).
-pub async fn pop_tool_call_id(request_id: &RequestId) -> Option<String> {
+pub async fn pop_tool_call_id(request_id: &RequestId) -> Option<ToolCallId> {
     global().pop_tool_call_id(request_id).await
 }
 
@@ -462,21 +452,23 @@ pub async fn tool_usage_unsubscribe(request_id: &str) {
 ///
 /// Called from `on_stream_completion_response_finish` when usage becomes available.
 /// Associates the listed tool_ids with the usage snapshot.
+/// Publish a prebuilt usage event, so a caller that knows the agent can name it.
+pub async fn publish_usage(request_id: &str, event: ToolUsageEvent) -> bool {
+    usage_broker_global().publish(request_id, event).await
+}
+
 pub async fn publish_tool_usage(
     request_id: &str,
-    tool_ids: Vec<String>,
-    prompt_tokens: u64,
-    completion_tokens: u64,
-    total_tokens: u64,
+    tool_ids: Vec<ToolCallId>,
+    usage: TokenUsage,
 ) -> bool {
     usage_broker_global()
         .publish(
             request_id,
             ToolUsageEvent {
                 tool_ids,
-                prompt_tokens,
-                completion_tokens,
-                total_tokens,
+                usage,
+                agent: None,
             },
         )
         .await
@@ -485,6 +477,7 @@ pub async fn publish_tool_usage(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aura_events::TokenCount;
     use rmcp::model::NumberOrString;
     use std::sync::Arc;
 
@@ -525,9 +518,10 @@ mod tests {
         let mut rx = broker.subscribe("req_123").await;
 
         let event = ToolLifecycleEvent::Start {
-            tool_id: "call_abc".to_string(),
-            tool_name: "list_pipelines".to_string(),
+            tool_id: ToolCallId::new("call_abc"),
+            tool_name: ToolName::new("list_pipelines"),
             progress_token: Some(numeric_token(42)),
+            agent: None,
         };
 
         let sent = broker.publish("req_123", event).await;
@@ -539,6 +533,7 @@ mod tests {
                 tool_id,
                 tool_name,
                 progress_token,
+                ..
             } => {
                 assert_eq!(tool_id, "call_abc");
                 assert_eq!(tool_name, "list_pipelines");
@@ -554,9 +549,10 @@ mod tests {
         let mut rx = broker.subscribe("req_123").await;
 
         let event = ToolLifecycleEvent::Requested {
-            tool_id: "call_abc".to_string(),
-            tool_name: "search".to_string(),
+            tool_id: ToolCallId::new("call_abc"),
+            tool_name: ToolName::new("search"),
             arguments: serde_json::json!({"query": "test"}),
+            agent: None,
         };
 
         let sent = broker.publish("req_123", event).await;
@@ -568,6 +564,7 @@ mod tests {
                 tool_id,
                 tool_name,
                 arguments,
+                ..
             } => {
                 assert_eq!(tool_id, "call_abc");
                 assert_eq!(tool_name, "search");
@@ -582,9 +579,10 @@ mod tests {
         let broker = ToolEventBroker::new();
 
         let event = ToolLifecycleEvent::Start {
-            tool_id: "call_abc".to_string(),
-            tool_name: "list_pipelines".to_string(),
+            tool_id: ToolCallId::new("call_abc"),
+            tool_name: ToolName::new("list_pipelines"),
             progress_token: None,
+            agent: None,
         };
 
         let sent = broker.publish("req_nonexistent", event).await;
@@ -598,9 +596,10 @@ mod tests {
         let mut rx2 = broker.subscribe("req_2").await;
 
         let event = ToolLifecycleEvent::Start {
-            tool_id: "call_1".to_string(),
-            tool_name: "tool_for_req_1".to_string(),
+            tool_id: ToolCallId::new("call_1"),
+            tool_name: ToolName::new("tool_for_req_1"),
             progress_token: Some(string_token("token_1")),
+            agent: None,
         };
         broker.publish("req_1", event).await;
 
@@ -618,9 +617,10 @@ mod tests {
         let mut rx = broker.subscribe("req_123").await;
 
         let event = ToolLifecycleEvent::Start {
-            tool_id: "call_xyz".to_string(),
-            tool_name: "some_tool".to_string(),
+            tool_id: ToolCallId::new("call_xyz"),
+            tool_name: ToolName::new("some_tool"),
             progress_token: None,
+            agent: None,
         };
 
         broker.publish("req_123", event).await;
@@ -648,7 +648,7 @@ mod tests {
         broker.push_tool_call_id("req_1", "call_abc123").await;
 
         let result = broker.pop_tool_call_id("req_1").await;
-        assert_eq!(result, Some("call_abc123".to_string()));
+        assert_eq!(result, Some(ToolCallId::new("call_abc123")));
 
         // Second pop should return None (consumed)
         let result2 = broker.pop_tool_call_id("req_1").await;
@@ -674,13 +674,13 @@ mod tests {
 
         // Pops should return in FIFO order
         let first = broker.pop_tool_call_id("req_1").await;
-        assert_eq!(first, Some("call_first".to_string()));
+        assert_eq!(first, Some(ToolCallId::new("call_first")));
 
         let second = broker.pop_tool_call_id("req_1").await;
-        assert_eq!(second, Some("call_second".to_string()));
+        assert_eq!(second, Some(ToolCallId::new("call_second")));
 
         let third = broker.pop_tool_call_id("req_1").await;
-        assert_eq!(third, Some("call_third".to_string()));
+        assert_eq!(third, Some(ToolCallId::new("call_third")));
 
         // Fourth should be None
         let fourth = broker.pop_tool_call_id("req_1").await;
@@ -696,10 +696,10 @@ mod tests {
 
         // Each request gets its own tool_call_id
         let result1 = broker.pop_tool_call_id("req_1").await;
-        assert_eq!(result1, Some("call_for_req_1".to_string()));
+        assert_eq!(result1, Some(ToolCallId::new("call_for_req_1")));
 
         let result2 = broker.pop_tool_call_id("req_2").await;
-        assert_eq!(result2, Some("call_for_req_2".to_string()));
+        assert_eq!(result2, Some(ToolCallId::new("call_for_req_2")));
     }
 
     #[tokio::test]
@@ -727,15 +727,15 @@ mod tests {
 
         // Peek should return the item
         let result = broker.peek_tool_call_id("req_1").await;
-        assert_eq!(result, Some("call_abc".to_string()));
+        assert_eq!(result, Some(ToolCallId::new("call_abc")));
 
         // Peek again should return the same item (not consumed)
         let result2 = broker.peek_tool_call_id("req_1").await;
-        assert_eq!(result2, Some("call_abc".to_string()));
+        assert_eq!(result2, Some(ToolCallId::new("call_abc")));
 
         // Pop should also return the same item
         let result3 = broker.pop_tool_call_id("req_1").await;
-        assert_eq!(result3, Some("call_abc".to_string()));
+        assert_eq!(result3, Some(ToolCallId::new("call_abc")));
 
         // Now it's consumed
         let result4 = broker.peek_tool_call_id("req_1").await;
@@ -760,19 +760,19 @@ mod tests {
 
         // Peek returns first item
         let peek1 = broker.peek_tool_call_id("req_1").await;
-        assert_eq!(peek1, Some("call_first".to_string()));
+        assert_eq!(peek1, Some(ToolCallId::new("call_first")));
 
         // Pop removes first item
         let pop1 = broker.pop_tool_call_id("req_1").await;
-        assert_eq!(pop1, Some("call_first".to_string()));
+        assert_eq!(pop1, Some(ToolCallId::new("call_first")));
 
         // Peek now returns second item
         let peek2 = broker.peek_tool_call_id("req_1").await;
-        assert_eq!(peek2, Some("call_second".to_string()));
+        assert_eq!(peek2, Some(ToolCallId::new("call_second")));
 
         // Pop removes second item
         let pop2 = broker.pop_tool_call_id("req_1").await;
-        assert_eq!(pop2, Some("call_second".to_string()));
+        assert_eq!(pop2, Some(ToolCallId::new("call_second")));
 
         // Both are now empty
         assert_eq!(broker.peek_tool_call_id("req_1").await, None);
@@ -792,11 +792,11 @@ mod tests {
 
         // Simulate MCP execution (peek)
         let for_tool_start = broker.peek_tool_call_id("req_1").await;
-        assert_eq!(for_tool_start, Some("call_mcp_1".to_string()));
+        assert_eq!(for_tool_start, Some(ToolCallId::new("call_mcp_1")));
 
         // Simulate on_tool_result (pop)
         let cleanup = broker.pop_tool_call_id("req_1").await;
-        assert_eq!(cleanup, Some("call_mcp_1".to_string()));
+        assert_eq!(cleanup, Some(ToolCallId::new("call_mcp_1")));
 
         // Queue is now empty
         assert_eq!(broker.peek_tool_call_id("req_1").await, None);
@@ -817,7 +817,7 @@ mod tests {
 
         // Simulate on_tool_result (pop)
         let cleanup = broker.pop_tool_call_id("req_1").await;
-        assert_eq!(cleanup, Some("call_vector_1".to_string()));
+        assert_eq!(cleanup, Some(ToolCallId::new("call_vector_1")));
 
         // Queue is clean
         assert_eq!(broker.peek_tool_call_id("req_1").await, None);
@@ -833,19 +833,19 @@ mod tests {
         broker.push_tool_call_id("req_1", "call_vector").await;
         // Vector store executes (no peek)
         let pop1 = broker.pop_tool_call_id("req_1").await; // on_tool_result
-        assert_eq!(pop1, Some("call_vector".to_string()));
+        assert_eq!(pop1, Some(ToolCallId::new("call_vector")));
 
         // Tool 2: MCP HTTP tool
         broker.push_tool_call_id("req_1", "call_mcp").await;
         let peek2 = broker.peek_tool_call_id("req_1").await; // MCP execution
-        assert_eq!(peek2, Some("call_mcp".to_string()));
+        assert_eq!(peek2, Some(ToolCallId::new("call_mcp")));
         let pop2 = broker.pop_tool_call_id("req_1").await; // on_tool_result
-        assert_eq!(pop2, Some("call_mcp".to_string()));
+        assert_eq!(pop2, Some(ToolCallId::new("call_mcp")));
 
         // Tool 3: Another vector store
         broker.push_tool_call_id("req_1", "call_vector_2").await;
         let pop3 = broker.pop_tool_call_id("req_1").await;
-        assert_eq!(pop3, Some("call_vector_2".to_string()));
+        assert_eq!(pop3, Some(ToolCallId::new("call_vector_2")));
 
         // Queue integrity maintained - all clean
         assert_eq!(broker.peek_tool_call_id("req_1").await, None);
@@ -863,14 +863,14 @@ mod tests {
 
         // MCP execution peeks
         let peek = broker.peek_tool_call_id("req_1").await;
-        assert_eq!(peek, Some("call_failing_tool".to_string()));
+        assert_eq!(peek, Some(ToolCallId::new("call_failing_tool")));
 
         // Tool execution fails... but on_tool_result still fires
         // (Rig converts Err(e) to e.to_string() and calls on_tool_result)
 
         // on_tool_result pops (even on failure)
         let pop = broker.pop_tool_call_id("req_1").await;
-        assert_eq!(pop, Some("call_failing_tool".to_string()));
+        assert_eq!(pop, Some(ToolCallId::new("call_failing_tool")));
 
         // Queue is clean despite failure
         assert_eq!(broker.peek_tool_call_id("req_1").await, None);
@@ -885,25 +885,25 @@ mod tests {
         // Tool 1: Success
         broker.push_tool_call_id("req_1", "call_1_success").await;
         let peek1 = broker.peek_tool_call_id("req_1").await;
-        assert_eq!(peek1, Some("call_1_success".to_string()));
+        assert_eq!(peek1, Some(ToolCallId::new("call_1_success")));
         // Tool executes successfully
         let pop1 = broker.pop_tool_call_id("req_1").await;
-        assert_eq!(pop1, Some("call_1_success".to_string()));
+        assert_eq!(pop1, Some(ToolCallId::new("call_1_success")));
 
         // Tool 2: Failure (but on_tool_result still fires)
         broker.push_tool_call_id("req_1", "call_2_failure").await;
         let peek2 = broker.peek_tool_call_id("req_1").await;
-        assert_eq!(peek2, Some("call_2_failure".to_string()));
+        assert_eq!(peek2, Some(ToolCallId::new("call_2_failure")));
         // Tool execution fails...
         let pop2 = broker.pop_tool_call_id("req_1").await; // on_tool_result still fires
-        assert_eq!(pop2, Some("call_2_failure".to_string()));
+        assert_eq!(pop2, Some(ToolCallId::new("call_2_failure")));
 
         // Tool 3: Success - must get correct tool_call_id, not stale one
         broker.push_tool_call_id("req_1", "call_3_success").await;
         let peek3 = broker.peek_tool_call_id("req_1").await;
-        assert_eq!(peek3, Some("call_3_success".to_string())); // Not call_2!
+        assert_eq!(peek3, Some(ToolCallId::new("call_3_success"))); // Not call_2!
         let pop3 = broker.pop_tool_call_id("req_1").await;
-        assert_eq!(pop3, Some("call_3_success".to_string()));
+        assert_eq!(pop3, Some(ToolCallId::new("call_3_success")));
 
         // Queue integrity maintained
         assert_eq!(broker.peek_tool_call_id("req_1").await, None);
@@ -919,16 +919,16 @@ mod tests {
         broker.push_tool_call_id("req_1", "call_vector_fails").await;
         // Tool execution fails... no peek happened
         let pop1 = broker.pop_tool_call_id("req_1").await; // on_tool_result
-        assert_eq!(pop1, Some("call_vector_fails".to_string()));
+        assert_eq!(pop1, Some(ToolCallId::new("call_vector_fails")));
 
         // Next MCP tool should work correctly
         broker
             .push_tool_call_id("req_1", "call_mcp_after_failure")
             .await;
         let peek2 = broker.peek_tool_call_id("req_1").await;
-        assert_eq!(peek2, Some("call_mcp_after_failure".to_string()));
+        assert_eq!(peek2, Some(ToolCallId::new("call_mcp_after_failure")));
         let pop2 = broker.pop_tool_call_id("req_1").await;
-        assert_eq!(pop2, Some("call_mcp_after_failure".to_string()));
+        assert_eq!(pop2, Some(ToolCallId::new("call_mcp_after_failure")));
 
         assert_eq!(broker.peek_tool_call_id("req_1").await, None);
     }
@@ -947,15 +947,15 @@ mod tests {
 
         // Request 2 peeks and pops (success)
         let peek_r2 = broker.peek_tool_call_id("req_2").await;
-        assert_eq!(peek_r2, Some("call_2_success".to_string()));
+        assert_eq!(peek_r2, Some(ToolCallId::new("call_2_success")));
         let pop_r2 = broker.pop_tool_call_id("req_2").await;
-        assert_eq!(pop_r2, Some("call_2_success".to_string()));
+        assert_eq!(pop_r2, Some(ToolCallId::new("call_2_success")));
 
         // Request 1 still has its item (failure doesn't affect isolation)
         let peek_r1 = broker.peek_tool_call_id("req_1").await;
-        assert_eq!(peek_r1, Some("call_1_fail".to_string()));
+        assert_eq!(peek_r1, Some(ToolCallId::new("call_1_fail")));
         let pop_r1 = broker.pop_tool_call_id("req_1").await;
-        assert_eq!(pop_r1, Some("call_1_fail".to_string()));
+        assert_eq!(pop_r1, Some(ToolCallId::new("call_1_fail")));
 
         // Both queues clean
         assert_eq!(broker.peek_tool_call_id("req_1").await, None);
@@ -970,17 +970,19 @@ mod tests {
 
         for i in 0..100 {
             let tool_id = format!("call_{}", i);
-            broker.push_tool_call_id("req_stress", &tool_id).await;
+            broker
+                .push_tool_call_id("req_stress", tool_id.as_str())
+                .await;
 
             // Simulate MCP tool (peek)
             if i % 2 == 0 {
                 let peek = broker.peek_tool_call_id("req_stress").await;
-                assert_eq!(peek, Some(tool_id.clone()));
+                assert_eq!(peek, Some(ToolCallId::new(&tool_id)));
             }
 
             // on_tool_result (pop) - always fires
             let pop = broker.pop_tool_call_id("req_stress").await;
-            assert_eq!(pop, Some(tool_id));
+            assert_eq!(pop, Some(ToolCallId::new(tool_id)));
         }
 
         // Queue should be empty after 100 push/pop cycles
@@ -1030,10 +1032,13 @@ mod tests {
         let mut rx = broker.subscribe("req_usage_1").await;
 
         let event = ToolUsageEvent {
-            tool_ids: vec!["call_abc".to_string(), "call_def".to_string()],
-            prompt_tokens: 18777,
-            completion_tokens: 500,
-            total_tokens: 19277,
+            tool_ids: vec![ToolCallId::new("call_abc"), ToolCallId::new("call_def")],
+            usage: TokenUsage {
+                prompt_tokens: TokenCount::new(18777),
+                completion_tokens: TokenCount::new(500),
+                total_tokens: TokenCount::new(19277),
+            },
+            agent: None,
         };
 
         let sent = broker.publish("req_usage_1", event).await;
@@ -1041,9 +1046,9 @@ mod tests {
 
         let received = rx.recv().await.unwrap();
         assert_eq!(received.tool_ids, vec!["call_abc", "call_def"]);
-        assert_eq!(received.prompt_tokens, 18777);
-        assert_eq!(received.completion_tokens, 500);
-        assert_eq!(received.total_tokens, 19277);
+        assert_eq!(received.usage.prompt_tokens.get(), 18777);
+        assert_eq!(received.usage.completion_tokens.get(), 500);
+        assert_eq!(received.usage.total_tokens.get(), 19277);
     }
 
     #[tokio::test]
@@ -1058,9 +1063,12 @@ mod tests {
                 "req_usage_2",
                 ToolUsageEvent {
                     tool_ids: vec![],
-                    prompt_tokens: 0,
-                    completion_tokens: 0,
-                    total_tokens: 0,
+                    usage: TokenUsage {
+                        prompt_tokens: TokenCount::new(0),
+                        completion_tokens: TokenCount::new(0),
+                        total_tokens: TokenCount::new(0),
+                    },
+                    agent: None,
                 },
             )
             .await;
@@ -1078,10 +1086,13 @@ mod tests {
             .publish(
                 "req_usage_a",
                 ToolUsageEvent {
-                    tool_ids: vec!["tool_for_a".to_string()],
-                    prompt_tokens: 1000,
-                    completion_tokens: 100,
-                    total_tokens: 1100,
+                    tool_ids: vec![ToolCallId::new("tool_for_a")],
+                    usage: TokenUsage {
+                        prompt_tokens: TokenCount::new(1000),
+                        completion_tokens: TokenCount::new(100),
+                        total_tokens: TokenCount::new(1100),
+                    },
+                    agent: None,
                 },
             )
             .await;
