@@ -15,7 +15,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aura::SessionId;
-use aura::hitl::{ApprovalDecision, DecisionId, ResolveError, ResolvedDecision};
+use aura::hitl::{
+    ApprovalAuthority, ApprovalDecision, DecisionId, ResolveError, ResolvedDecision,
+};
 use aura::session_store::{
     ApprovalStore, FileApprovalStore, FileSkillInvocationStore, InMemoryApprovalStore,
     MAX_SKILL_RECORDS_PER_SESSION, ParkedApprovalRecord, SKILL_INVOCATION_RECORD_VERSION,
@@ -205,7 +207,13 @@ async fn expired_resolve_is_not_found_and_approval_is_retained() {
     store.register(parked).await.unwrap();
 
     assert_eq!(
-        store.resolve(&id, ApprovalDecision::Approved.into()).await,
+        store
+            .resolve(
+                &id,
+                ApprovalAuthority::Conversational,
+                ApprovalDecision::Approved.into()
+            )
+            .await,
         Err(ResolveError::NotFound)
     );
     assert_eq!(store.decision(&id).await.unwrap(), None);
@@ -235,7 +243,11 @@ async fn approval_and_decision_are_retained_until_remove() {
     );
 
     store
-        .resolve(&id, ApprovalDecision::Approved.into())
+        .resolve(
+            &id,
+            ApprovalAuthority::Conversational,
+            ApprovalDecision::Approved.into(),
+        )
         .await
         .unwrap();
 
@@ -258,7 +270,13 @@ async fn approval_and_decision_are_retained_until_remove() {
     assert!(store.get(&id).await.unwrap().is_none());
     assert_eq!(store.decision(&id).await.unwrap(), None);
     assert_eq!(
-        store.resolve(&id, ApprovalDecision::Approved.into()).await,
+        store
+            .resolve(
+                &id,
+                ApprovalAuthority::Conversational,
+                ApprovalDecision::Approved.into()
+            )
+            .await,
         Err(ResolveError::NotFound)
     );
 }
@@ -278,7 +296,11 @@ async fn resolve_moves_the_approval_into_the_decision_file() {
     store.register(parked).await.unwrap();
 
     store
-        .resolve(&id, ApprovalDecision::Approved.into())
+        .resolve(
+            &id,
+            ApprovalAuthority::Conversational,
+            ApprovalDecision::Approved.into(),
+        )
         .await
         .unwrap();
 
@@ -344,7 +366,11 @@ async fn store_directories_and_files_are_owner_only() {
     );
 
     store
-        .resolve(&id, ApprovalDecision::Approved.into())
+        .resolve(
+            &id,
+            ApprovalAuthority::Conversational,
+            ApprovalDecision::Approved.into(),
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -367,7 +393,11 @@ async fn list_pending_removes_an_approval_file_that_already_has_a_decision() {
     let approval_bytes = std::fs::read(&approval_path).unwrap();
 
     store
-        .resolve(&id, ApprovalDecision::Approved.into())
+        .resolve(
+            &id,
+            ApprovalAuthority::Conversational,
+            ApprovalDecision::Approved.into(),
+        )
         .await
         .unwrap();
     assert!(!approval_path.exists(), "resolve unlinks the approval file");
@@ -422,7 +452,13 @@ async fn list_pending_keeps_the_approval_file_behind_an_incomplete_decision() {
         "the torn decision file reads as a decode error"
     );
     assert_eq!(
-        store.resolve(&id, ApprovalDecision::Approved.into()).await,
+        store
+            .resolve(
+                &id,
+                ApprovalAuthority::Conversational,
+                ApprovalDecision::Approved.into()
+            )
+            .await,
         Err(ResolveError::NotFound),
         "the torn file still holds the at-most-once claim"
     );
@@ -437,7 +473,11 @@ async fn list_pending_keeps_the_approval_file_behind_an_incomplete_decision() {
     let pending = store.list_pending().await.unwrap();
     assert_eq!(pending.len(), 1, "the row is pending again");
     store
-        .resolve(&id, ApprovalDecision::Approved.into())
+        .resolve(
+            &id,
+            ApprovalAuthority::Conversational,
+            ApprovalDecision::Approved.into(),
+        )
         .await
         .expect("a fresh resolve lands");
     assert!(!approval_path.exists(), "resolve unlinks the approval file");
@@ -457,7 +497,11 @@ async fn cancel_request_removes_only_undecided_matching_approvals() {
     let decided_id = decided.request.decision_id;
     store.register(decided).await.unwrap();
     store
-        .resolve(&decided_id, ApprovalDecision::Approved.into())
+        .resolve(
+            &decided_id,
+            ApprovalAuthority::Conversational,
+            ApprovalDecision::Approved.into(),
+        )
         .await
         .unwrap();
     let other = make_parked("req-other", Duration::from_secs(60));
@@ -495,7 +539,11 @@ async fn cancel_request_sweeps_a_stale_decided_approval_without_returning_it() {
     let residue = serde_json::to_vec(&ParkedApprovalRecord::from(&decided)).unwrap();
     store.register(decided).await.unwrap();
     store
-        .resolve(&decided_id, ApprovalDecision::Approved.into())
+        .resolve(
+            &decided_id,
+            ApprovalAuthority::Conversational,
+            ApprovalDecision::Approved.into(),
+        )
         .await
         .unwrap();
 
@@ -590,7 +638,11 @@ async fn list_pending_skips_a_stale_decided_approval() {
     let residue = serde_json::to_vec(&ParkedApprovalRecord::from(&decided)).unwrap();
     store.register(decided).await.unwrap();
     store
-        .resolve(&decided_id, ApprovalDecision::Approved.into())
+        .resolve(
+            &decided_id,
+            ApprovalAuthority::Conversational,
+            ApprovalDecision::Approved.into(),
+        )
         .await
         .unwrap();
 
@@ -742,7 +794,11 @@ async fn resolve_succeeds_when_the_approval_file_cannot_be_removed() {
     }
 
     store
-        .resolve(&id, ApprovalDecision::Approved.into())
+        .resolve(
+            &id,
+            ApprovalAuthority::Conversational,
+            ApprovalDecision::Approved.into(),
+        )
         .await
         .expect("resolve commits without the approval removal");
     assert_eq!(
@@ -756,7 +812,13 @@ async fn resolve_succeeds_when_the_approval_file_cannot_be_removed() {
         .expect("approval record survives the failed removal");
     assert_eq!(restored.request.decision_id, id);
     assert_eq!(
-        store.resolve(&id, ApprovalDecision::Approved.into()).await,
+        store
+            .resolve(
+                &id,
+                ApprovalAuthority::Conversational,
+                ApprovalDecision::Approved.into()
+            )
+            .await,
         Err(ResolveError::NotFound)
     );
 }
@@ -780,7 +842,11 @@ async fn state_survives_reopening_the_store() {
 
     let reopened = FileApprovalStore::open(dir.path()).unwrap();
     reopened
-        .resolve(&id, ApprovalDecision::Approved.into())
+        .resolve(
+            &id,
+            ApprovalAuthority::Conversational,
+            ApprovalDecision::Approved.into(),
+        )
         .await
         .expect("resolve after reopen");
     assert_eq!(

@@ -64,9 +64,10 @@ impl ApprovalStore for FaultInjectingStore {
     async fn resolve(
         &self,
         id: &DecisionId,
+        expected_authority: ApprovalAuthority,
         decision: ResolvedDecision,
     ) -> Result<(), ResolveError> {
-        self.inner.resolve(id, decision).await
+        self.inner.resolve(id, expected_authority, decision).await
     }
 
     async fn decision(
@@ -102,6 +103,12 @@ impl ApprovalStore for FaultInjectingStore {
     ) -> Result<ApprovalRead, SessionStoreError> {
         todo!(
             "P45 wave fill units E1/E2: the fault double delegates read-or-expire like every other operation"
+        )
+    }
+
+    async fn retained_rows(&self) -> Result<Vec<super::RetainedApproval>, SessionStoreError> {
+        todo!(
+            "P45 wave fill units E1/E2: the fault double delegates the retained scan like every other operation"
         )
     }
 }

@@ -5,9 +5,11 @@
 //! park-module's [`super::continuation::ResumingDocumentHandle`], which stays
 //! the append-and-publish surface of the resuming document itself.
 
-#![allow(dead_code)] // survivors: the grant's Drop-held lease, the
+#![allow(dead_code)] // survivors: the grant's Drop-held reservation, the
 // fingerprint stage's symmetry variant, the goldens'
-// TempDir cleanup handles
+// TempDir cleanup handles, and the declared E4/S4 seams
+// (ReservedEvaluation, convert_reserved, rename_back_under_reservation,
+// run_segment_borrowed) whose fills wire them
 
 pub(crate) mod claim;
 pub(crate) mod evaluate;
@@ -21,5 +23,9 @@ pub use claim::{
 pub use evaluate::{
     BlockingEntry, ConflictCode, Diagnostic, EmptyBlocking, EmptySegment, NonEmptyBlocking,
     ParkedToolName, ResumeConflictRow, ResumeEvaluation, ResumeGrant, ResumeRefusal, SegmentError,
-    SegmentResult, SegmentTurns, evaluate_resume, run_segment,
+    SegmentResult, SegmentTurns, evaluate_resume, run_segment, run_segment_borrowed,
 };
+// The ordered resume's internal carrier and consuming transition: consumed
+// by the E4 fill inside this crate only.
+#[allow(unused_imports)]
+pub(crate) use evaluate::{ReservedEvaluation, convert_reserved};

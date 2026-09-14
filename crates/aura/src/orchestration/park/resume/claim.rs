@@ -212,6 +212,25 @@ impl ResumeClaimTable {
         todo!("P45 wave fill unit E4: shared reservation table admit under the short standard lock")
     }
 
+    /// Ordered-resume step 3's rename-back, fenced by the held reservation:
+    /// the blocking rename tail holds a lease reference through completion,
+    /// so an awaiting request dropping never releases a run whose rename-back
+    /// is in flight. The pre-reservation [`Self::rename_back_to_parked`]
+    /// stays only until the E4 fill's ordered evaluation replaces it.
+    #[expect(
+        unused_variables,
+        reason = "todo!() body; filled by P45 wave fill units"
+    )]
+    pub(crate) async fn rename_back_under_reservation(
+        &self,
+        reservation: &RunReservationLease,
+        docs: &ResumeDocuments,
+    ) -> Result<(), Diagnostic> {
+        todo!(
+            "P45 wave fill unit E4: rename resuming → parked holding a lease reference through the blocking tail"
+        )
+    }
+
     /// Whether a live claim holds the run.
     #[must_use]
     pub(crate) fn is_live(&self, run: &ResumeRunId) -> bool {
@@ -272,10 +291,18 @@ impl ResumeClaimTable {
 
     /// Insert the claim and rename the parked document to its resuming name
     /// as one step under the claim lock: either both happen or neither does.
+    /// The returned lease is the shared run reservation — the grant owns it,
+    /// and the run releases when its last reference drops.
+    ///
+    /// Interim shape (until the E4 fill's ordered evaluation): the grant's
+    /// source is still this one-shot acquisition; the ordered path will hold
+    /// a reservation from step 2 and convert it instead, so this method's
+    /// insert-and-rename becomes the conversion's rename under the held
+    /// reservation.
     pub(crate) async fn claim_and_resume(
         &self,
         docs: &ResumeDocuments,
-    ) -> Result<ResumeLease, ClaimResumeFault> {
+    ) -> Result<RunReservationLease, ClaimResumeFault> {
         // The documents derive from a validated path (`for_path`), so the
         // parked name's stem is the validated run id: the claim keys on the
         // same run whose document the rename moves.
@@ -290,7 +317,7 @@ impl ResumeClaimTable {
         let resuming = docs.resuming().to_path_buf();
         let live = Arc::clone(&self.live);
         let lease_live = Arc::clone(&self.live);
-        tokio::task::spawn_blocking(move || -> Result<ResumeLease, ClaimResumeFault> {
+        tokio::task::spawn_blocking(move || -> Result<RunReservationLease, ClaimResumeFault> {
             // One acquisition covers check, insert, rename, and rollback: a
             // second caller's insert observes the live claim before any
             // rename, and a failed rename rolls the insert back, so the
@@ -300,10 +327,10 @@ impl ResumeClaimTable {
                 return Err(ClaimResumeFault::Live);
             }
             match std::fs::rename(&parked, &resuming) {
-                Ok(()) => Ok(ResumeLease {
-                    live: lease_live,
-                    run,
-                }),
+                Ok(()) => Ok(RunReservationLease::admitted(
+                    run.run_id(),
+                    Arc::clone(&lease_live),
+                )),
                 Err(e) => {
                     live.remove(&run.run_id());
                     Err(ClaimResumeFault::Io(Diagnostic::new(format!(
@@ -319,23 +346,6 @@ impl ResumeClaimTable {
                 "the claim task did not complete: {e}"
             )))
         })?
-    }
-}
-
-/// A held resume claim for one run.
-#[derive(Debug)]
-pub struct ResumeLease {
-    live: Arc<Mutex<HashSet<RunId>>>,
-    run: ResumeRunId,
-}
-
-impl Drop for ResumeLease {
-    /// Release the run; a later evaluation may claim it.
-    fn drop(&mut self) {
-        self.live
-            .lock()
-            .expect("resume claim lock")
-            .remove(&self.run.run_id());
     }
 }
 

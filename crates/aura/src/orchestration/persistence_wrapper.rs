@@ -1509,7 +1509,11 @@ mod tests {
         let item = parked.request.items.into_iter().next().expect("one item");
 
         registry_for_resolve
-            .resolve(&decision_id, ApprovalDecision::Approved.into())
+            .resolve(
+                &decision_id,
+                crate::hitl::ApprovalAuthority::Conversational,
+                ApprovalDecision::Approved.into(),
+            )
             .await
             .expect("resolve");
 

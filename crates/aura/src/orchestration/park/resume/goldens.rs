@@ -179,6 +179,7 @@ fn world() -> World {
             timeout: Duration::from_secs(3600),
         }),
         park_enabled: true,
+        park_ttl: aura_config::ParkTtl::default(),
     })
 }
 
@@ -330,7 +331,11 @@ async fn register_decided(world: &World) {
     register_undecided(world).await;
     world
         .registry
-        .resolve(&decision(), ApprovalDecision::Approved.into())
+        .resolve(
+            &decision(),
+            crate::hitl::ApprovalAuthority::Conversational,
+            ApprovalDecision::Approved.into(),
+        )
         .await
         .expect("record the approval");
 }
@@ -344,7 +349,11 @@ async fn register_decided_b(world: &World) {
         .expect("register node B's approval");
     world
         .registry
-        .resolve(&decision_b(), ApprovalDecision::Approved.into())
+        .resolve(
+            &decision_b(),
+            crate::hitl::ApprovalAuthority::Conversational,
+            ApprovalDecision::Approved.into(),
+        )
         .await
         .expect("record node B's approval");
 }
@@ -356,6 +365,7 @@ async fn register_denied(world: &World) {
         .registry
         .resolve(
             &decision(),
+            crate::hitl::ApprovalAuthority::Conversational,
             ApprovalDecision::Denied {
                 reason: Some(DENIAL_REASON.to_string()),
             }
@@ -384,7 +394,11 @@ async fn register_decided_duplicate_pair(world: &World) {
     for id in [decision(), decision_2()] {
         world
             .registry
-            .resolve(&id, ApprovalDecision::Approved.into())
+            .resolve(
+                &id,
+                crate::hitl::ApprovalAuthority::Conversational,
+                ApprovalDecision::Approved.into(),
+            )
             .await
             .expect("record the duplicate-pair approval");
     }
@@ -414,12 +428,20 @@ async fn register_decided_pivot_pair(
         .expect("register the pivot pair's second approval");
     world
         .registry
-        .resolve(&decision(), first.into())
+        .resolve(
+            &decision(),
+            crate::hitl::ApprovalAuthority::Conversational,
+            first.into(),
+        )
         .await
         .expect("record the pivot pair's first decision");
     world
         .registry
-        .resolve(&decision_pivot_2(), second.into())
+        .resolve(
+            &decision_pivot_2(),
+            crate::hitl::ApprovalAuthority::Conversational,
+            second.into(),
+        )
         .await
         .expect("record the pivot pair's second decision");
 }
@@ -434,6 +456,7 @@ async fn register_duplicate_pair_second_without_identity(world: &World) {
         .registry
         .resolve(
             &decision(),
+            crate::hitl::ApprovalAuthority::Conversational,
             ResolvedDecision::approved(Some(crate::approver_headers::tests::captured_overrides(
                 "x-forwarded-user",
                 "tok",
@@ -443,7 +466,11 @@ async fn register_duplicate_pair_second_without_identity(world: &World) {
         .expect("record the first duplicate's approval with identity");
     world
         .registry
-        .resolve(&decision_2(), ApprovalDecision::Approved.into())
+        .resolve(
+            &decision_2(),
+            crate::hitl::ApprovalAuthority::Conversational,
+            ApprovalDecision::Approved.into(),
+        )
         .await
         .expect("record the second duplicate's approval without identity");
 }
@@ -2053,7 +2080,11 @@ async fn consumed_subset_re_park_preserves_the_sibling_and_completes_on_the_seco
 
     world
         .registry
-        .resolve(&fresh_decision, ApprovalDecision::Approved.into())
+        .resolve(
+            &fresh_decision,
+            crate::hitl::ApprovalAuthority::Conversational,
+            ApprovalDecision::Approved.into(),
+        )
         .await
         .expect("record the fresh approval");
 
@@ -2268,7 +2299,11 @@ async fn post_substitution_new_call_re_parks_through_the_live_arm_not_a_strict_m
 
     world
         .registry
-        .resolve(&fresh_decision, ApprovalDecision::Approved.into())
+        .resolve(
+            &fresh_decision,
+            crate::hitl::ApprovalAuthority::Conversational,
+            ApprovalDecision::Approved.into(),
+        )
         .await
         .expect("record the fresh approval");
     install_worker_overrides(vec![
@@ -3114,7 +3149,11 @@ async fn same_key_duplicate_calls_execute_once_each_and_a_re_park_removes_both_c
 
     world
         .registry
-        .resolve(&fresh_decision, ApprovalDecision::Approved.into())
+        .resolve(
+            &fresh_decision,
+            crate::hitl::ApprovalAuthority::Conversational,
+            ApprovalDecision::Approved.into(),
+        )
         .await
         .expect("record the fresh approval");
     install_worker_overrides(vec![
@@ -4546,7 +4585,11 @@ async fn an_early_re_park_publishes_the_drive_loops_new_failures() {
     // once, under the resumed iteration.
     world
         .registry
-        .resolve(&fresh_decision, ApprovalDecision::Approved.into())
+        .resolve(
+            &fresh_decision,
+            crate::hitl::ApprovalAuthority::Conversational,
+            ApprovalDecision::Approved.into(),
+        )
         .await
         .expect("record the fresh approval");
     install_worker_overrides(vec![WorkerOverride {

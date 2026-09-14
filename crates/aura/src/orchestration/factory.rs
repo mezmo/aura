@@ -18,7 +18,8 @@ use crate::streaming::StreamingAgent;
 use super::orchestrator::{
     Orchestrator, STREAM_CHUNK_SIZE, spawn_timeout_watcher, spawn_tool_event_forwarder,
 };
-use super::park::resume::ResumeGrant;
+use super::park::resume::{ResumeClaimTable, ResumeGrant};
+use std::sync::Arc;
 
 /// Zero-state wrapper that implements `StreamingAgent` for orchestration mode.
 ///
@@ -26,6 +27,12 @@ use super::park::resume::ResumeGrant;
 /// allocation and ensure MCP progress notifications route correctly.
 pub struct OrchestratorFactory {
     agent_config: AgentRuntimeConfig,
+    /// The shared run-reservation table a park-enabled deployment injects:
+    /// the initial producer reserves its persistence-bound run id through
+    /// this table immediately after orchestrator construction, and its
+    /// supervisor owns that reservation until shutdown. `None` on a factory
+    /// that never parks.
+    reservations: Option<Arc<ResumeClaimTable>>,
 }
 
 /// A run's cancellation, and the signal that its task ended.
@@ -65,7 +72,23 @@ fn final_response(
 
 impl OrchestratorFactory {
     pub fn new(agent_config: AgentRuntimeConfig) -> Self {
-        Self { agent_config }
+        Self {
+            agent_config,
+            reservations: None,
+        }
+    }
+
+    /// Inject the shared reservation table (park-enabled deployments).
+    #[must_use]
+    pub fn with_reservation_table(mut self, table: Arc<ResumeClaimTable>) -> Self {
+        self.reservations = Some(table);
+        self
+    }
+
+    /// The shared reservation table, when this deployment's factories park.
+    #[must_use]
+    pub fn reservation_table(&self) -> Option<&Arc<ResumeClaimTable>> {
+        self.reservations.as_ref()
     }
 
     /// Resume one granted run into the normal orchestration stream:

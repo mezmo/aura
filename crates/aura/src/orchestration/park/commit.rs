@@ -28,7 +28,18 @@ pub(crate) struct ParkCommitInputs<'a> {
     pub memory_dir: &'a str,
     pub config: &'a AgentRuntimeConfig,
     /// Decision window stamped on a document with no surviving ticket.
+    /// Interim bridge input: E5's publication-transaction stamp replaces it.
     pub decision_window: std::time::Duration,
+    /// The validated retention age (`[hitl.park].park_ttl`), projected from
+    /// the runtime HITL config. The E5 stamp computes
+    /// `retention_expires_at` from the publication timestamp plus this age
+    /// — one timestamp source for the persisted deadline and the terminal
+    /// event.
+    #[expect(
+        dead_code,
+        reason = "read by the E5 publication-transaction stamp that replaces the interim bridge"
+    )]
+    pub park_ttl: aura_config::ParkTtl,
     /// Hex sha256 of the bound identity header's value, stamped into the
     /// document the resume side compares against; `None` when identity
     /// binding is not configured. A re-park passes the checkpoint's stored
@@ -140,6 +151,9 @@ pub(crate) async fn commit_from_run_state(
         memory_dir,
         config,
         decision_window,
+        // Consumed by the E5 stamp (`from_publication`); the interim bridge
+        // below still derives the deadline from the surviving tickets.
+        park_ttl: _,
         identity_hash,
     } = inputs;
 
@@ -533,7 +547,11 @@ mod tests {
             .await
             .unwrap();
         registry
-            .resolve(&decided, crate::hitl::ApprovalDecision::Approved.into())
+            .resolve(
+                &decided,
+                ApprovalAuthority::Conversational,
+                crate::hitl::ApprovalDecision::Approved.into(),
+            )
             .await
             .unwrap();
         registry.remove(&removed).await;
@@ -631,7 +649,11 @@ mod tests {
             .unwrap();
         // The decision wins the race against the park commit.
         registry
-            .resolve(&decided, crate::hitl::ApprovalDecision::Approved.into())
+            .resolve(
+                &decided,
+                ApprovalAuthority::Conversational,
+                crate::hitl::ApprovalDecision::Approved.into(),
+            )
             .await
             .unwrap();
 
@@ -746,7 +768,11 @@ mod tests {
             .await
             .unwrap();
         registry
-            .resolve(&decided, crate::hitl::ApprovalDecision::Approved.into())
+            .resolve(
+                &decided,
+                ApprovalAuthority::Conversational,
+                crate::hitl::ApprovalDecision::Approved.into(),
+            )
             .await
             .unwrap();
 
@@ -866,7 +892,11 @@ mod tests {
 
         assert_eq!(
             registry
-                .resolve(&ticket, crate::hitl::ApprovalDecision::Approved.into())
+                .resolve(
+                    &ticket,
+                    ApprovalAuthority::Conversational,
+                    crate::hitl::ApprovalDecision::Approved.into()
+                )
                 .await,
             Err(ResolveError::NotFound),
         );
@@ -885,6 +915,7 @@ mod tests {
                         timeout: Duration::from_secs(120),
                     }),
                     park_enabled: true,
+                    park_ttl: aura_config::ParkTtl::default(),
                 }),
                 ..crate::config::AgentRuntimeConfig::default()
             }
@@ -941,6 +972,7 @@ mod tests {
                         }
                     }),
                     park_enabled: true,
+                    park_ttl: aura_config::ParkTtl::default(),
                 }),
                 ..crate::config::AgentRuntimeConfig::default()
             }

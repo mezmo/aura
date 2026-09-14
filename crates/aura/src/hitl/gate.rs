@@ -2121,7 +2121,11 @@ mod tests {
 
             let payload_id = payload_decision_id(&mut events).await;
             registry
-                .resolve(&payload_id, ApprovalDecision::Approved.into())
+                .resolve(
+                    &payload_id,
+                    ApprovalAuthority::Conversational,
+                    ApprovalDecision::Approved.into(),
+                )
                 .await
                 .expect("parked approval resolves");
             call.await
@@ -2258,7 +2262,11 @@ mod tests {
                 tokio::join!(tool.call(json!({ "namespace": "prod" })), async {
                     let id = payload_decision_id(&mut events).await;
                     registry
-                        .resolve(&id, ApprovalDecision::Approved.into())
+                        .resolve(
+                            &id,
+                            ApprovalAuthority::Conversational,
+                            ApprovalDecision::Approved.into(),
+                        )
                         .await
                         .expect("parked approval resolves");
                     id

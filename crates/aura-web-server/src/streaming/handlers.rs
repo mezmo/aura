@@ -1506,7 +1506,7 @@ fn handle_orchestrator_event(
             OrchestrationStreamEvent::run_parked(
                 run_id,
                 decision_ids.clone(),
-                retention_expires_at,
+                *retention_expires_at,
                 *iteration,
                 event_context,
             )

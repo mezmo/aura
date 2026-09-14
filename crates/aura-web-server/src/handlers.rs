@@ -686,7 +686,7 @@ pub async fn execute_completion(
         tools_json,
         message_count: config.message_count,
         response_content: config.response_content,
-        system_prompt: streaming_agent.system_prompt().map(str::to_string),
+        system_prompt: callback_agent.system_prompt().map(str::to_string),
         orchestration_enabled,
     };
     otel_ctx.record_input();
@@ -1365,10 +1365,14 @@ pub async fn resolve_approval(
     };
     let decision = aura::hitl::ApprovalDecision::from(body);
     // The conversational ingress has no identity source: the decision
-    // resolves uncaptured.
+    // resolves uncaptured, under the conversational authority.
     match state
         .pending_approvals
-        .resolve(&decision_id, aura::hitl::ResolvedDecision::from(decision))
+        .resolve(
+            &decision_id,
+            aura::hitl::ApprovalAuthority::Conversational,
+            aura::hitl::ResolvedDecision::from(decision),
+        )
         .await
     {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
@@ -1725,13 +1729,40 @@ fn outcome_pair_result_ids(turn: &aura::Message) -> Option<Vec<&str>> {
 
 /// Project an evaluation refusal to its HTTP answer: a detail-less 404 for
 /// the two not-found rows, the one 409 shape for conflict rows, and the
-/// shared error envelope for faults.
+/// typed fault rows. The typed rows render their fixed client codes —
+/// `reify_failed` for corrupt/internal, `reify_unavailable` for known
+/// pre-execution I/O availability failures — and carry no diagnostic
+/// detail in the response; the diagnostic logs server-side.
 fn refusal_response(refusal: ResumeRefusal) -> Response {
     match refusal {
         ResumeRefusal::DocumentAbsent | ResumeRefusal::IdentityMismatch => {
             StatusCode::NOT_FOUND.into_response()
         }
         ResumeRefusal::Conflict(row) => (StatusCode::CONFLICT, Json(row)).into_response(),
+        ResumeRefusal::InvalidEvidence(diagnostic) => {
+            tracing::error!("resume refused: invalid evidence: {diagnostic}");
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the paused run could not be restored",
+                "reify_failed",
+            )
+        }
+        ResumeRefusal::Unavailable(diagnostic) => {
+            tracing::warn!("resume refused: approval storage unavailable: {diagnostic}");
+            error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "approval storage is temporarily unavailable; retry the resume",
+                "reify_unavailable",
+            )
+        }
+        ResumeRefusal::Internal(diagnostic) => {
+            tracing::error!("resume refused: internal fault: {diagnostic}");
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the paused run could not be restored",
+                "reify_failed",
+            )
+        }
         ResumeRefusal::Fault(diagnostic) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             diagnostic.to_string(),
