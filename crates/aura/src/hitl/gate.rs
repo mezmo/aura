@@ -13,7 +13,7 @@ use rig::tool::ToolError;
 use serde_json::Value;
 
 use super::decision::{AgentScope, ApprovalOrigin, DecisionId};
-use super::outcome::ApprovalAuthority;
+use super::outcome::{AddressedApproval, ApprovalAuthority};
 use super::protocol::{ApprovalItem, ApprovalRequest, PROTOCOL_VERSION};
 use super::registry::{AcknowledgmentState, ParkedApproval, PendingApprovals};
 use super::route::{ApprovalError, AskMode, DecisionRoute, GateDecision};
@@ -599,7 +599,7 @@ impl ToolWrapper for HitlApprovalWrapper {
                 ));
             };
             match recorded.take(&CallKey::new(task_id, &ctx.tool_name, args)) {
-                Some(resolved) => return recorded_pre_call(&self.route, resolved),
+                Some(outcome) => return recorded_pre_call(&self.route, outcome),
                 // A continuation invocation that misses is a resume fault,
                 // never a fresh park: the recorded call no longer matches what
                 // the chain produced. Fail the call closed and let the resume
@@ -685,19 +685,21 @@ fn denial_outcome(reason: Option<String>) -> PreCallOutcome {
     }
 }
 
-/// Map a recorded decision to a pre-call outcome — the same surfaces the live
+/// Map a recorded outcome to a pre-call outcome — the same surfaces the live
 /// gate produces. An approved call re-executes under its recorded identity,
 /// riding the same `Proceed.overrides` apply point the sync gate captures
 /// into; when the route's identity mapping demands identity and the recorded
 /// approval carries none (the poll-200 capture failed closed), reify blocks
 /// the approved execution rather than sending it under the requester's
-/// credentials.
+/// credentials. A durable timeout is terminal for its call and feeds the
+/// EXACT shared [`TerminalGateDecision::TimedOut`] mapping the live route
+/// uses — never a fabricated denial.
 fn recorded_pre_call(
     route: &DecisionRoute,
-    resolved: super::decision::ResolvedDecision,
+    outcome: AddressedApproval,
 ) -> Result<PreCallOutcome, ToolError> {
-    match resolved {
-        super::decision::ResolvedDecision::Approved { identity } => {
+    match outcome {
+        AddressedApproval::Decided(super::decision::ResolvedDecision::Approved { identity }) => {
             if identity.is_none() && route.requires_identity() {
                 return Err(ToolError::ToolCallError(
                     "resume mismatch: approved call is missing required approver identity"
@@ -709,7 +711,12 @@ fn recorded_pre_call(
                 overrides: identity,
             })
         }
-        super::decision::ResolvedDecision::Denied { reason } => Ok(denial_outcome(reason)),
+        AddressedApproval::Decided(super::decision::ResolvedDecision::Denied { reason }) => {
+            Ok(denial_outcome(reason))
+        }
+        AddressedApproval::TimedOut { .. } => {
+            approval_result_to_pre_call(Ok(TerminalGateDecision::TimedOut))
+        }
     }
 }
 
@@ -1660,7 +1667,13 @@ mod tests {
         use std::time::Duration;
 
         use super::*;
-        use crate::hitl::{ApprovalDecision, ResolvedDecision};
+        use crate::hitl::{AddressedApproval, ApprovalDecision, ResolvedDecision};
+
+        /// Wrap a recorded decision as the addressed outcome the consult
+        /// queue carries.
+        fn decided(decision: ResolvedDecision) -> AddressedApproval {
+            AddressedApproval::Decided(decision)
+        }
 
         /// A route whose webhook is unreachable, so a fall-through to the
         /// route fails closed rather than hanging. A recorded hit
@@ -1752,10 +1765,10 @@ mod tests {
             let args = serde_json::json!({"namespace": "prod"});
             recorded.push(
                 CallKey::new(1, "kubectl_apply", &args),
-                ResolvedDecision::approved(Some(identity(&[(
+                decided(ResolvedDecision::approved(Some(identity(&[(
                     "x-forwarded-user",
                     "approver-alice",
-                )]))),
+                )])))),
             );
 
             let gate = recorded_gate(recorded, identity_route());
@@ -1786,7 +1799,7 @@ mod tests {
             let args = serde_json::json!({"namespace": "prod"});
             recorded.push(
                 CallKey::new(1, "kubectl_apply", &args),
-                ResolvedDecision::approved(None),
+                decided(ResolvedDecision::approved(None)),
             );
 
             let gate = recorded_gate(recorded, identity_route());
@@ -1815,7 +1828,7 @@ mod tests {
             let args = serde_json::json!({"namespace": "prod"});
             recorded.push(
                 CallKey::new(1, "kubectl_apply", &args),
-                ResolvedDecision::approved(None),
+                decided(ResolvedDecision::approved(None)),
             );
 
             let gate = recorded_gate(recorded, discard_route());
@@ -1834,7 +1847,7 @@ mod tests {
             let args = serde_json::json!({"namespace": "prod"});
             recorded.push(
                 CallKey::new(1, "kubectl_apply", &args),
-                ApprovalDecision::Approved.into(),
+                decided(ApprovalDecision::Approved.into()),
             );
 
             let gate = recorded_gate(recorded, discard_route());
@@ -1855,10 +1868,12 @@ mod tests {
             let args = serde_json::json!({"namespace": "prod"});
             recorded.push(
                 CallKey::new(1, "kubectl_apply", &args),
-                ApprovalDecision::Denied {
-                    reason: Some("too risky".to_string()),
-                }
-                .into(),
+                decided(
+                    ApprovalDecision::Denied {
+                        reason: Some("too risky".to_string()),
+                    }
+                    .into(),
+                ),
             );
 
             let gate = recorded_gate(recorded, discard_route());
