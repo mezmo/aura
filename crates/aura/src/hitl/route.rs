@@ -1202,9 +1202,12 @@ impl WebhookClient {
     /// `{ "approved": bool, "reason": ... }` shape; pending is
     /// status-code-carried (207), and any 200 body outside the shape keeps
     /// the caller polling (the latter logs a warn).
+    ///
+    /// `_row_headers` is reserved for the row's own egress headers; currently unused.
     pub(crate) async fn poll_decision(
         &self,
         decision_id: DecisionId,
+        _row_headers: Option<&HeaderMap>,
     ) -> Result<PollOutcome, ApprovalError> {
         let Some(poll) = &self.poll else {
             return Err(ApprovalError::Misconfigured(
@@ -3338,7 +3341,7 @@ mod tests {
             let client =
                 loopback_poll_client(&url, EgressSigning::Disabled, &url, Duration::from_secs(5));
             let outcome = client
-                .poll_decision(DecisionId::generate())
+                .poll_decision(DecisionId::generate(), None)
                 .await
                 .expect("a 404 must not fault");
             assert!(matches!(outcome, PollOutcome::NotYet), "got {outcome:?}");
@@ -3350,7 +3353,7 @@ mod tests {
             let client =
                 loopback_poll_client(&url, EgressSigning::Disabled, &url, Duration::from_secs(5));
             let err = client
-                .poll_decision(DecisionId::generate())
+                .poll_decision(DecisionId::generate(), None)
                 .await
                 .expect_err("a 204 must fault as a channel error");
             assert!(
@@ -3380,7 +3383,7 @@ mod tests {
                 Duration::from_secs(5),
             );
             let outcome = client
-                .poll_decision(decision_id)
+                .poll_decision(decision_id, None)
                 .await
                 .expect("a signed poll of a decided approval must resolve");
             match outcome {
@@ -3447,7 +3450,7 @@ mod tests {
                 Duration::from_secs(5),
             );
             let outcome = client
-                .poll_decision(decision_id)
+                .poll_decision(decision_id, None)
                 .await
                 .expect("an out-of-envelope body must not fault");
             assert!(
@@ -3466,7 +3469,7 @@ mod tests {
             let client =
                 loopback_poll_client(&url, EgressSigning::Disabled, &url, Duration::from_secs(5));
             let outcome = client
-                .poll_decision(DecisionId::generate())
+                .poll_decision(DecisionId::generate(), None)
                 .await
                 .expect("a 207 pending must not fault");
             assert!(
@@ -3484,7 +3487,7 @@ mod tests {
             let client =
                 loopback_poll_client(&url, EgressSigning::Disabled, &url, Duration::from_secs(5));
             let outcome = client
-                .poll_decision(DecisionId::generate())
+                .poll_decision(DecisionId::generate(), None)
                 .await
                 .expect("an approved body must resolve");
             assert!(
@@ -3512,7 +3515,7 @@ mod tests {
             let client =
                 loopback_poll_client(&url, EgressSigning::Disabled, &url, Duration::from_secs(5));
             let outcome = client
-                .poll_decision(DecisionId::generate())
+                .poll_decision(DecisionId::generate(), None)
                 .await
                 .expect("a denied body must resolve");
             match outcome {
@@ -3538,7 +3541,7 @@ mod tests {
             let client =
                 loopback_poll_client(&url, EgressSigning::Disabled, &url, Duration::from_secs(5));
             let outcome = client
-                .poll_decision(DecisionId::generate())
+                .poll_decision(DecisionId::generate(), None)
                 .await
                 .expect("an out-of-shape body must not fault");
             assert!(
@@ -3593,7 +3596,7 @@ mod tests {
                 Duration::from_secs(5),
             );
             let err = client
-                .poll_decision(DecisionId::generate())
+                .poll_decision(DecisionId::generate(), None)
                 .await
                 .expect_err("an unsigned 200 decision must not be trusted");
             assert!(
@@ -3612,7 +3615,7 @@ mod tests {
             let client =
                 loopback_poll_client(&url, EgressSigning::Disabled, &url, Duration::from_secs(5));
             match client
-                .poll_decision(DecisionId::generate())
+                .poll_decision(DecisionId::generate(), None)
                 .await
                 .expect("an unsigned poll of a decided approval must resolve")
             {
@@ -3632,7 +3635,7 @@ mod tests {
                 Duration::from_secs(5),
             );
             let outcome = garbage_client
-                .poll_decision(DecisionId::generate())
+                .poll_decision(DecisionId::generate(), None)
                 .await
                 .expect("a garbage body must not fault in unsigned mode");
             assert!(
@@ -3740,7 +3743,7 @@ mod tests {
                 None,
             );
             let outcome = webhook_client_of(&runtime)
-                .poll_decision(DecisionId::generate())
+                .poll_decision(DecisionId::generate(), None)
                 .await
                 .expect("the resolved client must poll the override url");
             assert!(matches!(outcome, PollOutcome::NotYet), "got {outcome:?}");
@@ -3767,7 +3770,7 @@ mod tests {
                 None,
             );
             let outcome = webhook_client_of(&runtime)
-                .poll_decision(DecisionId::generate())
+                .poll_decision(DecisionId::generate(), None)
                 .await
                 .expect("the resolved client must poll the route url");
             assert!(matches!(outcome, PollOutcome::NotYet), "got {outcome:?}");

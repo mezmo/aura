@@ -7,9 +7,11 @@ stays green. Two narrow ACTIVE classification changes ride the surface
 (present since the REPAIR-2/3 error taxonomy, disclosed for the owner): an
 interim claim-rename failure now renders 503 `reify_unavailable` (was an
 undifferentiated 500-class Fault row carrying its diagnostic), and a
-blocking-task join failure renders the safe 500 `reify_failed` row — the
-dispatch contract's client-failure classification, not new behavior. Every
-other interim keeps admission/rename/rollback ordering identical.
+blocking-task join failure renders the safe 500 `reify_failed` row. Both are
+observable on the wire and await Mike's classification keep/defer ruling at
+U(surface); this header previously called them "not new behavior", which was
+misleading; corrected 2026-09-15. Every other interim keeps
+admission/rename/rollback ordering identical.
 
 Contract (REPAIR-2 corrected the pointer):
 `/Users/mshearer/workspace/aura-session-docs/boards/aura-orchestration-mode/docs/board/plans/2026-09-14-park-reify-dispatch.md`
@@ -66,7 +68,8 @@ Present outcome and a reservation-owning carrier, and the isolated
 | `ReservedEvaluation` + `convert_reserved` (holes, REPAIR-2 F2) | `park/resume/evaluate.rs` | The ordered resume's internal carrier (reservation + re-read checkpoint) and the CONSUMING step-6 transition: the same reservation becomes the grant's fence with a lease-holding rename tail and no ownerless gap. Dropping the carrier before conversion releases the reservation with no execution | E4 |
 | `ResumeClaimTable::rename_back_under_reservation` (hole, REPAIR-2 F2) | `park/resume/claim.rs` | Step 3's rename-back runs fenced by the held reservation: the blocking tail holds a lease reference through completion (the pre-reservation `rename_back_to_parked` stays only until E4's ordered evaluation replaces it) | E4 |
 | `ResumeGrant.reservation` + `.scope` (REPAIR-2 F2; REPAIR-3 G2) | `park/resume/evaluate.rs` | The grant owns the run's RESERVATION lease AND its ONE execution scope, established at conversion (`RunExecutionScope::new` runs once per grant; the interim `authorize` assembly establishes it the same way): single-use, non-cloneable, and `execution_scope()` returns a clone of that same `Arc` — never a fresh token or tracker — so the supervisor, driver, contexts, and guard share one cancellation and drain state | E4, S3/S4 |
-| `run_segment_borrowed` (hole, REPAIR-2 F3) | `park/resume/evaluate.rs` | The supervisor's borrowed-grant segment seam: the supervisor retains grant ownership across cancellation and never moves the grant into a cancellable select arm | S4 |
+| `run_segment_borrowed` (hole, REPAIR-2 F3; signature amended 2026-09-15) | `park/resume/evaluate.rs` | The supervisor's borrowed-grant segment seam: the supervisor retains grant ownership across cancellation and never moves the grant into a cancellable select arm. Since the 2026-09-15 alignment amendment the signature is stream-shaped; beside grant/config/headers it takes the existing event sender (`mpsc::Sender<Result<StreamItem, StreamError>>`); the caller's shared `UsageState`; `outer_budget: Option<Duration>`, projected by the factory from its timeout via the normal `(!timeout.is_zero()).then_some(timeout)` convention and received by the resumed coordinator. It returns `Result<ResumeStreamEnd, SegmentError>`. The driver forwards normal events only, with no duplicate final of its own; configured visibility/buffering is preserved (not every raw worker item must stream). Cancellation is the grant's one execution scope (`grant.execution_scope()`), the sole cancellation path; no second token parameter exists | S3 (factory projection), S4 (driver) |
+| `ResumeStreamEnd` (declared 2026-09-15) | `park/resume/evaluate.rs` | The streamed segment's terminal bookkeeping is exactly two-valued: `Completed { final_answer }` hands the final answer to the normal factory finalization (the driver never emits a duplicate final), and `Reparked` reports a fresh park: the publication owner emits `RunParked` once, while the supervisor still applies the normal terminal stream policy. Internal terminal bookkeeping, but nameable through the `orchestration` facade because `run_segment_borrowed` is public (re-exported beside it, same convention) | S4 (driver), S6 (atomic-path retirement) |
 | `OrchestratorFactory.reservations` (REPAIR-2 F3) | `aura/src/orchestration/factory.rs` | Shared reservation-table injection into the initial factory's configuration (`with_reservation_table`): the initial park-enabled producer reserves its persistence-bound run id through the shared table immediately after orchestrator construction | L4, E4 |
 | `ParkGuardMode` + `new_with_execution_scope` (REPAIR-2 F3; REPAIR-3 G2) | `aura/src/orchestration/park/guard.rs` | The resumed `ParkGuard` is checkpoint-preserving BY CONSTRUCTION and now carries its execution scope: the injection constructor takes MODE AND SCOPE together (a resumed guard cannot be assembled without the scope its deferred sweep and tracked tails spawn through — the same one `Arc` the supervisor holds). The unscoped `new` stays for the interim initial path the L3 fill rewires; `new_resumed` was replaced by the injection constructor | L3 |
 | `ToolCallContext::execution_scope` (+`with_execution_scope`) | `aura/src/tool_wrapper.rs` | The scope is optional by type: non-park calls keep unscoped behavior; no call site is injected yet | L2 |
@@ -80,6 +83,7 @@ Present outcome and a reservation-owning carrier, and the isolated
 | `CompletionInput` | `aura-web-server/src/handlers.rs` | The completion input is single-use and non-cloneable: a grant that could be duplicated would make the once-only rule a runtime check. Since REPAIR-5 `RequestSetup` owns it; since REPAIR-2 F10 the consumed match produces the common (stream, cancel, usage) tuple in BOTH arms | S2/S3 |
 | `RigBuilder::prepare_agent_config` (hole) | `aura/src/rig_builder.rs` | The production config projection for a request is fallible and distinct from the debug-only `get_agent_config`; resume never uses the debug path | S1 |
 | `OrchestratorFactory::resume_stream_with_timeout` (hole) | `aura/src/orchestration/factory.rs` | Resume enters through the factory, consuming the grant by value and returning the existing stream/cancel/usage tuple — no replayable adapter | S3 |
+| `StreamTermination` + `StreamOutcome` (declared 2026-09-15) | `aura-cli/src/api/stream.rs` | Client stream termination is a five-way distinction (`Done`, `EofWithoutDone`, `Malformed { detail }`, `StreamError { detail }`, `Cancelled`) carried beside the received `StreamResult` (today's accumulation, unchanged). The `detail` strings are diagnostic-only: consumers branch on the variant, never the text. DECLARED ONLY: the active parser's behavior is untouched and no old exit is rewritten as `Done`; no parallel parser/helper API exists beside the types | C2: explicitly an integration/signature-cutover unit that changes the existing `process_stream`/`process_sse_events` signatures and their backend/direct/HTTP/REPL/oneshot consumers; NOT a frozen rust-fill task |
 
 ## Visibility and seam table
 
@@ -97,12 +101,14 @@ Present outcome and a reservation-owning carrier, and the isolated
 | `aura_events::RetentionExpiresAt` | `aura-events::retention`, re-exported from `aura_events` | `pub` | every RunParked event surface (aura internal event, aura SSE mirror, aura-events DTO) |
 | `reserve`/`rename_back_under_reservation` | `ResumeClaimTable` | `pub` method / `pub(crate)` hole returning the typed `ClaimResumeFault` (REPAIR-3 G5) | E4 resume ordering |
 | `ReservedEvaluation`/`convert_reserved` | `park::resume::evaluate` | `pub(crate)` (declared for E4's in-crate ordered evaluation) | E4 |
-| `run_segment_borrowed` | `aura::orchestration` (pub through the resume facade list) | `pub` hole | S4 supervisor |
+| `run_segment_borrowed` | `aura::orchestration` (pub through the resume facade list) | `pub` hole (signature amended 2026-09-15; inputs: event sender; shared `UsageState`; `outer_budget: Option<Duration>`; output: `ResumeStreamEnd`) | S3 factory projection, S4 supervisor |
+| `ResumeStreamEnd` | `park::resume::evaluate`, re-exported through `park::resume` and `aura::orchestration` beside `run_segment_borrowed` (every type named in a re-exported signature is re-exported with it) | `pub` (declaration, no hole; the S4 todo returns it) | S4 driver, S6 retirement |
 | `OrchestratorFactory::with_reservation_table`/`reservation_table` | `orchestration::factory` | `pub` | L4/E4 wiring |
 | `CheckpointPresence`, `CleanupReservation`, `RunCleanupOutcome`, cleanup seams | `park::cleanup` | `pub(crate)`, `#![allow(dead_code)]` until E6/E8 | E6/E8 |
 | `CompletionInput` | `aura_web_server::handlers` | `pub` enum | owned by `RequestSetup`; both arms wired (F10): Chat = today's producer path, Resume = the factory's S3 hole |
 | `prepare_agent_config` | `RigBuilder` | `pub` | S1/S2 resume handler |
 | `resume_stream_with_timeout` | `OrchestratorFactory` | `pub` | S2/S3 completion entry |
+| `StreamTermination`, `StreamOutcome` | `aura_cli::api::stream` (`pub mod` chain from the crate root, so no dead-code marker is needed) | `pub` declarations, no hole | C2 cutover of `process_stream`/`process_sse_events` and the backend/direct/HTTP/REPL/oneshot consumers |
 
 ## Hole inventory
 
@@ -122,7 +128,7 @@ family per the contract's dispatch table:
 | 9 | `crates/aura/src/orchestration/park/lifetime.rs` `RunExecutionScope::drain` (REPAIR-2 F3) | L1 |
 | 10 | `crates/aura/src/orchestration/park/resume/claim.rs` `rename_back_under_reservation` (REPAIR-2 F2; REPAIR-3 G5 re-typed the fault to the classified `ClaimResumeFault`) | E4 |
 | 11 | `crates/aura/src/orchestration/park/resume/evaluate.rs` `convert_reserved` (REPAIR-2 F2; REPAIR-3 G2: the grant assembled here owns the reservation AND establishes its one execution scope) | E4 |
-| 12 | `crates/aura/src/orchestration/park/resume/evaluate.rs` `run_segment_borrowed` (REPAIR-2 F3) | S4 |
+| 12 | `crates/aura/src/orchestration/park/resume/evaluate.rs` `run_segment_borrowed` (REPAIR-2 F3; 2026-09-15 alignment amendment recut its SIGNATURE; inputs: event sender; shared `UsageState`; `outer_budget`; output: `ResumeStreamEnd`; the one `todo!()` body is unchanged) | S3/S4 |
 | 13 | `crates/aura/src/session_store/memory.rs` `retained_rows` (REPAIR-2 F11: unsupported-operation answer — no park parity) | E1/E2 |
 | 14 | `crates/aura/src/session_store/file.rs` `retained_rows` (REPAIR-2 F11) | E2 |
 | 15 | `crates/aura/src/session_store/fault_store.rs` `retained_rows` (REPAIR-2 F11) | E1/E2 |
@@ -133,6 +139,12 @@ family per the contract's dispatch table:
 | 20 | `crates/aura/src/rig_builder.rs` `RigBuilder::prepare_agent_config` | S1 |
 | 21 | `crates/aura/src/orchestration/factory.rs` `OrchestratorFactory::resume_stream_with_timeout` | S3 |
 | 22 | `crates/aura-web-server/src/handlers.rs` `build_completion_config` Resume arm (REPAIR-1/R-5; provider/model, otel query, and message count from the resumed run's factory) | S2/S3 |
+
+Count after the 2026-09-15 alignment amendments: still 22. The amendments
+declare types (`ResumeStreamEnd`, `StreamTermination`, `StreamOutcome`) and
+recut one existing hole's signature (`run_segment_borrowed`, #12) plus one
+private method's signature (`WebhookClient::poll_decision`, not a hole); no
+new `todo!()` body was added, so no new row is owed.
 
 Holes REMOVED by REPAIR-2:
 - `RunReservationLease::drop` (old #7): the per-reservation `ReservationInner`
@@ -416,5 +428,64 @@ completed board-owner-executed (logged on the card):
 - The header's identity claim is scoped: two narrow ACTIVE classification
   changes ride the surface (interim claim-rename failure renders 503
   `reify_unavailable`; blocking-task join failure renders 500
-  `reify_failed`), the contract's client-failure classification, not new
-  behavior. Recorded for Mike's visibility at U(surface).
+  `reify_failed`). These are observable client-visible classification
+  changes awaiting Mike's keep/defer ruling at U(surface); the earlier
+  "not new behavior" wording here was misleading and is corrected
+  alongside the header (2026-09-15). Recorded for Mike's visibility at
+  U(surface).
+
+## Alignment amendments (2026-09-15, surface-only; U(surface) still open)
+
+Mike approved alignment/code surface amendments only; no behavior
+activation. Four changes, all declaration/signature; the atomic driver and
+its callers are entirely unchanged until S4/S6:
+
+1. **`ResumeStreamEnd` + `run_segment_borrowed` recut** (owning units
+   S3/S4, with S6 retiring the atomic path). The enum is exactly
+   `Completed { final_answer: String } | Reparked`: `Completed` hands the
+   final answer to the normal factory finalization (the driver emits no
+   duplicate final) and `Reparked` reports a fresh park: the publication
+   owner emits `RunParked` once, and the supervisor still applies the
+   normal terminal stream policy. The hole's signature now takes, beside
+   grant/config/headers: the existing event sender
+   (`mpsc::Sender<Result<StreamItem, StreamError>>`); the caller's shared
+   `UsageState`; `outer_budget: Option<Duration>`. It returns
+   `Result<ResumeStreamEnd, SegmentError>`. The factory projects
+   `outer_budget` from its timeout by the normal
+   `(!timeout.is_zero()).then_some(timeout)` convention and the resumed
+   coordinator receives it; cancellation is `grant.execution_scope()`,
+   the sole cancellation path, and there is deliberately no second token
+   parameter. Normal configured visibility/buffering is preserved: not
+   every raw worker item must stream. Re-exported through `park::resume`
+   and `aura::orchestration` beside the driver (facade convention: every
+   type named in a re-exported signature travels with it). The `todo!()`
+   stands.
+2. **`StreamTermination` + `StreamOutcome` declared** in
+   `aura-cli/src/api/stream.rs` (owning unit C2). C2 is explicitly an
+   integration/signature-cutover unit: it changes the existing
+   `process_stream`/`process_sse_events` and their
+   backend/direct/HTTP/REPL/oneshot consumers, NOT a frozen rust-fill
+   task; declaring the types early only fixes the vocabulary. The active
+   parser is untouched, no old exit is rewritten as `Done`, `detail`
+   text is diagnostic-only, no `non_exhaustive` (no real need), and no
+   parallel parser/helper API was introduced. The types sit behind the
+   crate's `pub mod` chain, so no dead-code marker was needed.
+3. **`WebhookClient::poll_decision` gains `_row_headers:
+   Option<&HeaderMap>`** (owning unit H1 for the overlay; H2 for the
+   poller's row wiring). Intentionally ignored pending H1: H1/H2 later
+   use the existing header machinery (`notify`'s per-name overlay) and
+   the row's actual headers. Every caller passes `None` today: the
+   poller's tick read plus 13 in-file route.rs test call sites; those
+   test edits are mechanical signature conformance only, with assertions
+   unchanged. No overlay behavior was added ahead of U(surface).
+4. **Classification wording corrected** in this file's header and the
+   round-3 residue: the two ACTIVE classification changes are described
+   as observable and awaiting Mike's ruling at U(surface), replacing the
+   misleading "not new behavior" claim. No historical ledger content
+   unrelated to that claim was rewritten.
+
+Pending activation: every amendment above is inert until its owning fill
+unit lands behind U(surface). The atomic `run_segment` path, the
+orchestrator's atomic driver, the CLI parser loop, and the poller's
+behavior are byte-for-byte their pre-amendment selves apart from the
+declared names and the `None` arguments.

@@ -9,13 +9,16 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::config::AgentRuntimeConfig;
 use crate::hitl::{DecisionId, PendingApprovals};
+use crate::provider_agent::{StreamError, StreamItem};
 use crate::request_cancellation::RequestId;
+use crate::streaming_request_hook::UsageState;
 
 use super::super::RecordedDecisions;
 use super::super::commit::{cancel_run_approvals, config_fingerprint};
@@ -896,6 +899,25 @@ pub enum SegmentError {
     Continuation(Diagnostic),
 }
 
+/// One streamed resume segment's terminal bookkeeping: how the segment
+/// ended for the supervisor driving it through [`run_segment_borrowed`].
+/// Internal to the resumed execution's ownership chain, but nameable
+/// through the `orchestration` facade because that driver is public.
+#[derive(Debug, Clone)]
+pub enum ResumeStreamEnd {
+    /// The run completed within the segment; `final_answer` hands over to
+    /// the normal factory finalization — the driver emits no terminal of
+    /// its own.
+    Completed {
+        /// The run's final answer, for the normal factory finalization.
+        final_answer: String,
+    },
+    /// The segment ended in a fresh park: the publication owner emits
+    /// `RunParked` once, and the supervisor still applies the normal
+    /// terminal stream policy.
+    Reparked,
+}
+
 /// Execute one segment for a granted run: the decided approvals' next agent
 /// turns, until the run completes or a new approval-required call parks. The
 /// segment is atomic data — no streaming to the client mid-segment. The
@@ -909,11 +931,21 @@ pub async fn run_segment(
     crate::orchestration::Orchestrator::run_resume_segment(grant, config, headers).await
 }
 
-/// Drive one segment for a run the SUPERVISOR still owns: the borrowed
-/// form of [`run_segment`]. The supervisor retains the grant across
-/// cancellation — it never moves the grant into a cancellable select arm —
-/// so MCP shutdown, forwarder drain, and tracked-work joins complete under
-/// the grant's own fence before the reservation releases.
+/// Drive one segment for a run the supervisor still owns: the borrowed,
+/// stream-shaped form of [`run_segment`].
+///
+/// Events forward through `event_tx` — the same sender the normal
+/// completion path drives — and usage accumulates into the caller's
+/// shared `usage_state`, under the configured normal visibility and
+/// buffering. The driver emits no duplicate final: a completed segment
+/// hands the final answer to the normal factory finalization, and a
+/// re-park leaves `RunParked` to the publication owner. `outer_budget`
+/// is the resumed coordinator's outer request budget: the factory
+/// projects it from its timeout by the normal
+/// `(!timeout.is_zero()).then_some(timeout)` convention. Cancellation
+/// runs through the grant's one execution scope
+/// ([`ResumeGrant::execution_scope`]); it is the sole cancellation path,
+/// with no second token parameter.
 #[expect(
     unused_variables,
     reason = "todo!() body; filled by P45 wave fill units"
@@ -922,8 +954,13 @@ pub async fn run_segment_borrowed(
     grant: &ResumeGrant,
     config: &AgentRuntimeConfig,
     headers: &HashMap<String, String>,
-) -> Result<SegmentResult, SegmentError> {
+    event_tx: tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>,
+    usage_state: UsageState,
+    outer_budget: Option<Duration>,
+) -> Result<ResumeStreamEnd, SegmentError> {
     todo!(
-        "P45 wave fill unit S4: the borrowed-grant resume segment — the orchestrator drives the segment without taking grant ownership"
+        "P45 wave fill unit S4: the borrowed-grant resume segment — the orchestrator drives the \
+         segment without taking grant ownership, forwarding normal events to the caller's \
+         channel and ending in the stream-end bookkeeping"
     )
 }

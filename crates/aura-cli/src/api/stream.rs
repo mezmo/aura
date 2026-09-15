@@ -30,6 +30,44 @@ pub enum StreamResult {
     },
 }
 
+/// Why an SSE stream ended, distinguishing a completed response from
+/// every other exit.
+///
+/// The `detail` strings are diagnostic-only; consumers branch on the
+/// variant, never the text.
+#[derive(Debug, Clone)]
+pub enum StreamTermination {
+    /// The stream ended with the `[DONE]` sentinel after a completed
+    /// response.
+    Done,
+    /// The stream ended at EOF without ever receiving `[DONE]`.
+    EofWithoutDone,
+    /// A received event was malformed for the SSE/chat-completions
+    /// protocol.
+    Malformed {
+        /// Diagnostic-only description of the malformed input.
+        detail: String,
+    },
+    /// The transport surfaced a stream error.
+    StreamError {
+        /// Diagnostic-only rendering of the underlying transport error.
+        detail: String,
+    },
+    /// The user cancelled before the stream completed.
+    Cancelled,
+}
+
+/// The outcome of processing one stream: what the parser received before
+/// the stream ended, plus how the stream ended.
+#[derive(Debug)]
+pub struct StreamOutcome {
+    /// What was accumulated before the stream ended: a text response or
+    /// tool calls.
+    pub received: StreamResult,
+    /// How the stream ended.
+    pub termination: StreamTermination,
+}
+
 /// Poll an `AtomicBool` until it becomes `true`.
 async fn wait_for_cancel(flag: &AtomicBool) {
     while !flag.load(Ordering::Relaxed) {
