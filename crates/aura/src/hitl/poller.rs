@@ -140,7 +140,7 @@ impl PollReconciler {
             // receiver that holds the POST open delays its own row's
             // acknowledgment, never that row's status read, and a decided
             // row never re-posts its request.
-            match self.client.poll_decision(id).await {
+            match self.client.poll_decision(id, None).await {
                 Ok(PollOutcome::NotYet) => {}
                 Ok(PollOutcome::Decided {
                     decision,

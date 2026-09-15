@@ -95,8 +95,8 @@ pub use park::lifetime::{ReservationFault, RunExecutionScope, RunReservationLeas
 pub use park::resume::{
     BlockingEntry, ConflictCode, Diagnostic, EmptyBlocking, EmptySegment, MalformedId,
     NonEmptyBlocking, ParkedToolName, ResumeClaimTable, ResumeConflictRow, ResumeDocuments,
-    ResumeEvaluation, ResumeGrant, ResumeRefusal, ResumeRunId, ResumeSessionId, SegmentError,
-    SegmentResult, SegmentTurns, ValidatedResumePath, evaluate_resume, run_segment,
+    ResumeEvaluation, ResumeGrant, ResumeRefusal, ResumeRunId, ResumeSessionId, ResumeStreamEnd,
+    SegmentError, SegmentResult, SegmentTurns, ValidatedResumePath, evaluate_resume, run_segment,
     run_segment_borrowed,
 };
 // The sentinel leak guard drives the commit and the resuming document
