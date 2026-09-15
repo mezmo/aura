@@ -9,7 +9,7 @@
 // fingerprint stage's symmetry variant, the goldens'
 // TempDir cleanup handles, and the declared E4/S4 seams
 // (ReservedEvaluation, convert_reserved, rename_back_under_reservation,
-// run_segment_borrowed) whose fills wire them
+// run_segment_borrowed, ResumeStreamEnd) whose fills wire them
 
 pub(crate) mod claim;
 pub(crate) mod evaluate;
@@ -22,8 +22,9 @@ pub use claim::{
 };
 pub use evaluate::{
     BlockingEntry, ConflictCode, Diagnostic, EmptyBlocking, EmptySegment, NonEmptyBlocking,
-    ParkedToolName, ResumeConflictRow, ResumeEvaluation, ResumeGrant, ResumeRefusal, SegmentError,
-    SegmentResult, SegmentTurns, evaluate_resume, run_segment, run_segment_borrowed,
+    ParkedToolName, ResumeConflictRow, ResumeEvaluation, ResumeGrant, ResumeRefusal,
+    ResumeStreamEnd, SegmentError, SegmentResult, SegmentTurns, evaluate_resume, run_segment,
+    run_segment_borrowed,
 };
 // The ordered resume's internal carrier and consuming transition: consumed
 // by the E4 fill inside this crate only.
