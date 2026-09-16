@@ -880,6 +880,37 @@ mod tests {
             (url, rx)
         }
 
+        /// A two-shot scripted receiver: accepts two sequential POST
+        /// connections on one listener, replies the given status and body to
+        /// each, and forwards each captured request text to the channel
+        /// (the same-turn sibling test drives two gated asks through one
+        /// receiver).
+        async fn scripted_receiver_twice(
+            status: &'static str,
+            body: String,
+        ) -> (String, mpsc::Receiver<String>) {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let (tx, rx) = mpsc::channel(2);
+            tokio::spawn(async move {
+                for _ in 0..2 {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let captured = crate::hitl::read_full_request(&mut socket).await;
+                    let mut response = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n\
+                         content-length: {}\r\nconnection: close\r\n",
+                        body.len()
+                    );
+                    response.push_str("\r\n");
+                    response.push_str(&body);
+                    socket.write_all(response.as_bytes()).await.ok();
+                    socket.shutdown().await.ok();
+                    tx.send(captured).await.ok();
+                }
+            });
+            (url, rx)
+        }
+
         #[tokio::test]
         async fn register_error_fails_closed_with_no_cell_entry_and_no_event() {
             let request_id = format!("req_park_fail_{}", uuid::Uuid::new_v4().simple());
@@ -1192,6 +1223,466 @@ mod tests {
             assert!(rx.try_recv().is_err(), "exactly one POST");
         }
 
+        /// A 207 park registers through the bridge with the row the park
+        /// contract pins — and publishes NO attended Pending: the attended
+        /// conversational prompt must not fire on a webhook park (the
+        /// run-parked surface and approval links carry the operator side).
+        /// The gate-entry `Requested` stays.
+        #[tokio::test]
+        async fn gate_park_207_registration_emits_no_attended_pending() {
+            let request_id = format!("req_207_no_pending_{}", uuid::Uuid::new_v4().simple());
+            let mut events = crate::approval_event_broker::subscribe(&request_id).await;
+            let (url, mut rx) =
+                scripted_receiver("207 Multi-Status", vec![], String::new(), Duration::ZERO).await;
+            let store = Arc::new(crate::session_store::InMemoryApprovalStore::new());
+            let registry = PendingApprovals::with_backend(
+                store.clone(),
+                Arc::new(crate::session_store::InMemoryEventBus::new()),
+            );
+            let (_, route) = poll_route_with_mapping(
+                &registry,
+                Some(&req_headers(&[(
+                    "x-incoming-auth",
+                    "Bearer request-scoped",
+                )])),
+                Default::default(),
+                &url,
+            );
+            let cell = Arc::new(crate::orchestration::BlockedCell::default());
+            let gate = parked_gate(&registry, &route, &request_id, &cell);
+
+            let outcome = gate
+                .pre_call(
+                    &serde_json::json!({ "namespace": "prod" }),
+                    &ToolCallContext::new("kubectl_apply"),
+                )
+                .await
+                .expect("a 207 parks through the bridge");
+            assert_eq!(
+                outcome,
+                PreCallOutcome::ShortCircuit {
+                    output: super::PARK_SENTINEL.to_string()
+                },
+                "a parked call short-circuits with the inert sentinel"
+            );
+
+            cell.snapshot_if_pending(&[], &rig::completion::Message::user("results"));
+            let decision_id = match cell.outcome() {
+                crate::orchestration::CellOutcome::Blocked { pending } => pending[0].decision_id,
+                other => panic!("expected Blocked, got {other:?}"),
+            };
+            let parked = store
+                .get(&decision_id)
+                .await
+                .unwrap()
+                .expect("ticket parked");
+            assert_eq!(
+                parked.request.request_id, "run:0191e8c0-1111-7000-8000-000000000042",
+                "the parked row's request id is minted from the run owner"
+            );
+            assert_eq!(
+                parked.acknowledgment,
+                AcknowledgmentState::Acknowledged,
+                "the 207 is the receiver's ack: the row is born notified"
+            );
+
+            // Exactly one POST: the 207 is the ack, the reconciler never
+            // re-POSTs.
+            let captured = rx.recv().await.unwrap();
+            assert!(
+                captured.starts_with("POST "),
+                "the armed ask POSTs: {captured}"
+            );
+            assert!(rx.try_recv().is_err(), "exactly one POST");
+
+            // Drain the lifecycle stream until quiet: the gate-entry
+            // `Requested` must appear and the attended `Pending` must not —
+            // a webhook park never publishes the conversational prompt.
+            let mut requested = 0;
+            let mut attended_pending = 0;
+            loop {
+                match tokio::time::timeout(Duration::from_millis(150), events.recv()).await {
+                    Ok(Some(crate::approval_event_broker::ApprovalLifecycleEvent::Requested(
+                        _,
+                    ))) => requested += 1,
+                    Ok(Some(crate::approval_event_broker::ApprovalLifecycleEvent::Pending(_))) => {
+                        attended_pending += 1
+                    }
+                    Ok(Some(other)) => {
+                        panic!("unexpected approval event on a 207 park: {other:?}")
+                    }
+                    _ => break,
+                }
+            }
+            assert!(
+                requested >= 1,
+                "the 207 round trip publishes Requested at gate entry"
+            );
+            assert_eq!(
+                attended_pending, 0,
+                "a webhook park must not publish the attended ApprovalLifecycleEvent::Pending"
+            );
+
+            crate::approval_event_broker::unsubscribe(&request_id).await;
+        }
+
+        /// A park-armed invocation on the conversational route never
+        /// durable-parks: the conversational seam stays inline, so no
+        /// run-owner row and no blocked-cell entry may appear.
+        #[tokio::test]
+        async fn gate_park_armed_conversational_never_durable_parks() {
+            let request_id = format!("req_conv_no_park_{}", uuid::Uuid::new_v4().simple());
+            let mut events = crate::approval_event_broker::subscribe(&request_id).await;
+            let store = Arc::new(crate::session_store::InMemoryApprovalStore::new());
+            let registry = PendingApprovals::with_backend(
+                store.clone(),
+                Arc::new(crate::session_store::InMemoryEventBus::new()),
+            );
+            let route = conv_route_over(registry.clone(), Duration::from_secs(60));
+            let cell = Arc::new(crate::orchestration::BlockedCell::default());
+            let gate = parked_gate(&registry, &route, &request_id, &cell);
+
+            let handle = tokio::spawn(async move {
+                gate.pre_call(
+                    &serde_json::json!({ "namespace": "prod" }),
+                    &ToolCallContext::new("kubectl_apply"),
+                )
+                .await
+            });
+
+            // The direct park arm resolves quickly; poll a bounded window
+            // for either durable-park signal before giving up.
+            let run_owner = "run:0191e8c0-1111-7000-8000-000000000042";
+            let mut parked = false;
+            for _ in 0..50 {
+                if !cell.is_empty() {
+                    parked = true;
+                    break;
+                }
+                let rows = store.list_pending().await.unwrap();
+                if rows.iter().any(|row| row.request.request_id == run_owner) {
+                    parked = true;
+                    break;
+                }
+                // Keep the lifecycle channel drained: this test's subject is
+                // durable state, not the event stream.
+                let _ = events.try_recv();
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(
+                !parked,
+                "a park-armed conversational invocation must never durable-park: \
+                 no blocked-cell entry and no run-owner row may appear"
+            );
+
+            handle.abort();
+            crate::approval_event_broker::unsubscribe(&request_id).await;
+        }
+
+        /// A park-armed invocation on the single-agent scope asks the hold
+        /// (`response_type=sync`) round trip and never parks: an instant
+        /// machine approval proceeds in-request with no park document.
+        #[tokio::test]
+        async fn gate_park_armed_single_agent_asks_hold_and_never_parks() {
+            let (url, mut rx) = scripted_receiver(
+                "200 OK",
+                vec![],
+                r#"{"approved":true}"#.to_string(),
+                Duration::ZERO,
+            )
+            .await;
+            let store = Arc::new(crate::session_store::InMemoryApprovalStore::new());
+            let registry = PendingApprovals::with_backend(
+                store.clone(),
+                Arc::new(crate::session_store::InMemoryEventBus::new()),
+            );
+            let (_, route) = poll_route_with_mapping(&registry, None, Default::default(), &url);
+            let cell = Arc::new(crate::orchestration::BlockedCell::default());
+            let guard = ParkGuard::new(
+                registry.clone(),
+                "0191e8c0-1111-7000-8000-000000000042".to_string(),
+                "req-single-hold".to_string(),
+            );
+            let gate = HitlApprovalWrapper::new(
+                Arc::from([GlobPattern::new("kubectl_*").unwrap()]),
+                route,
+                AgentScope::Single { session_id: None },
+                "req-single-hold".to_string(),
+                "test-agent".to_string(),
+                "test-instance".to_string(),
+            )
+            .with_park(registry, cell.clone(), Arc::clone(&guard));
+
+            let outcome = gate
+                .pre_call(
+                    &serde_json::json!({ "namespace": "prod" }),
+                    &ToolCallContext::new("kubectl_apply"),
+                )
+                .await
+                .expect(
+                    "a park-armed single-agent invocation must ask the hold round trip, \
+                     never fail the park arm's worker-scope check",
+                );
+            assert_eq!(
+                outcome,
+                PreCallOutcome::Proceed { overrides: None },
+                "an instant machine approval on the hold ask proceeds in-request"
+            );
+            assert!(
+                store.list_pending().await.unwrap().is_empty(),
+                "a park-armed single-agent invocation must never durable-park"
+            );
+            assert!(
+                cell.is_empty(),
+                "a park-armed single-agent invocation must not append a blocked-cell entry"
+            );
+
+            let captured = rx.recv().await.unwrap();
+            assert!(
+                captured.starts_with("POST "),
+                "the hold ask POSTs: {captured}"
+            );
+            assert!(
+                captured.contains("response_type=sync"),
+                "the single-agent ask sends response_type=sync: {captured}"
+            );
+            assert!(rx.try_recv().is_err(), "exactly one POST");
+        }
+
+        /// A park-armed invocation on a hold-only (sync) webhook route asks
+        /// the hold (`response_type=sync`) round trip and never parks: the
+        /// route cannot park, so the park arm's park-capability error must
+        /// not fire on this shape.
+        #[tokio::test]
+        async fn gate_park_armed_hold_route_asks_hold_and_never_parks() {
+            let (url, mut rx) = scripted_receiver(
+                "200 OK",
+                vec![],
+                r#"{"approved":true}"#.to_string(),
+                Duration::ZERO,
+            )
+            .await;
+            let store = Arc::new(crate::session_store::InMemoryApprovalStore::new());
+            let registry = PendingApprovals::with_backend(
+                store.clone(),
+                Arc::new(crate::session_store::InMemoryEventBus::new()),
+            );
+            let (_, route) = hold_route_park_armed(&registry, &url);
+            let cell = Arc::new(crate::orchestration::BlockedCell::default());
+            let gate = parked_gate(&registry, &route, "req-hold-route", &cell);
+
+            let outcome = gate
+                .pre_call(
+                    &serde_json::json!({ "namespace": "prod" }),
+                    &ToolCallContext::new("kubectl_apply"),
+                )
+                .await
+                .expect(
+                    "a park-armed hold-route invocation must ask the hold round trip, \
+                     never fail the park arm's park-capability check",
+                );
+            assert_eq!(
+                outcome,
+                PreCallOutcome::Proceed { overrides: None },
+                "an instant machine approval on the hold ask proceeds in-request"
+            );
+            assert!(
+                store.list_pending().await.unwrap().is_empty(),
+                "a hold-only route must never durable-park, even with the park arm armed"
+            );
+            assert!(
+                cell.is_empty(),
+                "a hold-only route must not append a blocked-cell entry"
+            );
+
+            let captured = rx.recv().await.unwrap();
+            assert!(
+                captured.starts_with("POST "),
+                "the hold ask POSTs: {captured}"
+            );
+            assert!(
+                captured.contains("response_type=sync"),
+                "the hold-route ask sends response_type=sync: {captured}"
+            );
+            assert!(rx.try_recv().is_err(), "exactly one POST");
+        }
+
+        /// Two same-turn gated calls on the armed ask bridge into two
+        /// sibling registrations: each keeps its own decision id, and each
+        /// row is born notified under the run-owner request id.
+        #[tokio::test]
+        async fn gate_park_207_same_turn_sibling_registration() {
+            let (url, mut rx) = scripted_receiver_twice("207 Multi-Status", String::new()).await;
+            let store = Arc::new(crate::session_store::InMemoryApprovalStore::new());
+            let registry = PendingApprovals::with_backend(
+                store.clone(),
+                Arc::new(crate::session_store::InMemoryEventBus::new()),
+            );
+            let (_, route) = poll_route_with_mapping(
+                &registry,
+                Some(&req_headers(&[(
+                    "x-incoming-auth",
+                    "Bearer request-scoped",
+                )])),
+                Default::default(),
+                &url,
+            );
+            let cell = Arc::new(crate::orchestration::BlockedCell::default());
+            let gate = parked_gate(&registry, &route, "req-sibling-207", &cell);
+
+            let first = gate
+                .pre_call(
+                    &serde_json::json!({ "namespace": "prod" }),
+                    &ToolCallContext::new("kubectl_apply"),
+                )
+                .await
+                .expect("a 207 parks through the bridge");
+            let second = gate
+                .pre_call(
+                    &serde_json::json!({ "namespace": "stage" }),
+                    &ToolCallContext::new("kubectl_delete"),
+                )
+                .await
+                .expect("the same-turn sibling parks through the same bridge");
+            assert!(
+                matches!(first, PreCallOutcome::ShortCircuit { .. }),
+                "a parked call short-circuits with the inert sentinel"
+            );
+            assert!(
+                matches!(second, PreCallOutcome::ShortCircuit { .. }),
+                "a parked call short-circuits with the inert sentinel"
+            );
+
+            cell.snapshot_if_pending(&[], &rig::completion::Message::user("results"));
+            match cell.outcome() {
+                crate::orchestration::CellOutcome::Blocked { pending } => {
+                    assert_eq!(pending.len(), 2, "both same-turn gated calls are recorded");
+                    assert_eq!(
+                        pending[0].tool_name, "kubectl_apply",
+                        "cell entries keep the call order"
+                    );
+                    assert_eq!(
+                        pending[1].tool_name, "kubectl_delete",
+                        "cell entries keep the call order"
+                    );
+                    assert_ne!(
+                        pending[0].decision_id, pending[1].decision_id,
+                        "each gated call mints its own decision id"
+                    );
+                    for call in &pending {
+                        let parked = store
+                            .get(&call.decision_id)
+                            .await
+                            .unwrap()
+                            .expect("each sibling is parked");
+                        assert_eq!(
+                            parked.request.request_id, "run:0191e8c0-1111-7000-8000-000000000042",
+                            "each parked row's request id is minted from the run owner"
+                        );
+                        assert_eq!(
+                            parked.acknowledgment,
+                            AcknowledgmentState::Acknowledged,
+                            "the 207 is the receiver's ack: each row is born notified"
+                        );
+                    }
+                }
+                other => panic!("expected Blocked, got {other:?}"),
+            }
+
+            for _ in 0..2 {
+                let captured = rx.recv().await.unwrap();
+                assert!(
+                    captured.starts_with("POST "),
+                    "each gated call POSTs its own ask: {captured}"
+                );
+            }
+            assert!(
+                rx.try_recv().is_err(),
+                "exactly two POSTs: one per same-turn gated call"
+            );
+        }
+
+        /// The 207 bridge's registration is guarded like every park
+        /// registration: the run's guard learns the decision at
+        /// registration and sweeps the ticket when the run ends
+        /// unpublished.
+        #[tokio::test]
+        async fn gate_park_207_guard_learns_and_sweeps() {
+            let (url, mut rx) =
+                scripted_receiver("207 Multi-Status", vec![], String::new(), Duration::ZERO).await;
+            let store = Arc::new(crate::session_store::InMemoryApprovalStore::new());
+            let registry = PendingApprovals::with_backend(
+                store.clone(),
+                Arc::new(crate::session_store::InMemoryEventBus::new()),
+            );
+            let (_, route) = poll_route_with_mapping(
+                &registry,
+                Some(&req_headers(&[(
+                    "x-incoming-auth",
+                    "Bearer request-scoped",
+                )])),
+                Default::default(),
+                &url,
+            );
+            let cell = Arc::new(crate::orchestration::BlockedCell::default());
+            let guard = ParkGuard::new(
+                registry.clone(),
+                "0191e8c0-1111-7000-8000-000000000042".to_string(),
+                "req-guard-207".to_string(),
+            );
+            let gate = HitlApprovalWrapper::new(
+                Arc::from([GlobPattern::new("kubectl_*").unwrap()]),
+                route,
+                worker_scope(),
+                "req-guard-207".to_string(),
+                "test-agent".to_string(),
+                "test-instance".to_string(),
+            )
+            .with_park(registry, cell.clone(), Arc::clone(&guard));
+
+            let outcome = gate
+                .pre_call(
+                    &serde_json::json!({}),
+                    &ToolCallContext::new("kubectl_apply"),
+                )
+                .await
+                .expect("a 207 parks through the bridge");
+            assert!(
+                matches!(outcome, PreCallOutcome::ShortCircuit { .. }),
+                "a parked call short-circuits with the inert sentinel"
+            );
+            let decision_id = match cell.outcome() {
+                crate::orchestration::CellOutcome::Orphaned { pending } => pending[0].decision_id,
+                other => panic!("expected a parked call, got {other:?}"),
+            };
+            assert!(
+                store.get(&decision_id).await.unwrap().is_some(),
+                "the bridge's registration parks the ticket in the store"
+            );
+
+            // The run ends unpublished: the guard sweeps the ticket the
+            // bridge registered, without any record from the orchestrator.
+            drop(gate);
+            drop(guard);
+            for _ in 0..200 {
+                if store.get(&decision_id).await.unwrap().is_none() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            assert!(
+                store.get(&decision_id).await.unwrap().is_none(),
+                "the run's guard sweeps the bridge-registered ticket"
+            );
+
+            let captured = rx.recv().await.unwrap();
+            assert!(
+                captured.starts_with("POST "),
+                "the armed ask POSTs: {captured}"
+            );
+            assert!(rx.try_recv().is_err(), "exactly one POST");
+        }
+
         /// A poll webhook config with `headers_from_request`, built the
         /// production way with `req_headers` supplied by the caller.
         fn poll_route_with_mapping(
@@ -1238,6 +1729,44 @@ mod tests {
                 .iter()
                 .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
                 .collect()
+        }
+
+        /// A hold (sync) webhook route built the production way with the
+        /// park flag on: the anomalous runtime shape — a hold-only
+        /// (never-parking) webhook route whose gate nevertheless carries a
+        /// park arm. Sync delivery arms no poll settings, so the route
+        /// cannot park.
+        fn hold_route_park_armed(
+            registry: &PendingApprovals,
+            url: &str,
+        ) -> (
+            Arc<dyn crate::session_store::ApprovalStore>,
+            Arc<DecisionRoute>,
+        ) {
+            let store: Arc<dyn crate::session_store::ApprovalStore> =
+                Arc::new(crate::session_store::InMemoryApprovalStore::new());
+            let config = aura_config::HitlConfig {
+                require_approval: vec![aura_config::GlobPattern::new("kubectl_*").unwrap()],
+                park: aura_config::ParkConfig {
+                    enabled: true,
+                    bind_identity: false,
+                    park_ttl: aura_config::ParkTtl::default(),
+                },
+                route: aura_config::DecisionRouteConfig::Webhook {
+                    url: WebhookUrl::new(url).unwrap(),
+                    timeout_secs: 60,
+                    headers: std::collections::HashMap::new(),
+                    headers_from_request: std::collections::HashMap::new(),
+                    tool_headers_from_response: aura_config::ToolHeaderMappings::default(),
+                    delivery: aura_config::WebhookDelivery::Sync,
+                    poll_url: None,
+                    poll_interval_secs: 10,
+                    poll_request_timeout_secs: 30,
+                    receiver_wait_timeout_secs: 900,
+                },
+            };
+            let runtime = crate::hitl::HitlRuntime::from_config(&config, registry, None, None);
+            (store, runtime.route)
         }
 
         /// Capture failure fails the REGISTRATION closed: a mapped
