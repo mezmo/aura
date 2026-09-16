@@ -1418,4 +1418,153 @@ mod tests {
             crate::approval_event_broker::unsubscribe(&format!("run:{run_id}")).await;
         }
     }
+
+    // ====================================================================
+    // Poller authority filtering: the tick filters every non-WebhookPoll
+    // row BEFORE any network request. A same-instance row parked under
+    // Conversational (another channel's row in a shared store) gets no
+    // GET, no notify POST, and stays untouched. Red until the R4 fill
+    // adds the pre-network authority filter to `tick`.
+    // ====================================================================
+
+    /// Authority-parameterized sibling of [`park_pending`]: park a pending
+    /// approval under an explicit authority, expiring far out.
+    async fn park_pending_with_authority(
+        store: &Arc<dyn ApprovalStore>,
+        instance_id: &str,
+        authority: ApprovalAuthority,
+    ) -> DecisionId {
+        let request = parked_request(DecisionId::generate(), instance_id);
+        let id = request.decision_id;
+        store
+            .register(ParkedApproval {
+                request,
+                registered_at: chrono::Utc::now(),
+                expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+                authority,
+                egress_headers: None,
+                acknowledgment: AcknowledgmentState::RequiresNotification,
+            })
+            .await
+            .expect("pending approval registers");
+        id
+    }
+
+    /// A Conversational row gets no network call: the capture channel
+    /// stays empty and the row is untouched. Entry 1 (the 204) is the
+    /// load-bearing answer to the CURRENT runtime's status GET; the 503
+    /// filler absorbs its notify POST so the row stays unacknowledged —
+    /// an empty script would capture nothing in either world and could
+    /// not be red.
+    #[tokio::test]
+    async fn poller_authority_conversational_row_gets_no_network_call() {
+        let store: Arc<dyn ApprovalStore> = Arc::new(InMemoryApprovalStore::new());
+        let id =
+            park_pending_with_authority(&store, INSTANCE_ID, ApprovalAuthority::Conversational)
+                .await;
+        let (url, mut rx) = scripted_receiver(vec![
+            poll_pending(),
+            ("503 Service Unavailable", String::new()),
+        ])
+        .await;
+        let reconciler = reconciler_with(store.clone(), &url);
+
+        reconciler.tick().await;
+
+        assert!(
+            matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "a Conversational row must get no network call from the poller",
+        );
+        let parked = store
+            .get(&id)
+            .await
+            .unwrap()
+            .expect("the Conversational row stays parked");
+        assert!(
+            parked.acknowledgment.is_requires_notification(),
+            "the refused row must not be marked acknowledged",
+        );
+        assert!(
+            store_decision(&store, &id).await.is_none(),
+            "the refused row records no decision",
+        );
+    }
+
+    /// Shared-store hygiene: the tick resolves ONLY the WebhookPoll row
+    /// and leaves a same-instance Conversational row untouched. The
+    /// script is ordered POST-FILL-FIRST: entries 1-3 serve the
+    /// conforming fill's WebhookPoll flow (tick 1: GET pending + notify
+    /// ack; tick 2: GET decided, resolving the row); entries 4-5 are
+    /// fillers absorbing TODAY's unfiltered overflow — per-tick row order
+    /// is BTreeMap/UUID dependent, but tick 1 polls both rows, so the
+    /// Conversational row always receives at least one captured request
+    /// and the capture-scope assert fails deterministically today;
+    /// whichever row's GET lands on entry 3 today, the test is red via
+    /// the capture-scope or row-state asserts.
+    #[tokio::test]
+    async fn poller_authority_filters_to_webhook_rows_only() {
+        let store: Arc<dyn ApprovalStore> = Arc::new(InMemoryApprovalStore::new());
+        let webhook_id =
+            park_pending_with_authority(&store, INSTANCE_ID, ApprovalAuthority::WebhookPoll).await;
+        let conversational_id =
+            park_pending_with_authority(&store, INSTANCE_ID, ApprovalAuthority::Conversational)
+                .await;
+        // Post-fill-first ordering: entries 1-3 are the WebhookPoll row's
+        // conforming flow (tick 1: GET pending + notify ack; tick 2: GET
+        // decided, resolving the row); entries 4-5 are fillers absorbing
+        // today's unfiltered overflow, when tick 1 polls BOTH rows and
+        // whichever row GETs first drives the connection order.
+        let (url, mut rx) = scripted_receiver(vec![
+            poll_pending(),
+            ack_ok(),
+            poll_decided(r#"{"approved":true}"#),
+            poll_pending(),
+            ack_ok(),
+        ])
+        .await;
+        let reconciler = reconciler_with(store.clone(), &url);
+
+        reconciler.tick().await;
+        reconciler.tick().await;
+
+        let mut captured = Vec::new();
+        while let Ok(request) = rx.try_recv() {
+            captured.push(request);
+        }
+        assert!(!captured.is_empty(), "the WebhookPoll row is still polled");
+        for request in &captured {
+            assert!(
+                request.contains(&webhook_id.to_string())
+                    && !request.contains(&conversational_id.to_string()),
+                "the poller must only touch the WebhookPoll row; got a request \
+                 for another row: {request}",
+            );
+        }
+
+        assert_eq!(
+            store_decision(&store, &webhook_id).await,
+            Some(ResolvedDecision::from(ApprovalDecision::Approved)),
+            "the WebhookPoll row resolves through the pinned GET",
+        );
+        let parked = store
+            .get(&conversational_id)
+            .await
+            .unwrap()
+            .expect("the Conversational row stays parked");
+        assert!(
+            parked.acknowledgment.is_requires_notification(),
+            "the Conversational row must not be acknowledged",
+        );
+        assert!(
+            store_decision(&store, &conversational_id).await.is_none(),
+            "the Conversational row records no decision",
+        );
+        let still_pending = store.list_pending().await.unwrap();
+        assert!(
+            still_pending
+                .iter()
+                .any(|parked| parked.request.decision_id == conversational_id),
+            "the Conversational row stays in the pending scan",
+        );
+    }
 }

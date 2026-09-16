@@ -2331,4 +2331,102 @@ mod tests {
             &result.output[..result.output.len().min(120)]
         );
     }
+
+    // ====================================================================
+    // Poll-mode tool suppression: poll configurations do not advertise the
+    // server-side `request_approval` tool (single-agent/inline keeps it).
+    // Red until the R4 fill scopes the attach in `Agent::new` to non-poll
+    // routes.
+    // ====================================================================
+
+    /// A HITL-enabled single-agent config over the given decision route
+    /// (poll settings mirror poller.rs `poll_config`).
+    fn hitl_agent_config(route: aura_config::DecisionRouteConfig) -> AgentRuntimeConfig {
+        let hitl = aura_config::HitlConfig {
+            require_approval: vec![],
+            park: aura_config::ParkConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            route,
+        };
+        AgentRuntimeConfig {
+            hitl: Some(crate::hitl::HitlRuntime::from_config(
+                &hitl,
+                &crate::hitl::PendingApprovals::new(),
+                None,
+                None,
+            )),
+            ..AgentRuntimeConfig::default()
+        }
+    }
+
+    fn webhook_poll_route() -> aura_config::DecisionRouteConfig {
+        aura_config::DecisionRouteConfig::Webhook {
+            url: aura_config::WebhookUrl::new("https://approvals.example.com/").unwrap(),
+            timeout_secs: 300,
+            headers: std::collections::HashMap::new(),
+            headers_from_request: std::collections::HashMap::new(),
+            tool_headers_from_response: aura_config::ToolHeaderMappings::default(),
+            delivery: aura_config::WebhookDelivery::Poll,
+            poll_url: None,
+            poll_interval_secs: 1,
+            poll_request_timeout_secs: 30,
+            receiver_wait_timeout_secs: 900,
+        }
+    }
+
+    /// The tool names the built agent ADVERTISES — the contract surface
+    /// for poll-mode suppression (the transient config field is consumed
+    /// by the build; the advertised set is what the model sees).
+    async fn advertised_tool_names(agent: &Agent) -> Vec<String> {
+        let defs = match &agent.inner {
+            ProviderAgent::OpenAI(agent) => agent.tool_server_handle.get_tool_defs(None).await,
+            ProviderAgent::Anthropic(agent) => agent.tool_server_handle.get_tool_defs(None).await,
+            ProviderAgent::Bedrock(agent) => agent.tool_server_handle.get_tool_defs(None).await,
+            ProviderAgent::Gemini(agent) => agent.tool_server_handle.get_tool_defs(None).await,
+            ProviderAgent::Ollama(agent) => agent.tool_server_handle.get_tool_defs(None).await,
+            ProviderAgent::OpenRouter(agent) => agent.tool_server_handle.get_tool_defs(None).await,
+            #[cfg(test)]
+            ProviderAgent::Scripted(agent) => agent.tool_server_handle.get_tool_defs(None).await,
+        };
+        defs.expect("tool definitions list")
+            .into_iter()
+            .map(|def| def.name)
+            .collect()
+    }
+
+    /// Poll mode does not advertise the request_approval tool: the poll
+    /// contract resolves decisions without an agent-callable park path.
+    #[tokio::test]
+    async fn poll_mode_does_not_advertise_the_request_approval_tool() {
+        let config = hitl_agent_config(webhook_poll_route());
+        let agent = Agent::new(&config, vec![], None)
+            .await
+            .expect("the poll-mode agent builds");
+
+        let names = advertised_tool_names(&agent).await;
+        assert!(
+            !names.iter().any(|name| name == "request_approval"),
+            "poll mode must not advertise request_approval; advertised: {names:?}",
+        );
+    }
+
+    /// Conversational mode keeps the inline tool: suppression is
+    /// poll-scoped, not a removal.
+    #[tokio::test]
+    async fn conversational_route_keeps_the_inline_request_approval_tool() {
+        let config = hitl_agent_config(aura_config::DecisionRouteConfig::Conversational {
+            timeout_secs: 60,
+        });
+        let agent = Agent::new(&config, vec![], None)
+            .await
+            .expect("the conversational agent builds");
+
+        let names = advertised_tool_names(&agent).await;
+        assert!(
+            names.iter().any(|name| name == "request_approval"),
+            "conversational mode keeps the inline request_approval tool; advertised: {names:?}",
+        );
+    }
 }
