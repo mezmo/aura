@@ -229,7 +229,9 @@ pub fn validate_park_admission(
             }
             WebhookDelivery::Poll => {
                 let park_ttl = hitl.park.park_ttl;
-                let route_timeout = RouteTimeoutSecs::new(*timeout_secs);
+                // The webhook route timeout defaults to 300s when omitted
+                // (config's effective_webhook_timeout_secs parity).
+                let route_timeout = RouteTimeoutSecs::new(timeout_secs.unwrap_or(300));
                 if !hitl.park.enabled {
                     Err(ParkAdmissionError::PollWithoutPark)
                 } else if !orchestration_enabled {
