@@ -9,7 +9,7 @@ use crate::{
     },
     scratchpad,
     skill_tool::{SkillToolset, render_skill_catalog},
-    tool_wrapper::WrappedTool,
+    tool_wrapper::{ToolCallContext, WrappedTool},
     tools::{FilesystemTool, ListDirTool, ReadFileTool, WriteFileTool},
     vector_dynamic::DynamicVectorSearchTool,
     vector_store::VectorStoreManager,
@@ -186,9 +186,7 @@ impl Agent {
             .unwrap_or_default();
         let scratchpad_tool_map =
             scratchpad::scratchpad_tool_map(config.mcp.as_ref(), &tools_per_server);
-        let accessible_tools = mcp_manager
-            .map(|mgr| mgr.get_available_tool_names())
-            .unwrap_or_default();
+        let accessible_tools = mcp_manager.map(|mgr| mgr.all_tools()).unwrap_or_default();
         let filter = config
             .mcp_filter
             .as_deref()
@@ -897,7 +895,7 @@ impl Agent {
                 if let Some(server_tools) = mcp_manager.streamable_tools.get(server_name) {
                     let filtered_tools: Vec<_> = server_tools
                         .iter()
-                        .filter(|t| config.tool_matches_filter(&t.name))
+                        .filter(|t| config.tool_matches_filter(t))
                         .collect();
                     log_filtered_tools(
                         "",
@@ -909,17 +907,21 @@ impl Agent {
 
                     let client_arc = Arc::new(client.clone());
                     for mcp_tool in filtered_tools {
-                        tracing::info!("  Adding dynamic HTTP tool: {}", mcp_tool.name);
+                        tracing::info!("  Adding dynamic HTTP tool: {}", mcp_tool.name());
 
                         let tool_adaptor = crate::mcp::McpToolAdaptor::new(
                             mcp_tool.clone(),
-                            server_name.clone(),
                             Arc::clone(&client_arc),
                             crate::approver_headers::McpTransportKind::StreamableHttp,
                         );
 
                         // Wrap with tool_wrapper if configured
-                        builder_state = Self::add_mcp_tool(builder_state, tool_adaptor, config);
+                        builder_state = Self::add_mcp_tool(
+                            builder_state,
+                            tool_adaptor,
+                            mcp_tool.namespace().clone(),
+                            config,
+                        );
                     }
                 }
             }
@@ -931,7 +933,7 @@ impl Agent {
                 if let Some(server_tools) = mcp_manager.sse_tools.get(server_name) {
                     let filtered_tools: Vec<_> = server_tools
                         .iter()
-                        .filter(|t| config.tool_matches_filter(&t.name))
+                        .filter(|t| config.tool_matches_filter(t))
                         .collect();
                     log_filtered_tools(
                         "",
@@ -943,16 +945,20 @@ impl Agent {
 
                     let client_arc = Arc::new(client.clone());
                     for mcp_tool in filtered_tools {
-                        tracing::info!("  Adding dynamic SSE tool: {}", mcp_tool.name);
+                        tracing::info!("  Adding dynamic SSE tool: {}", mcp_tool.name());
 
                         let tool_adaptor = crate::mcp::McpToolAdaptor::new(
                             mcp_tool.clone(),
-                            server_name.clone(),
                             Arc::clone(&client_arc),
                             crate::approver_headers::McpTransportKind::Sse,
                         );
 
-                        builder_state = Self::add_mcp_tool(builder_state, tool_adaptor, config);
+                        builder_state = Self::add_mcp_tool(
+                            builder_state,
+                            tool_adaptor,
+                            mcp_tool.namespace().clone(),
+                            config,
+                        );
                     }
                 }
             }
@@ -1008,7 +1014,7 @@ impl Agent {
                 if let Some(server_tools) = mcp_manager.stdio_tools.get(server_name) {
                     let filtered_tools: Vec<_> = server_tools
                         .iter()
-                        .filter(|t| config.tool_matches_filter(&t.name))
+                        .filter(|t| config.tool_matches_filter(t))
                         .collect();
                     log_filtered_tools(
                         "",
@@ -1020,16 +1026,20 @@ impl Agent {
 
                     let client_arc = Arc::new(client.clone());
                     for mcp_tool in filtered_tools {
-                        tracing::info!("  Adding dynamic STDIO tool: {}", mcp_tool.name);
+                        tracing::info!("  Adding dynamic STDIO tool: {}", mcp_tool.name());
 
                         let tool_adaptor = crate::mcp::McpToolAdaptor::new(
                             mcp_tool.clone(),
-                            server_name.clone(),
                             Arc::clone(&client_arc),
                             crate::approver_headers::McpTransportKind::Stdio,
                         );
 
-                        builder_state = Self::add_mcp_tool(builder_state, tool_adaptor, config);
+                        builder_state = Self::add_mcp_tool(
+                            builder_state,
+                            tool_adaptor,
+                            mcp_tool.namespace().clone(),
+                            config,
+                        );
                     }
                 }
             }
@@ -1142,10 +1152,14 @@ impl Agent {
     /// Helper to add an MCP tool, optionally wrapping with config.tool_wrapper.
     ///
     /// If `config.tool_wrapper` is set, the tool is wrapped and a context is
-    /// created using `config.tool_context_factory` (or a default context).
+    /// created using `config.tool_context_factory` (or a default context),
+    /// always stamped with `namespace` so wrapper-layer consumers (HITL
+    /// approval requests, in particular) can attribute the call to its MCP
+    /// server without it ever touching the tool's model-facing name.
     fn add_mcp_tool<M, T>(
         builder_state: BuilderState<M>,
         tool: T,
+        namespace: crate::mcp::ToolNamespace,
         config: &AgentRuntimeConfig,
     ) -> BuilderState<M>
     where
@@ -1156,22 +1170,24 @@ impl Agent {
             + Clone
             + 'static,
     {
-        match (&config.tool_wrapper, &config.tool_context_factory) {
-            (Some(wrapper), Some(ctx_factory)) => {
-                // Wrap with both wrapper and context factory
+        match &config.tool_wrapper {
+            Some(wrapper) => {
                 let tool_name = tool.name();
-                let ctx_factory = ctx_factory.clone();
-                let wrapped = WrappedTool::new(tool, wrapper.clone())
-                    .with_context_factory(move |_| ctx_factory(&tool_name));
+                let base_ctx_factory = config.tool_context_factory.clone();
+                let wrapped =
+                    WrappedTool::new(tool, wrapper.clone()).with_context_factory(move |_| {
+                        let mut ctx = base_ctx_factory
+                            .as_ref()
+                            .map(|f| f(&tool_name))
+                            .unwrap_or_else(|| ToolCallContext::new(&tool_name));
+                        ctx.tool_namespace = Some(namespace.to_string());
+                        ctx
+                    });
                 builder_state.add_tool(wrapped)
             }
-            (Some(wrapper), None) => {
-                // Wrap with wrapper only (default context)
-                let wrapped = WrappedTool::new(tool, wrapper.clone());
-                builder_state.add_tool(wrapped)
-            }
-            _ => {
-                // No wrapping
+            None => {
+                // No wrapping: nothing consults a ToolCallContext for this
+                // tool, so there's nowhere for the namespace to matter.
                 builder_state.add_tool(tool)
             }
         }
@@ -2005,7 +2021,7 @@ mod tests {
         /// A completion model that exists only to satisfy the builder's type
         /// parameter. Composition never prompts it.
         #[derive(Clone)]
-        struct UnpromptedModel;
+        pub(super) struct UnpromptedModel;
 
         impl rig::completion::CompletionModel for UnpromptedModel {
             type Response = ();
@@ -2052,34 +2068,43 @@ mod tests {
             }
         }
 
-        fn declared_tool(name: &str) -> rmcp::model::Tool {
-            rmcp::model::Tool::new(
+        pub(super) fn declared_tool(name: &str, namespace: &str) -> crate::mcp::AuraTool {
+            let tool = rmcp::model::Tool::new(
                 name.to_owned(),
                 "test tool".to_owned(),
                 Arc::new(serde_json::Map::new()),
-            )
+            );
+            crate::mcp::AuraTool::new(tool, namespace)
         }
 
         /// A manager offering the same tool name on each of the three transports, all backed by `server`, so the tag composition distinguishes them downstream.
         async fn manager_serving_all_transports(server: &RecordingMcpServer) -> McpManager {
-            let connect = async || {
-                McpClient::new(server.url.clone(), &HashMap::new(), "test/0")
-                    .await
-                    .expect("the loopback server completes the handshake")
+            let connect = async |namespace: &str| {
+                McpClient::new(
+                    server.url.clone(),
+                    namespace.into(),
+                    &HashMap::new(),
+                    "test/0",
+                )
+                .await
+                .expect("the loopback server completes the handshake")
             };
             McpManager {
                 server_info: HashMap::new(),
-                streamable_clients: HashMap::from([("http".to_owned(), connect().await)]),
+                streamable_clients: HashMap::from([("http".to_owned(), connect("http").await)]),
                 streamable_tools: HashMap::from([(
                     "http".to_owned(),
-                    vec![declared_tool("http_tool")],
+                    vec![declared_tool("http_tool", "http")],
                 )]),
-                sse_clients: HashMap::from([("sse".to_owned(), connect().await)]),
-                sse_tools: HashMap::from([("sse".to_owned(), vec![declared_tool("sse_tool")])]),
-                stdio_clients: HashMap::from([("stdio".to_owned(), connect().await)]),
+                sse_clients: HashMap::from([("sse".to_owned(), connect("sse").await)]),
+                sse_tools: HashMap::from([(
+                    "sse".to_owned(),
+                    vec![declared_tool("sse_tool", "sse")],
+                )]),
+                stdio_clients: HashMap::from([("stdio".to_owned(), connect("stdio").await)]),
                 stdio_tools: HashMap::from([(
                     "stdio".to_owned(),
-                    vec![declared_tool("stdio_tool")],
+                    vec![declared_tool("stdio_tool", "stdio")],
                 )]),
                 sanitize_schemas: false,
                 user_agent: crate::config::McpUserAgent::new("test/0").unwrap(),
@@ -2146,6 +2171,196 @@ mod tests {
             for call in calls {
                 assert_eq!(call.header_values("x-forwarded-user"), vec!["alice"]);
             }
+        }
+    }
+
+    /// `add_mcp_tool` is the only place a tool's namespace is stamped onto the
+    /// `ToolCallContext` the approval gate reads. The matcher is unit-tested
+    /// against a hand-supplied namespace, so only a composed agent shows that
+    /// the value the gate matches on is the one the server was keyed by — and
+    /// a regression there fails open, silently ungating every `<ns>:*` rule.
+    mod namespace_gating {
+        use std::time::Duration;
+
+        use serde_json::json;
+
+        use std::collections::HashMap;
+
+        use super::transport_tagging::{UnpromptedModel, declared_tool};
+        use super::*;
+        use crate::approval_event_broker::ApprovalLifecycleEvent;
+        use crate::hitl::{AgentScope, DecisionRoute, HitlApprovalWrapper, PendingApprovals};
+        use crate::mcp::client::tests::RecordingMcpServer;
+        use crate::mcp::{McpClient, McpManager};
+
+        /// A manager offering one HTTP-streamable tool, keyed by `namespace`.
+        /// HTTP rather than stdio so the transport's fail-closed check cannot
+        /// be mistaken for the gate's decision.
+        async fn manager_serving(
+            server: &RecordingMcpServer,
+            namespace: &str,
+            tool: &str,
+        ) -> McpManager {
+            let client = McpClient::new(
+                server.url.clone(),
+                namespace.into(),
+                &HashMap::new(),
+                "test/0",
+            )
+            .await
+            .expect("the loopback server completes the handshake");
+            McpManager {
+                server_info: HashMap::new(),
+                streamable_clients: HashMap::from([(namespace.to_owned(), client)]),
+                streamable_tools: HashMap::from([(
+                    namespace.to_owned(),
+                    vec![declared_tool(tool, namespace)],
+                )]),
+                sse_clients: HashMap::new(),
+                sse_tools: HashMap::new(),
+                stdio_clients: HashMap::new(),
+                stdio_tools: HashMap::new(),
+                sanitize_schemas: false,
+                user_agent: crate::config::McpUserAgent::new("test/0").unwrap(),
+            }
+        }
+
+        /// A config carrying a real `HitlApprovalWrapper`. The conversational
+        /// route parks in-process and expires quickly: the approval event is
+        /// published before the wait, so no decision has to arrive.
+        fn gated_config(request_id: &str, pattern: &str) -> AgentRuntimeConfig {
+            let gate = HitlApprovalWrapper::new(
+                Arc::from([pattern.into()]),
+                Arc::new(DecisionRoute::Conversational {
+                    registry: PendingApprovals::new(),
+                    timeout: Duration::from_millis(50),
+                }),
+                AgentScope::Single { session_id: None },
+                request_id.to_owned(),
+                "test-agent".to_owned(),
+                "test-instance-id".to_owned(),
+            );
+            AgentRuntimeConfig {
+                tool_wrapper: Some(Arc::new(gate)),
+                ..Default::default()
+            }
+        }
+
+        async fn compose_gated_agent(
+            server: &RecordingMcpServer,
+            request_id: &str,
+            pattern: &str,
+            namespace: &str,
+            tool: &str,
+        ) -> rig::agent::Agent<UnpromptedModel> {
+            let config = gated_config(request_id, pattern);
+            let manager = Some(Arc::new(manager_serving(server, namespace, tool).await));
+            let state = BuilderState::Initial(rig::agent::AgentBuilder::new(UnpromptedModel));
+            Agent::add_all_tools(state, &config, &manager, Vec::new())
+                .await
+                .expect("composition succeeds")
+                .build()
+        }
+
+        /// Asserting on the raised approval rather than merely on "the call was
+        /// gated" is what spans the chain: the namespace in the event is the
+        /// one `add_mcp_tool` stamped, carried through `pre_call`.
+        #[tokio::test]
+        async fn a_namespace_scoped_pattern_gates_a_tool_from_that_server() {
+            let request_id = "req_ns_gating_match";
+            let mut rx = crate::approval_event_broker::subscribe(request_id).await;
+            let server = RecordingMcpServer::start().await;
+            let agent =
+                compose_gated_agent(&server, request_id, "github:*", "github", "list_repos").await;
+
+            // The parked approval expires unanswered; the call's own outcome is
+            // not what this test is about.
+            let _ = agent
+                .tool_server_handle
+                .call_tool("list_repos", &json!({}).to_string())
+                .await;
+
+            let event = rx
+                .try_recv()
+                .expect("a tool matching the namespace-scoped pattern must raise an approval");
+            crate::approval_event_broker::unsubscribe(request_id).await;
+
+            let ApprovalLifecycleEvent::Requested(requested) = event else {
+                panic!("the gate must raise Requested first, got: {event:?}");
+            };
+            assert_eq!(requested.tool_name, "list_repos");
+            assert_eq!(
+                requested.tool_namespace.as_deref(),
+                Some("github"),
+                "the approval must carry the namespace the server was keyed by",
+            );
+        }
+
+        /// The load-bearing half: same pattern, same bare tool name, different
+        /// server. Without this, the positive test passes just as well if the
+        /// namespace were ignored and the bare name alone matched.
+        #[tokio::test]
+        async fn a_namespace_scoped_pattern_ignores_a_tool_from_another_server() {
+            let request_id = "req_ns_gating_miss";
+            let mut rx = crate::approval_event_broker::subscribe(request_id).await;
+            let server = RecordingMcpServer::start().await;
+            let agent =
+                compose_gated_agent(&server, request_id, "github:*", "k8s", "list_repos").await;
+
+            agent
+                .tool_server_handle
+                .call_tool("list_repos", &json!({}).to_string())
+                .await
+                .expect("a tool outside the pattern's namespace runs ungated");
+
+            let raised = rx.try_recv();
+            crate::approval_event_broker::unsubscribe(request_id).await;
+            assert!(
+                raised.is_err(),
+                "a tool from another server must not be gated, got: {raised:?}",
+            );
+            assert_eq!(
+                server.tool_calls().len(),
+                1,
+                "the ungated call must reach the server",
+            );
+        }
+
+        /// `mcp_filter` reaches tool namespaces through the same `is_match`
+        /// path the gate uses, and is likewise only unit-tested against a
+        /// hand-built `AuraTool`. Registration is where it has to hold.
+        #[tokio::test]
+        async fn mcp_filter_scopes_registration_by_namespace() {
+            let server = RecordingMcpServer::start().await;
+            let github = manager_serving(&server, "github", "list_repos").await;
+            let mut manager = manager_serving(&server, "k8s", "get_pods").await;
+            manager.streamable_clients.extend(github.streamable_clients);
+            manager.streamable_tools.extend(github.streamable_tools);
+
+            let config = AgentRuntimeConfig {
+                mcp_filter: Some(vec!["github:*".into()]),
+                ..Default::default()
+            };
+            let state = BuilderState::Initial(rig::agent::AgentBuilder::new(UnpromptedModel));
+            let agent = Agent::add_all_tools(state, &config, &Some(Arc::new(manager)), Vec::new())
+                .await
+                .expect("composition succeeds")
+                .build();
+
+            agent
+                .tool_server_handle
+                .call_tool("list_repos", &json!({}).to_string())
+                .await
+                .expect("a tool inside the filter's namespace is registered");
+
+            assert!(
+                agent
+                    .tool_server_handle
+                    .call_tool("get_pods", &json!({}).to_string())
+                    .await
+                    .is_err(),
+                "a tool from a server outside the filter must not be registered",
+            );
         }
     }
 
