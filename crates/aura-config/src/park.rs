@@ -215,3 +215,114 @@ pub fn validate_park_admission(
 ) -> Result<ParkRouteAdmission, ParkAdmissionError> {
     todo!("P45 wave fill unit R1: mode/park/orchestration validation and the park_ttl relation")
 }
+
+/// The admission matrix: each case satisfies or violates exactly one
+/// channel-contract rule, asserted as the complete typed outcome.
+#[cfg(test)]
+mod tests {
+    use super::{NonParkingRoute, ParkAdmissionError, ParkRouteAdmission, validate_park_admission};
+    use crate::config::HitlConfig;
+
+    const CONVERSATIONAL_ROUTE: &str = "mode = \"conversational\"\ntimeout_secs = 300";
+    const SYNC_ROUTE: &str = "mode = \"webhook\"\n\
+                              url = \"https://approvals.example.com/decide\"\n\
+                              delivery = \"sync\"\n\
+                              timeout_secs = 300";
+    const POLL_ROUTE: &str = "mode = \"webhook\"\n\
+                              url = \"https://approvals.example.com/decide\"\n\
+                              delivery = \"poll\"\n\
+                              timeout_secs = 300";
+
+    /// Parse a real `[hitl]` TOML shape: the given `[route]` body plus the
+    /// park table carrying the retention age. Orchestration is the caller's
+    /// resolved mode flag.
+    fn hitl_config(route_body: &str, park_enabled: bool, park_ttl: u64) -> HitlConfig {
+        let toml = format!(
+            "require_approval = [\"kubectl_*\"]\n\n\
+             [route]\n{route_body}\n\n\
+             [park]\nenabled = {park_enabled}\npark_ttl = {park_ttl}\n"
+        );
+        toml::from_str(&toml).unwrap()
+    }
+
+    #[test]
+    fn park_admission_conversational_non_park() {
+        let hitl = hitl_config(CONVERSATIONAL_ROUTE, false, 3600);
+        assert_eq!(
+            validate_park_admission(&hitl, false),
+            Ok(ParkRouteAdmission::NonParking(
+                NonParkingRoute::Conversational
+            ))
+        );
+    }
+
+    #[test]
+    fn park_admission_sync_non_park() {
+        let hitl = hitl_config(SYNC_ROUTE, false, 3600);
+        assert_eq!(
+            validate_park_admission(&hitl, false),
+            Ok(ParkRouteAdmission::NonParking(NonParkingRoute::WebhookSync))
+        );
+    }
+
+    #[test]
+    fn park_admission_poll_orchestration_park() {
+        // Retention equal to the route timeout is the admitted boundary.
+        let hitl = hitl_config(POLL_ROUTE, true, 300);
+        let admitted = match validate_park_admission(&hitl, true) {
+            Ok(ParkRouteAdmission::PollOrchestration(admitted)) => admitted,
+            other => panic!("expected an admitted poll route, got {other:?}"),
+        };
+        assert_eq!(admitted.park_ttl().as_secs(), 300);
+        assert_eq!(admitted.route_timeout().as_secs(), 300);
+    }
+
+    #[test]
+    fn park_admission_rejects_conversational_park() {
+        let hitl = hitl_config(CONVERSATIONAL_ROUTE, true, 3600);
+        assert_eq!(
+            validate_park_admission(&hitl, true),
+            Err(ParkAdmissionError::ParkWithConversational)
+        );
+    }
+
+    #[test]
+    fn park_admission_rejects_sync_park() {
+        let hitl = hitl_config(SYNC_ROUTE, true, 3600);
+        assert_eq!(
+            validate_park_admission(&hitl, true),
+            Err(ParkAdmissionError::ParkWithWebhookSync)
+        );
+    }
+
+    #[test]
+    fn park_admission_rejects_poll_without_orchestration() {
+        let hitl = hitl_config(POLL_ROUTE, true, 3600);
+        assert_eq!(
+            validate_park_admission(&hitl, false),
+            Err(ParkAdmissionError::PollWithoutOrchestration)
+        );
+    }
+
+    #[test]
+    fn park_admission_rejects_poll_without_park() {
+        let hitl = hitl_config(POLL_ROUTE, false, 3600);
+        assert_eq!(
+            validate_park_admission(&hitl, true),
+            Err(ParkAdmissionError::PollWithoutPark)
+        );
+    }
+
+    #[test]
+    fn park_admission_rejects_ttl_below_timeout() {
+        let hitl = hitl_config(POLL_ROUTE, true, 299);
+        let (park_ttl, route_timeout) = match validate_park_admission(&hitl, true) {
+            Err(ParkAdmissionError::TtlBelowRouteTimeout {
+                park_ttl,
+                route_timeout,
+            }) => (park_ttl, route_timeout),
+            other => panic!("expected a TTL-below-timeout rejection, got {other:?}"),
+        };
+        assert_eq!((park_ttl.as_secs(), route_timeout.as_secs()), (299, 300));
+    }
+}
