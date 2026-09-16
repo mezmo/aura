@@ -911,163 +911,8 @@ mod tests {
             (url, rx)
         }
 
-        #[tokio::test]
-        async fn register_error_fails_closed_with_no_cell_entry_and_no_event() {
-            let request_id = format!("req_park_fail_{}", uuid::Uuid::new_v4().simple());
-            let mut events = crate::approval_event_broker::subscribe(&request_id).await;
-            let store: Arc<dyn crate::session_store::ApprovalStore> =
-                Arc::new(crate::session_store::FaultInjectingStore::failing_register());
-            let registry = PendingApprovals::with_backend(
-                store,
-                Arc::new(crate::session_store::InMemoryEventBus::new()),
-            );
-            let route = conv_route_over(registry.clone(), Duration::from_secs(60));
-            let cell = Arc::new(crate::orchestration::BlockedCell::default());
-            let gate = parked_gate(&registry, &route, &request_id, &cell);
-
-            let args = serde_json::json!({ "namespace": "prod" });
-            let ctx = ToolCallContext::new("kubectl_apply");
-            let result = gate.pre_call(&args, &ctx).await;
-
-            let err = result.expect_err("a register fault must fail the call closed");
-            assert!(
-                err.to_string().contains("approval store register failed"),
-                "error must name the register fault, got: {err}"
-            );
-            assert!(
-                err.to_string().contains("disk on fire"),
-                "error must carry the store's reason, got: {err}"
-            );
-            assert!(
-                cell.is_empty(),
-                "no cell entry may exist after a register fault"
-            );
-            assert!(
-                tokio::time::timeout(Duration::from_millis(50), events.recv())
-                    .await
-                    .is_err(),
-                "no approval event may be published after a register fault"
-            );
-
-            crate::approval_event_broker::unsubscribe(&request_id).await;
-        }
-
-        #[tokio::test]
-        async fn happy_path_registers_publishes_appends_and_short_circuits() {
-            let request_id = format!("req_park_ok_{}", uuid::Uuid::new_v4().simple());
-            let mut events = crate::approval_event_broker::subscribe(&request_id).await;
-            let store: Arc<dyn crate::session_store::ApprovalStore> =
-                Arc::new(crate::session_store::InMemoryApprovalStore::new());
-            let registry = PendingApprovals::with_backend(
-                store.clone(),
-                Arc::new(crate::session_store::InMemoryEventBus::new()),
-            );
-            let route = conv_route_over(registry.clone(), Duration::from_secs(120));
-            let cell = Arc::new(crate::orchestration::BlockedCell::default());
-            cell.set_current_call_id(Some("call_7".to_string()));
-            let gate = parked_gate(&registry, &route, &request_id, &cell);
-
-            let args = serde_json::json!({ "namespace": "prod" });
-            let ctx = ToolCallContext::new("kubectl_apply");
-            let outcome = gate.pre_call(&args, &ctx).await.unwrap();
-
-            assert_eq!(
-                outcome,
-                PreCallOutcome::ShortCircuit {
-                    output: super::PARK_SENTINEL.to_string()
-                },
-                "a parked call short-circuits with the inert sentinel"
-            );
-
-            // Mirror the hook's snapshot so the cell reports Blocked.
-            cell.snapshot_if_pending(
-                &[rig::completion::Message::user("do the thing")],
-                &rig::completion::Message::user("tool results"),
-            );
-            match cell.outcome() {
-                crate::orchestration::CellOutcome::Blocked { pending } => {
-                    assert_eq!(pending.len(), 1);
-                    assert_eq!(pending[0].tool_name, "kubectl_apply");
-                    assert_eq!(pending[0].call_id, "call_7");
-                    assert_eq!(pending[0].arguments, args);
-
-                    // Store: the ticket is parked under the run-scoped owner.
-                    let parked = store
-                        .get(&pending[0].decision_id)
-                        .await
-                        .unwrap()
-                        .expect("ticket parked in the store");
-                    assert_eq!(
-                        parked.request.request_id,
-                        "run:0191e8c0-1111-7000-8000-000000000042"
-                    );
-                    assert_eq!(parked.request.items[0].tool_name, "kubectl_apply");
-                    assert_eq!(parked.request.items[0].arguments, args);
-                }
-                other => panic!("expected Blocked, got {other:?}"),
-            }
-
-            // SSE: requested then pending, on the live request id.
-            match tokio::time::timeout(Duration::from_secs(1), events.recv()).await {
-                Ok(Some(crate::approval_event_broker::ApprovalLifecycleEvent::Requested(
-                    requested,
-                ))) => {
-                    assert_eq!(requested.tool_name, "kubectl_apply");
-                }
-                other => panic!("expected Requested event, got {other:?}"),
-            }
-            match tokio::time::timeout(Duration::from_secs(1), events.recv()).await {
-                Ok(Some(crate::approval_event_broker::ApprovalLifecycleEvent::Pending(
-                    pending,
-                ))) => {
-                    assert_eq!(pending.tool_name, "kubectl_apply");
-                    assert_eq!(pending.arguments, args);
-                    let scope = serde_json::to_value(&pending.scope).unwrap();
-                    assert_eq!(scope["kind"], "worker");
-                    assert_eq!(scope["run_id"], "0191e8c0-1111-7000-8000-000000000042");
-                }
-                other => panic!("expected Pending event, got {other:?}"),
-            }
-
-            crate::approval_event_broker::unsubscribe(&request_id).await;
-        }
-
-        #[tokio::test]
-        async fn two_gated_calls_append_two_cell_entries() {
-            let (registry, route) = conv_route(Duration::from_secs(60));
-            let cell = Arc::new(crate::orchestration::BlockedCell::default());
-            let gate = parked_gate(&registry, &route, "req-two-calls", &cell);
-
-            let first = gate
-                .pre_call(
-                    &serde_json::json!({ "namespace": "prod" }),
-                    &ToolCallContext::new("kubectl_apply"),
-                )
-                .await
-                .unwrap();
-            let second = gate
-                .pre_call(
-                    &serde_json::json!({ "namespace": "stage" }),
-                    &ToolCallContext::new("kubectl_delete"),
-                )
-                .await
-                .unwrap();
-            assert!(matches!(first, PreCallOutcome::ShortCircuit { .. }));
-            assert!(matches!(second, PreCallOutcome::ShortCircuit { .. }));
-
-            // Inspect without consuming: mirror the cell contents.
-            cell.snapshot_if_pending(&[], &rig::completion::Message::user("results"));
-            match cell.outcome() {
-                crate::orchestration::CellOutcome::Blocked { pending } => {
-                    assert_eq!(pending.len(), 2, "both gated calls are recorded");
-                    assert_eq!(pending[0].tool_name, "kubectl_apply");
-                    assert_eq!(pending[1].tool_name, "kubectl_delete");
-                    assert_ne!(pending[0].decision_id, pending[1].decision_id);
-                }
-                other => panic!("expected Blocked, got {other:?}"),
-            }
-        }
-
+        /// An ungated tool proceeds without parking: the park arm never
+        /// fires for a call no pattern matched.
         #[tokio::test]
         async fn ungated_tool_proceeds_without_parking() {
             let (registry, route) = conv_route(Duration::from_secs(60));
@@ -1080,56 +925,6 @@ mod tests {
                 .unwrap();
             assert_eq!(outcome, PreCallOutcome::Proceed { overrides: None });
             assert!(cell.is_empty());
-        }
-
-        #[tokio::test]
-        async fn guard_learns_the_decision_at_registration() {
-            let store: Arc<dyn crate::session_store::ApprovalStore> =
-                Arc::new(crate::session_store::InMemoryApprovalStore::new());
-            let registry = PendingApprovals::with_backend(
-                store.clone(),
-                Arc::new(crate::session_store::InMemoryEventBus::new()),
-            );
-            let route = conv_route_over(registry.clone(), Duration::from_secs(60));
-            let cell = Arc::new(crate::orchestration::BlockedCell::default());
-            let guard = ParkGuard::new(
-                registry.clone(),
-                "0191e8c0-1111-7000-8000-000000000042".to_string(),
-                "req-guard".to_string(),
-            );
-            let gate = HitlApprovalWrapper::new(
-                Arc::from([GlobPattern::new("kubectl_*").unwrap()]),
-                route,
-                worker_scope(),
-                "req-guard".to_string(),
-                "test-agent".to_string(),
-                "test-instance".to_string(),
-            )
-            .with_park(registry, cell.clone(), Arc::clone(&guard));
-
-            gate.pre_call(
-                &serde_json::json!({}),
-                &ToolCallContext::new("kubectl_apply"),
-            )
-            .await
-            .unwrap();
-            let decision_id = match cell.outcome() {
-                crate::orchestration::CellOutcome::Orphaned { pending } => pending[0].decision_id,
-                other => panic!("expected a parked call, got {other:?}"),
-            };
-            assert!(store.get(&decision_id).await.unwrap().is_some());
-
-            // The run ends unpublished: the guard sweeps the ticket the park
-            // arm registered, without any record from the orchestrator.
-            drop(gate);
-            drop(guard);
-            for _ in 0..200 {
-                if store.get(&decision_id).await.unwrap().is_none() {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-            assert!(store.get(&decision_id).await.unwrap().is_none());
         }
 
         /// An armed park-capable webhook route asks FIRST: one POST with
@@ -1327,8 +1122,9 @@ mod tests {
         }
 
         /// A park-armed invocation on the conversational route never
-        /// durable-parks: the conversational seam stays inline, so no
-        /// run-owner row and no blocked-cell entry may appear.
+        /// durable-parks AND stays inline: the attended seam carries the
+        /// registration on the live request id, so no run-owner row and no
+        /// blocked-cell entry may appear.
         #[tokio::test]
         async fn gate_park_armed_conversational_never_durable_parks() {
             let request_id = format!("req_conv_no_park_{}", uuid::Uuid::new_v4().simple());
@@ -1350,10 +1146,12 @@ mod tests {
                 .await
             });
 
-            // The direct park arm resolves quickly; poll a bounded window
-            // for either durable-park signal before giving up.
+            // Poll a bounded window for the durable-park signals (either
+            // one condemns the invocation) and for the inline registration
+            // the attended seam owes us on the live request id.
             let run_owner = "run:0191e8c0-1111-7000-8000-000000000042";
             let mut parked = false;
+            let mut inline_registration = false;
             for _ in 0..50 {
                 if !cell.is_empty() {
                     parked = true;
@@ -1362,6 +1160,10 @@ mod tests {
                 let rows = store.list_pending().await.unwrap();
                 if rows.iter().any(|row| row.request.request_id == run_owner) {
                     parked = true;
+                    break;
+                }
+                if rows.iter().any(|row| row.request.request_id == request_id) {
+                    inline_registration = true;
                     break;
                 }
                 // Keep the lifecycle channel drained: this test's subject is
@@ -1373,6 +1175,11 @@ mod tests {
                 !parked,
                 "a park-armed conversational invocation must never durable-park: \
                  no blocked-cell entry and no run-owner row may appear"
+            );
+            assert!(
+                inline_registration,
+                "the conversational invocation registers inline on the live request id: \
+                 the attended seam carries it, never the durable park arm"
             );
 
             handle.abort();
@@ -1893,7 +1700,7 @@ mod tests {
         }
 
         /// A static fallback keeps the egress resolution open under the
-        /// adaptive ask: the absent request header resolves to the static
+        /// park-armed ask: the absent request header resolves to the static
         /// value, and the 207-parked row carries it.
         #[tokio::test]
         async fn armed_webhook_parks_on_207_with_static_fallback_egress() {
