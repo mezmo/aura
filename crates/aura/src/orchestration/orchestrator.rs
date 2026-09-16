@@ -1365,8 +1365,8 @@ impl Orchestrator {
     }
 
     /// `[hitl.park].enabled` on a park-capable route: conversational, or a
-    /// webhook route that can park (`can_park` — poll delivery, and sync
-    /// delivery under the adaptive contract).
+    /// webhook route that can park (`can_park` — poll delivery with park
+    /// mode; sync never parks).
     fn park_enabled(&self) -> bool {
         self.agent_config
             .hitl
@@ -8586,7 +8586,7 @@ mod tests {
 
     /// The worker path under a park-capable webhook poll route attaches
     /// no `request_approval` tool: poll mode resolves decisions without
-    /// an agent-callable park path. Red until the R4 fill scopes the
+    /// an agent-callable park path. GREEN since R4-INT-4: the fill scopes the
     /// attach in `create_worker` to non-poll routes.
     #[tokio::test]
     async fn worker_poll_mode_does_not_attach_the_request_approval_tool() {
