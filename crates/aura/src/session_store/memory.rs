@@ -83,19 +83,24 @@ impl ApprovalStore for InMemoryApprovalStore {
     async fn resolve(
         &self,
         id: &DecisionId,
-        // The authority check runs under this same boundary with the E1/E2
-        // fills; the signature carries it now so no caller can bolt a
-        // validate-then-resolve race ahead of it.
-        _expected_authority: ApprovalAuthority,
+        // The authority check runs under this same boundary; the signature
+        // carries it so no caller can bolt a validate-then-resolve race
+        // ahead of it.
+        expected_authority: ApprovalAuthority,
         decision: ResolvedDecision,
     ) -> Result<(), ResolveError> {
         // Lock removal provides at-most-once.
         let parked = {
             let mut entries = self.lock();
-            if entries
-                .get(id)
-                .is_some_and(|parked| chrono::Utc::now() > parked.expires_at)
-            {
+            let row = entries.get(id).ok_or(ResolveError::NotFound)?;
+            // Wrong authority is indistinguishable from unknown: the row
+            // stays parked and nothing is recorded. This reads the stored
+            // row's authority, so it covers inline `register` rows and
+            // durable `register_durable` rows alike.
+            if row.authority != expected_authority {
+                return Err(ResolveError::NotFound);
+            }
+            if chrono::Utc::now() > row.expires_at {
                 return Err(ResolveError::NotFound);
             }
             entries.remove(id)
