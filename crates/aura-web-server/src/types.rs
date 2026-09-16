@@ -64,15 +64,17 @@ impl ActiveRequestTracker {
         tasks.push(handle);
     }
 
-    /// Abort every tracked task that hasn't finished yet. Used as the final
+    /// Abort and await every tracked task that hasn't finished yet. Used as the final
     /// step of shutdown so a straggler can't hold its `agent.stream` span
     /// open past the OTel provider shutdown/flush (#305).
-    pub fn abort_unfinished(&self) {
-        let tasks = self.tasks.lock().expect("tasks mutex poisoned");
-        for handle in tasks.iter() {
-            if !handle.is_finished() {
-                handle.abort();
-            }
+    ///
+    /// After calling, the list of tracked tasks will be empty since they should
+    /// have all been aborted.
+    pub async fn abort_unfinished(&self) {
+        let tasks = std::mem::take(&mut *self.tasks.lock().expect("tasks mutex poisoned"));
+        tasks.iter().for_each(tokio::task::JoinHandle::abort);
+        for handle in tasks {
+            let _ = handle.await;
         }
     }
 }
@@ -386,18 +388,16 @@ mod tests {
         tracker.track_task(tokio::spawn(async {}));
         tracker.track_task(running);
 
-        tracker.abort_unfinished();
+        let abort_res = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            tracker.abort_unfinished(),
+        )
+        .await;
 
-        // Give the abort a moment to be observed.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        let tasks = tracker.tasks.lock().unwrap();
-        for handle in tasks.iter() {
-            assert!(
-                handle.is_finished(),
-                "every tracked task should have stopped"
-            );
-        }
+        assert!(
+            abort_res.is_ok(),
+            "every tracked task should have stopped before deadline"
+        );
     }
 
     #[tokio::test]

@@ -211,15 +211,10 @@ pub(super) fn spawn_cancellation_watcher(
             was_cancelled = async {
                 let mut rx = cancel_rx;
                 loop {
-                    // A legitimate normal completion always sends an
-                    // explicit `false` (see the outer task's stream
-                    // drain) before dropping its sender, so an
-                    // unexplained drop here only ever happens when the
-                    // outer task ended without going through that path
-                    // (e.g. aborted during shutdown). Fail safe and
-                    // cancel rather than assume completion (#305) — a
-                    // spurious cancel on an already-finished inner task
-                    // is a no-op.
+                    // A closed channel means the outer stream can no longer
+                    // signal cancellation. Fail safe by cancelling the
+                    // orchestration token (#305) — cancelling an
+                    // already-finished inner task is a no-op.
                     if rx.changed().await.is_err() {
                         return true;
                     }

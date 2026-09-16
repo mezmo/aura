@@ -1,5 +1,13 @@
 //! Web-server entry point, shared by every binary that can launch the server.
 
+use crate::a2a::{
+    AuraAgentExecutor, AuraRequestHandler, BusBridgedExecutor, SharedTaskStore, agent_card_router,
+    legacy_jsonrpc_router,
+};
+use crate::handlers;
+use crate::session_store::{SessionStore, build_session_store};
+use crate::streaming::ToolResultMode;
+use crate::types::{ActiveRequestTracker, AppState, ErrorDetail, ErrorResponse};
 use aura::instance_id::instance_id as compute_instance_id;
 use aura_config::load_config;
 use axum::Json;
@@ -14,18 +22,11 @@ use axum::{
 use clap::{CommandFactory, FromArgMatches, Parser};
 use std::ffi::OsString;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
-
-use crate::a2a::{
-    AuraAgentExecutor, AuraRequestHandler, BusBridgedExecutor, SharedTaskStore, agent_card_router,
-    legacy_jsonrpc_router,
-};
-use crate::handlers;
-use crate::session_store::{SessionStore, build_session_store};
-use crate::streaming::ToolResultMode;
-use crate::types::{ActiveRequestTracker, AppState, ErrorDetail, ErrorResponse};
 
 /// Command-line and environment configuration for the web server.
 #[derive(Parser, Debug)]
@@ -372,7 +373,7 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
     let stream_shutdown_token = CancellationToken::new();
     let active_requests = Arc::new(ActiveRequestTracker::new());
 
-    let shutdown_timeout_secs = args.shutdown_timeout_secs;
+    let shutdown_timeout = Duration::from_secs(args.shutdown_timeout_secs);
 
     // Deployment-scoped, env-only configuration (AURA_SESSION_STORE*).
     let session_store_config = aura_config::SessionStoreConfig::from_env().map_err(|e| {
@@ -453,8 +454,8 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
     });
 
     info!(
-        "Starting server on {}:{} (shutdown_timeout={}s)",
-        args.host, args.port, shutdown_timeout_secs
+        "Starting server on {}:{} (shutdown_timeout={shutdown_timeout:?})",
+        args.host, args.port
     );
 
     let app = Router::new()
@@ -534,39 +535,44 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
             }
 
             // Phase 1: reject new requests (middleware returns 503)
+            let mut clean_shutdown = false;
             shutdown_token.cancel();
-
-            info!(
-                "Allowing {}s for in-flight requests to complete",
-                shutdown_timeout_secs
-            );
-            tokio::select! {
-                _ = tokio::time::sleep(std::time::Duration::from_secs(shutdown_timeout_secs)) => {
-                    info!("Grace period expired, terminating remaining streams");
-                }
-                _ = active_requests.wait_for_drain() => {
-                    info!("All in-flight requests completed, shutting down early");
-                }
+            info!("Allowing {shutdown_timeout:?} for in-flight requests to complete");
+            if timeout(shutdown_timeout, active_requests.wait_for_drain())
+                .await
+                .is_ok()
+            {
+                clean_shutdown = true;
             }
 
             // Phase 2: terminate remaining streams ([DONE] → MCP cleanup)
-            stream_shutdown_token.cancel();
-
-            tokio::select! {
-                _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
-                    warn!("Stream shutdown grace period expired, aborting stragglers");
-                }
-                _ = active_requests.wait_for_drain() => {
-                    info!("All streams terminated cleanly");
+            if !clean_shutdown {
+                info!("Grace period expired, terminating remaining streams");
+                stream_shutdown_token.cancel();
+                if timeout(Duration::from_secs(5), active_requests.wait_for_drain())
+                    .await
+                    .is_ok()
+                {
+                    clean_shutdown = true;
                 }
             }
 
             // Phase 3: hard-stop any request task that ignored the
             // cooperative signal above, so its `agent.stream` span closes
             // before the OTel provider shuts down/flushes below (#305).
-            active_requests.abort_unfinished();
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            let mut unaborted_tasks = false;
+            if !clean_shutdown {
+                warn!("Stream shutdown grace period expired, aborting stragglers");
+                let abort_timeout = Duration::from_millis(400);
+                if timeout(abort_timeout, active_requests.abort_unfinished())
+                    .await
+                    .is_err()
+                {
+                    unaborted_tasks = true;
+                }
+            }
 
+            info!(clean_shutdown, unaborted_tasks, "shutdown complete");
             let _ = shutdown_tx.send(());
         }
     });
