@@ -194,9 +194,11 @@ fn apply_worker_skills_override(
 /// fire-and-forget in production (the task self-terminates via `select!`),
 /// but callers in tests should `.await` it to assert post-conditions.
 ///
-/// Cleanup: when the caller drops the sender side of `cancel_rx`, `rx.changed()`
-/// returns `Err`, the `select!` resolves, and the sleep future is dropped
-/// (cancelling the timer via tokio's standard drop semantics).
+/// Cleanup: when the caller drops the sender side of `cancel_rx` after an
+/// explicit signal, `rx.changed()` returns `Err`, the `select!` resolves,
+/// and the sleep future is dropped (cancelling the timer via tokio's
+/// standard drop semantics). A drop with no explicit signal is treated as
+/// an unexplained abort — see the loop body below.
 #[must_use = "task runs independently; bind with `let _handle =` to document fire-and-forget intent"]
 pub(super) fn spawn_cancellation_watcher(
     cancel_rx: watch::Receiver<bool>,
@@ -209,8 +211,17 @@ pub(super) fn spawn_cancellation_watcher(
             was_cancelled = async {
                 let mut rx = cancel_rx;
                 loop {
+                    // A legitimate normal completion always sends an
+                    // explicit `false` (see the outer task's stream
+                    // drain) before dropping its sender, so an
+                    // unexplained drop here only ever happens when the
+                    // outer task ended without going through that path
+                    // (e.g. aborted during shutdown). Fail safe and
+                    // cancel rather than assume completion (#305) — a
+                    // spurious cancel on an already-finished inner task
+                    // is a no-op.
                     if rx.changed().await.is_err() {
-                        return false; // Sender dropped — stream finished normally
+                        return true;
                     }
                     if *rx.borrow_and_update() {
                         return true; // External cancellation requested
@@ -6507,7 +6518,7 @@ mod tests {
     // ========================================================================
 
     #[tokio::test(start_paused = true)]
-    async fn test_watcher_normal_completion_does_not_cancel() {
+    async fn test_watcher_unexplained_drop_triggers_failsafe_cancel() {
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let cancel_token = CancellationToken::new();
         let handle = spawn_cancellation_watcher(
@@ -6517,10 +6528,13 @@ mod tests {
             "test-normal".to_string(),
         );
 
+        // A bare drop with no explicit `false` first means the outer task
+        // ended without going through its normal completion path (e.g.
+        // aborted during shutdown) — the watcher must fail safe and cancel.
         drop(cancel_tx);
         tokio::task::yield_now().await;
         handle.await.unwrap();
-        assert!(!cancel_token.is_cancelled());
+        assert!(cancel_token.is_cancelled());
     }
 
     #[tokio::test(start_paused = true)]
@@ -6559,17 +6573,20 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn test_watcher_drop_before_timeout_prevents_spurious_cancel() {
+    async fn test_watcher_unexplained_drop_before_timeout_cancels_promptly() {
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let cancel_token = CancellationToken::new();
         let handle = spawn_cancellation_watcher(
             cancel_rx,
             Duration::from_secs(60),
             cancel_token.clone(),
-            "test-no-spurious".to_string(),
+            "test-abort-mid-stream".to_string(),
         );
 
-        // Advance to T=30s, then drop sender (simulating stream completing mid-timeout)
+        // Advance to T=30s, then drop the sender with no prior explicit
+        // signal — the production scenario of an outer task aborted mid-
+        // stream (e.g. during shutdown). The watcher must fail safe and
+        // cancel promptly rather than assume normal completion.
         tokio::time::advance(Duration::from_secs(30)).await;
         tokio::task::yield_now().await;
         drop(cancel_tx);
@@ -6580,8 +6597,8 @@ mod tests {
         let elapsed = start.elapsed();
 
         assert!(
-            !cancel_token.is_cancelled(),
-            "token should not be cancelled when sender is dropped before timeout"
+            cancel_token.is_cancelled(),
+            "an unexplained sender drop must fail safe and cancel"
         );
         // Task should exit promptly on sender drop, not wait for remaining 30s timeout
         assert!(
@@ -6611,11 +6628,11 @@ mod tests {
             "false signal should not cancel"
         );
 
-        // Clean exit via sender drop
+        // Bare drop with no final explicit signal — fail safe and cancel.
         drop(cancel_tx);
         tokio::task::yield_now().await;
         handle.await.unwrap();
-        assert!(!cancel_token.is_cancelled());
+        assert!(cancel_token.is_cancelled());
     }
 
     // ========================================================================
