@@ -2318,18 +2318,34 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
     /// Get all tool names from the MCP manager.
     ///
+    /// The `ask_agent` tool as workers will see it, for the planning
+    /// inventory only: it is built without a request binding and never
+    /// called from here. `None` when no `[a2a.remote]` is configured or a
+    /// remote's URL or headers cannot form a client (the worker build
+    /// reports that error).
+    fn remote_agents(&self) -> Option<crate::a2a::RemoteAgentTool> {
+        let a2a = self.agent_config.a2a.as_ref()?;
+        if a2a.remote.is_empty() {
+            return None;
+        }
+        crate::a2a::RemoteAgentTool::from_config(a2a, None).ok()
+    }
+
     /// Collects tool names from all sources:
+    /// - Remote agents (`ask_agent`)
     /// - Streamable HTTP tools
     /// - SSE tools
-    /// - Legacy tool definitions
+    /// - STDIO tools
     ///
-    /// Returns an empty Vec if no MCP manager is present.
+    /// Returns only the remote-agent entry if no MCP manager is present.
     fn get_all_tool_names(&self) -> Vec<String> {
-        let Some(ref mcp_manager) = self.mcp_manager else {
-            return Vec::new();
-        };
-
         let mut names = Vec::new();
+        if self.remote_agents().is_some() {
+            names.push(crate::a2a::ASK_AGENT_TOOL_NAME.to_string());
+        }
+        let Some(ref mcp_manager) = self.mcp_manager else {
+            return names;
+        };
 
         // Collect from streamable HTTP tools (rmcp::model::Tool has Cow<'static, str>)
         for tools in mcp_manager.streamable_tools.values() {
@@ -2366,11 +2382,16 @@ Assign tasks to the worker whose tools best match the required operations."#,
     ///
     /// Returns an empty HashMap if no MCP manager is present.
     fn get_all_tool_schemas(&self) -> std::collections::HashMap<String, serde_json::Value> {
-        let Some(ref mcp_manager) = self.mcp_manager else {
-            return std::collections::HashMap::new();
-        };
-
         let mut schemas = std::collections::HashMap::new();
+        if let Some(tool) = self.remote_agents() {
+            schemas.insert(
+                crate::a2a::ASK_AGENT_TOOL_NAME.to_string(),
+                tool.parameters().clone(),
+            );
+        }
+        let Some(ref mcp_manager) = self.mcp_manager else {
+            return schemas;
+        };
 
         // Collect from streamable HTTP tools
         // rmcp::model::Tool.input_schema is Arc<JsonObject> where JsonObject = Map<String, Value>
@@ -2454,6 +2475,13 @@ Assign tasks to the worker whose tools best match the required operations."#,
     /// Used when `tools_in_planning = "full"`.
     fn get_all_tool_descriptions(&self) -> std::collections::HashMap<String, String> {
         let mut descriptions = std::collections::HashMap::new();
+
+        if let Some(tool) = self.remote_agents() {
+            descriptions.insert(
+                crate::a2a::ASK_AGENT_TOOL_NAME.to_string(),
+                tool.description().to_string(),
+            );
+        }
 
         // Collect from MCP tools
         if let Some(ref mcp_manager) = self.mcp_manager {

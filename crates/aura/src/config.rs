@@ -75,6 +75,8 @@ pub struct AgentRuntimeConfig {
     pub agent: AgentSettings,
     pub vector_stores: Vec<VectorStoreConfig>,
     pub mcp: Option<McpConfig>,
+    /// Remote agents reachable over A2A.
+    pub a2a: Option<aura_config::A2aConfig>,
     pub tools: Option<ToolsConfig>,
     /// Top-level persistence directory shared by scratchpad and orchestration
     /// artifacts. Scratchpad: `{memory_dir}/scratchpad/` (single-agent) or
@@ -163,6 +165,7 @@ impl Clone for AgentRuntimeConfig {
             agent: self.agent.clone(),
             vector_stores: self.vector_stores.clone(),
             mcp: self.mcp.clone(),
+            a2a: self.a2a.clone(),
             tools: self.tools.clone(),
             memory_dir: self.memory_dir.clone(),
             orchestration: self.orchestration.clone(),
@@ -193,6 +196,7 @@ impl std::fmt::Debug for AgentRuntimeConfig {
             .field("agent", &self.agent)
             .field("vector_stores", &self.vector_stores)
             .field("mcp", &self.mcp)
+            .field("a2a", &self.a2a)
             .field("tools", &self.tools)
             .field("orchestration", &self.orchestration)
             .field(

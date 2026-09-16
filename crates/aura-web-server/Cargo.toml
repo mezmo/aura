@@ -31,8 +31,8 @@ chrono = "0.4"
 async-trait = "0.1.89"
 base64 = { workspace = true }
 
-a2a = { package = "a2a-lf", git = "https://github.com/a2aproject/a2a-rs.git", tag = "a2a-server-lf-v0.3.1" }
-a2a-server = { package = "a2a-server-lf", git = "https://github.com/a2aproject/a2a-rs.git", tag = "a2a-server-lf-v0.3.1" }
+a2a = { workspace = true }
+a2a-server = { workspace = true }
 
 redis = { version = "0.32", default-features = false, features = ["tokio-comp", "connection-manager", "script", "keep-alive"], optional = true }
 

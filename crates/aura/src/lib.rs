@@ -5,6 +5,7 @@
 //! in web services or other applications that need to build agents
 //! programmatically.
 
+pub mod a2a;
 pub mod agent_events;
 pub mod approval_event_broker;
 pub mod approver_headers;
@@ -79,7 +80,7 @@ pub use rig::completion::{Message, ToolDefinition as RigToolDefinition};
 pub use rig::message::{AssistantContent, ToolCall as RigToolCall, ToolResultContent, UserContent};
 pub use rig::one_or_many::OneOrMany;
 pub use rig::tool::{Tool as RigTool, ToolDyn};
-pub use rig_builder::{RigBuilder, resolve_mcp_headers_in};
+pub use rig_builder::{RigBuilder, resolve_a2a_headers_in, resolve_mcp_headers_in};
 pub use scratchpad::{ScratchpadConfig, ScratchpadToolEntry};
 pub use streaming::StreamingAgent;
 

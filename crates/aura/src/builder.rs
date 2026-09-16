@@ -919,7 +919,7 @@ impl Agent {
                         );
 
                         // Wrap with tool_wrapper if configured
-                        builder_state = Self::add_mcp_tool(builder_state, tool_adaptor, config);
+                        builder_state = Self::add_wrapped_tool(builder_state, tool_adaptor, config);
                     }
                 }
             }
@@ -952,7 +952,7 @@ impl Agent {
                             crate::approver_headers::McpTransportKind::Sse,
                         );
 
-                        builder_state = Self::add_mcp_tool(builder_state, tool_adaptor, config);
+                        builder_state = Self::add_wrapped_tool(builder_state, tool_adaptor, config);
                     }
                 }
             }
@@ -1029,9 +1029,31 @@ impl Agent {
                             crate::approver_headers::McpTransportKind::Stdio,
                         );
 
-                        builder_state = Self::add_mcp_tool(builder_state, tool_adaptor, config);
+                        builder_state = Self::add_wrapped_tool(builder_state, tool_adaptor, config);
                     }
                 }
+            }
+        }
+
+        // Remote agents over A2A, all behind the one `ask_agent` tool. The
+        // effective `mcp_filter` governs it like an MCP tool, so a worker's
+        // filter decides whether that worker may call out.
+        if let Some(a2a) = config.a2a.as_ref().filter(|a2a| !a2a.remote.is_empty()) {
+            if config.tool_matches_filter(crate::a2a::ASK_AGENT_TOOL_NAME) {
+                let tool =
+                    crate::a2a::RemoteAgentTool::from_config(a2a, config.request_id.clone())?;
+                tracing::info!(
+                    "Adding {} tool for {} remote agent(s): {:?}",
+                    crate::a2a::ASK_AGENT_TOOL_NAME,
+                    a2a.remote.len(),
+                    tool.remote_names()
+                );
+                builder_state = Self::add_wrapped_tool(builder_state, tool, config);
+            } else {
+                tracing::info!(
+                    "Skipping {} tool: excluded by mcp_filter",
+                    crate::a2a::ASK_AGENT_TOOL_NAME
+                );
             }
         }
 
@@ -1139,11 +1161,12 @@ impl Agent {
         Ok(builder_state)
     }
 
-    /// Helper to add an MCP tool, optionally wrapping with config.tool_wrapper.
+    /// Helper to add an externally-executing tool (MCP or remote agent),
+    /// optionally wrapping with config.tool_wrapper.
     ///
     /// If `config.tool_wrapper` is set, the tool is wrapped and a context is
     /// created using `config.tool_context_factory` (or a default context).
-    fn add_mcp_tool<M, T>(
+    fn add_wrapped_tool<M, T>(
         builder_state: BuilderState<M>,
         tool: T,
         config: &AgentRuntimeConfig,
