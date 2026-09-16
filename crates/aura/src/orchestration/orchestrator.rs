@@ -8468,10 +8468,9 @@ mod tests {
     }
 
     /// `park_enabled` requires the flag AND a park-capable route: the
-    /// conversational route parks, and the webhook route parks under poll
-    /// delivery or under sync delivery with the flag on (the adaptive
-    /// contract); sync delivery with the flag off keeps only the live
-    /// decision path.
+    /// conversational route parks inline, and the webhook route parks only
+    /// under poll delivery with the flag on; sync delivery never arms park,
+    /// with or without the flag - the flag alone is not admission.
     #[tokio::test]
     async fn park_enabled_requires_flag_and_park_capable_route() {
         use aura_config::GlobPattern;
@@ -8528,8 +8527,8 @@ mod tests {
         .await
         .unwrap();
         assert!(
-            sync_park.park_enabled(),
-            "webhook sync route with park enabled: park on"
+            !sync_park.park_enabled(),
+            "a webhook sync route never arms park: sync holds one POST"
         );
 
         let sync_hold = Orchestrator::new(config(
