@@ -416,33 +416,30 @@ impl Config {
         // Scratchpad validation
         self.validate_scratchpad()?;
 
-        // Park-capable routes carry poll settings: poll delivery always
-        // parks, and sync delivery parks under the adaptive contract when the
-        // park arm is armed. Both are validated the same way.
+        // Park admission delegates to the one authority, `crate::park`:
+        // webhook-poll plus orchestration is the only parking route;
+        // conversational and webhook-sync never durable-park.
+        if let Some(hitl) = &self.hitl {
+            crate::park::validate_park_admission(hitl, self.orchestration_enabled())
+                .map_err(|err| crate::ConfigError::Validation(err.to_string()))?;
+        }
+
+        // In the admitted world poll delivery is the only parking route, and
+        // it always carries poll settings: the reconciler needs a nonzero
+        // tick interval.
         if let Some(hitl) = &self.hitl
             && let DecisionRouteConfig::Webhook {
-                delivery,
+                delivery: WebhookDelivery::Poll,
                 poll_interval_secs,
                 ..
             } = &hitl.route
+            && *poll_interval_secs == 0
         {
-            let park_capable = matches!(delivery, WebhookDelivery::Poll) || hitl.park.enabled;
-            if park_capable {
-                if !hitl.park.enabled {
-                    return Err(crate::ConfigError::Validation(
-                        "`hitl.route.delivery = \"poll\"` requires `hitl.park.enabled = true`: \
-                         poll approvals may be long-lived and requests are never held open"
-                            .to_string(),
-                    ));
-                }
-                if *poll_interval_secs == 0 {
-                    return Err(crate::ConfigError::Validation(
-                        "`hitl.route.poll_interval_secs` must be greater than zero: \
-                         the poll reconciler ticks on this interval"
-                            .to_string(),
-                    ));
-                }
-            }
+            return Err(crate::ConfigError::Validation(
+                "`hitl.route.poll_interval_secs` must be greater than zero: \
+                 the poll reconciler ticks on this interval"
+                    .to_string(),
+            ));
         }
 
         // The route timeouts feed `chrono::Duration::from_std` at the
