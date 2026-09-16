@@ -19,6 +19,48 @@ use std::collections::HashMap;
 /// The tool name through which the model addresses every configured remote.
 pub const ASK_AGENT_TOOL_NAME: &str = "ask_agent";
 
+/// Header the remote reads to pick an agent config.
+pub const MODEL_HEADER: &str = "x-aura-model";
+
+/// Path of the A2A v1.0 JSON-RPC binding under a remote's origin.
+pub const JSONRPC_PATH: &str = "/a2a/v1/rpc";
+
+/// `{origin}/a2a/v1/rpc` for an absolute `http(s)` `base_url`. A trailing
+/// slash or an already-present binding path is tolerated. Shared by config
+/// validation and the client so a URL accepted at load never fails at build.
+pub fn jsonrpc_endpoint(base_url: &str) -> Result<String, String> {
+    let parsed = url::Url::parse(base_url.trim()).map_err(|e| e.to_string())?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(format!(
+            "scheme must be http or https, got {:?}",
+            parsed.scheme()
+        ));
+    }
+    if parsed.host_str().is_none() {
+        return Err("missing host".to_owned());
+    }
+    let base = parsed.as_str().trim_end_matches('/');
+    if base.ends_with(JSONRPC_PATH) {
+        Ok(base.to_owned())
+    } else {
+        Ok(format!("{base}{JSONRPC_PATH}"))
+    }
+}
+
+/// Parse one header for the wire, lowercasing the name. Shared by config
+/// validation and the client so a header accepted at load never fails at
+/// build.
+pub fn parse_header(
+    name: &str,
+    value: &str,
+) -> Result<(http::HeaderName, http::HeaderValue), String> {
+    let header_name = http::HeaderName::from_bytes(name.trim().to_ascii_lowercase().as_bytes())
+        .map_err(|e| format!("invalid header name {name:?}: {e}"))?;
+    let header_value = http::HeaderValue::from_str(value)
+        .map_err(|e| format!("invalid value for header {name:?}: {e}"))?;
+    Ok((header_name, header_value))
+}
+
 /// Remote agents reachable over A2A, keyed by the name the model uses to
 /// address them.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -88,9 +130,9 @@ impl A2aConfig {
     }
 
     /// Reject a config the model or the HTTP client could not act on: a
-    /// remote name that cannot appear in a tool schema enum, a URL that is
-    /// not an absolute `http(s)` origin, a zero budget, or a poll interval
-    /// that never fires inside the budget.
+    /// remote name that cannot appear in a tool schema enum, a URL or
+    /// header the client's own parsers would refuse, a zero budget, or a
+    /// poll interval that never fires inside the budget.
     pub fn validate(&self) -> Result<(), crate::ConfigError> {
         let invalid = |msg: String| Err(crate::ConfigError::Validation(msg));
 
@@ -104,26 +146,31 @@ impl A2aConfig {
                     "a2a.remote name {name:?} must be non-empty and use only letters, digits, '_' or '-'"
                 ));
             }
-            let url = remote.url.trim();
-            let Some(rest) = url
-                .strip_prefix("http://")
-                .or_else(|| url.strip_prefix("https://"))
-            else {
+            if let Err(reason) = jsonrpc_endpoint(&remote.url) {
                 return invalid(format!(
-                    "a2a.remote.{name}.url must be an absolute http(s) URL, got {:?}",
-                    remote.url
-                ));
-            };
-            if rest.split('/').next().unwrap_or_default().is_empty() {
-                return invalid(format!(
-                    "a2a.remote.{name}.url has no host: {:?}",
+                    "a2a.remote.{name}.url must be an absolute http(s) URL, got {:?}: {reason}",
                     remote.url
                 ));
             }
+            for (header, value) in &remote.headers {
+                if let Err(reason) = parse_header(header, value) {
+                    return invalid(format!("a2a.remote.{name}.headers: {reason}"));
+                }
+            }
+            if let Some(model) = &remote.model
+                && let Err(reason) = parse_header(MODEL_HEADER, model)
+            {
+                return invalid(format!("a2a.remote.{name}.model: {reason}"));
+            }
             for (outbound, inbound) in &remote.headers_from_request {
-                if outbound.trim().is_empty() || inbound.trim().is_empty() {
+                if inbound.trim().is_empty() {
                     return invalid(format!(
-                        "a2a.remote.{name}.headers_from_request entries must name both headers, got {outbound:?} = {inbound:?}"
+                        "a2a.remote.{name}.headers_from_request: {outbound:?} names no inbound header"
+                    ));
+                }
+                if let Err(reason) = http::HeaderName::from_bytes(outbound.trim().as_bytes()) {
+                    return invalid(format!(
+                        "a2a.remote.{name}.headers_from_request: invalid outbound header name {outbound:?}: {reason}"
                     ));
                 }
             }
@@ -195,14 +242,57 @@ mod tests {
     }
 
     #[test]
-    fn rejects_bad_names_urls_and_budgets() {
+    fn endpoint_is_derived_from_the_origin() {
+        assert_eq!(
+            jsonrpc_endpoint("http://spoke:8080").unwrap(),
+            "http://spoke:8080/a2a/v1/rpc"
+        );
+        assert_eq!(
+            jsonrpc_endpoint("https://spoke.example.com/").unwrap(),
+            "https://spoke.example.com/a2a/v1/rpc"
+        );
+        assert_eq!(
+            jsonrpc_endpoint("http://spoke:8080/a2a/v1/rpc").unwrap(),
+            "http://spoke:8080/a2a/v1/rpc"
+        );
+        for bad in ["spoke:8080", "ftp://spoke", "http://", "http://bad host"] {
+            assert!(jsonrpc_endpoint(bad).is_err(), "{bad} should be rejected");
+        }
+    }
+
+    #[test]
+    fn rejects_bad_names_urls_headers_and_budgets() {
         let cases = [
             (
                 "[remote.\"has space\"]\nurl = \"http://x\"",
                 "letters, digits",
             ),
             ("[remote.dev]\nurl = \"dev:8080\"", "absolute http(s) URL"),
-            ("[remote.dev]\nurl = \"https://\"", "no host"),
+            ("[remote.dev]\nurl = \"https://\"", "absolute http(s) URL"),
+            (
+                "[remote.dev]\nurl = \"http://bad host\"",
+                "absolute http(s) URL",
+            ),
+            (
+                "[remote.dev]\nurl = \"http://x\"\nheaders = { \"bad header\" = \"v\" }",
+                "invalid header name",
+            ),
+            (
+                "[remote.dev]\nurl = \"http://x\"\nheaders = { Authorization = \"line\\nbreak\" }",
+                "invalid value for header",
+            ),
+            (
+                "[remote.dev]\nurl = \"http://x\"\nmodel = \"two\\nlines\"",
+                "a2a.remote.dev.model",
+            ),
+            (
+                "[remote.dev]\nurl = \"http://x\"\nheaders_from_request = { \"bad name\" = \"x\" }",
+                "invalid outbound header name",
+            ),
+            (
+                "[remote.dev]\nurl = \"http://x\"\nheaders_from_request = { \"x-out\" = \"\" }",
+                "names no inbound header",
+            ),
             (
                 "[remote.dev]\nurl = \"http://x\"\npoll_interval_secs = 0",
                 "poll_interval_secs must be at least 1",
@@ -214,10 +304,6 @@ mod tests {
             (
                 "[remote.dev]\nurl = \"http://x\"\npoll_interval_secs = 30\ntimeout_secs = 30",
                 "must be below timeout_secs",
-            ),
-            (
-                "[remote.dev]\nurl = \"http://x\"\nheaders_from_request = { \"\" = \"x\" }",
-                "must name both headers",
             ),
         ];
         for (toml_str, expected) in cases {

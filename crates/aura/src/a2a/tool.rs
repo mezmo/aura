@@ -4,6 +4,7 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -81,19 +82,42 @@ impl RemoteAgent {
     /// Send the prompt, poll until the remote task settles, and render the
     /// outcome. Gives up at `self.timeout` or when `cancel` fires, in both
     /// cases asking the remote to cancel the task it was left with.
+    ///
+    /// The send runs as its own task so that giving up while it is still in
+    /// flight does not lose the task id the remote is about to return: the
+    /// abandon path waits briefly for that reply and cancels the task it
+    /// names.
     async fn ask(
         &self,
         args: &AskAgentArgs,
         cancel: RequestCancelToken,
     ) -> Result<String, ToolError> {
-        let model = args.model.as_deref().or(self.model.as_deref());
         let started_task: Mutex<Option<String>> = Mutex::new(None);
+        // Set once `run` has taken the send task's output; polling the
+        // JoinHandle again after that panics.
+        let send_consumed = AtomicBool::new(false);
+        let mut send = tokio::spawn({
+            let client = self.client.clone();
+            let prompt = args.prompt.clone();
+            let context_id = args.context_id.clone();
+            let model = self.model.clone();
+            async move {
+                client
+                    .send_message(&prompt, context_id.as_deref(), model.as_deref())
+                    .await
+            }
+        });
 
         let run = async {
-            let reply = self
-                .client
-                .send_message(&args.prompt, args.context_id.as_deref(), model)
-                .await
+            let sent = (&mut send).await;
+            send_consumed.store(true, Ordering::SeqCst);
+            let reply = sent
+                .map_err(|e| {
+                    call_error(format!(
+                        "remote agent {:?}: send task failed: {e}",
+                        self.name
+                    ))
+                })?
                 .map_err(|e| self.remote_error(e))?;
             let mut task = match reply {
                 SendMessageResponse::Message(message) => {
@@ -130,16 +154,25 @@ impl RemoteAgent {
             _ = cancel.cancelled() => Err(call_error("Request cancelled")),
         };
 
-        let abandoned = if result.is_err() {
-            started_task
+        if result.is_err() {
+            let mut abandoned = started_task
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .take()
-        } else {
-            None
-        };
-        if let Some(task_id) = abandoned {
-            self.abandon(&task_id).await;
+                .take();
+            if abandoned.is_none() && !send_consumed.load(Ordering::SeqCst) {
+                tracing::debug!(
+                    remote = %self.name,
+                    "gave up while SendMessage was in flight; waiting for its task id"
+                );
+                if let Ok(Ok(Ok(SendMessageResponse::Task(task)))) =
+                    tokio::time::timeout(ABANDON_TIMEOUT, &mut send).await
+                {
+                    abandoned = Some(task.id);
+                }
+            }
+            if let Some(task_id) = abandoned {
+                self.abandon(&task_id).await;
+            }
         }
         result
     }
@@ -185,7 +218,8 @@ fn is_settled(state: &TaskState) -> bool {
     state.is_terminal() || matches!(state, TaskState::InputRequired | TaskState::AuthRequired)
 }
 
-/// Arguments the model passes to `ask_agent`.
+/// Arguments the model passes to `ask_agent`. Which agent config a remote
+/// serves is the operator's `model` setting, never the caller's choice.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AskAgentArgs {
@@ -193,8 +227,6 @@ struct AskAgentArgs {
     prompt: String,
     #[serde(default)]
     context_id: Option<String>,
-    #[serde(default)]
-    model: Option<String>,
 }
 
 /// What `ask_agent` hands back to the model.
@@ -433,11 +465,6 @@ fn parameters(remotes: &BTreeMap<String, RemoteAgent>) -> Value {
                 "type": "string",
                 "description": "Continue an earlier exchange with the same agent: the \
                                 context_id a previous ask_agent result returned."
-            },
-            "model": {
-                "type": "string",
-                "description": "Agent name or alias to select on the remote, overriding \
-                                the configured default."
             }
         },
         "required": ["agent", "prompt"]
@@ -499,7 +526,7 @@ mod tests {
     use super::*;
     use crate::a2a::test_server::{LoopbackA2aServer, completed_task, working_task};
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::AtomicUsize;
 
     fn remote(name: &str, server: &LoopbackA2aServer, model: Option<&str>) -> RemoteAgent {
         remote_with_budget(
@@ -590,30 +617,71 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn model_argument_overrides_the_configured_model() {
+    async fn configured_model_is_sent_and_the_caller_cannot_override_it() {
         let server = completing_server(1).await;
-        let tool = RemoteAgentTool::new(vec![remote("dev", &server, Some("default"))], None);
+        let tool = RemoteAgentTool::new(vec![remote("dev", &server, Some("verifier"))], None);
 
-        tool.call(json!({ "agent": "dev", "prompt": "x" }))
+        tool.call(json!({ "agent": "dev", "prompt": "x", "context_id": "ctx-7" }))
             .await
             .unwrap();
-        tool.call(
-            json!({ "agent": "dev", "prompt": "x", "model": "verifier", "context_id": "ctx-7" }),
-        )
-        .await
-        .unwrap();
+        let err = tool
+            .call(json!({ "agent": "dev", "prompt": "x", "model": "admin" }))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("invalid ask_agent arguments"),
+            "{err}"
+        );
 
         let sends: Vec<_> = server
             .requests()
             .into_iter()
             .filter(|r| r.method() == "SendMessage")
             .collect();
-        assert_eq!(sends[0].header_values("x-aura-model"), vec!["default"]);
-        assert_eq!(sends[1].header_values("x-aura-model"), vec!["verifier"]);
+        assert_eq!(sends.len(), 1, "the rejected call never reached the wire");
+        assert_eq!(sends[0].header_values("x-aura-model"), vec!["verifier"]);
         assert_eq!(
-            sends[1].body_json()["params"]["message"]["contextId"],
+            sends[0].body_json()["params"]["message"]["contextId"],
             "ctx-7"
         );
+        assert!(
+            !tool.parameters()["properties"]
+                .as_object()
+                .unwrap()
+                .contains_key("model")
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_send_still_cancels_the_task_the_remote_opened() {
+        let server =
+            LoopbackA2aServer::start_slow_send(
+                Duration::from_millis(200),
+                |method, _| match method {
+                    "SendMessage" => Ok(json!({ "task": working_task("late", "c") })),
+                    "GetTask" => Ok(working_task("late", "c")),
+                    "CancelTask" => Ok(json!({
+                        "id": "late", "contextId": "c", "status": { "state": "TASK_STATE_CANCELED" }
+                    })),
+                    other => panic!("unexpected method {other}"),
+                },
+            )
+            .await;
+        let request_id = format!("req_{}", uuid::Uuid::new_v4());
+        let registration = RequestCancellation::register(request_id.clone());
+        let tool =
+            RemoteAgentTool::new(vec![remote("dev", &server, None)], Some(request_id.clone()));
+
+        let call =
+            tokio::spawn(async move { tool.call(json!({ "agent": "dev", "prompt": "x" })).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        registration.token.cancel();
+        let err = call.await.unwrap().unwrap_err();
+        RequestCancellation::unregister(&request_id);
+
+        assert!(err.to_string().contains("Request cancelled"), "{err}");
+        assert_eq!(server.methods(), ["SendMessage", "CancelTask"]);
+        assert_eq!(server.requests()[1].body_json()["params"]["id"], "late");
     }
 
     #[tokio::test]

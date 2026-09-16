@@ -393,6 +393,29 @@ pub(super) fn spawn_tool_event_forwarder(
 ///
 /// Created lazily by `OrchestratorFactory::stream()` to coordinate multiple
 /// agents through a plan-execute-continue loop.
+/// The tools a worker may use, as the planner should advertise them. The
+/// worker's own `mcp_filter` wins; a worker without one inherits the base
+/// agent's, matching `AgentRuntimeConfig::tool_matches_filter` at build
+/// time. No filter anywhere means every tool; `mcp_filter = []` means none.
+fn tools_matching_filter(
+    all_tools: &[String],
+    worker_filter: Option<&[String]>,
+    base_filter: Option<&[String]>,
+) -> Vec<String> {
+    match worker_filter.or(base_filter) {
+        None => all_tools.to_vec(),
+        Some(filter) => all_tools
+            .iter()
+            .filter(|tool_name| {
+                filter
+                    .iter()
+                    .any(|pattern| crate::config::glob_match(pattern, tool_name))
+            })
+            .cloned()
+            .collect(),
+    }
+}
+
 pub struct Orchestrator {
     /// ID for the orchestrator
     orchestrator_id: String,
@@ -2440,23 +2463,12 @@ Assign tasks to the worker whose tools best match the required operations."#,
     /// - "knowledge" -> ["ListKnowledgeBases", "QueryKnowledgeBases"]
     fn resolve_worker_tools(&self) -> std::collections::HashMap<String, Vec<String>> {
         let all_tools = self.get_all_tool_names();
+        let base_filter = self.agent_config.agent.mcp_filter.as_deref();
         let mut worker_tools = std::collections::HashMap::new();
 
         for (worker_name, worker_config) in &self.config.workers {
-            // Omitted filter = every MCP tool (backwards compatibility);
-            // `mcp_filter = []` = none.
-            let mut matching_tools: Vec<String> = match &worker_config.mcp_filter {
-                None => all_tools.clone(),
-                Some(filter) => all_tools
-                    .iter()
-                    .filter(|tool_name| {
-                        filter
-                            .iter()
-                            .any(|pattern| crate::config::glob_match(pattern, tool_name))
-                    })
-                    .cloned()
-                    .collect(),
-            };
+            let mut matching_tools =
+                tools_matching_filter(&all_tools, worker_config.mcp_filter.as_deref(), base_filter);
 
             // Add vector store tools based on explicit vector_stores assignment
             for store_name in &worker_config.vector_stores {
@@ -6015,6 +6027,30 @@ mod tests {
     fn test_is_context_overflow_error_not_context_error() {
         let error: Box<dyn std::error::Error + Send + Sync> = "network timeout".into();
         assert!(!is_context_overflow_error(error.as_ref()));
+    }
+
+    #[test]
+    fn worker_without_a_filter_inherits_the_base_filter_in_planning() {
+        let all: Vec<String> = ["ask_agent", "mezmo_logs", "kubectl_get"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let base = vec!["mezmo_*".to_string()];
+
+        // The runtime keeps the base filter for a worker that omits its own,
+        // so planning must not advertise ask_agent or kubectl_get to it.
+        assert_eq!(
+            tools_matching_filter(&all, None, Some(&base)),
+            vec!["mezmo_logs".to_string()]
+        );
+        // A worker filter replaces the base filter outright.
+        assert_eq!(
+            tools_matching_filter(&all, Some(&["ask_agent".to_string()]), Some(&base)),
+            vec!["ask_agent".to_string()]
+        );
+        // No filter anywhere: everything. Empty worker filter: nothing.
+        assert_eq!(tools_matching_filter(&all, None, None), all);
+        assert!(tools_matching_filter(&all, Some(&[]), None).is_empty());
     }
 
     // ========================================================================

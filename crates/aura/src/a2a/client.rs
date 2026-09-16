@@ -13,18 +13,13 @@ use a2a::{
     CancelTaskRequest, GetTaskRequest, JsonRpcId, JsonRpcRequest, JsonRpcResponse, Message, Part,
     Role, SendMessageConfiguration, SendMessageRequest, SendMessageResponse, Task, VERSION,
 };
+use aura_config::a2a::{MODEL_HEADER, jsonrpc_endpoint, parse_header};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
-/// Path of the v1.0 JSON-RPC binding under a remote's origin.
-const JSONRPC_PATH: &str = "/a2a/v1/rpc";
-
 /// Header carrying the protocol version on every request.
 const VERSION_HEADER: &str = "a2a-version";
-
-/// Header the remote reads to pick an agent config.
-pub const MODEL_HEADER: &str = "x-aura-model";
 
 /// Bytes of a non-2xx body kept in the error message.
 const MAX_ERROR_BODY_BYTES: usize = 512;
@@ -78,10 +73,13 @@ impl A2aClient {
         headers: &HashMap<String, String>,
         user_agent: &str,
     ) -> Result<Self, A2aClientError> {
-        let endpoint = jsonrpc_endpoint(base_url)?;
+        let endpoint = jsonrpc_endpoint(base_url).map_err(|reason| A2aClientError::InvalidUrl {
+            url: base_url.to_owned(),
+            reason,
+        })?;
         let mut header_map = HeaderMap::with_capacity(headers.len() + 1);
         for (name, value) in headers {
-            let (name, value) = parse_header(name, value)?;
+            let (name, value) = header_for_wire(name, value)?;
             header_map.insert(name, value);
         }
         header_map.insert(
@@ -129,7 +127,7 @@ impl A2aClient {
         };
         let mut extra = HeaderMap::new();
         if let Some(model) = model {
-            let (name, value) = parse_header(MODEL_HEADER, model)?;
+            let (name, value) = header_for_wire(MODEL_HEADER, model)?;
             extra.insert(name, value);
         }
         self.call(methods::SEND_MESSAGE, &request, extra).await
@@ -226,44 +224,11 @@ impl A2aClient {
     }
 }
 
-/// `{origin}/a2a/v1/rpc` for an absolute `http(s)` `base_url`; a trailing
-/// slash or an already-present path is tolerated.
-fn jsonrpc_endpoint(base_url: &str) -> Result<String, A2aClientError> {
-    let invalid = |reason: String| A2aClientError::InvalidUrl {
-        url: base_url.to_owned(),
-        reason,
-    };
-    let parsed = url::Url::parse(base_url.trim()).map_err(|e| invalid(e.to_string()))?;
-    if !matches!(parsed.scheme(), "http" | "https") {
-        return Err(invalid(format!(
-            "scheme must be http or https, got {:?}",
-            parsed.scheme()
-        )));
-    }
-    if parsed.host_str().is_none() {
-        return Err(invalid("missing host".to_owned()));
-    }
-    let base = parsed.as_str().trim_end_matches('/');
-    if base.ends_with(JSONRPC_PATH) {
-        Ok(base.to_owned())
-    } else {
-        Ok(format!("{base}{JSONRPC_PATH}"))
-    }
-}
-
-fn parse_header(name: &str, value: &str) -> Result<(HeaderName, HeaderValue), A2aClientError> {
-    let header_name =
-        HeaderName::from_bytes(name.trim().to_ascii_lowercase().as_bytes()).map_err(|e| {
-            A2aClientError::InvalidHeader {
-                name: name.to_owned(),
-                reason: e.to_string(),
-            }
-        })?;
-    let header_value = HeaderValue::from_str(value).map_err(|e| A2aClientError::InvalidHeader {
+fn header_for_wire(name: &str, value: &str) -> Result<(HeaderName, HeaderValue), A2aClientError> {
+    parse_header(name, value).map_err(|reason| A2aClientError::InvalidHeader {
         name: name.to_owned(),
-        reason: e.to_string(),
-    })?;
-    Ok((header_name, header_value))
+        reason,
+    })
 }
 
 fn bounded_text(body: &[u8]) -> String {
@@ -280,25 +245,6 @@ mod tests {
     use super::*;
     use crate::a2a::test_server::{LoopbackA2aServer, working_task};
     use a2a::TaskState;
-
-    #[test]
-    fn endpoint_is_derived_from_the_origin() {
-        assert_eq!(
-            jsonrpc_endpoint("http://spoke:8080").unwrap(),
-            "http://spoke:8080/a2a/v1/rpc"
-        );
-        assert_eq!(
-            jsonrpc_endpoint("https://spoke.example.com/").unwrap(),
-            "https://spoke.example.com/a2a/v1/rpc"
-        );
-        assert_eq!(
-            jsonrpc_endpoint("http://spoke:8080/a2a/v1/rpc").unwrap(),
-            "http://spoke:8080/a2a/v1/rpc"
-        );
-        for bad in ["spoke:8080", "ftp://spoke", "http://"] {
-            assert!(jsonrpc_endpoint(bad).is_err(), "{bad} should be rejected");
-        }
-    }
 
     #[test]
     fn rejects_headers_that_cannot_travel() {

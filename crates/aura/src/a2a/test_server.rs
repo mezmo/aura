@@ -41,6 +41,9 @@ impl RecordedRequest {
 
 enum Mode {
     Rpc(Arc<Handler>),
+    /// Like `Rpc`, but every `SendMessage` answer is held for the duration
+    /// first, so a test can cancel while the send is still in flight.
+    SlowSend(Arc<Handler>, std::time::Duration),
     FixedStatus(u16, String),
 }
 
@@ -56,6 +59,14 @@ impl LoopbackA2aServer {
         H: Fn(&str, &Value) -> Result<Value, (i32, String)> + Send + Sync + 'static,
     {
         Self::start_mode(Mode::Rpc(Arc::new(handler))).await
+    }
+
+    /// Like `start`, holding every `SendMessage` reply for `delay`.
+    pub(crate) async fn start_slow_send<H>(delay: std::time::Duration, handler: H) -> Self
+    where
+        H: Fn(&str, &Value) -> Result<Value, (i32, String)> + Send + Sync + 'static,
+    {
+        Self::start_mode(Mode::SlowSend(Arc::new(handler), delay)).await
     }
 
     /// Answer every request with `status` and `body`, as a gateway would.
@@ -138,11 +149,16 @@ async fn serve_one_request(
 
     let (status, payload) = match &*mode {
         Mode::FixedStatus(status, payload) => (*status, payload.clone()),
-        Mode::Rpc(handler) => {
+        Mode::Rpc(handler) | Mode::SlowSend(handler, _) => {
             let message: Value = serde_json::from_slice(&body).expect("client sends JSON-RPC");
             let id = message["id"].clone();
             let method = message["method"].as_str().unwrap_or_default();
             let params = message.get("params").cloned().unwrap_or(Value::Null);
+            if let Mode::SlowSend(_, delay) = &*mode
+                && method == "SendMessage"
+            {
+                tokio::time::sleep(*delay).await;
+            }
             let envelope = match handler(method, &params) {
                 Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
                 Err((code, msg)) => json!({
