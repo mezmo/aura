@@ -206,8 +206,15 @@ impl RemoteAgent {
             if let Some(task_id) = open.take() {
                 abandon(&self.name, &self.client, &task_id).await;
             }
+        } else {
+            // Settling suppresses the guard's Drop-cancel. That is only safe
+            // on success: a direct message opened no task, and a settled or
+            // input-waiting task stays on the remote on purpose. On an error
+            // path the slot is empty or was already taken for the inline
+            // abandon — unless the send is still in flight, in which case
+            // the guard must cancel the task the send goes on to record.
+            open.settle();
         }
-        open.settle();
         result
     }
 
@@ -1119,6 +1126,52 @@ mod tests {
         }
         let cancel = server.requests().into_iter().last().unwrap();
         assert_eq!(cancel.body_json()["params"]["id"], "orphan");
+    }
+
+    #[tokio::test]
+    async fn a_send_slower_than_the_abandon_wait_is_cancelled_once_it_lands() {
+        // The send outlives the abandon wait (ABANDON_TIMEOUT is 5s, hence
+        // the 7s delay), so the call gives up without a task id. When the
+        // send finally lands, the OpenTask guard's Drop must still cancel
+        // the task it records.
+        let server =
+            LoopbackA2aServer::start_slow_send(Duration::from_secs(7), |method, _| match method {
+                "SendMessage" => Ok(json!({ "task": working_task("slow", "c") })),
+                "CancelTask" => Ok(json!({
+                    "id": "slow", "contextId": "c", "status": { "state": "TASK_STATE_CANCELED" }
+                })),
+                other => panic!("unexpected method {other}"),
+            })
+            .await;
+        let tool = RemoteAgentTool::new(
+            vec![remote_with_budget(
+                "dev",
+                &server,
+                None,
+                Duration::from_millis(20),
+                Duration::from_millis(100),
+            )],
+            None,
+        );
+
+        let err = tool
+            .call(json!({ "agent": "dev", "prompt": "x" }))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("did not finish within"), "{err}");
+
+        // The call returned with the send still in flight; the guard fires
+        // when the send lands and records the task id.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while server.methods().last().map(String::as_str) != Some("CancelTask") {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no CancelTask after the slow send landed"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let cancel = server.requests().into_iter().last().unwrap();
+        assert_eq!(cancel.body_json()["params"]["id"], "slow");
     }
 
     #[tokio::test]
