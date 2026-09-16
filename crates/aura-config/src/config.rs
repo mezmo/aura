@@ -1335,6 +1335,20 @@ mode = "conversational"
         assert_eq!(poll_fields(&hitl.route).0, WebhookDelivery::Sync);
     }
 
+    /// `as_str` is the wire/fingerprint spelling: it must match the serde
+    /// `rename_all = "snake_case"` representation exactly, so the
+    /// `response_type` query param and the config fingerprint's
+    /// `"delivery"` projection can never drift from the TOML value.
+    #[test]
+    fn webhook_delivery_as_str_matches_serde() {
+        for delivery in [WebhookDelivery::Sync, WebhookDelivery::Poll] {
+            assert_eq!(
+                serde_json::to_value(delivery).unwrap(),
+                serde_json::Value::String(delivery.as_str().to_string()),
+            );
+        }
+    }
+
     #[test]
     fn hitl_webhook_poll_delivery_parses_with_defaults() {
         let hitl: HitlConfig = toml::from_str(&hitl_toml("delivery = \"poll\"")).unwrap();
@@ -1703,6 +1717,18 @@ impl WebhookDelivery {
     #[must_use]
     pub fn is_sync(&self) -> bool {
         matches!(self, Self::Sync)
+    }
+
+    /// The wire spelling, identical to the serde `rename_all = "snake_case"`
+    /// representation: the `response_type` query param on the approval POST
+    /// and the config fingerprint's `"delivery"` projection both read this,
+    /// so the two can never drift apart.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Sync => "sync",
+            Self::Poll => "poll",
+        }
     }
 }
 

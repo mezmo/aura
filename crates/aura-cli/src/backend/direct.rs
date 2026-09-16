@@ -118,6 +118,20 @@ impl DirectBackend {
             }
         }
 
+        // One shared session store backs both `pending_approvals` and
+        // `AppState::session_store`, mirroring `aura-web-server`'s wiring
+        // (`server.rs`): a `PollReconciler` reads and resolves through the
+        // same `ApprovalStore` the registry writes to, so a reconciler
+        // spawned against a store this registry never touches would never
+        // see the rows it is meant to notify.
+        let session_store: Arc<dyn aura_web_server::session_store::SessionStore> =
+            Arc::new(InMemorySessionStore::new());
+        let pending_approvals = aura::hitl::PendingApprovals::with_backend(
+            session_store.approvals(),
+            session_store.bus(),
+        );
+        let shutdown_token = CancellationToken::new();
+
         let app_state = Arc::new(AppState {
             configs: Arc::new(configs),
             tool_result_mode: ToolResultMode::Aura,
@@ -129,15 +143,52 @@ impl DirectBackend {
             streaming_timeout_secs: 900,
             first_chunk_timeout_secs: 30,
             stream_inactivity_timeout_secs: 0,
-            shutdown_token: CancellationToken::new(),
+            shutdown_token: shutdown_token.clone(),
             stream_shutdown_token: CancellationToken::new(),
             active_requests: Arc::new(ActiveRequestTracker::new()),
             default_agent: None,
             additional_tools: additional_tools_factory(),
-            pending_approvals: aura::hitl::PendingApprovals::new(),
+            pending_approvals,
             hitl_webhook_hmac,
-            session_store: Arc::new(InMemorySessionStore::new()),
+            session_store: session_store.clone(),
         });
+
+        // Poll delivery: one reconciler per poll-mode agent config, mirroring
+        // `aura-web-server`'s boot wiring (`server.rs`) so `delivery = "poll"`
+        // behaves identically under `aura webserver` and standalone `aura`.
+        // Without this, a poll-mode config parks approvals nothing ever
+        // notifies or polls — a silent, permanent hang.
+        let mut claims = Vec::new();
+        let mut reconcilers = Vec::new();
+        for config in app_state.configs.iter() {
+            let Some(hitl) = &config.hitl else {
+                continue;
+            };
+            let instance_id = aura::instance_id::instance_id(&config.agent).to_string();
+            let Some(reconciler) = aura::hitl::PollReconciler::from_config(
+                hitl,
+                app_state.hitl_webhook_hmac.as_ref(),
+                instance_id.clone(),
+                session_store.approvals(),
+                &app_state.pending_approvals,
+            ) else {
+                continue;
+            };
+            let label = config.agent.alias.as_deref().unwrap_or(&config.agent.name);
+            claims.push((label.to_string(), instance_id));
+            reconcilers.push(reconciler);
+        }
+        if let Some(((first, second), id)) = aura::hitl::reconciler_id_conflicts(&claims) {
+            anyhow::bail!(
+                "poll-delivery conflict: agents '{first}' and '{second}' resolve to the same \
+                 effective instance id {id}; two reconcilers in one process would claim the \
+                 same pending approvals. give each poll-mode agent a distinct instance_seed \
+                 (or a distinct name)"
+            );
+        }
+        for reconciler in reconcilers {
+            reconciler.spawn(&shutdown_token);
+        }
 
         let headers_map = extra_headers.into_iter().collect();
 

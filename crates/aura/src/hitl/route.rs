@@ -28,6 +28,14 @@ use crate::approval_event_broker::{self, ApprovalLifecycleEvent};
 /// phase for the full route timeout (e.g. 300s).
 const WEBHOOK_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// The governance receiver's delivery selector on the approval POST:
+/// `POST {url}?response_type={sync|poll}`. Outside the HMAC, which signs
+/// only the body — a query parameter carries no signature obligation — and
+/// appended, so a configured `url` that already carries a query string
+/// keeps it. Sent on both the sync decision leg and the poll ack leg; the
+/// poll status GET is unrelated and carries only `decision_id`.
+const RESPONSE_TYPE_PARAM: &str = "response_type";
+
 /// Request-stable HITL state shared by the config gate and the agent-callable
 /// tool: the compiled glob patterns and the resolved decision route. Built once
 /// per request in the builder and shared (by `Arc`) across orchestration
@@ -633,6 +641,18 @@ impl WebhookClient {
         self.poll.is_some()
     }
 
+    /// The delivery mode this client speaks, derived from the one marker
+    /// (`poll` settings present). Feeds the `response_type` query param on
+    /// the approval POST and the config fingerprint's delivery projection —
+    /// the two can never disagree, since both read this.
+    pub(crate) fn delivery(&self) -> WebhookDelivery {
+        if self.poll_delivery() {
+            WebhookDelivery::Poll
+        } else {
+            WebhookDelivery::Sync
+        }
+    }
+
     /// Whether the configured `tool_headers_from_response` mapping demands
     /// approver identity on an approved decision.
     pub(crate) fn requires_identity(&self) -> bool {
@@ -824,6 +844,15 @@ impl WebhookClient {
     /// caller owns `send()` and the response, which the legs read differently:
     /// the sync decision leg parses a decision off it, while the poll ack leg
     /// ([`Self::notify`]) never reads the body.
+    /// The base POST builder every approval request starts from: the
+    /// configured route URL plus the `response_type` selector derived from
+    /// this client's one delivery marker.
+    fn approval_post(&self) -> reqwest::RequestBuilder {
+        self.client
+            .post(self.url.as_str())
+            .query(&[(RESPONSE_TYPE_PARAM, self.delivery().as_str())])
+    }
+
     fn build_approval_post(
         &self,
         request: &ApprovalRequest,
@@ -836,7 +865,7 @@ impl WebhookClient {
         let wire = ApprovalRequestWire::from(request);
         let Some(hmac) = self.egress_hmac()? else {
             let builder = self.apply_row_headers(
-                self.apply_operator_headers(self.client.post(self.url.as_str()).json(&wire)),
+                self.apply_operator_headers(self.approval_post().json(&wire)),
                 row_headers,
             );
             return Ok(builder.timeout(timeout));
@@ -853,8 +882,7 @@ impl WebhookClient {
             .map_err(|e| ApprovalError::Signing(e.to_string()))?;
         let mut post = self.apply_row_headers(
             self.apply_operator_headers(
-                self.client
-                    .post(self.url.as_str())
+                self.approval_post()
                     .header(reqwest::header::CONTENT_TYPE, "application/json"),
             ),
             row_headers,
@@ -2811,6 +2839,115 @@ mod tests {
             assert!(
                 String::from_utf8_lossy(&received.body).contains(&decision_id.to_string()),
                 "the ack POST must carry the approval-request wire body"
+            );
+        }
+
+        /// The sync decision leg's POST carries `response_type=sync` — the
+        /// governance receiver's delivery selector. Without it the receiver
+        /// cannot tell a sync-mode caller from a poll-mode caller and may
+        /// answer with the wrong shape.
+        #[tokio::test]
+        async fn sync_decision_post_carries_response_type_sync() {
+            let (url, received) =
+                one_shot_receiver(vec![], r#"{"approved":true}"#.to_string()).await;
+
+            let client = loopback_client(
+                &url,
+                EgressSigning::Disabled,
+                aura_config::ToolHeaderMappings::default(),
+            );
+            client
+                .request_approval(
+                    &test_request(DecisionId::generate()),
+                    Duration::from_secs(5),
+                )
+                .await
+                .expect("the sync round trip succeeds");
+
+            let received = received.await.unwrap();
+            assert!(
+                received.request_line.contains("response_type=sync"),
+                "the sync decision POST must carry response_type=sync, got: {}",
+                received.request_line
+            );
+        }
+
+        /// The poll ack leg's POST carries `response_type=poll` — the same
+        /// selector, opposite value. The sync and poll legs share
+        /// `build_approval_post`, so this and the sync test above pin both
+        /// arms of that one code path.
+        #[tokio::test]
+        async fn notify_post_carries_response_type_poll() {
+            let decision_id = DecisionId::generate();
+            let (url, received) =
+                one_shot_receiver(vec![], r#"{"approved":true}"#.to_string()).await;
+
+            let client =
+                loopback_poll_client(&url, EgressSigning::Disabled, &url, Duration::from_secs(5));
+            client
+                .notify(&test_request(decision_id), None)
+                .await
+                .expect("a 2xx ack must resolve Ok");
+
+            let received = received.await.unwrap();
+            assert!(
+                received.request_line.contains("response_type=poll"),
+                "the poll notify POST must carry response_type=poll, got: {}",
+                received.request_line
+            );
+        }
+
+        /// The poll status GET is unrelated to `response_type`: it carries
+        /// only `decision_id`, never the delivery selector.
+        #[tokio::test]
+        async fn poll_status_get_never_carries_response_type() {
+            let decision_id = DecisionId::generate();
+            let (url, received) =
+                one_shot_receiver(vec![], r#"{"status":"pending"}"#.to_string()).await;
+
+            let client =
+                loopback_poll_client(&url, EgressSigning::Disabled, &url, Duration::from_secs(5));
+            let _ = client.poll_decision(decision_id).await;
+
+            let received = received.await.unwrap();
+            assert!(
+                !received.request_line.contains("response_type"),
+                "the poll status GET must never carry response_type, got: {}",
+                received.request_line
+            );
+        }
+
+        /// A configured route URL that already carries a query string keeps
+        /// it — `response_type` is appended, not substituted.
+        #[tokio::test]
+        async fn configured_url_with_existing_query_keeps_it() {
+            let (url, received) =
+                one_shot_receiver(vec![], r#"{"approved":true}"#.to_string()).await;
+            let url_with_query = format!("{url}/hook?tenant=acme");
+
+            let client = loopback_client(
+                &url_with_query,
+                EgressSigning::Disabled,
+                aura_config::ToolHeaderMappings::default(),
+            );
+            client
+                .request_approval(
+                    &test_request(DecisionId::generate()),
+                    Duration::from_secs(5),
+                )
+                .await
+                .expect("the sync round trip succeeds");
+
+            let received = received.await.unwrap();
+            assert!(
+                received.request_line.contains("tenant=acme"),
+                "the configured query string must survive, got: {}",
+                received.request_line
+            );
+            assert!(
+                received.request_line.contains("response_type=sync"),
+                "response_type must be appended alongside it, got: {}",
+                received.request_line
             );
         }
 

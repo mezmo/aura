@@ -231,6 +231,58 @@ impl PollerHandle {
     }
 }
 
+/// The reconciler boot guard's conflict scan: the first duplicate effective
+/// instance id among the configs that would spawn a reconciler, as
+/// `((first agent label, second agent label), shared id)`. Shared by both
+/// backends (`aura-web-server` and the CLI's standalone mode) that spawn
+/// `PollReconciler`s in one process, so two poll-mode configs whose agent
+/// settings produce the same effective instance id are refused identically
+/// in either.
+///
+/// The scan sees only configs [`PollReconciler::from_config`] arms (each
+/// caller's spawn loop claims no others), so a non-poll config sharing an id
+/// never reaches it; that gating is pinned by
+/// [`tests::from_config_gates_on_poll_delivery`].
+#[must_use]
+pub fn reconciler_id_conflicts(claims: &[(String, String)]) -> Option<((String, String), String)> {
+    let mut seen = std::collections::HashMap::new();
+    for (label, id) in claims {
+        if let Some(first) = seen.insert(id, label) {
+            return Some(((first.clone(), label.clone()), id.clone()));
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod reconciler_boot_guard_tests {
+    use super::reconciler_id_conflicts;
+
+    fn claim(label: &str, id: &str) -> (String, String) {
+        (label.to_string(), id.to_string())
+    }
+
+    #[test]
+    fn duplicate_id_reports_both_labels_and_the_id() {
+        let ((first, second), id) = reconciler_id_conflicts(&[
+            claim("alpha", "id-1"),
+            claim("beta", "id-2"),
+            claim("gamma", "id-1"),
+        ])
+        .expect("the shared id must conflict");
+        assert_eq!(first, "alpha");
+        assert_eq!(second, "gamma");
+        assert_eq!(id, "id-1");
+    }
+
+    #[test]
+    fn distinct_ids_do_not_conflict() {
+        assert!(
+            reconciler_id_conflicts(&[claim("alpha", "id-1"), claim("beta", "id-2")]).is_none()
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use tokio::io::AsyncWriteExt;

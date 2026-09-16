@@ -489,7 +489,7 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
         claims.push((label.to_string(), instance_id));
         reconcilers.push(reconciler);
     }
-    if let Some(((first, second), id)) = reconciler_id_conflicts(&claims) {
+    if let Some(((first, second), id)) = aura::hitl::reconciler_id_conflicts(&claims) {
         error!(
             "poll-delivery conflict: agents '{first}' and '{second}' resolve to the same \
              effective instance id {id}"
@@ -612,52 +612,6 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
             shutdown_rx.await.ok();
         })
         .await
-}
-
-/// The reconciler boot guard's conflict scan: the first duplicate
-/// effective instance id among the configs that would spawn a reconciler,
-/// as `((first agent label, second agent label), shared id)`.
-fn reconciler_id_conflicts(claims: &[(String, String)]) -> Option<((String, String), String)> {
-    let mut seen = std::collections::HashMap::new();
-    for (label, id) in claims {
-        if let Some(first) = seen.insert(id, label) {
-            return Some(((first.clone(), label.clone()), id.clone()));
-        }
-    }
-    None
-}
-
-/// The scan sees only configs `PollReconciler::from_config` arms (the
-/// spawn loop claims no others), so a non-poll config sharing an id never
-/// reaches it; that gating is pinned by the poller's
-/// `from_config_gates_on_poll_delivery`.
-#[cfg(test)]
-mod reconciler_boot_guard_tests {
-    use super::reconciler_id_conflicts;
-
-    fn claim(label: &str, id: &str) -> (String, String) {
-        (label.to_string(), id.to_string())
-    }
-
-    #[test]
-    fn duplicate_id_reports_both_labels_and_the_id() {
-        let ((first, second), id) = reconciler_id_conflicts(&[
-            claim("alpha", "id-1"),
-            claim("beta", "id-2"),
-            claim("gamma", "id-1"),
-        ])
-        .expect("the shared id must conflict");
-        assert_eq!(first, "alpha");
-        assert_eq!(second, "gamma");
-        assert_eq!(id, "id-1");
-    }
-
-    #[test]
-    fn distinct_ids_do_not_conflict() {
-        assert!(
-            reconciler_id_conflicts(&[claim("alpha", "id-1"), claim("beta", "id-2")]).is_none()
-        );
-    }
 }
 
 #[cfg(test)]

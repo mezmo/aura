@@ -153,24 +153,6 @@ impl HitlApprovalWrapper {
             ));
         };
 
-        // Egress capture, resolved where the route was built per request: a
-        // mapped destination with no usable value closes the registration
-        // before anything persists — notify is egress auth with no later
-        // reify checkpoint (deliberately stricter than identity docking).
-        let egress_headers = match self.route.park_egress() {
-            Ok(headers) => (!headers.is_empty()).then(|| headers.into_owned()),
-            Err(err) => {
-                tracing::warn!(
-                    tool_name = %ctx.tool_name,
-                    error = %err,
-                    "park-mode webhook egress capture failed; failing the gated call closed",
-                );
-                return Err(ToolError::ToolCallError(
-                    format!("tool call blocked: {err}").into(),
-                ));
-            }
-        };
-
         let now = chrono::Utc::now();
         let expires_at =
             now + chrono::Duration::from_std(timeout).expect("approval timeout fits in chrono");
@@ -193,6 +175,49 @@ impl HitlApprovalWrapper {
                 arguments: args.clone(),
                 tool_call_intent: ctx.tool_call_intent.clone(),
             }],
+        };
+
+        // Egress capture, resolved where the route was built per request: a
+        // REQUIRED mapped destination with no usable value closes the
+        // registration before anything persists — notify is egress auth
+        // with no later reify checkpoint (deliberately stricter than
+        // identity docking). The request is already built, so a failure
+        // here can still publish the same lifecycle pair a channel fault on
+        // the live webhook arm publishes — otherwise this failure is
+        // invisible to any SSE consumer, surfacing only as a tool error to
+        // the model.
+        let egress_headers = match self.route.park_egress() {
+            Ok(headers) => (!headers.is_empty()).then(|| headers.into_owned()),
+            Err(err) => {
+                tracing::error!(
+                    decision_id = %decision_id,
+                    tool_name = %ctx.tool_name,
+                    missing = ?err.missing_names(),
+                    "park-mode webhook egress capture failed; failing the gated call closed",
+                );
+                crate::approval_event_broker::publish(
+                    &self.request_id,
+                    crate::approval_event_broker::ApprovalLifecycleEvent::Requested(
+                        (&request).into(),
+                    ),
+                )
+                .await;
+                crate::approval_event_broker::publish(
+                    &self.request_id,
+                    crate::approval_event_broker::ApprovalLifecycleEvent::Completed(
+                        super::events::completed_error(
+                            decision_id,
+                            err.to_string(),
+                            &self.scope,
+                            std::time::Duration::ZERO,
+                        ),
+                    ),
+                )
+                .await;
+                return Err(ToolError::ToolCallError(
+                    format!("tool call blocked: {err}").into(),
+                ));
+            }
         };
 
         // The store's own register, not the registry's park-anyway one: a
@@ -232,7 +257,7 @@ impl HitlApprovalWrapper {
         // task returns still sweeps this ticket.
         park.guard.record(std::slice::from_ref(&call));
 
-        // The lifecycle pair goes to the live request's broker, not the owner id.
+        // Lifecycle events go to the live request's broker, not the owner id.
         crate::approval_event_broker::publish(
             &self.request_id,
             crate::approval_event_broker::ApprovalLifecycleEvent::Requested(
@@ -240,14 +265,18 @@ impl HitlApprovalWrapper {
             ),
         )
         .await;
-        crate::approval_event_broker::publish(
-            &self.request_id,
-            crate::approval_event_broker::ApprovalLifecycleEvent::Pending(super::events::pending(
-                &parked.request,
-                &parked.expires_at,
-            )),
-        )
-        .await;
+        // `Pending` is the attended prompt: conversational route only. A
+        // webhook (poll delivery) park is decided by the governance service,
+        // so no client may offer a local approve/deny prompt for it.
+        if matches!(&*self.route, DecisionRoute::Conversational { .. }) {
+            crate::approval_event_broker::publish(
+                &self.request_id,
+                crate::approval_event_broker::ApprovalLifecycleEvent::Pending(
+                    super::events::pending(&parked.request, &parked.expires_at),
+                ),
+            )
+            .await;
+        }
 
         park.cell.push(call);
         tracing::info!(
@@ -894,10 +923,13 @@ mod tests {
                 .collect()
         }
 
-        /// Capture failure fails the REGISTRATION closed: a mapped
+        /// Capture failure fails the REGISTRATION closed: a required mapped
         /// destination with no usable resolved value and no static fallback
-        /// produces no approval row, no pending event, and no blocked-cell
-        /// entry — so there is also nothing for the reconciler to notify.
+        /// produces no approval row and no blocked-cell entry — so there is
+        /// also nothing for the reconciler to notify. It DOES publish the
+        /// `Requested` + `Completed(Errored)` lifecycle pair, the same
+        /// shape a live-arm channel fault publishes, so an SSE consumer
+        /// (and the operator) sees the attempt rather than nothing.
         #[tokio::test]
         async fn egress_capture_failure_fails_the_registration_closed() {
             let request_id = format!("req_egress_fail_{}", uuid::Uuid::new_v4().simple());
@@ -929,12 +961,31 @@ mod tests {
                 "no approval row may exist"
             );
             assert!(cell.is_empty(), "no blocked-cell entry may exist");
-            assert!(
-                tokio::time::timeout(Duration::from_millis(50), events.recv())
-                    .await
-                    .is_err(),
-                "no approval event may be published"
-            );
+
+            match tokio::time::timeout(Duration::from_secs(1), events.recv()).await {
+                Ok(Some(crate::approval_event_broker::ApprovalLifecycleEvent::Requested(
+                    requested,
+                ))) => {
+                    assert_eq!(requested.tool_name, "kubectl_apply");
+                }
+                other => panic!("expected Requested event, got {other:?}"),
+            }
+            match tokio::time::timeout(Duration::from_secs(1), events.recv()).await {
+                Ok(Some(crate::approval_event_broker::ApprovalLifecycleEvent::Completed(
+                    completed,
+                ))) => {
+                    let outcome = serde_json::to_value(&completed.outcome).unwrap();
+                    assert_eq!(outcome["kind"], "errored");
+                    assert!(
+                        outcome["message"]
+                            .as_str()
+                            .unwrap()
+                            .contains("authorization"),
+                        "the errored outcome names the capture failure: {outcome}"
+                    );
+                }
+                other => panic!("expected Completed(Errored) event, got {other:?}"),
+            }
             crate::approval_event_broker::unsubscribe(&request_id).await;
         }
 
