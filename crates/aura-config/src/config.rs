@@ -1733,6 +1733,7 @@ mode = "conversational"
     fn validate_refuses_poll_delivery_with_headers_from_request() {
         let err = crate::load_config_from_str(&poll_config_toml(
             true,
+            3600,
             "delivery = \"poll\"\nheaders_from_request = { \"authorization\" = \"authorization\" }",
         ))
         .expect_err("poll delivery is refused regardless of header mappings");
@@ -1745,8 +1746,9 @@ mode = "conversational"
 
     #[test]
     fn validate_rejects_zero_poll_interval() {
-        let err = crate::load_config_from_str(&poll_config_toml(
+        let err = crate::load_config_from_str(&orchestrated_config_toml(
             true,
+            3600,
             "delivery = \"poll\"\npoll_interval_secs = 0",
         ))
         .expect_err("a zero poll interval must be rejected");
@@ -1799,6 +1801,7 @@ mode = "conversational"
     fn validate_refuses_poll_delivery_with_park() {
         let err = crate::load_config_from_str(&poll_config_toml(
             true,
+            3600,
             "delivery = \"poll\"\n\
              tool_headers_from_response = { \"X-Forwarded-User\" = \"X-Approver-Id\" }",
         ))
@@ -1926,6 +1929,120 @@ mode = "conversational"
     fn validate_accepts_sync_delivery_without_park() {
         crate::load_config_from_str(&poll_config_toml(false, ""))
             .expect("sync webhook without park mode must stay valid");
+    }
+
+    // -------------------------------------------------------------------
+    // Park admission into full Config validation
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn config_park_admission_rejects_conversational_with_park() {
+        let err = crate::load_config_from_str(&conversational_config_toml(true))
+            .expect_err("park mode on the conversational route must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("conversational route"),
+            "error must name the route: {msg}"
+        );
+    }
+
+    #[test]
+    fn config_park_admission_rejects_sync_delivery_with_park() {
+        let err = crate::load_config_from_str(&orchestrated_config_toml(
+            true,
+            3600,
+            "delivery = \"sync\"",
+        ))
+        .expect_err("park mode on webhook sync delivery must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("webhook sync delivery"),
+            "error must name the delivery mode: {msg}"
+        );
+    }
+
+    #[test]
+    fn config_park_admission_rejects_poll_without_orchestration() {
+        let err = crate::load_config_from_str(&poll_config_toml(true, "delivery = \"poll\""))
+            .expect_err("poll delivery without orchestration must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("requires orchestration"),
+            "error must name the orchestration requirement: {msg}"
+        );
+    }
+
+    /// Like [`orchestrated_config_toml`] with `enabled = false` in the
+    /// orchestration table: poll delivery parks nowhere when the resolved
+    /// mode flag is off, so the table is inlined minimal rather than
+    /// growing the shared helper with a second flag.
+    #[test]
+    fn config_park_admission_rejects_poll_with_orchestration_disabled() {
+        let toml = "[agent]\nname = \"Test\"\nsystem_prompt = \"test\"\n\n\
+                    [agent.llm]\nprovider = \"openai\"\napi_key = \"test\"\nmodel = \"gpt-4o\"\n\n\
+                    [orchestration]\nenabled = false\n\n\
+                    [hitl]\nrequire_approval = [\"kubectl_*\"]\n\n\
+                    [hitl.park]\nenabled = true\npark_ttl = 3600\n\n\
+                    [hitl.route]\nmode = \"webhook\"\nurl = \"https://approvals.example.com/decide\"\n\
+                    delivery = \"poll\"\n";
+        let err = crate::load_config_from_str(toml)
+            .expect_err("poll delivery with orchestration disabled must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("requires orchestration"),
+            "error must name the orchestration requirement: {msg}"
+        );
+    }
+
+    #[test]
+    fn config_park_admission_rejects_ttl_below_route_timeout() {
+        let err = crate::load_config_from_str(&orchestrated_config_toml(
+            true,
+            299,
+            "delivery = \"poll\"\ntimeout_secs = 300",
+        ))
+        .expect_err("a park retention age below the route timeout must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("retention"),
+            "error must name the retention age: {msg}"
+        );
+    }
+
+    #[test]
+    fn config_park_admission_accepts_conversational_without_park() {
+        crate::load_config_from_str(&conversational_config_toml(false))
+            .expect("conversational without park mode is valid");
+    }
+
+    /// Retention equal to the route timeout is the admitted boundary.
+    #[test]
+    fn config_park_admission_accepts_poll_with_orchestration_ttl_boundary() {
+        crate::load_config_from_str(&orchestrated_config_toml(
+            true,
+            300,
+            "delivery = \"poll\"\ntimeout_secs = 300",
+        ))
+        .expect("a park retention age equal to the route timeout is admitted");
+    }
+
+    #[test]
+    fn config_park_admission_accepts_poll_with_ttl_above_timeout() {
+        crate::load_config_from_str(&orchestrated_config_toml(
+            true,
+            3600,
+            "delivery = \"poll\"\ntimeout_secs = 300",
+        ))
+        .expect("a park retention age above the route timeout is admitted");
+    }
+
+    #[test]
+    fn config_park_admission_accepts_config_without_hitl() {
+        crate::load_config_from_str(
+            "[agent]\nname = \"Test\"\nsystem_prompt = \"test\"\n\n\
+             [agent.llm]\nprovider = \"openai\"\napi_key = \"test\"\nmodel = \"gpt-4o\"\n",
+        )
+        .expect("a config with no [hitl] table is valid");
     }
 
     #[test]
