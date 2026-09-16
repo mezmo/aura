@@ -2923,7 +2923,7 @@ url = "http://127.0.0.1:9"
         }
 
         /// The conversational ingress refuses a webhook-owned row: 404,
-        /// not 204, with zero mutation. Red until the R4 fill threads the
+        /// not 204, with zero mutation. GREEN since R4-INT-1: the store check
         /// row's authority into the store's resolve check.
         #[tokio::test]
         async fn resolve_approval_refuses_a_webhook_owned_row() {
@@ -2969,7 +2969,7 @@ url = "http://127.0.0.1:9"
 
         /// The same refusal through the HMAC-ON ingress: a VALIDLY signed
         /// body passes verification and still gets 404 — a valid signature
-        /// does not override the row's authority. Red until the R4 fill.
+        /// does not override the row's authority. GREEN since R4-INT-1.
         #[tokio::test]
         async fn resolve_approval_signed_request_still_refuses_a_webhook_owned_row() {
             let hmac = ingress_test_hmac();

@@ -2347,7 +2347,7 @@ mod tests {
     // ====================================================================
     // Poll-mode tool suppression: poll configurations do not advertise the
     // server-side `request_approval` tool (single-agent/inline keeps it).
-    // Red until the R4 fill scopes the attach in `Agent::new` to non-poll
+    // GREEN since R4-INT-4: the attach in `Agent::new` is scoped to non-poll
     // routes.
     // ====================================================================
 
