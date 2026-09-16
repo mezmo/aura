@@ -146,7 +146,11 @@ impl PollReconciler {
             // receiver that holds the POST open delays its own row's
             // acknowledgment, never that row's status read, and a decided
             // row never re-posts its request.
-            match self.client.poll_decision(id, None).await {
+            match self
+                .client
+                .poll_decision(id, parked.egress_headers.as_ref())
+                .await
+            {
                 Ok(PollOutcome::NotYet) => {}
                 Ok(PollOutcome::Decided {
                     decision,
@@ -1171,9 +1175,12 @@ mod tests {
             reconciler.tick().await;
             let poll = rx.recv().await.unwrap();
             assert!(poll.starts_with("GET "), "the status read: {poll}");
+            // The GET carries the row's own egress value (per-row poll
+            // credentials, H2); identity is response-side only and never
+            // rides the request.
             assert!(
-                !poll.contains(EGRESS_ALPHA) && !poll.contains(IDENTITY_SENTINEL),
-                "the status GET carries no row egress or identity values: {poll}"
+                poll.contains(EGRESS_ALPHA) && !poll.contains(IDENTITY_SENTINEL),
+                "the status GET carries the row's egress value and no identity: {poll}"
             );
 
             match store_decision(&store, &id).await.expect("resolved") {
@@ -1454,8 +1461,9 @@ mod tests {
         /// RED-H2: every born-acknowledged row's poll GET carries THAT
         /// row's `egress_headers` — the poller passes each row's own
         /// values into the per-row call, replacing the reconciler
-        /// client's static fallback for that one request (expected RED at
-        /// this tip: the tick passes `None` today). Each capture maps to
+        /// client's static fallback for that one request (GREEN since
+        /// H2-INT: the tick forwards `parked.egress_headers`). Each
+        /// capture maps to
         /// its row through the GET's own `decision_id` query param, so
         /// the assert holds regardless of within-tick row order.
         #[tokio::test]
@@ -1531,8 +1539,8 @@ mod tests {
         /// so a fresh reconciler over the reopened store neither re-POSTs
         /// the row nor drops its credentials: both GETs carry the row's
         /// value, zero POSTs occur, and the row resolves durably on the
-        /// decided 200 (expected RED at this tip via the GET-header
-        /// asserts).
+        /// decided 200 (GREEN since H2-INT via the tick's row-header
+        /// forwarding).
         #[tokio::test]
         async fn polled_get_keeps_row_headers_across_a_restart_and_never_reposts() {
             let dir = tempfile::tempdir().unwrap();
