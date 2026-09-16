@@ -135,6 +135,12 @@ impl PollReconciler {
             if parked.request.instance_id != self.instance_id {
                 continue;
             }
+            // Authority filter: the poller passes `WebhookPoll` and
+            // refuses every other row at the tick — cross-agent polling
+            // of a shared store gets no status read and no notify POST.
+            if parked.authority != ApprovalAuthority::WebhookPoll {
+                continue;
+            }
             let id = parked.request.decision_id;
             // The status read runs before the notify attempt, so a
             // receiver that holds the POST open delays its own row's
