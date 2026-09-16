@@ -877,7 +877,10 @@ mod tests {
         ) -> aura_config::HitlConfig {
             aura_config::HitlConfig {
                 require_approval: vec![],
-                park: aura_config::ParkConfig::default(),
+                park: aura_config::ParkConfig {
+                    enabled: true,
+                    ..Default::default()
+                },
                 route: aura_config::DecisionRouteConfig::Webhook {
                     url: aura_config::WebhookUrl::new("http://127.0.0.1:1").unwrap(),
                     timeout_secs: 300,
