@@ -8551,6 +8551,67 @@ mod tests {
         assert!(poll.park_enabled(), "webhook poll route: park on");
     }
 
+    /// The tool names a built worker agent ADVERTISES — the observable
+    /// for the poll-mode tool-suppression contract (the worker config's
+    /// `hitl_request_approval_tool` field is consumed by the build; the
+    /// advertised set is what the model sees).
+    async fn advertised_worker_tool_names(agent: &Agent) -> Vec<String> {
+        let defs = match &agent.inner {
+            ProviderAgent::OpenAI(agent) => agent.tool_server_handle.get_tool_defs(None).await,
+            ProviderAgent::Anthropic(agent) => agent.tool_server_handle.get_tool_defs(None).await,
+            ProviderAgent::Bedrock(agent) => agent.tool_server_handle.get_tool_defs(None).await,
+            ProviderAgent::Gemini(agent) => agent.tool_server_handle.get_tool_defs(None).await,
+            ProviderAgent::Ollama(agent) => agent.tool_server_handle.get_tool_defs(None).await,
+            ProviderAgent::OpenRouter(agent) => agent.tool_server_handle.get_tool_defs(None).await,
+            #[cfg(test)]
+            ProviderAgent::Scripted(agent) => agent.tool_server_handle.get_tool_defs(None).await,
+        };
+        defs.expect("tool definitions list")
+            .into_iter()
+            .map(|def| def.name)
+            .collect()
+    }
+
+    /// The worker path under a park-capable webhook poll route attaches
+    /// no `request_approval` tool: poll mode resolves decisions without
+    /// an agent-callable park path. Red until the R4 fill scopes the
+    /// attach in `create_worker` to non-poll routes.
+    #[tokio::test]
+    async fn worker_poll_mode_does_not_attach_the_request_approval_tool() {
+        fn config() -> AgentRuntimeConfig {
+            let hitl = aura_config::HitlConfig {
+                require_approval: vec![aura_config::GlobPattern::new("kubectl_*").unwrap()],
+                park: aura_config::ParkConfig {
+                    enabled: true,
+                    bind_identity: false,
+                    park_ttl: aura_config::ParkTtl::default(),
+                },
+                route: webhook_route_config(aura_config::WebhookDelivery::Poll),
+            };
+            AgentRuntimeConfig {
+                hitl: Some(crate::hitl::HitlRuntime::from_config(
+                    &hitl,
+                    &crate::hitl::PendingApprovals::new(),
+                    None,
+                    None,
+                )),
+                ..AgentRuntimeConfig::default()
+            }
+        }
+
+        let orchestrator = Orchestrator::new(config()).await.unwrap();
+        let worker = orchestrator
+            .create_worker(1, 1, None, None, None)
+            .await
+            .expect("the poll-mode worker builds");
+
+        let names = advertised_worker_tool_names(&worker.agent).await;
+        assert!(
+            !names.iter().any(|name| name == "request_approval"),
+            "poll-mode workers must not attach request_approval; advertised: {names:?}",
+        );
+    }
+
     /// Run-level activation: a webhook route with poll delivery
     /// arms the park guard, enables park, and the commit path publishes the
     /// checkpoint. The reconciler flow itself is the poller's.

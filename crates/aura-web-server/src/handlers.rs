@@ -2888,6 +2888,126 @@ url = "http://127.0.0.1:9"
             );
         }
 
+        /// Park a durable webhook-owned row (authority `WebhookPoll`, as
+        /// the 207 bridge registers it) directly in the app's approval
+        /// registry.
+        async fn park_webhook_owned(state: &Arc<AppState>) -> aura::hitl::DecisionId {
+            let req = aura::hitl::ApprovalRequest {
+                version: aura::hitl::PROTOCOL_VERSION,
+                instance_id: "test-instance".to_string(),
+                decision_id: aura::hitl::DecisionId::generate(),
+                request_id: "req-webhook".into(),
+                scope: aura::hitl::AgentScope::Single { session_id: None },
+                origin: aura::hitl::ApprovalOrigin::ConfigGate {
+                    matched_pattern: "test_*".into(),
+                    agent_name: "test-agent".to_string(),
+                },
+                items: vec![],
+            };
+            let decision_id = req.decision_id;
+            state
+                .pending_approvals
+                .register_durable(aura::hitl::ParkedApproval {
+                    request: req,
+                    registered_at: chrono::Utc::now(),
+                    expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+                    authority: aura::hitl::ApprovalAuthority::WebhookPoll,
+                    egress_headers: None,
+                    acknowledgment: aura::hitl::AcknowledgmentState::RequiresNotification,
+                })
+                .await
+                .expect("the webhook-owned row parks durably");
+            decision_id
+        }
+
+        /// The conversational ingress refuses a webhook-owned row: 404,
+        /// not 204, with zero mutation. Red until the R4 fill threads the
+        /// row's authority into the store's resolve check.
+        #[tokio::test]
+        async fn resolve_approval_refuses_a_webhook_owned_row() {
+            let state = test_app_state();
+            let decision_id = park_webhook_owned(&state).await;
+            let app = approval_router(state.clone());
+
+            let response = app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri(format!("/v1/approvals/{decision_id}"))
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(r#"{"approved": true}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::NOT_FOUND,
+                "the conversational ingress must not resolve a webhook-owned row",
+            );
+            assert!(
+                state
+                    .pending_approvals
+                    .try_parked(&decision_id)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "the refused ingress must not consume the row",
+            );
+            assert!(
+                state
+                    .pending_approvals
+                    .recorded_decision(&decision_id)
+                    .await
+                    .is_none(),
+                "the refused ingress must not record a decision",
+            );
+        }
+
+        /// The same refusal through the HMAC-ON ingress: a VALIDLY signed
+        /// body passes verification and still gets 404 — a valid signature
+        /// does not override the row's authority. Red until the R4 fill.
+        #[tokio::test]
+        async fn resolve_approval_signed_request_still_refuses_a_webhook_owned_row() {
+            let hmac = ingress_test_hmac();
+            let state = test_app_state();
+            let decision_id = park_webhook_owned(&state).await;
+            let app = approval_router_with_hmac(state.clone(), Some(hmac.clone()));
+
+            let response = app
+                .oneshot(signed_request(
+                    &hmac,
+                    &decision_id.to_string(),
+                    r#"{"approved":true}"#,
+                ))
+                .await
+                .unwrap();
+
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::NOT_FOUND,
+                "a valid signature must not override a webhook-owned row's authority",
+            );
+            assert!(
+                state
+                    .pending_approvals
+                    .try_parked(&decision_id)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "the refused ingress must not consume the row",
+            );
+            assert!(
+                state
+                    .pending_approvals
+                    .recorded_decision(&decision_id)
+                    .await
+                    .is_none(),
+                "the refused ingress must not record a decision",
+            );
+        }
+
         #[tokio::test]
         async fn resolve_unknown_id_returns_404() {
             let state = test_app_state();

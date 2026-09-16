@@ -997,4 +997,174 @@ mod tests {
             "the bus payload must be credential-free, got: {text}"
         );
     }
+
+    // ====================================================================
+    // Approval authority: a row parked by one channel is never consumable
+    // through another. Red until the R4 fill enforces the authority check
+    // inside the store's resolve (E1/E2); the contract is channel
+    // exclusivity — wrong authority is unknown (NotFound), never a
+    // mutation.
+    // ====================================================================
+
+    /// Park one durable row under [`ApprovalAuthority::WebhookPoll`] —
+    /// the 207 bridge's seeding shape, mirroring poller.rs `park_pending`
+    /// — and return its decision id.
+    async fn webhook_parked(registry: &PendingApprovals, request: ApprovalRequest) -> DecisionId {
+        let id = request.decision_id;
+        registry
+            .register_durable(ParkedApproval {
+                request,
+                registered_at: chrono::Utc::now(),
+                expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+                authority: ApprovalAuthority::WebhookPoll,
+                egress_headers: None,
+                acknowledgment: AcknowledgmentState::RequiresNotification,
+            })
+            .await
+            .expect("webhook-owned approval parks durably");
+        id
+    }
+
+    /// A webhook-owned row is unknown to the conversational channel, and
+    /// the refused resolve mutates nothing (memory backend).
+    #[tokio::test]
+    async fn authority_webhook_row_refuses_conversational_resolve_memory() {
+        let registry = PendingApprovals::new();
+        let req = test_request("req-authority-memory");
+        let id = webhook_parked(&registry, req).await;
+
+        assert_eq!(
+            registry
+                .resolve(
+                    &id,
+                    ApprovalAuthority::Conversational,
+                    ApprovalDecision::Approved.into(),
+                )
+                .await,
+            Err(ResolveError::NotFound),
+            "a webhook-owned row must be unknown to the conversational channel",
+        );
+        // Zero mutation: the row is still parked and nothing was recorded.
+        assert!(
+            registry.try_parked(&id).await.unwrap().is_some(),
+            "the refused resolve must not consume the row",
+        );
+        assert!(
+            registry.recorded_decision(&id).await.is_none(),
+            "the refused resolve must not record a decision",
+        );
+    }
+
+    /// The same refusal through the durable file backend: wrong authority
+    /// fails as unknown, no decision is recorded, and the row stays in the
+    /// undecided scan the poller consumes. Backend asymmetry noted: after
+    /// any (today: wrong-authority) resolve, `get` restores the row from
+    /// the decision envelope — the file store MOVES the row, it does not
+    /// delete it — so "pending" here means "no decision recorded + still
+    /// in the pending scan", not "get is None".
+    #[tokio::test]
+    async fn authority_webhook_row_refuses_conversational_resolve_file() {
+        use crate::session_store::FileApprovalStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn ApprovalStore> = Arc::new(FileApprovalStore::open(dir.path()).unwrap());
+        let registry =
+            PendingApprovals::with_backend(store.clone(), Arc::new(InMemoryEventBus::new()));
+        let req = test_request("req-authority-file");
+        let id = webhook_parked(&registry, req).await;
+
+        assert_eq!(
+            registry
+                .resolve(
+                    &id,
+                    ApprovalAuthority::Conversational,
+                    ApprovalDecision::Approved.into(),
+                )
+                .await,
+            Err(ResolveError::NotFound),
+            "a webhook-owned row must be unknown to the conversational channel",
+        );
+        assert!(
+            registry.recorded_decision(&id).await.is_none(),
+            "the refused resolve must not record a decision",
+        );
+        let pending = store.list_pending().await.unwrap();
+        assert!(
+            pending
+                .iter()
+                .any(|parked| parked.request.decision_id == id),
+            "the refused resolve must leave the row pending",
+        );
+    }
+
+    /// The inverse block: an inline conversational row is never consumable
+    /// through the poller's webhook-poll channel — cross-agent polling of
+    /// a shared store is refused as unknown.
+    #[tokio::test]
+    async fn authority_conversational_row_refuses_webhook_poll_resolve() {
+        let registry = PendingApprovals::new();
+        let req = test_request("req-authority-cross");
+        let id = req.decision_id;
+        let _handle = registry.register(req, Duration::from_secs(60)).await;
+
+        assert_eq!(
+            registry
+                .resolve(
+                    &id,
+                    ApprovalAuthority::WebhookPoll,
+                    ApprovalDecision::Approved.into(),
+                )
+                .await,
+            Err(ResolveError::NotFound),
+            "a conversational row must be unknown to the webhook-poll channel",
+        );
+        assert!(
+            registry.try_parked(&id).await.unwrap().is_some(),
+            "the refused resolve must not consume the row",
+        );
+        assert!(
+            registry.recorded_decision(&id).await.is_none(),
+            "the refused resolve must not record a decision",
+        );
+    }
+
+    /// The matching-channel regression: each channel consumes its own rows
+    /// — WebhookPoll under WebhookPoll, inline Conversational under
+    /// Conversational. Suppression is wrong-channel-scoped only.
+    #[tokio::test]
+    async fn authority_matching_channel_still_resolves() {
+        let registry = PendingApprovals::new();
+        let webhook_req = test_request("req-authority-match-webhook");
+        let webhook_id = webhook_req.decision_id;
+        webhook_parked(&registry, webhook_req).await;
+        let inline_req = test_request("req-authority-match-inline");
+        let inline_id = inline_req.decision_id;
+        let _handle = registry.register(inline_req, Duration::from_secs(60)).await;
+
+        registry
+            .resolve(
+                &webhook_id,
+                ApprovalAuthority::WebhookPoll,
+                ApprovalDecision::Approved.into(),
+            )
+            .await
+            .expect("the webhook row resolves under WebhookPoll");
+        registry
+            .resolve(
+                &inline_id,
+                ApprovalAuthority::Conversational,
+                ApprovalDecision::Approved.into(),
+            )
+            .await
+            .expect("the inline row resolves under Conversational");
+
+        assert!(
+            registry.recorded_decision(&webhook_id).await.is_some(),
+            "the webhook row's decision is recorded",
+        );
+        assert!(
+            registry.recorded_decision(&inline_id).await.is_some(),
+            "the inline row's decision is recorded",
+        );
+    }
 }
