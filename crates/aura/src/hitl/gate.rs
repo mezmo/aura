@@ -1131,7 +1131,7 @@ mod tests {
                         "x-forwarded-user",
                         "x-approver-id",
                     )]),
-                    delivery: aura_config::WebhookDelivery::Sync,
+                    delivery: aura_config::WebhookDelivery::Poll,
                     poll_url: None,
                     poll_interval_secs: 10,
                     poll_request_timeout_secs: 30,
