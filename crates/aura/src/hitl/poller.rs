@@ -964,6 +964,33 @@ mod tests {
             id
         }
 
+        /// RED-H2 sibling of [`park_row`]: park a BORN-ACKNOWLEDGED
+        /// durable row — the truthful post-207 state, `WebhookPoll`
+        /// authority plus `AcknowledgmentState::Acknowledged` — carrying
+        /// `egress` as its resolved authorization value. Existing
+        /// `park_row` callers are untouched.
+        async fn park_acknowledged_row(store: &Arc<dyn ApprovalStore>, egress: &str) -> DecisionId {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "authorization",
+                HeaderValue::from_str(egress).expect("sentinels are valid header values"),
+            );
+            let request = parked_request(DecisionId::generate(), INSTANCE_ID);
+            let id = request.decision_id;
+            store
+                .register(ParkedApproval {
+                    request,
+                    registered_at: chrono::Utc::now(),
+                    expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+                    authority: ApprovalAuthority::WebhookPoll,
+                    egress_headers: Some(headers),
+                    acknowledgment: AcknowledgmentState::Acknowledged,
+                })
+                .await
+                .expect("acknowledged approval registers");
+            id
+        }
+
         /// One scripted receiver response: status line, extra headers, body.
         type ScriptedResponse = (
             &'static str,
@@ -1422,6 +1449,165 @@ mod tests {
             assert!(!tmp_residue, "the append's temp write is renamed away");
 
             crate::approval_event_broker::unsubscribe(&format!("run:{run_id}")).await;
+        }
+
+        /// RED-H2: every born-acknowledged row's poll GET carries THAT
+        /// row's `egress_headers` — the poller passes each row's own
+        /// values into the per-row call, replacing the reconciler
+        /// client's static fallback for that one request (expected RED at
+        /// this tip: the tick passes `None` today). Each capture maps to
+        /// its row through the GET's own `decision_id` query param, so
+        /// the assert holds regardless of within-tick row order.
+        #[tokio::test]
+        async fn polled_get_carries_each_rows_egress_headers() {
+            let dir = tempfile::tempdir().unwrap();
+            let store_root = dir.path().join("approvals");
+
+            // Registration: two born-acknowledged rows with distinct
+            // resolved values on a file store.
+            let writer: Arc<dyn ApprovalStore> =
+                Arc::new(FileApprovalStore::open(&store_root).unwrap());
+            let alpha = park_acknowledged_row(&writer, EGRESS_ALPHA).await;
+            let beta = park_acknowledged_row(&writer, EGRESS_BETA).await;
+            let expected: HashMap<String, String> = HashMap::from([
+                (alpha.to_string(), EGRESS_ALPHA.to_string()),
+                (beta.to_string(), EGRESS_BETA.to_string()),
+            ]);
+
+            // The reconciler's view: a fresh handle over the same root.
+            let reader: Arc<dyn ApprovalStore> =
+                Arc::new(FileApprovalStore::open(&store_root).unwrap());
+
+            // The client's static value differs from both rows' values, so
+            // a per-row override failure is visible.
+            let mut static_headers = HashMap::new();
+            static_headers.insert(
+                "authorization".to_string(),
+                "Bearer client-static".to_string(),
+            );
+            let config = poll_config_with(static_headers, false);
+            let (url, mut rx) = scripted_receiver_with_headers(vec![
+                // Both rows poll pending; identical entries, so the
+                // within-tick row order cannot change the script's shape.
+                ("207 Multi-Status", vec![], ""),
+                ("207 Multi-Status", vec![], ""),
+            ])
+            .await;
+            let reconciler = reconciler_from(&config, Arc::clone(&reader), &url);
+
+            reconciler.tick().await;
+            for _ in 0..2 {
+                let captured = rx.recv().await.unwrap();
+                assert!(
+                    captured.starts_with("GET "),
+                    "each born-acknowledged row reads status, never POSTs: {captured}"
+                );
+                let row_id = captured
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .and_then(|target| target.split("decision_id=").nth(1))
+                    .and_then(|rest| rest.split([' ', '&']).next())
+                    .expect("the poll GET carries its row's decision id")
+                    .to_string();
+                let header_line = captured
+                    .lines()
+                    .find(|line| line.to_lowercase().starts_with("authorization:"))
+                    .unwrap_or_else(|| panic!("every poll GET carries a row header: {captured}"));
+                assert_eq!(
+                    header_line.split_once(':').expect("header line").1.trim(),
+                    expected[&row_id],
+                    "each poll GET authenticates with ITS row's value: {captured}"
+                );
+                assert!(
+                    !captured.contains("Bearer client-static"),
+                    "the client's static fallback must never leak beside the row's: {captured}"
+                );
+            }
+        }
+
+        /// RED-H2, restart leg: the persisted `Acknowledged` marker is the
+        /// source of truth (the 207 registration IS the acknowledgment),
+        /// so a fresh reconciler over the reopened store neither re-POSTs
+        /// the row nor drops its credentials: both GETs carry the row's
+        /// value, zero POSTs occur, and the row resolves durably on the
+        /// decided 200 (expected RED at this tip via the GET-header
+        /// asserts).
+        #[tokio::test]
+        async fn polled_get_keeps_row_headers_across_a_restart_and_never_reposts() {
+            let dir = tempfile::tempdir().unwrap();
+            let store_root = dir.path().join("approvals");
+
+            // The 207 bridge registered the row acknowledged; its
+            // egress values persist with it.
+            let writer: Arc<dyn ApprovalStore> =
+                Arc::new(FileApprovalStore::open(&store_root).unwrap());
+            let id = park_acknowledged_row(&writer, EGRESS_ALPHA).await;
+
+            // The restart: a fresh handle over the same store root — the
+            // same reopen shape as
+            // `distinct_rows_keep_their_own_headers_through_retry_and_reopen`.
+            let store_b: Arc<dyn ApprovalStore> =
+                Arc::new(FileApprovalStore::open(&store_root).unwrap());
+
+            let mut static_headers = HashMap::new();
+            static_headers.insert(
+                "authorization".to_string(),
+                "Bearer client-static".to_string(),
+            );
+            let config = poll_config_with(static_headers, false);
+            let (url, mut rx) = scripted_receiver_with_headers(vec![
+                // Tick 1: the restarted row reads status (pending).
+                ("207 Multi-Status", vec![], ""),
+                // Tick 2: the decided answer resolves the row.
+                ("200 OK", vec![], r#"{"approved":true}"#),
+            ])
+            .await;
+            let reconciler = reconciler_from(&config, Arc::clone(&store_b), &url);
+
+            reconciler.tick().await;
+            let first = rx.recv().await.unwrap();
+            reconciler.tick().await;
+            let second = rx.recv().await.unwrap();
+
+            assert!(first.starts_with("GET "), "boot two polls: {first}");
+            assert!(second.starts_with("GET "), "tick two polls: {second}");
+            assert!(
+                rx.try_recv().is_err(),
+                "zero POST captures across both ticks: the acknowledged row is never re-POSTed"
+            );
+            for captured in [&first, &second] {
+                let header_line = captured
+                    .lines()
+                    .find(|line| line.to_lowercase().starts_with("authorization:"))
+                    .unwrap_or_else(|| panic!("every poll GET carries the row header: {captured}"));
+                assert_eq!(
+                    header_line.split_once(':').expect("header line").1.trim(),
+                    EGRESS_ALPHA,
+                    "the restarted row's GET keeps its stored egress credential: {captured}"
+                );
+                assert!(
+                    !captured.contains("Bearer client-static"),
+                    "the client's static fallback must be replaced: {captured}"
+                );
+            }
+
+            // The row resolved durably and left the pending scan.
+            assert_eq!(
+                store_decision(&store_b, &id).await,
+                Some(ResolvedDecision::from(ApprovalDecision::Approved)),
+                "the restarted row resolves through the pinned GET",
+            );
+            let still_pending = store_b
+                .list_pending()
+                .await
+                .unwrap()
+                .into_iter()
+                .any(|parked| parked.request.decision_id == id);
+            assert!(
+                !still_pending,
+                "the resolved ticket leaves the pending scan"
+            );
         }
     }
 

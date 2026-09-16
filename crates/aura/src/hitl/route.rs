@@ -2138,6 +2138,30 @@ mod tests {
             }
         }
 
+        /// [`loopback_poll_client`] with operator headers on the client:
+        /// the poll GET's precedence base the row overlay builds on
+        /// (RED-H1). No other field differs.
+        fn loopback_poll_client_with_headers(
+            url: &str,
+            signing: EgressSigning,
+            poll_url: &str,
+            request_timeout: Duration,
+            operator_headers: HeaderMap,
+        ) -> WebhookClient {
+            WebhookClient {
+                client: build_webhook_client(),
+                url: aura_config::WebhookUrl::new(url).unwrap(),
+                headers: operator_headers,
+                signing,
+                tool_header_mappings: aura_config::ToolHeaderMappings::default(),
+                delivery: aura_config::WebhookDelivery::Poll,
+                poll: Some(PollSettings {
+                    poll_url: aura_config::WebhookUrl::new(poll_url).unwrap(),
+                    request_timeout,
+                }),
+            }
+        }
+
         fn loopback_signed_client(url: &str, hmac: WebhookHmac) -> WebhookClient {
             loopback_client(
                 url,
@@ -3248,6 +3272,211 @@ mod tests {
                 Bytes::from(received.body),
             )
             .expect("receiver must verify the notify signature over the request body");
+        }
+
+        // ---------------------------------------------------------
+        // RED-H1: the poll GET's header precedence — operator headers
+        // first, then the parked row's forwarded values overlaid per name,
+        // signing applied last so the signature can never be displaced.
+        // The response side (approver-identity capture) stays separate.
+        // ---------------------------------------------------------
+
+        /// Pins the precedence base (expected GREEN today): the poll GET
+        /// carries the client's operator headers as configured.
+        #[tokio::test]
+        async fn poll_get_carries_operator_headers() {
+            let (url, received) =
+                one_shot_receiver_with_status("207 Multi-Status", vec![], String::new()).await;
+            let mut operator = HeaderMap::new();
+            operator.insert(
+                "x-operator-pin",
+                reqwest::header::HeaderValue::from_static("ops"),
+            );
+
+            let client = loopback_poll_client_with_headers(
+                &url,
+                EgressSigning::Disabled,
+                &url,
+                Duration::from_secs(5),
+                operator,
+            );
+            let outcome = client
+                .poll_decision(DecisionId::generate(), None)
+                .await
+                .expect("a pending poll must not fault");
+            assert!(matches!(outcome, PollOutcome::NotYet), "got {outcome:?}");
+
+            let received = received.await.unwrap();
+            assert!(
+                received.request_line.starts_with("GET "),
+                "poll must GET, got: {}",
+                received.request_line
+            );
+            assert_eq!(
+                received.header("x-operator-pin"),
+                Some("ops"),
+                "the poll GET carries the operator headers as configured"
+            );
+        }
+
+        /// The row placeholders: the GET's `authorization` must carry the
+        /// parked row's forwarded value, replacing the client's static
+        /// fallback for this one request (expected RED at this tip —
+        /// `poll_decision` drops `_row_headers` today).
+        #[tokio::test]
+        async fn poll_get_overlays_the_rows_forwarded_values() {
+            let decision_id = DecisionId::generate();
+            let (url, received) =
+                one_shot_receiver_with_status("207 Multi-Status", vec![], String::new()).await;
+            let mut operator = HeaderMap::new();
+            operator.insert(
+                "authorization",
+                reqwest::header::HeaderValue::from_static("Bearer client-static"),
+            );
+            let client = loopback_poll_client_with_headers(
+                &url,
+                EgressSigning::Disabled,
+                &url,
+                Duration::from_secs(5),
+                operator,
+            );
+            let mut row = HeaderMap::new();
+            row.insert(
+                "authorization",
+                reqwest::header::HeaderValue::from_static("Bearer row-alpha"),
+            );
+
+            let outcome = client
+                .poll_decision(decision_id, Some(&row))
+                .await
+                .expect("a pending poll must not fault");
+            assert!(matches!(outcome, PollOutcome::NotYet), "got {outcome:?}");
+
+            let received = received.await.unwrap();
+            assert_eq!(
+                received.header("authorization"),
+                Some("Bearer row-alpha"),
+                "the GET authenticates with the row's forwarded value, not the client's"
+            );
+            assert!(
+                received
+                    .headers
+                    .iter()
+                    .all(|(_, value)| value.as_str() != "Bearer client-static"),
+                "the client's static fallback must be replaced, not duplicated: {:?}",
+                received.headers
+            );
+        }
+
+        /// Signing applies last on the poll GET: a row's stale or bogus
+        /// value under the signature header's own name never displaces the
+        /// applied signature — the receiver still verifies the GET under
+        /// `approval-request:{id}` — and the row's ordinary values ride
+        /// along (expected RED at this tip via the row-scope assert).
+        #[tokio::test]
+        async fn poll_get_signing_applies_last_and_cannot_be_displaced() {
+            let hmac = test_hmac();
+            let decision_id = DecisionId::generate();
+            let (url, received) =
+                one_shot_receiver_with_status("207 Multi-Status", vec![], String::new()).await;
+            let client = loopback_poll_client_with_headers(
+                &url,
+                EgressSigning::Enabled(hmac.clone()),
+                &url,
+                Duration::from_secs(5),
+                HeaderMap::new(),
+            );
+            let mut row = HeaderMap::new();
+            row.insert(
+                "x-row-scope",
+                reqwest::header::HeaderValue::from_static("alpha"),
+            );
+            row.insert(
+                reqwest::header::HeaderName::from_static("x-aura-signature-256"),
+                reqwest::header::HeaderValue::from_static("bogus row value"),
+            );
+
+            let outcome = client
+                .poll_decision(decision_id, Some(&row))
+                .await
+                .expect("a pending signed poll must not fault");
+            assert!(matches!(outcome, PollOutcome::NotYet), "got {outcome:?}");
+
+            let received = received.await.unwrap();
+            assert_eq!(
+                received.header("x-row-scope"),
+                Some("alpha"),
+                "the row's ordinary forwarded values still ride the signed GET: {:?}",
+                received.headers
+            );
+            let signature = received.header(SIGNATURE_HEADER).map(str::to_owned);
+            let timestamp = received.header(TIMESTAMP_HEADER).map(str::to_owned);
+            let egress_context =
+                SigningContext::new(&format!("approval-request:{decision_id}")).unwrap();
+            authorize_ingress(
+                Some(&hmac),
+                &egress_context,
+                signature.as_deref(),
+                timestamp.as_deref(),
+                Bytes::from(received.body.clone()),
+            )
+            .expect(
+                "the applied-last signature must win and verify over the empty GET body; the \
+                 bogus row value must never have displaced it",
+            );
+            assert_ne!(
+                signature.as_deref(),
+                Some("bogus row value"),
+                "the receiving side must read the real signature, not the row's bogus value"
+            );
+        }
+
+        /// The request-side overlay never touches response identity
+        /// capture: row headers on the poll GET do not perturb the decided
+        /// 200's `response_headers` (expected GREEN — pins the separation
+        /// the contract keeps).
+        #[tokio::test]
+        async fn poll_get_row_headers_leave_response_identity_capture_separate() {
+            let hmac = test_hmac();
+            let decision_id = DecisionId::generate();
+            let response_body = r#"{"approved":true}"#.to_string();
+            let mut response_headers = signed_response_headers(&hmac, decision_id, &response_body);
+            response_headers.push(("x-approver-id".to_owned(), "alice".to_owned()));
+            let (url, _received) = one_shot_receiver(response_headers, response_body).await;
+
+            let client = loopback_poll_client_with_headers(
+                &url,
+                EgressSigning::Enabled(hmac),
+                &url,
+                Duration::from_secs(5),
+                HeaderMap::new(),
+            );
+            let mut row = HeaderMap::new();
+            row.insert(
+                "authorization",
+                reqwest::header::HeaderValue::from_static("Bearer row-alpha"),
+            );
+
+            let outcome = client
+                .poll_decision(decision_id, Some(&row))
+                .await
+                .expect("a decided signed poll must resolve");
+            match outcome {
+                PollOutcome::Decided {
+                    decision,
+                    response_headers,
+                } => {
+                    assert_eq!(decision, ApprovalDecision::Approved);
+                    assert_eq!(
+                        response_headers
+                            .get("x-approver-id")
+                            .map(|v| v.to_str().unwrap()),
+                        Some("alice"),
+                        "the request-side overlay never touches response capture"
+                    );
+                }
+                other => panic!("expected Decided, got {other:?}"),
+            }
         }
 
         #[tokio::test]
