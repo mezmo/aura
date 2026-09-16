@@ -1189,13 +1189,25 @@ impl Orchestrator {
                 gate = gate.with_recorded_decisions(Arc::clone(recorded));
             }
             wrappers.insert(0, Arc::new(gate));
-            worker_config.hitl_request_approval_tool = Some(crate::hitl::RequestApprovalTool::new(
-                hitl.route.clone(),
-                scope,
-                request_id,
-                worker_config.agent.name.clone(),
-                worker_config.instance_id.clone(),
-            ));
+            // Poll-mode delivery gives the worker no callable park path: the
+            // 207 bridge registers the call server-side and the poller
+            // resolves it, so the tool is not attached. Only poll is
+            // suppressed — conversational keeps the inline tool and a sync
+            // hold keeps it too. The gate wrappers above still enforce the
+            // approval on gated calls.
+            if !matches!(
+                hitl.route.park_authority(),
+                Some(crate::hitl::ApprovalAuthority::WebhookPoll)
+            ) {
+                worker_config.hitl_request_approval_tool =
+                    Some(crate::hitl::RequestApprovalTool::new(
+                        hitl.route.clone(),
+                        scope,
+                        request_id,
+                        worker_config.agent.name.clone(),
+                        worker_config.instance_id.clone(),
+                    ));
+            }
         }
 
         let wrapper: Arc<dyn ToolWrapper> = Arc::new(ComposedWrapper::new(wrappers));
@@ -8736,7 +8748,9 @@ mod tests {
         };
         let orchestrator = Orchestrator::new(config).await.unwrap();
 
-        // Two durable registrations, as the park arm would make them.
+        // Two durable registrations, as the park arm would make them:
+        // born through the 207 bridge, acknowledged by the registration
+        // itself and never re-POSTed.
         let now = chrono::Utc::now();
         let mut pending = Vec::new();
         for tool in ["kubectl_apply", "kubectl_delete"] {
@@ -8757,9 +8771,9 @@ mod tests {
                     },
                     registered_at: now,
                     expires_at: now + chrono::Duration::seconds(60),
-                    authority: crate::hitl::ApprovalAuthority::Conversational,
+                    authority: crate::hitl::ApprovalAuthority::WebhookPoll,
                     egress_headers: None,
-                    acknowledgment: crate::hitl::AcknowledgmentState::RequiresNotification,
+                    acknowledgment: crate::hitl::AcknowledgmentState::Acknowledged,
                 })
                 .await
                 .expect("durable register succeeds");
@@ -8858,8 +8872,8 @@ mod tests {
     }
 
     /// An awaiting plan plus its park record, with every pending call
-    /// durably parked under the run-scoped owner — the state the gate and
-    /// hook leave behind at the quiescence verdict.
+    /// durably parked under the run-scoped owner — born through the 207
+    /// bridge, acknowledged by the registration itself and never re-POSTed.
     async fn awaiting_plan_with_parked_calls(
         registry: &crate::hitl::PendingApprovals,
         run_id: &str,
@@ -8893,9 +8907,9 @@ mod tests {
                     },
                     registered_at: now,
                     expires_at: now + chrono::Duration::hours(1),
-                    authority: crate::hitl::ApprovalAuthority::Conversational,
+                    authority: crate::hitl::ApprovalAuthority::WebhookPoll,
                     egress_headers: None,
-                    acknowledgment: crate::hitl::AcknowledgmentState::RequiresNotification,
+                    acknowledgment: crate::hitl::AcknowledgmentState::Acknowledged,
                 })
                 .await
                 .unwrap();
@@ -9107,9 +9121,9 @@ mod tests {
                     },
                     registered_at,
                     expires_at: registered_at + chrono::Duration::hours(1),
-                    authority: crate::hitl::ApprovalAuthority::Conversational,
+                    authority: crate::hitl::ApprovalAuthority::WebhookPoll,
                     egress_headers: None,
-                    acknowledgment: crate::hitl::AcknowledgmentState::RequiresNotification,
+                    acknowledgment: crate::hitl::AcknowledgmentState::Acknowledged,
                 })
                 .await
                 .unwrap();
@@ -9191,7 +9205,7 @@ mod tests {
             registry
                 .resolve(
                     &call.decision_id,
-                    crate::hitl::ApprovalAuthority::Conversational,
+                    crate::hitl::ApprovalAuthority::WebhookPoll,
                     crate::hitl::ApprovalDecision::Approved.into(),
                 )
                 .await
@@ -9213,7 +9227,7 @@ mod tests {
             registry
                 .resolve(
                     &call.decision_id,
-                    crate::hitl::ApprovalAuthority::Conversational,
+                    crate::hitl::ApprovalAuthority::WebhookPoll,
                     crate::hitl::ApprovalDecision::Approved.into(),
                 )
                 .await
@@ -9383,7 +9397,7 @@ mod tests {
         registry
             .resolve(
                 &decided,
-                crate::hitl::ApprovalAuthority::Conversational,
+                crate::hitl::ApprovalAuthority::WebhookPoll,
                 crate::hitl::ApprovalDecision::Approved.into(),
             )
             .await

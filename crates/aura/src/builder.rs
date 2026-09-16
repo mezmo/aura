@@ -342,13 +342,25 @@ impl Agent {
                 ])),
                 None => gate,
             });
-            config_owned.hitl_request_approval_tool = Some(crate::hitl::RequestApprovalTool::new(
-                hitl.route.clone(),
-                scope,
-                request_id,
-                config_owned.agent.name.clone(),
-                config_owned.instance_id.clone(),
-            ));
+            // Poll-mode delivery gives the agent no callable park path: the
+            // 207 bridge registers the call server-side and the poller
+            // resolves it, so the tool is not advertised. Only poll is
+            // suppressed — conversational keeps the inline tool and a sync
+            // hold keeps it too. The gate above still enforces the approval
+            // on gated calls.
+            if !matches!(
+                hitl.route.park_authority(),
+                Some(crate::hitl::ApprovalAuthority::WebhookPoll)
+            ) {
+                config_owned.hitl_request_approval_tool =
+                    Some(crate::hitl::RequestApprovalTool::new(
+                        hitl.route.clone(),
+                        scope,
+                        request_id,
+                        config_owned.agent.name.clone(),
+                        config_owned.instance_id.clone(),
+                    ));
+            }
         }
 
         // Scratchpad bonus only applies when scratchpad was actually wired up
