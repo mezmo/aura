@@ -7,7 +7,6 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use serde_json::{Value, json};
 
@@ -169,24 +168,81 @@ struct World {
     registry: PendingApprovals,
     config: AgentRuntimeConfig,
     claims: ResumeClaimTable,
+    /// The default world's 207 receiver, held so it stays alive for the
+    /// World's lifetime. `world_over_hitl` starts every world with an idle
+    /// placeholder; the default `world()` swaps in the real receiver after
+    /// construction.
+    _receiver: tokio::task::JoinHandle<()>,
 }
 
+/// The persistent scripted receiver the default world parks against: one
+/// ephemeral listener serving up to 64 sequential POST connections, each
+/// answered with an empty `207 Multi-Status` (the shape that registers the
+/// gated call for GET polling), then the loop exits. No request capture —
+/// the frames seed and read the registry directly. The std listener binds
+/// synchronously and converts inside the spawned task, so the caller needs
+/// no await.
+fn park_receiver() -> (String, tokio::task::JoinHandle<()>) {
+    use tokio::io::AsyncWriteExt;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("receiver listener binds");
+    let url = format!(
+        "http://{}",
+        listener.local_addr().expect("receiver address")
+    );
+    listener
+        .set_nonblocking(true)
+        .expect("receiver listener goes non-blocking for tokio");
+    let handle = tokio::spawn(async move {
+        let listener =
+            tokio::net::TcpListener::from_std(listener).expect("async receiver listener");
+        for _ in 0..64 {
+            let (mut socket, _) = listener.accept().await.expect("receiver accepts");
+            let _ = crate::hitl::read_full_request(&mut socket).await;
+            let response = "HTTP/1.1 207 Multi-Status\r\ncontent-type: application/json\r\n\
+                            content-length: 0\r\nconnection: close\r\n\r\n";
+            socket.write_all(response.as_bytes()).await.ok();
+            socket.shutdown().await.ok();
+        }
+    });
+    (url, handle)
+}
+
+/// The default world: parks through the 207 bridge on the poll-delivery
+/// route — the one route runtime admission parks; the conversational
+/// channel never durable-parks.
 fn world() -> World {
-    world_over_hitl(|registry| crate::hitl::HitlRuntime {
-        patterns: Arc::from([aura_config::GlobPattern::new("kubectl_*").unwrap()]),
-        route: Arc::new(crate::hitl::DecisionRoute::Conversational {
-            registry: registry.clone(),
-            timeout: Duration::from_secs(3600),
-        }),
-        park_enabled: true,
-        park_ttl: aura_config::ParkTtl::default(),
-    })
+    let (url, receiver) = park_receiver();
+    let mut world = world_over_hitl(|registry| {
+        let config = aura_config::HitlConfig {
+            require_approval: vec![aura_config::GlobPattern::new("kubectl_*").unwrap()],
+            park: aura_config::ParkConfig {
+                enabled: true,
+                bind_identity: false,
+                park_ttl: aura_config::ParkTtl::default(),
+            },
+            route: aura_config::DecisionRouteConfig::Webhook {
+                url: aura_config::WebhookUrl::new(&url).unwrap(),
+                timeout_secs: 3600,
+                headers: HashMap::new(),
+                headers_from_request: HashMap::new(),
+                tool_headers_from_response: aura_config::ToolHeaderMappings::default(),
+                delivery: aura_config::WebhookDelivery::Poll,
+                poll_url: None,
+                poll_interval_secs: 10,
+                poll_request_timeout_secs: 30,
+                receiver_wait_timeout_secs: 900,
+            },
+        };
+        crate::hitl::HitlRuntime::from_config(&config, registry, None, None)
+    });
+    world._receiver = receiver;
+    world
 }
 
-/// Build a world over the caller's HITL runtime: the default world speaks
-/// the conversational route; the identity frames swap in a poll-delivery
-/// webhook whose `tool_headers_from_response` mapping arms the reify-side
-/// identity rule.
+/// Build a world over the caller's HITL runtime: the default world parks
+/// through the 207 bridge on the poll-delivery route; the identity frames
+/// swap in a poll-delivery webhook whose `tool_headers_from_response`
+/// mapping arms the reify-side identity rule.
 fn world_over_hitl(hitl: impl FnOnce(&PendingApprovals) -> crate::hitl::HitlRuntime) -> World {
     let dir = tempfile::tempdir().expect("temp memory root");
     std::fs::create_dir_all(dir.path().join("approvals")).expect("approval dir");
@@ -233,6 +289,10 @@ fn world_over_hitl(hitl: impl FnOnce(&PendingApprovals) -> crate::hitl::HitlRunt
         registry,
         config,
         claims: ResumeClaimTable::new(),
+        // Idle placeholder so the construction stays total: the default
+        // `world()` swaps in its live 207 receiver after construction, and
+        // the identity frames never connect to a receiver at all.
+        _receiver: tokio::spawn(async {}),
     }
 }
 
@@ -311,7 +371,7 @@ fn node_approval(
         },
         registered_at: chrono::Utc::now(),
         expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
-        authority: crate::hitl::ApprovalAuthority::Conversational,
+        authority: crate::hitl::ApprovalAuthority::WebhookPoll,
         egress_headers: None,
         acknowledgment: crate::hitl::AcknowledgmentState::RequiresNotification,
     }
@@ -333,7 +393,7 @@ async fn register_decided(world: &World) {
         .registry
         .resolve(
             &decision(),
-            crate::hitl::ApprovalAuthority::Conversational,
+            crate::hitl::ApprovalAuthority::WebhookPoll,
             ApprovalDecision::Approved.into(),
         )
         .await
@@ -351,7 +411,7 @@ async fn register_decided_b(world: &World) {
         .registry
         .resolve(
             &decision_b(),
-            crate::hitl::ApprovalAuthority::Conversational,
+            crate::hitl::ApprovalAuthority::WebhookPoll,
             ApprovalDecision::Approved.into(),
         )
         .await
@@ -365,7 +425,7 @@ async fn register_denied(world: &World) {
         .registry
         .resolve(
             &decision(),
-            crate::hitl::ApprovalAuthority::Conversational,
+            crate::hitl::ApprovalAuthority::WebhookPoll,
             ApprovalDecision::Denied {
                 reason: Some(DENIAL_REASON.to_string()),
             }
@@ -396,7 +456,7 @@ async fn register_decided_duplicate_pair(world: &World) {
             .registry
             .resolve(
                 &id,
-                crate::hitl::ApprovalAuthority::Conversational,
+                crate::hitl::ApprovalAuthority::WebhookPoll,
                 ApprovalDecision::Approved.into(),
             )
             .await
@@ -430,7 +490,7 @@ async fn register_decided_pivot_pair(
         .registry
         .resolve(
             &decision(),
-            crate::hitl::ApprovalAuthority::Conversational,
+            crate::hitl::ApprovalAuthority::WebhookPoll,
             first.into(),
         )
         .await
@@ -439,7 +499,7 @@ async fn register_decided_pivot_pair(
         .registry
         .resolve(
             &decision_pivot_2(),
-            crate::hitl::ApprovalAuthority::Conversational,
+            crate::hitl::ApprovalAuthority::WebhookPoll,
             second.into(),
         )
         .await
@@ -456,7 +516,7 @@ async fn register_duplicate_pair_second_without_identity(world: &World) {
         .registry
         .resolve(
             &decision(),
-            crate::hitl::ApprovalAuthority::Conversational,
+            crate::hitl::ApprovalAuthority::WebhookPoll,
             ResolvedDecision::approved(Some(crate::approver_headers::tests::captured_overrides(
                 "x-forwarded-user",
                 "tok",
@@ -468,7 +528,7 @@ async fn register_duplicate_pair_second_without_identity(world: &World) {
         .registry
         .resolve(
             &decision_2(),
-            crate::hitl::ApprovalAuthority::Conversational,
+            crate::hitl::ApprovalAuthority::WebhookPoll,
             ApprovalDecision::Approved.into(),
         )
         .await
@@ -2082,7 +2142,7 @@ async fn consumed_subset_re_park_preserves_the_sibling_and_completes_on_the_seco
         .registry
         .resolve(
             &fresh_decision,
-            crate::hitl::ApprovalAuthority::Conversational,
+            crate::hitl::ApprovalAuthority::WebhookPoll,
             ApprovalDecision::Approved.into(),
         )
         .await
@@ -2301,7 +2361,7 @@ async fn post_substitution_new_call_re_parks_through_the_live_arm_not_a_strict_m
         .registry
         .resolve(
             &fresh_decision,
-            crate::hitl::ApprovalAuthority::Conversational,
+            crate::hitl::ApprovalAuthority::WebhookPoll,
             ApprovalDecision::Approved.into(),
         )
         .await
@@ -3151,7 +3211,7 @@ async fn same_key_duplicate_calls_execute_once_each_and_a_re_park_removes_both_c
         .registry
         .resolve(
             &fresh_decision,
-            crate::hitl::ApprovalAuthority::Conversational,
+            crate::hitl::ApprovalAuthority::WebhookPoll,
             ApprovalDecision::Approved.into(),
         )
         .await
@@ -4587,7 +4647,7 @@ async fn an_early_re_park_publishes_the_drive_loops_new_failures() {
         .registry
         .resolve(
             &fresh_decision,
-            crate::hitl::ApprovalAuthority::Conversational,
+            crate::hitl::ApprovalAuthority::WebhookPoll,
             ApprovalDecision::Approved.into(),
         )
         .await
