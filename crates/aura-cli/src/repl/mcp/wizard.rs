@@ -395,7 +395,7 @@ fn verify_server(
                     .chain(manager.sse_tools.get(name))
                     .chain(manager.stdio_tools.get(name))
                     .flatten()
-                    .map(|tool| tool.name.to_string())
+                    .map(|tool| tool.name().to_string())
                     .collect();
                 (info.status.clone(), tools)
             })

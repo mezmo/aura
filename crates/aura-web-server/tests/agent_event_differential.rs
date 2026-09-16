@@ -389,6 +389,7 @@ async fn approval_lifecycle_matches() {
     let requested = aura_events::ApprovalRequested {
         decision_id: "dec_1".to_string(),
         tool_name: TOOL_NAME.to_string(),
+        tool_namespace: None,
         origin: aura_events::ApprovalOriginWire::ConfigGate {
             matched_pattern: "list_*".to_string(),
             agent_name: "main".to_string(),

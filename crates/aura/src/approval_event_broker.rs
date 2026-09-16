@@ -138,6 +138,7 @@ mod tests {
         ApprovalLifecycleEvent::Requested(ApprovalRequested {
             decision_id: decision_id.to_owned(),
             tool_name: "dangerous_apply".to_owned(),
+            tool_namespace: None,
             origin: ApprovalOriginWire::ConfigGate {
                 matched_pattern: "dangerous_*".to_owned(),
                 agent_name: "test-agent".to_owned(),

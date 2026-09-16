@@ -105,13 +105,13 @@ pub fn completed_cancelled_event(
 /// `approval_requested`: emitted for both routes when an approval is raised.
 impl From<&ApprovalRequest> for ApprovalRequested {
     fn from(request: &ApprovalRequest) -> Self {
+        let first_item = request.items.first();
         Self {
             decision_id: request.decision_id.to_string(),
-            tool_name: request
-                .items
-                .first()
+            tool_name: first_item
                 .map(|item| item.tool_name.clone())
                 .unwrap_or_default(),
+            tool_namespace: first_item.and_then(|item| item.tool_namespace.clone()),
             origin: origin_to_wire(&request.origin),
             scope: scope_to_wire(&request.scope),
         }
@@ -145,6 +145,7 @@ impl From<&ParkedApproval> for ApprovalPending {
             tool_name: first_item
                 .map(|item| item.tool_name.clone())
                 .unwrap_or_default(),
+            tool_namespace: first_item.and_then(|item| item.tool_namespace.clone()),
             arguments: first_item
                 .map(|item| item.arguments.clone())
                 .unwrap_or(serde_json::Value::Null),
@@ -168,6 +169,7 @@ pub fn pending(
         tool_name: first_item
             .map(|item| item.tool_name.clone())
             .unwrap_or_default(),
+        tool_namespace: first_item.and_then(|item| item.tool_namespace.clone()),
         arguments: first_item
             .map(|item| item.arguments.clone())
             .unwrap_or(serde_json::Value::Null),
