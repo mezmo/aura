@@ -31,6 +31,9 @@ pub struct Config {
     /// Governance integration for catalog sync and policy endpoints.
     #[serde(default)]
     pub governance: Option<GovernanceConfig>,
+    /// Remote agents reachable over A2A.
+    #[serde(default)]
+    pub a2a: Option<crate::a2a::A2aConfig>,
 }
 
 /// Reasoning effort level for GPT-5 models
@@ -432,6 +435,10 @@ impl Config {
 
         if let Some(orch) = &self.orchestration {
             orch.validate_worker_names()?;
+        }
+
+        if let Some(a2a) = &self.a2a {
+            a2a.validate()?;
         }
 
         Ok(())

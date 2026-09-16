@@ -757,6 +757,7 @@ mod tests {
             orchestration: None,
             hitl: None,
             governance: None,
+            a2a: None,
             agent: aura_config::AgentConfig {
                 name: name.to_owned(),
                 alias: alias.map(str::to_owned),
