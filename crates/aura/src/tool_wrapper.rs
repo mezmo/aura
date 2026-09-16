@@ -71,6 +71,8 @@ use crate::mcp::CallOutcome;
 pub struct ToolCallContext {
     /// Tool name being called
     pub tool_name: String,
+    /// MCP server namespace associated with the tool.
+    pub tool_namespace: Option<String>,
     /// The ID of the orchestrator or worker initiating the tool call
     pub tool_initiator_id: String,
     /// Optional correlation ID for tracing

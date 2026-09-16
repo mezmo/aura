@@ -348,12 +348,14 @@ mod tests {
             AgentEventPayload::ApprovalRequested(aura_events::ApprovalRequested {
                 decision_id: "d-1".to_string(),
                 tool_name: "kubectl_apply".to_string(),
+                tool_namespace: None,
                 origin: origin(),
                 scope: scope(),
             }),
             AgentEventPayload::ApprovalPending(aura_events::ApprovalPending {
                 decision_id: "d-1".to_string(),
                 tool_name: "kubectl_apply".to_string(),
+                tool_namespace: None,
                 arguments: json!({ "ns": "prod" }),
                 origin: origin(),
                 scope: scope(),

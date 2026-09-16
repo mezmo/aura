@@ -804,6 +804,7 @@ mod tests {
             },
             items: vec![ApprovalItem {
                 tool_name: "shell_exec".to_string(),
+                tool_namespace: None,
                 arguments: json!({ "cmd": "ls -la" }),
                 tool_call_intent: None,
             }],
@@ -832,6 +833,28 @@ mod tests {
         assert_eq!(items[0]["tool_name"], "shell_exec");
         assert_eq!(items[0]["arguments"]["cmd"], "ls -la");
         assert!(items[0].get("tool_call_intent").is_none());
+    }
+
+    /// `tool_namespace` is skipped when absent, so an always-`None` field
+    /// serializes exactly like a correctly-populated one that happens to be
+    /// empty. Only the `Some` case shows the approver ever receives it.
+    #[test]
+    fn tool_namespace_reaches_the_approver_on_the_wire() {
+        let item = |tool_namespace: Option<String>| ApprovalItem {
+            tool_name: "list_repos".to_string(),
+            tool_namespace,
+            arguments: json!({}),
+            tool_call_intent: None,
+        };
+        let with_namespace =
+            serde_json::to_value(item(Some("github".to_string()))).expect("serializable");
+        assert_eq!(with_namespace["tool_namespace"], "github");
+
+        let without = serde_json::to_value(item(None)).expect("serializable");
+        assert!(
+            without.get("tool_namespace").is_none(),
+            "an absent namespace must be omitted, not sent as null",
+        );
     }
 
     #[test]
@@ -887,6 +910,7 @@ mod tests {
             },
             items: vec![ApprovalItem {
                 tool_name: "kubectl_delete".to_string(),
+                tool_namespace: None,
                 arguments: json!({ "namespace": "prod" }),
                 tool_call_intent: Some("rollout restart to pick up the new config map".to_string()),
             }],
@@ -915,6 +939,7 @@ mod tests {
             },
             items: vec![ApprovalItem {
                 tool_name: "request_approval".to_string(),
+                tool_namespace: None,
                 arguments: json!({
                     "action_description": "Delete namespace",
                     "risk_rationale": "touches prod"
@@ -943,6 +968,7 @@ mod tests {
             },
             items: vec![ApprovalItem {
                 tool_name: "request_approval".to_string(),
+                tool_namespace: None,
                 arguments: json!({
                     "action_description": "Delete namespace",
                     "risk_rationale": "touches prod"
@@ -2215,6 +2241,7 @@ mod tests {
             },
             items: vec![ApprovalItem {
                 tool_name: "dangerous_apply".into(),
+                tool_namespace: None,
                 arguments: serde_json::json!({}),
                 tool_call_intent: None,
             }],
@@ -2566,6 +2593,7 @@ mod tests {
             },
             items: vec![ApprovalItem {
                 tool_name: "dangerous_apply".into(),
+                tool_namespace: None,
                 arguments: serde_json::json!({}),
                 tool_call_intent: None,
             }],

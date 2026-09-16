@@ -399,6 +399,7 @@ mod tests {
                 },
                 items: vec![ApprovalItem {
                     tool_name: "kubectl_apply".to_string(),
+                    tool_namespace: None,
                     arguments: args,
                     tool_call_intent: None,
                 }],

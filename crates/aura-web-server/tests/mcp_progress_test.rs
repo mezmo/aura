@@ -14,6 +14,7 @@ async fn test_mcp_progress_notifications_received() {
     // Skip if mock server not running
     let client = match McpClient::new(
         "http://127.0.0.1:9999/mcp".to_owned(),
+        "test".into(),
         &HashMap::new(),
         "test/0",
     )
@@ -114,6 +115,7 @@ async fn test_call_tool_without_progress_still_works() {
     // Skip if mock server not running
     let client = match McpClient::new(
         "http://127.0.0.1:9999/mcp".to_owned(),
+        "test".into(),
         &HashMap::new(),
         "test/0",
     )

@@ -5,6 +5,7 @@
 //! building, vector-store context strings) live in the `aura` crate's
 //! `orchestration::config` module.
 
+use crate::GlobPattern;
 use crate::config::{LlmConfig, SkillsConfig};
 use crate::scratchpad::ScratchpadConfig;
 use serde::{Deserialize, Serialize};
@@ -73,7 +74,7 @@ pub struct WorkerConfig {
     ///
     /// Patterns are matched using glob syntax (supports `*`, `**`, `?`, `[abc]`).
     #[serde(default)]
-    pub mcp_filter: Option<Vec<String>>,
+    pub mcp_filter: Option<Vec<GlobPattern>>,
 
     /// Vector stores this worker has access to.
     ///
@@ -771,7 +772,7 @@ mod tests {
         let config: WorkerConfig = toml::from_str(toml).unwrap();
         assert_eq!(config.description, "For operations");
         assert_eq!(config.preamble, "You are an Operations Specialist.");
-        assert_eq!(config.mcp_filter, Some(vec!["mezmo_*".to_string()]));
+        assert_eq!(config.mcp_filter, Some(vec!["mezmo_*".into()]));
     }
 
     #[test]
@@ -806,8 +807,8 @@ mod tests {
         let config: WorkerConfig = toml::from_str(toml).unwrap();
         let filter = config.mcp_filter.expect("filter present");
         assert_eq!(filter.len(), 2);
-        assert!(filter.contains(&"ListKnowledgeBases".to_string()));
-        assert!(filter.contains(&"QueryKnowledgeBases".to_string()));
+        assert!(filter.contains(&"ListKnowledgeBases".into()));
+        assert!(filter.contains(&"QueryKnowledgeBases".into()));
     }
 
     #[test]
@@ -834,7 +835,7 @@ mod tests {
         let ops = config.get_worker("operations").unwrap();
         assert_eq!(ops.description, "For logs and pipelines");
         assert_eq!(ops.preamble, "Operations specialist.");
-        assert_eq!(ops.mcp_filter, Some(vec!["mezmo_*".to_string()]));
+        assert_eq!(ops.mcp_filter, Some(vec!["mezmo_*".into()]));
 
         let kb = config.get_worker("knowledge").unwrap();
         assert_eq!(kb.description, "For documentation");

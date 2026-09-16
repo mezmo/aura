@@ -47,6 +47,9 @@ pub struct ApprovalRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalItem {
     pub tool_name: String,
+    /// The MCP server (config key) `tool_name` came from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_namespace: Option<String>,
     pub arguments: Value,
     /// Agent's stated rationale for the tool call.
     #[serde(default, skip_serializing_if = "Option::is_none")]

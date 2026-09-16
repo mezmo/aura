@@ -511,7 +511,7 @@ impl McpProbeDispatcher {
         .find_map(|(tools, clients)| {
             tools
                 .iter()
-                .find(|(_, server_tools)| server_tools.iter().any(|t| t.name == tool))
+                .find(|(_, server_tools)| server_tools.iter().any(|t| t.name().as_str() == tool))
                 .and_then(|(server_name, _)| clients.get(server_name))
         })
     }

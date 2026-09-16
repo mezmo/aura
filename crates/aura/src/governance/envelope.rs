@@ -1,6 +1,6 @@
 //! Catalog envelope types for governance webhook payloads.
 
-use crate::mcp::McpManager;
+use crate::mcp::{McpManager, ToolName, ToolNamespace};
 use anyhow::anyhow;
 use aura_config::Config;
 use chrono::{DateTime, Utc};
@@ -95,8 +95,8 @@ impl TryFrom<&str> for McpServerStatus {
 /// Tool entry with full schema information.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolEntry {
-    /// Tool name.
-    pub name: String,
+    pub name: ToolName,
+    pub namespace: ToolNamespace,
     /// Tool description.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -104,12 +104,13 @@ pub struct ToolEntry {
     pub input_schema: serde_json::Value,
 }
 
-impl From<&rmcp::model::Tool> for ToolEntry {
-    fn from(value: &rmcp::model::Tool) -> Self {
+impl From<&crate::mcp::AuraTool> for ToolEntry {
+    fn from(value: &crate::mcp::AuraTool) -> Self {
         Self {
-            name: value.name.to_string(),
-            description: value.description.as_ref().map(|d| d.to_string()),
-            input_schema: value.schema_as_json_value(),
+            name: value.name().clone(),
+            namespace: value.namespace().clone(),
+            description: value.description().map(str::to_string),
+            input_schema: value.input_schema(),
         }
     }
 }
@@ -187,8 +188,12 @@ mod tests {
     // Fixtures
     // -----------------------------------------------------------------
 
-    fn tool_fixture(name: &str, description: Option<&str>) -> rmcp::model::Tool {
-        rmcp::model::Tool {
+    fn tool_fixture(
+        namespace: &str,
+        name: &str,
+        description: Option<&str>,
+    ) -> crate::mcp::AuraTool {
+        let tool = rmcp::model::Tool {
             name: Cow::Owned(name.to_string()),
             title: None,
             description: description.map(|d| Cow::Owned(d.to_string())),
@@ -200,7 +205,8 @@ mod tests {
             annotations: None,
             icons: None,
             meta: None,
-        }
+        };
+        crate::mcp::AuraTool::new(tool, namespace)
     }
 
     fn server_info_fixture(name: &str, transport: &str, status: ConnectionStatus) -> ServerInfo {
@@ -378,10 +384,11 @@ api_key = "k"
 
     #[test]
     fn tool_entry_from_tool_maps_name_description_and_schema() {
-        let tool = tool_fixture("list_pods", Some("List pods in a namespace"));
+        let tool = tool_fixture("kubernetes", "list_pods", Some("List pods in a namespace"));
 
         let entry = ToolEntry::from(&tool);
-        assert_eq!(entry.name, "list_pods");
+        assert_eq!(entry.name.as_str(), "list_pods");
+        assert_eq!(entry.namespace.as_str(), "kubernetes");
         assert_eq!(
             entry.description.as_deref(),
             Some("List pods in a namespace")
@@ -391,7 +398,7 @@ api_key = "k"
 
     #[test]
     fn tool_entry_from_tool_without_description_is_none() {
-        let tool = tool_fixture("no_desc", None);
+        let tool = tool_fixture("kubernetes", "no_desc", None);
 
         let entry = ToolEntry::from(&tool);
         assert_eq!(entry.description, None);
@@ -435,7 +442,8 @@ api_key = "k"
     #[test]
     fn tool_entry_omits_description_field_when_none() {
         let entry = ToolEntry {
-            name: "no_desc".to_string(),
+            name: "no_desc".into(),
+            namespace: "no_ns".into(),
             description: None,
             input_schema: serde_json::json!({}),
         };
@@ -532,7 +540,7 @@ api_key = "k"
         );
         manager.streamable_tools.insert(
             "kubernetes".to_string(),
-            vec![tool_fixture("list_pods", None)],
+            vec![tool_fixture("kubernetes", "list_pods", None)],
         );
 
         let entries = build_server_entries(&manager);
@@ -541,7 +549,12 @@ api_key = "k"
         assert_eq!(entries[0].transport, "http_streamable");
         assert_eq!(entries[0].status, McpServerStatus::Connected);
         assert_eq!(entries[0].tools.len(), 1);
-        assert_eq!(entries[0].tools[0].name, "list_pods");
+        assert_eq!(
+            entries[0].tools[0].name.as_str(),
+            "list_pods",
+            "tool name must be bare, never namespace-qualified"
+        );
+        assert_eq!(entries[0].tools[0].namespace.as_str(), "kubernetes");
     }
 
     #[test]
@@ -555,12 +568,12 @@ api_key = "k"
         );
         manager.sse_tools.insert(
             "legacy".to_string(),
-            vec![tool_fixture("legacy_tool", None)],
+            vec![tool_fixture("legacy", "legacy_tool", None)],
         );
 
         let entries = build_server_entries(&manager);
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].tools[0].name, "legacy_tool");
+        assert_eq!(entries[0].tools[0].name.as_str(), "legacy_tool");
     }
 
     #[test]

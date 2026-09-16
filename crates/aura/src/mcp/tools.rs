@@ -278,10 +278,10 @@ impl McpManager {
 
                 for mcp_tool in server_tools {
                     if let Some(rig_tool) = StreamableHttpMcpTool::new(
-                        mcp_tool.name.to_string(),
+                        mcp_tool.name().to_string(),
                         server_name.clone(),
                         Arc::new(client.clone()),
-                        mcp_tool.clone(),
+                        mcp_tool.raw().clone(),
                         self.sanitize_schemas,
                     ) {
                         tools.push(rig_tool);

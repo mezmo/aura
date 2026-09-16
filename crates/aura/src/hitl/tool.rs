@@ -158,6 +158,7 @@ impl Tool for RequestApprovalTool {
             },
             items: vec![ApprovalItem {
                 tool_name: Self::NAME.to_string(),
+                tool_namespace: None,
                 arguments: serde_json::to_value(&args).unwrap_or_default(),
                 tool_call_intent,
             }],
