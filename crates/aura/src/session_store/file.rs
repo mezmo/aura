@@ -230,10 +230,10 @@ impl Inner {
     fn resolve_sync(
         &self,
         id: &DecisionId,
-        // The authority check runs under this same lock with the E2 fill;
-        // the signature carries it now so no caller can bolt a
-        // validate-then-resolve race ahead of it.
-        _expected_authority: ApprovalAuthority,
+        // The authority check runs under this same lock; the signature
+        // carries it so no caller can bolt a validate-then-resolve race
+        // ahead of it.
+        expected_authority: ApprovalAuthority,
         decision: ResolvedDecision,
     ) -> Result<(), ResolveError> {
         let _guard = self.lock();
@@ -249,6 +249,11 @@ impl Inner {
             }
             Err(err) => return Err(ResolveError::Store(request_err(err))),
         };
+        // Wrong authority is indistinguishable from unknown: the row stays
+        // parked in `list_pending` and nothing is written.
+        if record.authority != expected_authority {
+            return Err(ResolveError::NotFound);
+        }
         if (self.clock)() > record.expires_at {
             return Err(ResolveError::NotFound);
         }
