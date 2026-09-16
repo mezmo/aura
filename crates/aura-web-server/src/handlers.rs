@@ -743,10 +743,11 @@ async fn handle_non_streaming_completion(
 
     let (result_tx, result_rx) = oneshot::channel();
 
-    tokio::spawn(
+    let handle = tokio::spawn(
         execute_completion(setup, config, DeliveryMode::Collect { result_tx })
             .instrument(tracing::info_span!(parent: None, "agent.stream")),
     );
+    data.active_requests.track_task(handle);
 
     match result_rx.await {
         Ok(collected) => build_json_response(response_ctx, max_tokens, collected),
@@ -787,7 +788,7 @@ async fn handle_streaming_completion(
 
     let heartbeat_interval = std::time::Duration::from_secs(15);
 
-    tokio::spawn(
+    let handle = tokio::spawn(
         execute_completion(
             setup,
             config,
@@ -798,6 +799,7 @@ async fn handle_streaming_completion(
         )
         .instrument(tracing::info_span!(parent: None, "agent.stream")),
     );
+    data.active_requests.track_task(handle);
 
     use futures_util::TryStreamExt;
     let response_stream = ReceiverStream::new(rx).map_err(std::io::Error::other);
