@@ -218,13 +218,16 @@ impl HitlApprovalWrapper {
         }
     }
 
-    /// The shared park-registration choreography both park paths call: build
-    /// the durable row, register it, recover the call id, update the guard
-    /// and cell, and publish the lifecycle transition. The caller supplies the
-    /// fully-minted `request` (decision-id provenance and request-id mint
-    /// source) plus the authority the row is parked under and the ack state;
-    /// `publish_requested` selects whether the `Requested` event goes out
-    /// (the 207 bridge skips it — already published at gate entry).
+    /// The shared park-registration choreography: build and register the
+    /// durable row, recover the call id, record the guard and cell entry, and
+    /// conditionally publish `Requested` (`publish_requested`; the 207 bridge
+    /// skips it — already published at gate entry). The attended conversational
+    /// `Pending` is not published by the park arm: the 207 registration emits
+    /// no attended prompt (the run-parked event and approval links carry the
+    /// operator surface; the conversational attended publish belongs to the
+    /// route runtime's inline seam). The caller supplies the fully-minted
+    /// `request` (decision-id provenance and request-id mint source) plus the
+    /// authority the row is parked under and the ack state.
     #[allow(clippy::too_many_arguments)]
     async fn park_register(
         &self,
@@ -289,14 +292,6 @@ impl HitlApprovalWrapper {
             )
             .await;
         }
-        crate::approval_event_broker::publish(
-            &self.request_id,
-            crate::approval_event_broker::ApprovalLifecycleEvent::Pending(super::events::pending(
-                &parked.request,
-                &parked.expires_at,
-            )),
-        )
-        .await;
 
         tracing::info!(
             decision_id = %decision_id,
@@ -448,12 +443,14 @@ impl ToolWrapper for HitlApprovalWrapper {
         // already carry a stored decision. A hit maps through the same
         // mapping the live route uses (so an approval proceeds and a denial
         // produces the live path's denial feedback); a miss while the task is
-        // strict is a resume fault; a miss otherwise falls through to the park
-        // arm (or the live route when park is unset) and re-parks.
+        // strict is a resume fault; a miss otherwise falls through to the live
+        // ask (the armed poll-ask on an admitted parking route; the Hold ask
+        // otherwise), where a gated call re-parks through the 207 bridge or
+        // registers inline.
         if let Some(recorded) = &self.recorded_decisions {
             // A resumed worker's tools always carry a task id. A gated call
             // without one on the resume path is a wiring fault, and falling
-            // through to the park arm would re-ask the human for a decided
+            // through to the live ask would re-ask the human for a decided
             // call.
             let Some(task_id) = ctx.task_id else {
                 return Err(ToolError::ToolCallError(
@@ -472,7 +469,8 @@ impl ToolWrapper for HitlApprovalWrapper {
                     ));
                 }
                 // A model-issued gated call after the continuation re-parks
-                // normally: fall through to the park arm (or the live route).
+                // normally: fall through to the live ask (the armed poll-ask
+                // on an admitted parking route; the Hold ask otherwise).
                 None => {}
             }
         }
