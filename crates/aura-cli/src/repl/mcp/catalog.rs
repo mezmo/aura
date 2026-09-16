@@ -130,8 +130,8 @@ pub(crate) const CATALOG: &[CatalogEntry] = &[
         key: "youcom",
         description: "You.com web search and research (keyless free tier, no credentials)",
         prerequisites: "No credentials needed: this uses You.com's keyless free tier \
-                        (rate-limited web search).\
-                        AURA will be able to search the web and read page content through \
+                        (rate-limited web search). \
+                        AURA will be able to search the web through \
                         the you-search and you-discover tools.",
         template: Template::Http {
             url: "https://api.you.com/mcp?profile=free",
