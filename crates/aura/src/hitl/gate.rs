@@ -127,93 +127,6 @@ impl HitlApprovalWrapper {
             .map(|p| p.as_str())
     }
 
-    /// The park arm: register durably, publish, append to the blocked cell,
-    /// and short-circuit with the inert sentinel. Ordering is load-bearing —
-    /// a register error must fail the call closed before anything is
-    /// published or recorded, so no checkpoint can reference a decision id
-    /// the store does not hold.
-    async fn park_pre_call(
-        &self,
-        park: &ParkContext,
-        matched: &str,
-        args: &Value,
-        ctx: &ToolCallContext,
-    ) -> Result<PreCallOutcome, ToolError> {
-        // Park is worker-only: the scope carries the run and task identity.
-        let AgentScope::Worker { run_id, .. } = &self.scope else {
-            return Err(ToolError::ToolCallError(
-                "tool call blocked: park mode requires an orchestration worker scope"
-                    .to_string()
-                    .into(),
-            ));
-        };
-        // The route timeout bounds the decision window until a park TTL exists.
-        let Some((_, timeout)) = self.route.park_registry() else {
-            return Err(ToolError::ToolCallError(
-                "tool call blocked: park mode requires a park-capable route"
-                    .to_string()
-                    .into(),
-            ));
-        };
-
-        // Egress capture, resolved where the route was built per request: a
-        // mapped destination with no usable value closes the registration
-        // before anything persists — notify is egress auth with no later
-        // reify checkpoint (deliberately stricter than identity docking).
-        let egress_headers = match self.route.park_egress() {
-            Ok(headers) => (!headers.is_empty()).then(|| headers.into_owned()),
-            Err(err) => {
-                tracing::warn!(
-                    tool_name = %ctx.tool_name,
-                    error = %err,
-                    "park-mode webhook egress capture failed; failing the gated call closed",
-                );
-                return Err(ToolError::ToolCallError(
-                    format!("tool call blocked: {err}").into(),
-                ));
-            }
-        };
-
-        let now = chrono::Utc::now();
-        let expires_at =
-            now + chrono::Duration::from_std(timeout).expect("approval timeout fits in chrono");
-        let decision_id = DecisionId::generate();
-        let request = ApprovalRequest {
-            version: PROTOCOL_VERSION,
-            instance_id: self.instance_id.clone(),
-            decision_id,
-            // Request teardown sweeps `cancel_request` by the live request
-            // id; the run-scoped owner id keeps a parked ticket out of that
-            // sweep. The run's own sweep passes the same `run_owner_id`.
-            request_id: run_owner_id(&run_id.to_string()),
-            scope: self.scope.clone(),
-            origin: ApprovalOrigin::ConfigGate {
-                matched_pattern: matched.to_string(),
-                agent_name: self.agent_name.clone(),
-            },
-            items: vec![ApprovalItem {
-                tool_name: ctx.tool_name.clone(),
-                arguments: args.clone(),
-                tool_call_intent: ctx.tool_call_intent.clone(),
-            }],
-        };
-
-        // The store's own register, not the registry's park-anyway one: a
-        // fault fails the call closed. `Requested` goes out here (the park
-        // arm is the first publish for this decision). Local ingress parks
-        // the conversational authority.
-        self.park_register(
-            park,
-            request,
-            expires_at,
-            ApprovalAuthority::Conversational,
-            egress_headers,
-            AcknowledgmentState::RequiresNotification,
-            true,
-        )
-        .await
-    }
-
     /// The 207 bridge: re-enter park registration with the posted
     /// `decision_id` (preserved on `request`). Mints the request id from the
     /// run owner, does not re-publish `Requested` (already published at gate
@@ -226,8 +139,8 @@ impl HitlApprovalWrapper {
         expires_at: chrono::DateTime<chrono::Utc>,
         started: std::time::Instant,
     ) -> Result<PreCallOutcome, ToolError> {
-        // Park is worker-only, as in `park_pre_call`: the scope carries the
-        // run identity the parked row's request id is minted from.
+        // Park is worker-only: the scope carries the run identity the parked
+        // row's request id is minted from.
         let AgentScope::Worker { run_id, .. } = &self.scope else {
             return Err(ToolError::ToolCallError(
                 "tool call blocked: park mode requires an orchestration worker scope"
@@ -236,9 +149,8 @@ impl HitlApprovalWrapper {
             ));
         };
 
-        // Egress capture, resolved the same way `park_pre_call` resolves it:
-        // a mapped destination with no usable value closes the registration
-        // before anything persists.
+        // Egress capture, resolved before anything persists: a mapped
+        // destination with no usable value closes the registration.
         let egress_headers = match self.route.park_egress() {
             Ok(headers) => (!headers.is_empty()).then(|| headers.into_owned()),
             Err(err) => {
@@ -398,12 +310,12 @@ impl HitlApprovalWrapper {
         })
     }
 
-    /// The adaptive decide leg: a webhook route whose client can park (poll
-    /// delivery, and sync delivery under the adaptive contract). Only this
-    /// route shape asks first when the park arm is armed; the conversational
-    /// route parks without a webhook ask (the attended seam, untouched), and
-    /// a hold-only webhook route keeps `park_pre_call`'s park-capability
-    /// error.
+    /// The park-capable webhook decide leg: poll delivery with park mode —
+    /// the one route shape runtime admission parks (the client's `can_park`
+    /// marker, armed only for that combination). Only this shape asks first
+    /// when the park arm is armed; the conversational route registers inline
+    /// through its own attended seam, and a hold-only webhook route keeps
+    /// the unarmed hold ask.
     fn park_capable_webhook(&self) -> bool {
         match &*self.route {
             DecisionRoute::Webhook { client, .. } => client.can_park(),
@@ -411,7 +323,7 @@ impl HitlApprovalWrapper {
         }
     }
 
-    /// The park-armed entry: the adaptive poll-ask (Ruling A). Asks the
+    /// The park-armed entry: the park-armed poll-ask (Ruling A). Asks the
     /// receiver FIRST with [`AskMode::ParkArmed`] (`response_type=poll`): an
     /// instant 200 is a machine decision and applies in-request through the
     /// terminal mapping — no park document, no reconciler tick; a 207 is
@@ -439,8 +351,8 @@ impl HitlApprovalWrapper {
     }
 
     /// The one decide leg both live asks share: the unarmed hold ask
-    /// ([`AskMode::Hold`], the sync-hold round trip) and the park-armed
-    /// adaptive ask ([`AskMode::ParkArmed`], the poll-ask) differ only in the
+    /// ([`AskMode::Hold`], the sync-hold round trip) and the park-armed ask
+    /// ([`AskMode::ParkArmed`], the poll-ask) differ only in the
     /// mode. The terminal arms convert through the shared
     /// [`approval_result_to_pre_call`] mapping; a pending reply (207 = human
     /// needed) bridges into park registration. The request rides the live
@@ -564,18 +476,20 @@ impl ToolWrapper for HitlApprovalWrapper {
                 None => {}
             }
         }
-        if let Some(park) = &self.park {
+        if self.park.is_some() {
             // Authorization split (Ruling A): the armed arm ALONE authorizes
-            // the adaptive poll-ask, and only for a worker on a park-capable
-            // webhook decide leg. ASK FIRST: an instant 200 applies
-            // in-request with no park; a 207 parks through the bridge. The
-            // conversational seam keeps `park_pre_call`, as does every other
-            // armed shape (which also keeps its fail-closed errors for a
-            // non-worker scope or a hold-only route).
+            // the poll-ask, and only for a worker on a park-capable webhook
+            // decide leg (poll delivery with park mode — the one admitted
+            // parking route). ASK FIRST: an instant 200 applies in-request
+            // with no park; a 207 parks through the bridge. Every other
+            // armed shape falls through to the live ask and never parks —
+            // the conversational route registers inline through its own
+            // attended seam, and a non-worker scope or a hold-only route
+            // asks `AskMode::Hold` (a 207 there stays the loud protocol
+            // violation).
             if matches!(self.scope, AgentScope::Worker { .. }) && self.park_capable_webhook() {
                 return self.park_armed_pre_call(matched, args, ctx).await;
             }
-            return self.park_pre_call(park, matched, args, ctx).await;
         }
         // The live hold ask: an unarmed invocation — single-agent, or a
         // park-enabled config whose invocation carries no arm — asks
