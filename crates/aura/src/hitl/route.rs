@@ -1634,14 +1634,20 @@ mod tests {
     }
 
     /// The park switch, built the production way (`HitlRuntime::from_config`
-    /// over the `[hitl]` config): conversational and webhook-poll park, and
-    /// webhook-sync keeps the live decision path.
+    /// over the `[hitl]` config): conversational parks inline, webhook-poll
+    /// with park mode parks, and webhook-sync never parks.
     #[test]
     fn park_registry_follows_delivery() {
-        fn webhook_route(delivery: aura_config::WebhookDelivery) -> DecisionRoute {
+        fn webhook_route(
+            delivery: aura_config::WebhookDelivery,
+            park_enabled: bool,
+        ) -> DecisionRoute {
             let config = aura_config::HitlConfig {
                 require_approval: vec![],
-                park: aura_config::ParkConfig::default(),
+                park: aura_config::ParkConfig {
+                    enabled: park_enabled,
+                    ..Default::default()
+                },
                 route: aura_config::DecisionRouteConfig::Webhook {
                     url: aura_config::WebhookUrl::new("https://approvals.example.com/").unwrap(),
                     timeout_secs: 60,
@@ -1666,10 +1672,10 @@ mod tests {
         let (_, got) = conv.park_registry().expect("conversational parks");
         assert_eq!(got, Duration::from_secs(60));
 
-        let sync = webhook_route(aura_config::WebhookDelivery::Sync);
+        let sync = webhook_route(aura_config::WebhookDelivery::Sync, false);
         assert!(sync.park_registry().is_none(), "webhook sync does not park");
 
-        let poll = webhook_route(aura_config::WebhookDelivery::Poll);
+        let poll = webhook_route(aura_config::WebhookDelivery::Poll, true);
         let (_, got) = poll.park_registry().expect("webhook poll parks");
         assert_eq!(got, Duration::from_secs(60));
     }
@@ -3084,7 +3090,10 @@ mod tests {
         fn poll_config(url: &str, poll_url: Option<&str>) -> aura_config::HitlConfig {
             aura_config::HitlConfig {
                 require_approval: vec![],
-                park: aura_config::ParkConfig::default(),
+                park: aura_config::ParkConfig {
+                    enabled: true,
+                    ..Default::default()
+                },
                 route: aura_config::DecisionRouteConfig::Webhook {
                     url: aura_config::WebhookUrl::new(url).unwrap(),
                     timeout_secs: 300,
@@ -3093,6 +3102,34 @@ mod tests {
                     tool_headers_from_response: aura_config::ToolHeaderMappings::default(),
                     delivery: aura_config::WebhookDelivery::Poll,
                     poll_url: poll_url.map(|u| aura_config::WebhookUrl::new(u).unwrap()),
+                    poll_interval_secs: 10,
+                    poll_request_timeout_secs: 30,
+                    receiver_wait_timeout_secs: 900,
+                },
+            }
+        }
+
+        /// A webhook `[hitl.route]` fixture with the delivery mode and park
+        /// mode as the parameters — the admission pair the runtime park
+        /// tests rule on.
+        fn route_park_config(
+            delivery: aura_config::WebhookDelivery,
+            park_enabled: bool,
+        ) -> aura_config::HitlConfig {
+            aura_config::HitlConfig {
+                require_approval: vec![],
+                park: aura_config::ParkConfig {
+                    enabled: park_enabled,
+                    ..Default::default()
+                },
+                route: aura_config::DecisionRouteConfig::Webhook {
+                    url: aura_config::WebhookUrl::new("https://approvals.example.com/").unwrap(),
+                    timeout_secs: 300,
+                    headers: HashMap::new(),
+                    headers_from_request: HashMap::new(),
+                    tool_headers_from_response: aura_config::ToolHeaderMappings::default(),
+                    delivery,
+                    poll_url: None,
                     poll_interval_secs: 10,
                     poll_request_timeout_secs: 30,
                     receiver_wait_timeout_secs: 900,
@@ -3791,11 +3828,11 @@ mod tests {
             );
         }
 
-        /// The capability split: park-eligibility keys off `poll.is_some()`
-        /// (poll delivery, and sync under the adaptive contract), while
-        /// live-decision keys off `delivery == Sync`. A hold route (sync,
-        /// park disabled) decides live but never parks; a park-enabled sync
-        /// route does both; a poll route parks but never decides live.
+        /// The capability split under park admission: park-eligibility keys
+        /// off poll delivery with park mode enabled, while live-decision keys
+        /// off `delivery == Sync`. A hold route (sync, park disabled) decides
+        /// live but never parks; a park-enabled sync route decides live but
+        /// never parks; a poll route parks but never decides live.
         #[test]
         fn capability_cells_split_decide_live_from_can_park() {
             fn client(delivery: aura_config::WebhookDelivery, park_enabled: bool) -> WebhookClient {
@@ -3837,13 +3874,162 @@ mod tests {
                 "a park-enabled sync route decides live"
             );
             assert!(
-                sync_park.can_park(),
-                "a park-enabled sync route parks on 207"
+                !sync_park.can_park(),
+                "a park-enabled sync route never parks: sync holds one POST"
             );
 
             let poll = client(aura_config::WebhookDelivery::Poll, true);
             assert!(!poll.can_decide_live(), "a poll route never decides live");
             assert!(poll.can_park(), "a poll route parks");
+        }
+
+        /// Runtime admission: a park-enabled sync route never parks — sync
+        /// holds one held POST. The registry, the authority, and the armed
+        /// ask guard must all refuse it.
+        #[test]
+        fn route_park_rejects_sync_with_park_at_runtime() {
+            use super::super::HitlRuntime;
+
+            let runtime = HitlRuntime::from_config(
+                &route_park_config(aura_config::WebhookDelivery::Sync, true),
+                &PendingApprovals::new(),
+                None,
+                None,
+            );
+            assert!(
+                runtime.route.park_registry().is_none(),
+                "a park-enabled sync route never registers a park registry: sync holds one POST"
+            );
+            assert!(
+                runtime.route.park_authority().is_none(),
+                "a park-enabled sync route carries no park authority: sync holds one POST"
+            );
+            let client = webhook_client_of(&runtime);
+            assert!(
+                matches!(
+                    super::super::decide_live_guard(client, AskMode::ParkArmed),
+                    Err(ApprovalError::Misconfigured(_))
+                ),
+                "an armed ask on a park-enabled sync route must fail as misconfigured"
+            );
+        }
+
+        /// Runtime admission: poll delivery without park mode never parks —
+        /// parked approvals may be long-lived and requests are never held
+        /// open.
+        #[test]
+        fn route_park_rejects_poll_without_park_at_runtime() {
+            use super::super::HitlRuntime;
+
+            let runtime = HitlRuntime::from_config(
+                &route_park_config(aura_config::WebhookDelivery::Poll, false),
+                &PendingApprovals::new(),
+                None,
+                None,
+            );
+            assert!(
+                runtime.route.park_registry().is_none(),
+                "a park-disabled poll route never registers a park registry"
+            );
+            assert!(
+                runtime.route.park_authority().is_none(),
+                "a park-disabled poll route carries no park authority"
+            );
+            let client = webhook_client_of(&runtime);
+            assert!(
+                matches!(
+                    super::super::decide_live_guard(client, AskMode::ParkArmed),
+                    Err(ApprovalError::Misconfigured(_))
+                ),
+                "an armed ask on a park-disabled poll route must fail as misconfigured"
+            );
+        }
+
+        /// Runtime admission: the conversational route parks inline — the
+        /// attended prompt is the park path, under the conversational
+        /// authority.
+        #[test]
+        fn route_park_keeps_conversational_inline() {
+            use super::super::HitlRuntime;
+
+            let config = aura_config::HitlConfig {
+                require_approval: vec![],
+                park: aura_config::ParkConfig::default(),
+                route: aura_config::DecisionRouteConfig::Conversational { timeout_secs: 60 },
+            };
+            let runtime = HitlRuntime::from_config(&config, &PendingApprovals::new(), None, None);
+            assert!(
+                runtime.route.park_registry().is_some(),
+                "the conversational route keeps its inline park registry"
+            );
+            assert_eq!(
+                runtime.route.park_authority(),
+                Some(crate::hitl::ApprovalAuthority::Conversational)
+            );
+        }
+
+        /// Runtime admission: a sync route without park mode stays one held
+        /// POST — it decides live and never registers a park surface.
+        #[test]
+        fn route_park_keeps_sync_hold_held() {
+            use super::super::HitlRuntime;
+
+            let runtime = HitlRuntime::from_config(
+                &route_park_config(aura_config::WebhookDelivery::Sync, false),
+                &PendingApprovals::new(),
+                None,
+                None,
+            );
+            let client = webhook_client_of(&runtime);
+            assert!(
+                client.can_decide_live(),
+                "a sync hold route decides live on its held POST"
+            );
+            assert!(
+                !client.can_park(),
+                "a sync hold route never parks: sync holds one POST"
+            );
+            assert!(
+                runtime.route.park_authority().is_none(),
+                "a sync hold route carries no park authority"
+            );
+            assert!(
+                runtime.route.park_registry().is_none(),
+                "a sync hold route never registers a park registry"
+            );
+            assert!(
+                super::super::decide_live_guard(client, AskMode::Hold).is_ok(),
+                "a hold ask is admissible on a sync route"
+            );
+        }
+
+        /// Runtime admission: webhook-poll delivery with park mode is the one
+        /// parking route — the webhook-poll authority and an admissible
+        /// armed ask.
+        #[test]
+        fn route_park_admits_poll_with_park() {
+            use super::super::HitlRuntime;
+
+            let runtime = HitlRuntime::from_config(
+                &route_park_config(aura_config::WebhookDelivery::Poll, true),
+                &PendingApprovals::new(),
+                None,
+                None,
+            );
+            let client = webhook_client_of(&runtime);
+            assert!(client.can_park(), "a park-enabled poll route parks");
+            assert_eq!(
+                runtime.route.park_authority(),
+                Some(crate::hitl::ApprovalAuthority::WebhookPoll)
+            );
+            assert!(
+                runtime.route.park_registry().is_some(),
+                "a park-enabled poll route registers its park registry"
+            );
+            assert!(
+                super::super::decide_live_guard(client, AskMode::ParkArmed).is_ok(),
+                "an armed ask is admissible on a park-enabled poll route"
+            );
         }
     }
 
