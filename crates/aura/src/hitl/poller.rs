@@ -278,7 +278,10 @@ mod tests {
     fn poll_config() -> aura_config::HitlConfig {
         aura_config::HitlConfig {
             require_approval: vec![],
-            park: aura_config::ParkConfig::default(),
+            park: aura_config::ParkConfig {
+                enabled: true,
+                ..Default::default()
+            },
             route: aura_config::DecisionRouteConfig::Webhook {
                 url: aura_config::WebhookUrl::new("http://127.0.0.1:1").unwrap(),
                 timeout_secs: 300,
@@ -586,7 +589,8 @@ mod tests {
         );
     }
 
-    /// `from_config` gates the production spawn on webhook poll delivery.
+    /// `from_config` gates the production spawn on the admitted parking
+    /// route: webhook poll delivery with park mode enabled.
     #[test]
     fn from_config_gates_on_poll_delivery() {
         let store: Arc<dyn ApprovalStore> = Arc::new(InMemoryApprovalStore::new());
