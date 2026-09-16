@@ -40,10 +40,10 @@ const WEBHOOK_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 pub struct HitlRuntime {
     pub patterns: Arc<[GlobPattern]>,
     pub route: Arc<DecisionRoute>,
-    /// `[hitl.park].enabled`: the capability. It provisions park support on
-    /// this config (poll settings present, reconciler eligible); it does not
-    /// by itself authorize any invocation to park — an armed `ParkContext`
-    /// does that.
+    /// `[hitl.park].enabled`: the capability. It provisions park support
+    /// (poll settings, reconciler eligibility) only on the admitted poll
+    /// route; it does not by itself authorize any invocation to park — an
+    /// armed `ParkContext` does that.
     pub park_enabled: bool,
     /// The validated `[hitl.park].park_ttl` projected from the parsed
     /// config: the disk-evidence retention age the park commit's
@@ -118,9 +118,13 @@ impl HitlRuntime {
 /// the poll reconciler's own client alike), so both see one wire shape.
 /// `None` for the conversational arm.
 ///
-/// Poll settings are present exactly for a park-capable route: poll delivery,
-/// and sync delivery under the adaptive contract (`park_enabled`). A hold
-/// route (sync, park disabled) carries none.
+/// Poll settings are present exactly for the admitted parking route: poll
+/// delivery with park mode enabled; a sync route never carries them (one
+/// held POST, never parked). This derivation follows
+/// [`aura_config::park::validate_park_admission`] — the admission
+/// authority — on every delivery × park input the runtime can see; the
+/// orchestration axis is enforced at config validation and the
+/// orchestrator's park arming.
 pub(crate) fn webhook_client_from_config(
     route: &DecisionRouteConfig,
     hmac: Option<&WebhookHmac>,
@@ -151,11 +155,8 @@ pub(crate) fn webhook_client_from_config(
         request_timeout: Duration::from_secs(*poll_request_timeout_secs),
     };
     let poll = match delivery {
-        WebhookDelivery::Poll => Some(poll_settings(url)),
-        // Adaptive sync: a park-capable sync config carries poll settings so
-        // the reconciler can drive its parked rows.
-        WebhookDelivery::Sync if park_enabled => Some(poll_settings(url)),
-        WebhookDelivery::Sync => None,
+        WebhookDelivery::Poll if park_enabled => Some(poll_settings(url)),
+        WebhookDelivery::Poll | WebhookDelivery::Sync => None,
     };
     Some(WebhookClient::with_headers_and_signing(
         build_webhook_client(),
@@ -405,9 +406,9 @@ impl DecisionRoute {
     /// The park arm's inputs: the approval registry to register against and
     /// the decision window the route timeout bounds. `Some` for the
     /// conversational route and for a webhook route that can park (poll
-    /// delivery, and sync delivery under the adaptive contract), `None` for
-    /// a hold route that never parks. The client's park marker is the one
-    /// delivery switch; the live-decision marker is its sibling.
+    /// delivery with park mode), `None` for a hold route that never parks.
+    /// The client's park marker is the one delivery switch; the
+    /// live-decision marker is its sibling.
     pub(crate) fn park_registry(&self) -> Option<(&PendingApprovals, Duration)> {
         match self {
             Self::Conversational { registry, timeout } => Some((registry, *timeout)),
@@ -690,7 +691,7 @@ pub struct WebhookClient {
     /// The config delivery mode (sync hold vs poll ack).
     delivery: WebhookDelivery,
     /// Poll settings, present exactly when the route is park-capable (poll
-    /// delivery, and sync delivery under the adaptive contract).
+    /// delivery with park mode).
     poll: Option<PollSettings>,
 }
 
@@ -780,9 +781,9 @@ impl WebhookClient {
     }
 
     /// Whether the route can park on a 207: poll settings are present (poll
-    /// delivery, and sync delivery under the adaptive contract). The park
-    /// switch (`park_registry`), the reconciler spawn, and the config
-    /// fingerprint's delivery projection all read this.
+    /// delivery with park mode). The park switch (`park_registry`), the
+    /// reconciler spawn, and the config fingerprint's delivery projection
+    /// all read this.
     pub(crate) fn can_park(&self) -> bool {
         self.poll.is_some()
     }
