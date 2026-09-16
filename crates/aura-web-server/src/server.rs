@@ -16,7 +16,7 @@ use std::ffi::OsString;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tower_http::trace::TraceLayer;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::a2a::{
     AuraAgentExecutor, AuraRequestHandler, BusBridgedExecutor, SharedTaskStore, agent_card_router,
@@ -551,6 +551,21 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
 
             // Phase 2: terminate remaining streams ([DONE] → MCP cleanup)
             stream_shutdown_token.cancel();
+
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                    warn!("Stream shutdown grace period expired, aborting stragglers");
+                }
+                _ = active_requests.wait_for_drain() => {
+                    info!("All streams terminated cleanly");
+                }
+            }
+
+            // Phase 3: hard-stop any request task that ignored the
+            // cooperative signal above, so its `agent.stream` span closes
+            // before the OTel provider shuts down/flushes below (#305).
+            active_requests.abort_unfinished();
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
             let _ = shutdown_tx.send(());
         }
