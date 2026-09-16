@@ -115,9 +115,9 @@ Present outcome and a reservation-owning carrier, and the isolated
 Every `todo!()` in the skeleton after REPAIR-3, with its owning fill-unit
 family per the contract's dispatch table:
 
-| # | Site | Fill family |
+| # | Site | Fill unit |
 | --- | --- | --- |
-| 1 | `crates/aura-config/src/park.rs` `validate_park_admission` (REPAIR-1 tightened the signature; REPAIR-2 F4 made `PollOrchestration` carry the opaque `AdmittedParkRoute` its body constructs) | R1 |
+| ~~1~~ | ~~`crates/aura-config/src/park.rs` `validate_park_admission`~~ FILLED at commit `79fbf06d` (2026-09-15; held patch released by Mike with exact-message approval; eight committed admission tests green) | R1 |
 | 2 | `crates/aura/src/session_store/memory.rs` `read_or_expire` | E1/E2 |
 | 3 | `crates/aura/src/session_store/file.rs` `read_or_expire` | E2 |
 | 4 | `crates/aura/src/session_store/fault_store.rs` `read_or_expire` (cfg(test) double; compile-conformance ripple of the trait method, disclosed to the owner) | E1/E2 |
@@ -140,7 +140,10 @@ family per the contract's dispatch table:
 | 21 | `crates/aura/src/orchestration/factory.rs` `OrchestratorFactory::resume_stream_with_timeout` | S3 |
 | 22 | `crates/aura-web-server/src/handlers.rs` `build_completion_config` Resume arm (REPAIR-1/R-5; provider/model, otel query, and message count from the resumed run's factory) | S2/S3 |
 
-Count after the 2026-09-15 alignment amendments: still 22. The amendments
+Count after the 2026-09-15 alignment amendments: 22 at the committed
+alignment baseline; R1's fill (commit `79fbf06d`, same day) removes row 1,
+leaving 21 alignment holes plus the separately excluded Redis
+`mark_acknowledged` todo. The amendments
 declare types (`ResumeStreamEnd`, `StreamTermination`, `StreamOutcome`) and
 recut one existing hole's signature (`run_segment_borrowed`, #12) plus one
 private method's signature (`WebhookClient::poll_decision`, not a hole); no
