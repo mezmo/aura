@@ -848,7 +848,7 @@ mode = "conversational"
 timeout_secs = 60
 
 [hitl.park]
-enabled = true
+enabled = false
 bind_identity = true
 "#;
         let builder = RigBuilder::new(
