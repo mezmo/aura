@@ -3407,8 +3407,8 @@ mod tests {
 
         /// The row placeholders: the GET's `authorization` must carry the
         /// parked row's forwarded value, replacing the client's static
-        /// fallback for this one request (expected RED at this tip —
-        /// `poll_decision` drops `_row_headers` today).
+        /// fallback for this one request (GREEN through `poll_decision`'s
+        /// row-header overlay, filled at H1).
         #[tokio::test]
         async fn poll_get_overlays_the_rows_forwarded_values() {
             let decision_id = DecisionId::generate();
@@ -3458,7 +3458,7 @@ mod tests {
         /// value under the signature header's own name never displaces the
         /// applied signature — the receiver still verifies the GET under
         /// `approval-request:{id}` — and the row's ordinary values ride
-        /// along (expected RED at this tip via the row-scope assert).
+        /// along (GREEN through the H1 fill's row-header overlay).
         #[tokio::test]
         async fn poll_get_signing_applies_last_and_cannot_be_displaced() {
             let hmac = test_hmac();
