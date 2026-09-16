@@ -3,7 +3,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use rig::tool::{Tool as RigTool, ToolError};
-use rmcp::model::Tool as McpTool;
 use serde_json::Value;
 
 use crate::approver_headers::{
@@ -11,13 +10,12 @@ use crate::approver_headers::{
 };
 use crate::mcp::client::McpClient;
 use crate::mcp::execution::execute_mcp_tool;
+use crate::mcp::types::AuraTool;
 
 /// Dynamic MCP Tool Adaptor for MCP clients (transport-agnostic)
 #[derive(Clone)]
 pub struct McpToolAdaptor {
-    tool: McpTool,
-    #[allow(dead_code)]
-    server_name: String,
+    tool: AuraTool,
     client: Arc<McpClient>,
     /// Which transport this adaptor fronts, tagged at construction.
     transport_kind: McpTransportKind,
@@ -29,15 +27,9 @@ impl McpToolAdaptor {
     /// transports. Construction sites are the three `add_all_tools`
     /// branches in `builder.rs`; a mistag bypasses the stdio fail-closed
     /// check.
-    pub fn new(
-        tool: McpTool,
-        server_name: String,
-        client: Arc<McpClient>,
-        transport_kind: McpTransportKind,
-    ) -> Self {
+    pub fn new(tool: AuraTool, client: Arc<McpClient>, transport_kind: McpTransportKind) -> Self {
         Self {
             tool,
-            server_name,
             client,
             transport_kind,
         }
@@ -52,8 +44,7 @@ impl RigTool for McpToolAdaptor {
     const NAME: &'static str = "dynamic_http_mcp_tool";
 
     fn name(&self) -> String {
-        // Tool name is already sanitized at build time
-        self.tool.name.to_string()
+        self.tool.name().to_string()
     }
 
     #[allow(refining_impl_trait)]
@@ -61,19 +52,16 @@ impl RigTool for McpToolAdaptor {
         &self,
         _prompt: String,
     ) -> Pin<Box<dyn Future<Output = rig::completion::ToolDefinition> + Send + Sync + '_>> {
-        // Tool is already sanitized - just extract the cached schema
-        let tool_name = self.tool.name.to_string();
-        let description = self
-            .tool
-            .description
-            .as_deref()
-            .unwrap_or_default()
-            .to_string();
-        let parameters = self.tool.schema_as_json_value();
+        // Must match `self.name()` exactly: Rig registers tools by
+        // this key and dispatches provider tool-call responses by matching
+        // the definition name it advertised, so the two can never diverge.
+        let name = self.name();
+        let description = self.tool.description().unwrap_or_default().to_string();
+        let parameters = self.tool.input_schema();
 
         Box::pin(async move {
             rig::completion::ToolDefinition {
-                name: tool_name,
+                name,
                 description,
                 parameters,
             }
@@ -85,7 +73,9 @@ impl RigTool for McpToolAdaptor {
         &self,
         args: Self::Args,
     ) -> Pin<Box<dyn Future<Output = Result<Self::Output, Self::Error>> + Send + Sync + '_>> {
-        let tool_name = self.tool.name.clone();
+        // The wire call always dispatches by the tool's sanitized bare name,
+        // never the namespaced name.
+        let tool_name = self.tool.name().as_str();
         let client = self.client.clone();
         let transport_kind = self.transport_kind;
 
@@ -102,7 +92,7 @@ impl RigTool for McpToolAdaptor {
             }
 
             // Use shared execution function for consistent logging and error handling
-            execute_mcp_tool(&client, &tool_name, args, approver_overrides).await
+            execute_mcp_tool(&client, tool_name, args, approver_overrides).await
         })
     }
 }
@@ -125,7 +115,8 @@ mod tests {
             "test tool".to_owned(),
             std::sync::Arc::new(serde_json::Map::new()),
         );
-        McpToolAdaptor::new(tool, "test-server".to_owned(), Arc::new(client), kind)
+        let tool = AuraTool::new(tool, "test-server");
+        McpToolAdaptor::new(tool, Arc::new(client), kind)
     }
 
     #[tokio::test]

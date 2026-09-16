@@ -3967,6 +3967,7 @@ mod tests {
         aura_events::ApprovalRequested {
             decision_id: "d-1".to_string(),
             tool_name: "mock_tool".to_string(),
+            tool_namespace: None,
             origin,
             scope: aura_events::AgentScopeWire::Single { session_id: None },
         }

@@ -804,6 +804,7 @@ mod tests {
             },
             items: vec![ApprovalItem {
                 tool_name: "shell_exec".to_string(),
+                tool_namespace: None,
                 arguments: json!({ "cmd": "ls -la" }),
                 tool_call_intent: None,
             }],
@@ -887,6 +888,7 @@ mod tests {
             },
             items: vec![ApprovalItem {
                 tool_name: "kubectl_delete".to_string(),
+                tool_namespace: None,
                 arguments: json!({ "namespace": "prod" }),
                 tool_call_intent: Some("rollout restart to pick up the new config map".to_string()),
             }],
@@ -915,6 +917,7 @@ mod tests {
             },
             items: vec![ApprovalItem {
                 tool_name: "request_approval".to_string(),
+                tool_namespace: None,
                 arguments: json!({
                     "action_description": "Delete namespace",
                     "risk_rationale": "touches prod"
@@ -943,6 +946,7 @@ mod tests {
             },
             items: vec![ApprovalItem {
                 tool_name: "request_approval".to_string(),
+                tool_namespace: None,
                 arguments: json!({
                     "action_description": "Delete namespace",
                     "risk_rationale": "touches prod"
@@ -2215,6 +2219,7 @@ mod tests {
             },
             items: vec![ApprovalItem {
                 tool_name: "dangerous_apply".into(),
+                tool_namespace: None,
                 arguments: serde_json::json!({}),
                 tool_call_intent: None,
             }],
@@ -2566,6 +2571,7 @@ mod tests {
             },
             items: vec![ApprovalItem {
                 tool_name: "dangerous_apply".into(),
+                tool_namespace: None,
                 arguments: serde_json::json!({}),
                 tool_call_intent: None,
             }],
