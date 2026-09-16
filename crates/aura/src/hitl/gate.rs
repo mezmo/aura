@@ -1406,8 +1406,9 @@ mod tests {
         }
 
         /// A park-armed invocation on the conversational route never
-        /// durable-parks: the conversational seam stays inline, so no
-        /// run-owner row and no blocked-cell entry may appear.
+        /// durable-parks AND stays inline: the attended seam carries the
+        /// registration on the live request id, so no run-owner row and no
+        /// blocked-cell entry may appear.
         #[tokio::test]
         async fn gate_park_armed_conversational_never_durable_parks() {
             let request_id = format!("req_conv_no_park_{}", uuid::Uuid::new_v4().simple());
@@ -1429,10 +1430,12 @@ mod tests {
                 .await
             });
 
-            // The direct park arm resolves quickly; poll a bounded window
-            // for either durable-park signal before giving up.
+            // Poll a bounded window for the durable-park signals (either
+            // one condemns the invocation) and for the inline registration
+            // the attended seam owes us on the live request id.
             let run_owner = "run:0191e8c0-1111-7000-8000-000000000042";
             let mut parked = false;
+            let mut inline_registration = false;
             for _ in 0..50 {
                 if !cell.is_empty() {
                     parked = true;
@@ -1441,6 +1444,10 @@ mod tests {
                 let rows = store.list_pending().await.unwrap();
                 if rows.iter().any(|row| row.request.request_id == run_owner) {
                     parked = true;
+                    break;
+                }
+                if rows.iter().any(|row| row.request.request_id == request_id) {
+                    inline_registration = true;
                     break;
                 }
                 // Keep the lifecycle channel drained: this test's subject is
@@ -1452,6 +1459,11 @@ mod tests {
                 !parked,
                 "a park-armed conversational invocation must never durable-park: \
                  no blocked-cell entry and no run-owner row may appear"
+            );
+            assert!(
+                inline_registration,
+                "the conversational invocation registers inline on the live request id: \
+                 the attended seam carries it, never the durable park arm"
             );
 
             handle.abort();
@@ -1972,7 +1984,7 @@ mod tests {
         }
 
         /// A static fallback keeps the egress resolution open under the
-        /// adaptive ask: the absent request header resolves to the static
+        /// park-armed ask: the absent request header resolves to the static
         /// value, and the 207-parked row carries it.
         #[tokio::test]
         async fn armed_webhook_parks_on_207_with_static_fallback_egress() {
