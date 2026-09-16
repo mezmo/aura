@@ -596,13 +596,13 @@ fn validate_llm_api_key(llm: &LlmConfig, location: &str) -> Result<(), crate::Co
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct McpConfig {
     pub servers: HashMap<String, McpServerConfig>,
-    /// Enable OpenAI-compatible tool schema sanitization (default: true)
+    /// Enable OpenAI-compatible tool schema sanitization.
     #[serde(default = "default_sanitize_schemas")]
     pub sanitize_schemas: bool,
     /// Client identity, as a `product/version` token.
     #[serde(default = "default_mcp_user_agent")]
     pub user_agent: McpUserAgent,
-    /// Per-server connect/initialize/discovery timeout, in seconds (default: 30).
+    /// Per-server connect/initialize/discovery timeout, in seconds.
     #[serde(default = "default_mcp_connect_timeout_secs")]
     pub connect_timeout_secs: u64,
 }
