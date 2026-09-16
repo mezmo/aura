@@ -9500,9 +9500,43 @@ mod tests {
     /// consumer serializes against ONE lock.
     use test_rig::WORKER_OVERRIDE_SERIAL as WORKER_OVERRIDE_LOCK;
 
+    /// A scripted 207 receiver mirroring the resume goldens' `park_receiver`:
+    /// the std listener binds synchronously and converts inside the spawned
+    /// task, so the caller needs no await; every accepted POST is answered
+    /// `207 Multi-Status` with an empty JSON body (the shape that parks the
+    /// gated call through the 207 bridge).
+    fn park_207_receiver() -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::AsyncWriteExt;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("receiver listener binds");
+        let url = format!(
+            "http://{}",
+            listener.local_addr().expect("receiver address")
+        );
+        listener
+            .set_nonblocking(true)
+            .expect("receiver listener goes non-blocking for tokio");
+        let handle = tokio::spawn(async move {
+            let listener =
+                tokio::net::TcpListener::from_std(listener).expect("async receiver listener");
+            for _ in 0..64 {
+                let (mut socket, _) = listener.accept().await.expect("receiver accepts");
+                let _ = crate::hitl::read_full_request(&mut socket).await;
+                let response = "HTTP/1.1 207 Multi-Status\r\ncontent-type: application/json\r\n\
+                                content-length: 0\r\nconnection: close\r\n\r\n";
+                socket.write_all(response.as_bytes()).await.ok();
+                socket.shutdown().await.ok();
+            }
+        });
+        (url, handle)
+    }
+
     /// A park-mode orchestrator whose `operations` worker is built through
     /// the override seam: the gate glob matches the stub tool, and the
     /// worker's turn depth is settable for the depth-exhaustion trigger.
+    /// The HITL runtime is the production [`HitlRuntime::from_config`]
+    /// construction over a poll-delivery webhook route with park enabled —
+    /// the one admitted parking route — so the gated calls park through the
+    /// 207 bridge exactly as production parks them.
     async fn override_park_orchestrator(
         memory_dir: &std::path::Path,
         turn_depth: usize,
@@ -9534,16 +9568,38 @@ mod tests {
             },
         )]);
         let request_id = format!("req_orphan_{}", uuid::Uuid::new_v4().simple());
+        let (url, receiver) = park_207_receiver();
+        // The receiver's JoinHandle is deliberately dropped here: dropping
+        // detaches the task without aborting it, so the scripted receiver
+        // lives for the process lifetime while the fixture's tuple signature
+        // (and every call site) stays unchanged.
+        drop(receiver);
         let config = AgentRuntimeConfig {
-            hitl: Some(crate::hitl::HitlRuntime {
-                patterns: Arc::from([aura_config::GlobPattern::new("echo_tool").unwrap()]),
-                route: Arc::new(crate::hitl::DecisionRoute::Conversational {
-                    registry: registry.clone(),
-                    timeout: Duration::from_secs(3600),
-                }),
-                park_enabled: true,
-                park_ttl: aura_config::ParkTtl::default(),
-            }),
+            hitl: Some(crate::hitl::HitlRuntime::from_config(
+                &aura_config::HitlConfig {
+                    require_approval: vec![aura_config::GlobPattern::new("echo_tool").unwrap()],
+                    park: aura_config::ParkConfig {
+                        enabled: true,
+                        bind_identity: false,
+                        park_ttl: aura_config::ParkTtl::default(),
+                    },
+                    route: aura_config::DecisionRouteConfig::Webhook {
+                        url: aura_config::WebhookUrl::new(&url).unwrap(),
+                        timeout_secs: 3600,
+                        headers: std::collections::HashMap::new(),
+                        headers_from_request: std::collections::HashMap::new(),
+                        tool_headers_from_response: aura_config::ToolHeaderMappings::default(),
+                        delivery: aura_config::WebhookDelivery::Poll,
+                        poll_url: None,
+                        poll_interval_secs: 10,
+                        poll_request_timeout_secs: 30,
+                        receiver_wait_timeout_secs: 900,
+                    },
+                },
+                &registry,
+                None,
+                None,
+            )),
             memory_dir: Some(memory_dir.to_string_lossy().into_owned()),
             session_id: Some("orphan-sess".to_string()),
             request_id: Some(request_id.clone()),
@@ -10185,18 +10241,15 @@ mod tests {
     use crate::orchestration::persistence_wrapper::{PersistenceWrapper, PersistenceWrapperParams};
     use crate::tool_wrapper::ToolCallContext;
 
-    fn conversational_route(registry: &PendingApprovals) -> Arc<crate::hitl::DecisionRoute> {
-        Arc::new(crate::hitl::DecisionRoute::Conversational {
-            registry: registry.clone(),
-            timeout: Duration::from_secs(3600),
-        })
-    }
-
     /// A park-mode orchestrator over a file-backed approval store (the park
     /// contract's backend: `get` returns the approval before and after the
-    /// decision), gating `echo_tool` on `route`.
+    /// decision), gating `echo_tool` on the production
+    /// [`HitlRuntime::from_config`] construction over a poll-delivery
+    /// webhook route with park enabled — the one admitted parking route —
+    /// so the gated call parks through the 207 bridge exactly as
+    /// production parks it.
     async fn file_backed_park_orchestrator(
-        route: Arc<crate::hitl::DecisionRoute>,
+        registry: &crate::hitl::PendingApprovals,
         memory_dir: &std::path::Path,
         session_id: &str,
     ) -> (Orchestrator, String) {
@@ -10213,13 +10266,38 @@ mod tests {
                 skills: None,
             },
         )]);
+        let (url, receiver) = park_207_receiver();
+        // The receiver's JoinHandle is deliberately dropped here: dropping
+        // detaches the task without aborting it, so the scripted receiver
+        // lives for the process lifetime while the helper's signature (and
+        // its single call site) stays simple.
+        drop(receiver);
         let config = AgentRuntimeConfig {
-            hitl: Some(crate::hitl::HitlRuntime {
-                patterns: Arc::from([aura_config::GlobPattern::new("echo_tool").unwrap()]),
-                route,
-                park_enabled: true,
-                park_ttl: aura_config::ParkTtl::default(),
-            }),
+            hitl: Some(crate::hitl::HitlRuntime::from_config(
+                &aura_config::HitlConfig {
+                    require_approval: vec![aura_config::GlobPattern::new("echo_tool").unwrap()],
+                    park: aura_config::ParkConfig {
+                        enabled: true,
+                        bind_identity: false,
+                        park_ttl: aura_config::ParkTtl::default(),
+                    },
+                    route: aura_config::DecisionRouteConfig::Webhook {
+                        url: aura_config::WebhookUrl::new(&url).unwrap(),
+                        timeout_secs: 3600,
+                        headers: std::collections::HashMap::new(),
+                        headers_from_request: std::collections::HashMap::new(),
+                        tool_headers_from_response: aura_config::ToolHeaderMappings::default(),
+                        delivery: aura_config::WebhookDelivery::Poll,
+                        poll_url: None,
+                        poll_interval_secs: 10,
+                        poll_request_timeout_secs: 30,
+                        receiver_wait_timeout_secs: 900,
+                    },
+                },
+                registry,
+                None,
+                None,
+            )),
             memory_dir: Some(memory_dir.to_string_lossy().into_owned()),
             session_id: Some(session_id.to_string()),
             request_id: Some(format!("req_resume_{}", uuid::Uuid::new_v4().simple())),
@@ -10275,8 +10353,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (registry, _store) = file_store_registry(&dir.path().join("approvals"));
         let (orchestrator, run_id) =
-            file_backed_park_orchestrator(conversational_route(&registry), dir.path(), "loop-sess")
-                .await;
+            file_backed_park_orchestrator(&registry, dir.path(), "loop-sess").await;
         let (event_tx, _event_rx) = tokio::sync::mpsc::channel(64);
 
         let (_park_model, park_invocations) =
@@ -10350,7 +10427,10 @@ mod tests {
         registry
             .resolve(
                 &decision_id,
-                ApprovalAuthority::Conversational,
+                // The row now parks through the 207 bridge under the route's
+                // poll authority; a mismatched expected authority answers
+                // NotFound with no mutation (the one-channel-one-row rule).
+                ApprovalAuthority::WebhookPoll,
                 ApprovalDecision::Approved.into(),
             )
             .await
