@@ -13,7 +13,7 @@ use aura_config::{
     DecisionRouteConfig, GlobPattern, HitlConfig, ParkTtl, ToolHeaderMappings, WebhookDelivery,
     WebhookUrl,
 };
-use reqwest::header::HeaderMap;
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 
 use super::decision::{ApprovalDecision, ApprovalOutcome, DecisionId};
 use super::events;
@@ -935,6 +935,28 @@ impl WebhookClient {
         }
     }
 
+    /// Apply the signed pairs per-name-REPLACING after the overlay: they are
+    /// collected into one `HeaderMap` and attached with a single `.headers()`
+    /// call. The builder-level `.header()` APPENDS, so an earlier row or
+    /// operator value under a signature header's name would leave two values
+    /// on the wire, and a first-match receiver (including aura's own ingress
+    /// primitive) reads the first — never let a stale value shadow the
+    /// signature. `.headers()` merges per name, replacing any collision.
+    fn apply_signature_headers(
+        mut builder: reqwest::RequestBuilder,
+        signed: [(&'static str, String); 2],
+    ) -> Result<reqwest::RequestBuilder, ApprovalError> {
+        let mut map = HeaderMap::new();
+        for (name, value) in signed {
+            map.insert(
+                HeaderName::try_from(name).map_err(|e| ApprovalError::Signing(e.to_string()))?,
+                HeaderValue::from_str(&value).map_err(|e| ApprovalError::Signing(e.to_string()))?,
+            );
+        }
+        builder = builder.headers(map);
+        Ok(builder)
+    }
+
     /// Resolve a decision without its response headers: the route-wide path,
     /// which never captures approver identity.
     async fn request_approval(
@@ -1035,9 +1057,7 @@ impl WebhookClient {
             ),
             row_headers,
         );
-        for (name, value) in headers.into_pairs() {
-            post = post.header(name, value);
-        }
+        post = Self::apply_signature_headers(post, headers.into_pairs())?;
         Ok(post.body(body).timeout(timeout))
     }
 
@@ -1227,11 +1247,15 @@ impl WebhookClient {
     /// status-code-carried (207), and any 200 body outside the shape keeps
     /// the caller polling (the latter logs a warn).
     ///
-    /// `_row_headers` is reserved for the row's own egress headers; currently unused.
+    /// `row_headers` (the parked row's own resolved egress values) follow
+    /// the notify leg's precedence: operator headers first, then the row's
+    /// values overlaid per name, then signing applied per-name-replacing
+    /// LAST so a row value under a signature header's name can never
+    /// displace the applied signature.
     pub(crate) async fn poll_decision(
         &self,
         decision_id: DecisionId,
-        _row_headers: Option<&HeaderMap>,
+        row_headers: Option<&HeaderMap>,
     ) -> Result<PollOutcome, ApprovalError> {
         let Some(poll) = &self.poll else {
             return Err(ApprovalError::Misconfigured(
@@ -1241,15 +1265,14 @@ impl WebhookClient {
             ));
         };
         let mut get = self.apply_operator_headers(self.client.get(poll.poll_url.as_str()));
+        get = self.apply_row_headers(get, row_headers);
         if let Some(hmac) = self.egress_hmac()? {
             let egress_context = SigningContext::new(&format!("approval-request:{}", decision_id))
                 .expect("decision id renders as dot-free ASCII");
             let headers = hmac
                 .sign(&egress_context, &[])
                 .map_err(|e| ApprovalError::Signing(e.to_string()))?;
-            for (name, value) in headers.into_pairs() {
-                get = get.header(name, value);
-            }
+            get = Self::apply_signature_headers(get, headers.into_pairs())?;
         }
         let resp = get
             .query(&[("decision_id", decision_id.to_string())])
@@ -1960,6 +1983,7 @@ mod tests {
 
         use bytes::Bytes;
         use reqwest::header::HeaderMap;
+
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
 
@@ -3359,6 +3383,68 @@ mod tests {
                 Bytes::from(received.body),
             )
             .expect("receiver must verify the notify signature over the request body");
+        }
+
+        /// POST-leg sibling of the poll GET pin: a row's stale or bogus value
+        /// under the signature header's own name never displaces the applied
+        /// POST signature (the signed pairs apply per-name-REPLACING after the
+        /// row overlay) — the receiver still verifies under
+        /// `approval-request:{id}` — and the row's ordinary values ride along.
+        #[tokio::test]
+        async fn signed_post_signing_cannot_be_displaced_by_row_headers() {
+            let hmac = test_hmac();
+            let decision_id = DecisionId::generate();
+            let (url, received) =
+                one_shot_receiver(vec![], r#"{"approved":true}"#.to_string()).await;
+
+            let client = loopback_poll_client(
+                &url,
+                EgressSigning::Enabled(hmac.clone()),
+                &url,
+                Duration::from_secs(5),
+            );
+            let mut row = HeaderMap::new();
+            row.insert(
+                "x-row-scope",
+                reqwest::header::HeaderValue::from_static("alpha"),
+            );
+            row.insert(
+                reqwest::header::HeaderName::from_static("x-aura-signature-256"),
+                reqwest::header::HeaderValue::from_static("bogus row value"),
+            );
+
+            client
+                .notify(&test_request(decision_id), Some(&row))
+                .await
+                .expect("a signed ack must resolve Ok");
+
+            let received = received.await.unwrap();
+            assert_eq!(
+                received.header("x-row-scope"),
+                Some("alpha"),
+                "the row's ordinary forwarded values still ride the signed POST: {:?}",
+                received.headers
+            );
+            let signature = received.header(SIGNATURE_HEADER).map(str::to_owned);
+            let timestamp = received.header(TIMESTAMP_HEADER).map(str::to_owned);
+            let egress_context =
+                SigningContext::new(&format!("approval-request:{decision_id}")).unwrap();
+            authorize_ingress(
+                Some(&hmac),
+                &egress_context,
+                signature.as_deref(),
+                timestamp.as_deref(),
+                Bytes::from(received.body),
+            )
+            .expect(
+                "the applied-last signature must win and verify over the request body; the \
+                 bogus row value must never have displaced it",
+            );
+            assert_ne!(
+                signature.as_deref(),
+                Some("bogus row value"),
+                "the receiving side must read the real signature, not the row's bogus value"
+            );
         }
 
         // ---------------------------------------------------------
