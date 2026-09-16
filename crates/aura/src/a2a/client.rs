@@ -13,16 +13,20 @@ use a2a::{
     CancelTaskRequest, GetTaskRequest, JsonRpcId, JsonRpcRequest, JsonRpcResponse, Message, Part,
     Role, SendMessageConfiguration, SendMessageRequest, SendMessageResponse, Task, VERSION,
 };
-use aura_config::a2a::{MODEL_HEADER, jsonrpc_endpoint, parse_header};
+use aura_config::a2a::{MODEL_HEADER, VERSION_HEADER, jsonrpc_endpoint, parse_header};
+use bytes::{Bytes, BytesMut};
+use futures::StreamExt;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
-/// Header carrying the protocol version on every request.
-const VERSION_HEADER: &str = "a2a-version";
-
 /// Bytes of a non-2xx body kept in the error message.
 const MAX_ERROR_BODY_BYTES: usize = 512;
+
+/// Largest response body read from a remote. A task carrying every artifact
+/// of a long run fits comfortably; anything larger is a broken gateway or a
+/// hostile peer, and is refused rather than buffered.
+pub const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
 
 /// Connect timeout for the underlying HTTP client.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -50,10 +54,25 @@ pub enum A2aClientError {
         status: u16,
         body: String,
     },
+    #[error("{endpoint} sent a response larger than {limit} bytes")]
+    ResponseTooLarge { endpoint: String, limit: usize },
     #[error("remote agent returned JSON-RPC error {code}: {message}")]
     Rpc { code: i32, message: String },
     #[error("malformed A2A response from {endpoint}: {reason}")]
     Protocol { endpoint: String, reason: String },
+}
+
+impl A2aClientError {
+    /// A failure a retry may clear: a transport error, or a gateway answering
+    /// with a server error or a rate limit. Protocol and JSON-RPC errors are
+    /// deterministic and are not.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            Self::Http { .. } => true,
+            Self::Status { status, .. } => *status == 429 || (500..600).contains(status),
+            _ => false,
+        }
+    }
 }
 
 /// One remote agent's JSON-RPC endpoint plus the headers every call carries.
@@ -86,8 +105,13 @@ impl A2aClient {
             HeaderName::from_static(VERSION_HEADER),
             HeaderValue::from_static(VERSION),
         );
+        // Never follow redirects: reqwest strips only the standard auth
+        // headers on a cross-host redirect, so a configured API key header
+        // would travel to wherever a redirect points. A JSON-RPC endpoint
+        // has no reason to redirect; a 3xx surfaces as a status error.
         let http = reqwest::Client::builder()
             .user_agent(user_agent)
+            .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(REQUEST_TIMEOUT)
             .build()
@@ -125,12 +149,14 @@ impl A2aClient {
             metadata: None,
             tenant: None,
         };
-        let mut extra = HeaderMap::new();
+        let mut headers = self.headers.clone();
         if let Some(model) = model {
             let (name, value) = header_for_wire(MODEL_HEADER, model)?;
-            extra.insert(name, value);
+            // `insert`, not `append`: the receiver reads the first value, so
+            // the configured model must be the only one on the wire.
+            headers.insert(name, value);
         }
-        self.call(methods::SEND_MESSAGE, &request, extra).await
+        self.call(methods::SEND_MESSAGE, &request, headers).await
     }
 
     pub async fn get_task(&self, task_id: &str) -> Result<Task, A2aClientError> {
@@ -139,7 +165,7 @@ impl A2aClient {
             history_length: Some(0),
             tenant: None,
         };
-        self.call(methods::GET_TASK, &request, HeaderMap::new())
+        self.call(methods::GET_TASK, &request, self.headers.clone())
             .await
     }
 
@@ -149,18 +175,19 @@ impl A2aClient {
             metadata: None,
             tenant: None,
         };
-        self.call(methods::CANCEL_TASK, &request, HeaderMap::new())
+        self.call(methods::CANCEL_TASK, &request, self.headers.clone())
             .await
     }
 
-    /// One JSON-RPC round trip. A non-2xx status is reported with a bounded
-    /// body excerpt because a gateway in front of the remote (auth, routing)
-    /// answers in its own format, not as a JSON-RPC envelope.
+    /// One JSON-RPC round trip carrying exactly `headers`. A non-2xx status
+    /// (a redirect included) is reported with a bounded body excerpt because
+    /// a gateway in front of the remote (auth, routing) answers in its own
+    /// format, not as a JSON-RPC envelope.
     async fn call<P: serde::Serialize, R: DeserializeOwned>(
         &self,
         method: &str,
         params: &P,
-        extra_headers: HeaderMap,
+        headers: HeaderMap,
     ) -> Result<R, A2aClientError> {
         let endpoint = self.endpoint.clone();
         let params = serde_json::to_value(params).map_err(|e| A2aClientError::Protocol {
@@ -176,8 +203,7 @@ impl A2aClient {
         let response = self
             .http
             .post(&endpoint)
-            .headers(self.headers.clone())
-            .headers(extra_headers)
+            .headers(headers)
             .json(&request)
             .send()
             .await
@@ -187,13 +213,7 @@ impl A2aClient {
             })?;
 
         let status = response.status();
-        let body = response
-            .bytes()
-            .await
-            .map_err(|source| A2aClientError::Http {
-                endpoint: endpoint.clone(),
-                source,
-            })?;
+        let body = read_body_bounded(response, &endpoint, MAX_BODY_BYTES).await?;
         if !status.is_success() {
             return Err(A2aClientError::Status {
                 endpoint,
@@ -222,6 +242,38 @@ impl A2aClient {
             reason: format!("{method} result did not deserialize: {e}"),
         })
     }
+}
+
+/// Read at most `limit` bytes of `response`, refusing a declared or streamed
+/// body beyond that instead of buffering it.
+async fn read_body_bounded(
+    response: reqwest::Response,
+    endpoint: &str,
+    limit: usize,
+) -> Result<Bytes, A2aClientError> {
+    let too_large = || A2aClientError::ResponseTooLarge {
+        endpoint: endpoint.to_owned(),
+        limit,
+    };
+    if response
+        .content_length()
+        .is_some_and(|declared| declared > limit as u64)
+    {
+        return Err(too_large());
+    }
+    let mut body = BytesMut::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|source| A2aClientError::Http {
+            endpoint: endpoint.to_owned(),
+            source,
+        })?;
+        if body.len() + chunk.len() > limit {
+            return Err(too_large());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body.freeze())
 }
 
 fn header_for_wire(name: &str, value: &str) -> Result<(HeaderName, HeaderValue), A2aClientError> {
@@ -291,6 +343,54 @@ mod tests {
         assert_eq!(body["params"]["message"]["contextId"], "ctx-1");
         assert_eq!(body["params"]["message"]["parts"][0]["text"], "hello");
         assert_eq!(body["params"]["configuration"]["returnImmediately"], true);
+    }
+
+    #[tokio::test]
+    async fn protocol_headers_win_over_static_ones_and_model_is_sent_once() {
+        let server = LoopbackA2aServer::start(|method, _params| match method {
+            "SendMessage" => Ok(serde_json::json!({ "task": working_task("t1", "c") })),
+            other => panic!("unexpected method {other}"),
+        })
+        .await;
+        // Config validation refuses these; the client still owns them if a
+        // caller bypasses validation.
+        let headers = HashMap::from([
+            ("A2A-Version".to_owned(), "0.3".to_owned()),
+            ("x-aura-model".to_owned(), "static".to_owned()),
+        ]);
+        let client = A2aClient::new(&server.url, &headers, "aura/test").unwrap();
+        client
+            .send_message("hi", None, Some("configured"))
+            .await
+            .unwrap();
+
+        let request = server.requests().remove(0);
+        assert_eq!(request.header_values("a2a-version"), vec!["1.0"]);
+        assert_eq!(request.header_values("x-aura-model"), vec!["configured"]);
+    }
+
+    #[tokio::test]
+    async fn redirects_are_not_followed() {
+        let server = LoopbackA2aServer::start_with_status(302, "").await;
+        let client = A2aClient::new(&server.url, &HashMap::new(), "aura/test").unwrap();
+        let err = client.get_task("t").await.unwrap_err();
+        assert!(
+            matches!(err, A2aClientError::Status { status: 302, .. }),
+            "{err}"
+        );
+        assert_eq!(server.requests().len(), 1, "no follow-up request was made");
+    }
+
+    #[tokio::test]
+    async fn oversized_bodies_are_refused_before_buffering() {
+        let huge = "x".repeat(MAX_BODY_BYTES + 1);
+        let server = LoopbackA2aServer::start_with_status(200, &huge).await;
+        let client = A2aClient::new(&server.url, &HashMap::new(), "aura/test").unwrap();
+        let err = client.get_task("t").await.unwrap_err();
+        assert!(
+            matches!(err, A2aClientError::ResponseTooLarge { limit, .. } if limit == MAX_BODY_BYTES),
+            "{err}"
+        );
     }
 
     #[tokio::test]

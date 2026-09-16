@@ -8,7 +8,10 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-/// A JSON-RPC handler: `Ok(result)` or `Err((code, message))`.
+/// A JSON-RPC handler: `Ok(result)` or `Err((code, message))`. A negative
+/// code is answered as a JSON-RPC error envelope; a code in the HTTP status
+/// range (100..600) is answered as that HTTP status with `message` as the
+/// body, the way a gateway in front of the remote would.
 pub(crate) type Handler =
     dyn Fn(&str, &Value) -> Result<Value, (i32, String)> + Send + Sync + 'static;
 
@@ -159,14 +162,21 @@ async fn serve_one_request(
             {
                 tokio::time::sleep(*delay).await;
             }
-            let envelope = match handler(method, &params) {
-                Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
-                Err((code, msg)) => json!({
-                    "jsonrpc": "2.0", "id": id,
-                    "error": { "code": code, "message": msg }
-                }),
-            };
-            (200, envelope.to_string())
+            match handler(method, &params) {
+                Ok(result) => (
+                    200,
+                    json!({ "jsonrpc": "2.0", "id": id, "result": result }).to_string(),
+                ),
+                Err((code, msg)) if (100..600).contains(&code) => (code as u16, msg),
+                Err((code, msg)) => (
+                    200,
+                    json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "error": { "code": code, "message": msg }
+                    })
+                    .to_string(),
+                ),
+            }
         }
     };
 

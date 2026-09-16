@@ -39,8 +39,10 @@ strip = "symbols"
 [workspace.dependencies]
 # A2A protocol: the wire types are shared by the web server (receiver) and the
 # core crate's remote-agent client (sender); the server binding is web-server only.
-a2a = { package = "a2a-lf", git = "https://github.com/a2aproject/a2a-rs.git", tag = "a2a-server-lf-v0.3.1" }
-a2a-server = { package = "a2a-server-lf", git = "https://github.com/a2aproject/a2a-rs.git", tag = "a2a-server-lf-v0.3.1" }
+# Pinned by commit (tag a2a-server-lf-v0.3.1) so a moved tag cannot change
+# the build, matching the rig fork pin.
+a2a = { package = "a2a-lf", git = "https://github.com/a2aproject/a2a-rs.git", rev = "a32ef57182dd0ecd1d3c04f338778f1974494905" }
+a2a-server = { package = "a2a-server-lf", git = "https://github.com/a2aproject/a2a-rs.git", rev = "a32ef57182dd0ecd1d3c04f338778f1974494905" }
 rig-core = { git = "https://github.com/mezmo/rig.git", rev = "097d08d6188c76debabedddd2ac65ca5bffd2863", default-features = false, features = ["rmcp", "reqwest-rustls"] }
 # The fork's vendored copy (versioned "0.3.10" but carrying prompt-caching
 # support beyond the crates.io release of that number), building against the

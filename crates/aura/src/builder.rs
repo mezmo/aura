@@ -1040,8 +1040,27 @@ impl Agent {
         // filter decides whether that worker may call out.
         if let Some(a2a) = config.a2a.as_ref().filter(|a2a| !a2a.remote.is_empty()) {
             if config.tool_matches_filter(crate::a2a::ASK_AGENT_TOOL_NAME) {
+                // Rig keys tools by name and silently overwrites on a
+                // collision, so an MCP tool named `ask_agent` would shadow
+                // this one (or vice versa) depending on registration order.
+                if let Some(mcp_manager) = mcp_manager.as_deref()
+                    && mcp_manager
+                        .get_available_tool_names()
+                        .iter()
+                        .any(|name| name == crate::a2a::ASK_AGENT_TOOL_NAME)
+                {
+                    return Err(format!(
+                        "an MCP server exposes a tool named {:?}, which collides with the                          remote-agent tool; filter it out with mcp_filter or drop [a2a.remote]",
+                        crate::a2a::ASK_AGENT_TOOL_NAME
+                    )
+                    .into());
+                }
+                // Orchestration workers are built with a tool context factory;
+                // they stream under their own ids, so their calls must not
+                // announce on the live request's event stream.
                 let tool =
-                    crate::a2a::RemoteAgentTool::from_config(a2a, config.request_id.clone())?;
+                    crate::a2a::RemoteAgentTool::from_config(a2a, config.request_id.clone())?
+                        .with_stream_events(config.tool_context_factory.is_none());
                 tracing::info!(
                     "Adding {} tool for {} remote agent(s): {:?}",
                     crate::a2a::ASK_AGENT_TOOL_NAME,
