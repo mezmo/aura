@@ -17,7 +17,7 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::config::HitlConfig;
+use crate::config::{DecisionRouteConfig, HitlConfig, WebhookDelivery};
 
 /// A validated park retention age in seconds: nonzero by construction.
 ///
@@ -109,10 +109,6 @@ impl AdmittedParkRoute {
     /// Wrap the pair after admission established the relation. Private to
     /// this module: only [`validate_park_admission`] constructs the
     /// payload.
-    #[expect(
-        dead_code,
-        reason = "constructed only by validate_park_admission's R1 fill body"
-    )]
     fn from_admission(park_ttl: ParkTtl, route_timeout: RouteTimeoutSecs) -> Self {
         Self {
             park_ttl,
@@ -205,15 +201,52 @@ pub enum ParkAdmissionError {
 /// from [`ParkRouteAdmission`] instead of re-checking raw config. The
 /// retention age is `[hitl.park].park_ttl` on `hitl`; orchestration
 /// enablement is the caller's resolved mode flag.
-#[expect(
-    unused_variables,
-    reason = "todo!() body; filled by P45 wave fill units"
-)]
 pub fn validate_park_admission(
     hitl: &HitlConfig,
     orchestration_enabled: bool,
 ) -> Result<ParkRouteAdmission, ParkAdmissionError> {
-    todo!("P45 wave fill unit R1: mode/park/orchestration validation and the park_ttl relation")
+    match &hitl.route {
+        DecisionRouteConfig::Conversational { .. } => {
+            if hitl.park.enabled {
+                Err(ParkAdmissionError::ParkWithConversational)
+            } else {
+                Ok(ParkRouteAdmission::NonParking(
+                    NonParkingRoute::Conversational,
+                ))
+            }
+        }
+        DecisionRouteConfig::Webhook {
+            timeout_secs,
+            delivery,
+            ..
+        } => match delivery {
+            WebhookDelivery::Sync => {
+                if hitl.park.enabled {
+                    Err(ParkAdmissionError::ParkWithWebhookSync)
+                } else {
+                    Ok(ParkRouteAdmission::NonParking(NonParkingRoute::WebhookSync))
+                }
+            }
+            WebhookDelivery::Poll => {
+                let park_ttl = hitl.park.park_ttl;
+                let route_timeout = RouteTimeoutSecs::new(*timeout_secs);
+                if !hitl.park.enabled {
+                    Err(ParkAdmissionError::PollWithoutPark)
+                } else if !orchestration_enabled {
+                    Err(ParkAdmissionError::PollWithoutOrchestration)
+                } else if park_ttl.as_secs() < route_timeout.as_secs() {
+                    Err(ParkAdmissionError::TtlBelowRouteTimeout {
+                        park_ttl,
+                        route_timeout,
+                    })
+                } else {
+                    Ok(ParkRouteAdmission::PollOrchestration(
+                        AdmittedParkRoute::from_admission(park_ttl, route_timeout),
+                    ))
+                }
+            }
+        },
+    }
 }
 
 /// The admission matrix: each case satisfies or violates exactly one
