@@ -27,7 +27,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 mod common;
 
-use common::{assistant_text, mcp_url, AuraServer, CHAT_TIMEOUT, ECHO_PROMPT};
+use common::{AuraServer, CHAT_TIMEOUT, ECHO_PROMPT, assistant_text, mcp_url};
 
 // ---------------------------------------------------------------------------
 // A hand-rolled mock webhook approver

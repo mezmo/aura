@@ -4804,11 +4804,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
                                 .map(|call| (call.decision_id, call.tool_name.clone())),
                         )
                     });
-                    let blocking = blocking_from_calls(
-                        calls.flatten(),
-                        expires_at,
-                        || "the re-park committed with no outstanding calls".to_string(),
-                    )
+                    let blocking = blocking_from_calls(calls.flatten(), expires_at, || {
+                        "the re-park committed with no outstanding calls".to_string()
+                    })
                     .map_err(fault)?;
                     splice_deferred_pairs(&mut turns, pair_blocks);
                     let turns = SegmentTurns::try_new(turns).map_err(|EmptySegment| {
@@ -5032,11 +5030,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     .map(|call| (call.decision_id, call.tool_name.clone())),
             )
         });
-        let blocking = blocking_from_calls(
-            calls.flatten(),
-            expires_at,
-            || "the re-park committed with no outstanding calls".to_string(),
-        )
+        let blocking = blocking_from_calls(calls.flatten(), expires_at, || {
+            "the re-park committed with no outstanding calls".to_string()
+        })
         .map_err(fault)?;
         Ok(ContinuationOutcome::ReParked { blocking })
     }

@@ -45,7 +45,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 mod common;
 
-use common::{assistant_text, mcp_url, read_full_request, AuraServer, CHAT_TIMEOUT, ECHO_PROMPT};
+use common::{AuraServer, CHAT_TIMEOUT, ECHO_PROMPT, assistant_text, mcp_url, read_full_request};
 
 /// The post-decide resolve must land within ~two poll intervals of the
 /// receiver's decision — a reconciler that only resolves on tick N > 1
