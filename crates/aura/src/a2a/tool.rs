@@ -669,8 +669,9 @@ fn describe(remotes: &BTreeMap<&str, Option<&str>>) -> String {
          exchange — including answering an input_required or auth_required question — call \
          ask_agent again with the same agent and the trailer's context_id. To put a request \
          to several agents at once, pass `calls` with one entry per agent instead of \
-         `agent` and `prompt`; the agents run in parallel and each answer returns its own \
-         trailer. Available agents:",
+         `agent` and `prompt`; the agents run in parallel, and the result carries each \
+         agent's report under a `## <agent>` heading with its own trailer — write one reply \
+         that presents each report, never the raw result. Available agents:",
     );
     for (name, description) in remotes {
         text.push_str("\n- ");
@@ -781,7 +782,7 @@ impl RigTool for RemoteAgentTool {
             // any answer carries each failure as its own section.
             let cancel = self.cancel_token();
             let sections: Vec<Result<String, ToolError>> =
-                futures::future::join_all(resolved.into_iter().map(|(remote, call)| {
+                futures::future::join_all(resolved.iter().map(|(remote, call)| {
                     let span = tracing::info_span!(
                         "a2a.ask_agent",
                         a2a.remote = %remote.name,
@@ -806,11 +807,22 @@ impl RigTool for RemoteAgentTool {
                     "all {count} remote agent calls failed: {details}"
                 )));
             }
+            // A batch reads as one report per agent under a heading naming
+            // it; a single agent's answer needs no heading.
+            let multi = resolved.len() > 1;
             Ok(sections
                 .into_iter()
-                .map(|r| r.unwrap_or_else(|e| e.to_string()))
+                .zip(resolved.iter())
+                .map(|(r, (remote, _))| {
+                    let body = r.unwrap_or_else(|e| e.to_string());
+                    if multi {
+                        format!("## {}\n\n{body}", remote.name)
+                    } else {
+                        body
+                    }
+                })
                 .collect::<Vec<_>>()
-                .join("\n\n===\n\n"))
+                .join("\n\n"))
         })
     }
 }
@@ -1004,9 +1016,10 @@ mod tests {
 
         assert!(out.contains("dev swept"), "{out}");
         assert!(out.contains("stage swept"), "{out}");
+        assert!(out.starts_with("## dev\n\n"), "{out}");
+        assert!(out.contains("\n\n## stage\n\n"), "{out}");
         assert!(out.contains("remote agent \"dev\" · completed"), "{out}");
         assert!(out.contains("remote agent \"stage\" · completed"), "{out}");
-        assert!(out.contains("\n\n===\n\n"), "{out}");
         assert!(
             !out.contains("did not finish within"),
             "sequential execution would have timed out: {out}"
@@ -1069,7 +1082,9 @@ mod tests {
             ]}))
             .await
             .unwrap();
+        assert!(out.contains("## dev"), "{out}");
         assert!(out.contains("42 is the answer"), "{out}");
+        assert!(out.contains("## stage"), "{out}");
         assert!(out.contains("remote agent \"stage\":"), "{out}");
         assert!(out.contains("HTTP 503"), "{out}");
     }
