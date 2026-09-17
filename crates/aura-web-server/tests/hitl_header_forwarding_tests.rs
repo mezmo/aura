@@ -21,19 +21,13 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
 
 use serde_json::{Value, json};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 mod common;
 
-use common::AuraServer;
-
-const CHAT_TIMEOUT: Duration = Duration::from_secs(90);
-
-/// The prompt that has the model call `echo_headers` and relay its output.
-const ECHO_PROMPT: &str = "Call the echo_headers tool now and reply with only its raw JSON output.";
+use common::{assistant_text, mcp_url, AuraServer, CHAT_TIMEOUT, ECHO_PROMPT};
 
 // ---------------------------------------------------------------------------
 // A hand-rolled mock webhook approver
@@ -87,40 +81,13 @@ impl MockApprover {
     }
 }
 
-/// Read one HTTP request off `socket` and answer it per `reply`. Ignores the request body: which decision to hand back is fixed per test.
+/// Read one HTTP request off `socket` and answer it per `reply`. Ignores the
+/// request body: which decision to hand back is fixed per test.
 async fn serve_one_decision(mut socket: tokio::net::TcpStream, reply: ApproverReply) {
-    let mut buf = Vec::new();
-    let head_end = loop {
-        let mut chunk = [0u8; 4096];
-        let Ok(n) = socket.read(&mut chunk).await else {
-            return;
-        };
-        if n == 0 {
-            return;
-        }
-        buf.extend_from_slice(&chunk[..n]);
-        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-            break pos;
-        }
+    let Some(request) = common::read_full_request(&mut socket).await else {
+        return;
     };
-    let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
-    let content_length: usize = head
-        .lines()
-        .filter_map(|line| line.split_once(':'))
-        .find(|(name, _)| name.trim().eq_ignore_ascii_case("content-length"))
-        .and_then(|(_, value)| value.trim().parse().ok())
-        .unwrap_or(0);
-    let mut body = buf[head_end + 4..].to_vec();
-    while body.len() < content_length {
-        let mut chunk = [0u8; 4096];
-        let Ok(n) = socket.read(&mut chunk).await else {
-            return;
-        };
-        if n == 0 {
-            return;
-        }
-        body.extend_from_slice(&chunk[..n]);
-    }
+    let _ = request; // the body is intentionally unread: the reply is fixed per test
 
     let (payload, extra_header) = match reply {
         ApproverReply::ApproveWithHeader { name, value } => {
@@ -149,12 +116,6 @@ async fn serve_one_decision(mut socket: tokio::net::TcpStream, reply: ApproverRe
 // ---------------------------------------------------------------------------
 // Generated config
 // ---------------------------------------------------------------------------
-
-/// The shared mock-mcp fixture's URL, the same server `header_forwarding_tests.rs` depends on, honoring the same `MCP_MOCK_HOST` override.
-fn mcp_url() -> String {
-    let host = std::env::var("MCP_MOCK_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
-    format!("http://{host}:9999/mcp")
-}
 
 /// A minimal single-agent config: one MCP server with a frozen static `Authorization` header (standing in for pre-approval requester identity), plus whatever `[hitl]` table the caller supplies.
 fn config_toml(mcp_url: &str, frozen_authorization: &str, hitl_toml: &str) -> String {
@@ -258,12 +219,6 @@ async fn send_chat(server: &AuraServer, prompt: &str) -> Value {
         "expected 200 OK from /v1/chat/completions"
     );
     response.json().await.expect("response body is valid JSON")
-}
-
-fn assistant_text(response_json: &Value) -> &str {
-    response_json["choices"][0]["message"]["content"]
-        .as_str()
-        .expect("response carries assistant message content")
 }
 
 /// Extract the `echo_headers` JSON blob from a chat response's assistant prose, with `context` naming what the test expected, so a miss identifies both expectation and actual assistant output.
