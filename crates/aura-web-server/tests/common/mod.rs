@@ -26,6 +26,64 @@ use aura::hitl::{
 };
 use aura::session_store::{ApprovalStore, ParkedApprovalRecord};
 
+/// The shared mock-mcp fixture's URL, the same server every HITL e2e suite
+/// depends on, honoring the same `MCP_MOCK_HOST` override.
+pub fn mcp_url() -> String {
+    let host = std::env::var("MCP_MOCK_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+    format!("http://{host}:9999/mcp")
+}
+
+/// Per-request bound for one chat completion call in the e2e suites.
+pub const CHAT_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// The prompt both e2e suites drive: one `echo_headers` tool call whose raw
+/// JSON output proves which headers the gated call saw.
+pub const ECHO_PROMPT: &str =
+    "Call the echo_headers tool now and reply with only its raw JSON output.";
+
+/// Read one full HTTP/1.1 request (head plus content-length body) off
+/// `socket`, or `None` if the peer hangs up first. Shared by the scripted
+/// governance receivers in the HITL e2e suites.
+pub async fn read_full_request(socket: &mut tokio::net::TcpStream) -> Option<String> {
+    use tokio::io::AsyncReadExt;
+
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        let n = socket.read(&mut chunk).await.ok()?;
+        if n == 0 {
+            return None;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+    }
+    let header_end = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+    let header_section = String::from_utf8_lossy(&buf[..header_end]).to_string();
+    let content_length: usize = header_section
+        .lines()
+        .find(|line| line.to_lowercase().starts_with("content-length:"))
+        .and_then(|line| line.split(':').nth(1))
+        .and_then(|val| val.trim().parse().ok())
+        .unwrap_or(0);
+    let body_already_read = buf.len() - header_end;
+    let remaining = content_length.saturating_sub(body_already_read);
+    if remaining > 0 {
+        let mut body_buf = vec![0u8; remaining];
+        socket.read_exact(&mut body_buf).await.ok()?;
+        buf.extend_from_slice(&body_buf);
+    }
+    Some(String::from_utf8_lossy(&buf).to_string())
+}
+
+/// The assistant's text content from a chat-completion response JSON.
+pub fn assistant_text(response_json: &serde_json::Value) -> &str {
+    response_json["choices"][0]["message"]["content"]
+        .as_str()
+        .expect("response carries assistant message content")
+}
+
 /// A representative parked approval, expiring in `ttl`.
 pub fn make_parked(request_id: &str, ttl: Duration) -> ParkedApproval {
     let now = chrono::Utc::now();

@@ -41,13 +41,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 mod common;
 
-use common::AuraServer;
-
-const CHAT_TIMEOUT: Duration = Duration::from_secs(90);
+use common::{assistant_text, mcp_url, read_full_request, AuraServer, CHAT_TIMEOUT, ECHO_PROMPT};
 
 /// The post-decide resolve must land within ~two poll intervals of the
 /// receiver's decision — a reconciler that only resolves on tick N > 1
@@ -67,9 +65,6 @@ const EGRESS_VALUE: &str = "Bearer rig-egress-sentinel";
 /// decision record by `tool_headers_from_response`.
 const IDENTITY_NAME: &str = "x-approver-id";
 const IDENTITY_VALUE: &str = "approver-mike";
-
-/// The prompt that has the model call `echo_headers` and relay its output.
-const ECHO_PROMPT: &str = "Call the echo_headers tool now and reply with only its raw JSON output.";
 
 // ---------------------------------------------------------------------------
 // A mock governance receiver: POST /authorize + GET /status on one port
@@ -187,50 +182,9 @@ fn build_receiver_response(captured: &str, decided: bool) -> String {
     "HTTP/1.1 207 Multi-Status\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_string()
 }
 
-/// Read one full HTTP/1.1 request (head plus content-length body) off
-/// `socket`, or `None` if the peer hangs up first. Mirrors the scripted
-/// receiver in `hitl::poller`'s tests.
-async fn read_full_request(socket: &mut tokio::net::TcpStream) -> Option<String> {
-    let mut buf = Vec::new();
-    let mut chunk = [0u8; 4096];
-    loop {
-        let n = socket.read(&mut chunk).await.ok()?;
-        if n == 0 {
-            return None;
-        }
-        buf.extend_from_slice(&chunk[..n]);
-        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-            break;
-        }
-    }
-    let header_end = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
-    let header_section = String::from_utf8_lossy(&buf[..header_end]).to_string();
-    let content_length: usize = header_section
-        .lines()
-        .find(|line| line.to_lowercase().starts_with("content-length:"))
-        .and_then(|line| line.split(':').nth(1))
-        .and_then(|val| val.trim().parse().ok())
-        .unwrap_or(0);
-    let body_already_read = buf.len() - header_end;
-    let remaining = content_length.saturating_sub(body_already_read);
-    if remaining > 0 {
-        let mut body_buf = vec![0u8; remaining];
-        socket.read_exact(&mut body_buf).await.ok()?;
-        buf.extend_from_slice(&body_buf);
-    }
-    Some(String::from_utf8_lossy(&buf).to_string())
-}
-
 // ---------------------------------------------------------------------------
 // Generated config
 // ---------------------------------------------------------------------------
-
-/// The shared mock-mcp fixture's URL, the same server the sibling HITL suite
-/// depends on, honoring the same `MCP_MOCK_HOST` override.
-fn mcp_url() -> String {
-    let host = std::env::var("MCP_MOCK_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
-    format!("http://{host}:9999/mcp")
-}
 
 /// Spawn a rig server: the rig config plus the store/instance env the
 /// reconciler identity depends on.
@@ -357,12 +311,6 @@ async fn send_chat(server: &AuraServer) -> Value {
         "expected 200 OK from /v1/chat/completions"
     );
     response.json().await.expect("response body is valid JSON")
-}
-
-fn assistant_text(response_json: &Value) -> &str {
-    response_json["choices"][0]["message"]["content"]
-        .as_str()
-        .expect("response carries assistant message content")
 }
 
 /// `{root}/approvals` and `{root}/decisions`: the file backend's layout, read
