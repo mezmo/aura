@@ -4361,6 +4361,16 @@ Assign tasks to the worker whose tools best match the required operations."#,
         // request's headers, so `[hitl.route] headers_from_request`-style
         // MCP mappings resolve against the resume caller.
         let mut config = config.clone();
+        // The resume segment's HITL gate stamps every wire POST with the
+        // config's `request_id`, and the chat path's `req_<uuid>` value is
+        // runtime state that never persists. Left unset, a re-park's
+        // authorize POST carries an empty `request_id`, which the governance
+        // schema rejects (surfacing as an opaque HTTP 500). Stamp the run
+        // owner id — the same id the park bridge re-mints parked rows to —
+        // so resumed wire POSTs name the checkpointed run.
+        config.request_id = Some(crate::orchestration::park::run_owner_id(
+            &grant.checkpoint().run_id,
+        ));
         if let Some(ref mut mcp_config) = config.mcp {
             crate::rig_builder::resolve_mcp_headers_in(mcp_config, Some(headers));
         }
