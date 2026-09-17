@@ -20,6 +20,7 @@ pub use claim::{
     MalformedId, ResumeClaimTable, ResumeDocuments, ResumeRunId, ResumeSessionId,
     ValidatedResumePath,
 };
+pub(crate) use evaluate::blocking_from_calls;
 pub use evaluate::{
     BlockingEntry, ConflictCode, Diagnostic, EmptyBlocking, EmptySegment, NonEmptyBlocking,
     ParkedToolName, ResumeConflictRow, ResumeEvaluation, ResumeGrant, ResumeRefusal,

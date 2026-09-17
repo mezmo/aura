@@ -161,6 +161,26 @@ impl NonEmptyBlocking {
     }
 }
 
+/// Build a mandatory blocking set from outstanding `(decision_id, tool)` rows
+/// sharing one retention deadline. The three re-park projections (evaluate,
+/// the resume drive loop, the coordinator continuation) iterate different
+/// sources but emit the same entry shape; the empty-set refusal is the
+/// caller's error to phrase.
+pub(crate) fn blocking_from_calls<E>(
+    calls: impl Iterator<Item = (DecisionId, String)>,
+    expires_at: chrono::DateTime<chrono::Utc>,
+    empty: impl FnOnce() -> E,
+) -> Result<NonEmptyBlocking, E> {
+    let entries: Vec<BlockingEntry> = calls
+        .map(|(decision_id, tool_name)| BlockingEntry {
+            decision_id,
+            tool: ParkedToolName::new(tool_name),
+            expires_at,
+        })
+        .collect();
+    NonEmptyBlocking::try_new(entries).map_err(|EmptyBlocking| empty())
+}
+
 /// The not-ready codes, declared in evaluation order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -717,7 +737,7 @@ async fn project_blocking(
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<NonEmptyBlocking, Diagnostic> {
     let expires_at = document.retention_expires_at.as_datetime();
-    let mut entries = Vec::new();
+    let mut calls = Vec::new();
     for node in &document.plan.tasks {
         let crate::orchestration::types::TaskStatus::AwaitingApproval = node.status else {
             continue;
@@ -727,15 +747,11 @@ async fn project_blocking(
         };
         for call in pending {
             if store.recorded_decision(&call.decision_id).await.is_none() {
-                entries.push(BlockingEntry {
-                    decision_id: call.decision_id,
-                    tool: ParkedToolName::new(call.tool_name.as_str()),
-                    expires_at,
-                });
+                calls.push((call.decision_id, call.tool_name.clone()));
             }
         }
     }
-    NonEmptyBlocking::try_new(entries).map_err(|EmptyBlocking| {
+    blocking_from_calls(calls.into_iter(), expires_at, || {
         Diagnostic::new(format!(
             "the blocking projection found no outstanding parked calls as of {now}"
         ))
