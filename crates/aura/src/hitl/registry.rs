@@ -1000,10 +1000,9 @@ mod tests {
 
     // ====================================================================
     // Approval authority: a row parked by one channel is never consumable
-    // through another. GREEN since R4-INT-1: the stores enforce the check
-    // inside the store's resolve (E1/E2); the contract is channel
-    // exclusivity — wrong authority is unknown (NotFound), never a
-    // mutation.
+    // through another. The stores enforce the check inside the store's
+    // resolve (E1/E2); the contract is channel exclusivity — wrong
+    // authority is unknown (NotFound), never a mutation.
     // ====================================================================
 
     /// Park one durable row under [`ApprovalAuthority::WebhookPoll`] —

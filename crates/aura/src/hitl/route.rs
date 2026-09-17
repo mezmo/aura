@@ -2198,8 +2198,8 @@ mod tests {
         }
 
         /// [`loopback_poll_client`] with operator headers on the client:
-        /// the poll GET's precedence base the row overlay builds on
-        /// (RED-H1). No other field differs.
+        /// the poll GET's precedence base the row overlay builds on.
+        /// No other field differs.
         fn loopback_poll_client_with_headers(
             url: &str,
             signing: EgressSigning,
@@ -3448,14 +3448,14 @@ mod tests {
         }
 
         // ---------------------------------------------------------
-        // RED-H1: the poll GET's header precedence — operator headers
-        // first, then the parked row's forwarded values overlaid per name,
-        // signing applied last so the signature can never be displaced.
-        // The response side (approver-identity capture) stays separate.
+        // The poll GET's header precedence — operator headers first, then
+        // the parked row's forwarded values overlaid per name, signing
+        // applied last so the signature can never be displaced. The
+        // response side (approver-identity capture) stays separate.
         // ---------------------------------------------------------
 
-        /// Pins the precedence base (expected GREEN today): the poll GET
-        /// carries the client's operator headers as configured.
+        /// Pins the precedence base: the poll GET carries the client's
+        /// operator headers as configured.
         #[tokio::test]
         async fn poll_get_carries_operator_headers() {
             let (url, received) =
@@ -3606,8 +3606,7 @@ mod tests {
 
         /// The request-side overlay never touches response identity
         /// capture: row headers on the poll GET do not perturb the decided
-        /// 200's `response_headers` (expected GREEN — pins the separation
-        /// the contract keeps).
+        /// 200's `response_headers` — the separation the contract keeps.
         #[tokio::test]
         async fn poll_get_row_headers_leave_response_identity_capture_separate() {
             let hmac = test_hmac();

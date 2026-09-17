@@ -968,11 +968,11 @@ mod tests {
             id
         }
 
-        /// RED-H2 sibling of [`park_row`]: park a BORN-ACKNOWLEDGED
-        /// durable row — the truthful post-207 state, `WebhookPoll`
-        /// authority plus `AcknowledgmentState::Acknowledged` — carrying
-        /// `egress` as its resolved authorization value. Existing
-        /// `park_row` callers are untouched.
+        /// Sibling of [`park_row`] for a BORN-ACKNOWLEDGED durable row —
+        /// the truthful post-207 state, `WebhookPoll` authority plus
+        /// `AcknowledgmentState::Acknowledged` — carrying `egress` as its
+        /// resolved authorization value. Existing `park_row` callers are
+        /// untouched.
         async fn park_acknowledged_row(store: &Arc<dyn ApprovalStore>, egress: &str) -> DecisionId {
             let mut headers = HeaderMap::new();
             headers.insert(
@@ -1458,12 +1458,10 @@ mod tests {
             crate::approval_event_broker::unsubscribe(&format!("run:{run_id}")).await;
         }
 
-        /// RED-H2: every born-acknowledged row's poll GET carries THAT
-        /// row's `egress_headers` — the poller passes each row's own
-        /// values into the per-row call, replacing the reconciler
-        /// client's static fallback for that one request (GREEN since
-        /// H2-INT: the tick forwards `parked.egress_headers`). Each
-        /// capture maps to
+        /// Every born-acknowledged row's poll GET carries THAT row's
+        /// `egress_headers` — the poller passes each row's own values
+        /// into the per-row call, replacing the reconciler client's
+        /// static fallback for that one request. Each capture maps to
         /// its row through the GET's own `decision_id` query param, so
         /// the assert holds regardless of within-tick row order.
         #[tokio::test]
@@ -1534,13 +1532,12 @@ mod tests {
             }
         }
 
-        /// RED-H2, restart leg: the persisted `Acknowledged` marker is the
-        /// source of truth (the 207 registration IS the acknowledgment),
-        /// so a fresh reconciler over the reopened store neither re-POSTs
-        /// the row nor drops its credentials: both GETs carry the row's
+        /// Restart leg: the persisted `Acknowledged` marker is the source
+        /// of truth (the 207 registration IS the acknowledgment), so a
+        /// fresh reconciler over the reopened store neither re-POSTs the
+        /// row nor drops its credentials: both GETs carry the row's
         /// value, zero POSTs occur, and the row resolves durably on the
-        /// decided 200 (GREEN since H2-INT via the tick's row-header
-        /// forwarding).
+        /// decided 200.
         #[tokio::test]
         async fn polled_get_keeps_row_headers_across_a_restart_and_never_reposts() {
             let dir = tempfile::tempdir().unwrap();
@@ -1623,8 +1620,8 @@ mod tests {
     // Poller authority filtering: the tick filters every non-WebhookPoll
     // row BEFORE any network request. A same-instance row parked under
     // Conversational (another channel's row in a shared store) gets no
-    // GET, no notify POST, and stays untouched. Red until the R4 fill
-    // adds the pre-network authority filter to `tick`.
+    // GET, no notify POST, and stays untouched: the tick's pre-network
+    // authority filter owns this.
     // ====================================================================
 
     /// Authority-parameterized sibling of [`park_pending`]: park a pending
