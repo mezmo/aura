@@ -17,7 +17,7 @@ use tracing::Instrument;
 
 use super::client::{A2aClient, A2aClientError};
 use crate::request_cancellation::{RequestCancelToken, RequestCancellation};
-use crate::tool_event_broker::{peek_tool_call_id, publish_tool_start};
+use crate::tool_event_broker::{peek_tool_call_id, publish_agent_answer, publish_tool_start};
 
 /// How long a best-effort remote `CancelTask` may take once the local call
 /// has already been given up on.
@@ -649,6 +649,36 @@ impl RemoteAgentTool {
         }
     }
 
+    /// Publish one batch member's section as an `aura.remote_agent_answer`
+    /// event as it lands, so a client can show one agent's report while the
+    /// rest of the batch is still running (single-agent streaming; workers
+    /// report through the orchestration observer).
+    async fn announce_agent_answer(
+        &self,
+        remote: &RemoteAgent,
+        result: &Result<String, ToolError>,
+        elapsed: Duration,
+    ) {
+        if !self.stream_events {
+            return;
+        }
+        let Some(request_id) = &self.request_id else {
+            return;
+        };
+        let (success, text) = match result {
+            Ok(text) => (true, text.clone()),
+            Err(e) => (false, e.to_string()),
+        };
+        publish_agent_answer(
+            request_id,
+            &remote.name,
+            success,
+            text,
+            elapsed.as_millis() as u64,
+        )
+        .await;
+    }
+
     fn cancel_token(&self) -> RequestCancelToken {
         self.request_id
             .as_deref()
@@ -781,17 +811,38 @@ impl RigTool for RemoteAgentTool {
             // N. A batch where every agent failed is a failed call; one with
             // any answer carries each failure as its own section.
             let cancel = self.cancel_token();
-            let sections: Vec<Result<String, ToolError>> =
-                futures::future::join_all(resolved.iter().map(|(remote, call)| {
+            let started = std::time::Instant::now();
+            let mut in_flight: futures::stream::FuturesUnordered<_> = resolved
+                .iter()
+                .enumerate()
+                .map(|(idx, (remote, call))| {
+                    let cancel = cancel.clone();
                     let span = tracing::info_span!(
                         "a2a.ask_agent",
                         a2a.remote = %remote.name,
                         a2a.endpoint = %remote.endpoint(),
                         a2a.task_id = tracing::field::Empty,
                     );
-                    remote.ask(call, cancel.clone()).instrument(span)
-                }))
-                .await;
+                    async move { (idx, remote.ask(call, cancel).await) }.instrument(span)
+                })
+                .collect();
+            let mut sections: Vec<Option<Result<String, ToolError>>> =
+                (0..resolved.len()).map(|_| None).collect();
+            // Sections assemble in request order, but each answer publishes
+            // as it lands so a client can show one agent's report while the
+            // rest of the batch is still running.
+            let multi = resolved.len() > 1;
+            while let Some((idx, result)) = futures::StreamExt::next(&mut in_flight).await {
+                if multi {
+                    self.announce_agent_answer(resolved[idx].0, &result, started.elapsed())
+                        .await;
+                }
+                sections[idx] = Some(result);
+            }
+            let sections: Vec<Result<String, ToolError>> = sections
+                .into_iter()
+                .map(|s| s.expect("every sub-call resolves"))
+                .collect();
             if sections.iter().all(Result::is_err) {
                 let mut sections = sections;
                 if sections.len() == 1 {
@@ -809,7 +860,6 @@ impl RigTool for RemoteAgentTool {
             }
             // A batch reads as one report per agent under a heading naming
             // it; a single agent's answer needs no heading.
-            let multi = resolved.len() > 1;
             Ok(sections
                 .into_iter()
                 .zip(resolved.iter())
@@ -1087,6 +1137,66 @@ mod tests {
         assert!(out.contains("## stage"), "{out}");
         assert!(out.contains("remote agent \"stage\":"), "{out}");
         assert!(out.contains("HTTP 503"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn batch_answers_publish_as_they_land_in_completion_order() {
+        let fast = completing_server(1).await;
+        let slow = completing_server(4).await;
+        let request_id = format!("req_{}", uuid::Uuid::new_v4());
+        let mut events = crate::tool_event_broker::subscribe(&request_id).await;
+        let tool = RemoteAgentTool::new(
+            vec![remote("dev", &slow, None), remote("stage", &fast, None)],
+            Some(request_id.clone()),
+        );
+
+        let out = tool
+            .call(json!({ "calls": [
+                { "agent": "dev", "prompt": "sweep" },
+                { "agent": "stage", "prompt": "pods" }
+            ]}))
+            .await
+            .unwrap();
+        assert!(out.contains("## dev") && out.contains("## stage"), "{out}");
+
+        // The fast remote's event lands first even though it was requested second.
+        let first = events.recv().await.expect("stage answer event");
+        let crate::tool_event_broker::ToolLifecycleEvent::AgentAnswer {
+            remote,
+            success,
+            text,
+            ..
+        } = &first
+        else {
+            panic!("expected an AgentAnswer, got {first:?}");
+        };
+        assert_eq!(remote, "stage");
+        assert!(success);
+        assert!(text.contains("42 is the answer"), "{text}");
+        let second = events.recv().await.expect("dev answer event");
+        let crate::tool_event_broker::ToolLifecycleEvent::AgentAnswer { remote, .. } = &second
+        else {
+            panic!("expected an AgentAnswer, got {second:?}");
+        };
+        assert_eq!(remote, "dev");
+        crate::tool_event_broker::unsubscribe(&request_id).await;
+    }
+
+    #[tokio::test]
+    async fn a_single_call_publishes_no_answer_event() {
+        let server = completing_server(1).await;
+        let request_id = format!("req_{}", uuid::Uuid::new_v4());
+        let mut events = crate::tool_event_broker::subscribe(&request_id).await;
+        let tool =
+            RemoteAgentTool::new(vec![remote("dev", &server, None)], Some(request_id.clone()));
+        tool.call(json!({ "agent": "dev", "prompt": "x" }))
+            .await
+            .unwrap();
+        assert!(
+            events.try_recv().is_err(),
+            "a lone call answers immediately; no mid-batch event"
+        );
+        crate::tool_event_broker::unsubscribe(&request_id).await;
     }
 
     #[tokio::test]

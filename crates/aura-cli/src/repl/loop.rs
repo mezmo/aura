@@ -2882,6 +2882,56 @@ impl StreamHandler for ReplStreamHandler {
             return;
         }
 
+        // One member of an ask_agent batch answered while the rest are still
+        // running: print its report into the scrollback immediately. Same
+        // spinner dance as the MCP_STATUS branch above.
+        if event_name == event_names::REMOTE_AGENT_ANSWER {
+            let Some(remote) = val.get("remote").and_then(|v| v.as_str()) else {
+                return;
+            };
+            let success = val.get("success").and_then(|v| v.as_bool()).unwrap_or(true);
+            let text = val.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            let elapsed_ms = val.get("elapsed_ms").and_then(|v| v.as_u64()).unwrap_or(0);
+
+            let had_ptw = if let Ok(mut guard) = self.post_tool_wave.lock() {
+                guard.take().map(|(a, _)| a.finish()).is_some()
+            } else {
+                false
+            };
+            if !had_ptw && !self.anim_cleared.load(Ordering::Relaxed) {
+                stop_and_clear_animation(&self.stop_flag);
+                self.anim_cleared.store(true, Ordering::Relaxed);
+            }
+            {
+                let _term = lock_term();
+                erase_input_frame();
+                let (style, label) = if success {
+                    (AuraStyle::Success, "answered")
+                } else {
+                    (AuraStyle::Error, "failed")
+                };
+                let line = format!("⏺ {remote} {label} in {:.1}s", elapsed_ms as f64 / 1000.0);
+                println!("{}", line.themed(style));
+                render_markdown(text);
+                println!();
+                crate::ui::prompt::increment_orch_scrollback();
+            }
+            let (wave_anim, wave_stop) = {
+                let _term = lock_term();
+                WaveAnimation::start(
+                    "Thinking",
+                    vec![],
+                    self.input_buf.clone(),
+                    Some(self.cancel.clone()),
+                )
+            };
+            if let Ok(mut guard) = self.post_tool_wave.lock() {
+                *guard = Some((wave_anim, wave_stop));
+            }
+            prepare_input_line(&self.input_buf, Some(&self.cancel));
+            return;
+        }
+
         // Handle aura.progress — prefer to attach the
         // message to the active orchestrator tool whose
         // progress_token matches; fall back to the

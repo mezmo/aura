@@ -55,14 +55,27 @@ pub enum ToolLifecycleEvent {
         progress_token: Option<ProgressToken>,
         agent: Option<AgentContext>,
     },
+    /// One member of an `ask_agent` batch answered while the rest of the
+    /// batch may still be running.
+    AgentAnswer {
+        /// Configured name of the remote agent that answered.
+        remote: String,
+        /// Whether this agent's sub-call succeeded.
+        success: bool,
+        /// The answer's section text (answer body plus its trailer).
+        text: String,
+        /// Wall-clock time from the batch's start to this answer.
+        elapsed_ms: u64,
+    },
 }
 
 impl ToolLifecycleEvent {
     /// Get the tool_name regardless of event variant
-    pub fn tool_name(&self) -> &ToolName {
+    pub fn tool_name(&self) -> &str {
         match self {
-            ToolLifecycleEvent::Requested { tool_name, .. } => tool_name,
-            ToolLifecycleEvent::Start { tool_name, .. } => tool_name,
+            ToolLifecycleEvent::Requested { tool_name, .. } => tool_name.as_str(),
+            ToolLifecycleEvent::Start { tool_name, .. } => tool_name.as_str(),
+            ToolLifecycleEvent::AgentAnswer { remote, .. } => remote,
         }
     }
 }
@@ -325,6 +338,26 @@ pub async fn publish_tool_start(
             tool_name,
             progress_token,
             agent: None,
+        },
+    )
+    .await
+}
+
+/// Convenience function to publish one batch member's answer
+pub async fn publish_agent_answer(
+    request_id: &str,
+    remote: &str,
+    success: bool,
+    text: String,
+    elapsed_ms: u64,
+) -> bool {
+    publish(
+        request_id,
+        ToolLifecycleEvent::AgentAnswer {
+            remote: remote.to_owned(),
+            success,
+            text,
+            elapsed_ms,
         },
     )
     .await
@@ -600,6 +633,41 @@ mod tests {
 
         // req_2 should NOT receive anything
         assert!(rx2.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn test_publish_agent_answer_event() {
+        let broker = ToolEventBroker::new();
+        let mut rx = broker.subscribe("req_aa").await;
+
+        let sent = broker
+            .publish(
+                "req_aa",
+                ToolLifecycleEvent::AgentAnswer {
+                    remote: "dev".to_string(),
+                    success: true,
+                    text: "done".to_string(),
+                    elapsed_ms: 5,
+                },
+            )
+            .await;
+        assert!(sent);
+
+        let received = rx.recv().await.unwrap();
+        assert_eq!(received.tool_name(), "dev");
+        match received {
+            ToolLifecycleEvent::AgentAnswer {
+                success,
+                text,
+                elapsed_ms,
+                ..
+            } => {
+                assert!(success);
+                assert_eq!(text, "done");
+                assert_eq!(elapsed_ms, 5);
+            }
+            other => panic!("Expected AgentAnswer, got {other:?}"),
+        }
     }
 
     #[tokio::test]

@@ -11,6 +11,7 @@ pub const TOOL_START: &str = "aura.tool_start";
 pub const TOOL_COMPLETE: &str = "aura.tool_complete";
 pub const REASONING: &str = "aura.reasoning";
 pub const PROGRESS: &str = "aura.progress";
+pub const REMOTE_AGENT_ANSWER: &str = "aura.remote_agent_answer";
 pub const WORKER_PHASE: &str = "aura.worker_phase";
 pub const TOOL_USAGE: &str = "aura.tool_usage";
 pub const USAGE: &str = "aura.usage";

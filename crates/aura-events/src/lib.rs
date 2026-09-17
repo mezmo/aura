@@ -560,6 +560,23 @@ pub enum AuraStreamEvent {
         #[serde(flatten)]
         correlation: CorrelationContext,
     },
+    /// Emitted when one agent in an `ask_agent` batch answers while the
+    /// batch's other agents may still be running, so a client can show each
+    /// remote answer as it lands instead of waiting for the whole batch.
+    RemoteAgentAnswer {
+        /// Configured name of the remote agent that answered.
+        remote: String,
+        /// Whether this agent's sub-call succeeded.
+        success: bool,
+        /// The answer's section text (answer body plus its trailer).
+        text: String,
+        /// Wall-clock time from the batch's start to this answer.
+        elapsed_ms: u64,
+        #[serde(flatten)]
+        agent: AgentContext,
+        #[serde(flatten)]
+        correlation: CorrelationContext,
+    },
     /// Emitted for multi-agent worker phase transitions.
     WorkerPhase {
         phase: WorkerPhase,
@@ -668,6 +685,7 @@ impl AuraStreamEvent {
             Self::ToolComplete { .. } => event_names::TOOL_COMPLETE,
             Self::Reasoning { .. } => event_names::REASONING,
             Self::Progress { .. } => event_names::PROGRESS,
+            Self::RemoteAgentAnswer { .. } => event_names::REMOTE_AGENT_ANSWER,
             Self::WorkerPhase { .. } => event_names::WORKER_PHASE,
             Self::ToolUsage { .. } => event_names::TOOL_USAGE,
             Self::Usage { .. } => event_names::USAGE,
@@ -788,6 +806,25 @@ impl AuraStreamEvent {
             phase: phase.into(),
             percent,
             progress_token,
+            agent,
+            correlation,
+        }
+    }
+
+    /// Create a RemoteAgentAnswer event for one member of an ask_agent batch.
+    pub fn remote_agent_answer(
+        remote: impl Into<String>,
+        success: bool,
+        text: impl Into<String>,
+        elapsed_ms: u64,
+        agent: AgentContext,
+        correlation: CorrelationContext,
+    ) -> Self {
+        Self::RemoteAgentAnswer {
+            remote: remote.into(),
+            success,
+            text: text.into(),
+            elapsed_ms,
             agent,
             correlation,
         }
@@ -1157,6 +1194,39 @@ mod tests {
             }
             other => panic!("expected ToolComplete, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn remote_agent_answer_roundtrip() {
+        let event = AuraStreamEvent::remote_agent_answer(
+            "dev",
+            true,
+            "the answer",
+            12_300,
+            AgentContext::single_agent(),
+            CorrelationContext::new("s1", None),
+        );
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: AuraStreamEvent = serde_json::from_str(&json).unwrap();
+        match parsed {
+            AuraStreamEvent::RemoteAgentAnswer {
+                remote,
+                success,
+                text,
+                elapsed_ms,
+                ..
+            } => {
+                assert_eq!(remote, "dev");
+                assert!(success);
+                assert_eq!(text, "the answer");
+                assert_eq!(elapsed_ms, 12_300);
+            }
+            other => panic!("expected RemoteAgentAnswer, got {:?}", other),
+        }
+        assert_eq!(event.event_name(), event_names::REMOTE_AGENT_ANSWER);
+        assert!(event
+            .format_sse()
+            .starts_with("event: aura.remote_agent_answer\n"));
     }
 
     #[test]
