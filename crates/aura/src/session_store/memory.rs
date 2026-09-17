@@ -9,8 +9,8 @@ use bytes::Bytes;
 use tokio::sync::broadcast;
 
 use crate::hitl::{
-    AcknowledgmentState, ApprovalAuthority, ApprovalRead, DecisionId, ParkedApproval, ResolveError,
-    ResolvedDecision, Timestamp,
+    AcknowledgmentState, AddressedApproval, ApprovalAuthority, ApprovalRead, DecisionId,
+    ParkedApproval, ResolveError, ResolvedDecision, Timestamp,
 };
 
 use super::{AcknowledgeOutcome, ApprovalStore, EventBus, SessionStoreError, Subscription};
@@ -27,10 +27,6 @@ const DECISION_RETENTION_MARGIN_SECS: i64 = 60;
 /// backend persists both halves in its decision record).
 struct DecidedEntry {
     decision: ResolvedDecision,
-    #[expect(
-        dead_code,
-        reason = "read by the E2 memory read_or_expire fill; the fill's marker sweep removes this"
-    )]
     approval: ParkedApproval,
     keep_until: Timestamp,
 }
@@ -163,24 +159,53 @@ impl ApprovalStore for InMemoryApprovalStore {
         Ok(pending)
     }
 
-    #[expect(
-        unused_variables,
-        reason = "todo!() body; filled by P45 wave fill units"
-    )]
     async fn read_or_expire(
         &self,
         id: &DecisionId,
         expected_authority: ApprovalAuthority,
     ) -> Result<ApprovalRead, SessionStoreError> {
-        todo!(
-            "P45 wave fill units E1/E2: memory read-or-expire enforces authority for inline requests without park parity"
-        )
+        // The pending path checks the row's own authority, so a wrong
+        // channel reads as missing with no mutation — one agent's poller
+        // cannot consume another's rows.
+        if let Some(parked) = self.lock().get(id).cloned() {
+            if parked.authority != expected_authority {
+                return Ok(ApprovalRead::Missing);
+            }
+            if chrono::Utc::now() > parked.expires_at {
+                // The timeout is re-derived from the row on every read:
+                // idempotent, with no cached winner and no mutation — a
+                // `DecidedEntry` cannot hold a timeout and none is needed.
+                let deadline = parked.expires_at;
+                return Ok(ApprovalRead::Addressed {
+                    approval: parked,
+                    outcome: AddressedApproval::TimedOut { deadline },
+                });
+            }
+            return Ok(ApprovalRead::Pending(parked));
+        }
+        // No pending row: a recorded decision inside the window wins over
+        // any timeout, carrying the row retained beside it at resolve time.
+        match self.lock_decided().get(id) {
+            Some(entry) => {
+                if entry.approval.authority != expected_authority {
+                    return Ok(ApprovalRead::Missing);
+                }
+                Ok(ApprovalRead::Addressed {
+                    approval: entry.approval.clone(),
+                    outcome: AddressedApproval::Decided(entry.decision.clone()),
+                })
+            }
+            None => Ok(ApprovalRead::Missing),
+        }
     }
 
     async fn retained_rows(&self) -> Result<Vec<super::RetainedApproval>, SessionStoreError> {
-        todo!(
-            "P45 wave fill units E1/E2: the memory backend answers the retained scan with the typed unsupported-operation error — no park parity"
-        )
+        Err(SessionStoreError::UnsupportedOperation {
+            operation: "retained_rows",
+            reason: "the in-memory backend has no park parity: a process-local \
+                     registry has no durable rows to scan"
+                .to_string(),
+        })
     }
 }
 
