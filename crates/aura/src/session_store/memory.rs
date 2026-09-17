@@ -327,8 +327,8 @@ mod tests {
 
     use super::*;
     use crate::hitl::{
-        AgentScope, ApprovalDecision, ApprovalItem, ApprovalOrigin, ApprovalRequest,
-        PROTOCOL_VERSION,
+        AgentScope, ApprovalAuthority, ApprovalDecision, ApprovalItem, ApprovalOrigin,
+        ApprovalRequest, PROTOCOL_VERSION,
     };
 
     fn parked(request_id: &str) -> ParkedApproval {
@@ -353,6 +353,7 @@ mod tests {
             },
             registered_at: now,
             expires_at: now + chrono::Duration::seconds(60),
+            authority: ApprovalAuthority::WebhookPoll,
             egress_headers: None,
         }
     }
