@@ -216,12 +216,8 @@ impl ResumeClaimTable {
     /// This is the generalized reservation entry the resume ordering reserves
     /// through (step 2 of the ownership contract); the claim-and-rename step
     /// converts the same reservation into a grant with no ownerless gap.
-    #[expect(
-        unused_variables,
-        reason = "todo!() body; filled by P45 wave fill units"
-    )]
     pub fn reserve(&self, run: &ResumeRunId) -> Result<RunReservationLease, ReservationFault> {
-        todo!("P45 wave fill unit E4: shared reservation table admit under the short standard lock")
+        self.reservations.admit(run.run_id())
     }
 
     /// Ordered-resume step 3's rename-back, fenced by the held reservation:
@@ -398,5 +394,35 @@ pub(crate) struct RaceGateGuard {
 impl Drop for RaceGateGuard {
     fn drop(&mut self) {
         self.gate.armed.store(false, Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reserve_admits_rejects_live_and_releases_on_drop() {
+        let table = ResumeClaimTable::new();
+        let run = ResumeRunId::parse("0191e8c0-aaaa-7000-8000-0000000000e4").unwrap();
+
+        let lease = table
+            .reserve(&run)
+            .expect("a fresh run reserves under the shared table");
+        assert!(
+            table.is_live(&run),
+            "the reserved run is live while the lease is held"
+        );
+
+        match table.reserve(&run) {
+            Err(ReservationFault::Live) => {}
+            other => panic!("a second reservation of a live run must be Live, got {other:?}"),
+        }
+
+        drop(lease);
+        assert!(
+            !table.is_live(&run),
+            "the final lease reference dropping releases the run"
+        );
     }
 }
