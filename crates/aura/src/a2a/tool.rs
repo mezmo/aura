@@ -17,7 +17,9 @@ use tracing::Instrument;
 
 use super::client::{A2aClient, A2aClientError};
 use crate::request_cancellation::{RequestCancelToken, RequestCancellation};
-use crate::tool_event_broker::{peek_tool_call_id, publish_agent_answer, publish_tool_start};
+use crate::tool_event_broker::{
+    ToolName, peek_tool_call_id, publish_agent_answer, publish_tool_start,
+};
 
 /// How long a best-effort remote `CancelTask` may take once the local call
 /// has already been given up on.
@@ -649,7 +651,7 @@ impl RemoteAgentTool {
             publish_tool_start(
                 request_id,
                 tool_call_id,
-                ASK_AGENT_TOOL_NAME.to_owned(),
+                ToolName::new(ASK_AGENT_TOOL_NAME),
                 None,
             )
             .await;
