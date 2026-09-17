@@ -271,3 +271,207 @@ impl RunExecutionScope {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::ReservationTable;
+    use super::RunExecutionScope;
+    use crate::orchestration::types::RunId;
+
+    /// Long enough for a fill to make visible progress, short enough that a
+    /// regressed fill (a drain that never joins its tails) fails fast instead
+    /// of hanging the suite.
+    const GATE_TICK: Duration = Duration::from_millis(500);
+
+    /// Distinct, probe-free run ids parsed through `RunId`'s `FromStr`.
+    fn run_id(uuid: &'static str) -> RunId {
+        uuid.parse().expect("well-formed run id")
+    }
+
+    // Hole: `RunExecutionScope::spawn_tracked` (SKELETON hole inventory
+    // row 7) — RED at the tracked-async-spawn `todo!()` site until the fill
+    // routes the future through the tracker and returns it output.
+
+    #[tokio::test]
+    async fn spawn_tracked_returns_output_through_join_handle() {
+        let table = ReservationTable::new();
+        let lease = table
+            .admit(run_id("28b3f0a6-6c71-4e02-9f0d-25df8e1f7a10"))
+            .expect("admission");
+        let scope = RunExecutionScope::new(lease);
+        let handle = scope.spawn_tracked(async { 21 * 2 });
+        let output = tokio::time::timeout(GATE_TICK, handle)
+            .await
+            .expect("tracked task joins within GATE_TICK")
+            .expect("tracked task did not panic");
+        assert_eq!(output, 42);
+    }
+
+    // Hole: `RunExecutionScope::spawn_tracked` (SKELETON hole inventory
+    // row 7) — spawned wrapper keeps its lease reference through the
+    // future's ACTUAL completion: the run stays live while the gate is
+    // closed (check via a separately-held `ReservationTable`, which shares
+    // the live set), and releases only at the task's real tail.
+
+    #[tokio::test]
+    async fn spawn_tracked_holds_reservation_through_task_completion() {
+        let table = ReservationTable::new();
+        let check = table.clone();
+        let run = run_id("91f2c4d7-1a55-4b83-8c2e-3b9e6d0f42b1");
+        let lease = table.admit(run).expect("admission");
+        // `RunExecutionScope::new` consumes the lease into the scope.
+        let scope = RunExecutionScope::new(lease);
+        let (release, gate) = tokio::sync::oneshot::channel::<()>();
+        let handle = scope.spawn_tracked(async move {
+            gate.await.ok();
+        });
+        // Owner-side handles all dropped: the spawned wrapper's lease
+        // reference is now the only fence holder.
+        drop(scope);
+        assert!(
+            check.is_live(run),
+            "run stays occupied while every owner handle is dropped but the tracked task still runs"
+        );
+        release.send(()).expect("gate still open for release");
+        tokio::time::timeout(GATE_TICK, handle)
+            .await
+            .expect("tracked task joins within GATE_TICK after the gate opens")
+            .expect("tracked task did not panic");
+        assert!(
+            !check.is_live(run),
+            "run releases only after the tracked task's actual completion"
+        );
+    }
+
+    // Hole: `RunExecutionScope::spawn_blocking_tracked` (SKELETON hole
+    // inventory row 8) — the same fence rule on the blocking pool: live
+    // while the body is blocked on the gate, released after it returns.
+
+    #[tokio::test]
+    async fn spawn_blocking_tracked_holds_reservation_through_completion() {
+        let table = ReservationTable::new();
+        let check = table.clone();
+        let run = run_id("5c1e8b23-77ad-4e60-9c4d-14a2f8d63e07");
+        let lease = table.admit(run).expect("admission");
+        let scope = RunExecutionScope::new(lease);
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let handle = scope.spawn_blocking_tracked(move || {
+            gate.recv().expect("gate open when receives");
+        });
+        drop(scope);
+        assert!(
+            check.is_live(run),
+            "run stays occupied while the blocked body still holds its lease reference"
+        );
+        release.send(()).expect("gate still open for release");
+        tokio::time::timeout(GATE_TICK, handle)
+            .await
+            .expect("tracked blocking task joins within GATE_TICK after the gate opens")
+            .expect("tracked blocking task did not panic");
+        assert!(
+            !check.is_live(run),
+            "run releases only after the blocking body returns"
+        );
+    }
+
+    // Hole: `RunExecutionScope::drain` (SKELETON hole inventory row 9, the
+    // RunExecutionScope rule row) — the join barrier: drain does NOT
+    // complete while any tracked gate is closed, and completes after all
+    // gates release. Never a yield-based counter.
+
+    #[tokio::test]
+    async fn drain_waits_for_every_tracked_tail() {
+        let table = ReservationTable::new();
+        let lease = table
+            .admit(run_id("e2a94d14-9a34-42f8-a5b9-7c6d1e0f83b2"))
+            .expect("admission");
+        let scope = RunExecutionScope::new(lease);
+        let (release_one, gate_one) = tokio::sync::oneshot::channel::<()>();
+        let (release_two, gate_two) = tokio::sync::oneshot::channel::<()>();
+        let handle_one = scope.spawn_tracked(async move {
+            gate_one.await.ok();
+            "one"
+        });
+        let handle_two = scope.spawn_tracked(async move {
+            gate_two.await.ok();
+            "two"
+        });
+        assert!(
+            tokio::time::timeout(GATE_TICK, scope.drain())
+                .await
+                .is_err(),
+            "drain must not complete while any tracked gate is closed"
+        );
+        release_one
+            .send(())
+            .expect("gate one still open for release");
+        let one = tokio::time::timeout(GATE_TICK, handle_one)
+            .await
+            .expect("tracked task one joins within GATE_TICK")
+            .expect("tracked task one did not panic");
+        assert_eq!(one, "one");
+        assert!(
+            tokio::time::timeout(GATE_TICK, scope.drain())
+                .await
+                .is_err(),
+            "drain must still wait while a tracked gate stays closed"
+        );
+        release_two
+            .send(())
+            .expect("gate two still open for release");
+        tokio::time::timeout(GATE_TICK, scope.drain())
+            .await
+            .expect("drain completes after every gate is released");
+        let two = tokio::time::timeout(GATE_TICK, handle_two)
+            .await
+            .expect("tracked task two joins within GATE_TICK")
+            .expect("tracked task two did not panic");
+        assert_eq!(two, "two");
+    }
+
+    // Hole: `RunExecutionScope::drain` — an idle scope's drain returns
+    // with nothing tracked at all.
+
+    #[tokio::test]
+    async fn drain_completes_with_no_tracked_tasks() {
+        let table = ReservationTable::new();
+        let lease = table
+            .admit(run_id("6f40b8e2-21d3-4a97-88c5-9b1e3f6d0a52"))
+            .expect("admission");
+        let scope = RunExecutionScope::new(lease);
+        tokio::time::timeout(GATE_TICK, scope.drain())
+            .await
+            .expect("an idle scope drains within GATE_TICK");
+    }
+
+    // Hole: `RunExecutionScope::drain` + `spawn_tracked` registration —
+    // membership is tracker-tracked, not handle-owned: a dropped
+    // `JoinHandle` does not abort the task, so drain waits out its actual
+    // tail.
+
+    #[tokio::test]
+    async fn drain_waits_for_tasks_whose_join_handles_are_dropped() {
+        let table = ReservationTable::new();
+        let lease = table
+            .admit(run_id("c08d75a1-4e2b-4d36-90f3-58a2e7c41d96"))
+            .expect("admission");
+        let scope = RunExecutionScope::new(lease);
+        let (release, gate) = tokio::sync::oneshot::channel::<()>();
+        let handle = scope.spawn_tracked(async move {
+            gate.await.ok();
+        });
+        drop(handle);
+        assert!(
+            tokio::time::timeout(GATE_TICK, scope.drain())
+                .await
+                .is_err(),
+            "drain must wait for the tracked tail even after its JoinHandle is dropped"
+        );
+        release.send(()).expect("gate still open for release");
+        tokio::time::timeout(GATE_TICK, scope.drain())
+            .await
+            .expect("drain completes once the dropped-handle task's actual tail has ended");
+    }
+}
