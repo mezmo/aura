@@ -17,8 +17,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::SessionId;
 use crate::hitl::{
-    AgentScope, ApprovalItem, ApprovalOrigin, ApprovalRequest, DecisionId, ParkedApproval,
-    ResolvedDecision, Timestamp,
+    AgentScope, ApprovalAuthority, ApprovalItem, ApprovalOrigin, ApprovalRequest, DecisionId,
+    ParkedApproval, ResolvedDecision, Timestamp,
 };
 use crate::orchestration::{RunId, TaskIdentity};
 
@@ -40,6 +40,9 @@ pub struct ParkedApprovalRecord {
     pub items: Vec<ApprovalItem>,
     pub registered_at: Timestamp,
     pub expires_at: Timestamp,
+    /// The channel the row was parked under. Required on every row: absence
+    /// is a decode failure, never a guessed authority.
+    pub authority: ApprovalAuthority,
     /// Resolved egress headers the parked row's notify POST authenticates
     /// with (lowercased name → value). Additive: absent on rows stored before
     /// poll-delivery egress capture existed, decoding to `None`.
@@ -64,6 +67,7 @@ impl std::fmt::Debug for ParkedApprovalRecord {
             .field("items", &self.items)
             .field("registered_at", &self.registered_at)
             .field("expires_at", &self.expires_at)
+            .field("authority", &self.authority)
             .field("egress_header_names", &pair_names(&self.egress_headers))
             .finish()
     }
@@ -200,6 +204,7 @@ impl From<&ParkedApproval> for ParkedApprovalRecord {
             items: request.items.clone(),
             registered_at: parked.registered_at,
             expires_at: parked.expires_at,
+            authority: parked.authority,
             egress_headers: parked
                 .egress_headers
                 .as_ref()
@@ -232,6 +237,7 @@ impl TryFrom<ParkedApprovalRecord> for ParkedApproval {
             },
             registered_at: record.registered_at,
             expires_at: record.expires_at,
+            authority: record.authority,
             egress_headers,
         })
     }
@@ -349,6 +355,7 @@ mod tests {
             },
             registered_at: now,
             expires_at: now + chrono::Duration::seconds(60),
+            authority: ApprovalAuthority::WebhookPoll,
             egress_headers: None,
         }
     }
@@ -375,6 +382,49 @@ mod tests {
                 agent_name: "test-agent".to_string(),
             },
         ));
+    }
+
+    #[test]
+    fn authority_survives_the_round_trip_both_ways() {
+        for authority in [ApprovalAuthority::Conversational, ApprovalAuthority::WebhookPoll] {
+            let mut parked = parked(
+                AgentScope::Single { session_id: None },
+                ApprovalOrigin::ConfigGate {
+                    matched_pattern: "*".to_string(),
+                    agent_name: "test-agent".to_string(),
+                },
+            );
+            parked.authority = authority;
+            let record = ParkedApprovalRecord::from(&parked);
+            assert_eq!(record.authority, authority, "stored stamp is the route's");
+            let stored: ParkedApprovalRecord =
+                serde_json::from_str(&serde_json::to_string(&record).unwrap()).unwrap();
+            let restored = ParkedApproval::try_from(stored).unwrap();
+            assert_eq!(restored.authority, authority, "restore keeps the stamp");
+        }
+    }
+
+    #[test]
+    fn a_record_without_authority_is_a_decode_failure() {
+        let record = ParkedApprovalRecord::from(&parked(
+            AgentScope::Single { session_id: None },
+            ApprovalOrigin::ConfigGate {
+                matched_pattern: "*".to_string(),
+                agent_name: "test-agent".to_string(),
+            },
+        ));
+        let mut value =
+            serde_json::to_value(&record).expect("record serializes to a JSON object");
+        value
+            .as_object_mut()
+            .expect("the record is an object")
+            .remove("authority");
+        let err = serde_json::from_value::<ParkedApprovalRecord>(value)
+            .expect_err("absent authority must not decode to a guessed route");
+        assert!(
+            err.to_string().contains("authority"),
+            "the refusal names the missing field, got: {err}"
+        );
     }
 
     #[test]
@@ -475,6 +525,10 @@ mod tests {
     /// failure.
     #[test]
     fn legacy_row_without_egress_headers_is_readable() {
+        // A row from before egress capture existed carries the required
+        // authority (this PR made it required at write) but no
+        // `egress_headers` key at all: the additive field must still
+        // decode to `None`.
         let legacy_json = r#"{
             "version": 1,
             "instance_id": "test-instance",
@@ -484,7 +538,8 @@ mod tests {
             "origin": { "kind": "config_gate", "matched_pattern": "kubectl_*", "agent_name": "t" },
             "items": [],
             "registered_at": "2026-08-01T00:00:00Z",
-            "expires_at": "2026-08-01T01:00:00Z"
+            "expires_at": "2026-08-01T01:00:00Z",
+            "authority": "webhook_poll"
         }"#;
 
         let record: ParkedApprovalRecord = serde_json::from_str(legacy_json).unwrap();

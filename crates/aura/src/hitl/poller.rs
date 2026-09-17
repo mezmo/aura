@@ -307,6 +307,7 @@ mod tests {
                 request,
                 registered_at: chrono::Utc::now(),
                 expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+                authority: crate::hitl::ApprovalAuthority::WebhookPoll,
                 egress_headers: None,
             })
             .await
@@ -624,6 +625,7 @@ mod tests {
                     request,
                     registered_at: chrono::Utc::now(),
                     expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+                    authority: crate::hitl::ApprovalAuthority::WebhookPoll,
                     egress_headers: None,
                 })
                 .await
@@ -841,6 +843,7 @@ mod tests {
                     request,
                     registered_at: chrono::Utc::now(),
                     expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+                    authority: crate::hitl::ApprovalAuthority::WebhookPoll,
                     egress_headers: Some(headers),
                 })
                 .await
@@ -1120,6 +1123,7 @@ mod tests {
                     request,
                     registered_at: chrono::Utc::now(),
                     expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+                    authority: crate::hitl::ApprovalAuthority::WebhookPoll,
                     egress_headers: Some(egress),
                 })
                 .await

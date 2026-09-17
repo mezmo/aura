@@ -13,6 +13,7 @@ use rig::tool::ToolError;
 use serde_json::Value;
 
 use super::decision::{AgentScope, ApprovalOrigin, DecisionId};
+use super::outcome::ApprovalAuthority;
 use super::protocol::{ApprovalItem, ApprovalRequest, PROTOCOL_VERSION};
 use super::registry::{ParkedApproval, PendingApprovals};
 use super::route::{ApprovalError, DecisionRoute, GateDecision};
@@ -175,6 +176,14 @@ impl HitlApprovalWrapper {
         let expires_at =
             now + chrono::Duration::from_std(timeout).expect("approval timeout fits in chrono");
         let decision_id = DecisionId::generate();
+        // The row's authority is the route that parked it: conversational
+        // parks inline, and the webhook park arm runs only under poll
+        // delivery (park_registry answers None for a sync client), so the
+        // Webhook arm here is always the poll channel.
+        let authority = match &*self.route {
+            DecisionRoute::Conversational { .. } => ApprovalAuthority::Conversational,
+            DecisionRoute::Webhook { .. } => ApprovalAuthority::WebhookPoll,
+        };
         let request = ApprovalRequest {
             version: PROTOCOL_VERSION,
             instance_id: self.instance_id.clone(),
@@ -201,6 +210,7 @@ impl HitlApprovalWrapper {
             request,
             registered_at: now,
             expires_at,
+            authority,
             egress_headers,
         };
         if let Err(err) = park.registry.register_durable(parked.clone()).await {
@@ -646,6 +656,11 @@ mod tests {
                         .unwrap()
                         .expect("ticket parked in the store");
                     assert_eq!(
+                        parked.authority,
+                        ApprovalAuthority::Conversational,
+                        "a conversational park stamps the inline authority"
+                    );
+                    assert_eq!(
                         parked.request.request_id,
                         "run:0191e8c0-1111-7000-8000-000000000042"
                     );
@@ -843,6 +858,11 @@ mod tests {
                         .await
                         .unwrap()
                         .expect("ticket parked in the store");
+                    assert_eq!(
+                        parked.authority,
+                        ApprovalAuthority::WebhookPoll,
+                        "a poll park stamps the poll authority"
+                    );
                     assert_eq!(
                         parked.request.request_id,
                         "run:0191e8c0-1111-7000-8000-000000000042"

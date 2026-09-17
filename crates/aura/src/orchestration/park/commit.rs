@@ -348,6 +348,7 @@ mod tests {
             },
             registered_at: chrono::Utc::now(),
             expires_at,
+            authority: crate::hitl::ApprovalAuthority::WebhookPoll,
             egress_headers: None,
         }
     }
@@ -595,6 +596,7 @@ mod tests {
                 },
                 registered_at: now,
                 expires_at: now + chrono::Duration::hours(1),
+                authority: crate::hitl::ApprovalAuthority::WebhookPoll,
                 egress_headers: None,
             })
             .await

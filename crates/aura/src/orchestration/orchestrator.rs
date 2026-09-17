@@ -7669,6 +7669,7 @@ mod tests {
                     },
                     registered_at: now,
                     expires_at: now + chrono::Duration::seconds(60),
+                    authority: crate::hitl::ApprovalAuthority::WebhookPoll,
                     egress_headers: None,
                 })
                 .await
@@ -7802,6 +7803,7 @@ mod tests {
                     },
                     registered_at: now,
                     expires_at: now + chrono::Duration::hours(1),
+                    authority: crate::hitl::ApprovalAuthority::WebhookPoll,
                     egress_headers: None,
                 })
                 .await
