@@ -4500,7 +4500,28 @@ Assign tasks to the worker whose tools best match the required operations."#,
     /// commit supersedes the resuming shadow with the refreshed checkpoint,
     /// stamped with the checkpoint's own run id. The grant is held for the
     /// whole segment so the claim lease outlives every await.
+    ///
+    /// Drains the grant's ONE execution scope on every body return before
+    /// the grant (and `self`) drop, so no tracked tail spawned during the
+    /// segment outlives the run's reservation fence. The body borrows the
+    /// grant, keeping its lease held across the drain; the drain waits only
+    /// for already-spawned tracked work, so no legitimate return is blocked.
     async fn drive_resume_segment(self, grant: ResumeGrant) -> Result<SegmentResult, SegmentError> {
+        let scope = grant.execution_scope();
+        let result = self.drive_resume_segment_body(&grant).await;
+        scope.drain().await;
+        result
+    }
+
+    /// The segment body driven by [`Self::drive_resume_segment`]: the
+    /// decided approvals' next agent turns through the coordinator
+    /// iteration loop, returning the terminal segment data or the
+    /// mid-segment fault. Borrows the grant so the drain wrapper holds the
+    /// reservation lease across its scope drain.
+    async fn drive_resume_segment_body(
+        &self,
+        grant: &ResumeGrant,
+    ) -> Result<SegmentResult, SegmentError> {
         let fault = |message: String| SegmentError::Continuation(Diagnostic::new(message));
         let Some(hitl) = self.agent_config.hitl.clone() else {
             return Err(fault(

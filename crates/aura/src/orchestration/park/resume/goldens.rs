@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde_json::{Value, json};
 
@@ -1814,12 +1815,133 @@ async fn all_decided_grant_runs_the_segment_to_completion() {
                     coordinator_tail_turn(),
                 ]),
                 "the completed segment carries the natural continuation turn and the \
-                 coordinator's scripted tail, and nothing else — the R2 pair prepend \
-                 is gone (R6: outcomes live in the rebuilt history)"
+                     coordinator's scripted tail, and nothing else — the R2 pair prepend \
+                     is gone (R6: outcomes live in the rebuilt history)"
             );
         }
         other => panic!("expected a completed segment, got {other:?}"),
     }
+}
+
+/// How long the end-of-segment drain probe waits before declaring the
+/// segment still blocked on its in-flight tail. Long enough for the
+/// scripted segment body to run to completion when it does NOT drain (the
+/// RED state), short enough that a regressed fill is observable as a
+/// still-blocked return rather than a hung suite.
+const DRAIN_PROBE: Duration = Duration::from_secs(2);
+
+/// The gated-tail stand-in for the decided call's tool: on invocation it
+/// spawns a TRACKED tail through the run's ONE execution scope — the same
+/// registration path every production fire-and-forget tail takes — that
+/// holds until the test releases it. The spawn happens DURING the segment
+/// (the substitution invokes this tool), so the tail is still in flight
+/// when the segment body finishes.
+struct GatedTailTool {
+    scope: Arc<crate::orchestration::RunExecutionScope>,
+    gate: Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>>,
+}
+
+impl rig::tool::Tool for GatedTailTool {
+    const NAME: &'static str = "gated_tail";
+
+    type Error = std::convert::Infallible;
+    type Args = FreeformArgs;
+    type Output = String;
+
+    fn name(&self) -> String {
+        TOOL.to_string()
+    }
+
+    async fn definition(&self, _prompt: String) -> rig::completion::ToolDefinition {
+        rig::completion::ToolDefinition {
+            name: self.name(),
+            description: "Test stand-in: spawns a gated tracked tail on the run's scope."
+                .to_string(),
+            parameters: json!({ "type": "object", "properties": {} }),
+        }
+    }
+
+    async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
+        let gate = self
+            .gate
+            .lock()
+            .expect("the gated tail's gate lock")
+            .take()
+            .expect("the gated tail spawns once");
+        self.scope.spawn_tracked(async move {
+            let _ = gate.await;
+        });
+        Ok(ECHO_TOOL_RESULT.to_string())
+    }
+}
+
+/// L4b golden (RED today): the atomic resume segment drains its tracked
+/// tails before returning. A tracked tail spawned DURING the segment —
+/// through the grant's ONE execution scope, exactly as production's
+/// fire-and-forget tails register — is still in flight when the segment
+/// body finishes. `drive_resume_segment` must await the scope's drain
+/// before the grant (its reservation lease) drops, so `run_segment` cannot
+/// return while the tail runs; RED today the segment returns without
+/// draining, leaving the tail in flight past the fence.
+#[tokio::test]
+async fn atomic_segment_drains_tracked_tails_before_fence_release() {
+    let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
+    let _drain = OverrideDrain;
+    let world = world();
+    register_decided(&world).await;
+    publish_document(&world, &sentinel_document(&world)).await;
+
+    let grant = evaluate_resume(evaluation(&world, false, None))
+        .await
+        .expect("the all-decided run grants");
+    let run = grant.run_id().clone();
+    // The tail must register through the grant's ONE scope, so capture the
+    // scope handle before the segment consumes the grant.
+    let scope = grant.execution_scope();
+    let (release, gate) = tokio::sync::oneshot::channel::<()>();
+    let gate = Arc::new(std::sync::Mutex::new(Some(gate)));
+    install_worker_overrides(vec![WorkerOverride {
+        model: ScriptedCompletionModel::new(vec![ScriptedTurn::text(FINAL_TEXT)]),
+        extra_tools: vec![Box::new(GatedTailTool {
+            scope,
+            gate: Arc::clone(&gate),
+        })],
+    }]);
+    install_coordinator_overrides(vec![CoordinatorOverride {
+        model: ScriptedCompletionModel::new(vec![coordinator_direct_turn()]),
+    }]);
+
+    let headers = HashMap::new();
+    let mut segment = Box::pin(run_segment(grant, &world.config, &headers));
+    // The body drives the substitution — spawning the gated tracked tail —
+    // then finishes. With no drain (RED) the segment returns here while the
+    // tail is still in flight; with the drain (GREEN) it stays blocked
+    // until the tail ends.
+    let returned_early = tokio::time::timeout(DRAIN_PROBE, &mut segment).await;
+    assert!(
+        returned_early.is_err(),
+        "the atomic segment returned while a tracked tail was still in flight: \
+         drive_resume_segment must drain the grant's scope before the segment and its \
+         reservation lease drop"
+    );
+    assert!(
+        world.claims.is_live(&run),
+        "the run stays reserved while the segment drains the in-flight tail"
+    );
+
+    release.send(()).expect("the gated tail is still held");
+    let segment = tokio::time::timeout(DRAIN_PROBE, segment)
+        .await
+        .expect("the segment returns once its tracked tail ends")
+        .expect("the segment driver did not panic");
+    assert!(
+        matches!(segment, SegmentResult::Completed { .. }),
+        "the drained segment completes: {segment:?}"
+    );
+    assert!(
+        !world.claims.is_live(&run),
+        "the reservation releases only after the segment drains its tracked tail"
+    );
 }
 
 /// A segment whose continuation issues a newly gated call re-parks: the
