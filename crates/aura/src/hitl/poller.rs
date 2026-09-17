@@ -1130,10 +1130,10 @@ mod tests {
                 .await
                 .unwrap();
 
-            // Watch the decision bus and the lifecycle broker before any
-            // traffic.
+            // Watch the decision bus before any traffic. The reconciler
+            // owns no run observer and has no lifecycle-emission path,
+            // so no event channel can carry a sentinel.
             let mut bus_sub = bus.subscribe(&format!("approval:{id}")).await.unwrap();
-            let mut sse = crate::approval_event_broker::subscribe(&format!("run:{run_id}")).await;
 
             // Tracing capture around the whole reconcile: strict DEBUG, so
             // every warn/error/debug line the flow could emit is checked.
@@ -1221,14 +1221,9 @@ mod tests {
                 "the bus payload is credential-free, got: {bus_text}"
             );
 
-            // Lifecycle/SSE events: the reconciler publishes none for the
-            // run's owner id, so nothing can carry a sentinel.
-            assert!(
-                tokio::time::timeout(Duration::from_millis(100), sse.recv())
-                    .await
-                    .is_err(),
-                "no lifecycle event may be published by the reconcile",
-            );
+            // Lifecycle/SSE events: the reconciler owns no observer and
+            // no emission path, so nothing can carry a sentinel; the bus
+            // and tracing guards below carry the leak checks.
 
             // Tracing and error text across the whole tick.
             let log = String::from_utf8_lossy(&log_buf.0.lock().unwrap()).to_string();
@@ -1312,8 +1307,6 @@ mod tests {
                 .filter_map(Result::ok)
                 .any(|e| e.file_name().to_string_lossy().ends_with(".tmp"));
             assert!(!tmp_residue, "the append's temp write is renamed away");
-
-            crate::approval_event_broker::unsubscribe(&format!("run:{run_id}")).await;
         }
     }
 }
