@@ -793,15 +793,21 @@ impl WebhookClient {
 
     /// Fire the approval request as an ack-only notification (poll delivery):
     /// 2xx means delivered; the response body is never read as a decision.
-    /// A 409 means delivered too: the receiver answers 409 only for a
-    /// decision id it already holds, so the conflict itself proves an
-    /// earlier POST landed. Without this arm, a torn notify — the receiver
-    /// recorded the row but the 2xx never came back — faults on every
-    /// tick until the human decides.
+    /// A 409 means delivered too, but only in one pinned shape: the receiver's
+    /// duplicate guard — a re-POST of an already-recorded `decision_id` — is
+    /// its unique `decision_id` index answering 409 with
+    /// `{"code": "ECONFLICT"}`. Only that body is a delivery proof; a bare or
+    /// differently-shaped 409 is not, and faults so the reconciler retries.
+    /// The contract is pinned by the receiver's own integration test
+    /// (answerbook/ai-governance-service,
+    /// `test/integration/routes/v3/governance/workflow/post-authorize.js`:
+    /// re-sending a recorded `decision_id` expects 409 with `code: ECONFLICT`
+    /// and writes no second row). Without this arm, a torn notify — the
+    /// receiver recorded the row but the 2xx never came back — would fault on
+    /// every tick until the human decides.
     ///
     /// A timeout is a transport fault, not a decision-shaped outcome — the
-    /// reconciler simply retries on the next tick. The response body is
-    /// dropped unread, so each attempt is its own connection.
+    /// reconciler simply retries on the next tick.
     pub(crate) async fn notify(&self, request: &ApprovalRequest) -> Result<(), ApprovalError> {
         let Some(poll) = &self.poll else {
             return Err(ApprovalError::Misconfigured(
@@ -814,13 +820,29 @@ impl WebhookClient {
             Err(e) => Err(e.into()),
             Ok(resp) => {
                 let status = resp.status();
-                if status.is_success() || status == reqwest::StatusCode::CONFLICT {
-                    Ok(())
-                } else {
-                    Err(ApprovalError::BadStatus {
-                        status: status.as_u16(),
-                    })
+                if status.is_success() {
+                    return Ok(());
                 }
+                if status == reqwest::StatusCode::CONFLICT {
+                    let body = resp
+                        .text()
+                        .await
+                        .map_err(|e| ApprovalError::Transport(e.to_string()))?;
+                    let is_recorded_duplicate = matches!(
+                        serde_json::from_str::<serde_json::Value>(&body),
+                        Ok(value)
+                            if value
+                                .get("code")
+                                .and_then(serde_json::Value::as_str)
+                                == Some("ECONFLICT")
+                    );
+                    if is_recorded_duplicate {
+                        return Ok(());
+                    }
+                }
+                Err(ApprovalError::BadStatus {
+                    status: status.as_u16(),
+                })
             }
         }
     }
@@ -2635,18 +2657,68 @@ mod tests {
 
         /// A 409 ack means the receiver already holds this decision id —
         /// the retry after a torn 2xx — so it acks instead of faulting the
-        /// reconciler's every tick.
+        /// reconciler's every tick. The proof is the receiver's duplicate
+        /// body: `{"code": "ECONFLICT"}`.
         #[tokio::test]
         async fn notify_duplicate_409_is_delivered() {
-            let (url, _received) =
-                one_shot_receiver_with_status("409 Conflict", vec![], String::new()).await;
+            let (url, _received) = one_shot_receiver_with_status(
+                "409 Conflict",
+                vec![],
+                r#"{"code": "ECONFLICT", "message": "the decision is already recorded"}"#
+                    .to_string(),
+            )
+            .await;
 
             let client =
                 loopback_poll_client(&url, EgressSigning::Disabled, &url, Duration::from_secs(5));
             client
                 .notify(&test_request(DecisionId::generate()))
                 .await
-                .expect("a 409 ack must resolve Ok: the receiver holding the row is the ack");
+                .expect("a 409 ECONFLICT ack must resolve Ok: the receiver holding the row is the ack");
+        }
+
+        /// A bare 409 — no `ECONFLICT` body — is not a delivery proof: the
+        /// receiver may have answered a conflict of its own that says nothing
+        /// about this decision id, so the row must stay un-notified and the
+        /// reconciler retries.
+        #[tokio::test]
+        async fn notify_bare_409_is_not_delivered() {
+            let (url, _received) =
+                one_shot_receiver_with_status("409 Conflict", vec![], String::new()).await;
+
+            let client =
+                loopback_poll_client(&url, EgressSigning::Disabled, &url, Duration::from_secs(5));
+            let err = client
+                .notify(&test_request(DecisionId::generate()))
+                .await
+                .expect_err("a bare 409 must not ack");
+            assert!(
+                matches!(err, ApprovalError::BadStatus { status: 409 }),
+                "expected BadStatus(409), got {err:?}"
+            );
+        }
+
+        /// A 409 whose body is JSON but not the duplicate guard's code is
+        /// likewise not a delivery proof.
+        #[tokio::test]
+        async fn notify_non_conflict_409_is_not_delivered() {
+            let (url, _received) = one_shot_receiver_with_status(
+                "409 Conflict",
+                vec![],
+                r#"{"code": "VERSION_CONFLICT"}"#.to_string(),
+            )
+            .await;
+
+            let client =
+                loopback_poll_client(&url, EgressSigning::Disabled, &url, Duration::from_secs(5));
+            let err = client
+                .notify(&test_request(DecisionId::generate()))
+                .await
+                .expect_err("a non-ECONFLICT 409 must not ack");
+            assert!(
+                matches!(err, ApprovalError::BadStatus { status: 409 }),
+                "expected BadStatus(409), got {err:?}"
+            );
         }
 
         /// A timed-out notify is not a decision-shaped outcome (there is no
