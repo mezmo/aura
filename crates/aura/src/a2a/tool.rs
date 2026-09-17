@@ -387,9 +387,11 @@ impl AskAgentOutcome {
         }
     }
 
-    /// The tool result string: a JSON object for a usable outcome, the
-    /// tool-error convention for a task that failed, was rejected, or was
-    /// cancelled on the remote.
+    /// The tool result string: the answer text with a one-line trailer
+    /// carrying the state, task id, and context_id for a usable outcome;
+    /// the tool-error convention for a task that failed, was rejected, or
+    /// was cancelled on the remote. The answer leads because a JSON envelope
+    /// invites the model to relay the envelope rather than the answer.
     fn render(self) -> String {
         match self.state.as_str() {
             "failed" | "rejected" | "canceled" => {
@@ -399,14 +401,27 @@ impl AskAgentOutcome {
                     self.response
                 };
                 format!(
-                    "{TOOL_ERROR_PREFIX}remote agent {:?} task {} ended in state {}: {detail}",
+                    "{TOOL_ERROR_PREFIX}remote agent {:?} task {} ended in state {}:\n{detail}",
                     self.agent,
                     self.task_id.as_deref().unwrap_or("?"),
                     self.state,
                 )
             }
-            _ => serde_json::to_string_pretty(&self)
-                .unwrap_or_else(|e| format!("{TOOL_ERROR_PREFIX}could not render outcome: {e}")),
+            _ => {
+                let body = if self.response.is_empty() {
+                    "(the remote agent returned no text)".to_owned()
+                } else {
+                    self.response
+                };
+                let mut trailer = format!("remote agent {:?} · {}", self.agent, self.state);
+                if let Some(task_id) = &self.task_id {
+                    trailer.push_str(&format!(" · task {task_id}"));
+                }
+                if let Some(context_id) = &self.context_id {
+                    trailer.push_str(&format!(" · context_id {context_id}"));
+                }
+                format!("{body}\n\n---\n{trailer}")
+            }
         }
     }
 }
@@ -603,7 +618,13 @@ fn describe(remotes: &BTreeMap<&str, Option<&str>>) -> String {
     let mut text = String::from(
         "Ask a remote AURA agent to handle a request and wait for its answer. The remote \
          agent runs its own tools and returns a text response. It does not see this \
-         conversation, so the prompt must be self-contained. Available agents:",
+         conversation, so the prompt must be self-contained. The result is the answer text \
+         followed by a one-line trailer carrying the task state, task id, and context_id; \
+         present the answer in your own words and do not quote the trailer. If a call fails, \
+         the result says why — summarize the failure for the user in your own words instead \
+         of relaying the raw error. To continue the \
+         exchange — including answering an input_required or auth_required question — call \
+         ask_agent again with the same agent and the trailer's context_id. Available agents:",
     );
     for (name, description) in remotes {
         text.push_str("\n- ");
@@ -778,12 +799,11 @@ mod tests {
             .call(json!({ "agent": "dev", "prompt": "what is 6 * 7?" }))
             .await
             .unwrap();
-        let outcome: Value = serde_json::from_str(&out).expect("outcome is JSON");
-        assert_eq!(outcome["agent"], "dev");
-        assert_eq!(outcome["state"], "completed");
-        assert_eq!(outcome["task_id"], "task-1");
-        assert_eq!(outcome["context_id"], "ctx-new");
-        assert_eq!(outcome["response"], "42 is the answer");
+        assert!(out.starts_with("42 is the answer"), "{out}");
+        assert!(
+            out.contains("remote agent \"dev\" · completed · task task-1 · context_id ctx-new"),
+            "{out}"
+        );
         assert_eq!(server.methods(), ["SendMessage", "GetTask", "GetTask"]);
     }
 
@@ -870,10 +890,11 @@ mod tests {
             .call(json!({ "agent": "dev", "prompt": "hi" }))
             .await
             .unwrap();
-        let outcome: Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(outcome["state"], "completed");
-        assert_eq!(outcome["context_id"], "ctx-m");
-        assert_eq!(outcome["response"], "instant answer");
+        assert!(out.starts_with("instant answer"), "{out}");
+        assert!(
+            out.contains("remote agent \"dev\" · completed · context_id ctx-m"),
+            "{out}"
+        );
         assert_eq!(server.methods(), ["SendMessage"]);
     }
 
@@ -897,7 +918,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             out,
-            "Tool returned an error: remote agent \"dev\" task t9 ended in state failed: LLM quota exceeded"
+            "Tool returned an error: remote agent \"dev\" task t9 ended in state failed:\nLLM quota exceeded"
         );
     }
 
@@ -918,10 +939,11 @@ mod tests {
             .call(json!({ "agent": "dev", "prompt": "verify" }))
             .await
             .unwrap();
-        let outcome: Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(outcome["state"], "input_required");
-        assert_eq!(outcome["context_id"], "c2");
-        assert_eq!(outcome["response"], "Which cluster?");
+        assert!(out.starts_with("Which cluster?"), "{out}");
+        assert!(
+            out.contains("remote agent \"dev\" · input_required · task t2 · context_id c2"),
+            "{out}"
+        );
         assert_eq!(server.methods(), ["SendMessage"]);
     }
 
@@ -1065,10 +1087,7 @@ mod tests {
             .call(json!({ "agent": "dev", "prompt": "x" }))
             .await
             .unwrap();
-        assert_eq!(
-            serde_json::from_str::<Value>(&out).unwrap()["response"],
-            "done"
-        );
+        assert!(out.starts_with("done"), "{out}");
         assert_eq!(server.methods(), ["SendMessage", "GetTask", "GetTask"]);
     }
 
@@ -1175,6 +1194,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn protojson_omitted_parts_do_not_fail_the_call() {
+        // A run whose workers used the scratchpad reports metadata-only
+        // scratchpad artifacts, and the v1.0 wire omits their empty `parts`.
+        let server = LoopbackA2aServer::start(|method, _| match method {
+            "SendMessage" => Ok(json!({ "task": working_task("t", "c") })),
+            "GetTask" => Ok(json!({
+                "id": "t", "contextId": "c",
+                "status": { "state": "TASK_STATE_COMPLETED" },
+                "artifacts": [
+                    { "artifactId": "scratchpad_worker", "name": "Scratchpad Usage",
+                      "metadata": { "tokens_intercepted": 10, "tokens_extracted": 3 } },
+                    { "artifactId": "final", "name": "Final Info",
+                      "parts": [ { "text": "sweep complete" } ] }
+                ]
+            })),
+            other => panic!("unexpected method {other}"),
+        })
+        .await;
+        let tool = RemoteAgentTool::new(vec![remote("dev", &server, None)], None);
+        let out = tool
+            .call(json!({ "agent": "dev", "prompt": "x" }))
+            .await
+            .unwrap();
+        assert!(out.starts_with("sweep complete"), "{out}");
+        assert!(out.contains("· completed · task t · context_id c"), "{out}");
+    }
+
+    #[tokio::test]
     async fn long_answers_are_truncated_with_a_notice() {
         let server = LoopbackA2aServer::start(|method, _| match method {
             "SendMessage" => Ok(json!({ "task": working_task("t", "c") })),
@@ -1199,18 +1246,16 @@ mod tests {
             .call(json!({ "agent": "dev", "prompt": "x" }))
             .await
             .unwrap();
-        let response = serde_json::from_str::<Value>(&out).unwrap()["response"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        assert!(response.starts_with("éé"));
+        assert!(out.starts_with("éé"), "{out}");
         assert!(
-            response.ends_with(
-                "[truncated by ask_agent: the remote answer was 4000 bytes, limit 1024]"
-            ),
-            "{response}"
+            out.contains("[truncated by ask_agent: the remote answer was 4000 bytes, limit 1024]"),
+            "{out}"
         );
-        assert!(response.len() < 1024 + 120);
+        assert!(
+            out.ends_with("remote agent \"dev\" · completed · task t · context_id c"),
+            "{out}"
+        );
+        assert!(out.len() < 1024 + 200, "{}", out.len());
     }
 
     #[tokio::test]
@@ -1230,9 +1275,11 @@ mod tests {
             .call(json!({ "agent": "dev", "prompt": "x" }))
             .await
             .unwrap();
-        assert_eq!(
-            serde_json::from_str::<Value>(&out).unwrap()["response"],
-            "[the remote agent returned 1 non-text part(s), which ask_agent cannot relay]"
+        assert!(
+            out.starts_with(
+                "[the remote agent returned 1 non-text part(s), which ask_agent cannot relay]"
+            ),
+            "{out}"
         );
     }
 
