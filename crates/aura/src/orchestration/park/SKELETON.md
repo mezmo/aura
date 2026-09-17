@@ -118,9 +118,9 @@ family per the contract's dispatch table:
 | # | Site | Fill unit |
 | --- | --- | --- |
 | ~~1~~ | ~~`crates/aura-config/src/park.rs` `validate_park_admission`~~ FILLED at commit `79fbf06d` (2026-09-15; held patch released by Mike with exact-message approval; eight committed admission tests green) | R1 |
-| 2 | `crates/aura/src/session_store/memory.rs` `read_or_expire` | E1/E2 |
-| 3 | `crates/aura/src/session_store/file.rs` `read_or_expire` | E2 |
-| 4 | `crates/aura/src/session_store/fault_store.rs` `read_or_expire` (cfg(test) double; compile-conformance ripple of the trait method, disclosed to the owner) | E1/E2 |
+| ~~2~~ | ~~`crates/aura/src/session_store/memory.rs` `read_or_expire`~~ FILLED at commit `0833493b` (2026-09-17; STORE E2 Fill 1, reviewed RED `bee367af`; authority both paths, idempotent TimedOut re-derivation) | E1/E2 |
+| ~~3~~ | ~~`crates/aura/src/session_store/file.rs` `read_or_expire`~~ FILLED at commit `0833493b` (2026-09-17; under the resolve/remove lock, injected clock sampled once, durable tagged TimedOut in resolve's write ceremony, decode-closed on torn decision files) | E2 |
+| ~~4~~ | ~~`crates/aura/src/session_store/fault_store.rs` `read_or_expire`~~ FILLED at commit `6e222515` (2026-09-17; general-lane cfg(test) delegation) | E1/E2 |
 | 5 | `crates/aura-web-server/src/session_store/redis/approval_store.rs` `read_or_expire` (unsupported park backend: returns the typed unsupported-configuration error) | E-family |
 | 6 | `crates/aura/src/orchestration/park/resume/claim.rs` `ResumeClaimTable::reserve` | E4 |
 | 7 | `crates/aura/src/orchestration/park/lifetime.rs` `RunExecutionScope::spawn_tracked` (REPAIR-2 F3) | L1 |
@@ -129,9 +129,9 @@ family per the contract's dispatch table:
 | 10 | `crates/aura/src/orchestration/park/resume/claim.rs` `rename_back_under_reservation` (REPAIR-2 F2; REPAIR-3 G5 re-typed the fault to the classified `ClaimResumeFault`) | E4 |
 | 11 | `crates/aura/src/orchestration/park/resume/evaluate.rs` `convert_reserved` (REPAIR-2 F2; REPAIR-3 G2: the grant assembled here owns the reservation AND establishes its one execution scope) | E4 |
 | 12 | `crates/aura/src/orchestration/park/resume/evaluate.rs` `run_segment_borrowed` (REPAIR-2 F3; 2026-09-15 alignment amendment recut its SIGNATURE; inputs: event sender; shared `UsageState`; `outer_budget`; output: `ResumeStreamEnd`; the one `todo!()` body is unchanged) | S3/S4 |
-| 13 | `crates/aura/src/session_store/memory.rs` `retained_rows` (REPAIR-2 F11: unsupported-operation answer — no park parity) | E1/E2 |
-| 14 | `crates/aura/src/session_store/file.rs` `retained_rows` (REPAIR-2 F11) | E2 |
-| 15 | `crates/aura/src/session_store/fault_store.rs` `retained_rows` (REPAIR-2 F11) | E1/E2 |
+| ~~13~~ | ~~`crates/aura/src/session_store/memory.rs` `retained_rows`~~ FILLED at commit `0833493b` (2026-09-17; typed unsupported-operation answer — no park parity) | E1/E2 |
+| 14 | ~~`crates/aura/src/session_store/file.rs` `retained_rows`~~ FILLED at commit `0833493b` (2026-09-17; side-effect-free both-directory scan, decision-file-wins classification) | E2 |
+| ~~15~~ | ~~`crates/aura/src/session_store/fault_store.rs` `retained_rows`~~ FILLED at commit `6e222515` (2026-09-17; general-lane cfg(test) delegation) | E1/E2 |
 | 16 | `crates/aura-web-server/src/session_store/redis/approval_store.rs` `retained_rows` (REPAIR-2 F11: unsupported-operation answer) | E-family |
 | 17 | `crates/aura/src/orchestration/park/cleanup.rs` `inspect_checkpoint_presence` (REPAIR-2 F11; REPAIR-3 G6: renamed from `confirm_checkpoint_absence`, gains `Present`, takes the `CleanupReservation` carrier) | E6 |
 | 18 | `crates/aura/src/orchestration/park/cleanup.rs` `delete_expired_run` (REPAIR-2 F11; REPAIR-3 G6: takes the `CleanupReservation` carrier — the blocking tail retains the lease) | E6 |
@@ -143,7 +143,11 @@ family per the contract's dispatch table:
 Count after the 2026-09-15 alignment amendments: 22 at the committed
 alignment baseline; R1's fill (commit `79fbf06d`, same day) removes row 1,
 leaving 21 alignment holes plus the separately excluded Redis
-`mark_acknowledged` todo. The amendments
+`mark_acknowledged` todo. STORE E2 (2026-09-17) fills rows 2/3/4/13/14/15
+(`0833493b`, `6e222515`), leaving **15 alignment rows** — of which rows
+5/16 are the EXCLUDED Redis holes (unsupported park backend; delete with
+the follow-up Redis-removal PR, no fill work owed) and row 6 belongs to
+E4. The amendments
 declare types (`ResumeStreamEnd`, `StreamTermination`, `StreamOutcome`) and
 recut one existing hole's signature (`run_segment_borrowed`, #12) plus one
 private method's signature (`WebhookClient::poll_decision`, not a hole); no
