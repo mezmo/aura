@@ -1377,6 +1377,7 @@ mod tests {
     fn make_hitl_config(route: aura_config::DecisionRouteConfig) -> aura_config::Config {
         aura_config::Config {
             hitl: Some(aura_config::HitlConfig {
+                exempt_from_approval: vec![],
                 require_approval: vec![],
                 park: aura_config::ParkConfig::default(),
                 route,

@@ -34,6 +34,7 @@ const WEBHOOK_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Clone)]
 pub struct HitlRuntime {
     pub patterns: Arc<[GlobPattern]>,
+    pub exemptions: Arc<[GlobPattern]>,
     pub route: Arc<DecisionRoute>,
     /// `[hitl.park].enabled`.
     pub park_enabled: bool,
@@ -91,6 +92,7 @@ impl HitlRuntime {
         };
         Self {
             patterns: Arc::from(config.require_approval.clone()),
+            exemptions: Arc::from(config.exempt_from_approval.clone()),
             route: Arc::new(route),
             park_enabled: config.park.enabled,
         }
@@ -1611,6 +1613,7 @@ mod tests {
 
             // Conversational route has no URL to validate.
             let conversational = aura_config::HitlConfig {
+                exempt_from_approval: vec![],
                 require_approval: vec![],
                 park: aura_config::ParkConfig::default(),
                 route: aura_config::DecisionRouteConfig::Conversational { timeout_secs: 60 },
@@ -1623,6 +1626,7 @@ mod tests {
             tool_headers_from_response: aura_config::ToolHeaderMappings,
         ) -> aura_config::HitlConfig {
             aura_config::HitlConfig {
+                exempt_from_approval: vec![],
                 require_approval: vec![],
                 park: aura_config::ParkConfig::default(),
                 route: aura_config::DecisionRouteConfig::Webhook {

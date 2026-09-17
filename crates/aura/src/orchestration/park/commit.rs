@@ -711,6 +711,7 @@ mod tests {
         fn config(pattern: &str) -> crate::config::AgentRuntimeConfig {
             crate::config::AgentRuntimeConfig {
                 hitl: Some(crate::hitl::HitlRuntime {
+                    exemptions: Arc::from([]),
                     patterns: Arc::from([GlobPattern::new(pattern).unwrap()]),
                     route: Arc::new(crate::hitl::DecisionRoute::Conversational {
                         registry: PendingApprovals::new(),

@@ -41,6 +41,8 @@ pub struct HitlApprovalWrapper {
     ///
     /// [`ApprovalOrigin::ConfigGate`]: super::decision::ApprovalOrigin::ConfigGate
     patterns: Arc<[GlobPattern]>,
+    /// Compiled globs whose match exempts a tool call from gating.
+    exemptions: Arc<[GlobPattern]>,
     /// Shared across single-agent and orchestration; held by `Arc` because the
     /// gate and the agent tool both reference one route.
     route: Arc<DecisionRoute>,
@@ -73,6 +75,7 @@ impl HitlApprovalWrapper {
     ) -> Self {
         Self {
             patterns,
+            exemptions: Arc::from([]),
             route,
             scope,
             request_id,
@@ -81,6 +84,13 @@ impl HitlApprovalWrapper {
             park: None,
             recorded_decisions: None,
         }
+    }
+
+    /// Exempt matching tool calls from gating, overriding `patterns`.
+    #[must_use]
+    pub fn with_exemptions(mut self, exemptions: Arc<[GlobPattern]>) -> Self {
+        self.exemptions = exemptions;
+        self
     }
 
     /// Arm the park arm: glob-matched calls park as durable approvals.
@@ -114,8 +124,14 @@ impl HitlApprovalWrapper {
     /// approval tool itself ("request_approval" == RequestApprovalTool::NAME).
     /// Any match gates the call; the returned pattern is only the reported
     /// `origin.matched_pattern`, so pattern order has no effect on gating.
+    ///
+    /// An exemption wins over `patterns`, so a broad glob keeps guarding tools
+    /// nobody has named yet while a known-safe one is let through by name.
     fn matched_pattern(&self, tool_name: &str) -> Option<&str> {
         if tool_name == "request_approval" {
+            return None;
+        }
+        if self.exemptions.iter().any(|p| p.matches(tool_name)) {
             return None;
         }
         self.patterns
@@ -368,6 +384,34 @@ mod tests {
         assert_eq!(wrapper.matched_pattern("kubectl_apply"), Some("kubectl_*"));
         assert_eq!(wrapper.matched_pattern("request_approval"), None);
         assert_eq!(wrapper.matched_pattern("ls"), None);
+    }
+
+    /// A broad glob keeps guarding every delete tool while a named exemption
+    /// lets one known-safe call through.
+    #[test]
+    fn exemption_wins_over_a_matching_glob() {
+        let wrapper = HitlApprovalWrapper::new(
+            Arc::from([GlobPattern::new("delete_*").unwrap()]),
+            Arc::new(DecisionRoute::Webhook {
+                client: WebhookClient::new(
+                    build_webhook_client(),
+                    WebhookUrl::new("http://localhost:9").unwrap(),
+                ),
+                timeout: Duration::from_secs(1),
+            }),
+            AgentScope::Single { session_id: None },
+            "t".into(),
+            "test-agent".to_string(),
+            "test-instance-id".to_string(),
+        )
+        .with_exemptions(Arc::from([GlobPattern::new("delete_notes").unwrap()]));
+
+        assert_eq!(wrapper.matched_pattern("delete_notes"), None);
+        assert_eq!(
+            wrapper.matched_pattern("delete_namespace"),
+            Some("delete_*"),
+            "a delete tool nobody exempted must still gate",
+        );
     }
 
     /// A matching tool whose approval channel is unreachable must fail closed

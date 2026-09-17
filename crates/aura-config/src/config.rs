@@ -1221,6 +1221,7 @@ mod tests {
     #[test]
     fn test_hitl_timeout_conflict_disabled_per_call_timeout() {
         let hitl = HitlConfig {
+            exempt_from_approval: vec![],
             require_approval: vec![],
             park: ParkConfig::default(),
             route: DecisionRouteConfig::Webhook {
@@ -1254,6 +1255,7 @@ mod tests {
     #[test]
     fn test_hitl_timeout_conflict_route_timeout_less_than_per_call() {
         let hitl = HitlConfig {
+            exempt_from_approval: vec![],
             require_approval: vec![],
             park: ParkConfig::default(),
             route: DecisionRouteConfig::Webhook {
@@ -1270,6 +1272,7 @@ mod tests {
     #[test]
     fn test_hitl_timeout_conflict_route_timeout_equals_per_call() {
         let hitl = HitlConfig {
+            exempt_from_approval: vec![],
             require_approval: vec![],
             park: ParkConfig::default(),
             route: DecisionRouteConfig::Webhook {
@@ -1288,6 +1291,7 @@ mod tests {
     #[test]
     fn test_hitl_timeout_conflict_route_timeout_greater_than_per_call() {
         let hitl = HitlConfig {
+            exempt_from_approval: vec![],
             require_approval: vec![],
             park: ParkConfig::default(),
             route: DecisionRouteConfig::Webhook {
@@ -1307,6 +1311,7 @@ mod tests {
     #[test]
     fn test_hitl_timeout_conflict_conversational_variant() {
         let hitl = HitlConfig {
+            exempt_from_approval: vec![],
             require_approval: vec![],
             park: ParkConfig::default(),
             route: DecisionRouteConfig::Conversational { timeout_secs: 120 },
@@ -1562,6 +1567,10 @@ pub struct HitlConfig {
     /// Glob patterns whose match gates a tool call. Compiled at TOML load.
     #[serde(default)]
     pub require_approval: Vec<GlobPattern>,
+    /// Glob patterns whose match exempts a tool call from gating. Compiled at
+    /// TOML load.
+    #[serde(default)]
+    pub exempt_from_approval: Vec<GlobPattern>,
     /// The decision route; required when `[hitl]` is present.
     pub route: DecisionRouteConfig,
     /// `[hitl.park]` settings.

@@ -728,6 +728,7 @@ pub(crate) async fn park_orchestrator_in(
     workers.insert(worker_name, worker);
     let config = crate::config::AgentRuntimeConfig {
         hitl: Some(crate::hitl::HitlRuntime {
+            exemptions: Arc::from([]),
             patterns: Arc::from([aura_config::GlobPattern::new("kubectl_*").unwrap()]),
             route: Arc::new(crate::hitl::DecisionRoute::Conversational {
                 registry: registry.clone(),
