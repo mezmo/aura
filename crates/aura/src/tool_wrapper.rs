@@ -432,6 +432,20 @@ where
     }
 }
 
+fn spawn_scoped<F>(
+    scope: &Option<Arc<crate::orchestration::RunExecutionScope>>,
+    future: F,
+) -> tokio::task::JoinHandle<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    match scope {
+        Some(scope) => scope.spawn_tracked(future),
+        None => tokio::spawn(future),
+    }
+}
+
 impl<T> RigTool for WrappedTool<T>
 where
     T: RigTool<Args = Value, Output = String, Error = ToolError> + Send + Sync + Clone + 'static,
@@ -507,7 +521,8 @@ where
                 let wrapper_clone = wrapper.clone();
                 let ctx_clone = ctx.clone();
                 let extracted_clone = extracted.clone();
-                tokio::spawn(async move {
+                let validate_scope = ctx.execution_scope.clone();
+                spawn_scoped(&validate_scope, async move {
                     wrapper_clone
                         .on_complete(
                             &ctx_clone,
@@ -528,10 +543,14 @@ where
             let pre_args = clean_args.clone();
             let pre_ctx = ctx.clone();
             let pre_span = tracing::Span::current();
-            let pre_handle = tokio::spawn(tracing::Instrument::instrument(
-                async move { pre_wrapper.pre_call(&pre_args, &pre_ctx).await },
-                pre_span,
-            ));
+            let pre_scope = ctx.execution_scope.clone();
+            let pre_handle = spawn_scoped(
+                &pre_scope,
+                tracing::Instrument::instrument(
+                    async move { pre_wrapper.pre_call(&pre_args, &pre_ctx).await },
+                    pre_span,
+                ),
+            );
             let pre_call_result = match pre_handle.await {
                 Ok(r) => r,
                 Err(join_error) => Err(ToolError::ToolCallError(join_error.into())),
@@ -550,7 +569,8 @@ where
                     let ctx_clone = ctx.clone();
                     let extracted_clone = extracted.clone();
                     let output_clone = output.clone();
-                    tokio::spawn(async move {
+                    let short_circuit_scope = ctx.execution_scope.clone();
+                    spawn_scoped(&short_circuit_scope, async move {
                         wrapper_clone
                             .on_complete(
                                 &ctx_clone,
@@ -570,7 +590,8 @@ where
                     let wrapper_clone = wrapper.clone();
                     let ctx_clone = ctx.clone();
                     let extracted_clone = extracted.clone();
-                    tokio::spawn(async move {
+                    let pre_error_scope = ctx.execution_scope.clone();
+                    spawn_scoped(&pre_error_scope, async move {
                         wrapper_clone
                             .on_complete(
                                 &ctx_clone,
@@ -590,12 +611,17 @@ where
             let inner_clone = inner.clone();
             let args_clone = clean_args.clone();
             let tool_span = tracing::Span::current();
-            let result_handle = tokio::spawn(tracing::Instrument::instrument(
-                crate::approver_headers::APPROVER_OVERRIDES.scope(approver_overrides, async move {
-                    inner_clone.call(args_clone).await
-                }),
-                tool_span,
-            ));
+            let inner_scope = ctx.execution_scope.clone();
+            let result_handle = spawn_scoped(
+                &inner_scope,
+                tracing::Instrument::instrument(
+                    crate::approver_headers::APPROVER_OVERRIDES
+                        .scope(approver_overrides, async move {
+                            inner_clone.call(args_clone).await
+                        }),
+                    tool_span,
+                ),
+            );
             let result = match result_handle.await {
                 Ok(r) => r,
                 Err(join_error) => Err(ToolError::ToolCallError(join_error.into())),
@@ -612,35 +638,40 @@ where
                     let ctx_clone = ctx.clone();
                     let extracted_clone = extracted.clone();
                     let span = tracing::Span::current();
-                    let transform_handle = tokio::spawn(tracing::Instrument::instrument(
-                        async move {
-                            let outcome = CallOutcome::classify_from_output(&output);
-                            let transformed = wrapper_clone
-                                .transform_output(
-                                    output,
-                                    &outcome,
-                                    &ctx_clone,
-                                    extracted_clone.as_ref(),
-                                )
-                                .await;
-
-                            // Fire-and-forget completion hook.
-                            let output_clone = transformed.output.clone();
-                            tokio::spawn(async move {
-                                wrapper_clone
-                                    .on_complete(
+                    let transform_scope = ctx.execution_scope.clone();
+                    let transform_handle = spawn_scoped(
+                        &transform_scope,
+                        tracing::Instrument::instrument(
+                            async move {
+                                let outcome = CallOutcome::classify_from_output(&output);
+                                let transformed = wrapper_clone
+                                    .transform_output(
+                                        output,
+                                        &outcome,
                                         &ctx_clone,
                                         extracted_clone.as_ref(),
-                                        Ok(&output_clone),
-                                        duration_ms,
                                     )
                                     .await;
-                            });
 
-                            transformed
-                        },
-                        span,
-                    ));
+                                // Fire-and-forget completion hook.
+                                let output_clone = transformed.output.clone();
+                                let nested_scope = ctx_clone.execution_scope.clone();
+                                spawn_scoped(&nested_scope, async move {
+                                    wrapper_clone
+                                        .on_complete(
+                                            &ctx_clone,
+                                            extracted_clone.as_ref(),
+                                            Ok(&output_clone),
+                                            duration_ms,
+                                        )
+                                        .await;
+                                });
+
+                                transformed
+                            },
+                            span,
+                        ),
+                    );
                     let transformed = match transform_handle.await {
                         Ok(t) => t,
                         Err(join_error) => {
@@ -650,7 +681,8 @@ where
                             let wrapper_clone = wrapper.clone();
                             let ctx_clone = ctx.clone();
                             let extracted_clone = extracted.clone();
-                            tokio::spawn(async move {
+                            let panic_scope = ctx.execution_scope.clone();
+                            spawn_scoped(&panic_scope, async move {
                                 wrapper_clone
                                     .on_complete(
                                         &ctx_clone,
@@ -678,7 +710,8 @@ where
                     let wrapper_clone = wrapper.clone();
                     let ctx_clone = ctx.clone();
                     let extracted_clone = extracted.clone();
-                    tokio::spawn(async move {
+                    let error_scope = ctx.execution_scope.clone();
+                    spawn_scoped(&error_scope, async move {
                         wrapper_clone
                             .on_complete(
                                 &ctx_clone,
