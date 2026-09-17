@@ -97,7 +97,7 @@ impl RemoteAgent {
     /// for instance), [`OpenTask`] cancels the remote task from its `Drop`.
     async fn ask(
         &self,
-        args: &AskAgentArgs,
+        call: &AskAgentCall,
         cancel: RequestCancelToken,
     ) -> Result<String, ToolError> {
         let open = Arc::new(OpenTask::new(&self.name, self.client.clone()));
@@ -106,8 +106,8 @@ impl RemoteAgent {
         let send_consumed = AtomicBool::new(false);
         let mut send = tokio::spawn({
             let client = self.client.clone();
-            let prompt = args.prompt.clone();
-            let context_id = args.context_id.clone();
+            let prompt = call.prompt.clone();
+            let context_id = call.context_id.clone();
             let model = self.model.clone();
             let open = Arc::clone(&open);
             async move {
@@ -333,11 +333,54 @@ fn is_settled(state: &TaskState) -> bool {
     state.is_terminal() || matches!(state, TaskState::InputRequired | TaskState::AuthRequired)
 }
 
-/// Arguments the model passes to `ask_agent`. Which agent config a remote
-/// serves is the operator's `model` setting, never the caller's choice.
+/// Arguments the model passes to `ask_agent`: the single-agent form
+/// (`agent` + `prompt`, optional `context_id`) or a `calls` batch that fans
+/// out to several agents in parallel. Which agent config a remote serves is
+/// the operator's `model` setting, never the caller's choice.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AskAgentArgs {
+    agent: Option<String>,
+    prompt: Option<String>,
+    #[serde(default)]
+    context_id: Option<String>,
+    #[serde(default)]
+    calls: Option<Vec<AskAgentCall>>,
+}
+
+impl AskAgentArgs {
+    /// Normalize the two call forms into a list of sub-requests: the
+    /// single-agent form becomes one entry; a batch is taken as given.
+    fn into_calls(self) -> Result<Vec<AskAgentCall>, ToolError> {
+        let invalid =
+            |msg: &str| call_error(format!("invalid {ASK_AGENT_TOOL_NAME} arguments: {msg}"));
+        let single = self.agent.is_some() || self.prompt.is_some() || self.context_id.is_some();
+        match (self.calls, single) {
+            (Some(calls), false) if !calls.is_empty() => Ok(calls),
+            (Some(_), false) => Err(invalid("`calls` must not be empty")),
+            (Some(_), true) => Err(invalid(
+                "`calls` cannot be combined with `agent`, `prompt`, or `context_id`",
+            )),
+            (None, true) => {
+                let (agent, prompt) = match (self.agent, self.prompt) {
+                    (Some(agent), Some(prompt)) => (agent, prompt),
+                    _ => return Err(invalid("both `agent` and `prompt` are required")),
+                };
+                Ok(vec![AskAgentCall {
+                    agent,
+                    prompt,
+                    context_id: self.context_id,
+                }])
+            }
+            (None, false) => Err(invalid("pass `agent` and `prompt`, or `calls`")),
+        }
+    }
+}
+
+/// One sub-request inside an `ask_agent` call.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AskAgentCall {
     agent: String,
     prompt: String,
     #[serde(default)]
@@ -624,7 +667,10 @@ fn describe(remotes: &BTreeMap<&str, Option<&str>>) -> String {
          the result says why — summarize the failure for the user in your own words instead \
          of relaying the raw error. To continue the \
          exchange — including answering an input_required or auth_required question — call \
-         ask_agent again with the same agent and the trailer's context_id. Available agents:",
+         ask_agent again with the same agent and the trailer's context_id. To put a request \
+         to several agents at once, pass `calls` with one entry per agent instead of \
+         `agent` and `prompt`; the agents run in parallel and each answer returns its own \
+         trailer. Available agents:",
     );
     for (name, description) in remotes {
         text.push_str("\n- ");
@@ -645,7 +691,8 @@ fn parameters(remotes: &BTreeMap<&str, Option<&str>>) -> Value {
             "agent": {
                 "type": "string",
                 "enum": names,
-                "description": "Which remote agent to ask."
+                "description": "Which remote agent to ask. For several agents at once, use \
+                                `calls` instead."
             },
             "prompt": {
                 "type": "string",
@@ -656,9 +703,34 @@ fn parameters(remotes: &BTreeMap<&str, Option<&str>>) -> Value {
                 "type": "string",
                 "description": "Continue an earlier exchange with the same agent: the \
                                 context_id a previous ask_agent result returned."
+            },
+            "calls": {
+                "type": "array",
+                "description": "Ask several agents in parallel: one entry per agent. Use \
+                                instead of `agent` and `prompt`.",
+                "minItems": 1,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "agent": {
+                            "type": "string",
+                            "enum": names,
+                            "description": "Which remote agent to ask."
+                        },
+                        "prompt": {
+                            "type": "string",
+                            "description": "The complete request for this agent."
+                        },
+                        "context_id": {
+                            "type": "string",
+                            "description": "Continue an earlier exchange with this agent."
+                        }
+                    },
+                    "required": ["agent", "prompt"],
+                    "additionalProperties": false
+                }
             }
-        },
-        "required": ["agent", "prompt"]
+        }
     })
 }
 
@@ -690,24 +762,55 @@ impl RigTool for RemoteAgentTool {
         Box::pin(async move {
             let args: AskAgentArgs = serde_json::from_value(args)
                 .map_err(|e| call_error(format!("invalid {ASK_AGENT_TOOL_NAME} arguments: {e}")))?;
-            let Some(remote) = self.remotes.get(&args.agent) else {
-                return Err(call_error(format!(
-                    "unknown remote agent {:?}; configured agents: {}",
-                    args.agent,
-                    self.remote_names().join(", ")
-                )));
-            };
+            let calls = args.into_calls()?;
+            let mut resolved = Vec::with_capacity(calls.len());
+            for call in &calls {
+                let Some(remote) = self.remotes.get(&call.agent) else {
+                    return Err(call_error(format!(
+                        "unknown remote agent {:?}; configured agents: {}",
+                        call.agent,
+                        self.remote_names().join(", ")
+                    )));
+                };
+                resolved.push((remote, call));
+            }
             self.announce_start().await;
-            let span = tracing::info_span!(
-                "a2a.ask_agent",
-                a2a.remote = %remote.name,
-                a2a.endpoint = %remote.endpoint(),
-                a2a.task_id = tracing::field::Empty,
-            );
-            remote
-                .ask(&args, self.cancel_token())
-                .instrument(span)
-                .await
+            // Every sub-call runs its own send/poll/cancel lifecycle; the
+            // batch waits for all of them, so N agents cost one budget, not
+            // N. A batch where every agent failed is a failed call; one with
+            // any answer carries each failure as its own section.
+            let cancel = self.cancel_token();
+            let sections: Vec<Result<String, ToolError>> =
+                futures::future::join_all(resolved.into_iter().map(|(remote, call)| {
+                    let span = tracing::info_span!(
+                        "a2a.ask_agent",
+                        a2a.remote = %remote.name,
+                        a2a.endpoint = %remote.endpoint(),
+                        a2a.task_id = tracing::field::Empty,
+                    );
+                    remote.ask(call, cancel.clone()).instrument(span)
+                }))
+                .await;
+            if sections.iter().all(Result::is_err) {
+                let mut sections = sections;
+                if sections.len() == 1 {
+                    return Err(sections.pop().expect("one section").unwrap_err());
+                }
+                let count = sections.len();
+                let details = sections
+                    .into_iter()
+                    .map(|r| r.unwrap_err().to_string())
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                return Err(call_error(format!(
+                    "all {count} remote agent calls failed: {details}"
+                )));
+            }
+            Ok(sections
+                .into_iter()
+                .map(|r| r.unwrap_or_else(|e| e.to_string()))
+                .collect::<Vec<_>>()
+                .join("\n\n===\n\n"))
         })
     }
 }
@@ -783,11 +886,19 @@ mod tests {
         assert_eq!(def.name, "ask_agent");
         assert!(def.description.contains("- dev: the dev agent"));
         assert!(def.description.contains("- prod: the prod agent"));
+        assert!(def.description.contains("parallel"));
         assert_eq!(
             def.parameters["properties"]["agent"]["enum"],
             json!(["dev", "prod"])
         );
-        assert_eq!(def.parameters["required"], json!(["agent", "prompt"]));
+        assert_eq!(
+            def.parameters["properties"]["calls"]["items"]["required"],
+            json!(["agent", "prompt"])
+        );
+        assert!(
+            def.parameters.get("required").is_none(),
+            "the single form and the batch form are validated in code"
+        );
     }
 
     #[tokio::test]
@@ -840,6 +951,147 @@ mod tests {
                 .as_object()
                 .unwrap()
                 .contains_key("model")
+        );
+    }
+
+    /// Two servers whose tasks each complete only after BOTH have been
+    /// polled: a sequential execution would run the first into its timeout.
+    #[tokio::test]
+    async fn calls_run_in_parallel() {
+        let polls = Arc::new([AtomicUsize::new(0), AtomicUsize::new(0)]);
+        let mut remotes = Vec::new();
+        let mut servers = Vec::new();
+        for (i, name) in [(0usize, "dev"), (1usize, "stage")] {
+            let polls = Arc::clone(&polls);
+            let server = LoopbackA2aServer::start(move |method, _| match method {
+                "SendMessage" => Ok(json!({ "task": working_task(&format!("t-{name}"), "c") })),
+                "GetTask" => {
+                    polls[i].fetch_add(1, Ordering::SeqCst);
+                    if polls[0].load(Ordering::SeqCst) > 0 && polls[1].load(Ordering::SeqCst) > 0 {
+                        Ok(completed_task(
+                            &format!("t-{name}"),
+                            "c",
+                            &format!("{name} swept"),
+                        ))
+                    } else {
+                        Ok(working_task(&format!("t-{name}"), "c"))
+                    }
+                }
+                other => panic!("unexpected method {other}"),
+            })
+            .await;
+            let client = A2aClient::new(&server.url, &HashMap::new(), "aura/test").unwrap();
+            remotes.push(RemoteAgent::new(
+                name,
+                client,
+                Some(format!("the {name} agent")),
+                None,
+                Duration::from_millis(20),
+                Duration::from_millis(800),
+                64 * 1024,
+            ));
+            servers.push(server);
+        }
+        let tool = RemoteAgentTool::new(remotes, None);
+
+        let out = tool
+            .call(json!({ "calls": [
+                { "agent": "dev", "prompt": "sweep", "context_id": "c-dev" },
+                { "agent": "stage", "prompt": "sweep", "context_id": "c-stage" }
+            ]}))
+            .await
+            .unwrap();
+
+        assert!(out.contains("dev swept"), "{out}");
+        assert!(out.contains("stage swept"), "{out}");
+        assert!(out.contains("remote agent \"dev\" · completed"), "{out}");
+        assert!(out.contains("remote agent \"stage\" · completed"), "{out}");
+        assert!(out.contains("\n\n===\n\n"), "{out}");
+        assert!(
+            !out.contains("did not finish within"),
+            "sequential execution would have timed out: {out}"
+        );
+        // Each entry's context_id rode on its own SendMessage.
+        for (server, ctx) in servers.iter().zip(["c-dev", "c-stage"]) {
+            assert_eq!(
+                server.requests()[0].body_json()["params"]["message"]["contextId"],
+                json!(ctx)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_and_single_forms_are_validated() {
+        let server = LoopbackA2aServer::start(|_, _| unreachable!()).await;
+        let tool = RemoteAgentTool::new(vec![remote("dev", &server, None)], None);
+
+        let cases = [
+            (
+                json!({ "agent": "dev", "prompt": "x", "calls": [{ "agent": "dev", "prompt": "y" }] }),
+                "cannot be combined",
+            ),
+            (json!({ "calls": [] }), "`calls` must not be empty"),
+            (json!({}), "pass `agent` and `prompt`, or `calls`"),
+            (
+                json!({ "agent": "dev" }),
+                "both `agent` and `prompt` are required",
+            ),
+            (
+                json!({ "calls": [{ "agent": "staging", "prompt": "x" }] }),
+                "unknown remote agent \"staging\"",
+            ),
+        ];
+        for (args, expected) in cases {
+            let err = tool.call(args).await.unwrap_err();
+            let text = err.to_string();
+            assert!(
+                text.contains("invalid ask_agent arguments")
+                    || text.contains("unknown remote agent"),
+                "{text}"
+            );
+            assert!(text.contains(expected), "{text}");
+        }
+        assert!(server.requests().is_empty(), "nothing reached the wire");
+    }
+
+    #[tokio::test]
+    async fn a_failed_agent_in_a_batch_is_its_own_section() {
+        let down = LoopbackA2aServer::start_with_status(503, "gateway down").await;
+        let up = completing_server(1).await;
+        let tool = RemoteAgentTool::new(
+            vec![remote("dev", &up, None), remote("stage", &down, None)],
+            None,
+        );
+        let out = tool
+            .call(json!({ "calls": [
+                { "agent": "dev", "prompt": "sweep" },
+                { "agent": "stage", "prompt": "sweep" }
+            ]}))
+            .await
+            .unwrap();
+        assert!(out.contains("42 is the answer"), "{out}");
+        assert!(out.contains("remote agent \"stage\":"), "{out}");
+        assert!(out.contains("HTTP 503"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn a_batch_where_every_agent_failed_is_a_tool_error() {
+        let a = LoopbackA2aServer::start_with_status(503, "down").await;
+        let b = LoopbackA2aServer::start_with_status(503, "also down").await;
+        let tool = RemoteAgentTool::new(
+            vec![remote("dev", &a, None), remote("stage", &b, None)],
+            None,
+        );
+        let err = tool
+            .call(json!({ "calls": [
+                { "agent": "dev", "prompt": "x" },
+                { "agent": "stage", "prompt": "x" }
+            ]}))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("all 2 remote agent calls failed"),
+            "{err}"
         );
     }
 
