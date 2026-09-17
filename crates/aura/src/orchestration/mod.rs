@@ -111,6 +111,11 @@ pub(crate) use park::{
 pub use prompt_constants::{context, fields, sections};
 #[cfg(test)]
 pub(crate) use test_rig::ScriptedAgent;
+// Test-only in-crate reach for the reservation table: the L2 lifetime
+// goldens (tool_wrapper.rs) build real scopes over admitted runs. Never
+// crosses the public facade (same pattern as ScriptedAgent above).
+#[cfg(test)]
+pub(crate) use park::lifetime::ReservationTable;
 pub use types::{
     BlockedCell, CellOutcome, ParkSnapshot, PendingCall, Plan, PlanningResponse, RunId, StepInput,
     StructuredTaskOutput, Task, TaskIdentity, TaskJson, TaskState, TaskStatus,
