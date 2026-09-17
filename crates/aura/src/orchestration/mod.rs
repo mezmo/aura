@@ -33,8 +33,8 @@
 //! // `RigBuilder` returns an `Orchestrator` (wrapped as `StreamingAgent`) when
 //! // `orchestration.enabled = true`, or a standard `Agent` otherwise.
 //! let config = load_config_from_str(toml_str)?;
-//! let agent: std::sync::Arc<dyn StreamingAgent> = RigBuilder::new(config)
-//!     .build_streaming_agent_with_headers(None, None, None)
+//! let agent: std::sync::Arc<dyn StreamingAgent> = RigBuilder::new(config, pending_approvals)
+//!     .build_streaming_agent_with_headers(None, None, None, None, None)
 //!     .await?;
 //!
 //! let stream = agent.stream(query, history, cancel_token, "req_123").await?;

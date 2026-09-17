@@ -209,19 +209,24 @@ impl RigBuilder {
     /// attaches them only to the coordinator / workers whose TOML config sets
     /// `enable_client_tools = true`, filtered by `client_tool_filter`. In single-agent mode,
     /// callers should attach client tools via `build_agent` instead.
+    ///
+    /// `reservation_table` is the deployment's one shared run-reservation
+    /// table, threaded through to an orchestrated build. Callers that hold no
+    /// shared table (CLI, A2A, tests) pass `None`.
     pub async fn build_streaming_agent_with_headers(
         &self,
         req_headers: Option<&HashMap<String, String>>,
         session_id: Option<String>,
         client_tools: Option<Vec<ClientTool>>,
         request_id: Option<String>,
+        reservation_table: Option<Arc<crate::orchestration::ResumeClaimTable>>,
     ) -> Result<Arc<dyn StreamingAgent>, BuilderError> {
         let mut agent_config = self.discovered_agent_config(req_headers)?;
         resolve_mcp_headers(&mut agent_config, req_headers);
         agent_config.session_id = session_id;
         agent_config.request_id = request_id;
 
-        build_streaming_agent(&agent_config, client_tools)
+        build_streaming_agent(&agent_config, client_tools, reservation_table)
             .await
             .map_err(|e| BuilderError::AgentError(format!("Failed to build streaming agent: {e}")))
     }

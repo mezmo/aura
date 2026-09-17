@@ -598,7 +598,13 @@ pub(super) fn spawn_tool_event_forwarder(
                     match result {
                         Ok(tool_event) => {
                             let orch_event = tool_event_to_orchestrator_event(tool_event);
-                            let _ = event_tx.send(Ok(StreamItem::OrchestratorEvent(orch_event))).await;
+                            // Race the send against cancellation: a full
+                            // channel with no consumer must not strand the
+                            // forwarder and block the supervisor's drain.
+                            tokio::select! {
+                                _ = event_tx.send(Ok(StreamItem::OrchestratorEvent(orch_event))) => {}
+                                _ = cancel_token.cancelled() => break,
+                            }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                             tracing::warn!("Tool observer lagged by {} events", n);

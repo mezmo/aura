@@ -1767,9 +1767,16 @@ impl StreamingAgent for Agent {
 /// `orchestration.enabled = true`, any supplied `client_tools` are dropped
 /// with a warning. In single-agent mode, they are attached to the agent only
 /// when `[agent].enable_client_tools = true` (filtered by `client_tool_filter`).
+///
+/// `reservation_table` is the deployment's one shared run-reservation table.
+/// An orchestrated build injects it so a park-enabled producer reserves its
+/// persistence-bound run; `None` on non-park callers and on callers that hold
+/// no shared table. The factory itself gates reservation on `park_enabled()`,
+/// so an injected table on a non-park config is inert.
 pub async fn build_streaming_agent(
     config: &crate::config::AgentRuntimeConfig,
     client_tools: Option<Vec<ClientTool>>,
+    reservation_table: Option<Arc<crate::orchestration::ResumeClaimTable>>,
 ) -> Result<Arc<dyn StreamingAgent>, Box<dyn std::error::Error + Send + Sync>> {
     use crate::orchestration::OrchestratorFactory;
 
@@ -1782,7 +1789,10 @@ pub async fn build_streaming_agent(
                  will be ignored. Use a non-orchestrated agent config to enable them."
             );
         }
-        let factory = OrchestratorFactory::new(config.clone());
+        let factory = match reservation_table {
+            Some(table) => OrchestratorFactory::new(config.clone()).with_reservation_table(table),
+            None => OrchestratorFactory::new(config.clone()),
+        };
         Ok(Arc::new(factory))
     } else {
         // Standard single-agent mode: gate client tools on the agent's TOML opt-in

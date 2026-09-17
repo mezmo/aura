@@ -202,7 +202,13 @@ impl OrchestratorFactory {
                     mcp_manager.set_current_request(&request_id).await;
                     let snapshot = mcp_manager.server_status_snapshot();
                     if !snapshot.is_empty() {
-                        let _ = event_tx.send(Ok(StreamItem::McpStatus(snapshot))).await;
+                        // Race the send against cancellation: a full channel
+                        // with no consumer must not strand the supervisor
+                        // ahead of its drain.
+                        tokio::select! {
+                            _ = event_tx.send(Ok(StreamItem::McpStatus(snapshot))) => {}
+                            _ = cancel_token_clone.cancelled() => {}
+                        }
                     }
                 }
 
@@ -220,20 +226,37 @@ impl OrchestratorFactory {
                     result = orchestrator.run_orchestration(&query, chat_history, event_tx.clone()) => {
                         match result {
                             Ok(final_result) => {
+                                // Each send races cancellation so a full
+                                // channel cannot strand the supervisor before
+                                // its drain. A cancelled run truncates the
+                                // final; the run is cancelled, so that is
+                                // correct.
+                                let mut cancelled = false;
                                 for chunk in final_result.chars().collect::<Vec<_>>().chunks(STREAM_CHUNK_SIZE) {
                                     let text: String = chunk.iter().collect();
-                                    let _ = event_tx.send(Ok(StreamItem::StreamAssistantItem(
-                                        crate::provider_agent::StreamedAssistantContent::Text(text)
-                                    ))).await;
+                                    tokio::select! {
+                                        _ = event_tx.send(Ok(StreamItem::StreamAssistantItem(
+                                            crate::provider_agent::StreamedAssistantContent::Text(text)
+                                        ))) => {}
+                                        _ = cancel_token_clone.cancelled() => {
+                                            cancelled = true;
+                                            break;
+                                        }
+                                    }
                                 }
 
-                                let _ = event_tx.send(Ok(StreamItem::Final(
-                                    crate::provider_agent::FinalResponseInfo {
-                                        content: final_result,
-                                        usage: Default::default(),
-                                        cache_usage: None,
+                                if !cancelled {
+                                    tokio::select! {
+                                        _ = event_tx.send(Ok(StreamItem::Final(
+                                            crate::provider_agent::FinalResponseInfo {
+                                                content: final_result,
+                                                usage: Default::default(),
+                                                cache_usage: None,
+                                            }
+                                        ))) => {}
+                                        _ = cancel_token_clone.cancelled() => {}
                                     }
-                                ))).await;
+                                }
                             }
                             Err(e) => {
                                 let _ = event_tx.send(Err(e)).await;
@@ -263,6 +286,10 @@ impl OrchestratorFactory {
                 // cancel-and-close stays in its arm, before this drain.
                 if let Some(scope) = execution_scope {
                     drop(orchestrator);
+                    // Signal cancellation before draining so cancellation-aware
+                    // tracked tails exit early; the drain must not wait on work
+                    // that has been told to stop.
+                    scope.cancel();
                     scope.drain().await;
                 }
             },

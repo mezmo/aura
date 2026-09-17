@@ -284,6 +284,7 @@ pub async fn prepare_request(
     req: &mut ChatCompletionRequest,
     chat_session_id: &str,
     req_headers_map: &HashMap<String, String>,
+    reservation_table: Option<Arc<ResumeClaimTable>>,
 ) -> Result<RequestSetup, PrepareError> {
     // Client-side tools are gated per-agent by `[agent].enable_client_tools`
     // (single-agent configs only — orchestrated configs drop client tools with a
@@ -345,6 +346,7 @@ pub async fn prepare_request(
                     Some(chat_session_id.to_string()),
                     client_tools_vec.clone(),
                     Some(request_id.clone()),
+                    reservation_table,
                 )
                 .await
                 .map_err(|e| {
@@ -424,10 +426,11 @@ fn validate_hitl_delivery_mode(
 }
 
 /// Handle chat completions endpoint
-#[tracing::instrument(name = "chat_completions", skip(state, req, headers), fields(otel.kind = "server"))]
+#[tracing::instrument(name = "chat_completions", skip(state, req, headers, claims), fields(otel.kind = "server"))]
 pub async fn chat_completions(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    axum::extract::Extension(claims): axum::extract::Extension<ResumeClaims>,
     Json(mut req): Json<ChatCompletionRequest>,
 ) -> Response {
     // Validate we have messages
@@ -461,7 +464,15 @@ pub async fn chat_completions(
         .filter_map(|(k, v)| v.to_str().ok().map(|val| (k.to_string(), val.to_string())))
         .collect();
 
-    let setup = match prepare_request(&state, &mut req, &chat_session_id, &req_headers_map).await {
+    let setup = match prepare_request(
+        &state,
+        &mut req,
+        &chat_session_id,
+        &req_headers_map,
+        Some(Arc::clone(&claims.0)),
+    )
+    .await
+    {
         Ok(s) => s,
         Err(e) => return e.into_http_response(),
     };
