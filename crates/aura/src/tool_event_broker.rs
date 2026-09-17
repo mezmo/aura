@@ -55,8 +55,7 @@ pub enum ToolLifecycleEvent {
         progress_token: Option<ProgressToken>,
         agent: Option<AgentContext>,
     },
-    /// One member of an `ask_agent` batch answered while the rest of the
-    /// batch may still be running.
+    /// One member's answer in an `ask_agent` batch.
     AgentAnswer {
         /// Configured name of the remote agent that answered.
         remote: String,
@@ -238,6 +237,43 @@ impl ToolEventBroker {
         tool_call_id
     }
 
+    /// Publish without waiting: a full (or momentarily locked) channel drops
+    /// the event instead of stalling the producer. For best-effort telemetry
+    /// whose delivery must never gate tool execution — the channel is bounded
+    /// and goes undrained when the request is not streaming custom events.
+    ///
+    /// Returns `true` if the event was queued, `false` otherwise.
+    pub fn try_publish(&self, request_id: &str, event: ToolLifecycleEvent) -> bool {
+        let sender = match self.senders.try_read() {
+            Ok(senders) => senders.get(request_id).cloned(),
+            Err(_) => None,
+        };
+        let Some(sender) = sender else {
+            debug!(
+                "No tool event subscriber for request '{}' (event dropped)",
+                request_id
+            );
+            return false;
+        };
+        match sender.try_send(event) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                debug!(
+                    "Tool event channel full for request '{}' (event dropped)",
+                    request_id
+                );
+                false
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                debug!(
+                    "Tool event receiver dropped for request '{}' (cleaned on unsubscribe)",
+                    request_id
+                );
+                false
+            }
+        }
+    }
+
     /// Publish a tool event to a specific request.
     ///
     /// Returns `true` if the event was sent, `false` if no subscriber exists.
@@ -343,15 +379,16 @@ pub async fn publish_tool_start(
     .await
 }
 
-/// Convenience function to publish one batch member's answer
-pub async fn publish_agent_answer(
+/// Convenience function to publish one batch member's answer. Never blocks:
+/// a full or undrained channel drops the event rather than stalling the call.
+pub fn publish_agent_answer(
     request_id: &str,
     remote: &str,
     success: bool,
     text: String,
     elapsed_ms: u64,
 ) -> bool {
-    publish(
+    global().try_publish(
         request_id,
         ToolLifecycleEvent::AgentAnswer {
             remote: remote.to_owned(),
@@ -360,7 +397,6 @@ pub async fn publish_agent_answer(
             elapsed_ms,
         },
     )
-    .await
 }
 
 /// Convenience function to push a tool_call_id from hook context.
@@ -668,6 +704,32 @@ mod tests {
             }
             other => panic!("Expected AgentAnswer, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_try_publish_never_blocks_on_a_full_channel() {
+        let broker = ToolEventBroker::new();
+        // Subscribe but never drain: the channel fills after EVENT_CHANNEL_CAPACITY.
+        let _rx = broker.subscribe("req_full").await;
+        let event = || ToolLifecycleEvent::AgentAnswer {
+            remote: "dev".to_string(),
+            success: true,
+            text: "x".to_string(),
+            elapsed_ms: 1,
+        };
+        for _ in 0..EVENT_CHANNEL_CAPACITY {
+            assert!(broker.try_publish("req_full", event()));
+        }
+        let attempt = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            std::future::ready(broker.try_publish("req_full", event())),
+        )
+        .await;
+        assert_eq!(
+            attempt,
+            Ok(false),
+            "a full channel drops instead of blocking"
+        );
     }
 
     #[tokio::test]

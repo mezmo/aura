@@ -560,11 +560,9 @@ pub enum AuraStreamEvent {
         #[serde(flatten)]
         correlation: CorrelationContext,
     },
-    /// Emitted when one agent in an `ask_agent` batch answers while the
-    /// batch's other agents may still be running, so a client can show each
-    /// remote answer as it lands instead of waiting for the whole batch.
+    /// One member's answer in an `ask_agent` batch.
     RemoteAgentAnswer {
-        /// Configured name of the remote agent that answered.
+        /// Configured name of the answering remote.
         remote: String,
         /// Whether this agent's sub-call succeeded.
         success: bool,
@@ -811,7 +809,9 @@ impl AuraStreamEvent {
         }
     }
 
-    /// Create a RemoteAgentAnswer event for one member of an ask_agent batch.
+    /// Create a RemoteAgentAnswer event, emitted as each batch member's
+    /// answer lands — instead of waiting for the whole batch — so a client
+    /// can show one agent's report while the rest are still running.
     pub fn remote_agent_answer(
         remote: impl Into<String>,
         success: bool,

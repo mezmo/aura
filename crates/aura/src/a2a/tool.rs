@@ -26,6 +26,9 @@ const ABANDON_TIMEOUT: Duration = Duration::from_secs(5);
 /// Consecutive transient `GetTask` failures tolerated before the call fails.
 const MAX_TRANSIENT_POLL_FAILURES: u32 = 2;
 
+/// Most agents one `ask_agent` call may fan out to in parallel.
+const MAX_BATCH_CALLS: usize = 8;
+
 /// Result prefix the tool-error detector recognizes; shared with MCP tool
 /// errors so a failed remote task lights up the same span status.
 const TOOL_ERROR_PREFIX: &str = "Tool returned an error: ";
@@ -334,9 +337,8 @@ fn is_settled(state: &TaskState) -> bool {
 }
 
 /// Arguments the model passes to `ask_agent`: the single-agent form
-/// (`agent` + `prompt`, optional `context_id`) or a `calls` batch that fans
-/// out to several agents in parallel. Which agent config a remote serves is
-/// the operator's `model` setting, never the caller's choice.
+/// (`agent` + `prompt`, optional `context_id`) or a `calls` batch of
+/// sub-requests.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AskAgentArgs {
@@ -349,15 +351,20 @@ struct AskAgentArgs {
 }
 
 impl AskAgentArgs {
-    /// Normalize the two call forms into a list of sub-requests: the
-    /// single-agent form becomes one entry; a batch is taken as given.
+    /// Normalize the two call forms into the sub-requests `call` runs
+    /// concurrently: the single-agent form becomes one entry; a batch is
+    /// taken as given, capped at [`MAX_BATCH_CALLS`].
     fn into_calls(self) -> Result<Vec<AskAgentCall>, ToolError> {
         let invalid =
             |msg: &str| call_error(format!("invalid {ASK_AGENT_TOOL_NAME} arguments: {msg}"));
         let single = self.agent.is_some() || self.prompt.is_some() || self.context_id.is_some();
         match (self.calls, single) {
-            (Some(calls), false) if !calls.is_empty() => Ok(calls),
-            (Some(_), false) => Err(invalid("`calls` must not be empty")),
+            (Some(calls), false) if calls.is_empty() => Err(invalid("`calls` must not be empty")),
+            (Some(calls), false) if calls.len() > MAX_BATCH_CALLS => Err(invalid(&format!(
+                "`calls` takes at most {MAX_BATCH_CALLS} entries, got {}",
+                calls.len()
+            ))),
+            (Some(calls), false) => Ok(calls),
             (Some(_), true) => Err(invalid(
                 "`calls` cannot be combined with `agent`, `prompt`, or `context_id`",
             )),
@@ -653,7 +660,7 @@ impl RemoteAgentTool {
     /// event as it lands, so a client can show one agent's report while the
     /// rest of the batch is still running (single-agent streaming; workers
     /// report through the orchestration observer).
-    async fn announce_agent_answer(
+    fn announce_agent_answer(
         &self,
         remote: &RemoteAgent,
         result: &Result<String, ToolError>,
@@ -675,8 +682,7 @@ impl RemoteAgentTool {
             success,
             text,
             elapsed.as_millis() as u64,
-        )
-        .await;
+        );
     }
 
     fn cancel_token(&self) -> RequestCancelToken {
@@ -740,6 +746,7 @@ fn parameters(remotes: &BTreeMap<&str, Option<&str>>) -> Value {
                 "description": "Ask several agents in parallel: one entry per agent. Use \
                                 instead of `agent` and `prompt`.",
                 "minItems": 1,
+                "maxItems": MAX_BATCH_CALLS,
                 "items": {
                     "type": "object",
                     "properties": {
@@ -834,8 +841,7 @@ impl RigTool for RemoteAgentTool {
             let multi = resolved.len() > 1;
             while let Some((idx, result)) = futures::StreamExt::next(&mut in_flight).await {
                 if multi {
-                    self.announce_agent_answer(resolved[idx].0, &result, started.elapsed())
-                        .await;
+                    self.announce_agent_answer(resolved[idx].0, &result, started.elapsed());
                 }
                 sections[idx] = Some(result);
             }
@@ -1102,6 +1108,10 @@ mod tests {
             (
                 json!({ "calls": [{ "agent": "staging", "prompt": "x" }] }),
                 "unknown remote agent \"staging\"",
+            ),
+            (
+                json!({ "calls": (0..=MAX_BATCH_CALLS).map(|_| json!({ "agent": "dev", "prompt": "x" })).collect::<Vec<_>>() }),
+                "takes at most 8 entries",
             ),
         ];
         for (args, expected) in cases {
