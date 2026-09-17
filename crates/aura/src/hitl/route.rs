@@ -2674,7 +2674,9 @@ mod tests {
             client
                 .notify(&test_request(DecisionId::generate()))
                 .await
-                .expect("a 409 ECONFLICT ack must resolve Ok: the receiver holding the row is the ack");
+                .expect(
+                    "a 409 ECONFLICT ack must resolve Ok: the receiver holding the row is the ack",
+                );
         }
 
         /// A bare 409 — no `ECONFLICT` body — is not a delivery proof: the
