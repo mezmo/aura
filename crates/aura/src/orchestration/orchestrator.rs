@@ -65,8 +65,8 @@ use super::config::OrchestrationConfig;
 use super::events::OrchestratorEvent;
 use super::park::resume::evaluate::IdentityHash;
 use super::park::resume::{
-    BlockingEntry, Diagnostic, EmptyBlocking, EmptySegment, NonEmptyBlocking, ParkedToolName,
-    ResumeGrant, SegmentError, SegmentResult, SegmentTurns,
+    Diagnostic, EmptySegment, NonEmptyBlocking, ResumeGrant, SegmentError, SegmentResult,
+    SegmentTurns, blocking_from_calls,
 };
 use super::park::{
     CallId, CallKey, NodePreflightInput, OutcomeWire, ParkCommitInputs, ParkGuard, ParkedRun,
@@ -4796,23 +4796,20 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     }
 
                     let expires_at = commit.retention_expires_at.as_datetime();
-                    let mut blocking = Vec::new();
-                    for task in &plan.tasks {
-                        let Some(pending) = commit.refreshed.pending_by_task.get(&task.id) else {
-                            continue;
-                        };
-                        for call in pending {
-                            blocking.push(BlockingEntry {
-                                decision_id: call.decision_id,
-                                tool: ParkedToolName::new(call.tool_name.as_str()),
-                                expires_at,
-                            });
-                        }
-                    }
-                    let blocking =
-                        NonEmptyBlocking::try_new(blocking).map_err(|EmptyBlocking| {
-                            fault("the re-park committed with no outstanding calls".to_string())
-                        })?;
+                    let calls = plan.tasks.iter().filter_map(|task| {
+                        let pending = commit.refreshed.pending_by_task.get(&task.id)?;
+                        Some(
+                            pending
+                                .iter()
+                                .map(|call| (call.decision_id, call.tool_name.clone())),
+                        )
+                    });
+                    let blocking = blocking_from_calls(
+                        calls.flatten(),
+                        expires_at,
+                        || "the re-park committed with no outstanding calls".to_string(),
+                    )
+                    .map_err(fault)?;
                     splice_deferred_pairs(&mut turns, pair_blocks);
                     let turns = SegmentTurns::try_new(turns).map_err(|EmptySegment| {
                         fault("the re-parked segment carried no turns".to_string())
@@ -5024,22 +5021,23 @@ Assign tasks to the worker whose tools best match the required operations."#,
             registry.remove(id).await;
         }
         let expires_at = republished.retention_expires_at.as_datetime();
-        let mut blocking = Vec::new();
-        for node in &republished.plan.tasks {
+        let calls = republished.plan.tasks.iter().filter_map(|node| {
             let super::types::TaskStatus::AwaitingApproval = node.status else {
-                continue;
+                return None;
             };
-            for call in node.pending.iter().flatten() {
-                blocking.push(BlockingEntry {
-                    decision_id: call.decision_id,
-                    tool: ParkedToolName::new(call.tool_name.as_str()),
-                    expires_at,
-                });
-            }
-        }
-        let blocking = NonEmptyBlocking::try_new(blocking).map_err(|EmptyBlocking| {
-            fault("the re-park committed with no outstanding calls".to_string())
-        })?;
+            Some(
+                node.pending
+                    .iter()
+                    .flatten()
+                    .map(|call| (call.decision_id, call.tool_name.clone())),
+            )
+        });
+        let blocking = blocking_from_calls(
+            calls.flatten(),
+            expires_at,
+            || "the re-park committed with no outstanding calls".to_string(),
+        )
+        .map_err(fault)?;
         Ok(ContinuationOutcome::ReParked { blocking })
     }
 
@@ -8648,8 +8646,8 @@ mod tests {
 
     /// The worker path under a park-capable webhook poll route attaches
     /// no `request_approval` tool: poll mode resolves decisions without
-    /// an agent-callable park path. GREEN since R4-INT-4: the fill scopes the
-    /// attach in `create_worker` to non-poll routes.
+    /// an agent-callable park path — `create_worker` scopes the attach to
+    /// non-poll routes.
     #[tokio::test]
     async fn worker_poll_mode_does_not_attach_the_request_approval_tool() {
         fn config() -> AgentRuntimeConfig {
