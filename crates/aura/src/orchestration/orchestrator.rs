@@ -770,6 +770,24 @@ struct ForwardedRun {
     turns: Vec<rig::completion::Message>,
 }
 
+/// Replay an assistant turn as conversation history.
+///
+/// Anthropic-family providers reject a message whose text block is empty
+/// (`messages: text content blocks must be non-empty`), and a turn spent
+/// entirely on reasoning or cut off before any output yields exactly that.
+/// Blank content is replaced with
+/// [`prompt_constants::corrections::EMPTY_ASSISTANT_TURN`] so the correction
+/// call that follows is accepted.
+fn assistant_history_message(content: &str) -> rig::completion::Message {
+    if content.trim().is_empty() {
+        rig::completion::Message::assistant(
+            super::prompt_constants::corrections::EMPTY_ASSISTANT_TURN,
+        )
+    } else {
+        rig::completion::Message::assistant(content)
+    }
+}
+
 /// One guarded step of a deadline-wrapped stream loop.
 enum LoopStep {
     End,
@@ -2373,7 +2391,7 @@ impl Orchestrator {
             let response_text = response.content.clone();
             coordinator_state
                 .conversation
-                .push(rig::completion::Message::assistant(&response_text));
+                .push(assistant_history_message(&response_text));
 
             {
                 let persistence = self.persistence.lock().await;
@@ -4053,7 +4071,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     super::prompt_constants::corrections::WORKER_SUBMIT_RESULT.to_string();
                 let history = vec![
                     rig::completion::Message::user(base_worker_prompt.clone()),
-                    rig::completion::Message::assistant(last_raw_response.clone()),
+                    assistant_history_message(&last_raw_response),
                 ];
                 (correction, history)
             };
