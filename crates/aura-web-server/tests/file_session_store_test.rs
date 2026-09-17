@@ -11,13 +11,27 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aura::hitl::{ApprovalAuthority, ApprovalDecision, ResolveError, ResolvedDecision};
+use aura::hitl::{
+    AddressedApproval, ApprovalAuthority, ApprovalDecision, ApprovalRead, DecisionId, ResolveError,
+    ResolvedDecision,
+};
 use aura::session_store::{
     ApprovalStore, FileApprovalStore, InMemoryApprovalStore, ParkedApprovalRecord,
-    SessionStoreError,
+    RetainedApproval, SessionStoreError,
 };
 
 use common::make_parked;
+
+/// The file names in `dir`, sorted: the scan's no-unlink side-effect check
+/// compares these sets around the call.
+fn dir_listing(dir: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
 
 /// Two handles to one file store at `dir`'s root: the single-writing-process
 /// deployment shape.
@@ -807,4 +821,362 @@ async fn ping_reports_an_unwritable_store_directory() {
         drop(restore);
         store.probe_writable().await.expect("ping recovers");
     }
+}
+
+// ---------------------------------------------------------------------------
+// read-or-expire and the retained-evidence scan (E2 RED)
+//
+// Every test here drives the store through `open_with_clock` with the clock
+// pinned to a fixed instant, so deadline and timeout arbitration are
+// deterministic: a test names the instant the store must sample, and the
+// wall clock never participates.
+// ---------------------------------------------------------------------------
+
+/// A store whose clock is pinned to `now`: every operation samples exactly
+/// this instant, under the same lock resolve and remove hold.
+fn store_pinned_at(
+    dir: &tempfile::TempDir,
+    now: chrono::DateTime<chrono::Utc>,
+) -> FileApprovalStore {
+    let clock: Arc<dyn Fn() -> chrono::DateTime<chrono::Utc> + Send + Sync> = Arc::new(move || now);
+    FileApprovalStore::open_with_clock(dir.path(), clock).unwrap()
+}
+
+/// A wrong-authority read answers `Missing` with no mutation: the approval
+/// file stays on disk and the row still reads through `get`.
+#[tokio::test]
+async fn file_read_or_expire_missing_row_reads_missing() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store_pinned_at(&dir, chrono::Utc::now());
+
+    assert!(
+        matches!(
+            store
+                .read_or_expire(&DecisionId::generate(), ApprovalAuthority::Conversational)
+                .await
+                .unwrap(),
+            ApprovalRead::Missing
+        ),
+        "an unknown id must read as Missing"
+    );
+}
+
+#[tokio::test]
+async fn file_read_or_expire_wrong_authority_reads_missing_without_mutation() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store_pinned_at(&dir, chrono::Utc::now());
+    let parked = make_parked("req-roe-authority", Duration::from_secs(60));
+    let id = parked.request.decision_id;
+    store.register(parked).await.unwrap();
+
+    assert!(
+        matches!(
+            store
+                .read_or_expire(&id, ApprovalAuthority::WebhookPoll)
+                .await
+                .unwrap(),
+            ApprovalRead::Missing
+        ),
+        "a wrong-authority read must answer Missing"
+    );
+    assert!(
+        dir.path()
+            .join("approvals")
+            .join(format!("{id}.json"))
+            .exists(),
+        "a wrong-authority read must not unlink the approval file"
+    );
+    assert!(
+        store.get(&id).await.unwrap().is_some(),
+        "a wrong-authority read must not consume the row"
+    );
+}
+
+/// A row inside its window reads as pending.
+#[tokio::test]
+async fn file_read_or_expire_pending_inside_window_is_pending() {
+    let dir = tempfile::tempdir().unwrap();
+    let parked = make_parked("req-roe-pending", Duration::from_secs(60));
+    let id = parked.request.decision_id;
+    let expected = ParkedApprovalRecord::from(&parked);
+    let store = store_pinned_at(&dir, parked.expires_at - chrono::Duration::seconds(1));
+    store.register(parked).await.unwrap();
+
+    match store
+        .read_or_expire(&id, ApprovalAuthority::Conversational)
+        .await
+        .unwrap()
+    {
+        ApprovalRead::Pending(got) => assert_eq!(ParkedApprovalRecord::from(&got), expected),
+        _ => panic!("expected Pending, got another ApprovalRead arm"),
+    }
+}
+
+/// Strictly past the deadline with no decision, the read expires the row
+/// durably: a `TimedOut` decision file carrying the row's own deadline
+/// replaces the approval file (resolve's move convention), the addressed
+/// answer carries that deadline, and a second read returns the same
+/// terminal winner instead of re-expiring.
+#[tokio::test]
+async fn file_read_or_expire_expired_row_writes_durable_timed_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut parked = make_parked("req-roe-expired", Duration::from_secs(60));
+    let mut egress = reqwest::header::HeaderMap::new();
+    egress.insert("x-tenant-egress", "tenant-secret".parse().unwrap());
+    parked.egress_headers = Some(egress);
+    let id = parked.request.decision_id;
+    // The durable record carries the row with its egress headers stripped —
+    // resolve's move convention — so that is the shape both reads return.
+    let mut expected_row = parked.clone();
+    expected_row.egress_headers = None;
+    let expected = ParkedApprovalRecord::from(&expected_row);
+    let deadline = parked.expires_at;
+    let store = store_pinned_at(&dir, deadline + chrono::Duration::seconds(1));
+    store.register(parked).await.unwrap();
+
+    for _ in 0..2 {
+        match store
+            .read_or_expire(&id, ApprovalAuthority::Conversational)
+            .await
+            .unwrap()
+        {
+            ApprovalRead::Addressed { approval, outcome } => {
+                assert_eq!(
+                    ParkedApprovalRecord::from(&approval),
+                    expected,
+                    "the addressed approval is the egress-stripped persisted row"
+                );
+                assert_eq!(outcome, AddressedApproval::TimedOut { deadline });
+            }
+            _ => panic!("expected Addressed, got another ApprovalRead arm"),
+        }
+    }
+
+    assert!(
+        !dir.path()
+            .join("approvals")
+            .join(format!("{id}.json"))
+            .exists(),
+        "the expired approval file is moved, not left behind"
+    );
+    let raw = std::fs::read_to_string(dir.path().join("decisions").join(format!("{id}.json")))
+        .expect("the durable timeout row is persisted");
+    let on_disk: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(on_disk["decision"]["kind"], "timed_out");
+    assert!(
+        !raw.contains("x-tenant-egress") && !raw.contains("tenant-secret"),
+        "egress credentials must not survive into the decision file"
+    );
+}
+
+/// A decision recorded inside the window wins: the read addresses with the
+/// recorded decision and never rewrites the decision file into a timeout.
+#[tokio::test]
+async fn file_read_or_expire_decided_winner_is_addressed_decided() {
+    let dir = tempfile::tempdir().unwrap();
+    let parked = make_parked("req-roe-decided", Duration::from_secs(60));
+    let id = parked.request.decision_id;
+    let expected = ParkedApprovalRecord::from(&parked);
+    let store = store_pinned_at(&dir, parked.expires_at - chrono::Duration::seconds(1));
+    store.register(parked).await.unwrap();
+    store
+        .resolve(
+            &id,
+            ApprovalAuthority::Conversational,
+            ApprovalDecision::Approved.into(),
+        )
+        .await
+        .unwrap();
+    let decided_raw =
+        std::fs::read_to_string(dir.path().join("decisions").join(format!("{id}.json"))).unwrap();
+
+    match store
+        .read_or_expire(&id, ApprovalAuthority::Conversational)
+        .await
+        .unwrap()
+    {
+        ApprovalRead::Addressed { approval, outcome } => {
+            assert_eq!(ParkedApprovalRecord::from(&approval), expected);
+            assert_eq!(
+                outcome,
+                AddressedApproval::Decided(ResolvedDecision::from(ApprovalDecision::Approved))
+            );
+        }
+        _ => panic!("expected Addressed, got another ApprovalRead arm"),
+    }
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("decisions").join(format!("{id}.json"))).unwrap(),
+        decided_raw,
+        "an existing terminal winner is returned unchanged"
+    );
+}
+
+/// Decode, unknown-id, and I/O failures are errors, never outcomes: a
+/// decision file that does not decode must fail the read as
+/// `SessionStoreError::Decode`, never as a fabricated `Missing`.
+#[tokio::test]
+async fn file_read_or_expire_corrupt_decision_file_is_a_decode_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let parked = make_parked("req-roe-corrupt", Duration::from_secs(60));
+    let id = parked.request.decision_id;
+    let store = store_pinned_at(&dir, parked.expires_at - chrono::Duration::seconds(1));
+    store.register(parked).await.unwrap();
+    store
+        .resolve(
+            &id,
+            ApprovalAuthority::Conversational,
+            ApprovalDecision::Approved.into(),
+        )
+        .await
+        .unwrap();
+    std::fs::write(
+        dir.path().join("decisions").join(format!("{id}.json")),
+        b"not json",
+    )
+    .unwrap();
+
+    match store
+        .read_or_expire(&id, ApprovalAuthority::Conversational)
+        .await
+    {
+        Err(SessionStoreError::Decode { .. }) => {}
+        _ => panic!("a corrupt decision file must read as a decode error, not another answer"),
+    }
+}
+
+/// The deadline rule is strictly past: a row sampled exactly at its own
+/// `expires_at` is still pending.
+#[tokio::test]
+async fn file_read_or_expire_deadline_exact_is_still_pending() {
+    let dir = tempfile::tempdir().unwrap();
+    let parked = make_parked("req-roe-exact", Duration::from_secs(60));
+    let id = parked.request.decision_id;
+    let store = store_pinned_at(&dir, parked.expires_at);
+    store.register(parked).await.unwrap();
+
+    assert!(
+        matches!(
+            store
+                .read_or_expire(&id, ApprovalAuthority::Conversational)
+                .await
+                .unwrap(),
+            ApprovalRead::Pending(_)
+        ),
+        "an exact-deadline read is still pending"
+    );
+}
+
+/// The retained scan covers pending AND addressed rows — rows inside and
+/// past their window, decided and timed-out — each exactly once, and it
+/// unlinks nothing.
+#[tokio::test]
+async fn file_retained_rows_scans_pending_and_addressed() {
+    let dir = tempfile::tempdir().unwrap();
+    let expired = make_parked("req-retain-expired", Duration::from_secs(60));
+    let expired_id = expired.request.decision_id;
+    let expired_deadline = expired.expires_at;
+    // The scan samples the pinned clock; the four rows' windows sit either
+    // side of it — one pending inside its window, one pending past it, one
+    // decided, one timed out through a first read_or_expire.
+    let scan_now = expired_deadline + chrono::Duration::seconds(1);
+    let mut inside = make_parked("req-retain-inside", Duration::from_secs(60));
+    inside.expires_at = scan_now + chrono::Duration::seconds(60);
+    let inside_id = inside.request.decision_id;
+    let mut past = make_parked("req-retain-past", Duration::from_secs(60));
+    past.expires_at = scan_now - chrono::Duration::seconds(1);
+    let past_id = past.request.decision_id;
+    let decided = make_parked("req-retain-decided", Duration::from_secs(60));
+    let decided_id = decided.request.decision_id;
+
+    // Registration and resolve run through a wall-clock store on the same
+    // root (their deadlines are open there); only the timed-out row is
+    // consumed through the pinned seam.
+    let registrar = FileApprovalStore::open(dir.path()).unwrap();
+    registrar.register(inside).await.unwrap();
+    registrar.register(past).await.unwrap();
+    registrar.register(decided).await.unwrap();
+    registrar.register(expired).await.unwrap();
+    registrar
+        .resolve(
+            &decided_id,
+            ApprovalAuthority::Conversational,
+            ApprovalDecision::Approved.into(),
+        )
+        .await
+        .unwrap();
+
+    let store = store_pinned_at(&dir, scan_now);
+    assert!(matches!(
+        store
+            .read_or_expire(&expired_id, ApprovalAuthority::Conversational)
+            .await
+            .unwrap(),
+        ApprovalRead::Addressed { .. }
+    ));
+
+    let approvals_before = dir_listing(&dir.path().join("approvals"));
+    let decisions_before = dir_listing(&dir.path().join("decisions"));
+
+    let rows = store.retained_rows().await.unwrap();
+
+    assert_eq!(approvals_before, dir_listing(&dir.path().join("approvals")));
+    assert_eq!(decisions_before, dir_listing(&dir.path().join("decisions")));
+    let mut scanned: Vec<(String, &str)> = Vec::new();
+    for row in rows {
+        match row {
+            RetainedApproval::Pending(parked) => {
+                let id = parked.request.decision_id;
+                if id == past_id {
+                    assert!(
+                        parked.expires_at <= scan_now,
+                        "the past-window row really is past"
+                    );
+                }
+                if id == inside_id {
+                    assert!(
+                        parked.expires_at > scan_now,
+                        "the inside row really is inside its window"
+                    );
+                }
+                scanned.push((id.to_string(), "pending"));
+            }
+            RetainedApproval::Addressed { approval, outcome } => match outcome {
+                AddressedApproval::Decided(_) => {
+                    assert_eq!(approval.request.decision_id, decided_id);
+                    scanned.push((decided_id.to_string(), "decided"));
+                }
+                AddressedApproval::TimedOut { deadline } => {
+                    assert_eq!(approval.request.decision_id, expired_id);
+                    assert_eq!(deadline, expired_deadline);
+                    scanned.push((expired_id.to_string(), "timed_out"));
+                }
+            },
+        }
+    }
+    scanned.sort();
+    let mut expected: Vec<(String, &str)> = vec![
+        (inside_id.to_string(), "pending"),
+        (past_id.to_string(), "pending"),
+        (decided_id.to_string(), "decided"),
+        (expired_id.to_string(), "timed_out"),
+    ];
+    expected.sort();
+    assert_eq!(
+        scanned.len(),
+        4,
+        "each of the four rows appears exactly once"
+    );
+    assert_eq!(scanned, expected);
+}
+
+/// An empty store scans to an empty retention set.
+#[tokio::test]
+async fn file_retained_rows_on_empty_store_is_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store_pinned_at(&dir, chrono::Utc::now());
+
+    assert!(
+        store.retained_rows().await.unwrap().is_empty(),
+        "an empty store must retain nothing"
+    );
 }

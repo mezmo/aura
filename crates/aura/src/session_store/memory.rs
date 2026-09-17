@@ -259,9 +259,10 @@ mod tests {
 
     use super::*;
     use crate::hitl::{
-        AgentScope, ApprovalAuthority, ApprovalDecision, ApprovalItem, ApprovalOrigin,
-        ApprovalRequest, PROTOCOL_VERSION,
+        AddressedApproval, AgentScope, ApprovalAuthority, ApprovalDecision, ApprovalItem,
+        ApprovalOrigin, ApprovalRequest, PROTOCOL_VERSION,
     };
+    use crate::session_store::ParkedApprovalRecord;
 
     fn parked(request_id: &str) -> ParkedApproval {
         let now = chrono::Utc::now();
@@ -432,5 +433,144 @@ mod tests {
 
         assert_eq!(sub_a.next().await.unwrap(), Bytes::from_static(b"for-a"));
         assert_eq!(sub_b.next().await.unwrap(), Bytes::from_static(b"for-b"));
+    }
+
+    // -- read-or-expire and retained scan (E2 RED) --------------------------
+
+    /// An unknown id reads as missing.
+    #[tokio::test]
+    async fn read_or_expire_missing_row_reads_missing() {
+        let store = InMemoryApprovalStore::new();
+
+        assert!(
+            matches!(
+                store
+                    .read_or_expire(&DecisionId::generate(), ApprovalAuthority::Conversational)
+                    .await
+                    .unwrap(),
+                ApprovalRead::Missing
+            ),
+            "an unknown id must read as Missing"
+        );
+    }
+
+    /// A row parked under a different authority reads as missing with no
+    /// mutation: one agent's poller cannot consume another's rows.
+    #[tokio::test]
+    async fn read_or_expire_wrong_authority_reads_missing_without_mutation() {
+        let store = InMemoryApprovalStore::new();
+        let entry = parked("req-roe-authority");
+        let id = entry.request.decision_id;
+        store.register(entry).await.unwrap();
+
+        assert!(
+            matches!(
+                store
+                    .read_or_expire(&id, ApprovalAuthority::WebhookPoll)
+                    .await
+                    .unwrap(),
+                ApprovalRead::Missing
+            ),
+            "a wrong-authority read must answer Missing"
+        );
+        assert!(
+            store.get(&id).await.unwrap().is_some(),
+            "a wrong-authority read must not consume the row"
+        );
+    }
+
+    /// A row inside its window reads as pending, carrying the row.
+    #[tokio::test]
+    async fn read_or_expire_pending_inside_window_is_pending() {
+        let store = InMemoryApprovalStore::new();
+        let entry = parked("req-roe-pending");
+        let id = entry.request.decision_id;
+        let expected = ParkedApprovalRecord::from(&entry);
+        store.register(entry).await.unwrap();
+
+        match store
+            .read_or_expire(&id, ApprovalAuthority::Conversational)
+            .await
+            .unwrap()
+        {
+            ApprovalRead::Pending(got) => assert_eq!(ParkedApprovalRecord::from(&got), expected),
+            _ => panic!("expected Pending, got another ApprovalRead arm"),
+        }
+    }
+
+    /// A row past its deadline addresses as `TimedOut` carrying the row's own
+    /// `expires_at`, and a second read returns the same addressed answer:
+    /// the derivation is idempotent, with no cached winner type.
+    #[tokio::test]
+    async fn read_or_expire_expired_row_is_addressed_timed_out() {
+        let store = InMemoryApprovalStore::new();
+        let mut entry = parked("req-roe-expired");
+        entry.expires_at = chrono::Utc::now() - chrono::Duration::seconds(1);
+        let id = entry.request.decision_id;
+        let expected = ParkedApprovalRecord::from(&entry);
+        let deadline = entry.expires_at;
+        store.register(entry).await.unwrap();
+
+        for _ in 0..2 {
+            match store
+                .read_or_expire(&id, ApprovalAuthority::Conversational)
+                .await
+                .unwrap()
+            {
+                ApprovalRead::Addressed { approval, outcome } => {
+                    assert_eq!(ParkedApprovalRecord::from(&approval), expected);
+                    assert_eq!(outcome, AddressedApproval::TimedOut { deadline });
+                }
+                _ => panic!("expected Addressed, got another ApprovalRead arm"),
+            }
+        }
+    }
+
+    /// A decision recorded inside the window wins: the read addresses with
+    /// the recorded decision, not a timeout.
+    #[tokio::test]
+    async fn read_or_expire_decided_winner_is_addressed_decided() {
+        let store = InMemoryApprovalStore::new();
+        let entry = parked("req-roe-decided");
+        let id = entry.request.decision_id;
+        let expected = ParkedApprovalRecord::from(&entry);
+        store.register(entry).await.unwrap();
+        store
+            .resolve(
+                &id,
+                ApprovalAuthority::Conversational,
+                ApprovalDecision::Approved.into(),
+            )
+            .await
+            .unwrap();
+
+        match store
+            .read_or_expire(&id, ApprovalAuthority::Conversational)
+            .await
+            .unwrap()
+        {
+            ApprovalRead::Addressed { approval, outcome } => {
+                assert_eq!(ParkedApprovalRecord::from(&approval), expected);
+                assert_eq!(
+                    outcome,
+                    AddressedApproval::Decided(ResolvedDecision::from(ApprovalDecision::Approved))
+                );
+            }
+            _ => panic!("expected Addressed, got another ApprovalRead arm"),
+        }
+    }
+
+    /// The memory backend has no park parity: the retained scan answers the
+    /// typed unsupported-operation error.
+    #[tokio::test]
+    async fn retained_rows_is_unsupported_without_park_parity() {
+        let store = InMemoryApprovalStore::new();
+
+        match store.retained_rows().await {
+            Err(SessionStoreError::UnsupportedOperation { operation, .. }) => {
+                assert_eq!(operation, "retained_rows");
+            }
+            _ => panic!("expected UnsupportedOperation, got another answer"),
+        }
     }
 }
