@@ -303,6 +303,42 @@ fn hitl_route_vs_server_window_warning(
     None
 }
 
+/// Refuse park mode on the memory backend: park-mode checkpoints and
+/// approval tickets must outlive the process for any resume to exist.
+fn refuse_park_on_memory_backend(
+    configs: &[aura_config::Config],
+    backend: aura_config::SessionStoreBackend,
+) -> Result<(), std::io::Error> {
+    if backend != aura_config::SessionStoreBackend::Memory {
+        return Ok(());
+    }
+    for config in configs {
+        let Some(hitl) = &config.hitl else {
+            continue;
+        };
+        if !hitl.park.enabled {
+            continue;
+        }
+        let agent = config.agent.alias.as_deref().unwrap_or(&config.agent.name);
+        error!(
+            "agent '{agent}': [hitl] park mode requires a restart-durable session store, but \
+             AURA_SESSION_STORE is 'memory'; parked checkpoints and approval tickets would die \
+             with the process, so no resume could ever succeed. Set AURA_SESSION_STORE=file (or \
+             redis)"
+        );
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "agent '{agent}': [hitl] park mode requires a restart-durable session store, but \
+                 AURA_SESSION_STORE is 'memory'; parked checkpoints and approval tickets would \
+                 die with the process, so no resume could ever succeed. Set \
+                 AURA_SESSION_STORE=file (or redis)"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Serve until SIGINT/SIGTERM, then drain in-flight streams and flush spans.
 pub async fn serve(args: ServerArgs) -> std::io::Result<()> {
     let result = run(args).await;
@@ -398,6 +434,8 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
     }
     info!("Session store backend: {}", session_store.backend());
 
+    refuse_park_on_memory_backend(&configs_arc, session_store.backend())?;
+
     // HITL webhook HMAC (AURA_HITL_WEBHOOK_SECRET*): fail startup loud on a
     // misconfiguration instead of silently serving unsigned, unverified
     // traffic. One load serves both legs: egress signing via AppState,
@@ -430,7 +468,7 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
     }
 
     let app_state = Arc::new(AppState {
-        configs: configs_arc,
+        configs: Arc::clone(&configs_arc),
         tool_result_mode: args.tool_result_mode,
         tool_result_max_length: args.tool_result_max_length,
         streaming_buffer_size: args.streaming_buffer_size,
@@ -458,6 +496,62 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
         args.host, args.port
     );
 
+    // Poll delivery: one reconciler per park-capable agent config, holding
+    // its own webhook client built from the same route config the per-request
+    // routes use, and the ingress registry's store. Each loop stops when the
+    // shutdown token cancels (phase 1).
+    //
+    // Boot guard: two park-capable configs whose agent settings produce the
+    // same effective instance id would each spawn a reconciler claiming
+    // the same pending rows in one process, breaking the single-writer
+    // posture the poller documents — refuse at boot, the same loud config
+    // error as the plaintext-http-with-secret refusal. In-process only: a
+    // cross-process same-id deployment (active/standby) must fence
+    // reconciler leadership externally.
+    //
+    // Cross-comment (see `PollReconciler::from_config`): the "can spawn a
+    // reconciler" predicate is `can_park`. This guard's duplicate-id scan
+    // sees exactly the configs the reconciler arms, so the two must move
+    // together.
+    let mut reconcilers = Vec::new();
+    let mut claims = Vec::new();
+    for config in configs_arc.iter() {
+        let Some(hitl) = &config.hitl else {
+            continue;
+        };
+        let instance_id = compute_instance_id(&config.agent).to_string();
+        let Some(reconciler) = aura::hitl::PollReconciler::from_config(
+            hitl,
+            ingress_hmac.as_ref(),
+            instance_id.clone(),
+            session_store.approvals(),
+            &app_state.pending_approvals,
+        ) else {
+            continue;
+        };
+        let label = config.agent.alias.as_deref().unwrap_or(&config.agent.name);
+        claims.push((label.to_string(), instance_id));
+        reconcilers.push(reconciler);
+    }
+    if let Some(((first, second), id)) = reconciler_id_conflicts(&claims) {
+        error!(
+            "poll-delivery conflict: agents '{first}' and '{second}' resolve to the same \
+             effective instance id {id}"
+        );
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "poll-delivery conflict: agents '{first}' and '{second}' resolve to the same \
+                 effective instance id {id}; two reconcilers in one process would claim the \
+                 same pending approvals. give each poll-mode agent a distinct instance_seed \
+                 (or a distinct name)"
+            ),
+        ));
+    }
+    for reconciler in reconcilers {
+        reconciler.spawn(&shutdown_token);
+    }
+
     let app = Router::new()
         .route("/health", get(handlers::health))
         .route("/aura/info", get(handlers::info))
@@ -467,9 +561,16 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
             "/v1/approvals/{decision_id}",
             post(handlers::resolve_approval),
         )
+        .route(
+            "/v1/sessions/{session_id}/runs/{run_id}",
+            post(handlers::resume_run),
+        )
         .layer(axum::extract::Extension(handlers::IngressHmac(
             ingress_hmac,
         )))
+        .layer(axum::extract::Extension(handlers::ResumeClaims(Arc::new(
+            aura::orchestration::ResumeClaimTable::new(),
+        ))))
         .layer(TraceLayer::new_for_http())
         .layer(middleware::from_fn_with_state(
             app_state.clone(),
@@ -582,6 +683,52 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
             shutdown_rx.await.ok();
         })
         .await
+}
+
+/// The reconciler boot guard's conflict scan: the first duplicate
+/// effective instance id among the configs that would spawn a reconciler,
+/// as `((first agent label, second agent label), shared id)`.
+fn reconciler_id_conflicts(claims: &[(String, String)]) -> Option<((String, String), String)> {
+    let mut seen = std::collections::HashMap::new();
+    for (label, id) in claims {
+        if let Some(first) = seen.insert(id, label) {
+            return Some(((first.clone(), label.clone()), id.clone()));
+        }
+    }
+    None
+}
+
+/// The scan sees only configs `PollReconciler::from_config` arms (the
+/// spawn loop claims no others), so a non-park-capable config sharing an id
+/// never reaches it; that gating is pinned by the poller's `can_park` key
+/// (cross-comment at `PollReconciler::from_config`).
+#[cfg(test)]
+mod reconciler_boot_guard_tests {
+    use super::reconciler_id_conflicts;
+
+    fn claim(label: &str, id: &str) -> (String, String) {
+        (label.to_string(), id.to_string())
+    }
+
+    #[test]
+    fn duplicate_id_reports_both_labels_and_the_id() {
+        let ((first, second), id) = reconciler_id_conflicts(&[
+            claim("alpha", "id-1"),
+            claim("beta", "id-2"),
+            claim("gamma", "id-1"),
+        ])
+        .expect("the shared id must conflict");
+        assert_eq!(first, "alpha");
+        assert_eq!(second, "gamma");
+        assert_eq!(id, "id-1");
+    }
+
+    #[test]
+    fn distinct_ids_do_not_conflict() {
+        assert!(
+            reconciler_id_conflicts(&[claim("alpha", "id-1"), claim("beta", "id-2")]).is_none()
+        );
+    }
 }
 
 #[cfg(test)]

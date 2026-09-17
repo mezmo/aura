@@ -83,6 +83,29 @@ pub use tools::wait_for::{StopReason, WaitForError, WaitForOutput, WaitForTool};
 pub use tools::{SubmitResultDecision, SubmitResultOutput, SubmitResultTool};
 
 pub(crate) use park::{CallKey, ParkGuard, RecordedDecisions, run_owner_id};
+// The park-owned execution lifetime: the shared run-reservation fence and
+// the scope detached park work registers under. `RunExecutionScope` rides
+// the public `ToolCallContext` field, and `ReservationFault` is the error
+// arm of the publicly reachable `ResumeClaimTable::reserve`, so all three
+// names are part of the crate's public surface.
+pub use park::lifetime::{ReservationFault, RunExecutionScope, RunReservationLease};
+// The resume endpoint's surfaces: consumed by aura-web-server's resume
+// handler (P45). Every type named in a re-exported signature is re-exported
+// with it, so the consumer can name what it receives.
+pub use park::resume::{
+    BlockingEntry, ConflictCode, Diagnostic, EmptyBlocking, EmptySegment, MalformedId,
+    NonEmptyBlocking, ParkedToolName, ResumeClaimTable, ResumeConflictRow, ResumeDocuments,
+    ResumeEvaluation, ResumeGrant, ResumeRefusal, ResumeRunId, ResumeSessionId, ResumeStreamEnd,
+    SegmentError, SegmentResult, SegmentTurns, ValidatedResumePath, evaluate_resume, run_segment,
+    run_segment_borrowed,
+};
+// The sentinel leak guard drives the commit and the resuming document
+// from the reconciler side of the crate.
+#[cfg(test)]
+pub(crate) use park::{
+    ParkCommitInputs, ParkedTaskRecord, ResumingDocumentHandle, RunStateForPark,
+    commit_from_run_state,
+};
 // The worker-model injection seam: `provider_agent.rs`'s cfg(test) variant
 // wraps the rig's scripted agent type.
 pub use prompt_constants::{context, fields, sections};

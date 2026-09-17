@@ -1,5 +1,5 @@
-//! The recorded-decisions set: decisions already recorded for a run's parked
-//! calls, consumed at most once each at the resume gate.
+//! The recorded-decisions set: the addressed outcomes already recorded for
+//! a run's parked calls, consumed at most once each at the resume gate.
 //!
 //! Vocabulary bounding line: the approval *request* is raised by the park arm;
 //! the *decision* recorded against it is what this set holds. "Ticket" is
@@ -11,9 +11,9 @@ use std::sync::{Arc, Mutex};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::hitl::ApprovalDecision;
+use crate::hitl::{AddressedApproval, ResolvedDecision};
 
-/// Decisions already recorded for this run's parked calls, consumed at most
+/// Outcomes already recorded for this run's parked calls, consumed at most
 /// once each. `strict_tasks` holds the task ids whose continuation is
 /// mid-invocation: a miss for one of those tasks is a resume fault, not a
 /// fresh park. Per task, because sibling continuations run concurrently in
@@ -24,27 +24,28 @@ use crate::hitl::ApprovalDecision;
 /// mismatch) clears the task's entry.
 #[derive(Debug, Default)]
 pub(crate) struct RecordedDecisions {
-    entries: Mutex<HashMap<CallKey, VecDeque<ApprovalDecision>>>,
+    entries: Mutex<HashMap<CallKey, VecDeque<AddressedApproval>>>,
     strict_tasks: Mutex<HashSet<usize>>,
 }
 
 impl RecordedDecisions {
-    /// Record a decision for a key, appending to that key's recorded-order
-    /// queue so two same-turn calls with identical arguments keep their own
-    /// decisions. Wired by the orchestrator continuation (P44 commit 3).
-    #[allow(dead_code)]
-    pub(crate) fn push(&self, key: CallKey, decision: ApprovalDecision) {
+    /// Record an addressed outcome — a decided approval with its captured
+    /// identity, or a durable per-call timeout — for a key, appending to
+    /// that key's recorded-order queue so two same-turn calls with
+    /// identical arguments keep their own outcomes. `Decided` preserves the
+    /// recorded decision identity; `TimedOut` rides independently, never
+    /// as a fabricated denial. Wired by the orchestrator continuation.
+    pub(crate) fn push(&self, key: CallKey, outcome: AddressedApproval) {
         self.entries
             .lock()
             .expect("recorded-decisions lock")
             .entry(key)
             .or_default()
-            .push_back(decision);
+            .push_back(outcome);
     }
 
     /// Mark a task's continuation as in-flight (`on = true`) or clear it. A
     /// miss for a strict task is a resume fault; a miss otherwise re-parks.
-    #[allow(dead_code)]
     pub(crate) fn set_strict(&self, task_id: usize, on: bool) {
         let mut strict = self.strict_tasks.lock().expect("recorded-decisions lock");
         if on {
@@ -63,9 +64,10 @@ impl RecordedDecisions {
             .contains(&task_id)
     }
 
-    /// Consume one decision for a key in recorded order; the next call returns
-    /// the following decision, and an empty queue returns `None`.
-    pub(crate) fn take(&self, key: &CallKey) -> Option<ApprovalDecision> {
+    /// Consume one addressed outcome for a key in recorded order; the next
+    /// call returns the following outcome, and an empty queue returns
+    /// `None`.
+    pub(crate) fn take(&self, key: &CallKey) -> Option<AddressedApproval> {
         self.entries
             .lock()
             .expect("recorded-decisions lock")
@@ -73,12 +75,67 @@ impl RecordedDecisions {
             .and_then(VecDeque::pop_front)
     }
 
+    /// The resume substitution's non-consuming, positional pre-flight
+    /// (fix-contract step 2): inspect the outcome the key's queue holds
+    /// at `position` — position 0 is the front a later
+    /// [`RecordedDecisions::take`] pops next — and leave the set
+    /// unchanged. Same-key duplicate calls (identical tool and
+    /// arguments, distinct call ids) share one queue; the calls in
+    /// document order pair with its entries front-to-back, so the i-th
+    /// same-key call pre-flights against position i. The identity rule
+    /// mirrors the gate's `recorded_pre_call`: an approval recorded
+    /// without identity blocks only when the route requires it
+    /// (`requires_identity`); a denial and a durable timeout never need
+    /// identity — a timeout is terminal for its call and feeds the exact
+    /// shared timeout feedback at consumption, so it pre-flights ready.
+    /// A [`PeekOutcome::Missing`] or [`PeekOutcome::IdentityBlocked`] is a
+    /// fatal `SegmentError` at the call site; the substitution prelude
+    /// in `drive_resume_segment` owns the fault mapping.
+    pub(crate) fn peek_at(
+        &self,
+        key: &CallKey,
+        position: usize,
+        requires_identity: bool,
+    ) -> PeekOutcome {
+        match self
+            .entries
+            .lock()
+            .expect("recorded-decisions lock")
+            .get(key)
+            .and_then(|queue| queue.get(position))
+        {
+            None => PeekOutcome::Missing,
+            Some(AddressedApproval::TimedOut { .. }) => PeekOutcome::Ready,
+            Some(AddressedApproval::Decided(ResolvedDecision::Denied { .. })) => PeekOutcome::Ready,
+            Some(AddressedApproval::Decided(ResolvedDecision::Approved { identity })) => {
+                if identity.is_none() && requires_identity {
+                    PeekOutcome::IdentityBlocked
+                } else {
+                    PeekOutcome::Ready
+                }
+            }
+        }
+    }
+
+    /// The key's queue depth: how many recorded decisions remain under
+    /// the key. The substitution prelude reads it around each
+    /// invocation; a drop of exactly one is that call's decision being
+    /// consumed, so the consumed set derives from the recorded set's
+    /// own before/after state (fix-contract step 6) — never from a
+    /// passed pre-flight.
+    pub(crate) fn depth(&self, key: &CallKey) -> usize {
+        self.entries
+            .lock()
+            .expect("recorded-decisions lock")
+            .get(key)
+            .map_or(0, VecDeque::len)
+    }
+
     /// Arm a drop guard that holds `task_id` strict until the guard is
     /// dropped, then clears it. Holds a clone of the `Arc` so the clear runs
     /// on every exit path (normal return, `?`-early-return, error, and panic
     /// unwind) regardless of the recorder's own lifetime. Wired by the
     /// orchestrator continuation (P44 commit 3).
-    #[allow(dead_code)]
     pub(crate) fn strict_guard(self: &Arc<Self>, task_id: usize) -> StrictGuard {
         self.set_strict(task_id, true);
         StrictGuard {
@@ -94,7 +151,7 @@ impl RecordedDecisions {
 /// and canonical; a test pins that. The separator byte (`0x00`) keeps the tool
 /// name and the arguments from aliasing across names that end where another
 /// begins.
-#[derive(Debug, Hash, PartialEq, Eq)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub(crate) struct CallKey {
     task_id: usize,
     tool_name: String,
@@ -122,7 +179,6 @@ impl CallKey {
 /// convert a model-issued re-park into a resume fault. Constructed via
 /// [`RecordedDecisions::strict_guard`]. Wired by the orchestrator
 /// continuation (P44 commit 3).
-#[allow(dead_code)]
 pub(crate) struct StrictGuard {
     recorded: Arc<RecordedDecisions>,
     task_id: usize,
@@ -134,14 +190,36 @@ impl Drop for StrictGuard {
     }
 }
 
+/// The pre-flight verdict [`RecordedDecisions::peek_at`] returns for
+/// one decided call at its key-position: whether the entry the
+/// resume's substitution would consume exists and is executable.
+/// Wired by the substitution prelude in `drive_resume_segment`.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PeekOutcome {
+    /// The front decision exists and may run: a denial, or an approval
+    /// whose recorded identity satisfies the route's demand.
+    Ready,
+    /// No decision is recorded under the key.
+    Missing,
+    /// The front decision is an approval recorded without identity while
+    /// the route requires it (record-then-block).
+    IdentityBlocked,
+}
+
 #[cfg(test)]
 mod tests {
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
     use super::*;
+    use crate::hitl::ApprovalDecision;
 
     fn key(task_id: usize, tool_name: &str, args: &Value) -> CallKey {
         CallKey::new(task_id, tool_name, args)
+    }
+
+    /// Wrap a recorded decision as the addressed outcome the queue carries.
+    fn decided(decision: ResolvedDecision) -> AddressedApproval {
+        AddressedApproval::Decided(decision)
     }
 
     /// Two same-key decisions consume in recorded order; a third take is
@@ -151,30 +229,257 @@ mod tests {
         let recorded = RecordedDecisions::default();
         let args = serde_json::json!({"namespace": "prod"});
 
-        recorded.push(key(1, "kubectl_apply", &args), ApprovalDecision::Approved);
         recorded.push(
             key(1, "kubectl_apply", &args),
-            ApprovalDecision::Denied {
-                reason: Some("too risky".to_string()),
-            },
+            decided(ApprovalDecision::Approved.into()),
+        );
+        recorded.push(
+            key(1, "kubectl_apply", &args),
+            decided(
+                ApprovalDecision::Denied {
+                    reason: Some("too risky".to_string()),
+                }
+                .into(),
+            ),
         );
 
         let probe = key(1, "kubectl_apply", &args);
         assert_eq!(
             recorded.take(&probe),
-            Some(ApprovalDecision::Approved),
+            Some(decided(ResolvedDecision::from(ApprovalDecision::Approved))),
             "first take returns the first recorded decision",
         );
         assert_eq!(
-            recorded
-                .take(&probe)
-                .map(|d| matches!(d, ApprovalDecision::Denied { .. })),
+            recorded.take(&probe).map(|outcome| matches!(
+                outcome,
+                AddressedApproval::Decided(ResolvedDecision::Denied { .. })
+            )),
             Some(true),
             "second take returns the second recorded decision, in order",
         );
         assert!(
             recorded.take(&probe).is_none(),
             "third take exhausts the queue"
+        );
+    }
+
+    /// A peek against an empty set misses — at any position.
+    #[test]
+    fn peek_at_missing_on_an_empty_set() {
+        let recorded = RecordedDecisions::default();
+        assert_eq!(
+            recorded.peek_at(
+                &key(1, "kubectl_apply", &serde_json::json!({"n": 1})),
+                0,
+                true
+            ),
+            PeekOutcome::Missing
+        );
+    }
+
+    /// An approval carrying its identity and a denial without one both
+    /// peek ready — the denial even under an identity-requiring route,
+    /// since a denial never executes and so never needs identity.
+    #[test]
+    fn peek_at_ready_for_an_approval_and_for_a_denial() {
+        let recorded = RecordedDecisions::default();
+        let args = serde_json::json!({"namespace": "prod"});
+        recorded.push(
+            key(1, "kubectl_apply", &args),
+            decided(ResolvedDecision::approved(Some(
+                crate::approver_headers::tests::captured_overrides("authorization", "tok"),
+            ))),
+        );
+        recorded.push(
+            key(2, "kubectl_delete", &args),
+            decided(
+                ApprovalDecision::Denied {
+                    reason: Some("too risky".to_string()),
+                }
+                .into(),
+            ),
+        );
+
+        assert_eq!(
+            recorded.peek_at(&key(1, "kubectl_apply", &args), 0, true),
+            PeekOutcome::Ready,
+            "an approval with identity is ready under an identity route",
+        );
+        assert_eq!(
+            recorded.peek_at(&key(2, "kubectl_delete", &args), 0, true),
+            PeekOutcome::Ready,
+            "a denial needs no identity even when the route requires it",
+        );
+    }
+
+    /// The identity rule keys off the route's demand: the same approval
+    /// recorded without identity blocks a requiring route and peeks ready
+    /// when the route demands none.
+    #[test]
+    fn peek_at_identity_rule_keys_off_route_demand() {
+        let recorded = RecordedDecisions::default();
+        let args = serde_json::json!({"namespace": "prod"});
+        recorded.push(
+            key(1, "kubectl_apply", &args),
+            decided(ApprovalDecision::Approved.into()),
+        );
+        let probe = key(1, "kubectl_apply", &args);
+
+        assert_eq!(
+            recorded.peek_at(&probe, 0, true),
+            PeekOutcome::IdentityBlocked,
+            "an identity-less approval blocks when the route requires it",
+        );
+        assert_eq!(
+            recorded.peek_at(&probe, 0, false),
+            PeekOutcome::Ready,
+            "the same approval is ready when the route demands no identity",
+        );
+    }
+
+    /// The peek reads the queue front — the decision a later `take` would
+    /// pop — and never consumes: with two decisions on one key the peek
+    /// reports on the first, and the subsequent take still returns it in
+    /// recorded order.
+    #[test]
+    fn peek_at_reads_the_front_and_does_not_consume() {
+        let recorded = RecordedDecisions::default();
+        let args = serde_json::json!({"namespace": "prod"});
+        recorded.push(
+            key(1, "kubectl_apply", &args),
+            decided(ApprovalDecision::Approved.into()),
+        );
+        recorded.push(
+            key(1, "kubectl_apply", &args),
+            decided(ApprovalDecision::Denied { reason: None }.into()),
+        );
+        let probe = key(1, "kubectl_apply", &args);
+
+        assert_eq!(
+            recorded.peek_at(&probe, 0, true),
+            PeekOutcome::IdentityBlocked,
+            "the peek reports on the first recorded decision, like take",
+        );
+        assert_eq!(
+            recorded.take(&probe),
+            Some(decided(ResolvedDecision::from(ApprovalDecision::Approved))),
+            "the peek did not consume: take still returns the front entry",
+        );
+        assert_eq!(
+            recorded.peek_at(&probe, 0, true),
+            PeekOutcome::Ready,
+            "the next peek reports on the second decision (a denial)",
+        );
+    }
+
+    /// Same-key duplicate calls pair with the queue front-to-back,
+    /// positionally: with an identity-less approval recorded first and a
+    /// denial second, position 0 sees the approval (blocked under an
+    /// identity route) while position 1 sees the denial (ready) — and
+    /// neither peek consumes, since a later take still returns the front
+    /// approval. A front-only peek would pass the second entry unseen.
+    #[test]
+    fn peek_at_pairs_same_key_positions_in_recorded_order() {
+        let recorded = RecordedDecisions::default();
+        let args = serde_json::json!({"namespace": "prod"});
+        recorded.push(
+            key(1, "kubectl_apply", &args),
+            decided(ApprovalDecision::Approved.into()),
+        );
+        recorded.push(
+            key(1, "kubectl_apply", &args),
+            decided(ApprovalDecision::Denied { reason: None }.into()),
+        );
+        let probe = key(1, "kubectl_apply", &args);
+
+        assert_eq!(
+            recorded.peek_at(&probe, 0, true),
+            PeekOutcome::IdentityBlocked,
+            "position 0 reports on the first recorded decision",
+        );
+        assert_eq!(
+            recorded.peek_at(&probe, 1, true),
+            PeekOutcome::Ready,
+            "position 1 reports on the second recorded decision (a denial, \
+             which never needs identity)",
+        );
+        assert_eq!(
+            recorded.take(&probe),
+            Some(decided(ResolvedDecision::from(ApprovalDecision::Approved))),
+            "neither positional peek consumed: take still returns the front entry",
+        );
+    }
+
+    /// A position past the key's depth is a miss even when earlier
+    /// positions pair: a queue holding one entry cannot pre-flight the
+    /// second same-key call ready.
+    #[test]
+    fn peek_at_beyond_the_queue_misses() {
+        let recorded = RecordedDecisions::default();
+        let args = serde_json::json!({"namespace": "prod"});
+        recorded.push(
+            key(1, "kubectl_apply", &args),
+            decided(ResolvedDecision::approved(Some(
+                crate::approver_headers::tests::captured_overrides("authorization", "tok"),
+            ))),
+        );
+        let probe = key(1, "kubectl_apply", &args);
+
+        assert_eq!(
+            recorded.peek_at(&probe, 0, true),
+            PeekOutcome::Ready,
+            "position 0 pairs with the single recorded entry",
+        );
+        assert_eq!(
+            recorded.peek_at(&probe, 1, true),
+            PeekOutcome::Missing,
+            "position 1 has no entry to pair with",
+        );
+        assert_eq!(
+            recorded.peek_at(&probe, 2, false),
+            PeekOutcome::Missing,
+            "every position past the depth misses, whatever the identity demand",
+        );
+    }
+
+    /// `depth` counts the key's remaining queue: it starts at the number
+    /// of recorded decisions, drops by one per `take`, and reads zero for
+    /// an exhausted or unknown key. The consumed derivation reads it
+    /// around each invocation and treats a drop of exactly one as the
+    /// call's own consumption.
+    #[test]
+    fn depth_tracks_consumption_per_key() {
+        let recorded = RecordedDecisions::default();
+        let args = serde_json::json!({"namespace": "prod"});
+        recorded.push(
+            key(1, "kubectl_apply", &args),
+            decided(ApprovalDecision::Approved.into()),
+        );
+        recorded.push(
+            key(1, "kubectl_apply", &args),
+            decided(ApprovalDecision::Denied { reason: None }.into()),
+        );
+        let probe = key(1, "kubectl_apply", &args);
+        let other = key(2, "kubectl_delete", &args);
+
+        assert_eq!(recorded.depth(&probe), 2, "both same-key decisions count");
+        assert_eq!(
+            recorded.depth(&other),
+            0,
+            "a key with no recorded decision has depth zero"
+        );
+        assert!(recorded.take(&probe).is_some());
+        assert_eq!(recorded.depth(&probe), 1, "one take drops the depth by one");
+        assert!(recorded.take(&probe).is_some());
+        assert_eq!(recorded.depth(&probe), 0, "the queue is exhausted");
+        assert!(
+            recorded.take(&probe).is_none(),
+            "a take past the depth consumes nothing"
+        );
+        assert_eq!(
+            recorded.depth(&probe),
+            0,
+            "a take past the depth leaves the depth unchanged"
         );
     }
 

@@ -18,12 +18,21 @@
 //! the record TTL and pruned best-effort on resolve/remove. The cancel sweep
 //! prunes per id, never the whole index key; `SWEEP_TAKE_SCRIPT` states what
 //! each id yields.
+//! `list_pending` SCANs the parked-record keys in batches (never KEYS),
+//! skipping decision and index keys by segment and wrong-typed or
+//! undecodable records per key; the native TTL is the primary expiry, with
+//! a post-decode filter as defense in depth.
 
 use std::sync::LazyLock;
 
 use async_trait::async_trait;
-use aura::hitl::{ApprovalDecision, DecisionId, ParkedApproval, ResolveError};
-use aura::session_store::{ApprovalStore, DecisionRecord, ParkedApprovalRecord, SessionStoreError};
+use aura::hitl::{
+    ApprovalAuthority, ApprovalRead, DecisionId, ParkedApproval, ResolveError, ResolvedDecision,
+};
+use aura::session_store::{
+    AcknowledgeOutcome, ApprovalStore, DecisionRecord, ParkedApprovalRecord, RetainedApproval,
+    SessionStoreError,
+};
 use redis::AsyncCommands;
 use redis::aio::ConnectionManager;
 
@@ -36,6 +45,25 @@ const MIN_TTL_SECS: u64 = 1;
 const REQ_INDEX_TTL_MARGIN_SECS: u64 = 60;
 /// Decision TTL margin over the parked record's remaining TTL.
 const DECISION_TTL_MARGIN_MS: u64 = 60_000;
+const SCAN_BATCH_SIZE: usize = 200;
+/// Type-guarded GET for the `list_pending` scan: a string key's value,
+/// integer 0 for a wrong-typed key (the caller warns and skips), nil for a
+/// key that expired or resolved between SCAN and here. A bare GET maps the
+/// server's WRONGTYPE to an extension error that would fail the whole scan.
+static TYPED_GET_SCRIPT: &str = r#"
+if redis.call('TYPE', KEYS[1]).ok == 'string' then
+    return redis.call('GET', KEYS[1])
+end
+if redis.call('EXISTS', KEYS[1]) == 1 then
+    return 0
+end
+return nil
+"#;
+/// Key prefixes under `{p}:approval:` that are not parked records: the
+/// recorded decisions and the `cancel_request` index sets. Matched against
+/// the key remainder after the `{p}:approval:` prefix is stripped.
+const DECISION_KEY_SEGMENT: &str = "decision:";
+const REQ_KEY_SEGMENT: &str = "req:";
 
 /// Sweep one approval key (KEYS[1]) out of its request index (KEYS[2]):
 /// a string key is GETDEL'd and its id SREM'd; a wrong-typed key returns 0
@@ -141,6 +169,14 @@ impl ApprovalStore for RedisApprovalStore {
         pipe.query_async::<()>(&mut conn).await.map_err(request_err)
     }
 
+    #[expect(unused_variables, reason = "fill layer consumes the id")]
+    async fn mark_acknowledged(
+        &self,
+        id: &DecisionId,
+    ) -> Result<AcknowledgeOutcome, SessionStoreError> {
+        todo!("conditional acknowledgment transition (fill layer)")
+    }
+
     async fn get(&self, id: &DecisionId) -> Result<Option<ParkedApproval>, SessionStoreError> {
         let mut conn = self.conn.clone();
         let payload: Option<String> = conn
@@ -153,12 +189,17 @@ impl ApprovalStore for RedisApprovalStore {
     async fn resolve(
         &self,
         id: &DecisionId,
-        decision: ApprovalDecision,
+        // The authority check joins the script's atomic arbitration with the
+        // E-family fills; the signature carries it now so no caller can bolt
+        // a validate-then-resolve race ahead of it.
+        _expected_authority: ApprovalAuthority,
+        decision: ResolvedDecision,
     ) -> Result<(), ResolveError> {
         // The script's atomic take is the at-most-once guarantee: exactly one
         // resolver gets the record; everyone else (and every later attempt)
-        // sees `NotFound`. The same step writes the decision record, so a
-        // consumed parked entry always leaves a recoverable decision.
+        // sees `NotFound`. The same step writes the decision record — the
+        // serialized record carries the decision AND any captured identity,
+        // so one atomic SET keeps the pair together under concurrency.
         let payload = serde_json::to_string(&DecisionRecord::from(&decision))
             .expect("decision record serializes to JSON");
         let mut conn = self.conn.clone();
@@ -180,7 +221,7 @@ impl ApprovalStore for RedisApprovalStore {
     async fn decision(
         &self,
         id: &DecisionId,
-    ) -> Result<Option<ApprovalDecision>, SessionStoreError> {
+    ) -> Result<Option<ResolvedDecision>, SessionStoreError> {
         let mut conn = self.conn.clone();
         let payload: Option<String> = conn
             .get(self.decision_key(&id.to_string()))
@@ -189,9 +230,13 @@ impl ApprovalStore for RedisApprovalStore {
         payload
             .map(|json| {
                 serde_json::from_str::<DecisionRecord>(&json)
-                    .map(ApprovalDecision::from)
                     .map_err(|e| SessionStoreError::Decode {
                         reason: e.to_string(),
+                    })
+                    .and_then(|record| {
+                        ResolvedDecision::try_from(record).map_err(|e| SessionStoreError::Decode {
+                            reason: e.to_string(),
+                        })
                     })
             })
             .transpose()
@@ -253,6 +298,112 @@ impl ApprovalStore for RedisApprovalStore {
             }
         }
         Ok(cleared)
+    }
+
+    async fn list_pending(&self) -> Result<Vec<ParkedApproval>, SessionStoreError> {
+        let mut conn = self.conn.clone();
+        let pattern = format!("{}:approval:*", self.key_prefix);
+
+        // SCAN in batches, never KEYS: a scan must not block the server.
+        // A mutating keyspace can hand a key back twice; dedupe before GET.
+        let mut cursor: u64 = 0;
+        let mut keys = std::collections::HashSet::new();
+        loop {
+            let (next, batch): (u64, Vec<String>) = redis::cmd("SCAN")
+                .cursor_arg(cursor)
+                .arg("MATCH")
+                .arg(&pattern)
+                .arg("COUNT")
+                .arg(SCAN_BATCH_SIZE)
+                .query_async(&mut conn)
+                .await
+                .map_err(request_err)?;
+            keys.extend(batch);
+            cursor = next;
+            if cursor == 0 {
+                break;
+            }
+        }
+
+        let now = chrono::Utc::now();
+        let mut pending = Vec::new();
+        for key in keys {
+            // Strip the configured prefix before the subspace test: a prefix
+            // containing ":decision:" or ":req:" must not exclude every key.
+            let Some(rest) = key.strip_prefix(format!("{}:approval:", self.key_prefix).as_str())
+            else {
+                continue;
+            };
+            if rest.starts_with(DECISION_KEY_SEGMENT) || rest.starts_with(REQ_KEY_SEGMENT) {
+                continue;
+            }
+            let value = redis::cmd("EVAL")
+                .arg(TYPED_GET_SCRIPT)
+                .arg(1)
+                .arg(&key)
+                .query_async::<redis::Value>(&mut conn)
+                .await
+                .map_err(request_err)?;
+            let json = match value {
+                // Expired or resolved between SCAN and GET: nothing to list.
+                redis::Value::Nil => continue,
+                redis::Value::Int(0) => {
+                    tracing::warn!(key = %key, "wrong-typed approval key skipped by list_pending");
+                    continue;
+                }
+                redis::Value::BulkString(bytes) => match String::from_utf8(bytes) {
+                    Ok(json) => json,
+                    Err(err) => {
+                        tracing::warn!(
+                            key = %key, error = %err,
+                            "non-UTF8 approval record skipped by list_pending"
+                        );
+                        continue;
+                    }
+                },
+                _ => {
+                    tracing::warn!(key = %key, "unexpected approval key value skipped by list_pending");
+                    continue;
+                }
+            };
+            let parked = match decode(&json) {
+                Ok(parked) => parked,
+                Err(err) => {
+                    tracing::warn!(
+                        key = %key, error = %err,
+                        "undecodable approval record skipped by list_pending"
+                    );
+                    continue;
+                }
+            };
+            // Native TTL is the primary expiry; the contract filter repeats
+            // here so a record inside its MIN_TTL_SECS floor past
+            // `expires_at` is never listed.
+            if parked.expires_at > now {
+                pending.push(parked);
+            }
+        }
+        Ok(pending)
+    }
+
+    #[expect(
+        unused_variables,
+        reason = "todo!() body; filled by P45 wave fill units"
+    )]
+    async fn read_or_expire(
+        &self,
+        id: &DecisionId,
+        expected_authority: ApprovalAuthority,
+    ) -> Result<ApprovalRead, SessionStoreError> {
+        todo!(
+            "P45 wave fill units: redis is an unsupported park backend; read_or_expire returns the typed unsupported-configuration error, never a faked outcome"
+        )
+    }
+
+    async fn retained_rows(&self) -> Result<Vec<RetainedApproval>, SessionStoreError> {
+        todo!(
+            "P45 wave fill units: redis is an unsupported park backend; the retained scan returns the typed unsupported-operation error"
+        )
     }
 }
 

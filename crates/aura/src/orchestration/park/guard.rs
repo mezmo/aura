@@ -6,23 +6,74 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::hitl::PendingApprovals;
 
 use super::commit::cancel_run_approvals;
+use super::lifetime::RunExecutionScope;
+
+/// The guard's sweep disposition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ParkGuardMode {
+    /// The initial producer: an unpublished drop sweeps the run's parked
+    /// tickets by owner id.
+    Initial,
+    /// A resumed segment: checkpoint-preserving — cancellation never sweeps
+    /// retained rows merely because the segment did not re-park. Retention
+    /// cleanup (E6/E8), not the guard, reclaims expired evidence.
+    Resumed,
+}
 
 /// Arms the unpublished-end sweep once the run has parked a call.
 pub(crate) struct ParkGuard {
     registry: PendingApprovals,
     run_id: String,
     request_id: String,
+    mode: ParkGuardMode,
+    /// The execution scope the guard's deferred work spawns through: a
+    /// clone of the run's ONE scope (the grant's for a resumed segment, the
+    /// initial producer's for a first run), so the guard's tails register
+    /// with the same tracker the supervisor drains before the fence
+    /// releases. `None` only on the unscoped initial constructor the L3
+    /// fill rewires.
+    #[expect(dead_code, reason = "read by the L3 fill's tracked-sweep wiring")]
+    execution_scope: Option<Arc<RunExecutionScope>>,
     published: AtomicBool,
     armed: AtomicBool,
 }
 
 impl ParkGuard {
-    /// Create the guard for a run; inert until the first [`Self::record`].
+    /// Create the guard for an initial producer's run; inert until the
+    /// first [`Self::record`].
     pub(crate) fn new(registry: PendingApprovals, run_id: String, request_id: String) -> Arc<Self> {
         Arc::new(Self {
             registry,
             run_id,
             request_id,
+            mode: ParkGuardMode::Initial,
+            execution_scope: None,
+            published: AtomicBool::new(false),
+            armed: AtomicBool::new(false),
+        })
+    }
+
+    /// Create the guard with its sweep disposition and its execution scope
+    /// TOGETHER — the L3 fill's injection seam. A resumed guard is always
+    /// checkpoint-preserving AND scoped: its deferred sweep and tracked
+    /// work spawn through the same [`RunExecutionScope`] the supervisor,
+    /// driver, and tool contexts hold (cloned from the grant's one scope),
+    /// so a guard tail can neither spawn unregistered nor outlive the
+    /// run's drain.
+    #[expect(dead_code, reason = "constructed by the L3 fill's scoped guard wiring")]
+    pub(crate) fn new_with_execution_scope(
+        registry: PendingApprovals,
+        run_id: String,
+        request_id: String,
+        mode: ParkGuardMode,
+        execution_scope: Arc<RunExecutionScope>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            registry,
+            run_id,
+            request_id,
+            mode,
+            execution_scope: Some(execution_scope),
             published: AtomicBool::new(false),
             armed: AtomicBool::new(false),
         })
@@ -43,6 +94,12 @@ impl ParkGuard {
 
 impl Drop for ParkGuard {
     fn drop(&mut self) {
+        // The resumed guard is checkpoint-preserving: whatever ends the
+        // segment, retained evidence survives for the next resume or the
+        // retention cleanup — only the initial producer sweeps.
+        if self.mode == ParkGuardMode::Resumed {
+            return;
+        }
         // An unpublished drop sweeps the run's parked tickets by owner id; a
         // process crash inside the commit is the one accepted window.
         if self.published.load(Ordering::Acquire) {
@@ -78,8 +135,8 @@ mod tests {
 
     use super::*;
     use crate::hitl::{
-        AgentScope, ApprovalItem, ApprovalOrigin, ApprovalRequest, DecisionId, PROTOCOL_VERSION,
-        ParkedApproval, PendingApprovals,
+        AgentScope, ApprovalAuthority, ApprovalItem, ApprovalOrigin, ApprovalRequest, DecisionId,
+        PROTOCOL_VERSION, ParkedApproval, PendingApprovals,
     };
     use crate::orchestration::{RunId, TaskIdentity, run_owner_id};
     use crate::session_store::{ApprovalStore, InMemoryApprovalStore, InMemoryEventBus};
@@ -125,6 +182,9 @@ mod tests {
             },
             registered_at: chrono::Utc::now(),
             expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+            authority: ApprovalAuthority::Conversational,
+            egress_headers: None,
+            acknowledgment: crate::hitl::AcknowledgmentState::RequiresNotification,
         }
     }
 

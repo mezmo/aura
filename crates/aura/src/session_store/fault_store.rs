@@ -4,8 +4,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 
-use super::{ApprovalStore, InMemoryApprovalStore, SessionStoreError};
-use crate::hitl::{ApprovalDecision, DecisionId, ParkedApproval, ResolveError};
+use super::{AcknowledgeOutcome, ApprovalStore, InMemoryApprovalStore, SessionStoreError};
+use crate::hitl::{
+    ApprovalAuthority, ApprovalRead, DecisionId, ParkedApproval, ResolveError, ResolvedDecision,
+};
 
 /// Delegates to an in-memory store; each `fail_*` flag makes that operation
 /// answer `SessionStoreError::Request` (the `*_once` flag fires one time).
@@ -43,6 +45,13 @@ impl ApprovalStore for FaultInjectingStore {
         self.inner.register(parked).await
     }
 
+    async fn mark_acknowledged(
+        &self,
+        id: &DecisionId,
+    ) -> Result<AcknowledgeOutcome, SessionStoreError> {
+        self.inner.mark_acknowledged(id).await
+    }
+
     async fn get(&self, id: &DecisionId) -> Result<Option<ParkedApproval>, SessionStoreError> {
         if self.fail_get_once.swap(false, Ordering::SeqCst) {
             return Err(SessionStoreError::Request {
@@ -55,15 +64,16 @@ impl ApprovalStore for FaultInjectingStore {
     async fn resolve(
         &self,
         id: &DecisionId,
-        decision: ApprovalDecision,
+        expected_authority: ApprovalAuthority,
+        decision: ResolvedDecision,
     ) -> Result<(), ResolveError> {
-        self.inner.resolve(id, decision).await
+        self.inner.resolve(id, expected_authority, decision).await
     }
 
     async fn decision(
         &self,
         id: &DecisionId,
-    ) -> Result<Option<ApprovalDecision>, SessionStoreError> {
+    ) -> Result<Option<ResolvedDecision>, SessionStoreError> {
         self.inner.decision(id).await
     }
 
@@ -76,5 +86,29 @@ impl ApprovalStore for FaultInjectingStore {
         request_id: &str,
     ) -> Result<Vec<ParkedApproval>, SessionStoreError> {
         self.inner.cancel_request(request_id).await
+    }
+
+    async fn list_pending(&self) -> Result<Vec<ParkedApproval>, SessionStoreError> {
+        self.inner.list_pending().await
+    }
+
+    #[expect(
+        unused_variables,
+        reason = "todo!() body; filled by P45 wave fill units"
+    )]
+    async fn read_or_expire(
+        &self,
+        id: &DecisionId,
+        expected_authority: ApprovalAuthority,
+    ) -> Result<ApprovalRead, SessionStoreError> {
+        todo!(
+            "P45 wave fill units E1/E2: the fault double delegates read-or-expire like every other operation"
+        )
+    }
+
+    async fn retained_rows(&self) -> Result<Vec<super::RetainedApproval>, SessionStoreError> {
+        todo!(
+            "P45 wave fill units E1/E2: the fault double delegates the retained scan like every other operation"
+        )
     }
 }

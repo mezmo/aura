@@ -136,6 +136,24 @@ pub struct AgentRuntimeConfig {
     /// `None` disables approval gating.
     pub hitl: Option<HitlRuntime>,
 
+    /// `[hitl.park].bind_identity`: stamp each parked checkpoint with the
+    /// identity header's hash and require it back at resume. Projected from
+    /// the parsed config; the default is off, which parks an unbound
+    /// checkpoint exactly as before.
+    pub park_bind_identity: bool,
+
+    /// The request's presented identity-header value, extracted when
+    /// [`Self::park_bind_identity`] is on; the park path hashes it into the
+    /// checkpoint. `None` outside an HTTP request context or when the header
+    /// is absent — a bound park then commits no hash, which the resume side
+    /// refuses (fail closed).
+    pub presented_identity: Option<String>,
+
+    /// The configured top-level `identity_header` name, projected from the
+    /// parsed config; part of the config fingerprint, so renaming the bound
+    /// header refuses a resume as `config_changed`.
+    pub identity_header: Option<String>,
+
     /// Request id (`req_…`) for this build, used to stamp HITL approval requests
     /// and route their SSE events. Threaded from the web server so the
     /// single-agent and orchestration paths share one value.
@@ -178,6 +196,9 @@ impl Clone for AgentRuntimeConfig {
             turn_nudge: self.turn_nudge.clone(),
             orchestration_submit_result: self.orchestration_submit_result.clone(),
             hitl: self.hitl.clone(),
+            park_bind_identity: self.park_bind_identity,
+            presented_identity: self.presented_identity.clone(),
+            identity_header: self.identity_header.clone(),
             request_id: self.request_id.clone(),
             instance_id: self.instance_id.clone(),
             hitl_request_approval_tool: self.hitl_request_approval_tool.clone(),
@@ -222,6 +243,15 @@ impl std::fmt::Debug for AgentRuntimeConfig {
                     .map(|_| "<submit_result>"),
             )
             .field("hitl", &self.hitl.as_ref().map(|_| "<hitl>"))
+            .field("park_bind_identity", &self.park_bind_identity)
+            .field("identity_header", &self.identity_header)
+            // The presented identity value is caller-attributable data; only
+            // its presence is debug-relevant, its content must not leak into
+            // logs.
+            .field(
+                "presented_identity",
+                &self.presented_identity.as_ref().map(|_| "<presented>"),
+            )
             .field("request_id", &self.request_id)
             .field("instance_id", &self.instance_id)
             .field(

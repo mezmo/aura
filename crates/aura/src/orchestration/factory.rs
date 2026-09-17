@@ -19,6 +19,8 @@ use crate::streaming::StreamingAgent;
 use super::orchestrator::{
     Orchestrator, STREAM_CHUNK_SIZE, spawn_cancellation_watcher, spawn_tool_event_forwarder,
 };
+use super::park::resume::{ResumeClaimTable, ResumeGrant};
+use std::sync::Arc;
 
 /// Zero-state wrapper that implements `StreamingAgent` for orchestration mode.
 ///
@@ -26,11 +28,60 @@ use super::orchestrator::{
 /// allocation and ensure MCP progress notifications route correctly.
 pub struct OrchestratorFactory {
     agent_config: AgentRuntimeConfig,
+    /// The shared run-reservation table a park-enabled deployment injects:
+    /// the initial producer reserves its persistence-bound run id through
+    /// this table immediately after orchestrator construction, and its
+    /// supervisor owns that reservation until shutdown. `None` on a factory
+    /// that never parks.
+    reservations: Option<Arc<ResumeClaimTable>>,
 }
 
 impl OrchestratorFactory {
     pub fn new(agent_config: AgentRuntimeConfig) -> Self {
-        Self { agent_config }
+        Self {
+            agent_config,
+            reservations: None,
+        }
+    }
+
+    /// Inject the shared reservation table (park-enabled deployments).
+    #[must_use]
+    pub fn with_reservation_table(mut self, table: Arc<ResumeClaimTable>) -> Self {
+        self.reservations = Some(table);
+        self
+    }
+
+    /// The shared reservation table, when this deployment's factories park.
+    #[must_use]
+    pub fn reservation_table(&self) -> Option<&Arc<ResumeClaimTable>> {
+        self.reservations.as_ref()
+    }
+
+    /// Resume one granted run into the normal orchestration stream:
+    /// consumes the grant (single-use, owned — this factory stays reusable
+    /// and never stores it) and returns the stream, cancellation sender, and
+    /// usage-state tuple the completion pipeline already consumes for chat.
+    ///
+    /// The spawned supervisor owns the grant's reservation lease for the
+    /// whole resumed execution: cancellation, MCP shutdown, forwarder drain,
+    /// and tracked-child joins complete before the fence releases.
+    #[expect(
+        unused_variables,
+        reason = "todo!() body; filled by P45 wave fill units"
+    )]
+    pub async fn resume_stream_with_timeout(
+        &self,
+        grant: ResumeGrant,
+        timeout: Duration,
+        request_id: &str,
+    ) -> (
+        BoxStream<'static, Result<StreamItem, StreamError>>,
+        watch::Sender<bool>,
+        crate::UsageState,
+    ) {
+        todo!(
+            "P45 wave fill unit S3: the factory supervisor that drives the granted run through the owned resume segment"
+        )
     }
 
     /// Spawn the background orchestration task and return its event stream.

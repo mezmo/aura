@@ -345,7 +345,11 @@ mod tests {
 
         // Approve so the spawned tool call completes.
         registry
-            .resolve(&decision_id, ApprovalDecision::Approved)
+            .resolve(
+                &decision_id,
+                crate::hitl::ApprovalAuthority::Conversational,
+                ApprovalDecision::Approved.into(),
+            )
             .await
             .expect("resolve");
 
@@ -502,7 +506,11 @@ mod tests {
                         other => panic!("expected Requested event, got {:?}", other),
                     };
                     registry
-                        .resolve(&id, ApprovalDecision::Approved)
+                        .resolve(
+                            &id,
+                            crate::hitl::ApprovalAuthority::Conversational,
+                            ApprovalDecision::Approved.into(),
+                        )
                         .await
                         .expect("parked approval resolves");
                     id

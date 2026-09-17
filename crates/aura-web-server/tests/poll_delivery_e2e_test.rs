@@ -1,0 +1,700 @@
+#![cfg(feature = "integration-hitl-header-forwarding")]
+
+//! End-to-end adaptive poll flow: ask (207) -> park -> poll -> durable
+//! resolve, over a real `aura-web-server` child, the real model, and an
+//! in-process mock governance receiver, on the actual `/v1/chat/completions`
+//! path.
+//!
+//! The armed gate asks FIRST with `response_type=poll`; the receiver answers
+//! 207 (human needed), which is the park trigger and the receiver's
+//! acknowledgment — the row is born notified, so the reconciler never
+//! re-POSTs it. The reconciler then polls the status GET until the receiver
+//! answers decided. No HMAC secret is configured — the rig runs unsigned; the
+//! signed legs are unit-proven in `hitl::route`.
+//!
+//! The flow is proven through durable resolve with the run still parked: the
+//! parked run ends with the orchestrator's parked message and no tool output,
+//! and the decision landing in the store (carrying the captured approver
+//! identity) is the terminal state asserted here. Re-execution belongs to
+//! the resume endpoint, which this rig does not start.
+//!
+//! The park arm requires an orchestration worker scope, so the rig config
+//! enables `[orchestration]` (a single-agent config would fail the gated call
+//! closed). The approval store is the file backend pointed at a per-test
+//! temp dir, which is what lets the restart test read the same rows from a
+//! rebooted server.
+//!
+//! # Run recipe
+//!
+//! `make test-integration-hitl-local` starts the shared `mock-mcp` fixture
+//! and runs the sibling header-forwarding suite followed by this one, both
+//! under the same feature flag; this suite needs no env beyond
+//! `OPENAI_API_KEY`. Direct invocation:
+//!
+//! ```sh
+//! cargo test -p aura-web-server --features integration-hitl-header-forwarding \
+//!     --test poll_delivery_e2e_test
+//! ```
+
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use serde_json::{Value, json};
+use tokio::io::AsyncWriteExt;
+use tokio::net::TcpListener;
+mod common;
+
+use common::{AuraServer, CHAT_TIMEOUT, ECHO_PROMPT, assistant_text, mcp_url, read_full_request};
+
+/// The post-decide resolve must land within ~two poll intervals of the
+/// receiver's decision — a reconciler that only resolves on tick N > 1
+/// fails this budget.
+const FIRST_TICK_BUDGET: Duration = Duration::from_secs(3);
+/// Wall-clock budget for one reconciler side effect (a run of status GETs,
+/// the durable resolve). `poll_interval_secs` is 1, so this tolerates ~20
+/// missed ticks before failing.
+const TICK_BUDGET: Duration = Duration::from_secs(20);
+
+/// The chat request header mapped onto the webhook egress; the receiver must
+/// see its value on the gate's decision-ask POST (the resolved request-scoped
+/// value, also persisted on the parked row).
+const EGRESS_NAME: &str = "x-tenant-egress";
+const EGRESS_VALUE: &str = "Bearer rig-egress-sentinel";
+/// The identity header the decided status GET carries, docked onto the
+/// decision record by `tool_headers_from_response`.
+const IDENTITY_NAME: &str = "x-approver-id";
+const IDENTITY_VALUE: &str = "approver-mike";
+
+// ---------------------------------------------------------------------------
+// A mock governance receiver: POST /authorize + GET /status on one port
+// ---------------------------------------------------------------------------
+
+/// The receiver's mutable state, shared across its connection tasks.
+struct ReceiverShared {
+    decided: bool,
+    /// Every request captured verbatim (request line, headers, body).
+    requests: Vec<String>,
+}
+
+/// An in-process governance receiver for the e2e rig: a TcpListener
+/// serving each connection on its own task, sharing the captured requests
+/// and the decided flip across tasks. The wire behavior of each answer is
+/// documented where it is served ([`serve_one`]).
+#[derive(Clone)]
+struct MockGovernanceReceiver {
+    base_url: String,
+    shared: Arc<Mutex<ReceiverShared>>,
+}
+
+impl MockGovernanceReceiver {
+    async fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock governance receiver");
+        let base_url = format!(
+            "http://{}",
+            listener.local_addr().expect("listener local addr")
+        );
+        let shared = Arc::new(Mutex::new(ReceiverShared {
+            decided: false,
+            requests: Vec::new(),
+        }));
+        let sink = Arc::clone(&shared);
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                // Serve each connection on its own task so one slow or
+                // half-dead client (a killed server mid-request) never
+                // head-of-line-blocks the reconciler's next attempt.
+                let sink = Arc::clone(&sink);
+                tokio::spawn(async move { serve_one(socket, sink).await });
+            }
+        });
+        Self { base_url, shared }
+    }
+
+    fn authorize_url(&self) -> String {
+        format!("{}/authorize", self.base_url)
+    }
+
+    fn status_url(&self) -> String {
+        format!("{}/status", self.base_url)
+    }
+
+    /// Flip the receiver to decided: status GETs start answering 200 with
+    /// the approver identity header.
+    fn set_decided(&self) {
+        self.shared.lock().expect("receiver state mutex").decided = true;
+    }
+
+    /// A snapshot of every captured request so far.
+    fn requests(&self) -> Vec<String> {
+        self.shared
+            .lock()
+            .expect("receiver state mutex")
+            .requests
+            .clone()
+    }
+}
+
+/// Read one request off `socket`, record it verbatim, and answer per the
+/// receiver's protocol: the decision-ask POST answers 207 (human needed —
+/// the park trigger and the receiver's acknowledgment, so the reconciler
+/// never re-POSTs), and the status GET answers 207 (pending) until the test
+/// flips `decided`, then 200 with the pinned `{approved: true}` body and the
+/// approver identity header. A peer that hangs up mid-request is dropped
+/// without recording a partial capture.
+async fn serve_one(mut socket: tokio::net::TcpStream, shared: Arc<Mutex<ReceiverShared>>) {
+    let Some(captured) = read_full_request(&mut socket).await else {
+        return;
+    };
+    let response = {
+        let mut state = shared.lock().expect("receiver state mutex");
+        state.requests.push(captured.clone());
+        build_receiver_response(&captured, state.decided)
+    };
+    socket.write_all(response.as_bytes()).await.ok();
+    socket.shutdown().await.ok();
+}
+
+/// The receiver's HTTP/1.1 answer: the decision-ask POST answers 207 (the
+/// park trigger; its body is never read); an undecided GET is a 207 pending;
+/// a decided GET carries the pinned `{approved: true}` body and the identity
+/// header.
+fn build_receiver_response(captured: &str, decided: bool) -> String {
+    let request_line = captured.lines().next().unwrap_or_default();
+    if request_line.starts_with("POST ") {
+        let body = json!({ "approved": false }).to_string();
+        return format!(
+            "HTTP/1.1 207 Multi-Status\r\ncontent-type: application/json\r\ncontent-length: \
+             {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+    }
+    if request_line.starts_with("GET ") && decided {
+        let body = json!({ "approved": true }).to_string();
+        return format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n{IDENTITY_NAME}: \
+             {IDENTITY_VALUE}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+    }
+    "HTTP/1.1 207 Multi-Status\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Generated config
+// ---------------------------------------------------------------------------
+
+/// Spawn a rig server: the rig config plus the store/instance env the
+/// reconciler identity depends on.
+async fn spawn_rig_server(
+    receiver: &MockGovernanceReceiver,
+    store_root: &std::path::Path,
+    instance_id: &str,
+) -> common::AuraServer {
+    let config_toml = rig_config_toml(&mcp_url(), &store_root.join("memory"), receiver);
+    AuraServer::start(
+        &config_toml,
+        "aura-poll-e2e-",
+        &[
+            ("AURA_INSTANCE_ID", instance_id.to_string()),
+            ("AURA_SESSION_STORE", "file".to_string()),
+            (
+                "AURA_SESSION_STORE_PATH",
+                store_root
+                    .to_str()
+                    .expect("store root is UTF-8")
+                    .to_string(),
+            ),
+        ],
+    )
+    .await
+}
+
+/// A minimal orchestrated single-worker rig: `memory_dir` (the park commit
+/// refuses to publish a checkpoint without it), orchestration on with direct
+/// answers off (the park arm needs a worker scope), and `[hitl]` gating
+/// `echo_headers` on the poll-mode webhook route. Byte-identical across the
+/// restart test's two boots, so the rebooted server resolves the same rows.
+fn rig_config_toml(mcp_url: &str, memory_dir: &Path, receiver: &MockGovernanceReceiver) -> String {
+    format!(
+        r#"
+memory_dir = "{memory_dir}"
+
+[mcp]
+sanitize_schemas = true
+
+[mcp.servers.mock_test_server]
+transport = "http_streamable"
+url = "{mcp_url}"
+description = "Mock MCP server for the poll-delivery e2e rig"
+
+[agent]
+name = "Poll Delivery E2E Assistant"
+alias = "poll-e2e-assistant"
+system_prompt = """
+You are a test assistant. Call tools immediately when requested, with no
+explanation, confirmation, or promise to call them later.
+
+If a tool call succeeds, reply with only its raw output - no commentary.
+
+If a tool call returns an error, reply with only the exact error message
+text - no apology, no extra commentary.
+
+AVAILABLE TOOLS (from mock_test_server):
+- echo_headers: Return HTTP headers as JSON (no params)
+"""
+turn_depth = 3
+
+[agent.llm]
+provider = "openai"
+api_key = "{{{{ env.OPENAI_API_KEY }}}}"
+model = "gpt-5.1"
+temperature = 0.0
+
+[orchestration]
+enabled = true
+allow_direct_answers = false
+
+[hitl]
+require_approval = ["echo_headers"]
+
+[hitl.park]
+enabled = true
+
+[hitl.route]
+mode = "webhook"
+url = "{authorize}"
+poll_url = "{status}"
+delivery = "poll"
+poll_interval_secs = 1
+poll_request_timeout_secs = 5
+headers_from_request = {{ "{EGRESS_NAME}" = "{EGRESS_NAME}" }}
+tool_headers_from_response = {{ "{IDENTITY_NAME}" = "{IDENTITY_NAME}" }}
+"#,
+        memory_dir = memory_dir.display(),
+        mcp_url = mcp_url,
+        authorize = receiver.authorize_url(),
+        status = receiver.status_url(),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Chat, store, and wait helpers
+// ---------------------------------------------------------------------------
+
+/// Drive one chat completion with the egress header attached — the request
+/// the gate's egress capture reads `x-tenant-egress` from.
+async fn send_chat(server: &AuraServer) -> Value {
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{}/v1/chat/completions", server.base_url()))
+        .header(EGRESS_NAME, EGRESS_VALUE)
+        .json(&json!({
+            "model": "poll-e2e-assistant",
+            "messages": [{"role": "user", "content": ECHO_PROMPT}],
+            "stream": false,
+            "metadata": {
+                "account_id": "test-account",
+                "chat_session_id": format!("poll-e2e-{}", uuid::Uuid::new_v4())
+            }
+        }))
+        .timeout(CHAT_TIMEOUT)
+        .send()
+        .await
+        .expect("chat completion request reaches the server");
+
+    assert_eq!(
+        response.status(),
+        200,
+        "expected 200 OK from /v1/chat/completions"
+    );
+    response.json().await.expect("response body is valid JSON")
+}
+
+/// `{root}/approvals` and `{root}/decisions`: the file backend's layout, read
+/// directly from the test so the store's durable state is proven on disk.
+fn store_json_files(store_root: &Path, subdir: &str) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(store_root.join(subdir)) else {
+        return Vec::new();
+    };
+    let mut files: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
+        .collect();
+    files.sort();
+    files
+}
+
+fn decision_files(store_root: &Path) -> Vec<PathBuf> {
+    store_json_files(store_root, "decisions")
+}
+
+fn approval_files(store_root: &Path) -> Vec<PathBuf> {
+    store_json_files(store_root, "approvals")
+}
+
+/// Poll until exactly one parked approval exists and return its decision id
+/// (the approval file's stem) plus the file's content.
+async fn wait_for_single_approval(store_root: &Path) -> (String, String) {
+    let deadline = tokio::time::Instant::now() + TICK_BUDGET;
+    loop {
+        let files = approval_files(store_root);
+        if let [only] = files.as_slice() {
+            let content = std::fs::read_to_string(only).expect("read approval file");
+            let id = only
+                .file_stem()
+                .expect("approval file has a stem")
+                .to_string_lossy()
+                .to_string();
+            return (id, content);
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "expected exactly one parked approval within {TICK_BUDGET:?}, found {} file(s): {:?}",
+            files.len(),
+            files
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Poll until a captured receiver request matching `matches` shows up; on
+/// timeout, dump everything captured so the failure is diagnosable.
+async fn wait_for_captured_request(
+    receiver: &MockGovernanceReceiver,
+    context: &str,
+    matches: impl Fn(&str) -> bool,
+) -> String {
+    let deadline = tokio::time::Instant::now() + TICK_BUDGET;
+    loop {
+        if let Some(captured) = receiver.requests().into_iter().find(|r| matches(r)) {
+            return captured;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{context} within {TICK_BUDGET:?}; captured requests so far:\n{}",
+            receiver.requests().join("\n---\n")
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Poll until at least `minimum` captured receiver requests match `matches`;
+/// on timeout, dump everything captured so the failure is diagnosable.
+async fn wait_for_request_count(
+    receiver: &MockGovernanceReceiver,
+    minimum: usize,
+    context: &str,
+    matches: impl Fn(&str) -> bool,
+) {
+    let deadline = tokio::time::Instant::now() + TICK_BUDGET;
+    loop {
+        let count = receiver
+            .requests()
+            .iter()
+            .filter(|captured| matches(captured))
+            .count();
+        if count >= minimum {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{context} within {TICK_BUDGET:?} (wanted {minimum}, saw {count}); captured \
+             requests so far:\n{}",
+            receiver.requests().join("\n---\n")
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Poll until the store holds exactly one decision file and return its
+/// content.
+async fn wait_for_decision_file(store_root: &Path) -> String {
+    wait_for_decision_file_within(store_root, TICK_BUDGET).await
+}
+
+/// [`wait_for_decision_file`] with a caller-owned budget, for asserts whose
+/// claim bounds the tick count (the reboot's first-tick resolve).
+async fn wait_for_decision_file_within(store_root: &Path, budget: Duration) -> String {
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        let files = decision_files(store_root);
+        if let [only] = files.as_slice() {
+            return std::fs::read_to_string(only).expect("read decision file");
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "expected exactly one durable decision within {budget:?}, found {} file(s): {:?}",
+            files.len(),
+            files
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// The rig runs unsigned by design; a secret in the environment would flip
+/// the poll legs into signed mode the mock receiver cannot satisfy.
+fn ensure_unsigned_mode() {
+    for var in [
+        "AURA_HITL_WEBHOOK_SECRET",
+        "AURA_HITL_WEBHOOK_SECRET_SECONDARY",
+    ] {
+        assert!(
+            std::env::var(var).is_err(),
+            "{var} must not be set: the rig's receiver is unsigned by design"
+        );
+    }
+}
+
+/// The park assertions both cases share: the parked run's terminal
+/// completion carries the orchestrator's parked message and no tool output;
+/// the approval row is at rest with its resolved egress value; the gate's
+/// decision-ask POST names the row's decision id and authenticates with its
+/// own egress value, and is the ONLY POST (the 207 is the receiver's ack, so
+/// the reconciler never re-POSTs). Returns the decision id of the parked
+/// approval.
+async fn park(receiver: &MockGovernanceReceiver, server: &AuraServer, store_root: &Path) -> String {
+    // The parked run's terminal completion: the orchestrator's parked
+    // message replaces any tool relay, so the gated call's output never
+    // reaches the client.
+    let response = send_chat(server).await;
+    let content = assistant_text(&response);
+    assert!(
+        content.contains("parked") && content.contains("awaiting human approval"),
+        "the parked run must end with the orchestrator's parked message, got: {content}"
+    );
+    assert!(
+        content.starts_with("Run ") && !content.contains('{'),
+        "the parked message is exclusive - no tool output may ride alongside it, got: {content}"
+    );
+    assert!(
+        !content.contains(EGRESS_VALUE),
+        "no request-scoped credential value may reach the client, got: {content}"
+    );
+
+    // The parked approval row is at rest in the store, carrying its
+    // request-scoped resolved egress value.
+    let (decision_id, approval_record) = wait_for_single_approval(store_root).await;
+    assert!(
+        approval_record.contains(EGRESS_VALUE),
+        "the parked approval record must persist the resolved egress value at \
+         rest, got: {approval_record}"
+    );
+    // The 207 is the receiver's acknowledgment, so the row is BORN
+    // acknowledged - asserted while still pending, before any resolution
+    // could rewrite the record.
+    assert!(
+        approval_record.contains("\"acknowledgment\":\"acknowledged\"")
+            || approval_record.contains("\"acknowledgment\": \"acknowledged\""),
+        "a 207-born row must persist the acknowledged state while pending, \
+         got: {approval_record}"
+    );
+
+    // The gate's decision-ask POST, authenticated with the resolved egress
+    // value and naming the parked decision id.
+    let ask = wait_for_captured_request(
+        receiver,
+        "the gate must ask the receiver for the decision",
+        |captured| captured.starts_with("POST /authorize"),
+    )
+    .await;
+    let wire_body = ask
+        .split("\r\n\r\n")
+        .nth(1)
+        .unwrap_or_else(|| panic!("the ask capture carries a body: {ask}"));
+    let wire: Value = serde_json::from_str(wire_body)
+        .unwrap_or_else(|err| panic!("the ask body is valid JSON: {err}; capture: {ask}"));
+    assert_eq!(
+        wire["decision_id"].as_str(),
+        Some(decision_id.as_str()),
+        "the ask names the parked approval's decision id: {ask}"
+    );
+    let egress_line = ask
+        .lines()
+        .find(|line| line.to_lowercase().starts_with(&format!("{EGRESS_NAME}:")))
+        .unwrap_or_else(|| panic!("the ask POST carries the row's egress header: {ask}"));
+    assert_eq!(
+        egress_line.split_once(':').expect("header line").1.trim(),
+        EGRESS_VALUE,
+        "the gate applies the resolved egress value: {ask}"
+    );
+
+    decision_id
+}
+
+// ---------------------------------------------------------------------------
+// Cases
+// ---------------------------------------------------------------------------
+
+/// The full adaptive poll flow with the run still parked: the armed gate
+/// asks FIRST (one POST, `response_type=poll`), the receiver answers 207
+/// (park trigger, born acknowledged), and the reconciler resolves via the
+/// pinned GET alone — 207 pending while undecided, then a decided 200 with
+/// the approver identity docked — while the run's completion stays the
+/// parked message. No second POST ever occurs.
+#[tokio::test]
+async fn poll_flow_parks_and_resolves_with_the_run_still_parked() {
+    ensure_unsigned_mode();
+    let store_dir = tempfile::tempdir().expect("temp store dir");
+    let store_root = store_dir.path().to_path_buf();
+    let receiver = MockGovernanceReceiver::start().await;
+    let server = spawn_rig_server(&receiver, &store_root, "poll-e2e-single").await;
+
+    let decision_id = park(&receiver, &server, &store_root).await;
+
+    // The 207 is the receiver's acknowledgment: the row is born notified, so
+    // no second POST may follow the gate's single decision ask.
+    let posts = receiver
+        .requests()
+        .iter()
+        .filter(|captured| captured.starts_with("POST "))
+        .count();
+    assert_eq!(posts, 1, "exactly one POST (the gate's decision ask)");
+
+    // While the receiver is undecided the pinned GET answers 207, so nothing
+    // resolves and the GETs keep coming. Two polls is past any single-tick
+    // misread.
+    wait_for_request_count(
+        &receiver,
+        2,
+        "status polls continue while the receiver is undecided",
+        |captured| captured.starts_with("GET /status"),
+    )
+    .await;
+    let status_get = receiver
+        .requests()
+        .into_iter()
+        .find(|captured| captured.starts_with("GET /status"))
+        .expect("at least one status poll was captured");
+    assert!(
+        status_get.contains(&format!("decision_id={decision_id}")),
+        "the status GET names the parked decision id: {status_get}"
+    );
+    assert!(
+        decision_files(&store_root).is_empty(),
+        "an undecided receiver must never resolve anything: {:?}",
+        decision_files(&store_root)
+    );
+    assert!(
+        !approval_files(&store_root).is_empty(),
+        "the approval row stays parked while undecided"
+    );
+
+    // The receiver decides; the reconciler's next poll resolves durably with
+    // the captured approver identity beside the decision, and the approval
+    // record carried into the resolved entry without its egress value.
+    receiver.set_decided();
+    let decision_record = wait_for_decision_file(&store_root).await;
+    assert!(
+        decision_record.contains(IDENTITY_VALUE),
+        "the decision record docks the poll-200's approver identity, got: {decision_record}"
+    );
+    assert!(
+        !decision_record.contains(EGRESS_VALUE),
+        "the egress value outlived resolve, got: {decision_record}"
+    );
+
+    // No re-POST may appear at any point in the flow: the count is
+    // re-taken after the pending-poll interval AND after resolution, so
+    // a reconciler that re-POSTs while pending cannot pass.
+    let posts_after = receiver
+        .requests()
+        .iter()
+        .filter(|captured| captured.starts_with("POST "))
+        .count();
+    assert_eq!(
+        posts_after, 1,
+        "still exactly one POST after the pending polls and the resolution"
+    );
+
+    server.stop().await;
+}
+
+/// Restart: park (one decision-ask POST, 207), kill the server, reboot onto
+/// the same store while the receiver is STILL pending — the rebooted server
+/// polls the pinned 207 status without re-posting (the row's persisted
+/// acknowledged state survives the reboot) — then the receiver decides and
+/// the next poll resolves durably, docking the approver identity.
+#[tokio::test]
+async fn restart_resolves_the_parked_approval_on_a_rebooted_server() {
+    ensure_unsigned_mode();
+    let store_dir = tempfile::tempdir().expect("temp store dir");
+    let store_root = store_dir.path().to_path_buf();
+    let receiver = MockGovernanceReceiver::start().await;
+    let instance_id = "poll-e2e-restart";
+
+    let first_boot = spawn_rig_server(&receiver, &store_root, instance_id).await;
+    park(&receiver, &first_boot, &store_root).await;
+    let posts_before_kill = receiver
+        .requests()
+        .iter()
+        .filter(|captured| captured.starts_with("POST "))
+        .count();
+    assert_eq!(
+        posts_before_kill, 1,
+        "exactly one POST before the kill (the gate's decision ask; the 207 \
+         acknowledgment short-circuits any re-POST)"
+    );
+
+    // Kill: process death with the ticket parked in the file store. No
+    // teardown runs, so nothing may sweep the approval row.
+    first_boot.stop().await;
+    assert!(
+        !approval_files(&store_root).is_empty(),
+        "the parked approval row must survive the process death"
+    );
+
+    // Reboot onto the SAME store and config while the receiver is STILL
+    // PENDING: the rebooted reconciler's polls must read the pinned 207
+    // status, and the persisted acknowledged state - not the reboot - is
+    // what keeps the row from being re-POSTed.
+    let gets_before_reboot = receiver
+        .requests()
+        .iter()
+        .filter(|captured| captured.starts_with("GET /status"))
+        .count();
+    let second_boot = spawn_rig_server(&receiver, &store_root, instance_id).await;
+    wait_for_request_count(
+        &receiver,
+        gets_before_reboot + 1,
+        "the rebooted reconciler polls the pinned status while pending",
+        |captured| captured.starts_with("GET /status"),
+    )
+    .await;
+    let posts_pending = receiver
+        .requests()
+        .iter()
+        .filter(|captured| captured.starts_with("POST "))
+        .count();
+    assert_eq!(
+        posts_pending, 1,
+        "no re-POST across the reboot while the row is still pending"
+    );
+
+    // The decision lands; the next poll resolves - a born-acknowledged row
+    // never re-posts its request, so no duplicate POST occurs.
+    receiver.set_decided();
+    let decision_record = wait_for_decision_file_within(&store_root, FIRST_TICK_BUDGET).await;
+    assert!(
+        decision_record.contains(IDENTITY_VALUE),
+        "the rebooted server's resolve docks the approver identity, got: {decision_record}"
+    );
+
+    let posts = receiver
+        .requests()
+        .iter()
+        .filter(|captured| captured.starts_with("POST "))
+        .count();
+    assert_eq!(
+        posts,
+        1,
+        "only the pre-kill decision ask may exist; the reboot reads the decided \
+         status first and never re-posts the request; captured requests:\n{}",
+        receiver.requests().join("\n---\n")
+    );
+
+    second_boot.stop().await;
+}

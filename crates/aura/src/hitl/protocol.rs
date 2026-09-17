@@ -77,6 +77,13 @@ impl From<ApprovalDecisionWire> for ApprovalDecision {
     }
 }
 
+/// Wire form of one status-poll answer: the `{ "approved": bool, "reason": ... }`
+/// shape shared with the POST. Pending is status-code-carried (207), never a
+/// body field; unknown fields are rejected. A type alias for
+/// [`ApprovalDecisionWire`] — the pinned GET contract is the authorize shape,
+/// so the poll leg reuses the one wire type and its conversion.
+pub(crate) type PollDecisionWire = ApprovalDecisionWire;
+
 /// The webhook request projected to its wire form: the flat, rename-stable JSON
 /// AURA POSTs to an approval webhook (Route A).
 ///

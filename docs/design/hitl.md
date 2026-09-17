@@ -30,7 +30,20 @@ of `POST /v1/approvals/{id}`.
 
 ### Route A: webhook (unattended)
 
-One synchronous HTTP round-trip. The decision comes back in the response body.
+Adaptive since the 2026-09-13 receiver contract (P56; governance 4.7.0
+with PRs #76 and #78): every authorize POST carries an explicit
+`response_type`. A hold ask sends `sync` and blocks up to
+`timeout_secs`; a 207 on a hold ask is a protocol violation and fails
+closed without recording a denial. A park-armed ask sends `poll`: an
+instant 200 is a machine decision applied in-request (no park
+document, no reconciler tick); a 207 means a human is needed and parks
+the call through the 207 bridge - the parked row mints its request id
+from the run owner so request-teardown sweeps cannot cancel it, is
+born acknowledged (the 207 is the receiver's acknowledgment; the
+reconciler never re-POSTs it), and its expiry anchors at gate entry.
+The reconciler then polls the pinned GET contract: 200
+`{approved, reason}` decided, 207 pending, 404 unknown; pending is
+carried by the status code alone and never trusted from a body.
 
 ```mermaid
 sequenceDiagram
@@ -39,9 +52,19 @@ sequenceDiagram
     participant W as webhook svc
     C->>S: POST /v1/chat/completions
     Note over S: agent loop hits gate
-    S->>W: POST approval request
-    W-->>S: {"approved": true} (one round-trip, blocks <= timeout_secs)
-    Note over S: tool executes / denied
+    S->>W: POST approval request ?response_type=poll (park-armed)
+    alt machine decision
+        W-->>S: 200 {"approved": true}
+        Note over S: applied in-request, no park document
+    else human needed
+        W-->>S: 207
+        Note over S: 207 bridge parks (run-owner id, born acknowledged)
+        loop until decided or expiry (anchored at gate entry)
+            S->>W: GET authorize status
+            W-->>S: 207 pending / 404 unknown
+        end
+        W-->>S: 200 {"approved": false, "reason": ...}
+    end
     S-->>C: SSE approval_requested ... approval_completed ... tool result
 ```
 
@@ -220,12 +243,36 @@ pub struct ParkedApproval {
                                              //   origin, items -- the full payload
     pub registered_at: Timestamp,
     pub expires_at: Timestamp,
+    pub egress_headers: Option<HeaderMap>,   // poll delivery: resolved webhook headers
+                                             //   captured at request-scoped route
+                                             //   construction; the reconciler's notify
+                                             //   authenticates with the row's own values
+    pub acknowledgment: AcknowledgmentState, // durable notification state: a row born
+                                             //   from a 207 is Acknowledged (the 207 is
+                                             //   the receiver's ack) and is never
+                                             //   re-POSTed, across restarts; a row from
+                                             //   fresh registration RequiresNotification
+                                             //   until the reconciler's notify acks and
+                                             //   marks it via the store's conditional
+                                             //   transition
 }
 
 impl PendingApprovals {
-    pub fn register(&self, request: ApprovalRequest, timeout: Duration) -> AwaitingDecision;
-    pub fn resolve(&self, id: &DecisionId, d: ApprovalDecision) -> Result<(), ResolveError>;
-    pub fn cancel_request(&self, request_id: &RequestId);
+    pub async fn register(&self, request: ApprovalRequest, timeout: Duration) -> AwaitingDecision;
+    pub async fn register_durable(&self, parked: ParkedApproval) -> Result<(), SessionStoreError>;
+    pub async fn resolve(&self, id: &DecisionId, d: ResolvedDecision) -> Result<(), ResolveError>;
+    pub async fn recorded_decision(&self, id: &DecisionId) -> Option<ResolvedDecision>;
+    pub async fn cancel_request(&self, request_id: &str) -> Vec<ParkedApproval>;
+}
+
+// decision.rs -- the identity-preserving resolve carrier: decision and
+// captured approver identity move as one unit through resolve, the store
+// read-back, and RecordedDecisions. Identity exists only on an approval, so
+// the pairing is the enum, not two parallel Options. The decision bus
+// publishes only `carrier.decision()` -- never identity.
+pub enum ResolvedDecision {
+    Approved { identity: Option<ApproverHeaders> },
+    Denied { reason: Option<String> },
 }
 
 // route.rs -- closed two-variant enum. The spike's ApprovalDispatch trait is
@@ -246,6 +293,71 @@ durable version slots in behind the same type.
 `ApprovalRequest.request_id` is the global request id (the one used for SSE
 routing and MCP cancellation). The spike's two per-call `Uuid::new_v4()` sites
 (`crates/aura/src/hitl.rs:402`, `:534` on `52f37e6`) are deleted.
+
+## Storage records: egress at rest and identity docking
+
+Poll delivery parks approvals durably, so two credential surfaces outlive the
+request that captured them. Both records are additive-serde: a row or decision
+stored before the field existed decodes with `None` - absence means
+uncaptured, never fabricated - and both records implement **manual `Debug`
+that prints header NAMES only**, never values (the `ApproverHeaders`
+precedent; `PollOutcome`'s raw response headers carry the same redaction).
+
+### Parked approval record: egress headers at rest
+
+`ParkedApprovalRecord.egress_headers: Option<BTreeMap<String, String>>`
+(lowercased outbound name → value). The resolved `headers_from_request`
+overlay is captured at **request-scoped runtime construction** - where the
+route is built per request (`webhook_utils::resolve_headers`; the park arm
+never sees the client request) - and copied onto the row **before
+`register_durable`**. The reconciler applies the row's own headers to each
+notify POST as a per-name overlay on the shared client's operator headers:
+per-row override, not client state, so two rows authenticate with their own
+credentials on every retry and after a store reopen.
+
+At rest, the file backend creates rows, decision envelopes, and parked
+documents owner-only (0600 files in 0700 directories). `resolve` writes the
+decision envelope without the row's egress headers, `list_pending` unlinks
+expired undecided rows, and a resume removes the envelopes it consumed. Redis
+rows carry a TTL of the remaining decision window instead.
+
+Registration-closed semantics: when a mapped destination resolves to no
+usable value (request header absent, no explicit valid static fallback), the
+park arm closes the gated call as failed at route construction. No approval
+row exists afterwards, so nothing reaches the client or the receiver.
+Notify is egress auth with no later reify checkpoint, so an undeliverable
+registration must not exist. The exception: an explicitly configured **valid
+static fallback** keeps the existing resolution semantics and parks with the
+static value. This is `webhook_utils::check_egress_capture`'s verdict, stored
+on the route at construction and consulted by the park arm.
+
+### Decision record: identity in the same resolve
+
+`DecisionRecord.identity: Option<BTreeMap<String, String>>`, present only on
+approvals. Identity is captured off the poll-200's `tool_headers_from_response`
+mappings by the same `ApproverHeaders::from_captured` the sync gate uses, and
+persists **in the SAME resolve** as the decision: the record is one JSON
+document, and the redis backend's atomic Lua script writes it in one SET, so
+concurrent resolvers can never split the pair. The decision bus publishes only
+the credential-free `ApprovalDecision`; the wake, the events, and every log
+line see no identity.
+
+Capture failure at the poll-200 is NOT a channel error: the decision records
+without identity (a warn names the missing headers). At re-execution the
+resume gate maps the recorded carrier onto the same apply point as the sync
+gate - `PreCallOutcome::Proceed { overrides }` - and **blocks the approved
+call closed** when the route's mapping demands identity and the recorded
+approval carries none. That asymmetry is deliberate: a decision is human
+intent worth keeping; an unauthenticated egress registration is not.
+
+### Carrier
+
+`ResolvedDecision` (`hitl::decision`) is the storage/domain carrier every
+decision-bearing API moves as a unit: `ApprovalStore::resolve`/`decision`,
+`PendingApprovals::resolve`/`recorded_decision`, and `RecordedDecisions`.
+`ApprovalDecision` alone survives only where identity has no meaning, namely
+the bus payload and the conversational wake, as well as the outcomes
+projected into events.
 
 ## Where cross-request state lives
 
@@ -387,9 +499,15 @@ ApprovalCompleted { decision_id, outcome, duration_ms, scope }   // outcome incl
                                                                  // timeout/cancelled
 ```
 
-`aura.approval_pending` emits only on the conversational route. It is the
-attended prompt: `decision_id` is the resolution handle, `expires_at` lets a
-client render a countdown. The webhook route keeps the requested/completed pair.
+`aura.approval_pending` — the attended SSE prompt — emits only on the
+conversational route: `decision_id` is the resolution handle, and `expires_at`
+lets a client render a countdown. The webhook route never emits that attended
+prompt. Its client-visible bookends stay approval_requested/approval_completed
+(an instant-200 machine decision is exactly that pair, with no park). A 207
+park instead emits the internal park-lifecycle transitions, pending included,
+exactly like any durable park — a lifecycle state distinct from the attended
+SSE event; client-visible completion fires when the reconciler resolves the
+row.
 
 ```text
 POST /v1/approvals/{decision_id}

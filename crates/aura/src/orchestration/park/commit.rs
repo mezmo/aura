@@ -17,6 +17,7 @@ use super::ParkedTaskRecords;
 use super::document::{
     PARKED_DOCUMENT_SUFFIX, ParkedRun, RESUMING_DOCUMENT_SUFFIX, RunStateForPark, build_document,
 };
+use super::retention::RetentionExpiresAt;
 
 /// The inputs the orchestrator hands the park commit.
 pub(crate) struct ParkCommitInputs<'a> {
@@ -27,11 +28,28 @@ pub(crate) struct ParkCommitInputs<'a> {
     pub memory_dir: &'a str,
     pub config: &'a AgentRuntimeConfig,
     /// Decision window stamped on a document with no surviving ticket.
+    /// Interim bridge input: E5's publication-transaction stamp replaces it.
     pub decision_window: std::time::Duration,
+    /// The validated retention age (`[hitl.park].park_ttl`), projected from
+    /// the runtime HITL config. The E5 stamp computes
+    /// `retention_expires_at` from the publication timestamp plus this age
+    /// — one timestamp source for the persisted deadline and the terminal
+    /// event.
+    #[expect(
+        dead_code,
+        reason = "read by the E5 publication-transaction stamp that replaces the interim bridge"
+    )]
+    pub park_ttl: aura_config::ParkTtl,
+    /// Hex sha256 of the bound identity header's value, stamped into the
+    /// document the resume side compares against; `None` when identity
+    /// binding is not configured. A re-park passes the checkpoint's stored
+    /// value through so the binding survives the segment.
+    pub identity_hash: Option<String>,
 }
 
-/// The refreshed awaiting set: per-task pending calls still awaiting a
-/// decision, and the earliest expiry among them.
+/// The refreshed awaiting set: per-task pending calls still parked —
+/// including calls decided since the gate hit, retained for the resume
+/// consult — and the earliest expiry among the undecided tickets.
 pub(crate) struct RefreshedAwaiting {
     pub pending_by_task: HashMap<usize, Vec<PendingCall>>,
     pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -39,11 +57,11 @@ pub(crate) struct RefreshedAwaiting {
     pub decision_ids: Vec<DecisionId>,
 }
 
-/// A completed park commit: the resolved expiry stamp and the refreshed
+/// A completed park commit: the stamped retention deadline and the refreshed
 /// awaiting set.
 pub(crate) struct ParkCommitOutcome {
-    /// RFC 3339 expiry timestamp.
-    pub expires_at: String,
+    /// The retention deadline the published document carries.
+    pub retention_expires_at: RetentionExpiresAt,
     pub refreshed: RefreshedAwaiting,
 }
 
@@ -53,10 +71,13 @@ pub(crate) fn run_owner_id(run_id: &str) -> String {
     format!("run:{run_id}")
 }
 
-/// Narrow the plan's awaiting tasks to the calls still parked and undecided,
-/// with the earliest surviving ticket expiry. A store fault fails the
-/// refresh, and with it the commit, rather than dropping a still-decidable
-/// approval from the checkpoint.
+/// Narrow the plan's awaiting tasks to the calls still parked, with the
+/// earliest surviving ticket expiry. A call decided between gate-hit and
+/// commit stays in the checkpoint — the resume consult consumes its
+/// recorded decision — but its settled ticket contributes neither expiry
+/// nor an outstanding id. A store fault fails the refresh, and with it the
+/// commit, rather than dropping a still-decidable approval from the
+/// checkpoint.
 pub(crate) async fn refresh_awaiting(
     plan: &Plan,
     registry: &PendingApprovals,
@@ -91,8 +112,9 @@ pub(crate) async fn refresh_awaiting(
                 tracing::info!(
                     decision_id = %call.decision_id,
                     task_id = task.id,
-                    "park approval decided before commit; dropping from checkpoint",
+                    "park approval decided before commit; retaining for the resume consult",
                 );
+                surviving.push(call.clone());
                 continue;
             }
             expires_at = Some(match expires_at {
@@ -115,9 +137,9 @@ pub(crate) async fn refresh_awaiting(
 }
 
 /// The whole commit: refresh the awaiting set against the store, build the
-/// document, publish it. `expires_at` is resolved once here so the document
-/// and the caller's terminal event carry the same stamp; a refresh with no
-/// surviving ticket stamps `now + decision_window`.
+/// document, publish it. The retention deadline is resolved once here so the
+/// document and the caller's terminal event carry the same stamp; a refresh
+/// with no surviving ticket stamps `now + decision_window`.
 pub(crate) async fn commit_from_run_state(
     inputs: &ParkCommitInputs<'_>,
 ) -> io::Result<ParkCommitOutcome> {
@@ -129,28 +151,31 @@ pub(crate) async fn commit_from_run_state(
         memory_dir,
         config,
         decision_window,
+        // Consumed by the E5 stamp (`from_publication`); the interim bridge
+        // below still derives the deadline from the surviving tickets.
+        park_ttl: _,
+        identity_hash,
     } = inputs;
 
     let refreshed = refresh_awaiting(plan, registry).await?;
-    let expires_at = refreshed
-        .expires_at
-        .unwrap_or_else(|| {
+    let retention_expires_at =
+        RetentionExpiresAt::from_datetime(refreshed.expires_at.unwrap_or_else(|| {
             chrono::Utc::now()
                 + chrono::Duration::from_std(*decision_window).expect("decision window fits chrono")
-        })
-        .to_rfc3339();
+        }));
     let document = build_document(
         state,
         plan,
         records,
         &refreshed.pending_by_task,
-        expires_at.clone(),
+        retention_expires_at,
         config_fingerprint(config),
+        identity_hash.clone(),
     )?;
     let parked_dir = parked_document_dir(memory_dir, state.session_id);
     publish(&document, &parked_dir, state.run_id).await?;
     Ok(ParkCommitOutcome {
-        expires_at,
+        retention_expires_at,
         refreshed,
     })
 }
@@ -183,10 +208,10 @@ pub(crate) async fn publish(
     let parked_dir = parked_dir.to_path_buf();
     let run_id = run_id.to_string();
     tokio::task::spawn_blocking(move || {
-        std::fs::create_dir_all(&parked_dir)?;
+        crate::session_store::private_dir(&parked_dir)?;
 
         let tmp = parked_dir.join(format!(".{run_id}.tmp"));
-        std::fs::write(&tmp, &bytes)?;
+        crate::session_store::write_private(&tmp, &bytes)?;
         let dest = parked_dir.join(format!("{run_id}{PARKED_DOCUMENT_SUFFIX}"));
         std::fs::rename(&tmp, &dest)?;
 
@@ -251,7 +276,15 @@ pub(crate) fn parked_document_dir(memory_dir: &str, session_id: Option<&str>) ->
 
 /// Fingerprint the configuration a resume must not drift from: the HITL
 /// gating surface (globs, route, park flag), the agent's model and tool
-/// filter, and the per-worker model and tool configuration.
+/// filter, the per-worker model and tool configuration, and the bound
+/// identity header's NAME.
+///
+/// The webhook route's projection carries the two delivery markers —
+/// `decide_live` and `park`, the same sources `park_registry` and the
+/// reconciler spawn read. Poll tuning (poll_url, interval, per-attempt
+/// timeout) is deliberately fingerprint-COMPATIBLE, and no credential value
+/// (headers, secrets) enters the projection; resume-side enforcement is a
+/// one-way bump on change.
 pub(crate) fn config_fingerprint(config: &AgentRuntimeConfig) -> String {
     let hitl = config.hitl.as_ref();
     let route = hitl.map(|h| match &*h.route {
@@ -259,9 +292,13 @@ pub(crate) fn config_fingerprint(config: &AgentRuntimeConfig) -> String {
             "kind": "conversational",
             "timeout_secs": timeout.as_secs(),
         }),
-        crate::hitl::DecisionRoute::Webhook { timeout, .. } => json!({
+        crate::hitl::DecisionRoute::Webhook {
+            client, timeout, ..
+        } => json!({
             "kind": "webhook",
             "timeout_secs": timeout.as_secs(),
+            "decide_live": client.can_decide_live(),
+            "park": client.can_park(),
         }),
     });
     let source = json!({
@@ -277,6 +314,7 @@ pub(crate) fn config_fingerprint(config: &AgentRuntimeConfig) -> String {
             "llm": serde_json::to_value(&config.llm).ok(),
             "mcp_filter": &config.agent.mcp_filter,
         },
+        "identity_header": &config.identity_header,
         "workers": config
             .orchestration
             .as_ref()
@@ -293,12 +331,21 @@ mod tests {
 
     use super::*;
     use crate::hitl::{
-        AgentScope, ApprovalItem, ApprovalOrigin, ApprovalRequest, DecisionId, PROTOCOL_VERSION,
-        ParkedApproval, PendingApprovals, ResolveError,
+        AgentScope, ApprovalAuthority, ApprovalItem, ApprovalOrigin, ApprovalRequest, DecisionId,
+        PROTOCOL_VERSION, ParkedApproval, PendingApprovals, ResolveError,
     };
     use crate::orchestration::park::document::{ParkedPlan, SCHEMA_VERSION, load_parked_run};
+    use crate::orchestration::park::retention::RetentionExpiresAt;
     use crate::orchestration::types::Task;
     use crate::session_store::{ApprovalStore, InMemoryApprovalStore, InMemoryEventBus};
+
+    fn fixture_retention() -> RetentionExpiresAt {
+        RetentionExpiresAt::from_datetime(
+            chrono::DateTime::parse_from_rfc3339("2026-09-02T15:00:00+00:00")
+                .expect("fixture stamp parses")
+                .with_timezone(&chrono::Utc),
+        )
+    }
 
     fn conv_registry() -> (PendingApprovals, std::sync::Arc<InMemoryApprovalStore>) {
         let store = std::sync::Arc::new(InMemoryApprovalStore::new());
@@ -333,6 +380,9 @@ mod tests {
             },
             registered_at: chrono::Utc::now(),
             expires_at,
+            authority: ApprovalAuthority::Conversational,
+            egress_headers: None,
+            acknowledgment: crate::hitl::AcknowledgmentState::RequiresNotification,
         }
     }
 
@@ -353,7 +403,7 @@ mod tests {
             session_id: Some("sess".to_string()),
             run_id: run_id.to_string(),
             parked_at: "2026-09-02T14:00:00+00:00".to_string(),
-            expires_at: "2026-09-02T15:00:00+00:00".to_string(),
+            retention_expires_at: fixture_retention(),
             query: "Deploy".to_string(),
             chat_history: vec![],
             coordinator_conversation: vec![],
@@ -368,6 +418,7 @@ mod tests {
             },
             executed: vec![],
             config_fingerprint: "f".to_string(),
+            identity_hash: None,
         };
 
         let dest = publish(&document, &parked_dir, run_id).await.unwrap();
@@ -390,10 +441,15 @@ mod tests {
 
         let reloaded = load_parked_run(&dest).await.unwrap();
         assert_eq!(reloaded.run_id, run_id);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "the checkpoint is owner-only");
+        }
     }
 
-    /// A read-only parked directory fails the temp write, publishes nothing,
-    /// and leaves no partial document.
+    /// An obstructed temp-file path fails the write and publishes nothing.
     #[tokio::test]
     async fn failing_temp_write_publishes_nothing() {
         let dir = tempfile::tempdir().unwrap();
@@ -405,7 +461,7 @@ mod tests {
             session_id: None,
             run_id: run_id.to_string(),
             parked_at: "2026-09-02T14:00:00+00:00".to_string(),
-            expires_at: "2026-09-02T15:00:00+00:00".to_string(),
+            retention_expires_at: fixture_retention(),
             query: "Deploy".to_string(),
             chat_history: vec![],
             coordinator_conversation: vec![],
@@ -420,26 +476,12 @@ mod tests {
             },
             executed: vec![],
             config_fingerprint: "f".to_string(),
+            identity_hash: None,
         };
 
-        let mut perms = tokio::fs::metadata(&parked_dir)
-            .await
-            .unwrap()
-            .permissions();
-        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o555);
-        tokio::fs::set_permissions(&parked_dir, perms)
-            .await
-            .unwrap();
+        let tmp = parked_dir.join(format!(".{run_id}.tmp"));
+        tokio::fs::create_dir(&tmp).await.unwrap();
         let result = publish(&document, &parked_dir, run_id).await;
-        // Restore writability so the tempdir can clean itself up.
-        let mut perms = tokio::fs::metadata(&parked_dir)
-            .await
-            .unwrap()
-            .permissions();
-        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
-        tokio::fs::set_permissions(&parked_dir, perms)
-            .await
-            .unwrap();
 
         assert!(result.is_err(), "the temp write must fail");
         assert!(
@@ -449,10 +491,14 @@ mod tests {
                 .unwrap(),
             "no document is published on a failed temp write"
         );
+        assert!(tmp.is_dir(), "the obstruction is left in place");
     }
 
-    /// Refresh drops decided and removed approvals, keeps the undecided
-    /// ones, and reports the earliest surviving expiry.
+    /// Refresh drops approvals the store no longer holds, keeps the
+    /// undecided ones, and reports the earliest surviving expiry. The memory
+    /// backend's resolve moves the row, so a decided call reads as removed
+    /// here; the file-backed retention case is
+    /// [`early_decision_is_retained_and_consumed_at_resume`].
     #[tokio::test]
     async fn refresh_drops_decided_and_takes_earliest_expiry() {
         let (registry, _store) = conv_registry();
@@ -496,7 +542,11 @@ mod tests {
             .await
             .unwrap();
         registry
-            .resolve(&decided, crate::hitl::ApprovalDecision::Approved)
+            .resolve(
+                &decided,
+                ApprovalAuthority::Conversational,
+                crate::hitl::ApprovalDecision::Approved.into(),
+            )
             .await
             .unwrap();
         registry.remove(&removed).await;
@@ -544,6 +594,142 @@ mod tests {
         );
     }
 
+    /// A decision landing between gate-hit and
+    /// park commit is retained by the refresh and consumed by the resume
+    /// consult. Park mode's file backend keeps the approval readable after
+    /// resolve, which is what both sides key on.
+    #[tokio::test]
+    async fn early_decision_is_retained_and_consumed_at_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn ApprovalStore> = Arc::new(
+            crate::session_store::FileApprovalStore::open(dir.path().join("approvals")).unwrap(),
+        );
+        let registry = PendingApprovals::with_backend(store, Arc::new(InMemoryEventBus::new()));
+
+        let run_id = "0191e8c0-cccc-7000-8000-000000000009";
+        let owner = run_owner_id(run_id);
+        let decided = DecisionId::generate();
+        let args = serde_json::json!({ "namespace": "prod" });
+        let now = chrono::Utc::now();
+        registry
+            .register_durable(ParkedApproval {
+                request: ApprovalRequest {
+                    version: PROTOCOL_VERSION,
+                    instance_id: "test-instance".to_string(),
+                    decision_id: decided,
+                    request_id: owner,
+                    scope: AgentScope::Worker {
+                        run_id: run_id.parse().unwrap(),
+                        task: crate::orchestration::TaskIdentity::new(3, None),
+                        session_id: None,
+                    },
+                    origin: ApprovalOrigin::ConfigGate {
+                        matched_pattern: "kubectl_*".to_string(),
+                        agent_name: "test-agent".to_string(),
+                    },
+                    items: vec![ApprovalItem {
+                        tool_name: "kubectl_apply".to_string(),
+                        arguments: args.clone(),
+                        tool_call_intent: None,
+                    }],
+                },
+                registered_at: now,
+                expires_at: now + chrono::Duration::hours(1),
+                authority: ApprovalAuthority::Conversational,
+                egress_headers: None,
+                acknowledgment: crate::hitl::AcknowledgmentState::RequiresNotification,
+            })
+            .await
+            .unwrap();
+        // The decision wins the race against the park commit.
+        registry
+            .resolve(
+                &decided,
+                ApprovalAuthority::Conversational,
+                crate::hitl::ApprovalDecision::Approved.into(),
+            )
+            .await
+            .unwrap();
+
+        let mut plan = Plan::new("Deploy");
+        plan.add_task(Task::new(3, "Gated apply", "r"));
+        plan.tasks[0].state = TaskState::AwaitingApproval {
+            pending: vec![PendingCall {
+                decision_id: decided,
+                tool_name: "kubectl_apply".to_string(),
+                arguments: args.clone(),
+                call_id: "c1".to_string(),
+            }],
+        };
+
+        let refreshed = refresh_awaiting(&plan, &registry).await.unwrap();
+        assert_eq!(
+            refreshed.pending_by_task[&3].len(),
+            1,
+            "the decided call stays in the checkpoint"
+        );
+        assert!(
+            refreshed.decision_ids.is_empty(),
+            "a decided call is no longer outstanding"
+        );
+        assert!(
+            refreshed.expires_at.is_none(),
+            "a settled ticket bounds nothing"
+        );
+
+        // The resume consult consumes the retained call's recorded decision.
+        let mut records = ParkedTaskRecords::new();
+        records.insert(
+            3,
+            crate::orchestration::park::ParkedTaskRecord {
+                attempt: 1,
+                snapshot: crate::orchestration::ParkSnapshot {
+                    history: vec![rig::completion::Message::user("apply it")],
+                    current_prompt: rig::completion::Message::user("tool results"),
+                },
+            },
+        );
+        let document = build_document(
+            &RunStateForPark {
+                run_id,
+                session_id: None,
+                query: "Deploy",
+                chat_history: &[],
+                coordinator_conversation: &[],
+                routing_decision: None,
+                iteration: 1,
+                planning_ms: 0,
+                failure_history: &[],
+            },
+            &plan,
+            &records,
+            &refreshed.pending_by_task,
+            RetentionExpiresAt::from_datetime(chrono::Utc::now() + chrono::Duration::hours(1)),
+            config_fingerprint(&AgentRuntimeConfig::default()),
+            None,
+        )
+        .unwrap();
+        let (recorded, ids) = crate::orchestration::park::load_recorded_decisions(
+            &registry,
+            &document,
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ids, vec![decided]);
+        assert_eq!(
+            recorded.take(&crate::orchestration::CallKey::new(
+                3,
+                "kubectl_apply",
+                &args
+            )),
+            Some(crate::hitl::AddressedApproval::Decided(
+                crate::hitl::ResolvedDecision::from(crate::hitl::ApprovalDecision::Approved)
+            )),
+            "the early decision is consumed at resume",
+        );
+    }
+
     /// The sweep cancels exactly what the store still holds: the undecided
     /// sibling clears with one event, while the decided sibling — whose
     /// ticket resolve already removed — is absent from the cleared set and
@@ -576,7 +762,11 @@ mod tests {
             .await
             .unwrap();
         registry
-            .resolve(&decided, crate::hitl::ApprovalDecision::Approved)
+            .resolve(
+                &decided,
+                ApprovalAuthority::Conversational,
+                crate::hitl::ApprovalDecision::Approved.into(),
+            )
             .await
             .unwrap();
 
@@ -590,8 +780,9 @@ mod tests {
         );
         assert_eq!(
             registry.recorded_decision(&decided).await,
-            Some(crate::hitl::ApprovalDecision::Approved),
-            "the recorded decision survives the sweep"
+            Some(crate::hitl::ResolvedDecision::from(
+                crate::hitl::ApprovalDecision::Approved
+            )),
         );
 
         match tokio::time::timeout(Duration::from_secs(1), events.recv()).await {
@@ -696,7 +887,11 @@ mod tests {
 
         assert_eq!(
             registry
-                .resolve(&ticket, crate::hitl::ApprovalDecision::Approved)
+                .resolve(
+                    &ticket,
+                    ApprovalAuthority::Conversational,
+                    crate::hitl::ApprovalDecision::Approved.into()
+                )
                 .await,
             Err(ResolveError::NotFound),
         );
@@ -717,6 +912,7 @@ mod tests {
                         timeout: Duration::from_secs(120),
                     }),
                     park_enabled: true,
+                    park_ttl: aura_config::ParkTtl::default(),
                 }),
                 ..crate::config::AgentRuntimeConfig::default()
             }
@@ -731,6 +927,127 @@ mod tests {
             config_fingerprint(&config("kubectl_*")),
             config_fingerprint(&config("helm_*")),
             "a changed gate surface changes the hash"
+        );
+    }
+
+    /// Webhook routes: the fingerprint carries `"delivery"` from the client's
+    /// poll marker, so poll and sync differ, an unchanged webhook config is
+    /// stable, and poll TUNING (poll_url, interval, per-attempt timeout)
+    /// stays compatible. Credentials (static headers, mapped-header values)
+    /// never enter the projection.
+    #[test]
+    fn config_fingerprint_carries_delivery_and_stays_tuning_compatible() {
+        use aura_config::{
+            DecisionRouteConfig, GlobPattern, ToolHeaderMappings, WebhookDelivery, WebhookUrl,
+        };
+        use std::collections::HashMap;
+
+        fn config_with_route(
+            route: DecisionRouteConfig,
+            patterns: &str,
+        ) -> crate::config::AgentRuntimeConfig {
+            crate::config::AgentRuntimeConfig {
+                hitl: Some(crate::hitl::HitlRuntime {
+                    patterns: Arc::from([GlobPattern::new(patterns).unwrap()]),
+                    route: Arc::new(match &route {
+                        DecisionRouteConfig::Conversational { .. } => {
+                            crate::hitl::DecisionRoute::Conversational {
+                                registry: PendingApprovals::new(),
+                                timeout: Duration::from_secs(120),
+                            }
+                        }
+                        DecisionRouteConfig::Webhook { .. } => {
+                            let client =
+                                crate::hitl::webhook_client_from_config(&route, None, None, false)
+                                    .expect("a webhook route config builds a client");
+                            crate::hitl::DecisionRoute::Webhook {
+                                client,
+                                registry: PendingApprovals::new(),
+                                timeout: Duration::from_secs(300),
+                                egress_capture: Ok(()),
+                            }
+                        }
+                    }),
+                    park_enabled: true,
+                    park_ttl: aura_config::ParkTtl::default(),
+                }),
+                ..crate::config::AgentRuntimeConfig::default()
+            }
+        }
+
+        fn webhook_route(
+            delivery: WebhookDelivery,
+            poll_url: Option<&str>,
+            poll_interval_secs: u64,
+            poll_request_timeout_secs: u64,
+            headers: HashMap<String, String>,
+        ) -> DecisionRouteConfig {
+            DecisionRouteConfig::Webhook {
+                url: WebhookUrl::new("https://approvals.example.com/hook").unwrap(),
+                timeout_secs: 300,
+                headers,
+                headers_from_request: HashMap::new(),
+                tool_headers_from_response: ToolHeaderMappings::default(),
+                delivery,
+                poll_url: poll_url.map(|u| WebhookUrl::new(u).unwrap()),
+                poll_interval_secs,
+                poll_request_timeout_secs,
+                receiver_wait_timeout_secs: 900,
+            }
+        }
+
+        let sync = webhook_route(WebhookDelivery::Sync, None, 10, 30, HashMap::new());
+        let poll = webhook_route(WebhookDelivery::Poll, None, 10, 30, HashMap::new());
+
+        assert_eq!(
+            config_fingerprint(&config_with_route(poll.clone(), "kubectl_*")),
+            config_fingerprint(&config_with_route(poll.clone(), "kubectl_*")),
+            "an unchanged webhook config is a stable hash"
+        );
+        assert_ne!(
+            config_fingerprint(&config_with_route(sync.clone(), "kubectl_*")),
+            config_fingerprint(&config_with_route(poll.clone(), "kubectl_*")),
+            "poll and sync deliveries must fingerprint differently"
+        );
+
+        // Poll tuning is fingerprint-compatible: a redeploy that only moves
+        // the status endpoint or retunes cadence/timeouts resumes.
+        let retuned = webhook_route(
+            WebhookDelivery::Poll,
+            Some("https://status.example.com/x"),
+            45,
+            7,
+            HashMap::new(),
+        );
+        assert_eq!(
+            config_fingerprint(&config_with_route(poll.clone(), "kubectl_*")),
+            config_fingerprint(&config_with_route(retuned, "kubectl_*")),
+            "poll tuning must not change the fingerprint"
+        );
+
+        // The gate surface still moves the hash on a webhook route.
+        assert_ne!(
+            config_fingerprint(&config_with_route(poll.clone(), "kubectl_*")),
+            config_fingerprint(&config_with_route(poll, "helm_*")),
+            "a changed gate surface changes the hash"
+        );
+
+        // Credential values are excluded: a route whose static headers carry
+        // a secret fingerprints the same as one with none.
+        let with_secret = webhook_route(
+            WebhookDelivery::Sync,
+            None,
+            10,
+            30,
+            HashMap::from([(
+                "authorization".to_string(),
+                "Bearer credential-value".to_string(),
+            )]),
+        );
+        assert_eq!(
+            config_fingerprint(&config_with_route(sync, "kubectl_*")),
+            config_fingerprint(&config_with_route(with_secret, "kubectl_*")),
+            "credential values must not enter the fingerprint"
         );
     }
 }

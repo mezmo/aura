@@ -121,7 +121,6 @@ impl ScriptedTurn {
     }
 
     /// Attach text alongside this turn's tool calls.
-    #[allow(dead_code)] // reserved: text+tool-call turn scripts, not yet consumed
     pub(crate) fn with_text(mut self, text: impl Into<String>) -> Self {
         self.text = Some(text.into());
         self
@@ -152,8 +151,10 @@ impl ScriptedToolCall {
         }
     }
 
-    /// Set the provider-side `call_id` (what the park gate records on a
-    /// pending call and what the continuation's sentinel replacement keys on).
+    /// Set the provider-side `call_id` (the id that rides the streamed
+    /// tool-call wire). The park gate records the rig `ToolCall.id` on a
+    /// pending call (`take_current_call_id` stashes the rig id), and that
+    /// recorded id is what the continuation's sentinel replacement keys on.
     pub(crate) fn with_call_id(mut self, call_id: impl Into<String>) -> Self {
         self.call_id = Some(call_id.into());
         self
@@ -319,8 +320,9 @@ pub(crate) struct WorkerOverride {
 static WORKER_OVERRIDES: OnceLock<Mutex<VecDeque<WorkerOverride>>> = OnceLock::new();
 
 /// Queue worker-model overrides. FIFO: the *n*-th worker build after this
-/// call consumes the *n*-th override. Tests that use the seam must serialize
-/// against each other — the queue is process-global.
+/// call consumes the *n*-th override. Tests that use the seam must hold
+/// [`WORKER_OVERRIDE_SERIAL`] for the duration of the test — the queue is
+/// process-global.
 pub(crate) fn install_worker_overrides(overrides: Vec<WorkerOverride>) {
     let queue = WORKER_OVERRIDES.get_or_init(|| Mutex::new(VecDeque::new()));
     queue
@@ -329,11 +331,49 @@ pub(crate) fn install_worker_overrides(overrides: Vec<WorkerOverride>) {
         .extend(overrides);
 }
 
+/// One lock every worker-override consumer holds for the duration of its
+/// test: the queue is process-global, so parallel consumers would pop each
+/// other's scripted models.
+pub(crate) static WORKER_OVERRIDE_SERIAL: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
+
 /// Pop the next override, if one is queued. Consumed by the orchestrator's
 /// cfg(test) prelude in `build_worker_provider_agent`.
 pub(crate) fn take_worker_override() -> Option<WorkerOverride> {
     let queue = WORKER_OVERRIDES.get_or_init(|| Mutex::new(VecDeque::new()));
     queue.lock().expect("worker-override lock").pop_front()
+}
+
+/// One queued coordinator-model override: the scripted model the next
+/// `create_coordinator` build builds the coordinator from. The
+/// coordinator's toolset (routing, recon, read_artifact) is its own — an
+/// override carries the model only, unlike a worker override's extra
+/// tools.
+pub(crate) struct CoordinatorOverride {
+    pub(crate) model: ScriptedCompletionModel,
+}
+
+/// Take-once coordinator-override queue, mirroring the worker queue: a
+/// test installs one override per coordinator build it will drive.
+static COORDINATOR_OVERRIDES: OnceLock<Mutex<VecDeque<CoordinatorOverride>>> = OnceLock::new();
+
+/// Queue coordinator-model overrides. FIFO: the *n*-th `create_coordinator`
+/// build after this call consumes the *n*-th override. Consumers hold
+/// [`WORKER_OVERRIDE_SERIAL`] for the duration of the test — both queues
+/// are process-global.
+pub(crate) fn install_coordinator_overrides(overrides: Vec<CoordinatorOverride>) {
+    let queue = COORDINATOR_OVERRIDES.get_or_init(|| Mutex::new(VecDeque::new()));
+    queue
+        .lock()
+        .expect("coordinator-override lock")
+        .extend(overrides);
+}
+
+/// Pop the next coordinator override, if one is queued. Consumed by the
+/// orchestrator's cfg(test) prelude in `create_coordinator`.
+pub(crate) fn take_coordinator_override() -> Option<CoordinatorOverride> {
+    let queue = COORDINATOR_OVERRIDES.get_or_init(|| Mutex::new(VecDeque::new()));
+    queue.lock().expect("coordinator-override lock").pop_front()
 }
 
 /// Adapter presenting a boxed dynamic tool as a concrete [`rig::tool::Tool`]
@@ -485,6 +525,12 @@ impl rig::tool::Tool for RecordingTool {
     type Error = std::convert::Infallible;
     type Args = FreeformArgs;
     type Output = String;
+
+    // The registered name, so `with_name` renames the tool everywhere rig
+    // resolves it — the toolset key, not just the streamed definition.
+    fn name(&self) -> String {
+        self.registered_name.clone()
+    }
 
     async fn definition(&self, _prompt: String) -> rig::completion::ToolDefinition {
         rig::completion::ToolDefinition {
@@ -734,6 +780,7 @@ pub(crate) async fn park_orchestrator_in(
                 timeout: Duration::from_secs(3600),
             }),
             park_enabled: true,
+            park_ttl: aura_config::ParkTtl::default(),
         }),
         memory_dir: Some(memory_dir.to_string_lossy().into_owned()),
         session_id: Some("park-sess".to_string()),

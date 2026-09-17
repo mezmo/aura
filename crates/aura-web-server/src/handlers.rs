@@ -8,11 +8,12 @@ use aura::{
 use aura_events::{AgentInfo, ServerInfo};
 use axum::Json;
 use axum::body::Body;
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use chrono::Utc;
+use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
@@ -25,6 +26,11 @@ use crate::streaming::{
     TurnContext, collect_stream_to_completion, process_sse_stream_full,
 };
 use crate::types::*;
+use aura::orchestration::{
+    BlockingEntry, OrchestratorFactory, ResumeClaimTable, ResumeEvaluation, ResumeGrant,
+    ResumeRefusal, ResumeRunId, ResumeSessionId, SegmentError, SegmentResult, ValidatedResumePath,
+    evaluate_resume, run_segment,
+};
 
 /// RAII guard for request-scoped subscriptions. Ensures cleanup even on panic.
 struct RequestResourceGuard {
@@ -213,12 +219,43 @@ async fn build_agent_for_request(
     Ok(Arc::new(agent))
 }
 
+/// The single-use completion input one request owns: a fresh chat, or the
+/// resume of one granted run. Deliberately not cloneable — a resume grant is
+/// consumed exactly once, and an input that could be duplicated would make
+/// the single-use rule a runtime check instead of a type fact.
+///
+/// The factory in the `Resume` arm stays reusable and never stores the
+/// grant; ownership runs request → input → the spawned completion.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "one input per request, moved once into the spawned completion; \
+              the grant dominates but boxing it would churn the fill-time \
+              consumers for no runtime benefit"
+)]
+pub enum CompletionInput {
+    /// A normal chat completion.
+    Chat {
+        /// The agent built for this request.
+        agent: Arc<dyn StreamingAgent>,
+        /// The user's message.
+        query: String,
+        /// The conversation before the user's message.
+        history: Vec<aura::Message>,
+    },
+    /// Resume a parked run through the normal completion pipeline.
+    Resume {
+        /// The reusable orchestrator factory this deployment builds.
+        factory: Arc<OrchestratorFactory>,
+        /// The owned, single-use resume grant.
+        grant: ResumeGrant,
+    },
+}
+
 /// Shared request setup extracted from the incoming ChatCompletionRequest.
 /// Used by both streaming and non-streaming handlers.
 pub struct RequestSetup {
-    pub query: String,
-    pub chat_history: Vec<aura::Message>,
-    pub streaming_agent: Arc<dyn StreamingAgent>,
+    /// The single-use completion input this request owns.
+    pub completion: CompletionInput,
     pub config: aura_config::Config,
     pub completion_id: String,
     pub model_str: String,
@@ -351,9 +388,11 @@ pub async fn prepare_request(
         .and_then(|m| serde_json::to_string(m).ok());
 
     Ok(RequestSetup {
-        query,
-        chat_history,
-        streaming_agent,
+        completion: CompletionInput::Chat {
+            agent: streaming_agent,
+            query,
+            history: chat_history,
+        },
         config,
         completion_id,
         model_str,
@@ -460,6 +499,21 @@ pub fn build_completion_config(
     let request_id = setup.request_id.clone();
     let fallback_tool_parsing = setup.config.is_fallback_tool_parsing_enabled();
 
+    // The resume arm's provider/model, otel inputs, and message count come
+    // from the factory's resumed stream (S2/S3); only the chat arm is wired.
+    let ((provider_ref, model_ref), message_count, query_for_otel) = match &setup.completion {
+        CompletionInput::Chat {
+            agent,
+            query,
+            history,
+        } => (agent.get_provider_info(), history.len() + 1, query.clone()),
+        CompletionInput::Resume { .. } => todo!(
+            "P45 S2/S3: resume completion entry — provider/model, otel query, and message \
+             count come from the resumed run's factory"
+        ),
+    };
+    let (provider, model) = (provider_ref.to_string(), model_ref.to_string());
+
     let stream_config = StreamConfig::new(
         emit_custom_events,
         emit_reasoning,
@@ -485,10 +539,7 @@ pub fn build_completion_config(
         }
     };
 
-    let (p, m) = setup.streaming_agent.get_provider_info();
-    let (provider, model) = (p.to_string(), m.to_string());
     let response_content = ResponseContent::new();
-    let message_count = setup.chat_history.len() + 1; // +1 for the current query
 
     CompletionConfig {
         request_id,
@@ -501,7 +552,7 @@ pub fn build_completion_config(
         active_requests: data.active_requests.clone(),
         provider,
         model,
-        query_for_otel: setup.query.clone(),
+        query_for_otel,
         message_count,
         response_content,
         pending_approvals: data.pending_approvals.clone(),
@@ -527,11 +578,9 @@ pub async fn execute_completion(
     let invocation_parameters = aura::logging::llm_invocation_parameters(&setup.config.agent.llm);
     let orchestration_enabled = setup.config.orchestration_enabled();
 
-    // Destructure to move chat_history instead of cloning
+    // Destructure to move the owned completion input instead of cloning
     let RequestSetup {
-        query,
-        chat_history,
-        streaming_agent,
+        completion,
         config: _,
         completion_id: _,
         model_str,
@@ -544,8 +593,9 @@ pub async fn execute_completion(
         tools_json,
     } = setup;
 
-    // Orchestration spawns inside `stream_with_timeout`, so SSE side-channel
-    // receivers must be subscribed before stream startup.
+    // Both completion arms spawn their producers inside this function, so
+    // the SSE side-channel receivers subscribe BEFORE the owned input
+    // matches and either arm starts a producer.
     let delivery_channels = match delivery {
         DeliveryMode::Collect { result_tx } => DeliveryChannels::Collect { result_tx },
         DeliveryMode::Sse {
@@ -561,15 +611,34 @@ pub async fn execute_completion(
         },
     };
 
-    // Create stream with timeout — single path for both Agent and Orchestrator
-    let (stream, cancel_tx, usage_state) = streaming_agent
-        .stream_with_timeout(
-            &query,
-            chat_history,
-            config.timeout_duration,
-            &config.request_id,
-        )
-        .await;
+    // Match the owned input exactly once; both arms produce the common
+    // (stream, cancellation sender, usage state) tuple. The chat arm is
+    // today's producer path exactly; the resume arm enters through the
+    // factory's grant-consuming stream (S3). The callback/telemetry agent
+    // rides alongside: the chat arm's agent, or the reusable factory —
+    // never a replayable adapter holding the grant.
+    let (stream, cancel_tx, usage_state, callback_agent) = match completion {
+        CompletionInput::Chat {
+            agent,
+            query,
+            history,
+        } => {
+            let (stream, cancel_tx, usage_state) = agent
+                .stream_with_timeout(&query, history, config.timeout_duration, &config.request_id)
+                .await;
+            (stream, cancel_tx, usage_state, agent)
+        }
+        CompletionInput::Resume { factory, grant } => {
+            let (stream, cancel_tx, usage_state) = factory
+                .resume_stream_with_timeout(grant, config.timeout_duration, &config.request_id)
+                .await;
+            // The reusable factory is the callback/telemetry agent: it
+            // implements the streaming surface without ever holding the
+            // grant, so no replayable adapter is needed.
+            let callback_agent: Arc<dyn StreamingAgent> = factory;
+            (stream, cancel_tx, usage_state, callback_agent)
+        }
+    };
 
     let response_content = config.response_content.clone();
     let otel_ctx = StreamOtelContext {
@@ -584,7 +653,7 @@ pub async fn execute_completion(
         tools_json,
         message_count: config.message_count,
         response_content: config.response_content,
-        system_prompt: streaming_agent.system_prompt().map(str::to_string),
+        system_prompt: callback_agent.system_prompt().map(str::to_string),
         orchestration_enabled,
     };
     otel_ctx.record_input();
@@ -615,7 +684,7 @@ pub async fn execute_completion(
         } => {
             let callbacks = StreamingCallbacks {
                 request_id: config.request_id.clone(),
-                agent: streaming_agent.clone(),
+                agent: callback_agent.clone(),
                 tool_event_rx,
                 progress_rx,
                 tool_usage_rx,
@@ -1208,9 +1277,15 @@ pub async fn resolve_approval(
         }
     };
     let decision = aura::hitl::ApprovalDecision::from(body);
+    // The conversational ingress has no identity source: the decision
+    // resolves uncaptured, under the conversational authority.
     match state
         .pending_approvals
-        .resolve(&decision_id, decision)
+        .resolve(
+            &decision_id,
+            aura::hitl::ApprovalAuthority::Conversational,
+            aura::hitl::ResolvedDecision::from(decision),
+        )
         .await
     {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
@@ -1340,6 +1415,386 @@ fn error_response(
         .into_response()
 }
 
+// -------------------------------------------------------------------------
+// Resume endpoint (P45): `POST /v1/sessions/{session_id}/runs/{run_id}`
+// -------------------------------------------------------------------------
+
+/// OpenAI's tool-call type discriminant on the chat-completions wire.
+const TOOL_CALL_FUNCTION_TYPE: &str = "function";
+
+/// The shared per-run resume claim table, carried as a request extension.
+#[derive(Clone)]
+pub struct ResumeClaims(pub Arc<ResumeClaimTable>);
+
+/// The segment state token on the resume success body.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum ResumeRunState {
+    Completed,
+    Parked,
+}
+
+/// The resume success body.
+#[derive(Debug, Serialize)]
+struct ResumeRunResponse {
+    session_id: String,
+    run_id: String,
+    state: ResumeRunState,
+    turns: Vec<ChatMessage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    blocking: Option<Vec<BlockingEntry>>,
+}
+
+impl ResumeRunResponse {
+    fn from_segment(session: &ResumeSessionId, run: &ResumeRunId, segment: SegmentResult) -> Self {
+        let (state, turns, blocking) = match segment {
+            SegmentResult::Completed { turns } => (
+                ResumeRunState::Completed,
+                natural_turns(turns.as_slice()),
+                None,
+            ),
+            SegmentResult::Parked { turns, blocking } => (
+                ResumeRunState::Parked,
+                continuation_turns(turns.as_slice()),
+                Some(blocking.as_slice().to_vec()),
+            ),
+        };
+        Self {
+            session_id: session.to_string(),
+            run_id: run.to_string(),
+            state,
+            turns,
+            blocking,
+        }
+    }
+}
+
+/// Project one segment turn to the chat-completion message object(s) the
+/// `turns` array carries — the same objects `/v1/chat/completions` uses.
+///
+/// Tool-call fidelity: the wire `tool_calls[].id` prefers the rig call's
+/// provider `call_id`, which a parked segment's snapshot-derived turns carry
+/// at full fidelity. A completed segment's turns are reassembled from
+/// provider-agnostic stream items that drop the `call_id`, so the wire id
+/// falls back to the stream item's own id — the same value the live SSE
+/// stream emits for the same call, never a fabricated one. Reasoning and
+/// image content have no chat-completion slot and are skipped. A user
+/// turn's `ToolResult` pieces each project to a `role: "tool"` message
+/// keyed by the result's `id` with the result's text verbatim; a user
+/// turn with non-ToolResult content (plain text) does not occur on the
+/// segment surface and stays skipped.
+fn project_turn(turn: &aura::Message, projected: &mut Vec<ChatMessage>) {
+    match turn {
+        aura::Message::Assistant { content, .. } => {
+            let mut text = String::new();
+            let mut tool_calls = Vec::new();
+            for piece in content.iter() {
+                match piece {
+                    aura::AssistantContent::Text(t) => {
+                        if !text.is_empty() {
+                            text.push('\n');
+                        }
+                        text.push_str(&t.text);
+                    }
+                    aura::AssistantContent::ToolCall(call) => {
+                        tool_calls.push(ChatMessageToolCall {
+                            id: call.call_id.clone().unwrap_or_else(|| call.id.clone()),
+                            call_type: TOOL_CALL_FUNCTION_TYPE.to_string(),
+                            function: ChatMessageFunctionCall {
+                                name: call.function.name.clone(),
+                                arguments: call.function.arguments.to_string(),
+                            },
+                        });
+                    }
+                    aura::AssistantContent::Reasoning(_) | aura::AssistantContent::Image(_) => {}
+                }
+            }
+            projected.push(ChatMessage {
+                role: Role::Assistant,
+                content: (!text.is_empty()).then_some(text),
+                tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
+                tool_call_id: None,
+                name: None,
+            });
+        }
+        aura::Message::User { content } => {
+            for piece in content.iter() {
+                let aura::UserContent::ToolResult(result) = piece else {
+                    continue;
+                };
+                let mut text = String::new();
+                for result_piece in result.content.iter() {
+                    match result_piece {
+                        aura::ToolResultContent::Text(t) => {
+                            if !text.is_empty() {
+                                text.push('\n');
+                            }
+                            text.push_str(&t.text);
+                        }
+                        aura::ToolResultContent::Image(_) => {}
+                    }
+                }
+                projected.push(ChatMessage {
+                    role: Role::Tool,
+                    content: (!text.is_empty()).then_some(text),
+                    tool_calls: None,
+                    tool_call_id: Some(result.id.clone()),
+                    name: None,
+                });
+            }
+        }
+    }
+}
+
+/// Project the parked segment's turns to the `turns` array through
+/// [`project_turn`] in segment order.
+///
+/// Outcome pairs (R2): the re-parked arm's turns carry, per decided call,
+/// the assistant tool-call turn followed by the tool-result turn ahead of
+/// the gated turn — the only arm the segment driver merges pairs into —
+/// both halves keyed by the original call id: the rig id the park
+/// recorded on the pending call, with `call_id: None` on both. The call
+/// turn projects through the tool-call arm of [`project_turn`], its wire
+/// `tool_calls[].id` landing on that same original call id via the
+/// `call_id` fallback. The result turn is a user-role `ToolResult` turn,
+/// which projects to a `role: "tool"` message: `tool_call_id` is the
+/// `ToolResult`'s `id` and `content` is the result's text verbatim, so
+/// the pair rides the wire keyed consistently on one id.
+fn continuation_turns(turns: &[aura::Message]) -> Vec<ChatMessage> {
+    let mut projected = Vec::with_capacity(turns.len());
+    for turn in turns {
+        project_turn(turn, &mut projected);
+    }
+    projected
+}
+
+/// Project the completed segment's turns — the run's natural turns only
+/// (the R6 wire shape): worker tool-call turns and the coordinator's
+/// tail ride verbatim through [`project_turn`] in segment order, and the
+/// synthesized outcome pairs come off the wire entirely, both halves,
+/// because the outcome packages live inside the reconstructed worker
+/// histories the continuations streamed from.
+///
+/// The completed surface carries assistant turns only, so a user turn on
+/// it can only be an outcome pair's result half. A pair is recognized
+/// structurally — an assistant turn that is nothing but tool calls,
+/// immediately followed by a user turn that is nothing but the tool
+/// results keyed to the same wire ids — and both halves are dropped. A
+/// natural worker tool-call turn has no result half following it, is
+/// never a pair, and rides verbatim.
+fn natural_turns(turns: &[aura::Message]) -> Vec<ChatMessage> {
+    let mut projected = Vec::with_capacity(turns.len());
+    let mut index = 0;
+    while index < turns.len() {
+        if let Some(call_ids) = outcome_pair_call_ids(&turns[index])
+            && turns
+                .get(index + 1)
+                .and_then(outcome_pair_result_ids)
+                .is_some_and(|result_ids| result_ids == call_ids)
+        {
+            index += 2;
+            continue;
+        }
+        project_turn(&turns[index], &mut projected);
+        index += 1;
+    }
+    projected
+}
+
+/// The wire ids an outcome pair's assistant half keys on, when the turn
+/// is one: an assistant turn that is nothing but tool calls keys by those
+/// calls' wire ids — `call_id`, falling back to the call's own id, the
+/// same keying [`project_turn`] renders. Any other turn is not a pair
+/// half.
+fn outcome_pair_call_ids(turn: &aura::Message) -> Option<Vec<&str>> {
+    let aura::Message::Assistant { content, .. } = turn else {
+        return None;
+    };
+    content
+        .iter()
+        .map(|piece| match piece {
+            aura::AssistantContent::ToolCall(call) => {
+                Some(call.call_id.as_deref().unwrap_or(call.id.as_str()))
+            }
+            aura::AssistantContent::Text(_)
+            | aura::AssistantContent::Reasoning(_)
+            | aura::AssistantContent::Image(_) => None,
+        })
+        .collect()
+}
+
+/// The wire ids an outcome pair's tool-result half keys on, when the turn
+/// is one: a user turn that is nothing but tool results keys by the
+/// results' own ids — the original call ids the park recorded. Any other
+/// turn is not a pair half.
+fn outcome_pair_result_ids(turn: &aura::Message) -> Option<Vec<&str>> {
+    let aura::Message::User { content } = turn else {
+        return None;
+    };
+    content
+        .iter()
+        .map(|piece| match piece {
+            aura::UserContent::ToolResult(result) => Some(result.id.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Project an evaluation refusal to its HTTP answer: a detail-less 404 for
+/// the two not-found rows, the one 409 shape for conflict rows, and the
+/// typed fault rows. The typed rows render their fixed client codes —
+/// `reify_failed` for corrupt/internal, `reify_unavailable` for known
+/// pre-execution I/O availability failures — and carry no diagnostic
+/// detail in the response; the diagnostic logs server-side.
+fn refusal_response(refusal: ResumeRefusal) -> Response {
+    match refusal {
+        ResumeRefusal::DocumentAbsent | ResumeRefusal::IdentityMismatch => {
+            StatusCode::NOT_FOUND.into_response()
+        }
+        ResumeRefusal::Conflict(row) => (StatusCode::CONFLICT, Json(row)).into_response(),
+        ResumeRefusal::InvalidEvidence(diagnostic) => {
+            tracing::error!("resume refused: invalid evidence: {diagnostic}");
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the paused run could not be restored",
+                "reify_failed",
+            )
+        }
+        ResumeRefusal::Unavailable(diagnostic) => {
+            tracing::warn!("resume refused: approval storage unavailable: {diagnostic}");
+            error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "approval storage is temporarily unavailable; retry the resume",
+                "reify_unavailable",
+            )
+        }
+        ResumeRefusal::Internal(diagnostic) => {
+            tracing::error!("resume refused: internal fault: {diagnostic}");
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the paused run could not be restored",
+                "reify_failed",
+            )
+        }
+        ResumeRefusal::Fault(diagnostic) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            diagnostic.to_string(),
+            "internal_error",
+        ),
+    }
+}
+
+/// Resume a parked run: evaluate the checkpoint against the config and the
+/// store, claim the run, and execute one segment — the decided approvals'
+/// next agent turns — to completion or the next approval-required park.
+///
+/// `POST /v1/sessions/{session_id}/runs/{run_id}`
+#[tracing::instrument(
+    name = "resume_run",
+    skip(state, claims, headers),
+    fields(otel.kind = "server")
+)]
+pub async fn resume_run(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Extension(claims): axum::extract::Extension<ResumeClaims>,
+    headers: HeaderMap,
+    Path((session_raw, run_raw)): Path<(String, String)>,
+) -> Response {
+    // Both path segments validate before anything else: a malformed segment
+    // answers the bare 404 without a single filesystem read.
+    let Ok(path) = ValidatedResumePath::parse(&session_raw, &run_raw) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    // The run's config from the parsed startup configs: single-config
+    // servers pass through, multi-config servers need DEFAULT_AGENT — the
+    // resume path carries no model field to select with.
+    let config = if state.configs.len() == 1 {
+        Some(&state.configs[0])
+    } else {
+        let default_agent = state.default_agent.as_deref();
+        default_agent.and_then(|agent| {
+            state
+                .configs
+                .iter()
+                .find(|c| c.agent.alias.as_deref().unwrap_or(&c.agent.name) == agent)
+        })
+    };
+    let Some(config) = config else {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "no configuration can serve this resume: multi-agent servers must set DEFAULT_AGENT",
+            "internal_error",
+        );
+    };
+
+    // Binding is a parsed-config flag; the presented header is read only
+    // when it is on. Binding on without a configured header name (unreachable
+    // past load-time validation) presents nothing and fails closed below.
+    let bind_identity = config
+        .hitl
+        .as_ref()
+        .is_some_and(|hitl| hitl.park.bind_identity);
+    let presented_identity = if bind_identity {
+        config
+            .identity_header
+            .as_deref()
+            .and_then(|name| headers.get(name))
+            .and_then(|value| value.to_str().ok())
+    } else {
+        None
+    };
+
+    // Pure config projection — no skill discovery, no filesystem access.
+    let builder = RigBuilder::new(config.clone(), state.pending_approvals.clone())
+        .with_hitl_hmac(state.hitl_webhook_hmac.clone());
+    let agent_config = builder.get_agent_config();
+    let Some(memory_dir) = agent_config.effective_memory_dir() else {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the resume configuration has no memory_dir; no checkpoint can exist",
+            "internal_error",
+        );
+    };
+
+    let evaluation = ResumeEvaluation {
+        path,
+        memory_dir,
+        config: &agent_config,
+        store: &state.pending_approvals,
+        claims: &claims.0,
+        bind_identity,
+        presented_identity,
+        request_id: format!("req_{}", Uuid::new_v4().simple()),
+        now: chrono::Utc::now(),
+    };
+    let grant = match evaluate_resume(evaluation).await {
+        Ok(grant) => grant,
+        Err(refusal) => return refusal_response(refusal),
+    };
+
+    let session_id = grant.session_id().clone();
+    let run_id = grant.run_id().clone();
+    let headers_map: HashMap<String, String> = headers
+        .iter()
+        .filter_map(|(k, v)| v.to_str().ok().map(|val| (k.to_string(), val.to_string())))
+        .collect();
+    match run_segment(grant, &agent_config, &headers_map).await {
+        Ok(segment) => {
+            let body = ResumeRunResponse::from_segment(&session_id, &run_id, segment);
+            (StatusCode::OK, Json(body)).into_response()
+        }
+        Err(SegmentError::Continuation(diagnostic)) => {
+            refusal_response(ResumeRefusal::Fault(diagnostic))
+        }
+        Err(_) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "unexpected resume segment error",
+            "internal_error",
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1363,6 +1818,7 @@ mod tests {
     fn make_test_config() -> aura_config::Config {
         aura_config::Config {
             memory_dir: None,
+            identity_header: None,
             mcp: None,
             vector_stores: vec![],
             tools: None,
@@ -1433,6 +1889,11 @@ mod tests {
             headers: std::collections::HashMap::new(),
             headers_from_request: std::collections::HashMap::new(),
             tool_headers_from_response: aura_config::ToolHeaderMappings::default(),
+            delivery: aura_config::WebhookDelivery::Sync,
+            poll_url: None,
+            poll_interval_secs: 10,
+            poll_request_timeout_secs: 30,
+            receiver_wait_timeout_secs: 900,
         });
         let req = chat_request_with_stream(None);
 
@@ -1466,9 +1927,11 @@ mod tests {
             }
         }));
         let setup = RequestSetup {
-            query: "trigger approval".to_string(),
-            chat_history: vec![],
-            streaming_agent: agent,
+            completion: CompletionInput::Chat {
+                agent,
+                query: "trigger approval".to_string(),
+                history: vec![],
+            },
             config: make_test_config(),
             completion_id: "chatcmpl-test".to_string(),
             model_str: "test/fake".to_string(),
@@ -2427,6 +2890,126 @@ url = "http://127.0.0.1:9"
             );
         }
 
+        /// Park a durable webhook-owned row (authority `WebhookPoll`, as
+        /// the 207 bridge registers it) directly in the app's approval
+        /// registry.
+        async fn park_webhook_owned(state: &Arc<AppState>) -> aura::hitl::DecisionId {
+            let req = aura::hitl::ApprovalRequest {
+                version: aura::hitl::PROTOCOL_VERSION,
+                instance_id: "test-instance".to_string(),
+                decision_id: aura::hitl::DecisionId::generate(),
+                request_id: "req-webhook".into(),
+                scope: aura::hitl::AgentScope::Single { session_id: None },
+                origin: aura::hitl::ApprovalOrigin::ConfigGate {
+                    matched_pattern: "test_*".into(),
+                    agent_name: "test-agent".to_string(),
+                },
+                items: vec![],
+            };
+            let decision_id = req.decision_id;
+            state
+                .pending_approvals
+                .register_durable(aura::hitl::ParkedApproval {
+                    request: req,
+                    registered_at: chrono::Utc::now(),
+                    expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+                    authority: aura::hitl::ApprovalAuthority::WebhookPoll,
+                    egress_headers: None,
+                    acknowledgment: aura::hitl::AcknowledgmentState::RequiresNotification,
+                })
+                .await
+                .expect("the webhook-owned row parks durably");
+            decision_id
+        }
+
+        /// The conversational ingress refuses a webhook-owned row: 404,
+        /// not 204, with zero mutation — the store checks the row's
+        /// authority inside its resolve boundary.
+        #[tokio::test]
+        async fn resolve_approval_refuses_a_webhook_owned_row() {
+            let state = test_app_state();
+            let decision_id = park_webhook_owned(&state).await;
+            let app = approval_router(state.clone());
+
+            let response = app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri(format!("/v1/approvals/{decision_id}"))
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(r#"{"approved": true}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::NOT_FOUND,
+                "the conversational ingress must not resolve a webhook-owned row",
+            );
+            assert!(
+                state
+                    .pending_approvals
+                    .try_parked(&decision_id)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "the refused ingress must not consume the row",
+            );
+            assert!(
+                state
+                    .pending_approvals
+                    .recorded_decision(&decision_id)
+                    .await
+                    .is_none(),
+                "the refused ingress must not record a decision",
+            );
+        }
+
+        /// The same refusal through the HMAC-ON ingress: a VALIDLY signed
+        /// body passes verification and still gets 404 — a valid signature
+        /// does not override the row's authority.
+        #[tokio::test]
+        async fn resolve_approval_signed_request_still_refuses_a_webhook_owned_row() {
+            let hmac = ingress_test_hmac();
+            let state = test_app_state();
+            let decision_id = park_webhook_owned(&state).await;
+            let app = approval_router_with_hmac(state.clone(), Some(hmac.clone()));
+
+            let response = app
+                .oneshot(signed_request(
+                    &hmac,
+                    &decision_id.to_string(),
+                    r#"{"approved":true}"#,
+                ))
+                .await
+                .unwrap();
+
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::NOT_FOUND,
+                "a valid signature must not override a webhook-owned row's authority",
+            );
+            assert!(
+                state
+                    .pending_approvals
+                    .try_parked(&decision_id)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "the refused ingress must not consume the row",
+            );
+            assert!(
+                state
+                    .pending_approvals
+                    .recorded_decision(&decision_id)
+                    .await
+                    .is_none(),
+                "the refused ingress must not record a decision",
+            );
+        }
+
         #[tokio::test]
         async fn resolve_unknown_id_returns_404() {
             let state = test_app_state();
@@ -2758,6 +3341,333 @@ url = "http://127.0.0.1:9"
             request.headers_mut().remove(aura::hitl::TIMESTAMP_HEADER);
             let response = app.oneshot(request).await.unwrap();
             assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
+        }
+    }
+
+    /// Whole-frame goldens for the resume endpoint's wire surfaces (P45
+    /// layer 2): the handler's bare 404 frames and the 200-body projection.
+    /// The evaluation rows' frames live beside the pipeline in
+    /// `aura::orchestration::park::resume::goldens`; `GOLDENS.md` there maps
+    /// every row to its fixture and records the exclusions.
+    mod resume_goldens {
+        use super::*;
+
+        fn resume_claims() -> axum::extract::Extension<ResumeClaims> {
+            axum::extract::Extension(ResumeClaims(Arc::new(ResumeClaimTable::new())))
+        }
+
+        fn config_with_memory_dir(memory_dir: &str) -> aura_config::Config {
+            aura_config::Config {
+                memory_dir: Some(memory_dir.to_string()),
+                ..make_test_config()
+            }
+        }
+
+        async fn body_bytes(response: Response) -> Bytes {
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("response body reads")
+        }
+
+        async fn bare_404(response: Response) {
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            assert!(
+                body_bytes(response).await.is_empty(),
+                "the 404 frame carries no body"
+            );
+        }
+
+        /// A malformed session segment answers the bare 404 frame. The
+        /// memory root is a regular file, so any filesystem read would
+        /// surface as a fault, never as this 404.
+        #[tokio::test]
+        async fn malformed_session_id_answers_bare_404_without_reading_the_filesystem() {
+            let obstructed = tempfile::tempdir().expect("temp dir");
+            let memory_file = obstructed.path().join("memory-not-a-dir");
+            std::fs::write(&memory_file, "not a directory").expect("obstruct the memory root");
+            let state = make_state(vec![config_with_memory_dir(
+                memory_file.to_str().expect("UTF-8 path"),
+            )]);
+
+            let response = resume_run(
+                State(state),
+                resume_claims(),
+                HeaderMap::new(),
+                Path((
+                    "../escape".to_string(),
+                    "0199c0de-4545-7000-8000-000000000045".to_string(),
+                )),
+            )
+            .await;
+
+            bare_404(response).await;
+        }
+
+        /// A malformed run segment answers the same bare 404 frame.
+        #[tokio::test]
+        async fn malformed_run_id_answers_bare_404_without_reading_the_filesystem() {
+            let obstructed = tempfile::tempdir().expect("temp dir");
+            let memory_file = obstructed.path().join("memory-not-a-dir");
+            std::fs::write(&memory_file, "not a directory").expect("obstruct the memory root");
+            let state = make_state(vec![config_with_memory_dir(
+                memory_file.to_str().expect("UTF-8 path"),
+            )]);
+
+            let response = resume_run(
+                State(state),
+                resume_claims(),
+                HeaderMap::new(),
+                Path(("sess-p45".to_string(), "not-a-uuid".to_string())),
+            )
+            .await;
+
+            bare_404(response).await;
+        }
+
+        /// A run with no checkpoint under either name answers the bare 404
+        /// frame through the full handler path.
+        #[tokio::test]
+        async fn missing_checkpoint_answers_bare_404() {
+            let empty = tempfile::tempdir().expect("temp memory root");
+            let state = make_state(vec![config_with_memory_dir(
+                empty.path().to_str().expect("UTF-8 path"),
+            )]);
+
+            let response = resume_run(
+                State(state),
+                resume_claims(),
+                HeaderMap::new(),
+                Path((
+                    "sess-p45".to_string(),
+                    "0199c0de-4545-7000-8000-000000000045".to_string(),
+                )),
+            )
+            .await;
+
+            bare_404(response).await;
+        }
+
+        /// The completed segment projects the complete 200 body: the
+        /// chat-completion turn objects, the lowercase state token, and no
+        /// blocking member.
+        #[tokio::test]
+        async fn completed_segment_projects_the_full_200_body() {
+            let session = ResumeSessionId::parse("sess-p45").expect("golden session parses");
+            let run = ResumeRunId::parse("0199c0de-4545-7000-8000-000000000045")
+                .expect("golden run parses");
+            let turns = aura::orchestration::SegmentTurns::try_new(vec![aura::Message::assistant(
+                "approved and applied",
+            )])
+            .expect("one turn");
+
+            let body =
+                ResumeRunResponse::from_segment(&session, &run, SegmentResult::Completed { turns });
+
+            assert_eq!(
+                serde_json::to_value(&body).expect("the 200 body serializes"),
+                serde_json::json!({
+                    "session_id": "sess-p45",
+                    "run_id": "0199c0de-4545-7000-8000-000000000045",
+                    "state": "completed",
+                    "turns": [
+                        { "role": "assistant", "content": "approved and applied" },
+                    ],
+                }),
+            );
+        }
+
+        /// The original call id both halves of an R2 outcome pair key on:
+        /// the pending call's id the park recorded (`ToolCall.id`), which is
+        /// also the rig id the assistant turn's wire `tool_calls[].id`
+        /// falls back to.
+        const CALL_ID: &str = "call_apply_1";
+        /// The decided call's tool, fixed so every expected body is literal.
+        const TOOL: &str = "kubectl_apply";
+        /// The continuation's final assistant text turn, fixed so every
+        /// expected body is literal.
+        const FINAL_TEXT: &str = "approved and applied";
+        /// A real tool result in the chain's wire form: the rig tool server
+        /// JSON-quotes a plain string output, and the result turn carries
+        /// that rendering verbatim.
+        const RESULT_WIRE: &str = "\"applied successfully\"";
+        /// The live denial text in the chain's wire form — the gate's denial
+        /// arm, JSON-quoted like every Ok-path tool result.
+        const DENIAL_WIRE: &str = "\"Tool call blocked by human approval denial: the prod namespace is off limits. \
+             Do not execute this action.\"";
+
+        /// The assistant tool-call turn of an R2 outcome pair: the decided
+        /// call re-issued with `call_id: None`, keyed by the original call id.
+        fn decided_call_turn() -> aura::Message {
+            aura::Message::Assistant {
+                id: None,
+                content: aura::OneOrMany::one(aura::AssistantContent::tool_call(
+                    CALL_ID,
+                    TOOL,
+                    serde_json::json!({ "namespace": "prod" }),
+                )),
+            }
+        }
+
+        /// The tool-result turn of an R2 outcome pair: the outcome's wire
+        /// text, keyed by the original call id (`ToolResult.id`, with
+        /// `call_id: None`).
+        fn decided_result_turn(result_wire: &str) -> aura::Message {
+            aura::Message::User {
+                content: aura::OneOrMany::one(aura::UserContent::tool_result(
+                    CALL_ID,
+                    aura::OneOrMany::one(aura::ToolResultContent::text(result_wire)),
+                )),
+            }
+        }
+
+        /// A completed segment's natural worker tool turns ride the wire
+        /// verbatim: the continuation's tool-call turn — the stream
+        /// collector's assembly shape, a lone tool call keyed by its own
+        /// id with `call_id: None`, exactly the fields an outcome pair's
+        /// call half wears — projects to its assistant message with
+        /// `tool_calls` keyed by that id, ahead of the final text, in
+        /// segment order. No result half follows a natural worker call
+        /// turn (the worker's tool results stay inside its own loop), so
+        /// nothing pairs it and nothing strips it.
+        #[tokio::test]
+        async fn completed_segment_carries_natural_worker_tool_turns_verbatim() {
+            let session = ResumeSessionId::parse("sess-p45").expect("golden session parses");
+            let run = ResumeRunId::parse("0199c0de-4545-7000-8000-000000000045")
+                .expect("golden run parses");
+            let turns = aura::orchestration::SegmentTurns::try_new(vec![
+                decided_call_turn(),
+                aura::Message::assistant(FINAL_TEXT),
+            ])
+            .expect("two turns");
+
+            let body =
+                ResumeRunResponse::from_segment(&session, &run, SegmentResult::Completed { turns });
+
+            assert_eq!(
+                serde_json::to_value(&body).expect("the 200 body serializes"),
+                serde_json::json!({
+                    "session_id": "sess-p45",
+                    "run_id": "0199c0de-4545-7000-8000-000000000045",
+                    "state": "completed",
+                    "turns": [
+                        {
+                            "role": "assistant",
+                            "tool_calls": [
+                                {
+                                    "id": CALL_ID,
+                                    "type": "function",
+                                    "function": {
+                                        "name": TOOL,
+                                        "arguments": "{\"namespace\":\"prod\"}",
+                                    },
+                                },
+                            ],
+                        },
+                        { "role": "assistant", "content": FINAL_TEXT },
+                    ],
+                }),
+            );
+        }
+
+        // ====================================================================
+        // Stage 6 frames (the R6 natural-finish ruling, 2026-09-12): the
+        // completed arm's 200 body carries the run's NATURAL turns only —
+        // the outcome packages live inside the reconstructed worker
+        // histories, and the prepended R2 outcome pairs come off the wire.
+        // Flipped by the coordinator-loop fill, which rewrote the
+        // approve-path R2-pair frame into the natural-tool-turn pin above
+        // and deleted its denial twin. The parked arm's envelope is
+        // unchanged by R6.
+        // ====================================================================
+
+        /// The approve-path continuation's interim natural turn, ahead of
+        /// the final text: R6 lets the completed body carry the run's
+        /// natural turns, multi-message.
+        const APPROVE_INTERIM_TEXT: &str = "the apply finished; verifying the rollout";
+
+        /// The deny-path continuation's first natural adaptation turn:
+        /// the worker acknowledges the denial as it re-plans.
+        const DENIAL_ADAPTATION_TEXT: &str = "understood; the prod namespace stays untouched";
+
+        /// The deny-path continuation's final natural turn: the run's
+        /// final answer without the blocked apply.
+        const DENIAL_FINAL_TEXT: &str =
+            "nothing was applied; awaiting a namespace you will approve";
+
+        /// A completed segment's 200 body carries the run's natural turns
+        /// only: an R2 outcome pair riding the segment surface ahead of the
+        /// natural continuation turns comes off the wire entirely, both
+        /// halves — no assistant tool-call turn for the decided call and no
+        /// role:tool turn keyed by the original call id — because the
+        /// outcome package lives inside the reconstructed worker history.
+        /// The natural continuation turns ride in segment order,
+        /// multi-message allowed, and the envelope keys are unchanged.
+        #[tokio::test]
+        async fn completed_approve_segment_carries_natural_turns_without_the_outcome_pair() {
+            let session = ResumeSessionId::parse("sess-p45").expect("golden session parses");
+            let run = ResumeRunId::parse("0199c0de-4545-7000-8000-000000000045")
+                .expect("golden run parses");
+            let turns = aura::orchestration::SegmentTurns::try_new(vec![
+                decided_call_turn(),
+                decided_result_turn(RESULT_WIRE),
+                aura::Message::assistant(APPROVE_INTERIM_TEXT),
+                aura::Message::assistant(FINAL_TEXT),
+            ])
+            .expect("four turns");
+
+            let body =
+                ResumeRunResponse::from_segment(&session, &run, SegmentResult::Completed { turns });
+
+            assert_eq!(
+                serde_json::to_value(&body).expect("the 200 body serializes"),
+                serde_json::json!({
+                    "session_id": "sess-p45",
+                    "run_id": "0199c0de-4545-7000-8000-000000000045",
+                    "state": "completed",
+                    "turns": [
+                        { "role": "assistant", "content": APPROVE_INTERIM_TEXT },
+                        { "role": "assistant", "content": FINAL_TEXT },
+                    ],
+                }),
+            );
+        }
+
+        /// The denial variant of the completed body's natural-turns-only
+        /// rule: a denial pair riding the segment surface ahead of the
+        /// worker's natural adaptation turns comes off the wire, both
+        /// halves — no tool-message turn carrying the denial text keyed by
+        /// the call id and no assistant tool-call turn for the decided
+        /// call — because the denial package lives inside the
+        /// reconstructed worker history. The natural adaptation turns ride
+        /// in segment order and the envelope keys are unchanged.
+        #[tokio::test]
+        async fn completed_deny_segment_carries_natural_turns_without_the_denial_pair() {
+            let session = ResumeSessionId::parse("sess-p45").expect("golden session parses");
+            let run = ResumeRunId::parse("0199c0de-4545-7000-8000-000000000045")
+                .expect("golden run parses");
+            let turns = aura::orchestration::SegmentTurns::try_new(vec![
+                decided_call_turn(),
+                decided_result_turn(DENIAL_WIRE),
+                aura::Message::assistant(DENIAL_ADAPTATION_TEXT),
+                aura::Message::assistant(DENIAL_FINAL_TEXT),
+            ])
+            .expect("four turns");
+
+            let body =
+                ResumeRunResponse::from_segment(&session, &run, SegmentResult::Completed { turns });
+
+            assert_eq!(
+                serde_json::to_value(&body).expect("the 200 body serializes"),
+                serde_json::json!({
+                    "session_id": "sess-p45",
+                    "run_id": "0199c0de-4545-7000-8000-000000000045",
+                    "state": "completed",
+                    "turns": [
+                        { "role": "assistant", "content": DENIAL_ADAPTATION_TEXT },
+                        { "role": "assistant", "content": DENIAL_FINAL_TEXT },
+                    ],
+                }),
+            );
         }
     }
 }

@@ -19,156 +19,15 @@
 //! this suite. Each test spawns its server fresh, waits on `/health`, drives
 //! one chat completion, and kills it on drop.
 
-use std::path::PathBuf;
-use std::process::Stdio;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
-use tokio::process::{Child, Command};
+mod common;
 
-const CHAT_TIMEOUT: Duration = Duration::from_secs(90);
-const HEALTH_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// The prompt that has the model call `echo_headers` and relay its output.
-const ECHO_PROMPT: &str = "Call the echo_headers tool now and reply with only its raw JSON output.";
-
-// ---------------------------------------------------------------------------
-// A dedicated aura-web-server, spawned fresh per test case
-// ---------------------------------------------------------------------------
-
-/// A freshly spawned `aura-web-server`, bound to its own port and reading a config generated for exactly one test case. Killed and its config file removed on drop.
-struct AuraServer {
-    port: u16,
-    child: Child,
-    config_path: PathBuf,
-    /// Accumulated stderr, drained continuously so the child's pipe never
-    /// blocks; read back to explain a health-check timeout.
-    stderr_log: Arc<Mutex<String>>,
-}
-
-impl AuraServer {
-    fn base_url(&self) -> String {
-        format!("http://127.0.0.1:{}", self.port)
-    }
-
-    /// Spawn `aura-web-server` against `config_toml`, wait until it answers `/health`. `free_port`'s bind-then-drop leaves a window for another process to grab the port; one retry on a fresh port covers that.
-    async fn start(config_toml: &str) -> Self {
-        match Self::try_start(config_toml).await {
-            Ok(server) => server,
-            Err(failed) => {
-                let log = failed.stderr_log.lock().expect("stderr log mutex").clone();
-                eprintln!(
-                    "aura-web-server on port {} never answered /health within {HEALTH_TIMEOUT:?}; \
-                     retrying once on a fresh port. stderr:\n{log}",
-                    failed.port
-                );
-                failed.stop().await;
-                match Self::try_start(config_toml).await {
-                    Ok(server) => server,
-                    Err(failed) => {
-                        let log = failed.stderr_log.lock().expect("stderr log mutex").clone();
-                        let port = failed.port;
-                        failed.stop().await;
-                        panic!(
-                            "aura-web-server never answered /health, on a fresh port either; \
-                             last tried port {port}; stderr:\n{log}"
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    /// One spawn-and-wait attempt. `Err` carries the (still-running) server
-    /// so the caller can log its stderr and stop it before retrying.
-    async fn try_start(config_toml: &str) -> Result<Self, Self> {
-        let port = free_port();
-        let config_path =
-            std::env::temp_dir().join(format!("aura-hitl-test-{}.toml", uuid::Uuid::new_v4()));
-        std::fs::write(&config_path, config_toml).expect("write generated test config");
-
-        let mut child = Command::new(env!("CARGO_BIN_EXE_aura-web-server"))
-            .env("CONFIG_PATH", &config_path)
-            .env("HOST", "127.0.0.1")
-            .env("PORT", port.to_string())
-            .env("RUST_LOG", "warn")
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .expect("spawn aura-web-server (did `cargo build -p aura-web-server` succeed?)");
-
-        let stderr_log = Arc::new(Mutex::new(String::new()));
-        let stderr = child.stderr.take().expect("stderr was piped");
-        let log_sink = Arc::clone(&stderr_log);
-        tokio::spawn(async move {
-            let mut lines = tokio::io::BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let mut log = log_sink.lock().expect("stderr log mutex");
-                log.push_str(&line);
-                log.push('\n');
-            }
-        });
-
-        let server = Self {
-            port,
-            child,
-            config_path,
-            stderr_log,
-        };
-        if server.is_healthy_within(HEALTH_TIMEOUT).await {
-            Ok(server)
-        } else {
-            Err(server)
-        }
-    }
-
-    async fn is_healthy_within(&self, timeout: Duration) -> bool {
-        let client = reqwest::Client::new();
-        let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            if let Ok(resp) = client
-                .get(format!("{}/health", self.base_url()))
-                .send()
-                .await
-                && resp.status().is_success()
-            {
-                return true;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return false;
-            }
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
-    }
-
-    /// Kill the child and await its exit, reaping the process, then remove its generated config file. Call this explicitly at test end; `Drop`'s `start_kill` is only the fallback for a test that panics.
-    async fn stop(mut self) {
-        let _ = self.child.kill().await;
-        let _ = std::fs::remove_file(&self.config_path);
-    }
-}
-
-impl Drop for AuraServer {
-    fn drop(&mut self) {
-        let _ = self.child.start_kill();
-        let _ = std::fs::remove_file(&self.config_path);
-    }
-}
-
-/// An OS-assigned free port, read and released before the caller uses it.
-/// The bind-then-drop race is the standard tolerance for test-local ports.
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("bind ephemeral port")
-        .local_addr()
-        .expect("local addr")
-        .port()
-}
+use common::{AuraServer, CHAT_TIMEOUT, ECHO_PROMPT, assistant_text, mcp_url};
 
 // ---------------------------------------------------------------------------
 // A hand-rolled mock webhook approver
@@ -222,40 +81,13 @@ impl MockApprover {
     }
 }
 
-/// Read one HTTP request off `socket` and answer it per `reply`. Ignores the request body: which decision to hand back is fixed per test.
+/// Read one HTTP request off `socket` and answer it per `reply`. Ignores the
+/// request body: which decision to hand back is fixed per test.
 async fn serve_one_decision(mut socket: tokio::net::TcpStream, reply: ApproverReply) {
-    let mut buf = Vec::new();
-    let head_end = loop {
-        let mut chunk = [0u8; 4096];
-        let Ok(n) = socket.read(&mut chunk).await else {
-            return;
-        };
-        if n == 0 {
-            return;
-        }
-        buf.extend_from_slice(&chunk[..n]);
-        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-            break pos;
-        }
+    let Some(request) = common::read_full_request(&mut socket).await else {
+        return;
     };
-    let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
-    let content_length: usize = head
-        .lines()
-        .filter_map(|line| line.split_once(':'))
-        .find(|(name, _)| name.trim().eq_ignore_ascii_case("content-length"))
-        .and_then(|(_, value)| value.trim().parse().ok())
-        .unwrap_or(0);
-    let mut body = buf[head_end + 4..].to_vec();
-    while body.len() < content_length {
-        let mut chunk = [0u8; 4096];
-        let Ok(n) = socket.read(&mut chunk).await else {
-            return;
-        };
-        if n == 0 {
-            return;
-        }
-        body.extend_from_slice(&chunk[..n]);
-    }
+    let _ = request; // the body is intentionally unread: the reply is fixed per test
 
     let (payload, extra_header) = match reply {
         ApproverReply::ApproveWithHeader { name, value } => {
@@ -284,12 +116,6 @@ async fn serve_one_decision(mut socket: tokio::net::TcpStream, reply: ApproverRe
 // ---------------------------------------------------------------------------
 // Generated config
 // ---------------------------------------------------------------------------
-
-/// The shared mock-mcp fixture's URL, the same server `header_forwarding_tests.rs` depends on, honoring the same `MCP_MOCK_HOST` override.
-fn mcp_url() -> String {
-    let host = std::env::var("MCP_MOCK_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
-    format!("http://{host}:9999/mcp")
-}
 
 /// A minimal single-agent config: one MCP server with a frozen static `Authorization` header (standing in for pre-approval requester identity), plus whatever `[hitl]` table the caller supplies.
 fn config_toml(mcp_url: &str, frozen_authorization: &str, hitl_toml: &str) -> String {
@@ -395,12 +221,6 @@ async fn send_chat(server: &AuraServer, prompt: &str) -> Value {
     response.json().await.expect("response body is valid JSON")
 }
 
-fn assistant_text(response_json: &Value) -> &str {
-    response_json["choices"][0]["message"]["content"]
-        .as_str()
-        .expect("response carries assistant message content")
-}
-
 /// Extract the `echo_headers` JSON blob from a chat response's assistant prose, with `context` naming what the test expected, so a miss identifies both expectation and actual assistant output.
 fn headers_from_response(response_json: &Value, context: &str) -> Value {
     let text = assistant_text(response_json);
@@ -436,11 +256,15 @@ fn extract_json_object(text: &str) -> Option<Value> {
 /// `[hitl]` route points at it and whose client carries the frozen identity.
 async fn gated_server(reply: ApproverReply) -> (MockApprover, AuraServer) {
     let approver = MockApprover::start(reply).await;
-    let server = AuraServer::start(&config_toml(
-        &mcp_url(),
-        "Bearer legacy-frozen-identity",
-        &gated_hitl_toml(&approver.url),
-    ))
+    let server = AuraServer::start(
+        &config_toml(
+            &mcp_url(),
+            "Bearer legacy-frozen-identity",
+            &gated_hitl_toml(&approver.url),
+        ),
+        "aura-hitl-test-",
+        &[],
+    )
     .await;
     (approver, server)
 }
@@ -514,11 +338,15 @@ async fn missing_mapped_header_fails_the_call_by_name_only() {
 #[tokio::test]
 async fn a_tool_the_glob_does_not_match_is_unaffected() {
     let approver = MockApprover::start(ApproverReply::Deny).await;
-    let server = AuraServer::start(&config_toml(
-        &mcp_url(),
-        "Bearer legacy-frozen-identity",
-        &ungated_hitl_toml(&approver.url),
-    ))
+    let server = AuraServer::start(
+        &config_toml(
+            &mcp_url(),
+            "Bearer legacy-frozen-identity",
+            &ungated_hitl_toml(&approver.url),
+        ),
+        "aura-hitl-test-",
+        &[],
+    )
     .await;
 
     let response = send_chat(&server, ECHO_PROMPT).await;

@@ -20,7 +20,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use a2a::{ListTasksRequest, Message, Part, Role, Task, TaskState, TaskStatus};
-use aura::hitl::{ApprovalDecision, ApprovalOutcome, PendingApprovals, ResolveError};
+use aura::hitl::{
+    ApprovalAuthority, ApprovalDecision, ApprovalOutcome, PendingApprovals, ResolveError,
+};
 use aura::request_cancellation::RequestCancelToken;
 use aura::session_store::ParkedApprovalRecord;
 use aura_config::{RedisSessionStoreConfig, SessionStoreBackend};
@@ -366,7 +368,11 @@ async fn approval_resolve_removes_the_parked_record() {
     approvals.register(parked).await.unwrap();
 
     approvals
-        .resolve(&id, ApprovalDecision::Approved)
+        .resolve(
+            &id,
+            ApprovalAuthority::Conversational,
+            ApprovalDecision::Approved.into(),
+        )
         .await
         .unwrap();
 
@@ -390,6 +396,16 @@ async fn approval_resolve_records_decision_readable_cross_instance() {
     common::resolve_records_readable_decision(&instance_a, &instance_b).await;
 }
 
+/// The decision record keeps identity and decision together across
+/// instances.
+#[tokio::test]
+async fn approval_resolve_records_identity_readable_cross_instance() {
+    let config = test_config(60);
+    let instance_a = connect(&config).await.approvals();
+    let instance_b = connect(&config).await.approvals();
+    common::resolve_records_identity_with_the_decision(&instance_a, &instance_b).await;
+}
+
 /// The decision record's TTL keeps a margin past the parked record's.
 #[tokio::test]
 async fn decision_record_outlives_parked_record_ttl() {
@@ -398,7 +414,11 @@ async fn decision_record_outlives_parked_record_ttl() {
     let id = parked.request.decision_id;
     approvals.register(parked).await.unwrap();
     approvals
-        .resolve(&id, ApprovalDecision::Approved)
+        .resolve(
+            &id,
+            ApprovalAuthority::Conversational,
+            ApprovalDecision::Approved.into(),
+        )
         .await
         .unwrap();
 
@@ -406,7 +426,7 @@ async fn decision_record_outlives_parked_record_ttl() {
 
     assert_eq!(
         approvals.decision(&id).await.unwrap(),
-        Some(ApprovalDecision::Approved)
+        Some(ApprovalDecision::Approved.into())
     );
 }
 
@@ -420,6 +440,62 @@ async fn approval_remove_makes_resolve_not_found() {
 async fn approval_cancel_request_removes_only_matching() {
     let approvals = connect(&test_config(60)).await.approvals();
     common::cancel_request_removes_only_matching(&approvals).await;
+}
+
+#[tokio::test]
+async fn approval_list_pending_returns_only_live_undecided() {
+    let config = test_config(60);
+    let instance_a = connect(&config).await.approvals();
+    let instance_b = connect(&config).await.approvals();
+    common::list_pending_returns_only_live_undecided(&instance_a, &instance_b).await;
+}
+
+#[tokio::test]
+async fn approval_list_pending_empty_store_returns_empty() {
+    let approvals = connect(&test_config(60)).await.approvals();
+    common::list_pending_empty_store_returns_empty(&approvals).await;
+}
+
+/// An expired record still inside its MIN_TTL_SECS floor must not be
+/// listed: the post-decode filter backs the native TTL.
+#[tokio::test]
+async fn approval_list_pending_excludes_expired() {
+    let config = test_config(60);
+    let instance_a = connect(&config).await.approvals();
+    let instance_b = connect(&config).await.approvals();
+    common::list_pending_excludes_expired(&instance_a, &instance_b).await;
+}
+
+#[tokio::test]
+async fn approval_list_pending_skips_wrong_typed_and_undecodable_keys() {
+    let config = test_config(60);
+    let approvals = connect(&config).await.approvals();
+    let parked = make_parked("req-list-skips", std::time::Duration::from_secs(60));
+    let live_id = parked.request.decision_id;
+    approvals.register(parked).await.unwrap();
+
+    let client = redis::Client::open(redis_url()).unwrap();
+    let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+    let prefix = &config.key_prefix;
+    let wrong_typed = format!("{prefix}:approval:{}", uuid::Uuid::new_v4());
+    redis::cmd("SADD")
+        .arg(&wrong_typed)
+        .arg("x")
+        .query_async::<()>(&mut conn)
+        .await
+        .unwrap();
+    let undecodable = format!("{prefix}:approval:{}", uuid::Uuid::new_v4());
+    redis::cmd("SET")
+        .arg(&undecodable)
+        .arg("not a parked approval")
+        .query_async::<()>(&mut conn)
+        .await
+        .unwrap();
+
+    let pending = approvals.list_pending().await.unwrap();
+
+    let ids: Vec<_> = pending.iter().map(|p| p.request.decision_id).collect();
+    assert_eq!(ids, [live_id], "only the genuine record is listed");
 }
 
 /// `cancel_request` returns exactly the records it cleared; a decided
@@ -440,7 +516,11 @@ async fn approval_cancel_request_returns_cleared_set() {
     approvals.register(decided).await.unwrap();
     approvals.register(keep).await.unwrap();
     approvals
-        .resolve(&decided_id, ApprovalDecision::Approved)
+        .resolve(
+            &decided_id,
+            ApprovalAuthority::Conversational,
+            ApprovalDecision::Approved.into(),
+        )
         .await
         .unwrap();
 
@@ -455,7 +535,11 @@ async fn approval_cancel_request_returns_cleared_set() {
     assert!(approvals.get(&keep_id).await.unwrap().is_some());
     assert_eq!(
         approvals
-            .resolve(&undecided_id, ApprovalDecision::Approved)
+            .resolve(
+                &undecided_id,
+                ApprovalAuthority::Conversational,
+                ApprovalDecision::Approved.into()
+            )
             .await,
         Err(ResolveError::NotFound),
         "a cleared ticket resolves NotFound"
@@ -499,7 +583,11 @@ async fn approval_cancel_request_returns_cleared_set() {
     );
     assert_eq!(
         approvals
-            .resolve(&late_id, ApprovalDecision::Approved)
+            .resolve(
+                &late_id,
+                ApprovalAuthority::Conversational,
+                ApprovalDecision::Approved.into()
+            )
             .await,
         Err(ResolveError::NotFound),
         "the second cancel GETDEL'd the late ticket"
@@ -691,9 +779,28 @@ async fn approval_expires_with_its_record_ttl() {
 
     assert!(approvals.get(&id).await.unwrap().is_none());
     assert_eq!(
-        approvals.resolve(&id, ApprovalDecision::Approved).await,
+        approvals
+            .resolve(
+                &id,
+                ApprovalAuthority::Conversational,
+                ApprovalDecision::Approved.into()
+            )
+            .await,
         Err(ResolveError::NotFound)
     );
+}
+
+/// Native TTL expiry removes the record outright: the `list_pending` scan
+/// sees neither the key nor a residue.
+#[tokio::test]
+async fn approval_list_pending_excludes_a_natively_expired_record() {
+    let approvals = connect(&test_config(60)).await.approvals();
+    let parked = make_parked("req-poll-ttl", Duration::from_secs(1));
+    approvals.register(parked).await.unwrap();
+
+    tokio::time::sleep(Duration::from_millis(1600)).await;
+
+    assert!(approvals.list_pending().await.unwrap().is_empty());
 }
 
 // ---------------------------------------------------------------------------
@@ -1058,7 +1165,11 @@ async fn approval_parked_on_one_instance_wakes_when_resolved_on_another() {
     let handle = instance_a.register(request, Duration::from_secs(30)).await;
 
     instance_b
-        .resolve(&id, ApprovalDecision::Approved)
+        .resolve(
+            &id,
+            ApprovalAuthority::Conversational,
+            ApprovalDecision::Approved.into(),
+        )
         .await
         .expect("resolve through the other instance succeeds");
 
@@ -1088,7 +1199,11 @@ async fn store_only_resolve_wakes_parking_instance_via_poll() {
     // Resolve against the store alone — no registry, no publish.
     store_b
         .approvals()
-        .resolve(&id, ApprovalDecision::Approved)
+        .resolve(
+            &id,
+            ApprovalAuthority::Conversational,
+            ApprovalDecision::Approved.into(),
+        )
         .await
         .expect("store resolve succeeds");
 

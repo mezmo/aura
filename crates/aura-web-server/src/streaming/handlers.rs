@@ -1432,7 +1432,7 @@ fn handle_orchestrator_event(
         OrchestratorEvent::RunParked {
             run_id,
             decision_ids,
-            expires_at,
+            retention_expires_at,
             iteration,
         } => {
             tracing::debug!(
@@ -1440,12 +1440,12 @@ fn handle_orchestrator_event(
                 run_id,
                 iteration,
                 decision_ids.len(),
-                expires_at
+                retention_expires_at
             );
             OrchestrationStreamEvent::run_parked(
                 run_id,
                 decision_ids.clone(),
-                expires_at,
+                *retention_expires_at,
                 *iteration,
                 event_context,
             )

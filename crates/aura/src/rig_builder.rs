@@ -48,6 +48,30 @@ impl RigBuilder {
         self.to_agent_config(None)
     }
 
+    /// The production config projection for one HTTP request: skill
+    /// discovery, `headers_from_request` resolution, and request/session
+    /// stamping in one fallible step.
+    ///
+    /// The resume path builds its orchestrator through this surface — never
+    /// the debug-only [`Self::get_agent_config`], which skips discovery and
+    /// header resolution. `request_id` is the new HTTP request's id for
+    /// request-scoped events; `session_id` is the request's chat session,
+    /// preserved from the parked run where it matters downstream.
+    #[expect(
+        unused_variables,
+        reason = "todo!() body; filled by P45 wave fill units"
+    )]
+    pub fn prepare_agent_config(
+        &self,
+        req_headers: Option<&HashMap<String, String>>,
+        request_id: &str,
+        session_id: &str,
+    ) -> Result<AgentRuntimeConfig, BuilderError> {
+        todo!(
+            "P45 wave fill unit S1: factor discovery, header resolution, and request/session stamping from the existing build paths"
+        )
+    }
+
     /// Project the parsed `Config` into the runtime `AgentRuntimeConfig`.
     ///
     /// The `[agent]` TOML table is split into `AgentSettings` (the runtime
@@ -59,8 +83,28 @@ impl RigBuilder {
     ///
     /// `req_headers` threads the inbound client request's HTTP headers through
     /// to [`HitlRuntime::from_config`] for `[hitl.route]` `headers_from_request`
-    /// resolution. Pass `None` outside an HTTP request context.
+    /// resolution, and — when `[hitl.park].bind_identity` is on — carries the
+    /// configured `identity_header`'s presented value onto the config for the
+    /// park path to hash. Pass `None` outside an HTTP request context; a bound
+    /// config then presents no identity and the park commits an unbound
+    /// checkpoint.
     fn to_agent_config(&self, req_headers: Option<&HashMap<String, String>>) -> AgentRuntimeConfig {
+        let park_bind_identity = self
+            .config
+            .hitl
+            .as_ref()
+            .is_some_and(|hitl| hitl.park.bind_identity);
+        let presented_identity = if park_bind_identity {
+            self.config.identity_header.as_deref().and_then(|name| {
+                req_headers?
+                    .iter()
+                    .find(|(key, _)| key.to_lowercase() == name.to_lowercase())
+                    .map(|(_, value)| value.clone())
+            })
+        } else {
+            None
+        };
+        let identity_header = self.config.identity_header.clone();
         let agent = AgentSettings {
             name: self.config.agent.name.clone(),
             system_prompt: self.config.agent.system_prompt.clone(),
@@ -91,6 +135,9 @@ impl RigBuilder {
                     req_headers,
                 )
             }),
+            park_bind_identity,
+            presented_identity,
+            identity_header,
             instance_id: crate::instance_id::instance_id(&self.config.agent).to_string(),
             ..Default::default()
         }
@@ -773,5 +820,77 @@ source = '/nonexistent/path/to/worker/skills'
             .discovered_agent_config(None)
             .unwrap_err();
         assert!(err.to_string().contains("not found"));
+    }
+
+    /// The park bind-identity projection: the flag comes from the parsed
+    /// `[hitl.park]` table, and the configured identity header's value is
+    /// extracted from the request headers only while the flag is on —
+    /// case-insensitively, like every other request-header lookup.
+    #[test]
+    fn bind_identity_projects_the_flag_and_extracts_the_presented_header() {
+        let config_str = r#"
+identity_header = "X-Client-Identity"
+
+[agent]
+name = "Binder"
+system_prompt = "You bind."
+
+[agent.llm]
+provider = "openai"
+api_key = "test"
+model = "gpt-5.1"
+
+[hitl]
+require_approval = []
+
+[hitl.route]
+mode = "conversational"
+timeout_secs = 60
+
+[hitl.park]
+enabled = false
+bind_identity = true
+"#;
+        let builder = RigBuilder::new(
+            aura_config::Config::parse_toml(config_str).expect("config should parse"),
+            PendingApprovals::new(),
+        );
+
+        let mut req_headers = HashMap::new();
+        req_headers.insert("x-client-identity".to_string(), "alice-token".to_string());
+
+        let bound = builder.to_agent_config(Some(&req_headers));
+        assert!(bound.park_bind_identity, "the [hitl.park] flag projects");
+        assert_eq!(
+            bound.presented_identity.as_deref(),
+            Some("alice-token"),
+            "the configured header's value is extracted"
+        );
+
+        let headerless = builder.to_agent_config(Some(&HashMap::new()));
+        assert!(headerless.park_bind_identity);
+        assert!(
+            headerless.presented_identity.is_none(),
+            "a request without the header presents nothing"
+        );
+
+        let offline = builder.to_agent_config(None);
+        assert!(offline.park_bind_identity);
+        assert!(
+            offline.presented_identity.is_none(),
+            "no request context presents nothing"
+        );
+
+        // Binding off leaves the presented value unset even when the header
+        // is present: the park commits an unbound checkpoint as before.
+        let unbound_config_str =
+            config_str.replace("bind_identity = true", "bind_identity = false");
+        let unbound = RigBuilder::new(
+            aura_config::Config::parse_toml(&unbound_config_str).expect("config should parse"),
+            PendingApprovals::new(),
+        )
+        .to_agent_config(Some(&req_headers));
+        assert!(!unbound.park_bind_identity);
+        assert!(unbound.presented_identity.is_none());
     }
 }

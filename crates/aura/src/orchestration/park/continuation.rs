@@ -1,6 +1,5 @@
-//! The continuation surfaces: the checkpointed worker conversation a resume
-//! drives, the per-run resuming-document handle, and the typed rehydrate
-//! errors.
+//! The continuation surfaces: the per-run resuming-document handle and the
+//! typed rehydrate errors.
 //!
 //! Distinct-owner note (P44 frontier finding): [`ResumingDocumentHandle`] is
 //! the park-module's per-run handle for appending tombstones to a resuming
@@ -11,52 +10,20 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use rig::completion::Message;
-
-use crate::hitl::{DecisionId, PendingApprovals};
+use crate::hitl::{AddressedApproval, DecisionId, PendingApprovals};
 use crate::orchestration::park::document::{ParkedRun, RESUMING_DOCUMENT_SUFFIX, load_parked_run};
 use crate::orchestration::park::recorded_decisions::{CallKey, RecordedDecisions};
 use crate::orchestration::persistence::is_safe_path_component;
-use crate::orchestration::types::PendingCall;
-
-/// One parked task's continuation payload: the recorded attempt, the
-/// conversation captured when the worker parked, and the calls awaiting a
-/// decision in recorded order. Built by the resume path from a checkpoint
-/// document (and so carries the restored coordinator-facing state's
-/// worker-side half).
-#[derive(Debug, Clone)]
-pub(crate) struct TaskContinuation {
-    /// The worker attempt that blocked; the resume rebuilds the worker for
-    /// the same attempt number.
-    pub attempt: usize,
-    /// Everything before the final worker turn.
-    pub history: Vec<Message>,
-    /// The final worker turn's aggregated tool-result prompt, still carrying
-    /// one sentinel per parked call id.
-    pub current_prompt: Message,
-    /// The parked calls, in the order the continuation invokes them.
-    pub pending: Vec<PendingCall>,
-}
-
-/// Everything the continuation arm needs besides the checkpoint itself: the
-/// run's recorded decisions (behind the `Arc` the gate already holds) and the
-/// resuming document every tombstone appends through.
-#[derive(Clone)]
-pub(crate) struct ResumeContext {
-    pub recorded: Arc<RecordedDecisions>,
-    pub document: Arc<ResumingDocumentHandle>,
-}
 
 /// Why a run could not rehydrate, mapped to the section 2.6 condition rows.
-#[allow(dead_code)] // P45 resume endpoint consumes the rehydrate entry points
 #[derive(Debug)]
 pub(crate) enum RehydrateError {
     /// Condition row "not found": no checkpoint document exists for the run.
     NotFound,
     /// Condition row "expired": a pending call has no recorded decision and
-    /// the run is past `expires_at`. A run whose decisions were all recorded
-    /// in time resumes after expiry — the window bounds the decision, not
-    /// the resumer.
+    /// the run is past `retention_expires_at`. A run whose decisions were all
+    /// recorded in time resumes after expiry — the window bounds the
+    /// decision, not the resumer.
     Expired,
     /// Condition row "mismatch": the store and the document disagree — the
     /// stored approval is missing, its scope names another run or task than
@@ -67,13 +34,12 @@ pub(crate) enum RehydrateError {
     /// decision inside the decision window. The resume endpoint answers
     /// 409 `parked` with the outstanding ids and `expires_at`; an
     /// all-decided resume never sees this.
-    Parked {
-        outstanding: Vec<DecisionId>,
-        expires_at: chrono::DateTime<chrono::Utc>,
-    },
+    Parked { outstanding: Vec<DecisionId> },
     /// Condition row "config_changed": the fingerprint no longer matches the
     /// rebuilt configuration. Checked by the resume endpoint against a
     /// header-resolved config entry point (P45 adoption).
+    #[allow(dead_code)]
+    // reserved: the fingerprint row is enforced structurally ahead of the consult
     ConfigChanged,
     /// Condition row carried as a store fault: the approval store failed
     /// mid-read.
@@ -89,7 +55,7 @@ impl std::fmt::Display for RehydrateError {
             Self::NotFound => write!(f, "no checkpoint document for the run"),
             Self::Expired => write!(f, "the run's decision window has expired"),
             Self::Mismatch(detail) => write!(f, "resume mismatch: {detail}"),
-            Self::Parked { outstanding, .. } => write!(
+            Self::Parked { outstanding } => write!(
                 f,
                 "{} approval(s) still await a decision inside the window",
                 outstanding.len()
@@ -121,7 +87,6 @@ impl ResumingDocumentHandle {
     /// Load the parked document at `path` and arm the handle. Appends publish
     /// to the sibling `{run_id}.resuming.json`; the parked document itself is
     /// left untouched.
-    #[allow(dead_code)] // P45 resume endpoint consumes the rehydrate entry points
     pub(crate) async fn open(path: &Path) -> Result<Self, RehydrateError> {
         let document = match load_parked_run(path).await {
             Ok(document) => document,
@@ -166,7 +131,10 @@ impl ResumingDocumentHandle {
                 .unwrap_or_default()
         ));
         tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-            std::fs::write(&tmp, &bytes)?;
+            if let Some(parent) = non_empty_parent(&publish_path) {
+                crate::session_store::private_dir(parent)?;
+            }
+            crate::session_store::write_private(&tmp, &bytes)?;
             std::fs::rename(&tmp, &publish_path)
         })
         .await
@@ -196,19 +164,19 @@ impl ResumingDocumentHandle {
 /// must still match the stored approval, or the resume is a mismatch. The
 /// approval must be a park-retained one: park mode requires the file-backed
 /// store, whose `get` returns the approval before and after the decision.
-#[allow(dead_code)] // P45 resume endpoint consumes the rehydrate entry points
+/// The caller injects `now`: the decision window's expired row is evaluated
+/// against the caller's clock, not the wall clock at read time.
 pub(crate) async fn load_recorded_decisions(
     store: &PendingApprovals,
     doc: &ParkedRun,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Result<(Arc<RecordedDecisions>, Vec<DecisionId>), RehydrateError> {
     let recorded = Arc::new(RecordedDecisions::default());
     let mut decision_ids = Vec::new();
     let mut outstanding = Vec::new();
-    // The document's expiry stamp is the run's decision window the 2.6
+    // The document's retention stamp is the run's decision window the 2.6
     // expired row is evaluated against.
-    let expires_at = chrono::DateTime::parse_from_rfc3339(&doc.expires_at)
-        .map_err(|e| RehydrateError::Document(format!("bad expiry stamp: {e}")))?
-        .with_timezone(&chrono::Utc);
+    let expires_at = doc.retention_expires_at.as_datetime();
 
     for node in &doc.plan.tasks {
         let crate::orchestration::types::TaskStatus::AwaitingApproval = node.status else {
@@ -223,6 +191,9 @@ pub(crate) async fn load_recorded_decisions(
                 .await
                 .map_err(|e| RehydrateError::Store(e.to_string()))?;
             let Some(parked) = parked else {
+                if now > expires_at {
+                    return Err(RehydrateError::Expired);
+                }
                 return Err(RehydrateError::Mismatch(format!(
                     "store approval {} is missing",
                     call.decision_id
@@ -273,65 +244,63 @@ pub(crate) async fn load_recorded_decisions(
                     call.tool_name, call.decision_id
                 )));
             }
-            let Some(decision) = store.recorded_decision(&call.decision_id).await else {
+            let Some(resolved) = store.recorded_decision(&call.decision_id).await else {
                 // No decision yet: expired past the window (the 2.6 expired
                 // row outranks parked), still parked otherwise — collected
                 // so the 409 body can carry every outstanding id.
-                if chrono::Utc::now() > expires_at {
+                if now > expires_at {
                     return Err(RehydrateError::Expired);
                 }
                 outstanding.push(call.decision_id);
                 continue;
             };
             // The key's task id comes from the awaiting node, the tool name
-            // and arguments from the store's approval record.
+            // and arguments from the store's approval record. The carrier
+            // keeps the recorded identity with the decision it rode in with;
+            // the interim consult records decisions only — the E7 cutover
+            // replaces this read with the authority-aware read-or-expire,
+            // whose addressed arm also carries durable per-call timeouts.
             recorded.push(
                 CallKey::new(node.task_id, &item.tool_name, &item.arguments),
-                decision,
+                AddressedApproval::Decided(resolved),
             );
             decision_ids.push(call.decision_id);
         }
     }
     if !outstanding.is_empty() {
-        return Err(RehydrateError::Parked {
-            outstanding,
-            expires_at,
-        });
+        return Err(RehydrateError::Parked { outstanding });
     }
 
     Ok((recorded, decision_ids))
 }
 
-/// Replace the sentinel tool result for `call_id` in `current_prompt` with
-/// `wire` — the result text as the loop delivers it to the model (rig
-/// JSON-serializes tool outputs, so a plain string arrives JSON-quoted).
-/// Returns whether an entry was replaced; the continuation fails the resume
-/// when none was, so no sentinel can survive into the resumed conversation.
-pub(crate) fn replace_tool_result(current_prompt: &mut Message, call_id: &str, wire: &str) -> bool {
-    let Message::User { content } = current_prompt else {
-        return false;
-    };
-    let mut replaced = false;
-    for item in content.iter_mut() {
-        if let rig::message::UserContent::ToolResult(tr) = item
-            && tr.id == call_id
-        {
-            tr.content =
-                rig::OneOrMany::one(rig::message::ToolResultContent::text(wire.to_string()));
-            replaced = true;
-        }
-    }
-    replaced
+/// The directory a document lives in, or `None` for a bare file name whose
+/// parent is the empty path.
+fn non_empty_parent(path: &std::path::Path) -> Option<&std::path::Path> {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn non_empty_parent_skips_a_bare_file_name() {
+        use std::path::Path;
+        assert_eq!(super::non_empty_parent(Path::new("run.json")), None);
+        assert_eq!(
+            super::non_empty_parent(Path::new("parked/run.json")),
+            Some(Path::new("parked"))
+        );
+    }
+
     use super::*;
     use crate::hitl::{
-        AgentScope, ApprovalDecision, ApprovalItem, ApprovalOrigin, ApprovalRequest,
-        PROTOCOL_VERSION, ParkedApproval,
+        AgentScope, ApprovalAuthority, ApprovalDecision, ApprovalItem, ApprovalOrigin,
+        ApprovalRequest, PROTOCOL_VERSION, ParkedApproval, ResolvedDecision,
     };
     use crate::orchestration::park::document::{ParkedPlan, ParkedTaskNode, SCHEMA_VERSION};
+    use crate::orchestration::park::retention::RetentionExpiresAt;
+    use crate::orchestration::types::PendingCall;
     use crate::orchestration::types::TaskStatus;
 
     fn parked_run(pending: Vec<PendingCall>) -> ParkedRun {
@@ -340,7 +309,9 @@ mod tests {
             session_id: Some("sess".to_string()),
             run_id: "0191e8c0-aaaa-7000-8000-00000000c0de".to_string(),
             parked_at: "2026-09-02T14:00:00+00:00".to_string(),
-            expires_at: (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
+            retention_expires_at: RetentionExpiresAt::from_datetime(
+                chrono::Utc::now() + chrono::Duration::hours(1),
+            ),
             query: "Deploy".to_string(),
             chat_history: vec![],
             coordinator_conversation: vec![],
@@ -369,6 +340,7 @@ mod tests {
             },
             executed: vec![],
             config_fingerprint: "f".to_string(),
+            identity_hash: None,
         }
     }
 
@@ -405,6 +377,9 @@ mod tests {
             },
             registered_at: chrono::Utc::now(),
             expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+            authority: ApprovalAuthority::Conversational,
+            egress_headers: None,
+            acknowledgment: crate::hitl::AcknowledgmentState::RequiresNotification,
         }
     }
 
@@ -434,7 +409,11 @@ mod tests {
             .await
             .unwrap();
         registry
-            .resolve(&decision_id, ApprovalDecision::Approved)
+            .resolve(
+                &decision_id,
+                ApprovalAuthority::Conversational,
+                ApprovalDecision::Approved.into(),
+            )
             .await
             .unwrap();
 
@@ -444,7 +423,7 @@ mod tests {
             decision_id,
             serde_json::json!({ "namespace": "stage" }),
         )]);
-        let err = load_recorded_decisions(&registry, &mismatched)
+        let err = load_recorded_decisions(&registry, &mismatched, chrono::Utc::now())
             .await
             .unwrap_err();
         assert!(
@@ -455,11 +434,15 @@ mod tests {
 
         // The matching shape: the entry consumes at the resume gate.
         let doc = parked_run(vec![pending_call(decision_id, args.clone())]);
-        let (recorded, ids) = load_recorded_decisions(&registry, &doc).await.unwrap();
+        let (recorded, ids) = load_recorded_decisions(&registry, &doc, chrono::Utc::now())
+            .await
+            .unwrap();
         assert_eq!(ids, vec![decision_id]);
         assert_eq!(
             recorded.take(&CallKey::new(3, "kubectl_apply", &args)),
-            Some(ApprovalDecision::Approved),
+            Some(AddressedApproval::Decided(ResolvedDecision::from(
+                ApprovalDecision::Approved
+            ))),
             "the recorded decision is consumable at the resume gate"
         );
         assert!(
@@ -487,6 +470,7 @@ mod tests {
         let err = load_recorded_decisions(
             &registry,
             &parked_run(vec![pending_call(vanished, args.clone())]),
+            chrono::Utc::now(),
         )
         .await
         .unwrap_err();
@@ -498,11 +482,12 @@ mod tests {
         let err = load_recorded_decisions(
             &registry,
             &parked_run(vec![pending_call(undecided, args.clone())]),
+            chrono::Utc::now(),
         )
         .await
         .unwrap_err();
         match err {
-            RehydrateError::Parked { outstanding, .. } => {
+            RehydrateError::Parked { outstanding } => {
                 assert_eq!(outstanding, vec![undecided]);
             }
             other => panic!("expected Parked with the outstanding id, got: {other}"),
@@ -510,10 +495,21 @@ mod tests {
 
         // The same undecided call past the document's expiry is the expired
         // row.
-        let mut doc = parked_run(vec![pending_call(undecided, args)]);
-        doc.expires_at = (chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
-        let err = load_recorded_decisions(&registry, &doc).await.unwrap_err();
+        let mut doc = parked_run(vec![pending_call(undecided, args.clone())]);
+        doc.retention_expires_at =
+            RetentionExpiresAt::from_datetime(chrono::Utc::now() - chrono::Duration::seconds(1));
+        let err = load_recorded_decisions(&registry, &doc, chrono::Utc::now())
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("expired"), "got: {err}");
+
+        // A row the store already swept past the window is expired, not a
+        // mismatch.
+        doc.plan.tasks[0].pending = Some(vec![pending_call(vanished, args)]);
+        let err = load_recorded_decisions(&registry, &doc, chrono::Utc::now())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RehydrateError::Expired), "got: {err}");
     }
 
     /// The stored approval's scope must name this run and this checkpoint
@@ -535,6 +531,7 @@ mod tests {
         let err = load_recorded_decisions(
             &registry,
             &parked_run(vec![pending_call(decision_id, args.clone())]),
+            chrono::Utc::now(),
         )
         .await
         .unwrap_err();
@@ -551,6 +548,7 @@ mod tests {
         let err = load_recorded_decisions(
             &registry,
             &parked_run(vec![pending_call(decision_id, args.clone())]),
+            chrono::Utc::now(),
         )
         .await
         .unwrap_err();
@@ -565,6 +563,7 @@ mod tests {
         let err = load_recorded_decisions(
             &registry,
             &parked_run(vec![pending_call(decision_id, serde_json::json!({}))]),
+            chrono::Utc::now(),
         )
         .await
         .unwrap_err();
@@ -586,70 +585,24 @@ mod tests {
             .unwrap();
         // The decision lands after the document was committed.
         registry
-            .resolve(&decision_id, ApprovalDecision::Approved)
+            .resolve(
+                &decision_id,
+                ApprovalAuthority::Conversational,
+                ApprovalDecision::Approved.into(),
+            )
             .await
             .unwrap();
 
         let doc = parked_run(vec![pending_call(decision_id, args.clone())]);
-        let (recorded, ids) = load_recorded_decisions(&registry, &doc).await.unwrap();
+        let (recorded, ids) = load_recorded_decisions(&registry, &doc, chrono::Utc::now())
+            .await
+            .unwrap();
         assert_eq!(ids, vec![decision_id]);
         assert_eq!(
             recorded.take(&CallKey::new(3, "kubectl_apply", &args)),
-            Some(ApprovalDecision::Approved)
-        );
-    }
-
-    /// The sentinel replacement: matching call ids swap in the wire result;
-    /// an absent call id reports false so the continuation fails instead of
-    /// shipping a sentinel back to the model.
-    #[test]
-    fn replace_tool_result_swaps_only_the_matching_call() {
-        let mut prompt = Message::User {
-            content: rig::OneOrMany::many(vec![
-                rig::message::UserContent::Text(rig::message::Text {
-                    text: "context".to_string(),
-                }),
-                rig::message::UserContent::ToolResult(rig::message::ToolResult {
-                    id: "call_a".to_string(),
-                    call_id: None,
-                    content: rig::OneOrMany::one(rig::message::ToolResultContent::text("sentinel")),
-                }),
-                rig::message::UserContent::ToolResult(rig::message::ToolResult {
-                    id: "call_b".to_string(),
-                    call_id: None,
-                    content: rig::OneOrMany::one(rig::message::ToolResultContent::text("sentinel")),
-                }),
-            ])
-            .unwrap(),
-        };
-
-        assert!(replace_tool_result(&mut prompt, "call_a", "\"applied\""));
-        let Message::User { content } = &prompt else {
-            unreachable!()
-        };
-        for item in content.iter() {
-            let rig::message::UserContent::ToolResult(tr) = item else {
-                continue;
-            };
-            let text = tr
-                .content
-                .iter()
-                .map(|c| match c {
-                    rig::message::ToolResultContent::Text(t) => t.text.clone(),
-                    rig::message::ToolResultContent::Image(_) => "[image]".to_string(),
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            if tr.id == "call_a" {
-                assert_eq!(text, "\"applied\"");
-            } else {
-                assert_eq!(text, "sentinel", "siblings are untouched");
-            }
-        }
-
-        assert!(
-            !replace_tool_result(&mut prompt, "call_missing", "\"x\""),
-            "an unknown call id must not silently succeed"
+            Some(AddressedApproval::Decided(ResolvedDecision::from(
+                ApprovalDecision::Approved
+            )))
         );
     }
 
@@ -666,6 +619,12 @@ mod tests {
         )
         .unwrap();
 
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            dir.path(),
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+        )
+        .unwrap();
         let handle = Arc::new(ResumingDocumentHandle::open(&parked_path).await.unwrap());
         let h1 = Arc::clone(&handle);
         let h2 = Arc::clone(&handle);
@@ -698,6 +657,21 @@ mod tests {
             .filter_map(|e| e.ok())
             .any(|e| e.file_name().to_string_lossy().ends_with(".tmp"));
         assert!(!residue, "no temp file residue");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(handle.publish_path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "the resuming document is owner-only");
+            let dir_mode = std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                dir_mode, 0o700,
+                "the parked directory is tightened on append"
+            );
+        }
     }
 
     /// A missing document opens as NotFound — the section 2.6 "not found"

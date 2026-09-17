@@ -23,6 +23,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures::StreamExt;
+use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 use tokio::task::AbortHandle;
 use tokio::time::Instant;
@@ -33,7 +34,10 @@ use crate::session_store::{
     Subscription,
 };
 
-use super::decision::{ApprovalDecision, AwaitingDecision, DecisionId, Timestamp};
+use super::decision::{
+    ApprovalDecision, AwaitingDecision, DecisionId, ResolvedDecision, Timestamp,
+};
+use super::outcome::{ApprovalAuthority, ApprovalRead};
 use super::protocol::ApprovalRequest;
 
 /// Bus topic carrying the decision for one parked approval.
@@ -72,13 +76,51 @@ impl WakeEntry {
     }
 }
 
+/// Whether a parked row still needs its notify POST, or was already
+/// acknowledged by the receiver. A row is acknowledged either at registration
+/// (the 207 bridge: the 207 IS the receiver's ack) or after a successful
+/// notify POST; either way the reconciler never re-POSTs it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AcknowledgmentState {
+    /// The receiver has not been notified; the reconciler must POST.
+    #[default]
+    RequiresNotification,
+    /// The receiver has acknowledged; the reconciler must never re-POST this
+    /// row.
+    Acknowledged,
+}
+
+impl AcknowledgmentState {
+    /// Whether the reconciler must still notify this row.
+    #[must_use]
+    pub fn is_requires_notification(&self) -> bool {
+        matches!(self, Self::RequiresNotification)
+    }
+}
+
 /// The serializable record of a parked approval. Carries everything needed to
-/// re-render and re-validate the approval after a restart.
+/// re-render and re-validate the approval after a restart — and, under poll
+/// delivery, the resolved egress headers its notify POST authenticates with.
 #[derive(Clone)]
 pub struct ParkedApproval {
     pub request: ApprovalRequest,
     pub registered_at: Timestamp,
     pub expires_at: Timestamp,
+    /// Which channel may address the row: inline registration parks
+    /// `Conversational`, the 207 bridge parks `WebhookPoll`. Resolve and
+    /// read-or-expire check it, so one channel's row can never be consumed
+    /// through another.
+    pub authority: ApprovalAuthority,
+    /// Resolved egress headers (`headers_from_request` overlaying the static
+    /// headers) for this row's notify POST. Values are credentials at rest:
+    /// the storage projection's Debug prints names only.
+    pub egress_headers: Option<reqwest::header::HeaderMap>,
+    /// Durable acknowledgment state, written atomically with registration
+    /// and updated by the reconciler's post-notify mark. The 207 bridge
+    /// constructs the acknowledged state; the reconciler reads this, never a
+    /// process-local set alone.
+    pub acknowledgment: AcknowledgmentState,
 }
 
 /// Why a [`PendingApprovals::resolve`] could not complete.
@@ -129,6 +171,9 @@ impl PendingApprovals {
             registered_at: now,
             expires_at: now
                 + chrono::Duration::from_std(timeout).expect("approval timeout fits in chrono"),
+            authority: ApprovalAuthority::Conversational,
+            egress_headers: None,
+            acknowledgment: AcknowledgmentState::RequiresNotification,
         };
 
         // Subscribe before the store insert: once `store.register` returns,
@@ -182,16 +227,29 @@ impl PendingApprovals {
         self.0.store.register(parked).await
     }
 
-    /// Resolve a parked approval: durably record the decision in the store
-    /// (at most once per `DecisionId`) and publish it on the bus, waking the
-    /// parked await wherever it lives.
+    /// Resolve a parked approval: durably record the decision — and the
+    /// approver identity captured alongside it, as one carrier — in the store
+    /// (at most once per `DecisionId`), and publish the credential-free
+    /// decision on the bus, waking the parked await wherever it lives.
+    ///
+    /// `expected_authority` is the channel the caller resolves under: the
+    /// local ingress and standalone resolver pass `Conversational`, the
+    /// poller `WebhookPoll`. A row parked under another authority answers
+    /// `NotFound` with no mutation, inside the store's one serialization
+    /// boundary.
     pub async fn resolve(
         &self,
         id: &DecisionId,
-        decision: ApprovalDecision,
+        expected_authority: ApprovalAuthority,
+        resolved: ResolvedDecision,
     ) -> Result<(), ResolveError> {
-        self.0.store.resolve(id, decision.clone()).await?;
-        let payload = serde_json::to_vec(&decision).expect("ApprovalDecision serializes to JSON");
+        self.0
+            .store
+            .resolve(id, expected_authority, resolved.clone())
+            .await?;
+        // Identity never rides the bus: the payload is the decision alone.
+        let payload =
+            serde_json::to_vec(&resolved.decision()).expect("ApprovalDecision serializes to JSON");
         if let Err(err) = self
             .0
             .bus
@@ -213,10 +271,23 @@ impl PendingApprovals {
         self.0.store.get(id).await
     }
 
-    /// The durably recorded decision for an already-resolved approval, if
-    /// any. A store fault reads as "no recorded decision" (logged), so
-    /// callers keep their fail-closed shape.
-    pub async fn recorded_decision(&self, id: &DecisionId) -> Option<ApprovalDecision> {
+    /// Read one approval row and, under the store's serialization boundary,
+    /// expire it when its own deadline has passed strictly: the consult's
+    /// per-member read. Forwards fail-closed — a store fault is an error,
+    /// never an outcome.
+    pub async fn read_or_expire(
+        &self,
+        id: &DecisionId,
+        expected_authority: ApprovalAuthority,
+    ) -> Result<ApprovalRead, SessionStoreError> {
+        self.0.store.read_or_expire(id, expected_authority).await
+    }
+
+    /// The decision durably recorded for an already-resolved approval —
+    /// decision and captured identity together — if any. A store fault reads
+    /// as "no recorded decision" (logged), so callers keep their fail-closed
+    /// shape.
+    pub async fn recorded_decision(&self, id: &DecisionId) -> Option<ResolvedDecision> {
         match self.0.store.decision(id).await {
             Ok(decision) => decision,
             Err(err) => {
@@ -322,7 +393,7 @@ async fn wake_on_decision(
                     return;
                 };
                 match inner.store.decision(&id).await {
-                    Ok(Some(decision)) => decision,
+                    Ok(Some(resolved)) => resolved.decision(),
                     Ok(None) => continue,
                     Err(err) => {
                         warn!(
@@ -399,7 +470,11 @@ mod tests {
         let cancel = RequestCancelToken::unbound();
 
         registry
-            .resolve(&id, ApprovalDecision::Approved)
+            .resolve(
+                &id,
+                ApprovalAuthority::Conversational,
+                ApprovalDecision::Approved.into(),
+            )
             .await
             .expect("resolve succeeds");
 
@@ -420,9 +495,11 @@ mod tests {
         registry
             .resolve(
                 &id,
+                ApprovalAuthority::Conversational,
                 ApprovalDecision::Denied {
                     reason: Some("not safe".into()),
-                },
+                }
+                .into(),
             )
             .await
             .expect("resolve succeeds");
@@ -440,7 +517,13 @@ mod tests {
         let registry = PendingApprovals::new();
         let unknown = DecisionId::generate();
         assert_eq!(
-            registry.resolve(&unknown, ApprovalDecision::Approved).await,
+            registry
+                .resolve(
+                    &unknown,
+                    ApprovalAuthority::Conversational,
+                    ApprovalDecision::Approved.into()
+                )
+                .await,
             Err(ResolveError::NotFound)
         );
     }
@@ -453,11 +536,21 @@ mod tests {
         let _handle = registry.register(req, Duration::from_secs(60)).await;
 
         registry
-            .resolve(&id, ApprovalDecision::Approved)
+            .resolve(
+                &id,
+                ApprovalAuthority::Conversational,
+                ApprovalDecision::Approved.into(),
+            )
             .await
             .expect("first resolve succeeds");
         assert_eq!(
-            registry.resolve(&id, ApprovalDecision::Approved).await,
+            registry
+                .resolve(
+                    &id,
+                    ApprovalAuthority::Conversational,
+                    ApprovalDecision::Approved.into()
+                )
+                .await,
             Err(ResolveError::NotFound)
         );
     }
@@ -472,7 +565,13 @@ mod tests {
         registry.remove(&id).await;
 
         assert_eq!(
-            registry.resolve(&id, ApprovalDecision::Approved).await,
+            registry
+                .resolve(
+                    &id,
+                    ApprovalAuthority::Conversational,
+                    ApprovalDecision::Approved.into()
+                )
+                .await,
             Err(ResolveError::NotFound)
         );
     }
@@ -488,7 +587,13 @@ mod tests {
         drop(handle);
 
         assert_eq!(
-            registry.resolve(&id, ApprovalDecision::Approved).await,
+            registry
+                .resolve(
+                    &id,
+                    ApprovalAuthority::Conversational,
+                    ApprovalDecision::Approved.into()
+                )
+                .await,
             Ok(())
         );
     }
@@ -510,7 +615,11 @@ mod tests {
             .await
             .expect("publish succeeds");
         registry
-            .resolve(&id, ApprovalDecision::Approved)
+            .resolve(
+                &id,
+                ApprovalAuthority::Conversational,
+                ApprovalDecision::Approved.into(),
+            )
             .await
             .expect("resolve succeeds");
 
@@ -565,13 +674,23 @@ mod tests {
             ApprovalOutcome::Cancelled(CancelReason::SenderDropped)
         );
         assert_eq!(
-            registry.resolve(&id_a, ApprovalDecision::Approved).await,
+            registry
+                .resolve(
+                    &id_a,
+                    ApprovalAuthority::Conversational,
+                    ApprovalDecision::Approved.into()
+                )
+                .await,
             Err(ResolveError::NotFound),
             "cancelled approval must be gone from the store too",
         );
 
         registry
-            .resolve(&id_b, ApprovalDecision::Approved)
+            .resolve(
+                &id_b,
+                ApprovalAuthority::Conversational,
+                ApprovalDecision::Approved.into(),
+            )
             .await
             .expect("unrelated entry survives");
         assert_eq!(
@@ -647,7 +766,11 @@ mod tests {
         let handle = parker.register(req, Duration::from_secs(60)).await;
 
         resolver
-            .resolve(&id, ApprovalDecision::Approved)
+            .resolve(
+                &id,
+                ApprovalAuthority::Conversational,
+                ApprovalDecision::Approved.into(),
+            )
             .await
             .expect("resolve succeeds");
 
@@ -679,9 +802,11 @@ mod tests {
         registry
             .resolve(
                 &id,
+                ApprovalAuthority::Conversational,
                 ApprovalDecision::Denied {
                     reason: Some("nope".into()),
-                },
+                }
+                .into(),
             )
             .await
             .expect("resolve succeeds");
@@ -710,13 +835,335 @@ mod tests {
         let handle = instance_a.register(req, Duration::from_secs(60)).await;
 
         instance_b
-            .resolve(&id, ApprovalDecision::Approved)
+            .resolve(
+                &id,
+                ApprovalAuthority::Conversational,
+                ApprovalDecision::Approved.into(),
+            )
             .await
             .expect("resolve on the other instance succeeds");
 
         assert_eq!(
             handle.outcome(&cancel).await,
             ApprovalOutcome::Decided(ApprovalDecision::Approved)
+        );
+    }
+
+    /// Identity captured at resolve time persists in the SAME resolve: the
+    /// store read-back carries the decision AND the identity together, and
+    /// the wake (the conversational consumer) sees the credential-free
+    /// decision only.
+    #[tokio::test]
+    async fn resolve_persists_identity_with_the_decision() {
+        let registry = PendingApprovals::new();
+        let cancel = RequestCancelToken::unbound();
+        let req = test_request("req-identity");
+        let id = req.decision_id;
+        let handle = registry.register(req, Duration::from_secs(60)).await;
+
+        let identity = crate::approver_headers::ApproverHeaders::from_pairs([(
+            "x-forwarded-user".to_owned(),
+            "alice".to_owned(),
+        )])
+        .unwrap();
+        registry
+            .resolve(
+                &id,
+                ApprovalAuthority::Conversational,
+                ResolvedDecision::approved(Some(identity)),
+            )
+            .await
+            .expect("resolve succeeds");
+
+        let recorded = registry
+            .recorded_decision(&id)
+            .await
+            .expect("the decision is recorded");
+        match recorded {
+            ResolvedDecision::Approved {
+                identity: Some(got),
+            } => {
+                assert_eq!(
+                    got.captured_names().collect::<Vec<_>>(),
+                    ["x-forwarded-user"]
+                );
+            }
+            other => panic!("expected Approved with identity, got {other:?}"),
+        }
+        // The wake carries the decision alone.
+        assert_eq!(
+            handle.outcome(&cancel).await,
+            ApprovalOutcome::Decided(ApprovalDecision::Approved)
+        );
+    }
+
+    /// Two competing resolves under concurrency: exactly one wins, and the
+    /// stored pair is the winner's decision AND identity — a losing resolver
+    /// cannot overwrite either half.
+    #[tokio::test]
+    async fn competing_resolves_keep_the_winning_decision_and_identity_together() {
+        let store: Arc<dyn ApprovalStore> = Arc::new(InMemoryApprovalStore::new());
+        let registry = PendingApprovals::with_backend(store, Arc::new(InMemoryEventBus::new()));
+        let req = test_request("req-competing");
+        let id = req.decision_id;
+        registry
+            .register_durable(ParkedApproval {
+                request: req,
+                registered_at: chrono::Utc::now(),
+                expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+                authority: ApprovalAuthority::Conversational,
+                egress_headers: None,
+                acknowledgment: AcknowledgmentState::RequiresNotification,
+            })
+            .await
+            .unwrap();
+
+        let alice_pair = |v: &str| {
+            std::collections::BTreeMap::from([("x-forwarded-user".to_owned(), v.to_owned())])
+        };
+        let (a, b) = tokio::join!(
+            registry.resolve(
+                &id,
+                ApprovalAuthority::Conversational,
+                ResolvedDecision::approved(Some(
+                    crate::approver_headers::ApproverHeaders::from_pairs(alice_pair("alice"))
+                        .unwrap(),
+                )),
+            ),
+            registry.resolve(
+                &id,
+                ApprovalAuthority::Conversational,
+                ResolvedDecision::approved(Some(
+                    crate::approver_headers::ApproverHeaders::from_pairs(alice_pair("mallory"))
+                        .unwrap(),
+                )),
+            ),
+        );
+        let winners = usize::from(a.is_ok()) + usize::from(b.is_ok());
+        assert_eq!(winners, 1, "exactly one resolver wins: {a:?} / {b:?}");
+
+        match registry.recorded_decision(&id).await.expect("recorded") {
+            ResolvedDecision::Approved {
+                identity: Some(got),
+            } => {
+                // The surviving identity is exactly one resolver's pair —
+                // decision and identity won their race together.
+                let stored = got.to_pair_map();
+                assert!(
+                    stored == alice_pair("alice") || stored == alice_pair("mallory"),
+                    "the winner's identity is stored whole, got {stored:?}"
+                );
+            }
+            other => panic!("expected Approved with identity, got {other:?}"),
+        }
+    }
+
+    /// The decision bus publishes only the credential-free decision: the
+    /// payload on the approval topic is exactly the serialized
+    /// `ApprovalDecision`, with no identity field or value.
+    #[tokio::test]
+    async fn decision_bus_payload_is_credential_free() {
+        let store: Arc<dyn ApprovalStore> = Arc::new(InMemoryApprovalStore::new());
+        let bus: Arc<dyn EventBus> = Arc::new(InMemoryEventBus::new());
+        let registry = PendingApprovals::with_backend(store, bus.clone());
+        let req = test_request("req-bus");
+        let id = req.decision_id;
+        let _handle = registry.register(req, Duration::from_secs(60)).await;
+        let mut sub = bus.subscribe(&approval_topic(&id)).await.unwrap();
+        let identity = crate::approver_headers::ApproverHeaders::from_pairs([(
+            "x-forwarded-user".to_owned(),
+            "alice-sentinel".to_owned(),
+        )])
+        .unwrap();
+        registry
+            .resolve(
+                &id,
+                ApprovalAuthority::Conversational,
+                ResolvedDecision::approved(Some(identity)),
+            )
+            .await
+            .expect("resolve succeeds");
+
+        let payload = tokio::time::timeout(Duration::from_secs(1), sub.next())
+            .await
+            .expect("the bus wake arrives")
+            .expect("stream open");
+        let json: serde_json::Value =
+            serde_json::from_slice(&payload).expect("the payload is the serialized decision");
+        assert_eq!(json, serde_json::json!("Approved"));
+        let text = String::from_utf8_lossy(&payload).to_string();
+        assert!(
+            !text.contains("alice-sentinel") && !text.contains("x-forwarded-user"),
+            "the bus payload must be credential-free, got: {text}"
+        );
+    }
+
+    // ====================================================================
+    // Approval authority: a row parked by one channel is never consumable
+    // through another. The stores enforce the check inside the store's
+    // resolve (E1/E2); the contract is channel exclusivity — wrong
+    // authority is unknown (NotFound), never a mutation.
+    // ====================================================================
+
+    /// Park one durable row under [`ApprovalAuthority::WebhookPoll`] —
+    /// the 207 bridge's seeding shape, mirroring poller.rs `park_pending`
+    /// — and return its decision id.
+    async fn webhook_parked(registry: &PendingApprovals, request: ApprovalRequest) -> DecisionId {
+        let id = request.decision_id;
+        registry
+            .register_durable(ParkedApproval {
+                request,
+                registered_at: chrono::Utc::now(),
+                expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+                authority: ApprovalAuthority::WebhookPoll,
+                egress_headers: None,
+                acknowledgment: AcknowledgmentState::RequiresNotification,
+            })
+            .await
+            .expect("webhook-owned approval parks durably");
+        id
+    }
+
+    /// A webhook-owned row is unknown to the conversational channel, and
+    /// the refused resolve mutates nothing (memory backend).
+    #[tokio::test]
+    async fn authority_webhook_row_refuses_conversational_resolve_memory() {
+        let registry = PendingApprovals::new();
+        let req = test_request("req-authority-memory");
+        let id = webhook_parked(&registry, req).await;
+
+        assert_eq!(
+            registry
+                .resolve(
+                    &id,
+                    ApprovalAuthority::Conversational,
+                    ApprovalDecision::Approved.into(),
+                )
+                .await,
+            Err(ResolveError::NotFound),
+            "a webhook-owned row must be unknown to the conversational channel",
+        );
+        // Zero mutation: the row is still parked and nothing was recorded.
+        assert!(
+            registry.try_parked(&id).await.unwrap().is_some(),
+            "the refused resolve must not consume the row",
+        );
+        assert!(
+            registry.recorded_decision(&id).await.is_none(),
+            "the refused resolve must not record a decision",
+        );
+    }
+
+    /// The same refusal through the durable file backend: wrong authority
+    /// fails as unknown, no decision is recorded, and the row stays in the
+    /// undecided scan the poller consumes. Backend asymmetry noted: after
+    /// any (today: wrong-authority) resolve, `get` restores the row from
+    /// the decision envelope — the file store MOVES the row, it does not
+    /// delete it — so "pending" here means "no decision recorded + still
+    /// in the pending scan", not "get is None".
+    #[tokio::test]
+    async fn authority_webhook_row_refuses_conversational_resolve_file() {
+        use crate::session_store::FileApprovalStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn ApprovalStore> = Arc::new(FileApprovalStore::open(dir.path()).unwrap());
+        let registry =
+            PendingApprovals::with_backend(store.clone(), Arc::new(InMemoryEventBus::new()));
+        let req = test_request("req-authority-file");
+        let id = webhook_parked(&registry, req).await;
+
+        assert_eq!(
+            registry
+                .resolve(
+                    &id,
+                    ApprovalAuthority::Conversational,
+                    ApprovalDecision::Approved.into(),
+                )
+                .await,
+            Err(ResolveError::NotFound),
+            "a webhook-owned row must be unknown to the conversational channel",
+        );
+        assert!(
+            registry.recorded_decision(&id).await.is_none(),
+            "the refused resolve must not record a decision",
+        );
+        let pending = store.list_pending().await.unwrap();
+        assert!(
+            pending
+                .iter()
+                .any(|parked| parked.request.decision_id == id),
+            "the refused resolve must leave the row pending",
+        );
+    }
+
+    /// The inverse block: an inline conversational row is never consumable
+    /// through the poller's webhook-poll channel — cross-agent polling of
+    /// a shared store is refused as unknown.
+    #[tokio::test]
+    async fn authority_conversational_row_refuses_webhook_poll_resolve() {
+        let registry = PendingApprovals::new();
+        let req = test_request("req-authority-cross");
+        let id = req.decision_id;
+        let _handle = registry.register(req, Duration::from_secs(60)).await;
+
+        assert_eq!(
+            registry
+                .resolve(
+                    &id,
+                    ApprovalAuthority::WebhookPoll,
+                    ApprovalDecision::Approved.into(),
+                )
+                .await,
+            Err(ResolveError::NotFound),
+            "a conversational row must be unknown to the webhook-poll channel",
+        );
+        assert!(
+            registry.try_parked(&id).await.unwrap().is_some(),
+            "the refused resolve must not consume the row",
+        );
+        assert!(
+            registry.recorded_decision(&id).await.is_none(),
+            "the refused resolve must not record a decision",
+        );
+    }
+
+    /// The matching-channel regression: each channel consumes its own rows
+    /// — WebhookPoll under WebhookPoll, inline Conversational under
+    /// Conversational. Suppression is wrong-channel-scoped only.
+    #[tokio::test]
+    async fn authority_matching_channel_still_resolves() {
+        let registry = PendingApprovals::new();
+        let webhook_req = test_request("req-authority-match-webhook");
+        let webhook_id = webhook_req.decision_id;
+        webhook_parked(&registry, webhook_req).await;
+        let inline_req = test_request("req-authority-match-inline");
+        let inline_id = inline_req.decision_id;
+        let _handle = registry.register(inline_req, Duration::from_secs(60)).await;
+
+        registry
+            .resolve(
+                &webhook_id,
+                ApprovalAuthority::WebhookPoll,
+                ApprovalDecision::Approved.into(),
+            )
+            .await
+            .expect("the webhook row resolves under WebhookPoll");
+        registry
+            .resolve(
+                &inline_id,
+                ApprovalAuthority::Conversational,
+                ApprovalDecision::Approved.into(),
+            )
+            .await
+            .expect("the inline row resolves under Conversational");
+
+        assert!(
+            registry.recorded_decision(&webhook_id).await.is_some(),
+            "the webhook row's decision is recorded",
+        );
+        assert!(
+            registry.recorded_decision(&inline_id).await.is_some(),
+            "the inline row's decision is recorded",
         );
     }
 }

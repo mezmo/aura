@@ -27,6 +27,7 @@
 
 use crate::orchestration::events::RoutingMode;
 use crate::stream_events::{AgentContext, CorrelationContext};
+use aura_events::RetentionExpiresAt;
 use serde::{Deserialize, Serialize};
 
 /// Shared context included in every orchestration SSE event.
@@ -151,8 +152,10 @@ pub enum OrchestrationStreamEvent {
         run_id: String,
         /// The decision ids still awaiting a human decision.
         decision_ids: Vec<String>,
-        /// RFC 3339 timestamp after which the decisions expire.
-        expires_at: String,
+        /// The validated retention deadline the checkpoint carries: an
+        /// RFC 3339 instant by construction. The SSE wire key stays
+        /// `retention_expires_at`, rendered as the RFC 3339 string.
+        retention_expires_at: RetentionExpiresAt,
         /// Which iteration the run parked in (1-indexed).
         iteration: usize,
         #[serde(flatten)]
@@ -363,14 +366,14 @@ impl OrchestrationStreamEvent {
     pub fn run_parked(
         run_id: impl Into<String>,
         decision_ids: Vec<String>,
-        expires_at: impl Into<String>,
+        retention_expires_at: RetentionExpiresAt,
         iteration: usize,
         context: EventContext,
     ) -> Self {
         Self::RunParked {
             run_id: run_id.into(),
             decision_ids,
-            expires_at: expires_at.into(),
+            retention_expires_at,
             iteration,
             context,
         }
@@ -660,7 +663,8 @@ mod tests {
                 "0191e8c0-1111-7000-8000-00000000000a".to_string(),
                 "0191e8c0-1111-7000-8000-00000000000b".to_string(),
             ],
-            "2026-09-02T15:03:11+00:00",
+            RetentionExpiresAt::parse_rfc3339("2026-09-02T15:03:11+00:00")
+                .expect("fixture stamp parses"),
             2,
             test_ctx(),
         );
@@ -675,7 +679,7 @@ mod tests {
         assert!(sse.contains("\"decision_ids\":["));
         assert!(sse.contains("\"0191e8c0-1111-7000-8000-00000000000a\""));
         assert!(sse.contains("\"0191e8c0-1111-7000-8000-00000000000b\""));
-        assert!(sse.contains("\"expires_at\":\"2026-09-02T15:03:11+00:00\""));
+        assert!(sse.contains("\"retention_expires_at\":\"2026-09-02T15:03:11Z\""));
         assert!(sse.contains("\"iteration\":2"));
     }
 
