@@ -16,15 +16,14 @@ use std::time::Duration;
 
 use aura::SessionId;
 use aura::hitl::{
-    ApprovalAuthority,
-    ApprovalDecision,
-    DecisionId,
-    ResolveError,
+    AddressedApproval, ApprovalAuthority, ApprovalDecision, ApprovalRead, DecisionId, ResolveError,
     ResolvedDecision,
 };
 use aura::session_store::{
-    ,
-};
+    ApprovalStore, FileApprovalStore, FileSkillInvocationStore, InMemoryApprovalStore,
+    MAX_SKILL_RECORDS_PER_SESSION, ParkedApprovalRecord, RetainedApproval,
+    SKILL_INVOCATION_RECORD_VERSION, SessionStoreError, SkillInvocation, SkillInvocationRecord,
+    SkillInvocationStore,
 };
 use aura_web_server::session_store::{FileSessionStore, SessionStore};
 
@@ -1197,6 +1196,7 @@ async fn file_session_store_skill_log_survives_a_restart() {
     let reopened = FileSessionStore::new(&config).unwrap();
     assert_eq!(reopened.skills().list(&session).await.unwrap().len(), 1);
     reopened.ping().await.unwrap();
+}
 
 // read-or-expire and the retained-evidence scan (E2 RED)
 //
