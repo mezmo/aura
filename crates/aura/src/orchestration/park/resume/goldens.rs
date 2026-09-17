@@ -222,7 +222,7 @@ fn world() -> World {
             },
             route: aura_config::DecisionRouteConfig::Webhook {
                 url: aura_config::WebhookUrl::new(&url).unwrap(),
-                timeout_secs: 3600,
+                timeout_secs: Some(3600),
                 headers: HashMap::new(),
                 headers_from_request: HashMap::new(),
                 tool_headers_from_response: aura_config::ToolHeaderMappings::default(),
@@ -314,7 +314,7 @@ fn identity_world() -> World {
             },
             route: aura_config::DecisionRouteConfig::Webhook {
                 url: aura_config::WebhookUrl::new("https://approvals.example.com/hook").unwrap(),
-                timeout_secs: 3600,
+                timeout_secs: Some(3600),
                 headers: HashMap::new(),
                 headers_from_request: HashMap::new(),
                 tool_headers_from_response: crate::approver_headers::tests::mappings(&[(
@@ -365,6 +365,7 @@ fn node_approval(
             },
             items: vec![ApprovalItem {
                 tool_name: tool.to_string(),
+                tool_namespace: None,
                 arguments: args.clone(),
                 tool_call_intent: None,
             }],

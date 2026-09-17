@@ -962,6 +962,7 @@ mod unlink_recheck_tests {
             expires_at: now + chrono::Duration::hours(1),
             authority: ApprovalAuthority::WebhookPoll,
             egress_headers: None,
+            acknowledgment: crate::hitl::AcknowledgmentState::RequiresNotification,
         }
     }
 
@@ -1194,7 +1195,11 @@ mod unlink_recheck_tests {
 
         store
             .inner
-            .resolve_sync(&id, ResolvedDecision::from(ApprovalDecision::Approved))
+            .resolve_sync(
+                &id,
+                ApprovalAuthority::WebhookPoll,
+                ResolvedDecision::from(ApprovalDecision::Approved),
+            )
             .unwrap();
 
         assert!(

@@ -898,15 +898,34 @@ mod tests {
         async fn register(&self, _parked: ParkedApproval) -> Result<(), SessionStoreError> {
             unreachable!("the panicking-scan battery never registers");
         }
+        async fn mark_acknowledged(
+            &self,
+            _id: &DecisionId,
+        ) -> Result<crate::session_store::AcknowledgeOutcome, SessionStoreError> {
+            unreachable!("the panicking-scan battery never acknowledges");
+        }
         async fn get(&self, _id: &DecisionId) -> Result<Option<ParkedApproval>, SessionStoreError> {
             unreachable!("the panicking-scan battery never reads a row");
         }
         async fn resolve(
             &self,
             _id: &DecisionId,
+            _expected_authority: crate::hitl::ApprovalAuthority,
             _decision: ResolvedDecision,
         ) -> Result<(), ResolveError> {
             unreachable!("the panicking-scan battery never resolves");
+        }
+        async fn read_or_expire(
+            &self,
+            _id: &DecisionId,
+            _expected_authority: crate::hitl::ApprovalAuthority,
+        ) -> Result<crate::hitl::ApprovalRead, SessionStoreError> {
+            unreachable!("the panicking-scan battery never reads a row");
+        }
+        async fn retained_rows(
+            &self,
+        ) -> Result<Vec<crate::session_store::RetainedApproval>, SessionStoreError> {
+            unreachable!("the panicking-scan battery never scans retention");
         }
         async fn decision(
             &self,

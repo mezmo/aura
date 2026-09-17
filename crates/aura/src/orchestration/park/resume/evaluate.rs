@@ -806,7 +806,7 @@ pub async fn evaluate_resume(
         claims,
         bind_identity,
         presented_identity,
-        request_id,
+        request_id: _,
         now,
     } = evaluation;
     let docs = ResumeDocuments::for_path(&path, memory_dir);
@@ -854,7 +854,13 @@ pub async fn evaluate_resume(
                     ))));
                 }
             }
-            if let Err(e) = cancel_run_approvals(store, &path.run.to_string(), &request_id).await {
+            if let Err(e) = cancel_run_approvals(
+                store,
+                &path.run.to_string(),
+                crate::run_context::current_run(),
+            )
+            .await
+            {
                 return Err(ResumeRefusal::Fault(Diagnostic::new(format!(
                     "the approval sweep for the expired run did not complete: {e}"
                 ))));

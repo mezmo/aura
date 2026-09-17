@@ -15,9 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aura::SessionId;
-use aura::hitl::{
-    ApprovalAuthority, ApprovalDecision, DecisionId, ResolveError, ResolvedDecision,
-};
+use aura::hitl::{ApprovalAuthority, ApprovalDecision, DecisionId, ResolveError, ResolvedDecision};
 use aura::session_store::{
     ApprovalStore, FileApprovalStore, FileSkillInvocationStore, InMemoryApprovalStore,
     MAX_SKILL_RECORDS_PER_SESSION, ParkedApprovalRecord, SKILL_INVOCATION_RECORD_VERSION,

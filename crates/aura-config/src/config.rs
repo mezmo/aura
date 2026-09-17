@@ -1969,7 +1969,7 @@ mode = "conversational"
         let err = crate::load_config_from_str(&conversational_config_toml(
             "[hitl.park]\nenabled = true\n\n",
         ))
-            .expect_err("park mode on the conversational route must be rejected");
+        .expect_err("park mode on the conversational route must be rejected");
         let msg = err.to_string();
         assert!(
             msg.contains("conversational route"),

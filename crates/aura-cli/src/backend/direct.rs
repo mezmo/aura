@@ -991,8 +991,8 @@ preamble = "p"
             Ok(_) => panic!("a poll-delivery config must fail the direct backend boot"),
         };
         assert!(
-            format!("{err:#}").contains("hitl.route.delivery"),
-            "the load error must carry the admission diagnostic: {err:#}"
+            format!("{err:#}").contains("webhook poll delivery requires orchestration"),
+            "the load error must carry the typed admission diagnostic: {err:#}"
         );
     }
 

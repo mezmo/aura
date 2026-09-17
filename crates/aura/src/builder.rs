@@ -2731,7 +2731,7 @@ mod tests {
     fn webhook_poll_route() -> aura_config::DecisionRouteConfig {
         aura_config::DecisionRouteConfig::Webhook {
             url: aura_config::WebhookUrl::new("https://approvals.example.com/").unwrap(),
-            timeout_secs: 300,
+            timeout_secs: Some(300),
             headers: std::collections::HashMap::new(),
             headers_from_request: std::collections::HashMap::new(),
             tool_headers_from_response: aura_config::ToolHeaderMappings::default(),

@@ -1771,6 +1771,7 @@ impl Orchestrator {
             history,
             phase,
             event_tx,
+            context_agent: _,
         } = params;
         let timeout_secs = self.config.per_call_timeout_secs();
         let stream_future = async {
@@ -1854,6 +1855,7 @@ impl Orchestrator {
             history,
             phase,
             event_tx,
+            context_agent,
         } = params;
         let timeout_secs = self.config.per_call_timeout_secs();
         let inactivity_secs = self.config.stream_inactivity_timeout_secs();
@@ -2019,14 +2021,16 @@ impl Orchestrator {
                     deadline.suspend();
                 }
             }
-            // Coordinator occupancy under the same agent id single-agent uses,
-            // so clients track one conversation context across both modes. The
-            // last planning cycle runs after the workers, so its event is the
-            // one that lands last.
-            if let Some(tx) = event_tx.filter(|_| tally.last.input_tokens > 0) {
+            // Report this call's occupancy under the agent id the caller asked
+            // for; callers whose context is scratch pass none. The reading is
+            // the call's final inner turn, which is the coordinator's live
+            // conversation at the point the decision was made.
+            if let (Some(tx), Some(agent_id)) = (event_tx, context_agent)
+                && tally.last.input_tokens > 0
+            {
                 let _ = tx
                     .send(Ok(StreamItem::ContextUsage {
-                        agent_id: COORDINATOR_AGENT_ID.to_string(),
+                        agent_id: agent_id.to_string(),
                         context_tokens: tally.last.input_tokens,
                         response_tokens: tally.last.output_tokens,
                         context_window: agent.context_window,
@@ -2143,6 +2147,7 @@ impl Orchestrator {
                         history: params.history.clone(),
                         phase: params.phase,
                         event_tx: params.event_tx,
+                        context_agent: None,
                     },
                     || {
                         let rd = rd.clone();
@@ -3037,6 +3042,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     mcp_manager: None,
                     fallback_tool_parsing: false,
                     fallback_tool_names: vec![],
+                    fallback_mcp_filter: None,
+                    hitl_gate: None,
+                    hitl_approval_tool: None,
+                    skills: Vec::new(),
                     context_window: self.agent_config.llm.context_window(),
                     scratchpad_budget: None,
                     client_tool_names: Default::default(),
@@ -4105,6 +4114,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         history,
                         phase: "Worker task",
                         event_tx,
+                        context_agent: None,
                     },
                     worker_name.map(|name| StreamContext {
                         task_id,
@@ -4345,6 +4355,16 @@ Assign tasks to the worker whose tools best match the required operations."#,
         // request's headers, so `[hitl.route] headers_from_request`-style
         // MCP mappings resolve against the resume caller.
         let mut config = config.clone();
+        // The resume segment's HITL gate stamps every wire POST with the
+        // config's `request_id`, and the chat path's `req_<uuid>` value is
+        // runtime state that never persists. Left unset, a re-park's
+        // authorize POST carries an empty `request_id`, which the governance
+        // schema rejects (surfacing as an opaque HTTP 500). Stamp the run
+        // owner id — the same id the park bridge re-mints parked rows to —
+        // so resumed wire POSTs name the checkpointed run.
+        config.request_id = Some(crate::orchestration::park::run_owner_id(
+            &grant.checkpoint().run_id,
+        ));
         if let Some(ref mut mcp_config) = config.mcp {
             crate::rig_builder::resolve_mcp_headers_in(mcp_config, Some(headers));
         }
@@ -4670,13 +4690,13 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 &park.key,
                 park.cell.clone(),
             );
-            let (stream, _cancel_tx, _usage_state) = worker
+            let run = worker
                 .inner
                 .stream_chat_message_with_timeout(
                     current_prompt,
                     rebuilt_history,
                     worker.max_depth,
-                    Duration::MAX,
+                    crate::streaming::RunOptions::default(),
                     &park.key,
                     worker.scratchpad_budget.clone(),
                     worker.client_tool_names.clone(),
@@ -4684,7 +4704,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 .await;
             let srd = submit_result_decision.clone();
             let stream_result = Self::collect_segment_turns(
-                stream,
+                run.into_events(),
                 &self.usage_state,
                 self.config.stream_inactivity_timeout_secs(),
                 worker.scratchpad_budget.as_ref(),
@@ -9107,6 +9127,7 @@ mod tests {
                         },
                         items: vec![crate::hitl::ApprovalItem {
                             tool_name: tool.to_string(),
+                            tool_namespace: None,
                             arguments: serde_json::json!({ "namespace": "prod" }),
                             tool_call_intent: None,
                         }],
@@ -9663,7 +9684,7 @@ mod tests {
                     },
                     route: aura_config::DecisionRouteConfig::Webhook {
                         url: aura_config::WebhookUrl::new(&url).unwrap(),
-                        timeout_secs: 3600,
+                        timeout_secs: Some(3600),
                         headers: std::collections::HashMap::new(),
                         headers_from_request: std::collections::HashMap::new(),
                         tool_headers_from_response: aura_config::ToolHeaderMappings::default(),
@@ -9831,7 +9852,7 @@ mod tests {
         // directly, so the scope is established here instead.
         let result = crate::run_context::with_run(
             Arc::clone(&run),
-            orchestrator.execute_task(0, &params, Some(&event_tx), None, None),
+            orchestrator.execute_task(0, &params, Some(&event_tx)),
         )
         .await;
 
@@ -9875,7 +9896,7 @@ mod tests {
         // directly, so the scope is established here instead.
         let result = crate::run_context::with_run(
             Arc::clone(&run),
-            orchestrator.execute_task(0, &params, Some(&event_tx), None, None),
+            orchestrator.execute_task(0, &params, Some(&event_tx)),
         )
         .await;
 
@@ -10368,7 +10389,7 @@ mod tests {
                     },
                     route: aura_config::DecisionRouteConfig::Webhook {
                         url: aura_config::WebhookUrl::new(&url).unwrap(),
-                        timeout_secs: 3600,
+                        timeout_secs: Some(3600),
                         headers: std::collections::HashMap::new(),
                         headers_from_request: std::collections::HashMap::new(),
                         tool_headers_from_response: aura_config::ToolHeaderMappings::default(),

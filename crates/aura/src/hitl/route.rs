@@ -359,8 +359,12 @@ async fn webhook_round_trip<T>(
             }
         }
         Err(err) => {
-            let completed =
-                events::completed_error_event(decision_id, err.to_string(), &scope, started.elapsed());
+            let completed = events::completed_error_event(
+                decision_id,
+                err.to_string(),
+                &scope,
+                started.elapsed(),
+            );
             let _ = emit(completed).await;
         }
     }
@@ -2490,6 +2494,7 @@ mod tests {
                     ),
                     poll_interval_secs: 10,
                     poll_request_timeout_secs: 30,
+                    receiver_wait_timeout_secs: 900,
                 },
             };
 
@@ -3207,7 +3212,7 @@ mod tests {
                 },
                 route: aura_config::DecisionRouteConfig::Webhook {
                     url: aura_config::WebhookUrl::new("https://approvals.example.com/").unwrap(),
-                    timeout_secs: 300,
+                    timeout_secs: Some(300),
                     headers: HashMap::new(),
                     headers_from_request: HashMap::new(),
                     tool_headers_from_response: aura_config::ToolHeaderMappings::default(),
@@ -4195,7 +4200,7 @@ mod tests {
                     route: aura_config::DecisionRouteConfig::Webhook {
                         url: aura_config::WebhookUrl::new("https://approvals.example.com/")
                             .unwrap(),
-                        timeout_secs: 60,
+                        timeout_secs: Some(60),
                         headers: std::collections::HashMap::new(),
                         headers_from_request: std::collections::HashMap::new(),
                         tool_headers_from_response: aura_config::ToolHeaderMappings::default(),

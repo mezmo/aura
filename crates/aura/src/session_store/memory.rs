@@ -15,8 +15,8 @@ use crate::hitl::{
 };
 
 use super::{
-    AcknowledgeOutcome, ApprovalStore, EventBus, MAX_SKILL_RECORDS_PER_SESSION,
-    SessionStoreError, SkillInvocationRecord, SkillInvocationStore, Subscription,
+    AcknowledgeOutcome, ApprovalStore, EventBus, MAX_SKILL_RECORDS_PER_SESSION, SessionStoreError,
+    SkillInvocationRecord, SkillInvocationStore, Subscription,
 };
 
 /// Buffered payloads per topic before slow subscribers start lagging.

@@ -110,7 +110,7 @@ impl OrchestratorFactory {
         request_id: &str,
     ) -> (
         BoxStream<'static, Result<StreamItem, StreamError>>,
-        watch::Sender<bool>,
+        crate::request_cancellation::RequestCancelToken,
         crate::UsageState,
     ) {
         todo!(

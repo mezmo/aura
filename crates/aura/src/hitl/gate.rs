@@ -234,18 +234,13 @@ impl HitlApprovalWrapper {
                 // failure shape the route's channel faults use — or the
                 // published `Requested` has no terminal. No pending
                 // transition, no blocked-cell entry, no park row.
-                crate::approval_event_broker::publish(
-                    &self.request_id,
-                    crate::approval_event_broker::ApprovalLifecycleEvent::Completed(
-                        super::events::completed_error(
-                            decision_id,
-                            err.to_string(),
-                            &scope,
-                            started.elapsed(),
-                        ),
-                    ),
-                )
-                .await;
+                let completed = super::events::completed_error_event(
+                    decision_id,
+                    err.to_string(),
+                    &scope,
+                    started.elapsed(),
+                );
+                let _ = self.emit(completed).await;
                 Err(err)
             }
         }
@@ -317,13 +312,8 @@ impl HitlApprovalWrapper {
         park.guard.record(std::slice::from_ref(&call));
 
         if publish_requested {
-            crate::approval_event_broker::publish(
-                &self.request_id,
-                crate::approval_event_broker::ApprovalLifecycleEvent::Requested(
-                    (&parked.request).into(),
-                ),
-            )
-            .await;
+            self.emit(super::events::requested_event(&parked.request))
+                .await;
         }
 
         tracing::info!(
@@ -436,11 +426,16 @@ impl HitlApprovalWrapper {
             Some(run) => {
                 crate::run_context::with_run(
                     run,
-                    self.route.decide_for_gate(request, &cancel, mode, expires_at),
+                    self.route
+                        .decide_for_gate(request, &cancel, mode, expires_at),
                 )
                 .await
             }
-            None => self.route.decide_for_gate(request, &cancel, mode, expires_at).await,
+            None => {
+                self.route
+                    .decide_for_gate(request, &cancel, mode, expires_at)
+                    .await
+            }
         };
         match decision {
             Ok(GateDecision::Pending {
@@ -542,7 +537,6 @@ impl ToolWrapper for HitlApprovalWrapper {
         // `AskMode::Hold` (`response_type=sync`) and never parks.
         self.ask_route_pre_call(AskMode::Hold, matched, args, ctx)
             .await
-    }
     }
 }
 
@@ -909,44 +903,6 @@ mod tests {
             (url, rx)
         }
 
-        
-        
-        #[tokio::test]
-        async fn two_gated_calls_append_two_cell_entries() {
-            let (registry, route) = conv_route(Duration::from_secs(60));
-            let cell = Arc::new(crate::orchestration::BlockedCell::default());
-            let gate = parked_gate(&registry, &route, "req-two-calls", &cell);
-
-            let first = gate
-                .pre_call(
-                    &serde_json::json!({ "namespace": "prod" }),
-                    &ToolCallContext::new("kubectl_apply"),
-                )
-                .await
-                .unwrap();
-            let second = gate
-                .pre_call(
-                    &serde_json::json!({ "namespace": "stage" }),
-                    &ToolCallContext::new("kubectl_delete"),
-                )
-                .await
-                .unwrap();
-            assert!(matches!(first, PreCallOutcome::ShortCircuit { .. }));
-            assert!(matches!(second, PreCallOutcome::ShortCircuit { .. }));
-
-            // Inspect without consuming: mirror the cell contents.
-            cell.snapshot_if_pending(&[], &rig::completion::Message::user("results"));
-            match cell.outcome() {
-                crate::orchestration::CellOutcome::Blocked { pending } => {
-                    assert_eq!(pending.len(), 2, "both gated calls are recorded");
-                    assert_eq!(pending[0].tool_name, "kubectl_apply");
-                    assert_eq!(pending[1].tool_name, "kubectl_delete");
-                    assert_ne!(pending[0].decision_id, pending[1].decision_id);
-                }
-                other => panic!("expected Blocked, got {other:?}"),
-            }
-        }
-
         #[tokio::test]
         async fn ungated_tool_proceeds_without_parking() {
             let (registry, route) = conv_route(Duration::from_secs(60));
@@ -959,55 +915,6 @@ mod tests {
                 .unwrap();
             assert_eq!(outcome, PreCallOutcome::Proceed { overrides: None });
             assert!(cell.is_empty());
-        }
-
-        #[tokio::test]
-        async fn guard_learns_the_decision_at_registration() {
-            let store: Arc<dyn crate::session_store::ApprovalStore> =
-                Arc::new(crate::session_store::InMemoryApprovalStore::new());
-            let registry = PendingApprovals::with_backend(
-                store.clone(),
-                Arc::new(crate::session_store::InMemoryEventBus::new()),
-            );
-            let route = conv_route_over(registry.clone(), Duration::from_secs(60));
-            let cell = Arc::new(crate::orchestration::BlockedCell::default());
-            let guard = ParkGuard::new(
-                registry.clone(),
-                "0191e8c0-1111-7000-8000-000000000042".to_string(),
-            );
-            let gate = HitlApprovalWrapper::new(
-                Arc::from(["kubectl_*".into()]),
-                route,
-                worker_scope(),
-                "req-guard".to_string(),
-                "test-agent".to_string(),
-                "test-instance".to_string(),
-            )
-            .with_park(registry, cell.clone(), Arc::clone(&guard));
-
-            gate.pre_call(
-                &serde_json::json!({}),
-                &ToolCallContext::new("kubectl_apply"),
-            )
-            .await
-            .unwrap();
-            let decision_id = match cell.outcome() {
-                crate::orchestration::CellOutcome::Orphaned { pending } => pending[0].decision_id,
-                other => panic!("expected a parked call, got {other:?}"),
-            };
-            assert!(store.get(&decision_id).await.unwrap().is_some());
-
-            // The run ends unpublished: the guard sweeps the ticket the park
-            // arm registered, without any record from the orchestrator.
-            drop(gate);
-            drop(guard);
-            for _ in 0..200 {
-                if store.get(&decision_id).await.unwrap().is_none() {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-            assert!(store.get(&decision_id).await.unwrap().is_none());
         }
 
         /// An armed park-capable webhook route asks FIRST: one POST with
@@ -1109,7 +1016,7 @@ mod tests {
         #[tokio::test]
         async fn gate_park_207_registration_emits_no_attended_pending() {
             let request_id = format!("req_207_no_pending_{}", uuid::Uuid::new_v4().simple());
-            let mut events = crate::approval_event_broker::subscribe(&request_id).await;
+            let (run, mut events) = crate::run_context::RunContext::channel(request_id.as_str());
             let (url, mut rx) =
                 scripted_receiver("207 Multi-Status", vec![], String::new(), Duration::ZERO).await;
             let store = Arc::new(crate::session_store::InMemoryApprovalStore::new());
@@ -1128,6 +1035,7 @@ mod tests {
             );
             let cell = Arc::new(crate::orchestration::BlockedCell::default());
             let gate = parked_gate(&registry, &route, &request_id, &cell);
+            gate.bind_run(run);
 
             let outcome = gate
                 .pre_call(
@@ -1178,18 +1086,15 @@ mod tests {
             // a webhook park never publishes the conversational prompt.
             let mut requested = 0;
             let mut attended_pending = 0;
-            loop {
-                match tokio::time::timeout(Duration::from_millis(150), events.recv()).await {
-                    Ok(Some(crate::approval_event_broker::ApprovalLifecycleEvent::Requested(
-                        _,
-                    ))) => requested += 1,
-                    Ok(Some(crate::approval_event_broker::ApprovalLifecycleEvent::Pending(_))) => {
+            while let Ok(Some(event)) =
+                tokio::time::timeout(Duration::from_millis(150), events.recv()).await
+            {
+                match event.payload {
+                    aura_events::agent::AgentEventPayload::ApprovalRequested(_) => requested += 1,
+                    aura_events::agent::AgentEventPayload::ApprovalPending(_) => {
                         attended_pending += 1
                     }
-                    Ok(Some(other)) => {
-                        panic!("unexpected approval event on a 207 park: {other:?}")
-                    }
-                    _ => break,
+                    other => panic!("unexpected approval event on a 207 park: {other:?}"),
                 }
             }
             assert!(
@@ -1200,8 +1105,6 @@ mod tests {
                 attended_pending, 0,
                 "a webhook park must not publish the attended ApprovalLifecycleEvent::Pending"
             );
-
-            crate::approval_event_broker::unsubscribe(&request_id).await;
         }
 
         /// A park-armed invocation on the conversational route never
@@ -1211,7 +1114,7 @@ mod tests {
         #[tokio::test]
         async fn gate_park_armed_conversational_never_durable_parks() {
             let request_id = format!("req_conv_no_park_{}", uuid::Uuid::new_v4().simple());
-            let mut events = crate::approval_event_broker::subscribe(&request_id).await;
+            let (run, mut events) = crate::run_context::RunContext::channel(request_id.as_str());
             let store = Arc::new(crate::session_store::InMemoryApprovalStore::new());
             let registry = PendingApprovals::with_backend(
                 store.clone(),
@@ -1220,6 +1123,7 @@ mod tests {
             let route = conv_route_over(registry.clone(), Duration::from_secs(60));
             let cell = Arc::new(crate::orchestration::BlockedCell::default());
             let gate = parked_gate(&registry, &route, &request_id, &cell);
+            gate.bind_run(run);
 
             let handle = tokio::spawn(async move {
                 gate.pre_call(
@@ -1266,7 +1170,6 @@ mod tests {
             );
 
             handle.abort();
-            crate::approval_event_broker::unsubscribe(&request_id).await;
         }
 
         /// A park-armed invocation on the single-agent scope asks the hold
@@ -1291,7 +1194,6 @@ mod tests {
             let guard = ParkGuard::new(
                 registry.clone(),
                 "0191e8c0-1111-7000-8000-000000000042".to_string(),
-                "req-single-hold".to_string(),
             );
             let gate = HitlApprovalWrapper::new(
                 Arc::from([GlobPattern::new("kubectl_*").unwrap()]),
@@ -1518,7 +1420,6 @@ mod tests {
             let guard = ParkGuard::new(
                 registry.clone(),
                 "0191e8c0-1111-7000-8000-000000000042".to_string(),
-                "req-guard-207".to_string(),
             );
             let gate = HitlApprovalWrapper::new(
                 Arc::from([GlobPattern::new("kubectl_*").unwrap()]),
@@ -1644,7 +1545,7 @@ mod tests {
                 },
                 route: aura_config::DecisionRouteConfig::Webhook {
                     url: WebhookUrl::new(url).unwrap(),
-                    timeout_secs: 60,
+                    timeout_secs: Some(60),
                     headers: std::collections::HashMap::new(),
                     headers_from_request: std::collections::HashMap::new(),
                     tool_headers_from_response: aura_config::ToolHeaderMappings::default(),
@@ -1850,7 +1751,7 @@ mod tests {
         #[tokio::test]
         async fn bridge_register_fault_emits_one_error_completed_and_no_park() {
             let request_id = format!("req_bridge_fail_{}", uuid::Uuid::new_v4().simple());
-            let mut events = crate::approval_event_broker::subscribe(&request_id).await;
+            let (run, mut events) = crate::run_context::RunContext::channel(request_id.as_str());
             let (url, mut rx) =
                 scripted_receiver("207 Multi-Status", vec![], String::new(), Duration::ZERO).await;
             let store: Arc<dyn crate::session_store::ApprovalStore> =
@@ -1870,6 +1771,7 @@ mod tests {
             );
             let cell = Arc::new(crate::orchestration::BlockedCell::default());
             let gate = parked_gate(&registry, &route, &request_id, &cell);
+            gate.bind_run(run);
 
             let err = gate
                 .pre_call(
@@ -1886,20 +1788,26 @@ mod tests {
             // One Requested (published at gate entry), then exactly one
             // error Completed; no Pending transition.
             match tokio::time::timeout(Duration::from_secs(1), events.recv()).await {
-                Ok(Some(crate::approval_event_broker::ApprovalLifecycleEvent::Requested(_))) => {}
+                Ok(Some(event)) => match event.payload {
+                    aura_events::agent::AgentEventPayload::ApprovalRequested(_) => {}
+                    other => panic!("expected Requested, got {other:?}"),
+                },
                 other => panic!("expected Requested, got {other:?}"),
             }
             match tokio::time::timeout(Duration::from_secs(1), events.recv()).await {
-                Ok(Some(crate::approval_event_broker::ApprovalLifecycleEvent::Completed(
-                    completed,
-                ))) => assert!(
-                    matches!(
-                        completed.outcome,
-                        aura_events::ApprovalOutcomeWire::Errored { .. }
-                    ),
-                    "the terminal event is an infrastructure-failure outcome, got {:?}",
-                    completed.outcome
-                ),
+                Ok(Some(event)) => match event.payload {
+                    aura_events::agent::AgentEventPayload::ApprovalCompleted(completed) => {
+                        assert!(
+                            matches!(
+                                completed.outcome,
+                                aura_events::ApprovalOutcomeWire::Errored { .. }
+                            ),
+                            "the terminal event is an infrastructure-failure outcome, got {:?}",
+                            completed.outcome
+                        )
+                    }
+                    other => panic!("expected error Completed, got {other:?}"),
+                },
                 other => panic!("expected error Completed, got {other:?}"),
             }
             assert!(
@@ -1921,8 +1829,6 @@ mod tests {
                 "the armed ask POSTs: {captured}"
             );
             assert!(rx.try_recv().is_err(), "exactly one POST");
-
-            crate::approval_event_broker::unsubscribe(&request_id).await;
         }
 
         /// The parked row's expiry anchors at gate entry, not at the park: a

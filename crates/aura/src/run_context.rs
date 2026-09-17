@@ -223,20 +223,6 @@ impl<S: Stream + Unpin> Stream for ScopedStream<S> {
     }
 }
 
-/// Runs `f` with a fresh run in scope and returns what it emitted, for a test
-/// that asserts on a run's events without standing up an observer.
-#[cfg(test)]
-pub(crate) async fn observing<F: Future>(id: &str, f: F) -> (F::Output, Vec<AgentEvent>) {
-    let (run, mut events) = RunContext::channel(id);
-    let out = with_run(run, f).await;
-
-    let mut seen = Vec::new();
-    while let Ok(event) = events.try_recv() {
-        seen.push(event);
-    }
-    (out, seen)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

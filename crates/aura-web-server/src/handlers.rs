@@ -686,7 +686,7 @@ pub async fn execute_completion(
         tools_json,
         message_count: config.message_count,
         response_content: config.response_content,
-        system_prompt: callback_agent.system_prompt().map(str::to_string),
+        system_prompt: streaming_agent.system_prompt().map(str::to_string),
         orchestration_enabled,
     };
     otel_ctx.record_input();

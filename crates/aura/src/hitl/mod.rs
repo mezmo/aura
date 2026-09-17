@@ -86,7 +86,6 @@ pub(crate) async fn read_full_request(socket: &mut tokio::net::TcpStream) -> Str
 }
 
 pub use gate::HitlApprovalWrapper;
-pub use outcome::ApprovalAuthority;
 pub use poller::{PollReconciler, PollerExit, PollerHandle};
 pub use protocol::{ApprovalDecisionWire, ApprovalItem, ApprovalRequest, PROTOCOL_VERSION};
 pub use registry::{AcknowledgmentState, ParkedApproval, PendingApprovals, ResolveError};

@@ -264,6 +264,13 @@ mod tests {
             Ok(())
         }
 
+        async fn mark_acknowledged(
+            &self,
+            _id: &DecisionId,
+        ) -> Result<AcknowledgeOutcome, SessionStoreError> {
+            unreachable!("the scanless default-probe battery never acknowledges");
+        }
+
         async fn get(&self, _id: &DecisionId) -> Result<Option<ParkedApproval>, SessionStoreError> {
             Ok(None)
         }
@@ -271,9 +278,22 @@ mod tests {
         async fn resolve(
             &self,
             _id: &DecisionId,
+            _expected_authority: ApprovalAuthority,
             _decision: ResolvedDecision,
         ) -> Result<(), ResolveError> {
             Ok(())
+        }
+
+        async fn read_or_expire(
+            &self,
+            _id: &DecisionId,
+            _expected_authority: ApprovalAuthority,
+        ) -> Result<ApprovalRead, SessionStoreError> {
+            unreachable!("the scanless default-probe battery never reads a row");
+        }
+
+        async fn retained_rows(&self) -> Result<Vec<RetainedApproval>, SessionStoreError> {
+            unreachable!("the scanless default-probe battery never scans retention");
         }
 
         async fn decision(
@@ -306,8 +326,9 @@ mod tests {
         };
         assert_eq!(
             err,
-            SessionStoreError::Unsupported {
-                operation: "list_pending"
+            SessionStoreError::UnsupportedOperation {
+                operation: "list_pending",
+                reason: "this backend implements no pending scan".to_string(),
             }
         );
     }
