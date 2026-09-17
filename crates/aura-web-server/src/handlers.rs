@@ -1316,6 +1316,7 @@ fn generate_chat_session_id() -> String {
 /// while buffering — maps to the same uniform 401; the real cause is logged
 /// server-side only. Post-verification JSON rejections (415/400/422) surface
 /// as-is: the request is already authenticated at that point.
+#[allow(clippy::result_large_err)]
 async fn verify_approval_ingress(
     hmac: &aura::hitl::WebhookHmac,
     decision_id_str: &str,

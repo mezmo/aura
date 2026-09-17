@@ -49,18 +49,15 @@ fn prompt_choice(message: &str, options: &[&str]) -> Option<usize> {
     let _ = io::stdout().flush();
 
     loop {
-        if let Some(ch) = read_keypress() {
-            if let Some(digit) = ch.to_digit(10) {
-                let idx = digit as usize;
-                if idx >= 1 && idx <= options.len() {
-                    return Some(idx);
-                }
+        let ch = read_keypress()?;
+        if let Some(digit) = ch.to_digit(10) {
+            let idx = digit as usize;
+            if idx >= 1 && idx <= options.len() {
+                return Some(idx);
             }
-            print!("Please enter a number between 1 and {}: ", options.len());
-            let _ = io::stdout().flush();
-        } else {
-            return None;
         }
+        print!("Please enter a number between 1 and {}: ", options.len());
+        let _ = io::stdout().flush();
     }
 }
 

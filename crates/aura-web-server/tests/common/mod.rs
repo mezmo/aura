@@ -443,6 +443,7 @@ impl AuraServer {
 
     /// One spawn-and-wait attempt. `Err` carries the (still-running) server
     /// so the caller can log its stderr and stop it before retrying.
+    #[allow(clippy::result_large_err)]
     async fn try_start(
         config_toml: &str,
         config_prefix: &str,
