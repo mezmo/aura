@@ -828,4 +828,250 @@ mod tests {
             "error names the corrupt value: {err}"
         );
     }
+
+    fn ts(raw: &str) -> Timestamp {
+        chrono::DateTime::parse_from_rfc3339(raw)
+            .expect("test timestamp parses")
+            .with_timezone(&chrono::Utc)
+    }
+
+    /// The timed-out terminal round-trips through JSON with its tag intact
+    /// and restores to the addressed `TimedOut` outcome carrying the exact
+    /// deadline verbatim.
+    #[test]
+    fn terminal_record_timed_out_round_trips_the_deadline() {
+        let record = TerminalRecord::TimedOut {
+            deadline: ts("2026-08-01T01:00:00Z"),
+        };
+        let json = serde_json::to_value(&record).expect("record serializes");
+        assert_eq!(json["kind"], "timed_out", "the tag is exactly timed_out");
+        let object = json.as_object().expect("the record is an object");
+        assert_eq!(
+            object.len(),
+            2,
+            "a timed-out record carries only kind and deadline: {object:?}"
+        );
+        let decoded: TerminalRecord = serde_json::from_value(json).expect("record parses");
+        let addressed = AddressedApproval::try_from(decoded).expect("a timed-out record restores");
+        match addressed {
+            AddressedApproval::TimedOut { deadline } => {
+                assert_eq!(deadline, ts("2026-08-01T01:00:00Z"), "deadline verbatim");
+            }
+            other => panic!("a timed-out row is never a decision: {other:?}"),
+        }
+    }
+
+    /// Decided terminals round-trip through JSON: an approved decision with
+    /// an identity pair map, and a denied decision with a reason, both
+    /// restore to `AddressedApproval::Decided` with their fields intact.
+    #[test]
+    fn terminal_record_decided_round_trips_into_addressed() {
+        let approved = TerminalRecord::Decided {
+            approved: true,
+            reason: None,
+            decided_at: ts("2026-08-01T00:00:00Z"),
+            identity: Some(pairs(&[("x-forwarded-user", "approver-alice")])),
+        };
+        let json = serde_json::to_value(&approved).expect("approved serializes");
+        assert_eq!(json["kind"], "decided", "the tag is exactly decided");
+        let decoded: TerminalRecord = serde_json::from_value(json).expect("approved parses");
+        match AddressedApproval::try_from(decoded).expect("approved restores") {
+            AddressedApproval::Decided(ResolvedDecision::Approved { identity }) => {
+                assert_eq!(
+                    identity
+                        .as_ref()
+                        .map(crate::approver_headers::ApproverHeaders::to_pair_map),
+                    Some(pairs(&[("x-forwarded-user", "approver-alice")])),
+                    "identity is restored"
+                );
+            }
+            other => panic!("an approved record restores approved: {other:?}"),
+        }
+
+        let denied = TerminalRecord::Decided {
+            approved: false,
+            reason: Some("no".to_string()),
+            decided_at: ts("2026-08-01T00:00:00Z"),
+            identity: None,
+        };
+        let json = serde_json::to_value(&denied).expect("denied serializes");
+        let decoded: TerminalRecord = serde_json::from_value(json).expect("denied parses");
+        match AddressedApproval::try_from(decoded).expect("denied restores") {
+            AddressedApproval::Decided(ResolvedDecision::Denied { reason }) => {
+                assert_eq!(reason, Some("no".to_string()), "reason is preserved");
+            }
+            other => panic!("a denied record restores denied: {other:?}"),
+        }
+    }
+
+    /// A payload carrying both decided fields and a `deadline` is
+    /// contradictory and fails decode: no first-variant-wins fallthrough.
+    #[test]
+    fn terminal_record_decided_with_deadline_fails_decode() {
+        let json = serde_json::json!({
+            "kind": "decided",
+            "approved": true,
+            "reason": null,
+            "decided_at": "2026-08-01T00:00:00Z",
+            "deadline": "2026-08-01T01:00:00Z",
+        });
+        serde_json::from_value::<TerminalRecord>(json)
+            .expect_err("decided fields plus a deadline must not decode");
+    }
+
+    /// A `timed_out` payload additionally carrying a decided field fails
+    /// decode. The payload includes a valid `deadline` so the refusal
+    /// attributes to the contradicting field, not to a missing one.
+    #[test]
+    fn terminal_record_timed_out_with_decided_fields_fails_decode() {
+        let json = serde_json::json!({
+            "kind": "timed_out",
+            "deadline": "2026-08-01T01:00:00Z",
+            "approved": false,
+        });
+        let err = serde_json::from_value::<TerminalRecord>(json)
+            .expect_err("timed_out plus decided fields must not decode");
+        assert!(
+            err.to_string().contains("approved"),
+            "the refusal names the contradicting field, got: {err}"
+        );
+    }
+
+    /// A `kind` outside {decided, timed_out} fails decode: no
+    /// first-variant fallthrough, no compatibility fallback.
+    #[test]
+    fn terminal_record_unknown_kind_is_rejected() {
+        for kind in ["expired", "denied"] {
+            let json = serde_json::json!({ "kind": kind });
+            let err = serde_json::from_value::<TerminalRecord>(json)
+                .expect_err("an unknown kind must not decode");
+            assert!(
+                err.to_string().contains(kind),
+                "the refusal names the unknown kind, got: {err}"
+            );
+        }
+    }
+
+    /// An extra unknown field on either arm fails decode: unknown fields
+    /// are denied on both.
+    #[test]
+    fn terminal_record_unknown_field_is_rejected() {
+        let decided = serde_json::json!({
+            "kind": "decided",
+            "approved": true,
+            "reason": null,
+            "decided_at": "2026-08-01T00:00:00Z",
+            "shim_field": 1,
+        });
+        serde_json::from_value::<TerminalRecord>(decided)
+            .expect_err("an extra field on the decided arm must not decode");
+
+        let timed_out = serde_json::json!({
+            "kind": "timed_out",
+            "deadline": "2026-08-01T01:00:00Z",
+            "shim_field": 1,
+        });
+        serde_json::from_value::<TerminalRecord>(timed_out)
+            .expect_err("an extra field on the timed_out arm must not decode");
+    }
+
+    /// `From<&ResolvedDecision>` is always the decided arm carrying the
+    /// decision's fields (approved/reason/identity — `decided_at` is
+    /// freshly stamped), and `into_decision_record` is `Some` for a decided
+    /// record and `None` for a timed-out one.
+    #[test]
+    fn terminal_record_from_resolved_decision_is_decided_only() {
+        let identity = crate::approver_headers::ApproverHeaders::from_pairs(pairs(&[(
+            "x-forwarded-user",
+            "approver-alice",
+        )]))
+        .unwrap();
+        let resolved = ResolvedDecision::approved(Some(identity));
+        match TerminalRecord::from(&resolved) {
+            TerminalRecord::Decided {
+                approved,
+                reason,
+                identity: record_identity,
+                ..
+            } => {
+                let original = match &resolved {
+                    ResolvedDecision::Approved { identity: _ } => (
+                        true,
+                        None,
+                        Some(pairs(&[("x-forwarded-user", "approver-alice")])),
+                    ),
+                    ResolvedDecision::Denied { .. } => unreachable!("resolved is approved"),
+                };
+                assert_eq!(approved, original.0, "approved survives the stamp");
+                assert_eq!(reason, original.1, "reason survives the stamp");
+                assert_eq!(record_identity, original.2, "identity survives the stamp");
+                assert!(
+                    TerminalRecord::from(&resolved)
+                        .into_decision_record()
+                        .is_some(),
+                    "a decided record yields its decision"
+                );
+            }
+            other => panic!("a resolved decision is never a timeout: {other:?}"),
+        }
+
+        let denied = ResolvedDecision::Denied {
+            reason: Some("no".to_string()),
+        };
+        match TerminalRecord::from(&denied) {
+            TerminalRecord::Decided {
+                approved,
+                reason,
+                identity,
+                ..
+            } => {
+                assert!(!approved, "a denial stamps decided as not approved");
+                assert_eq!(reason, Some("no".to_string()), "the reason is kept");
+                assert!(identity.is_none(), "a denial never captures identity");
+            }
+            other => panic!("a resolved decision is never a timeout: {other:?}"),
+        }
+
+        assert!(
+            TerminalRecord::TimedOut {
+                deadline: ts("2026-08-01T01:00:00Z"),
+            }
+            .into_decision_record()
+            .is_none(),
+            "a timed-out row records no decision"
+        );
+    }
+
+    /// The terminal record's Debug is a names-only surface on the decided
+    /// arm: identity names render, identity values never do. The timed-out
+    /// arm renders its deadline.
+    #[test]
+    fn terminal_record_debug_prints_names_not_values() {
+        let record = TerminalRecord::Decided {
+            approved: true,
+            reason: None,
+            decided_at: ts("2026-08-01T00:00:00Z"),
+            identity: Some(pairs(&[("x-forwarded-user", "approver-alice")])),
+        };
+        let rendered = format!("{record:?}");
+        assert!(
+            rendered.contains("x-forwarded-user"),
+            "identity names render: {rendered}"
+        );
+        assert!(
+            !rendered.contains("approver-alice"),
+            "identity values must never render: {rendered}"
+        );
+
+        let rendered = format!(
+            "{:?}",
+            TerminalRecord::TimedOut {
+                deadline: ts("2026-08-01T01:00:00Z"),
+            }
+        );
+        assert!(
+            rendered.contains("01:00:00"),
+            "the timed-out arm renders its deadline: {rendered}"
+        );
+    }
 }
