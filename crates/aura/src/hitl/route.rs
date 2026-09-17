@@ -21,7 +21,6 @@ use super::protocol::{
 };
 use super::registry::PendingApprovals;
 use super::signing::{SigningContext, VerifiedBody, WebhookHmac, authorize_ingress};
-use crate::approval_event_broker::{self, ApprovalLifecycleEvent};
 use crate::run_context::emit;
 
 /// Maximum time to wait for a TCP connection to the approval webhook before
@@ -2688,7 +2687,9 @@ mod tests {
             client
                 .notify(&test_request(DecisionId::generate()))
                 .await
-                .expect("a 409 ECONFLICT ack must resolve Ok: the receiver holding the row is the ack");
+                .expect(
+                    "a 409 ECONFLICT ack must resolve Ok: the receiver holding the row is the ack",
+                );
         }
 
         /// A bare 409 — no `ECONFLICT` body — is not a delivery proof: the

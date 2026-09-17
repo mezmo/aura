@@ -242,6 +242,7 @@ mod tests {
             },
             items: vec![ApprovalItem {
                 tool_name: "kubectl_apply".to_string(),
+                tool_namespace: None,
                 arguments: serde_json::json!({ "namespace": "prod" }),
                 tool_call_intent: None,
             }],
