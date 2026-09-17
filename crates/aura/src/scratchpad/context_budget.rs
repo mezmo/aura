@@ -301,7 +301,7 @@ impl ContextBudget {
 
         match self
             .estimated_used
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 if current + tokens <= usable {
                     Some(current + tokens)
                 } else {
@@ -352,7 +352,7 @@ impl ContextBudget {
         // Atomically update to max(current, llm_total)
         let _ = self
             .estimated_used
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 if llm_total > current {
                     Some(llm_total)
                 } else {
