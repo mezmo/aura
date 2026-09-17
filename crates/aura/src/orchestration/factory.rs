@@ -222,7 +222,22 @@ impl OrchestratorFactory {
                     execution_scope.clone(),
                 );
 
+                // Cancellation-prioritized: an already-latched cancel wins
+                // over a simultaneous result, so a cancelled run never
+                // publishes chunks or a Final (checkpoint round-2 finding).
                 tokio::select! {
+                    biased;
+                    _ = cancel_token_clone.cancelled() => {
+                        tracing::info!("Orchestration cancelled");
+                        if let Some(ref mcp_manager) = orchestrator.mcp_manager {
+                            let cancelled = mcp_manager
+                                .cancel_and_close_all(&request_id, "Client disconnected or timeout")
+                                .await;
+                            if cancelled > 0 {
+                                tracing::info!("Cancelled {} MCP request(s) during orchestration shutdown", cancelled);
+                            }
+                        }
+                    }
                     result = orchestrator.run_orchestration(&query, chat_history, event_tx.clone()) => {
                         match result {
                             Ok(final_result) => {
@@ -235,18 +250,21 @@ impl OrchestratorFactory {
                                 for chunk in final_result.chars().collect::<Vec<_>>().chunks(STREAM_CHUNK_SIZE) {
                                     let text: String = chunk.iter().collect();
                                     tokio::select! {
-                                        _ = event_tx.send(Ok(StreamItem::StreamAssistantItem(
-                                            crate::provider_agent::StreamedAssistantContent::Text(text)
-                                        ))) => {}
+                                        biased;
                                         _ = cancel_token_clone.cancelled() => {
                                             cancelled = true;
                                             break;
                                         }
+                                        _ = event_tx.send(Ok(StreamItem::StreamAssistantItem(
+                                            crate::provider_agent::StreamedAssistantContent::Text(text)
+                                        ))) => {}
                                     }
                                 }
 
                                 if !cancelled {
                                     tokio::select! {
+                                        biased;
+                                        _ = cancel_token_clone.cancelled() => {}
                                         _ = event_tx.send(Ok(StreamItem::Final(
                                             crate::provider_agent::FinalResponseInfo {
                                                 content: final_result,
@@ -254,23 +272,11 @@ impl OrchestratorFactory {
                                                 cache_usage: None,
                                             }
                                         ))) => {}
-                                        _ = cancel_token_clone.cancelled() => {}
                                     }
                                 }
                             }
                             Err(e) => {
                                 let _ = event_tx.send(Err(e)).await;
-                            }
-                        }
-                    }
-                    _ = cancel_token_clone.cancelled() => {
-                        tracing::info!("Orchestration cancelled");
-                        if let Some(ref mcp_manager) = orchestrator.mcp_manager {
-                            let cancelled = mcp_manager
-                                .cancel_and_close_all(&request_id, "Client disconnected or timeout")
-                                .await;
-                            if cancelled > 0 {
-                                tracing::info!("Cancelled {} MCP request(s) during orchestration shutdown", cancelled);
                             }
                         }
                     }
