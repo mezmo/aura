@@ -92,23 +92,29 @@ impl ApprovalStore for InMemoryApprovalStore {
         expected_authority: ApprovalAuthority,
         decision: ResolvedDecision,
     ) -> Result<(), ResolveError> {
-        // Lock removal provides at-most-once.
-        let parked = {
-            let mut entries = self.lock();
+        // One serialization boundary: the entries guard spans the removal
+        // AND the decided insert, so a concurrent read_or_expire (which
+        // holds the same lock pair in the same order) observes either the
+        // pending row or the decided winner — never neither. Lock order:
+        // entries -> decided, the only nesting in this module.
+        let mut entries = self.lock();
+        let (row_authority, row_expires_at) = {
             let row = entries.get(id).ok_or(ResolveError::NotFound)?;
-            // Wrong authority is indistinguishable from unknown: the row
-            // stays parked and nothing is recorded. This reads the stored
-            // row's authority, so it covers inline `register` rows and
-            // durable `register_durable` rows alike.
-            if row.authority != expected_authority {
-                return Err(ResolveError::NotFound);
-            }
-            if chrono::Utc::now() > row.expires_at {
-                return Err(ResolveError::NotFound);
-            }
-            entries.remove(id)
+            (row.authority, row.expires_at)
         };
-        let parked = parked.ok_or(ResolveError::NotFound)?;
+        // Wrong authority is indistinguishable from unknown: the row
+        // stays parked and nothing is recorded. This reads the stored
+        // row's authority, so it covers inline `register` rows and
+        // durable `register_durable` rows alike.
+        if row_authority != expected_authority {
+            return Err(ResolveError::NotFound);
+        }
+        if chrono::Utc::now() > row_expires_at {
+            return Err(ResolveError::NotFound);
+        }
+        // Lock removal provides at-most-once; the row is present under
+        // this guard, so the removal cannot miss.
+        let parked = entries.remove(id).ok_or(ResolveError::NotFound)?;
         let keep_until =
             parked.expires_at + chrono::Duration::seconds(DECISION_RETENTION_MARGIN_SECS);
         self.lock_decided().insert(
@@ -119,6 +125,7 @@ impl ApprovalStore for InMemoryApprovalStore {
                 keep_until,
             },
         );
+        drop(entries);
         Ok(())
     }
 
@@ -164,10 +171,16 @@ impl ApprovalStore for InMemoryApprovalStore {
         id: &DecisionId,
         expected_authority: ApprovalAuthority,
     ) -> Result<ApprovalRead, SessionStoreError> {
+        // One serialization boundary with resolve: the entries guard
+        // spans the pending check AND the decided check (lock order:
+        // entries -> decided, mirroring resolve's nesting), so a resolve
+        // in flight cannot make this read observe neither map and
+        // misreport a row being decided as Missing.
+        let entries = self.lock();
         // The pending path checks the row's own authority, so a wrong
         // channel reads as missing with no mutation — one agent's poller
         // cannot consume another's rows.
-        if let Some(parked) = self.lock().get(id).cloned() {
+        if let Some(parked) = entries.get(id).cloned() {
             if parked.authority != expected_authority {
                 return Ok(ApprovalRead::Missing);
             }
