@@ -30,9 +30,16 @@ const DECISION_RETENTION_MARGIN_SECS: i64 = 60;
 const MAX_SKILL_SESSIONS: usize = 1024;
 
 /// A recorded resolved decision (decision plus captured identity) and its
-/// retention deadline.
+/// retention deadline. The row itself is retained beside the decision so
+/// `read_or_expire`'s addressed arm can return it unchanged (the file
+/// backend persists both halves in its decision record).
 struct DecidedEntry {
     decision: ResolvedDecision,
+    #[expect(
+        dead_code,
+        reason = "read by the E2 memory read_or_expire fill; the fill's marker sweep removes this"
+    )]
+    approval: ParkedApproval,
     keep_until: Timestamp,
 }
 
@@ -114,12 +121,14 @@ impl ApprovalStore for InMemoryApprovalStore {
             entries.remove(id)
         };
         let parked = parked.ok_or(ResolveError::NotFound)?;
+        let keep_until =
+            parked.expires_at + chrono::Duration::seconds(DECISION_RETENTION_MARGIN_SECS);
         self.lock_decided().insert(
             *id,
             DecidedEntry {
                 decision,
-                keep_until: parked.expires_at
-                    + chrono::Duration::seconds(DECISION_RETENTION_MARGIN_SECS),
+                approval: parked,
+                keep_until,
             },
         );
         Ok(())
@@ -415,6 +424,7 @@ mod tests {
             id,
             DecidedEntry {
                 decision: ResolvedDecision::from(ApprovalDecision::Approved),
+                approval: parked("req-prune"),
                 keep_until: chrono::Utc::now() - chrono::Duration::seconds(1),
             },
         );
