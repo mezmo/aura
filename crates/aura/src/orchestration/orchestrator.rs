@@ -175,6 +175,15 @@ struct AgentWithPreamble {
     /// Shared state for the worker's `submit_result` tool. Read after the
     /// worker completes to extract structured output (summary, result, confidence).
     submit_result_decision: super::tools::SubmitResultDecision,
+    /// The tool context factory this build produced. Workers consume it through
+    /// their config; the coordinator's is declared here (its tools are added
+    /// unwrapped today). Carries the run's execution scope when the
+    /// orchestrator is resume-bound, `None` scope on the initial path.
+    ///
+    /// Read by the L3a context-threading goldens (the production worker path
+    /// reads the factory off its config before this return).
+    #[allow(dead_code)]
+    tool_context_factory: Option<crate::config::ToolContextFactory>,
 }
 
 /// Persistent coordinator state for conversation across planning iterations.
@@ -647,6 +656,13 @@ pub struct Orchestrator {
 
     /// Run-scoped park guard (park mode).
     park_guard: Option<Arc<ParkGuard>>,
+
+    /// The run's ONE park execution scope, threaded into every tool context
+    /// this orchestrator builds. `None` for an initial run: every context
+    /// stays unscoped, byte-equivalent to before. `Some` only for a
+    /// resume-bound orchestrator — a clone of the grant's single scope `Arc`,
+    /// never a freshly minted second.
+    execution_scope: Option<Arc<crate::orchestration::RunExecutionScope>>,
 }
 
 /// Stream context for reasoning attribution in `stream_and_forward`.
@@ -806,7 +822,14 @@ impl Orchestrator {
             Arc::new(Mutex::new(ExecutionPersistence::disabled()))
         };
 
-        Ok(Self::assemble(agent_config, orchestration_config, mcp_manager, persistence).await)
+        Ok(Self::assemble(
+            agent_config,
+            orchestration_config,
+            mcp_manager,
+            persistence,
+            None,
+        )
+        .await)
     }
 
     /// Bind an orchestrator to a checkpointed run for one resume segment.
@@ -866,6 +889,7 @@ impl Orchestrator {
             orchestration_config,
             mcp_manager,
             persistence,
+            Some(grant.execution_scope()),
         )
         .await)
     }
@@ -880,6 +904,7 @@ impl Orchestrator {
         orchestration_config: OrchestrationConfig,
         mcp_manager: Option<Arc<McpManager>>,
         persistence: Arc<Mutex<ExecutionPersistence>>,
+        execution_scope: Option<Arc<crate::orchestration::RunExecutionScope>>,
     ) -> Self {
         // Tool call observer for real-time streaming. The _rx receiver is consumed
         // by spawn_tool_event_forwarder in factory.rs when the stream starts.
@@ -924,6 +949,7 @@ impl Orchestrator {
             usage_state: crate::UsageState::new(),
             outer_budget: None,
             park_guard,
+            execution_scope,
         }
     }
 
@@ -1274,26 +1300,40 @@ impl Orchestrator {
             );
             let worker_name_copy = String::from(name);
 
-            // Orchestrator provides context factory with task metadata
+            // Orchestrator provides context factory with task metadata, and
+            // threads the run's execution scope when this orchestrator is
+            // resume-bound (`None` scope keeps the context unscoped).
+            let execution_scope = self.execution_scope.clone();
             worker_config.tool_context_factory = Some(Arc::new(move |tool_name: &str| {
-                ToolCallContext::new(tool_name).with_task_context(
+                let ctx = ToolCallContext::new(tool_name).with_task_context(
                     task_id,
                     worker_name_copy.clone(),
                     attempt,
-                )
+                );
+                match &execution_scope {
+                    Some(scope) => ctx.with_execution_scope(Arc::clone(scope)),
+                    None => ctx,
+                }
             }));
         } else {
             worker_config.preamble_override =
                 Some(super::config::build_worker_preamble(&self.config));
             let orchestrator_id_copy = self.orchestrator_id.clone();
 
-            // Orchestrator provides context factory with task metadata
+            // Orchestrator provides context factory with task metadata, and
+            // threads the run's execution scope when this orchestrator is
+            // resume-bound (`None` scope keeps the context unscoped).
+            let execution_scope = self.execution_scope.clone();
             worker_config.tool_context_factory = Some(Arc::new(move |tool_name: &str| {
-                ToolCallContext::new(tool_name).with_task_context(
+                let ctx = ToolCallContext::new(tool_name).with_task_context(
                     task_id,
                     orchestrator_id_copy.clone(),
                     attempt,
-                )
+                );
+                match &execution_scope {
+                    Some(scope) => ctx.with_execution_scope(Arc::clone(scope)),
+                    None => ctx,
+                }
             }));
         }
 
@@ -1371,6 +1411,7 @@ impl Orchestrator {
             preamble,
             escalation_flag,
             submit_result_decision,
+            tool_context_factory: worker_config.tool_context_factory.clone(),
         })
     }
 
@@ -2896,8 +2937,21 @@ Assign tasks to the worker whose tools best match the required operations."#,
         routing_tools: RoutingToolSet,
         allow_recon_tools: bool,
     ) -> Result<AgentWithPreamble, Box<dyn std::error::Error + Send + Sync>> {
+        use crate::tool_wrapper::ToolCallContext;
         use crate::vector_dynamic::DynamicVectorSearchTool;
         use crate::vector_store::VectorStoreManager;
+
+        // The coordinator's tool context factory: a resume-bound orchestrator
+        // threads the grant's ONE execution scope into every context the
+        // coordinator's tools build; an initial run stays unscoped. The
+        // coordinator adds its tools unwrapped today, so this is the produced
+        // factory the L3a goldens pin.
+        let coordinator_tool_context_factory: Option<crate::config::ToolContextFactory> =
+            self.execution_scope.clone().map(|scope| {
+                Arc::new(move |tool_name: &str| {
+                    ToolCallContext::new(tool_name).with_execution_scope(Arc::clone(&scope))
+                }) as crate::config::ToolContextFactory
+            });
 
         // Capture tool information for reconnaissance tools
         let tool_names = self.get_all_tool_names();
@@ -3063,6 +3117,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 preamble,
                 escalation_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 submit_result_decision: Arc::new(Mutex::new(None)),
+                tool_context_factory: coordinator_tool_context_factory.clone(),
             });
         }
 
@@ -3102,6 +3157,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             preamble,
             escalation_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             submit_result_decision: Arc::new(Mutex::new(None)),
+            tool_context_factory: coordinator_tool_context_factory,
         })
     }
 
@@ -4059,6 +4115,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 preamble: worker_preamble,
                 escalation_flag,
                 submit_result_decision,
+                ..
             } = self
                 .create_worker(
                     task_id,
@@ -9270,6 +9327,239 @@ mod tests {
             .expect("the matching header is admitted");
         assert_eq!(granted.run_id().to_string(), run_id);
         assert_eq!(granted.session_id().to_string(), SESSION);
+    }
+
+    // ====================================================================
+    // L3a execution-scope context threading
+    // ====================================================================
+
+    /// A resume grant over a file-backed conversational park: an awaiting run
+    /// whose two gated calls are durably parked under the run's worker scope,
+    /// both decided, then admitted through the interim `authorize` path — the
+    /// scope the grant owns is minted there and never re-minted. The
+    /// evaluation config is returned so `for_resume_segment` can rebuild from
+    /// the same shape (the file backend keeps each decided approval readable
+    /// for the consult, which the memory store does not).
+    async fn resume_grant_fixture(
+        root: &std::path::Path,
+        session: &str,
+    ) -> (AgentRuntimeConfig, crate::orchestration::ResumeGrant) {
+        use crate::orchestration::park::resume::{
+            ResumeClaimTable, ResumeEvaluation, ValidatedResumePath, evaluate_resume,
+        };
+
+        let approval_dir = root.join("approvals");
+        std::fs::create_dir_all(&approval_dir).unwrap();
+        let registry = crate::hitl::PendingApprovals::with_backend(
+            Arc::new(crate::session_store::FileApprovalStore::open(&approval_dir).unwrap()),
+            Arc::new(crate::session_store::InMemoryEventBus::new()),
+        );
+        let memory_dir = root.to_string_lossy().into_owned();
+        let config = || AgentRuntimeConfig {
+            hitl: Some(crate::hitl::HitlRuntime {
+                patterns: Arc::from([aura_config::GlobPattern::new("kubectl_*").unwrap()]),
+                route: Arc::new(crate::hitl::DecisionRoute::Conversational {
+                    registry: registry.clone(),
+                    timeout: Duration::from_secs(3600),
+                }),
+                park_enabled: true,
+                park_ttl: aura_config::ParkTtl::default(),
+            }),
+            memory_dir: Some(memory_dir.clone()),
+            session_id: Some(session.to_string()),
+            request_id: Some(format!("req_l3a_{}", uuid::Uuid::new_v4().simple())),
+            ..AgentRuntimeConfig::default()
+        };
+
+        let orchestrator = Orchestrator::new(config()).await.unwrap();
+        let run_id = orchestrator.persistence.lock().await.run_id().to_string();
+
+        let mut plan = Plan::new("Deploy");
+        plan.add_task(Task::new(0, "Facts", "r"));
+        plan.add_task(Task::new(1, "Gated apply", "r").with_dependency(0));
+        plan.get_task_mut(0).unwrap().complete("facts");
+
+        let registered_at = chrono::Utc::now();
+        let mut pending = Vec::new();
+        for tool in ["kubectl_apply", "kubectl_delete"] {
+            let decision_id = TestDecisionId::generate();
+            registry
+                .register_durable(ParkedApproval {
+                    request: crate::hitl::ApprovalRequest {
+                        version: crate::hitl::PROTOCOL_VERSION,
+                        instance_id: "test-instance".to_string(),
+                        decision_id,
+                        request_id: format!("run:{run_id}"),
+                        scope: crate::hitl::AgentScope::Worker {
+                            run_id: run_id.parse().expect("run id parses"),
+                            task: crate::orchestration::TaskIdentity::new(1, None),
+                            session_id: None,
+                        },
+                        origin: crate::hitl::ApprovalOrigin::ConfigGate {
+                            matched_pattern: "kubectl_*".to_string(),
+                            agent_name: "test-agent".to_string(),
+                        },
+                        items: vec![ApprovalItem {
+                            tool_name: tool.to_string(),
+                            arguments: serde_json::json!({ "namespace": "prod" }),
+                            tool_call_intent: None,
+                        }],
+                    },
+                    registered_at,
+                    expires_at: registered_at + chrono::Duration::hours(1),
+                    authority: crate::hitl::ApprovalAuthority::WebhookPoll,
+                    egress_headers: None,
+                    acknowledgment: crate::hitl::AcknowledgmentState::Acknowledged,
+                })
+                .await
+                .unwrap();
+            pending.push(TestPendingCall {
+                decision_id,
+                tool_name: tool.to_string(),
+                arguments: serde_json::json!({ "namespace": "prod" }),
+                call_id: format!("call_{}", pending.len()),
+            });
+        }
+        mark_awaiting(&mut plan, 1, pending.clone());
+
+        let mut records = ParkedTaskRecords::new();
+        records.insert(
+            1,
+            crate::orchestration::park::ParkedTaskRecord {
+                attempt: 1,
+                snapshot: crate::orchestration::ParkSnapshot {
+                    history: vec![rig::completion::Message::user("apply it")],
+                    current_prompt: rig::completion::Message::user("tool results"),
+                },
+            },
+        );
+
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(32);
+        orchestrator
+            .park_run(
+                "deploy the service",
+                &[rig::completion::Message::user("deploy the service")],
+                &[],
+                None,
+                1,
+                2_500,
+                &[],
+                &plan,
+                &records,
+                &event_tx,
+            )
+            .await
+            .expect("the fixture park commits");
+
+        for call in &pending {
+            registry
+                .resolve(
+                    &call.decision_id,
+                    crate::hitl::ApprovalAuthority::WebhookPoll,
+                    crate::hitl::ApprovalDecision::Approved.into(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let claims = ResumeClaimTable::new();
+        let resume_config = config();
+        let evaluation = ResumeEvaluation {
+            path: ValidatedResumePath::parse(session, &run_id).expect("path validates"),
+            memory_dir: &memory_dir,
+            config: &resume_config,
+            store: &registry,
+            claims: &claims,
+            bind_identity: false,
+            presented_identity: None,
+            request_id: format!("req_l3a_{}", uuid::Uuid::new_v4().simple()),
+            now: chrono::Utc::now(),
+        };
+        let grant = evaluate_resume(evaluation)
+            .await
+            .expect("the resume is admitted over the decided park");
+        (resume_config, grant)
+    }
+
+    /// L3a golden (RED today): a resume segment's worker tool context carries
+    /// the grant's ONE execution scope — the same `Arc`, never a second.
+    #[tokio::test]
+    async fn resume_segment_worker_context_carries_execution_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, grant) = resume_grant_fixture(dir.path(), "l3a-worker-sess").await;
+
+        let segment = Orchestrator::for_resume_segment(&grant, &config)
+            .await
+            .expect("the resume segment orchestrator builds");
+        let worker = segment
+            .create_worker(1, 1, None, None, None)
+            .await
+            .expect("the resume worker builds");
+        let factory = worker
+            .tool_context_factory
+            .as_ref()
+            .expect("create_worker produces a tool context factory");
+
+        let ctx = factory("kubectl_apply");
+        let scope = ctx.execution_scope.expect(
+            "the resume worker context carries the execution scope (RED today: never injected)",
+        );
+        assert!(
+            Arc::ptr_eq(&scope, &grant.execution_scope()),
+            "the worker context must carry the grant's ONE scope Arc, not a fresh one"
+        );
+    }
+
+    /// L3a golden (RED today): a resume segment's coordinator tool context
+    /// carries the same grant-owned execution scope.
+    #[tokio::test]
+    async fn resume_segment_coordinator_context_carries_execution_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, grant) = resume_grant_fixture(dir.path(), "l3a-coord-sess").await;
+
+        let segment = Orchestrator::for_resume_segment(&grant, &config)
+            .await
+            .expect("the resume segment orchestrator builds");
+        let coordinator = segment
+            .create_coordinator(RoutingToolSet::new(), true)
+            .await
+            .expect("the resume coordinator builds");
+        let factory = coordinator
+            .tool_context_factory
+            .as_ref()
+            .expect("create_coordinator produces a tool context factory");
+
+        let ctx = factory("read_artifact");
+        let scope = ctx.execution_scope.expect(
+            "the resume coordinator context carries the execution scope (RED today: never injected)",
+        );
+        assert!(
+            Arc::ptr_eq(&scope, &grant.execution_scope()),
+            "the coordinator context must carry the grant's ONE scope Arc, not a fresh one"
+        );
+    }
+
+    /// L3a characterization (green today, must stay green): an initial
+    /// `Orchestrator::new`-built orchestrator's worker context stays unscoped.
+    #[tokio::test]
+    async fn initial_orchestrator_contexts_stay_unscoped() {
+        let orchestrator = Orchestrator::new(AgentRuntimeConfig::default())
+            .await
+            .expect("the initial orchestrator builds");
+        let worker = orchestrator
+            .create_worker(1, 1, None, None, None)
+            .await
+            .expect("the initial worker builds");
+        let factory = worker
+            .tool_context_factory
+            .as_ref()
+            .expect("create_worker produces a tool context factory");
+
+        let ctx = factory("kubectl_apply");
+        assert!(
+            ctx.execution_scope.is_none(),
+            "an initial run's worker context must stay unscoped"
+        );
     }
 
     #[tokio::test]
