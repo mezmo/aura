@@ -578,15 +578,20 @@ async fn forward_internal_tool_completed(
 /// Spawn a task that forwards tool call events to the SSE stream.
 ///
 /// Listens on the observer's broadcast channel and converts `ToolEvent`s
-/// to `OrchestratorEvent`s, sending them through the event channel.
+/// to `OrchestratorEvent`s, sending them through the event channel. When the
+/// producing run is park-scoped, the forwarder spawns tracked through that
+/// scope (registered before it starts, holding a lease reference through its
+/// actual completion), so the supervisor's drain waits it out; an unscoped
+/// caller passes `None` and keeps today's bare spawn.
 pub(super) fn spawn_tool_event_forwarder(
     observer: &ToolCallObserver,
     event_tx: tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>,
     cancel_token: CancellationToken,
+    execution_scope: Option<Arc<crate::orchestration::RunExecutionScope>>,
 ) {
     let mut tool_rx = observer.subscribe();
 
-    tokio::spawn(async move {
+    let forward = async move {
         loop {
             tokio::select! {
                 result = tool_rx.recv() => {
@@ -608,7 +613,16 @@ pub(super) fn spawn_tool_event_forwarder(
                 }
             }
         }
-    });
+    };
+
+    match execution_scope {
+        Some(scope) => {
+            scope.spawn_tracked(forward);
+        }
+        None => {
+            tokio::spawn(forward);
+        }
+    }
 }
 
 // ============================================================================
@@ -637,8 +651,12 @@ pub struct Orchestrator {
     /// Arc-wrapped so workers can share the same connections.
     pub(super) mcp_manager: Option<Arc<McpManager>>,
 
-    /// Execution persistence for debugging and retry intelligence
-    persistence: Arc<Mutex<ExecutionPersistence>>,
+    /// Execution persistence for debugging and retry intelligence.
+    ///
+    /// `pub(super)` so the factory's initial supervisor can read the
+    /// persistence-bound run id it reserves before worker registration
+    /// (the same read [`Self::assemble`] makes).
+    pub(super) persistence: Arc<Mutex<ExecutionPersistence>>,
 
     /// Accumulated token usage across all LLM calls in this orchestration run
     /// (planning, workers, continuation routing).
@@ -1447,11 +1465,31 @@ impl Orchestrator {
     /// `[hitl.park].enabled` on a park-capable route: conversational, or a
     /// webhook route that can park (`can_park` — poll delivery with park
     /// mode; sync never parks).
-    fn park_enabled(&self) -> bool {
+    pub(super) fn park_enabled(&self) -> bool {
         self.agent_config
             .hitl
             .as_ref()
             .is_some_and(|hitl| hitl.park_enabled && hitl.route.park_registry().is_some())
+    }
+
+    /// Arm this constructed orchestrator with its run's ONE execution scope:
+    /// the initial park-enabled producer reserves its persistence-bound run
+    /// id, then calls this before worker registration, so every tool context,
+    /// the tool-event forwarder, and the guard's tails share the scope the
+    /// supervisor drains before the fence releases. `scope` is a clone of the
+    /// caller's single `Arc` — never a freshly minted second token or tracker.
+    pub(super) fn arm_execution_scope(
+        &mut self,
+        scope: Arc<crate::orchestration::RunExecutionScope>,
+    ) {
+        // The initial guard was built unscoped in `assemble` (the run id it
+        // would reserve does not exist yet); arm its deferred sweep with the
+        // same ONE scope the supervisor holds. Set-once: an already-scoped
+        // (resumed) guard ignores it.
+        if let Some(guard) = &self.park_guard {
+            guard.arm_execution_scope(Arc::clone(&scope));
+        }
+        self.execution_scope = Some(scope);
     }
 
     /// The worker approval scope stamped on a task's approvals — the same

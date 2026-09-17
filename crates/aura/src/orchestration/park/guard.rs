@@ -30,9 +30,11 @@ pub(crate) struct ParkGuard {
     /// clone of the run's ONE scope (the grant's for a resumed segment, the
     /// initial producer's for a first run), so the guard's tails register
     /// with the same tracker the supervisor drains before the fence
-    /// releases. `None` only on the unscoped initial constructor the L3
-    /// fill rewires.
-    execution_scope: Option<Arc<RunExecutionScope>>,
+    /// releases. Set-once arming: the resume path sets it at construction
+    /// (`new_with_execution_scope`); the initial producer arms it after the
+    /// factory reserves the run (`arm_execution_scope`) — the guard is
+    /// built before the persistence-bound run id exists to reserve.
+    execution_scope: std::sync::OnceLock<Arc<RunExecutionScope>>,
     published: AtomicBool,
     armed: AtomicBool,
 }
@@ -46,7 +48,7 @@ impl ParkGuard {
             run_id,
             request_id,
             mode: ParkGuardMode::Initial,
-            execution_scope: None,
+            execution_scope: std::sync::OnceLock::new(),
             published: AtomicBool::new(false),
             armed: AtomicBool::new(false),
         })
@@ -71,10 +73,17 @@ impl ParkGuard {
             run_id,
             request_id,
             mode,
-            execution_scope: Some(execution_scope),
+            execution_scope: std::sync::OnceLock::from(execution_scope),
             published: AtomicBool::new(false),
             armed: AtomicBool::new(false),
         })
+    }
+
+    /// Arm the deferred sweep's execution scope (set-once): the initial
+    /// producer's factory calls this once it has reserved the
+    /// persistence-bound run; an already-scoped (resumed) guard ignores it.
+    pub(crate) fn arm_execution_scope(&self, scope: Arc<RunExecutionScope>) {
+        let _ = self.execution_scope.set(scope);
     }
 
     /// Record parked calls; the first record arms the guard.
@@ -100,7 +109,7 @@ impl ParkGuard {
     /// compare it by `Arc::ptr_eq` against the grant's ONE scope.
     #[cfg(test)]
     pub(crate) fn execution_scope(&self) -> Option<Arc<RunExecutionScope>> {
-        self.execution_scope.clone()
+        self.execution_scope.get().cloned()
     }
 }
 
@@ -128,12 +137,7 @@ impl Drop for ParkGuard {
         // and skip.
         match tokio::runtime::Handle::try_current() {
             Ok(_) => {
-                cancel_run_approvals(
-                    &registry,
-                    &run_id,
-                    &request_id,
-                    self.execution_scope.as_ref(),
-                );
+                cancel_run_approvals(&registry, &run_id, &request_id, self.execution_scope.get());
             }
             Err(_) => {
                 tracing::warn!(
@@ -147,6 +151,7 @@ impl Drop for ParkGuard {
 
 #[cfg(test)]
 mod tests {
+    use std::pin::pin;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -327,7 +332,7 @@ mod tests {
         // sees a still-pending barrier. Untracked (the pre-L3b state), the
         // tracker is empty and the poll completes at once.
         {
-            let mut drain = std::pin::pin!(scope.drain());
+            let mut drain = pin!(scope.drain());
             let waker = std::task::Waker::noop();
             let mut cx = std::task::Context::from_waker(waker);
             assert!(
@@ -347,6 +352,58 @@ mod tests {
     /// L3b characterization (GREEN today, must stay green): a resumed guard
     /// is checkpoint-preserving — its drop never sweeps retained approvals,
     /// scoped or not.
+
+    #[tokio::test]
+    async fn armed_initial_guard_sweep_registers_with_tracker() {
+        use crate::orchestration::ReservationTable;
+        use crate::orchestration::park::lifetime::RunExecutionScope;
+
+        let (registry, store) = registry_with_store();
+        let run_id: RunId = "0191e8c0-5155-7000-8000-000000000042".parse().unwrap();
+        let request_id = format!("req_guard_arm_{}", uuid::Uuid::new_v4().simple());
+        let table = ReservationTable::new();
+        let lease = table.admit(run_id).expect("admission");
+        let scope = RunExecutionScope::new(lease);
+
+        let scope_for_worker = worker_scope(run_id);
+        let decision_id = DecisionId::generate();
+        registry
+            .register_durable(durable_approval(
+                decision_id,
+                &format!("run:{run_id}"),
+                &scope_for_worker,
+            ))
+            .await
+            .unwrap();
+
+        // The initial path's shape: an unscoped guard armed with the run's
+        // scope once the factory reserved the run.
+        let guard = ParkGuard::new(registry.clone(), run_id.to_string(), request_id.clone());
+        guard.arm_execution_scope(Arc::clone(&scope));
+        guard.record(std::slice::from_ref(&parked_call(decision_id)));
+        drop(guard);
+
+        // The sweep registered with the tracker: drain cannot complete
+        // while the sweep is still publishing (deterministic first-poll
+        // probe, as in the scoped-construction golden).
+        let mut drain = pin!(scope.drain());
+        assert!(
+            drain
+                .as_mut()
+                .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+                .is_pending(),
+            "an armed initial guard's sweep must register with the tracker"
+        );
+
+        tokio::time::timeout(Duration::from_secs(2), drain)
+            .await
+            .expect("drain completes once the sweep finishes");
+        assert!(
+            store.get(&decision_id).await.unwrap().is_none(),
+            "the sweep cleared the parked ticket"
+        );
+    }
+
     #[tokio::test]
     async fn resumed_guard_drop_preserves_parked_approvals() {
         let (registry, store) = registry_with_store();
