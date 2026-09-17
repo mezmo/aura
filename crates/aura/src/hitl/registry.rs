@@ -1166,4 +1166,195 @@ mod tests {
             "the inline row's decision is recorded",
         );
     }
+
+    // ====================================================================
+    // E3 contract row: the registry read-or-expire seam and its fail-closed
+    // error propagation. The store semantics themselves (pending / missing
+    // / addressed / authority / expiry) are pinned by the committed E2
+    // battery; these tests pin ONLY the forward: the registry passes the
+    // authority-aware read through untouched, and a store fault surfaces
+    // as an error, never as an outcome.
+    // ====================================================================
+
+    /// A local fault double: every operation delegates to an inner
+    /// in-memory store EXCEPT `read_or_expire`, which always faults. Used
+    /// to prove the registry propagates a store fault fail-closed instead
+    /// of answering an outcome (test-only code inside this module).
+    struct FaultingReadOrExpireStore(InMemoryApprovalStore);
+
+    #[async_trait::async_trait]
+    impl ApprovalStore for FaultingReadOrExpireStore {
+        async fn register(&self, parked: ParkedApproval) -> Result<(), SessionStoreError> {
+            self.0.register(parked).await
+        }
+
+        async fn mark_acknowledged(
+            &self,
+            id: &DecisionId,
+        ) -> Result<crate::session_store::AcknowledgeOutcome, SessionStoreError> {
+            self.0.mark_acknowledged(id).await
+        }
+
+        async fn get(&self, id: &DecisionId) -> Result<Option<ParkedApproval>, SessionStoreError> {
+            self.0.get(id).await
+        }
+
+        async fn resolve(
+            &self,
+            id: &DecisionId,
+            expected_authority: ApprovalAuthority,
+            decision: ResolvedDecision,
+        ) -> Result<(), ResolveError> {
+            self.0.resolve(id, expected_authority, decision).await
+        }
+
+        async fn decision(
+            &self,
+            id: &DecisionId,
+        ) -> Result<Option<ResolvedDecision>, SessionStoreError> {
+            self.0.decision(id).await
+        }
+
+        async fn remove(&self, id: &DecisionId) -> Result<(), SessionStoreError> {
+            self.0.remove(id).await
+        }
+
+        async fn cancel_request(
+            &self,
+            request_id: &str,
+        ) -> Result<Vec<ParkedApproval>, SessionStoreError> {
+            self.0.cancel_request(request_id).await
+        }
+
+        async fn list_pending(&self) -> Result<Vec<ParkedApproval>, SessionStoreError> {
+            self.0.list_pending().await
+        }
+
+        async fn read_or_expire(
+            &self,
+            _id: &DecisionId,
+            _expected_authority: ApprovalAuthority,
+        ) -> Result<ApprovalRead, SessionStoreError> {
+            Err(SessionStoreError::Request {
+                reason: "registry fault probe".to_string(),
+            })
+        }
+
+        async fn retained_rows(
+            &self,
+        ) -> Result<Vec<crate::session_store::RetainedApproval>, SessionStoreError> {
+            self.0.retained_rows().await
+        }
+    }
+
+    /// The read-or-expire seam answers a still-pending inline row through
+    /// the store: `Pending` carrying the row.
+    #[tokio::test]
+    async fn registry_read_or_expire_answers_pending_through_the_store() {
+        let registry = PendingApprovals::new();
+        let req = test_request("req-roe-pending");
+        let id = req.decision_id;
+        let _handle = registry.register(req, Duration::from_secs(60)).await;
+
+        match registry
+            .read_or_expire(&id, ApprovalAuthority::Conversational)
+            .await
+            .expect("the store read succeeds")
+        {
+            ApprovalRead::Pending(parked) => {
+                assert_eq!(parked.request.decision_id, id);
+                assert_eq!(parked.request.request_id, "req-roe-pending");
+            }
+            _other => panic!("expected Pending, got another ApprovalRead arm"),
+        }
+    }
+
+    /// The registry passes `expected_authority` through to the store rather
+    /// than substituting or ignoring it: a webhook-owned row read under
+    /// Conversational is Missing, and the read mutates nothing.
+    #[tokio::test]
+    async fn registry_read_or_expire_wrong_authority_is_missing() {
+        let registry = PendingApprovals::new();
+        let req = test_request("req-roe-wrong");
+        let id = webhook_parked(&registry, req).await;
+
+        match registry
+            .read_or_expire(&id, ApprovalAuthority::Conversational)
+            .await
+            .expect("the store read itself succeeds")
+        {
+            ApprovalRead::Missing => {
+                assert!(
+                    registry.try_parked(&id).await.unwrap().is_some(),
+                    "the wrong-authority read must leave the row parked",
+                );
+                assert!(
+                    registry.recorded_decision(&id).await.is_none(),
+                    "the wrong-authority read must record no decision",
+                );
+            }
+            ApprovalRead::Pending(_) | ApprovalRead::Addressed { .. } => {
+                panic!("the wrong-authority read must be Missing, never an outcome");
+            }
+        }
+    }
+
+    /// A decision resolved inside the window reads back as the addressed
+    /// arm carrying the row beside `Decided(Approved)`.
+    #[tokio::test]
+    async fn registry_read_or_expire_forwards_a_decided_winner() {
+        use crate::hitl::AddressedApproval;
+
+        let registry = PendingApprovals::new();
+        let req = test_request("req-roe-decided");
+        let id = req.decision_id;
+        let _handle = registry.register(req, Duration::from_secs(60)).await;
+
+        registry
+            .resolve(
+                &id,
+                ApprovalAuthority::Conversational,
+                ApprovalDecision::Approved.into(),
+            )
+            .await
+            .expect("resolve succeeds");
+
+        match registry
+            .read_or_expire(&id, ApprovalAuthority::Conversational)
+            .await
+            .expect("the store read succeeds")
+        {
+            ApprovalRead::Addressed {
+                approval,
+                outcome: AddressedApproval::Decided(ResolvedDecision::Approved { .. }),
+            } => {
+                assert_eq!(approval.request.decision_id, id);
+            }
+            _other => panic!("expected Addressed-Approved, got another ApprovalRead arm"),
+        }
+    }
+
+    /// The fail-closed propagation: a store fault at `read_or_expire`
+    /// surfaces as the exact error through the registry — never
+    /// `Ok(Missing)`, never an outcome.
+    #[tokio::test]
+    async fn registry_read_or_expire_propagates_store_faults_fail_closed() {
+        let registry = PendingApprovals::with_backend(
+            Arc::new(FaultingReadOrExpireStore(InMemoryApprovalStore::new())),
+            Arc::new(InMemoryEventBus::new()),
+        );
+        let req = test_request("req-roe-fault");
+        let id = req.decision_id;
+        let _handle = registry.register(req, Duration::from_secs(60)).await;
+
+        match registry
+            .read_or_expire(&id, ApprovalAuthority::Conversational)
+            .await
+        {
+            Err(SessionStoreError::Request { reason }) => {
+                assert_eq!(reason, "registry fault probe");
+            }
+            _other => panic!("expected the exact store fault, got another answer"),
+        }
+    }
 }
