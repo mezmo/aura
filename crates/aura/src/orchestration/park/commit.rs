@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -17,6 +18,7 @@ use super::ParkedTaskRecords;
 use super::document::{
     PARKED_DOCUMENT_SUFFIX, ParkedRun, RESUMING_DOCUMENT_SUFFIX, RunStateForPark, build_document,
 };
+use super::lifetime::RunExecutionScope;
 use super::retention::RetentionExpiresAt;
 
 /// The inputs the orchestrator hands the park commit.
@@ -238,15 +240,22 @@ pub(crate) async fn publish(
 /// ordered teardown. A decided ticket is never in the cleared set, so the
 /// stream cannot disagree with a decision that won the race. A lost store
 /// reply yields warn-and-empty, the conceded residual.
+///
+/// When the run carries an execution scope, the sweep spawns TRACKED through
+/// it — registered before it starts and holding a lease reference through
+/// completion, so the supervisor's drain cannot release the run's fence while
+/// the sweep is still publishing. An unscoped run keeps the bare spawn
+/// (byte-equivalent behavior).
 pub(crate) fn cancel_run_approvals(
     registry: &PendingApprovals,
     run_id: &str,
     request_id: &str,
+    scope: Option<&Arc<RunExecutionScope>>,
 ) -> tokio::task::JoinHandle<()> {
     let registry = registry.clone();
     let run_id = run_id.to_string();
     let request_id = request_id.to_string();
-    tokio::task::spawn(async move {
+    let sweep = async move {
         for parked in registry.cancel_request(&run_owner_id(&run_id)).await {
             crate::approval_event_broker::publish(
                 &request_id,
@@ -260,7 +269,11 @@ pub(crate) fn cancel_run_approvals(
             )
             .await;
         }
-    })
+    };
+    match scope {
+        Some(scope) => scope.spawn_tracked(sweep),
+        None => tokio::task::spawn(sweep),
+    }
 }
 
 /// The directory checkpoint documents live in:
@@ -770,7 +783,7 @@ mod tests {
             .await
             .unwrap();
 
-        cancel_run_approvals(&registry, run_id, &request_id)
+        cancel_run_approvals(&registry, run_id, &request_id, None)
             .await
             .unwrap();
 
@@ -836,7 +849,7 @@ mod tests {
             .await
             .unwrap();
 
-        cancel_run_approvals(&registry, run_id, &request_id)
+        cancel_run_approvals(&registry, run_id, &request_id, None)
             .await
             .unwrap();
 
@@ -881,7 +894,7 @@ mod tests {
             .await
             .unwrap();
 
-        cancel_run_approvals(&registry, run_id, "req_late_resolve")
+        cancel_run_approvals(&registry, run_id, "req_late_resolve", None)
             .await
             .unwrap();
 

@@ -32,7 +32,6 @@ pub(crate) struct ParkGuard {
     /// with the same tracker the supervisor drains before the fence
     /// releases. `None` only on the unscoped initial constructor the L3
     /// fill rewires.
-    #[expect(dead_code, reason = "read by the L3 fill's tracked-sweep wiring")]
     execution_scope: Option<Arc<RunExecutionScope>>,
     published: AtomicBool,
     armed: AtomicBool,
@@ -60,7 +59,6 @@ impl ParkGuard {
     /// driver, and tool contexts hold (cloned from the grant's one scope),
     /// so a guard tail can neither spawn unregistered nor outlive the
     /// run's drain.
-    #[expect(dead_code, reason = "constructed by the L3 fill's scoped guard wiring")]
     pub(crate) fn new_with_execution_scope(
         registry: PendingApprovals,
         run_id: String,
@@ -90,6 +88,20 @@ impl ParkGuard {
     pub(crate) fn mark_published(&self) {
         self.published.store(true, Ordering::Release);
     }
+
+    /// The guard's sweep disposition — read by the L3b goldens to prove a
+    /// resume segment builds the checkpoint-preserving guard.
+    #[cfg(test)]
+    pub(crate) fn mode(&self) -> ParkGuardMode {
+        self.mode
+    }
+
+    /// A clone of the guard's execution scope, if any — the L3b goldens
+    /// compare it by `Arc::ptr_eq` against the grant's ONE scope.
+    #[cfg(test)]
+    pub(crate) fn execution_scope(&self) -> Option<Arc<RunExecutionScope>> {
+        self.execution_scope.clone()
+    }
 }
 
 impl Drop for ParkGuard {
@@ -116,7 +128,12 @@ impl Drop for ParkGuard {
         // and skip.
         match tokio::runtime::Handle::try_current() {
             Ok(_) => {
-                cancel_run_approvals(&registry, &run_id, &request_id);
+                cancel_run_approvals(
+                    &registry,
+                    &run_id,
+                    &request_id,
+                    self.execution_scope.as_ref(),
+                );
             }
             Err(_) => {
                 tracing::warn!(
@@ -138,7 +155,7 @@ mod tests {
         AgentScope, ApprovalAuthority, ApprovalItem, ApprovalOrigin, ApprovalRequest, DecisionId,
         PROTOCOL_VERSION, ParkedApproval, PendingApprovals,
     };
-    use crate::orchestration::{RunId, TaskIdentity, run_owner_id};
+    use crate::orchestration::{ReservationTable, RunId, TaskIdentity, run_owner_id};
     use crate::session_store::{ApprovalStore, InMemoryApprovalStore, InMemoryEventBus};
 
     fn registry_with_store() -> (PendingApprovals, Arc<InMemoryApprovalStore>) {
@@ -269,6 +286,100 @@ mod tests {
         assert!(
             store.get(&decision_id).await.unwrap().is_some(),
             "a published run's approvals survive its end"
+        );
+    }
+
+    /// L3b golden (RED today): a scoped guard's deferred sweep registers with
+    /// the run's tracker before it spawns, so `drain` waits it out — an
+    /// untracked `tokio::spawn` lets drain return while the sweep is still in
+    /// flight.
+    #[tokio::test]
+    async fn scoped_guard_sweep_registers_with_tracker() {
+        let (registry, store) = registry_with_store();
+        let run_id: RunId = "0191e8c0-6666-7000-8000-000000000042".parse().unwrap();
+        let request_id = format!("req_scoped_{}", uuid::Uuid::new_v4().simple());
+        let table = ReservationTable::new();
+        let lease = table.admit(run_id).expect("the run admits");
+        let scope = RunExecutionScope::new(lease);
+
+        let decision_id = DecisionId::generate();
+        registry
+            .register_durable(durable_approval(
+                decision_id,
+                &format!("run:{run_id}"),
+                &worker_scope(run_id),
+            ))
+            .await
+            .unwrap();
+
+        let guard = ParkGuard::new_with_execution_scope(
+            registry.clone(),
+            run_id.to_string(),
+            request_id,
+            ParkGuardMode::Initial,
+            scope.clone(),
+        );
+        guard.record(std::slice::from_ref(&parked_call(decision_id)));
+        drop(guard);
+
+        // The sweep registers with the tracker BEFORE spawning, so a single
+        // synchronous poll of `drain` — with no runtime scheduling between —
+        // sees a still-pending barrier. Untracked (the pre-L3b state), the
+        // tracker is empty and the poll completes at once.
+        {
+            let mut drain = std::pin::pin!(scope.drain());
+            let waker = std::task::Waker::noop();
+            let mut cx = std::task::Context::from_waker(waker);
+            assert!(
+                std::future::Future::poll(drain.as_mut(), &mut cx).is_pending(),
+                "a scoped guard's sweep must register with the tracker, so drain waits it out"
+            );
+        }
+        tokio::time::timeout(Duration::from_secs(1), scope.drain())
+            .await
+            .expect("the registered sweep drains once its tail ends");
+        assert!(
+            store.get(&decision_id).await.unwrap().is_none(),
+            "the scoped guard's sweep clears the run's parked ticket"
+        );
+    }
+
+    /// L3b characterization (GREEN today, must stay green): a resumed guard
+    /// is checkpoint-preserving — its drop never sweeps retained approvals,
+    /// scoped or not.
+    #[tokio::test]
+    async fn resumed_guard_drop_preserves_parked_approvals() {
+        let (registry, store) = registry_with_store();
+        let run_id: RunId = "0191e8c0-7777-7000-8000-000000000042".parse().unwrap();
+        let request_id = format!("req_resumed_{}", uuid::Uuid::new_v4().simple());
+        let table = ReservationTable::new();
+        let lease = table.admit(run_id).expect("the run admits");
+        let scope = RunExecutionScope::new(lease);
+
+        let decision_id = DecisionId::generate();
+        registry
+            .register_durable(durable_approval(
+                decision_id,
+                &format!("run:{run_id}"),
+                &worker_scope(run_id),
+            ))
+            .await
+            .unwrap();
+
+        let guard = ParkGuard::new_with_execution_scope(
+            registry.clone(),
+            run_id.to_string(),
+            request_id,
+            ParkGuardMode::Resumed,
+            scope,
+        );
+        guard.record(std::slice::from_ref(&parked_call(decision_id)));
+        drop(guard);
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(
+            store.get(&decision_id).await.unwrap().is_some(),
+            "a resumed segment's drop preserves retained approvals"
         );
     }
 

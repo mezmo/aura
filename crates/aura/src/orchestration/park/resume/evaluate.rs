@@ -854,7 +854,9 @@ pub async fn evaluate_resume(
                     ))));
                 }
             }
-            if let Err(e) = cancel_run_approvals(store, &path.run.to_string(), &request_id).await {
+            if let Err(e) =
+                cancel_run_approvals(store, &path.run.to_string(), &request_id, None).await
+            {
                 return Err(ResumeRefusal::Fault(Diagnostic::new(format!(
                     "the approval sweep for the expired run did not complete: {e}"
                 ))));

@@ -69,9 +69,10 @@ use super::park::resume::{
     SegmentTurns, blocking_from_calls,
 };
 use super::park::{
-    CallId, CallKey, NodePreflightInput, OutcomeWire, ParkCommitInputs, ParkGuard, ParkedRun,
-    ParkedTaskRecord, ParkedTaskRecords, PeekOutcome, RecordedDecisions, ResumingDocumentHandle,
-    RunStateForPark, SegmentPreflight, commit_from_run_state, load_parked_run, rebuild_context,
+    CallId, CallKey, NodePreflightInput, OutcomeWire, ParkCommitInputs, ParkGuard, ParkGuardMode,
+    ParkedRun, ParkedTaskRecord, ParkedTaskRecords, PeekOutcome, RecordedDecisions,
+    ResumingDocumentHandle, RunStateForPark, SegmentPreflight, commit_from_run_state,
+    load_parked_run, rebuild_context,
 };
 use super::persistence::ExecutionPersistence;
 use super::types::{
@@ -828,6 +829,7 @@ impl Orchestrator {
             mcp_manager,
             persistence,
             None,
+            ParkGuardMode::Initial,
         )
         .await)
     }
@@ -890,6 +892,7 @@ impl Orchestrator {
             mcp_manager,
             persistence,
             Some(grant.execution_scope()),
+            ParkGuardMode::Resumed,
         )
         .await)
     }
@@ -897,14 +900,15 @@ impl Orchestrator {
     /// Shared constructor tail of [`Self::new`] and
     /// [`Self::for_resume_segment`]: the observer, the orchestrator id, and
     /// the park guard — armed under the persistence-bound run id, so a
-    /// resume-bound orchestrator sweeps and re-parks against the
-    /// checkpointed run.
+    /// resume-bound orchestrator re-parks against the checkpointed run
+    /// with a checkpoint-preserving (non-sweeping) scoped guard.
     async fn assemble(
         agent_config: AgentRuntimeConfig,
         orchestration_config: OrchestrationConfig,
         mcp_manager: Option<Arc<McpManager>>,
         persistence: Arc<Mutex<ExecutionPersistence>>,
         execution_scope: Option<Arc<crate::orchestration::RunExecutionScope>>,
+        park_mode: ParkGuardMode,
     ) -> Self {
         // Tool call observer for real-time streaming. The _rx receiver is consumed
         // by spawn_tool_event_forwarder in factory.rs when the stream starts.
@@ -914,17 +918,28 @@ impl Orchestrator {
 
         let run_id_str = persistence.lock().await.run_id().to_string();
         // One guard per park-mode run; `ParkGuard` documents arming and drop.
+        // A scoped run (the resume segment's grant, or the L3 initial path)
+        // builds the guard with its mode AND its scope TOGETHER, so the
+        // guard's deferred sweep spawns tracked through the run's ONE scope;
+        // an unscoped initial run keeps the interim unscoped constructor.
         let park_guard = agent_config
             .hitl
             .as_ref()
             .filter(|hitl| hitl.park_enabled)
             .and_then(|hitl| {
                 let (registry, _) = hitl.route.park_registry()?;
-                Some(ParkGuard::new(
-                    registry.clone(),
-                    run_id_str.clone(),
-                    agent_config.request_id.clone().unwrap_or_default(),
-                ))
+                let run_id = run_id_str.clone();
+                let request_id = agent_config.request_id.clone().unwrap_or_default();
+                Some(match &execution_scope {
+                    Some(scope) => ParkGuard::new_with_execution_scope(
+                        registry.clone(),
+                        run_id,
+                        request_id,
+                        park_mode,
+                        Arc::clone(scope),
+                    ),
+                    None => ParkGuard::new(registry.clone(), run_id, request_id),
+                })
             });
         let default_turn_depth = agent_config
             .agent
@@ -6456,7 +6471,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             return;
         };
         let request_id = self.agent_config.request_id.clone().unwrap_or_default();
-        super::park::cancel_run_approvals(registry, run_id, &request_id)
+        super::park::cancel_run_approvals(registry, run_id, &request_id, None)
             .await
             .ok();
     }
@@ -9536,6 +9551,34 @@ mod tests {
         assert!(
             Arc::ptr_eq(&scope, &grant.execution_scope()),
             "the coordinator context must carry the grant's ONE scope Arc, not a fresh one"
+        );
+    }
+
+    /// L3b golden (RED today): the resume segment's orchestrator builds the
+    /// checkpoint-preserving guard, scoped to the grant's ONE execution scope.
+    #[tokio::test]
+    async fn resume_segment_guard_is_scoped_and_preserving() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, grant) = resume_grant_fixture(dir.path(), "l3b-guard-sess").await;
+
+        let segment = Orchestrator::for_resume_segment(&grant, &config)
+            .await
+            .expect("the resume segment orchestrator builds");
+        let guard = segment
+            .park_guard
+            .as_ref()
+            .expect("the resume segment arms a park guard");
+        assert_eq!(
+            guard.mode(),
+            ParkGuardMode::Resumed,
+            "a resume segment's guard is checkpoint-preserving"
+        );
+        let scope = guard
+            .execution_scope()
+            .expect("the resume guard carries the grant's execution scope");
+        assert!(
+            Arc::ptr_eq(&scope, &grant.execution_scope()),
+            "the resume guard must carry the grant's ONE scope Arc, not a fresh one"
         );
     }
 
