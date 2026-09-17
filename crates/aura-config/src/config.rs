@@ -1567,8 +1567,7 @@ pub struct HitlConfig {
     /// Glob patterns whose match gates a tool call. Compiled at TOML load.
     #[serde(default)]
     pub require_approval: Vec<GlobPattern>,
-    /// Glob patterns whose match exempts a tool call from gating. Compiled at
-    /// TOML load.
+    /// Tool-name globs that do not require approval.
     #[serde(default)]
     pub exempt_from_approval: Vec<GlobPattern>,
     /// The decision route; required when `[hitl]` is present.

@@ -41,7 +41,7 @@ pub struct HitlApprovalWrapper {
     ///
     /// [`ApprovalOrigin::ConfigGate`]: super::decision::ApprovalOrigin::ConfigGate
     patterns: Arc<[GlobPattern]>,
-    /// Compiled globs whose match exempts a tool call from gating.
+    /// Compiled `[hitl] exempt_from_approval` globs.
     exemptions: Arc<[GlobPattern]>,
     /// Shared across single-agent and orchestration; held by `Arc` because the
     /// gate and the agent tool both reference one route.
