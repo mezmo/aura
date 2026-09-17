@@ -144,6 +144,7 @@ pub(crate) async fn refresh_awaiting(
 /// with no surviving ticket stamps `now + decision_window`.
 pub(crate) async fn commit_from_run_state(
     inputs: &ParkCommitInputs<'_>,
+    scope: Option<&Arc<RunExecutionScope>>,
 ) -> io::Result<ParkCommitOutcome> {
     let ParkCommitInputs {
         state,
@@ -175,7 +176,7 @@ pub(crate) async fn commit_from_run_state(
         identity_hash.clone(),
     )?;
     let parked_dir = parked_document_dir(memory_dir, state.session_id);
-    publish(&document, &parked_dir, state.run_id).await?;
+    publish(&document, &parked_dir, state.run_id, scope).await?;
     Ok(ParkCommitOutcome {
         retention_expires_at,
         refreshed,
@@ -194,6 +195,7 @@ pub(crate) async fn publish(
     document: &ParkedRun,
     parked_dir: &Path,
     run_id: &str,
+    scope: Option<&Arc<RunExecutionScope>>,
 ) -> io::Result<PathBuf> {
     if !is_safe_path_component(run_id) {
         return Err(io::Error::new(
@@ -209,7 +211,7 @@ pub(crate) async fn publish(
     // performs file I/O.
     let parked_dir = parked_dir.to_path_buf();
     let run_id = run_id.to_string();
-    tokio::task::spawn_blocking(move || {
+    let write = move || -> io::Result<PathBuf> {
         crate::session_store::private_dir(&parked_dir)?;
 
         let tmp = parked_dir.join(format!(".{run_id}.tmp"));
@@ -228,7 +230,11 @@ pub(crate) async fn publish(
             );
         }
         Ok(dest)
-    })
+    };
+    match scope {
+        Some(scope) => scope.spawn_blocking_tracked(write),
+        None => tokio::task::spawn_blocking(write),
+    }
     .await
     .map_err(io::Error::other)?
 }
@@ -434,7 +440,7 @@ mod tests {
             identity_hash: None,
         };
 
-        let dest = publish(&document, &parked_dir, run_id).await.unwrap();
+        let dest = publish(&document, &parked_dir, run_id, None).await.unwrap();
         assert_eq!(dest, parked_dir.join(format!("{run_id}.json")));
         assert!(dest.try_exists().unwrap(), "published document exists");
         assert!(
@@ -494,7 +500,7 @@ mod tests {
 
         let tmp = parked_dir.join(format!(".{run_id}.tmp"));
         tokio::fs::create_dir(&tmp).await.unwrap();
-        let result = publish(&document, &parked_dir, run_id).await;
+        let result = publish(&document, &parked_dir, run_id, None).await;
 
         assert!(result.is_err(), "the temp write must fail");
         assert!(

@@ -15,6 +15,8 @@ use crate::orchestration::park::document::{ParkedRun, RESUMING_DOCUMENT_SUFFIX, 
 use crate::orchestration::park::recorded_decisions::{CallKey, RecordedDecisions};
 use crate::orchestration::persistence::is_safe_path_component;
 
+use super::lifetime::RunExecutionScope;
+
 /// Why a run could not rehydrate, mapped to the section 2.6 condition rows.
 #[derive(Debug)]
 pub(crate) enum RehydrateError {
@@ -81,13 +83,21 @@ pub(crate) struct ResumingDocumentHandle {
     document: tokio::sync::Mutex<ParkedRun>,
     /// The file appends publish to: `{parked_dir}/{run_id}.resuming.json`.
     publish_path: PathBuf,
+    /// The run's execution scope, when the handle is built on a resume-bound
+    /// run: every append's blocking write-rename tail is spawned TRACKED
+    /// through it, holding a lease reference until the rename completes.
+    /// `None` for an unscoped construction (bare spawn, byte-equivalent).
+    execution_scope: Option<Arc<RunExecutionScope>>,
 }
 
 impl ResumingDocumentHandle {
     /// Load the parked document at `path` and arm the handle. Appends publish
     /// to the sibling `{run_id}.resuming.json`; the parked document itself is
     /// left untouched.
-    pub(crate) async fn open(path: &Path) -> Result<Self, RehydrateError> {
+    pub(crate) async fn open(
+        path: &Path,
+        execution_scope: Option<Arc<RunExecutionScope>>,
+    ) -> Result<Self, RehydrateError> {
         let document = match load_parked_run(path).await {
             Ok(document) => document,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -109,6 +119,7 @@ impl ResumingDocumentHandle {
         Ok(Self {
             document: tokio::sync::Mutex::new(document),
             publish_path,
+            execution_scope,
         })
     }
 
@@ -130,14 +141,17 @@ impl ResumingDocumentHandle {
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default()
         ));
-        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        let write = move || -> std::io::Result<()> {
             if let Some(parent) = non_empty_parent(&publish_path) {
                 crate::session_store::private_dir(parent)?;
             }
             crate::session_store::write_private(&tmp, &bytes)?;
             std::fs::rename(&tmp, &publish_path)
-        })
-        .await
+        };
+        match self.execution_scope.as_ref() {
+            Some(scope) => scope.spawn_blocking_tracked(write).await,
+            None => tokio::task::spawn_blocking(write).await,
+        }
         .map_err(std::io::Error::other)??;
         Ok(())
     }
@@ -625,7 +639,11 @@ mod tests {
             <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
         )
         .unwrap();
-        let handle = Arc::new(ResumingDocumentHandle::open(&parked_path).await.unwrap());
+        let handle = Arc::new(
+            ResumingDocumentHandle::open(&parked_path, None)
+                .await
+                .unwrap(),
+        );
         let h1 = Arc::clone(&handle);
         let h2 = Arc::clone(&handle);
         let (a, b) = tokio::join!(
@@ -679,7 +697,7 @@ mod tests {
     #[tokio::test]
     async fn open_reports_not_found_for_a_missing_document() {
         let dir = tempfile::tempdir().unwrap();
-        let err = ResumingDocumentHandle::open(&dir.path().join("absent.json"))
+        let err = ResumingDocumentHandle::open(&dir.path().join("absent.json"), None)
             .await
             .unwrap_err();
         assert!(matches!(err, RehydrateError::NotFound));

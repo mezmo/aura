@@ -4570,9 +4570,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
         // identity demand — the same source the gate's `recorded_pre_call`
         // consults. The consumed accumulator holds the decided calls this
         // segment actually consumed; a re-park removes only that subset.
-        let document_handle = ResumingDocumentHandle::open(documents.resuming())
-            .await
-            .map_err(|e| fault(format!("opening the resuming document failed: {e}")))?;
+        let document_handle =
+            ResumingDocumentHandle::open(documents.resuming(), self.execution_scope.clone())
+                .await
+                .map_err(|e| fault(format!("opening the resuming document failed: {e}")))?;
         let requires_identity = hitl.route.requires_identity();
         let mut consumed = Vec::new();
 
@@ -4864,7 +4865,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         // identity the original park bound.
                         identity_hash: checkpoint.identity_hash.clone(),
                     };
-                    let commit = commit_from_run_state(&inputs)
+                    let commit = commit_from_run_state(&inputs, self.execution_scope.as_ref())
                         .await
                         .map_err(|e| fault(format!("the re-park commit failed: {e}")))?;
                     if let Some(ref guard) = self.park_guard {
@@ -6412,7 +6413,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             identity_hash,
         };
 
-        match super::park::commit_from_run_state(&inputs).await {
+        match super::park::commit_from_run_state(&inputs, self.execution_scope.as_ref()).await {
             Ok(commit) => {
                 if let Some(ref guard) = self.park_guard {
                     guard.mark_published();

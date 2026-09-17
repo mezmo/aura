@@ -1421,7 +1421,7 @@ mod tests {
                 park_ttl: aura_config::ParkTtl::default(),
                 identity_hash: None,
             };
-            crate::orchestration::commit_from_run_state(&inputs)
+            crate::orchestration::commit_from_run_state(&inputs, None)
                 .await
                 .expect("the park commit publishes");
 
@@ -1432,7 +1432,7 @@ mod tests {
                 "the parked document must never carry approval credentials, got: {parked_text}"
             );
 
-            let handle = crate::orchestration::ResumingDocumentHandle::open(&parked_doc)
+            let handle = crate::orchestration::ResumingDocumentHandle::open(&parked_doc, None)
                 .await
                 .expect("the resuming handle opens");
             handle

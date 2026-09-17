@@ -1005,7 +1005,7 @@ fn parked_document(
 
 async fn publish_document(world: &World, document: &ParkedRun) {
     let dir = parked_document_dir(&world.memory_dir, Some(SESSION));
-    publish(document, &dir, RUN)
+    publish(document, &dir, RUN, None)
         .await
         .expect("publish the checkpoint");
 }
