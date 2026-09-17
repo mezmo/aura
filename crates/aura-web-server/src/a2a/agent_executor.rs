@@ -307,6 +307,7 @@ impl AgentExecutor for AuraAgentExecutor {
                     session_id,
                     None,
                     Some(request_id.clone()),
+                    None,
                 )
                 .await
             {
