@@ -832,6 +832,7 @@ mod tests {
                 ParkGuard::new(
                     registry.clone(),
                     "0191e8c0-1111-7000-8000-000000000042".to_string(),
+                    request_id.to_string(),
                 ),
             )
         }
@@ -1194,6 +1195,7 @@ mod tests {
             let guard = ParkGuard::new(
                 registry.clone(),
                 "0191e8c0-1111-7000-8000-000000000042".to_string(),
+                "req-single-hold".to_string(),
             );
             let gate = HitlApprovalWrapper::new(
                 Arc::from([GlobPattern::new("kubectl_*").unwrap()]),
@@ -1420,6 +1422,7 @@ mod tests {
             let guard = ParkGuard::new(
                 registry.clone(),
                 "0191e8c0-1111-7000-8000-000000000042".to_string(),
+                "req-guard-207".to_string(),
             );
             let gate = HitlApprovalWrapper::new(
                 Arc::from([GlobPattern::new("kubectl_*").unwrap()]),

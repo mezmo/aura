@@ -128,6 +128,7 @@ mod tests {
                     agent_name: "test-agent".to_string(),
                 },
                 items: vec![ApprovalItem {
+                    tool_namespace: None,
                     tool_name: "test_tool".to_string(),
                     arguments: serde_json::json!({}),
                     tool_call_intent: None,

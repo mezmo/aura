@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -17,6 +18,7 @@ use super::ParkedTaskRecords;
 use super::document::{
     PARKED_DOCUMENT_SUFFIX, ParkedRun, RESUMING_DOCUMENT_SUFFIX, RunStateForPark, build_document,
 };
+use super::lifetime::RunExecutionScope;
 use super::retention::RetentionExpiresAt;
 
 /// The inputs the orchestrator hands the park commit.
@@ -238,16 +240,25 @@ pub(crate) async fn publish(
 /// ordered teardown. A decided ticket is never in the cleared set, so the
 /// stream cannot disagree with a decision that won the race. A lost store
 /// reply yields warn-and-empty, the conceded residual.
-/// The sweep is its own task, which no scope reaches, so the run comes from the
-/// caller rather than the ambient one.
+/// The sweep is its own task, which no scope reaches, so the run comes from
+/// the caller rather than the ambient one. When the run carries an execution
+/// scope, the sweep spawns TRACKED through it — registered before it starts
+/// and holding a lease reference through completion, so the supervisor's
+/// drain cannot release the run's fence while the sweep is still publishing.
+/// An unscoped run keeps the bare spawn (byte-equivalent behavior).
 pub(crate) fn cancel_run_approvals(
     registry: &PendingApprovals,
     run_id: &str,
+    request_id: &str,
     run: Option<std::sync::Arc<crate::run_context::RunContext>>,
+    scope: Option<&Arc<RunExecutionScope>>,
 ) -> tokio::task::JoinHandle<()> {
     let registry = registry.clone();
     let run_id = run_id.to_string();
-    tokio::task::spawn(async move {
+    // Signature parity with the span: the emit-port addresses publications
+    // through the run, so the request id itself is unused here.
+    let _ = request_id;
+    let sweep = async move {
         for parked in registry.cancel_request(&run_owner_id(&run_id)).await {
             let cancelled = crate::hitl::completed_cancelled_event(
                 parked.request.decision_id,
@@ -264,7 +275,11 @@ pub(crate) fn cancel_run_approvals(
                 ),
             }
         }
-    })
+    };
+    match scope {
+        Some(scope) => scope.spawn_tracked(sweep),
+        None => tokio::task::spawn(sweep),
+    }
 }
 
 /// The directory checkpoint documents live in:
@@ -776,9 +791,15 @@ mod tests {
             .await
             .unwrap();
 
-        cancel_run_approvals(&registry, run_id, Some(std::sync::Arc::clone(&run)))
-            .await
-            .unwrap();
+        cancel_run_approvals(
+            &registry,
+            run_id,
+            &request_id,
+            Some(std::sync::Arc::clone(&run)),
+            None,
+        )
+        .await
+        .unwrap();
 
         assert!(
             store.get(&sibling).await.unwrap().is_none(),
@@ -841,9 +862,15 @@ mod tests {
             .await
             .unwrap();
 
-        cancel_run_approvals(&registry, run_id, Some(std::sync::Arc::clone(&run)))
-            .await
-            .unwrap();
+        cancel_run_approvals(
+            &registry,
+            run_id,
+            &request_id,
+            Some(std::sync::Arc::clone(&run)),
+            None,
+        )
+        .await
+        .unwrap();
 
         assert!(store.get(&first).await.unwrap().is_none());
         assert!(store.get(&second).await.unwrap().is_none());
@@ -888,7 +915,9 @@ mod tests {
             .unwrap();
 
         // No run here, since this case asserts the store is swept.
-        cancel_run_approvals(&registry, run_id, None).await.unwrap();
+        cancel_run_approvals(&registry, run_id, "req_late_resolve", None, None)
+            .await
+            .unwrap();
 
         assert_eq!(
             registry

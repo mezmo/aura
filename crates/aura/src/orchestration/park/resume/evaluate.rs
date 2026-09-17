@@ -806,7 +806,7 @@ pub async fn evaluate_resume(
         claims,
         bind_identity,
         presented_identity,
-        request_id: _,
+        request_id,
         now,
     } = evaluation;
     let docs = ResumeDocuments::for_path(&path, memory_dir);
@@ -857,7 +857,9 @@ pub async fn evaluate_resume(
             if let Err(e) = cancel_run_approvals(
                 store,
                 &path.run.to_string(),
+                &request_id,
                 crate::run_context::current_run(),
+                None,
             )
             .await
             {
