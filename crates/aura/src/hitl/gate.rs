@@ -483,7 +483,9 @@ mod tests {
                     build_webhook_client(),
                     WebhookUrl::new("http://localhost:9").unwrap(),
                 ),
+                registry: crate::hitl::PendingApprovals::new(),
                 timeout: Duration::from_secs(1),
+                egress_capture: Ok(()),
             }),
             AgentScope::Single { session_id: None },
             "t".into(),
@@ -987,7 +989,7 @@ mod tests {
         #[tokio::test]
         async fn egress_capture_failure_fails_the_registration_closed() {
             let request_id = format!("req_egress_fail_{}", uuid::Uuid::new_v4().simple());
-            let mut events = crate::approval_event_broker::subscribe(&request_id).await;
+            let (run, mut events) = crate::run_context::RunContext::channel(request_id.as_str());
             let store = Arc::new(crate::session_store::InMemoryApprovalStore::new());
             let registry = PendingApprovals::with_backend(
                 store.clone(),
@@ -996,6 +998,7 @@ mod tests {
             let (_, route) = poll_route_with_mapping(&registry, None, Default::default());
             let cell = Arc::new(crate::orchestration::BlockedCell::default());
             let gate = parked_gate(&registry, &route, &request_id, &cell);
+            gate.bind_run(run);
 
             let err = gate
                 .pre_call(
@@ -1021,7 +1024,6 @@ mod tests {
                     .is_err(),
                 "no approval event may be published"
             );
-            crate::approval_event_broker::unsubscribe(&request_id).await;
         }
 
         /// The successful capture copies the request-scoped resolved values

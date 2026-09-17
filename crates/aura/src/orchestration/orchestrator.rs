@@ -625,11 +625,7 @@ impl Orchestrator {
             .filter(|hitl| hitl.park_enabled)
             .and_then(|hitl| {
                 let (registry, _) = hitl.route.park_registry()?;
-                Some(ParkGuard::new(
-                    registry.clone(),
-                    run_id_str.clone(),
-                    agent_config.request_id.clone().unwrap_or_default(),
-                ))
+                Some(ParkGuard::new(registry.clone(), run_id_str.clone()))
             });
         let default_turn_depth = agent_config
             .agent
@@ -7536,9 +7532,12 @@ mod tests {
         let expected_ids: Vec<String> = pending.iter().map(|c| c.decision_id.to_string()).collect();
         assert_eq!(document.awaiting_decision_ids(), expected_ids);
         match tokio::time::timeout(std::time::Duration::from_millis(50), event_rx.recv()).await {
-            Ok(Some(Ok(StreamItem::OrchestratorEvent(
-                crate::orchestration::OrchestratorEvent::RunParked { decision_ids, .. },
-            )))) => {
+            Ok(Some(Ok(StreamItem::AgentEvent(event))))
+                if matches!(event.payload, AgentEventPayload::RunParked { .. }) =>
+            {
+                let AgentEventPayload::RunParked { decision_ids, .. } = event.payload else {
+                    unreachable!("guarded above")
+                };
                 assert_eq!(decision_ids, expected_ids, "both calls are outstanding");
             }
             other => panic!("expected the RunParked event, got {other:?}"),
