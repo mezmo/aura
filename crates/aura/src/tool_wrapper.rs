@@ -1231,3 +1231,360 @@ mod tests {
         }
     }
 }
+
+/// LIFETIME L2 goldens (unit L2, contract "Ownership and lifetime"). Three
+/// behavioral reds pin TRACKER MEMBERSHIP: under a scoped call, every
+/// fire-and-forget detached tail a `WrappedTool::call` spawns (completion
+/// hooks, the inner tool) must be registered with the scope's task tracker,
+/// so `scope.drain()` may not return while any live tail is still running.
+/// Today each tail is a bare `tokio::spawn`, unregistered, so tests 1-3 fail
+/// at their drain-membership assertion and flip green when the integration
+/// routes the spawns through `RunExecutionScope::spawn_tracked`. Test 4 is a
+/// CHARACTERIZATION, not a golden: it pins the non-park (no scope) behavior
+/// that must stay exactly as-is through the integration.
+///
+/// (LEASE liveness through a tail is deliberately NOT pinned here: a ctx
+/// carrying a scope already hands every spawned tail an `Arc` clone that
+/// holds the reservation lease, so that property is incidentally true today
+/// and belongs to the L1 goldens.)
+#[cfg(test)]
+mod lifetime_goldens {
+    use super::*;
+
+    use crate::orchestration::{ReservationTable, RunExecutionScope, RunId};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    /// Long enough for a spawned tail to make visible progress, short
+    /// enough that a hang or a regressed drain fails fast instead of
+    /// hanging the suite.
+    const GATE_TICK: Duration = Duration::from_millis(500);
+
+    /// Distinct, probe-free run ids parsed through `RunId`'s `FromStr`
+    /// (same pattern as the lifetime.rs unit tests).
+    fn run_id(uuid: &'static str) -> RunId {
+        uuid.parse().expect("well-formed run id")
+    }
+
+    /// A scope built over one freshly admitted run, as the resume grant
+    /// establishes it (`ReservationTable::admit` + `RunExecutionScope::new`).
+    /// The test keeps its own `Arc<RunExecutionScope>` clone for `drain()`;
+    /// wrappers keep state in their own `Arc` fields (ctx.metadata is
+    /// overwritten at the `WrappedTool::call` seam, so nothing rides on it).
+    fn scoped(run: &'static str) -> Arc<RunExecutionScope> {
+        let table = ReservationTable::new();
+        let lease = table.admit(run_id(run)).expect("admission");
+        RunExecutionScope::new(lease)
+    }
+
+    /// Spin until a tail's handshake flag is set, bounded so a tail that
+    /// never signals cannot hang the test.
+    async fn wait_entered(entered: &Arc<AtomicBool>, label: &str) {
+        tokio::time::timeout(GATE_TICK, async {
+            while !entered.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{label} tail never signaled `entered`"));
+    }
+
+    /// A do-nothing inner tool whose Ok path returns a fixed output.
+    #[derive(Clone)]
+    struct OkInner;
+
+    impl RigTool for OkInner {
+        const NAME: &'static str = "lifetime_goldens_ok_inner";
+        type Error = ToolError;
+        type Args = Value;
+        type Output = String;
+
+        async fn definition(&self, _prompt: String) -> rig::completion::ToolDefinition {
+            rig::completion::ToolDefinition {
+                name: Self::NAME.to_string(),
+                description: String::new(),
+                parameters: serde_json::json!({ "type": "object" }),
+            }
+        }
+
+        async fn call(&self, _args: Value) -> Result<String, ToolError> {
+            Ok("inner output".to_string())
+        }
+    }
+
+    /// A gated inner tool: signals `gated` through one channel the moment it
+    /// is entered, then blocks on a second channel until it is released.
+    /// Both channels are `Notify` (stored permits), so the signal is never
+    /// lost regardless of waiter registration order.
+    #[derive(Clone)]
+    struct GatedInner {
+        gated: Arc<tokio::sync::Notify>,
+        blocker: Arc<tokio::sync::Notify>,
+    }
+
+    impl RigTool for GatedInner {
+        const NAME: &'static str = "lifetime_goldens_gated_inner";
+        type Error = ToolError;
+        type Args = Value;
+        type Output = String;
+
+        async fn definition(&self, _prompt: String) -> rig::completion::ToolDefinition {
+            rig::completion::ToolDefinition {
+                name: Self::NAME.to_string(),
+                description: String::new(),
+                parameters: serde_json::json!({ "type": "object" }),
+            }
+        }
+
+        async fn call(&self, _args: Value) -> Result<String, ToolError> {
+            self.gated.notify_one();
+            self.blocker.notified().await;
+            Ok("inner output".to_string())
+        }
+    }
+
+    /// A wrapper whose `on_complete` blocks on a gate channel, with an
+    /// `entered` handshake set BEFORE the block so the test can prove the
+    /// tail is live before asserting drain still waits. `transform_output`
+    /// is a passthrough override so the Ok path runs both seams. When
+    /// `short_circuit` is set, `pre_call` returns
+    /// `PreCallOutcome::ShortCircuit` with that output instead of
+    /// proceeding to the inner tool.
+    struct GatedCompletion {
+        short_circuit: Option<String>,
+        gate: Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>>,
+        entered: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl ToolWrapper for GatedCompletion {
+        async fn pre_call(
+            &self,
+            _args: &Value,
+            _ctx: &ToolCallContext,
+        ) -> Result<PreCallOutcome, ToolError> {
+            match &self.short_circuit {
+                Some(output) => Ok(PreCallOutcome::ShortCircuit {
+                    output: output.clone(),
+                }),
+                None => Ok(PreCallOutcome::Proceed { overrides: None }),
+            }
+        }
+        async fn transform_output(
+            &self,
+            output: String,
+            _outcome: &CallOutcome,
+            _ctx: &ToolCallContext,
+            _extracted: Option<&Value>,
+        ) -> TransformOutputResult {
+            TransformOutputResult::new(output)
+        }
+
+        async fn on_complete(
+            &self,
+            _ctx: &ToolCallContext,
+            _extracted: Option<&Value>,
+            _result: Result<&str, &str>,
+            _duration_ms: u64,
+        ) {
+            let gate = self.gate.lock().expect("gate cell lock").take();
+            self.entered.store(true, Ordering::SeqCst);
+            if let Some(gate) = gate {
+                let _ = gate.await;
+            }
+        }
+    }
+
+    /// A do-nothing wrapper (the default pass-throughs).
+    struct PassThroughWrapper;
+
+    #[async_trait::async_trait]
+    impl ToolWrapper for PassThroughWrapper {}
+
+    // Golden 1: the plain-fire-and-forget on_complete tail on the
+    // short-circuit path. `pre_call` returns `ShortCircuit`, so the call
+    // body spawns the hook DIRECTLY (the non-nested tail) and returns
+    // `Ok(output)` without touching the inner tool. RED today: that tail's
+    // spawn is unregistered, so `drain()` returns while the hook is still
+    // blocked with its gate closed.
+    #[tokio::test]
+    async fn drain_waits_for_scoped_completion_hook_tail() {
+        let scope = scoped("f39a5be0-1b6e-4d02-8c74-2e6d9a30f5b1");
+        let (release, gate) = tokio::sync::oneshot::channel::<()>();
+        let entered = Arc::new(AtomicBool::new(false));
+        let wrapper: Arc<dyn ToolWrapper> = Arc::new(GatedCompletion {
+            short_circuit: Some("short-circuited".to_string()),
+            gate: Arc::new(std::sync::Mutex::new(Some(gate))),
+            entered: Arc::clone(&entered),
+        });
+        let scope_for_factory = Arc::clone(&scope);
+        let wrapped = WrappedTool::new(OkInner, wrapper).with_context_factory(move |_| {
+            ToolCallContext::new("gated_hook_tool")
+                .with_execution_scope(Arc::clone(&scope_for_factory))
+        });
+
+        // Drive the call through the pre_call short-circuit; the
+        // fire-and-forget on_complete tail is spawned directly in the call
+        // body and outlives this await.
+        let outcome = tokio::time::timeout(GATE_TICK, wrapped.call(serde_json::json!({})))
+            .await
+            .expect("scoped call completes within GATE_TICK")
+            .expect("short-circuited call succeeded");
+        assert_eq!(outcome, "short-circuited");
+
+        // Handshake first: the tail has entered its hook, and the drain
+        // assertion below must be judged only after that.
+        wait_entered(&entered, "completion hook").await;
+
+        assert!(
+            tokio::time::timeout(GATE_TICK, scope.drain())
+                .await
+                .is_err(),
+            "drain must NOT complete while the scoped on_complete tail is still blocked on its gate",
+        );
+
+        release.send(()).expect("gate still open for release");
+        tokio::time::timeout(GATE_TICK, scope.drain())
+            .await
+            .expect("drain completes once the hook's gate opens");
+    }
+
+    // Golden 2: the NESTED on_complete the transform path spawns inside its
+    // spawned task. Same red shape as golden 1; the nested spawn is the one
+    // the gate holds.
+    #[tokio::test]
+    async fn drain_waits_for_scoped_nested_completion_hook() {
+        let scope = scoped("9d47c1a2-3fb8-4625-b0ea-64c10f8d7e93");
+        let (release, gate) = tokio::sync::oneshot::channel::<()>();
+        let entered = Arc::new(AtomicBool::new(false));
+        let wrapper: Arc<dyn ToolWrapper> = Arc::new(GatedCompletion {
+            short_circuit: None,
+            gate: Arc::new(std::sync::Mutex::new(Some(gate))),
+            entered: Arc::clone(&entered),
+        });
+        let scope_for_factory = Arc::clone(&scope);
+        let wrapped = WrappedTool::new(OkInner, wrapper).with_context_factory(move |_| {
+            ToolCallContext::new("nested_hook_tool")
+                .with_execution_scope(Arc::clone(&scope_for_factory))
+        });
+
+        let outcome = tokio::time::timeout(GATE_TICK, wrapped.call(serde_json::json!({})))
+            .await
+            .expect("scoped call completes within GATE_TICK")
+            .expect("scoped call succeeded");
+        assert_eq!(outcome, "inner output");
+
+        wait_entered(&entered, "nested completion hook").await;
+
+        assert!(
+            tokio::time::timeout(GATE_TICK, scope.drain())
+                .await
+                .is_err(),
+            "drain must NOT complete while the nested on_complete tail inside the transform path is still blocked on its gate",
+        );
+
+        release.send(()).expect("gate still open for release");
+        tokio::time::timeout(GATE_TICK, scope.drain())
+            .await
+            .expect("drain completes once the nested hook's gate opens");
+    }
+
+    // Golden 3: caller cancellation against a gated inner tool. The inner
+    // tool signals `gated` before blocking; the test aborts the outer call
+    // task only after that signal, with the gate still closed. RED today:
+    // the inner tool's spawn is unregistered, so `drain()` returns while
+    // the inner tool still runs.
+    #[tokio::test]
+    async fn drain_waits_for_scoped_inner_tool_after_caller_drops() {
+        let scope = scoped("5b8e2f7c-4a91-4d36-9c02-e71b0a4f63d8");
+        let gated = Arc::new(tokio::sync::Notify::new());
+        let blocker = Arc::new(tokio::sync::Notify::new());
+        let inner = GatedInner {
+            gated: Arc::clone(&gated),
+            blocker: Arc::clone(&blocker),
+        };
+        let scope_for_factory = Arc::clone(&scope);
+        let wrapped = WrappedTool::new(inner, Arc::new(PassThroughWrapper) as Arc<dyn ToolWrapper>)
+            .with_context_factory(move |_| {
+                ToolCallContext::new("gated_inner_tool")
+                    .with_execution_scope(Arc::clone(&scope_for_factory))
+            });
+
+        // Caller-side: spawn the call future, then cancel it while the
+        // inner tool is gated.
+        let caller = tokio::spawn(async move { wrapped.call(serde_json::json!({})).await });
+
+        tokio::time::timeout(GATE_TICK, gated.notified())
+            .await
+            .expect("inner tool signaled `gated` within GATE_TICK");
+
+        caller.abort();
+
+        assert!(
+            tokio::time::timeout(GATE_TICK, scope.drain())
+                .await
+                .is_err(),
+            "drain must NOT complete while the scoped inner tool still runs after the caller aborts",
+        );
+
+        blocker.notify_one();
+        tokio::time::timeout(GATE_TICK, scope.drain())
+            .await
+            .expect("drain completes once the inner tool is released");
+    }
+
+    // CHARACTERIZATION, not a golden: a plain ctx (no execution_scope) keeps
+    // today's unscoped behavior — a full Ok call whose on_complete fires —
+    // both now and after the scoped integration. This is the non-park
+    // regression guard for the L2 integration.
+    #[tokio::test]
+    async fn unscoped_call_keeps_current_unscoped_behavior() {
+        struct RecordingCompletion {
+            completed: Arc<std::sync::Mutex<Vec<String>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl ToolWrapper for RecordingCompletion {
+            async fn on_complete(
+                &self,
+                _ctx: &ToolCallContext,
+                _extracted: Option<&Value>,
+                result: Result<&str, &str>,
+                _duration_ms: u64,
+            ) {
+                let result = result.map(str::to_string).map_err(str::to_string);
+                self.completed
+                    .lock()
+                    .expect("completions lock")
+                    .push(format!("{result:?}"));
+            }
+        }
+
+        let completed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let wrapper: Arc<dyn ToolWrapper> = Arc::new(RecordingCompletion {
+            completed: Arc::clone(&completed),
+        });
+        let wrapped = WrappedTool::new(OkInner, Arc::clone(&wrapper) as Arc<dyn ToolWrapper>)
+            .with_context_factory(|_| ToolCallContext::new("unscoped_tool"));
+
+        let outcome = tokio::time::timeout(GATE_TICK, wrapped.call(serde_json::json!({})))
+            .await
+            .expect("unscoped call completes within GATE_TICK")
+            .expect("unscoped call succeeded");
+        assert_eq!(outcome, "inner output");
+
+        // The fire-and-forget on_complete still ran; give it a bounded
+        // window instead of racing it.
+        tokio::time::timeout(GATE_TICK, async {
+            while completed.lock().expect("completions lock").is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("unscoped on_complete ran within GATE_TICK");
+        assert_eq!(
+            *completed.lock().expect("completions lock"),
+            vec![r#"Ok("inner output")"#.to_string()],
+        );
+    }
+}
