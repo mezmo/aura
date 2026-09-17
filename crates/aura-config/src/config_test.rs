@@ -1879,6 +1879,33 @@ turn_depth_bonus = 3
     }
 
     #[test]
+    fn mcp_connect_timeout_zero_rejected() {
+        let config = r#"
+[agent]
+name = "Test"
+system_prompt = "Test"
+
+[agent.llm]
+provider = "openai"
+api_key = "test"
+model = "gpt-4o"
+
+[mcp]
+connect_timeout_secs = 0
+
+[mcp.servers.example]
+transport = "http_streamable"
+url = "http://localhost:8000/mcp"
+"#;
+        let err = load_config_from_str(config).expect_err("should reject");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("connect_timeout_secs"),
+            "error should mention connect_timeout_secs: {msg}"
+        );
+    }
+
+    #[test]
     fn scratchpad_mcp_server_thresholds_parse() {
         let config = r#"
 memory_dir = "/tmp/aura"

@@ -106,7 +106,7 @@ pub struct A2aConfig {
     /// Wall-clock budget in seconds for one remote call.
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
-    /// Bytes of a remote answer handed to the model before truncation.
+    /// Cap in bytes on a remote answer's text.
     #[serde(default = "default_max_response_bytes")]
     pub max_response_bytes: usize,
 }

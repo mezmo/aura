@@ -441,6 +441,17 @@ impl Config {
             a2a.validate()?;
         }
 
+        // A zero connect timeout fires `tokio::time::timeout` immediately, so
+        // every server would fail at startup; reject it instead of silently
+        // disabling MCP.
+        if let Some(mcp) = &self.mcp
+            && mcp.connect_timeout_secs == 0
+        {
+            return Err(crate::ConfigError::Validation(
+                "mcp.connect_timeout_secs must be at least 1".to_string(),
+            ));
+        }
+
         Ok(())
     }
 
