@@ -231,44 +231,39 @@ impl RunExecutionScope {
     /// owns a lease reference through the future's actual completion — a
     /// dropped scope or awaiting request never releases the run while the
     /// task still runs.
-    #[expect(
-        unused_variables,
-        reason = "todo!() body; filled by P45 wave fill units"
-    )]
     pub fn spawn_tracked<F>(&self, future: F) -> tokio::task::JoinHandle<F::Output>
     where
         F: std::future::Future + Send + 'static,
         F::Output: Send + 'static,
     {
-        todo!(
-            "P45 wave fill unit L1: tracked async spawn — register before spawn, hold a lease reference through actual completion"
-        )
+        let reservation = self.reservation.clone();
+        self.tracker.spawn(async move {
+            let _lease = reservation;
+            future.await
+        })
     }
 
     /// Spawn one tracked blocking task under this scope: same registration
     /// and lease-holding contract as [`Self::spawn_tracked`], for the
     /// blocking pool (renames, checkpoint writes, sweeps).
-    #[expect(
-        unused_variables,
-        reason = "todo!() body; filled by P45 wave fill units"
-    )]
     pub fn spawn_blocking_tracked<F, R>(&self, body: F) -> tokio::task::JoinHandle<R>
     where
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
     {
-        todo!(
-            "P45 wave fill unit L1: tracked blocking spawn — register before spawn, hold a lease reference through actual completion"
-        )
+        let reservation = self.reservation.clone();
+        self.tracker.spawn_blocking(move || {
+            let _lease = reservation;
+            body()
+        })
     }
 
     /// Wait for every task spawned under this scope to end: the join
     /// barrier the supervisor drains through before the fence may release.
     /// Never a yield-based counter.
     pub async fn drain(&self) {
-        todo!(
-            "P45 wave fill unit L1: close the tracker to new spawns and wait for every tracked tail to end"
-        )
+        self.tracker.close();
+        self.tracker.wait().await;
     }
 }
 
