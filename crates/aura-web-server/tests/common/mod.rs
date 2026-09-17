@@ -21,8 +21,8 @@ use std::time::Duration;
 use tokio::process::{Child, Command};
 
 use aura::hitl::{
-    AgentScope, ApprovalDecision, ApprovalItem, ApprovalOrigin, ApprovalRequest, DecisionId,
-    PROTOCOL_VERSION, ParkedApproval, ResolveError, ResolvedDecision, ApprovalAuthority,
+    AgentScope, ApprovalAuthority, ApprovalDecision, ApprovalItem, ApprovalOrigin, ApprovalRequest,
+    DecisionId, PROTOCOL_VERSION, ParkedApproval, ResolveError, ResolvedDecision,
 };
 use aura::session_store::{ApprovalStore, ParkedApprovalRecord};
 

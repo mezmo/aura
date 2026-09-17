@@ -386,7 +386,10 @@ mod tests {
 
     #[test]
     fn authority_survives_the_round_trip_both_ways() {
-        for authority in [ApprovalAuthority::Conversational, ApprovalAuthority::WebhookPoll] {
+        for authority in [
+            ApprovalAuthority::Conversational,
+            ApprovalAuthority::WebhookPoll,
+        ] {
             let mut parked = parked(
                 AgentScope::Single { session_id: None },
                 ApprovalOrigin::ConfigGate {
@@ -413,8 +416,7 @@ mod tests {
                 agent_name: "test-agent".to_string(),
             },
         ));
-        let mut value =
-            serde_json::to_value(&record).expect("record serializes to a JSON object");
+        let mut value = serde_json::to_value(&record).expect("record serializes to a JSON object");
         value
             .as_object_mut()
             .expect("the record is an object")
