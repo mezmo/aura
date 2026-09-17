@@ -341,7 +341,8 @@ pub async fn publish(request_id: &str, event: ToolLifecycleEvent) -> bool {
     global().publish(request_id, event).await
 }
 
-/// Convenience function to publish a tool_requested event
+/// Superseded by [`crate::agent_events::emit`], which is the seam producers
+/// publish through. Kept for the differential test that compares the two paths.
 pub async fn publish_tool_requested(
     request_id: &str,
     tool_id: ToolCallId,
@@ -360,7 +361,8 @@ pub async fn publish_tool_requested(
     .await
 }
 
-/// Convenience function to publish a tool_start event
+/// Superseded by [`crate::agent_events::emit`], which is the seam producers
+/// publish through. Kept for the differential test that compares the two paths.
 pub async fn publish_tool_start(
     request_id: &str,
     tool_id: ToolCallId,
@@ -514,10 +516,8 @@ pub async fn publish_usage(request_id: &str, event: ToolUsageEvent) -> bool {
     usage_broker_global().publish(request_id, event).await
 }
 
-/// Publish a tool usage event.
-///
-/// Called from `on_stream_completion_response_finish` when usage becomes available.
-/// Associates the listed tool_ids with the usage snapshot.
+/// Superseded by [`crate::agent_events::emit`], which is the seam producers
+/// publish through. Kept for the differential test that compares the two paths.
 pub async fn publish_tool_usage(
     request_id: &str,
     tool_ids: Vec<ToolCallId>,

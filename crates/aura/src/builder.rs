@@ -1728,7 +1728,9 @@ impl StreamingAgent for Agent {
         request_id: &str,
     ) -> Result<BoxStream<'static, Result<StreamItem, StreamError>>, StreamError> {
         if let Some(mcp_manager) = &self.mcp_manager {
-            mcp_manager.set_current_request(request_id).await;
+            mcp_manager
+                .set_current_call(request_id, aura_events::AgentContext::single_agent())
+                .await;
         }
 
         let stream = if chat_history.is_empty() {
@@ -1753,7 +1755,9 @@ impl StreamingAgent for Agent {
     ) {
         // Production entry point — set MCP request ID before delegating
         if let Some(mcp_manager) = &self.mcp_manager {
-            mcp_manager.set_current_request(request_id).await;
+            mcp_manager
+                .set_current_call(request_id, aura_events::AgentContext::single_agent())
+                .await;
         }
 
         let (stream, cancel_tx, usage_state) = if chat_history.is_empty() {

@@ -12,7 +12,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use aura::agent_events::{Routed, publish_to_brokers};
+use aura::agent_events::Routed;
 use aura::tool_event_broker::publish_tool_requested;
 use aura::{
     ApprovalLifecycleEvent, NumberOrString, Progress, ProgressNotification, ProgressToken,
@@ -82,6 +82,14 @@ async fn unsubscribe_all(request_id: &str) {
 }
 
 async fn run(request_id: &str, steps: Vec<Step>) -> Vec<SseEvent> {
+    run_as(request_id, steps, false).await
+}
+
+/// `orchestration` swaps the turn's agent context to the coordinator. The two
+/// paths only agree on `agent_id` by accident under the single-agent context,
+/// where the broker path's absent agent and the schema path's stamped one are
+/// the same value.
+async fn run_as(request_id: &str, steps: Vec<Step>, orchestration: bool) -> Vec<SseEvent> {
     let callbacks = callbacks_for(request_id).await;
     let config = StreamConfig::new(true, false, ToolResultMode::Aura, 0);
     let ctx = TurnContext::new(
@@ -91,6 +99,11 @@ async fn run(request_id: &str, steps: Vec<Step>) -> Vec<SseEvent> {
         None,
         SESSION_ID,
     );
+    let ctx = if orchestration {
+        ctx.with_orchestration()
+    } else {
+        ctx
+    };
 
     let stream = MockAgent::scripted(steps)
         .stream("q", vec![], CancellationToken::new(), request_id)
@@ -159,26 +172,61 @@ async fn assert_paths_agree(case: &str, broker: Vec<Step>, schema: Vec<Step>) {
     );
 }
 
-/// Publishing through the adapter must reach a subscriber; a silent
-/// `NoSubscriber` would make both paths agree on emptiness.
+/// The `Delivered` assert matters because a silent drop would make both paths
+/// agree on emptiness.
 fn emit(
     event: AgentEvent,
 ) -> impl Fn(String) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>> {
     move |request_id: String| {
         let event = event.clone();
         Box::pin(async move {
-            let routed = publish_to_brokers(&request_id, event).await;
-            assert_eq!(
-                routed,
-                Routed::Delivered,
-                "adapter should reach a subscriber"
-            );
+            let routed = aura::agent_events::emit(&request_id, event).await;
+            assert_eq!(routed, Routed::Delivered, "event should reach a consumer");
         })
     }
 }
 
 fn tool_result_ok() -> Result<StreamItem, StreamError> {
     items::tool_result(TOOL_ID, "README.md\nsrc/")
+}
+
+/// A worker context is one the fallback cannot produce: the SSE handler stamps
+/// the turn's own agent when a frame carries none, and under orchestration that
+/// is the coordinator. Asserting on a worker id is therefore the only shape
+/// that fails if the adapter drops or fabricates `agent`.
+#[tokio::test(start_paused = true)]
+async fn a_carried_agent_beats_the_handlers_fallback() {
+    let events = run_as(
+        "req_schema_agent_ctx",
+        vec![
+            Step::effect(emit(AgentEvent::new(
+                aura_events::AgentContext::worker("log_worker", None, "coordinator"),
+                AgentEventPayload::ToolProgress {
+                    progress_token: token(),
+                    progress: Progress::ratio(1.0, 4.0),
+                    message: Some("half".to_string()),
+                },
+            ))),
+            Step::item(items::text("done")),
+        ],
+        true,
+    )
+    .await;
+
+    let progress = events
+        .iter()
+        .find(|e| e.event_type.as_deref() == Some("aura.progress"))
+        .expect("a progress frame");
+    assert!(
+        progress.data.contains(r#""agent_id":"log_worker""#),
+        "the carried agent must reach the frame, got: {}",
+        progress.data
+    );
+    assert!(
+        !progress.data.contains(r#""agent_id":"coordinator""#),
+        "the handler fallback must not override a carried agent, got: {}",
+        progress.data
+    );
 }
 
 #[tokio::test(start_paused = true)]
