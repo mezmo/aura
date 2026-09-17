@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::hitl::ApprovalDecision;
+use crate::hitl::ResolvedDecision;
 
 /// Decisions already recorded for this run's parked calls, consumed at most
 /// once each. `strict_tasks` holds the task ids whose continuation is
@@ -24,16 +24,17 @@ use crate::hitl::ApprovalDecision;
 /// mismatch) clears the task's entry.
 #[derive(Debug, Default)]
 pub(crate) struct RecordedDecisions {
-    entries: Mutex<HashMap<CallKey, VecDeque<ApprovalDecision>>>,
+    entries: Mutex<HashMap<CallKey, VecDeque<ResolvedDecision>>>,
     strict_tasks: Mutex<HashSet<usize>>,
 }
 
 impl RecordedDecisions {
-    /// Record a decision for a key, appending to that key's recorded-order
-    /// queue so two same-turn calls with identical arguments keep their own
-    /// decisions. Wired by the orchestrator continuation (P44 commit 3).
+    /// Record a resolved decision — decision and captured identity together —
+    /// for a key, appending to that key's recorded-order queue so two
+    /// same-turn calls with identical arguments keep their own decisions.
+    /// Wired by the orchestrator continuation.
     #[allow(dead_code)]
-    pub(crate) fn push(&self, key: CallKey, decision: ApprovalDecision) {
+    pub(crate) fn push(&self, key: CallKey, decision: ResolvedDecision) {
         self.entries
             .lock()
             .expect("recorded-decisions lock")
@@ -63,9 +64,9 @@ impl RecordedDecisions {
             .contains(&task_id)
     }
 
-    /// Consume one decision for a key in recorded order; the next call returns
-    /// the following decision, and an empty queue returns `None`.
-    pub(crate) fn take(&self, key: &CallKey) -> Option<ApprovalDecision> {
+    /// Consume one resolved decision for a key in recorded order; the next
+    /// call returns the following decision, and an empty queue returns `None`.
+    pub(crate) fn take(&self, key: &CallKey) -> Option<ResolvedDecision> {
         self.entries
             .lock()
             .expect("recorded-decisions lock")
@@ -139,6 +140,7 @@ mod tests {
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
     use super::*;
+    use crate::hitl::ApprovalDecision;
 
     fn key(task_id: usize, tool_name: &str, args: &Value) -> CallKey {
         CallKey::new(task_id, tool_name, args)
@@ -151,24 +153,28 @@ mod tests {
         let recorded = RecordedDecisions::default();
         let args = serde_json::json!({"namespace": "prod"});
 
-        recorded.push(key(1, "kubectl_apply", &args), ApprovalDecision::Approved);
+        recorded.push(
+            key(1, "kubectl_apply", &args),
+            ApprovalDecision::Approved.into(),
+        );
         recorded.push(
             key(1, "kubectl_apply", &args),
             ApprovalDecision::Denied {
                 reason: Some("too risky".to_string()),
-            },
+            }
+            .into(),
         );
 
         let probe = key(1, "kubectl_apply", &args);
         assert_eq!(
             recorded.take(&probe),
-            Some(ApprovalDecision::Approved),
+            Some(ResolvedDecision::from(ApprovalDecision::Approved)),
             "first take returns the first recorded decision",
         );
         assert_eq!(
             recorded
                 .take(&probe)
-                .map(|d| matches!(d, ApprovalDecision::Denied { .. })),
+                .map(|d| matches!(d, ResolvedDecision::Denied { .. })),
             Some(true),
             "second take returns the second recorded decision, in order",
         );

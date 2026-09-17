@@ -125,6 +125,8 @@ mod tests {
             },
             registered_at: chrono::Utc::now(),
             expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+            authority: crate::hitl::ApprovalAuthority::WebhookPoll,
+            egress_headers: None,
         }
     }
 

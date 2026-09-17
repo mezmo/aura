@@ -31,6 +31,7 @@
 mod decision;
 mod events;
 mod gate;
+mod outcome;
 mod poller;
 mod protocol;
 mod registry;
@@ -40,7 +41,7 @@ mod tool;
 
 pub use decision::{
     AgentScope, ApprovalDecision, ApprovalOrigin, ApprovalOutcome, AwaitingDecision, CancelReason,
-    DecisionId, Timestamp,
+    DecisionId, ResolvedDecision, Timestamp,
 };
 pub(crate) use events::completed_cancelled;
 /// Read one full HTTP/1.1 request (head plus content-length body) off a
@@ -84,9 +85,14 @@ pub(crate) async fn read_full_request(socket: &mut tokio::net::TcpStream) -> Str
 }
 
 pub use gate::HitlApprovalWrapper;
+pub use outcome::ApprovalAuthority;
 pub use poller::{PollReconciler, PollerHandle};
 pub use protocol::{ApprovalDecisionWire, ApprovalItem, ApprovalRequest, PROTOCOL_VERSION};
 pub use registry::{ParkedApproval, PendingApprovals, ResolveError};
+// Re-exported so config-fingerprint tests construct the poll client the
+// production way.
+#[cfg(test)]
+pub(crate) use route::webhook_client_from_config;
 pub use route::{
     ApprovalError, DecisionRoute, HitlRuntime, PlaintextWebhookUrlError, WebhookClient,
     cleartext_capture_warning, validate_webhook_signing_config, warn_on_cleartext_capture,
