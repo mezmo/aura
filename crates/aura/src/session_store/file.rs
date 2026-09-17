@@ -548,10 +548,13 @@ impl Inner {
         // moves into a durable tagged `TimedOut` decision file — the
         // create_new claim commits at-most-once, sync narrows the empty-
         // file crash window, and the approval unlink past the commit is
-        // best-effort.
+        // best-effort. The complete record restores BEFORE any credential
+        // strip: a corrupt egress header is the stored row's decode fault
+        // returned with no mutation, never erased into a durable timeout.
+        let mut restored = restore_approval(record.clone())?;
+        restored.egress_headers = None;
         record.egress_headers = None;
         let deadline = record.expires_at;
-        let restored = restore_approval(record.clone())?;
         let payload = serde_json::to_vec(&ResolvedEntry {
             approval: record,
             decision: TerminalRecord::TimedOut { deadline },

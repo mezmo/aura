@@ -1044,6 +1044,48 @@ async fn file_read_or_expire_corrupt_decision_file_is_a_decode_error() {
     }
 }
 
+/// Corrupt evidence is an error, never a timeout, on the expired path too:
+/// a stored record whose egress headers fail validation must answer
+/// `SessionStoreError::Decode` and leave the store untouched — never have
+/// its corruption erased by the expiry strip and convert into a durable
+/// `TimedOut` row.
+#[tokio::test]
+async fn file_read_or_expire_corrupt_egress_on_expired_row_is_a_decode_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let parked = make_parked("req-roe-egress-corrupt", Duration::from_secs(60));
+    let id = parked.request.decision_id;
+    let deadline = parked.expires_at;
+    let store = store_pinned_at(&dir, deadline + chrono::Duration::seconds(1));
+    store.register(parked).await.unwrap();
+
+    // Corrupt the STORED record: an egress header value a real
+    // `HeaderValue` can never carry (a newline), written straight to disk.
+    let approval_path = dir.path().join("approvals").join(format!("{id}.json"));
+    let mut on_disk: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&approval_path).unwrap()).unwrap();
+    on_disk["egress_headers"] = serde_json::json!({ "x-tenant-egress": "tenant\nsecret" });
+    std::fs::write(&approval_path, serde_json::to_vec(&on_disk).unwrap()).unwrap();
+
+    match store
+        .read_or_expire(&id, ApprovalAuthority::Conversational)
+        .await
+    {
+        Err(SessionStoreError::Decode { .. }) => {}
+        _ => panic!("a corrupt expired row must read as a decode error, NOT a TimedOut outcome"),
+    }
+    assert!(
+        !dir.path()
+            .join("decisions")
+            .join(format!("{id}.json"))
+            .exists(),
+        "a refused expiry must not write a durable TimedOut record"
+    );
+    assert!(
+        approval_path.exists(),
+        "the corrupt approval file must not be removed by a failed read"
+    );
+}
+
 /// The deadline rule is strictly past: a row sampled exactly at its own
 /// `expires_at` is still pending.
 #[tokio::test]
