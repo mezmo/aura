@@ -1,9 +1,10 @@
 //! Minimal A2A v1.0 JSON-RPC client over the crate's `reqwest` dependency.
 //!
 //! Only the three calls the remote-agent tool needs are implemented:
-//! `SendMessage`, `GetTask`, and `CancelTask`. Wire types come from the
-//! `a2a` crate so the request and response shapes match the server binding
-//! the web server crate hosts.
+//! `SendMessage`, `GetTask`, and `CancelTask`. Requests serialize with the
+//! `a2a` crate's serde types; responses are read through the lenient mirrors
+//! in [`wire`], because the server binding's wire format is not plain serde
+//! JSON (see the module comment there).
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -156,7 +157,13 @@ impl A2aClient {
             // the configured model must be the only one on the wire.
             headers.insert(name, value);
         }
-        self.call(methods::SEND_MESSAGE, &request, headers).await
+        let result = self.call(methods::SEND_MESSAGE, &request, headers).await?;
+        Ok(parse_wire::<wire::WireSendMessageResponse>(
+            methods::SEND_MESSAGE,
+            &self.endpoint,
+            result,
+        )?
+        .into())
     }
 
     pub async fn get_task(&self, task_id: &str) -> Result<Task, A2aClientError> {
@@ -165,8 +172,10 @@ impl A2aClient {
             history_length: Some(0),
             tenant: None,
         };
-        self.call(methods::GET_TASK, &request, self.headers.clone())
-            .await
+        let result = self
+            .call(methods::GET_TASK, &request, self.headers.clone())
+            .await?;
+        Ok(parse_wire::<wire::WireTask>(methods::GET_TASK, &self.endpoint, result)?.into())
     }
 
     pub async fn cancel_task(&self, task_id: &str) -> Result<Task, A2aClientError> {
@@ -175,20 +184,23 @@ impl A2aClient {
             metadata: None,
             tenant: None,
         };
-        self.call(methods::CANCEL_TASK, &request, self.headers.clone())
-            .await
+        let result = self
+            .call(methods::CANCEL_TASK, &request, self.headers.clone())
+            .await?;
+        Ok(parse_wire::<wire::WireTask>(methods::CANCEL_TASK, &self.endpoint, result)?.into())
     }
 
-    /// One JSON-RPC round trip carrying exactly `headers`. A non-2xx status
-    /// (a redirect included) is reported with a bounded body excerpt because
-    /// a gateway in front of the remote (auth, routing) answers in its own
-    /// format, not as a JSON-RPC envelope.
-    async fn call<P: serde::Serialize, R: DeserializeOwned>(
+    /// One JSON-RPC round trip carrying exactly `headers`, returning the
+    /// envelope's `result` verbatim for [`parse_wire`] to read. A non-2xx
+    /// status (a redirect included) is reported with a bounded body excerpt
+    /// because a gateway in front of the remote (auth, routing) answers in
+    /// its own format, not as a JSON-RPC envelope.
+    async fn call<P: serde::Serialize>(
         &self,
         method: &str,
         params: &P,
         headers: HeaderMap,
-    ) -> Result<R, A2aClientError> {
+    ) -> Result<Value, A2aClientError> {
         let endpoint = self.endpoint.clone();
         let params = serde_json::to_value(params).map_err(|e| A2aClientError::Protocol {
             endpoint: endpoint.clone(),
@@ -233,14 +245,135 @@ impl A2aClient {
                 message: error.message,
             });
         }
-        let result: Value = envelope.result.ok_or_else(|| A2aClientError::Protocol {
-            endpoint: endpoint.clone(),
-            reason: format!("{method} response carries neither result nor error"),
-        })?;
-        serde_json::from_value(result).map_err(|e| A2aClientError::Protocol {
+        envelope.result.ok_or_else(|| A2aClientError::Protocol {
             endpoint,
-            reason: format!("{method} result did not deserialize: {e}"),
+            reason: format!("{method} response carries neither result nor error"),
         })
+    }
+}
+
+/// Parse a JSON-RPC result through one of the [`wire`] mirrors.
+fn parse_wire<W: DeserializeOwned>(
+    method: &str,
+    endpoint: &str,
+    result: Value,
+) -> Result<W, A2aClientError> {
+    serde_json::from_value(result).map_err(|e| A2aClientError::Protocol {
+        endpoint: endpoint.to_owned(),
+        reason: format!("{method} result did not deserialize: {e}"),
+    })
+}
+
+/// Lenient mirrors of the `a2a` response types, matching what the v1.0
+/// JSON-RPC server binding actually puts on the wire.
+///
+/// The binding transcends every response through protobuf
+/// (`a2a-pb`'s `protojson_conv`), and proto3 JSON omits empty repeated fields
+/// instead of sending `[]`: a metadata-only artifact — the receiver's
+/// per-worker scratchpad-usage artifact is one — arrives with no `parts` key
+/// at all, which the `a2a` serde types (where `parts` is required) cannot
+/// read. Only the fields the tool consumes are mirrored; the rest
+/// (`timestamp`, `history`, artifact metadata, ...) are dropped on the way
+/// into the `a2a` types.
+mod wire {
+    use a2a::{Artifact, Message, Part, Role, SendMessageResponse, Task, TaskState, TaskStatus};
+    use serde::Deserialize;
+
+    #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct WireTask {
+        pub id: String,
+        pub context_id: String,
+        pub status: WireTaskStatus,
+        #[serde(default)]
+        pub artifacts: Option<Vec<WireArtifact>>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    pub struct WireTaskStatus {
+        pub state: TaskState,
+        #[serde(default)]
+        pub message: Option<WireMessage>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct WireMessage {
+        pub role: Role,
+        #[serde(default)]
+        pub parts: Vec<Part>,
+        #[serde(default)]
+        pub context_id: Option<String>,
+        #[serde(default)]
+        pub task_id: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct WireArtifact {
+        pub artifact_id: String,
+        #[serde(default)]
+        pub parts: Vec<Part>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    pub enum WireSendMessageResponse {
+        #[serde(rename = "task")]
+        Task(WireTask),
+        #[serde(rename = "message")]
+        Message(WireMessage),
+    }
+
+    impl From<WireTask> for Task {
+        fn from(w: WireTask) -> Self {
+            Task {
+                id: w.id,
+                context_id: w.context_id,
+                status: TaskStatus {
+                    state: w.status.state,
+                    message: w.status.message.map(Into::into),
+                    timestamp: None,
+                },
+                artifacts: w
+                    .artifacts
+                    .map(|artifacts| artifacts.into_iter().map(Into::into).collect()),
+                history: None,
+                metadata: None,
+            }
+        }
+    }
+
+    impl From<WireMessage> for Message {
+        fn from(w: WireMessage) -> Self {
+            let mut message = Message::new(w.role, w.parts);
+            message.context_id = w.context_id;
+            message.task_id = w.task_id;
+            message
+        }
+    }
+
+    impl From<WireArtifact> for Artifact {
+        fn from(w: WireArtifact) -> Self {
+            Artifact {
+                artifact_id: w.artifact_id,
+                name: None,
+                description: None,
+                parts: w.parts,
+                metadata: None,
+                extensions: None,
+            }
+        }
+    }
+
+    impl From<WireSendMessageResponse> for SendMessageResponse {
+        fn from(w: WireSendMessageResponse) -> Self {
+            match w {
+                WireSendMessageResponse::Task(task) => SendMessageResponse::Task(task.into()),
+                WireSendMessageResponse::Message(message) => {
+                    SendMessageResponse::Message(message.into())
+                }
+            }
+        }
     }
 }
 
@@ -391,6 +524,67 @@ mod tests {
             matches!(err, A2aClientError::ResponseTooLarge { limit, .. } if limit == MAX_BODY_BYTES),
             "{err}"
         );
+    }
+
+    #[tokio::test]
+    async fn get_task_tolerates_protojson_omitted_parts() {
+        // The v1.0 server binding omits empty repeated fields: the receiver's
+        // metadata-only scratchpad artifact arrives with no `parts` key.
+        let server = LoopbackA2aServer::start(|method, _| match method {
+            "GetTask" => Ok(serde_json::json!({
+                "id": "t1", "contextId": "c",
+                "status": { "state": "TASK_STATE_COMPLETED" },
+                "artifacts": [
+                    { "artifactId": "scratchpad_log-analyst", "name": "Scratchpad Usage",
+                      "metadata": { "tokens_intercepted": 12 } },
+                    { "artifactId": "final", "parts": [ { "text": "done" } ] }
+                ]
+            })),
+            other => panic!("unexpected method {other}"),
+        })
+        .await;
+        let client = A2aClient::new(&server.url, &HashMap::new(), "aura/test").unwrap();
+        let task = client.get_task("t1").await.unwrap();
+        let artifacts = task.artifacts.unwrap();
+        assert_eq!(artifacts.len(), 2);
+        assert_eq!(artifacts[0].artifact_id, "scratchpad_log-analyst");
+        assert!(artifacts[0].parts.is_empty());
+        assert_eq!(artifacts[1].parts.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn send_message_tolerates_protojson_omitted_parts() {
+        let server = LoopbackA2aServer::start(|method, _| match method {
+            "SendMessage" => Ok(serde_json::json!({ "task": {
+                "id": "t", "contextId": "c",
+                "status": { "state": "TASK_STATE_WORKING" },
+                "artifacts": [ { "artifactId": "scratchpad_dev", "name": "Scratchpad Usage" } ]
+            }})),
+            other => panic!("unexpected method {other}"),
+        })
+        .await;
+        let client = A2aClient::new(&server.url, &HashMap::new(), "aura/test").unwrap();
+        let reply = client.send_message("hi", None, None).await.unwrap();
+        let SendMessageResponse::Task(task) = reply else {
+            panic!("expected a task");
+        };
+        assert!(task.artifacts.unwrap()[0].parts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancel_task_tolerates_protojson_omitted_parts() {
+        let server = LoopbackA2aServer::start(|method, _| match method {
+            "CancelTask" => Ok(serde_json::json!({
+                "id": "t", "contextId": "c",
+                "status": { "state": "TASK_STATE_CANCELED" },
+                "artifacts": [ { "artifactId": "scratchpad_dev" } ]
+            })),
+            other => panic!("unexpected method {other}"),
+        })
+        .await;
+        let client = A2aClient::new(&server.url, &HashMap::new(), "aura/test").unwrap();
+        let task = client.cancel_task("t").await.unwrap();
+        assert_eq!(task.status.state, TaskState::Canceled);
     }
 
     #[tokio::test]
