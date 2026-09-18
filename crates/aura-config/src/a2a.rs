@@ -137,13 +137,13 @@ pub struct A2aRemoteConfig {
     /// Static request headers, e.g. an API key.
     #[serde(default)]
     pub headers: HashMap<String, String>,
-    /// Outbound header name → inbound request header to copy it from.
+    /// Outbound header name → inbound request header name.
     #[serde(default)]
     pub headers_from_request: HashMap<String, String>,
-    /// Seconds between task-status polls.
+    /// Poll interval in seconds for this remote.
     #[serde(default)]
     pub poll_interval_secs: Option<u64>,
-    /// Wall-clock budget in seconds for one call.
+    /// Call budget in seconds for this remote.
     #[serde(default)]
     pub timeout_secs: Option<u64>,
 }
