@@ -436,6 +436,46 @@ pub(super) fn spawn_tool_event_forwarder(
 ///
 /// Created lazily by `OrchestratorFactory::stream()` to coordinate multiple
 /// agents through a plan-execute-continue loop.
+/// The tools a worker may use, as the planner should advertise them. The
+/// worker's own `mcp_filter` wins; a worker without one inherits the base
+/// agent's, matching `AgentRuntimeConfig::tool_matches_filter` at build
+/// time. No filter anywhere means every tool; `mcp_filter = []` means none.
+fn tools_matching_filter(
+    all_tools: &[String],
+    worker_filter: Option<&[String]>,
+    base_filter: Option<&[String]>,
+) -> Vec<String> {
+    match worker_filter.or(base_filter) {
+        None => all_tools.to_vec(),
+        Some(filter) => all_tools
+            .iter()
+            .filter(|tool_name| {
+                filter
+                    .iter()
+                    .any(|pattern| crate::config::glob_match(pattern, tool_name))
+            })
+            .cloned()
+            .collect(),
+    }
+}
+
+/// The `[a2a]` config a worker is built with: the base agent's, narrowed to
+/// the remotes the worker's `remotes` list names. A worker that names none
+/// gets `None`, so `add_all_tools` registers no `ask_agent` for it; remote
+/// access is opt-in per worker, like `vector_stores`. Validation has already
+/// checked that every name is a configured remote.
+fn a2a_for_worker(
+    base: Option<aura_config::A2aConfig>,
+    remotes: &[String],
+) -> Option<aura_config::A2aConfig> {
+    if remotes.is_empty() {
+        return None;
+    }
+    let mut a2a = base?;
+    a2a.remote.retain(|name, _| remotes.contains(name));
+    Some(a2a)
+}
+
 pub struct Orchestrator {
     /// ID for the orchestrator
     orchestrator_id: String,
@@ -741,6 +781,10 @@ impl Orchestrator {
         // Create a modified config for workers with extension fields
         let mut worker_config = self.agent_config.clone();
         let worker_cfg = worker_name.and_then(|name| self.config.workers.get(name));
+        worker_config.a2a = a2a_for_worker(
+            worker_config.a2a.take(),
+            worker_cfg.map(|w| w.remotes.as_slice()).unwrap_or(&[]),
+        );
 
         // Named workers report their own agent name (Rig stamps it on turn
         // spans as `gen_ai.agent.name`); the generic worker keeps the base
@@ -775,7 +819,14 @@ impl Orchestrator {
                 .unwrap_or_default();
             let scratchpad_tool_map =
                 scratchpad::scratchpad_tool_map(self.agent_config.mcp.as_ref(), &tools_per_server);
-            let worker_filter = worker_cfg.and_then(|w| w.mcp_filter.as_deref());
+            // The worker's own filter, else the base agent's: the same
+            // inheritance `tool_matches_filter` applies when the worker is
+            // built, so this gate sees the tools the worker will actually get.
+            let worker_filter = worker_cfg.and_then(|w| w.mcp_filter.as_deref()).or(self
+                .agent_config
+                .agent
+                .mcp_filter
+                .as_deref());
             let accessible_tools = self
                 .mcp_manager
                 .as_ref()
@@ -1065,14 +1116,19 @@ impl Orchestrator {
         }
 
         tracing::debug!(
-            "Worker {} config: preamble length = {} chars, mcp_filter = {:?}",
+            "Worker {} config: preamble length = {} chars, mcp_filter = {:?}, remotes = {:?}",
             task_id,
             worker_config
                 .preamble_override
                 .as_ref()
                 .map(|s| s.len())
                 .unwrap_or(0),
-            worker_config.mcp_filter
+            worker_config.mcp_filter,
+            worker_config
+                .a2a
+                .as_ref()
+                .map(|a2a| a2a.remote.keys().collect::<Vec<_>>())
+                .unwrap_or_default()
         );
 
         // Capture preamble before config is consumed by builder
@@ -2285,15 +2341,22 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
         for (name, config) in &self.config.workers {
             let tools = worker_tools.get(name).cloned().unwrap_or_default();
+            // `ask_agent` lists only this worker's remotes, so the planner
+            // does not route a remote to a worker that cannot reach it.
+            let ask_agent = self.worker_remote_agents(config).map(|(desc, _)| desc);
 
             let tool_details: Vec<String> = tools
                 .iter()
                 .take(max_tools)
                 .map(|t| {
-                    if let Some(desc) = tool_descriptions.get(t) {
-                        format!("  - {}: {}", t, desc)
+                    let desc = if t == crate::a2a::ASK_AGENT_TOOL_NAME {
+                        ask_agent.as_deref()
                     } else {
-                        format!("  - {}", t)
+                        tool_descriptions.get(t).map(String::as_str)
+                    };
+                    match desc {
+                        Some(desc) => format!("  - {}: {}", t, desc),
+                        None => format!("  - {}", t),
                     }
                 })
                 .collect();
@@ -2353,20 +2416,49 @@ Assign tasks to the worker whose tools best match the required operations."#,
     // Tool Resolution Methods (for capability-aware planning)
     // ========================================================================
 
+    /// The `ask_agent` tool's description and schema as the named worker
+    /// sees them: built from the remotes its `remotes` list names, the same
+    /// narrowing `create_worker` applies. `None` for a worker that names no
+    /// remote, which gets no `ask_agent`.
+    fn worker_remote_agents(
+        &self,
+        worker: &super::WorkerConfig,
+    ) -> Option<(String, serde_json::Value)> {
+        let a2a = a2a_for_worker(self.agent_config.a2a.clone(), &worker.remotes)?;
+        Some(crate::a2a::RemoteAgentTool::planning_definition(&a2a))
+    }
+
+    /// The `ask_agent` tool's schema over every remote any worker may
+    /// address, for `inspect_tool_params`. `None` when no worker names one.
+    fn any_worker_remote_agents(&self) -> Option<(String, serde_json::Value)> {
+        let a2a = self.agent_config.a2a.as_ref()?;
+        let named: Vec<String> = self
+            .config
+            .workers
+            .values()
+            .flat_map(|w| w.remotes.iter().cloned())
+            .collect();
+        let a2a = a2a_for_worker(Some(a2a.clone()), &named)?;
+        Some(crate::a2a::RemoteAgentTool::planning_definition(&a2a))
+    }
+
     /// Get all tool names from the MCP manager.
     ///
     /// Collects tool names from all sources:
+    /// - Remote agents (`ask_agent`), when any worker names a remote
     /// - Streamable HTTP tools
     /// - SSE tools
-    /// - Legacy tool definitions
+    /// - STDIO tools
     ///
-    /// Returns an empty Vec if no MCP manager is present.
+    /// Returns only the remote-agent entry if no MCP manager is present.
     fn get_all_tool_names(&self) -> Vec<String> {
-        let Some(ref mcp_manager) = self.mcp_manager else {
-            return Vec::new();
-        };
-
         let mut names = Vec::new();
+        if self.any_worker_remote_agents().is_some() {
+            names.push(crate::a2a::ASK_AGENT_TOOL_NAME.to_string());
+        }
+        let Some(ref mcp_manager) = self.mcp_manager else {
+            return names;
+        };
 
         // Collect from streamable HTTP tools (rmcp::model::Tool has Cow<'static, str>)
         for tools in mcp_manager.streamable_tools.values() {
@@ -2403,11 +2495,13 @@ Assign tasks to the worker whose tools best match the required operations."#,
     ///
     /// Returns an empty HashMap if no MCP manager is present.
     fn get_all_tool_schemas(&self) -> std::collections::HashMap<String, serde_json::Value> {
-        let Some(ref mcp_manager) = self.mcp_manager else {
-            return std::collections::HashMap::new();
-        };
-
         let mut schemas = std::collections::HashMap::new();
+        if let Some((_, parameters)) = self.any_worker_remote_agents() {
+            schemas.insert(crate::a2a::ASK_AGENT_TOOL_NAME.to_string(), parameters);
+        }
+        let Some(ref mcp_manager) = self.mcp_manager else {
+            return schemas;
+        };
 
         // Collect from streamable HTTP tools
         // rmcp::model::Tool.input_schema is Arc<JsonObject> where JsonObject = Map<String, Value>
@@ -2438,7 +2532,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
         schemas
     }
 
-    /// Resolve which tools each worker can access based on their mcp_filter.
+    /// Resolve which tools each worker can access: MCP tools by its
+    /// `mcp_filter`, `ask_agent` when its `remotes` list names any remote,
+    /// and a `vector_search_*` tool per assigned vector store.
     ///
     /// Returns a map of worker_name -> Vec<tool_name>.
     /// Tools that don't match any worker's filter are omitted.
@@ -2455,24 +2551,23 @@ Assign tasks to the worker whose tools best match the required operations."#,
     /// - "operations" -> ["mezmo_logs", "mezmo_pipelines"]
     /// - "knowledge" -> ["ListKnowledgeBases", "QueryKnowledgeBases"]
     fn resolve_worker_tools(&self) -> std::collections::HashMap<String, Vec<String>> {
-        let all_tools = self.get_all_tool_names();
+        let mcp_tools: Vec<String> = self
+            .get_all_tool_names()
+            .into_iter()
+            .filter(|name| name != crate::a2a::ASK_AGENT_TOOL_NAME)
+            .collect();
+        let base_filter = self.agent_config.agent.mcp_filter.as_deref();
         let mut worker_tools = std::collections::HashMap::new();
 
         for (worker_name, worker_config) in &self.config.workers {
-            // Omitted filter = every MCP tool (backwards compatibility);
-            // `mcp_filter = []` = none.
-            let mut matching_tools: Vec<String> = match &worker_config.mcp_filter {
-                None => all_tools.clone(),
-                Some(filter) => all_tools
-                    .iter()
-                    .filter(|tool_name| {
-                        filter
-                            .iter()
-                            .any(|pattern| crate::config::glob_match(pattern, tool_name))
-                    })
-                    .cloned()
-                    .collect(),
-            };
+            let mut matching_tools =
+                tools_matching_filter(&mcp_tools, worker_config.mcp_filter.as_deref(), base_filter);
+
+            // `ask_agent` is opt-in per worker, exactly when `create_worker`
+            // will build one for it.
+            if self.worker_remote_agents(worker_config).is_some() {
+                matching_tools.push(crate::a2a::ASK_AGENT_TOOL_NAME.to_string());
+            }
 
             // Add vector store tools based on explicit vector_stores assignment
             for store_name in &worker_config.vector_stores {
@@ -6020,6 +6115,58 @@ mod tests {
         assert!(!is_context_overflow_error(error.as_ref()));
     }
 
+    #[test]
+    fn worker_without_a_filter_inherits_the_base_filter_in_planning() {
+        let all: Vec<String> = ["mezmo_logs", "kubectl_get"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let base = vec!["mezmo_*".to_string()];
+
+        // The runtime keeps the base filter for a worker that omits its own,
+        // so planning must not advertise kubectl_get to it.
+        assert_eq!(
+            tools_matching_filter(&all, None, Some(&base)),
+            vec!["mezmo_logs".to_string()]
+        );
+        // A worker filter replaces the base filter outright.
+        assert_eq!(
+            tools_matching_filter(&all, Some(&["kubectl_*".to_string()]), Some(&base)),
+            vec!["kubectl_get".to_string()]
+        );
+        // No filter anywhere: everything. Empty worker filter: nothing.
+        assert_eq!(tools_matching_filter(&all, None, None), all);
+        assert!(tools_matching_filter(&all, Some(&[]), None).is_empty());
+    }
+
+    #[test]
+    fn worker_a2a_is_narrowed_to_its_remotes_and_absent_without_any() {
+        let a2a: aura_config::A2aConfig = toml::from_str(
+            r#"
+            [remote.k8s_ops]
+            url = "http://k8s:8080"
+            [remote.db_ops]
+            url = "http://db:8080"
+            "#,
+        )
+        .unwrap();
+
+        // A worker that names no remote gets no [a2a] at all, so the builder
+        // registers no ask_agent for it, even though the base agent has two.
+        assert!(a2a_for_worker(Some(a2a.clone()), &[]).is_none());
+        // Naming one remote narrows the map to that remote; the timing and
+        // response budgets ride along unchanged.
+        let narrowed = a2a_for_worker(Some(a2a.clone()), &["k8s_ops".to_string()]).unwrap();
+        assert_eq!(narrowed.remote.keys().collect::<Vec<_>>(), vec!["k8s_ops"]);
+        assert_eq!(narrowed.timeout_secs, a2a.timeout_secs);
+        // The planning definition built from the narrowed config lists only
+        // that remote, so the coordinator cannot route db_ops to this worker.
+        let (description, parameters) = crate::a2a::RemoteAgentTool::planning_definition(&narrowed);
+        assert!(description.contains("k8s_ops") && !description.contains("db_ops"));
+        assert!(parameters.to_string().contains("k8s_ops"));
+        assert!(!parameters.to_string().contains("db_ops"));
+    }
+
     // ========================================================================
     // Vector Store Tool Visibility Tests
     // ========================================================================
@@ -6036,6 +6183,7 @@ mod tests {
                 preamble: "Operations specialist.".to_string(),
                 mcp_filter: Some(vec!["mezmo_*".to_string()]),
                 vector_stores: vec![], // No RAG for operations
+                remotes: Vec::new(),
                 turn_depth: None,
                 llm: None,
                 scratchpad: None,
@@ -6049,6 +6197,7 @@ mod tests {
                 preamble: "Knowledge specialist.".to_string(),
                 mcp_filter: Some(vec![]), // No MCP tools
                 vector_stores: vec!["mezmo_docs".to_string()], // RAG access
+                remotes: Vec::new(),
                 turn_depth: None,
                 llm: None,
                 scratchpad: None,
@@ -6114,6 +6263,7 @@ mod tests {
                 preamble: "Documentation specialist.".to_string(),
                 mcp_filter: Some(vec![]),
                 vector_stores: vec!["docs".to_string()],
+                remotes: Vec::new(),
                 turn_depth: None,
                 llm: None,
                 scratchpad: None,
@@ -6129,6 +6279,7 @@ mod tests {
                 preamble: "Knowledge specialist.".to_string(),
                 mcp_filter: Some(vec![]),
                 vector_stores: vec!["kb".to_string(), "runbooks".to_string()],
+                remotes: Vec::new(),
                 turn_depth: None,
                 llm: None,
                 scratchpad: None,
@@ -6144,6 +6295,7 @@ mod tests {
                 preamble: "Operations specialist.".to_string(),
                 mcp_filter: Some(vec!["mezmo_*".to_string()]),
                 vector_stores: vec![], // Explicitly no RAG access
+                remotes: Vec::new(),
                 turn_depth: None,
                 llm: None,
                 scratchpad: None,
@@ -6278,6 +6430,7 @@ mod tests {
                 preamble: "Test".to_string(),
                 mcp_filter: Some(vec![]),
                 vector_stores: vec!["worker_store".to_string()],
+                remotes: Vec::new(),
                 turn_depth: None,
                 llm: None,
                 scratchpad: None,
@@ -8230,6 +8383,7 @@ mod tests {
                 preamble: "You apply changes with the echo tool.".to_string(),
                 mcp_filter: Some(vec![]),
                 vector_stores: vec![],
+                remotes: Vec::new(),
                 turn_depth: Some(turn_depth),
                 llm: None,
                 scratchpad: None,
@@ -8519,6 +8673,7 @@ mod tests {
                 preamble: "You apply changes with the echo tool.".to_string(),
                 mcp_filter: Some(vec![]),
                 vector_stores: vec![],
+                remotes: Vec::new(),
                 turn_depth: None,
                 llm: None,
                 scratchpad: None,

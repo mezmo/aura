@@ -13,7 +13,7 @@ use crate::config::{AgentRuntimeConfig, WorkerSkills};
 use crate::error::BuilderError;
 use crate::hitl::PendingApprovals;
 use crate::streaming::StreamingAgent;
-use aura_config::{AgentSettings, Config, McpConfig, McpServerConfig};
+use aura_config::{A2aConfig, AgentSettings, Config, McpConfig, McpServerConfig};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -80,6 +80,7 @@ impl RigBuilder {
             agent,
             vector_stores: self.config.vector_stores.clone(),
             mcp: self.config.mcp.clone(),
+            a2a: self.config.a2a.clone(),
             tools: self.config.tools.clone(),
             memory_dir: self.config.memory_dir.clone(),
             orchestration: self.config.orchestration.clone(),
@@ -145,6 +146,7 @@ impl RigBuilder {
     ) -> Result<Agent, BuilderError> {
         let mut agent_config = self.discovered_agent_config(req_headers)?;
         resolve_mcp_headers(&mut agent_config, req_headers);
+        resolve_a2a_headers(&mut agent_config, req_headers);
         agent_config.request_id = request_id;
         agent_config.session_id = session_id;
         Agent::new(&agent_config, additional_tools, client_tools)
@@ -171,6 +173,7 @@ impl RigBuilder {
     ) -> Result<Arc<dyn StreamingAgent>, BuilderError> {
         let mut agent_config = self.discovered_agent_config(req_headers)?;
         resolve_mcp_headers(&mut agent_config, req_headers);
+        resolve_a2a_headers(&mut agent_config, req_headers);
         agent_config.session_id = session_id;
         agent_config.request_id = request_id;
 
@@ -202,6 +205,55 @@ pub(crate) fn apply_request_header_mappings(
         }
     }
     resolved
+}
+
+/// Resolve remote-agent headers by applying `headers_from_request` mappings
+/// from the incoming request, the same way [`resolve_mcp_headers`] does for
+/// MCP servers.
+fn resolve_a2a_headers(
+    agent_config: &mut AgentRuntimeConfig,
+    req_headers: Option<&HashMap<String, String>>,
+) {
+    let Some(ref mut a2a_config) = agent_config.a2a else {
+        return;
+    };
+    resolve_a2a_headers_in(a2a_config, req_headers);
+}
+
+/// Resolve `headers_from_request` mappings on an [`A2aConfig`] directly.
+///
+/// Static TOML `headers` are already loaded in each remote's header map and
+/// serve as fallback when the mapped request header is absent. Static keys
+/// are lowercased first so a mapped override replaces the static value
+/// instead of coexisting under a case-distinct key.
+pub fn resolve_a2a_headers_in(
+    a2a_config: &mut A2aConfig,
+    req_headers: Option<&HashMap<String, String>>,
+) {
+    let empty = HashMap::new();
+    let req_headers = req_headers.unwrap_or(&empty);
+
+    for (remote_name, remote) in a2a_config.remote.iter_mut() {
+        let normalized: HashMap<String, String> = remote
+            .headers
+            .iter()
+            .map(|(k, v)| (k.to_lowercase(), v.clone()))
+            .collect();
+        remote.headers = normalized;
+
+        let resolved = apply_request_header_mappings(
+            &mut remote.headers,
+            &remote.headers_from_request,
+            req_headers,
+        );
+        if resolved > 0 {
+            tracing::debug!(
+                "Remote agent '{}': resolved {} header(s) from the request",
+                remote_name,
+                resolved
+            );
+        }
+    }
 }
 
 /// Resolve MCP server headers by applying `headers_from_request` mappings from the
@@ -350,6 +402,70 @@ mod tests {
 
         let headers = get_server_headers(&config);
         assert_eq!(headers.get("x-static"), Some(&"original".to_string()));
+    }
+
+    fn make_a2a_config(
+        static_headers: HashMap<String, String>,
+        headers_from_request: HashMap<String, String>,
+    ) -> A2aConfig {
+        let mut remote = HashMap::new();
+        remote.insert(
+            "dev".to_string(),
+            aura_config::A2aRemoteConfig {
+                url: "https://dev.example.com".to_string(),
+                description: None,
+                model: None,
+                headers: static_headers,
+                headers_from_request,
+                poll_interval_secs: None,
+                timeout_secs: None,
+            },
+        );
+        A2aConfig {
+            remote,
+            ..A2aConfig::default()
+        }
+    }
+
+    #[test]
+    fn a2a_headers_from_request_override_static_headers_case_insensitively() {
+        let static_headers = HashMap::from([
+            ("Authorization".to_string(), "Bearer static".to_string()),
+            ("X-Static".to_string(), "kept".to_string()),
+        ]);
+        let headers_from_request = HashMap::from([
+            ("Authorization".to_string(), "X-Incoming-Auth".to_string()),
+            ("x-missing".to_string(), "x-never-sent".to_string()),
+        ]);
+        let mut config = make_a2a_config(static_headers, headers_from_request);
+        let req_headers =
+            HashMap::from([("x-incoming-auth".to_string(), "Bearer dynamic".to_string())]);
+
+        resolve_a2a_headers_in(&mut config, Some(&req_headers));
+
+        let headers = &config.remote["dev"].headers;
+        assert_eq!(
+            headers.get("authorization"),
+            Some(&"Bearer dynamic".to_string())
+        );
+        assert_eq!(headers.get("x-static"), Some(&"kept".to_string()));
+        assert_eq!(headers.get("x-missing"), None);
+        assert_eq!(
+            headers.len(),
+            2,
+            "static keys are lowercased, not duplicated"
+        );
+    }
+
+    #[test]
+    fn a2a_static_headers_survive_a_headerless_build() {
+        let static_headers = HashMap::from([("X-Key".to_string(), "k".to_string())]);
+        let mut config = make_a2a_config(static_headers, HashMap::new());
+        resolve_a2a_headers_in(&mut config, None);
+        assert_eq!(
+            config.remote["dev"].headers.get("x-key"),
+            Some(&"k".to_string())
+        );
     }
 
     #[test]

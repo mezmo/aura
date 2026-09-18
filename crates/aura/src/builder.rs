@@ -919,7 +919,7 @@ impl Agent {
                         );
 
                         // Wrap with tool_wrapper if configured
-                        builder_state = Self::add_mcp_tool(builder_state, tool_adaptor, config);
+                        builder_state = Self::add_wrapped_tool(builder_state, tool_adaptor, config);
                     }
                 }
             }
@@ -952,7 +952,7 @@ impl Agent {
                             crate::approver_headers::McpTransportKind::Sse,
                         );
 
-                        builder_state = Self::add_mcp_tool(builder_state, tool_adaptor, config);
+                        builder_state = Self::add_wrapped_tool(builder_state, tool_adaptor, config);
                     }
                 }
             }
@@ -1029,10 +1029,48 @@ impl Agent {
                             crate::approver_headers::McpTransportKind::Stdio,
                         );
 
-                        builder_state = Self::add_mcp_tool(builder_state, tool_adaptor, config);
+                        builder_state = Self::add_wrapped_tool(builder_state, tool_adaptor, config);
                     }
                 }
             }
+        }
+
+        // Remote agents over A2A, all behind the one `ask_agent` tool. A
+        // single agent's `config.a2a` carries every `[a2a.remote]` entry; an
+        // orchestration worker's carries the subset its `remotes` names, or
+        // nothing (see `Orchestrator::create_worker`). `mcp_filter` does not
+        // apply: it governs MCP tools only.
+        if let Some(a2a) = config.a2a.as_ref().filter(|a2a| !a2a.remote.is_empty()) {
+            // Rig keys tools by name and silently overwrites on a
+            // collision, so an MCP tool named `ask_agent` would shadow
+            // this one (or vice versa) depending on registration order.
+            // Only an MCP tool that passes the effective filter is
+            // registered, so only that one collides.
+            if let Some(mcp_manager) = mcp_manager.as_deref()
+                && config.tool_matches_filter(crate::a2a::ASK_AGENT_TOOL_NAME)
+                && mcp_manager
+                    .get_available_tool_names()
+                    .iter()
+                    .any(|name| name == crate::a2a::ASK_AGENT_TOOL_NAME)
+            {
+                return Err(format!(
+                    "an MCP server exposes a tool named {:?}, which collides with the remote-agent tool; filter it out with mcp_filter or drop [a2a.remote]",
+                    crate::a2a::ASK_AGENT_TOOL_NAME
+                )
+                .into());
+            }
+            // Orchestration workers are built with a tool context factory;
+            // they stream under their own ids, so their calls must not
+            // announce on the live request's event stream.
+            let tool = crate::a2a::RemoteAgentTool::from_config(a2a, config.request_id.clone())?
+                .with_stream_events(config.tool_context_factory.is_none());
+            tracing::info!(
+                "Adding {} tool for {} remote agent(s): {:?}",
+                crate::a2a::ASK_AGENT_TOOL_NAME,
+                a2a.remote.len(),
+                tool.remote_names()
+            );
+            builder_state = Self::add_wrapped_tool(builder_state, tool, config);
         }
 
         if let Some(ref scratchpad) = config.scratchpad_tools_config {
@@ -1139,11 +1177,12 @@ impl Agent {
         Ok(builder_state)
     }
 
-    /// Helper to add an MCP tool, optionally wrapping with config.tool_wrapper.
+    /// Helper to add an externally-executing tool (MCP or remote agent),
+    /// optionally wrapping with config.tool_wrapper.
     ///
     /// If `config.tool_wrapper` is set, the tool is wrapped and a context is
     /// created using `config.tool_context_factory` (or a default context).
-    fn add_mcp_tool<M, T>(
+    fn add_wrapped_tool<M, T>(
         builder_state: BuilderState<M>,
         tool: T,
         config: &AgentRuntimeConfig,

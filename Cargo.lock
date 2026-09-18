@@ -5,7 +5,7 @@ version = 4
 [[package]]
 name = "a2a-lf"
 version = "0.3.0"
-source = "git+https://github.com/a2aproject/a2a-rs.git?tag=a2a-server-lf-v0.3.1#a32ef57182dd0ecd1d3c04f338778f1974494905"
+source = "git+https://github.com/a2aproject/a2a-rs.git?rev=a32ef57182dd0ecd1d3c04f338778f1974494905#a32ef57182dd0ecd1d3c04f338778f1974494905"
 dependencies = [
  "base64",
  "chrono",
@@ -18,7 +18,7 @@ dependencies = [
 [[package]]
 name = "a2a-pb"
 version = "0.1.8"
-source = "git+https://github.com/a2aproject/a2a-rs.git?tag=a2a-server-lf-v0.3.1#a32ef57182dd0ecd1d3c04f338778f1974494905"
+source = "git+https://github.com/a2aproject/a2a-rs.git?rev=a32ef57182dd0ecd1d3c04f338778f1974494905#a32ef57182dd0ecd1d3c04f338778f1974494905"
 dependencies = [
  "a2a-lf",
  "chrono",
@@ -38,7 +38,7 @@ dependencies = [
 [[package]]
 name = "a2a-server-lf"
 version = "0.3.1"
-source = "git+https://github.com/a2aproject/a2a-rs.git?tag=a2a-server-lf-v0.3.1#a32ef57182dd0ecd1d3c04f338778f1974494905"
+source = "git+https://github.com/a2aproject/a2a-rs.git?rev=a32ef57182dd0ecd1d3c04f338778f1974494905#a32ef57182dd0ecd1d3c04f338778f1974494905"
 dependencies = [
  "a2a-lf",
  "a2a-pb",
@@ -213,6 +213,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 name = "aura"
 version = "0.2.17"
 dependencies = [
+ "a2a-lf",
  "anyhow",
  "async-stream",
  "async-trait",
@@ -317,6 +318,7 @@ dependencies = [
  "toml 0.8.23",
  "toml_edit 0.22.27",
  "tracing",
+ "url",
 ]
 
 [[package]]

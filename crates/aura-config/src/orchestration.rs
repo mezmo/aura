@@ -48,6 +48,7 @@ pub enum ToolVisibility {
 /// description = "For logs, pipelines, metrics, and system analysis"
 /// preamble = "You are an Operations Specialist..."
 /// mcp_filter = ["mezmo_*"]
+/// remotes = ["k8s_ops"]
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerConfig {
@@ -84,6 +85,11 @@ pub struct WorkerConfig {
     /// Values should match the `name` field of entries in `[[vector_stores]]`.
     #[serde(default)]
     pub vector_stores: Vec<String>,
+
+    /// Remote agents this worker may address through `ask_agent`, as keys
+    /// of `[a2a.remote.<name>]`.
+    #[serde(default)]
+    pub remotes: Vec<String>,
 
     /// Max tool-calling turns for this worker.
     ///
