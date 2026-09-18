@@ -5,10 +5,6 @@
 //! checkpoint publication from the publication timestamp plus the validated
 //! retention age, renewed by each re-park. Sweeps delete only strictly past
 //! it, under a run reservation, with no execution active.
-#![allow(dead_code)] // `from_publication`'s consumer is the E5 fill: the
-// publication-transaction stamp and re-park renewal — the deadline type
-// itself is stamped onto every checkpoint document, and `RetentionError`
-// reaches the commit's fallible stamping seam
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -56,7 +52,10 @@ impl RetentionExpiresAt {
             .ok_or(RetentionError::DeadlineOverflow)
     }
 
-    /// Wrap an already-resolved absolute deadline.
+    /// Wrap an already-resolved absolute deadline. Test-only since E5: the
+    /// production stamp is [`Self::from_publication`], and the remaining
+    /// callers are `#[cfg(test)]` fixtures.
+    #[cfg(test)]
     #[must_use]
     pub fn from_datetime(deadline: DateTime<Utc>) -> Self {
         Self(deadline)
