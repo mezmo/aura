@@ -256,18 +256,13 @@ impl Tool for CreatePlanTool {
             });
         }
 
-        let mut steps = args.steps;
-        if steps.is_empty() {
-            // The steps sometimes arrive inside planning_summary, carried there by a
-            // model that wrote XML tool syntax into a JSON argument.
-            steps = recover_steps_from_summary(&args.planning_summary).unwrap_or_default();
-        }
-        if steps.is_empty() {
+        if args.steps.is_empty() {
             return Ok(CreatePlanOutput {
                 status: STEPS_REQUIRED_HELP.to_string(),
             });
         }
 
+        let steps = args.steps;
         let step_count = count_leaf_steps(&steps);
         *guard = Some(PlanningResponse::StepsPlan {
             goal: args.goal,
@@ -285,20 +280,18 @@ impl Tool for CreatePlanTool {
 /// looks like: a bare deserialization error tells the model nothing, and it retries the
 /// same malformed shape until the planning depth budget is gone.
 const STEPS_REQUIRED_HELP: &str = concat!(
-    "Error: `steps` is required and must be a JSON array of step objects, not a string ",
-    "and not XML. Call create_plan again with, for example: ",
-    r#""steps": [{"type": "task", "worker": "<worker>", "task": "<what to do>"}]"#,
-    " — put every argument in the JSON object itself, with no <parameter> or <invoke> tags."
+    "Error: `steps` is required and must be a JSON array of step objects. Call ",
+    "create_plan again with, for example: ",
+    r#""steps": [{"type": "task", "worker": "<worker>", "task": "<what to do>"}]"#
 );
 
 /// Deserialize `steps` from an array, or from a string holding the JSON array.
 ///
-/// Models sometimes send the array as a string, carrying trailing XML tool-call syntax
-/// (`</parameter>`, `</invoke>`) or markdown fencing; both are stripped before parsing.
-/// Any other shape — a number, an object, a string holding no array — yields an empty
-/// list rather than a deserialization error, so `call` can answer with
-/// `STEPS_REQUIRED_HELP`. Failing here instead would cost a planning turn and hand the
-/// model the opaque serde message this recovery exists to replace.
+/// Models routinely send a nested array argument as a string. Any shape that yields no
+/// steps — a string holding no array, a number, an object — returns an empty list rather
+/// than a deserialization error, so `call` can answer with `STEPS_REQUIRED_HELP`:
+/// failing here costs a planning turn and hands the model a serde message it cannot act
+/// on.
 fn deserialize_steps<'de, D>(deserializer: D) -> Result<Vec<StepInput>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -336,34 +329,16 @@ where
 }
 
 /// Parse a JSON array of steps out of a string argument.
+///
+/// Slices from the first `[` to the last `]`, so prose or markup around the array does
+/// not have to be recognised to be ignored.
 fn parse_steps_str(raw: &str) -> Option<Vec<StepInput>> {
-    let body = strip_tool_call_wrappers(raw);
-    let start = body.find('[')?;
-    let end = body.rfind(']')?;
+    let start = raw.find('[')?;
+    let end = raw.rfind(']')?;
     if end < start {
         return None;
     }
-    serde_json::from_str(&body[start..=end]).ok()
-}
-
-/// Recover steps left inside `planning_summary` by a model that closed the summary and
-/// opened a `<steps>` block in the same string.
-fn recover_steps_from_summary(summary: &str) -> Option<Vec<StepInput>> {
-    let tail = summary.split("<steps>").nth(1)?;
-    let steps = parse_steps_str(tail)?;
-    tracing::warn!("create_plan carried `steps` inside planning_summary; recovered them");
-    Some(steps)
-}
-
-/// Drop XML tool-call syntax and markdown fencing a model may append to an argument.
-fn strip_tool_call_wrappers(raw: &str) -> &str {
-    let mut body = raw;
-    for marker in ["</steps>", "</parameter>", "</invoke>", "```"] {
-        if let Some(idx) = body.find(marker) {
-            body = &body[..idx];
-        }
-    }
-    body.trim()
+    serde_json::from_str(&raw[start..=end]).ok()
 }
 
 /// Count the number of leaf tasks in a step tree (for status messages).
@@ -517,11 +492,14 @@ mod tests {
         assert_eq!(count_leaf_steps(&args.steps), 1);
     }
 
+    /// A string payload may carry markup or prose around the array; slicing to the outer
+    /// brackets ignores it without recognising any particular syntax.
     #[test]
-    fn test_steps_string_with_tool_call_wrappers() {
+    fn test_steps_string_ignores_surrounding_markup() {
         let raw = concat!(
+            "```json\n",
             r#"[{"type": "task", "worker": "operations", "task": "Fetch recent logs"}]"#,
-            "</parameter>\n</invoke>\n"
+            "\n```\n"
         );
         let args: CreatePlanArgs = serde_json::from_value(serde_json::json!({
             "goal": "Investigate logs",
@@ -555,31 +533,6 @@ mod tests {
             let result = toolset.create_plan.call(args).await.unwrap();
             assert!(result.status.starts_with("Error: `steps` is required"));
             assert!(toolset.decision.lock().await.is_none());
-        }
-    }
-
-    /// `steps` omitted entirely, with the array left inside planning_summary.
-    #[tokio::test]
-    async fn test_create_plan_recovers_steps_from_summary() {
-        let args: CreatePlanArgs = serde_json::from_value(serde_json::json!({
-            "goal": "Investigate logs",
-            "routing_rationale": "Requires tool execution",
-            "planning_summary": concat!(
-                "Fetch and analyze recent logs</planning_summary>\n<steps>",
-                r#"[{"type": "task", "worker": "operations", "task": "Fetch recent logs"}]"#,
-                "</steps>"
-            ),
-        }))
-        .unwrap();
-        assert!(args.steps.is_empty());
-
-        let toolset = RoutingToolSet::new();
-        let result = toolset.create_plan.call(args).await.unwrap();
-
-        assert!(result.status.contains("1 steps"), "got {}", result.status);
-        match toolset.decision.lock().await.as_ref().unwrap() {
-            PlanningResponse::StepsPlan { steps, .. } => assert_eq!(steps.len(), 1),
-            other => panic!("Expected StepsPlan, got {:?}", other),
         }
     }
 
