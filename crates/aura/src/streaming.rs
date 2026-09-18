@@ -39,6 +39,82 @@ use rig::completion::Message;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
+/// Cancelling reaches the provider through the same token the agent races
+/// internally, so callers need no second mechanism.
+pub struct AgentRun {
+    events: BoxStream<'static, Result<StreamItem, StreamError>>,
+    cancel: CancellationToken,
+    usage: UsageState,
+}
+
+impl AgentRun {
+    pub fn new(
+        events: BoxStream<'static, Result<StreamItem, StreamError>>,
+        cancel: CancellationToken,
+        usage: UsageState,
+    ) -> Self {
+        Self {
+            events,
+            cancel,
+            usage,
+        }
+    }
+
+    pub fn cancel_token(&self) -> CancellationToken {
+        self.cancel.clone()
+    }
+
+    pub fn usage(&self) -> &UsageState {
+        &self.usage
+    }
+
+    /// Wraps the run's stream, keeping the cancellation and usage that belong
+    /// with it. A layer that decorates the stream has no reason to take the
+    /// handle apart and rebuild it.
+    #[must_use]
+    pub fn map_stream<F>(self, f: F) -> Self
+    where
+        F: FnOnce(
+            BoxStream<'static, Result<StreamItem, StreamError>>,
+        ) -> BoxStream<'static, Result<StreamItem, StreamError>>,
+    {
+        Self {
+            events: f(self.events),
+            ..self
+        }
+    }
+
+    /// Dropping the returned stream cancels the run.
+    ///
+    /// A consumer that goes away without draining — an aborted task, a dropped
+    /// stream — would otherwise leave the run spending provider turns nobody
+    /// reads, and a run started with no timeout has nothing else to stop it.
+    pub fn into_events(self) -> BoxStream<'static, Result<StreamItem, StreamError>> {
+        Box::pin(CancelOnDrop {
+            _guard: self.cancel.drop_guard(),
+            inner: self.events,
+        })
+    }
+}
+
+/// Cancels its run when dropped, by holding the guard for as long as the stream
+/// it wraps.
+struct CancelOnDrop<S> {
+    inner: S,
+    _guard: tokio_util::sync::DropGuard,
+}
+
+impl<S: futures::Stream + Unpin> futures::Stream for CancelOnDrop<S> {
+    type Item = S::Item;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_next(cx)
+    }
+}
+
 /// Trait for agents that produce streaming completions.
 ///
 /// This trait abstracts the streaming iteration loop so that both
@@ -64,59 +140,20 @@ pub trait StreamingAgent: Send + Sync {
     /// needs to know the concrete agent type.
     fn get_provider_info(&self) -> (&str, &str);
 
-    /// Stream a completion response.
+    /// Start a run.
     ///
-    /// Returns a stream of `StreamItem`s. The caller is responsible for:
-    /// - Converting items to SSE bytes (via handlers)
-    /// - Sending to the client
-    /// - Handling cancellation on disconnect
+    /// `timeout` bounds the whole run; `None` leaves it unbounded. The returned
+    /// handle owns the events, the token that cancels them, and the usage they
+    /// accumulate.
     ///
-    /// # Arguments
-    ///
-    /// * `query` - The user's query/message
-    /// * `chat_history` - Previous messages in the conversation
-    /// * `cancel_token` - Token for cancellation (e.g., on client disconnect)
-    /// * `request_id` - HTTP request ID for MCP progress routing and tool correlation
-    ///
-    /// # Returns
-    ///
-    /// A boxed stream of `StreamItem` results, or an error if streaming cannot start.
+    /// `request_id` correlates MCP progress and tool events for this run.
     async fn stream(
         &self,
         query: &str,
         chat_history: Vec<Message>,
-        cancel_token: CancellationToken,
+        timeout: Option<Duration>,
         request_id: &str,
-    ) -> Result<BoxStream<'static, Result<StreamItem, StreamError>>, StreamError>;
-
-    /// Stream with timeout support.
-    ///
-    /// This is the primary entry point for production use. It wraps the stream
-    /// with timeout handling and integrates with the cancellation hook.
-    ///
-    /// # Arguments
-    ///
-    /// * `query` - The user's query/message
-    /// * `chat_history` - Previous messages in the conversation
-    /// * `timeout` - Maximum duration for the entire stream
-    /// * `request_id` - Request ID for MCP cancellation correlation
-    ///
-    /// # Returns
-    ///
-    /// A tuple of (stream, cancel_sender, usage_state) where cancel_sender can
-    /// be used to signal cancellation to the underlying provider and usage_state
-    /// tracks token consumption via Rig hooks.
-    async fn stream_with_timeout(
-        &self,
-        query: &str,
-        chat_history: Vec<Message>,
-        timeout: Duration,
-        request_id: &str,
-    ) -> (
-        BoxStream<'static, Result<StreamItem, StreamError>>,
-        tokio::sync::watch::Sender<bool>,
-        UsageState,
-    );
+    ) -> AgentRun;
 
     /// Cancel in-flight MCP requests and close connections.
     ///

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use a2a::{
@@ -41,13 +42,41 @@ struct TaskCancelEntry {
     request_id: String,
 }
 
-/// The live executions' cancel handles, keyed by task id.
-type TaskCancelState = Mutex<HashMap<String, TaskCancelEntry>>;
+/// Where a task is between accepting the request and owning a run.
+///
+/// Starting an orchestrated run spawns its work before it can hand over a
+/// token, so a cancel arriving in that window has nothing to cancel and marks
+/// the slot instead.
+enum Slot {
+    Starting { cancelled: bool },
+    Running(TaskCancelEntry),
+}
+
+/// Takes the entry a cancel should act on.
+///
+/// A run that has not handed over its token leaves a marked slot instead, which
+/// the run reads when it registers. An id with no slot has nothing starting or
+/// running, so nothing is remembered — late cancels are ordinary, and keeping
+/// them would grow the map for the process lifetime.
+fn take_for_cancel(state: &TaskCancelState, task_id: &str) -> Option<TaskCancelEntry> {
+    let mut map = lock_cancel_state(state);
+    match map.remove(task_id) {
+        Some(Slot::Running(entry)) => Some(entry),
+        Some(Slot::Starting { .. }) => {
+            map.insert(task_id.to_string(), Slot::Starting { cancelled: true });
+            None
+        }
+        None => None,
+    }
+}
+
+/// The live executions, keyed by task id.
+type TaskCancelState = Mutex<HashMap<String, Slot>>;
 
 /// Lock the cancel map, taking a poisoned lock's contents rather than
 /// panicking: nothing awaits while the map is held, so a panicking holder
 /// cannot have left it half-updated.
-fn lock_cancel_state(state: &TaskCancelState) -> MutexGuard<'_, HashMap<String, TaskCancelEntry>> {
+fn lock_cancel_state(state: &TaskCancelState) -> MutexGuard<'_, HashMap<String, Slot>> {
     state.lock().unwrap_or_else(|poisoned| {
         event!(Level::ERROR, "task cancel state lock poisoned, recovering");
         poisoned.into_inner()
@@ -247,7 +276,6 @@ impl AgentExecutor for AuraAgentExecutor {
             // build any history for this context that can be used in further aura reasoning
             let history = get_history_for_context(task_store.clone(), &request_id, &context_id, &task_id).await?;
 
-            let cancel_token = stream_shutdown_token.child_token();
             // Register with the global cancellation registry for parity with the OpenAI handler
             // and to let any future code address this request by id.
             RequestCancellation::register(request_id.clone());
@@ -256,19 +284,57 @@ impl AgentExecutor for AuraAgentExecutor {
                 task_id: task_id.clone(),
                 request_id: request_id.clone(),
             };
-            lock_cancel_state(&task_cancel_state).insert(task_id.clone(), TaskCancelEntry {
-                token: cancel_token.clone(),
-                agent: agent.clone(),
-                request_id: request_id.clone(),
+
+            // Claimed before the run starts, because starting an orchestrated
+            // run spawns its work immediately and a cancel arriving in that
+            // window needs somewhere to land.
+            lock_cancel_state(&task_cancel_state)
+                .insert(task_id.clone(), Slot::Starting { cancelled: false });
+
+            // A2A tasks have their own lifetime, so the run is unbounded here and
+            // ends on cancelTask or shutdown.
+            let run = agent.stream(&text, history, None, &request_id).await;
+            let cancel_token = run.cancel_token();
+            let mut stream = run.into_events();
+
+            // The run owns its token, so server shutdown has to be forwarded to it
+            // rather than inherited through a child token. The flag records that
+            // shutdown is why, which the run's token cannot say on its own.
+            let shutdown_seen = Arc::new(AtomicBool::new(false));
+            let shutdown = stream_shutdown_token.child_token();
+            let on_shutdown = cancel_token.clone();
+            let saw_shutdown = shutdown_seen.clone();
+            tokio::spawn(async move {
+                // Exits with the run, so a completed request leaves no task behind.
+                tokio::select! {
+                    () = shutdown.cancelled() => {
+                        saw_shutdown.store(true, Ordering::SeqCst);
+                        on_shutdown.cancel();
+                    }
+                    () = on_shutdown.cancelled() => {}
+                }
             });
 
-            let mut stream = match agent.stream(&text, history, cancel_token.clone(), &request_id).await {
-                Ok(s) => s,
-                Err(e) => {
-                    yield Ok(fail_status(&task_id, &context_id, &e.to_string()));
-                    return;
-                }
+            // A cancel that arrived while the run was starting marked the slot.
+            let cancelled_while_starting = {
+                let mut state = lock_cancel_state(&task_cancel_state);
+                let was_cancelled = matches!(
+                    state.get(&task_id),
+                    Some(Slot::Starting { cancelled: true })
+                );
+                state.insert(
+                    task_id.clone(),
+                    Slot::Running(TaskCancelEntry {
+                        token: cancel_token.clone(),
+                        agent: agent.clone(),
+                        request_id: request_id.clone(),
+                    }),
+                );
+                was_cancelled
             };
+            if cancelled_while_starting {
+                cancel_token.cancel();
+            }
 
             // RAII guard: drop on any generator exit (loop break, early return, panic,
             // consumer drop) produces exactly one decrement. Replaces the manual
@@ -459,14 +525,12 @@ impl AgentExecutor for AuraAgentExecutor {
                 }
             }
 
-            // If cancel_token fired but our entry is still in the map, the cancel came
-            // from the parent stream_shutdown_token (server shutdown), not from our
-            // cancel() hook — cancel() removes its entry before firing the token.
-            // In that case the executor has to drive MCP cleanup itself and emit a
-            // terminal Canceled status (the OpenAI handler does the equivalent in its
-            // Shutdown post-loop arm).
-            let entry_still_present = lock_cancel_state(&task_cancel_state).remove(&task_id).is_some();
-            let shutdown_initiated_cancel = cancel_token.is_cancelled() && entry_still_present;
+            // Shutdown is the one cancel the executor has to clean up after itself:
+            // cancel() drives its own MCP cleanup, and a run that merely finished
+            // needs none. Read from the flag rather than the run's token, which
+            // says a run stopped but not who stopped it.
+            lock_cancel_state(&task_cancel_state).remove(&task_id);
+            let shutdown_initiated_cancel = shutdown_seen.load(Ordering::SeqCst);
             RequestCancellation::unregister(&request_id);
 
             if shutdown_initiated_cancel {
@@ -511,7 +575,7 @@ impl AgentExecutor for AuraAgentExecutor {
         let task_cancel_state = self.task_cancel_state.clone();
 
         Box::pin(futures_util::stream::once(async move {
-            let entry = lock_cancel_state(&task_cancel_state).remove(&task_id);
+            let entry = take_for_cancel(&task_cancel_state, &task_id);
 
             // Token-cancel wakes execute()'s select! → loop breaks → generator drops
             // → ActiveRequestGuard drops → exactly one decrement. cancel() never
@@ -863,11 +927,11 @@ mod tests {
         };
         lock_cancel_state(&state).insert(
             task_id.clone(),
-            TaskCancelEntry {
+            Slot::Running(TaskCancelEntry {
                 token: CancellationToken::new(),
                 agent: Arc::new(MockAgent::pending()),
                 request_id: request_id.clone(),
-            },
+            }),
         );
         assert!(RequestCancellation::token_for_id(&request_id).is_some());
 
@@ -875,6 +939,34 @@ mod tests {
 
         assert!(!lock_cancel_state(&state).contains_key(&task_id));
         assert!(RequestCancellation::token_for_id(&request_id).is_none());
+    }
+
+    /// A cancel for a task that is starting has to be remembered, and a cancel
+    /// for one that already finished has to leave nothing behind — late cancels
+    /// are ordinary client behaviour, so remembering them would grow the map
+    /// for the process lifetime.
+    #[test]
+    fn a_cancel_is_remembered_only_while_a_run_is_starting() {
+        let starting = format!("t_{}", uuid::Uuid::new_v4());
+        let finished = format!("t_{}", uuid::Uuid::new_v4());
+        let state: Arc<TaskCancelState> = Arc::new(Mutex::new(HashMap::new()));
+
+        lock_cancel_state(&state).insert(starting.clone(), Slot::Starting { cancelled: false });
+
+        assert!(take_for_cancel(&state, &starting).is_none());
+        assert!(take_for_cancel(&state, &finished).is_none());
+
+        assert!(
+            matches!(
+                lock_cancel_state(&state).get(&starting),
+                Some(Slot::Starting { cancelled: true })
+            ),
+            "a run still starting must see the cancel"
+        );
+        assert!(
+            !lock_cancel_state(&state).contains_key(&finished),
+            "a cancel for a finished task must leave no entry"
+        );
     }
 
     /// `cancel()` takes the entry before the generator unwinds, so the guard

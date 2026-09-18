@@ -21,12 +21,12 @@
 use rmcp::{
     ClientHandler,
     handler::client::progress::ProgressDispatcher,
-    model::{ClientInfo, Implementation, ProgressNotificationParam},
+    model::{ClientInfo, Implementation, ProgressNotificationParam, ProgressToken},
     service::{NotificationContext, RoleClient},
 };
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
 use aura_events::Progress;
@@ -38,29 +38,15 @@ use crate::mcp::client::CallContext;
 ///
 /// This handler is used instead of `()` when creating MCP clients to enable
 /// progress notification support. Progress notifications received from the
-/// server are routed to the specific HTTP request that initiated the tool call,
-/// ensuring no cross-request or cross-customer data leakage.
-///
-/// # Example
-/// ```ignore
-/// // Create handler with a shared reference to the in-flight call
-/// let current_call = Arc::new(RwLock::new(None));
-/// let handler = ProgressEnabledHandler::new(current_call.clone(), "aura/0.1.0");
-/// let client = serve_client(handler.clone(), transport).await?;
-///
-/// // Name the call before tool execution
-/// *current_call.write().await = Some(CallContext {
-///     request_id: "req_123".to_string(),
-///     agent: AgentContext::single_agent(),
-/// });
-///
-/// // Progress notifications will now be routed to req_123's channel
-/// ```
+/// server are routed to the call that initiated them, by the progress token
+/// that call minted, so concurrent runs cannot see each other's progress.
 #[derive(Clone)]
 pub struct ProgressEnabledHandler {
     progress_dispatcher: ProgressDispatcher,
-    /// The call this client is serving, shared with the [`McpClient`] that owns it.
-    current_call: Arc<RwLock<Option<CallContext>>>,
+    /// Which call each in-flight progress token belongs to. Notifications
+    /// arrive on the transport's task, which cannot read the run's task-local,
+    /// so the token is the only thing tying one back to its call.
+    token_owners: Arc<std::sync::Mutex<HashMap<ProgressToken, CallContext>>>,
     /// Flag to log orphaned progress only once (prevents log flood from servers ignoring cancellation)
     logged_orphaned_warning: Arc<AtomicBool>,
     /// Counter for orphaned progress notifications (for diagnostics)
@@ -73,20 +59,32 @@ impl std::fmt::Debug for ProgressEnabledHandler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ProgressEnabledHandler")
             .field("progress_dispatcher", &self.progress_dispatcher)
-            .field("current_call", &"Arc<RwLock<Option<CallContext>>>")
+            .field("token_owners", &"Arc<RwLock<HashMap<..>>>")
             .finish()
     }
 }
 
 impl ProgressEnabledHandler {
+    /// The call a progress token belongs to, or `None` once that call has ended.
+    pub fn owner_of(&self, token: &ProgressToken) -> Option<CallContext> {
+        self.token_owners
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(token)
+            .cloned()
+    }
+
     /// `user_agent` is the same `product/version` token sent as the HTTP
     /// `User-Agent` header; the handshake announces it split into
     /// `clientInfo.name` and `clientInfo.version`, the shape MCP servers
     /// expect there.
-    pub fn new(current_call: Arc<RwLock<Option<CallContext>>>, user_agent: &str) -> Self {
+    pub fn new(
+        token_owners: Arc<std::sync::Mutex<HashMap<ProgressToken, CallContext>>>,
+        user_agent: &str,
+    ) -> Self {
         Self {
             progress_dispatcher: ProgressDispatcher::new(),
-            current_call,
+            token_owners,
             logged_orphaned_warning: Arc::new(AtomicBool::new(false)),
             orphaned_count: Arc::new(AtomicU64::new(0)),
             client_info: ClientInfo {
@@ -156,11 +154,12 @@ impl ClientHandler for ProgressEnabledHandler {
         _context: NotificationContext<RoleClient>,
     ) -> impl std::future::Future<Output = ()> + Send + '_ {
         async move {
-            // One read, so the id and the agent describe the same call.
-            let current_call = self.current_call.read().await.clone();
+            // One lookup, so the id and the agent describe the same call.
+            let call = self.owner_of(&params.progress_token);
 
-            if let Some(CallContext { request_id, agent }) = current_call {
+            if let Some(CallContext { request_id, agent }) = call {
                 let req_id = &request_id;
+
                 let routed = crate::agent_events::emit(
                     req_id,
                     AgentEvent::new(
@@ -211,9 +210,10 @@ impl ClientHandler for ProgressEnabledHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rmcp::model::NumberOrString;
 
-    fn create_test_handler() -> ProgressEnabledHandler {
-        ProgressEnabledHandler::new(Arc::new(RwLock::new(None)), "test/0")
+    fn token(n: i64) -> ProgressToken {
+        ProgressToken(NumberOrString::Number(n))
     }
 
     fn call(request_id: &str) -> CallContext {
@@ -223,10 +223,25 @@ mod tests {
         }
     }
 
+    fn handler_owning(pairs: &[(i64, &str)]) -> ProgressEnabledHandler {
+        let owners = pairs
+            .iter()
+            .map(|(t, run)| (token(*t), call(run)))
+            .collect::<HashMap<_, _>>();
+        ProgressEnabledHandler::new(Arc::new(std::sync::Mutex::new(owners)), "test/0")
+    }
+
+    fn create_test_handler() -> ProgressEnabledHandler {
+        handler_owning(&[])
+    }
+
     /// A `product/version` token lands as separate name and version fields.
     #[test]
     fn handshake_info_splits_the_user_agent_into_name_and_version() {
-        let handler = ProgressEnabledHandler::new(Arc::new(RwLock::new(None)), "aura/1.2.3");
+        let handler = ProgressEnabledHandler::new(
+            Arc::new(std::sync::Mutex::new(HashMap::new())),
+            "aura/1.2.3",
+        );
         let info = handler.get_info().client_info;
         assert_eq!(info.name, "aura");
         assert_eq!(info.version, "1.2.3");
@@ -237,7 +252,8 @@ mod tests {
     #[test]
     fn handshake_info_falls_back_to_the_crate_version() {
         for token in ["mezmo-aura", "mezmo-aura/", " mezmo-aura / "] {
-            let handler = ProgressEnabledHandler::new(Arc::new(RwLock::new(None)), token);
+            let handler =
+                ProgressEnabledHandler::new(Arc::new(std::sync::Mutex::new(HashMap::new())), token);
             let info = handler.get_info().client_info;
             assert_eq!(info.name, "mezmo-aura", "token {token:?}");
             assert_eq!(info.version, env!("CARGO_PKG_VERSION"), "token {token:?}");
@@ -246,57 +262,47 @@ mod tests {
 
     #[test]
     fn test_handler_creation() {
-        let handler = create_test_handler();
-        // Just verify it can be created and progress_dispatcher is accessible
+        let handler = handler_owning(&[]);
         let _ = handler.progress_dispatcher();
     }
 
     #[test]
     fn test_handler_clone() {
-        let handler = create_test_handler();
+        let handler = handler_owning(&[]);
         let cloned = handler.clone();
-        // Both should have accessible progress dispatchers
         let _ = cloned.progress_dispatcher();
     }
 
     #[tokio::test]
-    async fn test_handler_with_request_id() {
-        let current_call = Arc::new(RwLock::new(Some(call("req_test_123"))));
-        let handler = ProgressEnabledHandler::new(current_call.clone(), "test/0");
+    async fn an_unowned_token_has_no_run() {
+        assert!(handler_owning(&[]).owner_of(&token(1)).is_none());
+    }
 
-        // Verify request ID is accessible
-        let guard = handler.current_call.read().await;
+    /// The ambient "current request" this replaced was last-writer-wins, so a
+    /// worker's progress could be attributed to whichever run set it last.
+    #[tokio::test]
+    async fn concurrent_runs_route_by_their_own_token() {
+        let handler = handler_owning(&[(1, "run_a"), (2, "run_b")]);
+
         assert_eq!(
-            guard.as_ref().map(|c| c.request_id.as_str()),
-            Some("req_test_123")
+            handler.owner_of(&token(1)).map(|c| c.request_id),
+            Some("run_a".to_string())
+        );
+        assert_eq!(
+            handler.owner_of(&token(2)).map(|c| c.request_id),
+            Some("run_b".to_string())
         );
     }
 
     #[tokio::test]
-    async fn test_handler_request_id_changes() {
-        let current_call = Arc::new(RwLock::new(None));
-        let handler = ProgressEnabledHandler::new(current_call.clone(), "test/0");
+    async fn a_released_token_stops_routing() {
+        let owners = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let handler = ProgressEnabledHandler::new(owners.clone(), "test/0");
+        owners.lock().unwrap().insert(token(7), call("run_a"));
+        assert!(handler.owner_of(&token(7)).is_some());
 
-        // Initially no request ID
-        {
-            let guard = handler.current_call.read().await;
-            assert!(guard.is_none());
-        }
-
-        // Set request ID
-        {
-            let mut guard = current_call.write().await;
-            *guard = Some(call("req_456"));
-        }
-
-        // Handler should see the new value
-        {
-            let guard = handler.current_call.read().await;
-            assert_eq!(
-                guard.as_ref().map(|c| c.request_id.as_str()),
-                Some("req_456")
-            );
-        }
+        owners.lock().unwrap().remove(&token(7));
+        assert!(handler.owner_of(&token(7)).is_none());
     }
 
     #[test]

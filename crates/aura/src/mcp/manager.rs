@@ -813,17 +813,15 @@ impl McpManager {
             .chain(self.stdio_clients.values())
     }
 
-    /// Name the request these clients are serving and the agent it belongs to.
-    pub async fn set_current_call(&self, http_request_id: &str, agent: aura_events::AgentContext) {
+    /// Bind these clients to the call they serve and the agent it belongs to.
+    pub async fn bind_call(&self, http_request_id: &str, agent: aura_events::AgentContext) {
         let mut total_clients = 0;
         for client in self.clients() {
-            client
-                .set_current_call(http_request_id, agent.clone())
-                .await;
+            client.bind_call(http_request_id, agent.clone()).await;
             total_clients += 1;
         }
         debug!(
-            "Set current call on {} MCP client(s): {}",
+            "Bound {} MCP client(s) to call: {}",
             total_clients, http_request_id
         );
     }
