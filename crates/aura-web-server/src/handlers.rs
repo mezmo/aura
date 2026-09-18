@@ -3746,5 +3746,169 @@ bind_identity = true
             // not the projection fault's 500.
             bare_404(response).await;
         }
+
+        /// A valid UUID run id that no other S2 frame claims.
+        const S2_RUN: &str = "0199c0de-9944-7000-8000-00000000d027";
+
+        /// The bound-config shape the identity frames resolve: the identity
+        /// header is configured and `bind_identity` is on, so the presented
+        /// header decides attribution.
+        fn s2_bound_memory_root(memory_path: &std::path::Path) -> aura_config::Config {
+            parse_config(&format!(
+                r#"
+identity_header = "X-Client-Identity"
+memory_dir = "{}"
+
+[agent]
+name = "test-agent"
+system_prompt = "You answer."
+
+[agent.llm]
+provider = "openai"
+api_key = "test"
+model = "gpt-5.1"
+
+[hitl]
+require_approval = []
+
+[hitl.route]
+mode = "conversational"
+timeout_secs = 60
+
+[hitl.park]
+enabled = false
+bind_identity = true
+"#,
+                memory_path.display()
+            ))
+        }
+
+        /// S2 green guard: the identity refusal row's pre-header (404) shape
+        /// fires through the FULL handler path under a bound config with no
+        /// presented header — evaluation step 1
+        /// (`evaluate.rs`: `IdentityBindingState::resolve`), before the
+        /// reservation, the checkpoint read, or anything the streaming
+        /// rewire depends on. The row is a detail-less bare 404, body
+        /// empty.
+        #[tokio::test]
+        async fn s2_identity_mismatch_refusal_row_is_unchanged_by_the_rewire() {
+            let memory = tempfile::tempdir().expect("temp memory root");
+            let state = make_state(vec![s2_bound_memory_root(memory.path())]);
+
+            let response = resume_run(
+                State(state),
+                resume_claims(),
+                HeaderMap::new(),
+                Path(("sess-p45".to_string(), S2_RUN.to_string())),
+            )
+            .await;
+
+            bare_404(response).await;
+        }
+
+        /// A second valid UUID run id so each S2 frame plants its own
+        /// checkpoint namespace.
+        const S2_INTERRUPTED_RUN: &str = "0199c0de-9944-7000-8000-00000000e02d";
+
+        /// S2 green guard: a dead resume answers the interrupted
+        /// terminal-409 row through the full handler path, and the document
+        /// stays exactly as found — no rename hides the evidence. The
+        /// fabricated checkpoint is a hand-built JSON value following the
+        /// real `ParkedRun` serde shape: every non-defaulted v1 field
+        /// literal, `executed` non-empty, `identity_hash` omitted, no
+        /// fingerprint match needed — the interruption recheck resolves
+        /// BEFORE `check_fingerprint` in `evaluate_resume`'s ordered entry
+        /// (`evaluate.rs` ~762-820: identity step 1, reservation step 2,
+        /// the one authoritative re-read and the identity + interruption
+        /// rechecks at step 3, `check_fingerprint` strictly after). The
+        /// `pub` `ResumeDocuments` surface (`aura::orchestration`) exposes
+        /// only `for_path` — its path members and `parked()`/`resuming()`
+        /// accessors are `pub(crate)` (`claim.rs` 131-155) — so the file is
+        /// planted at the documented checkpoint layout itself
+        /// (`commit.rs` `parked_document_dir`:
+        /// `{memory_dir}/{session_id}/parked/{run}.resuming.json`).
+        #[tokio::test]
+        async fn s2_interrupted_refusal_row_is_unchanged_by_the_rewire() {
+            let memory = tempfile::tempdir().expect("temp memory root");
+            let parked_dir = memory.path().join("sess-p45").join("parked");
+            std::fs::create_dir_all(&parked_dir).expect("the parked directory creates");
+            let resuming_path = parked_dir.join(format!("{S2_INTERRUPTED_RUN}.resuming.json"));
+            // The fabricated dead-resume document: the real v1 `ParkedRun`
+            // wire shape with every required field, a non-empty `executed`
+            // list, and no stored identity hash (binding is off in this
+            // config, so the identity recheck passes without one).
+            let document = r#"
+                {
+                    "schema_version": 1,
+                    "run_id": "0199c0de-9944-7000-8000-00000000e02d",
+                    "parked_at": "2026-09-18T00:00:00Z",
+                    "retention_expires_at": "2027-09-18T00:00:00Z",
+                    "query": "the interrupted query",
+                    "chat_history": [],
+                    "coordinator_conversation": [],
+                    "iteration": 0,
+                    "planning_ms": 0,
+                    "failure_history": [],
+                    "plan": { "goal": "p45 interrupted document", "tasks": [] },
+                    "executed": ["call_refused_before_any_rename"],
+                    "config_fingerprint": "never consulted: interrupted fires first"
+                }
+            "#;
+            std::fs::write(&resuming_path, document).expect("the resuming document writes");
+            let document_bytes_on_disk =
+                std::fs::read(&resuming_path).expect("the planted document reads back");
+            let state = make_state(vec![config_with_memory_dir(
+                memory.path().to_str().expect("UTF-8 path"),
+            )]);
+
+            let response = resume_run(
+                State(state),
+                resume_claims(),
+                HeaderMap::new(),
+                Path(("sess-p45".to_string(), S2_INTERRUPTED_RUN.to_string())),
+            )
+            .await;
+
+            // The refusal_response mapping: `ResumeRefusal::Conflict(row)` is
+            // the one not-ready shape — 409 with the JSON row body.
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            // The row shape is `{code, detail, blocking}`; `code` renders
+            // snake_case and `detail` is the transparent diagnostic string
+            // (`evaluate.rs` `ResumeConflictRow::interrupted`). Format
+            // tolerance: the row decodes before the code/detail pins, so
+            // whitespace never shadows the verdict.
+            let row: serde_json::Value =
+                serde_json::from_slice(&body_bytes(response).await).expect("the 409 row parses");
+            assert_eq!(
+                row.get("code").and_then(serde_json::Value::as_str),
+                Some("interrupted")
+            );
+            assert_eq!(
+                row.get("detail").and_then(serde_json::Value::as_str),
+                Some("a previous resume died mid-segment; the executed list is non-empty")
+            );
+            assert!(
+                row.get("blocking")
+                    .map(serde_json::Value::as_array)
+                    .unwrap_or_default()
+                    .map_or(true, |blocking| blocking.is_empty()),
+                "the interrupted row carries no blocking set"
+            );
+
+            // The document stays exactly as found: same bytes, same name, no
+            // rename to the parked name and no parked document created.
+            assert_eq!(
+                std::fs::read(&resuming_path).expect("the resuming document still reads"),
+                document_bytes_on_disk,
+                "the interrupted refusal leaves the document byte-identical"
+            );
+            assert!(
+                !parked_dir
+                    .join(format!("{S2_INTERRUPTED_RUN}.json"))
+                    .try_exists()
+                    .expect("the parked-name probe reads"),
+                "no parked-name document is created for a dead resume"
+            );
+        }
     }
 }
