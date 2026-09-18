@@ -122,12 +122,12 @@ family per the contract's dispatch table:
 | ~~3~~ | ~~`crates/aura/src/session_store/file.rs` `read_or_expire`~~ FILLED at commit `0833493b` (2026-09-17; under the resolve/remove lock, injected clock sampled once, durable tagged TimedOut in resolve's write ceremony, decode-closed on torn decision files) | E2 |
 | ~~4~~ | ~~`crates/aura/src/session_store/fault_store.rs` `read_or_expire`~~ FILLED at commit `6e222515` (2026-09-17; general-lane cfg(test) delegation) | E1/E2 |
 | 5 | `crates/aura-web-server/src/session_store/redis/approval_store.rs` `read_or_expire` (unsupported park backend: returns the typed unsupported-configuration error) | E-family |
-| ~~6~~ | ~~`crates/aura/src/orchestration/park/resume/claim.rs` `ResumeClaimTable::reserve`~~ FILLED at commit `PENDING` (2026-09-17; DISCLOSED owner takeover as L4a's prerequisite — the initial producer's supervisor needs the generalized admit seam. The 4-line delegation to `ReservationTable::admit` with a RED-first golden (admit/Live/release); E4's remaining scope — admit_with ordering, `convert_reserved`, `rename_back_under_reservation`, empty-resume recovery — is untouched and still E4's) | E4 -> L4a |
+| ~~6~~ | ~~`crates/aura/src/orchestration/park/resume/claim.rs` `ResumeClaimTable::reserve`~~ FILLED at commit `9697d80e` (2026-09-17; DISCLOSED owner takeover as L4a's prerequisite — the initial producer's supervisor needs the generalized admit seam. The 4-line delegation to `ReservationTable::admit` with a RED-first golden (admit/Live/release); E4's remaining scope — admit_with ordering, `convert_reserved`, `rename_back_under_reservation`, empty-resume recovery — is untouched and still E4's) | E4 -> L4a |
 | ~~7~~ | ~~`crates/aura/src/orchestration/park/lifetime.rs` `RunExecutionScope::spawn_tracked`~~ FILLED at commit `afe73e14` (2026-09-17; LIFETIME L1, reviewed RED `b3cb819e`; tracker-registered wrapper owns the lease clone through the future's actual completion) | L1 |
 | ~~8~~ | ~~`crates/aura/src/orchestration/park/lifetime.rs` `RunExecutionScope::spawn_blocking_tracked`~~ FILLED at commit `afe73e14` (2026-09-17; LIFETIME L1; same registration and lease contract on the blocking pool) | L1 |
 | ~~9~~ | ~~`crates/aura/src/orchestration/park/lifetime.rs` `RunExecutionScope::drain`~~ FILLED at commit `afe73e14` (2026-09-17; LIFETIME L1; literal `close()` + `wait().await` join barrier — drain is terminal for the scope, supervisor-use discipline lands with L2-L4) | L1 |
-| 10 | `crates/aura/src/orchestration/park/resume/claim.rs` `rename_back_under_reservation` (REPAIR-2 F2; REPAIR-3 G5 re-typed the fault to the classified `ClaimResumeFault`) | E4 |
-| 11 | `crates/aura/src/orchestration/park/resume/evaluate.rs` `convert_reserved` (REPAIR-2 F2; REPAIR-3 G2: the grant assembled here owns the reservation AND establishes its one execution scope) | E4 |
+| ~~10~~ | ~~`crates/aura/src/orchestration/park/resume/claim.rs` `rename_back_under_reservation`~~ FILLED at commit `2c5713f9` (2026-09-18; RESERVATION E4-F, reviewed RED `105535a6`; lease-fenced blocking tail, the safe ENOENT semantics, Unavailable/Internal classification — wired as the empty-resume recovery by E4-I `22347993`) | E4 |
+| ~~11~~ | ~~`crates/aura/src/orchestration/park/resume/evaluate.rs` `convert_reserved`~~ FILLED at commit `2c5713f9` (2026-09-18; RESERVATION E4-F; carrier-consuming conversion, no-ENOENT source, the grant owns the same reservation and its ONE execution scope — wired as the ordered entry's step 6 by E4-I `22347993`, which also retired the interim `claim_and_resume`/`authorize`/`admit`/`check_claim` pipeline and the unfenced `rename_back_to_parked`) | E4 |
 | 12 | `crates/aura/src/orchestration/park/resume/evaluate.rs` `run_segment_borrowed` (REPAIR-2 F3; 2026-09-15 alignment amendment recut its SIGNATURE; inputs: event sender; shared `UsageState`; `outer_budget`; output: `ResumeStreamEnd`; the one `todo!()` body is unchanged) | S3/S4 |
 | ~~13~~ | ~~`crates/aura/src/session_store/memory.rs` `retained_rows`~~ FILLED at commit `0833493b` (2026-09-17; typed unsupported-operation answer — no park parity) | E1/E2 |
 | ~~14~~ | ~~`crates/aura/src/session_store/file.rs` `retained_rows`~~ FILLED at commit `0833493b` (2026-09-17; side-effect-free both-directory scan, decision-file-wins classification) | E2 |
@@ -155,7 +155,14 @@ new `todo!()` body was added, so no new row is owed. LIFETIME L1 (2026-09-17)
 fills rows 7/8/9, leaving **12 alignment rows** — of which rows 5/16 are the
 EXCLUDED Redis holes (unsupported park backend; delete with the follow-up
 Redis-removal PR, no fill work owed), rows 6/10/11 belong to E4, rows 17-19
-to E6, 20 to S1, 21 to S3, 22 to S2/S3, and 12 to S3/S4.
+to E6, 20 to S1, 21 to S3, 22 to S2/S3, and 12 to S3/S4. RESERVATION E4
+(2026-09-18) fills rows 10/11 (`2c5713f9`, wired by the E4-I ordered-entry
+integration `22347993`) and row 6 had already filled at `9697d80e` (the
+disclosed L4a takeover), leaving **9 alignment rows** — of which rows 5/16
+are the EXCLUDED Redis holes, 12 belongs to S3/S4, rows 17-19 to E6, 20 to
+S1, 21 to S3, and 22 to S2/S3. E4's open scope is complete: the ordered
+entry runs on the shared reservation surface with empty-resume recovery
+fenced by it; E7 owns the production consult cutover next.
 
 Holes REMOVED by REPAIR-2:
 - `RunReservationLease::drop` (old #7): the per-reservation `ReservationInner`
@@ -390,13 +397,16 @@ Round-2 verification (frontier-reviewer, panel/ROUND-2.md) found 7 BLOCKING
   enum-variant fields are public, so a constructor adds no enforcement
   while implying one. Consumers of the addressed arm must not treat the
   two deadlines as independently trustworthy.
-- `evaluate_resume` still enters through the one-shot
-  `claim_and_resume` acquisition (behavior-identical interim); the E4 fill
-  reorders it onto `reserve` → re-read/recheck → consult →
-  `convert_reserved`. Until then the fenced rename-back seam
-  (`rename_back_under_reservation`) and the consuming transition are
-  declared but unwired, and the unfenced pre-reservation
-  `rename_back_to_parked` remains in production.
+- ~~`evaluate_resume` still enters through the one-shot `claim_and_resume`
+  acquisition~~ RESOLVED 2026-09-18 by E4-I (`22347993`): the ordered entry
+  runs `reserve` → the one authoritative re-read/recheck → consult →
+  `convert_reserved`, the fenced rename-back seam is wired as the
+  empty-resume recovery, and the unfenced pre-reservation
+  `rename_back_to_parked` is retired with the one-shot acquisition. Residual
+  carried forward: the conversion tail inside `convert_reserved` holds its
+  lease clone through the same binding shape as the rename-back tail, but
+  has no rendezvous golden of its own (a cross-module cfg(test) seam was
+  ruled not worth the surface); S3 owns it with the supervisor rework.
 - The memory backend's `read_or_expire` hole must enforce authority for
   inline requests WITHOUT park parity; the hole message states this so the
   fill cannot forget it.
