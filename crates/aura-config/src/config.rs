@@ -441,6 +441,26 @@ impl Config {
             a2a.validate()?;
         }
 
+        // A worker's `remotes` must name `[a2a.remote]` entries: the worker's
+        // `ask_agent` is built from exactly those, so an unknown name would
+        // otherwise surface only when the planner assigns it work.
+        if let Some(orch) = &self.orchestration {
+            for (worker, cfg) in &orch.workers {
+                for remote in &cfg.remotes {
+                    let known = self
+                        .a2a
+                        .as_ref()
+                        .is_some_and(|a2a| a2a.remote.contains_key(remote));
+                    if !known {
+                        return Err(crate::ConfigError::Validation(format!(
+                            "orchestration.worker.{worker}.remotes names {remote:?}, \
+                             which is not an [a2a.remote.<name>] entry"
+                        )));
+                    }
+                }
+            }
+        }
+
         // A zero connect timeout fires `tokio::time::timeout` immediately, so
         // every server would fail at startup; reject it instead of silently
         // disabling MCP.

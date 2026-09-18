@@ -2200,6 +2200,77 @@ max_extraction_tokens = 4000
     }
 
     // ========================================================================
+    // Worker Remote Agent Tests
+    // ========================================================================
+
+    fn orchestration_with_remotes(remotes: &str, a2a: &str) -> String {
+        format!(
+            r#"
+[agent]
+name = "Hub"
+system_prompt = "Hub"
+
+[agent.llm]
+provider = "openai"
+api_key = "test"
+model = "gpt-4o"
+
+[orchestration]
+enabled = true
+
+[orchestration.worker.k8s]
+description = "Kubernetes questions, via the remote k8s_ops agent"
+preamble = "k8s"
+remotes = {remotes}
+{a2a}
+"#
+        )
+    }
+
+    #[test]
+    fn worker_remotes_name_configured_a2a_remotes() {
+        let a2a = "[a2a.remote.k8s_ops]\nurl = \"http://k8s:8080\"";
+        let config = load_config_from_str(&orchestration_with_remotes(r#"["k8s_ops"]"#, a2a))
+            .expect("a worker naming a configured remote is valid");
+        assert_eq!(
+            config.orchestration.unwrap().workers["k8s"].remotes,
+            vec!["k8s_ops".to_string()]
+        );
+    }
+
+    #[test]
+    fn worker_remotes_omitted_is_empty() {
+        let config = r#"
+            description = "No remotes"
+            preamble = "local only"
+        "#;
+        let worker: crate::WorkerConfig = toml::from_str(config).unwrap();
+        assert!(worker.remotes.is_empty());
+    }
+
+    #[test]
+    fn worker_remotes_reject_an_unknown_remote() {
+        let a2a = "[a2a.remote.k8s_ops]\nurl = \"http://k8s:8080\"";
+        let err = load_config_from_str(&orchestration_with_remotes(r#"["prod_ops"]"#, a2a))
+            .expect_err("unknown remote name should be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("orchestration.worker.k8s.remotes") && msg.contains("\"prod_ops\""),
+            "error should name the worker and the remote: {msg}"
+        );
+    }
+
+    #[test]
+    fn worker_remotes_reject_without_an_a2a_section() {
+        let err = load_config_from_str(&orchestration_with_remotes(r#"["k8s_ops"]"#, ""))
+            .expect_err("remotes without [a2a] should be rejected");
+        assert!(
+            err.to_string().contains("[a2a.remote.<name>]"),
+            "error should point at [a2a.remote]: {err}"
+        );
+    }
+
+    // ========================================================================
     // Worker Name Validation Tests
     // ========================================================================
 
@@ -2211,6 +2282,7 @@ max_extraction_tokens = 4000
             preamble: "p".to_string(),
             mcp_filter: None,
             vector_stores: Vec::new(),
+            remotes: Vec::new(),
             turn_depth: None,
             llm: None,
             scratchpad: None,
