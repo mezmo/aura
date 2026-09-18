@@ -25,13 +25,13 @@ use super::resume::{BlockingEntry, ParkedToolName};
 pub(crate) enum RehydrateError {
     /// Condition row "not found": no checkpoint document exists for the run.
     NotFound,
-    /// Condition row "expired": the run is past `retention_expires_at` with
-    /// at least one call still unaddressed in the store. Carries the pending
-    /// snapshots the consult collected — each outstanding call with its own
-    /// per-call deadline — possibly empty when every member was addressed
-    /// before the window closed (the terminal row is honest either way). A
-    /// run whose decisions were all recorded in time resumes after expiry —
-    /// the window bounds the decision, not the resumer.
+    /// Condition row "expired": the run is past `retention_expires_at`.
+    /// Carries the pending snapshots the consult collected — each
+    /// outstanding call with its own per-call deadline — possibly empty
+    /// when every member was addressed before the retention deadline (the
+    /// terminal row is honest either way). Retention expiry is terminal
+    /// for the checkpoint: past the stamp the run tears down whatever the
+    /// members' states, and only an inside-retention run resumes.
     Expired { blocking: Vec<BlockingEntry> },
     /// Condition row "mismatch": the store and the document disagree — the
     /// stored approval is missing, its scope names another run or task than
