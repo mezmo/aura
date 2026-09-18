@@ -3699,5 +3699,66 @@ url = "http://127.0.0.1:9"
                 }),
             );
         }
+
+        /// The pre-grant refusal contract: a refusal row answers from the
+        /// pure projection of the config and the presented headers, before
+        /// the fallible `prepare_agent_config` projection runs. With
+        /// `bind_identity` on, a configured `identity_header`, and no
+        /// presented header, the identity row resolves at evaluation step 1
+        /// with no I/O — so even an unrepresentable skills source (a
+        /// discovery that fails and 500s at the projection) must never
+        /// turn the identity 404 into an internal_error. This frame pins
+        /// the restored order: evaluation first, production projection
+        /// after the grant.
+        #[tokio::test]
+        async fn s1_refusal_rows_answer_before_the_fallible_projection() {
+            let memory = tempfile::tempdir().expect("temp memory root");
+            let config = parse_config(&format!(
+                r#"
+identity_header = "X-Client-Identity"
+memory_dir = "{}"
+
+[agent]
+name = "test-agent"
+system_prompt = "You answer."
+
+[agent.llm]
+provider = "openai"
+api_key = "test"
+model = "gpt-5.1"
+
+[[agent.skills.local]]
+source = "/nonexistent/s1/red/skill/source"
+
+[hitl]
+require_approval = []
+
+[hitl.route]
+mode = "conversational"
+timeout_secs = 60
+
+[hitl.park]
+enabled = false
+bind_identity = true
+"#,
+                memory.path().display()
+            ));
+            let state = make_state(vec![config]);
+
+            let response = resume_run(
+                State(state),
+                resume_claims(),
+                HeaderMap::new(),
+                Path((
+                    "sess-p45".to_string(),
+                    "0199c0de-4545-7000-8000-000000000045".to_string(),
+                )),
+            )
+            .await;
+
+            // The post-repair shape: the identity refusal row's bare 404,
+            // not the projection fault's 500.
+            bare_404(response).await;
+        }
     }
 }
