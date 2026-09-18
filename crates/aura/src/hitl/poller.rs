@@ -1417,7 +1417,6 @@ mod tests {
                 registry: &registry,
                 memory_dir: memory_dir.to_str().unwrap(),
                 config: &crate::config::AgentRuntimeConfig::default(),
-                decision_window: Duration::from_secs(300),
                 park_ttl: aura_config::ParkTtl::default(),
                 identity_hash: None,
             };

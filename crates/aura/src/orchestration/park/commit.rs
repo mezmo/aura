@@ -29,18 +29,10 @@ pub(crate) struct ParkCommitInputs<'a> {
     pub registry: &'a PendingApprovals,
     pub memory_dir: &'a str,
     pub config: &'a AgentRuntimeConfig,
-    /// Decision window stamped on a document with no surviving ticket.
-    /// Interim bridge input: E5's publication-transaction stamp replaces it.
-    pub decision_window: std::time::Duration,
     /// The validated retention age (`[hitl.park].park_ttl`), projected from
-    /// the runtime HITL config. The E5 stamp computes
-    /// `retention_expires_at` from the publication timestamp plus this age
-    /// — one timestamp source for the persisted deadline and the terminal
-    /// event.
-    #[expect(
-        dead_code,
-        reason = "read by the E5 publication-transaction stamp that replaces the interim bridge"
-    )]
+    /// the runtime HITL config. The stamp computes `retention_expires_at`
+    /// from the publication timestamp plus this age — one timestamp source
+    /// for the persisted deadline and the terminal event.
     pub park_ttl: aura_config::ParkTtl,
     /// Hex sha256 of the bound identity header's value, stamped into the
     /// document the resume side compares against; `None` when identity
@@ -51,10 +43,9 @@ pub(crate) struct ParkCommitInputs<'a> {
 
 /// The refreshed awaiting set: per-task pending calls still parked —
 /// including calls decided since the gate hit, retained for the resume
-/// consult — and the earliest expiry among the undecided tickets.
+/// consult.
 pub(crate) struct RefreshedAwaiting {
     pub pending_by_task: HashMap<usize, Vec<PendingCall>>,
-    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Every decision id still awaiting a decision, in plan order.
     pub decision_ids: Vec<DecisionId>,
 }
@@ -73,19 +64,16 @@ pub(crate) fn run_owner_id(run_id: &str) -> String {
     format!("run:{run_id}")
 }
 
-/// Narrow the plan's awaiting tasks to the calls still parked, with the
-/// earliest surviving ticket expiry. A call decided between gate-hit and
-/// commit stays in the checkpoint — the resume consult consumes its
-/// recorded decision — but its settled ticket contributes neither expiry
-/// nor an outstanding id. A store fault fails the refresh, and with it the
-/// commit, rather than dropping a still-decidable approval from the
-/// checkpoint.
+/// Narrow the plan's awaiting tasks to the calls still parked. A call decided
+/// between gate-hit and commit stays in the checkpoint — the resume consult
+/// consumes its recorded decision — but its settled ticket contributes no
+/// outstanding id. A store fault fails the refresh, and with it the commit,
+/// rather than dropping a still-decidable approval from the checkpoint.
 pub(crate) async fn refresh_awaiting(
     plan: &Plan,
     registry: &PendingApprovals,
 ) -> io::Result<RefreshedAwaiting> {
     let mut pending_by_task = HashMap::new();
-    let mut expires_at = None;
     let mut decision_ids = Vec::new();
 
     for task in &plan.tasks {
@@ -94,7 +82,11 @@ pub(crate) async fn refresh_awaiting(
         };
         let mut surviving = Vec::with_capacity(pending.len());
         for call in pending {
-            let Some(parked) = registry
+            // The load is the retain/drop check: a ticket the store no longer
+            // holds drops the call from the checkpoint. The ticket's deadline
+            // feeds nothing (the retention stamp is the publication timestamp
+            // plus `park_ttl`), so the parked value is deliberately unread.
+            let Some(_parked) = registry
                 .try_parked(&call.decision_id)
                 .await
                 .map_err(io::Error::other)?
@@ -119,10 +111,6 @@ pub(crate) async fn refresh_awaiting(
                 surviving.push(call.clone());
                 continue;
             }
-            expires_at = Some(match expires_at {
-                Some(earliest) if parked.expires_at >= earliest => earliest,
-                _ => parked.expires_at,
-            });
             surviving.push(call.clone());
             decision_ids.push(call.decision_id);
         }
@@ -133,15 +121,14 @@ pub(crate) async fn refresh_awaiting(
 
     Ok(RefreshedAwaiting {
         pending_by_task,
-        expires_at,
         decision_ids,
     })
 }
 
 /// The whole commit: refresh the awaiting set against the store, build the
-/// document, publish it. The retention deadline is resolved once here so the
-/// document and the caller's terminal event carry the same stamp; a refresh
-/// with no surviving ticket stamps `now + decision_window`.
+/// document, publish it. The retention deadline is resolved once here — the
+/// publication timestamp plus the validated `park_ttl` — so the document and
+/// the caller's terminal event carry the same stamp.
 pub(crate) async fn commit_from_run_state(
     inputs: &ParkCommitInputs<'_>,
     scope: Option<&Arc<RunExecutionScope>>,
@@ -153,19 +140,14 @@ pub(crate) async fn commit_from_run_state(
         registry,
         memory_dir,
         config,
-        decision_window,
-        // Consumed by the E5 stamp (`from_publication`); the interim bridge
-        // below still derives the deadline from the surviving tickets.
-        park_ttl: _,
+        park_ttl,
         identity_hash,
     } = inputs;
 
     let refreshed = refresh_awaiting(plan, registry).await?;
-    let retention_expires_at =
-        RetentionExpiresAt::from_datetime(refreshed.expires_at.unwrap_or_else(|| {
-            chrono::Utc::now()
-                + chrono::Duration::from_std(*decision_window).expect("decision window fits chrono")
-        }));
+    let published_at = chrono::Utc::now();
+    let retention_expires_at = RetentionExpiresAt::from_publication(published_at, *park_ttl)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     let document = build_document(
         state,
         plan,
@@ -513,13 +495,12 @@ mod tests {
         assert!(tmp.is_dir(), "the obstruction is left in place");
     }
 
-    /// Refresh drops approvals the store no longer holds, keeps the
-    /// undecided ones, and reports the earliest surviving expiry. The memory
-    /// backend's resolve moves the row, so a decided call reads as removed
-    /// here; the file-backed retention case is
-    /// [`early_decision_is_retained_and_consumed_at_resume`].
+    /// Refresh drops approvals the store no longer holds and keeps the
+    /// surviving undecided set. The memory backend's resolve moves the row,
+    /// so a decided call reads as removed here; the file-backed retention
+    /// case is [`early_decision_is_retained_and_consumed_at_resume`].
     #[tokio::test]
-    async fn refresh_drops_decided_and_takes_earliest_expiry() {
+    async fn refresh_drops_decided_and_keeps_the_surviving_set() {
         let (registry, _store) = conv_registry();
         let owner = "run:0191e8c0-eeee-7000-8000-000000000003";
         let now = chrono::Utc::now();
@@ -605,12 +586,6 @@ mod tests {
         let surviving = &refreshed.pending_by_task[&0];
         assert_eq!(surviving.len(), 2, "decided and removed drop out");
         assert_eq!(refreshed.decision_ids, vec![earliest, latest]);
-        let reported = refreshed.expires_at.expect("earliest expiry reported");
-        let expected = now + chrono::Duration::minutes(30);
-        assert!(
-            (reported - expected).num_seconds().abs() < 1,
-            "expiry is the earliest surviving expiry"
-        );
     }
 
     /// A decision landing between gate-hit and
@@ -693,10 +668,6 @@ mod tests {
             refreshed.decision_ids.is_empty(),
             "a decided call is no longer outstanding"
         );
-        assert!(
-            refreshed.expires_at.is_none(),
-            "a settled ticket bounds nothing"
-        );
 
         // The resume consult consumes the retained call's recorded decision.
         let mut records = ParkedTaskRecords::new();
@@ -754,14 +725,13 @@ mod tests {
     /// E5-R R1: the retention stamp derives from the publication timestamp
     /// plus the validated `park_ttl` (7200s here), never from the earliest
     /// surviving ticket — the ticket windows and the stamp part ways exactly
-    /// here. The fixture's park_ttl (7200) differs from both the ticket
-    /// window (30min) and the decision_window (30min) it also carries, so
-    /// the interim bridge's value and the E5 value are observably different
-    /// instants.
+    /// here. The fixture's park_ttl (7200) differs from the ticket window
+    /// (30min), so the retired interim-bridge value and the E5 value are
+    /// observably different instants.
     ///
-    /// RED today: the interim bridge stamps the refresh's earliest surviving
-    /// ticket expiry (`now + 30min`), so both value assertions fail at the
-    /// value — never at compilation or setup.
+    /// RED at E5-R: the interim bridge stamped the refresh's earliest
+    /// surviving ticket expiry (`now + 30min`), so both value assertions
+    /// failed at the value — never at compilation or setup. E5 turns it green.
     #[tokio::test]
     async fn retention_stamp_derives_from_publication_not_the_earliest_ticket() {
         let dir = tempfile::tempdir().unwrap();
@@ -818,7 +788,6 @@ mod tests {
             registry: &registry,
             memory_dir: &memory_dir,
             config: &AgentRuntimeConfig::default(),
-            decision_window: Duration::from_secs(30 * 60),
             park_ttl: aura_config::ParkTtl::try_new(7200).expect("park ttl validates"),
             identity_hash: None,
         };
@@ -845,11 +814,12 @@ mod tests {
     /// E5-R R2: a commit with no surviving undecided ticket — the call
     /// decided between gate-hit and commit, its decided row retained by the
     /// file-backed store — stamps retention from the publication timestamp
-    /// plus the validated `park_ttl` (7200s), never from the
-    /// `now + decision_window` fallback (30 minutes here).
+    /// plus the validated `park_ttl` (7200s), never from the retired
+    /// `now + decision_window` fallback (30 minutes at E5-R).
     ///
-    /// RED today: the bridge's no-surviving-ticket fallback stamps
-    /// `now + decision_window`, so the window assertion fails at the value.
+    /// RED at E5-R: the bridge's no-surviving-ticket fallback stamped
+    /// `now + decision_window`, so the window assertion failed at the value.
+    /// E5 turns it green.
     #[tokio::test]
     async fn retention_stamp_with_no_surviving_ticket_derives_from_park_ttl() {
         let dir = tempfile::tempdir().unwrap();
@@ -925,7 +895,6 @@ mod tests {
             registry: &registry,
             memory_dir: &memory_dir,
             config: &AgentRuntimeConfig::default(),
-            decision_window: Duration::from_secs(30 * 60),
             park_ttl: aura_config::ParkTtl::try_new(7200).expect("park ttl validates"),
             identity_hash: None,
         };
@@ -935,9 +904,9 @@ mod tests {
         let after = chrono::Utc::now();
 
         assert!(
-            outcome.refreshed.expires_at.is_none(),
+            outcome.refreshed.decision_ids.is_empty(),
             "fixture shape: no undecided ticket survives, so the refresh reports \
-             no ticket expiry"
+             no outstanding ticket"
         );
         let stamp = outcome.retention_expires_at.as_datetime();
         let lower = before + chrono::Duration::seconds(7200 - 30);

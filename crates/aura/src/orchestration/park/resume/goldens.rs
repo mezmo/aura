@@ -6587,22 +6587,19 @@ async fn consult_a_present_mismatch_outranks_expiry_regardless_of_member_order()
 /// tickets, two blocking entries. The SIBLING parks first and holds the
 /// EARLIER ticket deadline; the TARGET parks second with the LATER one.
 /// Both tickets live in the store at the commit, undecided and inside
-/// their own windows, so the renewed document retention stamp derives from
-/// the earliest outstanding ticket (`refresh_awaiting`) — the SIBLING's.
-/// Pins at the re-park row: (i) the TARGET entry's `expires_at` equals the
-/// target ticket's OWN stored deadline; (ii) it does NOT equal the renewed
-/// retention stamp; (iii) the SIBLING entry's `expires_at` equals the
-/// sibling ticket's deadline and equals the renewed stamp. The equality pin
-/// (i) rides along green at the cutover and becomes load-bearing when E5
-/// later moves the renewal derivation.
+/// their own windows. Pins at the re-park row: (i) the TARGET entry's
+/// `expires_at` equals the target ticket's OWN stored deadline; (ii) it does
+/// NOT equal the renewed retention stamp; (iii) the SIBLING entry's
+/// `expires_at` equals the sibling ticket's deadline but does NOT equal the
+/// renewed stamp — the renewed stamp derives from the re-publication
+/// timestamp plus `park_ttl`, never from any ticket deadline.
 ///
-/// RED today: the re-park stamps EVERY entry with the renewed stamp (the
-/// single-deadline blocking construction), so the TARGET entry carries the
-/// sibling-derived stamp and assertion (ii)'s inequality fails. The sibling
-/// pins stay green today — the stamp coincides with the sibling's deadline
-/// by derivation. Asserted (iii) → (ii) → (i) so today's failure lands on
-/// the stamp inequality, not on the equality (i), which today's stamping
-/// breaks too.
+/// RED at E5-R (the re-park consult cutover): the re-park stamped EVERY
+/// entry with the renewed stamp (the single-deadline blocking construction),
+/// so the TARGET entry carried the sibling-derived stamp and assertion
+/// (ii)'s inequality failed. E7-C turned (ii) green; E5 later moved the
+/// renewal derivation off the earliest outstanding ticket, flipping (iii)'s
+/// second assertion from equality to inequality.
 #[tokio::test]
 async fn reparked_blocking_entries_carry_the_new_calls_own_deadline() {
     let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
@@ -6722,17 +6719,19 @@ async fn reparked_blocking_entries_carry_the_new_calls_own_deadline() {
         .expect("the re-park re-published the checkpoint under the parked name");
     let renewed_stamp = republished.retention_expires_at.as_datetime();
 
-    // (iii) — green today: the renewal derives from the earliest outstanding
-    // ticket, the sibling's, so the sibling's entry coincides with its own
-    // deadline AND the renewed stamp.
+    // (iii) — the sibling entry still carries its OWN ticket deadline (first
+    // assertion, unchanged), but the renewed retention stamp derives from the
+    // re-publication timestamp plus `park_ttl`, not from any ticket deadline,
+    // so the entry and the stamp part ways (inequality).
     assert_eq!(
         sibling_entry_expires, sibling_ticket.expires_at,
         "(iii) the sibling's blocking entry carries the sibling ticket's deadline"
     );
-    assert_eq!(
+    assert_ne!(
         sibling_entry_expires, renewed_stamp,
-        "(iii) the sibling's entry equals the renewed stamp: the renewal derives \
-         from the earliest outstanding ticket — the sibling's earlier deadline"
+        "(iii) the sibling's entry must NOT equal the renewed retention stamp: \
+         the renewal derives from the publication timestamp plus `park_ttl`, \
+         not from any ticket deadline"
     );
     // (ii) — RED today: the re-park stamps EVERY entry with the renewed
     // stamp, so the target entry carries the sibling-derived stamp instead

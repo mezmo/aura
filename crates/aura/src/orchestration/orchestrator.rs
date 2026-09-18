@@ -4534,7 +4534,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 "the resume segment requires the HITL runtime".to_string(),
             ));
         };
-        let Some((registry, decision_window)) = hitl.route.park_registry() else {
+        let Some((registry, _)) = hitl.route.park_registry() else {
             return Err(fault(
                 "the resume segment requires a park-capable decision route".to_string(),
             ));
@@ -4923,7 +4923,6 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         registry,
                         memory_dir: &memory_dir,
                         config: &self.agent_config,
-                        decision_window,
                         park_ttl: hitl.park_ttl,
                         // The checkpoint's binding rides forward: the
                         // re-parked document compares against the same
@@ -6465,7 +6464,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         let Some(hitl) = self.agent_config.hitl.clone() else {
             return Err("run parked without the HITL runtime configured".into());
         };
-        let Some((registry, timeout)) = hitl.route.park_registry() else {
+        let Some((registry, _)) = hitl.route.park_registry() else {
             return Err("run parked without a park-capable route".into());
         };
         let (run_id, session_id) = {
@@ -6518,7 +6517,6 @@ Assign tasks to the worker whose tools best match the required operations."#,
             registry,
             memory_dir: &memory_dir,
             config: &self.agent_config,
-            decision_window: timeout,
             park_ttl: hitl.park_ttl,
             identity_hash,
         };
@@ -9717,7 +9715,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn park_run_with_every_call_decided_stamps_the_decision_window() {
+    async fn park_run_with_every_call_decided_stamps_publication_plus_park_ttl() {
         let dir = tempfile::tempdir().unwrap();
         let (orchestrator, _store, registry, run_id) = park_orchestrator(dir.path()).await;
         let (plan, records, pending) = awaiting_plan_with_parked_calls(&registry, &run_id).await;
@@ -9761,10 +9759,11 @@ mod tests {
         .unwrap();
         assert!(document.awaiting_decision_ids().is_empty());
         let expires_at = document.retention_expires_at.as_datetime();
-        // The fixture route timeout is one hour.
+        // The fixture park_ttl is one hour: the stamp is the publication
+        // timestamp plus it, and publication is at or after `before`.
         assert!(
             expires_at >= before + chrono::Duration::seconds(3600 - 5),
-            "retention_expires_at carries the decision window: {}",
+            "retention_expires_at carries the publication stamp plus the park_ttl: {}",
             expires_at.to_rfc3339()
         );
         match event_rx.recv().await {
