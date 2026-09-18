@@ -227,18 +227,45 @@ impl ResumeClaimTable {
     /// — the run is already reserved, so `Live` is impossible. The
     /// pre-reservation [`Self::rename_back_to_parked`] stays only until the
     /// E4 fill's ordered evaluation replaces it.
-    #[expect(
-        unused_variables,
-        reason = "todo!() body; filled by P45 wave fill units"
-    )]
     pub(crate) async fn rename_back_under_reservation(
         &self,
         reservation: &RunReservationLease,
         docs: &ResumeDocuments,
     ) -> Result<(), ClaimResumeFault> {
-        todo!(
-            "P45 wave fill unit E4: rename resuming → parked holding a lease reference through the blocking tail"
-        )
+        let parked = docs.parked().to_path_buf();
+        let resuming = docs.resuming().to_path_buf();
+        // The blocking tail MOVES a lease reference in: the fence survives an
+        // awaiting request dropping, so the run stays reserved until the
+        // rename has actually completed.
+        let lease = reservation.clone();
+        tokio::task::spawn_blocking(move || -> Result<(), ClaimResumeFault> {
+            // The held reservation is the whole fence: the run is already
+            // reserved, so no second caller can be renaming, and the table's
+            // standard lock is never held across this tail. The lease
+            // binding keeps the fence alive through the rename's completion.
+            let _lease = lease;
+            // The safe rename-back semantics of the interim
+            // [`Self::rename_back_to_parked`] hold exactly: `NotFound` while
+            // the parked name already exists reads as success (a concurrent
+            // winner already restored the name); every other io error fails.
+            std::fs::rename(&resuming, &parked).or_else(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound && parked.try_exists().unwrap_or(false)
+                {
+                    Ok(())
+                } else {
+                    Err(ClaimResumeFault::Unavailable(Diagnostic::new(format!(
+                        "renaming the resuming checkpoint {} back to its parked name failed: {e}",
+                        resuming.display()
+                    ))))
+                }
+            })
+        })
+        .await
+        .map_err(|e| {
+            ClaimResumeFault::Internal(Diagnostic::new(format!(
+                "the rename-back task did not complete: {e}"
+            )))
+        })?
     }
 
     /// Whether a live claim holds the run.
