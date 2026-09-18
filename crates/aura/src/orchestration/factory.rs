@@ -1415,6 +1415,12 @@ mod tests {
     #[tokio::test]
     async fn s3_outer_budget_projects_from_the_factory_timeout_by_the_zero_timeout_convention() {
         let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
+        // Arm B installs FOUR worker overrides (the restored node's build
+        // plus one per permitted fresh cycle) but the fourth is never
+        // requested — the loop answers at the third. Without the drain
+        // guard the leftover rides the process-global queue into the next
+        // serialized test's first build.
+        let _drain = ResumeOverrideDrain;
 
         // Arm A: a NONZERO timeout whose whole budget cannot fit even one
         // per-call slice — the projected Some(timeout) engages the
@@ -1787,7 +1793,12 @@ mod tests {
                         )
                         .with_call_id(RESUME_NEW_CALL_ID),
                     ])]),
-                    extra_tools: vec![],
+                    // The fresh gated call must reach the gate to register
+                    // its pending call — the tool is registered exactly as
+                    // the goldens' fresh-call frames do (goldens.rs:2244).
+                    extra_tools: vec![Box::new(
+                        RecordingTool::new(resume_invocations()).with_name(RESUME_NEW_TOOL),
+                    )],
                 },
             ]);
             // The continuation builds its coordinator before the loop; the
