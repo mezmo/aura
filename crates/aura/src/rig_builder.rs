@@ -898,4 +898,159 @@ bind_identity = true
         assert!(!unbound.park_bind_identity);
         assert!(unbound.presented_identity.is_none());
     }
+
+    #[test]
+    fn s1_prepare_agent_config_discovers_skills_into_the_projection() {
+        // The production projection runs skill discovery; the debug
+        // `get_agent_config` path never does. Both assertions live in one
+        // test so the distinct-value pair is inseparable evidence.
+        let skills_dir = tempfile::TempDir::new().unwrap();
+        write_skill(skills_dir.path(), "s1-probe-skill", "S1 discovery probe");
+
+        let config_str = format!(
+            r#"
+[agent]
+name = "S1Discovery"
+system_prompt = "You discover."
+
+[agent.llm]
+provider = "openai"
+api_key = "test"
+model = "gpt-5.1"
+
+[[agent.skills.local]]
+source = '{}'
+"#,
+            skills_dir.path().display()
+        );
+        let builder = RigBuilder::new(
+            aura_config::Config::parse_toml(&config_str).expect("config should parse"),
+            PendingApprovals::new(),
+        );
+
+        let projection = builder
+            .prepare_agent_config(None, "req-s1-disc", "sess-s1-disc")
+            .expect("projection should build from a valid skill source");
+        assert_eq!(projection.agent.skills.len(), 1);
+        assert_eq!(projection.agent.skills[0].name, "s1-probe-skill");
+
+        let debug = builder.get_agent_config();
+        assert!(
+            debug.agent.skills.is_empty(),
+            "the debug path skips discovery and must stay empty"
+        );
+    }
+
+    #[test]
+    fn s1_prepare_agent_config_resolves_headers_from_request_once() {
+        // A presented request header resolves into the projection's MCP
+        // server entry; passing None resolves nothing and the static TOML
+        // fallback stands. The two arms hold distinct values so an
+        // unresolved/identity pass cannot fake the resolved one.
+        let config_str = r#"
+[agent]
+name = "S1Headers"
+system_prompt = "You resolve."
+
+[agent.llm]
+provider = "openai"
+api_key = "test"
+model = "gpt-5.1"
+
+[mcp.servers.test_server]
+transport = "http_streamable"
+url = "https://example.com/mcp"
+headers = { "x-s1-auth" = "static-fallback" }
+
+[mcp.servers.test_server.headers_from_request]
+"x-s1-auth" = "x-s1-incoming-auth"
+"#;
+        let builder = RigBuilder::new(
+            aura_config::Config::parse_toml(config_str).expect("config should parse"),
+            PendingApprovals::new(),
+        );
+
+        let mut req_headers = HashMap::new();
+        req_headers.insert(
+            "x-s1-incoming-auth".to_string(),
+            "resolved-dynamic".to_string(),
+        );
+
+        let resolved = builder
+            .prepare_agent_config(Some(&req_headers), "req-s1-hdr", "sess-s1-hdr")
+            .expect("projection should build");
+        assert_eq!(
+            get_server_headers(&resolved).get("x-s1-auth"),
+            Some(&"resolved-dynamic".to_string()),
+            "the presented header resolves into the projection's MCP entry"
+        );
+
+        let unresolved = builder
+            .prepare_agent_config(None, "req-s1-hdr", "sess-s1-hdr")
+            .expect("projection should build");
+        assert_eq!(
+            get_server_headers(&unresolved).get("x-s1-auth"),
+            Some(&"static-fallback".to_string()),
+            "no request context resolves nothing; the static fallback stands"
+        );
+    }
+
+    #[test]
+    fn s1_prepare_agent_config_stamps_the_request_and_session_ids() {
+        let config_str = r#"
+[agent]
+name = "S1Stamps"
+system_prompt = "You stamp."
+
+[agent.llm]
+provider = "openai"
+api_key = "test"
+model = "gpt-5.1"
+"#;
+        let builder = RigBuilder::new(
+            aura_config::Config::parse_toml(config_str).expect("config should parse"),
+            PendingApprovals::new(),
+        );
+
+        let projection = builder
+            .prepare_agent_config(None, "req-s1-42", "sess-s1-42")
+            .expect("projection should build");
+        assert_eq!(projection.request_id.as_deref(), Some("req-s1-42"));
+        assert_eq!(projection.session_id.as_deref(), Some("sess-s1-42"));
+
+        let debug = builder.get_agent_config();
+        assert_eq!(debug.request_id, None, "the debug path carries no stamp");
+        assert_eq!(debug.session_id, None, "the debug path carries no stamp");
+    }
+
+    #[test]
+    fn s1_prepare_agent_config_is_fallible_on_broken_skill_sources() {
+        // An unrepresentable skills source must surface as Err(BuilderError)
+        // from the projection — not a panic, not a silent empty-skills Ok.
+        let config_str = r#"
+[agent]
+name = "S1Fallible"
+system_prompt = "You fail."
+
+[agent.llm]
+provider = "openai"
+api_key = "test"
+model = "gpt-5.1"
+
+[[agent.skills.local]]
+source = '/nonexistent/s1/red/skill/source'
+"#;
+        let builder = RigBuilder::new(
+            aura_config::Config::parse_toml(config_str).expect("config should parse"),
+            PendingApprovals::new(),
+        );
+
+        let err = builder
+            .prepare_agent_config(None, "req-s1-err", "sess-s1-err")
+            .expect_err("a broken skill source must be an Err, not a panic or empty Ok");
+        assert!(
+            err.to_string().contains("not found"),
+            "unexpected error shape: {err}"
+        );
+    }
 }
