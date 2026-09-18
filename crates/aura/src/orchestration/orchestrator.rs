@@ -32,7 +32,7 @@
 //!
 //! # Streaming Events
 //!
-//! The orchestrator emits `OrchestratorEvent` variants through the stream:
+//! The orchestrator emits `AgentEventPayload` variants through the stream:
 //! - `PlanCreated` - when the coordinator produces a plan
 //! - `TaskStarted` - when a worker begins a task
 //! - `TaskCompleted` - when a worker finishes a task
@@ -41,6 +41,8 @@
 //! - `IterationComplete` - when the post-execute coordinator decision completes
 //! - `Synthesizing` - when task results are being consolidated for the coordinator
 
+use aura_events::agent::{AgentEvent, AgentEventPayload};
+use aura_events::orchestration::RoutingMode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -61,7 +63,6 @@ use super::tools::RoutingToolSet;
 use super::tools::{InspectToolParamsTool, ListToolsTool, ReadArtifactTool};
 
 use super::config::OrchestrationConfig;
-use super::events::OrchestratorEvent;
 use super::park::{
     ParkGuard, ParkedTaskRecord, ParkedTaskRecords, RecordedDecisions, ResumeContext,
     TaskContinuation,
@@ -247,10 +248,21 @@ fn extract_task_id(tool_call_id: &str) -> Option<usize> {
         .and_then(|s| s.parse().ok())
 }
 
-/// Convert a `ToolEvent` to an `OrchestratorEvent`.
-fn tool_event_to_orchestrator_event(
-    event: crate::tool_call_observer::ToolEvent,
-) -> OrchestratorEvent {
+/// Names the worker an event came from, so the payload does not have to carry
+/// attribution the envelope already holds.
+fn by_worker(worker_id: &str, payload: AgentEventPayload) -> AgentEvent {
+    AgentEvent::new(
+        aura_events::AgentContext::worker(worker_id, None, "coordinator"),
+        payload,
+    )
+}
+
+fn by_coordinator(payload: AgentEventPayload) -> AgentEvent {
+    AgentEvent::new(aura_events::AgentContext::coordinator(), payload)
+}
+
+/// Converts an observed tool call into the agent event it is published as.
+fn tool_event_to_orchestrator_event(event: crate::tool_call_observer::ToolEvent) -> AgentEvent {
     match event {
         crate::tool_call_observer::ToolEvent::CallStarted {
             tool_call_id,
@@ -258,15 +270,19 @@ fn tool_event_to_orchestrator_event(
             tool_initiator_id,
             arguments,
             ..
-        } => OrchestratorEvent::ToolCallStarted {
-            task_id: extract_task_id(&tool_call_id),
-            tool_call_id,
-            tool_name,
-            worker_id: tool_initiator_id,
-            arguments,
-        },
+        } => by_worker(
+            &tool_initiator_id,
+            AgentEventPayload::ToolStart {
+                task_id: extract_task_id(&tool_call_id),
+                tool_call_id: tool_call_id.into(),
+                tool_name: tool_name.into(),
+                arguments: Some(arguments),
+                progress_token: None,
+            },
+        ),
         crate::tool_call_observer::ToolEvent::CallCompleted {
             tool_call_id,
+            tool_name,
             result,
             duration_ms,
         } => {
@@ -275,23 +291,41 @@ fn tool_event_to_orchestrator_event(
                 crate::tool_call_observer::ToolOutcome::Success(content) => content,
                 crate::tool_call_observer::ToolOutcome::Error { message, .. } => message,
             };
-            OrchestratorEvent::ToolCallCompleted {
+            by_coordinator(AgentEventPayload::ToolComplete {
                 task_id: extract_task_id(&tool_call_id),
-                tool_call_id,
-                success,
+                tool_call_id: tool_call_id.into(),
+                tool_name: tool_name.into(),
                 duration_ms,
-                result: result_str,
-            }
+                outcome: outcome_of(success, result_str),
+            })
         }
     }
 }
 
-/// Forward a `ToolCallStarted` event for a non-MCP tool the worker
+/// The schema distinguishes success from failure by variant; the observer
+/// reports one string either way.
+fn outcome_of(success: bool, message: String) -> aura_events::agent::ToolOutcome {
+    if success {
+        aura_events::agent::ToolOutcome::Success { result: message }
+    } else {
+        aura_events::agent::ToolOutcome::Failure { error: message }
+    }
+}
+
+/// Forward a `ToolStart` event for a non-MCP tool the worker
 /// `ObserverWrapper` does not cover: skills, orchestration operations, and
 /// scratchpad tools when enabled (see [`scratchpad::should_forward_tool_event`]).
 /// Records the start instant so the completion can report a duration. No-op
 /// without an event channel. Used by both `stream_and_forward` (workers) and
 /// `stream_and_collect` (coordinator) so skill use surfaces in both roles.
+/// What a forwarded internal tool call needs from its start to report a
+/// completion.
+struct InternalToolStart {
+    at: std::time::Instant,
+    tool_name: String,
+    worker_id: String,
+}
+
 async fn forward_internal_tool_started(
     event_tx: Option<&tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>>,
     task_id: Option<usize>,
@@ -299,22 +333,30 @@ async fn forward_internal_tool_started(
     tool_call_id: &str,
     tool_name: &str,
     raw_arguments: &str,
-    starts: &mut std::collections::HashMap<String, std::time::Instant>,
+    starts: &mut std::collections::HashMap<String, InternalToolStart>,
 ) {
     let Some(tx) = event_tx else { return };
     let tool_call_id = tool_call_id.to_string();
-    starts.insert(tool_call_id.clone(), std::time::Instant::now());
+    starts.insert(
+        tool_call_id.clone(),
+        InternalToolStart {
+            at: std::time::Instant::now(),
+            tool_name: tool_name.to_string(),
+            worker_id: worker_id.to_string(),
+        },
+    );
     let arguments = serde_json::from_str(raw_arguments).unwrap_or_else(|_| serde_json::json!({}));
     let _ = tx
-        .send(Ok(StreamItem::OrchestratorEvent(
-            OrchestratorEvent::ToolCallStarted {
+        .send(Ok(StreamItem::AgentEvent(Box::new(by_worker(
+            worker_id,
+            AgentEventPayload::ToolStart {
                 task_id,
-                tool_call_id,
-                tool_name: tool_name.to_string(),
-                worker_id: worker_id.to_string(),
-                arguments,
+                tool_call_id: tool_call_id.into(),
+                tool_name: tool_name.into(),
+                arguments: Some(arguments),
+                progress_token: None,
             },
-        )))
+        )))))
         .await;
 }
 
@@ -326,7 +368,7 @@ async fn forward_internal_tool_completed(
     task_id: Option<usize>,
     tool_call_id: &str,
     result: &str,
-    starts: &mut std::collections::HashMap<String, std::time::Instant>,
+    starts: &mut std::collections::HashMap<String, InternalToolStart>,
 ) {
     let Some(start) = starts.remove(tool_call_id) else {
         return;
@@ -337,22 +379,23 @@ async fn forward_internal_tool_completed(
         crate::tool_error_detection::ToolResultStatus::Success
     );
     let _ = tx
-        .send(Ok(StreamItem::OrchestratorEvent(
-            OrchestratorEvent::ToolCallCompleted {
+        .send(Ok(StreamItem::AgentEvent(Box::new(by_worker(
+            &start.worker_id,
+            AgentEventPayload::ToolComplete {
                 task_id,
-                tool_call_id: tool_call_id.to_string(),
-                success,
-                duration_ms: start.elapsed().as_millis() as u64,
-                result: result.to_string(),
+                tool_call_id: tool_call_id.into(),
+                tool_name: start.tool_name.into(),
+                duration_ms: start.at.elapsed().as_millis() as u64,
+                outcome: outcome_of(success, result.to_string()),
             },
-        )))
+        )))))
         .await;
 }
 
 /// Spawn a task that forwards tool call events to the SSE stream.
 ///
 /// Listens on the observer's broadcast channel and converts `ToolEvent`s
-/// to `OrchestratorEvent`s, sending them through the event channel.
+/// to `AgentEventPayload`s, sending them through the event channel.
 pub(super) fn spawn_tool_event_forwarder(
     observer: &ToolCallObserver,
     event_tx: tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>,
@@ -367,7 +410,7 @@ pub(super) fn spawn_tool_event_forwarder(
                     match result {
                         Ok(tool_event) => {
                             let orch_event = tool_event_to_orchestrator_event(tool_event);
-                            let _ = event_tx.send(Ok(StreamItem::OrchestratorEvent(orch_event))).await;
+                            let _ = event_tx.send(Ok(StreamItem::AgentEvent(Box::new(orch_event)))).await;
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                             tracing::warn!("Tool observer lagged by {} events", n);
@@ -427,7 +470,7 @@ pub struct Orchestrator {
     agent_config: AgentRuntimeConfig,
 
     /// Tool call observer for coordinator visibility into worker tool execution.
-    /// Wired to emit OrchestratorEvent for real-time SSE streaming via spawn_tool_event_forwarder.
+    /// Wired to emit AgentEventPayload for real-time SSE streaming via spawn_tool_event_forwarder.
     pub(super) tool_call_observer: ToolCallObserver,
 
     /// Shared MCP manager for tool discovery and cancellation.
@@ -456,11 +499,7 @@ pub struct Orchestrator {
     park_guard: Option<Arc<ParkGuard>>,
 }
 
-/// Stream context for reasoning attribution in `stream_and_forward`.
-///
-/// When `Some`, reasoning items are wrapped as `OrchestratorEvent::WorkerReasoning`
-/// with proper task/worker attribution. When `None`, reasoning is forwarded raw
-/// (coordinator context — attributed as `agent_id: "main"` by handlers).
+/// The task and worker a stream's reasoning is attributed to.
 struct StreamContext<'a> {
     task_id: usize,
     worker_id: &'a str,
@@ -1225,7 +1264,7 @@ impl Orchestrator {
         // ToolResult can report a duration. Membership also gates completion:
         // only IDs we started get completed, so MCP tools (covered by
         // ObserverWrapper) are never double-emitted.
-        let mut internal_tool_starts: HashMap<String, std::time::Instant> = HashMap::new();
+        let mut internal_tool_starts: HashMap<String, InternalToolStart> = HashMap::new();
 
         // Two guarded phases per iteration, so the body (its sends and the
         // decision-ready branch's inner `next()`) runs under the deadline
@@ -1268,13 +1307,13 @@ impl Orchestrator {
                         if let Some(tx) = event_tx {
                             if let Some(ref ctx) = stream_context {
                                 let _ = tx
-                                    .send(Ok(StreamItem::OrchestratorEvent(
-                                        OrchestratorEvent::WorkerReasoning {
-                                            task_id: ctx.task_id,
-                                            worker_id: ctx.worker_id.to_string(),
+                                    .send(Ok(StreamItem::AgentEvent(Box::new(by_worker(
+                                        ctx.worker_id,
+                                        AgentEventPayload::Reasoning {
+                                            task_id: Some(ctx.task_id),
                                             content: delta,
                                         },
-                                    )))
+                                    )))))
                                     .await;
                             } else {
                                 let _ = tx
@@ -1529,7 +1568,7 @@ impl Orchestrator {
             // The coordinator is not ObserverWrapped, so forward the same non-MCP
             // tool calls a worker does (skills, orchestration operations), attributed
             // to the main agent.
-            let mut internal_tool_starts: HashMap<String, std::time::Instant> = HashMap::new();
+            let mut internal_tool_starts: HashMap<String, InternalToolStart> = HashMap::new();
 
             // Same two-phase guarded shape as `stream_and_forward`; see the
             // rationale there, including why new_disarmed() rather than new().
@@ -3354,14 +3393,14 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     task.start();
                 }
                 let _ = event_tx
-                    .send(Ok(StreamItem::OrchestratorEvent(
-                        OrchestratorEvent::TaskStarted {
+                    .send(Ok(StreamItem::AgentEvent(Box::new(by_worker(
+                        &worker_name.clone().unwrap_or(self.orchestrator_id.clone()),
+                        AgentEventPayload::TaskStarted {
                             task_id: *task_id,
                             description: task_desc.clone(),
                             orchestrator_id: self.orchestrator_id.clone(),
-                            worker_id: worker_name.clone().unwrap_or(self.orchestrator_id.clone()),
                         },
-                    )))
+                    )))))
                     .await;
             }
 
@@ -3410,18 +3449,15 @@ Assign tasks to the worker whose tools best match the required operations."#,
                             t.structured_output = exec_result.structured_output;
                         }
                         let _ = event_tx
-                            .send(Ok(StreamItem::OrchestratorEvent(
-                                OrchestratorEvent::TaskCompleted {
+                            .send(Ok(StreamItem::AgentEvent(Box::new(by_worker(
+                                &worker_name.clone().unwrap_or(self.orchestrator_id.clone()),
+                                AgentEventPayload::TaskCompleted {
                                     task_id,
-                                    success,
                                     duration_ms,
                                     orchestrator_id: self.orchestrator_id.clone(),
-                                    worker_id: worker_name
-                                        .clone()
-                                        .unwrap_or(self.orchestrator_id.clone()),
-                                    result: result_for_event,
+                                    outcome: outcome_of(success, result_for_event),
                                 },
-                            )))
+                            )))))
                             .await;
                         if success {
                             tracing::info!("Task {} completed in {}ms", task_id, duration_ms);
@@ -3443,16 +3479,16 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         let worker_id = worker_name.clone().unwrap_or(self.orchestrator_id.clone());
                         for call in &pending {
                             let _ = event_tx
-                                .send(Ok(StreamItem::OrchestratorEvent(
-                                    OrchestratorEvent::TaskBlocked {
+                                .send(Ok(StreamItem::AgentEvent(Box::new(by_worker(
+                                    &worker_id,
+                                    AgentEventPayload::TaskBlocked {
                                         task_id,
                                         orchestrator_id: self.orchestrator_id.clone(),
-                                        worker_id: worker_id.clone(),
-                                        tool_call_id: call.call_id.clone(),
+                                        tool_call_id: call.call_id.clone().into(),
                                         decision_id: call.decision_id.to_string(),
-                                        tool_name: call.tool_name.clone(),
+                                        tool_name: call.tool_name.clone().into(),
                                     },
-                                )))
+                                )))))
                                 .await;
                         }
                         if let Some(t) = plan.get_task_mut(task_id) {
@@ -3473,18 +3509,15 @@ Assign tasks to the worker whose tools best match the required operations."#,
                             t.fail(err_str.clone(), category);
                         }
                         let _ = event_tx
-                            .send(Ok(StreamItem::OrchestratorEvent(
-                                OrchestratorEvent::TaskCompleted {
+                            .send(Ok(StreamItem::AgentEvent(Box::new(by_worker(
+                                &worker_name.clone().unwrap_or(self.orchestrator_id.clone()),
+                                AgentEventPayload::TaskCompleted {
                                     task_id,
-                                    success: false,
                                     duration_ms,
                                     orchestrator_id: self.orchestrator_id.clone(),
-                                    worker_id: worker_name
-                                        .clone()
-                                        .unwrap_or(self.orchestrator_id.clone()),
-                                    result: err_str.clone(),
+                                    outcome: outcome_of(false, err_str.clone()),
                                 },
-                            )))
+                            )))))
                             .await;
                         let worker_label = worker_name.as_deref().unwrap_or("generic");
                         let (task_preview, _) = safe_truncate(&task_desc, 100);
@@ -4392,10 +4425,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
     /// Send an orchestrator event through the stream channel.
     async fn emit_event(
         event_tx: &tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>,
-        event: OrchestratorEvent,
+        event: AgentEventPayload,
     ) {
         let _ = event_tx
-            .send(Ok(StreamItem::OrchestratorEvent(event)))
+            .send(Ok(StreamItem::AgentEvent(Box::new(by_coordinator(event)))))
             .await;
     }
 
@@ -4414,7 +4447,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
     ) -> (Option<IterationContext>, Plan) {
         Self::emit_event(
             event_tx,
-            OrchestratorEvent::ReplanStarted {
+            AgentEventPayload::ReplanStarted {
                 iteration: iteration + 1,
                 trigger: trigger.to_string(),
             },
@@ -4520,7 +4553,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 span.record("orchestration.routing", "direct");
                 Self::emit_event(
                     &event_tx,
-                    OrchestratorEvent::DirectAnswer {
+                    AgentEventPayload::DirectAnswer {
                         response: response.clone(),
                         routing_rationale,
                     },
@@ -4538,7 +4571,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 span.record("orchestration.routing", "clarification");
                 Self::emit_event(
                     &event_tx,
-                    OrchestratorEvent::ClarificationNeeded {
+                    AgentEventPayload::ClarificationNeeded {
                         question: question.clone(),
                         options,
                         routing_rationale,
@@ -4555,10 +4588,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
                 Self::emit_event(
                     &event_tx,
-                    OrchestratorEvent::PlanCreated {
+                    AgentEventPayload::PlanCreated {
                         goal: plan.goal.clone(),
                         tasks: plan.tasks.iter().map(|t| t.description.clone()).collect(),
-                        routing_mode: super::events::RoutingMode::for_plan(plan.tasks.len()),
+                        routing_mode: RoutingMode::for_plan(plan.tasks.len()),
                         routing_rationale: routing_rationale.clone(),
                         planning_response: planning_summary,
                     },
@@ -4902,7 +4935,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             failure_history.clone(),
             tool_traces,
         );
-        Self::emit_event(event_tx, OrchestratorEvent::Synthesizing { iteration }).await;
+        Self::emit_event(event_tx, AgentEventPayload::Synthesizing { iteration }).await;
         let decision_start = Instant::now();
         let routing = self
             .plan_with_routing(
@@ -4937,7 +4970,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     .record("orchestration.post_execute_decision", "respond_directly");
                 Self::emit_event(
                     event_tx,
-                    OrchestratorEvent::DirectAnswer {
+                    AgentEventPayload::DirectAnswer {
                         response: response.clone(),
                         routing_rationale,
                     },
@@ -4945,7 +4978,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 .await;
                 Self::emit_event(
                     event_tx,
-                    OrchestratorEvent::IterationComplete {
+                    AgentEventPayload::IterationComplete {
                         iteration,
                         will_replan: false,
                         reasoning: String::new(),
@@ -4985,7 +5018,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 );
                 Self::emit_event(
                     event_tx,
-                    OrchestratorEvent::ClarificationNeeded {
+                    AgentEventPayload::ClarificationNeeded {
                         question: question.clone(),
                         options,
                         routing_rationale,
@@ -4994,7 +5027,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 .await;
                 Self::emit_event(
                     event_tx,
-                    OrchestratorEvent::IterationComplete {
+                    AgentEventPayload::IterationComplete {
                         iteration,
                         will_replan: false,
                         reasoning: String::new(),
@@ -5044,7 +5077,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     let raw = Self::build_raw_task_results(&plan, detail);
                     Self::emit_event(
                         event_tx,
-                        OrchestratorEvent::IterationComplete {
+                        AgentEventPayload::IterationComplete {
                             iteration,
                             will_replan: false,
                             reasoning: reasoning.to_string(),
@@ -5064,14 +5097,14 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
                 Self::emit_event(
                     event_tx,
-                    OrchestratorEvent::PlanCreated {
+                    AgentEventPayload::PlanCreated {
                         goal: new_plan.goal.clone(),
                         tasks: new_plan
                             .tasks
                             .iter()
                             .map(|t| t.description.clone())
                             .collect(),
-                        routing_mode: super::events::RoutingMode::for_plan(new_plan.tasks.len()),
+                        routing_mode: RoutingMode::for_plan(new_plan.tasks.len()),
                         routing_rationale,
                         planning_response: planning_summary,
                     },
@@ -5079,7 +5112,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 .await;
                 Self::emit_event(
                     event_tx,
-                    OrchestratorEvent::IterationComplete {
+                    AgentEventPayload::IterationComplete {
                         iteration,
                         will_replan: true,
                         reasoning: String::new(),
@@ -5147,7 +5180,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 let raw = Self::build_raw_task_results(&plan, &note);
                 Self::emit_event(
                     event_tx,
-                    OrchestratorEvent::IterationComplete {
+                    AgentEventPayload::IterationComplete {
                         iteration,
                         will_replan: false,
                         reasoning: note,
@@ -5312,7 +5345,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 }
                 Self::emit_event(
                     event_tx,
-                    OrchestratorEvent::RunParked {
+                    AgentEventPayload::RunParked {
                         run_id: run_id.clone(),
                         decision_ids: commit
                             .refreshed
@@ -5493,7 +5526,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             goal: plan.goal.clone(),
             status,
             iterations,
-            routing_mode: Some(super::events::RoutingMode::for_plan(plan.tasks.len())),
+            routing_mode: Some(RoutingMode::for_plan(plan.tasks.len())),
             outcome,
             response_summary,
             task_summaries,
@@ -5530,7 +5563,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             goal: query.to_string(),
             status: RunStatus::Success,
             iterations: 0,
-            routing_mode: Some(super::events::RoutingMode::DirectAnswer),
+            routing_mode: Some(RoutingMode::DirectAnswer),
             outcome: Some("Answered directly".to_string()),
             response_summary,
             task_summaries: vec![],
@@ -7859,12 +7892,18 @@ mod tests {
         assert!(awaiting.history.is_some() && awaiting.current_prompt.is_some());
 
         match event_rx.recv().await {
-            Some(Ok(StreamItem::OrchestratorEvent(OrchestratorEvent::RunParked {
-                run_id: event_run,
-                decision_ids,
-                iteration,
-                ..
-            }))) => {
+            Some(Ok(StreamItem::AgentEvent(event)))
+                if matches!(event.payload, AgentEventPayload::RunParked { .. }) =>
+            {
+                let AgentEventPayload::RunParked {
+                    run_id: event_run,
+                    decision_ids,
+                    iteration,
+                    ..
+                } = event.payload
+                else {
+                    unreachable!("guarded above")
+                };
                 assert_eq!(event_run, run_id);
                 assert_eq!(decision_ids, expected_ids);
                 assert_eq!(iteration, 1);
@@ -7929,11 +7968,17 @@ mod tests {
             document.expires_at
         );
         match event_rx.recv().await {
-            Some(Ok(StreamItem::OrchestratorEvent(OrchestratorEvent::RunParked {
-                decision_ids,
-                expires_at: stamp,
-                ..
-            }))) => {
+            Some(Ok(StreamItem::AgentEvent(event)))
+                if matches!(event.payload, AgentEventPayload::RunParked { .. }) =>
+            {
+                let AgentEventPayload::RunParked {
+                    decision_ids,
+                    expires_at: stamp,
+                    ..
+                } = event.payload
+                else {
+                    unreachable!("guarded above")
+                };
                 assert!(decision_ids.is_empty());
                 assert_eq!(stamp, document.expires_at);
             }

@@ -19,6 +19,7 @@
 //! 3. Cancel MCP requests and close connections via `agent.cancel_and_close_mcp()`
 
 use crate::streaming::types::openai::UsageInfo;
+use aura_events::agent::{AgentEvent, AgentEventPayload};
 
 use super::types::{
     CHUNK_OBJECT, ChatCompletionChunk, ChatCompletionChunkChoice, ChatCompletionChunkDelta,
@@ -28,10 +29,10 @@ use super::types::{
 };
 use aura::stream_events::{AgentContext, AuraStreamEvent, CorrelationContext};
 use aura::{
-    ApprovalLifecycleEvent, EventContext, OrchestrationStreamEvent, OrchestratorEvent,
-    PASSTHROUGH_MARKER, ProgressNotification, RequestCancellation, ResponseContent, StreamError,
-    StreamItem, StreamedAssistantContent, StreamedUserContent, StreamingAgent, ToolCall,
-    ToolCallId, ToolLifecycleEvent, ToolResult, ToolUsageEvent, UsageState,
+    ApprovalLifecycleEvent, EventContext, OrchestrationStreamEvent, PASSTHROUGH_MARKER,
+    ProgressNotification, RequestCancellation, ResponseContent, StreamError, StreamItem,
+    StreamedAssistantContent, StreamedUserContent, StreamingAgent, ToolCall, ToolCallId,
+    ToolLifecycleEvent, ToolResult, ToolUsageEvent, UsageState,
 };
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
@@ -768,7 +769,7 @@ fn handle_stream_item(
             tracing::debug!("Received final/turn-usage marker");
             vec![]
         }
-        StreamItem::OrchestratorEvent(event) => handle_orchestrator_event(config, ctx, event),
+        StreamItem::AgentEvent(event) => handle_orchestrator_event(config, ctx, event),
         StreamItem::ScratchpadUsage {
             agent_id,
             tokens_intercepted,
@@ -1194,7 +1195,7 @@ fn maybe_truncate(s: &str, max_len: usize) -> Option<String> {
 fn handle_orchestrator_event(
     config: &StreamConfig,
     ctx: &TurnContext,
-    event: &OrchestratorEvent,
+    event: &AgentEvent,
 ) -> Vec<Bytes> {
     if !config.emit_custom_events {
         tracing::debug!(
@@ -1204,10 +1205,20 @@ fn handle_orchestrator_event(
         return vec![];
     }
 
-    let event_context = EventContext::new(ctx.agent_context.clone(), ctx.correlation.clone());
+    // Variants like ToolStart are emitted by both modes, so the envelope is
+    // what decides which frames an event becomes. A single-agent event routed
+    // here would be projected as an orchestration frame.
+    if event.agent.is_single_agent() {
+        return vec![];
+    }
 
-    let sse_event: OrchestrationStreamEvent = match event {
-        OrchestratorEvent::PlanCreated {
+    let event_context = EventContext::new(ctx.agent_context.clone(), ctx.correlation.clone());
+    // Orchestration frames name the worker in a field of their own; the
+    // envelope is where that now comes from.
+    let worker_id = &event.agent.agent_id;
+
+    let sse_event: OrchestrationStreamEvent = match &event.payload {
+        AgentEventPayload::PlanCreated {
             goal,
             tasks,
             routing_mode,
@@ -1234,7 +1245,7 @@ fn handle_orchestrator_event(
                 event_context,
             )
         }
-        OrchestratorEvent::DirectAnswer {
+        AgentEventPayload::DirectAnswer {
             response,
             routing_rationale,
         } => {
@@ -1244,7 +1255,7 @@ fn handle_orchestrator_event(
             );
             OrchestrationStreamEvent::direct_answer(response, routing_rationale, event_context)
         }
-        OrchestratorEvent::ClarificationNeeded {
+        AgentEventPayload::ClarificationNeeded {
             question,
             options,
             routing_rationale,
@@ -1261,29 +1272,30 @@ fn handle_orchestrator_event(
                 event_context,
             )
         }
-        OrchestratorEvent::TaskStarted {
+        AgentEventPayload::TaskStarted {
             task_id,
             description,
             orchestrator_id,
-            worker_id,
         } => {
             tracing::debug!("Orchestrator: task {} started - {}", task_id, description);
             OrchestrationStreamEvent::task_started(
                 *task_id,
                 description,
                 orchestrator_id,
-                worker_id,
+                worker_id.as_str(),
                 event_context,
             )
         }
-        OrchestratorEvent::TaskCompleted {
+        AgentEventPayload::TaskCompleted {
             task_id,
-            success,
             duration_ms,
             orchestrator_id,
-            worker_id,
-            result,
+            outcome,
         } => {
+            let (success, result) = match outcome {
+                aura_events::agent::ToolOutcome::Success { result } => (true, result),
+                aura_events::agent::ToolOutcome::Failure { error } => (false, error),
+            };
             tracing::debug!(
                 "Orchestrator: task {} completed (success={}) in {}ms",
                 task_id,
@@ -1292,18 +1304,17 @@ fn handle_orchestrator_event(
             );
             OrchestrationStreamEvent::task_completed(
                 *task_id,
-                *success,
+                success,
                 *duration_ms,
                 orchestrator_id,
-                worker_id,
+                worker_id.as_str(),
                 maybe_truncate(result, config.tool_result_max_length),
                 event_context,
             )
         }
-        OrchestratorEvent::TaskBlocked {
+        AgentEventPayload::TaskBlocked {
             task_id,
             orchestrator_id,
-            worker_id,
             tool_call_id,
             decision_id,
             tool_name,
@@ -1317,15 +1328,15 @@ fn handle_orchestrator_event(
             );
             OrchestrationStreamEvent::task_blocked(
                 *task_id,
-                tool_call_id,
+                tool_call_id.as_ref(),
                 decision_id,
-                tool_name,
+                tool_name.as_ref(),
                 orchestrator_id,
-                worker_id,
+                worker_id.as_str(),
                 event_context,
             )
         }
-        OrchestratorEvent::IterationComplete {
+        AgentEventPayload::IterationComplete {
             iteration,
             will_replan,
             reasoning,
@@ -1353,7 +1364,7 @@ fn handle_orchestrator_event(
                 event_context,
             )
         }
-        OrchestratorEvent::ReplanStarted { iteration, trigger } => {
+        AgentEventPayload::ReplanStarted { iteration, trigger } => {
             tracing::debug!(
                 "Orchestrator: replan started (iteration={}, trigger={})",
                 iteration,
@@ -1361,16 +1372,15 @@ fn handle_orchestrator_event(
             );
             OrchestrationStreamEvent::replan_started(*iteration, trigger, event_context)
         }
-        OrchestratorEvent::Synthesizing { iteration } => {
+        AgentEventPayload::Synthesizing { iteration } => {
             tracing::debug!(
                 "Orchestrator: consolidating results for coordinator (iteration={})",
                 iteration
             );
             OrchestrationStreamEvent::synthesizing(*iteration, event_context)
         }
-        OrchestratorEvent::WorkerReasoning {
-            task_id,
-            worker_id,
+        AgentEventPayload::Reasoning {
+            task_id: Some(task_id),
             content,
         } => {
             if !config.emit_custom_events || !config.emit_reasoning {
@@ -1384,26 +1394,24 @@ fn handle_orchestrator_event(
             // Emit as aura.orchestrator.worker_reasoning (orchestration event)
             let orch_event = OrchestrationStreamEvent::worker_reasoning(
                 *task_id,
-                worker_id,
+                worker_id.as_str(),
                 content,
                 event_context.clone(),
             );
             let mut bytes = vec![Bytes::from(orch_event.format_sse())];
             // Also emit as aura.reasoning with agent_id set to the worker name
             // for backward-compatible reasoning aggregation
-            let worker_agent =
-                aura::stream_events::AgentContext::worker(worker_id, None, "coordinator");
             let reasoning_event =
-                AuraStreamEvent::reasoning(content, worker_agent, ctx.correlation.clone());
+                AuraStreamEvent::reasoning(content, event.agent.clone(), ctx.correlation.clone());
             bytes.push(Bytes::from(reasoning_event.format_sse()));
             return bytes;
         }
-        OrchestratorEvent::ToolCallStarted {
+        AgentEventPayload::ToolStart {
             task_id,
             tool_call_id,
             tool_name,
-            worker_id,
             arguments,
+            ..
         } => {
             tracing::debug!(
                 "Orchestrator: task {:?} tool call started - {} ({})",
@@ -1413,20 +1421,24 @@ fn handle_orchestrator_event(
             );
             OrchestrationStreamEvent::tool_call_started(
                 *task_id,
-                tool_call_id,
-                tool_name,
-                worker_id,
-                Some(arguments.clone()),
+                tool_call_id.as_ref(),
+                tool_name.as_ref(),
+                worker_id.as_str(),
+                arguments.clone(),
                 event_context,
             )
         }
-        OrchestratorEvent::ToolCallCompleted {
+        AgentEventPayload::ToolComplete {
             task_id,
             tool_call_id,
-            success,
             duration_ms,
-            result,
+            outcome,
+            ..
         } => {
+            let (success, result) = match outcome {
+                aura_events::agent::ToolOutcome::Success { result } => (true, result),
+                aura_events::agent::ToolOutcome::Failure { error } => (false, error),
+            };
             tracing::debug!(
                 "Orchestrator: task {:?} tool call completed - {} (success={}) in {}ms",
                 task_id,
@@ -1436,14 +1448,14 @@ fn handle_orchestrator_event(
             );
             OrchestrationStreamEvent::tool_call_completed(
                 *task_id,
-                tool_call_id,
-                *success,
+                tool_call_id.as_ref(),
+                success,
                 *duration_ms,
                 maybe_truncate(result, config.tool_result_max_length),
                 event_context,
             )
         }
-        OrchestratorEvent::RunParked {
+        AgentEventPayload::RunParked {
             run_id,
             decision_ids,
             expires_at,
@@ -1463,6 +1475,16 @@ fn handle_orchestrator_event(
                 *iteration,
                 event_context,
             )
+        }
+        // `AgentEventPayload` is `#[non_exhaustive]`, so the compiler cannot
+        // flag an orchestration variant that arrives with no projection here.
+        // Log it rather than drop it silently.
+        other => {
+            tracing::debug!(
+                payload = ?std::mem::discriminant(other),
+                "orchestration event has no SSE projection; dropped"
+            );
+            return vec![];
         }
     };
 

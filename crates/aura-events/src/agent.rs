@@ -17,6 +17,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::orchestration::{IterationTimings, RoutingMode};
 use crate::{
     AgentContext, ApprovalCompleted, ApprovalPending, ApprovalRequested, McpServerStatus, Progress,
     ProgressToken, TokenCount, TokenUsage, ToolCallId, ToolName, WorkerPhase,
@@ -49,7 +50,7 @@ pub enum ToolOutcome {
 /// What an agent has to say about its own execution.
 ///
 /// `#[non_exhaustive]` because the vocabulary grows as producers move onto this
-/// schema — orchestration events in particular are not yet modelled here.
+/// schema.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[non_exhaustive]
@@ -70,6 +71,8 @@ pub enum AgentEventPayload {
 
     Reasoning {
         content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_id: Option<usize>,
     },
 
     /// The model's decision to call a tool, ahead of any execution.
@@ -84,6 +87,10 @@ pub enum AgentEventPayload {
         tool_name: ToolName,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         progress_token: Option<ProgressToken>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        arguments: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_id: Option<usize>,
     },
 
     ToolComplete {
@@ -92,6 +99,8 @@ pub enum AgentEventPayload {
         duration_ms: u64,
         #[serde(flatten)]
         outcome: ToolOutcome,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_id: Option<usize>,
     },
 
     ToolProgress {
@@ -143,6 +152,76 @@ pub enum AgentEventPayload {
     ApprovalPending(ApprovalPending),
 
     ApprovalCompleted(ApprovalCompleted),
+
+    PlanCreated {
+        goal: String,
+        tasks: Vec<String>,
+        routing_mode: RoutingMode,
+        routing_rationale: String,
+        planning_response: String,
+    },
+
+    DirectAnswer {
+        response: String,
+        routing_rationale: String,
+    },
+
+    ClarificationNeeded {
+        question: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        options: Option<Vec<String>>,
+        routing_rationale: String,
+    },
+
+    TaskStarted {
+        task_id: usize,
+        description: String,
+        orchestrator_id: String,
+    },
+
+    TaskCompleted {
+        task_id: usize,
+        duration_ms: u64,
+        orchestrator_id: String,
+        #[serde(flatten)]
+        outcome: ToolOutcome,
+    },
+
+    /// A worker's gated call is waiting on an approval the run will not block
+    /// for; one per parked call.
+    TaskBlocked {
+        task_id: usize,
+        tool_call_id: ToolCallId,
+        decision_id: String,
+        tool_name: ToolName,
+        orchestrator_id: String,
+    },
+
+    /// The run stopped to await its parked approvals. Terminal.
+    RunParked {
+        run_id: String,
+        decision_ids: Vec<String>,
+        expires_at: String,
+        iteration: usize,
+    },
+
+    IterationComplete {
+        iteration: usize,
+        will_replan: bool,
+        reasoning: String,
+        gaps: Vec<String>,
+        timings: IterationTimings,
+    },
+
+    ReplanStarted {
+        iteration: usize,
+        /// `"coordinator"` or `"failure"`.
+        trigger: String,
+    },
+
+    Synthesizing {
+        iteration: usize,
+    },
 }
 
 #[cfg(test)]
@@ -175,6 +254,8 @@ mod tests {
             tool_call_id: ToolCallId::new("call_1"),
             tool_name: ToolName::new("list_files"),
             progress_token: None,
+            arguments: None,
+            task_id: None,
         });
         assert!(matches!(start, AgentEventPayload::ToolStart { .. }));
 
@@ -200,6 +281,7 @@ mod tests {
     #[test]
     fn tool_outcome_flattens_onto_tool_complete() {
         let json = serde_json::to_value(AgentEventPayload::ToolComplete {
+            task_id: None,
             tool_call_id: ToolCallId::new("call_1"),
             tool_name: ToolName::new("list_files"),
             duration_ms: 12,
@@ -212,6 +294,39 @@ mod tests {
         assert_eq!(json["type"], "tool_complete");
         assert_eq!(json["outcome"], "failure");
         assert_eq!(json["error"], "boom");
+    }
+
+    /// `ToolStart` is emitted by a lone agent and by an orchestration worker,
+    /// so nothing about the payload says which frames it becomes — only the
+    /// envelope does.
+    #[test]
+    fn a_shared_variant_is_told_apart_by_its_agent_not_its_payload() {
+        let payload = || AgentEventPayload::ToolStart {
+            tool_call_id: ToolCallId::new("call_1"),
+            tool_name: ToolName::new("list_files"),
+            progress_token: None,
+            arguments: None,
+            task_id: None,
+        };
+
+        let alone = AgentEvent::single_agent(payload());
+        let worker = AgentEvent::new(
+            AgentContext::worker("log_worker", None, "coordinator"),
+            payload(),
+        );
+
+        assert!(alone.agent.is_single_agent());
+        assert!(!worker.agent.is_single_agent());
+    }
+
+    /// An orchestration run names its coordinator-owned tool calls `"main"`,
+    /// the same id a lone agent uses, so only the parent tells them apart.
+    #[test]
+    fn a_coordinator_owned_call_named_main_is_not_the_lone_agent() {
+        let coordinator_owned = AgentContext::worker("main", None, "coordinator");
+
+        assert!(!coordinator_owned.is_single_agent());
+        assert!(AgentContext::single_agent().is_single_agent());
     }
 
     #[test]
