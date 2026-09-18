@@ -65,8 +65,8 @@ use super::config::OrchestrationConfig;
 use super::events::OrchestratorEvent;
 use super::park::resume::evaluate::IdentityHash;
 use super::park::resume::{
-    Diagnostic, EmptySegment, NonEmptyBlocking, ResumeGrant, SegmentError, SegmentResult,
-    SegmentTurns, blocking_from_calls,
+    Diagnostic, EmptySegment, NonEmptyBlocking, ResumeGrant, ResumeStreamEnd, SegmentError,
+    SegmentResult, SegmentTurns, blocking_from_calls,
 };
 use super::park::{
     CallId, CallKey, NodePreflightInput, OutcomeWire, ParkCommitInputs, ParkGuard, ParkGuardMode,
@@ -158,8 +158,72 @@ struct AwaitingNode {
 /// run_iteration's park path (the segment parks with the re-derived
 /// blocking set).
 enum ContinuationOutcome {
-    Completed,
-    ReParked { blocking: NonEmptyBlocking },
+    Completed {
+        /// The run's natural finish, the normal factory finalization's
+        /// answer. The atomic segment discards it (its callers read turns);
+        /// the borrowed stream drive hands it to the supervisor.
+        final_answer: String,
+    },
+    ReParked {
+        blocking: NonEmptyBlocking,
+    },
+}
+
+/// One resumed segment's terminal data, shape-independent: the atomic
+/// segment projects it to [`SegmentResult`] (its public 200 body), and the
+/// borrowed stream drive projects it to [`ResumeStreamEnd`].
+enum SegmentTerminal {
+    Completed {
+        final_answer: String,
+        turns: SegmentTurns,
+    },
+    Parked {
+        blocking: NonEmptyBlocking,
+        turns: SegmentTurns,
+    },
+}
+
+/// Where one resumed segment's drive sends its events, and whether its
+/// coordinator continuation starts a fresh cycle budget.
+///
+/// The atomic segment ([`Orchestrator::run_resume_segment`]) discards the
+/// drive's events through a closed channel and continues the checkpoint's
+/// historical iteration; the borrowed stream drive
+/// ([`Orchestrator::run_resume_segment_borrowed`]) forwards normal events to
+/// the caller's channel and counts fresh cycles, so a checkpoint carrying a
+/// high historical iteration cannot shorten or extend the resumed run's
+/// three-cycle budget.
+enum SegmentDriveShape {
+    Atomic,
+    Streaming(tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>),
+}
+
+impl SegmentDriveShape {
+    /// The publication sink: the caller's channel on the stream shape, the
+    /// publication owner's route for `RunParked` exactly once. The atomic
+    /// shape has none — its events are discarded.
+    fn publication_tx(
+        &self,
+    ) -> Option<&tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>> {
+        match self {
+            Self::Atomic => None,
+            Self::Streaming(tx) => Some(tx),
+        }
+    }
+
+    /// Whether the coordinator continuation seeds a FRESH cycle counter
+    /// instead of the checkpoint's historical iteration.
+    fn fresh_cycle_counter(&self) -> bool {
+        matches!(self, Self::Streaming(_))
+    }
+}
+
+/// How the borrowed stream drive's body future ended: returned (carrying
+/// the body's result, or a caught panic payload), or was dropped because the
+/// grant's scope was cancelled mid-segment.
+enum SegmentDriveExit {
+    Returned(Result<Result<SegmentTerminal, SegmentError>, Box<dyn std::any::Any + Send>>),
+    Cancelled,
 }
 
 /// Named return type for `create_*` coordinator/worker methods.
@@ -4514,20 +4578,204 @@ Assign tasks to the worker whose tools best match the required operations."#,
     /// for already-spawned tracked work, so no legitimate return is blocked.
     async fn drive_resume_segment(self, grant: ResumeGrant) -> Result<SegmentResult, SegmentError> {
         let scope = grant.execution_scope();
-        let result = self.drive_resume_segment_body(&grant).await;
+        let result = self
+            .drive_resume_segment_core(&grant, &SegmentDriveShape::Atomic)
+            .await;
         scope.drain().await;
-        result
+        match result? {
+            SegmentTerminal::Completed { turns, .. } => Ok(SegmentResult::Completed { turns }),
+            SegmentTerminal::Parked { turns, blocking } => {
+                Ok(SegmentResult::Parked { turns, blocking })
+            }
+        }
     }
 
-    /// The segment body driven by [`Self::drive_resume_segment`]: the
-    /// decided approvals' next agent turns through the coordinator
-    /// iteration loop, returning the terminal segment data or the
-    /// mid-segment fault. Borrows the grant so the drain wrapper holds the
-    /// reservation lease across its scope drain.
-    async fn drive_resume_segment_body(
+    /// The resume module's borrowed-grant seam
+    /// ([`super::park::resume::run_segment_borrowed`]): build the segment
+    /// orchestrator from the prepared config, hand it the caller's usage
+    /// handle and projected outer budget, then drive the borrowed grant with
+    /// events streaming to the caller's channel.
+    ///
+    /// Unlike the atomic [`Self::run_resume_segment`], this drive never
+    /// takes the grant by value: the supervisor keeps ownership so the claim
+    /// lease outlives every await, and the drive borrows `&ResumeGrant`
+    /// across its whole body.
+    pub(super) async fn run_resume_segment_borrowed(
+        grant: &ResumeGrant,
+        config: &AgentRuntimeConfig,
+        event_tx: tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>,
+        usage_state: crate::UsageState,
+        outer_budget: Option<Duration>,
+    ) -> Result<ResumeStreamEnd, SegmentError> {
+        // The config arrives already prepared by `run_segment_borrowed`:
+        // the run-owner `request_id` stamp and the deliberate header
+        // no-op both happened there, before the orchestrator build.
+        let mut orchestrator = Self::for_resume_segment(grant, config).await?;
+        // Share the caller's usage handle so the resumed turns accumulate
+        // into the state the streaming handler reads, exactly as the live
+        // supervisor wires it; the projected budget bounds the resumed
+        // coordinator's outer request budget.
+        orchestrator.usage_state = usage_state;
+        orchestrator.outer_budget = outer_budget;
+        orchestrator
+            .drive_resume_segment_stream(grant, event_tx)
+            .await
+    }
+
+    /// Drive the borrowed grant as a stream shape.
+    ///
+    /// Races the segment body against the grant's ONE execution scope: a
+    /// cancellation that arrives mid-segment drops the body future (the
+    /// grant is borrowed, never moved, so dropping is safe) and forwards the
+    /// run's stop through the caller's channel BEFORE returning, because the
+    /// supervisor's post-return sends are cancellation-aware and would lose
+    /// the race once the scope is cancelled. This is where the carried-over
+    /// frame-7 Leg D stop publication lands.
+    ///
+    /// Closes the MCP manager exactly once in every exit arm — normal,
+    /// error, cancellation, and the caught panic — BEFORE the scope drain,
+    /// so a supervised-task panic cannot strand the manager. Then drains the
+    /// grant's scope so no tracked tail outlives the reservation fence.
+    async fn drive_resume_segment_stream(
+        self,
+        grant: &ResumeGrant,
+        event_tx: tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>,
+    ) -> Result<ResumeStreamEnd, SegmentError> {
+        use futures::FutureExt;
+
+        let scope = grant.execution_scope();
+        let shape = SegmentDriveShape::Streaming(event_tx.clone());
+        let outcome = {
+            let drive = std::panic::AssertUnwindSafe(self.drive_resume_segment_core(grant, &shape))
+                .catch_unwind();
+            tokio::pin!(drive);
+            tokio::select! {
+                biased;
+                _ = scope.cancellation().cancelled() => SegmentDriveExit::Cancelled,
+                returned = &mut drive => SegmentDriveExit::Returned(returned),
+            }
+        };
+
+        match outcome {
+            // A supervised-task panic must not strand the manager: close it
+            // and drain the scope first, then propagate the panic.
+            SegmentDriveExit::Returned(Err(panic)) => {
+                self.close_segment_mcp().await;
+                scope.drain().await;
+                std::panic::resume_unwind(panic);
+            }
+            SegmentDriveExit::Returned(Ok(Ok(SegmentTerminal::Completed {
+                final_answer, ..
+            }))) => {
+                self.close_segment_mcp().await;
+                Self::drain_resume_scope_with_stop(&scope, &event_tx).await;
+                Ok(ResumeStreamEnd::Completed { final_answer })
+            }
+            SegmentDriveExit::Returned(Ok(Ok(SegmentTerminal::Parked { .. }))) => {
+                self.close_segment_mcp().await;
+                Self::drain_resume_scope_with_stop(&scope, &event_tx).await;
+                Ok(ResumeStreamEnd::Reparked)
+            }
+            // A mid-segment fault must surface before the drain: the
+            // supervisor's error-arm send runs only after this drive returns
+            // (that is, after the drain), and the frame's fault arm reads the
+            // error while the held tail keeps the drain pending. Forward the
+            // fault here, first, then latch the scope so the supervisor's
+            // cancellation-aware error-arm send races a cancelled token and
+            // cannot duplicate the fault we just published.
+            SegmentDriveExit::Returned(Ok(Err(fault))) => {
+                let wire: StreamError = match &fault {
+                    SegmentError::Continuation(diagnostic) => diagnostic.to_string().into(),
+                };
+                let _ = event_tx.send(Err(wire)).await;
+                scope.cancel();
+                self.close_segment_mcp().await;
+                scope.drain().await;
+                Err(fault)
+            }
+            // The scope's cancellation is the run's stop: forward it on the
+            // stream first, since the supervisor's exit-arm sends race the
+            // now-latched cancellation and cannot publish it.
+            SegmentDriveExit::Cancelled => {
+                Self::forward_segment_stop(&event_tx).await;
+                self.close_segment_mcp().await;
+                scope.drain().await;
+                Err(SegmentError::Continuation(Diagnostic::new(
+                    "the resume segment was cancelled",
+                )))
+            }
+        }
+    }
+
+    /// Publish the run's stop on the caller's channel: a terminal-shaped
+    /// item the client consumes, emitted only where the supervisor's own
+    /// cancellation-aware sends would lose the race — a mid-segment
+    /// cancellation, or a cancellation that lands while the drain still
+    /// waits on tracked tails.
+    async fn forward_segment_stop(
+        event_tx: &tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>,
+    ) {
+        let _ = event_tx
+            .send(Ok(StreamItem::Final(
+                crate::provider_agent::FinalResponseInfo {
+                    content: String::new(),
+                    usage: Default::default(),
+                    cache_usage: None,
+                },
+            )))
+            .await;
+    }
+
+    /// Drain the grant's scope, publishing the run's stop if the scope is
+    /// cancelled before the drain ends. A cancellation that lands after the
+    /// segment body finished must not strand the client behind a held
+    /// tracked tail: the supervisor's post-return sends race the latched
+    /// cancellation and lose, so the drive publishes the stop here.
+    async fn drain_resume_scope_with_stop(
+        scope: &crate::orchestration::RunExecutionScope,
+        event_tx: &tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>,
+    ) {
+        let drain = scope.drain();
+        tokio::pin!(drain);
+        tokio::select! {
+            biased;
+            _ = scope.cancellation().cancelled() => {
+                Self::forward_segment_stop(event_tx).await;
+                (&mut drain).await;
+            }
+            _ = &mut drain => {}
+        }
+    }
+
+    /// Close the segment's MCP manager exactly once, the same close shape
+    /// the normal supervisor's cancellation arm uses. A segment with no MCP
+    /// configured has nothing to close.
+    async fn close_segment_mcp(&self) {
+        let Some(ref mcp_manager) = self.mcp_manager else {
+            return;
+        };
+        let request_id = self.agent_config.request_id.clone().unwrap_or_default();
+        let cancelled = mcp_manager
+            .cancel_and_close_all(&request_id, "Resume segment ended")
+            .await;
+        if cancelled > 0 {
+            tracing::info!(
+                "Cancelled {} MCP request(s) during resume segment shutdown",
+                cancelled
+            );
+        }
+    }
+
+    /// The segment body shared by the atomic and stream drives: the decided
+    /// approvals' next agent turns through the coordinator iteration loop,
+    /// returning the terminal segment data or the mid-segment fault.
+    /// Borrows the grant so the drain wrapper holds the reservation lease
+    /// across its scope drain.
+    async fn drive_resume_segment_core(
         &self,
         grant: &ResumeGrant,
-    ) -> Result<SegmentResult, SegmentError> {
+        shape: &SegmentDriveShape,
+    ) -> Result<SegmentTerminal, SegmentError> {
         let fault = |message: String| SegmentError::Continuation(Diagnostic::new(message));
         let Some(hitl) = self.agent_config.hitl.clone() else {
             return Err(fault(
@@ -4935,6 +5183,32 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     if let Some(ref guard) = self.park_guard {
                         guard.mark_published();
                     }
+                    // This inline drive-loop re-park is the publication
+                    // owner: the stream shape routes its ONE `RunParked`
+                    // through the caller's channel, exactly as `park_run`
+                    // does for a coordinator-loop re-park. The atomic shape
+                    // has no caller and emits nothing. The segment returns
+                    // immediately below, so no second publication path runs.
+                    if let Some(tx) = shape.publication_tx() {
+                        Self::emit_event(
+                            tx,
+                            OrchestratorEvent::RunParked {
+                                run_id: checkpoint.run_id.clone(),
+                                decision_ids: commit
+                                    .refreshed
+                                    .decision_ids
+                                    .iter()
+                                    .map(ToString::to_string)
+                                    .collect(),
+                                retention_expires_at:
+                                    aura_events::RetentionExpiresAt::from_datetime(
+                                        commit.retention_expires_at.as_datetime(),
+                                    ),
+                                iteration: checkpoint.iteration,
+                            },
+                        )
+                        .await;
+                    }
                     // A re-park removes only the actually-consumed subset
                     // from the store, after the commit published, so
                     // untouched sibling nodes keep their recorded approvals.
@@ -4984,7 +5258,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     let turns = SegmentTurns::try_new(turns).map_err(|EmptySegment| {
                         fault("the re-parked segment carried no turns".to_string())
                     })?;
-                    return Ok(SegmentResult::Parked { turns, blocking });
+                    return Ok(SegmentTerminal::Parked { turns, blocking });
                 }
                 CellOutcome::Orphaned { pending } => {
                     self.cancel_parked_approvals(task_id, worker_name, &pending)
@@ -5038,7 +5312,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         // not finished until the loop answers or a newly gated call parks
         // again — the segment's terminal arm is the loop's, not the last
         // worker's.
-        match self
+        let final_answer = match self
             .resume_coordinator_continuation(
                 &checkpoint,
                 plan,
@@ -5047,18 +5321,22 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 registry,
                 &consumed,
                 &mut turns,
+                shape,
             )
             .await?
         {
-            ContinuationOutcome::Completed => {}
+            // A Completed segment carries none of the deferred pairs: they
+            // are a Parked segment's report only, and the completion
+            // teardown below runs before the terminal is built.
+            ContinuationOutcome::Completed { final_answer } => final_answer,
             ContinuationOutcome::ReParked { blocking } => {
                 splice_deferred_pairs(&mut turns, pair_blocks);
                 let turns = SegmentTurns::try_new(turns).map_err(|EmptySegment| {
                     fault("the re-parked segment carried no turns".to_string())
                 })?;
-                return Ok(SegmentResult::Parked { turns, blocking });
+                return Ok(SegmentTerminal::Parked { turns, blocking });
             }
-        }
+        };
 
         // Every awaiting node completed and the continuation finished: the
         // checkpoint is the record only until the segment ends — delete the
@@ -5086,7 +5364,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
         let turns = SegmentTurns::try_new(turns)
             .map_err(|EmptySegment| fault("the completed segment carried no turns".to_string()))?;
-        Ok(SegmentResult::Completed { turns })
+        Ok(SegmentTerminal::Completed {
+            final_answer,
+            turns,
+        })
     }
 
     /// Re-enter the coordinator iteration loop after every awaiting node
@@ -5109,6 +5390,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         registry: &crate::hitl::PendingApprovals,
         consumed: &[crate::hitl::DecisionId],
         turns: &mut Vec<rig::completion::Message>,
+        shape: &SegmentDriveShape,
     ) -> Result<ContinuationOutcome, SegmentError> {
         let fault = |message: String| SegmentError::Continuation(Diagnostic::new(message));
         // Restore the coordinator exactly as run_orchestration creates it,
@@ -5133,13 +5415,60 @@ Assign tasks to the worker whose tools best match the required operations."#,
             routing_decision,
         };
 
-        // The segment is atomic to the client: no SSE stream consumes the
-        // loop's events, so the channel closes at birth and every send the
-        // loop makes is a no-op.
-        let (event_tx, event_rx) = tokio::sync::mpsc::channel::<Result<StreamItem, StreamError>>(1);
-        drop(event_rx);
+        // The loop's routine events are discarded: a resumed segment is not
+        // re-streamed to the client (the caller already has the run's
+        // context), so the channel closes at birth and every send the loop
+        // makes is a no-op. The ONE exception is the publication owner's
+        // `RunParked`: the stream shape relays exactly that event to the
+        // caller's channel so a re-park reaches the client once and only
+        // once; the atomic shape has no caller and drops it.
+        let (event_tx, publication_relay) = match shape {
+            SegmentDriveShape::Atomic => {
+                let (tx, rx) = tokio::sync::mpsc::channel::<Result<StreamItem, StreamError>>(1);
+                drop(rx);
+                (tx, None)
+            }
+            SegmentDriveShape::Streaming(caller_tx) => {
+                let (tx, mut rx) =
+                    tokio::sync::mpsc::channel::<Result<StreamItem, StreamError>>(64);
+                let caller_tx = caller_tx.clone();
+                let relay = tokio::spawn(async move {
+                    while let Some(item) = rx.recv().await {
+                        if let Ok(StreamItem::OrchestratorEvent(OrchestratorEvent::RunParked {
+                            ..
+                        })) = &item
+                            && caller_tx.send(item).await.is_err()
+                        {
+                            break;
+                        }
+                    }
+                });
+                (tx, Some(relay))
+            }
+        };
 
-        let (_final_answer, worker_turns) = self
+        // The resumed coordinator's cycle counter: the stream shape counts
+        // FRESH cycles (three, per `max_planning_cycles`), so the
+        // checkpoint's historical iteration stays evidence-only and can
+        // neither shorten nor extend the resumed run's budget. The atomic
+        // shape continues the checkpoint's historical iteration unchanged.
+        let seed = if shape.fresh_cycle_counter() {
+            LoopSeed {
+                iteration: 0,
+                planning_ms: 0,
+                failure_history: checkpoint.failure_history.clone(),
+                known_failed_tasks,
+            }
+        } else {
+            LoopSeed {
+                iteration: checkpoint.iteration,
+                planning_ms: checkpoint.planning_ms,
+                failure_history: checkpoint.failure_history.clone(),
+                known_failed_tasks,
+            }
+        };
+
+        let loop_result = self
             .run_orchestration_loop(
                 &checkpoint.query,
                 plan,
@@ -5147,15 +5476,17 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 &mut coordinator_state,
                 event_tx,
                 Instant::now(),
-                LoopSeed {
-                    iteration: checkpoint.iteration,
-                    planning_ms: checkpoint.planning_ms,
-                    failure_history: checkpoint.failure_history.clone(),
-                    known_failed_tasks,
-                },
+                seed,
             )
-            .await
-            .map_err(|e| fault(format!("the resumed coordinator loop failed: {e}")))?;
+            .await;
+        // The relay exits once the loop's sender drops (above); awaiting it
+        // guarantees the publication owner's `RunParked`, if any, reached the
+        // caller's channel before this continuation returns.
+        if let Some(relay) = publication_relay {
+            let _ = relay.await;
+        }
+        let (final_answer, worker_turns) =
+            loop_result.map_err(|e| fault(format!("the resumed coordinator loop failed: {e}")))?;
 
         // The completed segment's turns: the workers' natural turns (the
         // drive loop's continuations, then the loop-driven workers'), then
@@ -5179,7 +5510,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             .await
             .map_err(|e| fault(format!("the re-park probe task did not complete: {e}")))?;
         if !re_parked {
-            return Ok(ContinuationOutcome::Completed);
+            return Ok(ContinuationOutcome::Completed { final_answer });
         }
         let republished = load_parked_run(documents.parked())
             .await

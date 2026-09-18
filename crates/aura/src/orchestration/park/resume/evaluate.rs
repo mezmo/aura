@@ -966,10 +966,6 @@ pub async fn run_segment(
 /// runs through the grant's one execution scope
 /// ([`ResumeGrant::execution_scope`]); it is the sole cancellation path,
 /// with no second token parameter.
-#[expect(
-    unused_variables,
-    reason = "todo!() body; filled by P45 wave fill units"
-)]
 pub async fn run_segment_borrowed(
     grant: &ResumeGrant,
     config: &AgentRuntimeConfig,
@@ -978,9 +974,30 @@ pub async fn run_segment_borrowed(
     usage_state: UsageState,
     outer_budget: Option<Duration>,
 ) -> Result<ResumeStreamEnd, SegmentError> {
-    todo!(
-        "P45 wave fill unit S4: the borrowed-grant resume segment — the orchestrator drives the \
-         segment without taking grant ownership, forwarding normal events to the caller's \
-         channel and ending in the stream-end bookkeeping"
+    let mut config = config.clone();
+    // The resume segment's HITL gate stamps every wire POST with the
+    // config's `request_id`, and the chat path's `req_<uuid>` value is
+    // runtime state that never persists. Left unset, a re-park's authorize
+    // POST carries an empty `request_id`, which the governance schema
+    // rejects (surfacing as an opaque HTTP 500). Stamp the run owner id —
+    // the same id the park bridge re-mints parked rows to — so resumed wire
+    // POSTs name the checkpointed run (the gov-500 rule; precedent
+    // `Orchestrator::run_resume_segment`).
+    config.request_id = Some(crate::orchestration::park::run_owner_id(
+        &grant.checkpoint().run_id,
+    ));
+    // Header re-resolution is a deliberate no-op here: S1's
+    // `prepare_agent_config` already resolved `headers_from_request`
+    // forwarding once against the resume caller into this config, and the
+    // supervisor passes the EMPTY headers map. The parameter is retained
+    // for the frozen seam's call shape.
+    let _ = headers;
+    crate::orchestration::Orchestrator::run_resume_segment_borrowed(
+        grant,
+        &config,
+        event_tx,
+        usage_state,
+        outer_budget,
     )
+    .await
 }
