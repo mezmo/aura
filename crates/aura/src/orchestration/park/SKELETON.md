@@ -74,7 +74,7 @@ Present outcome and a reservation-owning carrier, and the isolated
 | `ParkGuardMode` + `new_with_execution_scope` (REPAIR-2 F3; REPAIR-3 G2) | `aura/src/orchestration/park/guard.rs` | The resumed `ParkGuard` is checkpoint-preserving BY CONSTRUCTION and now carries its execution scope: the injection constructor takes MODE AND SCOPE together (a resumed guard cannot be assembled without the scope its deferred sweep and tracked tails spawn through — the same one `Arc` the supervisor holds). The unscoped `new` stays for the interim initial path the L3 fill rewires; `new_resumed` was replaced by the injection constructor | L3 |
 | `ToolCallContext::execution_scope` (+`with_execution_scope`) | `aura/src/tool_wrapper.rs` | The scope is optional by type: non-park calls keep unscoped behavior; no call site is injected yet | L2 |
 | `RetentionError` + `RetentionExpiresAt::from_publication` (REPAIR-2 F8) | `park/retention.rs` | Stamping is fully checked: `Duration::try_seconds` + `checked_add_signed` behind a typed `Result` (`AgeOutOfRange` / `DeadlineOverflow`) — the `chrono::Duration::seconds` panic above i64::MAX/1000s is unreachable, and an unrepresentable deadline is refused, never wrapped or saturated | E5 |
-| `HitlRuntime.park_ttl` + `ParkCommitInputs.park_ttl` (REPAIR-2 F8) | `aura/src/hitl/route.rs`, `park/commit.rs` | The validated retention age is projected from the parsed config into the runtime HITL state and the publication inputs: E5's stamp reads a validated `ParkTtl`, never a raw window. The interim bridge (earliest ticket expiry, else `now + decision_window`) still stamps; `decision_window` stays its input until E5 replaces it | E5 |
+| `HitlRuntime.park_ttl` + `ParkCommitInputs.park_ttl` (REPAIR-2 F8) | `aura/src/hitl/route.rs`, `park/commit.rs` | The validated retention age is projected from the parsed config into the runtime HITL state and the publication inputs: E5's stamp reads a validated `ParkTtl`, never a raw window. RESOLVED 2026-09-18 (E5, `079ffa53`): the stamp is the publication transaction timestamp plus this age via `from_publication`; the interim bridge and the `decision_window` input are retired | E5 |
 | `ParkedRun.retention_expires_at` | `park/document.rs` (REPAIR-1) | The checkpoint document carries the absolute retention deadline as a typed field (serde: RFC 3339 instant); the run-wide decision `expires_at` string is gone from the format, and a stamp that is not a valid instant cannot decode | E5 (publication-transaction stamp and re-park renewal replace the interim commit bridge) |
 | `aura_events::RetentionExpiresAt` (REPAIR-2 F9) | `aura-events/src/retention.rs` | The validated absolute-retention wire stamp, in the dependency location every event surface sees: an RFC 3339 instant by construction — `"not-an-instant"` cannot ride an event or cross decode. Wire key and RFC 3339 rendering preserved | SSE fills consume it as-is |
 | `RunParked.retention_expires_at` | `orchestration/events.rs`, `stream_events.rs`, `aura-events/orchestration.rs` (REPAIR-2 F9) | All three RunParked surfaces carry the validated stamp type; the terminal park event names the retention deadline, not a decision expiry, and never an arbitrary string | SSE fills consume it as-is |
@@ -97,7 +97,7 @@ Present outcome and a reservation-owning carrier, and the isolated
 | `park_authority` | `DecisionRoute` | `pub` method | gate/bridge (R3), poller filtering (R4) |
 | `RunExecutionScope`, `RunReservationLease`, `ReservationFault` | `park::lifetime`; REPAIR-2 F12 re-exports ALL THREE through `aura::orchestration` — `ReservationFault` is the error arm of the public `ResumeClaimTable::reserve`, so a caller can name and match `ReservationFault::Live` through the facade | `pub`, re-exported from `aura::orchestration` | `ToolCallContext` field (public type in a pub field), L fills, E4 |
 | `ReservationTable` + `AdmissionFault` (REPAIR-3 G1) | `park::lifetime` | `pub(crate)` (never crosses the facade; the occupied-run set and its lock are private to the module) | `ResumeClaimTable` (composition), the E4 fills (admit/admit_with), factory injection via `ResumeClaimTable` |
-| `RetentionExpiresAt` (deadline, `from_publication`, `RetentionError`) | `park::retention` | `pub(crate)`, module `#![allow(dead_code)]` until E5 fills the stamp; persisted (serde newtype over `DateTime<Utc>`) on every checkpoint document via `ParkedRun.retention_expires_at` | the checkpoint commit stamp (E5); `as_datetime`/`from_datetime` are the interim commit bridge |
+| `RetentionExpiresAt` (deadline, `from_publication`, `RetentionError`) | `park::retention` | `pub(crate)`; persisted (serde newtype over `DateTime<Utc>`) on every checkpoint document via `ParkedRun.retention_expires_at`. E5-resolved 2026-09-18 (`079ffa53`): the module `#![allow(dead_code)]` retired with the wired stamp; `as_datetime` is production (the RunParked emit site); `from_datetime` is `#[cfg(test)]` fixture-only since the bridge's retirement | the checkpoint commit stamp (E5) |
 | `aura_events::RetentionExpiresAt` | `aura-events::retention`, re-exported from `aura_events` | `pub` | every RunParked event surface (aura internal event, aura SSE mirror, aura-events DTO) |
 | `reserve`/`rename_back_under_reservation` | `ResumeClaimTable` | `pub` method / `pub(crate)` hole returning the typed `ClaimResumeFault` (REPAIR-3 G5) | E4 resume ordering |
 | `ReservedEvaluation`/`convert_reserved` | `park::resume::evaluate` | `pub(crate)` (declared for E4's in-crate ordered evaluation) | E4 |
@@ -162,7 +162,10 @@ disclosed L4a takeover), leaving **9 alignment rows** — of which rows 5/16
 are the EXCLUDED Redis holes, 12 belongs to S3/S4, rows 17-19 to E6, 20 to
 S1, 21 to S3, and 22 to S2/S3. E4's open scope is complete: the ordered
 entry runs on the shared reservation surface with empty-resume recovery
-fenced by it; E7 owns the production consult cutover next.
+fenced by it; E7's production consult cutover closed 2026-09-18
+(`6f14da4f`) and E5's publication-transaction retention stamp closed the
+same day (`079ffa53`) — the 9 rows stand with no E-family owner left open
+until CLEANUP (E6/E8, after SSE).
 
 Holes REMOVED by REPAIR-2:
 - `RunReservationLease::drop` (old #7): the per-reservation `ReservationInner`
@@ -202,12 +205,14 @@ EXECUTE with authorized test ripples. All five executed; no site stopped.
    `ParkCommitOutcome`, and every reader take/return the typed deadline.
    The interim commit bridge stamps the same value the old string body did
    (earliest surviving ticket expiry, else `now + decision_window`) via
-   `RetentionExpiresAt::from_datetime`; E5 replaces that bridge with the
-   publication-transaction stamp plus `park_ttl`. Ripples: the golden
+   `RetentionExpiresAt::from_datetime`; E5 replaced that bridge with the
+   publication-transaction stamp plus `park_ttl` (2026-09-18, `079ffa53`).
+   Ripples: the golden
    fixture `testdata/park/parked_run_v1.json` (key renamed; value
    normalized to chrono's canonical `"2026-09-02T15:03:11Z"` — the
    round-trip assertion is unchanged), the `orchestrator.rs` frame
-   `park_run_with_every_call_decided_stamps_the_decision_window`, the
+   `park_run_with_every_call_decided_stamps_the_decision_window`
+   (renamed `..._stamps_publication_plus_park_ttl` by E5, `079ffa53`), the
    `commit.rs` fixture literals, and the `goldens.rs` `parked_document`
    helper.
 2. **R-2 EXECUTED — `RunParked` carries `retention_expires_at`.** Renamed
@@ -378,16 +383,20 @@ Round-2 verification (frontier-reviewer, panel/ROUND-2.md) found 7 BLOCKING
 
 ## Residual risks
 
-- The commit's retention stamp is still the interim bridge (earliest
-  surviving ticket expiry, else `now + decision_window`, wrapped via
-  `from_datetime`) until E5 lands the publication-transaction stamp plus
-  `park_ttl`; `from_publication` remains unwired and the retention
-  module's `#![allow(dead_code)]` stays for it. `decision_window` remains
-  `ParkCommitInputs`'s interim input alongside the projected `park_ttl`.
-- The blocking projection and the consult still stamp every 409 entry with
-  the document's single deadline and still consult one run-wide window;
-  E7 owns the per-call snapshot replacement. `RefreshedAwaiting.expires_at`
-  (the earliest per-call deadline) stays for the same reason.
+- The commit's retention stamp was the interim bridge (earliest surviving
+  ticket expiry, else `now + decision_window`, wrapped via `from_datetime`)
+  until E5 landed the publication-transaction stamp plus `park_ttl`
+  (2026-09-18, `079ffa53` over the reviewed RED `545c5ce9`): `from_publication`
+  is wired, the retention module's `#![allow(dead_code)]` is gone, and
+  `decision_window` is retired from `ParkCommitInputs` at all three
+  construction sites. RESOLVED.
+- The blocking projection and the consult stamped every 409 entry with the
+  document's single deadline and consulted one run-wide window; E7's
+  per-call snapshot replacement RESOLVED that 2026-09-18 (`6f14da4f`).
+  `RefreshedAwaiting.expires_at` (the earliest per-call deadline) survived
+  E7 for the retention derivation and was DELETED with it by E5
+  2026-09-18 (`079ffa53`) — the retention stamp no longer derives from any
+  ticket deadline.
 - **F14 residual (owner-ruled):** the public
   `ApprovalRead::Addressed { approval, outcome }` variant permits an
   approval whose row deadline is A paired with `TimedOut { deadline: B }`.
