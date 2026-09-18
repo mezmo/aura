@@ -1044,7 +1044,10 @@ impl Agent {
             // Rig keys tools by name and silently overwrites on a
             // collision, so an MCP tool named `ask_agent` would shadow
             // this one (or vice versa) depending on registration order.
+            // Only an MCP tool that passes the effective filter is
+            // registered, so only that one collides.
             if let Some(mcp_manager) = mcp_manager.as_deref()
+                && config.tool_matches_filter(crate::a2a::ASK_AGENT_TOOL_NAME)
                 && mcp_manager
                     .get_available_tool_names()
                     .iter()

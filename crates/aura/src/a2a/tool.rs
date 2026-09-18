@@ -250,11 +250,8 @@ async fn abandon(remote: &str, client: &A2aClient, task_id: &str) {
     }
 }
 
-/// The remote task one `ask_agent` call has opened. Shared between the call
-/// and its send task; whichever learns the task id records it. Dropping the
-/// last handle with the task unsettled (the call's future was dropped
-/// mid-poll, e.g. by an orchestration timeout) cancels the task on the
-/// remote from a detached tokio task.
+/// The remote task one `ask_agent` call has opened, shared between the call
+/// and its send task.
 struct OpenTask {
     remote: String,
     client: A2aClient,
@@ -272,6 +269,8 @@ impl OpenTask {
         }
     }
 
+    /// Called by whichever of the call and its send task learns the task id
+    /// first.
     fn record(&self, task_id: &str) {
         *self.task_id.lock().unwrap_or_else(|p| p.into_inner()) = Some(task_id.to_owned());
     }
@@ -297,6 +296,9 @@ impl OpenTask {
     }
 }
 
+/// Dropping the last handle with the task unsettled means the call's future
+/// was dropped mid-poll (an orchestration timeout, for instance), so the
+/// task is cancelled on the remote from a detached tokio task.
 impl Drop for OpenTask {
     fn drop(&mut self) {
         if self.settled.load(Ordering::SeqCst) {
