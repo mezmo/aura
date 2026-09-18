@@ -1757,32 +1757,18 @@ pub async fn resume_run(
         None
     };
 
-    // The production config projection for this request: skill discovery,
-    // `headers_from_request` resolution, and request/session stamping. The
-    // debug `get_agent_config` skips discovery and header resolution and must
-    // never serve the resume path.
+    // Pure config projection — no skill discovery, no filesystem access. The
+    // fallible production projection's first consumer lands with S2; refusal
+    // rows must answer before any fallible discovery.
     let builder = RigBuilder::new(config.clone(), state.pending_approvals.clone())
         .with_hitl_hmac(state.hitl_webhook_hmac.clone());
-    // One mint per request: the evaluation and the projection share this id.
+    // One mint per request: the evaluation uses it; S2's factory shares it.
     let request_id = format!("req_{}", Uuid::new_v4().simple());
-    // The validated path session, taken before `path` moves into the
-    // evaluation below; never the raw path segment.
-    let session_id = path.session.clone();
     let headers_map: HashMap<String, String> = headers
         .iter()
         .filter_map(|(k, v)| v.to_str().ok().map(|val| (k.to_string(), val.to_string())))
         .collect();
-    let agent_config =
-        match builder.prepare_agent_config(Some(&headers_map), &request_id, session_id.as_ref()) {
-            Ok(agent_config) => agent_config,
-            Err(_) => {
-                return error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "the resume configuration could not be prepared for this request",
-                    "internal_error",
-                );
-            }
-        };
+    let agent_config = builder.get_agent_config();
     let Some(memory_dir) = agent_config.effective_memory_dir() else {
         return error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
