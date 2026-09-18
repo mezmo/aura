@@ -560,7 +560,7 @@ impl ReservedEvaluation {
 /// execution.
 #[expect(
     unused_variables,
-    reason = "todo!() body; filled by P45 wave fill units"
+    reason = "the `claims` parameter stays unused: the held reservation is the conversion's whole fence, and E4-I settles the parameter"
 )]
 pub(crate) async fn convert_reserved(
     claims: &ResumeClaimTable,
@@ -570,9 +570,55 @@ pub(crate) async fn convert_reserved(
     recorded: Arc<RecordedDecisions>,
     consumed: Vec<DecisionId>,
 ) -> Result<ResumeGrant, ClaimResumeFault> {
-    todo!(
-        "P45 wave fill unit E4: rename parked → resuming under the held reservation (the blocking tail holds a lease reference), then assemble the grant owning that same reservation and its one execution scope"
-    )
+    // Destructuring IS the consumption: the carrier is gone from here on, so
+    // a rename failure drops the reservation inside this function — the
+    // refused-outcome shape with no execution riding it.
+    let ReservedEvaluation {
+        reservation,
+        docs,
+        document,
+    } = reserved;
+    let parked = docs.parked().to_path_buf();
+    let resuming = docs.resuming().to_path_buf();
+    // The blocking tail MOVES a lease reference in: the fence survives an
+    // awaiting request dropping, so the run stays reserved until the rename
+    // has actually completed.
+    let lease = reservation.clone();
+    tokio::task::spawn_blocking(move || -> Result<(), ClaimResumeFault> {
+        // The lease binding keeps the fence alive through the rename's
+        // completion — the same shape as `rename_back_under_reservation`.
+        let _lease = lease;
+        // NO ENOENT tolerance on the source: the parked document was read
+        // under this reservation moments before, so a missing parked name is
+        // an honest failure, never a speculative fallback.
+        std::fs::rename(&parked, &resuming).map_err(|e| {
+            ClaimResumeFault::Unavailable(Diagnostic::new(format!(
+                "renaming the parked checkpoint {} to its resuming name failed: {e}",
+                parked.display()
+            )))
+        })
+    })
+    .await
+    .map_err(|e| {
+        ClaimResumeFault::Internal(Diagnostic::new(format!(
+            "the conversion rename task did not complete: {e}"
+        )))
+    })??;
+
+    // The scope is established exactly once, at conversion, over the same
+    // reservation the grant owns — every later consumer clones this one Arc.
+    // The reservation passes carrier → grant with no ownerless gap.
+    let scope = RunExecutionScope::new(reservation.clone());
+    Ok(ResumeGrant {
+        reservation,
+        scope,
+        documents: docs,
+        document,
+        recorded,
+        consumed,
+        session,
+        run,
+    })
 }
 
 /// Locate and load whichever checkpoint name exists for the run: the parked
