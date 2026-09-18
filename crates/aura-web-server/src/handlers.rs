@@ -28,9 +28,14 @@ use crate::streaming::{
 use crate::types::*;
 use aura::orchestration::{
     BlockingEntry, OrchestratorFactory, ResumeClaimTable, ResumeEvaluation, ResumeGrant,
-    ResumeRefusal, ResumeRunId, ResumeSessionId, SegmentError, SegmentResult, ValidatedResumePath,
-    evaluate_resume, run_segment,
+    ResumeRefusal, ResumeRunId, ResumeSessionId, SegmentResult, ValidatedResumePath,
+    evaluate_resume,
 };
+// The atomic segment tail's types stay imported until S6 retires the
+// projection surface: S2-INT routes a granted run through the streaming
+// completion path instead of calling `run_segment` directly.
+#[allow(unused_imports)] // S6 retires the atomic projection surface
+use aura::orchestration::{SegmentError, run_segment};
 
 /// RAII guard for request-scoped subscriptions. Ensures cleanup even on panic.
 struct RequestResourceGuard {
@@ -1437,6 +1442,7 @@ fn error_response(
 // -------------------------------------------------------------------------
 
 /// OpenAI's tool-call type discriminant on the chat-completions wire.
+#[allow(dead_code)] // S6 retires the atomic projection surface
 const TOOL_CALL_FUNCTION_TYPE: &str = "function";
 
 /// The shared per-run resume claim table, carried as a request extension.
@@ -1444,6 +1450,7 @@ const TOOL_CALL_FUNCTION_TYPE: &str = "function";
 pub struct ResumeClaims(pub Arc<ResumeClaimTable>);
 
 /// The segment state token on the resume success body.
+#[allow(dead_code)] // S6 retires the atomic projection surface
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "lowercase")]
 enum ResumeRunState {
@@ -1452,6 +1459,7 @@ enum ResumeRunState {
 }
 
 /// The resume success body.
+#[allow(dead_code)] // S6 retires the atomic projection surface
 #[derive(Debug, Serialize)]
 struct ResumeRunResponse {
     session_id: String,
@@ -1462,6 +1470,7 @@ struct ResumeRunResponse {
     blocking: Option<Vec<BlockingEntry>>,
 }
 
+#[allow(dead_code)] // S6 retires the atomic projection surface
 impl ResumeRunResponse {
     fn from_segment(session: &ResumeSessionId, run: &ResumeRunId, segment: SegmentResult) -> Self {
         let (state, turns, blocking) = match segment {
@@ -1500,6 +1509,7 @@ impl ResumeRunResponse {
 /// keyed by the result's `id` with the result's text verbatim; a user
 /// turn with non-ToolResult content (plain text) does not occur on the
 /// segment surface and stays skipped.
+#[allow(dead_code)] // S6 retires the atomic projection surface
 fn project_turn(turn: &aura::Message, projected: &mut Vec<ChatMessage>) {
     match turn {
         aura::Message::Assistant { content, .. } => {
@@ -1577,6 +1587,7 @@ fn project_turn(turn: &aura::Message, projected: &mut Vec<ChatMessage>) {
 /// which projects to a `role: "tool"` message: `tool_call_id` is the
 /// `ToolResult`'s `id` and `content` is the result's text verbatim, so
 /// the pair rides the wire keyed consistently on one id.
+#[allow(dead_code)] // S6 retires the atomic projection surface
 fn continuation_turns(turns: &[aura::Message]) -> Vec<ChatMessage> {
     let mut projected = Vec::with_capacity(turns.len());
     for turn in turns {
@@ -1599,6 +1610,7 @@ fn continuation_turns(turns: &[aura::Message]) -> Vec<ChatMessage> {
 /// results keyed to the same wire ids — and both halves are dropped. A
 /// natural worker tool-call turn has no result half following it, is
 /// never a pair, and rides verbatim.
+#[allow(dead_code)] // S6 retires the atomic projection surface
 fn natural_turns(turns: &[aura::Message]) -> Vec<ChatMessage> {
     let mut projected = Vec::with_capacity(turns.len());
     let mut index = 0;
@@ -1623,6 +1635,7 @@ fn natural_turns(turns: &[aura::Message]) -> Vec<ChatMessage> {
 /// calls' wire ids — `call_id`, falling back to the call's own id, the
 /// same keying [`project_turn`] renders. Any other turn is not a pair
 /// half.
+#[allow(dead_code)] // S6 retires the atomic projection surface
 fn outcome_pair_call_ids(turn: &aura::Message) -> Option<Vec<&str>> {
     let aura::Message::Assistant { content, .. } = turn else {
         return None;
@@ -1644,6 +1657,7 @@ fn outcome_pair_call_ids(turn: &aura::Message) -> Option<Vec<&str>> {
 /// is one: a user turn that is nothing but tool results keys by the
 /// results' own ids — the original call ids the park recorded. Any other
 /// turn is not a pair half.
+#[allow(dead_code)] // S6 retires the atomic projection surface
 fn outcome_pair_result_ids(turn: &aura::Message) -> Option<Vec<&str>> {
     let aura::Message::User { content } = turn else {
         return None;
@@ -1769,6 +1783,10 @@ pub async fn resume_run(
         .with_hitl_hmac(state.hitl_webhook_hmac.clone());
     // One mint per request: the evaluation uses it; S2's factory shares it.
     let request_id = format!("req_{}", Uuid::new_v4().simple());
+    // The validated path session, taken before `path` moves into the
+    // evaluation below. The grant carries this same validated id; the
+    // production projection and the RequestSetup both read it from here.
+    let session_id = path.session.clone();
     let headers_map: HashMap<String, String> = headers
         .iter()
         .filter_map(|(k, v)| v.to_str().ok().map(|val| (k.to_string(), val.to_string())))
@@ -1790,7 +1808,7 @@ pub async fn resume_run(
         claims: &claims.0,
         bind_identity,
         presented_identity,
-        request_id,
+        request_id: request_id.clone(),
         now: chrono::Utc::now(),
     };
     let grant = match evaluate_resume(evaluation).await {
@@ -1798,22 +1816,48 @@ pub async fn resume_run(
         Err(refusal) => return refusal_response(refusal),
     };
 
-    let session_id = grant.session_id().clone();
-    let run_id = grant.run_id().clone();
-    match run_segment(grant, &agent_config, &headers_map).await {
-        Ok(segment) => {
-            let body = ResumeRunResponse::from_segment(&session_id, &run_id, segment);
-            (StatusCode::OK, Json(body)).into_response()
-        }
-        Err(SegmentError::Continuation(diagnostic)) => {
-            refusal_response(ResumeRefusal::Fault(diagnostic))
-        }
-        Err(_) => error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "unexpected resume segment error",
-            "internal_error",
-        ),
-    }
+    // The production projection for the actually-resuming run, built AFTER
+    // the grant: broken skill sources answer the 500 here, never over a
+    // refusal row that already answered above. The evaluation kept the pure
+    // projection; this factory is the production projection's first
+    // consumer, mirroring the chat path's factory wiring.
+    let execution_config =
+        match builder.prepare_agent_config(Some(&headers_map), &request_id, session_id.as_ref()) {
+            Ok(execution_config) => execution_config,
+            Err(err) => {
+                error!("Failed to prepare resume execution config: {err}");
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "the resume configuration could not be prepared for this request",
+                    "internal_error",
+                );
+            }
+        };
+    let factory =
+        OrchestratorFactory::new(execution_config).with_reservation_table(Arc::clone(&claims.0));
+
+    // One request id (the hoisted mint) and one validated session id serve
+    // the whole resumed request. The parsed `config` is the same run the
+    // factory's prepared config describes; `model_info()` is its identity.
+    let (provider, model) = config.agent.llm.model_info();
+    let setup = RequestSetup {
+        completion: CompletionInput::Resume {
+            factory: Arc::new(factory),
+            grant,
+        },
+        config: config.clone(),
+        completion_id: format!("chatcmpl-{}", Uuid::new_v4()),
+        model_str: format!("{provider}/{model}"),
+        created_timestamp: Utc::now().timestamp() as u64,
+        chat_session_id: session_id.to_string(),
+        has_client_tools: false,
+        request_id,
+        user_id: None,
+        metadata_json: None,
+        tools_json: vec![],
+    };
+
+    handle_streaming_completion(state, setup, None).await
 }
 
 #[cfg(test)]
