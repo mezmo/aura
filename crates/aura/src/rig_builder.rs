@@ -57,19 +57,17 @@ impl RigBuilder {
     /// header resolution. `request_id` is the new HTTP request's id for
     /// request-scoped events; `session_id` is the request's chat session,
     /// preserved from the parked run where it matters downstream.
-    #[expect(
-        unused_variables,
-        reason = "todo!() body; filled by P45 wave fill units"
-    )]
     pub fn prepare_agent_config(
         &self,
         req_headers: Option<&HashMap<String, String>>,
         request_id: &str,
         session_id: &str,
     ) -> Result<AgentRuntimeConfig, BuilderError> {
-        todo!(
-            "P45 wave fill unit S1: factor discovery, header resolution, and request/session stamping from the existing build paths"
-        )
+        let mut agent_config = self.discovered_agent_config(req_headers)?;
+        resolve_mcp_headers(&mut agent_config, req_headers);
+        agent_config.request_id = Some(request_id.to_string());
+        agent_config.session_id = Some(session_id.to_string());
+        Ok(agent_config)
     }
 
     /// Project the parsed `Config` into the runtime `AgentRuntimeConfig`.
