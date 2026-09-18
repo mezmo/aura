@@ -154,10 +154,7 @@ pub struct CreatePlanArgs {
     /// The overall goal this plan addresses.
     pub goal: String,
     /// Ordered steps to execute. Sequential by default; use `{"parallel": [...]}` for concurrency.
-    ///
-    /// Models sometimes send this as a JSON string rather than an array, or omit it and
-    /// leave the steps embedded in `planning_summary`. Both are recovered rather than
-    /// failed: a rejected argument costs a planning turn, and six of them end the run.
+    /// Empty when the argument held no usable steps (see `deserialize_steps`).
     #[serde(default, deserialize_with = "deserialize_steps")]
     pub steps: Vec<StepInput>,
     /// Why this query requires orchestration.
@@ -296,9 +293,12 @@ const STEPS_REQUIRED_HELP: &str = concat!(
 
 /// Deserialize `steps` from an array, or from a string holding the JSON array.
 ///
-/// A string payload may carry trailing XML tool-call syntax (`</parameter>`,
-/// `</invoke>`) or markdown fencing; both are stripped before parsing. Anything still
-/// unparseable yields an empty list, which `call` turns into `STEPS_REQUIRED_HELP`.
+/// Models sometimes send the array as a string, carrying trailing XML tool-call syntax
+/// (`</parameter>`, `</invoke>`) or markdown fencing; both are stripped before parsing.
+/// Any other shape — a number, an object, a string holding no array — yields an empty
+/// list rather than a deserialization error, so `call` can answer with
+/// `STEPS_REQUIRED_HELP`. Failing here instead would cost a planning turn and hand the
+/// model the opaque serde message this recovery exists to replace.
 fn deserialize_steps<'de, D>(deserializer: D) -> Result<Vec<StepInput>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -308,7 +308,8 @@ where
     enum StepsPayload {
         List(Vec<StepInput>),
         Raw(String),
-        Missing,
+        /// Anything else the model sent: a number, a bool, an object, null.
+        Other(serde_json::Value),
     }
 
     Ok(match StepsPayload::deserialize(deserializer)? {
@@ -317,7 +318,20 @@ where
             tracing::warn!("create_plan sent `steps` as an unparseable string; asking again");
             Vec::new()
         }),
-        StepsPayload::Missing => Vec::new(),
+        StepsPayload::Other(value) => {
+            if !value.is_null() {
+                tracing::warn!(
+                    "create_plan sent `steps` as {}; asking again",
+                    match value {
+                        serde_json::Value::Object(_) => "an object",
+                        serde_json::Value::Number(_) => "a number",
+                        serde_json::Value::Bool(_) => "a bool",
+                        _ => "an unexpected type",
+                    }
+                );
+            }
+            Vec::new()
+        }
     })
 }
 
@@ -518,6 +532,30 @@ mod tests {
         .unwrap();
 
         assert_eq!(count_leaf_steps(&args.steps), 1);
+    }
+
+    /// A shape no variant matches — an object, a number — still reaches `call`, so the
+    /// model gets the help text rather than an opaque deserialization error.
+    #[tokio::test]
+    async fn test_steps_of_wrong_type_reaches_the_help_text() {
+        for bad in [
+            serde_json::json!({"first": "fetch logs"}),
+            serde_json::json!(3),
+            serde_json::json!(true),
+        ] {
+            let args: CreatePlanArgs = serde_json::from_value(serde_json::json!({
+                "goal": "Investigate logs",
+                "steps": bad,
+                "routing_rationale": "Requires tool execution",
+                "planning_summary": "Fetch and analyze recent logs",
+            }))
+            .expect("malformed steps must not fail deserialization");
+
+            let toolset = RoutingToolSet::new();
+            let result = toolset.create_plan.call(args).await.unwrap();
+            assert!(result.status.starts_with("Error: `steps` is required"));
+            assert!(toolset.decision.lock().await.is_none());
+        }
     }
 
     /// `steps` omitted entirely, with the array left inside planning_summary.
