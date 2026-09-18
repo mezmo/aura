@@ -30,3 +30,9 @@ globset = "0.4"
 
 # Directory perms validation
 tempfile = "3"
+
+# [dev-dependencies]
+peg = "0.8.6"
+
+[features]
+test_util = []

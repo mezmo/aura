@@ -9,7 +9,7 @@ use crate::{
     },
     scratchpad,
     skill_tool::{SkillToolset, render_skill_catalog},
-    tool_wrapper::WrappedTool,
+    tool_wrapper::{ToolCallContext, WrappedTool},
     tools::{FilesystemTool, ListDirTool, ReadFileTool, WriteFileTool},
     vector_dynamic::DynamicVectorSearchTool,
     vector_store::VectorStoreManager,
@@ -186,9 +186,7 @@ impl Agent {
             .unwrap_or_default();
         let scratchpad_tool_map =
             scratchpad::scratchpad_tool_map(config.mcp.as_ref(), &tools_per_server);
-        let accessible_tools = mcp_manager
-            .map(|mgr| mgr.get_available_tool_names())
-            .unwrap_or_default();
+        let accessible_tools = mcp_manager.map(|mgr| mgr.all_tools()).unwrap_or_default();
         let filter = config
             .mcp_filter
             .as_deref()
@@ -897,7 +895,7 @@ impl Agent {
                 if let Some(server_tools) = mcp_manager.streamable_tools.get(server_name) {
                     let filtered_tools: Vec<_> = server_tools
                         .iter()
-                        .filter(|t| config.tool_matches_filter(&t.name))
+                        .filter(|t| config.tool_matches_filter(t))
                         .collect();
                     log_filtered_tools(
                         "",
@@ -909,17 +907,21 @@ impl Agent {
 
                     let client_arc = Arc::new(client.clone());
                     for mcp_tool in filtered_tools {
-                        tracing::info!("  Adding dynamic HTTP tool: {}", mcp_tool.name);
+                        tracing::info!("  Adding dynamic HTTP tool: {}", mcp_tool.name());
 
                         let tool_adaptor = crate::mcp::McpToolAdaptor::new(
                             mcp_tool.clone(),
-                            server_name.clone(),
                             Arc::clone(&client_arc),
                             crate::approver_headers::McpTransportKind::StreamableHttp,
                         );
 
                         // Wrap with tool_wrapper if configured
-                        builder_state = Self::add_mcp_tool(builder_state, tool_adaptor, config);
+                        builder_state = Self::add_mcp_tool(
+                            builder_state,
+                            tool_adaptor,
+                            mcp_tool.namespace().clone(),
+                            config,
+                        );
                     }
                 }
             }
@@ -931,7 +933,7 @@ impl Agent {
                 if let Some(server_tools) = mcp_manager.sse_tools.get(server_name) {
                     let filtered_tools: Vec<_> = server_tools
                         .iter()
-                        .filter(|t| config.tool_matches_filter(&t.name))
+                        .filter(|t| config.tool_matches_filter(t))
                         .collect();
                     log_filtered_tools(
                         "",
@@ -943,16 +945,20 @@ impl Agent {
 
                     let client_arc = Arc::new(client.clone());
                     for mcp_tool in filtered_tools {
-                        tracing::info!("  Adding dynamic SSE tool: {}", mcp_tool.name);
+                        tracing::info!("  Adding dynamic SSE tool: {}", mcp_tool.name());
 
                         let tool_adaptor = crate::mcp::McpToolAdaptor::new(
                             mcp_tool.clone(),
-                            server_name.clone(),
                             Arc::clone(&client_arc),
                             crate::approver_headers::McpTransportKind::Sse,
                         );
 
-                        builder_state = Self::add_mcp_tool(builder_state, tool_adaptor, config);
+                        builder_state = Self::add_mcp_tool(
+                            builder_state,
+                            tool_adaptor,
+                            mcp_tool.namespace().clone(),
+                            config,
+                        );
                     }
                 }
             }
@@ -1008,7 +1014,7 @@ impl Agent {
                 if let Some(server_tools) = mcp_manager.stdio_tools.get(server_name) {
                     let filtered_tools: Vec<_> = server_tools
                         .iter()
-                        .filter(|t| config.tool_matches_filter(&t.name))
+                        .filter(|t| config.tool_matches_filter(t))
                         .collect();
                     log_filtered_tools(
                         "",
@@ -1020,16 +1026,20 @@ impl Agent {
 
                     let client_arc = Arc::new(client.clone());
                     for mcp_tool in filtered_tools {
-                        tracing::info!("  Adding dynamic STDIO tool: {}", mcp_tool.name);
+                        tracing::info!("  Adding dynamic STDIO tool: {}", mcp_tool.name());
 
                         let tool_adaptor = crate::mcp::McpToolAdaptor::new(
                             mcp_tool.clone(),
-                            server_name.clone(),
                             Arc::clone(&client_arc),
                             crate::approver_headers::McpTransportKind::Stdio,
                         );
 
-                        builder_state = Self::add_mcp_tool(builder_state, tool_adaptor, config);
+                        builder_state = Self::add_mcp_tool(
+                            builder_state,
+                            tool_adaptor,
+                            mcp_tool.namespace().clone(),
+                            config,
+                        );
                     }
                 }
             }
@@ -1142,10 +1152,14 @@ impl Agent {
     /// Helper to add an MCP tool, optionally wrapping with config.tool_wrapper.
     ///
     /// If `config.tool_wrapper` is set, the tool is wrapped and a context is
-    /// created using `config.tool_context_factory` (or a default context).
+    /// created using `config.tool_context_factory` (or a default context),
+    /// always stamped with `namespace` so wrapper-layer consumers (HITL
+    /// approval requests, in particular) can attribute the call to its MCP
+    /// server without it ever touching the tool's model-facing name.
     fn add_mcp_tool<M, T>(
         builder_state: BuilderState<M>,
         tool: T,
+        namespace: crate::mcp::ToolNamespace,
         config: &AgentRuntimeConfig,
     ) -> BuilderState<M>
     where
@@ -1156,22 +1170,24 @@ impl Agent {
             + Clone
             + 'static,
     {
-        match (&config.tool_wrapper, &config.tool_context_factory) {
-            (Some(wrapper), Some(ctx_factory)) => {
-                // Wrap with both wrapper and context factory
+        match &config.tool_wrapper {
+            Some(wrapper) => {
                 let tool_name = tool.name();
-                let ctx_factory = ctx_factory.clone();
-                let wrapped = WrappedTool::new(tool, wrapper.clone())
-                    .with_context_factory(move |_| ctx_factory(&tool_name));
+                let base_ctx_factory = config.tool_context_factory.clone();
+                let wrapped =
+                    WrappedTool::new(tool, wrapper.clone()).with_context_factory(move |_| {
+                        let mut ctx = base_ctx_factory
+                            .as_ref()
+                            .map(|f| f(&tool_name))
+                            .unwrap_or_else(|| ToolCallContext::new(&tool_name));
+                        ctx.tool_namespace = Some(namespace.to_string());
+                        ctx
+                    });
                 builder_state.add_tool(wrapped)
             }
-            (Some(wrapper), None) => {
-                // Wrap with wrapper only (default context)
-                let wrapped = WrappedTool::new(tool, wrapper.clone());
-                builder_state.add_tool(wrapped)
-            }
-            _ => {
-                // No wrapping
+            None => {
+                // No wrapping: nothing consults a ToolCallContext for this
+                // tool, so there's nowhere for the namespace to matter.
                 builder_state.add_tool(tool)
             }
         }
@@ -2052,34 +2068,43 @@ mod tests {
             }
         }
 
-        fn declared_tool(name: &str) -> rmcp::model::Tool {
-            rmcp::model::Tool::new(
+        fn declared_tool(name: &str, namespace: &str) -> crate::mcp::AuraTool {
+            let tool = rmcp::model::Tool::new(
                 name.to_owned(),
                 "test tool".to_owned(),
                 Arc::new(serde_json::Map::new()),
-            )
+            );
+            crate::mcp::AuraTool::new(tool, namespace)
         }
 
         /// A manager offering the same tool name on each of the three transports, all backed by `server`, so the tag composition distinguishes them downstream.
         async fn manager_serving_all_transports(server: &RecordingMcpServer) -> McpManager {
-            let connect = async || {
-                McpClient::new(server.url.clone(), &HashMap::new(), "test/0")
-                    .await
-                    .expect("the loopback server completes the handshake")
+            let connect = async |namespace: &str| {
+                McpClient::new(
+                    server.url.clone(),
+                    namespace.into(),
+                    &HashMap::new(),
+                    "test/0",
+                )
+                .await
+                .expect("the loopback server completes the handshake")
             };
             McpManager {
                 server_info: HashMap::new(),
-                streamable_clients: HashMap::from([("http".to_owned(), connect().await)]),
+                streamable_clients: HashMap::from([("http".to_owned(), connect("http").await)]),
                 streamable_tools: HashMap::from([(
                     "http".to_owned(),
-                    vec![declared_tool("http_tool")],
+                    vec![declared_tool("http_tool", "http")],
                 )]),
-                sse_clients: HashMap::from([("sse".to_owned(), connect().await)]),
-                sse_tools: HashMap::from([("sse".to_owned(), vec![declared_tool("sse_tool")])]),
-                stdio_clients: HashMap::from([("stdio".to_owned(), connect().await)]),
+                sse_clients: HashMap::from([("sse".to_owned(), connect("sse").await)]),
+                sse_tools: HashMap::from([(
+                    "sse".to_owned(),
+                    vec![declared_tool("sse_tool", "sse")],
+                )]),
+                stdio_clients: HashMap::from([("stdio".to_owned(), connect("stdio").await)]),
                 stdio_tools: HashMap::from([(
                     "stdio".to_owned(),
-                    vec![declared_tool("stdio_tool")],
+                    vec![declared_tool("stdio_tool", "stdio")],
                 )]),
                 sanitize_schemas: false,
                 user_agent: crate::config::McpUserAgent::new("test/0").unwrap(),

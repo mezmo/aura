@@ -46,6 +46,7 @@ use aura_events::orchestration::RoutingMode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use aura_config::GlobPattern;
 use rig::client::CompletionClient;
 use tokio::sync::{Mutex, watch};
 use tokio_util::sync::CancellationToken;
@@ -779,7 +780,7 @@ impl Orchestrator {
             let accessible_tools = self
                 .mcp_manager
                 .as_ref()
-                .map(|m| m.get_available_tool_names())
+                .map(|m| m.all_tools())
                 .unwrap_or_default();
             let has_matching_tool = scratchpad::has_accessible_scratchpad_tool(
                 &accessible_tools,
@@ -788,7 +789,7 @@ impl Orchestrator {
             );
 
             if !has_matching_tool {
-                if worker_filter.is_some_and(<[String]>::is_empty) {
+                if worker_filter.is_some_and(<[GlobPattern]>::is_empty) {
                     // The deliberate no-tools assignment — nothing to intercept.
                     tracing::info!(
                         "Worker {}: mcp_filter = [] (no MCP tools); scratchpad not needed",
@@ -2366,28 +2367,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
             return Vec::new();
         };
 
-        let mut names = Vec::new();
-
-        // Collect from streamable HTTP tools (rmcp::model::Tool has Cow<'static, str>)
-        for tools in mcp_manager.streamable_tools.values() {
-            for tool in tools {
-                names.push(tool.name.to_string());
-            }
-        }
-
-        // Collect from SSE tools
-        for tools in mcp_manager.sse_tools.values() {
-            for tool in tools {
-                names.push(tool.name.to_string());
-            }
-        }
-
-        // Collect from STDIO tools
-        for tools in mcp_manager.stdio_tools.values() {
-            for tool in tools {
-                names.push(tool.name.to_string());
-            }
-        }
+        let mut names: Vec<String> = mcp_manager
+            .tool_definitions_iter()
+            .map(|tool| tool.name().to_string())
+            .collect();
 
         // Remove duplicates while preserving order
         let mut seen = std::collections::HashSet::new();
@@ -2407,35 +2390,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
             return std::collections::HashMap::new();
         };
 
-        let mut schemas = std::collections::HashMap::new();
-
-        // Collect from streamable HTTP tools
-        // rmcp::model::Tool.input_schema is Arc<JsonObject> where JsonObject = Map<String, Value>
-        for tools in mcp_manager.streamable_tools.values() {
-            for tool in tools {
-                // Convert Arc<Map<String, Value>> to serde_json::Value
-                let schema_value = serde_json::Value::Object((*tool.input_schema).clone());
-                schemas.insert(tool.name.to_string(), schema_value);
-            }
-        }
-
-        // Collect from SSE tools
-        for tools in mcp_manager.sse_tools.values() {
-            for tool in tools {
-                let schema_value = serde_json::Value::Object((*tool.input_schema).clone());
-                schemas.insert(tool.name.to_string(), schema_value);
-            }
-        }
-
-        // Collect from STDIO tools
-        for tools in mcp_manager.stdio_tools.values() {
-            for tool in tools {
-                let schema_value = serde_json::Value::Object((*tool.input_schema).clone());
-                schemas.insert(tool.name.to_string(), schema_value);
-            }
-        }
-
-        schemas
+        mcp_manager
+            .tool_definitions_iter()
+            .map(|tool| (tool.name().to_string(), tool.input_schema()))
+            .collect()
     }
 
     /// Resolve which tools each worker can access based on their mcp_filter.
@@ -2455,22 +2413,25 @@ Assign tasks to the worker whose tools best match the required operations."#,
     /// - "operations" -> ["mezmo_logs", "mezmo_pipelines"]
     /// - "knowledge" -> ["ListKnowledgeBases", "QueryKnowledgeBases"]
     fn resolve_worker_tools(&self) -> std::collections::HashMap<String, Vec<String>> {
-        let all_tools = self.get_all_tool_names();
+        let all_tools: Vec<crate::mcp::AuraTool> = self
+            .mcp_manager
+            .as_ref()
+            .map(|m| m.all_tools())
+            .unwrap_or_default();
         let mut worker_tools = std::collections::HashMap::new();
 
         for (worker_name, worker_config) in &self.config.workers {
             // Omitted filter = every MCP tool (backwards compatibility);
-            // `mcp_filter = []` = none.
+            // `mcp_filter = []` = none. Matching is namespace-aware — see
+            // `AuraTool::is_match` — so a worker's `mcp_filter` can scope to
+            // one server (`k8s:*`) even though the resulting tool names are
+            // always bare.
             let mut matching_tools: Vec<String> = match &worker_config.mcp_filter {
-                None => all_tools.clone(),
+                None => all_tools.iter().map(|t| t.name().to_string()).collect(),
                 Some(filter) => all_tools
                     .iter()
-                    .filter(|tool_name| {
-                        filter
-                            .iter()
-                            .any(|pattern| crate::config::glob_match(pattern, tool_name))
-                    })
-                    .cloned()
+                    .filter(|tool| filter.iter().any(|pattern| tool.is_match(pattern)))
+                    .map(|t| t.name().to_string())
                     .collect(),
             };
 
@@ -2494,30 +2455,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
         // Collect from MCP tools
         if let Some(ref mcp_manager) = self.mcp_manager {
-            // Collect from streamable HTTP tools (description is Option<Cow<'static, str>>)
-            for tools in mcp_manager.streamable_tools.values() {
-                for tool in tools {
-                    if let Some(ref desc) = tool.description {
-                        descriptions.insert(tool.name.to_string(), desc.to_string());
-                    }
-                }
-            }
-
-            // Collect from SSE tools
-            for tools in mcp_manager.sse_tools.values() {
-                for tool in tools {
-                    if let Some(ref desc) = tool.description {
-                        descriptions.insert(tool.name.to_string(), desc.to_string());
-                    }
-                }
-            }
-
-            // Collect from STDIO tools
-            for tools in mcp_manager.stdio_tools.values() {
-                for tool in tools {
-                    if let Some(ref desc) = tool.description {
-                        descriptions.insert(tool.name.to_string(), desc.to_string());
-                    }
+            for tool in mcp_manager.tool_definitions_iter() {
+                if let Some(desc) = tool.description() {
+                    descriptions.insert(tool.name().to_string(), desc.to_string());
                 }
             }
         }
@@ -6034,7 +5974,7 @@ mod tests {
             WorkerConfig {
                 description: "For logs and pipelines".to_string(),
                 preamble: "Operations specialist.".to_string(),
-                mcp_filter: Some(vec!["mezmo_*".to_string()]),
+                mcp_filter: Some(vec!["mezmo_*".into()]),
                 vector_stores: vec![], // No RAG for operations
                 turn_depth: None,
                 llm: None,
@@ -6142,7 +6082,7 @@ mod tests {
             WorkerConfig {
                 description: "For operational tasks".to_string(),
                 preamble: "Operations specialist.".to_string(),
-                mcp_filter: Some(vec!["mezmo_*".to_string()]),
+                mcp_filter: Some(vec!["mezmo_*".into()]),
                 vector_stores: vec![], // Explicitly no RAG access
                 turn_depth: None,
                 llm: None,
@@ -7497,8 +7437,6 @@ mod tests {
     /// webhook arm of park mode is out of V1 scope.
     #[tokio::test]
     async fn park_enabled_requires_flag_and_conversational_route() {
-        use aura_config::GlobPattern;
-
         fn config(park_enabled: bool, conversational: bool) -> AgentRuntimeConfig {
             let mut config = AgentRuntimeConfig::default();
             let route = if conversational {
@@ -7516,7 +7454,7 @@ mod tests {
                 }
             };
             config.hitl = Some(crate::hitl::HitlRuntime {
-                patterns: Arc::from([GlobPattern::new("kubectl_*").unwrap()]),
+                patterns: Arc::from(["kubectl_*".into()]),
                 route: Arc::new(route),
                 park_enabled,
             });
@@ -7558,7 +7496,7 @@ mod tests {
             PendingApprovals::with_backend(store.clone(), Arc::new(InMemoryEventBus::new()));
         let config = AgentRuntimeConfig {
             hitl: Some(crate::hitl::HitlRuntime {
-                patterns: Arc::from([aura_config::GlobPattern::new("kubectl_*").unwrap()]),
+                patterns: Arc::from(["kubectl_*".into()]),
                 route: Arc::new(crate::hitl::DecisionRoute::Conversational {
                     registry: registry.clone(),
                     timeout: Duration::from_secs(60),
@@ -7670,7 +7608,7 @@ mod tests {
         let registry = PendingApprovals::with_backend(store, Arc::new(InMemoryEventBus::new()));
         let config = AgentRuntimeConfig {
             hitl: Some(crate::hitl::HitlRuntime {
-                patterns: Arc::from([aura_config::GlobPattern::new("kubectl_*").unwrap()]),
+                patterns: Arc::from(["kubectl_*".into()]),
                 route: Arc::new(crate::hitl::DecisionRoute::Conversational {
                     registry: registry.clone(),
                     timeout: Duration::from_secs(3600),
@@ -7717,6 +7655,7 @@ mod tests {
                         },
                         items: vec![ApprovalItem {
                             tool_name: tool.to_string(),
+                            tool_namespace: None,
                             arguments: serde_json::json!({ "namespace": "prod" }),
                             tool_call_intent: None,
                         }],
@@ -8239,7 +8178,7 @@ mod tests {
         let request_id = format!("req_orphan_{}", uuid::Uuid::new_v4().simple());
         let config = AgentRuntimeConfig {
             hitl: Some(crate::hitl::HitlRuntime {
-                patterns: Arc::from([aura_config::GlobPattern::new("echo_tool").unwrap()]),
+                patterns: Arc::from(["echo_tool".into()]),
                 route: Arc::new(crate::hitl::DecisionRoute::Conversational {
                     registry: registry.clone(),
                     timeout: Duration::from_secs(3600),
@@ -8527,7 +8466,7 @@ mod tests {
         )]);
         let config = AgentRuntimeConfig {
             hitl: Some(crate::hitl::HitlRuntime {
-                patterns: Arc::from([aura_config::GlobPattern::new("echo_tool").unwrap()]),
+                patterns: Arc::from(["echo_tool".into()]),
                 route: Arc::new(crate::hitl::DecisionRoute::Conversational {
                     registry: registry.clone(),
                     timeout: Duration::from_secs(3600),

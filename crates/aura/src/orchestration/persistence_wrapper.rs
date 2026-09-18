@@ -1432,7 +1432,6 @@ mod tests {
             ApprovalStore, EventBus, InMemoryApprovalStore, InMemoryEventBus,
         };
         use crate::tool_wrapper::{ComposedWrapper, ToolCallContext, ToolWrapper, WrappedTool};
-        use aura_config::GlobPattern;
 
         let store: Arc<dyn ApprovalStore> = Arc::new(InMemoryApprovalStore::new());
         let bus: Arc<dyn EventBus> = Arc::new(InMemoryEventBus::new());
@@ -1453,7 +1452,7 @@ mod tests {
         let request_id = format!("req_w2_{}", uuid::Uuid::new_v4().simple());
 
         let gate: Arc<dyn ToolWrapper> = Arc::new(HitlApprovalWrapper::new(
-            Arc::from([GlobPattern::new("kubectl_*").unwrap()]),
+            Arc::from(["kubectl_*".into()]),
             route,
             scope,
             request_id.clone(),
