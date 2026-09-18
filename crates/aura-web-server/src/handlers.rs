@@ -3750,9 +3750,14 @@ bind_identity = true
         /// A valid UUID run id that no other S2 frame claims.
         const S2_RUN: &str = "0199c0de-9944-7000-8000-00000000d027";
 
-        /// The bound-config shape the identity frames resolve: the identity
+        /// The bound-config shape the identity frame resolves: the identity
         /// header is configured and `bind_identity` is on, so the presented
-        /// header decides attribution.
+        /// header decides attribution. The skills source is unrepresentable
+        /// (the S1 red-repair shape): any fallible work that ran before the
+        /// identity check — discovery inside `prepare_agent_config` — would
+        /// fault and 500, so the bare-404 assertion proves the identity row
+        /// answers before ANY fallible work, not just before a healthy
+        /// evaluation.
         fn s2_bound_memory_root(memory_path: &std::path::Path) -> aura_config::Config {
             parse_config(&format!(
                 r#"
@@ -3767,6 +3772,9 @@ system_prompt = "You answer."
 provider = "openai"
 api_key = "test"
 model = "gpt-5.1"
+
+[[agent.skills.local]]
+source = "/nonexistent/s2/red/skill/source"
 
 [hitl]
 require_approval = []
@@ -3887,12 +3895,10 @@ bind_identity = true
                 row.get("detail").and_then(serde_json::Value::as_str),
                 Some("a previous resume died mid-segment; the executed list is non-empty")
             );
-            assert!(
-                row.get("blocking")
-                    .map(serde_json::Value::as_array)
-                    .unwrap_or_default()
-                    .map_or(true, |blocking| blocking.is_empty()),
-                "the interrupted row carries no blocking set"
+            assert_eq!(
+                row.get("blocking"),
+                Some(&serde_json::json!([])),
+                "the interrupted row carries an explicitly present, empty blocking set"
             );
 
             // The document stays exactly as found: same bytes, same name, no
