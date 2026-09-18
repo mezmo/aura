@@ -111,10 +111,18 @@ impl ToolWrapper for ObserverWrapper {
 
         // Emit CallCompleted event (full output — truncation happens at SSE handler layer)
         let event = match result {
-            Ok(output) => ToolEvent::call_completed_success(tool_call_id, output, duration_ms),
+            Ok(output) => {
+                ToolEvent::call_completed_success(tool_call_id, &ctx.tool_name, output, duration_ms)
+            }
             Err(err) => {
                 let retry_hint = RetryHint::from_error_message(err);
-                ToolEvent::call_completed_error(tool_call_id, err, Some(retry_hint), duration_ms)
+                ToolEvent::call_completed_error(
+                    tool_call_id,
+                    &ctx.tool_name,
+                    err,
+                    Some(retry_hint),
+                    duration_ms,
+                )
             }
         };
 

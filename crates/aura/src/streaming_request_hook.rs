@@ -44,6 +44,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use aura_events::agent::{AgentEvent, AgentEventPayload};
 use rig::agent::{CancelSignal, StreamingPromptHook};
 use rig::completion::{CompletionModel, GetTokenUsage, Message};
 use tokio::sync::watch;
@@ -51,7 +52,7 @@ use tokio::sync::watch;
 use crate::orchestration::BlockedCell;
 use crate::scratchpad::{self, ContextBudget};
 use crate::tool_event_broker::{
-    pop_tool_call_id, publish_tool_requested, publish_tool_usage, push_tool_call_id,
+    TokenUsage, ToolCallId, ToolName, pop_tool_call_id, push_tool_call_id,
 };
 
 /// Maximum pending tool IDs before warning. Prevents unbounded growth if
@@ -140,7 +141,7 @@ pub struct UsageState {
     /// Output tokens of the most recent turn.
     last_output_tokens: Arc<AtomicU64>,
     /// Tool IDs completed since the last usage event (for aura.tool_usage correlation)
-    pending_tool_ids: Arc<Mutex<Vec<String>>>,
+    pending_tool_ids: Arc<Mutex<Vec<ToolCallId>>>,
 }
 
 impl UsageState {
@@ -255,7 +256,7 @@ impl UsageState {
     /// Add a tool ID to the pending list.
     ///
     /// Called from on_tool_result when a tool completes.
-    pub fn add_pending_tool_id(&self, tool_id: String) {
+    pub fn add_pending_tool_id(&self, tool_id: ToolCallId) {
         match self.pending_tool_ids.lock() {
             Ok(mut pending) => {
                 if pending.len() >= MAX_PENDING_TOOL_IDS {
@@ -283,7 +284,7 @@ impl UsageState {
     /// Take all pending tool IDs, leaving the list empty.
     ///
     /// Called when usage becomes available to associate tools with usage snapshot.
-    pub fn take_pending_tool_ids(&self) -> Vec<String> {
+    pub fn take_pending_tool_ids(&self) -> Vec<ToolCallId> {
         match self.pending_tool_ids.lock() {
             Ok(mut pending) => std::mem::take(&mut *pending),
             Err(poisoned) => {
@@ -592,9 +593,17 @@ where
 
                 // Rig 0.28+ passes correct tool_call_id; register for event correlation
                 if let Some(id) = &tool_call_id {
+                    let id = ToolCallId::new(id);
                     push_tool_call_id(&request_id, id.clone()).await;
-                    publish_tool_requested(&request_id, id.clone(), tool_name.clone(), arguments)
-                        .await;
+                    let _ = crate::agent_events::emit(
+                        &request_id,
+                        AgentEvent::single_agent(AgentEventPayload::ToolRequested {
+                            tool_call_id: id,
+                            tool_name: ToolName::new(&tool_name),
+                            arguments,
+                        }),
+                    )
+                    .await;
                 } else {
                     tracing::warn!(
                         "Tool '{}' called without tool_call_id for request '{}' - event correlation unavailable",
@@ -660,7 +669,7 @@ where
                 // This allows us to correlate tools with the usage snapshot when
                 // on_stream_completion_response_finish fires
                 if let Some(id) = tool_call_id {
-                    usage_state.add_pending_tool_id(id);
+                    usage_state.add_pending_tool_id(ToolCallId::new(id));
                 }
 
                 tracing::debug!(
@@ -730,12 +739,16 @@ where
                         tool_ids.len(),
                         tool_ids
                     );
-                    publish_tool_usage(
+                    let _ = crate::agent_events::emit(
                         &request_id,
-                        tool_ids,
-                        usage.input_tokens,
-                        usage.output_tokens,
-                        usage.total_tokens,
+                        AgentEvent::single_agent(AgentEventPayload::ToolUsage {
+                            tool_call_ids: tool_ids,
+                            usage: TokenUsage {
+                                prompt_tokens: usage.input_tokens.into(),
+                                completion_tokens: usage.output_tokens.into(),
+                                total_tokens: usage.total_tokens.into(),
+                            },
+                        }),
                     )
                     .await;
                 }
@@ -939,8 +952,8 @@ mod tests {
     fn test_usage_state_pending_tool_ids() {
         let usage_state = UsageState::new();
 
-        usage_state.add_pending_tool_id("call_abc".to_string());
-        usage_state.add_pending_tool_id("call_def".to_string());
+        usage_state.add_pending_tool_id(ToolCallId::new("call_abc"));
+        usage_state.add_pending_tool_id(ToolCallId::new("call_def"));
 
         let tool_ids = usage_state.take_pending_tool_ids();
         assert_eq!(tool_ids, vec!["call_abc", "call_def"]);
@@ -973,11 +986,11 @@ mod tests {
 
         // Fill to capacity
         for i in 0..MAX_PENDING_TOOL_IDS {
-            usage_state.add_pending_tool_id(format!("call_{}", i));
+            usage_state.add_pending_tool_id(ToolCallId::new(format!("call_{}", i)));
         }
 
         // Add one more - should drop oldest
-        usage_state.add_pending_tool_id("call_overflow".to_string());
+        usage_state.add_pending_tool_id(ToolCallId::new("call_overflow"));
 
         let tool_ids = usage_state.take_pending_tool_ids();
         assert_eq!(tool_ids.len(), MAX_PENDING_TOOL_IDS);

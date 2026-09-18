@@ -102,6 +102,27 @@ fn main() -> Result<()> {
         aura_telemetry::init(tcfg)
     };
 
+    // `run_oneshot`/`run_repl` block the main thread inside `rt.block_on`,
+    // so a cooperative flag (as `install_sigint_handler` uses) can't
+    // preempt either — a SIGTERM handler needs its own task on `rt` to
+    // fire regardless of which mode is running. Without this, SIGTERM hits
+    // the OS default and skips `shutdown_tracer` entirely, dropping
+    // whatever OTel spans are still buffered (#305).
+    {
+        let telemetry = telemetry.clone();
+        rt.spawn(async move {
+            let mut sigterm =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("failed to register SIGTERM handler");
+            sigterm.recv().await;
+            eprintln!("warning: received SIGTERM, flushing telemetry before exit");
+            telemetry.shutdown(std::time::Duration::from_secs(2)).await;
+            #[cfg(feature = "standalone-cli")]
+            aura::logging::shutdown_tracer().await;
+            std::process::exit(143); // 128 + SIGTERM
+        });
+    }
+
     // Make sure `~/.aura/cli.toml` exists and has a `style` line. First-run
     // users get a discoverable file with `style = "normal"` they can edit.
     // Failure is silent — read-only filesystems and weird home setups

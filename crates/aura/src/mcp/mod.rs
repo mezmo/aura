@@ -29,7 +29,7 @@ mod response;
 mod sse;
 mod tools;
 
-pub use client::{InFlightRequests, McpClient};
+pub use client::{CallContext, InFlightRequests, McpClient};
 pub use dynamic::McpToolAdaptor;
 pub use execution::execute_mcp_tool;
 pub use manager::{ConnectionStatus, McpManager, ServerInfo};

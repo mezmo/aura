@@ -19,6 +19,7 @@
 //! 3. Cancel MCP requests and close connections via `agent.cancel_and_close_mcp()`
 
 use crate::streaming::types::openai::UsageInfo;
+use aura_events::agent::{AgentEvent, AgentEventPayload};
 
 use super::types::{
     CHUNK_OBJECT, ChatCompletionChunk, ChatCompletionChunkChoice, ChatCompletionChunkDelta,
@@ -26,11 +27,11 @@ use super::types::{
     FunctionCallChunk, MessageRole, StreamConfig, ToolCallChunk, ToolResultMode, ToolResultStatus,
     TurnContext, TurnState, detect_tool_error, format_sse_chunk, truncate_result,
 };
-use aura::stream_events::AuraStreamEvent;
+use aura::stream_events::{AgentContext, AuraStreamEvent, CorrelationContext};
 use aura::{
-    ApprovalLifecycleEvent, EventContext, OrchestrationStreamEvent, OrchestratorEvent,
-    PASSTHROUGH_MARKER, ProgressNotification, RequestCancellation, ResponseContent, StreamError,
-    StreamItem, StreamedAssistantContent, StreamedUserContent, StreamingAgent, ToolCall,
+    ApprovalLifecycleEvent, EventContext, OrchestrationStreamEvent, PASSTHROUGH_MARKER,
+    ProgressNotification, RequestCancellation, ResponseContent, StreamError, StreamItem,
+    StreamedAssistantContent, StreamedUserContent, StreamingAgent, ToolCall, ToolCallId,
     ToolLifecycleEvent, ToolResult, ToolUsageEvent, UsageState,
 };
 use bytes::Bytes;
@@ -240,19 +241,18 @@ where
                     inactivity.touch();
                     let event = AuraStreamEvent::progress(
                         notification.message.clone().unwrap_or_else(|| {
-                            format!("Progress: {}/{:?}", notification.progress, notification.total)
+                            format!("Progress: {}", notification.progress)
                         }),
                         "mcp_progress",
                         notification.percent(),
                         Some(notification.progress_token.clone()),
-                        ctx.agent_context.clone(),
+                        notification.agent.clone().unwrap_or_else(|| ctx.agent_context.clone()),
                         ctx.correlation.clone(),
                     );
                     tracing::debug!(
-                        "Emitting aura.progress event: token={:?}, progress={}/{:?}",
+                        "Emitting aura.progress event: token={:?}, progress={}",
                         notification.progress_token,
-                        notification.progress,
-                        notification.total
+                        notification.progress
                     );
                     if tx.send(Ok(Bytes::from(event.format_sse()))).await.is_err() {
                         tracing::info!("Client disconnected during progress notification");
@@ -266,29 +266,29 @@ where
                 if let Some(tool_event) = tool_event {
                     inactivity.touch();
                     let sse_event = match tool_event {
-                        ToolLifecycleEvent::Requested { tool_id, tool_name, arguments } => {
+                        ToolLifecycleEvent::Requested { tool_id, tool_name, arguments, agent } => {
                             tracing::debug!(
                                 "Emitting aura.tool_requested event: tool_id={}, tool_name={}",
                                 tool_id, tool_name
                             );
                             AuraStreamEvent::tool_requested(
-                                &tool_id,
-                                &tool_name,
+                                tool_id.as_str(),
+                                tool_name.as_str(),
                                 arguments,
-                                ctx.agent_context.clone(),
+                                agent.unwrap_or_else(|| ctx.agent_context.clone()),
                                 ctx.correlation.clone(),
                             )
                         }
-                        ToolLifecycleEvent::Start { tool_id, tool_name, progress_token } => {
+                        ToolLifecycleEvent::Start { tool_id, tool_name, progress_token, agent } => {
                             tracing::debug!(
                                 "Emitting aura.tool_start event: tool_id={}, tool_name={}, progress_token={:?}",
                                 tool_id, tool_name, progress_token
                             );
                             AuraStreamEvent::tool_start(
-                                &tool_id,
-                                &tool_name,
+                                tool_id.as_str(),
+                                tool_name.as_str(),
                                 progress_token,
-                                ctx.agent_context.clone(),
+                                agent.unwrap_or_else(|| ctx.agent_context.clone()),
                                 ctx.correlation.clone(),
                             )
                         }
@@ -328,15 +328,9 @@ where
                     inactivity.touch();
                     tracing::debug!(
                         "Emitting aura.tool_usage event: tool_ids={:?}, prompt_tokens={}",
-                        usage_event.tool_ids, usage_event.prompt_tokens
+                        usage_event.tool_ids, usage_event.usage.prompt_tokens
                     );
-                    let sse_event = AuraStreamEvent::tool_usage(
-                        usage_event.tool_ids,
-                        usage_event.prompt_tokens,
-                        usage_event.completion_tokens,
-                        usage_event.total_tokens,
-                        ctx.correlation.clone(),
-                    );
+                    let sse_event = tool_usage_sse(usage_event, ctx.agent_context.clone(), ctx.correlation.clone());
                     if tx.send(Ok(Bytes::from(sse_event.format_sse()))).await.is_err() {
                         tracing::info!("Client disconnected during tool_usage event");
                         break StreamTermination::Disconnected;
@@ -478,6 +472,25 @@ fn resolve_billed_usage(
     }
 }
 
+fn tool_usage_sse(
+    event: ToolUsageEvent,
+    agent: AgentContext,
+    correlation: CorrelationContext,
+) -> AuraStreamEvent {
+    AuraStreamEvent::tool_usage(
+        event
+            .tool_ids
+            .into_iter()
+            .map(ToolCallId::into_string)
+            .collect(),
+        event.usage.prompt_tokens.get(),
+        event.usage.completion_tokens.get(),
+        event.usage.total_tokens.get(),
+        event.agent.unwrap_or(agent),
+        correlation,
+    )
+}
+
 /// Send final usage events, finish chunk, and [DONE] marker to the client.
 async fn send_final_events(
     emit_custom_events: bool,
@@ -489,11 +502,9 @@ async fn send_final_events(
     // Drain any pending tool_usage events before emitting final aura.usage
     if emit_custom_events {
         while let Ok(usage_event) = callbacks.tool_usage_rx.try_recv() {
-            let sse_event = AuraStreamEvent::tool_usage(
-                usage_event.tool_ids,
-                usage_event.prompt_tokens,
-                usage_event.completion_tokens,
-                usage_event.total_tokens,
+            let sse_event = tool_usage_sse(
+                usage_event,
+                ctx.agent_context.clone(),
                 ctx.correlation.clone(),
             );
             if tx
@@ -744,7 +755,7 @@ fn handle_stream_item(
             tracing::debug!("Received final/turn-usage marker");
             vec![]
         }
-        StreamItem::OrchestratorEvent(event) => handle_orchestrator_event(config, ctx, event),
+        StreamItem::AgentEvent(event) => handle_orchestrator_event(config, ctx, event),
         StreamItem::ScratchpadUsage {
             agent_id,
             tokens_intercepted,
@@ -1170,7 +1181,7 @@ fn maybe_truncate(s: &str, max_len: usize) -> Option<String> {
 fn handle_orchestrator_event(
     config: &StreamConfig,
     ctx: &TurnContext,
-    event: &OrchestratorEvent,
+    event: &AgentEvent,
 ) -> Vec<Bytes> {
     if !config.emit_custom_events {
         tracing::debug!(
@@ -1180,10 +1191,20 @@ fn handle_orchestrator_event(
         return vec![];
     }
 
-    let event_context = EventContext::new(ctx.agent_context.clone(), ctx.correlation.clone());
+    // Variants like ToolStart are emitted by both modes, so the envelope is
+    // what decides which frames an event becomes. A single-agent event routed
+    // here would be projected as an orchestration frame.
+    if event.agent.is_single_agent() {
+        return vec![];
+    }
 
-    let sse_event: OrchestrationStreamEvent = match event {
-        OrchestratorEvent::PlanCreated {
+    let event_context = EventContext::new(ctx.agent_context.clone(), ctx.correlation.clone());
+    // Orchestration frames name the worker in a field of their own; the
+    // envelope is where that now comes from.
+    let worker_id = &event.agent.agent_id;
+
+    let sse_event: OrchestrationStreamEvent = match &event.payload {
+        AgentEventPayload::PlanCreated {
             goal,
             tasks,
             routing_mode,
@@ -1210,7 +1231,7 @@ fn handle_orchestrator_event(
                 event_context,
             )
         }
-        OrchestratorEvent::DirectAnswer {
+        AgentEventPayload::DirectAnswer {
             response,
             routing_rationale,
         } => {
@@ -1220,7 +1241,7 @@ fn handle_orchestrator_event(
             );
             OrchestrationStreamEvent::direct_answer(response, routing_rationale, event_context)
         }
-        OrchestratorEvent::ClarificationNeeded {
+        AgentEventPayload::ClarificationNeeded {
             question,
             options,
             routing_rationale,
@@ -1237,29 +1258,30 @@ fn handle_orchestrator_event(
                 event_context,
             )
         }
-        OrchestratorEvent::TaskStarted {
+        AgentEventPayload::TaskStarted {
             task_id,
             description,
             orchestrator_id,
-            worker_id,
         } => {
             tracing::debug!("Orchestrator: task {} started - {}", task_id, description);
             OrchestrationStreamEvent::task_started(
                 *task_id,
                 description,
                 orchestrator_id,
-                worker_id,
+                worker_id.as_str(),
                 event_context,
             )
         }
-        OrchestratorEvent::TaskCompleted {
+        AgentEventPayload::TaskCompleted {
             task_id,
-            success,
             duration_ms,
             orchestrator_id,
-            worker_id,
-            result,
+            outcome,
         } => {
+            let (success, result) = match outcome {
+                aura_events::agent::ToolOutcome::Success { result } => (true, result),
+                aura_events::agent::ToolOutcome::Failure { error } => (false, error),
+            };
             tracing::debug!(
                 "Orchestrator: task {} completed (success={}) in {}ms",
                 task_id,
@@ -1268,18 +1290,17 @@ fn handle_orchestrator_event(
             );
             OrchestrationStreamEvent::task_completed(
                 *task_id,
-                *success,
+                success,
                 *duration_ms,
                 orchestrator_id,
-                worker_id,
+                worker_id.as_str(),
                 maybe_truncate(result, config.tool_result_max_length),
                 event_context,
             )
         }
-        OrchestratorEvent::TaskBlocked {
+        AgentEventPayload::TaskBlocked {
             task_id,
             orchestrator_id,
-            worker_id,
             tool_call_id,
             decision_id,
             tool_name,
@@ -1293,15 +1314,15 @@ fn handle_orchestrator_event(
             );
             OrchestrationStreamEvent::task_blocked(
                 *task_id,
-                tool_call_id,
+                tool_call_id.as_ref(),
                 decision_id,
-                tool_name,
+                tool_name.as_ref(),
                 orchestrator_id,
-                worker_id,
+                worker_id.as_str(),
                 event_context,
             )
         }
-        OrchestratorEvent::IterationComplete {
+        AgentEventPayload::IterationComplete {
             iteration,
             will_replan,
             reasoning,
@@ -1329,7 +1350,7 @@ fn handle_orchestrator_event(
                 event_context,
             )
         }
-        OrchestratorEvent::ReplanStarted { iteration, trigger } => {
+        AgentEventPayload::ReplanStarted { iteration, trigger } => {
             tracing::debug!(
                 "Orchestrator: replan started (iteration={}, trigger={})",
                 iteration,
@@ -1337,16 +1358,15 @@ fn handle_orchestrator_event(
             );
             OrchestrationStreamEvent::replan_started(*iteration, trigger, event_context)
         }
-        OrchestratorEvent::Synthesizing { iteration } => {
+        AgentEventPayload::Synthesizing { iteration } => {
             tracing::debug!(
                 "Orchestrator: consolidating results for coordinator (iteration={})",
                 iteration
             );
             OrchestrationStreamEvent::synthesizing(*iteration, event_context)
         }
-        OrchestratorEvent::WorkerReasoning {
-            task_id,
-            worker_id,
+        AgentEventPayload::Reasoning {
+            task_id: Some(task_id),
             content,
         } => {
             if !config.emit_custom_events || !config.emit_reasoning {
@@ -1360,26 +1380,24 @@ fn handle_orchestrator_event(
             // Emit as aura.orchestrator.worker_reasoning (orchestration event)
             let orch_event = OrchestrationStreamEvent::worker_reasoning(
                 *task_id,
-                worker_id,
+                worker_id.as_str(),
                 content,
                 event_context.clone(),
             );
             let mut bytes = vec![Bytes::from(orch_event.format_sse())];
             // Also emit as aura.reasoning with agent_id set to the worker name
             // for backward-compatible reasoning aggregation
-            let worker_agent =
-                aura::stream_events::AgentContext::worker(worker_id, None, "coordinator");
             let reasoning_event =
-                AuraStreamEvent::reasoning(content, worker_agent, ctx.correlation.clone());
+                AuraStreamEvent::reasoning(content, event.agent.clone(), ctx.correlation.clone());
             bytes.push(Bytes::from(reasoning_event.format_sse()));
             return bytes;
         }
-        OrchestratorEvent::ToolCallStarted {
+        AgentEventPayload::ToolStart {
             task_id,
             tool_call_id,
             tool_name,
-            worker_id,
             arguments,
+            ..
         } => {
             tracing::debug!(
                 "Orchestrator: task {:?} tool call started - {} ({})",
@@ -1389,20 +1407,24 @@ fn handle_orchestrator_event(
             );
             OrchestrationStreamEvent::tool_call_started(
                 *task_id,
-                tool_call_id,
-                tool_name,
-                worker_id,
-                Some(arguments.clone()),
+                tool_call_id.as_ref(),
+                tool_name.as_ref(),
+                worker_id.as_str(),
+                arguments.clone(),
                 event_context,
             )
         }
-        OrchestratorEvent::ToolCallCompleted {
+        AgentEventPayload::ToolComplete {
             task_id,
             tool_call_id,
-            success,
             duration_ms,
-            result,
+            outcome,
+            ..
         } => {
+            let (success, result) = match outcome {
+                aura_events::agent::ToolOutcome::Success { result } => (true, result),
+                aura_events::agent::ToolOutcome::Failure { error } => (false, error),
+            };
             tracing::debug!(
                 "Orchestrator: task {:?} tool call completed - {} (success={}) in {}ms",
                 task_id,
@@ -1412,14 +1434,14 @@ fn handle_orchestrator_event(
             );
             OrchestrationStreamEvent::tool_call_completed(
                 *task_id,
-                tool_call_id,
-                *success,
+                tool_call_id.as_ref(),
+                success,
                 *duration_ms,
                 maybe_truncate(result, config.tool_result_max_length),
                 event_context,
             )
         }
-        OrchestratorEvent::RunParked {
+        AgentEventPayload::RunParked {
             run_id,
             decision_ids,
             expires_at,
@@ -1439,6 +1461,16 @@ fn handle_orchestrator_event(
                 *iteration,
                 event_context,
             )
+        }
+        // `AgentEventPayload` is `#[non_exhaustive]`, so the compiler cannot
+        // flag an orchestration variant that arrives with no projection here.
+        // Log it rather than drop it silently.
+        other => {
+            tracing::debug!(
+                payload = ?std::mem::discriminant(other),
+                "orchestration event has no SSE projection; dropped"
+            );
+            return vec![];
         }
     };
 
@@ -1554,7 +1586,7 @@ fn build_final_chunk(ctx: &TurnContext, state: &TurnState) -> Vec<Bytes> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura::stream_events::{AgentContext, CorrelationContext};
+    use aura::{Progress, ToolName};
     use aura_events::event_names;
 
     /// Verify handle_tool_call does NOT emit aura.tool_requested events directly.
@@ -2415,9 +2447,9 @@ mod tests {
                                 progress_token: aura::ProgressToken(aura::NumberOrString::Number(
                                     n,
                                 )),
-                                progress: n as f64,
-                                total: Some(3.0),
+                                progress: Progress::ratio(n as f64, 3.0),
                                 message: Some("working".into()),
+                                agent: None,
                             })
                             .await;
                     }
@@ -2625,9 +2657,10 @@ mod tests {
                 let tx = tx.clone();
                 async move {
                     tx.send(ToolLifecycleEvent::Requested {
-                        tool_id: TOOL_ID.to_string(),
-                        tool_name: TOOL_NAME.to_string(),
+                        tool_id: ToolCallId::new(TOOL_ID),
+                        tool_name: ToolName::new(TOOL_NAME),
                         arguments: json!({ "path": "/mock" }),
+                        agent: None,
                     })
                     .await
                     .expect("tool event channel open");
@@ -2641,9 +2674,10 @@ mod tests {
                 let tx = tx.clone();
                 async move {
                     tx.send(ToolLifecycleEvent::Start {
-                        tool_id: TOOL_ID.to_string(),
-                        tool_name: TOOL_NAME.to_string(),
+                        tool_id: ToolCallId::new(TOOL_ID),
+                        tool_name: ToolName::new(TOOL_NAME),
                         progress_token: Some(ProgressToken(NumberOrString::Number(7))),
+                        agent: None,
                     })
                     .await
                     .expect("tool event channel open");
@@ -2658,9 +2692,9 @@ mod tests {
                 async move {
                     tx.send(ProgressNotification {
                         progress_token: ProgressToken(NumberOrString::Number(7)),
-                        progress: 50.0,
-                        total: Some(100.0),
+                        progress: Progress::ratio(50.0, 100.0),
                         message: Some("halfway".to_string()),
+                        agent: None,
                     })
                     .await
                     .expect("progress channel open");
@@ -2804,6 +2838,49 @@ mod tests {
                 payload(&events[progress_pos])["progress_token"],
                 7,
                 "progress must correlate with tool_start's token"
+            );
+        }
+
+        /// A notification with no message of its own renders one from the raw
+        /// counts, and that text goes out on the wire.
+        #[tokio::test(start_paused = true)]
+        async fn progress_without_a_message_renders_its_counts() {
+            async fn message_for(progress: Progress) -> String {
+                let events = run_with(|s| {
+                    let tx = s.progress_tx.clone();
+                    vec![
+                        Step::effect(move |_| {
+                            let tx = tx.clone();
+                            async move {
+                                tx.send(ProgressNotification {
+                                    progress_token: ProgressToken(NumberOrString::Number(7)),
+                                    progress,
+                                    message: None,
+                                    agent: None,
+                                })
+                                .await
+                                .expect("progress channel open");
+                            }
+                        }),
+                        Step::item(items::text("done")),
+                    ]
+                })
+                .await;
+
+                let progress_events = events_by_type(&events, event_names::PROGRESS);
+                payload(progress_events[0])["message"]
+                    .as_str()
+                    .expect("message")
+                    .to_string()
+            }
+
+            assert_eq!(
+                message_for(Progress::ratio(50.0, 100.0)).await,
+                "Progress: 50/100"
+            );
+            assert_eq!(
+                message_for(Progress::indeterminate(3.0)).await,
+                "Progress: 3"
             );
         }
 
