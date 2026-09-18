@@ -3,7 +3,7 @@
 //! The single definition of these frames, shared by the web server that emits
 //! them and the CLI that parses them, so the two cannot disagree about a field.
 
-use crate::{format_named_sse, AgentContext, CorrelationContext};
+use crate::{format_named_sse, AgentContext, CorrelationContext, PlanTaskId};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,7 +66,7 @@ impl EventContext {
 /// Shared identity fields for task events (TaskStarted, TaskCompleted).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TaskContext {
-    pub task_id: usize,
+    pub task_id: PlanTaskId,
     pub orchestrator_id: String,
     pub worker_id: String,
 }
@@ -150,7 +150,7 @@ pub enum OrchestrationStreamEvent {
     },
     /// A worker task parked a gated call (park mode); one event per call.
     TaskBlocked {
-        task_id: usize,
+        task_id: PlanTaskId,
         tool_call_id: String,
         decision_id: String,
         tool_name: String,
@@ -196,7 +196,7 @@ pub enum OrchestrationStreamEvent {
     },
     /// Emitted when a worker produces reasoning content.
     WorkerReasoning {
-        task_id: usize,
+        task_id: PlanTaskId,
         worker_id: String,
         content: String,
         #[serde(flatten)]
@@ -205,7 +205,7 @@ pub enum OrchestrationStreamEvent {
     /// Emitted when a tool call starts within a worker task.
     ToolCallStarted {
         #[serde(skip_serializing_if = "Option::is_none")]
-        task_id: Option<usize>,
+        task_id: Option<PlanTaskId>,
         tool_call_id: String,
         tool_name: String,
         worker_id: String,
@@ -217,7 +217,7 @@ pub enum OrchestrationStreamEvent {
     /// Emitted when a tool call completes within a worker task.
     ToolCallCompleted {
         #[serde(skip_serializing_if = "Option::is_none")]
-        task_id: Option<usize>,
+        task_id: Option<PlanTaskId>,
         tool_call_id: String,
         #[serde(flatten)]
         outcome: CompletionOutcome,
@@ -304,7 +304,7 @@ impl OrchestrationStreamEvent {
 
     /// Create a TaskStarted event.
     pub fn task_started(
-        task_id: usize,
+        task_id: PlanTaskId,
         description: impl Into<String>,
         orchestrator_id: impl Into<String>,
         worker_id: impl Into<String>,
@@ -323,7 +323,7 @@ impl OrchestrationStreamEvent {
 
     /// Create a TaskCompleted event.
     pub fn task_completed(
-        task_id: usize,
+        task_id: PlanTaskId,
         success: bool,
         duration_ms: u64,
         orchestrator_id: impl Into<String>,
@@ -349,7 +349,7 @@ impl OrchestrationStreamEvent {
     /// Create a TaskBlocked event (one per parked call).
     #[allow(clippy::too_many_arguments)]
     pub fn task_blocked(
-        task_id: usize,
+        task_id: PlanTaskId,
         tool_call_id: impl Into<String>,
         decision_id: impl Into<String>,
         tool_name: impl Into<String>,
@@ -425,7 +425,7 @@ impl OrchestrationStreamEvent {
 
     /// Create a WorkerReasoning event.
     pub fn worker_reasoning(
-        task_id: usize,
+        task_id: PlanTaskId,
         worker_id: impl Into<String>,
         content: impl Into<String>,
         context: EventContext,
@@ -440,7 +440,7 @@ impl OrchestrationStreamEvent {
 
     /// Create a ToolCallStarted event.
     pub fn tool_call_started(
-        task_id: Option<usize>,
+        task_id: Option<PlanTaskId>,
         tool_call_id: impl Into<String>,
         tool_name: impl Into<String>,
         worker_id: impl Into<String>,
@@ -459,7 +459,7 @@ impl OrchestrationStreamEvent {
 
     /// Create a ToolCallCompleted event.
     pub fn tool_call_completed(
-        task_id: Option<usize>,
+        task_id: Option<PlanTaskId>,
         tool_call_id: impl Into<String>,
         success: bool,
         duration_ms: u64,

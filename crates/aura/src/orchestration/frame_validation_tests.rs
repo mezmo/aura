@@ -6,6 +6,7 @@
 //! data: tool traces, artifact entries, failure categories, structured
 //! output, and cross-run references.
 
+use aura_events::PlanTaskId;
 use std::collections::HashMap;
 
 use super::config::build_coordinator_preamble;
@@ -72,7 +73,7 @@ fn tool_artifact(filename: &str, size: u64, tool: &str) -> ArtifactEntry {
 }
 
 fn complete_task_summary(
-    id: usize,
+    id: PlanTaskId,
     desc: &str,
     worker: &str,
     preview: &str,
@@ -96,7 +97,7 @@ fn complete_task_summary(
 }
 
 fn failed_task_summary(
-    id: usize,
+    id: PlanTaskId,
     desc: &str,
     worker: &str,
     error: &str,
@@ -124,7 +125,7 @@ fn failed_task_summary(
     }
 }
 
-fn blocked_task_summary(id: usize, desc: &str, worker: &str) -> TaskSummary {
+fn blocked_task_summary(id: PlanTaskId, desc: &str, worker: &str) -> TaskSummary {
     TaskSummary {
         task_id: id,
         description: desc.into(),
@@ -171,7 +172,11 @@ fn test_continuation_full_scenario() {
     let mut plan = Plan::new("Investigate elevated error rates in payments service");
 
     // Task 0: complete with structured output + artifact footer + tool traces
-    let mut t0 = Task::new(0, "Search prod logs", "Search prod logs for error patterns");
+    let mut t0 = Task::new(
+        PlanTaskId::new(0),
+        "Search prod logs",
+        "Search prod logs for error patterns",
+    );
     let result_with_footer = "Found 47 error groups across 3 services. Top failures: connection timeouts (38%), OOM (12%), TLS (3%). \
         [Full result (3200 chars) saved to artifact: task-0-sre-iter-1-result.txt]";
     t0.complete(result_with_footer.to_string());
@@ -182,7 +187,7 @@ fn test_continuation_full_scenario() {
 
     // Task 1: failed with tool chain showing success→failure
     let mut t1 = Task::new(
-        1,
+        PlanTaskId::new(1),
         "Query deployments",
         "Query deployment history for error window",
     );
@@ -193,7 +198,7 @@ fn test_continuation_full_scenario() {
 
     // Task 2: blocked
     let t2 = Task::new(
-        2,
+        PlanTaskId::new(2),
         "Correlate events",
         "Correlate deployment events with error rates",
     );
@@ -205,7 +210,7 @@ fn test_continuation_full_scenario() {
     // Tool traces for continuation
     let mut traces = HashMap::new();
     traces.insert(
-        0,
+        PlanTaskId::new(0),
         vec![
             trace_with_artifact(
                 "log_search",
@@ -222,7 +227,7 @@ fn test_continuation_full_scenario() {
         ],
     );
     traces.insert(
-        1,
+        PlanTaskId::new(1),
         vec![
             trace("get_deployments", "checking staging baseline", 1200, None),
             trace(
@@ -342,7 +347,7 @@ fn test_continuation_full_scenario() {
 #[test]
 fn test_continuation_final_attempt_urgency() {
     let mut plan = Plan::new("Simple goal");
-    let mut t = Task::new(0, "task", "do something");
+    let mut t = Task::new(PlanTaskId::new(0), "task", "do something");
     t.complete("done".to_string());
     plan.add_task(t);
 
@@ -361,7 +366,11 @@ fn test_continuation_mixed_structured_and_raw() {
     let mut plan = Plan::new("Mixed output test");
 
     // Task 0: structured output via submit_result
-    let mut t0 = Task::new(0, "structured", "Task with structured output");
+    let mut t0 = Task::new(
+        PlanTaskId::new(0),
+        "structured",
+        "Task with structured output",
+    );
     t0.complete("Full detailed result from structured output".to_string());
     t0.structured_output = Some(StructuredTaskOutput {
         summary: "Concise structured summary".into(),
@@ -369,7 +378,7 @@ fn test_continuation_mixed_structured_and_raw() {
     });
 
     // Task 1: raw output (no submit_result)
-    let mut t1 = Task::new(1, "raw", "Task without structured output");
+    let mut t1 = Task::new(PlanTaskId::new(1), "raw", "Task without structured output");
     t1.complete("Raw unstructured worker output text here".to_string());
 
     plan.add_task(t0);
@@ -417,7 +426,7 @@ fn test_session_history_full_scenario() {
         RunStatus::PartialSuccess,
         vec![
             complete_task_summary(
-                0,
+                PlanTaskId::new(0),
                 "Search prod logs for error patterns",
                 "sre",
                 "Found 47 error groups. Top: timeouts 38%, OOM 12%",
@@ -447,7 +456,7 @@ fn test_session_history_full_scenario() {
                 ],
             ),
             failed_task_summary(
-                1,
+                PlanTaskId::new(1),
                 "Query deployment history",
                 "sre",
                 "403 Forbidden",
@@ -463,7 +472,7 @@ fn test_session_history_full_scenario() {
                 ],
                 Some("Staging query succeeded (3 deployments found)"),
             ),
-            blocked_task_summary(2, "Correlate events", "sre"),
+            blocked_task_summary(PlanTaskId::new(2), "Correlate events", "sre"),
         ],
     );
 
@@ -575,7 +584,7 @@ fn test_session_history_multi_run_chronological() {
         outcome: Some("1/1 tasks completed".into()),
         response_summary: None,
         task_summaries: vec![complete_task_summary(
-            0,
+            PlanTaskId::new(0),
             "task A",
             "w",
             "done A",
@@ -707,7 +716,7 @@ fn test_session_history_and_continuation_independent_artifact_refs() {
         "Earlier investigation",
         RunStatus::Success,
         vec![complete_task_summary(
-            0,
+            PlanTaskId::new(0),
             "Search logs",
             "sre",
             "Found errors in auth-service",
@@ -741,7 +750,11 @@ fn test_session_history_and_continuation_independent_artifact_refs() {
 
     // Current iteration continuation — its own artifacts are independent
     let mut plan = Plan::new("Follow-up investigation");
-    let mut t = Task::new(0, "Deeper analysis", "Analyze auth-service in detail");
+    let mut t = Task::new(
+        PlanTaskId::new(0),
+        "Deeper analysis",
+        "Analyze auth-service in detail",
+    );
     let result = "Auth-service has 12 failing endpoints. [Full result (5000 chars) saved to artifact: task-0-sre-iter-1-result.txt]";
     t.complete(result.to_string());
     plan.add_task(t);
@@ -766,7 +779,7 @@ fn test_session_history_and_continuation_independent_artifact_refs() {
 #[test]
 fn test_continuation_tool_output_artifacts_visible() {
     let mut plan = Plan::new("Test goal");
-    let mut t = Task::new(0, "Search logs", "Search prod logs");
+    let mut t = Task::new(PlanTaskId::new(0), "Search logs", "Search prod logs");
     t.complete(
         "Found errors. [Full result (3200 chars) saved to artifact: task-0-sre-iter-1-result.txt]"
             .to_string(),
@@ -775,7 +788,7 @@ fn test_continuation_tool_output_artifacts_visible() {
 
     let mut traces = HashMap::new();
     traces.insert(
-        0,
+        PlanTaskId::new(0),
         vec![
             trace_with_artifact(
                 "log_search",
@@ -824,13 +837,13 @@ fn test_continuation_tool_output_artifacts_visible() {
 #[test]
 fn test_continuation_failed_task_no_artifact_refs() {
     let mut plan = Plan::new("Test goal");
-    let mut t = Task::new(0, "Deploy check", "Check deployments");
+    let mut t = Task::new(PlanTaskId::new(0), "Deploy check", "Check deployments");
     t.fail("403 Forbidden".to_string(), FailureCategory::AgentError);
     plan.add_task(t);
 
     let mut traces = HashMap::new();
     traces.insert(
-        0,
+        PlanTaskId::new(0),
         vec![
             trace("get_deployments", "checking staging", 1200, None),
             trace(
@@ -873,7 +886,7 @@ fn test_continuation_all_failure_categories() {
 
     for (category, display) in categories {
         let mut plan = Plan::new("Test goal");
-        let mut t = Task::new(0, "failing task", "This task fails");
+        let mut t = Task::new(PlanTaskId::new(0), "failing task", "This task fails");
         t.fail(format!("error for {}", display), category);
         plan.add_task(t);
 
@@ -893,7 +906,11 @@ fn test_continuation_all_failure_categories() {
 #[test]
 fn test_continuation_soft_failure_with_structured_output() {
     let mut plan = Plan::new("Test goal");
-    let mut t = Task::new(0, "Inconclusive task", "Investigate ambiguous signal");
+    let mut t = Task::new(
+        PlanTaskId::new(0),
+        "Inconclusive task",
+        "Investigate ambiguous signal",
+    );
     t.fail(
         "Worker reported inconclusive findings".to_string(),
         FailureCategory::SoftFailure,
@@ -923,7 +940,11 @@ fn test_continuation_soft_failure_with_structured_output() {
 #[test]
 fn test_continuation_soft_failure_without_structured_output() {
     let mut plan = Plan::new("Test goal");
-    let mut t = Task::new(0, "Inconclusive task", "Investigate ambiguous signal");
+    let mut t = Task::new(
+        PlanTaskId::new(0),
+        "Inconclusive task",
+        "Investigate ambiguous signal",
+    );
     t.fail(
         "Worker did not call submit_result".to_string(),
         FailureCategory::SoftFailure,
@@ -962,7 +983,7 @@ fn test_session_history_routed_single_worker() {
         outcome: Some("1/1 tasks completed".into()),
         response_summary: None,
         task_summaries: vec![complete_task_summary(
-            0,
+            PlanTaskId::new(0),
             "Get pod status",
             "sre",
             "3 pods running, 0 pending",
@@ -1128,7 +1149,11 @@ fn test_worker_task_empty_context() {
 #[test]
 fn test_continuation_running_task_renders_as_blocked() {
     let mut plan = Plan::new("Test goal");
-    let t0 = Task::new(0, "running task", "This task is still running");
+    let t0 = Task::new(
+        PlanTaskId::new(0),
+        "running task",
+        "This task is still running",
+    );
     plan.add_task(t0);
 
     let ctx = IterationContext::new(1, plan, None, vec![], HashMap::new());
@@ -1144,9 +1169,9 @@ fn test_continuation_running_task_renders_as_blocked() {
 #[test]
 fn test_continuation_clean_success_no_failure_sections() {
     let mut plan = Plan::new("Simple goal");
-    let mut t0 = Task::new(0, "task A", "First task");
+    let mut t0 = Task::new(PlanTaskId::new(0), "task A", "First task");
     t0.complete("Done A".to_string());
-    let mut t1 = Task::new(1, "task B", "Second task");
+    let mut t1 = Task::new(PlanTaskId::new(1), "task B", "Second task");
     t1.complete("Done B".to_string());
     plan.add_task(t0);
     plan.add_task(t1);
@@ -1172,7 +1197,11 @@ fn test_continuation_clean_success_no_failure_sections() {
 #[test]
 fn test_continuation_short_result_no_artifact() {
     let mut plan = Plan::new("Test goal");
-    let mut t = Task::new(0, "short result task", "Task with short result");
+    let mut t = Task::new(
+        PlanTaskId::new(0),
+        "short result task",
+        "Task with short result",
+    );
     t.complete("Short result, no artifact needed".to_string());
     plan.add_task(t);
 
@@ -1190,7 +1219,7 @@ fn test_continuation_short_result_no_artifact() {
 #[test]
 fn test_continuation_result_forwarding_absent_when_all_failed() {
     let mut plan = Plan::new("Test goal");
-    let mut t = Task::new(0, "failing", "This fails");
+    let mut t = Task::new(PlanTaskId::new(0), "failing", "This fails");
     t.fail("error".to_string(), FailureCategory::AgentError);
     plan.add_task(t);
 
@@ -1207,7 +1236,7 @@ fn test_continuation_result_forwarding_absent_when_all_failed() {
 #[test]
 fn test_continuation_failure_history_worker_none() {
     let mut plan = Plan::new("Test goal");
-    let mut t = Task::new(0, "task", "A task");
+    let mut t = Task::new(PlanTaskId::new(0), "task", "A task");
     t.fail("oops".to_string(), FailureCategory::AgentError);
     plan.add_task(t);
 
@@ -1234,9 +1263,9 @@ fn test_continuation_failure_history_worker_none() {
 #[test]
 fn test_continuation_multiple_repeated_failure_patterns() {
     let mut plan = Plan::new("Test goal");
-    let mut t0 = Task::new(0, "task A", "First task");
+    let mut t0 = Task::new(PlanTaskId::new(0), "task A", "First task");
     t0.fail("timeout".to_string(), FailureCategory::AgentTimeout);
-    let mut t1 = Task::new(1, "task B", "Second task");
+    let mut t1 = Task::new(PlanTaskId::new(1), "task B", "Second task");
     t1.fail("403".to_string(), FailureCategory::ProviderAuthError);
     plan.add_task(t0);
     plan.add_task(t1);
@@ -1293,13 +1322,13 @@ fn test_continuation_multiple_repeated_failure_patterns() {
 #[test]
 fn test_continuation_empty_reasoning_in_tool_chain() {
     let mut plan = Plan::new("Test goal");
-    let mut t = Task::new(0, "task", "A task");
+    let mut t = Task::new(PlanTaskId::new(0), "task", "A task");
     t.complete("Done".to_string());
     plan.add_task(t);
 
     let mut traces = HashMap::new();
     traces.insert(
-        0,
+        PlanTaskId::new(0),
         vec![
             trace("tool_a", "", 1000, None),
             trace("tool_b", "has reasoning", 2000, None),
@@ -1337,7 +1366,7 @@ fn test_session_history_task_with_no_worker() {
         "Test goal",
         RunStatus::Success,
         vec![TaskSummary {
-            task_id: 0,
+            task_id: PlanTaskId::new(0),
             description: "Unassigned task".into(),
             status: TaskStatus::Complete,
             worker: None,
@@ -1366,7 +1395,7 @@ fn test_session_history_complete_task_no_preview_no_confidence() {
         "Test goal",
         RunStatus::Success,
         vec![TaskSummary {
-            task_id: 0,
+            task_id: PlanTaskId::new(0),
             description: "Bare task".into(),
             status: TaskStatus::Complete,
             worker: Some("sre".into()),
@@ -1396,7 +1425,7 @@ fn test_session_history_failed_task_no_error_no_context() {
         "Test goal",
         RunStatus::Failed,
         vec![TaskSummary {
-            task_id: 0,
+            task_id: PlanTaskId::new(0),
             description: "Failed bare".into(),
             status: TaskStatus::Failed,
             worker: Some("sre".into()),
@@ -1427,7 +1456,7 @@ fn test_session_history_no_artifacts_no_crossrun_hint() {
         "Simple query",
         RunStatus::Success,
         vec![complete_task_summary(
-            0,
+            PlanTaskId::new(0),
             "Simple task",
             "sre",
             "Done",
@@ -1452,7 +1481,7 @@ fn test_session_history_manifest_outcome_none() {
         "Test goal",
         RunStatus::Success,
         vec![complete_task_summary(
-            0,
+            PlanTaskId::new(0),
             "task",
             "sre",
             "done",
@@ -1475,7 +1504,7 @@ fn test_session_history_current_time_placeholder_replaced() {
         "Test",
         RunStatus::Success,
         vec![complete_task_summary(
-            0,
+            PlanTaskId::new(0),
             "t",
             "w",
             "d",
@@ -1503,7 +1532,7 @@ fn test_session_history_error_context_without_partial_result() {
         "Test",
         RunStatus::Failed,
         vec![TaskSummary {
-            task_id: 0,
+            task_id: PlanTaskId::new(0),
             description: "Failed task".into(),
             status: TaskStatus::Failed,
             worker: Some("sre".into()),
@@ -1537,11 +1566,11 @@ fn test_session_history_error_context_without_partial_result() {
 #[test]
 fn test_continuation_section_ordering() {
     let mut plan = Plan::new("Order test");
-    let mut t0 = Task::new(0, "complete", "Completed task");
+    let mut t0 = Task::new(PlanTaskId::new(0), "complete", "Completed task");
     t0.complete("done".to_string());
-    let mut t1 = Task::new(1, "failed", "Failed task");
+    let mut t1 = Task::new(PlanTaskId::new(1), "failed", "Failed task");
     t1.fail("error".to_string(), FailureCategory::AgentError);
-    let t2 = Task::new(2, "blocked", "Blocked task");
+    let t2 = Task::new(PlanTaskId::new(2), "blocked", "Blocked task");
     plan.add_task(t0);
     plan.add_task(t1);
     plan.add_task(t2);
@@ -1588,7 +1617,7 @@ fn test_session_history_running_task_status() {
         "Test",
         RunStatus::PartialSuccess,
         vec![TaskSummary {
-            task_id: 0,
+            task_id: PlanTaskId::new(0),
             description: "Stuck task".into(),
             status: TaskStatus::Running,
             worker: Some("sre".into()),
@@ -1617,7 +1646,7 @@ fn test_session_history_multi_artifact_listing() {
         "Test",
         RunStatus::Success,
         vec![complete_task_summary(
-            0,
+            PlanTaskId::new(0),
             "Multi-artifact task",
             "sre",
             "Produced lots of data",

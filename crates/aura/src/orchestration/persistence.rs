@@ -29,6 +29,7 @@
 //!     └── iteration-{n}/
 //! ```
 
+use aura_events::PlanTaskId;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io;
@@ -139,7 +140,7 @@ pub struct RunManifest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskSummary {
     /// Task ID within the plan.
-    pub task_id: usize,
+    pub task_id: PlanTaskId,
     /// Human-readable task description.
     pub description: String,
     /// Final task status.
@@ -234,7 +235,7 @@ pub enum RunStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskExecutionRecord {
     /// Task ID
-    pub task_id: usize,
+    pub task_id: PlanTaskId,
     /// Task description
     pub description: String,
     /// Attempt number (1-indexed)
@@ -274,7 +275,7 @@ pub struct ExecutionPersistence {
     in_flight: Arc<AtomicUsize>,
     drain_notify: Arc<Notify>,
     /// Condensed tool-call trace per task id.
-    tool_traces: Arc<StdMutex<HashMap<usize, Vec<ToolTraceEntry>>>>,
+    tool_traces: Arc<StdMutex<HashMap<PlanTaskId, Vec<ToolTraceEntry>>>>,
 }
 
 impl ExecutionPersistence {
@@ -485,7 +486,7 @@ impl ExecutionPersistence {
     }
 
     /// Build a dot-namespaced filename for a task attempt artifact.
-    fn task_attempt_filename(&self, task_id: usize, attempt: usize, suffix: &str) -> String {
+    fn task_attempt_filename(&self, task_id: PlanTaskId, attempt: usize, suffix: &str) -> String {
         format!("task-{}.attempt-{}.{}", task_id, attempt, suffix)
     }
 
@@ -542,7 +543,7 @@ impl ExecutionPersistence {
     /// Write worker task execution artifacts.
     pub async fn write_task_execution(
         &self,
-        task_id: usize,
+        task_id: PlanTaskId,
         attempt: usize,
         prompt: &str,
         response: &str,
@@ -578,7 +579,7 @@ impl ExecutionPersistence {
     }
 
     /// Get relative path for logging.
-    pub fn relative_path(&self, task_id: usize, attempt: usize) -> String {
+    pub fn relative_path(&self, task_id: PlanTaskId, attempt: usize) -> String {
         self.task_attempt_filename(task_id, attempt, "*")
     }
 
@@ -598,7 +599,7 @@ impl ExecutionPersistence {
     /// `task-{id}-{worker}-iter-{n}-result.txt`
     pub async fn write_result_artifact(
         &self,
-        task_id: usize,
+        task_id: PlanTaskId,
         worker_name: Option<&str>,
         iteration: usize,
         result: &str,
@@ -629,7 +630,7 @@ impl ExecutionPersistence {
     /// Filename: `task-{id}-{worker}-iter-{n}-{tool_name}-{call_idx}-output.txt`
     pub async fn write_tool_output_artifact(
         &self,
-        task_id: usize,
+        task_id: PlanTaskId,
         worker_name: &str,
         iteration: usize,
         tool_name: &str,
@@ -809,7 +810,7 @@ impl ExecutionPersistence {
 
     /// All tool traces recorded for a task so far, in call-completion order
     /// across every iteration and attempt.
-    pub fn tool_traces_for_task(&self, task_id: usize) -> Vec<ToolTraceEntry> {
+    pub fn tool_traces_for_task(&self, task_id: PlanTaskId) -> Vec<ToolTraceEntry> {
         if !self.enabled {
             return Vec::new();
         }
@@ -855,7 +856,7 @@ impl ExecutionPersistence {
     /// held in memory for continuation-prompt rendering and reach disk only
     /// via the run manifest (`TaskSummary.tool_trace`); full tool outputs are
     /// captured by artifact promotion and OTel, not here.
-    pub fn record_tool_trace(&self, task_id: usize, entry: ToolTraceEntry) {
+    pub fn record_tool_trace(&self, task_id: PlanTaskId, entry: ToolTraceEntry) {
         if !self.enabled {
             return;
         }
@@ -1105,6 +1106,31 @@ fn render_task_summary(task: &TaskSummary, out: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The run manifest stores `task_id` as a bare JSON number. Every instance
+    /// reading a prior run's manifest depends on that shape.
+    #[test]
+    fn task_summary_task_id_persists_as_a_bare_number() {
+        let summary = TaskSummary {
+            task_id: PlanTaskId::new(3),
+            description: "task".to_string(),
+            status: TaskStatus::Complete,
+            worker: None,
+            result_preview: None,
+            confidence: None,
+            failure_category: None,
+            error: None,
+            error_context: None,
+            tool_trace: Vec::new(),
+            artifacts: Vec::new(),
+        };
+
+        let json = serde_json::to_value(&summary).expect("summary serializes");
+        assert_eq!(json["task_id"], 3);
+
+        let back: TaskSummary = serde_json::from_value(json).expect("a bare number parses back");
+        assert_eq!(back.task_id, PlanTaskId::new(3));
+    }
     use tempfile::TempDir;
 
     #[tokio::test]
@@ -1271,7 +1297,12 @@ mod tests {
             .unwrap();
 
         let filename = persistence
-            .write_result_artifact(0, Some("research"), 1, "full result content")
+            .write_result_artifact(
+                PlanTaskId::new(0),
+                Some("research"),
+                1,
+                "full result content",
+            )
             .await
             .unwrap();
         assert_eq!(filename, "task-0-research-iter-1-result.txt");
@@ -1293,11 +1324,11 @@ mod tests {
 
         // Write two artifacts
         persistence
-            .write_result_artifact(0, None, 1, "result 0")
+            .write_result_artifact(PlanTaskId::new(0), None, 1, "result 0")
             .await
             .unwrap();
         persistence
-            .write_result_artifact(1, Some("stats"), 1, "result 1")
+            .write_result_artifact(PlanTaskId::new(1), Some("stats"), 1, "result 1")
             .await
             .unwrap();
 
@@ -1346,7 +1377,7 @@ mod tests {
             .unwrap();
         let run_a_id = run_a.run_id().to_string();
         run_a
-            .write_result_artifact(0, Some("sre"), 1, "prior run content")
+            .write_result_artifact(PlanTaskId::new(0), Some("sre"), 1, "prior run content")
             .await
             .unwrap();
 
@@ -1385,7 +1416,7 @@ mod tests {
 
         // Write returns empty string
         let filename = persistence
-            .write_result_artifact(0, None, 1, "content")
+            .write_result_artifact(PlanTaskId::new(0), None, 1, "content")
             .await
             .unwrap();
         assert!(filename.is_empty());
@@ -1471,7 +1502,7 @@ mod tests {
             response_summary: None,
             task_summaries: vec![
                 TaskSummary {
-                    task_id: 0,
+                    task_id: PlanTaskId::new(0),
                     description: "First task".to_string(),
                     status: TaskStatus::Complete,
                     worker: Some("research".to_string()),
@@ -1484,7 +1515,7 @@ mod tests {
                     artifacts: vec![],
                 },
                 TaskSummary {
-                    task_id: 1,
+                    task_id: PlanTaskId::new(1),
                     description: "Second task".to_string(),
                     status: TaskStatus::Failed,
                     worker: None,
@@ -1599,7 +1630,7 @@ mod tests {
             outcome: None,
             response_summary: None,
             task_summaries: vec![TaskSummary {
-                task_id: 0,
+                task_id: PlanTaskId::new(0),
                 description: "Compute mean".to_string(),
                 status: TaskStatus::Complete,
                 worker: Some("statistics".to_string()),
@@ -1850,7 +1881,7 @@ mod tests {
             outcome: None,
             response_summary: None,
             task_summaries: vec![TaskSummary {
-                task_id: 0,
+                task_id: PlanTaskId::new(0),
                 description: "Bad task".to_string(),
                 status: TaskStatus::Failed,
                 worker: Some("worker1".to_string()),
@@ -1886,7 +1917,7 @@ mod tests {
             outcome: Some("2/2 tasks completed".to_string()),
             response_summary: None,
             task_summaries: vec![TaskSummary {
-                task_id: 0,
+                task_id: PlanTaskId::new(0),
                 description: "Search error logs".to_string(),
                 status: TaskStatus::Complete,
                 worker: Some("sre".to_string()),
@@ -1938,7 +1969,7 @@ mod tests {
             outcome: None,
             response_summary: None,
             task_summaries: vec![TaskSummary {
-                task_id: 1,
+                task_id: PlanTaskId::new(1),
                 description: "Write summary".to_string(),
                 status: TaskStatus::Complete,
                 worker: Some("writer".to_string()),
@@ -1988,7 +2019,7 @@ mod tests {
             outcome: Some("0/1 tasks completed".to_string()),
             response_summary: None,
             task_summaries: vec![TaskSummary {
-                task_id: 0,
+                task_id: PlanTaskId::new(0),
                 description: "Run SQL query".to_string(),
                 status: TaskStatus::Failed,
                 worker: Some("db-worker".to_string()),
@@ -2117,7 +2148,7 @@ mod tests {
             .unwrap();
 
         let filename = persistence
-            .write_result_artifact(0, Some("sre"), 2, "content")
+            .write_result_artifact(PlanTaskId::new(0), Some("sre"), 2, "content")
             .await
             .unwrap();
         assert_eq!(filename, "task-0-sre-iter-2-result.txt");
@@ -2134,7 +2165,7 @@ mod tests {
             .unwrap();
 
         let filename = persistence
-            .write_result_artifact(3, None, 1, "content")
+            .write_result_artifact(PlanTaskId::new(3), None, 1, "content")
             .await
             .unwrap();
         assert_eq!(filename, "task-3-default-iter-1-result.txt");
@@ -2152,7 +2183,14 @@ mod tests {
             .unwrap();
 
         let filename = persistence
-            .write_tool_output_artifact(0, "sre", 1, "log_search", 0, "search results here")
+            .write_tool_output_artifact(
+                PlanTaskId::new(0),
+                "sre",
+                1,
+                "log_search",
+                0,
+                "search results here",
+            )
             .await
             .unwrap();
         assert_eq!(filename, "task-0-sre-iter-1-log-search-0-output.txt");
@@ -2169,7 +2207,14 @@ mod tests {
             .unwrap();
 
         let filename = persistence
-            .write_tool_output_artifact(2, "SRE/Ops", 1, "My Search Tool", 3, "data")
+            .write_tool_output_artifact(
+                PlanTaskId::new(2),
+                "SRE/Ops",
+                1,
+                "My Search Tool",
+                3,
+                "data",
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -2182,7 +2227,7 @@ mod tests {
     async fn test_write_tool_output_artifact_disabled() {
         let persistence = ExecutionPersistence::disabled();
         let filename = persistence
-            .write_tool_output_artifact(0, "w", 1, "t", 0, "data")
+            .write_tool_output_artifact(PlanTaskId::new(0), "w", 1, "t", 0, "data")
             .await
             .unwrap();
         assert!(filename.is_empty());
@@ -2284,7 +2329,7 @@ mod tests {
             response_summary: None,
             task_summaries: vec![
                 TaskSummary {
-                    task_id: 0,
+                    task_id: PlanTaskId::new(0),
                     description: "Search logs".to_string(),
                     status: TaskStatus::Complete,
                     worker: Some("sre".to_string()),
@@ -2320,7 +2365,7 @@ mod tests {
                     ],
                 },
                 TaskSummary {
-                    task_id: 1,
+                    task_id: PlanTaskId::new(1),
                     description: "Query deployments".to_string(),
                     status: TaskStatus::Failed,
                     worker: Some("sre".to_string()),
@@ -2442,14 +2487,14 @@ mod tests {
             .await
             .unwrap();
 
-        persistence.record_tool_trace(0, trace_entry("log_search", 1500));
+        persistence.record_tool_trace(PlanTaskId::new(0), trace_entry("log_search", 1500));
 
-        let traces = persistence.tool_traces_for_task(0);
+        let traces = persistence.tool_traces_for_task(PlanTaskId::new(0));
         assert_eq!(traces.len(), 1);
         assert_eq!(traces[0].tool, "log_search");
         assert_eq!(traces[0].duration_ms, 1500);
 
-        let empty = persistence.tool_traces_for_task(99);
+        let empty = persistence.tool_traces_for_task(PlanTaskId::new(99));
         assert!(empty.is_empty());
     }
 
@@ -2463,18 +2508,22 @@ mod tests {
         // Traces recorded through a clone (as PersistenceWrapper holds one)
         // must be visible to the original.
         let clone = persistence.clone();
-        persistence.record_tool_trace(0, trace_entry("log_search", 10));
-        clone.record_tool_trace(0, trace_entry("log_search", 20));
+        persistence.record_tool_trace(PlanTaskId::new(0), trace_entry("log_search", 10));
+        clone.record_tool_trace(PlanTaskId::new(0), trace_entry("log_search", 20));
 
-        let traces = persistence.tool_traces_for_task(0);
+        let traces = persistence.tool_traces_for_task(PlanTaskId::new(0));
         assert_eq!(traces.len(), 2);
     }
 
     #[tokio::test]
     async fn test_record_tool_trace_noop_when_disabled() {
         let persistence = ExecutionPersistence::disabled();
-        persistence.record_tool_trace(0, trace_entry("log_search", 10));
-        assert!(persistence.tool_traces_for_task(0).is_empty());
+        persistence.record_tool_trace(PlanTaskId::new(0), trace_entry("log_search", 10));
+        assert!(
+            persistence
+                .tool_traces_for_task(PlanTaskId::new(0))
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -2485,11 +2534,11 @@ mod tests {
             .unwrap();
 
         persistence
-            .write_result_artifact(0, Some("sre"), 1, "short")
+            .write_result_artifact(PlanTaskId::new(0), Some("sre"), 1, "short")
             .await
             .unwrap();
         persistence
-            .write_result_artifact(1, Some("sre"), 1, "a longer result here")
+            .write_result_artifact(PlanTaskId::new(1), Some("sre"), 1, "a longer result here")
             .await
             .unwrap();
 

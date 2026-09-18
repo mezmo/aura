@@ -769,6 +769,7 @@ fn header_value(headers: &reqwest::header::HeaderMap, name: &str) -> Option<Stri
 
 #[cfg(test)]
 mod tests {
+    use aura_events::PlanTaskId;
     use serde_json::json;
 
     use super::super::decision::{
@@ -857,7 +858,10 @@ mod tests {
             request_id: "req-9".to_string(),
             scope: AgentScope::Worker {
                 run_id,
-                task: crate::orchestration::TaskIdentity::new(2, Some("k8s-agent".to_string())),
+                task: crate::orchestration::TaskIdentity::new(
+                    PlanTaskId::new(2),
+                    Some("k8s-agent".to_string()),
+                ),
                 session_id: Some(crate::config::SessionId::new("sess-abc".to_string())),
             },
             origin: ApprovalOrigin::AgentRequested {

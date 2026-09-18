@@ -54,6 +54,7 @@
 //! ```
 
 use async_trait::async_trait;
+use aura_events::PlanTaskId;
 use rig::tool::{Tool as RigTool, ToolError};
 use serde_json::Value;
 use std::future::Future;
@@ -76,7 +77,7 @@ pub struct ToolCallContext {
     /// Optional correlation ID for tracing
     pub correlation_id: Option<String>,
     /// Optional task context (for orchestration)
-    pub task_id: Option<usize>,
+    pub task_id: Option<PlanTaskId>,
     /// Optional attempt number (for retries)
     pub attempt: Option<usize>,
     /// Custom metadata that wrappers can use
@@ -103,7 +104,7 @@ impl ToolCallContext {
     /// Set task context for orchestration.
     pub fn with_task_context(
         mut self,
-        task_id: usize,
+        task_id: PlanTaskId,
         tool_initiator_id: String,
         attempt: usize,
     ) -> Self {
@@ -846,12 +847,12 @@ mod tests {
     fn test_tool_call_context_builder() {
         let ctx = ToolCallContext::new("test_tool")
             .with_correlation_id("req-123")
-            .with_task_context(1, String::from("initiator"), 2)
+            .with_task_context(PlanTaskId::new(1), String::from("initiator"), 2)
             .with_metadata(serde_json::json!({"key": "value"}));
 
         assert_eq!(ctx.tool_name, "test_tool");
         assert_eq!(ctx.correlation_id, Some("req-123".to_string()));
-        assert_eq!(ctx.task_id, Some(1));
+        assert_eq!(ctx.task_id, Some(PlanTaskId::new(1)));
         assert_eq!(ctx.attempt, Some(2));
         assert!(ctx.metadata.is_some());
     }

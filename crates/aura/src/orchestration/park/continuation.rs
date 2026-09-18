@@ -333,6 +333,7 @@ mod tests {
     };
     use crate::orchestration::park::document::{ParkedPlan, ParkedTaskNode, SCHEMA_VERSION};
     use crate::orchestration::types::TaskStatus;
+    use aura_events::PlanTaskId;
 
     fn parked_run(pending: Vec<PendingCall>) -> ParkedRun {
         ParkedRun {
@@ -352,7 +353,7 @@ mod tests {
                 goal: "Deploy".to_string(),
                 steps: None,
                 tasks: vec![ParkedTaskNode {
-                    task_id: 3,
+                    task_id: PlanTaskId::new(3),
                     description: "Gated apply".to_string(),
                     dependencies: vec![],
                     worker: Some("operations".to_string()),
@@ -390,7 +391,7 @@ mod tests {
                 request_id: "run:test".to_string(),
                 scope: AgentScope::Worker {
                     run_id: "0191e8c0-aaaa-7000-8000-00000000c0de".parse().unwrap(),
-                    task: crate::orchestration::types::TaskIdentity::new(3, None),
+                    task: crate::orchestration::types::TaskIdentity::new(PlanTaskId::new(3), None),
                     session_id: None,
                 },
                 origin: ApprovalOrigin::ConfigGate {
@@ -458,13 +459,13 @@ mod tests {
         let (recorded, ids) = load_recorded_decisions(&registry, &doc).await.unwrap();
         assert_eq!(ids, vec![decision_id]);
         assert_eq!(
-            recorded.take(&CallKey::new(3, "kubectl_apply", &args)),
+            recorded.take(&CallKey::new(PlanTaskId::new(3), "kubectl_apply", &args)),
             Some(ApprovalDecision::Approved),
             "the recorded decision is consumable at the resume gate"
         );
         assert!(
             recorded
-                .take(&CallKey::new(3, "kubectl_apply", &args))
+                .take(&CallKey::new(PlanTaskId::new(3), "kubectl_apply", &args))
                 .is_none()
         );
     }
@@ -528,7 +529,7 @@ mod tests {
         let mut other_run = approval(decision_id, args.clone());
         other_run.request.scope = crate::hitl::AgentScope::Worker {
             run_id: "0191e8c0-bbbb-7000-8000-00000000c0de".parse().unwrap(),
-            task: crate::orchestration::types::TaskIdentity::new(3, None),
+            task: crate::orchestration::types::TaskIdentity::new(PlanTaskId::new(3), None),
             session_id: None,
         };
         registry.register_durable(other_run).await.unwrap();
@@ -544,7 +545,7 @@ mod tests {
         let mut other_task = approval(decision_id, args.clone());
         other_task.request.scope = crate::hitl::AgentScope::Worker {
             run_id: "0191e8c0-aaaa-7000-8000-00000000c0de".parse().unwrap(),
-            task: crate::orchestration::types::TaskIdentity::new(7, None),
+            task: crate::orchestration::types::TaskIdentity::new(PlanTaskId::new(7), None),
             session_id: None,
         };
         registry.register_durable(other_task).await.unwrap();
@@ -594,7 +595,7 @@ mod tests {
         let (recorded, ids) = load_recorded_decisions(&registry, &doc).await.unwrap();
         assert_eq!(ids, vec![decision_id]);
         assert_eq!(
-            recorded.take(&CallKey::new(3, "kubectl_apply", &args)),
+            recorded.take(&CallKey::new(PlanTaskId::new(3), "kubectl_apply", &args)),
             Some(ApprovalDecision::Approved)
         );
     }

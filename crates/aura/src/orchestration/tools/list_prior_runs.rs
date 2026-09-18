@@ -123,6 +123,7 @@ impl Tool for ListPriorRunsTool {
 mod tests {
     use super::*;
     use crate::orchestration::persistence::RunManifest;
+    use aura_events::PlanTaskId;
     use tempfile::TempDir;
     use tokio::fs;
 
@@ -161,7 +162,7 @@ mod tests {
             response_summary: None,
             task_summaries: (0..task_count)
                 .map(|i| TaskSummary {
-                    task_id: i,
+                    task_id: PlanTaskId::new(i as u32),
                     description: format!("Task {i}"),
                     status: TaskStatus::Complete,
                     worker: Some("test-worker".to_string()),
