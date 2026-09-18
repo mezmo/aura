@@ -4943,16 +4943,41 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         registry.remove(id).await;
                     }
 
-                    let expires_at = commit.retention_expires_at.as_datetime();
-                    let calls = plan.tasks.iter().filter_map(|task| {
-                        let pending = commit.refreshed.pending_by_task.get(&task.id)?;
-                        Some(
-                            pending
-                                .iter()
-                                .map(|call| (call.decision_id, call.tool_name.clone())),
-                        )
-                    });
-                    let blocking = blocking_from_calls(calls.flatten(), expires_at, || {
+                    // Each blocking entry carries its own call's stored
+                    // deadline, read from the row the re-park just
+                    // registered: a pending call with no store row at
+                    // projection time is a fault, never a synthesized
+                    // deadline. The call identities are owned before the
+                    // per-call store reads so no document borrow is held
+                    // across an await.
+                    let calls: Vec<_> = plan
+                        .tasks
+                        .iter()
+                        .flat_map(|task| {
+                            commit
+                                .refreshed
+                                .pending_by_task
+                                .get(&task.id)
+                                .into_iter()
+                                .flatten()
+                        })
+                        .map(|call| (call.decision_id, call.tool_name.clone()))
+                        .collect();
+                    let mut entries = Vec::new();
+                    for (decision_id, tool_name) in calls {
+                        let parked = registry.try_parked(&decision_id).await.map_err(|e| {
+                            fault(format!(
+                                "reading the re-parked approval {decision_id} failed: {e}"
+                            ))
+                        })?;
+                        let Some(parked) = parked else {
+                            return Err(fault(format!(
+                                "the re-park registered no store row for pending call {decision_id}"
+                            )));
+                        };
+                        entries.push((decision_id, tool_name, parked.expires_at));
+                    }
+                    let blocking = blocking_from_calls(entries.into_iter(), || {
                         "the re-park committed with no outstanding calls".to_string()
                     })
                     .map_err(fault)?;
@@ -5166,19 +5191,39 @@ Assign tasks to the worker whose tools best match the required operations."#,
         for id in consumed {
             registry.remove(id).await;
         }
-        let expires_at = republished.retention_expires_at.as_datetime();
-        let calls = republished.plan.tasks.iter().filter_map(|node| {
-            let super::types::TaskStatus::AwaitingApproval = node.status else {
-                return None;
+        // Same rule as the drive loop's re-park projection: each entry's
+        // deadline comes from the freshly registered store row, and a
+        // pending call whose row is missing at projection time is a fault.
+        // The call identities are owned before the per-call store reads so
+        // no document borrow is held across an await.
+        let calls: Vec<_> = republished
+            .plan
+            .tasks
+            .iter()
+            .filter_map(|node| {
+                let super::types::TaskStatus::AwaitingApproval = node.status else {
+                    return None;
+                };
+                Some(node.pending.iter().flatten())
+            })
+            .flatten()
+            .map(|call| (call.decision_id, call.tool_name.clone()))
+            .collect();
+        let mut entries = Vec::new();
+        for (decision_id, tool_name) in calls {
+            let parked = registry.try_parked(&decision_id).await.map_err(|e| {
+                fault(format!(
+                    "reading the re-parked approval {decision_id} failed: {e}"
+                ))
+            })?;
+            let Some(parked) = parked else {
+                return Err(fault(format!(
+                    "the re-park registered no store row for pending call {decision_id}"
+                )));
             };
-            Some(
-                node.pending
-                    .iter()
-                    .flatten()
-                    .map(|call| (call.decision_id, call.tool_name.clone())),
-            )
-        });
-        let blocking = blocking_from_calls(calls.flatten(), expires_at, || {
+            entries.push((decision_id, tool_name, parked.expires_at));
+        }
+        let blocking = blocking_from_calls(entries.into_iter(), || {
             "the re-park committed with no outstanding calls".to_string()
         })
         .map_err(fault)?;

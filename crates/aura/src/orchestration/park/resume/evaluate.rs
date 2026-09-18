@@ -161,18 +161,17 @@ impl NonEmptyBlocking {
     }
 }
 
-/// Build a mandatory blocking set from outstanding `(decision_id, tool)` rows
-/// sharing one retention deadline. The three re-park projections (evaluate,
-/// the resume drive loop, the coordinator continuation) iterate different
-/// sources but emit the same entry shape; the empty-set refusal is the
-/// caller's error to phrase.
+/// Build a mandatory blocking set from outstanding `(decision_id, tool,
+/// deadline)` rows. The two re-park projections (the resume drive loop and
+/// the coordinator continuation) iterate different sources but emit the same
+/// entry shape, each entry carrying its own call's stored deadline; the
+/// empty-set refusal is the caller's error to phrase.
 pub(crate) fn blocking_from_calls<E>(
-    calls: impl Iterator<Item = (DecisionId, String)>,
-    expires_at: chrono::DateTime<chrono::Utc>,
+    calls: impl Iterator<Item = (DecisionId, String, chrono::DateTime<chrono::Utc>)>,
     empty: impl FnOnce() -> E,
 ) -> Result<NonEmptyBlocking, E> {
     let entries: Vec<BlockingEntry> = calls
-        .map(|(decision_id, tool_name)| BlockingEntry {
+        .map(|(decision_id, tool_name, expires_at)| BlockingEntry {
             decision_id,
             tool: ParkedToolName::new(tool_name),
             expires_at,
@@ -329,7 +328,9 @@ enum FingerprintFault {
 /// Why the recorded-decisions consult failed.
 enum ConsultFault {
     Mismatch(Diagnostic),
-    Expired(NonEmptyBlocking),
+    /// The terminal expired row: blocking may be empty when every member was
+    /// addressed before the run-wide window closed.
+    Expired(Vec<BlockingEntry>),
     Parked(NonEmptyBlocking),
     Fault(Diagnostic),
 }
@@ -392,9 +393,7 @@ impl From<ConsultFault> for ResumeRefusal {
             ConsultFault::Mismatch(diagnostic) => {
                 Self::Conflict(ResumeConflictRow::mismatch(diagnostic))
             }
-            ConsultFault::Expired(blocking) => {
-                Self::Conflict(ResumeConflictRow::expired(blocking.0))
-            }
+            ConsultFault::Expired(blocking) => Self::Conflict(ResumeConflictRow::expired(blocking)),
             ConsultFault::Parked(blocking) => Self::Conflict(ResumeConflictRow::parked(blocking)),
             ConsultFault::Fault(diagnostic) => Self::Fault(diagnostic),
         }
@@ -700,18 +699,21 @@ async fn consult_decisions(
         Err(RehydrateError::Mismatch(detail)) => {
             Err(ConsultFault::Mismatch(Diagnostic::new(detail)))
         }
-        Err(RehydrateError::Parked { .. }) => {
-            let blocking = project_blocking(document, store, now)
-                .await
-                .map_err(ConsultFault::Fault)?;
+        Err(RehydrateError::Parked { blocking }) => {
+            // The consult reports parked only with at least one pending
+            // snapshot; an empty set would be an internal contradiction, so
+            // refuse loudly rather than invent a row.
+            let blocking = NonEmptyBlocking::try_new(blocking).map_err(|EmptyBlocking| {
+                ConsultFault::Fault(Diagnostic::new(
+                    "the consult answered parked with no outstanding calls",
+                ))
+            })?;
             Err(ConsultFault::Parked(blocking))
         }
-        Err(RehydrateError::Expired) => {
-            // The remote TTL swept the ticket: the expired row outranks the
-            // mismatch row and carries the pre-sweep blocking list.
-            let blocking = project_blocking(document, store, now)
-                .await
-                .map_err(ConsultFault::Fault)?;
+        Err(RehydrateError::Expired { blocking }) => {
+            // The terminal expired row, carrying the same pending snapshots
+            // the consult collected — possibly empty when every member was
+            // addressed before the run-wide window closed.
             Err(ConsultFault::Expired(blocking))
         }
         Err(RehydrateError::Store(detail)) | Err(RehydrateError::Document(detail)) => {
@@ -726,40 +728,6 @@ async fn consult_decisions(
             ))))
         }
     }
-}
-
-/// Project the run's outstanding parked calls onto blocking entries. The
-/// expired and parked rows are unreachable without at least one outstanding
-/// call, so an empty projection is a fault, not an empty body. Outstanding
-/// means undecided in the store: a call decided since the park commit is
-/// settled and blocks nobody, while a ticket a remote TTL swept is still
-/// outstanding — the expired row's pre-sweep list. Every entry carries the
-/// document's window stamp, the bound the human decision was held to.
-async fn project_blocking(
-    document: &ParkedRun,
-    store: &PendingApprovals,
-    now: chrono::DateTime<chrono::Utc>,
-) -> Result<NonEmptyBlocking, Diagnostic> {
-    let expires_at = document.retention_expires_at.as_datetime();
-    let mut calls = Vec::new();
-    for node in &document.plan.tasks {
-        let crate::orchestration::types::TaskStatus::AwaitingApproval = node.status else {
-            continue;
-        };
-        let Some(pending) = &node.pending else {
-            continue;
-        };
-        for call in pending {
-            if store.recorded_decision(&call.decision_id).await.is_none() {
-                calls.push((call.decision_id, call.tool_name.clone()));
-            }
-        }
-    }
-    blocking_from_calls(calls.into_iter(), expires_at, || {
-        Diagnostic::new(format!(
-            "the blocking projection found no outstanding parked calls as of {now}"
-        ))
-    })
 }
 
 /// Evaluate a run under the ruled ordered entry and either convert the
@@ -884,7 +852,7 @@ pub async fn evaluate_resume(
                 ))));
             }
             return Err(ResumeRefusal::Conflict(ResumeConflictRow::expired(
-                blocking.0,
+                blocking,
             )));
         }
         Err(fault) => return Err(fault.into()),

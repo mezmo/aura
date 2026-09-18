@@ -10,33 +10,40 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::hitl::{AddressedApproval, DecisionId, PendingApprovals};
+use crate::hitl::{
+    AddressedApproval, ApprovalAuthority, ApprovalRead, DecisionId, PendingApprovals,
+};
 use crate::orchestration::park::document::{ParkedRun, RESUMING_DOCUMENT_SUFFIX, load_parked_run};
 use crate::orchestration::park::recorded_decisions::{CallKey, RecordedDecisions};
 use crate::orchestration::persistence::is_safe_path_component;
 
 use super::lifetime::RunExecutionScope;
+use super::resume::{BlockingEntry, ParkedToolName};
 
 /// Why a run could not rehydrate, mapped to the section 2.6 condition rows.
 #[derive(Debug)]
 pub(crate) enum RehydrateError {
     /// Condition row "not found": no checkpoint document exists for the run.
     NotFound,
-    /// Condition row "expired": a pending call has no recorded decision and
-    /// the run is past `retention_expires_at`. A run whose decisions were all
-    /// recorded in time resumes after expiry — the window bounds the
-    /// decision, not the resumer.
-    Expired,
+    /// Condition row "expired": the run is past `retention_expires_at` with
+    /// at least one call still unaddressed in the store. Carries the pending
+    /// snapshots the consult collected — each outstanding call with its own
+    /// per-call deadline — possibly empty when every member was addressed
+    /// before the window closed (the terminal row is honest either way). A
+    /// run whose decisions were all recorded in time resumes after expiry —
+    /// the window bounds the decision, not the resumer.
+    Expired { blocking: Vec<BlockingEntry> },
     /// Condition row "mismatch": the store and the document disagree — the
     /// stored approval is missing, its scope names another run or task than
     /// the checkpoint node, or its recorded call differs from the
     /// document's.
     Mismatch(String),
     /// Condition row "parked": a pending call still has no recorded
-    /// decision inside the decision window. The resume endpoint answers
-    /// 409 `parked` with the outstanding ids and `expires_at`; an
-    /// all-decided resume never sees this.
-    Parked { outstanding: Vec<DecisionId> },
+    /// decision inside the decision window. Carries the pending snapshots —
+    /// each outstanding call with its own per-call deadline — the resume
+    /// endpoint renders as the 409 `parked` body; an all-decided resume
+    /// never sees this.
+    Parked { blocking: Vec<BlockingEntry> },
     /// Condition row "config_changed": the fingerprint no longer matches the
     /// rebuilt configuration. Checked by the resume endpoint against a
     /// header-resolved config entry point (P45 adoption).
@@ -55,12 +62,12 @@ impl std::fmt::Display for RehydrateError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotFound => write!(f, "no checkpoint document for the run"),
-            Self::Expired => write!(f, "the run's decision window has expired"),
+            Self::Expired { .. } => write!(f, "the run's decision window has expired"),
             Self::Mismatch(detail) => write!(f, "resume mismatch: {detail}"),
-            Self::Parked { outstanding } => write!(
+            Self::Parked { blocking } => write!(
                 f,
                 "{} approval(s) still await a decision inside the window",
-                outstanding.len()
+                blocking.len()
             ),
             Self::ConfigChanged => write!(f, "configuration changed since the run parked"),
             Self::Store(detail) => write!(f, "approval store read failed: {detail}"),
@@ -170,16 +177,29 @@ impl ResumingDocumentHandle {
 }
 
 /// Read the run's recorded decisions out of the store, keyed the way the
-/// resume gate consumes them. For each awaiting node's pending call the
-/// stored approval (`try_parked`, the `items[0]` the human saw) and the
-/// recorded decision (`recorded_decision`) come from the **store**, never the
-/// document's copy — the store corrects the document at resume (the P43
-/// lenient-refresh ruling's backing condition). The document's recorded call
-/// must still match the stored approval, or the resume is a mismatch. The
-/// approval must be a park-retained one: park mode requires the file-backed
-/// store, whose `get` returns the approval before and after the decision.
-/// The caller injects `now`: the decision window's expired row is evaluated
-/// against the caller's clock, not the wall clock at read time.
+/// resume gate consumes them. Every awaiting node's pending call is read
+/// through the store's ONE authority-aware read-or-expire boundary
+/// ([`ApprovalAuthority::WebhookPoll`], the authority production park rows
+/// register under): the store owns authority, deadline, and terminal-winner
+/// arbitration under its serialization boundary, so a row whose own deadline
+/// has passed comes back `Addressed TimedOut` carrying its durable deadline,
+/// and an already-decided row comes back `Addressed Decided` — never
+/// re-derived from the document, and never a fabricated decision. The
+/// document's recorded call must still match the stored approval, or the
+/// resume is a mismatch. The approval must be a park-retained one: park mode
+/// requires the file-backed store, whose `get` returns the approval before
+/// and after the decision.
+///
+/// The caller injects `now`, which now drives ONLY the run-wide retention
+/// check: per-call deadline arbitration belongs to the store's clock inside
+/// `read_or_expire`, and the pending snapshots carry each call's own
+/// deadline. The loop reads EVERY member exactly once; a store fault aborts
+/// immediately, while a present-row identity violation and a missing row are
+/// collected so the loop can finish. The after-loop precedence is:
+/// present-row mismatch outranks the run-wide expiry (a stored row that
+/// cannot decide this call is the 2.6 mismatch whatever the clock), which
+/// outranks a missing-inside-the-window mismatch, which outranks the parked
+/// row; otherwise the run resumes ready.
 pub(crate) async fn load_recorded_decisions(
     store: &PendingApprovals,
     doc: &ParkedRun,
@@ -187,9 +207,17 @@ pub(crate) async fn load_recorded_decisions(
 ) -> Result<(Arc<RecordedDecisions>, Vec<DecisionId>), RehydrateError> {
     let recorded = Arc::new(RecordedDecisions::default());
     let mut decision_ids = Vec::new();
-    let mut outstanding = Vec::new();
-    // The document's retention stamp is the run's decision window the 2.6
-    // expired row is evaluated against.
+    let mut blocking = Vec::new();
+    // The FIRST present row whose identity violates validation: it outranks
+    // the expired and parked outcomes, so it is collected and returned only
+    // after every member has been read (the one-read-per-member contract).
+    let mut present_mismatch: Option<String> = None;
+    // The FIRST missing row: inside the window it is the mismatch row, but
+    // only after the present-row mismatch and the run-wide window checks.
+    let mut missing: Option<DecisionId> = None;
+    // The document's retention stamp is the run-wide decision window the 2.6
+    // expired row is evaluated against; each call's own deadline lives in
+    // the store and is reported through its pending snapshot.
     let expires_at = doc.retention_expires_at.as_datetime();
 
     for node in &doc.plan.tasks {
@@ -200,89 +228,138 @@ pub(crate) async fn load_recorded_decisions(
             continue;
         };
         for call in pending {
-            let parked = store
-                .try_parked(&call.decision_id)
+            let read = store
+                .read_or_expire(&call.decision_id, ApprovalAuthority::WebhookPoll)
                 .await
                 .map_err(|e| RehydrateError::Store(e.to_string()))?;
-            let Some(parked) = parked else {
-                if now > expires_at {
-                    return Err(RehydrateError::Expired);
+            let (parked, outcome) = match read {
+                ApprovalRead::Missing => {
+                    // A missing row has no per-call deadline and no identity
+                    // to validate; remember the FIRST so the after-loop
+                    // precedence can answer it inside the window, and keep
+                    // reading the remaining members — a later PRESENT row
+                    // that mismatches outranks the run-wide expiry.
+                    if missing.is_none() {
+                        missing = Some(call.decision_id);
+                    }
+                    continue;
                 }
-                return Err(RehydrateError::Mismatch(format!(
-                    "store approval {} is missing",
-                    call.decision_id
-                )));
+                ApprovalRead::Pending(parked) => (parked, None),
+                ApprovalRead::Addressed { approval, outcome } => (approval, Some(outcome)),
             };
             // The stored approval must name this run and this checkpoint
-            // node: an approval borrowed from another run or task cannot
-            // decide this document's call (the 2.6 mismatch row).
-            match &parked.request.scope {
-                crate::hitl::AgentScope::Worker { run_id, task, .. } => {
-                    if run_id.to_string() != doc.run_id {
-                        return Err(RehydrateError::Mismatch(format!(
-                            "approval {} belongs to run {run_id}, not this run",
+            // node, carry one item, and match the documented call. A present
+            // row that violates any of these outranks the expired and parked
+            // outcomes alike: collect the FIRST such violation and finish the
+            // loop, so every member is still read exactly once.
+            let identity: Result<&crate::hitl::ApprovalItem, String> = 'identity: {
+                match &parked.request.scope {
+                    crate::hitl::AgentScope::Worker { run_id, task, .. } => {
+                        if run_id.to_string() != doc.run_id {
+                            break 'identity Err(format!(
+                                "approval {} belongs to run {run_id}, not this run",
+                                call.decision_id
+                            ));
+                        }
+                        if task.task_id != node.task_id {
+                            break 'identity Err(format!(
+                                "approval {} belongs to task {}, not task {}",
+                                call.decision_id, task.task_id, node.task_id
+                            ));
+                        }
+                    }
+                    crate::hitl::AgentScope::Single { .. } => {
+                        break 'identity Err(format!(
+                            "approval {} carries a single-agent scope",
                             call.decision_id
-                        )));
+                        ));
                     }
-                    if task.task_id != node.task_id {
-                        return Err(RehydrateError::Mismatch(format!(
-                            "approval {} belongs to task {}, not task {}",
-                            call.decision_id, task.task_id, node.task_id
-                        )));
+                    crate::hitl::AgentScope::Coordinator { .. } => {
+                        break 'identity Err(format!(
+                            "approval {} carries a coordinator scope",
+                            call.decision_id
+                        ));
                     }
                 }
-                crate::hitl::AgentScope::Single { .. } => {
-                    return Err(RehydrateError::Mismatch(format!(
-                        "approval {} carries a single-agent scope",
+                // The approval is single-item by construction (one parked
+                // call raises one request); items[0] is the call the human
+                // decided on.
+                let Some(item) = parked.request.items.first() else {
+                    break 'identity Err(format!(
+                        "approval {} carries no approval item",
                         call.decision_id
-                    )));
+                    ));
+                };
+                if item.tool_name != call.tool_name || item.arguments != call.arguments {
+                    break 'identity Err(format!(
+                        "documented call {}({}) does not match the stored approval",
+                        call.tool_name, call.decision_id
+                    ));
                 }
-                crate::hitl::AgentScope::Coordinator { .. } => {
-                    return Err(RehydrateError::Mismatch(format!(
-                        "approval {} carries a coordinator scope",
-                        call.decision_id
-                    )));
-                }
-            }
-            // The approval is single-item by construction (one parked call
-            // raises one request); items[0] is the call the human decided on.
-            let Some(item) = parked.request.items.first() else {
-                return Err(RehydrateError::Mismatch(format!(
-                    "approval {} carries no approval item",
-                    call.decision_id
-                )));
+                Ok(item)
             };
-            if item.tool_name != call.tool_name || item.arguments != call.arguments {
-                return Err(RehydrateError::Mismatch(format!(
-                    "documented call {}({}) does not match the stored approval",
-                    call.tool_name, call.decision_id
-                )));
-            }
-            let Some(resolved) = store.recorded_decision(&call.decision_id).await else {
-                // No decision yet: expired past the window (the 2.6 expired
-                // row outranks parked), still parked otherwise — collected
-                // so the 409 body can carry every outstanding id.
-                if now > expires_at {
-                    return Err(RehydrateError::Expired);
+            let item = match identity {
+                Ok(item) => item,
+                Err(detail) => {
+                    if present_mismatch.is_none() {
+                        present_mismatch = Some(detail);
+                    }
+                    continue;
                 }
-                outstanding.push(call.decision_id);
-                continue;
             };
             // The key's task id comes from the awaiting node, the tool name
             // and arguments from the store's approval record. The carrier
-            // keeps the recorded identity with the decision it rode in with;
-            // the interim consult records decisions only — the E7 cutover
-            // replaces this read with the authority-aware read-or-expire,
-            // whose addressed arm also carries durable per-call timeouts.
-            recorded.push(
-                CallKey::new(node.task_id, &item.tool_name, &item.arguments),
-                AddressedApproval::Decided(resolved),
-            );
-            decision_ids.push(call.decision_id);
+            // keeps the recorded identity with the decision it rode in with.
+            match outcome {
+                // Still parked inside its own window: the snapshot the 409
+                // body renders, carrying THIS call's own deadline.
+                None => blocking.push(BlockingEntry {
+                    decision_id: call.decision_id,
+                    tool: ParkedToolName::new(call.tool_name.clone()),
+                    expires_at: parked.expires_at,
+                }),
+                Some(AddressedApproval::Decided(resolved)) => {
+                    recorded.push(
+                        CallKey::new(node.task_id, &item.tool_name, &item.arguments),
+                        AddressedApproval::Decided(resolved),
+                    );
+                    // A decided call is consumed from the store; the id the
+                    // re-park cleanup releases.
+                    decision_ids.push(call.decision_id);
+                }
+                Some(AddressedApproval::TimedOut { deadline }) => {
+                    // The store already published the durable terminal record
+                    // and removed the undecided half: nothing pending remains
+                    // to consume, so the id joins neither the consumed list
+                    // nor the pending snapshots.
+                    recorded.push(
+                        CallKey::new(node.task_id, &item.tool_name, &item.arguments),
+                        AddressedApproval::TimedOut { deadline },
+                    );
+                }
+            }
         }
     }
-    if !outstanding.is_empty() {
-        return Err(RehydrateError::Parked { outstanding });
+    // After every member has been read: a present-row identity mismatch
+    // outranks the run-wide window (a stored row that cannot decide this call
+    // is the 2.6 mismatch whatever the clock). Past retention the terminal
+    // expired row follows, carrying the pending snapshots collected so far
+    // (possibly empty when every member was addressed before the window
+    // closed). Inside the window a missing row is the mismatch, the pending
+    // snapshots are the parked row, and otherwise the run resumes ready.
+    if let Some(detail) = present_mismatch {
+        return Err(RehydrateError::Mismatch(detail));
+    }
+    if now > expires_at {
+        return Err(RehydrateError::Expired { blocking });
+    }
+    if let Some(decision_id) = missing {
+        return Err(RehydrateError::Mismatch(format!(
+            "store approval {decision_id} is missing"
+        )));
+    }
+    if !blocking.is_empty() {
+        return Err(RehydrateError::Parked { blocking });
     }
 
     Ok((recorded, decision_ids))
@@ -391,7 +468,9 @@ mod tests {
             },
             registered_at: chrono::Utc::now(),
             expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
-            authority: ApprovalAuthority::Conversational,
+            // The consult presents the authority production park rows
+            // register under; the fixture matches the new read seam.
+            authority: ApprovalAuthority::WebhookPoll,
             egress_headers: None,
             acknowledgment: crate::hitl::AcknowledgmentState::RequiresNotification,
         }
@@ -425,7 +504,7 @@ mod tests {
         registry
             .resolve(
                 &decision_id,
-                ApprovalAuthority::Conversational,
+                ApprovalAuthority::WebhookPoll,
                 ApprovalDecision::Approved.into(),
             )
             .await
@@ -501,8 +580,12 @@ mod tests {
         .await
         .unwrap_err();
         match err {
-            RehydrateError::Parked { outstanding } => {
-                assert_eq!(outstanding, vec![undecided]);
+            RehydrateError::Parked { blocking } => {
+                assert_eq!(blocking.len(), 1, "one outstanding member: {blocking:?}");
+                assert_eq!(
+                    blocking[0].decision_id, undecided,
+                    "the parked snapshot names the undecided call"
+                );
             }
             other => panic!("expected Parked with the outstanding id, got: {other}"),
         }
@@ -523,7 +606,7 @@ mod tests {
         let err = load_recorded_decisions(&registry, &doc, chrono::Utc::now())
             .await
             .unwrap_err();
-        assert!(matches!(err, RehydrateError::Expired), "got: {err}");
+        assert!(matches!(err, RehydrateError::Expired { .. }), "got: {err}");
     }
 
     /// The stored approval's scope must name this run and this checkpoint
@@ -601,7 +684,7 @@ mod tests {
         registry
             .resolve(
                 &decision_id,
-                ApprovalAuthority::Conversational,
+                ApprovalAuthority::WebhookPoll,
                 ApprovalDecision::Approved.into(),
             )
             .await

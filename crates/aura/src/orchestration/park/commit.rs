@@ -654,7 +654,9 @@ mod tests {
                 },
                 registered_at: now,
                 expires_at: now + chrono::Duration::hours(1),
-                authority: ApprovalAuthority::Conversational,
+                // The authority production park rows register under; the
+                // resume consult reads the retained row under this seam.
+                authority: ApprovalAuthority::WebhookPoll,
                 egress_headers: None,
                 acknowledgment: crate::hitl::AcknowledgmentState::RequiresNotification,
             })
@@ -664,7 +666,7 @@ mod tests {
         registry
             .resolve(
                 &decided,
-                ApprovalAuthority::Conversational,
+                ApprovalAuthority::WebhookPoll,
                 crate::hitl::ApprovalDecision::Approved.into(),
             )
             .await

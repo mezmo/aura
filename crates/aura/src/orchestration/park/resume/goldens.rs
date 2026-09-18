@@ -136,6 +136,10 @@ const TOOL_FAILURE: &str = "the apply command failed: the cluster is unreachable
 /// does not depend on which clock the consult reads.
 const FUTURE_STAMP: &str = "2099-01-01T00:00:00Z";
 const PAST_STAMP: &str = "2000-01-01T00:00:00Z";
+/// The fixed per-call window the shared `node_approval` fixture stamps on a
+/// parked ticket: distinct from `FUTURE_STAMP` so a blocking entry carrying
+/// the document's retention stamp cannot pass as the call's own deadline.
+const TICKET_STAMP: &str = "2098-01-01T00:00:00Z";
 const REQUEST_ID: &str = "req_golden_p45";
 
 fn decision() -> DecisionId {
@@ -371,7 +375,12 @@ fn node_approval(
             }],
         },
         registered_at: chrono::Utc::now(),
-        expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+        // The ticket's OWN window, fixed and distinct from the document
+        // retention stamp: the consult's blocking entries must carry this
+        // per-call deadline, never the run-wide stamp.
+        expires_at: chrono::DateTime::parse_from_rfc3339(TICKET_STAMP)
+            .expect("the ticket stamp parses")
+            .with_timezone(&chrono::Utc),
         authority: crate::hitl::ApprovalAuthority::WebhookPoll,
         egress_headers: None,
         acknowledgment: crate::hitl::AcknowledgmentState::RequiresNotification,
@@ -1542,7 +1551,7 @@ async fn empty_resuming_document_renames_back_and_answers_the_parked_row() {
         json!({
             "code": "parked",
             "detail": "calls still await a decision",
-            "blocking": [entry(decision(), TOOL, FUTURE_STAMP)],
+            "blocking": [entry(decision(), TOOL, TICKET_STAMP)],
         }),
     );
     assert!(
@@ -1598,7 +1607,7 @@ async fn concurrent_posts_on_an_empty_resuming_run_answer_parked_and_running() {
             json!({
                 "code": "parked",
                 "detail": "calls still await a decision",
-                "blocking": [entry(decision(), TOOL, FUTURE_STAMP)],
+                "blocking": [entry(decision(), TOOL, TICKET_STAMP)],
             }),
             json!({
                 "code": "running",
@@ -1793,8 +1802,13 @@ async fn missing_ticket_inside_the_window_refuses_with_the_mismatch_row() {
     );
 }
 
-/// The same missing ticket past the window is the expired row, carrying the
-/// pre-sweep blocking list re-derived from the document.
+/// The same missing ticket past the window is the expired row. A missing
+/// ticket has no stored row, so no actual per-call deadline exists to
+/// report: past retention the expired row is terminal and the teardown
+/// sweep follows, and an empty blocking list is the honest shape (the
+/// possibly-empty expired row is the F11 contract semantics) — synthesizing
+/// the run-wide document stamp would restore exactly the projection this
+/// cutover retires.
 #[tokio::test]
 async fn missing_ticket_past_the_window_refuses_with_the_expired_row() {
     let world = world();
@@ -1812,7 +1826,7 @@ async fn missing_ticket_past_the_window_refuses_with_the_expired_row() {
         json!({
             "code": "expired",
             "detail": "the decision window closed before every pending call was decided",
-            "blocking": [entry(decision(), TOOL, PAST_STAMP)],
+            "blocking": [],
         }),
     );
 }
@@ -1837,7 +1851,9 @@ async fn undecided_calls_answer_the_parked_row_with_the_outstanding_set() {
         json!({
             "code": "parked",
             "detail": "calls still await a decision",
-            "blocking": [entry(decision(), TOOL, FUTURE_STAMP)],
+            // The entry carries the ticket's OWN deadline, not the
+            // document's retention stamp.
+            "blocking": [entry(decision(), TOOL, TICKET_STAMP)],
         }),
     );
 }
@@ -5396,21 +5412,23 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 /// A one-shot stalling store double: every operation forwards to the
 /// wrapped file store exactly as the E3 fault double forwards to its
-/// inner store, EXCEPT `get`, which stalls exactly the FIRST call —
-/// signals arrival, awaits the release gate — then forwards the read.
-/// Every later `get` forwards immediately.
-struct StallingGetStore {
+/// inner store, EXCEPT `read_or_expire` — the cutover consult's per-member
+/// read — which stalls exactly the FIRST call: signals arrival, awaits the
+/// release gate, then forwards the read. Every later `read_or_expire`
+/// forwards immediately.
+struct StallingReadStore {
     inner: Arc<crate::session_store::FileApprovalStore>,
-    /// Notified when the first stalling `get` arrives inside the consult.
+    /// Notified when the first stalling `read_or_expire` arrives inside the
+    /// consult.
     arrived: Arc<tokio::sync::Notify>,
-    /// The one-shot release the stalling `get` awaits.
+    /// The one-shot release the stalling `read_or_expire` awaits.
     release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
-    /// Whether the first `get` already stalled.
+    /// Whether the first `read_or_expire` already stalled.
     stalled: AtomicBool,
 }
 
 #[async_trait::async_trait]
-impl ApprovalStore for StallingGetStore {
+impl ApprovalStore for StallingReadStore {
     async fn register(
         &self,
         parked: ParkedApproval,
@@ -5430,16 +5448,6 @@ impl ApprovalStore for StallingGetStore {
         &self,
         id: &DecisionId,
     ) -> Result<Option<ParkedApproval>, crate::session_store::SessionStoreError> {
-        if !self.stalled.swap(true, Ordering::SeqCst) {
-            self.arrived.notify_one();
-            let release = self
-                .release
-                .lock()
-                .expect("the stalling store's release gate")
-                .take()
-                .expect("the stalling get's release is supplied exactly once");
-            let _ = release.await;
-        }
         self.inner.get(id).await
     }
 
@@ -5481,6 +5489,16 @@ impl ApprovalStore for StallingGetStore {
         id: &DecisionId,
         expected_authority: crate::hitl::ApprovalAuthority,
     ) -> Result<crate::hitl::ApprovalRead, crate::session_store::SessionStoreError> {
+        if !self.stalled.swap(true, Ordering::SeqCst) {
+            self.arrived.notify_one();
+            let release = self
+                .release
+                .lock()
+                .expect("the stalling store's release gate")
+                .take()
+                .expect("the stalling read_or_expire's release is supplied exactly once");
+            let _ = release.await;
+        }
         self.inner.read_or_expire(id, expected_authority).await
     }
 
@@ -5493,7 +5511,7 @@ impl ApprovalStore for StallingGetStore {
 }
 
 /// The gate the ordered-entry golden holds against its stalling world.
-struct StallingGetGate {
+struct StallingReadGate {
     /// Notified when the first POST's consult reaches its store read.
     arrived: Arc<tokio::sync::Notify>,
     /// The release that lets the stalled consult proceed.
@@ -5505,7 +5523,7 @@ struct StallingGetGate {
 /// unreachable-URL poll-route shape the identity frames use — the consult
 /// never reaches the network, and the run's consult read stalls on the
 /// double for exactly one call.
-fn world_over_stalling_get() -> (World, StallingGetGate) {
+fn world_over_stalling_read() -> (World, StallingReadGate) {
     let dir = tempfile::tempdir().expect("temp memory root");
     std::fs::create_dir_all(dir.path().join("approvals")).expect("approval dir");
     let store = Arc::new(
@@ -5514,7 +5532,7 @@ fn world_over_stalling_get() -> (World, StallingGetGate) {
     );
     let (release, held) = tokio::sync::oneshot::channel::<()>();
     let arrived = Arc::new(tokio::sync::Notify::new());
-    let double = StallingGetStore {
+    let double = StallingReadStore {
         inner: Arc::clone(&store),
         arrived: Arc::clone(&arrived),
         release: Mutex::new(Some(held)),
@@ -5562,7 +5580,7 @@ fn world_over_stalling_get() -> (World, StallingGetGate) {
         claims: ResumeClaimTable::new(),
         _receiver: tokio::spawn(async {}),
     };
-    (world, StallingGetGate { arrived, release })
+    (world, StallingReadGate { arrived, release })
 }
 
 /// The unreachable-URL poll-route HITL closure the identity frames build
@@ -5812,7 +5830,7 @@ async fn reservation_convert_reserved_maps_a_failed_rename_to_unavailable_and_re
 /// first POST, released, answers the parked row. No ownerless gap.
 #[tokio::test]
 async fn reservation_second_post_during_the_consult_answers_running() {
-    let (world, gate) = world_over_stalling_get();
+    let (world, gate) = world_over_stalling_read();
     register_undecided(&world).await;
     publish_document(
         &world,
@@ -5851,7 +5869,7 @@ async fn reservation_second_post_during_the_consult_answers_running() {
         json!({
             "code": "parked",
             "detail": "calls still await a decision",
-            "blocking": [entry(decision(), TOOL, FUTURE_STAMP)],
+            "blocking": [entry(decision(), TOOL, TICKET_STAMP)],
         }),
     );
 }
@@ -5877,7 +5895,7 @@ async fn reservation_pending_outcome_releases_the_reservation() {
         json!({
             "code": "parked",
             "detail": "calls still await a decision",
-            "blocking": [entry(decision(), TOOL, FUTURE_STAMP)],
+            "blocking": [entry(decision(), TOOL, TICKET_STAMP)],
         }),
     );
     let path = ValidatedResumePath::parse(SESSION, RUN).expect("golden path validates");
@@ -6322,8 +6340,9 @@ async fn consult_blocking_entries_carry_each_calls_own_deadline() {
 /// Both members addressed (one decided, one timed-out), the caller's `now`
 /// past the document's retention stamp. The checkpoint must still expire:
 /// the terminal `409 expired` row (both members addressed, so nothing
-/// blocks), the parked checkpoint unlinked, the run's approvals swept, and
-/// a retried resume of the same run answers the absent row.
+/// blocks), the parked checkpoint unlinked, the durable addressed terminal
+/// records retained as evidence, and a retried resume of the same run
+/// answers the absent row.
 ///
 /// RED today: the consult pins the addressed bundle to members addressed
 /// `TimedOut` only after the cutover — the interim consult carries the
@@ -6364,15 +6383,24 @@ async fn consult_a_retention_expired_all_addressed_checkpoint_still_expires_and_
         !parked_document_path(&world).exists() && !resuming_document_path(&world).exists(),
         "the expired teardown unlinked the parked checkpoint"
     );
-    assert!(
-        world
-            .registry
-            .try_parked(&decision_pivot_2())
-            .await
-            .expect("the store reads")
-            .is_none(),
-        "the expired teardown swept the run's approvals"
-    );
+    // Retained-evidence semantics: the durable terminal records survive the
+    // resume-path expired teardown and stay readable. A was decided through
+    // the store and B timed out on its own stored deadline; both wrote a
+    // durable decision file, and the file store's cancel sweep excludes any
+    // id whose decision file is present (session_store/file.rs
+    // `cancel_request_sync`'s `stale_decided` branch), so `try_parked` still
+    // answers `Some` from the decision file.
+    for id in [decision(), decision_pivot_2()] {
+        assert!(
+            world
+                .registry
+                .try_parked(&id)
+                .await
+                .expect("the store reads")
+                .is_some(),
+            "the durable terminal record for {id} remains retained evidence"
+        );
+    }
     let retry = evaluate_resume(evaluation(&world, false, None)).await;
     assert!(
         matches!(retry, Err(ResumeRefusal::DocumentAbsent)),
@@ -6467,6 +6495,77 @@ async fn consult_reads_each_member_exactly_once() {
         read_or_expires, 2,
         "EXACTLY ONE read_or_expire per bundle member (2 members); RED today: \
          the interim consult never calls read_or_expire at all"
+    );
+    assert_eq!(
+        counts.gets.load(Ordering::SeqCst),
+        0,
+        "the interim try_parked reads must fire ZERO times for the member consult"
+    );
+    assert_eq!(
+        counts.decisions.load(Ordering::SeqCst),
+        0,
+        "the interim recorded_decision reads must fire ZERO times for the member consult"
+    );
+}
+
+/// Gate A round-1 repair regression: a bundle whose FIRST member's ticket is
+/// missing and whose LATER member is present but identity-mismatched must
+/// answer the MISMATCH row even past the document's retention stamp — the
+/// present-row mismatch outranks expiry — and the loop must read EVERY member
+/// exactly once. The early `Missing`-past-retention return masked the later
+/// present mismatch and short-circuited member B's read.
+///
+/// Fixture: the two-call bundle, member order MISSING FIRST (call A has no
+/// store row at all), then call B with a PRESENT row naming another run (its
+/// identity validation is the mismatch); the caller's `now` (the real clock)
+/// sits past the document's PAST_STAMP retention.
+///
+/// RED at the fill state: member A's missing row past retention returns the
+/// expired row immediately, so B's present mismatch is never observed and B
+/// is never read.
+#[tokio::test]
+async fn consult_a_present_mismatch_outranks_expiry_regardless_of_member_order() {
+    let (world, counts) = world_over_counting();
+    // Member A (the FIRST bundle member) has NO store row at all.
+    // Member B (the LATER member) is present but names another run, so its
+    // identity validation is the mismatch the consult must report.
+    world
+        .registry
+        .register_durable(node_approval_expiring(
+            decision_pivot_2(),
+            OTHER_RUN,
+            3,
+            TOOL_B,
+            &call_args_b(),
+            chrono::DateTime::parse_from_rfc3339(FUTURE_STAMP)
+                .expect("golden stamp parses")
+                .with_timezone(&chrono::Utc),
+        ))
+        .await
+        .expect("register member B's borrowed-run row");
+    // The caller's `now` is the real clock: past PAST_STAMP retention.
+    publish_document(&world, &two_call_bundle_document(&world, PAST_STAMP)).await;
+
+    let refusal = evaluate_resume(evaluation(&world, false, None))
+        .await
+        .expect_err("the later present mismatch refuses, never the expired row");
+    assert_conflict(
+        refusal,
+        json!({
+            "code": "mismatch",
+            "detail": format!(
+                "approval {PIVOT_DECISION_2} belongs to run {OTHER_RUN}, not this run"
+            ),
+            "blocking": [],
+        }),
+    );
+
+    let read_or_expires = counts.read_or_expires.load(Ordering::SeqCst);
+    assert_eq!(
+        read_or_expires, 2,
+        "BOTH members are read through read_or_expire exactly once each, even \
+         though the FIRST is missing; RED at the fill state: the early \
+         Missing-past-retention return reads only member A (count 1)"
     );
     assert_eq!(
         counts.gets.load(Ordering::SeqCst),
@@ -6708,8 +6807,9 @@ async fn expired_teardown_unlinks_sweeps_and_stays_idempotent() {
 /// fabrication — and the caller's `now` past the document's retention
 /// stamp, with the caller inside nothing else. The checkpoint must still
 /// expire: the terminal `409 expired` conflict row, the parked checkpoint
-/// unlinked, the run's approvals swept, and a retried resume of the same
-/// run answers the absent row — never a ready grant.
+/// unlinked, the durable decided terminal records retained as evidence, and
+/// a retried resume of the same run answers the absent row — never a ready
+/// grant.
 ///
 /// RED today: the all-decided interim consult never checks the retention
 /// stamp and returns the ready grant. (Test 4's decided+timed-out mix runs
@@ -6745,6 +6845,12 @@ async fn consult_an_all_decided_retention_expired_checkpoint_expires_and_tears_d
         !parked_document_path(&world).exists() && !resuming_document_path(&world).exists(),
         "the expired teardown unlinked the parked checkpoint"
     );
+    // Retained-evidence semantics: both members decided through the store,
+    // so both wrote a durable decision file. The file store's cancel sweep
+    // excludes any id whose decision file is present (session_store/file.rs
+    // `cancel_request_sync`'s `stale_decided` branch), so the expired
+    // teardown leaves the terminal records readable and `try_parked` still
+    // answers `Some`.
     for id in [decision(), decision_pivot_2()] {
         assert!(
             world
@@ -6752,8 +6858,8 @@ async fn consult_an_all_decided_retention_expired_checkpoint_expires_and_tears_d
                 .try_parked(&id)
                 .await
                 .expect("the store reads")
-                .is_none(),
-            "the expired teardown swept the run's approvals ({id})"
+                .is_some(),
+            "the durable terminal record for {id} remains retained evidence"
         );
     }
     let retry = evaluate_resume(evaluation(&world, false, None)).await;
