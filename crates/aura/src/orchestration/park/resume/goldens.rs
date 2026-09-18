@@ -5886,3 +5886,879 @@ async fn reservation_pending_outcome_releases_the_reservation() {
         "a refused outcome releases the reservation with no execution"
     );
 }
+
+// =====================================================================
+// E7-R goldens (the CONSULT wave, aura/P57): the contract's "Outcome and
+// expiry seam" as RED goldens for the E7 production consult cutover.
+// Per-member `read_or_expire`; a timeout ADDRESSES one call through
+// `Addressed`/`TimedOut`; `blocking[]` carries each call's ACTUAL
+// deadline; the run-wide window treatment and the second racy projection
+// retire. Tests 2 and 8 are regression guards (green today); the rest
+// must fail for the documented behavioral reasons, never compilation.
+// =====================================================================
+
+use crate::hitl::{AddressedApproval, DecisionRoute, WebhookClient};
+use crate::orchestration::RecordedDecisions;
+use crate::tool_wrapper::{ToolCallContext, ToolWrapper};
+use std::sync::atomic::AtomicUsize;
+
+/// The expired row's detail: the consult's own prose, not under test for
+/// redesign — pinned verbatim here and by the retired-window guard.
+const EXPIRED_DETAIL: &str = "the decision window closed before every pending call was decided";
+
+/// The two-call bundle's member deadlines in the per-call-deadline frames
+/// (tests 3): fixed whole-second stamps, distinct from each other and from
+/// the document's retention stamp, so an entry stamped with the retention
+/// stamp cannot pass as its call's own deadline.
+const ROW_DEADLINE_A: &str = "2090-01-01T00:00:00Z";
+const ROW_DEADLINE_B: &str = "2091-01-01T00:00:00Z";
+
+/// One node's ticket with a caller-supplied approval deadline — the fixture
+/// voice for rows whose OWN window the consult must honor ("per-member
+/// read_or_expire"). Same shape `node_approval` builds, so the stored row
+/// is exactly what a park producer writes, only its window differs.
+#[allow(clippy::too_many_arguments)]
+fn node_approval_expiring(
+    decision_id: DecisionId,
+    run: &str,
+    task_id: usize,
+    tool: &str,
+    args: &Value,
+    expires_at: chrono::DateTime<chrono::Utc>,
+) -> ParkedApproval {
+    let mut approval = node_approval(decision_id, run, task_id, tool, args);
+    approval.expires_at = expires_at;
+    approval
+}
+
+/// The two-call, one-awaiting-node bundle: node task 3 carrying the standard
+/// first call plus the pivot-shape second call (a distinct `kubectl_*` tool,
+/// its own arguments, its own call id and decision) — the bundle shape the
+/// timed-out-addressing (test 1) and retention-expired all-addressed
+/// (test 4) frames drive.
+fn two_call_bundle_document(world: &World, expires_at: &str) -> ParkedRun {
+    let mut document = parked_document(expires_at, matching_fingerprint(world), None, Vec::new());
+    let node = document
+        .plan
+        .tasks
+        .first_mut()
+        .expect("the skeleton carries one awaiting node");
+    node.history = Some(vec![
+        rig::completion::Message::user("apply it"),
+        tool_call_turn(vec![assistant_tool_call(CALL_ID, TOOL, &call_args())]),
+    ]);
+    node.current_prompt = Some(sentinel_prompt());
+    node.pending = Some(vec![
+        PendingCall {
+            decision_id: decision(),
+            tool_name: TOOL.to_string(),
+            arguments: call_args(),
+            call_id: CALL_ID.to_string(),
+        },
+        PendingCall {
+            decision_id: decision_pivot_2(),
+            tool_name: TOOL_B.to_string(),
+            arguments: call_args_b(),
+            call_id: PIVOT_CALL_ID_2.to_string(),
+        },
+    ]);
+    document
+}
+
+/// The standard fixture's sentinel document carrying a caller-supplied
+/// retention stamp: the single-awaiting-node shape the expired-row frames
+/// (tests 5 and 8) publish, without touching the shared helpers.
+fn sentinel_document_with_retention(world: &World, expires_at: &str) -> ParkedRun {
+    let mut document = parked_document(expires_at, matching_fingerprint(world), None, Vec::new());
+    let node = document
+        .plan
+        .tasks
+        .first_mut()
+        .expect("the skeleton carries one awaiting node");
+    node.current_prompt = Some(sentinel_prompt());
+    document
+}
+
+/// A counting store double: every operation forwards to the wrapped file
+/// store exactly as the E4-R fault double forwards to its inner store,
+/// EXCEPT it counts the consult's reads — `read_or_expire` (the cutover's
+/// per-member read) and the interim consult's reads (`try_parked` → `get`,
+/// `recorded_decision` → `decision`). Test 6's frame.
+struct CountingStore {
+    inner: Arc<crate::session_store::FileApprovalStore>,
+    gets: AtomicUsize,
+    decisions: AtomicUsize,
+    read_or_expires: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl ApprovalStore for CountingStore {
+    async fn register(
+        &self,
+        parked: ParkedApproval,
+    ) -> Result<(), crate::session_store::SessionStoreError> {
+        self.inner.register(parked).await
+    }
+
+    async fn mark_acknowledged(
+        &self,
+        id: &DecisionId,
+    ) -> Result<crate::session_store::AcknowledgeOutcome, crate::session_store::SessionStoreError>
+    {
+        self.inner.mark_acknowledged(id).await
+    }
+
+    async fn get(
+        &self,
+        id: &DecisionId,
+    ) -> Result<Option<ParkedApproval>, crate::session_store::SessionStoreError> {
+        self.gets.fetch_add(1, Ordering::SeqCst);
+        self.inner.get(id).await
+    }
+
+    async fn resolve(
+        &self,
+        id: &DecisionId,
+        expected_authority: crate::hitl::ApprovalAuthority,
+        decision: ResolvedDecision,
+    ) -> Result<(), crate::hitl::ResolveError> {
+        self.inner.resolve(id, expected_authority, decision).await
+    }
+
+    async fn decision(
+        &self,
+        id: &DecisionId,
+    ) -> Result<Option<ResolvedDecision>, crate::session_store::SessionStoreError> {
+        self.decisions.fetch_add(1, Ordering::SeqCst);
+        self.inner.decision(id).await
+    }
+
+    async fn remove(&self, id: &DecisionId) -> Result<(), crate::session_store::SessionStoreError> {
+        self.inner.remove(id).await
+    }
+
+    async fn cancel_request(
+        &self,
+        request_id: &str,
+    ) -> Result<Vec<ParkedApproval>, crate::session_store::SessionStoreError> {
+        self.inner.cancel_request(request_id).await
+    }
+
+    async fn list_pending(
+        &self,
+    ) -> Result<Vec<ParkedApproval>, crate::session_store::SessionStoreError> {
+        self.inner.list_pending().await
+    }
+
+    async fn read_or_expire(
+        &self,
+        id: &DecisionId,
+        expected_authority: crate::hitl::ApprovalAuthority,
+    ) -> Result<crate::hitl::ApprovalRead, crate::session_store::SessionStoreError> {
+        self.read_or_expires.fetch_add(1, Ordering::SeqCst);
+        self.inner.read_or_expire(id, expected_authority).await
+    }
+
+    async fn retained_rows(
+        &self,
+    ) -> Result<Vec<crate::session_store::RetainedApproval>, crate::session_store::SessionStoreError>
+    {
+        self.inner.retained_rows().await
+    }
+}
+
+/// The counting world: the default world's config over a registry whose
+/// store is the counting double — the consult's reads pass through it, and
+/// the test pins the counts through the returned `Arc`.
+fn world_over_counting() -> (World, Arc<CountingStore>) {
+    let dir = tempfile::tempdir().expect("temp memory root");
+    std::fs::create_dir_all(dir.path().join("approvals")).expect("approval dir");
+    let store = Arc::new(
+        crate::session_store::FileApprovalStore::open(dir.path().join("approvals"))
+            .expect("file approval store"),
+    );
+    let double = Arc::new(CountingStore {
+        inner: Arc::clone(&store),
+        gets: AtomicUsize::new(0),
+        decisions: AtomicUsize::new(0),
+        read_or_expires: AtomicUsize::new(0),
+    });
+    let registry = PendingApprovals::with_backend(
+        std::sync::Arc::clone(&double) as Arc<dyn crate::session_store::ApprovalStore>,
+        Arc::new(crate::session_store::InMemoryEventBus::new())
+            as Arc<dyn crate::session_store::EventBus>,
+    );
+    let memory_dir = dir.path().join("memory").to_string_lossy().into_owned();
+    std::fs::create_dir_all(&memory_dir).expect("memory dir");
+    let mut workers = HashMap::new();
+    workers.insert(
+        "operations".to_string(),
+        WorkerConfig {
+            description: "Runs the gated apply".to_string(),
+            preamble: "You apply changes with the gated tools.".to_string(),
+            mcp_filter: Some(vec![]),
+            vector_stores: vec![],
+            turn_depth: None,
+            llm: None,
+            scratchpad: None,
+            skills: None,
+        },
+    );
+    let config = AgentRuntimeConfig {
+        hitl: Some(hitl_closure(&registry)),
+        memory_dir: Some(memory_dir.clone()),
+        session_id: Some(SESSION.to_string()),
+        request_id: Some(REQUEST_ID.to_string()),
+        orchestration: Some(OrchestrationConfig {
+            enabled: true,
+            workers,
+            ..Default::default()
+        }),
+        ..AgentRuntimeConfig::default()
+    };
+    let world = World {
+        dir,
+        memory_dir,
+        store,
+        registry,
+        config,
+        claims: ResumeClaimTable::new(),
+        _receiver: tokio::spawn(async {}),
+    };
+    (world, double)
+}
+
+/// Register node B's ticket with a caller-supplied deadline — the fixture
+/// voice for the bundle's second member whose own window differs from the
+/// retention stamp. (Node B: task 4, distinct tool, its own arguments.)
+async fn register_undecided_b_expiring(world: &World, expires_at: chrono::DateTime<chrono::Utc>) {
+    world
+        .registry
+        .register_durable(node_approval_expiring(
+            decision_b(),
+            RUN,
+            4,
+            TOOL_B,
+            &call_args_b(),
+            expires_at,
+        ))
+        .await
+        .expect("register node B's expiring approval");
+}
+
+/// A poll webhook route whose webhook is unreachable, so a fall-through to
+/// the route fails closed rather than hanging — the recorded-consult shape
+/// the gate's own tests build. A recorded hit short-circuits before the
+/// route; it never sees this.
+fn golden_discard_route() -> Arc<DecisionRoute> {
+    Arc::new(DecisionRoute::Webhook {
+        client: WebhookClient::new(
+            reqwest::Client::new(),
+            // Discard port: nothing listens, so the POST fails closed.
+            aura_config::WebhookUrl::new("http://127.0.0.1:9").unwrap(),
+        ),
+        registry: PendingApprovals::new(),
+        timeout: Duration::from_secs(2),
+        egress_capture: Ok(()),
+    })
+}
+
+/// Two-call bundle on one awaiting node: call A decided (approved) in the
+/// store; call B's parked row registered with a deadline already past (the
+/// store's `read_or_expire` therefore addresses it `TimedOut`); the caller's
+/// `now` sits inside the document's retention stamp. The consult must
+/// address B through its per-member `read_or_expire` and grant the ready
+/// bundle, carrying A as `Decided` and B as `TimedOut { deadline }` in the
+/// recorded set, with only A in the consumed id list.
+///
+/// RED today: the interim consult reads `try_parked` + `recorded_decision`,
+/// sees B undecided, and refuses (`409 parked`); it never calls
+/// `read_or_expire`.
+#[tokio::test]
+async fn consult_a_timed_out_member_addresses_its_call_and_the_ready_bundle_resumes() {
+    let world = world();
+    register_decided(&world).await;
+    let b_expires = chrono::Utc::now() - chrono::Duration::hours(1);
+    world
+        .registry
+        .register_durable(node_approval_expiring(
+            decision_pivot_2(),
+            RUN,
+            3,
+            TOOL_B,
+            &call_args_b(),
+            b_expires,
+        ))
+        .await
+        .expect("register call B's parked row with its past deadline");
+    publish_document(&world, &two_call_bundle_document(&world, FUTURE_STAMP)).await;
+
+    let grant = evaluate_resume(evaluation(&world, false, None))
+        .await
+        .expect(
+            "the addressed bundle must resume READY: call B's stored row deadline is \
+             past, so the consult's per-member read_or_expire must address it \
+             TimedOut — never the interim 409 parked",
+        );
+
+    // The recorded set carries A as Decided and B as TimedOut { deadline }.
+    let recorded = grant.recorded_decisions();
+    match recorded.take(&CallKey::new(3, TOOL, &call_args())) {
+        Some(AddressedApproval::Decided(ResolvedDecision::Approved { .. })) => {}
+        other => panic!("call A addresses Decided: {other:?}"),
+    }
+    match recorded.take(&CallKey::new(3, TOOL_B, &call_args_b())) {
+        Some(AddressedApproval::TimedOut { deadline }) => assert_eq!(
+            deadline, b_expires,
+            "the timed-out member's deadline is exactly its stored row deadline"
+        ),
+        other => panic!("call B addresses TimedOut {{ deadline }}: {other:?}"),
+    }
+
+    // The consumed id list contains A and NOT B: a timeout consumes no
+    // decision from the store.
+    let consumed = grant.consumed_decisions();
+    assert!(
+        consumed.contains(&decision()),
+        "the decided member is consumed: {consumed:?}"
+    );
+    assert!(
+        !consumed.contains(&decision_pivot_2()),
+        "the timed-out member is never a consumed decision: {consumed:?}"
+    );
+    drop(grant);
+}
+
+/// Guard: the recordable `TimedOut` arm, consumed through the gate's
+/// recorded-decision path (`recorded_pre_call` / `TerminalGateDecision::
+/// TimedOut`), yields exactly `tool call denied: approval timed out` — the
+/// exact shared mapping (`approval_result_to_pre_call`), not a paraphrase
+/// and never a fabricated denial. The consult cutover must feed its
+/// addressed timeouts through THIS mapping unchanged.
+#[tokio::test]
+async fn consult_feeds_the_exact_shared_timeout_feedback_at_consumption() {
+    let recorded = Arc::new(RecordedDecisions::default());
+    recorded.push(
+        CallKey::new(3, TOOL, &call_args()),
+        AddressedApproval::TimedOut {
+            deadline: chrono::DateTime::parse_from_rfc3339(PAST_STAMP)
+                .expect("golden stamp parses")
+                .with_timezone(&chrono::Utc),
+        },
+    );
+    let gate = crate::hitl::HitlApprovalWrapper::new(
+        Arc::from([aura_config::GlobPattern::new("kubectl_*").unwrap()]),
+        golden_discard_route(),
+        AgentScope::Single { session_id: None },
+        REQUEST_ID.to_string(),
+        "test-agent".to_string(),
+        "golden-instance".to_string(),
+    )
+    .with_recorded_decisions(recorded);
+    let mut ctx = ToolCallContext::new(TOOL);
+    ctx.task_id = Some(3);
+
+    let err = gate
+        .pre_call(&call_args(), &ctx)
+        .await
+        .expect_err("the recorded TimedOut arm fails the call closed");
+    let rig::tool::ToolError::ToolCallError(inner) = err else {
+        panic!("the timeout mapping is a tool call error: {err:?}")
+    };
+    assert_eq!(
+        inner.to_string(),
+        "tool call denied: approval timed out",
+        "the exact shared TerminalGateDecision::TimedOut wording — never a \
+         paraphrase, never a fabricated denial"
+    );
+}
+
+/// Two pending calls whose stored rows carry DIFFERENT deadlines; the
+/// caller's `now` sits inside retention. The `409 parked` row must carry
+/// each `blocking[]` entry's OWN stored row deadline — and neither entry
+/// may equal the document's retention stamp (the run-wide retirement).
+///
+/// RED today: every entry carries `document.retention_expires_at`.
+#[tokio::test]
+async fn consult_blocking_entries_carry_each_calls_own_deadline() {
+    let world = world();
+    world
+        .registry
+        .register_durable(node_approval_expiring(
+            decision(),
+            RUN,
+            3,
+            TOOL,
+            &call_args(),
+            chrono::DateTime::parse_from_rfc3339(ROW_DEADLINE_A)
+                .expect("golden stamp parses")
+                .with_timezone(&chrono::Utc),
+        ))
+        .await
+        .expect("register member A with its own window");
+    let b_stamp = chrono::DateTime::parse_from_rfc3339(ROW_DEADLINE_B)
+        .expect("golden stamp parses")
+        .with_timezone(&chrono::Utc);
+    // Registered LATER than member A, with its own (different) window.
+    register_undecided_b_expiring(&world, b_stamp).await;
+    publish_document(&world, &two_node_sentinel_document(&world)).await;
+
+    let refusal = evaluate_resume(evaluation(&world, false, None))
+        .await
+        .expect_err("the undecided members refuse parked");
+    assert_conflict(
+        refusal,
+        json!({
+            "code": "parked",
+            "detail": "calls still await a decision",
+            "blocking": [
+                entry(decision(), TOOL, ROW_DEADLINE_A),
+                entry(decision_b(), TOOL_B, ROW_DEADLINE_B),
+            ],
+        }),
+    );
+}
+
+/// Both members addressed (one decided, one timed-out), the caller's `now`
+/// past the document's retention stamp. The checkpoint must still expire:
+/// the terminal `409 expired` row (both members addressed, so nothing
+/// blocks), the parked checkpoint unlinked, the run's approvals swept, and
+/// a retried resume of the same run answers the absent row.
+///
+/// RED today: the consult pins the addressed bundle to members addressed
+/// `TimedOut` only after the cutover — the interim consult carries the
+/// addressed member as an outstanding undecided call, so the expired row's
+/// blocking set is not empty.
+#[tokio::test]
+async fn consult_a_retention_expired_all_addressed_checkpoint_still_expires_and_tears_down() {
+    let world = world();
+    register_decided(&world).await;
+    let b_expires = chrono::Utc::now() - chrono::Duration::hours(1);
+    world
+        .registry
+        .register_durable(node_approval_expiring(
+            decision_pivot_2(),
+            RUN,
+            3,
+            TOOL_B,
+            &call_args_b(),
+            b_expires,
+        ))
+        .await
+        .expect("register call B's parked row with its past deadline");
+    // The caller's `now` is the real clock: past PAST_STAMP retention.
+    publish_document(&world, &two_call_bundle_document(&world, PAST_STAMP)).await;
+
+    let refusal = evaluate_resume(evaluation(&world, false, None))
+        .await
+        .expect_err("the retention-expired run expires even all-addressed");
+    assert_conflict(
+        refusal,
+        json!({
+            "code": "expired",
+            "detail": "the decision window closed before every pending call was decided",
+            "blocking": [],
+        }),
+    );
+    assert!(
+        !parked_document_path(&world).exists() && !resuming_document_path(&world).exists(),
+        "the expired teardown unlinked the parked checkpoint"
+    );
+    assert!(
+        world
+            .registry
+            .try_parked(&decision_pivot_2())
+            .await
+            .expect("the store reads")
+            .is_none(),
+        "the expired teardown swept the run's approvals"
+    );
+    let retry = evaluate_resume(evaluation(&world, false, None)).await;
+    assert!(
+        matches!(retry, Err(ResumeRefusal::DocumentAbsent)),
+        "a retried resume of the same run answers the absent row: {retry:?}"
+    );
+}
+
+/// One member pending INSIDE its own window (its stored row deadline in the
+/// future on the store clock), the caller's `now` past the document's
+/// retention stamp. The terminal `409 expired` row's single `blocking[]`
+/// entry carries that call's own (future) deadline — not the past retention
+/// stamp.
+///
+/// RED today: the entry carries the retention stamp.
+#[tokio::test]
+async fn consult_expired_row_blocks_with_each_calls_actual_deadline() {
+    let world = world();
+    world
+        .registry
+        .register_durable(node_approval_expiring(
+            decision(),
+            RUN,
+            3,
+            TOOL,
+            &call_args(),
+            chrono::DateTime::parse_from_rfc3339(FUTURE_STAMP)
+                .expect("golden stamp parses")
+                .with_timezone(&chrono::Utc),
+        ))
+        .await
+        .expect("register the member pending inside its own window");
+    publish_document(
+        &world,
+        &sentinel_document_with_retention(&world, PAST_STAMP),
+    )
+    .await;
+
+    let refusal = evaluate_resume(evaluation(&world, false, None))
+        .await
+        .expect_err("the retention-expired run refuses");
+    assert_conflict(
+        refusal,
+        json!({
+            "code": "expired",
+            "detail": "the decision window closed before every pending call was decided",
+            "blocking": [entry(decision(), TOOL, FUTURE_STAMP)],
+        }),
+    );
+}
+
+/// A consult ending in the `409 parked` row reads its bundle members
+/// EXACTLY once each through `read_or_expire`, and the interim consult
+/// reads (`try_parked`, `recorded_decision`) fire ZERO times for the member
+/// consult.
+///
+/// RED today: zero `read_or_expire` calls — the interim consult reads
+/// `try_parked` + `recorded_decision` per member instead.
+#[tokio::test]
+async fn consult_reads_each_member_exactly_once() {
+    let (world, counts) = world_over_counting();
+    register_undecided(&world).await;
+    let b_expires = chrono::Utc::now() + chrono::Duration::hours(1);
+    world
+        .registry
+        .register_durable(node_approval_expiring(
+            decision_b(),
+            RUN,
+            4,
+            TOOL_B,
+            &call_args_b(),
+            b_expires,
+        ))
+        .await
+        .expect("register member B undecided");
+    publish_document(&world, &two_node_sentinel_document(&world)).await;
+
+    let refusal = evaluate_resume(evaluation(&world, false, None))
+        .await
+        .expect_err("the undecided members answer the parked row");
+    match &refusal {
+        ResumeRefusal::Conflict(row) => {
+            assert!(
+                matches!(row.code(), ConflictCode::Parked),
+                "the consult ends parked: {row:?}"
+            );
+        }
+        other => panic!("expected the parked row, got {other:?}"),
+    }
+
+    let read_or_expires = counts.read_or_expires.load(Ordering::SeqCst);
+    assert_eq!(
+        read_or_expires, 2,
+        "EXACTLY ONE read_or_expire per bundle member (2 members); RED today: \
+         the interim consult never calls read_or_expire at all"
+    );
+    assert_eq!(
+        counts.gets.load(Ordering::SeqCst),
+        0,
+        "the interim try_parked reads must fire ZERO times for the member consult"
+    );
+    assert_eq!(
+        counts.decisions.load(Ordering::SeqCst),
+        0,
+        "the interim recorded_decision reads must fire ZERO times for the member consult"
+    );
+}
+
+/// Mid-segment re-park (the existing re-park golden harness, extended by
+/// ADDITION — the decided fixture and the re-park step stay exactly as the
+/// loop-re-park frames drive them; the single-entry rewrite helper is NOT
+/// reused, this frame owns its two-entry assertions): the mid-segment park
+/// raises TWO new gated calls out of ONE assistant turn — two fresh
+/// tickets, two blocking entries. The SIBLING parks first and holds the
+/// EARLIER ticket deadline; the TARGET parks second with the LATER one.
+/// Both tickets live in the store at the commit, undecided and inside
+/// their own windows, so the renewed document retention stamp derives from
+/// the earliest outstanding ticket (`refresh_awaiting`) — the SIBLING's.
+/// Pins at the re-park row: (i) the TARGET entry's `expires_at` equals the
+/// target ticket's OWN stored deadline; (ii) it does NOT equal the renewed
+/// retention stamp; (iii) the SIBLING entry's `expires_at` equals the
+/// sibling ticket's deadline and equals the renewed stamp. The equality pin
+/// (i) rides along green at the cutover and becomes load-bearing when E5
+/// later moves the renewal derivation.
+///
+/// RED today: the re-park stamps EVERY entry with the renewed stamp (the
+/// single-deadline blocking construction), so the TARGET entry carries the
+/// sibling-derived stamp and assertion (ii)'s inequality fails. The sibling
+/// pins stay green today — the stamp coincides with the sibling's deadline
+/// by derivation. Asserted (iii) → (ii) → (i) so today's failure lands on
+/// the stamp inequality, not on the equality (i), which today's stamping
+/// breaks too.
+#[tokio::test]
+async fn reparked_blocking_entries_carry_the_new_calls_own_deadline() {
+    let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
+    let _drain = OverrideDrain;
+    let world = world();
+    // The re-park pair's rig ids and provider call ids: one per freshly
+    // parked call, distinct — the loop keys tool results by the rig id and
+    // the park stamps each pending call's id from the one it observed.
+    const SIBLING_RIG_ID: &str = "call_0";
+    const TARGET_RIG_ID: &str = "call_1";
+    const SIBLING_CALL_ID: &str = "call_id_0";
+    const TARGET_CALL_ID: &str = "call_id_1";
+
+    let apply_invocations = Arc::new(Mutex::new(Vec::new()));
+    let sibling_invocations = Arc::new(Mutex::new(Vec::new()));
+    let target_invocations = Arc::new(Mutex::new(Vec::new()));
+    // ONE assistant turn issues BOTH gated calls: the sibling parks first
+    // (its gate entry mints the EARLIER ticket deadline), the target second
+    // (the LATER one). The stream ends after the one batch — the park hook
+    // cancels after the snapshot, before the next completion.
+    install_worker_overrides(vec![WorkerOverride {
+        model: ScriptedCompletionModel::new(vec![ScriptedTurn::tool_calls(vec![
+            ScriptedToolCall::new(SIBLING_RIG_ID, TOOL_B, json!({ "namespace": "stage" }))
+                .with_call_id(SIBLING_CALL_ID),
+            ScriptedToolCall::new(TARGET_RIG_ID, NEW_TOOL, json!({ "namespace": "stage" }))
+                .with_call_id(TARGET_CALL_ID),
+        ])]),
+        extra_tools: vec![
+            Box::new(RecordingTool::new(apply_invocations.clone()).with_name(TOOL)),
+            Box::new(RecordingTool::new(sibling_invocations.clone()).with_name(TOOL_B)),
+            Box::new(RecordingTool::new(target_invocations.clone()).with_name(NEW_TOOL)),
+        ],
+    }]);
+    register_decided(&world).await;
+    publish_document(&world, &sentinel_document(&world)).await;
+
+    let grant = evaluate_resume(evaluation(&world, false, None))
+        .await
+        .expect("the decided checkpoint grants: the mid-segment park has not run yet");
+    let segment = run_segment(grant, &world.config, &HashMap::new())
+        .await
+        .expect("the segment re-parks on the two fresh gated calls");
+    assert_eq!(
+        apply_invocations
+            .lock()
+            .expect("apply invocation log")
+            .len(),
+        1,
+        "the decided call executes exactly once before the re-park"
+    );
+    assert!(
+        sibling_invocations
+            .lock()
+            .expect("sibling invocation log")
+            .is_empty()
+            && target_invocations
+                .lock()
+                .expect("target invocation log")
+                .is_empty(),
+        "neither freshly parked call executed its tool"
+    );
+    let blocking = match segment {
+        SegmentResult::Parked { blocking, .. } => blocking,
+        other => panic!("expected a re-parked segment, got {other:?}"),
+    };
+    assert_eq!(
+        blocking.as_slice().len(),
+        2,
+        "the refreshed blocking set carries the two freshly parked calls, found {:?}",
+        blocking.as_slice()
+    );
+    let sibling_entry = blocking
+        .as_slice()
+        .iter()
+        .find(|blocked| blocked.tool.as_ref() == TOOL_B)
+        .expect("the sibling's blocking entry names the sibling call");
+    let target_entry = blocking
+        .as_slice()
+        .iter()
+        .find(|blocked| blocked.tool.as_ref() == NEW_TOOL)
+        .expect("the target's blocking entry names the newly gated call");
+    let sibling_decision_id = sibling_entry.decision_id;
+    let target_decision_id = target_entry.decision_id;
+    let sibling_entry_expires = sibling_entry.expires_at;
+    let target_entry_expires = target_entry.expires_at;
+
+    // Both fresh tickets live in the store at the commit — undecided, each
+    // inside its OWN window — and the sibling's is the earlier deadline.
+    let sibling_ticket = world
+        .registry
+        .try_parked(&sibling_decision_id)
+        .await
+        .expect("the store reads")
+        .expect("the sibling's fresh ticket is in the store at the commit");
+    let target_ticket = world
+        .registry
+        .try_parked(&target_decision_id)
+        .await
+        .expect("the store reads")
+        .expect("the target's fresh ticket is in the store at the commit");
+    assert!(
+        sibling_ticket.expires_at > chrono::Utc::now(),
+        "the sibling's fresh ticket sits inside its own window"
+    );
+    assert!(
+        target_ticket.expires_at > chrono::Utc::now(),
+        "the target's fresh ticket sits inside its own window"
+    );
+    assert!(
+        sibling_ticket.expires_at < target_ticket.expires_at,
+        "the fixture shape: the sibling parks first and holds the EARLIER ticket \
+         deadline; the target's is the later one"
+    );
+
+    let republished = load_parked_run(&parked_document_path(&world))
+        .await
+        .expect("the re-park re-published the checkpoint under the parked name");
+    let renewed_stamp = republished.retention_expires_at.as_datetime();
+
+    // (iii) — green today: the renewal derives from the earliest outstanding
+    // ticket, the sibling's, so the sibling's entry coincides with its own
+    // deadline AND the renewed stamp.
+    assert_eq!(
+        sibling_entry_expires, sibling_ticket.expires_at,
+        "(iii) the sibling's blocking entry carries the sibling ticket's deadline"
+    );
+    assert_eq!(
+        sibling_entry_expires, renewed_stamp,
+        "(iii) the sibling's entry equals the renewed stamp: the renewal derives \
+         from the earliest outstanding ticket — the sibling's earlier deadline"
+    );
+    // (ii) — RED today: the re-park stamps EVERY entry with the renewed
+    // stamp, so the target entry carries the sibling-derived stamp instead
+    // of its own later deadline.
+    assert_ne!(
+        target_entry_expires, renewed_stamp,
+        "(ii) the TARGET entry must NOT carry the renewed document retention \
+         stamp — the stamp derives from the earliest outstanding ticket (the \
+         sibling's earlier deadline), while the target entry must carry the \
+         target call's OWN later deadline; RED today: both entries carry the \
+         renewed stamp"
+    );
+    // (i) — asserted after the inequality so today's failure lands on the
+    // stamp break, not here; green at the cutover, load-bearing at E5.
+    assert_eq!(
+        target_entry_expires, target_ticket.expires_at,
+        "(i) the TARGET entry carries the target ticket's OWN stored deadline"
+    );
+}
+
+/// Regression guard (green today): the expired arms unlink the parked
+/// checkpoint, sweep the undecided approvals, tolerate a retried resume of
+/// the already-unlinked run (the NotFound-tolerant unlink keeps the arms
+/// idempotent), and the retry answers the absent row.
+#[tokio::test]
+async fn expired_teardown_unlinks_sweeps_and_stays_idempotent() {
+    let world = world();
+    register_undecided(&world).await;
+    // One undecided member past its document's retention stamp.
+    publish_document(
+        &world,
+        &sentinel_document_with_retention(&world, PAST_STAMP),
+    )
+    .await;
+
+    let refusal = evaluate_resume(evaluation(&world, false, None))
+        .await
+        .expect_err("the retention-expired run refuses");
+    match &refusal {
+        ResumeRefusal::Conflict(row) => {
+            let body = serde_json::to_value(row).expect("the conflict row serializes");
+            assert_eq!(body["code"], "expired", "the terminal expired code: {body}");
+            assert_eq!(
+                body["detail"], "the decision window closed before every pending call was decided",
+                "the expired detail: {body}"
+            );
+        }
+        other => panic!("expected the expired row, got {other:?}"),
+    }
+    assert!(
+        !parked_document_path(&world).exists() && !resuming_document_path(&world).exists(),
+        "the expired teardown unlinked the parked checkpoint"
+    );
+    assert!(
+        world
+            .registry
+            .try_parked(&decision())
+            .await
+            .expect("the store reads")
+            .is_none(),
+        "the expired teardown swept the undecided approval"
+    );
+    let retry = evaluate_resume(evaluation(&world, false, None)).await;
+    assert!(
+        matches!(retry, Err(ResumeRefusal::DocumentAbsent)),
+        "the retried resume answers the absent row: {retry:?}"
+    );
+}
+
+/// (test 9, repair-round addition) BOTH bundle members decided through the
+/// store — real recorded approvals on the two-call bundle's tickets, no
+/// fabrication — and the caller's `now` past the document's retention
+/// stamp, with the caller inside nothing else. The checkpoint must still
+/// expire: the terminal `409 expired` conflict row, the parked checkpoint
+/// unlinked, the run's approvals swept, and a retried resume of the same
+/// run answers the absent row — never a ready grant.
+///
+/// RED today: the all-decided interim consult never checks the retention
+/// stamp and returns the ready grant. (Test 4's decided+timed-out mix runs
+/// the teardown arms today because the interim consult reads the timed-out
+/// member as undecided; this frame is the leg that does not.)
+#[tokio::test]
+async fn consult_an_all_decided_retention_expired_checkpoint_expires_and_tears_down() {
+    let world = world();
+    register_decided_pivot_pair(
+        &world,
+        ApprovalDecision::Approved,
+        ApprovalDecision::Approved,
+    )
+    .await;
+    publish_document(&world, &two_call_bundle_document(&world, PAST_STAMP)).await;
+
+    let refusal = evaluate_resume(evaluation(&world, false, None))
+        .await
+        .expect_err(
+            "the retention-expired all-decided checkpoint must expire and tear \
+             down, never grant — RED today: the all-decided interim consult \
+             never checks the retention stamp and returns the ready grant",
+        );
+    assert_conflict(
+        refusal,
+        json!({
+            "code": "expired",
+            "detail": EXPIRED_DETAIL,
+            "blocking": [],
+        }),
+    );
+    assert!(
+        !parked_document_path(&world).exists() && !resuming_document_path(&world).exists(),
+        "the expired teardown unlinked the parked checkpoint"
+    );
+    for id in [decision(), decision_pivot_2()] {
+        assert!(
+            world
+                .registry
+                .try_parked(&id)
+                .await
+                .expect("the store reads")
+                .is_none(),
+            "the expired teardown swept the run's approvals ({id})"
+        );
+    }
+    let retry = evaluate_resume(evaluation(&world, false, None)).await;
+    assert!(
+        matches!(retry, Err(ResumeRefusal::DocumentAbsent)),
+        "a retried resume of the same run answers the absent row: {retry:?}"
+    );
+}
