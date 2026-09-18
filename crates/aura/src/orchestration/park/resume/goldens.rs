@@ -1995,6 +1995,71 @@ impl rig::tool::Tool for GatedTailTool {
     }
 }
 
+/// The supervisor-drain rendezvous stand-in frame 10 stages with: the
+/// same tracked-tail shape as [`GatedTailTool`], plus the two frame
+/// observables — the substitution's spawn moment and the tail's own
+/// completion moment.
+struct SupervisorGatedTailTool {
+    scope: Arc<crate::orchestration::RunExecutionScope>,
+    gate: Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>>,
+    spawned: Arc<std::sync::atomic::AtomicUsize>,
+    finished: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl SupervisorGatedTailTool {
+    fn new(
+        scope: Arc<crate::orchestration::RunExecutionScope>,
+        gate: Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>>,
+        spawned: Arc<std::sync::atomic::AtomicUsize>,
+        finished: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
+        Self {
+            scope,
+            gate,
+            spawned,
+            finished,
+        }
+    }
+}
+
+impl rig::tool::Tool for SupervisorGatedTailTool {
+    const NAME: &'static str = "supervisor_gated_tail";
+
+    type Error = std::convert::Infallible;
+    type Args = FreeformArgs;
+    type Output = String;
+
+    fn name(&self) -> String {
+        TOOL.to_string()
+    }
+
+    async fn definition(&self, _prompt: String) -> rig::completion::ToolDefinition {
+        rig::completion::ToolDefinition {
+            name: self.name(),
+            description: "Test stand-in: spawns a gated tracked tail on the run's scope."
+                .to_string(),
+            parameters: json!({ "type": "object", "properties": {} }),
+        }
+    }
+
+    async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
+        let gate = self
+            .gate
+            .lock()
+            .expect("the gated tail's gate lock")
+            .take()
+            .expect("the gated tail spawns once");
+        let finished = Arc::clone(&self.finished);
+        self.spawned
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        self.scope.spawn_tracked(async move {
+            let _ = gate.await;
+            finished.fetch_add(1, std::sync::atomic::Ordering::Release);
+        });
+        Ok(ECHO_TOOL_RESULT.to_string())
+    }
+}
+
 /// L4b golden (RED today): the atomic resume segment drains its tracked
 /// tails before returning. A tracked tail spawned DURING the segment —
 /// through the grant's ONE execution scope, exactly as production's
@@ -6983,6 +7048,676 @@ async fn expired_teardown_unlinks_sweeps_and_stays_idempotent() {
     assert!(
         matches!(retry, Err(ResumeRefusal::DocumentAbsent)),
         "the retried resume answers the absent row: {retry:?}"
+    );
+}
+
+// =====================================================================
+// S4-R frames (the SSE wave's RED, aura/P45 joint hole #12): the
+// borrowed-grant driver. Each frame drives one whole resume segment
+// through `run_segment_borrowed` — the same fixtures the atomic
+// segment goldens stage, now observed at the streaming boundary —
+// RED today at the hole's named todo.
+// =====================================================================
+
+use crate::orchestration::OrchestratorEvent;
+use crate::orchestration::OrchestratorFactory;
+use crate::provider_agent::{FinalResponseInfo, StreamError, StreamItem};
+use futures::StreamExt;
+
+/// A stencil coordinator turn whose decision is `create_plan` over the
+/// one fresh task — the repeated-cycle shape the fresh-cycle-counter
+/// frame scripts four of.
+fn planning_turn_for(marker: &str) -> ScriptedTurn {
+    ScriptedTurn::tool_calls(vec![ScriptedToolCall::new(
+        "call_plan",
+        "create_plan",
+        json!({
+            "goal": marker,
+            "steps": [
+                {"type": "task", "task": marker, "worker": "operations"}
+            ],
+            "routing_rationale": "the restored run has tool work to finish",
+            "planning_summary": marker,
+        }),
+    )])
+    .with_text(marker)
+}
+
+/// The world with caller-supplied duplicate-call thresholds: the default
+/// webhook-poll world behind a config whose guard thresholds stage the
+/// fresh-counter arithmetic the call-counter frame pins. The mutation
+/// happens before the frame computes the fingerprint, so the published
+/// checkpoint matches the threshold-bearing config.
+fn world_with_work_call_thresholds(nudge: usize, block: usize) -> World {
+    let mut world = world();
+    if let Some(mut orchestration) = world.config.orchestration.take() {
+        orchestration.duplicate_call_nudge_threshold = nudge;
+        orchestration.duplicate_call_block_threshold = block;
+        world.config.orchestration = Some(orchestration);
+    }
+    world
+}
+
+/// How long a borrowed-driver probe waits before declaring the driver
+/// still blocked on its in-flight tail or its drain — the same bound the
+/// atomic golden's `DRAIN_PROBE` holds (long enough for a segment body
+/// that does NOT block, short enough that a regression reads as
+/// still-blocked instead of hanging the suite).
+const BORROWED_PROBE: Duration = Duration::from_secs(5);
+
+/// Count the `Final` terminals a borrowed stream aggregates, driving it
+/// to its end: the terminal-count probe the completed-arm pins key on.
+async fn count_final_terminals<S>(stream: &mut S) -> usize
+where
+    S: futures::Stream<Item = Result<StreamItem, StreamError>> + Unpin,
+{
+    use futures::StreamExt;
+    let mut count = 0;
+    while let Some(item) = stream.next().await {
+        if let Ok(StreamItem::Final(_)) = item {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// Collect every item a borrowed stream forwards, driving it to its end.
+async fn drive_to_items<S>(stream: &mut S) -> Vec<Result<StreamItem, StreamError>>
+where
+    S: futures::Stream<Item = Result<StreamItem, StreamError>> + Unpin,
+{
+    use futures::StreamExt;
+    let mut items = Vec::new();
+    while let Some(item) = stream.next().await {
+        items.push(item);
+    }
+    items
+}
+
+/// The hand-summarized `RunParked` events the forwarded items carry, in
+/// wire order — the exact-once probe the publication-owner frame keys on.
+/// (`OrchestratorEvent` is Debug-only, so the event rides as prose.)
+fn run_parked_events(items: &[Result<StreamItem, StreamError>]) -> Vec<String> {
+    items
+        .iter()
+        .filter_map(|result| match result {
+            Ok(StreamItem::OrchestratorEvent(OrchestratorEvent::RunParked {
+                run_id,
+                decision_ids,
+                retention_expires_at: _,
+                iteration,
+            })) => Some(format!(
+                "RunParked(run_id={run_id}, decision_ids={decision_ids:?}, iteration={iteration})"
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Whether none of the forwarded items is a `Final` terminal — the
+/// no-duplicate-final probe the re-parked arm pins.
+fn carries_no_final(items: &[Result<StreamItem, StreamError>]) -> bool {
+    items
+        .iter()
+        .all(|result| !matches!(result, Ok(StreamItem::Final(_))))
+}
+
+/// Frame 8 (S4): a segment completing mid-run yields
+/// `ResumeStreamEnd::Completed { final_answer }` and the stream it
+/// streams over carries EXACTLY ONE terminal — the borrowed driver
+/// emits no final of its own, so the normal factory finalization's
+/// single emission is the only one the client sees.
+#[tokio::test]
+async fn s4_completed_segment_hands_final_answer_to_normal_finalization_no_duplicate_final() {
+    let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
+    let _drain = OverrideDrain;
+    let world = world();
+    let invocations = Arc::new(Mutex::new(Vec::new()));
+    install_worker_overrides(vec![WorkerOverride {
+        model: ScriptedCompletionModel::new(vec![ScriptedTurn::text(FINAL_TEXT)]),
+        extra_tools: vec![Box::new(RecordingTool::new(invocations).with_name(TOOL))],
+    }]);
+    install_coordinator_overrides(vec![CoordinatorOverride {
+        model: ScriptedCompletionModel::new(vec![coordinator_direct_turn()]),
+    }]);
+    register_decided(&world).await;
+    publish_document(&world, &sentinel_document(&world)).await;
+
+    let grant = evaluate_resume(evaluation(&world, false, None))
+        .await
+        .expect("the all-decided run grants");
+
+    let (event_tx, event_rx) = tokio::sync::mpsc::channel::<Result<StreamItem, StreamError>>(64);
+    // The factory's own finalization would send its one terminal over
+    // this same channel: clone the sender BEFORE the driver consumes
+    // the original, so the frame's stream carries it as queued work.
+    let finalization_tx = event_tx.clone();
+    let finalized_marker: FinalResponseInfo = FinalResponseInfo {
+        content: "the normal factory finalization emitted this single terminal".to_string(),
+        usage: Default::default(),
+        cache_usage: None,
+    };
+
+    let mut stream = Box::pin(futures::stream::unfold(event_rx, |mut rx| async move {
+        rx.recv().await.map(|item| (item, rx))
+    }));
+
+    let end = tokio::time::timeout(
+        BORROWED_PROBE,
+        run_segment_borrowed(
+            &grant,
+            &world.config,
+            &HashMap::new(),
+            event_tx,
+            crate::UsageState::new(),
+            None,
+        ),
+    )
+    .await
+    .expect("the borrowed segment returns within the bound")
+    .expect("the segment driver did not panic");
+
+    let ResumeStreamEnd::Completed { final_answer } = &end else {
+        panic!("a completed segment yields Completed, got {end:?}")
+    };
+    assert_eq!(
+        final_answer, COORD_FINAL_ANSWER,
+        "the returned final answer is the run's natural finish, not the driver's own"
+    );
+
+    // The driver forwarded no terminal of its own: the completion leg's
+    // synthetic Final is queued first, and it is the ONLY one to arrive
+    // once the driver exits (dropping the original sender).
+    finalization_tx
+        .send(Ok(StreamItem::Final(finalized_marker)))
+        .await
+        .expect("the channel is open for the normal finalization leg");
+    drop(finalization_tx);
+
+    let count = count_final_terminals(&mut stream).await;
+    assert_eq!(
+        count, 1,
+        "the stream carries exactly one terminal — the normal factory \
+            finalization's; the borrowed driver emits none of its own"
+    );
+}
+
+/// Frame 9 (S4): a segment re-parking on a newly gated call emits
+/// `RunParked` to the caller's channel EXACTLY ONCE, and the
+/// coordinator's re-park probe (the E7-era golden's parked-name probe)
+/// never duplicates it. The staged shape is the loop re-park:
+/// node A completes its decided call, the never-started sibling's
+/// continuation issues a fresh gated call, and the run_iteration's
+/// park path publishes the checkpoint — the publication owner's
+/// single emission rides the borrowed driver's channel, and the
+/// coordinator's continuation's parked-name probe observes the same
+/// publication without emitting again.
+#[tokio::test]
+async fn s4_publication_owner_emits_runparked_exactly_once() {
+    let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
+    let _drain = OverrideDrain;
+    let world = world();
+    let apply_invocations = Arc::new(Mutex::new(Vec::new()));
+    let fresh_invocations = Arc::new(Mutex::new(Vec::new()));
+    // Build order: node A first (the drive loop), then the sibling's
+    // (a build only the resumed coordinator loop can make).
+    install_worker_overrides(vec![
+        WorkerOverride {
+            model: ScriptedCompletionModel::new(vec![
+                ScriptedTurn::tool_calls(vec![ScriptedToolCall::new(
+                    "call_sub_a",
+                    "submit_result",
+                    json!({
+                        "summary": "apply done",
+                        "result": "applied cleanly",
+                        "confidence": "high",
+                    }),
+                )])
+                .with_text(A_DONE),
+            ]),
+            extra_tools: vec![Box::new(
+                RecordingTool::new(apply_invocations.clone()).with_name(TOOL),
+            )],
+        },
+        WorkerOverride {
+            model: ScriptedCompletionModel::new(vec![ScriptedTurn::tool_calls(vec![
+                ScriptedToolCall::new(FRESH_CALL_ID, NEW_TOOL, json!({ "namespace": "stage" }))
+                    .with_call_id(NEW_CALL_ID),
+            ])]),
+            extra_tools: vec![Box::new(
+                RecordingTool::new(fresh_invocations.clone()).with_name(NEW_TOOL),
+            )],
+        },
+    ]);
+    // The continuation builds its coordinator before the loop; the park
+    // path skips the coordinator call, so the script is never consumed
+    // by a request.
+    install_coordinator_overrides(vec![CoordinatorOverride {
+        model: ScriptedCompletionModel::new(vec![coordinator_direct_turn()]),
+    }]);
+    register_decided(&world).await;
+    publish_document(&world, &sibling_parks_document(&world)).await;
+
+    let grant = evaluate_resume(evaluation(&world, false, None))
+        .await
+        .expect("the all-decided run grants");
+
+    let (event_tx, event_rx) = tokio::sync::mpsc::channel::<Result<StreamItem, StreamError>>(64);
+    let mut stream = Box::pin(futures::stream::unfold(event_rx, |mut rx| async move {
+        rx.recv().await.map(|item| (item, rx))
+    }));
+    let end = tokio::time::timeout(
+        BORROWED_PROBE,
+        run_segment_borrowed(
+            &grant,
+            &world.config,
+            &HashMap::new(),
+            event_tx,
+            crate::UsageState::new(),
+            None,
+        ),
+    )
+    .await
+    .expect("the borrowed segment returns within the bound")
+    .expect("the segment driver did not panic");
+
+    match &end {
+        ResumeStreamEnd::Reparked => {}
+        other => panic!("a re-parked segment yields Reparked, got {other:?}"),
+    }
+
+    // The drive-loop substitutions ran exactly once each across the
+    // segment: node A's decided call executed once; the sibling's fresh
+    // gated call never executed its tool.
+    assert_eq!(
+        apply_invocations
+            .lock()
+            .expect("apply invocation log")
+            .len(),
+        1,
+        "node A's decided call executes exactly once before the re-park"
+    );
+    assert!(
+        fresh_invocations
+            .lock()
+            .expect("fresh invocation log")
+            .is_empty(),
+        "the sibling's freshly gated call never executes its tool"
+    );
+
+    let items = drive_to_items(&mut stream).await;
+    let parked = run_parked_events(items.as_slice());
+    assert_eq!(
+        parked.len(),
+        1,
+        "RunParked rides the borrowed driver's channel EXACTLY once — \
+         the publication owner's emission; the coordinator's re-park probe \
+         parked-name observation must never duplicate it (found {parked:?})"
+    );
+    assert!(
+        carries_no_final(items.as_slice()),
+        "a re-parked segment carries no Final — the driver emits none of its own"
+    );
+}
+
+/// Frame 10 (S4): THE RENDEZVOUS GOLDEN — the fence's lease reference
+/// (from the conversion's held reservation) survives the STREAM BOUNDARY
+/// and is released only at the supervisor's drain completion, observed
+/// through the shared reservation table across the real ownership chain.
+///
+/// The frame drives the FACTORY supervisor (`resume_stream_with_timeout`),
+/// not the borrowed driver directly: the grant is consumed by value and
+/// the test holds NOTHING but the factory's returned surface, so the
+/// fence-live assertion below cannot be satisfied by any reference the
+/// caller still owns — it is held by the supervisor's internal ownership
+/// chain (the grant's lease through the segment, plus the tracked tail
+/// the decided call's tool registered through the grant's ONE scope).
+/// With the tail in flight at the stream boundary (its gate closed), the
+/// run stays reserved; release happens only when the drain completes,
+/// never on drop: release-at-drop is falsified for the supervisor-owned
+/// fence.
+///
+/// Review-covered residual (stated, not asserted): the specific lease
+/// clone `convert_reserved` moves into its blocking rename tail lives
+/// only until that rename completes — a cfg(test) rendezvous INSIDE
+/// `convert_reserved` (evaluate.rs:564) would be needed to assert the
+/// clone's own binding shape at runtime, and that seam is the recorded
+/// residual (goldens.rs:1636's note). This frame pins the property that
+/// survives without production visibility: the fence releases at the
+/// supervisor's drain end through the real ownership chain, and the
+/// conversion's held reservation never drops before the segment's own
+/// fences have.
+#[tokio::test]
+async fn s4_conversion_tail_lease_clone_holds_until_the_supervisor_drain_ends() {
+    let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
+    let _drain = OverrideDrain;
+    let world = world();
+    register_decided(&world).await;
+    publish_document(&world, &sentinel_document(&world)).await;
+
+    let grant = evaluate_resume(evaluation(&world, false, None))
+        .await
+        .expect("the all-decided run grants");
+    let run = grant.run_id().clone();
+    // The tail must register through the grant's ONE scope, so capture
+    // the scope handle before the supervisor consumes the grant.
+    let scope = grant.execution_scope();
+    let spawned = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let finished = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (release, gate) = tokio::sync::oneshot::channel::<()>();
+    let gate = Arc::new(std::sync::Mutex::new(Some(gate)));
+    install_worker_overrides(vec![WorkerOverride {
+        model: ScriptedCompletionModel::new(vec![ScriptedTurn::text(FINAL_TEXT)]),
+        extra_tools: vec![Box::new(SupervisorGatedTailTool::new(
+            scope,
+            Arc::clone(&gate),
+            Arc::clone(&spawned),
+            Arc::clone(&finished),
+        ))],
+    }]);
+    install_coordinator_overrides(vec![CoordinatorOverride {
+        model: ScriptedCompletionModel::new(vec![coordinator_direct_turn()]),
+    }]);
+
+    // The supervisor consumes the grant BY VALUE: no lease reference of
+    // the conversion survives in the test's hands — the fence below is
+    // held only by the supervisor's internal ownership chain.
+    let factory = OrchestratorFactory::new(world.config.clone())
+        .with_reservation_table(Arc::new(ResumeClaimTable::new()));
+    let (mut stream, _cancel_tx, _usage) = factory
+        .resume_stream_with_timeout(grant, Duration::from_secs(600), "req_rendezvous")
+        .await;
+
+    // The frame's lifecycle, state by state:
+    // (i) TODAY (pre-#21): the factory call above panics at the S3 todo —
+    //     this point is never reached.
+    // (ii) AFTER hole #21's fill, BEFORE hole #12's: the supervisor task
+    //     dies at the S4 todo (evaluate.rs:981) before any terminal rides
+    //     the stream — the consumer side sees an EARLY CLOSE. Detect it
+    //     and FAIL with the explicit message naming the unfilled driver;
+    //     never hang, never assert over a partial set.
+    // (iii) AFTER hole #12's fill: the honest supervisor holds the stream
+    //     open while its drain waits on the held tail — the boundary
+    //     assertions below hold, then the release completes the drain.
+    let deadline = std::time::Instant::now() + BORROWED_PROBE;
+    loop {
+        // The held tail must reach its in-flight hold, bounded, with the
+        // stream's own termination checked on every poll: an EARLY CLOSE
+        // with no terminal is state (ii) and fails here, never hangs.
+        assert!(
+            !futures::poll!(stream.next()).is_ready(),
+            "the factory stream terminated with no terminal having ridden it: \
+             the supervisor died before the segment boundary — the S4 borrowed \
+             driver (evaluate.rs:981, hole #12) is UNFILLED and must land \
+             before this frame can pin its boundary"
+        );
+        if spawned.load(std::sync::atomic::Ordering::Acquire) >= 1 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the supervisor's held tail never reached its in-flight hold within \
+             the bound"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    // (iii) The stream boundary with the drain still waiting on the
+    // in-flight tail: the supervisor holds the stream OPEN (no terminal
+    // can ride it while the drain pends — the same shape frame 7 legs
+    // pin; a skip-drain shortcut's early close fails here), and the
+    // fence is still live. The blocked-window runs CONCURRENTLY with
+    // the hold: it asserts stream-pending + fence-live on every
+    // iteration for a bounded run of the window, then EXITS — it never
+    // waits for the hold to end. Releasing the tail follows and
+    // completes the drain.
+    for _ in 0..20 {
+        assert!(
+            !futures::poll!(stream.next()).is_ready(),
+            "the factory stream terminated while its drain still waited on the \
+             in-flight tail: the exit arm drained late or skipped its \
+             tracked-child join"
+        );
+        assert!(
+            world.claims.is_live(&run),
+            "the fence survived to the stream boundary — the supervisor's lease \
+             held it across every stream item"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    release.send(()).expect("the gated tail is still held");
+    // The release completes the drain: the tail's own completion moment
+    // (its `finished` observable, bounded) precedes the fence's release.
+    let release_deadline = std::time::Instant::now() + BORROWED_PROBE;
+    while finished.load(std::sync::atomic::Ordering::Acquire) < 1 {
+        assert!(
+            std::time::Instant::now() < release_deadline,
+            "the released tail never completed within the bound"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while world.claims.is_live(&run) && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        !world.claims.is_live(&run),
+        "the released tail ends the supervisor's drain — the fence releases only \
+         after every reference the conversion handed out has ended"
+    );
+}
+
+/// Frame 11 (S4): the resumed coordinator increments a fresh local cycle
+/// counter before each iteration; three fresh cycles are permitted and
+/// the fourth fresh cycle stops. The fixture's checkpoint deliberately
+/// carries a high historical iteration — evidence-only numbering, so the
+/// counter the resumed loop bounds is the fresh one: the resumed run
+/// still consumes three full coordinator decision turns (then stops at
+/// the fourth) regardless of the checkpoint carrying iteration 8.
+#[tokio::test]
+async fn s4_coordinator_cycle_counter_allows_three_fresh_cycles() {
+    let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
+    let _drain = OverrideDrain;
+    let world = world();
+    let coordinator = ScriptedCompletionModel::new(vec![
+        planning_turn_for("cycle one"),
+        planning_turn_for("cycle two"),
+        planning_turn_for("cycle three"),
+        planning_turn_for("the fourth fresh cycle must never be requested"),
+    ]);
+    let coordinator_requests = coordinator.requests();
+    install_coordinator_overrides(vec![CoordinatorOverride { model: coordinator }]);
+    // Iteration 1 executes the restored plan (node A's awaiting node,
+    // already complete on the drive loop's side); each permitted fresh
+    // cycle drives its own `operations` plan, so each fresh build gets
+    // its own override — an exhausted queue is never a passage.
+    install_worker_overrides(vec![
+        WorkerOverride {
+            model: ScriptedCompletionModel::new(vec![ScriptedTurn::text(FINAL_TEXT)]),
+            extra_tools: vec![Box::new(
+                RecordingTool::new(Arc::new(Mutex::new(Vec::new()))).with_name(TOOL),
+            )],
+        },
+        WorkerOverride {
+            model: ScriptedCompletionModel::new(vec![
+                ScriptedTurn::tool_calls(vec![ScriptedToolCall::new(
+                    "call_sub_fresh_1",
+                    "submit_result",
+                    json!({
+                        "summary": "fresh 1 done",
+                        "result": "fresh task one applied",
+                        "confidence": "high",
+                    }),
+                )])
+                .with_text("fresh one done"),
+            ]),
+            extra_tools: vec![],
+        },
+        WorkerOverride {
+            model: ScriptedCompletionModel::new(vec![
+                ScriptedTurn::tool_calls(vec![ScriptedToolCall::new(
+                    "call_sub_fresh_2",
+                    "submit_result",
+                    json!({
+                        "summary": "fresh 2 done",
+                        "result": "fresh task two applied",
+                        "confidence": "high",
+                    }),
+                )])
+                .with_text("fresh two done"),
+            ]),
+            extra_tools: vec![],
+        },
+        WorkerOverride {
+            model: ScriptedCompletionModel::new(vec![
+                ScriptedTurn::tool_calls(vec![ScriptedToolCall::new(
+                    "call_sub_fresh_3",
+                    "submit_result",
+                    json!({
+                        "summary": "fresh 3 done",
+                        "result": "fresh task three applied",
+                        "confidence": "high",
+                    }),
+                )])
+                .with_text("fresh three done"),
+            ]),
+            extra_tools: vec![],
+        },
+    ]);
+    register_decided(&world).await;
+    // The fixture: everything standard, but the checkpoint carries a
+    // HIGH historical iteration — the resumed loop's counter is the
+    // FRESH one it increments, never the historical count.
+    let mut document = sentinel_document(&world);
+    document.iteration = 8;
+    publish_document(&world, &document).await;
+
+    let grant = evaluate_resume(evaluation(&world, false, None))
+        .await
+        .expect("the all-decided run grants despite the checkpoint's iteration");
+
+    let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<Result<StreamItem, StreamError>>(64);
+    let end = run_segment_borrowed(
+        &grant,
+        &world.config,
+        &HashMap::new(),
+        event_tx,
+        crate::UsageState::new(),
+        None,
+    )
+    .await
+    .expect("the resumed run completes and never dead-ends on history");
+    assert!(
+        matches!(end, ResumeStreamEnd::Completed { .. }),
+        "the resumed run completes under the fresh counter: {end:?}"
+    );
+
+    // Three fresh cycles permitted; the fourth (the fourth scripted
+    // coordinator turn) is never requested.
+    let recorded = coordinator_requests
+        .lock()
+        .expect("coordinator request log")
+        .len();
+    assert_eq!(
+        recorded, 3,
+        "the resumed coordinator runs three FRESH cycles and stops at the \
+         fourth request — the checkpoint carrying iteration 8 must neither \
+         shorten nor extend the fresh budget (found {recorded})"
+    );
+}
+
+/// Frame 12 (S4): the resumed worker's call counters start at zero for
+/// the resumed execution, with the historical checkpoint numbering
+/// staying separate. The fixture: the awaiting node's decided call
+/// executes through the substitution (the resumed execution's first
+/// call on its own counters), then the worker's continuation re-issues
+/// the SAME tool with the SAME arguments — twice — and the guard's
+/// fresh counting is visible check-side: the FIRST repeat's guidance
+/// annotation counts exactly 2 (fresh-started) and the SECOND repeat's
+/// abort carries the arithmetic of a fresh start, never history.
+#[tokio::test]
+async fn s4_resumed_worker_starts_fresh_call_counters() {
+    let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
+    let _drain = OverrideDrain;
+    let world = world_with_work_call_thresholds(2, 3);
+    let continuation_text = "the resumed worker adapts and reports";
+    // The fresh continuation's first call re-issues the checkpoint's
+    // decided tool with identical arguments — the fingerprints match the
+    // substitution's invocation, so the counter arithmetic of the resumed
+    // run is observable through the guard's annotations.
+    let scripted_worker = ScriptedCompletionModel::new(vec![
+        ScriptedTurn::tool_calls(vec![ScriptedToolCall::new(
+            "call_repeat_1",
+            TOOL,
+            call_args(),
+        )]),
+        ScriptedTurn::tool_calls(vec![ScriptedToolCall::new(
+            "call_repeat_2",
+            TOOL,
+            call_args(),
+        )]),
+        ScriptedTurn::text(continuation_text),
+    ]);
+    let requests = scripted_worker.requests();
+    install_worker_overrides(vec![WorkerOverride {
+        model: scripted_worker,
+        extra_tools: vec![Box::new(
+            RecordingTool::new(Arc::new(Mutex::new(Vec::new()))).with_name(TOOL),
+        )],
+    }]);
+    install_coordinator_overrides(vec![CoordinatorOverride {
+        model: ScriptedCompletionModel::new(vec![coordinator_direct_turn()]),
+    }]);
+    register_decided(&world).await;
+    publish_document(&world, &sentinel_document(&world)).await;
+
+    let grant = evaluate_resume(evaluation(&world, false, None))
+        .await
+        .expect("the all-decided run grants");
+
+    let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<Result<StreamItem, StreamError>>(64);
+    let end = run_segment_borrowed(
+        &grant,
+        &world.config,
+        &HashMap::new(),
+        event_tx,
+        crate::UsageState::new(),
+        None,
+    )
+    .await
+    .expect("the resumed run completes");
+    assert!(
+        matches!(end, ResumeStreamEnd::Completed { .. }),
+        "the resumed run completes with the fresh counters: {end:?}"
+    );
+
+    let recorded = requests.lock().expect("scripted request log").clone();
+    assert_eq!(
+        recorded.len(),
+        2,
+        "the three-turn continuation fronts exactly two completion requests \
+         before the final text (found {})",
+        recorded.len()
+    );
+    let wire_history =
+        serde_json::to_value(&recorded[0].chat_history).expect("the request history serializes");
+    assert!(
+        wire_history
+            .to_string()
+            .contains(&format!("identical arguments 2 times")),
+        "the FIRST repeated call's guard annotation counts EXACTLY 2 — the resumed \
+         execution's substitution call (1) plus the worker's one fresh repeat: the \
+         worker's call counters started at zero (history rendered {wire_history})"
+    );
+    let wire_history_2 =
+        serde_json::to_value(&recorded[1].chat_history).expect("the request history serializes");
+    assert!(
+        wire_history_2
+            .to_string()
+            .contains(&format!("identical arguments 3 times")),
+        "the SECOND repeated call crosses the block threshold at count 3 — no \
+         checkpoint history arithmetic piggybacks (history rendered {wire_history_2})"
     );
 }
 

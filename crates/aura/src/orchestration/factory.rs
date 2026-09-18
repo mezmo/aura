@@ -398,16 +398,26 @@ mod tests {
 
     use super::*;
     use crate::config::AgentRuntimeConfig;
-    use crate::hitl::{DecisionRoute, HitlRuntime, PendingApprovals};
+    use crate::hitl::{
+        AgentScope, ApprovalDecision, ApprovalItem, ApprovalOrigin, ApprovalRequest, DecisionId,
+        DecisionRoute, HitlRuntime, PROTOCOL_VERSION, ParkedApproval, PendingApprovals,
+    };
+    use crate::orchestration::park::resume::{ResumeEvaluation, ResumeGrant, evaluate_resume};
+    use crate::orchestration::run_owner_id;
     use crate::orchestration::test_rig::{
         CoordinatorOverride, ECHO_TOOL_NAME, RecordingTool, ScriptedCompletionModel,
         ScriptedToolCall, ScriptedTurn, StallHook, WORKER_OVERRIDE_SERIAL, WorkerOverride,
-        install_coordinator_overrides, install_worker_overrides,
+        install_coordinator_overrides, install_worker_overrides, take_coordinator_override,
+        take_worker_override,
     };
-    use crate::orchestration::{OrchestrationConfig, ResumeRunId, WorkerConfig};
+    use crate::orchestration::{
+        OrchestrationConfig, OrchestratorEvent, ParkSnapshot, PendingCall, Plan, ResumeRunId, Task,
+        TaskState, WorkerConfig,
+    };
     use crate::provider_agent::{StreamError, StreamItem};
-    use crate::session_store::{InMemoryApprovalStore, InMemoryEventBus};
+    use crate::session_store::{FileApprovalStore, InMemoryApprovalStore, InMemoryEventBus};
     use crate::streaming::StreamingAgent;
+    use tokio::io::AsyncWriteExt;
 
     /// The scripted coordinator's final answer — the deterministic natural
     /// finish of a run that never needs a worker.
@@ -641,5 +651,1167 @@ mod tests {
             drive_to_end(&mut stream).await,
             "a factory with no reservation table completes exactly as before"
         );
+    }
+
+    // =================================================================
+    // S3 frames (the SSE wave's RED, aura/P45 joint hole #21): the
+    // factory's resume supervisor. Each frame stages one whole granted
+    // run — the same webhook-poll world the resume goldens build — and
+    // drives it through `resume_stream_with_timeout`, RED today at the
+    // hole's named todo.
+    // =================================================================
+
+    /// The granted-run frames' session path segment — distinct from
+    /// `l4a-sess` (the initial-producer frames' fixture) so the two
+    /// fixture families never collide on disk.
+    const RESUME_SESSION: &str = "s3-resume-sess";
+    /// The granted run's persistence-bound run id, fixed for determinism.
+    const RESUME_RUN: &str = "0199c0de-1313-7000-8000-000000003131";
+    /// The pending call's decision id.
+    const RESUME_DECISION: &str = "0199c0de-1313-7000-8000-000000004141";
+    /// The pending call's tool — inside the gate's `kubectl_*` pattern.
+    const RESUME_TOOL: &str = "kubectl_apply";
+    /// The pending call's id.
+    const RESUME_CALL_ID: &str = "call_apply_1";
+    /// The checkpoint's pending call arguments.
+    fn resume_args() -> serde_json::Value {
+        serde_json::json!({ "namespace": "prod" })
+    }
+    /// A long deadline the frames that mutate budgets post to.
+    const RESUME_BOUND: Duration = Duration::from_secs(5);
+
+    fn resume_decision() -> DecisionId {
+        DecisionId::parse(RESUME_DECISION).expect("resume decision id parses")
+    }
+
+    /// The granted-run world a resume frame drives: the fingerprint-matching
+    /// config, the file approval store behind the registry, the 207 poll
+    /// receiver the fresh-gated paths deliver through, and the run's claim
+    /// table the frames observe the fence through.
+    struct GrantedRunWorld {
+        // Held so the checkpoint tempdirs outlive every frame's drive.
+        _dir: tempfile::TempDir,
+        memory_dir: String,
+        registry: PendingApprovals,
+        config: AgentRuntimeConfig,
+        claims: ResumeClaimTable,
+        _receiver: tokio::task::JoinHandle<()>,
+    }
+
+    fn granted_world(mutate: impl FnOnce(&mut OrchestrationConfig)) -> GrantedRunWorld {
+        let dir = tempfile::tempdir().expect("temp memory root");
+        std::fs::create_dir_all(dir.path().join("approvals")).expect("approval dir");
+        let store = Arc::new(
+            FileApprovalStore::open(dir.path().join("approvals")).expect("file approval store"),
+        );
+        let registry = PendingApprovals::with_backend(
+            std::sync::Arc::clone(&store) as Arc<dyn crate::session_store::ApprovalStore>,
+            Arc::new(InMemoryEventBus::new()) as Arc<dyn crate::session_store::EventBus>,
+        );
+        let (url, receiver) = resume_receiver();
+        let memory_dir = dir.path().join("memory").to_string_lossy().into_owned();
+        std::fs::create_dir_all(&memory_dir).expect("memory dir");
+        let mut workers = HashMap::new();
+        workers.insert(
+            "operations".to_string(),
+            WorkerConfig {
+                description: "Runs the gated apply".to_string(),
+                preamble: "You apply changes with the gated tools.".to_string(),
+                mcp_filter: Some(vec![]),
+                vector_stores: vec![],
+                turn_depth: None,
+                llm: None,
+                scratchpad: None,
+                skills: None,
+            },
+        );
+        let mut orchestration = OrchestrationConfig {
+            enabled: true,
+            workers,
+            ..Default::default()
+        };
+        mutate(&mut orchestration);
+        let config = AgentRuntimeConfig {
+            hitl: Some(resume_route_hitl(&url, &registry)),
+            memory_dir: Some(memory_dir.clone()),
+            session_id: Some(RESUME_SESSION.to_string()),
+            request_id: Some(format!("req_{}", uuid::Uuid::new_v4().simple())),
+            orchestration: Some(orchestration),
+            ..AgentRuntimeConfig::default()
+        };
+        GrantedRunWorld {
+            _dir: dir,
+            memory_dir,
+            registry,
+            config,
+            claims: ResumeClaimTable::new(),
+            _receiver: receiver,
+        }
+    }
+
+    /// The persistent scripted 207 receiver the granted-world parks against:
+    /// one ephemeral listener answering up to 64 POST connections with an
+    /// empty `207 Multi-Status`, exactly like the resume goldens' world.
+    fn resume_receiver() -> (String, tokio::task::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("receiver listener binds");
+        let url = format!(
+            "http://{}",
+            listener.local_addr().expect("receiver address")
+        );
+        listener
+            .set_nonblocking(true)
+            .expect("receiver listener goes non-blocking for tokio");
+        let handle = tokio::spawn(async move {
+            let listener =
+                tokio::net::TcpListener::from_std(listener).expect("async receiver listener");
+            for _ in 0..64 {
+                let (mut socket, _) = match listener.accept().await {
+                    Ok(accept) => accept,
+                    Err(_) => return,
+                };
+                let _ = crate::hitl::read_full_request(&mut socket).await;
+                let response = "HTTP/1.1 207 Multi-Status\r\ncontent-type: application/json\r\n\
+                                content-length: 0\r\nconnection: close\r\n\r\n";
+                socket.write_all(response.as_bytes()).await.ok();
+                socket.shutdown().await.ok();
+            }
+        });
+        (url, handle)
+    }
+
+    /// The webhook-poll HITL runtime the granted-world config arms (the same
+    /// route shape `evaluate_resume` resumes against in production).
+    fn resume_route_hitl(url: &str, registry: &PendingApprovals) -> HitlRuntime {
+        let config = aura_config::HitlConfig {
+            require_approval: vec![aura_config::GlobPattern::new("kubectl_*").unwrap()],
+            park: aura_config::ParkConfig {
+                enabled: true,
+                bind_identity: false,
+                park_ttl: aura_config::ParkTtl::default(),
+            },
+            route: aura_config::DecisionRouteConfig::Webhook {
+                url: aura_config::WebhookUrl::new(url).unwrap(),
+                timeout_secs: 3600,
+                headers: HashMap::new(),
+                headers_from_request: HashMap::new(),
+                tool_headers_from_response: aura_config::ToolHeaderMappings::default(),
+                delivery: aura_config::WebhookDelivery::Poll,
+                poll_url: None,
+                poll_interval_secs: 10,
+                poll_request_timeout_secs: 30,
+                receiver_wait_timeout_secs: 900,
+            },
+        };
+        crate::hitl::HitlRuntime::from_config(&config, registry, None, None)
+    }
+
+    /// The worker-scoped approval for the checkpoint's pending call, riding
+    /// the granted run's owner id (the same shape the resume goldens stamp).
+    fn resume_approval() -> ParkedApproval {
+        ParkedApproval {
+            request: ApprovalRequest {
+                version: PROTOCOL_VERSION,
+                instance_id: "factory-frame".to_string(),
+                decision_id: resume_decision(),
+                request_id: run_owner_id(RESUME_RUN),
+                scope: AgentScope::Worker {
+                    run_id: RESUME_RUN.parse().expect("the granted run id parses"),
+                    task: crate::orchestration::TaskIdentity::new(3, None),
+                    session_id: None,
+                },
+                origin: ApprovalOrigin::ConfigGate {
+                    matched_pattern: "kubectl_*".to_string(),
+                    agent_name: "test-agent".to_string(),
+                },
+                items: vec![ApprovalItem {
+                    tool_name: RESUME_TOOL.to_string(),
+                    arguments: resume_args(),
+                    tool_call_intent: None,
+                }],
+            },
+            registered_at: chrono::Utc::now(),
+            expires_at: chrono::DateTime::parse_from_rfc3339("2099-01-01T00:00:00Z")
+                .expect("the ticket stamp parses")
+                .with_timezone(&chrono::Utc),
+            authority: crate::hitl::ApprovalAuthority::WebhookPoll,
+            egress_headers: None,
+            acknowledgment: crate::hitl::AcknowledgmentState::RequiresNotification,
+        }
+    }
+
+    /// The sentinel fixture the decided resume drives: one awaiting node
+    /// whose pending call was recorded approved.
+    async fn register_decided_run(world: &GrantedRunWorld) {
+        world
+            .registry
+            .register_durable(resume_approval())
+            .await
+            .expect("register the granted approval");
+        world
+            .registry
+            .resolve(
+                &resume_decision(),
+                crate::hitl::ApprovalAuthority::WebhookPoll,
+                ApprovalDecision::Approved.into(),
+            )
+            .await
+            .expect("record the approval");
+    }
+
+    /// The granted run's checkpoint plan: one AwaitingApproval node (task 3)
+    /// whose pending call was registered in the store and recorded approved,
+    /// plus — for the re-parking leg — one never-started Pending sibling
+    /// (task 5). The park commit stamps the config fingerprint itself.
+    fn granted_plan(with_sibling: bool) -> Plan {
+        let mut plan = Plan::new("Deploy the service");
+        plan.add_task(Task {
+            id: 3,
+            description: "Gated apply".to_string(),
+            dependencies: vec![],
+            state: TaskState::AwaitingApproval {
+                pending: vec![PendingCall {
+                    decision_id: resume_decision(),
+                    tool_name: RESUME_TOOL.to_string(),
+                    arguments: resume_args(),
+                    call_id: RESUME_CALL_ID.to_string(),
+                }],
+            },
+            worker: Some("operations".to_string()),
+            rationale: "the manifest needs the gated apply".to_string(),
+            structured_output: None,
+        });
+        if with_sibling {
+            plan.add_task(Task {
+                id: 5,
+                description: "Run the post-apply deployment checks".to_string(),
+                dependencies: vec![],
+                state: TaskState::Pending,
+                worker: Some("operations".to_string()),
+                rationale: String::new(),
+                structured_output: None,
+            });
+        }
+        plan
+    }
+
+    /// The sentinel tool-result prompt a live park leaves as the awaiting
+    /// node's current prompt: the placeholder keyed by the pending call's id.
+    fn resume_sentinel_prompt() -> rig::completion::Message {
+        rig::completion::Message::User {
+            content: rig::OneOrMany::one(rig::message::UserContent::ToolResult(
+                rig::message::ToolResult {
+                    id: RESUME_CALL_ID.to_string(),
+                    call_id: None,
+                    content: rig::OneOrMany::one(rig::message::ToolResultContent::text(
+                        serde_json::to_string(
+                            "This tool call is parked pending human approval. \
+                             It has not run. Do not retry.",
+                        )
+                        .expect("a plain string serializes"),
+                    )),
+                },
+            )),
+        }
+    }
+
+    /// Publish the granted run's checkpoint through the production park
+    /// commit: the commit stamps the config fingerprint itself, so the
+    /// document always matches the frame's config.
+    async fn publish_checkpoint(world: &GrantedRunWorld, with_sibling: bool) {
+        let plan = granted_plan(with_sibling);
+        let mut records: HashMap<usize, crate::orchestration::ParkedTaskRecord> = HashMap::new();
+        records.insert(
+            3,
+            crate::orchestration::ParkedTaskRecord {
+                attempt: 1,
+                snapshot: ParkSnapshot {
+                    history: vec![rig::completion::Message::user("apply it")],
+                    current_prompt: resume_sentinel_prompt(),
+                },
+            },
+        );
+        let chat_history = vec![rig::completion::Message::user("Deploy the service")];
+        let inputs = crate::orchestration::ParkCommitInputs {
+            state: crate::orchestration::RunStateForPark {
+                run_id: RESUME_RUN,
+                session_id: Some(RESUME_SESSION),
+                query: "Deploy the service",
+                chat_history: &chat_history,
+                coordinator_conversation: &[],
+                routing_decision: None,
+                iteration: 1,
+                planning_ms: 0,
+                failure_history: &[],
+            },
+            plan: &plan,
+            records: &records,
+            registry: &world.registry,
+            memory_dir: &world.memory_dir,
+            config: &world.config,
+            park_ttl: world
+                .config
+                .hitl
+                .as_ref()
+                .expect("the granted world's hitl")
+                .park_ttl,
+            identity_hash: None,
+        };
+        crate::orchestration::commit_from_run_state(&inputs, None)
+            .await
+            .expect("the granted checkpoint publishes");
+    }
+
+    /// Stage the checkpoint and grant the run: the frames' shared granted-run
+    /// staging (register_decided + publish + evaluate).
+    async fn granted_run(world: &GrantedRunWorld, with_sibling: bool) -> ResumeGrant {
+        register_decided_run(world).await;
+        publish_checkpoint(world, with_sibling).await;
+        evaluate_resume(ResumeEvaluation {
+            path: crate::orchestration::ValidatedResumePath::parse(RESUME_SESSION, RESUME_RUN)
+                .expect("the granted path validates"),
+            memory_dir: &world.memory_dir,
+            config: &world.config,
+            store: &world.registry,
+            claims: &world.claims,
+            bind_identity: false,
+            presented_identity: None,
+            request_id: format!("req_{}", uuid::Uuid::new_v4().simple()),
+            now: chrono::Utc::now(),
+        })
+        .await
+        .expect("the all-decided run grants")
+    }
+
+    /// The factory over the granted world's config, with its own (never
+    /// consulted) reservation table: the resume surface the frames drive.
+    fn granted_factory(world: &GrantedRunWorld) -> OrchestratorFactory {
+        OrchestratorFactory::new(world.config.clone())
+            .with_reservation_table(Arc::new(ResumeClaimTable::new()))
+    }
+
+    /// A factory frame's own namespaced scripted tool:
+    /// the stand-in worker's invocation log the substitution's decided
+    /// call rides.
+    fn resume_invocations()
+    -> Arc<std::sync::Mutex<Vec<crate::orchestration::test_rig::ToolInvocation>>> {
+        Arc::new(std::sync::Mutex::new(Vec::new()))
+    }
+
+    /// One creation-plan coordinator decision turn with a marker as the
+    /// fresh plan's text: the repeated-cycle shape the fresh-cycle pinning
+    /// frames script several of.
+    fn resume_plan_turn(marker: &str) -> ScriptedTurn {
+        ScriptedTurn::tool_calls(vec![ScriptedToolCall::new(
+            "call_plan",
+            "create_plan",
+            serde_json::json!({
+                "goal": marker,
+                "steps": [
+                    {"type": "task", "task": marker, "worker": "operations"}
+                ],
+                "routing_rationale": "the restored run has tool work to finish",
+                "planning_summary": marker,
+            }),
+        )])
+        .with_text(marker)
+    }
+
+    /// The coordinator's scripted deterministic direct answer — the
+    /// deterministic natural finish of a completed segment.
+    const RESUME_COORD_ANSWER: &str = "the resumed run is done";
+
+    fn resume_direct_turn() -> ScriptedTurn {
+        ScriptedTurn::tool_calls(vec![ScriptedToolCall::new(
+            "call_route",
+            "respond_directly",
+            serde_json::json!({
+                "response": RESUME_COORD_ANSWER,
+                "routing_rationale": "the resumed run's tasks are done",
+            }),
+        )])
+        .with_text(RESUME_COORD_ANSWER)
+    }
+
+    /// A frame's own panic must not leak its undriven overrides into the next
+    /// consumer's builds: the queues are take-once and process-global. Drains
+    /// on drop; instantiate right after installing (the goldens' convention).
+    struct ResumeOverrideDrain;
+
+    impl Drop for ResumeOverrideDrain {
+        fn drop(&mut self) {
+            while take_worker_override().is_some() {
+                // drained
+            }
+            while take_coordinator_override().is_some() {
+                // drained
+            }
+        }
+    }
+
+    /// Drive a resumed factory stream to its terminal item, returning the
+    /// last `Final` item's content (empty when none rode the stream).
+    async fn drive_resume_final_text(
+        stream: &mut BoxStream<'static, Result<StreamItem, StreamError>>,
+    ) -> String {
+        let mut final_text = String::new();
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(StreamItem::Final(info)) => final_text = info.content,
+                Ok(_) => {}
+                Err(e) => panic!("the resumed stream must not error: {e}"),
+            }
+        }
+        final_text
+    }
+
+    /// Poll the granted run's claim table until the run's reservation is
+    /// released, bounded — the supervisor's exit (its tracked tails joined)
+    /// is the only release.
+    async fn await_resume_release(world: &GrantedRunWorld, run: &ResumeRunId) {
+        let deadline = Instant::now() + RESUME_BOUND;
+        while world.claims.is_live(run) {
+            assert!(
+                Instant::now() < deadline,
+                "the supervisor releases the run reservation within the bound"
+            );
+            sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// One `submit_result` turn the awaiting node's continuation streams:
+    /// the loop's success semantics, the worker's completion report.
+    fn resume_submit_turn(marker: &str) -> ScriptedTurn {
+        ScriptedTurn::tool_calls(vec![ScriptedToolCall::new(
+            "call_sub",
+            "submit_result",
+            serde_json::json!({
+                "summary": "apply done",
+                "result": marker,
+                "confidence": "high",
+            }),
+        )])
+        .with_text(marker)
+    }
+
+    /// The awaiting-node worker override the resumed drive loop builds
+    /// first: its scripted model streams once (the substitution precedes
+    /// every model turn), carrying the shared invocation log.
+    fn resume_worker_override(
+        turns: Vec<ScriptedTurn>,
+        invocations: Arc<std::sync::Mutex<Vec<crate::orchestration::test_rig::ToolInvocation>>>,
+    ) -> WorkerOverride {
+        WorkerOverride {
+            model: ScriptedCompletionModel::new(turns),
+            extra_tools: vec![Box::new(
+                RecordingTool::new(invocations).with_name(RESUME_TOOL),
+            )],
+        }
+    }
+
+    /// The fresh-gated call the never-started sibling's continuation
+    /// issues: inside the gate's `kubectl_*` pattern, distinct from the
+    /// checkpoint's decided call, so a re-parking segment registers a NEW
+    /// pending call.
+    const RESUME_NEW_TOOL: &str = "kubectl_delete";
+    const RESUME_NEW_CALL_ID: &str = "call_id_0";
+    const RESUME_FRESH_CALL_ID: &str = "call_0";
+
+    /// The tracked-tail stand-in the decided call's tool carries: on
+    /// invocation it spawns a TRACKED tail through the run's ONE execution
+    /// scope — the same registration path every production fire-and-forget
+    /// tail takes — and holds until the frame releases it. The spawn
+    /// happens DURING the segment (the substitution invokes this tool), so
+    /// the tail is still in flight when the segment body finishes. The
+    /// `finished` counter increments in the tail's own completion moment,
+    /// so a frame can pin "the tail had not completed" ahead of its
+    /// release and "the tail completed" after it. The `spawned` counter
+    /// increments at the SUBSTITUTION's spawn point itself — the frame's
+    /// synchronisation on the held tail.
+    struct ResumeGatedTailTool {
+        scope: Arc<RunExecutionScope>,
+        gate: Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>>,
+        spawned: Arc<std::sync::atomic::AtomicUsize>,
+        finished: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl ResumeGatedTailTool {
+        /// Arm the stand-in over the run's ONE scope with the frame's two
+        /// observables: the substitution's spawn moment and the tail's own
+        /// completion moment.
+        fn new(
+            scope: Arc<RunExecutionScope>,
+            gate: Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>>,
+            spawned: Arc<std::sync::atomic::AtomicUsize>,
+            finished: Arc<std::sync::atomic::AtomicUsize>,
+        ) -> Self {
+            Self {
+                scope,
+                gate,
+                spawned,
+                finished,
+            }
+        }
+    }
+
+    impl rig::tool::Tool for ResumeGatedTailTool {
+        const NAME: &'static str = "resume_gated_tail";
+
+        type Error = std::convert::Infallible;
+        type Args = crate::orchestration::test_rig::FreeformArgs;
+        type Output = String;
+
+        fn name(&self) -> String {
+            RESUME_TOOL.to_string()
+        }
+
+        async fn definition(&self, _prompt: String) -> rig::completion::ToolDefinition {
+            rig::completion::ToolDefinition {
+                name: self.name(),
+                description: "Test stand-in: spawns a tracked tail on the run's scope.".to_string(),
+                parameters: serde_json::json!({ "type": "object", "properties": {} }),
+            }
+        }
+
+        async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
+            let gate = self
+                .gate
+                .lock()
+                .expect("the gated tail's gate lock")
+                .take()
+                .expect("the gated tail spawns once");
+            let finished = Arc::clone(&self.finished);
+            self.spawned
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
+            self.scope.spawn_tracked(async move {
+                let _ = gate.await;
+                finished.fetch_add(1, std::sync::atomic::Ordering::Release);
+            });
+            Ok(ECHO_TOOL_NAME.to_string())
+        }
+    }
+
+    /// Hold the gated tail's spawn point open: poll the frame's `spawned`
+    /// handle until the substitution has registered the tracked tail
+    /// (in flight, holding) — bounded.
+    async fn await_tail_spawned(spawned: &Arc<std::sync::atomic::AtomicUsize>) {
+        let deadline = Instant::now() + RESUME_BOUND;
+        while spawned.load(std::sync::atomic::Ordering::Acquire) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the decided call's substitution spawns the tracked tail within the bound"
+            );
+            sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// The pre-release blocked-window probe: assert the supervisor is
+    /// BLOCKED on its drain for a bounded window CONCURRENTLY with the
+    /// held tail — the window runs to its end and EXITS there; it never
+    /// waits for the hold to end. On every iteration of the window: (i)
+    /// the fence is still live (`is_live`) and (ii) the stream has not
+    /// terminated (`futures::poll!` stays pending). Under an honest
+    /// implementation the window passes (drain blocked, fence live), and
+    /// the caller then releases the tail; under a skip-drain shortcut the
+    /// supervisor exits DURING the window and the probe fails that
+    /// iteration. The callers never reach this probe under today's todo
+    /// state (the factory call panics at the S3 hole).
+    async fn await_drain_blocked_window(
+        world: &GrantedRunWorld,
+        run: &ResumeRunId,
+        stream: &mut BoxStream<'static, Result<StreamItem, StreamError>>,
+    ) {
+        for _ in 0..20 {
+            assert!(
+                world.claims.is_live(run),
+                "the supervisor's fence released before its drain completed: \
+                 the exit arm's drain must hold the in-flight tail"
+            );
+            assert!(
+                !futures::poll!(stream.next()).is_ready(),
+                "the supervisor's stream terminated while its drain still \
+                 waited on the in-flight tail: the exit arm drained late or \
+                 skipped its tracked-child join"
+            );
+            sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Frame 1 (S3): `outer_budget` projects from the timeout by the zero-
+    /// timeout convention. NONZERO timeout → the resumed coordinator's
+    /// `outer_budget` is `Some(timeout)` — observable at the strongest seam
+    /// the module's harness can reach: the projected budget's behavioral
+    /// consequence at the segment seam. The fixture's per-call slice is
+    /// bigger than the whole budget, so with the projection engaged the
+    /// FIRST post-execute `create_plan` hits the 'Time budget exhausted'
+    /// arm and the loop stops (one scripted decision turn consumed); with
+    /// the ZERO timeout projecting `None`, the loop replans normally
+    /// (three decision turns consumed; the fourth scripted reference
+    /// never consulted).
+    #[tokio::test]
+    async fn s3_outer_budget_projects_from_the_factory_timeout_by_the_zero_timeout_convention() {
+        let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
+
+        // Arm A: a NONZERO timeout whose whole budget cannot fit even one
+        // per-call slice — the projected Some(timeout) engages the
+        // coordinator's budget check.
+        let arm_a_world = granted_world(|orchestration| {
+            orchestration.timeouts.per_call_timeout_secs = 5;
+        });
+        let arm_a_grant = granted_run(&arm_a_world, false).await;
+        let arm_a_factory = granted_factory(&arm_a_world);
+        let arm_a_coordinator = ScriptedCompletionModel::new(vec![resume_plan_turn("cycle one")]);
+        let arm_a_requests = arm_a_coordinator.requests();
+        install_coordinator_overrides(vec![CoordinatorOverride {
+            model: arm_a_coordinator,
+        }]);
+        install_worker_overrides(vec![resume_worker_override(
+            vec![resume_submit_turn("applied and settled")],
+            resume_invocations(),
+        )]);
+
+        let (mut stream, _cancel_tx, _usage) = arm_a_factory
+            .resume_stream_with_timeout(arm_a_grant, Duration::from_secs(1), "req_budget_some")
+            .await;
+        let arm_a_text = drive_resume_final_text(&mut stream).await;
+        assert_eq!(
+            arm_a_requests
+                .lock()
+                .expect("coordinator request log")
+                .len(),
+            1,
+            "the projected Some(timeout) outer budget stops the coordinator loop at \
+             its FIRST create_plan decision ('Time budget exhausted') — the projected \
+             value reached the segment seam"
+        );
+        assert!(
+            arm_a_text.contains("Time budget exhausted"),
+            "the projected budget's exhausted arm rides the resumed run's final \
+             answer: {arm_a_text:?}"
+        );
+
+        // Arm B: a ZERO timeout projects `None` — the budget does not
+        // engage, so the coordinator replans normally (three decision
+        // turns; the fourth is never requested, max three fresh cycles).
+        let arm_b_world = granted_world(|orchestration| {
+            orchestration.timeouts.per_call_timeout_secs = 5;
+        });
+        let arm_b_grant = granted_run(&arm_b_world, false).await;
+        let arm_b_factory = granted_factory(&arm_b_world);
+        let arm_b_coordinator = ScriptedCompletionModel::new(vec![
+            resume_plan_turn("cycle one"),
+            resume_plan_turn("cycle two"),
+            resume_plan_turn("cycle three"),
+            resume_direct_turn(),
+        ]);
+        let arm_b_requests = arm_b_coordinator.requests();
+        install_coordinator_overrides(vec![CoordinatorOverride {
+            model: arm_b_coordinator,
+        }]);
+        // Every fresh `operations` plan consumes its OWN worker build: the
+        // restored node's build first, then one override per permitted
+        // fresh cycle, so all three fresh cycles are reachable by an
+        // honest implementation (an exhausted queue is never a passage).
+        install_worker_overrides(vec![
+            resume_worker_override(
+                vec![resume_submit_turn("applied and settled")],
+                resume_invocations(),
+            ),
+            resume_worker_override(
+                vec![resume_submit_turn("fresh one settled")],
+                resume_invocations(),
+            ),
+            resume_worker_override(
+                vec![resume_submit_turn("fresh two settled")],
+                resume_invocations(),
+            ),
+            resume_worker_override(
+                vec![resume_submit_turn("fresh three settled")],
+                resume_invocations(),
+            ),
+        ]);
+
+        let (mut stream, _cancel, _usage) = arm_b_factory
+            .resume_stream_with_timeout(arm_b_grant, Duration::ZERO, "req_budget_none")
+            .await;
+        let arm_b_text = drive_resume_final_text(&mut stream).await;
+        assert_eq!(
+            arm_b_requests
+                .lock()
+                .expect("coordinator request log")
+                .len(),
+            3,
+            "the projected None budget never disturbs the coordinator loop — all \
+             three decision turns consumed, the fourth never requested"
+        );
+        assert!(
+            arm_b_text.contains("Replan budget exhausted"),
+            "the zero-timeout arm's own stopping reason is the cycle budget, not \
+             the projected outer one: {arm_b_text:?}"
+        );
+    }
+
+    /// Frame 2 (S3): firing the returned watch sender cancels the grant's
+    /// execution scope — the supervisor's own cancellation path is that
+    /// bridge. The scope's cancelled state is the observed effect: absent
+    /// before the watch fires, present after it.
+    ///
+    /// The cancellation surface holding the run has no second token to
+    /// name: the frozen `run_segment_borrowed` signature carries no token
+    /// parameter (evaluate.rs:973), so "the watch bridge is the ONE
+    /// cancellation path" is a structural property of the frozen surface,
+    /// not a runtime-observable — this frame observes the bridge's effect
+    /// alone.
+    #[tokio::test]
+    async fn s3_request_scoped_watcher_bridges_cancel_to_the_grants_one_scope() {
+        let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
+        let _drain = ResumeOverrideDrain;
+        let world = granted_world(|_| {});
+        let grant = granted_run(&world, false).await;
+        // The scope handle is captured BEFORE the factory consumes the grant:
+        // the grant's ONE execution scope is the bridge's observable.
+        let scope = grant.execution_scope();
+        let factory = granted_factory(&world);
+        install_coordinator_overrides(vec![CoordinatorOverride {
+            model: ScriptedCompletionModel::new(vec![resume_direct_turn()]),
+        }]);
+        install_worker_overrides(vec![resume_worker_override(
+            vec![resume_submit_turn("applied and settled")],
+            resume_invocations(),
+        )]);
+
+        let (stream, cancel_tx, _usage) = factory
+            .resume_stream_with_timeout(grant, Duration::from_secs(600), "req_watcher_bridge")
+            .await;
+
+        // Before the watch fires, no cancellation runs.
+        assert!(
+            !scope.cancellation().is_cancelled(),
+            "the grant's execution scope stays live until the watch fires"
+        );
+
+        cancel_tx.send(true).expect("the cancellation watch sends");
+        let deadline = Instant::now() + RESUME_BOUND;
+        while !scope.cancellation().is_cancelled() {
+            assert!(
+                Instant::now() < deadline,
+                "firing the returned watch sender cancels the grant's ONE execution \
+                 scope within the bound"
+            );
+            sleep(Duration::from_millis(10)).await;
+        }
+        drop(stream);
+    }
+
+    /// Frame 3 (S3): disconnect before the first SSE byte cancels execution —
+    /// the returned stream dropped without consuming any item cancels the
+    /// grant's execution scope, and the reservation fence releases only
+    /// after the supervisor's drain, not at stream drop. The drain-wait is
+    /// made OBSERVABLE: a tracked tail spawned during the segment holds
+    /// past the segment body, so the frame can pin (i) the fence stays
+    /// live after the stream's drop (release-at-drop falsified), and
+    /// (ii) the tail's completion happens only at the drain's release —
+    /// the tail's own completion moment rendezvouses with the fence's.
+    #[tokio::test]
+    async fn s3_disconnect_before_first_sse_byte_cancels_execution() {
+        let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
+        let _drain = ResumeOverrideDrain;
+        let world = granted_world(|_| {});
+        let grant = granted_run(&world, false).await;
+        let run = grant.run_id().clone();
+        let scope = grant.execution_scope();
+        let spawned = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let finished = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let factory = granted_factory(&world);
+        install_coordinator_overrides(vec![CoordinatorOverride {
+            model: ScriptedCompletionModel::new(vec![resume_direct_turn()]),
+        }]);
+        let (release, gate) = tokio::sync::oneshot::channel::<()>();
+        let gate = Arc::new(std::sync::Mutex::new(Some(gate)));
+        install_worker_overrides(vec![WorkerOverride {
+            model: ScriptedCompletionModel::new(vec![resume_submit_turn("applied and settled")]),
+            extra_tools: vec![Box::new(ResumeGatedTailTool::new(
+                Arc::clone(&scope),
+                Arc::clone(&gate),
+                Arc::clone(&spawned),
+                Arc::clone(&finished),
+            ))],
+        }]);
+
+        let (stream, _cancel_tx, _usage) = factory
+            .resume_stream_with_timeout(grant, Duration::from_secs(600), "req_disconnect_early")
+            .await;
+        // The substitution runs even on a stream nobody consumes: the
+        // decided call's tool spawns the tracked tail and holds it.
+        await_tail_spawned(&spawned).await;
+
+        // The disconnect: the stream is dropped WITHOUT ever consuming an
+        // item — no first SSE byte ever rode it.
+        drop(stream);
+
+        // The supervisor's disconnect detection cancels the grant's scope.
+        let deadline = Instant::now() + RESUME_BOUND;
+        while !scope.cancellation().is_cancelled() {
+            assert!(
+                Instant::now() < deadline,
+                "dropping the returned stream before any SSE byte cancels the \
+                 grant's execution scope within the bound"
+            );
+            sleep(Duration::from_millis(10)).await;
+        }
+
+        // The fence stays live past the drop: the held tail keeps the
+        // supervisor's drain pending (release-at-drop falsified).
+        assert!(
+            world.claims.is_live(&run),
+            "the fence is live after the stream's drop — the reservation releases \
+             only after the supervisor's drain completes, never at drop"
+        );
+        // The tail had not completed while the drain held.
+        assert!(
+            finished.load(std::sync::atomic::Ordering::Acquire) == 0,
+            "the tracked tail had not completed while the supervisor's drain \
+             waited on it"
+        );
+
+        // End the frame's own lease binding: from here the only remaining
+        // owner of the run's reservation is the supervisor's drive (the
+        // grant's lease through its drain) — without this drop the next
+        // assert could never observe a release at all.
+        drop(scope);
+
+        // Releasing the tail completes the drain — the tail's completion
+        // moment and the fence's release are the same transition.
+        release.send(()).expect("the gated tail is still held");
+        await_resume_release(&world, &run).await;
+        assert!(
+            finished.load(std::sync::atomic::Ordering::Acquire) == 1,
+            "the tracked tail completed exactly once, at the drain's end"
+        );
+    }
+
+    // =================================================================
+    // FRAME 4 WITHDRAWN (owner ruling, round 2 — same disposition as the
+    // frames 5/6 withdrawal this round accepted): `s3_cancellation_aware_
+    // send_never_strands_the_supervisor` cannot test the BLOCKED-send
+    // class honestly from this module. Falsifying a genuinely blocked
+    // send requires controlling the supervisor's internal channel
+    // occupancy — the fill-owned capacity and per-segment event count,
+    // neither constructible from the test module: a scripted segment's
+    // few forwarded events against the factory's capacity-100 channel
+    // never block, so no honest staging of the blocked-send class exists.
+    // Cancellation-aware sends are review-covered (Gate A plus the phase
+    // checkpoint verify the biased select pattern); the no-strand
+    // property itself is covered by frame 3's and frame 7's drain
+    // assertions (a stranded supervisor never reaches its drain, so their
+    // bounded release waits fail).
+    // =================================================================
+
+    /// Frame 7 (S3): tracked tails spawned during the segment are joined in
+    /// EVERY exit arm before the fence releases, asserted via the run's
+    /// reservation-table state transitions. Four legs: COMPLETED (terminals
+    /// volitional), RE-PARKED (the publication arm), FAULT (the fault
+    /// arrives after a tracked tail spawned), and CANCELLED (the run's
+    /// consumer cancels after a tracked tail spawned). In each, the run's
+    /// ONE execution scope carried the tracked tail across the segment
+    /// body's end, the fence stayed live while the drain waited it out,
+    /// and the release happened only after the drain completed.
+    #[tokio::test]
+    async fn s3_supervisor_drains_tracked_work_in_every_exit_arm() {
+        let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
+
+        // -------- Leg A: the COMPLETED exit arm ------------------------
+        {
+            let _drain = ResumeOverrideDrain;
+            let world = granted_world(|_| {});
+            let granted = granted_run(&world, false).await;
+            let run = granted.run_id().clone();
+            // The tail registers through the grant's ONE scope (captured
+            // before the factory consumes the grant).
+            let scope = granted.execution_scope();
+            let spawned = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let finished = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let (release, gate) = tokio::sync::oneshot::channel::<()>();
+            let gate = Arc::new(std::sync::Mutex::new(Some(gate)));
+            let tool = ResumeGatedTailTool::new(
+                scope,
+                Arc::clone(&gate),
+                Arc::clone(&spawned),
+                Arc::clone(&finished),
+            );
+            install_worker_overrides(vec![WorkerOverride {
+                model: ScriptedCompletionModel::new(vec![resume_submit_turn(
+                    "applied and settled",
+                )]),
+                extra_tools: vec![Box::new(tool)],
+            }]);
+            install_coordinator_overrides(vec![CoordinatorOverride {
+                model: ScriptedCompletionModel::new(vec![resume_direct_turn()]),
+            }]);
+            let factory = granted_factory(&world);
+            let (mut stream, _cancel, _usage) = factory
+                .resume_stream_with_timeout(
+                    granted,
+                    Duration::from_secs(600),
+                    "req_drain_completed",
+                )
+                .await;
+
+            // The completed exit arm: with the tracked tail still in flight,
+            // the supervisor cannot reach its terminal finalization — no
+            // Final may arrive while the fence holds the drain.
+            let blocked =
+                tokio::time::timeout(RESUME_BOUND, drive_resume_final_text(&mut stream)).await;
+            assert!(
+                blocked.is_err(),
+                "the resumed stream finalized while a tracked tail was still in \
+                 flight: the supervisor's drain must wait out every tracked child \
+                 before the fence releases"
+            );
+            assert!(
+                world.claims.is_live(&run),
+                "the run stays reserved while the supervisor's drain waits out the \
+                 in-flight tail"
+            );
+
+            release.send(()).expect("the gated tail is still held");
+            let final_text =
+                tokio::time::timeout(RESUME_BOUND, drive_resume_final_text(&mut stream))
+                    .await
+                    .expect("the stream finalizes once its tracked tail ends");
+            assert_eq!(
+                final_text, RESUME_COORD_ANSWER,
+                "the completed exit arm finalizes through the scripted natural \
+                 finish after the drain releases: {final_text:?}"
+            );
+            await_resume_release(&world, &run).await;
+        }
+
+        // -------- Leg B: the RE-PARKED (publication) exit arm -----------
+        {
+            let _drain = ResumeOverrideDrain;
+            let world = granted_world(|_| {});
+            let granted = granted_run(&world, true).await;
+            let run = granted.run_id().clone();
+            let scope = granted.execution_scope();
+            let spawned = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let finished = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let (release, gate) = tokio::sync::oneshot::channel::<()>();
+            let gate = Arc::new(std::sync::Mutex::new(Some(gate)));
+            install_worker_overrides(vec![
+                // Build order: the drive loop's awaiting node first (its
+                // substitution spawns the tracked tail), then the sibling's
+                // (a build only the resumed coordinator loop can make; its
+                // continuation issues the fresh gated call that re-parks).
+                WorkerOverride {
+                    model: ScriptedCompletionModel::new(vec![resume_submit_turn(
+                        "applied and settled",
+                    )]),
+                    extra_tools: vec![Box::new(ResumeGatedTailTool::new(
+                        scope,
+                        Arc::clone(&gate),
+                        Arc::clone(&spawned),
+                        Arc::clone(&finished),
+                    ))],
+                },
+                WorkerOverride {
+                    model: ScriptedCompletionModel::new(vec![ScriptedTurn::tool_calls(vec![
+                        ScriptedToolCall::new(
+                            RESUME_FRESH_CALL_ID,
+                            RESUME_NEW_TOOL,
+                            serde_json::json!({ "namespace": "stage" }),
+                        )
+                        .with_call_id(RESUME_NEW_CALL_ID),
+                    ])]),
+                    extra_tools: vec![],
+                },
+            ]);
+            // The continuation builds its coordinator before the loop; the
+            // park path skips the coordinator call, so the script is never
+            // consumed by a request.
+            install_coordinator_overrides(vec![CoordinatorOverride {
+                model: ScriptedCompletionModel::new(vec![resume_direct_turn()]),
+            }]);
+            let factory = granted_factory(&world);
+            let (mut stream, _cancel, _usage) = factory
+                .resume_stream_with_timeout(granted, Duration::from_secs(600), "req_drain_reparked")
+                .await;
+
+            // The re-parked exit arm: the RunParked event (the publication
+            // owner's ONE terminal) rides the stream BEFORE the segment
+            // body ends, with the tracked tail still in flight.
+            let parked = tokio::time::timeout(RESUME_BOUND, stream.next()).await;
+            let Ok(Some(item)) = parked else {
+                panic!(
+                    "a re-parking run publishes its checkpoint and emits \
+                        RunParked within the bound: settled {parked:?}"
+                )
+            };
+            assert!(
+                matches!(
+                    item,
+                    Ok(StreamItem::OrchestratorEvent(
+                        OrchestratorEvent::RunParked { .. }
+                    ))
+                ),
+                "the publication owner's RunParked rides the stream: got {item:?}"
+            );
+
+            // The supervisor is BLOCKED on the drain BEFORE the release
+            // (completed-leg shape): the bounded blocked-window runs
+            // CONCURRENTLY with the hold — the fence stays held and the
+            // stream stays open past the publication owner's RunParked for
+            // the window's whole run; the window then exits and the frame
+            // releases the tail.
+            await_drain_blocked_window(&world, &run, &mut stream).await;
+
+            release.send(()).expect("the gated tail is still held");
+            // The re-parked arm carries no Final: the publication owner's
+            // RunParked is the terminal, and the supervisor's exit drains.
+            let rest = drive_resume_final_text(&mut stream).await;
+            assert!(
+                rest.is_empty(),
+                "a re-parked segment carries no Final — its own terminal is the \
+                 publication owner's RunParked: {rest:?}"
+            );
+            await_resume_release(&world, &run).await;
+        }
+
+        // -------- Leg C: the FAULT exit arm ------------------------------
+        {
+            let _drain = ResumeOverrideDrain;
+            let world = granted_world(|_| {});
+            let granted = granted_run(&world, false).await;
+            let run = granted.run_id().clone();
+            let scope = granted.execution_scope();
+            let spawned = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let finished = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let (release, gate) = tokio::sync::oneshot::channel::<()>();
+            let gate = Arc::new(std::sync::Mutex::new(Some(gate)));
+            install_worker_overrides(vec![WorkerOverride {
+                // The substitution's decided call spawns the tracked tail;
+                // the node's own continuation then fails its provider
+                // stream deterministically (the loop's established
+                // mid-turn error break), faulting the segment AFTER the
+                // tail was spawned.
+                model: ScriptedCompletionModel::new(vec![
+                    ScriptedTurn::tool_calls_then_stream_failure(vec![]),
+                ]),
+                extra_tools: vec![Box::new(ResumeGatedTailTool::new(
+                    scope,
+                    Arc::clone(&gate),
+                    Arc::clone(&spawned),
+                    Arc::clone(&finished),
+                ))],
+            }]);
+            // The fault arm exits the drive loop before an answer, so no
+            // coordinator decision is ever consulted; the queue's script
+            // stays unconsumed (the drain clears what no build consumed).
+            install_coordinator_overrides(vec![CoordinatorOverride {
+                model: ScriptedCompletionModel::new(vec![resume_direct_turn()]),
+            }]);
+            let factory = granted_factory(&world);
+            let (mut stream, _cancel, _usage) = factory
+                .resume_stream_with_timeout(granted, Duration::from_secs(600), "req_drain_fault")
+                .await;
+
+            // The tail spawns during the substitution (still in flight);
+            // then the node's continuation faults.
+            await_tail_spawned(&spawned).await;
+            let faulted = tokio::time::timeout(RESUME_BOUND, stream.next()).await;
+            let Ok(Some(Err(_))) = faulted else {
+                panic!(
+                    "a faulting resumed segment surfaces its error on the \
+                     factory stream within the bound: settled {faulted:?}"
+                )
+            };
+
+            // The supervisor is BLOCKED on the drain BEFORE the release
+            // (completed-leg shape): the bounded blocked-window runs
+            // CONCURRENTLY with the hold — the fence stays held and the
+            // stream stays open past the fault's error item for the
+            // window's whole run; the window then exits and the frame
+            // releases the tail.
+            await_drain_blocked_window(&world, &run, &mut stream).await;
+
+            release.send(()).expect("the gated tail is still held");
+            let _rest = drive_resume_final_text(&mut stream).await;
+            await_resume_release(&world, &run).await;
+            assert!(
+                finished.load(std::sync::atomic::Ordering::Acquire) == 1,
+                "the tracked tail joined only at the fault arm's drain end"
+            );
+        }
+
+        // -------- Leg D: the CANCELLED exit arm -------------------------
+        {
+            let _drain = ResumeOverrideDrain;
+            let world = granted_world(|_| {});
+            let granted = granted_run(&world, false).await;
+            let run = granted.run_id().clone();
+            let scope = granted.execution_scope();
+            let spawned = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let finished = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let (release, gate) = tokio::sync::oneshot::channel::<()>();
+            let gate = Arc::new(std::sync::Mutex::new(Some(gate)));
+            install_worker_overrides(vec![WorkerOverride {
+                // The continuation holds: the cancellation fires while the
+                // node's stream is still live, with the tracked tail held
+                // at its spawn point — the supervisor's cancel arm runs.
+                model: ScriptedCompletionModel::new(vec![ScriptedTurn::tool_calls(vec![
+                    ScriptedToolCall::new(
+                        "call_sub_a",
+                        "submit_result",
+                        serde_json::json!({
+                            "summary": "apply done",
+                            "result": "applied cleanly",
+                            "confidence": "high",
+                        }),
+                    ),
+                ])]),
+                extra_tools: vec![Box::new(ResumeGatedTailTool::new(
+                    scope,
+                    Arc::clone(&gate),
+                    Arc::clone(&spawned),
+                    Arc::clone(&finished),
+                ))],
+            }]);
+            install_coordinator_overrides(vec![CoordinatorOverride {
+                model: ScriptedCompletionModel::new(vec![resume_direct_turn()]),
+            }]);
+            let factory = granted_factory(&world);
+            let (mut stream, cancel_tx, _usage) = factory
+                .resume_stream_with_timeout(
+                    granted,
+                    Duration::from_secs(600),
+                    "req_drain_cancelled",
+                )
+                .await;
+
+            // The tail spawns during the substitution; the run's own
+            // cancellation fires WHILE it is still in flight.
+            await_tail_spawned(&spawned).await;
+            cancel_tx.send(true).expect("the cancellation watch sends");
+
+            // The cancelled run still reaches its stop within the bound.
+            tokio::time::timeout(RESUME_BOUND, stream.next())
+                .await
+                .expect("a cancelling run surfaces its stop within the bound");
+
+            // The supervisor is BLOCKED on the drain BEFORE the release
+            // (completed-leg shape): the bounded blocked-window runs
+            // CONCURRENTLY with the hold — the fence stays held and the
+            // stream stays open past the cancelled arm's stop for the
+            // window's whole run; the window then exits and the frame
+            // releases the tail.
+            await_drain_blocked_window(&world, &run, &mut stream).await;
+
+            release.send(()).expect("the gated tail is still held");
+            await_resume_release(&world, &run).await;
+            assert!(
+                finished.load(std::sync::atomic::Ordering::Acquire) == 1,
+                "the tracked tail completed exactly once, joined at the \
+                 cancelled arm's drain end"
+            );
+        }
     }
 }
