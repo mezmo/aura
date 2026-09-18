@@ -9,7 +9,6 @@
 use std::collections::HashMap;
 
 use super::config::build_coordinator_preamble;
-use super::events::RoutingMode;
 use super::orchestrator::Orchestrator;
 use super::persistence::build_session_context;
 use super::persistence::{
@@ -21,6 +20,7 @@ use super::types::{
     FailedTaskRecord, FailureCategory, FailureSummary, IterationContext, Plan,
     StructuredTaskOutput, Task, TaskStatus,
 };
+use aura_events::orchestration::RoutingMode;
 
 // ========================================================================
 // Helpers — construct realistic test data

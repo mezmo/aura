@@ -1,10 +1,49 @@
-//! Orchestration-specific SSE streaming events.
+//! Orchestration SSE streaming events.
 //!
-//! These events are emitted during orchestrated multi-agent execution to provide
-//! visibility into plan creation, task execution, and synthesis phases.
+//! The single definition of these frames, shared by the web server that emits
+//! them and the CLI that parses them, so the two cannot disagree about a field.
 
 use crate::{format_named_sse, AgentContext, CorrelationContext};
 use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoutingMode {
+    /// Coordinator answered directly without task execution.
+    DirectAnswer,
+    /// Coordinator classified query to a single worker.
+    Routed,
+    /// Full orchestration — multi-task DAG execution.
+    Orchestrated,
+}
+
+impl RoutingMode {
+    /// Derive routing mode from the number of tasks in a plan.
+    pub fn for_plan(task_count: usize) -> Self {
+        if task_count == 1 {
+            Self::Routed
+        } else {
+            Self::Orchestrated
+        }
+    }
+}
+
+/// Phase-level wall-clock spans for one iteration, in milliseconds.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct IterationTimings {
+    /// Prompt → plan created.
+    #[serde(default)]
+    pub planning_ms: u64,
+    /// Plan ready → continuation-prompt entrypoint.
+    #[serde(default)]
+    pub execution_ms: u64,
+    /// Sum of per-task wall durations across the iteration.
+    #[serde(default)]
+    pub task_compute_ms: u64,
+    /// Sum of tool-call durations recorded for the iteration's tasks.
+    #[serde(default)]
+    pub tool_ms: u64,
+}
 
 /// Shared context included in every orchestration SSE event.
 ///
@@ -24,48 +63,24 @@ impl EventContext {
     }
 }
 
-/// How the coordinator routed a query that produced a plan.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RoutingMode {
-    /// Coordinator classified query to a single worker.
-    Routed,
-    /// Full orchestration — multi-task DAG with synthesis + evaluation.
-    Orchestrated,
+/// Shared identity fields for task events (TaskStarted, TaskCompleted).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TaskContext {
+    pub task_id: usize,
+    pub orchestrator_id: String,
+    pub worker_id: String,
 }
 
-impl RoutingMode {
-    /// Derive routing mode from the number of tasks in a plan.
-    pub fn for_plan(task_count: usize) -> Self {
-        if task_count == 1 {
-            Self::Routed
-        } else {
-            Self::Orchestrated
-        }
-    }
+/// Outcome fields shared by completion events (TaskCompleted, ToolCallCompleted).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CompletionOutcome {
+    pub success: bool,
+    pub duration_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<String>,
 }
 
-/// The continuation decision after a phase completes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum PhaseContinuation {
-    /// Proceed to the next phase as planned.
-    #[default]
-    Continue,
-    /// Discard remaining phases and replan based on results so far.
-    Replan,
-}
-
-impl std::fmt::Display for PhaseContinuation {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Continue => write!(f, "continue"),
-            Self::Replan => write!(f, "replan"),
-        }
-    }
-}
-
-/// Constants for SSE event names.
+/// Constants for SSE event names. Import in tests for compile-time linkage.
 pub mod event_names {
     pub const PLAN_CREATED: &str = "aura.orchestrator.plan_created";
     pub const DIRECT_ANSWER: &str = "aura.orchestrator.direct_answer";
@@ -80,8 +95,6 @@ pub mod event_names {
     pub const WORKER_REASONING: &str = "aura.orchestrator.worker_reasoning";
     pub const TOOL_CALL_STARTED: &str = "aura.orchestrator.tool_call_started";
     pub const TOOL_CALL_COMPLETED: &str = "aura.orchestrator.tool_call_completed";
-    pub const PHASE_STARTED: &str = "aura.orchestrator.phase_started";
-    pub const PHASE_COMPLETED: &str = "aura.orchestrator.phase_completed";
 }
 
 /// SSE events specific to orchestration mode.
@@ -94,7 +107,7 @@ pub enum OrchestrationStreamEvent {
     /// Emitted when orchestrator creates a plan from user query.
     PlanCreated {
         goal: String,
-        task_count: usize,
+        tasks: Vec<String>,
         routing_mode: RoutingMode,
         routing_rationale: String,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -120,22 +133,18 @@ pub enum OrchestrationStreamEvent {
     },
     /// Emitted when orchestrator starts a task.
     TaskStarted {
-        task_id: usize,
         description: String,
-        worker_id: String,
-        orchestrator_id: String,
+        #[serde(flatten)]
+        task: TaskContext,
         #[serde(flatten)]
         context: EventContext,
     },
     /// Emitted when orchestrator completes a task.
     TaskCompleted {
-        task_id: usize,
-        success: bool,
-        duration_ms: u64,
-        orchestrator_id: String,
-        worker_id: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        result: Option<String>,
+        #[serde(flatten)]
+        task: TaskContext,
+        #[serde(flatten)]
+        outcome: CompletionOutcome,
         #[serde(flatten)]
         context: EventContext,
     },
@@ -162,26 +171,13 @@ pub enum OrchestrationStreamEvent {
     /// Emitted when orchestrator completes an iteration.
     IterationComplete {
         iteration: usize,
-        quality_score: f32,
-        quality_threshold: f32,
         will_replan: bool,
-        evaluation_skipped: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         reasoning: Option<String>,
-        #[serde(skip_serializing_if = "Vec::is_empty")]
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
         gaps: Vec<String>,
-        /// Prompt → plan created (ms).
-        #[serde(default)]
-        planning_ms: u64,
-        /// Plan ready → continuation-prompt entrypoint (ms), wall-clock.
-        #[serde(default)]
-        execution_ms: u64,
-        /// Sum of per-task wall durations (ms) across the iteration.
-        #[serde(default)]
-        task_compute_ms: u64,
-        /// Sum of tool-call durations (ms) within the iteration.
-        #[serde(default)]
-        tool_ms: u64,
+        #[serde(flatten)]
+        timings: IterationTimings,
         #[serde(flatten)]
         context: EventContext,
     },
@@ -192,7 +188,7 @@ pub enum OrchestrationStreamEvent {
         #[serde(flatten)]
         context: EventContext,
     },
-    /// Emitted when orchestrator starts synthesizing results.
+    /// Emitted when task results are being consolidated for the coordinator.
     Synthesizing {
         iteration: usize,
         #[serde(flatten)]
@@ -223,27 +219,8 @@ pub enum OrchestrationStreamEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         task_id: Option<usize>,
         tool_call_id: String,
-        success: bool,
-        duration_ms: u64,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        result: Option<String>,
         #[serde(flatten)]
-        context: EventContext,
-    },
-    /// Emitted when a phase starts execution.
-    PhaseStarted {
-        phase_id: usize,
-        label: String,
-        orchestrator_id: String,
-        #[serde(flatten)]
-        context: EventContext,
-    },
-    /// Emitted when a phase completes execution.
-    PhaseCompleted {
-        phase_id: usize,
-        label: String,
-        continuation: PhaseContinuation,
-        orchestrator_id: String,
+        outcome: CompletionOutcome,
         #[serde(flatten)]
         context: EventContext,
     },
@@ -266,8 +243,6 @@ impl OrchestrationStreamEvent {
             Self::WorkerReasoning { .. } => event_names::WORKER_REASONING,
             Self::ToolCallStarted { .. } => event_names::TOOL_CALL_STARTED,
             Self::ToolCallCompleted { .. } => event_names::TOOL_CALL_COMPLETED,
-            Self::PhaseStarted { .. } => event_names::PHASE_STARTED,
-            Self::PhaseCompleted { .. } => event_names::PHASE_COMPLETED,
         }
     }
 
@@ -276,9 +251,14 @@ impl OrchestrationStreamEvent {
         format_named_sse(self.event_name(), self)
     }
 
+    // ========================================================================
+    // Constructors
+    // ========================================================================
+
+    /// Create a PlanCreated event.
     pub fn plan_created(
         goal: impl Into<String>,
-        task_count: usize,
+        tasks: Vec<String>,
         routing_mode: RoutingMode,
         routing_rationale: impl Into<String>,
         planning_response: Option<String>,
@@ -286,7 +266,7 @@ impl OrchestrationStreamEvent {
     ) -> Self {
         Self::PlanCreated {
             goal: goal.into(),
-            task_count,
+            tasks,
             routing_mode,
             routing_rationale: routing_rationale.into(),
             planning_response,
@@ -294,6 +274,7 @@ impl OrchestrationStreamEvent {
         }
     }
 
+    /// Create a DirectAnswer event.
     pub fn direct_answer(
         response: impl Into<String>,
         routing_rationale: impl Into<String>,
@@ -306,6 +287,7 @@ impl OrchestrationStreamEvent {
         }
     }
 
+    /// Create a ClarificationNeeded event.
     pub fn clarification_needed(
         question: impl Into<String>,
         options: Option<Vec<String>>,
@@ -320,6 +302,7 @@ impl OrchestrationStreamEvent {
         }
     }
 
+    /// Create a TaskStarted event.
     pub fn task_started(
         task_id: usize,
         description: impl Into<String>,
@@ -328,14 +311,17 @@ impl OrchestrationStreamEvent {
         context: EventContext,
     ) -> Self {
         Self::TaskStarted {
-            task_id,
             description: description.into(),
-            orchestrator_id: orchestrator_id.into(),
-            worker_id: worker_id.into(),
+            task: TaskContext {
+                task_id,
+                orchestrator_id: orchestrator_id.into(),
+                worker_id: worker_id.into(),
+            },
             context,
         }
     }
 
+    /// Create a TaskCompleted event.
     pub fn task_completed(
         task_id: usize,
         success: bool,
@@ -346,12 +332,16 @@ impl OrchestrationStreamEvent {
         context: EventContext,
     ) -> Self {
         Self::TaskCompleted {
-            task_id,
-            success,
-            duration_ms,
-            orchestrator_id: orchestrator_id.into(),
-            worker_id: worker_id.into(),
-            result,
+            task: TaskContext {
+                task_id,
+                orchestrator_id: orchestrator_id.into(),
+                worker_id: worker_id.into(),
+            },
+            outcome: CompletionOutcome {
+                success,
+                duration_ms,
+                result,
+            },
             context,
         }
     }
@@ -395,37 +385,27 @@ impl OrchestrationStreamEvent {
         }
     }
 
+    /// Create an IterationComplete event.
     #[allow(clippy::too_many_arguments)]
     pub fn iteration_complete(
         iteration: usize,
-        quality_score: f32,
-        quality_threshold: f32,
         will_replan: bool,
-        evaluation_skipped: bool,
         reasoning: Option<String>,
         gaps: Vec<String>,
-        planning_ms: u64,
-        execution_ms: u64,
-        task_compute_ms: u64,
-        tool_ms: u64,
+        timings: IterationTimings,
         context: EventContext,
     ) -> Self {
         Self::IterationComplete {
             iteration,
-            quality_score,
-            quality_threshold,
             will_replan,
-            evaluation_skipped,
             reasoning,
             gaps,
-            planning_ms,
-            execution_ms,
-            task_compute_ms,
-            tool_ms,
+            timings,
             context,
         }
     }
 
+    /// Create a ReplanStarted event.
     pub fn replan_started(
         iteration: usize,
         trigger: impl Into<String>,
@@ -438,10 +418,12 @@ impl OrchestrationStreamEvent {
         }
     }
 
+    /// Create a Synthesizing event.
     pub fn synthesizing(iteration: usize, context: EventContext) -> Self {
         Self::Synthesizing { iteration, context }
     }
 
+    /// Create a WorkerReasoning event.
     pub fn worker_reasoning(
         task_id: usize,
         worker_id: impl Into<String>,
@@ -456,6 +438,7 @@ impl OrchestrationStreamEvent {
         }
     }
 
+    /// Create a ToolCallStarted event.
     pub fn tool_call_started(
         task_id: Option<usize>,
         tool_call_id: impl Into<String>,
@@ -474,6 +457,7 @@ impl OrchestrationStreamEvent {
         }
     }
 
+    /// Create a ToolCallCompleted event.
     pub fn tool_call_completed(
         task_id: Option<usize>,
         tool_call_id: impl Into<String>,
@@ -485,40 +469,65 @@ impl OrchestrationStreamEvent {
         Self::ToolCallCompleted {
             task_id,
             tool_call_id: tool_call_id.into(),
-            success,
-            duration_ms,
-            result,
+            outcome: CompletionOutcome {
+                success,
+                duration_ms,
+                result,
+            },
             context,
         }
     }
+}
 
-    pub fn phase_started(
-        phase_id: usize,
-        label: impl Into<String>,
-        orchestrator_id: impl Into<String>,
-        context: EventContext,
-    ) -> Self {
-        Self::PhaseStarted {
-            phase_id,
-            label: label.into(),
-            orchestrator_id: orchestrator_id.into(),
-            context,
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{AgentContext, CorrelationContext};
+
+    fn ctx() -> EventContext {
+        EventContext::new(
+            AgentContext::coordinator(),
+            CorrelationContext::new("test-session", None),
+        )
     }
 
-    pub fn phase_completed(
-        phase_id: usize,
-        label: impl Into<String>,
-        continuation: PhaseContinuation,
-        orchestrator_id: impl Into<String>,
-        context: EventContext,
-    ) -> Self {
-        Self::PhaseCompleted {
-            phase_id,
-            label: label.into(),
-            continuation,
-            orchestrator_id: orchestrator_id.into(),
-            context,
-        }
+    /// The enum is untagged, so a field omitted on the wire must still
+    /// deserialize. Without a default, an absent `gaps` drops the variant and
+    /// the frame binds to whichever later variant its remaining fields fit.
+    #[test]
+    fn iteration_complete_survives_a_roundtrip_with_no_gaps() {
+        let event = OrchestrationStreamEvent::iteration_complete(
+            1,
+            false,
+            Some("done".to_string()),
+            vec![],
+            IterationTimings::default(),
+            ctx(),
+        );
+
+        let json = serde_json::to_string(&event).expect("should serialize");
+        assert!(!json.contains("gaps"));
+
+        let parsed: OrchestrationStreamEvent =
+            serde_json::from_str(&json).expect("should deserialize");
+        assert!(matches!(
+            parsed,
+            OrchestrationStreamEvent::IterationComplete { .. }
+        ));
+    }
+
+    /// Each timing carries its own default for the same reason.
+    #[test]
+    fn iteration_complete_survives_a_roundtrip_with_missing_timings() {
+        let json = r#"{"iteration":2,"will_replan":true,"planning_ms":5,"agent_id":"coordinator","session_id":"s"}"#;
+
+        let parsed: OrchestrationStreamEvent =
+            serde_json::from_str(json).expect("should deserialize");
+
+        let OrchestrationStreamEvent::IterationComplete { timings, .. } = parsed else {
+            panic!("expected IterationComplete, got {parsed:?}");
+        };
+        assert_eq!(timings.planning_ms, 5);
+        assert_eq!(timings.tool_ms, 0);
     }
 }

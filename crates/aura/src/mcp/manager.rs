@@ -82,10 +82,18 @@ impl McpManager {
             info!("Connecting to MCP server: {}", server_name);
 
             let transport = Self::transport_label(server_config).to_string();
-            match manager
-                .connect_and_discover_tools(server_name, server_config)
-                .await
-            {
+            let connect_result = tokio::time::timeout(
+                std::time::Duration::from_secs(mcp_config.connect_timeout_secs),
+                manager.connect_and_discover_tools(server_name, server_config),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                Err(BuilderError::McpInitError(format!(
+                    "Connection timed out after {}s",
+                    mcp_config.connect_timeout_secs
+                )))
+            });
+            match connect_result {
                 Ok(tools_count) => {
                     manager.server_info.insert(
                         server_name.clone(),
@@ -797,41 +805,36 @@ impl McpManager {
         total_cancelled
     }
 
-    /// Set the current HTTP request ID for cancellation tracking.
-    pub async fn set_current_request(&self, http_request_id: &str) {
-        for client in self.streamable_clients.values() {
-            client.set_current_request(http_request_id).await;
+    /// Every connected client, across all three transports.
+    fn clients(&self) -> impl Iterator<Item = &McpClient> {
+        self.streamable_clients
+            .values()
+            .chain(self.sse_clients.values())
+            .chain(self.stdio_clients.values())
+    }
+
+    /// Name the request these clients are serving and the agent it belongs to.
+    pub async fn set_current_call(&self, http_request_id: &str, agent: aura_events::AgentContext) {
+        let mut total_clients = 0;
+        for client in self.clients() {
+            client
+                .set_current_call(http_request_id, agent.clone())
+                .await;
+            total_clients += 1;
         }
-        for client in self.sse_clients.values() {
-            client.set_current_request(http_request_id).await;
-        }
-        for client in self.stdio_clients.values() {
-            client.set_current_request(http_request_id).await;
-        }
-        let total_clients =
-            self.streamable_clients.len() + self.sse_clients.len() + self.stdio_clients.len();
         debug!(
-            "Set current HTTP request ID on {} MCP client(s): {}",
+            "Set current call on {} MCP client(s): {}",
             total_clients, http_request_id
         );
     }
 
-    pub async fn clear_current_request(&self) {
-        for client in self.streamable_clients.values() {
-            client.clear_current_request().await;
+    pub async fn clear_current_call(&self) {
+        let mut total_clients = 0;
+        for client in self.clients() {
+            client.clear_current_call().await;
+            total_clients += 1;
         }
-        for client in self.sse_clients.values() {
-            client.clear_current_request().await;
-        }
-        for client in self.stdio_clients.values() {
-            client.clear_current_request().await;
-        }
-        let total_clients =
-            self.streamable_clients.len() + self.sse_clients.len() + self.stdio_clients.len();
-        debug!(
-            "Cleared current HTTP request ID on {} MCP client(s)",
-            total_clients
-        );
+        debug!("Cleared current call on {} MCP client(s)", total_clients);
     }
 
     /// Get all available tool names across all transports.
@@ -1223,6 +1226,55 @@ mod tests {
         assert_eq!(snapshot[1].status, "connected");
         assert_eq!(snapshot[1].tools_count, 0);
         assert_eq!(snapshot[1].reason, None);
+    }
+
+    /// A server that accepts the TCP connection but never speaks HTTP must
+    /// not hang `initialize_from_config` past `connect_timeout_secs` (#305).
+    #[tokio::test]
+    async fn initialize_from_config_times_out_on_hung_server() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            // Accept and hold the connection open without ever responding.
+            // Keeping the accepted stream alive (not just the listener) is
+            // what makes the client hang instead of seeing a reset.
+            let (_stream, _addr) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        let mut servers = HashMap::new();
+        servers.insert(
+            "hung".to_string(),
+            McpServerConfig::HttpStreamable {
+                url: format!("http://{addr}"),
+                headers: HashMap::new(),
+                description: None,
+                headers_from_request: HashMap::new(),
+                scratchpad: HashMap::new(),
+                user_agent: None,
+            },
+        );
+        let mcp_config = McpConfig {
+            servers,
+            connect_timeout_secs: 1,
+            ..Default::default()
+        };
+
+        let manager = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            McpManager::initialize_from_config(&mcp_config),
+        )
+        .await
+        .expect("initialize_from_config must not hang past connect_timeout_secs")
+        .expect("manager construction itself does not fail on a per-server timeout");
+
+        let status = &manager.server_info["hung"].status;
+        match status {
+            ConnectionStatus::Failed(reason) => {
+                assert!(reason.contains("timed out"), "got reason: {reason}")
+            }
+            other => panic!("expected Failed(timed out), got {other:?}"),
+        }
     }
 
     // ========================================

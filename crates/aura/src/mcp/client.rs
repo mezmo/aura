@@ -28,7 +28,9 @@ use tracing::{debug, error, info, warn};
 use crate::approver_headers::ApproverHeaders;
 use crate::mcp::progress::ProgressEnabledHandler;
 use crate::mcp::response::extract_tool_result;
-use crate::tool_event_broker::{peek_tool_call_id, publish_tool_start};
+use crate::tool_event_broker::{ToolName, peek_tool_call_id};
+use aura_events::AgentContext;
+use aura_events::agent::{AgentEvent, AgentEventPayload};
 
 /// Custom HTTP client that captures the underlying HTTP status when a request
 /// fails.
@@ -368,8 +370,16 @@ pub struct McpClient {
     server_url: String,
     /// Tracks in-flight MCP requests for cancellation support
     in_flight: Arc<InFlightRequests>,
-    /// Current HTTP request ID for automatic cancellation tracking.
-    current_http_request_id: Arc<RwLock<Option<String>>>,
+    current_call: Arc<RwLock<Option<CallContext>>>,
+}
+
+/// The request an MCP client is currently serving, and the agent on whose
+/// behalf it serves it. Cancellation tracking keys off `request_id`; emitted
+/// events are attributed to `agent`.
+#[derive(Clone, Debug)]
+pub struct CallContext {
+    pub request_id: String,
+    pub agent: AgentContext,
 }
 
 impl Clone for McpClient {
@@ -378,7 +388,7 @@ impl Clone for McpClient {
             client: self.client.clone(),
             server_url: self.server_url.clone(),
             in_flight: self.in_flight.clone(),
-            current_http_request_id: self.current_http_request_id.clone(),
+            current_call: self.current_call.clone(),
         }
     }
 }
@@ -397,8 +407,8 @@ impl McpClient {
         T: rmcp::transport::Transport<RoleClient> + Send + 'static,
         T::Error: std::error::Error + Send + Sync + 'static,
     {
-        let current_http_request_id = Arc::new(RwLock::new(None));
-        let handler = ProgressEnabledHandler::new(Arc::clone(&current_http_request_id), user_agent);
+        let current_call = Arc::new(RwLock::new(None));
+        let handler = ProgressEnabledHandler::new(Arc::clone(&current_call), user_agent);
 
         let client = serve_client(handler, transport)
             .await
@@ -408,7 +418,7 @@ impl McpClient {
             client: Arc::new(client),
             server_url,
             in_flight: Arc::new(InFlightRequests::new()),
-            current_http_request_id,
+            current_call,
         })
     }
 
@@ -485,27 +495,38 @@ impl McpClient {
         Ok(client)
     }
 
-    /// Set the current HTTP request ID for cancellation tracking.
-    pub async fn set_current_request(&self, http_request_id: &str) {
-        let mut guard = self.current_http_request_id.write().await;
-        *guard = Some(http_request_id.to_string());
-        debug!(
-            "Set current HTTP request ID for MCP client: {}",
-            http_request_id
-        );
+    /// Request id and agent are stored together so a reader sees one
+    /// request's id paired with that same request's agent.
+    pub async fn set_current_call(&self, request_id: &str, agent: AgentContext) {
+        *self.current_call.write().await = Some(CallContext {
+            request_id: request_id.to_string(),
+            agent,
+        });
+        debug!("Set current call for MCP client: {}", request_id);
     }
 
-    /// Clear the current HTTP request ID.
-    pub async fn clear_current_request(&self) {
-        let mut guard = self.current_http_request_id.write().await;
-        if let Some(ref id) = *guard {
-            debug!("Cleared current HTTP request ID: {}", id);
+    pub async fn clear_current_call(&self) {
+        let mut guard = self.current_call.write().await;
+        if let Some(call) = guard.take() {
+            debug!("Cleared current call: {}", call.request_id);
         }
-        *guard = None;
     }
 
     pub async fn get_current_request(&self) -> Option<String> {
-        self.current_http_request_id.read().await.clone()
+        let guard = self.current_call.read().await;
+        guard.as_ref().map(|call| call.request_id.clone())
+    }
+
+    /// The agent named for `request_id`. A client serving a different request,
+    /// or none, yields the single-agent context — the same value the SSE
+    /// handler stamps on a frame that arrives without an agent.
+    async fn agent_for(&self, request_id: &str) -> AgentContext {
+        let guard = self.current_call.read().await;
+        guard
+            .as_ref()
+            .filter(|call| call.request_id == request_id)
+            .map(|call| call.agent.clone())
+            .unwrap_or_else(AgentContext::single_agent)
     }
 
     pub async fn discover_tools(&self) -> Result<Vec<Tool>> {
@@ -787,11 +808,19 @@ impl McpClient {
         let progress_token = Some(handle.progress_token.clone());
         let request_id_string = http_request_id.to_string();
         if let Some(tool_call_id) = peek_tool_call_id(&request_id_string).await {
-            publish_tool_start(
+            let agent = self.agent_for(http_request_id).await;
+            let _ = crate::agent_events::emit(
                 http_request_id,
-                tool_call_id.clone(),
-                tool_name.to_string(),
-                progress_token.clone(),
+                AgentEvent::new(
+                    agent,
+                    AgentEventPayload::ToolStart {
+                        arguments: None,
+                        task_id: None,
+                        tool_call_id: tool_call_id.clone(),
+                        tool_name: ToolName::new(tool_name),
+                        progress_token: progress_token.clone(),
+                    },
+                ),
             )
             .await;
             debug!(
@@ -903,8 +932,8 @@ impl McpClient {
     pub async fn cancel_and_close(&self, http_request_id: &str, reason: &str) -> usize {
         let count = self.cancel_all_for_request(http_request_id, reason).await;
 
-        // Also clear the request ID to stop routing any straggler progress notifications
-        self.clear_current_request().await;
+        // Also clear the call to stop routing any straggler progress notifications
+        self.clear_current_call().await;
 
         // Forcefully close connection - server is ignoring cancellation anyway
         self.close_connection();
@@ -1405,6 +1434,35 @@ pub(crate) mod tests {
         }
     }
 
+    /// Attribution is guarded by request id, so a client still holding a
+    /// finished request's context cannot lend that agent to the next one.
+    #[tokio::test]
+    async fn agent_for_answers_only_for_the_request_that_named_it() {
+        let (_server, client) = client_and_server(&requester_headers()).await;
+        let worker = AgentContext::worker("log_worker", None, "coordinator");
+
+        assert_eq!(
+            client.agent_for("req-1").await,
+            AgentContext::single_agent(),
+            "an unnamed client falls back to the single-agent context"
+        );
+
+        client.set_current_call("req-1", worker.clone()).await;
+        assert_eq!(client.agent_for("req-1").await, worker);
+        assert_eq!(
+            client.agent_for("req-2").await,
+            AgentContext::single_agent(),
+            "another request's id must not pick up this call's agent"
+        );
+
+        client.clear_current_call().await;
+        assert_eq!(
+            client.agent_for("req-1").await,
+            AgentContext::single_agent(),
+            "clearing the call drops the agent with the request id"
+        );
+    }
+
     /// `set_current_request` selects the tracked branch, so this is the same entry point a gated call takes in the server and the branch choice must not decide whether identity is delivered.
     #[tokio::test]
     async fn call_tool_delivers_the_override_on_either_branch() {
@@ -1419,7 +1477,9 @@ pub(crate) mod tests {
             .await
             .expect("the untracked call succeeds");
 
-        client.set_current_request("http-req-1").await;
+        client
+            .set_current_call("http-req-1", AgentContext::single_agent())
+            .await;
         client
             .call_tool(
                 "tracked",

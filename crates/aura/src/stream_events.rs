@@ -314,6 +314,7 @@ mod tests {
             18777,
             500,
             19277,
+            AgentContext::single_agent(),
             CorrelationContext::new("sess_123", None),
         );
         let sse = event.format_sse();
@@ -351,8 +352,14 @@ mod tests {
             AuraStreamEvent::session_info("gpt-4", None, CorrelationContext::default());
         assert_eq!(session_info.event_name(), event_names::SESSION_INFO);
 
-        let tool_usage =
-            AuraStreamEvent::tool_usage(vec![], 0, 0, 0, CorrelationContext::default());
+        let tool_usage = AuraStreamEvent::tool_usage(
+            vec![],
+            0,
+            0,
+            0,
+            AgentContext::single_agent(),
+            CorrelationContext::default(),
+        );
         assert_eq!(tool_usage.event_name(), event_names::TOOL_USAGE);
 
         let usage = AuraStreamEvent::usage(0, 0, 0, None, CorrelationContext::default());
