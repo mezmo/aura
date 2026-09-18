@@ -7705,7 +7705,7 @@ async fn s4_resumed_worker_starts_fresh_call_counters() {
     assert!(
         wire_history
             .to_string()
-            .contains(&format!("identical arguments 2 times")),
+            .contains("identical arguments 2 times"),
         "the FIRST repeated call's guard annotation counts EXACTLY 2 — the resumed \
          execution's substitution call (1) plus the worker's one fresh repeat: the \
          worker's call counters started at zero (history rendered {wire_history})"
@@ -7715,7 +7715,7 @@ async fn s4_resumed_worker_starts_fresh_call_counters() {
     assert!(
         wire_history_2
             .to_string()
-            .contains(&format!("identical arguments 3 times")),
+            .contains("identical arguments 3 times"),
         "the SECOND repeated call crosses the block threshold at count 3 — no \
          checkpoint history arithmetic piggybacks (history rendered {wire_history_2})"
     );
