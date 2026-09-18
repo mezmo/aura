@@ -5278,3 +5278,507 @@ fn outcome_pair_and_sentinel_literals_match_the_wire_serializers() {
         "the denial's wire form is the JSON-quoted live denial text"
     );
 }
+
+// =====================================================================
+// E4-R goldens (the RESERVATION wave, aura/P57): the reserved
+// rename-back and conversion seams (SKELETON rows 10/11 — RED today,
+// each raising its documented todo), the ordered entry (reserve
+// precedes the consult — RED behavioral today), and the pending-outcome
+// release regression guard.
+// =====================================================================
+
+use super::claim::ClaimResumeFault;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// A one-shot stalling store double: every operation forwards to the
+/// wrapped file store exactly as the E3 fault double forwards to its
+/// inner store, EXCEPT `get`, which stalls exactly the FIRST call —
+/// signals arrival, awaits the release gate — then forwards the read.
+/// Every later `get` forwards immediately.
+struct StallingGetStore {
+    inner: Arc<crate::session_store::FileApprovalStore>,
+    /// Notified when the first stalling `get` arrives inside the consult.
+    arrived: Arc<tokio::sync::Notify>,
+    /// The one-shot release the stalling `get` awaits.
+    release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    /// Whether the first `get` already stalled.
+    stalled: AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl ApprovalStore for StallingGetStore {
+    async fn register(
+        &self,
+        parked: ParkedApproval,
+    ) -> Result<(), crate::session_store::SessionStoreError> {
+        self.inner.register(parked).await
+    }
+
+    async fn mark_acknowledged(
+        &self,
+        id: &DecisionId,
+    ) -> Result<crate::session_store::AcknowledgeOutcome, crate::session_store::SessionStoreError>
+    {
+        self.inner.mark_acknowledged(id).await
+    }
+
+    async fn get(
+        &self,
+        id: &DecisionId,
+    ) -> Result<Option<ParkedApproval>, crate::session_store::SessionStoreError> {
+        if !self.stalled.swap(true, Ordering::SeqCst) {
+            self.arrived.notify_one();
+            let release = self
+                .release
+                .lock()
+                .expect("the stalling store's release gate")
+                .take()
+                .expect("the stalling get's release is supplied exactly once");
+            let _ = release.await;
+        }
+        self.inner.get(id).await
+    }
+
+    async fn resolve(
+        &self,
+        id: &DecisionId,
+        expected_authority: crate::hitl::ApprovalAuthority,
+        decision: ResolvedDecision,
+    ) -> Result<(), crate::hitl::ResolveError> {
+        self.inner.resolve(id, expected_authority, decision).await
+    }
+
+    async fn decision(
+        &self,
+        id: &DecisionId,
+    ) -> Result<Option<ResolvedDecision>, crate::session_store::SessionStoreError> {
+        self.inner.decision(id).await
+    }
+
+    async fn remove(&self, id: &DecisionId) -> Result<(), crate::session_store::SessionStoreError> {
+        self.inner.remove(id).await
+    }
+
+    async fn cancel_request(
+        &self,
+        request_id: &str,
+    ) -> Result<Vec<ParkedApproval>, crate::session_store::SessionStoreError> {
+        self.inner.cancel_request(request_id).await
+    }
+
+    async fn list_pending(
+        &self,
+    ) -> Result<Vec<ParkedApproval>, crate::session_store::SessionStoreError> {
+        self.inner.list_pending().await
+    }
+
+    async fn read_or_expire(
+        &self,
+        id: &DecisionId,
+        expected_authority: crate::hitl::ApprovalAuthority,
+    ) -> Result<crate::hitl::ApprovalRead, crate::session_store::SessionStoreError> {
+        self.inner.read_or_expire(id, expected_authority).await
+    }
+
+    async fn retained_rows(
+        &self,
+    ) -> Result<Vec<crate::session_store::RetainedApproval>, crate::session_store::SessionStoreError>
+    {
+        self.inner.retained_rows().await
+    }
+}
+
+/// The gate the ordered-entry golden holds against its stalling world.
+struct StallingGetGate {
+    /// Notified when the first POST's consult reaches its store read.
+    arrived: Arc<tokio::sync::Notify>,
+    /// The release that lets the stalled consult proceed.
+    release: tokio::sync::oneshot::Sender<()>,
+}
+
+/// The ordered-entry world: the default world's store and worker surface
+/// recomposed over the stalling store double, with a HITL closure in the
+/// unreachable-URL poll-route shape the identity frames use — the consult
+/// never reaches the network, and the run's consult read stalls on the
+/// double for exactly one call.
+fn world_over_stalling_get() -> (World, StallingGetGate) {
+    let dir = tempfile::tempdir().expect("temp memory root");
+    std::fs::create_dir_all(dir.path().join("approvals")).expect("approval dir");
+    let store = Arc::new(
+        crate::session_store::FileApprovalStore::open(dir.path().join("approvals"))
+            .expect("file approval store"),
+    );
+    let (release, held) = tokio::sync::oneshot::channel::<()>();
+    let arrived = Arc::new(tokio::sync::Notify::new());
+    let double = StallingGetStore {
+        inner: Arc::clone(&store),
+        arrived: Arc::clone(&arrived),
+        release: Mutex::new(Some(held)),
+        stalled: AtomicBool::new(false),
+    };
+    let registry = PendingApprovals::with_backend(
+        std::sync::Arc::new(double) as Arc<dyn crate::session_store::ApprovalStore>,
+        Arc::new(crate::session_store::InMemoryEventBus::new())
+            as Arc<dyn crate::session_store::EventBus>,
+    );
+    let memory_dir = dir.path().join("memory").to_string_lossy().into_owned();
+    std::fs::create_dir_all(&memory_dir).expect("memory dir");
+    let mut workers = HashMap::new();
+    workers.insert(
+        "operations".to_string(),
+        WorkerConfig {
+            description: "Runs the gated apply".to_string(),
+            preamble: "You apply changes with the gated tools.".to_string(),
+            mcp_filter: Some(vec![]),
+            vector_stores: vec![],
+            turn_depth: None,
+            llm: None,
+            scratchpad: None,
+            skills: None,
+        },
+    );
+    let config = AgentRuntimeConfig {
+        hitl: Some(hitl_closure(&registry)),
+        memory_dir: Some(memory_dir.clone()),
+        session_id: Some(SESSION.to_string()),
+        request_id: Some(REQUEST_ID.to_string()),
+        orchestration: Some(OrchestrationConfig {
+            enabled: true,
+            workers,
+            ..Default::default()
+        }),
+        ..AgentRuntimeConfig::default()
+    };
+    let world = World {
+        dir,
+        memory_dir,
+        store,
+        registry,
+        config,
+        claims: ResumeClaimTable::new(),
+        _receiver: tokio::spawn(async {}),
+    };
+    (world, StallingGetGate { arrived, release })
+}
+
+/// The unreachable-URL poll-route HITL closure the identity frames build
+/// with: same shape, no receiver to connect.
+fn hitl_closure(registry: &PendingApprovals) -> crate::hitl::HitlRuntime {
+    let config = aura_config::HitlConfig {
+        require_approval: vec![aura_config::GlobPattern::new("kubectl_*").unwrap()],
+        park: aura_config::ParkConfig {
+            enabled: true,
+            bind_identity: false,
+            park_ttl: aura_config::ParkTtl::default(),
+        },
+        route: aura_config::DecisionRouteConfig::Webhook {
+            url: aura_config::WebhookUrl::new("https://approvals.example.com/hook").unwrap(),
+            timeout_secs: 3600,
+            headers: HashMap::new(),
+            headers_from_request: HashMap::new(),
+            tool_headers_from_response: crate::approver_headers::tests::mappings(&[(
+                "x-forwarded-user",
+                "x-approver-id",
+            )]),
+            delivery: aura_config::WebhookDelivery::Poll,
+            poll_url: None,
+            poll_interval_secs: 10,
+            poll_request_timeout_secs: 30,
+            receiver_wait_timeout_secs: 900,
+        },
+    };
+    crate::hitl::HitlRuntime::from_config(&config, registry, None, None)
+}
+
+/// A resuming document is renamed back to its parked name under the held
+/// reservation: the run is live while the fenced seam runs, the blocking
+/// rename tail completes with the parked path restored and the resuming
+/// path gone, and dropping the lease reference releases the run.
+#[tokio::test]
+async fn reservation_rename_back_restores_the_parked_name_under_the_held_reservation() {
+    let world = world();
+    stage_resuming_document(
+        &world,
+        &parked_document(FUTURE_STAMP, matching_fingerprint(&world), None, vec![]),
+    )
+    .await;
+
+    let path = ValidatedResumePath::parse(SESSION, RUN).expect("golden path validates");
+    let docs = ResumeDocuments::for_path(&path, &world.memory_dir);
+    let reservation = world
+        .claims
+        .reserve(&path.run)
+        .expect("the fresh run reserves");
+    assert!(
+        world.claims.is_live(&path.run),
+        "the reserved run is live while the fenced rename-back runs"
+    );
+
+    world
+        .claims
+        .rename_back_under_reservation(&reservation, &docs)
+        .await
+        .expect("the fenced rename-back completes");
+
+    assert!(
+        parked_document_path(&world).exists(),
+        "the fenced rename-back restored the parked name"
+    );
+    assert!(
+        !resuming_document_path(&world).exists(),
+        "the resuming name is gone after the fenced rename-back"
+    );
+    drop(reservation);
+    assert!(
+        !world.claims.is_live(&path.run),
+        "dropping the lease reference releases the run"
+    );
+}
+
+/// A rename the filesystem refuses answers the availability arm while the
+/// reservation stays held: a directory at the rename destination makes the
+/// rename fail deterministically, and the fenced seam's fault is the
+/// availability arm, never the live or internal arm.
+#[tokio::test]
+async fn reservation_rename_back_maps_a_failed_rename_to_unavailable() {
+    let world = world();
+    stage_resuming_document(
+        &world,
+        &parked_document(FUTURE_STAMP, matching_fingerprint(&world), None, vec![]),
+    )
+    .await;
+    let path = ValidatedResumePath::parse(SESSION, RUN).expect("golden path validates");
+    let docs = ResumeDocuments::for_path(&path, &world.memory_dir);
+    let reservation = world
+        .claims
+        .reserve(&path.run)
+        .expect("the fresh run reserves");
+    // A directory occupying the parked name makes the resuming → parked
+    // rename fail deterministically on every platform: the destination
+    // must be replaced, not descended into.
+    std::fs::create_dir_all(parked_document_path(&world)).expect("stage the destination obstacle");
+
+    match world
+        .claims
+        .rename_back_under_reservation(&reservation, &docs)
+        .await
+    {
+        Err(ClaimResumeFault::Unavailable(_)) => {}
+        other => panic!("a filesystem-refused rename answers the availability arm, got {other:?}"),
+    }
+    // The directory stays in place; the TempDir cleanup removes it.
+}
+
+/// A rename with neither name on disk answers the availability arm: the
+/// resuming name is absent and no parked name exists to have lost a race,
+/// so there is no live hold and no internal fault to answer instead.
+#[tokio::test]
+async fn reservation_rename_back_maps_a_missing_pair_to_unavailable() {
+    let world = world();
+    let path = ValidatedResumePath::parse(SESSION, RUN).expect("golden path validates");
+    let docs = ResumeDocuments::for_path(&path, &world.memory_dir);
+    let reservation = world
+        .claims
+        .reserve(&path.run)
+        .expect("the fresh run reserves");
+
+    match world
+        .claims
+        .rename_back_under_reservation(&reservation, &docs)
+        .await
+    {
+        Err(ClaimResumeFault::Unavailable(_)) => {}
+        other => panic!("a missing document pair answers the availability arm, got {other:?}"),
+    }
+}
+
+/// The held reservation converts into the grant and nothing else: the
+/// parked document renames to its resuming name under that same
+/// reservation — no second acquisition, no ownerless gap — and the grant
+/// assembles owning the run's ONE execution scope, the Arc its accessor
+/// hands out twice being one shared scope, while the grant lives the run
+/// stays reserved and its drop releases it.
+#[tokio::test]
+async fn reservation_convert_reserved_grants_owning_the_held_reservation_and_one_scope() {
+    let world = world();
+    register_decided(&world).await;
+    publish_document(
+        &world,
+        &parked_document(FUTURE_STAMP, matching_fingerprint(&world), None, vec![]),
+    )
+    .await;
+
+    let path = ValidatedResumePath::parse(SESSION, RUN).expect("golden path validates");
+    let session = path.session.clone();
+    let run = path.run.clone();
+    let docs = ResumeDocuments::for_path(&path, &world.memory_dir);
+    let reserved = ReservedEvaluation::new(
+        world.claims.reserve(&run).expect("the fresh run reserves"),
+        docs,
+        parked_document(FUTURE_STAMP, matching_fingerprint(&world), None, vec![]),
+    );
+
+    let grant = convert_reserved(
+        &world.claims,
+        reserved,
+        session,
+        run.clone(),
+        Arc::new(super::super::RecordedDecisions::default()),
+        vec![],
+    )
+    .await
+    .expect("the held reservation converts into the grant");
+
+    assert!(
+        resuming_document_path(&world).exists(),
+        "the consuming conversion renamed the parked document to its resuming name"
+    );
+    assert!(
+        !parked_document_path(&world).exists(),
+        "the parked name is gone after the consuming conversion"
+    );
+    assert!(
+        world.claims.is_live(&run),
+        "the run stays reserved while the grant lives"
+    );
+    assert!(
+        Arc::ptr_eq(&grant.execution_scope(), &grant.execution_scope()),
+        "the grant's scope accessor clones the ONE scope Arc, never a fresh scope"
+    );
+    drop(grant);
+    assert!(
+        !world.claims.is_live(&run),
+        "the grant dropping releases the reservation"
+    );
+}
+
+/// A refused conversion releases the reservation with no execution: a
+/// directory at the resuming name makes the conversion's rename fail, the
+/// fault answers the availability arm, and the run is not live after the
+/// refusal — no execution may ride a refused conversion.
+#[tokio::test]
+async fn reservation_convert_reserved_maps_a_failed_rename_to_unavailable_and_releases() {
+    let world = world();
+    register_decided(&world).await;
+    publish_document(
+        &world,
+        &parked_document(FUTURE_STAMP, matching_fingerprint(&world), None, vec![]),
+    )
+    .await;
+
+    let path = ValidatedResumePath::parse(SESSION, RUN).expect("golden path validates");
+    let session = path.session.clone();
+    let run = path.run.clone();
+    let docs = ResumeDocuments::for_path(&path, &world.memory_dir);
+    let reserved = ReservedEvaluation::new(
+        world.claims.reserve(&run).expect("the fresh run reserves"),
+        docs,
+        parked_document(FUTURE_STAMP, matching_fingerprint(&world), None, vec![]),
+    );
+    // A directory occupying the resuming name makes the parked → resuming
+    // rename fail deterministically on every platform.
+    std::fs::create_dir_all(resuming_document_path(&world))
+        .expect("stage the resuming-name obstacle");
+
+    match convert_reserved(
+        &world.claims,
+        reserved,
+        session,
+        run.clone(),
+        Arc::new(super::super::RecordedDecisions::default()),
+        vec![],
+    )
+    .await
+    {
+        Err(ClaimResumeFault::Unavailable(_)) => {}
+        other => {
+            panic!("a filesystem-refused conversion answers the availability arm, got {other:?}")
+        }
+    }
+    assert!(
+        !world.claims.is_live(&run),
+        "a refused conversion releases the reservation with no execution"
+    );
+}
+
+/// The ordered entry fences the consult: while a first POST is blocked
+/// inside its consult's store read, a second POST of the same run answers
+/// the running row — the run's reservation was pinned at step 2, before
+/// the consult, so no second evaluation can consult unreserved — and the
+/// first POST, released, answers the parked row. No ownerless gap.
+#[tokio::test]
+async fn reservation_second_post_during_the_consult_answers_running() {
+    let (world, gate) = world_over_stalling_get();
+    register_undecided(&world).await;
+    publish_document(
+        &world,
+        &parked_document(FUTURE_STAMP, matching_fingerprint(&world), None, vec![]),
+    )
+    .await;
+    let world = Arc::new(world);
+
+    let first = tokio::spawn({
+        let world = Arc::clone(&world);
+        async move { evaluate_resume(evaluation(&world, false, None)).await }
+    });
+    gate.arrived.notified().await;
+
+    let refusal = evaluate_resume(evaluation(&world, false, None))
+        .await
+        .expect_err("the second post of a held-back run refuses");
+    assert_conflict(
+        refusal,
+        json!({
+            "code": "running",
+            "detail": "another resume holds this run",
+            "blocking": [],
+        }),
+    );
+
+    gate.release
+        .send(())
+        .expect("the stalling consult's gate releases");
+    let first_refusal = first
+        .await
+        .expect("the first post's task completes")
+        .expect_err("the undecided first post answers the parked row");
+    assert_conflict(
+        first_refusal,
+        json!({
+            "code": "parked",
+            "detail": "calls still await a decision",
+            "blocking": [entry(decision(), TOOL, FUTURE_STAMP)],
+        }),
+    );
+}
+
+/// A pending outcome releases the reservation: the undecided-run POST
+/// answers the parked row and the run is not live after the refusal — no
+/// reservation may leak on the release-with-no-execution path.
+#[tokio::test]
+async fn reservation_pending_outcome_releases_the_reservation() {
+    let world = world();
+    register_undecided(&world).await;
+    publish_document(
+        &world,
+        &parked_document(FUTURE_STAMP, matching_fingerprint(&world), None, vec![]),
+    )
+    .await;
+
+    let refusal = evaluate_resume(evaluation(&world, false, None))
+        .await
+        .expect_err("the undecided call refuses");
+    assert_conflict(
+        refusal,
+        json!({
+            "code": "parked",
+            "detail": "calls still await a decision",
+            "blocking": [entry(decision(), TOOL, FUTURE_STAMP)],
+        }),
+    );
+    let path = ValidatedResumePath::parse(SESSION, RUN).expect("golden path validates");
+    assert!(
+        !world.claims.is_live(&path.run),
+        "a refused outcome releases the reservation with no execution"
+    );
+}
