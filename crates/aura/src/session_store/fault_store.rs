@@ -77,4 +77,8 @@ impl ApprovalStore for FaultInjectingStore {
     ) -> Result<Vec<ParkedApproval>, SessionStoreError> {
         self.inner.cancel_request(request_id).await
     }
+
+    async fn list_pending(&self) -> Result<Vec<ParkedApproval>, SessionStoreError> {
+        self.inner.list_pending().await
+    }
 }
