@@ -5,6 +5,7 @@
 //! when a request arrives, ensuring MCP progress notifications route correctly
 //! and avoiding duplicate resource allocation.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -19,7 +20,9 @@ use crate::streaming::StreamingAgent;
 use super::orchestrator::{
     Orchestrator, STREAM_CHUNK_SIZE, spawn_cancellation_watcher, spawn_tool_event_forwarder,
 };
-use super::park::resume::{ResumeClaimTable, ResumeGrant, ResumeRunId};
+use super::park::resume::{
+    ResumeClaimTable, ResumeGrant, ResumeRunId, ResumeStreamEnd, SegmentError, run_segment_borrowed,
+};
 use super::{ReservationFault, RunExecutionScope};
 use std::sync::Arc;
 
@@ -89,23 +92,185 @@ impl OrchestratorFactory {
     /// The spawned supervisor owns the grant's reservation lease for the
     /// whole resumed execution: cancellation, MCP shutdown, forwarder drain,
     /// and tracked-child joins complete before the fence releases.
-    #[expect(
-        unused_variables,
-        reason = "todo!() body; filled by P45 wave fill units"
-    )]
     pub async fn resume_stream_with_timeout(
         &self,
         grant: ResumeGrant,
         timeout: Duration,
-        request_id: &str,
+        _request_id: &str,
     ) -> (
         BoxStream<'static, Result<StreamItem, StreamError>>,
         watch::Sender<bool>,
         crate::UsageState,
     ) {
-        todo!(
-            "P45 wave fill unit S3: the factory supervisor that drives the granted run through the owned resume segment"
-        )
+        // The same channel bound the chat path's supervisor uses: the
+        // driver's forwarded segment events and this supervisor's exit-arm
+        // sends share one capacity, so the resumed path back-pressures
+        // exactly like the fresh one.
+        let (event_tx, event_rx) =
+            tokio::sync::mpsc::channel::<Result<StreamItem, StreamError>>(100);
+
+        // The caller's cancellation surface, and the request-scoped watcher
+        // that bridges it to the grant's ONE execution scope — the resumed
+        // segment's sole cancellation path. Cancellation-prioritized
+        // (biased, the chat path's precedent): an already-latched cancel
+        // wins over a simultaneous start, so a cancelling consumer never
+        // races a late bridge. The watcher holds only the token clone,
+        // never the scope `Arc`, so a parked watcher owns no lease and the
+        // reservation fence releases with the supervisor's drive. Dropping
+        // the watch sender with no explicit signal is an unexplained abort
+        // and fails safe by cancelling (#305) — a no-op on an ended run.
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let scope = grant.execution_scope();
+        let watcher_token = scope.cancellation().clone();
+        let _watcher_handle = tokio::spawn(async move {
+            tokio::select! {
+                biased;
+                _ = watcher_token.cancelled() => {
+                    // The run's execution already ended: nothing left to
+                    // bridge.
+                }
+                _ = async {
+                    let mut cancel_rx = cancel_rx;
+                    loop {
+                        if cancel_rx.changed().await.is_err() {
+                            return; // sender dropped: fail safe (#305)
+                        }
+                        if !*cancel_rx.borrow_and_update() {
+                            continue;
+                        }
+                        return; // external cancellation requested
+                    }
+                } => {}
+            }
+            watcher_token.cancel();
+        });
+
+        // The factory projection: the zero-timeout convention. A zero
+        // timeout means no outer budget, not an instantly exhausted one.
+        let outer_budget = (!timeout.is_zero()).then_some(timeout);
+
+        // The supervisor: spawn the resumed execution and return its
+        // stream. The grant stays OWNED here across cancellation — the
+        // segment drive future borrows it and is never cancelled, so the
+        // grant is never moved into a cancellable select arm.
+        let agent_config = self.agent_config.clone();
+        let usage_state = crate::UsageState::new();
+        let supervisor_state = usage_state.clone();
+        let _supervisor_handle = tokio::spawn(async move {
+            let segment_headers = HashMap::new();
+            let drive = run_segment_borrowed(
+                &grant,
+                &agent_config,
+                // The EMPTY headers map is deliberate: S1's
+                // `prepare_agent_config` already resolved
+                // `headers_from_request` forwarding once against the resume
+                // caller into this config; re-resolution is a no-op.
+                &segment_headers,
+                event_tx.clone(),
+                supervisor_state,
+                outer_budget,
+            );
+            tokio::pin!(drive);
+            // Drive the segment to its end, watching for the consumer's
+            // disconnect: the returned stream is the only reader of
+            // `event_tx`, so its drop closes the channel. A disconnect
+            // cancels the grant's ONE scope — the segment's sole
+            // cancellation path — and the drive then runs to its cancelled
+            // end: the drive future is never dropped here, so the grant
+            // keeps its owner. The disconnect arm disables itself after it
+            // fires (a closed channel reports closed immediately), leaving
+            // the drive arm as the loop's only exit.
+            let mut disconnected = false;
+            let probe = event_tx.clone();
+            let end = loop {
+                tokio::select! {
+                    end = &mut drive => break end,
+                    _ = probe.closed(), if !disconnected => {
+                        scope.cancel();
+                        disconnected = true;
+                    }
+                }
+            };
+
+            match end {
+                // The run completed within the segment: the normal factory
+                // finalization — chunked answer text and ONE `Final`, the
+                // same shape the chat path emits, racing cancellation so a
+                // cancelled run truncates its final instead of stranding
+                // the supervisor. The driver emitted no terminal of its
+                // own; this is the only one.
+                Ok(ResumeStreamEnd::Completed { final_answer }) => {
+                    let mut cancelled = false;
+                    for chunk in final_answer
+                        .chars()
+                        .collect::<Vec<_>>()
+                        .chunks(STREAM_CHUNK_SIZE)
+                    {
+                        let text: String = chunk.iter().collect();
+                        tokio::select! {
+                            biased;
+                            _ = scope.cancellation().cancelled() => {
+                                cancelled = true;
+                                break;
+                            }
+                            _ = event_tx.send(Ok(StreamItem::StreamAssistantItem(
+                                crate::provider_agent::StreamedAssistantContent::Text(text),
+                            ))) => {}
+                        }
+                    }
+                    if !cancelled {
+                        tokio::select! {
+                            biased;
+                            _ = scope.cancellation().cancelled() => {}
+                            _ = event_tx.send(Ok(StreamItem::Final(
+                                crate::provider_agent::FinalResponseInfo {
+                                    content: final_answer,
+                                    usage: Default::default(),
+                                    cache_usage: None,
+                                },
+                            ))) => {}
+                        }
+                    }
+                }
+                // A fresh park: the publication owner already emitted the
+                // ONE `RunParked` while the segment was live. The normal
+                // terminal stream policy adds nothing.
+                Ok(ResumeStreamEnd::Reparked) => {}
+                // The segment faulted: the fault rides the error arm as the
+                // stream's terminal `Err` (never unwrapped). The segment's
+                // `Diagnostic` prose is the stream error's content.
+                Err(segment_fault) => {
+                    let fault: StreamError = match segment_fault {
+                        SegmentError::Continuation(diagnostic) => diagnostic.to_string().into(),
+                    };
+                    tokio::select! {
+                        biased;
+                        _ = scope.cancellation().cancelled() => {}
+                        _ = event_tx.send(Err(fault)) => {}
+                    }
+                }
+            }
+
+            // Every exit arm (completed, reparked, fault, cancelled)
+            // reaches the same drain: signal the grant's scope first so
+            // cancellation-aware tracked tails exit early, then join every
+            // tracked child before the task ends. The scope local — and
+            // with it the grant's reservation lease — drops last, so the
+            // fence releases only after the drain ends, never at a stream
+            // drop or a terminal send. NO MCP close runs here: the
+            // supervisor owns no MCP handle (the manager lives inside the
+            // segment's orchestrator); MCP cancel-and-close is the driver's
+            // exit-arm duty.
+            scope.cancel();
+            scope.drain().await;
+        });
+
+        // Convert receiver to stream — the chat path's same unfold.
+        let stream = stream::unfold(event_rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        });
+
+        (Box::pin(stream), cancel_tx, usage_state)
     }
 
     /// Spawn the background orchestration task and return its event stream.
