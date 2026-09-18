@@ -1555,14 +1555,15 @@ async fn empty_resuming_document_renames_back_and_answers_the_parked_row() {
     );
 }
 
-/// Two evaluations racing the rename-back of the same crashed resuming
-/// document: the claim lock serializes the renames, the loser's ENOENT
-/// proceeds against the already-restored parked name, and both answer the
-/// parked row - no fault.
+/// Two POSTs racing the recovery of the same crashed empty resuming
+/// document under the ordered entry: the reservation is step 2, so exactly
+/// one evaluation holds the run before any rename begins — the winner
+/// restores the parked name and answers the parked row, the loser answers
+/// the running row without ever reaching the checkpoint or the store. No
+/// fault on either side.
 #[tokio::test]
-async fn concurrent_rename_back_losers_answer_the_parked_row_not_a_fault() {
+async fn concurrent_posts_on_an_empty_resuming_run_answer_parked_and_running() {
     let world = world();
-    let _race_gate = world.claims.arm_rename_back_race();
     register_undecided(&world).await;
     stage_resuming_document(
         &world,
@@ -1574,24 +1575,127 @@ async fn concurrent_rename_back_losers_answer_the_parked_row_not_a_fault() {
         evaluate_resume(evaluation(&world, false, None)),
         evaluate_resume(evaluation(&world, false, None)),
     );
+    // Order-independent: exactly one parked body and one running body.
+    let mut bodies = Vec::new();
     for outcome in [first, second] {
-        let refusal = outcome.expect_err("undecided calls answer the parked row");
-        assert_conflict(
-            refusal,
+        let refusal = outcome.expect_err("the crashed run refuses");
+        match refusal {
+            ResumeRefusal::Conflict(row) => {
+                bodies.push(serde_json::to_value(row).expect("the conflict row serializes"))
+            }
+            other => panic!("both answers are conflict rows, got {other:?}"),
+        }
+    }
+    bodies.sort_by_key(|body| {
+        body["code"]
+            .as_str()
+            .expect("the conflict row carries its code")
+            .to_string()
+    });
+    assert_eq!(
+        bodies,
+        vec![
             json!({
                 "code": "parked",
                 "detail": "calls still await a decision",
                 "blocking": [entry(decision(), TOOL, FUTURE_STAMP)],
             }),
-        );
-    }
+            json!({
+                "code": "running",
+                "detail": "another resume holds this run",
+                "blocking": [],
+            }),
+        ],
+        "one winner answers parked, one loser answers running"
+    );
     assert!(
         parked_document_path(&world).exists(),
-        "the parked name exists for whichever evaluation renamed it back"
+        "the winner's fenced rename-back restored the parked name"
     );
     assert!(
         !resuming_document_path(&world).exists(),
         "the resuming name is gone"
+    );
+}
+
+/// The fenced rename-back's lease clone is the whole fence once its awaiter
+/// is gone: with the rendezvous armed, the awaiting task is aborted mid-await
+/// and every OUTER lease reference is dropped, and the run still reads live
+/// until the released tail actually completes the rename — then, and only
+/// then, the final reference drops and the run releases.
+///
+/// The conversion tail inside `convert_reserved` holds its lease clone
+/// through the same binding shape; a rendezvous for it would need a
+/// cross-module cfg(test) seam, so that proof is a recorded residual at S3
+/// scope.
+#[tokio::test]
+async fn the_fenced_rename_tail_holds_the_reservation_after_its_awaiter_drops() {
+    let world = Arc::new(world());
+    stage_resuming_document(
+        &world,
+        &parked_document(FUTURE_STAMP, matching_fingerprint(&world), None, vec![]),
+    )
+    .await;
+    let run = ResumeRunId::parse(RUN).expect("the golden run id parses");
+    let lease = world
+        .claims
+        .reserve(&run)
+        .expect("the run reserves before the recovery rename");
+    let guard = world.claims.arm_fenced_rename();
+
+    let awaiter = {
+        let world = Arc::clone(&world);
+        let lease = lease.clone();
+        tokio::spawn(async move {
+            // The `'static` shape: the path and documents are built inside
+            // the task, so nothing borrowed crosses the spawn boundary.
+            let path = ValidatedResumePath::parse(SESSION, RUN).expect("the golden path validates");
+            let docs = ResumeDocuments::for_path(&path, &world.memory_dir);
+            world
+                .claims
+                .rename_back_under_reservation(&lease, &docs)
+                .await
+        })
+    };
+
+    // The tail signals arrival and holds before renaming; the blocking recv
+    // runs off the async worker, and the guard comes back for the release.
+    let guard = tokio::task::spawn_blocking(move || {
+        guard
+            .arrival
+            .recv()
+            .expect("the fenced tail signals arrival");
+        guard
+    })
+    .await
+    .expect("the arrival task completes");
+
+    // The awaiting request dies mid-await and the test drops its own lease:
+    // the blocking tail's clone is now the only holder.
+    awaiter.abort();
+    drop(lease);
+    assert!(
+        world.claims.is_live(&run),
+        "the in-flight tail's lease clone keeps the run reserved after every outer reference dropped"
+    );
+
+    // The release lets the tail finish; the fence drops only then.
+    guard.release.send(()).expect("the release channel is open");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while world.claims.is_live(&run) && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        !world.claims.is_live(&run),
+        "the run releases once the tail actually completes"
+    );
+    assert!(
+        parked_document_path(&world).exists(),
+        "the released tail completed the rename-back"
+    );
+    assert!(
+        !resuming_document_path(&world).exists(),
+        "the resuming name is gone after the released tail"
     );
 }
 

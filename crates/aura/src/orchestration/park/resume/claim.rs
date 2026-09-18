@@ -11,10 +11,11 @@ use std::str::FromStr;
 #[cfg(test)]
 use std::sync::Arc;
 #[cfg(test)]
-use std::sync::{
-    Barrier,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::Mutex;
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(test)]
+use std::sync::mpsc;
 
 use crate::config::SessionId;
 use crate::orchestration::persistence::is_safe_path_component;
@@ -24,7 +25,7 @@ use super::super::commit::parked_document_dir;
 use super::super::document::{PARKED_DOCUMENT_SUFFIX, RESUMING_DOCUMENT_SUFFIX};
 use super::evaluate::Diagnostic;
 use crate::orchestration::park::lifetime::{
-    AdmissionFault, ReservationFault, ReservationTable, RunReservationLease,
+    ReservationFault, ReservationTable, RunReservationLease,
 };
 
 /// Why a raw path segment failed validation. Every variant is
@@ -178,7 +179,7 @@ pub(crate) enum ClaimResumeFault {
 pub struct ResumeClaimTable {
     reservations: ReservationTable,
     #[cfg(test)]
-    race_gate: Arc<RaceGate>,
+    fence_gate: Arc<FenceGate>,
 }
 
 impl std::fmt::Debug for ResumeClaimTable {
@@ -194,7 +195,7 @@ impl Default for ResumeClaimTable {
         Self {
             reservations: ReservationTable::new(),
             #[cfg(test)]
-            race_gate: Arc::new(RaceGate::new()),
+            fence_gate: Arc::new(FenceGate::new()),
         }
     }
 }
@@ -224,9 +225,7 @@ impl ResumeClaimTable {
     /// the blocking rename tail holds a lease reference through completion,
     /// so an awaiting request dropping never releases a run whose rename-back
     /// is in flight. Only the availability and internal arms can arise here
-    /// — the run is already reserved, so `Live` is impossible. The
-    /// pre-reservation [`Self::rename_back_to_parked`] stays only until the
-    /// E4 fill's ordered evaluation replaces it.
+    /// — the run is already reserved, so `Live` is impossible.
     pub(crate) async fn rename_back_under_reservation(
         &self,
         reservation: &RunReservationLease,
@@ -234,20 +233,28 @@ impl ResumeClaimTable {
     ) -> Result<(), ClaimResumeFault> {
         let parked = docs.parked().to_path_buf();
         let resuming = docs.resuming().to_path_buf();
+        #[cfg(test)]
+        let fence_gate = Arc::clone(&self.fence_gate);
         // The blocking tail MOVES a lease reference in: the fence survives an
         // awaiting request dropping, so the run stays reserved until the
         // rename has actually completed.
         let lease = reservation.clone();
         tokio::task::spawn_blocking(move || -> Result<(), ClaimResumeFault> {
+            // Deterministic rendezvous for the fence-lifetime golden, the
+            // retired pre-reservation seam's convention carried onto this
+            // fenced tail: while armed, the tail signals arrival and holds on
+            // the release channel BEFORE renaming.
+            #[cfg(test)]
+            fence_gate.meet();
             // The held reservation is the whole fence: the run is already
             // reserved, so no second caller can be renaming, and the table's
             // standard lock is never held across this tail. The lease
             // binding keeps the fence alive through the rename's completion.
             let _lease = lease;
-            // The safe rename-back semantics of the interim
-            // [`Self::rename_back_to_parked`] hold exactly: `NotFound` while
-            // the parked name already exists reads as success (a concurrent
-            // winner already restored the name); every other io error fails.
+            // The safe rename-back semantics of the retired pre-reservation
+            // seam hold exactly: `NotFound` while the parked name already
+            // exists reads as success (the name is already restored); every
+            // other io error fails.
             std::fs::rename(&resuming, &parked).or_else(|e| {
                 if e.kind() == std::io::ErrorKind::NotFound && parked.try_exists().unwrap_or(false)
                 {
@@ -274,153 +281,102 @@ impl ResumeClaimTable {
         self.reservations.is_live(run.run_id())
     }
 
-    /// Arm this table's rename-back rendezvous for the concurrent golden:
-    /// exactly two `rename_back_to_parked` arrivals must occur while the
-    /// returned guard is alive, or they hold.
+    /// Arm this table's fenced-tail rendezvous for the lease-lifetime golden:
+    /// while the returned guard is alive, this table's next fenced rename-back
+    /// tail signals arrival on the guard's receiver and holds on its release
+    /// sender before renaming. The gate is scoped to ONE table, so the
+    /// parallel test harness cannot pair an unrelated table's tail.
     #[cfg(test)]
-    pub(crate) fn arm_rename_back_race(&self) -> RaceGateGuard {
-        self.race_gate.armed.store(true, Ordering::SeqCst);
-        RaceGateGuard {
-            gate: Arc::clone(&self.race_gate),
+    pub(crate) fn arm_fenced_rename(&self) -> FenceGateGuard {
+        // `mpsc::channel()` hands back `(Sender, Receiver)`: the tail side
+        // takes the arrival sender and the release receiver, and the guard
+        // gets the opposite ends.
+        let (arrival_to_tail, arrival_to_test) = mpsc::channel();
+        let (release_to_test, release_to_tail) = mpsc::channel();
+        self.fence_gate.arm_with(arrival_to_tail, release_to_tail);
+        FenceGateGuard {
+            gate: Arc::clone(&self.fence_gate),
+            arrival: arrival_to_test,
+            release: release_to_test,
         }
     }
-
-    /// Rename the run's resuming document back to its parked name while
-    /// holding the table's short standard lock, so a concurrent evaluation
-    /// cannot observe the half-renamed pair.
-    pub(crate) async fn rename_back_to_parked(
-        &self,
-        docs: &ResumeDocuments,
-    ) -> Result<(), Diagnostic> {
-        let parked = docs.parked().to_path_buf();
-        let resuming = docs.resuming().to_path_buf();
-        let reservations = self.reservations.clone();
-        #[cfg(test)]
-        let race_gate = Arc::clone(&self.race_gate);
-        tokio::task::spawn_blocking(move || -> Result<(), Diagnostic> {
-            #[cfg(test)]
-            race_gate.meet();
-            // The table's lock lives only inside this closure: the rename is
-            // serialized against `claim_and_resume`'s insert-and-rename
-            // through the table's one mutual-exclusion seam, and no guard is
-            // ever held across an await.
-            reservations.under_standard_lock(|| {
-                std::fs::rename(&resuming, &parked).or_else(|e| {
-                    if e.kind() == std::io::ErrorKind::NotFound
-                        && parked.try_exists().unwrap_or(false)
-                    {
-                        // A concurrent evaluation won the rename-back under the
-                        // lock; the document is already at its parked name and
-                        // evaluation proceeds against the in-memory document.
-                        Ok(())
-                    } else {
-                        Err(Diagnostic::new(format!(
-                            "renaming the resuming checkpoint {} back to its parked name failed: {e}",
-                            resuming.display()
-                        )))
-                    }
-                })
-            })
-        })
-        .await
-        .map_err(|e| Diagnostic::new(format!("the rename-back task did not complete: {e}")))?
-    }
-
-    /// Insert the claim and rename the parked document to its resuming name
-    /// as one step under the claim lock: either both happen or neither does.
-    /// The returned lease is the shared run reservation — the grant owns it,
-    /// and the run releases when its last reference drops.
-    ///
-    /// Interim shape (until the E4 fill's ordered evaluation): the grant's
-    /// source is still this one-shot acquisition; the ordered path will hold
-    /// a reservation from step 2 and convert it instead, so this method's
-    /// insert-and-rename becomes the conversion's rename under the held
-    /// reservation.
-    pub(crate) async fn claim_and_resume(
-        &self,
-        docs: &ResumeDocuments,
-    ) -> Result<RunReservationLease, ClaimResumeFault> {
-        // The documents derive from a validated path (`for_path`), so the
-        // parked name's stem is the validated run id: the claim keys on the
-        // same run whose document the rename moves.
-        let raw_run = docs
-            .parked()
-            .file_stem()
-            .and_then(std::ffi::OsStr::to_str)
-            .expect("the claim documents carry the validated run id as their stem");
-        let run =
-            ResumeRunId::parse(raw_run).expect("the stem of a validated document name re-parses");
-        let parked = docs.parked().to_path_buf();
-        let resuming = docs.resuming().to_path_buf();
-        let reservations = self.reservations.clone();
-        tokio::task::spawn_blocking(move || -> Result<RunReservationLease, ClaimResumeFault> {
-            // One table admission covers check, insert, rename, and
-            // rollback: a second caller's insert observes the live claim
-            // before any rename, and `admit_with` rolls the occupation back
-            // when the rename fails, so the claim and the document name move
-            // together or not at all — and the lease is born only on the
-            // all-succeeded path.
-            reservations
-                .admit_with(run.run_id(), || std::fs::rename(&parked, &resuming))
-                .map_err(|fault| match fault {
-                    AdmissionFault::Live => ClaimResumeFault::Live,
-                    AdmissionFault::Step(e) => {
-                        ClaimResumeFault::Unavailable(Diagnostic::new(format!(
-                            "renaming the parked checkpoint {} to its resuming name failed: {e}",
-                            parked.display()
-                        )))
-                    }
-                })
-        })
-        .await
-        .map_err(|e| {
-            ClaimResumeFault::Internal(Diagnostic::new(format!(
-                "the claim task did not complete: {e}"
-            )))
-        })?
-    }
 }
 
-/// Deterministic rendezvous for the concurrent rename-back golden. Arming
-/// is scoped to ONE claim table (the armed test's world), so the parallel
-/// test harness cannot pair an unrelated table's rename with the barrier.
-/// With the gate armed, both of that table's rename-back closures hold past
-/// `locate_checkpoint` before either contends the claim lock, so the
-/// loser's ENOENT path is exercised on every run instead of by scheduling
-/// luck. Arming obliges exactly two rename-back arrivals while held.
+/// Deterministic rendezvous for the fenced rename tail's lease-lifetime
+/// golden ([`ResumeClaimTable::arm_fenced_rename`]). `meet` runs at the top
+/// of the blocking tail: while armed, it signals arrival and blocks on the
+/// release channel BEFORE the rename, so a test can drop every outer lease
+/// reference and prove the tail's own lease clone keeps the run reserved
+/// until the rename actually completes. Fail-open on a closed channel: a
+/// panicking or departed test can never deadlock the tail.
 #[cfg(test)]
-pub(crate) struct RaceGate {
+pub(crate) struct FenceGate {
     armed: AtomicBool,
-    barrier: Barrier,
+    rendezvous: Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
 }
 
 #[cfg(test)]
-impl RaceGate {
+impl FenceGate {
     pub(crate) fn new() -> Self {
         Self {
             armed: AtomicBool::new(false),
-            barrier: Barrier::new(2),
+            rendezvous: Mutex::new(None),
         }
     }
 
+    /// Store the tail-side channel ends and arm the gate.
+    fn arm_with(&self, arrival_from_tail: mpsc::Sender<()>, release_to_tail: mpsc::Receiver<()>) {
+        *self
+            .rendezvous
+            .lock()
+            .expect("the fence gate's lock is healthy") =
+            Some((arrival_from_tail, release_to_tail));
+        self.armed.store(true, Ordering::SeqCst);
+    }
+
+    /// Disarm the gate; a later `meet` proceeds without rendezvous.
+    fn disarm(&self) {
+        self.armed.store(false, Ordering::SeqCst);
+    }
+
+    /// The tail's rendezvous: while armed, take the stored channel ends (a
+    /// spent or absent rendezvous proceeds), signal arrival, and hold until
+    /// released.
     fn meet(&self) {
-        if self.armed.load(Ordering::SeqCst) {
-            self.barrier.wait();
+        if !self.armed.load(Ordering::SeqCst) {
+            return;
         }
+        let Some((arrival, release)) = self
+            .rendezvous
+            .lock()
+            .expect("the fence gate's lock is healthy")
+            .take()
+        else {
+            // A second arrival while armed: the rendezvous is spent, so this
+            // tail proceeds.
+            return;
+        };
+        // Either end may already be gone if the test departed: both channel
+        // operations fail open so the tail never deadlocks behind it.
+        let _ = arrival.send(());
+        let _ = release.recv();
     }
 }
 
-/// Disarms the rendezvous on drop, so a panicking test unwinds with the
-/// gate disarmed and the armed flag cannot outlive the test body.
+/// Disarms the rendezvous on drop and carries the test's ends of the channel
+/// pairs: `arrival` receives the tail's arrival signal, `release` lets the
+/// held tail proceed.
 #[cfg(test)]
-pub(crate) struct RaceGateGuard {
-    gate: Arc<RaceGate>,
+pub(crate) struct FenceGateGuard {
+    gate: Arc<FenceGate>,
+    pub(crate) arrival: mpsc::Receiver<()>,
+    pub(crate) release: mpsc::Sender<()>,
 }
 
 #[cfg(test)]
-impl Drop for RaceGateGuard {
+impl Drop for FenceGateGuard {
     fn drop(&mut self) {
-        self.gate.armed.store(false, Ordering::SeqCst);
+        self.gate.disarm();
     }
 }
 

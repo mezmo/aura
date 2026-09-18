@@ -24,7 +24,7 @@ use super::super::RecordedDecisions;
 use super::super::commit::{cancel_run_approvals, config_fingerprint};
 use super::super::continuation::{RehydrateError, load_recorded_decisions};
 use super::super::document::{ParkedRun, load_parked_run};
-use super::super::lifetime::{RunExecutionScope, RunReservationLease};
+use super::super::lifetime::{ReservationFault, RunExecutionScope, RunReservationLease};
 use super::claim::{
     ClaimResumeFault, ResumeClaimTable, ResumeDocuments, ResumeRunId, ResumeSessionId,
     ValidatedResumePath,
@@ -560,7 +560,7 @@ impl ReservedEvaluation {
 /// execution.
 #[expect(
     unused_variables,
-    reason = "the `claims` parameter stays unused: the held reservation is the conversion's whole fence, and E4-I settles the parameter"
+    reason = "the `claims` parameter stays unused: the held reservation is the conversion's whole fence, and the surface keeps the table parameter as declared"
 )]
 pub(crate) async fn convert_reserved(
     claims: &ResumeClaimTable,
@@ -671,48 +671,6 @@ fn check_identity(
     }
 }
 
-/// Reject a run another evaluation already holds; a race lost later, at the
-/// claim itself, surfaces through `authorize` and maps to the same row.
-fn check_claim(claims: &ResumeClaimTable, run: &ResumeRunId) -> Result<(), ClaimResumeFault> {
-    if claims.is_live(run) {
-        Err(ClaimResumeFault::Live)
-    } else {
-        Ok(())
-    }
-}
-
-/// Apply the interrupted and rename-back rows, yielding the parked document
-/// the content rows evaluate. Non-empty executed tombstones refuse as
-/// interrupted under either name; an empty resuming document is renamed back
-/// to its parked name under the claim lock before the content rows run.
-async fn admit(
-    located: LocatedCheckpoint,
-    docs: &ResumeDocuments,
-    claims: &ResumeClaimTable,
-) -> Result<ParkedRun, AdmitFault> {
-    match located {
-        LocatedCheckpoint::Parked { document } => {
-            if document.executed.is_empty() {
-                Ok(document)
-            } else {
-                Err(AdmitFault::Interrupted)
-            }
-        }
-        LocatedCheckpoint::Resuming { document } => {
-            if !document.executed.is_empty() {
-                // The dead resume's document stays exactly as found: the
-                // interrupted row refuses, and no rename hides the evidence.
-                return Err(AdmitFault::Interrupted);
-            }
-            claims
-                .rename_back_to_parked(docs)
-                .await
-                .map_err(AdmitFault::Fault)?;
-            Ok(document)
-        }
-    }
-}
-
 /// Compare the checkpoint's fingerprint against the rebuilt configuration.
 /// The check runs before the consult, so a drifted config refuses with zero
 /// tool invocations and no consumed-decision cleanup.
@@ -804,43 +762,19 @@ async fn project_blocking(
     })
 }
 
-/// Take the claim and rename the parked document to its resuming name as
-/// one step, then assemble the grant. A claim lost to a concurrent
-/// evaluation between `check_claim` and here maps to the running row.
-///
-/// Interim shape (until the E4 fill's ordered evaluation): the acquisition
-/// is the one-shot claim; the ordered path reserves at step 2 and converts
-/// through [`convert_reserved`] instead.
-async fn authorize(
-    docs: &ResumeDocuments,
-    claims: &ResumeClaimTable,
-    evaluation_path: &ValidatedResumePath,
-    document: ParkedRun,
-    recorded: Arc<RecordedDecisions>,
-    consumed: Vec<DecisionId>,
-) -> Result<ResumeGrant, ClaimResumeFault> {
-    let reservation = claims.claim_and_resume(docs).await?;
-    // The scope is established exactly once, at grant assembly, over the
-    // same reservation the grant owns — every later consumer clones this
-    // one Arc.
-    let scope = RunExecutionScope::new(reservation.clone());
-    Ok(ResumeGrant {
-        reservation,
-        scope,
-        documents: docs.clone(),
-        document,
-        recorded,
-        consumed,
-        session: evaluation_path.session.clone(),
-        run: evaluation_path.run.clone(),
-    })
-}
-
-/// Evaluate a run against the ordered table and either authorize the
-/// claim-and-segment or refuse with the first matching row. An expired
-/// refusal tears the run down before rendering: the checkpoint is unlinked
-/// and the run's undecided tickets are swept under the bundle's request id,
-/// so the row the client sees matches the state left behind.
+/// Evaluate a run under the ruled ordered entry and either convert the
+/// reservation into the segment's grant or refuse with the first matching
+/// row. The order is the contract: (1) the presented identity resolves enough
+/// to preserve 404 privacy before anything is occupied, (2) the run is
+/// reserved, (3) the authoritative checkpoint is re-read and rechecked for
+/// identity, interruption, and fingerprint under that reservation, (4) the
+/// member consult runs under it, (5) a pending or refused outcome releases
+/// the reservation with no execution, and (6) a ready outcome converts the
+/// SAME reservation into the grant, renaming parked to resuming with no
+/// ownerless gap and no second acquisition. An expired refusal tears the run
+/// down before rendering: the checkpoint is unlinked and the run's undecided
+/// tickets are swept under the bundle's request id, so the row the client
+/// sees matches the state left behind.
 pub async fn evaluate_resume(
     evaluation: ResumeEvaluation<'_>,
 ) -> Result<ResumeGrant, ResumeRefusal> {
@@ -857,6 +791,25 @@ pub async fn evaluate_resume(
     } = evaluation;
     let docs = ResumeDocuments::for_path(&path, memory_dir);
 
+    // Step 1: resolve the presented identity before anything is occupied. An
+    // unattributable caller under a bound config answers the not-found row
+    // and never reaches the table.
+    if let IdentityBindingState::BoundMissingHeader =
+        IdentityBindingState::resolve(bind_identity, presented_identity)
+    {
+        return Err(IdentityFault::Mismatch.into());
+    }
+
+    // Step 2: reserve the run. The lock covers the check-and-insert only; the
+    // lease is the fence every later step runs under, and a refusal anywhere
+    // below drops it with no execution.
+    let reservation = claims
+        .reserve(&path.run)
+        .map_err(|ReservationFault::Live| ClaimResumeFault::Live)
+        .map_err(ResumeRefusal::from)?;
+
+    // Step 3: the ONE authoritative read, now under the reservation, then the
+    // identity, interruption, and fingerprint rechecks.
     let located = locate_checkpoint(&docs).await?;
 
     // The stored hash is parsed before the comparison, so a malformed stamp
@@ -871,12 +824,35 @@ pub async fn evaluate_resume(
     };
     check_identity(stored, bind_identity, presented_identity)?;
 
-    check_claim(claims, &path.run)?;
-
-    let document = admit(located, &docs, claims).await?;
+    let document = match located {
+        LocatedCheckpoint::Parked { document } => {
+            if document.executed.is_empty() {
+                document
+            } else {
+                return Err(AdmitFault::Interrupted.into());
+            }
+        }
+        LocatedCheckpoint::Resuming { document } => {
+            if !document.executed.is_empty() {
+                // The dead resume's document stays exactly as found: the
+                // interrupted row refuses, and no rename hides the evidence.
+                return Err(AdmitFault::Interrupted.into());
+            }
+            // The empty-resume recovery: the rename-back runs fenced by THIS
+            // reservation, the original approval and retention deadlines
+            // unchanged. The typed claim vocabulary classifies any failure —
+            // propagated as-is, never flattened into the fault sink.
+            claims
+                .rename_back_under_reservation(&reservation, &docs)
+                .await?;
+            document
+        }
+    };
 
     check_fingerprint(&document, config)?;
 
+    // Step 4: the member consult, under the reservation. The consult stays
+    // the interim recorded-decisions path — E7 owns the production cutover.
     let (recorded, consumed) = match consult_decisions(&document, store, now).await {
         Ok(recorded) => recorded,
         Err(ConsultFault::Expired(blocking)) => {
@@ -914,7 +890,19 @@ pub async fn evaluate_resume(
         Err(fault) => return Err(fault.into()),
     };
 
-    let grant = authorize(&docs, claims, &path, document, recorded, consumed).await?;
+    // Steps 5-6: the ready outcome converts the SAME reservation into the
+    // grant — no second acquisition and no ownerless gap. The parked document
+    // renames to its resuming name under the lease-fenced tail, and the grant
+    // owns that one reservation and its one execution scope.
+    let grant = convert_reserved(
+        claims,
+        ReservedEvaluation::new(reservation, docs, document),
+        path.session,
+        path.run,
+        recorded,
+        consumed,
+    )
+    .await?;
     Ok(grant)
 }
 
