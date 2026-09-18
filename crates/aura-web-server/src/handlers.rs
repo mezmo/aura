@@ -511,17 +511,22 @@ pub fn build_completion_config(
     let fallback_tool_parsing = setup.config.is_fallback_tool_parsing_enabled();
 
     // The resume arm's provider/model, otel inputs, and message count come
-    // from the factory's resumed stream (S2/S3); only the chat arm is wired.
+    // from the prepared resume config (setup.config) — the same projection
+    // the resumed run's factory builds from (S2/S3).
     let ((provider_ref, model_ref), message_count, query_for_otel) = match &setup.completion {
         CompletionInput::Chat {
             agent,
             query,
             history,
         } => (agent.get_provider_info(), history.len() + 1, query.clone()),
-        CompletionInput::Resume { .. } => todo!(
-            "P45 S2/S3: resume completion entry — provider/model, otel query, and message \
-             count come from the resumed run's factory"
-        ),
+        CompletionInput::Resume { factory: _, grant } => {
+            let (provider_ref, model_ref) = setup.config.agent.llm.model_info();
+            (
+                (provider_ref, model_ref),
+                1,
+                format!("resume {}/{}", grant.session_id(), grant.run_id()),
+            )
+        }
     };
     let (provider, model) = (provider_ref.to_string(), model_ref.to_string());
 
