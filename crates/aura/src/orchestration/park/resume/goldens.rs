@@ -6753,6 +6753,191 @@ async fn reparked_blocking_entries_carry_the_new_calls_own_deadline() {
     );
 }
 
+/// E5-R R3: the re-park RENEWS the document's retention stamp from the
+/// publication timestamp plus the configured `park_ttl` (7200s here) — the
+/// earliest outstanding ticket no longer derives it. The E7 test-7 drive
+/// shape by ADDITION ([`reparked_blocking_entries_carry_the_new_calls_own_deadline`]
+/// is untouched): a `world_over_hitl` variant whose
+/// `ParkConfig.park_ttl = 7200` rides the same 207-poll route
+/// (`timeout_secs` 3600), and the mid-segment re-park raises two fresh
+/// gated calls — the sibling parks first with the EARLIER ticket, the
+/// target second — both undecided in the store at the commit. The ttl
+/// differs from the ticket windows, so the interim bridge's value and the
+/// E5 value are observably different instants.
+///
+/// RED today: the interim bridge renews the stamp from the earliest
+/// outstanding ticket — the sibling's ≈ +1h deadline — so both stamp
+/// assertions fail at the value.
+///
+/// Guard (green today and after E5): the TARGET blocking entry still equals
+/// the target ticket's OWN deadline — E7's per-call deadline semantics are
+/// untouched by the stamp.
+#[tokio::test]
+async fn reparked_document_renews_retention_from_the_publication_timestamp() {
+    let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
+    let _drain = OverrideDrain;
+    let (url, receiver) = park_receiver();
+    let mut world = world_over_hitl(|registry| {
+        let config = aura_config::HitlConfig {
+            require_approval: vec![aura_config::GlobPattern::new("kubectl_*").unwrap()],
+            park: aura_config::ParkConfig {
+                enabled: true,
+                bind_identity: false,
+                park_ttl: aura_config::ParkTtl::try_new(7200).expect("park ttl validates"),
+            },
+            route: aura_config::DecisionRouteConfig::Webhook {
+                url: aura_config::WebhookUrl::new(&url).unwrap(),
+                timeout_secs: 3600,
+                headers: HashMap::new(),
+                headers_from_request: HashMap::new(),
+                tool_headers_from_response: aura_config::ToolHeaderMappings::default(),
+                delivery: aura_config::WebhookDelivery::Poll,
+                poll_url: None,
+                poll_interval_secs: 10,
+                poll_request_timeout_secs: 30,
+                receiver_wait_timeout_secs: 900,
+            },
+        };
+        crate::hitl::HitlRuntime::from_config(&config, registry, None, None)
+    });
+    world._receiver = receiver;
+
+    // The re-park pair's rig ids and provider call ids, distinct per frame:
+    // the loop keys tool results by the rig id and the park stamps each
+    // pending call's id from the one it observed.
+    const SIBLING_RIG_ID: &str = "call_r0";
+    const TARGET_RIG_ID: &str = "call_r1";
+    const SIBLING_CALL_ID: &str = "call_id_r0";
+    const TARGET_CALL_ID: &str = "call_id_r1";
+
+    let apply_invocations = Arc::new(Mutex::new(Vec::new()));
+    let sibling_invocations = Arc::new(Mutex::new(Vec::new()));
+    let target_invocations = Arc::new(Mutex::new(Vec::new()));
+    // ONE assistant turn issues BOTH gated calls: the sibling parks first
+    // (its gate entry mints the EARLIER ticket deadline), the target second
+    // (the LATER one). The stream ends after the one batch — the park hook
+    // cancels after the snapshot, before the next completion.
+    install_worker_overrides(vec![WorkerOverride {
+        model: ScriptedCompletionModel::new(vec![ScriptedTurn::tool_calls(vec![
+            ScriptedToolCall::new(SIBLING_RIG_ID, TOOL_B, json!({ "namespace": "stage" }))
+                .with_call_id(SIBLING_CALL_ID),
+            ScriptedToolCall::new(TARGET_RIG_ID, NEW_TOOL, json!({ "namespace": "stage" }))
+                .with_call_id(TARGET_CALL_ID),
+        ])]),
+        extra_tools: vec![
+            Box::new(RecordingTool::new(apply_invocations.clone()).with_name(TOOL)),
+            Box::new(RecordingTool::new(sibling_invocations.clone()).with_name(TOOL_B)),
+            Box::new(RecordingTool::new(target_invocations.clone()).with_name(NEW_TOOL)),
+        ],
+    }]);
+    register_decided(&world).await;
+    publish_document(&world, &sentinel_document(&world)).await;
+
+    let grant = evaluate_resume(evaluation(&world, false, None))
+        .await
+        .expect("the decided checkpoint grants: the mid-segment park has not run yet");
+    let republish_before = chrono::Utc::now();
+    let segment = run_segment(grant, &world.config, &HashMap::new())
+        .await
+        .expect("the segment re-parks on the two fresh gated calls");
+    let republish_after = chrono::Utc::now();
+
+    assert_eq!(
+        apply_invocations
+            .lock()
+            .expect("apply invocation log")
+            .len(),
+        1,
+        "the decided call executes exactly once before the re-park"
+    );
+    assert!(
+        sibling_invocations
+            .lock()
+            .expect("sibling invocation log")
+            .is_empty()
+            && target_invocations
+                .lock()
+                .expect("target invocation log")
+                .is_empty(),
+        "neither freshly parked call executed its tool"
+    );
+    let blocking = match segment {
+        SegmentResult::Parked { blocking, .. } => blocking,
+        other => panic!("expected a re-parked segment, got {other:?}"),
+    };
+    assert_eq!(
+        blocking.as_slice().len(),
+        2,
+        "the refreshed blocking set carries the two freshly parked calls, found {:?}",
+        blocking.as_slice()
+    );
+    let sibling_entry = blocking
+        .as_slice()
+        .iter()
+        .find(|blocked| blocked.tool.as_ref() == TOOL_B)
+        .expect("the sibling's blocking entry names the sibling call");
+    let target_entry = blocking
+        .as_slice()
+        .iter()
+        .find(|blocked| blocked.tool.as_ref() == NEW_TOOL)
+        .expect("the target's blocking entry names the newly gated call");
+    let sibling_decision_id = sibling_entry.decision_id;
+    let target_decision_id = target_entry.decision_id;
+    let target_entry_expires = target_entry.expires_at;
+
+    // Both fresh tickets live in the store at the commit — undecided, each
+    // inside its own ≈ +1h window — and the sibling's is the earlier
+    // deadline.
+    let sibling_ticket = world
+        .registry
+        .try_parked(&sibling_decision_id)
+        .await
+        .expect("the store reads")
+        .expect("the sibling's fresh ticket is in the store at the commit");
+    let target_ticket = world
+        .registry
+        .try_parked(&target_decision_id)
+        .await
+        .expect("the store reads")
+        .expect("the target's fresh ticket is in the store at the commit");
+    assert!(
+        sibling_ticket.expires_at > chrono::Utc::now(),
+        "the sibling's fresh ticket sits inside its own window"
+    );
+    assert!(
+        sibling_ticket.expires_at < target_ticket.expires_at,
+        "the fixture shape: the sibling parks first and holds the EARLIER \
+         ticket deadline; the target's is the later one"
+    );
+
+    let republished = load_parked_run(&parked_document_path(&world))
+        .await
+        .expect("the re-park re-published the checkpoint under the parked name");
+    let renewed = republished.retention_expires_at.as_datetime();
+
+    let lower = republish_before + chrono::Duration::seconds(7200 - 30);
+    let upper = republish_after + chrono::Duration::seconds(7200 + 30);
+    assert!(
+        renewed >= lower && renewed <= upper,
+        "the renewed retention stamp is the re-publication timestamp plus the \
+         park_ttl (7200s): got {renewed}, expected within [{lower}, {upper}]"
+    );
+    assert!(
+        (renewed - sibling_ticket.expires_at).num_seconds().abs() >= 60,
+        "the renewed stamp must not derive from the earliest outstanding \
+         ticket: {renewed} sits within one minute of the sibling ticket's \
+         deadline {}",
+        sibling_ticket.expires_at
+    );
+    // Guard (green today and after E5): the TARGET entry carries the target
+    // ticket's OWN deadline — per-call deadline semantics are untouched by
+    // the stamp.
+    assert_eq!(
+        target_entry_expires, target_ticket.expires_at,
+        "the TARGET blocking entry still carries the target call's OWN deadline"
+    );
+}
+
 /// Regression guard (green today): the expired arms unlink the parked
 /// checkpoint, sweep the undecided approvals, tolerate a retried resume of
 /// the already-unlinked run (the NotFound-tolerant unlink keeps the arms

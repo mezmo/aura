@@ -68,3 +68,45 @@ impl RetentionExpiresAt {
         self.0
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// E5-R R4 guard: an age chrono cannot represent as a duration is
+    /// refused as `AgeOutOfRange` — never wrapped, never saturated. `ParkTtl`
+    /// admits every nonzero `u64`, and chrono's seconds range is narrower,
+    /// so the seam must stay reachable.
+    #[test]
+    fn retention_from_publication_refuses_an_unrepresentable_age() {
+        let published = Utc::now();
+        let ttl = ParkTtl::try_new(u64::MAX).expect("ParkTtl admits every nonzero u64");
+        assert_eq!(
+            RetentionExpiresAt::from_publication(published, ttl),
+            Err(RetentionError::AgeOutOfRange { secs: u64::MAX }),
+        );
+    }
+
+    /// E5-R R4 guard: a publication timestamp at chrono's representable edge
+    /// plus any age overflows — `DeadlineOverflow`, never a wrap.
+    #[test]
+    fn retention_from_publication_refuses_a_deadline_overflow() {
+        let ttl = ParkTtl::try_new(3600).expect("one hour validates");
+        assert_eq!(
+            RetentionExpiresAt::from_publication(DateTime::<Utc>::MAX_UTC, ttl),
+            Err(RetentionError::DeadlineOverflow),
+        );
+    }
+
+    /// E5-R R4 guard: a normal stamp round-trips through `as_datetime` as
+    /// `published_at + age`.
+    #[test]
+    fn retention_from_publication_stamps_publication_plus_age() {
+        let published = Utc::now();
+        let ttl = ParkTtl::try_new(7200).expect("two hours validate");
+        let stamped =
+            RetentionExpiresAt::from_publication(published, ttl).expect("a normal stamp succeeds");
+        let age = chrono::Duration::try_seconds(7200).expect("7200s fits chrono");
+        assert_eq!(stamped.as_datetime(), published + age);
+    }
+}

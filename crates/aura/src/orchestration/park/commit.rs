@@ -751,6 +751,205 @@ mod tests {
         );
     }
 
+    /// E5-R R1: the retention stamp derives from the publication timestamp
+    /// plus the validated `park_ttl` (7200s here), never from the earliest
+    /// surviving ticket — the ticket windows and the stamp part ways exactly
+    /// here. The fixture's park_ttl (7200) differs from both the ticket
+    /// window (30min) and the decision_window (30min) it also carries, so
+    /// the interim bridge's value and the E5 value are observably different
+    /// instants.
+    ///
+    /// RED today: the interim bridge stamps the refresh's earliest surviving
+    /// ticket expiry (`now + 30min`), so both value assertions fail at the
+    /// value — never at compilation or setup.
+    #[tokio::test]
+    async fn retention_stamp_derives_from_publication_not_the_earliest_ticket() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory_dir = dir.path().join("memory").to_string_lossy().into_owned();
+        let (registry, _store) = conv_registry();
+
+        let run_id = "0191e8c0-eeee-7000-8000-0000000000a1";
+        let owner = run_owner_id(run_id);
+        let now = chrono::Utc::now();
+        let ticket = DecisionId::generate();
+        let ticket_expiry = now + chrono::Duration::minutes(30);
+        registry
+            .register_durable(parked_approval(ticket, &owner, ticket_expiry))
+            .await
+            .unwrap();
+
+        let mut plan = Plan::new("Deploy");
+        plan.add_task(Task::new(0, "Gated apply", "r"));
+        plan.tasks[0].state = TaskState::AwaitingApproval {
+            pending: vec![PendingCall {
+                decision_id: ticket,
+                tool_name: "kubectl_apply".to_string(),
+                arguments: serde_json::json!({ "namespace": "prod" }),
+                call_id: "c1".to_string(),
+            }],
+        };
+        let mut records = ParkedTaskRecords::new();
+        records.insert(
+            0,
+            crate::orchestration::park::ParkedTaskRecord {
+                attempt: 1,
+                snapshot: crate::orchestration::ParkSnapshot {
+                    history: vec![rig::completion::Message::user("apply it")],
+                    current_prompt: rig::completion::Message::user("tool results"),
+                },
+            },
+        );
+
+        let state = RunStateForPark {
+            run_id,
+            session_id: None,
+            query: "Deploy",
+            chat_history: &[],
+            coordinator_conversation: &[],
+            routing_decision: None,
+            iteration: 1,
+            planning_ms: 0,
+            failure_history: &[],
+        };
+        let inputs = ParkCommitInputs {
+            state,
+            plan: &plan,
+            records: &records,
+            registry: &registry,
+            memory_dir: &memory_dir,
+            config: &AgentRuntimeConfig::default(),
+            decision_window: Duration::from_secs(30 * 60),
+            park_ttl: aura_config::ParkTtl::try_new(7200).expect("park ttl validates"),
+            identity_hash: None,
+        };
+
+        let before = chrono::Utc::now();
+        let outcome = commit_from_run_state(&inputs, None).await.unwrap();
+        let after = chrono::Utc::now();
+
+        let stamp = outcome.retention_expires_at.as_datetime();
+        let lower = before + chrono::Duration::seconds(7200 - 30);
+        let upper = after + chrono::Duration::seconds(7200 + 30);
+        assert!(
+            stamp >= lower && stamp <= upper,
+            "the retention stamp is the publication timestamp plus the park_ttl \
+             (7200s): got {stamp}, expected within [{lower}, {upper}]"
+        );
+        assert!(
+            (stamp - ticket_expiry).num_seconds().abs() >= 60,
+            "the stamp must not be the earliest-ticket derivation: {stamp} sits \
+             within one minute of the ticket's expiry {ticket_expiry}"
+        );
+    }
+
+    /// E5-R R2: a commit with no surviving undecided ticket — the call
+    /// decided between gate-hit and commit, its decided row retained by the
+    /// file-backed store — stamps retention from the publication timestamp
+    /// plus the validated `park_ttl` (7200s), never from the
+    /// `now + decision_window` fallback (30 minutes here).
+    ///
+    /// RED today: the bridge's no-surviving-ticket fallback stamps
+    /// `now + decision_window`, so the window assertion fails at the value.
+    #[tokio::test]
+    async fn retention_stamp_with_no_surviving_ticket_derives_from_park_ttl() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory_dir = dir.path().join("memory").to_string_lossy().into_owned();
+        // The file-backed registry, exactly as
+        // `early_decision_is_retained_and_consumed_at_resume` builds it:
+        // resolve keeps the decided row readable, so the refresh retains the
+        // decided call for the resume consult while its settled ticket
+        // contributes no expiry.
+        let store: Arc<dyn ApprovalStore> = Arc::new(
+            crate::session_store::FileApprovalStore::open(dir.path().join("approvals")).unwrap(),
+        );
+        let registry = PendingApprovals::with_backend(store, Arc::new(InMemoryEventBus::new()));
+
+        let run_id = "0191e8c0-eeee-7000-8000-0000000000a2";
+        let owner = run_owner_id(run_id);
+        let now = chrono::Utc::now();
+        let ticket = DecisionId::generate();
+        registry
+            .register_durable(parked_approval(
+                ticket,
+                &owner,
+                now + chrono::Duration::minutes(30),
+            ))
+            .await
+            .unwrap();
+        registry
+            .resolve(
+                &ticket,
+                ApprovalAuthority::Conversational,
+                crate::hitl::ApprovalDecision::Approved.into(),
+            )
+            .await
+            .unwrap();
+
+        let mut plan = Plan::new("Deploy");
+        plan.add_task(Task::new(0, "Gated apply", "r"));
+        plan.tasks[0].state = TaskState::AwaitingApproval {
+            pending: vec![PendingCall {
+                decision_id: ticket,
+                tool_name: "kubectl_apply".to_string(),
+                arguments: serde_json::json!({ "namespace": "prod" }),
+                call_id: "c1".to_string(),
+            }],
+        };
+        let mut records = ParkedTaskRecords::new();
+        records.insert(
+            0,
+            crate::orchestration::park::ParkedTaskRecord {
+                attempt: 1,
+                snapshot: crate::orchestration::ParkSnapshot {
+                    history: vec![rig::completion::Message::user("apply it")],
+                    current_prompt: rig::completion::Message::user("tool results"),
+                },
+            },
+        );
+
+        let state = RunStateForPark {
+            run_id,
+            session_id: None,
+            query: "Deploy",
+            chat_history: &[],
+            coordinator_conversation: &[],
+            routing_decision: None,
+            iteration: 1,
+            planning_ms: 0,
+            failure_history: &[],
+        };
+        let inputs = ParkCommitInputs {
+            state,
+            plan: &plan,
+            records: &records,
+            registry: &registry,
+            memory_dir: &memory_dir,
+            config: &AgentRuntimeConfig::default(),
+            decision_window: Duration::from_secs(30 * 60),
+            park_ttl: aura_config::ParkTtl::try_new(7200).expect("park ttl validates"),
+            identity_hash: None,
+        };
+
+        let before = chrono::Utc::now();
+        let outcome = commit_from_run_state(&inputs, None).await.unwrap();
+        let after = chrono::Utc::now();
+
+        assert!(
+            outcome.refreshed.expires_at.is_none(),
+            "fixture shape: no undecided ticket survives, so the refresh reports \
+             no ticket expiry"
+        );
+        let stamp = outcome.retention_expires_at.as_datetime();
+        let lower = before + chrono::Duration::seconds(7200 - 30);
+        let upper = after + chrono::Duration::seconds(7200 + 30);
+        assert!(
+            stamp >= lower && stamp <= upper,
+            "the no-surviving-ticket stamp is the publication timestamp plus the \
+             park_ttl (7200s), never now + decision_window (30 minutes): got \
+             {stamp}, expected within [{lower}, {upper}]"
+        );
+    }
+
     /// The sweep cancels exactly what the store still holds: the undecided
     /// sibling clears with one event, while the decided sibling — whose
     /// ticket resolve already removed — is absent from the cleared set and
