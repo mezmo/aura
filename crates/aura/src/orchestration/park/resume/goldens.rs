@@ -18,9 +18,9 @@ use crate::hitl::{
 };
 use crate::orchestration::test_rig::{
     CoordinatorOverride, ECHO_TOOL_RESULT, FreeformArgs, RecordingTool, ScriptedCompletionModel,
-    ScriptedToolCall, ScriptedTurn, WORKER_OVERRIDE_SERIAL, WorkerOverride, echo_tool_result_wire,
-    install_coordinator_overrides, install_worker_overrides, take_coordinator_override,
-    take_worker_override,
+    ScriptedToolCall, ScriptedTurn, StallHook, WORKER_OVERRIDE_SERIAL, WorkerOverride,
+    echo_tool_result_wire, install_coordinator_overrides, install_worker_overrides,
+    take_coordinator_override, take_worker_override,
 };
 use crate::orchestration::types::{FailedTaskRecord, FailureCategory};
 use crate::orchestration::{
@@ -7047,7 +7047,736 @@ async fn expired_teardown_unlinks_sweeps_and_stays_idempotent() {
     let retry = evaluate_resume(evaluation(&world, false, None)).await;
     assert!(
         matches!(retry, Err(ResumeRefusal::DocumentAbsent)),
-        "the retried resume answers the absent row: {retry:?}"
+        "a retried resume of the same run answers the absent row: {retry:?}"
+    );
+}
+
+// =====================================================================
+// S5-RED frames (the fresh-budget wave's RED, aura/P45 #271 S5).
+// Dispatch contract "Resume SSE input": the resumed worker gets the
+// configured per-call timeout, maximum depth, and fresh call counters;
+// the resumed coordinator gets the configured outer server timeout
+// through the normal chain and a fresh local cycle counter (the
+// three-fresh-cycle ceiling is S4 frame 11's golden — not re-derived
+// here). Each frame stages a fixture whose fresh-budget inputs are
+// CONFIGURED values distinct from every default the fixtures otherwise
+// carry (the retention wave's distinct-value discipline), then pins the
+// resumed execution honoring exactly those values.
+//
+// Verification-unit arrival states (brief line 22): each frame's
+// doc-comment names its arrival state honestly — red-with-reason where
+// the wiring is absent at this tip, green-guard where the S3/S4 fills
+// already established the behavior (a green guard here is a
+// contract-proof guard, never a manufactured failure).
+// =====================================================================
+
+/// How long a borrowed-driver probe waits before declaring the driver
+/// still blocked on its in-flight tail or its drain — the same bound the
+/// S4-R frames' `BORROWED_PROBE` holds. Frame 1's honest-RED bound rides
+/// the same constant: the unfilled wiring never ends, the bound declares
+/// it in bounded time, and the suite never hangs.
+const S5_STALL_BOUND: Duration = Duration::from_secs(5);
+
+/// The world with caller-supplied per-call timeout (seconds): the default
+/// webhook-poll world behind a config whose `per_call_timeout_secs` stages
+/// the fresh budget a worker-budget frame pins. The mutation happens
+/// before any fixture is built, so the published checkpoint matches the
+/// timeout-bearing config's fingerprint.
+fn world_with_per_call_timeout(secs: u64) -> World {
+    let mut world = world();
+    if let Some(mut orchestration) = world.config.orchestration.take() {
+        orchestration.timeouts.per_call_timeout_secs = secs;
+        world.config.orchestration = Some(orchestration);
+    }
+    world
+}
+
+/// The world with the `operations` worker's configured turn depth: the
+/// default webhook-poll world behind a config whose worker turn depth
+/// stages the fresh ceiling a depth frame pins. Mutated before any
+/// fixture build, so the checkpoint matches the config's fingerprint.
+fn world_with_turn_depth(depth: usize) -> World {
+    let mut world = world();
+    if let Some(mut orchestration) = world.config.orchestration.take() {
+        if let Some(worker) = orchestration.workers.get_mut("operations") {
+            worker.turn_depth = Some(depth);
+        }
+        world.config.orchestration = Some(orchestration);
+    }
+    world
+}
+
+/// A worker override whose scripted continuation issues the probe tool
+/// calls exactly as scripted: each call a distinct (id, arguments) pair so
+/// the duplicate-call guard's fingerprint never pairs them, riding the
+/// ungated `deploy_probe` name so the drive loop never touches the park
+/// machinery between turns.
+fn s5_probe_call(rig_id: &str, args: Value) -> ScriptedToolCall {
+    ScriptedToolCall::new(rig_id, PROBE_TOOL, args)
+}
+
+/// Frame 1 (S5) — RED today (wiring absent). A parked run whose config
+/// sets per-call timeout 1s resumes with that exact deadline on its next
+/// gated call. The fixture value is distinct from every default (the
+/// config default is 120s; the fixture is 1s), so an implementation that
+/// keeps some other deadline cannot pass.
+///
+/// Vehicle: after the decided call executes, the resumed continuation's
+/// first turn issues an UNGATED probe tool call whose recording
+/// implementation holds open under a stall hook — the deterministic
+/// stand-in for a hung provider/turn. The configured per-call budget must
+/// kill that continuation stream at 1s and the segment must fault with an
+/// error naming the configured one-second deadline.
+///
+/// RED today with reason: the resumed worker's continuation stream is
+/// started with a hard-coded `Duration::MAX` hook timeout and no
+/// `per_call_timeout_secs` wrap (orchestrator.rs, the segment's
+/// `stream_chat_message_with_timeout` call), so the configured deadline
+/// never bounds it — the stalled stream runs past the frame's bound and
+/// the outer timeout declares it. The bound keeps the RED bounded: the
+/// suite reads a deterministic failure, never a hang. After the fill the
+/// continuation faults within 1s and the pinned deadline text appears.
+///
+/// OWNER NOTE (recorded at repair, next commit): this vehicle stalls a
+/// TOOL invocation — mid-tool-execution interruption is out of contract
+/// by design (the resumed run's tools are tracked on the run's execution
+/// scope so a tail outlives the segment; the S4 drain waits them out), so
+/// the frame is re-scoped to a stalled PROVIDER RESPONSE in the following
+/// commit. The RED it records (no per-call wrap at the stream seam) is
+/// real and survives the re-scope.
+#[tokio::test]
+async fn s5_resumed_worker_uses_the_configured_per_call_timeout() {
+    let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
+    let _drain = OverrideDrain;
+    let stall = StallHook::new();
+    let world = world_with_per_call_timeout(1);
+    let probe_invocations = Arc::new(Mutex::new(Vec::new()));
+    install_worker_overrides(vec![WorkerOverride {
+        model: ScriptedCompletionModel::new(vec![ScriptedTurn::tool_calls(vec![s5_probe_call(
+            "call_probe_t",
+            json!({ "namespace": "s5-stall" }),
+        )])]),
+        extra_tools: vec![
+            Box::new(RecordingTool::new(Arc::new(Mutex::new(Vec::new()))).with_name(TOOL)),
+            Box::new(
+                RecordingTool::new(probe_invocations.clone())
+                    .with_name(PROBE_TOOL)
+                    .with_stall(stall),
+            ),
+        ],
+    }]);
+    register_decided(&world).await;
+    publish_document(&world, &sentinel_document(&world)).await;
+
+    let grant = evaluate_resume(evaluation(&world, false, None))
+        .await
+        .expect("the all-decided run grants");
+
+    let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<Result<StreamItem, StreamError>>(64);
+    let end = tokio::time::timeout(
+        S5_STALL_BOUND,
+        run_segment_borrowed(
+            &grant,
+            &world.config,
+            &HashMap::new(),
+            event_tx,
+            crate::UsageState::new(),
+            None,
+        ),
+    )
+    .await;
+    let end = match end {
+        Ok(result) => result,
+        Err(_elapsed) => panic!(
+            "RED with reason: the configured per-call timeout (1s) never bounds \x20
+             the resumed worker's continuation stream — the segment starts it
+             with a hard-coded `Duration::MAX` hook timeout and no
+             `per_call_timeout_secs` wrap, so a stalled invocation inside the
+             stream cannot be interrupted (the bound was reached)"
+        ),
+    };
+    let Err(fault) = end else {
+        panic!(
+            "the stalled continuation must fault under the configured per-call \x20
+             timeout — the segment instead finished or parked, which no honest
+             fresh per-call budget can produce"
+        )
+    };
+    let SegmentError::Continuation(diagnostic) = &fault;
+    let text = diagnostic.to_string();
+    assert!(
+        text.contains("timed out after 1s"),
+        "the continuation stream must carry the configured per-call deadline \
+         (1s) in its error — the same config field the normal chat path \
+         reads, not some resumed default: {text}"
+    );
+}
+
+/// Frame 2 (S5) — arrival state observed live: a nested continuation past
+/// the configured maximum depth stops at the configured ceiling, not the
+/// checkpoint's historical anything. The fixture configures the
+/// `operations` worker's turn depth at 2 (the rig default is 16 — the
+/// interim and target must not coincide) and deliberately carries a deep
+/// checkpoint history (ten historical turns) so no historically-derived
+/// depth can masquerade as the configured ceiling.
+///
+/// The continuation's script issues MORE probe turns than the ceiling:
+/// fresh requests must stop at the configured depth, the ceiling breach
+/// asserts itself, and the segment ends on that error naming the
+/// configured limit of 2 — never a deeper budget, never a
+/// checkpoint-derived one.
+#[tokio::test]
+async fn s5_resumed_worker_applies_the_configured_maximum_depth() {
+    let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
+    let _drain = OverrideDrain;
+    let world = world_with_turn_depth(2);
+    let probe_invocations = Arc::new(Mutex::new(Vec::new()));
+    install_worker_overrides(vec![WorkerOverride {
+        // Four probe turns — one turn more than the rig ceiling check can
+        // ever grant at depth 2, distinct arguments each so the guard's
+        // fingerprint arithmetic stays out of the pins. The final text
+        // turn is never requested under the ceiling.
+        model: ScriptedCompletionModel::new(vec![
+            ScriptedTurn::tool_calls(vec![s5_probe_call(
+                "call_depth_0",
+                json!({ "step": "one" }),
+            )]),
+            ScriptedTurn::tool_calls(vec![s5_probe_call(
+                "call_depth_1",
+                json!({ "step": "two" }),
+            )]),
+            ScriptedTurn::tool_calls(vec![s5_probe_call(
+                "call_depth_2",
+                json!({ "step": "three" }),
+            )]),
+            ScriptedTurn::tool_calls(vec![s5_probe_call(
+                "call_depth_3",
+                json!({ "step": "four" }),
+            )]),
+            // The fifth turn exists ONLY to prove the stop came from the
+            // ceiling: an extended or checkpoint-derived budget or an
+            // unguarded loop would consume it; the configured ceiling 2
+            // must never reach it.
+            ScriptedTurn::tool_calls(vec![s5_probe_call(
+                "call_depth_4",
+                json!({ "step": "five" }),
+            )]),
+        ]),
+        extra_tools: vec![
+            Box::new(RecordingTool::new(Arc::new(Mutex::new(Vec::new()))).with_name(TOOL)),
+            Box::new(RecordingTool::new(probe_invocations.clone()).with_name(PROBE_TOOL)),
+        ],
+    }]);
+    register_decided(&world).await;
+    // The fixture adds the historical TURN depth: ten historical turns on
+    // the awaiting node — the conversation the checkpoint records as
+    // evidence. A fresh budget derived from the checkpoint's depth instead
+    // of the configured 2 would fail this frame from the fixture alone.
+    let mut document = sentinel_document(&world);
+    if let Some(history) = document.plan.tasks.first_mut().unwrap().history.as_mut() {
+        for i in 0..10 {
+            history.push(rig::completion::Message::user(format!(
+                "historical turn {i}"
+            )));
+            history.push(rig::completion::Message::assistant(
+                "historical settled step",
+            ));
+        }
+    }
+    publish_document(&world, &document).await;
+
+    let grant = evaluate_resume(evaluation(&world, false, None))
+        .await
+        .expect("the all-decided run grants despite the deep checkpoint history");
+
+    let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<Result<StreamItem, StreamError>>(64);
+    let end = run_segment_borrowed(
+        &grant,
+        &world.config,
+        &HashMap::new(),
+        event_tx,
+        crate::UsageState::new(),
+        None,
+    )
+    .await;
+    let Err(fault) = end else {
+        panic!(
+            "a continuation past the configured ceiling must stop at it — the \
+             segment instead finished or re-parked, which no honest fresh \
+             ceiling can produce"
+        )
+    };
+    let SegmentError::Continuation(diagnostic) = &fault;
+    let text = diagnostic.to_string();
+    assert!(
+        text.contains("reached limit: 2"),
+        "the continuation stops at the CONFIGURED ceiling (turn depth 2) — \
+          not the checkpoint's historical depth and not any default: {text}"
+    );
+    assert!(
+        !text.contains("script exhausted"),
+        "the stop reason is the ceiling breach itself, never an exhausted \
+         script read-through: {text}"
+    );
+    let recorded = probe_invocations
+        .lock()
+        .expect("probe invocation log")
+        .len();
+    assert_eq!(
+        recorded, 4,
+        "the loop stops at the configured ceiling's turn boundary — the fifth \
+         scripted turn is never executed, and neither a script exhaustion nor \
+         any checkpoint-derived budget produced the stop (executed {recorded})"
+    );
+}
+
+/// Frame 3 (S5) — green-guard. The resumed worker's call counters (the
+/// duplicate-call guard's escalation counts, seeded from the configured
+/// nudge/block thresholds) start FRESH for the resumed execution: the
+/// checkpoint's historical counts seed nothing. The fixture configures
+/// nudge=1 / block=2 (the rig defaults are 3 / 5 — the interim and target
+/// must not coincide) and stages two pre-park executions of the very call
+/// the continuation repeats — recorded in the node's conversation history
+/// as the evidence a park document carries (a grantable checkpoint's
+/// executed-tombstone ledger always reads empty; the consult refuses a
+/// non-empty one as death evidence) — so a counter seeded from history
+/// would open the fresh stream already past the configured nudge, and
+/// even one seeded prior call would point the very first fresh call at
+/// `DUPLICATE_CALL_ABORT` instead of the configured nudge.
+///
+/// The fresh stream must therefore run the configured arithmetic from
+/// zero: the first fresh repeat annotates with the configured nudge
+/// (`[DUPLICATE_CALL_GUIDANCE]`), the second with the configured block
+/// (`[DUPLICATE_CALL_ABORT]`) — the checkpoint's two historical executions
+/// present and counted as nothing.
+#[tokio::test]
+async fn s5_resumed_worker_call_counters_start_fresh_from_the_configuration() {
+    let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
+    let _drain = OverrideDrain;
+    let world = world_with_work_call_thresholds(1, 2);
+    let probe_invocations = Arc::new(Mutex::new(Vec::new()));
+    // Node A's script uses the SAME probe arguments in both fresh turns —
+    // the exact invocation pattern whose historical executions sit in the
+    // checkpoint — so the fresh-counter zero-start is proven against the
+    // strongest witness: even one seeded prior call would point the very
+    // first fresh call at `DUPLICATE_CALL_ABORT` instead of the
+    // configured nudge. The worker build consumes the queued override;
+    // this handle holds a clone sharing the same request log the build's
+    // model drives, so the request-log pins read the real turn requests.
+    let counter_model = ScriptedCompletionModel::new(vec![
+        ScriptedTurn::tool_calls(vec![s5_probe_call(
+            "call_fresh_0",
+            json!({ "namespace": "s5-counts" }),
+        )])
+        .with_text("fresh repeat one"),
+        ScriptedTurn::tool_calls(vec![s5_probe_call(
+            "call_fresh_1",
+            json!({ "namespace": "s5-counts" }),
+        )])
+        .with_text("fresh repeat two"),
+        ScriptedTurn::tool_calls(vec![ScriptedToolCall::new(
+            "call_sub_counters",
+            "submit_result",
+            json!({
+                "summary": "fresh counters stage pinned",
+                "result": "the fresh calls escalate on their own counts",
+                "confidence": "high",
+            }),
+        )]),
+    ]);
+    let counter_requests = counter_model.requests();
+    install_worker_overrides(vec![WorkerOverride {
+        model: counter_model,
+        extra_tools: vec![
+            Box::new(RecordingTool::new(Arc::new(Mutex::new(Vec::new()))).with_name(TOOL)),
+            Box::new(RecordingTool::new(probe_invocations.clone()).with_name(PROBE_TOOL)),
+        ],
+    }]);
+    install_coordinator_overrides(vec![CoordinatorOverride {
+        model: ScriptedCompletionModel::new(vec![coordinator_direct_turn()]),
+    }]);
+    register_decided(&world).await;
+    // The checkpoint carries the historical executions as EVIDENCE: two
+    // pre-park executions of the very call the fresh turns repeat, their
+    // returns recorded in the node's conversation history — the shape a
+    // live park captures. A counter seeded from that history fails the
+    // frame; fresh counters read it as nothing.
+    let mut document = sentinel_document(&world);
+    {
+        let node = document.plan.tasks.first_mut().expect("the awaiting node");
+        let history = node.history.as_mut().expect("the node's history");
+        history.push(tool_call_turn(vec![assistant_tool_call(
+            "call_hist_p0",
+            PROBE_TOOL,
+            &json!({ "namespace": "s5-counts" }),
+        )]));
+        history.push(tool_result_prompt(
+            "call_hist_p0",
+            &tool_wire(ECHO_TOOL_RESULT),
+        ));
+        history.push(tool_call_turn(vec![assistant_tool_call(
+            "call_hist_p1",
+            PROBE_TOOL,
+            &json!({ "namespace": "s5-counts" }),
+        )]));
+        history.push(tool_result_prompt(
+            "call_hist_p1",
+            &tool_wire(ECHO_TOOL_RESULT),
+        ));
+    }
+    publish_document(&world, &document).await;
+
+    let grant = evaluate_resume(evaluation(&world, false, None))
+        .await
+        .expect("the all-decided run grants");
+    let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<Result<StreamItem, StreamError>>(64);
+    let end = run_segment_borrowed(
+        &grant,
+        &world.config,
+        &HashMap::new(),
+        event_tx,
+        crate::UsageState::new(),
+        None,
+    )
+    .await
+    .expect("the segment driver did not panic");
+    let ResumeStreamEnd::Completed { final_answer } = &end else {
+        panic!("the fresh counters stage completes: {end:?}")
+    };
+    assert_eq!(
+        final_answer, COORD_FINAL_ANSWER,
+        "the staged run finishes naturally on the fresh counters"
+    );
+    assert_eq!(
+        probe_invocations
+            .lock()
+            .expect("probe invocation log")
+            .len(),
+        2,
+        "exactly the fresh stream's two repeats execute — the checkpoint's \
+         historical executions are evidence, never re-runs"
+    );
+
+    // The fresh requests' histories carry the configured escalation:
+    // the SECOND turn sees the first fresh repeat's result annotated with
+    // the configured GUIDANCE (fresh count 1 reached nudge 1), and the
+    // THIRD turn sees the second fresh repeat's result annotated with the
+    // configured ABORT (fresh count 2 reached block 2). A counter seeded
+    // from the checkpoint's two historical executions would have opened
+    // the fresh stream already aborting — the distinct-value witness the
+    // fixture stages on purpose.
+    let logged = counter_requests.lock().expect("worker request log").clone();
+    assert_eq!(
+        logged.len(),
+        3,
+        "exactly the scripted three fresh turns are requested: {}",
+        logged.len()
+    );
+    let second_saw = format!("{:?}", logged[1]).contains(ECHO_TOOL_RESULT);
+    if second_saw {
+        // Turn 2's history carries turn 1's fresh probe result: annotated
+        // with the configured nudge, never the block.
+        let body = format!("{:?}", logged[1]);
+        assert!(
+            body.contains("[DUPLICATE_CALL_GUIDANCE]"),
+            "the first FRESH repeat escalates on the configured nudge (1), \
+             not on a history-seeded count: {body}"
+        );
+        assert!(
+            !body.contains("[DUPLICATE_CALL_ABORT]"),
+            "the first FRESH repeat must not reach the configured block (2): \
+             a seeded counter would have: {body}"
+        );
+        let body = format!("{:?}", logged[2]);
+        assert!(
+            body.contains("[DUPLICATE_CALL_ABORT]"),
+            "the second FRESH repeat escalates on the configured block (2): \
+             the fresh counters derive from the configuration alone: {body}"
+        );
+    } else {
+        panic!(
+            "turn 2's request must carry turn 1's fresh probe result — the \
+             scripted result text (\"{}\") is missing from the request log",
+            ECHO_TOOL_RESULT
+        );
+    }
+}
+
+/// Frame 4 (S5) — green-guard (the S3 projection at the factory seam is
+/// already golden: `s3_outer_budget_projects_from_the_factory_timeout_...`
+/// in factory.rs pins the projection seam; this frame pins the RECEIPT).
+/// The outer server timeout reaches the resumed coordinator through the
+/// same chain the normal path uses — factory timeout → `outer_budget` →
+/// the resumed coordinator's budget check — not a resume-specific bypass.
+///
+/// Arm A: a nonzero factory timeout whose whole budget (2s) cannot fit
+/// even one configured per-call slice (7s) — the resumed coordinator's
+/// first post-execute `create_plan` decision hits the normal
+/// 'Time budget exhausted' arm and the loop stops on ONE scripted
+/// decision turn, its final answer carrying that stopping reason.
+///
+/// Arm B: the same fixture under a timeout large enough to fund its
+/// slices (600s) replans normally — three exact decision turns consumed,
+/// the fourth never requested (the fresh cycle budget S4 frame 11 pins
+/// does that stopping; the outer chain does not). The only input
+/// difference between the arms is the factory timeout argument, so the
+/// budget the coordinator reads is the projected outer value, through the
+/// normal chain.
+#[tokio::test]
+async fn s5_resumed_coordinator_receives_the_outer_server_timeout_through_the_normal_chain() {
+    let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
+    // Arm B installs FOUR worker overrides (the restored node plus one per
+    // permitted fresh cycle); the fourth is never requested. Arm A
+    // installs one. The drain guard keeps either arm's leftovers off the
+    // process-global queue.
+    let _drain = OverrideDrain;
+
+    fn budget_world() -> World {
+        world_with_per_call_timeout(7)
+    }
+
+    // Arm A: budget 2s < one per-call slice 7s → the chain engages.
+    let arm_a_world = budget_world();
+    register_decided(&arm_a_world).await;
+    publish_document(&arm_a_world, &sentinel_document(&arm_a_world)).await;
+    let arm_a_grant = evaluate_resume(evaluation(&arm_a_world, false, None))
+        .await
+        .expect("the all-decided run grants");
+    let arm_a_coordinator = ScriptedCompletionModel::new(vec![planning_turn_for("cycle one")]);
+    let arm_a_requests = arm_a_coordinator.requests();
+    install_coordinator_overrides(vec![CoordinatorOverride {
+        model: arm_a_coordinator,
+    }]);
+    install_worker_overrides(vec![WorkerOverride {
+        model: ScriptedCompletionModel::new(vec![
+            ScriptedTurn::tool_calls(vec![ScriptedToolCall::new(
+                "call_sub_s5a",
+                "submit_result",
+                json!({
+                    "summary": "arm a settled",
+                    "result": "the restored node completed under arm a",
+                    "confidence": "high",
+                }),
+            )])
+            .with_text(A_DONE),
+        ]),
+        extra_tools: vec![Box::new(
+            RecordingTool::new(Arc::new(Mutex::new(Vec::new()))).with_name(TOOL),
+        )],
+    }]);
+    let arm_a_factory = OrchestratorFactory::new(arm_a_world.config.clone())
+        .with_reservation_table(Arc::new(ResumeClaimTable::new()));
+
+    let (mut arm_a_stream, _arm_a_cancel, _arm_a_usage) = arm_a_factory
+        .resume_stream_with_timeout(arm_a_grant, Duration::from_secs(2), "req_s5_chain_some")
+        .await;
+    let arm_a_text = s5_driven_final_text(&mut arm_a_stream).await;
+    assert_eq!(
+        arm_a_requests
+            .lock()
+            .expect("coordinator request log")
+            .len(),
+        1,
+        "the projected Some(timeout) outer budget stops the resumed coordinator \
+         loop at its FIRST create_plan decision ('Time budget exhausted') — the \
+         factory timeout reached the segment through the normal chain"
+    );
+    assert!(
+        arm_a_text.contains("Time budget exhausted"),
+        "the projected budget's exhausted arm rides the resumed run's final \
+         answer: {arm_a_text:?}"
+    );
+
+    // Arm B: the same fixture shape under a timeout large enough to fit
+    // every configured slice — the chain must NOT disturb the loop, whose
+    // own cycle budget is the only stopper.
+    let arm_b_world = budget_world();
+    register_decided(&arm_b_world).await;
+    publish_document(&arm_b_world, &sentinel_document(&arm_b_world)).await;
+    let arm_b_grant = evaluate_resume(evaluation(&arm_b_world, false, None))
+        .await
+        .expect("the all-decided run grants");
+    let arm_b_coordinator = ScriptedCompletionModel::new(vec![
+        planning_turn_for("cycle one"),
+        planning_turn_for("cycle two"),
+        planning_turn_for("cycle three"),
+        planning_turn_for("the fourth fresh cycle must never be requested"),
+    ]);
+    let arm_b_requests = arm_b_coordinator.requests();
+    install_coordinator_overrides(vec![CoordinatorOverride {
+        model: arm_b_coordinator,
+    }]);
+    install_worker_overrides(vec![
+        WorkerOverride {
+            model: ScriptedCompletionModel::new(vec![ScriptedTurn::text(A_DONE)]),
+            extra_tools: vec![Box::new(
+                RecordingTool::new(Arc::new(Mutex::new(Vec::new()))).with_name(TOOL),
+            )],
+        },
+        s5_cycle_worker_override("arm b fresh cycle one"),
+        s5_cycle_worker_override("arm b fresh cycle two"),
+        s5_cycle_worker_override("arm b fresh cycle three"),
+    ]);
+    let arm_b_factory = OrchestratorFactory::new(arm_b_world.config.clone())
+        .with_reservation_table(Arc::new(ResumeClaimTable::new()));
+
+    let (mut arm_b_stream, _cancel, _usage) = arm_b_factory
+        .resume_stream_with_timeout(arm_b_grant, Duration::from_secs(600), "req_s5_chain_none")
+        .await;
+    let arm_b_text = s5_driven_final_text(&mut arm_b_stream).await;
+    assert_eq!(
+        arm_b_requests
+            .lock()
+            .expect("coordinator request log")
+            .len(),
+        3,
+        "the projector's None-unbounded shape — a budget that fits its slices \
+         — never disturbs the resumed coordinator loop: three decision turns \
+         consumed, the fourth never requested"
+    );
+    assert!(
+        arm_b_text.contains("Replan budget exhausted"),
+        "the wide-budget arm stops on the cycle budget alone, never the outer \
+         chain: {arm_b_text:?}"
+    );
+}
+
+/// One worker override for a fresh-planned `operations` task: a single
+/// submit-result turn whose marker text is the cycle's own.
+fn s5_cycle_worker_override(marker: &str) -> WorkerOverride {
+    WorkerOverride {
+        model: ScriptedCompletionModel::new(vec![
+            ScriptedTurn::tool_calls(vec![ScriptedToolCall::new(
+                "call_sub_cycle",
+                "submit_result",
+                json!({
+                    "summary": marker,
+                    "result": marker,
+                    "confidence": "high",
+                }),
+            )])
+            .with_text(marker),
+        ]),
+        extra_tools: vec![],
+    }
+}
+
+/// Drive a resume stream to its `Final` terminal, returning the content
+/// that terminal carries — the frame-4 arms' final-answer probe.
+async fn s5_driven_final_text<S>(stream: &mut S) -> String
+where
+    S: futures::Stream<Item = Result<StreamItem, StreamError>> + Unpin,
+{
+    use futures::StreamExt;
+    let mut text = String::new();
+    while let Some(item) = stream.next().await {
+        if let Ok(StreamItem::Final(info)) = item {
+            text = info.content;
+            break;
+        }
+    }
+    text
+}
+
+/// Frame 5 (S5) — green-guard. Historical turn/call numbering on the
+/// restored checkpoint is preserved as evidence and never constrains the
+/// fresh limits: a checkpoint whose historical depth sits near the max —
+/// iteration 8, an executed-tombstone ledger of six historical handles,
+/// and a ten-turn historical worker history — still gets the FULL
+/// configured fresh depth (turn depth 3 here; the rig default is 16, so
+/// the interim and a checkpoint-derived budget must not coincide).
+///
+/// The continuation spends the full fresh budget — two probe calls and
+/// the natural submit — stops nowhere, requests the fourth turn never,
+/// and completes with the natural finish; the historical numbering rides
+/// the checkpoint untouched as the evidence it is (a grantable
+/// checkpoint's executed-tombstone ledger always reads empty, so the
+/// historical executions stage in the conversation history instead).
+#[tokio::test]
+async fn s5_historical_checkpoint_numbering_stays_separate_from_fresh_limits() {
+    let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
+    let _drain = OverrideDrain;
+    let world = world_with_turn_depth(3);
+    let probe_invocations = Arc::new(Mutex::new(Vec::new()));
+    install_worker_overrides(vec![WorkerOverride {
+        model: ScriptedCompletionModel::new(vec![
+            ScriptedTurn::tool_calls(vec![s5_probe_call("call_full_0", json!({ "step": "one" }))])
+                .with_text("full budget step one"),
+            ScriptedTurn::tool_calls(vec![s5_probe_call("call_full_1", json!({ "step": "two" }))])
+                .with_text("full budget step two"),
+            ScriptedTurn::tool_calls(vec![ScriptedToolCall::new(
+                "call_sub_full",
+                "submit_result",
+                json!({
+                    "summary": "full fresh depth spent",
+                    "result": "the continuation reached its natural finish",
+                    "confidence": "high",
+                }),
+            )]),
+            // The fourth scripted turn exists ONLY to prove the fresh
+            // budget was spent exactly: an extended or checkpoint-derived
+            // budget might reach it; the configured one must not.
+            ScriptedTurn::tool_calls(vec![s5_probe_call(
+                "call_full_3",
+                json!({ "step": "four" }),
+            )]),
+        ]),
+        extra_tools: vec![
+            Box::new(RecordingTool::new(Arc::new(Mutex::new(Vec::new()))).with_name(TOOL)),
+            Box::new(RecordingTool::new(probe_invocations.clone()).with_name(PROBE_TOOL)),
+        ],
+    }]);
+    install_coordinator_overrides(vec![CoordinatorOverride {
+        model: ScriptedCompletionModel::new(vec![coordinator_direct_turn()]),
+    }]);
+    register_decided(&world).await;
+    // The fixture's historical numbering, near the max everywhere:
+    // iteration 8, six executed tombstones, and ten historical turns on
+    // the awaiting node's history with their own numbered call ids.
+    let mut document = sentinel_document(&world);
+    document.iteration = 8;
+    if let Some(history) = document.plan.tasks.first_mut().unwrap().history.as_mut() {
+        for i in 0..10 {
+            history.push(rig::completion::Message::user(format!(
+                "historical turn {i}"
+            )));
+            history.push(rig::completion::Message::assistant(
+                "historical settled step",
+            ));
+        }
+    }
+    publish_document(&world, &document).await;
+
+    let grant = evaluate_resume(evaluation(&world, false, None))
+        .await
+        .expect("the all-decided run grants despite the near-max historical numbering");
+
+    let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<Result<StreamItem, StreamError>>(64);
+    let end = run_segment_borrowed(
+        &grant,
+        &world.config,
+        &HashMap::new(),
+        event_tx,
+        crate::UsageState::new(),
+        None,
+    )
+    .await
+    .expect("the segment driver did not panic");
+    let ResumeStreamEnd::Completed { final_answer } = &end else {
+        panic!("the fresh limits complete the near-max historical checkpoint: {end:?}")
+    };
+    assert_eq!(
+        final_answer, COORD_FINAL_ANSWER,
+        "the historical numbering neither shortened nor obstructed the fresh \
+         run's natural finish"
+    );
+    assert_eq!(
+        probe_invocations
+            .lock()
+            .expect("probe invocation log")
+            .len(),
+        2,
+        "the FULL fresh budget's probe calls executed"
     );
 }
 
