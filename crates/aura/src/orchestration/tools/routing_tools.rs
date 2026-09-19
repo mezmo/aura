@@ -154,6 +154,8 @@ pub struct CreatePlanArgs {
     /// The overall goal this plan addresses.
     pub goal: String,
     /// Ordered steps to execute. Sequential by default; use `{"parallel": [...]}` for concurrency.
+    /// Empty when the argument held no usable steps (see `deserialize_steps`).
+    #[serde(default, deserialize_with = "deserialize_steps")]
     pub steps: Vec<StepInput>,
     /// Why this query requires orchestration.
     pub routing_rationale: String,
@@ -254,10 +256,17 @@ impl Tool for CreatePlanTool {
             });
         }
 
-        let step_count = count_leaf_steps(&args.steps);
+        if args.steps.is_empty() {
+            return Ok(CreatePlanOutput {
+                status: STEPS_REQUIRED_HELP.to_string(),
+            });
+        }
+
+        let steps = args.steps;
+        let step_count = count_leaf_steps(&steps);
         *guard = Some(PlanningResponse::StepsPlan {
             goal: args.goal,
-            steps: args.steps,
+            steps,
             routing_rationale: args.routing_rationale,
             planning_summary: args.planning_summary,
         });
@@ -265,6 +274,71 @@ impl Tool for CreatePlanTool {
             status: format!("Plan created with {} steps.", step_count),
         })
     }
+}
+
+/// Returned when `steps` is missing or could not be parsed. Says what a valid argument
+/// looks like: a bare deserialization error tells the model nothing, and it retries the
+/// same malformed shape until the planning depth budget is gone.
+const STEPS_REQUIRED_HELP: &str = concat!(
+    "Error: `steps` is required and must be a JSON array of step objects. Call ",
+    "create_plan again with, for example: ",
+    r#""steps": [{"type": "task", "worker": "<worker>", "task": "<what to do>"}]"#
+);
+
+/// Deserialize `steps` from an array, or from a string holding the JSON array.
+///
+/// Models routinely send a nested array argument as a string. Any shape that yields no
+/// steps — a string holding no array, a number, an object — returns an empty list rather
+/// than a deserialization error, so `call` can answer with `STEPS_REQUIRED_HELP`:
+/// failing here costs a planning turn and hands the model a serde message it cannot act
+/// on.
+fn deserialize_steps<'de, D>(deserializer: D) -> Result<Vec<StepInput>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StepsPayload {
+        List(Vec<StepInput>),
+        Raw(String),
+        /// Anything else the model sent: a number, a bool, an object, null.
+        Other(serde_json::Value),
+    }
+
+    Ok(match StepsPayload::deserialize(deserializer)? {
+        StepsPayload::List(steps) => steps,
+        StepsPayload::Raw(raw) => parse_steps_str(&raw).unwrap_or_else(|| {
+            tracing::warn!("create_plan sent `steps` as an unparseable string; asking again");
+            Vec::new()
+        }),
+        StepsPayload::Other(value) => {
+            if !value.is_null() {
+                tracing::warn!(
+                    "create_plan sent `steps` as {}; asking again",
+                    match value {
+                        serde_json::Value::Object(_) => "an object",
+                        serde_json::Value::Number(_) => "a number",
+                        serde_json::Value::Bool(_) => "a bool",
+                        _ => "an unexpected type",
+                    }
+                );
+            }
+            Vec::new()
+        }
+    })
+}
+
+/// Parse a JSON array of steps out of a string argument.
+///
+/// Slices from the first `[` to the last `]`, so prose or markup around the array does
+/// not have to be recognised to be ignored.
+fn parse_steps_str(raw: &str) -> Option<Vec<StepInput>> {
+    let start = raw.find('[')?;
+    let end = raw.rfind(']')?;
+    if end < start {
+        return None;
+    }
+    serde_json::from_str(&raw[start..=end]).ok()
 }
 
 /// Count the number of leaf tasks in a step tree (for status messages).
@@ -401,6 +475,86 @@ mod tests {
             }
             other => panic!("Expected Direct, got {:?}", other),
         }
+    }
+
+    /// A model that writes XML tool syntax sends `steps` as a JSON string, sometimes with
+    /// the closing tags still attached. Both parse rather than costing a planning turn.
+    #[test]
+    fn test_steps_accepts_json_string() {
+        let args: CreatePlanArgs = serde_json::from_value(serde_json::json!({
+            "goal": "Investigate logs",
+            "steps": r#"[{"type": "task", "worker": "operations", "task": "Fetch recent logs"}]"#,
+            "routing_rationale": "Requires tool execution",
+            "planning_summary": "Fetch and analyze recent logs",
+        }))
+        .unwrap();
+
+        assert_eq!(count_leaf_steps(&args.steps), 1);
+    }
+
+    /// A string payload may carry markup or prose around the array; slicing to the outer
+    /// brackets ignores it without recognising any particular syntax.
+    #[test]
+    fn test_steps_string_ignores_surrounding_markup() {
+        let raw = concat!(
+            "```json\n",
+            r#"[{"type": "task", "worker": "operations", "task": "Fetch recent logs"}]"#,
+            "\n```\n"
+        );
+        let args: CreatePlanArgs = serde_json::from_value(serde_json::json!({
+            "goal": "Investigate logs",
+            "steps": raw,
+            "routing_rationale": "Requires tool execution",
+            "planning_summary": "Fetch and analyze recent logs",
+        }))
+        .unwrap();
+
+        assert_eq!(count_leaf_steps(&args.steps), 1);
+    }
+
+    /// A shape no variant matches — an object, a number — still reaches `call`, so the
+    /// model gets the help text rather than an opaque deserialization error.
+    #[tokio::test]
+    async fn test_steps_of_wrong_type_reaches_the_help_text() {
+        for bad in [
+            serde_json::json!({"first": "fetch logs"}),
+            serde_json::json!(3),
+            serde_json::json!(true),
+        ] {
+            let args: CreatePlanArgs = serde_json::from_value(serde_json::json!({
+                "goal": "Investigate logs",
+                "steps": bad,
+                "routing_rationale": "Requires tool execution",
+                "planning_summary": "Fetch and analyze recent logs",
+            }))
+            .expect("malformed steps must not fail deserialization");
+
+            let toolset = RoutingToolSet::new();
+            let result = toolset.create_plan.call(args).await.unwrap();
+            assert!(result.status.starts_with("Error: `steps` is required"));
+            assert!(toolset.decision.lock().await.is_none());
+        }
+    }
+
+    /// Nothing recoverable: the model is told what a valid `steps` looks like, and no
+    /// plan is recorded.
+    #[tokio::test]
+    async fn test_create_plan_without_steps_asks_for_an_array() {
+        let toolset = RoutingToolSet::new();
+        let result = toolset
+            .create_plan
+            .call(CreatePlanArgs {
+                goal: "Investigate logs".to_string(),
+                steps: Vec::new(),
+                routing_rationale: "Requires tool execution".to_string(),
+                planning_summary: "Fetch and analyze recent logs".to_string(),
+            })
+            .await
+            .unwrap();
+
+        assert!(result.status.starts_with("Error: `steps` is required"));
+        assert!(result.status.contains("JSON array"));
+        assert!(toolset.decision.lock().await.is_none());
     }
 
     #[tokio::test]
