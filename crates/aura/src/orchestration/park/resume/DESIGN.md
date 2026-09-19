@@ -1,5 +1,20 @@
 # P45 skeleton design record — the resume endpoint's type surface
 
+> **Supersession record (2026-09-18, S6 / `a9ad8a8a`).** The atomic JSON
+> projection this document designed was retired when the SSE wave closed:
+> the public `SegmentTurns` / `EmptySegment` / `SegmentResult` /
+> `run_segment` surface, `Orchestrator::run_resume_segment`, the
+> `DeferredPairs` wire-pair assembly, and the handlers.rs projection
+> cluster are gone, per the removal manifest's S2/S6 and S4/S6 rows.
+> The live surface is the borrowed-grant stream drive:
+> `run_segment_borrowed(&ResumeGrant, &AgentRuntimeConfig, &HashMap, Sender, UsageState, Option<Duration>) -> Result<ResumeStreamEnd, SegmentError>`
+> in `evaluate.rs`, `ResumeStreamEnd::{Completed { final_answer }, Reparked}`,
+> the `pub(super)` `Orchestrator::run_resume_segment_borrowed`, and the
+> factory supervisor `OrchestratorFactory::resume_stream_with_timeout`.
+> Everything below describes the pre-S6 type surface — it remains as the
+> design history of the skeleton layer, and every row naming a retired
+> type is historical only.
+
 Layer 1 typed-holes unit: real signatures, real derives, `todo!()` bodies for
 everything with behavior. The public surface lives in
 `orchestration/park/resume/` and is re-exported flat from
@@ -13,7 +28,7 @@ everything with behavior. The public surface lives in
 | `claim.rs` | Path-segment parse types, checkpoint document locations, the per-run claim table and its lease |
 | `evaluate.rs` | Presented-identity resolution, blocking entries (plain and non-empty), the refusal rows, the ordered evaluation stages, the grant, the segment seam |
 | `mod.rs` | Re-exports; the `#![allow(dead_code)]` slice for the skeleton |
-| `orchestrator.rs` (outside this directory, by ruling) | The segment entry `Orchestrator::run_resume_segment`: the segment loop `run_segment` delegates to — run-id binding, continuation streaming, re-park commit, completion teardown |
+| `orchestrator.rs` (outside this directory, by ruling) | ~~The segment entry `Orchestrator::run_resume_segment`: the segment loop `run_segment` delegates to — run-id binding, continuation streaming, re-park commit, completion teardown~~ — RETIRED at S6; the live entry is `run_resume_segment_borrowed` (id binding, the stream drive, re-park publication, completion teardown) |
 
 ## Type → business rule → forbidden invalid state
 
@@ -36,13 +51,13 @@ everything with behavior. The public surface lives in
 | `ResumeConflictRow` | One 409 shape `{code, detail, blocking}` for every not-ready row | Six divergent 409 body shapes; a conflict row without its code |
 | `ResumeRefusal` | The evaluation's refusal rows in card order; two detail-less rows, then conflicts, then faults | A verdict outside the table; a 404 row carrying detail |
 | `ResumeEvaluation` | One bundle per request: path, the parked-dir input, config, store, claim table, the bind flag, the presented identity, request id, clock | A stage reading a request facet the bundle does not carry; documents or a resolved binding state constructed independently of their inputs |
-| `ResumeGrant` | All-decided ⇒ authorization; the grant is the only door to `run_segment` | A segment running on an unevaluated or refused run |
-| `SegmentTurns` | A segment — completed or parked — carries at least one turn | An empty `turns` array on the 200 body |
-| `SegmentResult` | A segment ends completed or parked, never both | A success body with `blocking` on a completed segment |
+| `ResumeGrant` | All-decided ⇒ authorization; the grant is the only door to the segment seam (`run_segment_borrowed` since S6) | A segment running on an unevaluated or refused run |
+| `SegmentTurns` | ~~A segment — completed or parked — carries at least one turn~~ — RETIRED at S6 with the atomic 200 body | ~~An empty `turns` array on the 200 body~~ |
+| `SegmentResult` | ~~A segment ends completed or parked, never both~~ — RETIRED at S6; `ResumeStreamEnd` is the two-valued terminal now | ~~A success body with `blocking` on a completed segment~~ |
 | `SegmentError` | Mid-segment faults are distinct from refusals | A resume fault rendering as an evaluation verdict |
 | `PeekOutcome` | The substitution pre-flight's verdict per decided call at its key-position (same-key duplicate calls pair with their key's FIFO queue front-to-back): the entry exists and is executable — a denial never needs identity, an approval under an identity-demanding route must carry it | A pre-flight that consumes; a consumption assumed from a passed pre-flight |
 | `evaluate_resume` | First matching row wins; each stage's fault type admits only its own rows (row purity is structural); the stage sequence is the body's | A verdict from a foreign stage's fault type; sequence drift, which the Layer-2 golden tests pin |
-| `run_segment` | One call = one segment; atomic data, no mid-segment streaming | Partial streaming of a segment's turns |
+| `run_segment` | ~~One call = one segment; atomic data, no mid-segment streaming~~ — RETIRED at S6; one `run_segment_borrowed` call = one segment streamed to the caller's channel | ~~Partial streaming of a segment's turns~~ (the segment now streams by contract) |
 
 ## How the evaluation order is encoded
 
@@ -109,10 +124,13 @@ Two duties ride on specific stages:
   pre-render: `project_blocking` has produced the pre-sweep blocking list
   by then, and the sweep (`park::commit::cancel_run_approvals`) publishes
   its broker events under the bundle's `request_id`.
-- **Parked-arm turns.** `SegmentResult::Parked` carries `SegmentTurns`
-  (non-empty) like the completed arm: the continuation's first gated
-  assistant turn always exists, so a zero-turn park is unreachable in
-  production. If ever observed it surfaces as a loud fault (residual risks
+- **Parked-arm turns.** ~~`SegmentResult::Parked` carries `SegmentTurns`
+  (non-empty) like the completed arm~~ — RETIRED at S6 with the atomic 200
+  body; the parked arm's client-visible signal is the publication owner's
+  `RunParked` (with the refreshed blocking set). Historical note: the
+  continuation's first gated assistant turn always exists, so a zero-turn
+  park was unreachable in production. If ever observed it surfaces as a
+  loud fault (residual risks
   below), never as a silent empty body.
 
 ## Fill-unit duties (in-crate; applied by the evaluate fill)
@@ -133,19 +151,19 @@ Two duties ride on specific stages:
 | Seam | Visibility | Consumer |
 | --- | --- | --- |
 | `park::resume` re-exports | `pub use` at `orchestration/mod.rs` | `aura-web-server` (`aura::orchestration::*`) |
-| Payload types reachable through re-exported carriers | `pub use` at both hops (`park::resume`, `orchestration`) | `aura-web-server`, which must be able to name every type in a re-exported signature: `Diagnostic` (`ResumeRefusal::Fault`), `ParkedToolName` (`BlockingEntry::tool`), `SegmentTurns`/`EmptySegment` (`SegmentResult`, `SegmentTurns::try_new`), `NonEmptyBlocking`/`EmptyBlocking` (`SegmentResult::Parked`, `try_new`), `SegmentError` (`run_segment`). Checked and excluded — named in no re-exported signature: `IdentityHash` (comparison-only since the binding state went private), `ResumeLease` (private `ResumeGrant` field), `IdentityBindingState` (private) |
+| Payload types reachable through re-exported carriers | `pub use` at both hops (`park::resume`, `orchestration`) | `aura-web-server`, which must be able to name every type in a re-exported signature: `Diagnostic` (`ResumeRefusal::Fault`), `ParkedToolName` (`BlockingEntry::tool`), `NonEmptyBlocking`/`EmptyBlocking` (the refusal rows' parked/expired signatures), `SegmentError` (`run_segment_borrowed`). ~~`SegmentTurns`/`EmptySegment` (`SegmentResult`, `SegmentTurns::try_new`)~~ — RETIRED at S6 with the atomic surface; the live terminal `ResumeStreamEnd` names no blocking types. Checked and excluded — named in no re-exported signature: `IdentityHash` (comparison-only since the binding state went private), `ResumeLease` (private `ResumeGrant` field), `IdentityBindingState` (private) |
 | Stage fns, `LocatedCheckpoint`, the `*Fault` enums (private to `evaluate.rs`; `ClaimResumeFault` in `claim.rs`) | private / `pub(crate)` | the fill unit only |
 | `ResumeClaimTable::is_live`, `rename_back_to_parked`, `claim_and_resume` | `pub(crate)` | in-crate evaluation stages |
 | `ResumeDocuments::parked`/`resuming`, `Diagnostic::new`, `IdentityHash::from_stored`, `IdentityHash::into_inner`, `ParkedToolName::new`, `ResumeConflictRow` row constructors | `pub(crate)` | in-crate stages and the handler-side projections; `into_inner` hands the hashed digest to `ParkCommitInputs` at the live park site |
 | `config_fingerprint`, `parked_document_dir` | `pub(crate)` in `park::commit`, reached as `super::super::commit::*` | `check_fingerprint`, `ResumeDocuments::for_path` |
 | `RecordedDecisions`, `ParkedRun` | `pub(crate)` types behind private `ResumeGrant` fields | the in-crate segment runner; opaque to the web server |
 | `ResumeGrant::checkpoint`/`recorded_decisions`/`consumed_decisions`/`documents` | `pub(crate)` accessors over the private fields | the orchestrator's segment entry |
-| `Orchestrator::run_resume_segment` | `pub(super)` associated fn on the orchestrator (no blanket visibility opening) | `run_segment`, which is a thin delegation |
-| `Orchestrator::for_resume_segment`, `drive_resume_segment`, `collect_segment_turns`, the segment helpers | private to `orchestrator.rs` | the entry only |
+| `Orchestrator::run_resume_segment` | `pub(super)` associated fn on the orchestrator (no blanket visibility opening) | `run_segment`, which is a thin delegation — RETIRED at S6; the live entry is `run_resume_segment_borrowed`, same `pub(super)` discipline |
+| `Orchestrator::for_resume_segment`, `drive_resume_segment`, `collect_segment_turns`, the segment helpers | private to `orchestrator.rs` | the entry only — `drive_resume_segment` and `collect_segment_turns` RETIRED at S6 (`collect_segment_content` is the live collector); `for_resume_segment` and the drive helpers persist |
 | `ExecutionPersistence::resume` | `pub` constructor in `persistence.rs` | `for_resume_segment`: seeds the checkpoint's existing `(run_id, session_id, iteration)` instead of minting a fresh run id |
 | `ParkCommitInputs::identity_hash` | `pub(crate)` field on the park commit inputs | the park path (write side of `bind_identity`); a re-park passes the checkpoint's stored value through |
 | `ResumeGrant::session_id`/`run_id` | `pub` accessors | the endpoint's 200 body |
-| `ResumeRunResponse`, `ResumeRunState`, `refusal_response`, `continuation_turns`, `from_segment` | private in `handlers.rs`; their skeleton `#[allow(dead_code)]` markers were swept when `resume_run` landed | the handler body (filled) |
+| `ResumeRunResponse`, `ResumeRunState`, `refusal_response`, `continuation_turns`, `from_segment` | private in `handlers.rs`; their skeleton `#[allow(dead_code)]` markers were swept when `resume_run` landed | the handler body (filled) — the projection cluster RETIRED at S6; the handler now feeds the normal SSE completion path |
 | Test-only accessors | none added | existing `#[cfg(test)]` accessors in the park module are untouched |
 
 The `#![allow(dead_code)]` at `resume/mod.rs` covers exactly the new module;
@@ -191,10 +209,13 @@ card; continuation.rs :202's marker was swept at the gate-a fold when
   re-derivation — an expired row with nothing outstanding — surfaces as a
   500 fault. If that fault is ever observed, the expired row's
   reachability assumption is wrong; stop and re-derive the row's semantics.
-- **A zero-turn park is a loud fault, by design.** The continuation's first
+- **A zero-turn park is a loud fault, by design.** ~~The continuation's first
   gated assistant turn always exists, so `SegmentTurns::try_new` cannot
   reject a real park; a re-park carrying zero turns fails the segment
-  (500) rather than rendering an empty `turns` array.
+  (500) rather than rendering an empty `turns` array.~~ — RETIRED at S6:
+  the atomic turns body is gone; the re-park's turns ride the stream and
+  the checkpoint commit, and a structurally empty re-park still fails the
+  segment loudly.
 - **Claim-lock discipline is a fill-unit obligation.** The table uses a
   `std::sync::Mutex` so `ResumeLease::drop` can release without a runtime.
   The rename-under-lock holes must acquire the guard inside a
@@ -232,10 +253,10 @@ card; continuation.rs :202's marker was swept at the gate-a fold when
 | `park/resume/evaluate.rs` | `project_blocking` — filled |
 | `park/resume/evaluate.rs` | `authorize` — filled |
 | `park/resume/evaluate.rs` | `evaluate_resume` — filled |
-| `park/resume/evaluate.rs:744` | `run_segment` — filled (thin delegation to `Orchestrator::run_resume_segment`) |
+| `park/resume/evaluate.rs:744` | `run_segment` — filled (thin delegation to `Orchestrator::run_resume_segment`); RETIRED at S6 — the live seam is `run_segment_borrowed` |
 | `aura-config/src/config.rs:587` | `require_identity_header_for_binding` — filled |
 | `aura-web-server/src/server.rs:312` | `refuse_park_on_memory_backend` — filled |
-| `aura-web-server/src/handlers.rs:1403` | `continuation_turns` — filled |
+| `aura-web-server/src/handlers.rs:1403` | `continuation_turns` — filled; RETIRED at S6 with the projection cluster |
 | `aura-web-server/src/handlers.rs:1441` | `resume_run` (handler dispatch) — filled |
 
 With the handler unit filled, this closes the card's hole inventory: every
@@ -245,18 +266,19 @@ identity-hash write side with no new holes: `ParkCommitInputs::identity_hash`
 (commit.rs) and `build_document`'s matching parameter (document.rs) are
 implemented bodies, and the orchestrator's segment entry carries none.
 
-**Completed-arm tool-call fidelity (recorded at the handler fill).**
-`continuation_turns` renders the wire `tool_calls[].id` from the rig call's
-provider `call_id` when the turn carries one (the parked arm's
-snapshot-derived turns: full fidelity). Completed segments' turns are
-reassembled from provider-agnostic stream items that drop the `call_id`
-(`collect_segment_turns`), and nothing in the `SegmentResult::Completed`
-surface — stream-derived `SegmentTurns` only — supports re-deriving it
-without widening the seam beyond the card's files. The projection falls
-back to the stream item's own id, the same value the live SSE stream
-emits for the same call (never null, never fabricated); the loss is real
-only for providers where the responses-API-style `call_id` differs from
-the item id. This is the recorded spec gap for Gate U.
+**Completed-arm tool-call fidelity (recorded at the handler fill;
+superseded at S6).** ~~`continuation_turns` renders the wire
+`tool_calls[].id` from the rig call's provider `call_id` when the turn
+carries one (the parked arm's snapshot-derived turns: full fidelity).
+Completed segments' turns are reassembled from provider-agnostic stream
+items that drop the `call_id` (`collect_segment_turns`), and nothing in
+the `SegmentResult::Completed` surface — stream-derived `SegmentTurns`
+only — supports re-deriving it without widening the seam beyond the
+card's files.~~ The atomic 200 body this gap was recorded against is
+retired; the live SSE stream's own ids are the only client-visible
+values now, and the re-park's checkpoint commit preserves the
+snapshot-derived turns on disk. Historical record of the spec gap for
+Gate U.
 
 ## The P45 correction fold (dispatch unit B1, 2026-09-12)
 

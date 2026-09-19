@@ -7,7 +7,10 @@ records:
 
 - **Pipeline frames** —
   `orchestration::park::resume::goldens` (this directory, `goldens.rs`):
-  drive `evaluate_resume` / `run_segment` over production-reachable
+  drive `evaluate_resume` / `run_segment_borrowed` (the borrowed-grant
+  stream seam; the atomic `run_segment` entry was retired at S6 and the
+  migrated frames drive a `run_segment_live` test helper over the same
+  seam) over production-reachable
   fixtures (file-backed approval store, `publish`-ed documents, matching
   `config_fingerprint`), and pin the complete 409 body as the exact
   `serde_json` value of the `ResumeConflictRow` — the value axum's
@@ -153,10 +156,11 @@ internals.
   frames stayed red on the fold's replace-miss fatal until the Stage 3
   reconstruction wiring landed (this change's commit; all three flipped green
   unedited); the retired slot-swap helper was reaped at Stage 7.
-- `run_segment` consumes the `test_rig` worker-override queue for its
+- `run_segment_borrowed` consumes the `test_rig` worker-override queue for its
   continuation's worker builds and the coordinator-override queue for the
   resumed coordinator loop's build, so the segment frames run scripted
-  models on both seats.
+  models on both seats. (Written when the atomic `run_segment` was the
+  entry; the seam moved at S6, the consumption contract is unchanged.)
 - The two-resume lifecycle frames install their worker overrides per resume,
   never up front: the queue is take-once and process-global, and a frame
   failing mid-lifecycle must not leak the resumes it never drove into the
