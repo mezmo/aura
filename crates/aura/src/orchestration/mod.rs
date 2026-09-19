@@ -93,11 +93,10 @@ pub use park::lifetime::{ReservationFault, RunExecutionScope, RunReservationLeas
 // handler (P45). Every type named in a re-exported signature is re-exported
 // with it, so the consumer can name what it receives.
 pub use park::resume::{
-    BlockingEntry, ConflictCode, Diagnostic, EmptyBlocking, EmptySegment, MalformedId,
-    NonEmptyBlocking, ParkedToolName, ResumeClaimTable, ResumeConflictRow, ResumeDocuments,
-    ResumeEvaluation, ResumeGrant, ResumeRefusal, ResumeRunId, ResumeSessionId, ResumeStreamEnd,
-    SegmentError, SegmentResult, SegmentTurns, ValidatedResumePath, evaluate_resume, run_segment,
-    run_segment_borrowed,
+    BlockingEntry, ConflictCode, Diagnostic, EmptyBlocking, MalformedId, NonEmptyBlocking,
+    ParkedToolName, ResumeClaimTable, ResumeConflictRow, ResumeDocuments, ResumeEvaluation,
+    ResumeGrant, ResumeRefusal, ResumeRunId, ResumeSessionId, ResumeStreamEnd, SegmentError,
+    ValidatedResumePath, evaluate_resume, run_segment_borrowed,
 };
 // The sentinel leak guard drives the commit and the resuming document
 // from the reconciler side of the crate.

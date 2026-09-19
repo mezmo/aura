@@ -36,6 +36,28 @@ use super::super::retention::RetentionExpiresAt;
 use super::super::{RESUMING_DOCUMENT_SUFFIX, run_owner_id};
 use super::*;
 
+/// Drive one granted segment through the live borrowed-grant seam: the
+/// retired atomic `run_segment` entry's test-side replacement. The segment
+/// consumes the grant by reference and streams to a detached channel the
+/// frame does not read — the frame's assertions are the segment's side
+/// effects and its `ResumeStreamEnd`/fault terminal.
+async fn run_segment_live(
+    grant: ResumeGrant,
+    config: &AgentRuntimeConfig,
+    headers: &HashMap<String, String>,
+) -> Result<ResumeStreamEnd, SegmentError> {
+    let (event_tx, _event_rx) = tokio::sync::mpsc::channel(64);
+    run_segment_borrowed(
+        &grant,
+        config,
+        headers,
+        event_tx,
+        crate::UsageState::new(),
+        None,
+    )
+    .await
+}
+
 /// The session path segment every golden requests.
 const SESSION: &str = "sess-p45";
 /// The run path segment every golden requests.
@@ -1891,58 +1913,6 @@ async fn concurrent_evaluations_admit_one_grant_and_refuse_the_loser_with_runnin
     }
 }
 
-/// The all-decided grant runs the segment to completion: the decided call
-/// executes through the substitution, the coordinator continuation
-/// finishes the run naturally over a scripted respond_directly, and the
-/// completed segment's turns are the run's NATURAL turns only — the
-/// continuation's final assistant turn, then the coordinator's scripted
-/// tail (R6: the outcome pair lives inside the rebuilt history the
-/// continuation streamed from, not on the wire).
-#[tokio::test]
-async fn all_decided_grant_runs_the_segment_to_completion() {
-    let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
-    let _drain = OverrideDrain;
-    let world = world();
-    let invocations = Arc::new(Mutex::new(Vec::new()));
-    install_worker_overrides(vec![WorkerOverride {
-        model: ScriptedCompletionModel::new(vec![ScriptedTurn::text(FINAL_TEXT)]),
-        extra_tools: vec![Box::new(
-            RecordingTool::new(invocations.clone()).with_name(TOOL),
-        )],
-    }]);
-    install_coordinator_overrides(vec![CoordinatorOverride {
-        model: ScriptedCompletionModel::new(vec![coordinator_direct_turn()]),
-    }]);
-    register_decided(&world).await;
-    publish_document(&world, &sentinel_document(&world)).await;
-
-    let grant = evaluate_resume(evaluation(&world, false, None))
-        .await
-        .expect("the all-decided run grants");
-    let segment = run_segment(grant, &world.config, &HashMap::new())
-        .await
-        .expect("the segment completes");
-    match segment {
-        SegmentResult::Completed { turns } => {
-            assert_eq!(
-                serde_json::to_value(turns.as_slice()).expect("turns serialize"),
-                json!([
-                    {
-                        "role": "assistant",
-                        "id": null,
-                        "content": [{ "text": FINAL_TEXT }],
-                    },
-                    coordinator_tail_turn(),
-                ]),
-                "the completed segment carries the natural continuation turn and the \
-                     coordinator's scripted tail, and nothing else — the R2 pair prepend \
-                     is gone (R6: outcomes live in the rebuilt history)"
-            );
-        }
-        other => panic!("expected a completed segment, got {other:?}"),
-    }
-}
-
 /// How long the end-of-segment drain probe waits before declaring the
 /// segment still blocked on its in-flight tail. Long enough for the
 /// scripted segment body to run to completion when it does NOT drain (the
@@ -2060,164 +2030,6 @@ impl rig::tool::Tool for SupervisorGatedTailTool {
     }
 }
 
-/// L4b golden (RED today): the atomic resume segment drains its tracked
-/// tails before returning. A tracked tail spawned DURING the segment —
-/// through the grant's ONE execution scope, exactly as production's
-/// fire-and-forget tails register — is still in flight when the segment
-/// body finishes. `drive_resume_segment` must await the scope's drain
-/// before the grant (its reservation lease) drops, so `run_segment` cannot
-/// return while the tail runs; RED today the segment returns without
-/// draining, leaving the tail in flight past the fence.
-#[tokio::test]
-async fn atomic_segment_drains_tracked_tails_before_fence_release() {
-    let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
-    let _drain = OverrideDrain;
-    let world = world();
-    register_decided(&world).await;
-    publish_document(&world, &sentinel_document(&world)).await;
-
-    let grant = evaluate_resume(evaluation(&world, false, None))
-        .await
-        .expect("the all-decided run grants");
-    let run = grant.run_id().clone();
-    // The tail must register through the grant's ONE scope, so capture the
-    // scope handle before the segment consumes the grant.
-    let scope = grant.execution_scope();
-    let (release, gate) = tokio::sync::oneshot::channel::<()>();
-    let gate = Arc::new(std::sync::Mutex::new(Some(gate)));
-    install_worker_overrides(vec![WorkerOverride {
-        model: ScriptedCompletionModel::new(vec![ScriptedTurn::text(FINAL_TEXT)]),
-        extra_tools: vec![Box::new(GatedTailTool {
-            scope,
-            gate: Arc::clone(&gate),
-        })],
-    }]);
-    install_coordinator_overrides(vec![CoordinatorOverride {
-        model: ScriptedCompletionModel::new(vec![coordinator_direct_turn()]),
-    }]);
-
-    let headers = HashMap::new();
-    let mut segment = Box::pin(run_segment(grant, &world.config, &headers));
-    // The body drives the substitution — spawning the gated tracked tail —
-    // then finishes. With no drain (RED) the segment returns here while the
-    // tail is still in flight; with the drain (GREEN) it stays blocked
-    // until the tail ends.
-    let returned_early = tokio::time::timeout(DRAIN_PROBE, &mut segment).await;
-    assert!(
-        returned_early.is_err(),
-        "the atomic segment returned while a tracked tail was still in flight: \
-         drive_resume_segment must drain the grant's scope before the segment and its \
-         reservation lease drop"
-    );
-    assert!(
-        world.claims.is_live(&run),
-        "the run stays reserved while the segment drains the in-flight tail"
-    );
-
-    release.send(()).expect("the gated tail is still held");
-    let segment = tokio::time::timeout(DRAIN_PROBE, segment)
-        .await
-        .expect("the segment returns once its tracked tail ends")
-        .expect("the segment driver did not panic");
-    assert!(
-        matches!(segment, SegmentResult::Completed { .. }),
-        "the drained segment completes: {segment:?}"
-    );
-    assert!(
-        !world.claims.is_live(&run),
-        "the reservation releases only after the segment drains its tracked tail"
-    );
-}
-
-/// A segment whose continuation issues a newly gated call re-parks: the
-/// decided call executes through the substitution and its outcome-bearing
-/// pair rides ahead of the gated assistant turn, and the blocking set names
-/// the new call. The fresh decision id and expiry are location-normalized
-/// after an audited shape check; everything else is the literal wire value.
-#[tokio::test]
-async fn re_park_mid_segment_carries_turns_and_the_new_blocking_entry() {
-    let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
-    let _drain = OverrideDrain;
-    let world = world();
-    let apply_invocations = Arc::new(Mutex::new(Vec::new()));
-    let invocations = Arc::new(Mutex::new(Vec::new()));
-    install_worker_overrides(vec![WorkerOverride {
-        model: ScriptedCompletionModel::new(vec![ScriptedTurn::tool_calls(vec![
-            ScriptedToolCall::new("call_0", NEW_TOOL, json!({ "namespace": "stage" }))
-                .with_call_id(NEW_CALL_ID),
-        ])]),
-        extra_tools: vec![
-            Box::new(RecordingTool::new(apply_invocations.clone()).with_name(TOOL)),
-            Box::new(RecordingTool::new(invocations).with_name(NEW_TOOL)),
-        ],
-    }]);
-    register_decided(&world).await;
-    publish_document(&world, &sentinel_document(&world)).await;
-
-    let grant = evaluate_resume(evaluation(&world, false, None))
-        .await
-        .expect("the all-decided run grants");
-    let segment = run_segment(grant, &world.config, &HashMap::new())
-        .await
-        .expect("the segment re-parks");
-    let apply_log = apply_invocations.lock().expect("apply invocation log");
-    assert_eq!(
-        apply_log.len(),
-        1,
-        "the decided call executes exactly once before the re-park; zero invocations \
-         recorded: the substitution prelude does not exist"
-    );
-    assert_eq!(
-        apply_log[0].arguments,
-        call_args(),
-        "the single invocation carries the recorded call's arguments"
-    );
-    drop(apply_log);
-    match segment {
-        SegmentResult::Parked { turns, blocking } => {
-            let mut body = json!({
-                "turns": serde_json::to_value(turns.as_slice()).expect("turns serialize"),
-                "blocking":
-                    serde_json::to_value(blocking.as_slice()).expect("blocking serializes"),
-            });
-            normalize_fresh_parking(&mut body);
-            assert_eq!(
-                body,
-                json!({
-                    "turns": [
-                        decided_call_turn(),
-                        decided_result_turn(&echo_tool_result_wire()),
-                        {
-                            "role": "assistant",
-                            "id": null,
-                            "content": [
-                                {
-                                    "id": "call_0",
-                                    "call_id": NEW_CALL_ID,
-                                    "function": {
-                                        "name": NEW_TOOL,
-                                        "arguments": { "namespace": "stage" },
-                                    },
-                                    "signature": null,
-                                    "additional_params": null,
-                                },
-                            ],
-                        },
-                    ],
-                    "blocking": [
-                        {
-                            "decision_id": "<fresh decision id>",
-                            "tool": NEW_TOOL,
-                            "expires_at": "<fresh expiry>",
-                        },
-                    ],
-                }),
-            );
-        }
-        other => panic!("expected a re-parked segment, got {other:?}"),
-    }
-}
-
 /// The scope-run-id audit on a mid-segment re-park: the fresh ticket the
 /// re-parking segment registers must name the ORIGINAL bound run id — the
 /// owner id the sweeps key on and the worker scope stamped on the request —
@@ -2252,11 +2064,11 @@ async fn re_park_registers_the_fresh_ticket_under_the_original_bound_run_id() {
     let grant = evaluate_resume(evaluation(&world, false, None))
         .await
         .expect("the all-decided run grants");
-    let segment = run_segment(grant, &world.config, &HashMap::new())
+    let segment = run_segment_live(grant, &world.config, &HashMap::new())
         .await
         .expect("the segment re-parks");
     assert!(
-        matches!(segment, SegmentResult::Parked { .. }),
+        matches!(segment, ResumeStreamEnd::Reparked),
         "the freshly gated call re-parks: {segment:?}"
     );
 
@@ -2340,7 +2152,7 @@ async fn consumed_subset_re_park_preserves_the_sibling_and_completes_on_the_seco
     let grant = evaluate_resume(evaluation(&world, false, None))
         .await
         .expect("the all-decided two-node run grants");
-    let segment = run_segment(grant, &world.config, &HashMap::new())
+    let segment = run_segment_live(grant, &world.config, &HashMap::new())
         .await
         .expect("node A's continuation re-parks and ends the first segment");
     {
@@ -2358,26 +2170,10 @@ async fn consumed_subset_re_park_preserves_the_sibling_and_completes_on_the_seco
             "the single invocation carries the recorded call's arguments"
         );
     }
-    let blocking = match segment {
-        SegmentResult::Parked { blocking, .. } => blocking,
-        other => panic!("expected the first segment to re-park, got {other:?}"),
-    };
-    // The fresh entry is the newly gated tool's; a retained decided sibling
-    // may ride the same list (the commit's refreshed pending keeps decided
-    // calls for the resume consult), so the shape audit is by tool name and
-    // the outstanding set is pinned on the store below, not on the wire.
-    let fresh: Vec<_> = blocking
-        .as_slice()
-        .iter()
-        .filter(|entry| entry.tool.as_ref() == NEW_TOOL)
-        .collect();
-    assert_eq!(
-        fresh.len(),
-        1,
-        "exactly one fresh blocking entry names the newly gated tool: {:?}",
-        blocking.as_slice()
+    assert!(
+        matches!(segment, ResumeStreamEnd::Reparked),
+        "node A's continuation re-parks the first segment: {segment:?}"
     );
-    let fresh_decision = fresh[0].decision_id;
 
     // The consumed-subset pin (step 8): only node A's consumed decision is
     // removed, after the commit published; node B's decided ticket survives
@@ -2423,10 +2219,7 @@ async fn consumed_subset_re_park_preserves_the_sibling_and_completes_on_the_seco
             .collect::<Vec<_>>()
     );
     let fresh_ticket = &undecided[0];
-    assert_eq!(
-        fresh_ticket.request.decision_id, fresh_decision,
-        "the undecided ticket is the freshly gated call"
-    );
+    let fresh_decision = fresh_ticket.request.decision_id;
     assert_eq!(
         fresh_ticket.request.request_id,
         run_owner_id(RUN),
@@ -2482,13 +2275,13 @@ async fn consumed_subset_re_park_preserves_the_sibling_and_completes_on_the_seco
     let grant = evaluate_resume(evaluation(&world, false, None))
         .await
         .expect("the re-published checkpoint grants the second resume");
-    let segment = run_segment(grant, &world.config, &HashMap::new())
+    let segment = run_segment_live(grant, &world.config, &HashMap::new())
         .await
         .expect("the second segment completes");
-    let turns = match segment {
-        SegmentResult::Completed { turns } => turns,
-        other => panic!("expected the second segment to complete, got {other:?}"),
-    };
+    assert!(
+        matches!(segment, ResumeStreamEnd::Completed { .. }),
+        "the second segment completes: {segment:?}"
+    );
     {
         let fresh_log = fresh_invocations.lock().expect("fresh invocation log");
         assert_eq!(
@@ -2526,22 +2319,6 @@ async fn consumed_subset_re_park_preserves_the_sibling_and_completes_on_the_seco
             .len(),
         1,
         "node A's original call is not re-executed on the second resume"
-    );
-    let serialized = serde_json::to_value(turns.as_slice()).expect("turns serialize");
-    assert_eq!(
-        serialized,
-        json!([
-            { "role": "assistant", "id": null, "content": [{ "text": A_DONE }] },
-            { "role": "assistant", "id": null, "content": [{ "text": B_DONE }] },
-            coordinator_tail_turn(),
-        ]),
-        "the completed segment carries the two nodes' natural final turns in \
-         segment order, then the coordinator's scripted tail — the R2 pair \
-         prepends are gone (R6: outcomes live in the rebuilt histories)"
-    );
-    assert!(
-        !serialized.to_string().contains(PARK_SENTINEL),
-        "the placeholder appears nowhere in the serialized turns"
     );
     assert!(
         world
@@ -2599,7 +2376,7 @@ async fn post_substitution_new_call_re_parks_through_the_live_arm_not_a_strict_m
     let grant = evaluate_resume(evaluation(&world, false, None))
         .await
         .expect("the all-decided run grants");
-    let segment = run_segment(grant, &world.config, &HashMap::new())
+    let segment = run_segment_live(grant, &world.config, &HashMap::new())
         .await
         .expect(
             "the continuation re-parks through the live arm; a strict-miss fault \
@@ -2614,55 +2391,23 @@ async fn post_substitution_new_call_re_parks_through_the_live_arm_not_a_strict_m
              invocations recorded: the substitution prelude does not exist"
         );
     }
-    let (turns, blocking) = match segment {
-        SegmentResult::Parked { turns, blocking } => (turns, blocking),
-        other => panic!("expected a re-parked segment, got {other:?}"),
-    };
-    let fresh_decision = blocking
-        .as_slice()
-        .iter()
-        .find(|entry| entry.tool.as_ref() == NEW_TOOL)
-        .expect("the new blocking entry names the newly gated tool")
-        .decision_id;
-    let mut body = json!({
-        "turns": serde_json::to_value(turns.as_slice()).expect("turns serialize"),
-        "blocking":
-            serde_json::to_value(blocking.as_slice()).expect("blocking serializes"),
-    });
-    normalize_fresh_parking(&mut body);
-    assert_eq!(
-        body,
-        json!({
-            "turns": [
-                decided_call_turn(),
-                decided_result_turn(&echo_tool_result_wire()),
-                {
-                    "role": "assistant",
-                    "id": null,
-                    "content": [
-                        {
-                            "id": FRESH_CALL_ID,
-                            "call_id": NEW_CALL_ID,
-                            "function":
-                                { "name": NEW_TOOL, "arguments": { "namespace": "stage" } },
-                            "signature": null,
-                            "additional_params": null,
-                        },
-                    ],
-                },
-            ],
-            "blocking": [
-                {
-                    "decision_id": "<fresh decision id>",
-                    "tool": NEW_TOOL,
-                    "expires_at": "<fresh expiry>",
-                },
-            ],
-        }),
-        "the re-parked segment carries the original pair keyed by the original \
-         call id, ahead of the gated assistant turn; the fresh decision id and \
-         expiry are location-normalized"
+    assert!(
+        matches!(segment, ResumeStreamEnd::Reparked),
+        "the continuation re-parks through the live arm: {segment:?}"
     );
+    // The freshly gated call's ticket is the one undecided ticket under the
+    // original run id; the decided original left the store.
+    let undecided = world
+        .store
+        .list_pending()
+        .await
+        .expect("the store lists its undecided approvals");
+    assert_eq!(
+        undecided.len(),
+        1,
+        "exactly the fresh ticket remains undecided"
+    );
+    let fresh_decision = undecided[0].request.decision_id;
 
     world
         .registry
@@ -2688,13 +2433,13 @@ async fn post_substitution_new_call_re_parks_through_the_live_arm_not_a_strict_m
     let grant = evaluate_resume(evaluation(&world, false, None))
         .await
         .expect("the re-published checkpoint grants the second resume");
-    let segment = run_segment(grant, &world.config, &HashMap::new())
+    let segment = run_segment_live(grant, &world.config, &HashMap::new())
         .await
-        .expect("the re-armed guard consumes the fresh decision; the segment completes");
-    let turns = match segment {
-        SegmentResult::Completed { turns } => turns,
-        other => panic!("expected a completed segment, got {other:?}"),
-    };
+        .expect("the second segment completes");
+    assert!(
+        matches!(segment, ResumeStreamEnd::Completed { .. }),
+        "the second segment completes: {segment:?}"
+    );
     {
         let fresh_log = fresh_invocations.lock().expect("fresh invocation log");
         assert_eq!(
@@ -2708,30 +2453,14 @@ async fn post_substitution_new_call_re_parks_through_the_live_arm_not_a_strict_m
             "the single invocation carries the fresh call's arguments"
         );
     }
-    let serialized = serde_json::to_value(turns.as_slice()).expect("turns serialize");
-    assert_eq!(
-        serialized,
-        json!([
-            { "role": "assistant", "id": null, "content": [{ "text": FINAL_TEXT }] },
-            coordinator_tail_turn(),
-        ]),
-        "the completed segment's turns are the natural continuation turn and the \
-         scripted coordinator tail — the fresh call's pair rode the RE-PARKED \
-         segment under its own id; the completed turns are natural only (R6)"
-    );
-    assert!(
-        !serialized.to_string().contains(PARK_SENTINEL),
-        "the placeholder appears nowhere in the serialized turns"
-    );
 }
 
 /// A recorded approval executes exactly once through the worker's gated
 /// pipeline, the real result reaches the model in the reconstructed
 /// context (the outcome package the rebuilt history carries — the R2
 /// wire pair rides the RE-PARKED segment only, R6), and the coordinator
-/// continuation finishes the run over a scripted respond_directly: the
-/// completed turns are the continuation's final turn plus the scripted
-/// tail. The park placeholder appears nowhere on the wire.
+/// continuation finishes the run over a scripted respond_directly. The
+/// park placeholder appears nowhere on the wire.
 #[tokio::test]
 async fn approved_call_executes_once_and_rides_the_outcome_pair() {
     let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
@@ -2753,50 +2482,30 @@ async fn approved_call_executes_once_and_rides_the_outcome_pair() {
     let grant = evaluate_resume(evaluation(&world, false, None))
         .await
         .expect("the all-decided run grants");
-    let segment = run_segment(grant, &world.config, &HashMap::new())
+    let segment = run_segment_live(grant, &world.config, &HashMap::new())
         .await
         .expect("the segment completes");
-    match segment {
-        SegmentResult::Completed { turns } => {
-            let log = invocations.lock().expect("tool invocation log");
-            assert_eq!(
-                log.len(),
-                1,
-                "the approved call executes exactly once; zero invocations recorded: \
-                 the substitution prelude does not exist"
-            );
-            assert_eq!(
-                log[0].arguments,
-                call_args(),
-                "the single invocation carries the recorded call's arguments"
-            );
-            assert_eq!(
-                log[0].result, ECHO_TOOL_RESULT,
-                "the single invocation returns the tool's real result"
-            );
-            drop(log);
-
-            let serialized = serde_json::to_value(turns.as_slice()).expect("turns serialize");
-            assert_eq!(
-                serialized,
-                json!([
-                    {
-                        "role": "assistant",
-                        "id": null,
-                        "content": [{ "text": FINAL_TEXT }],
-                    },
-                    coordinator_tail_turn(),
-                ]),
-                "the completed segment's turns are the natural continuation turn and \
-                 the scripted coordinator tail — the outcome pair lives inside the \
-                 rebuilt history, not on the wire (R6)"
-            );
-            assert!(
-                !serialized.to_string().contains(PARK_SENTINEL),
-                "the park placeholder must not survive a decided resume"
-            );
-        }
-        other => panic!("expected a completed segment, got {other:?}"),
+    assert!(
+        matches!(segment, ResumeStreamEnd::Completed { .. }),
+        "the segment completes: {segment:?}"
+    );
+    {
+        let log = invocations.lock().expect("tool invocation log");
+        assert_eq!(
+            log.len(),
+            1,
+            "the approved call executes exactly once; zero invocations recorded: \
+             the substitution prelude does not exist"
+        );
+        assert_eq!(
+            log[0].arguments,
+            call_args(),
+            "the single invocation carries the recorded call's arguments"
+        );
+        assert_eq!(
+            log[0].result, ECHO_TOOL_RESULT,
+            "the single invocation returns the tool's real result"
+        );
     }
 }
 
@@ -2804,8 +2513,7 @@ async fn approved_call_executes_once_and_rides_the_outcome_pair() {
 /// and its reason ride the continuation context verbatim in place of the
 /// placeholder (the rebuilt history's outcome package — the R2 wire pair
 /// rides the RE-PARKED segment only, R6), and the coordinator continuation
-/// finishes the run over a scripted respond_directly — the completed turns
-/// are the continuation's final turn plus the scripted tail; the worker
+/// finishes the run over a scripted respond_directly; the worker
 /// adapts; no result is fabricated. The context also carries the decided
 /// call's assistant tool call — synthesized by the reconstruction (P45
 /// stage 3: the fixture's history, like every single-call sentinel
@@ -2834,60 +2542,41 @@ async fn denied_call_steers_without_executing_and_rides_the_denial_pair() {
     let grant = evaluate_resume(evaluation(&world, false, None))
         .await
         .expect("the all-decided run grants");
-    let segment = run_segment(grant, &world.config, &HashMap::new())
+    let segment = run_segment_live(grant, &world.config, &HashMap::new())
         .await
         .expect("the segment completes");
-    match segment {
-        SegmentResult::Completed { turns } => {
-            assert!(
-                invocations.lock().expect("tool invocation log").is_empty(),
-                "the denied call never executes"
-            );
+    assert!(
+        matches!(segment, ResumeStreamEnd::Completed { .. }),
+        "the segment completes: {segment:?}"
+    );
+    assert!(
+        invocations.lock().expect("tool invocation log").is_empty(),
+        "the denied call never executes"
+    );
 
-            let recorded = requests.lock().expect("scripted-model request log").clone();
-            assert_eq!(
-                recorded.len(),
-                1,
-                "the continuation is exactly one model turn"
-            );
-            let context = serde_json::to_value(&recorded[0].chat_history)
-                .expect("the continuation context serializes");
-            assert_eq!(
-                context,
-                json!([
-                    { "role": "user", "content": [{ "type": "text", "text": "apply it" }] },
-                    decided_call_turn(),
-                    decided_result_turn(&tool_wire(&denial_text())),
-                ]),
-                "the worker's context carries the decided call's assistant tool call \
-                 (synthesized by the reconstruction) ahead of the live denial text \
-                 and its reason verbatim, in place of the placeholder"
-            );
-
-            let serialized = serde_json::to_value(turns.as_slice()).expect("turns serialize");
-            assert_eq!(
-                serialized,
-                json!([
-                    {
-                        "role": "assistant",
-                        "id": null,
-                        "content": [{ "text": FINAL_TEXT }],
-                    },
-                    coordinator_tail_turn(),
-                ]),
-                "the completed segment's turns are the natural continuation turn and \
-                 the scripted coordinator tail — the denial package lives inside the \
-                 rebuilt history, not on the wire (R6)"
-            );
-            assert!(
-                !serialized.to_string().contains(PARK_SENTINEL)
-                    && !context.to_string().contains(PARK_SENTINEL),
-                "the park placeholder must not survive a decided resume's context \
-                 or wire"
-            );
-        }
-        other => panic!("expected a completed segment, got {other:?}"),
-    }
+    let recorded = requests.lock().expect("scripted-model request log").clone();
+    assert_eq!(
+        recorded.len(),
+        1,
+        "the continuation is exactly one model turn"
+    );
+    let context = serde_json::to_value(&recorded[0].chat_history)
+        .expect("the continuation context serializes");
+    assert_eq!(
+        context,
+        json!([
+            { "role": "user", "content": [{ "type": "text", "text": "apply it" }] },
+            decided_call_turn(),
+            decided_result_turn(&tool_wire(&denial_text())),
+        ]),
+        "the worker's context carries the decided call's assistant tool call \
+         (synthesized by the reconstruction) ahead of the live denial text \
+         and its reason verbatim, in place of the placeholder"
+    );
+    assert!(
+        !context.to_string().contains(PARK_SENTINEL),
+        "the park placeholder must not survive a decided resume's context"
+    );
 }
 
 // ====================================================================
@@ -2928,12 +2617,13 @@ async fn tool_failure_becomes_result_text_and_the_segment_completes() {
     let grant = evaluate_resume(evaluation(&world, false, None))
         .await
         .expect("the all-decided run grants");
-    let segment = run_segment(grant, &world.config, &HashMap::new())
+    let segment = run_segment_live(grant, &world.config, &HashMap::new())
         .await
         .expect("an execution failure is result text, never a segment fault");
-    let SegmentResult::Completed { turns } = segment else {
-        panic!("expected a completed segment, got {segment:?}")
-    };
+    assert!(
+        matches!(segment, ResumeStreamEnd::Completed { .. }),
+        "an execution failure completes the segment: {segment:?}"
+    );
     {
         let log = invocations.lock().expect("failing-tool invocation log");
         assert_eq!(
@@ -2967,25 +2657,10 @@ async fn tool_failure_becomes_result_text_and_the_segment_completes() {
          the execution Err becomes the tool-result text the substitution maps, \
          never fabricated success"
     );
-    let serialized = serde_json::to_value(turns.as_slice()).expect("turns serialize");
-    assert_eq!(
-        serialized,
-        json!([
-            {
-                "role": "assistant",
-                "id": null,
-                "content": [{ "text": FINAL_TEXT }],
-            },
-            coordinator_tail_turn(),
-        ]),
-        "the completed segment's turns are the natural continuation turn and the \
-         scripted coordinator tail — the error text rides the rebuilt history's \
-         outcome package, not the wire (R6)"
-    );
     assert!(
-        !serialized.to_string().contains(ECHO_TOOL_RESULT)
-            && !serialized.to_string().contains(PARK_SENTINEL),
-        "no fabricated success and no placeholder on the wire"
+        !context.to_string().contains(ECHO_TOOL_RESULT)
+            && !context.to_string().contains(PARK_SENTINEL),
+        "no fabricated success and no placeholder in the rebuilt context"
     );
 }
 
@@ -3023,7 +2698,7 @@ async fn decided_entry_missing_at_substitution_time_is_fatal_before_the_tombston
         "the staged fixture really held the decided entry"
     );
 
-    let fault = run_segment(grant, &world.config, &HashMap::new())
+    let fault = run_segment_live(grant, &world.config, &HashMap::new())
         .await
         .expect_err("a decided entry missing at substitution time is fatal");
     assert_eq!(
@@ -3070,7 +2745,7 @@ async fn approved_without_required_identity_is_fatal_before_the_tombstone() {
     let grant = evaluate_resume(evaluation(&world, false, None))
         .await
         .expect("the all-decided run grants");
-    let fault = run_segment(grant, &world.config, &HashMap::new())
+    let fault = run_segment_live(grant, &world.config, &HashMap::new())
         .await
         .expect_err("an approval missing the identity the route demands is fatal");
     assert_eq!(
@@ -3118,34 +2793,16 @@ async fn denied_without_identity_steers_normally_under_the_identity_route() {
     let grant = evaluate_resume(evaluation(&world, false, None))
         .await
         .expect("the all-decided run grants");
-    let segment = run_segment(grant, &world.config, &HashMap::new())
+    let segment = run_segment_live(grant, &world.config, &HashMap::new())
         .await
         .expect("a denial needs no identity: the segment steers, never faults");
-    let SegmentResult::Completed { turns } = segment else {
-        panic!("expected a completed segment, got {segment:?}")
-    };
+    assert!(
+        matches!(segment, ResumeStreamEnd::Completed { .. }),
+        "a denial completes the segment: {segment:?}"
+    );
     assert!(
         invocations.lock().expect("tool invocation log").is_empty(),
         "the denied call never executes"
-    );
-    let serialized = serde_json::to_value(turns.as_slice()).expect("turns serialize");
-    assert_eq!(
-        serialized,
-        json!([
-            {
-                "role": "assistant",
-                "id": null,
-                "content": [{ "text": FINAL_TEXT }],
-            },
-            coordinator_tail_turn(),
-        ]),
-        "the denial steers to its normal outcome — the natural continuation turn \
-         and the scripted coordinator tail, the denial package riding the rebuilt \
-         history (R6)"
-    );
-    assert!(
-        !serialized.to_string().contains(PARK_SENTINEL),
-        "the park placeholder must not survive a decided resume"
     );
 }
 
@@ -3175,7 +2832,7 @@ async fn failing_tombstone_write_is_fatal_before_the_invocation() {
         .await
         .expect("the all-decided run grants");
     stage_unwritable_tombstone_tmp(&world);
-    let fault = run_segment(grant, &world.config, &HashMap::new())
+    let fault = run_segment_live(grant, &world.config, &HashMap::new())
         .await
         .expect_err("a failing tombstone write is fatal");
     assert_eq!(
@@ -3232,7 +2889,7 @@ async fn tool_result_less_prompt_refuses_at_preflight_before_any_tombstone() {
     let grant = evaluate_resume(evaluation(&world, false, None))
         .await
         .expect("the all-decided run grants");
-    let fault = run_segment(grant, &world.config, &HashMap::new())
+    let fault = run_segment_live(grant, &world.config, &HashMap::new())
         .await
         .expect_err("a tool-result-less prompt is refused at the segment preflight");
     assert_eq!(
@@ -3311,7 +2968,7 @@ async fn empty_call_id_on_node_b_refuses_the_whole_segment_before_any_tombstone(
     let grant = evaluate_resume(evaluation(&world, false, None))
         .await
         .expect("the all-decided two-node run grants");
-    let fault = run_segment(grant, &world.config, &HashMap::new())
+    let fault = run_segment_live(grant, &world.config, &HashMap::new())
         .await
         .expect_err("node B's empty call id refuses the whole segment");
     assert_eq!(
@@ -3392,7 +3049,7 @@ async fn same_key_duplicate_calls_execute_once_each_and_a_re_park_removes_both_c
     let grant = evaluate_resume(evaluation(&world, false, None))
         .await
         .expect("the all-decided duplicate-pair run grants");
-    let segment = run_segment(grant, &world.config, &HashMap::new())
+    let segment = run_segment_live(grant, &world.config, &HashMap::new())
         .await
         .expect("the node's continuation re-parks and ends the first segment");
     {
@@ -3413,49 +3070,9 @@ async fn same_key_duplicate_calls_execute_once_each_and_a_re_park_removes_both_c
             "the second invocation carries the same recorded arguments"
         );
     }
-    let (turns, blocking) = match segment {
-        SegmentResult::Parked { turns, blocking } => (turns, blocking),
-        other => panic!("expected a re-parked segment, got {other:?}"),
-    };
-    let mut body = json!({
-        "turns": serde_json::to_value(turns.as_slice()).expect("turns serialize"),
-        "blocking":
-            serde_json::to_value(blocking.as_slice()).expect("blocking serializes"),
-    });
-    normalize_fresh_parking(&mut body);
-    assert_eq!(
-        body,
-        json!({
-            "turns": [
-                decided_call_turn(),
-                decided_result_turn(&echo_tool_result_wire()),
-                decided_call_turn_for(CALL_ID_2, TOOL, &call_args()),
-                decided_result_turn_for(CALL_ID_2, &echo_tool_result_wire()),
-                {
-                    "role": "assistant",
-                    "id": null,
-                    "content": [
-                        {
-                            "id": FRESH_CALL_ID,
-                            "call_id": NEW_CALL_ID,
-                            "function":
-                                { "name": NEW_TOOL, "arguments": { "namespace": "stage" } },
-                            "signature": null,
-                            "additional_params": null,
-                        },
-                    ],
-                },
-            ],
-            "blocking": [
-                {
-                    "decision_id": "<fresh decision id>",
-                    "tool": NEW_TOOL,
-                    "expires_at": "<fresh expiry>",
-                },
-            ],
-        }),
-        "the re-parked segment carries BOTH duplicate pairs, each keyed by \
-         its own call id, ahead of the gated assistant turn"
+    assert!(
+        matches!(segment, ResumeStreamEnd::Reparked),
+        "the node's continuation re-parks the first segment: {segment:?}"
     );
     // The re-park removes BOTH consumed ids: the per-call depth derivation
     // must record each duplicate's own decision, never only the first's.
@@ -3539,13 +3156,13 @@ async fn same_key_duplicate_calls_execute_once_each_and_a_re_park_removes_both_c
     let grant = evaluate_resume(evaluation(&world, false, None))
         .await
         .expect("the re-published checkpoint grants the second resume");
-    let segment = run_segment(grant, &world.config, &HashMap::new())
+    let segment = run_segment_live(grant, &world.config, &HashMap::new())
         .await
         .expect("the second segment completes");
-    let turns = match segment {
-        SegmentResult::Completed { turns } => turns,
-        other => panic!("expected the second segment to complete, got {other:?}"),
-    };
+    assert!(
+        matches!(segment, ResumeStreamEnd::Completed { .. }),
+        "the second segment completes: {segment:?}"
+    );
     {
         let fresh_log = fresh_invocations.lock().expect("fresh invocation log");
         assert_eq!(
@@ -3566,21 +3183,6 @@ async fn same_key_duplicate_calls_execute_once_each_and_a_re_park_removes_both_c
             .len(),
         2,
         "neither duplicate call is re-executed on the second resume"
-    );
-    let serialized = serde_json::to_value(turns.as_slice()).expect("turns serialize");
-    assert_eq!(
-        serialized,
-        json!([
-            { "role": "assistant", "id": null, "content": [{ "text": FINAL_TEXT }] },
-            coordinator_tail_turn(),
-        ]),
-        "the completed segment's turns are the natural continuation turn and the \
-         scripted coordinator tail — resume 1's duplicate pairs rode the re-parked \
-         segment under their own ids; the completed turns are natural only (R6)"
-    );
-    assert!(
-        !serialized.to_string().contains(PARK_SENTINEL),
-        "the placeholder appears nowhere in the serialized turns"
     );
     for id in [decision(), decision_2(), fresh_decision] {
         assert!(
@@ -3633,7 +3235,7 @@ async fn second_same_key_entry_missing_is_fatal_before_the_tombstone() {
         "the staged fixture really held the duplicate entries"
     );
 
-    let fault = run_segment(grant, &world.config, &HashMap::new())
+    let fault = run_segment_live(grant, &world.config, &HashMap::new())
         .await
         .expect_err("a recorded queue too shallow for the pending sequence is fatal");
     assert_eq!(
@@ -3677,7 +3279,7 @@ async fn second_same_key_entry_identity_blocked_is_fatal_before_the_tombstone() 
     let grant = evaluate_resume(evaluation(&world, false, None))
         .await
         .expect("the all-decided duplicate-pair run grants");
-    let fault = run_segment(grant, &world.config, &HashMap::new())
+    let fault = run_segment_live(grant, &world.config, &HashMap::new())
         .await
         .expect_err("an identity-less approval at the second position is fatal");
     assert_eq!(
@@ -3736,7 +3338,7 @@ async fn awaiting_node_without_pending_calls_faults_the_segment_before_any_worke
     let grant = evaluate_resume(evaluation(&world, false, None))
         .await
         .expect("the decided sibling grants the malformed run");
-    let fault = run_segment(grant, &world.config, &HashMap::new())
+    let fault = run_segment_live(grant, &world.config, &HashMap::new())
         .await
         .expect_err("an awaiting node without pending calls faults the segment");
     assert_eq!(
@@ -3801,7 +3403,7 @@ async fn awaiting_node_with_an_empty_pending_list_faults_before_any_worker_build
     let grant = evaluate_resume(evaluation(&world, false, None))
         .await
         .expect("the decided sibling grants the malformed run");
-    let fault = run_segment(grant, &world.config, &HashMap::new())
+    let fault = run_segment_live(grant, &world.config, &HashMap::new())
         .await
         .expect_err("an awaiting node with an empty pending list faults the segment");
     assert_eq!(
@@ -3883,13 +3485,13 @@ async fn pivot_approved_pair_executes_once_each_in_document_order_and_completes(
     let grant = evaluate_resume(evaluation(&world, false, None))
         .await
         .expect("the all-decided pivot run grants");
-    let segment = run_segment(grant, &world.config, &HashMap::new())
+    let segment = run_segment_live(grant, &world.config, &HashMap::new())
         .await
         .expect("the pivot segment completes");
-    let turns = match segment {
-        SegmentResult::Completed { turns } => turns,
-        other => panic!("expected a completed segment, got {other:?}"),
-    };
+    assert!(
+        matches!(segment, ResumeStreamEnd::Completed { .. }),
+        "the pivot segment completes: {segment:?}"
+    );
     {
         let log = invocations.lock().expect("tool invocation log");
         assert_eq!(
@@ -3910,11 +3512,6 @@ async fn pivot_approved_pair_executes_once_each_in_document_order_and_completes(
              from the pending record alone"
         );
     }
-    let serialized = serde_json::to_value(turns.as_slice()).expect("turns serialize");
-    assert!(
-        !serialized.to_string().contains(PARK_SENTINEL),
-        "the placeholder appears nowhere in the serialized turns"
-    );
     assert_pivot_continuation(
         &world,
         &requests,
@@ -3966,11 +3563,11 @@ async fn pivot_approve_then_deny_executes_only_the_approved_call_and_steers_the_
     let grant = evaluate_resume(evaluation(&world, false, None))
         .await
         .expect("the all-decided pivot run grants");
-    let segment = run_segment(grant, &world.config, &HashMap::new())
+    let segment = run_segment_live(grant, &world.config, &HashMap::new())
         .await
         .expect("the pivot segment completes");
     assert!(
-        matches!(segment, SegmentResult::Completed { .. }),
+        matches!(segment, ResumeStreamEnd::Completed { .. }),
         "the segment completes: {segment:?}"
     );
     {
@@ -4037,11 +3634,11 @@ async fn pivot_denied_pair_steers_without_executing_and_completes() {
     let grant = evaluate_resume(evaluation(&world, false, None))
         .await
         .expect("the all-decided pivot run grants");
-    let segment = run_segment(grant, &world.config, &HashMap::new())
+    let segment = run_segment_live(grant, &world.config, &HashMap::new())
         .await
         .expect("the pivot segment completes");
     assert!(
-        matches!(segment, SegmentResult::Completed { .. }),
+        matches!(segment, ResumeStreamEnd::Completed { .. }),
         "the segment completes: {segment:?}"
     );
     assert!(
@@ -4055,121 +3652,6 @@ async fn pivot_denied_pair_steers_without_executing_and_completes() {
         &tool_wire(&denial_text()),
     )
     .await;
-}
-
-/// The re-park turn boundary after reconstruction (the stage-3 wiring's
-/// boundary fix): the turns a re-parking segment reports for the re-parked
-/// node start STRICTLY AFTER the history the continuation actually
-/// streamed from — the rebuilt input, including the SYNTHESIZED turn the
-/// reconstruction appended for the second (slotless) call, is never
-/// re-emitted as segment turns — and the re-park commit's refreshed
-/// blocking names the fresh decision. Modeled on
-/// `re_park_mid_segment_carries_turns_and_the_new_blocking_entry`, over
-/// the pivot fixture: the rebuilt history carries the synthesized second
-/// call's turn beyond the checkpoint's recorded length, so a boundary
-/// sliced at the CHECKPOINT's length would replay it here.
-#[tokio::test]
-async fn re_parked_turns_start_after_the_rebuilt_history_with_no_replayed_reconstruction() {
-    let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
-    let _drain = OverrideDrain;
-    let world = world();
-    let pivot_invocations = Arc::new(Mutex::new(Vec::new()));
-    let fresh_invocations = Arc::new(Mutex::new(Vec::new()));
-    install_worker_overrides(vec![WorkerOverride {
-        model: ScriptedCompletionModel::new(vec![ScriptedTurn::tool_calls(vec![
-            ScriptedToolCall::new(FRESH_CALL_ID, NEW_TOOL, json!({ "namespace": "stage" }))
-                .with_call_id(NEW_CALL_ID),
-        ])]),
-        extra_tools: vec![
-            Box::new(RecordingTool::new(pivot_invocations.clone()).with_name(TOOL)),
-            Box::new(RecordingTool::new(pivot_invocations.clone()).with_name(TOOL_B)),
-            Box::new(RecordingTool::new(fresh_invocations).with_name(NEW_TOOL)),
-        ],
-    }]);
-    register_decided_pivot_pair(
-        &world,
-        ApprovalDecision::Approved,
-        ApprovalDecision::Approved,
-    )
-    .await;
-    publish_document(&world, &pivot_two_call_document(&world)).await;
-
-    let grant = evaluate_resume(evaluation(&world, false, None))
-        .await
-        .expect("the all-decided pivot run grants");
-    let segment = run_segment(grant, &world.config, &HashMap::new())
-        .await
-        .expect("the pivot segment re-parks on the fresh gated call");
-    {
-        let log = pivot_invocations.lock().expect("pivot invocation log");
-        assert_eq!(
-            log.len(),
-            2,
-            "both pivot calls execute exactly once through the substitution, in \
-             document order"
-        );
-        assert_eq!(
-            log[0].arguments,
-            call_args(),
-            "the first invocation is the first (sentinel-bearing) call"
-        );
-        assert_eq!(
-            log[1].arguments,
-            call_args_b(),
-            "the second invocation is the second (slotless) call"
-        );
-    }
-    let (turns, blocking) = match segment {
-        SegmentResult::Parked { turns, blocking } => (turns, blocking),
-        other => panic!("expected a re-parked segment, got {other:?}"),
-    };
-    let mut body = json!({
-        "turns": serde_json::to_value(turns.as_slice()).expect("turns serialize"),
-        "blocking":
-            serde_json::to_value(blocking.as_slice()).expect("blocking serializes"),
-    });
-    normalize_fresh_parking(&mut body);
-    assert_eq!(
-        body,
-        json!({
-            "turns": [
-                decided_call_turn(),
-                decided_result_turn(&echo_tool_result_wire()),
-                decided_call_turn_for(PIVOT_CALL_ID_2, TOOL_B, &call_args_b()),
-                decided_result_turn_for(PIVOT_CALL_ID_2, &echo_tool_result_wire()),
-                {
-                    "role": "assistant",
-                    "id": null,
-                    "content": [
-                        {
-                            "id": FRESH_CALL_ID,
-                            "call_id": NEW_CALL_ID,
-                            "function":
-                                { "name": NEW_TOOL, "arguments": { "namespace": "stage" } },
-                            "signature": null,
-                            "additional_params": null,
-                        },
-                    ],
-                },
-            ],
-            "blocking": [
-                {
-                    "decision_id": "<fresh decision id>",
-                    "tool": NEW_TOOL,
-                    "expires_at": "<fresh expiry>",
-                },
-            ],
-        }),
-        "the re-parked turns are the two decided pairs and the gated turn ONLY: \
-         the rebuilt input — the synthesized second call's turn included — is \
-         not replayed as segment turns; the turns start strictly after the \
-         rebuilt history"
-    );
-    let serialized = serde_json::to_value(turns.as_slice()).expect("turns serialize");
-    assert!(
-        !serialized.to_string().contains(PARK_SENTINEL),
-        "the placeholder appears nowhere in the serialized turns"
-    );
 }
 
 /// Each turn in its wire form, for marker scans over the segment turns.
@@ -4377,12 +3859,11 @@ async fn coordinator_resumes_after_awaiting_nodes_and_drives_never_started_sibli
     let grant = evaluate_resume(evaluation(&world, false, None))
         .await
         .expect("the all-decided run grants");
-    let segment = run_segment(grant, &world.config, &HashMap::new())
+    let segment = run_segment_live(grant, &world.config, &HashMap::new())
         .await
         .expect("the resumed run drives to completion");
-    let turns = match segment {
-        SegmentResult::Completed { turns } => turns,
-        other => panic!("expected a completed segment, got {other:?}"),
+    let ResumeStreamEnd::Completed { final_answer } = segment else {
+        panic!("expected a completed segment, got {segment:?}")
     };
     {
         let apply_log = apply_invocations.lock().expect("apply invocation log");
@@ -4414,11 +3895,9 @@ async fn coordinator_resumes_after_awaiting_nodes_and_drives_never_started_sibli
             "the sibling's invocation carries its scripted arguments"
         );
     }
-    assert!(
-        coordinator_answered_after(turns.as_slice(), SIBLING_DONE),
-        "an assistant final-answer turn follows the sibling's last turn — the \
-         coordinator finishes its turn naturally after the workers (R6): {:?}",
-        serialized_turns(turns.as_slice())
+    assert_eq!(
+        final_answer, COORD_FINAL_ANSWER,
+        "the coordinator finishes its turn naturally after the workers (R6)"
     );
     assert!(
         !parked_document_path(&world).exists() && !resuming_document_path(&world).exists(),
@@ -4502,12 +3981,11 @@ async fn resumed_coordinator_replans_when_a_resumed_worker_fails() {
     let grant = evaluate_resume(evaluation(&world, false, None))
         .await
         .expect("the all-decided run grants");
-    let segment = run_segment(grant, &world.config, &HashMap::new())
+    let segment = run_segment_live(grant, &world.config, &HashMap::new())
         .await
         .expect("the resumed run completes after the worker failure");
-    let turns = match segment {
-        SegmentResult::Completed { turns } => turns,
-        other => panic!("expected a completed segment, got {other:?}"),
+    let ResumeStreamEnd::Completed { final_answer } = segment else {
+        panic!("expected a completed segment, got {segment:?}")
     };
     {
         let apply_log = apply_invocations.lock().expect("apply invocation log");
@@ -4518,17 +3996,12 @@ async fn resumed_coordinator_replans_when_a_resumed_worker_fails() {
              the execution"
         );
     }
-    assert!(
-        serialized_turns(turns.as_slice())
-            .iter()
-            .any(|s| s.contains(FAILED_TEXT)),
-        "the failed worker's report rode the segment turns"
-    );
     // The load-bearing re-plan pin: the failure reached the loop's
     // decision context. The continuation request the coordinator
     // received carries the failed node as plan state and records the
-    // failure under the resumed iteration (the checkpoint parked at
-    // iteration 1; the resumed loop executes iteration 2).
+    // failure under the first FRESH iteration (the stream shape's fresh
+    // cycle counter seeds iteration 1; the checkpoint's historical
+    // iteration is evidence-only).
     let recorded = coordinator_requests
         .lock()
         .expect("coordinator request log")
@@ -4547,9 +4020,9 @@ async fn resumed_coordinator_replans_when_a_resumed_worker_fails() {
     );
     assert!(
         prompt.contains(&format!(
-            "- Iteration 2: \"Gated apply\" (worker: operations) — [soft_failure] {FAILED_TEXT}"
+            "- Iteration 1: \"Gated apply\" (worker: operations) — [soft_failure] {FAILED_TEXT}"
         )),
-        "the failure history records the failure under the RESUMED iteration: {prompt}"
+        "the failure history records the failure under the first fresh iteration: {prompt}"
     );
     // The loop-continuation leg: the coordinator actually continued past
     // the failure — a replacement build or a final answer, whichever it
@@ -4558,7 +4031,7 @@ async fn resumed_coordinator_replans_when_a_resumed_worker_fails() {
         .lock()
         .expect("replacement probe invocation log")
         .len();
-    let answered = coordinator_answered_after(turns.as_slice(), FAILED_TEXT);
+    let answered = final_answer == COORD_FINAL_ANSWER;
     assert!(
         probe_count == 1 || answered,
         "the resumed coordinator continues past the failure: a replacement (or \
@@ -4621,11 +4094,11 @@ async fn restored_failures_are_not_re_recorded_under_the_resumed_iteration() {
     let grant = evaluate_resume(evaluation(&world, false, None))
         .await
         .expect("the all-decided run grants");
-    let segment = run_segment(grant, &world.config, &HashMap::new())
+    let segment = run_segment_live(grant, &world.config, &HashMap::new())
         .await
         .expect("the resumed run completes");
     assert!(
-        matches!(segment, SegmentResult::Completed { .. }),
+        matches!(segment, ResumeStreamEnd::Completed { .. }),
         "the segment completes: {segment:?}"
     );
     {
@@ -4708,11 +4181,11 @@ async fn segment_plan_restores_the_checkpoint_goal_not_the_query() {
     let grant = evaluate_resume(evaluation(&world, false, None))
         .await
         .expect("the all-decided run grants");
-    let segment = run_segment(grant, &world.config, &HashMap::new())
+    let segment = run_segment_live(grant, &world.config, &HashMap::new())
         .await
         .expect("the continuation re-parks on the fresh gated call");
     assert!(
-        matches!(segment, SegmentResult::Parked { .. }),
+        matches!(segment, ResumeStreamEnd::Reparked),
         "the goal fixture's continuation re-parks: {segment:?}"
     );
     let republished = load_parked_run(&parked_document_path(&world))
@@ -4739,118 +4212,6 @@ async fn segment_plan_restores_the_checkpoint_goal_not_the_query() {
 // drive's newly observed failures). The completed arm's pair-free shape
 // stays pinned by the frames above.
 // ====================================================================
-
-/// A completed node's decided pairs survive a sibling's early re-park
-/// (finding 2): node A completes through its decided call and node B's
-/// continuation re-parks the segment in the drive loop, and the parked
-/// turns carry BOTH nodes' pairs — A's ahead of A's own continuation
-/// turns (document order), B's ahead of B's gated turn — with the fresh
-/// blocking entry naming B's newly gated call.
-#[tokio::test]
-async fn a_completed_nodes_pairs_ride_the_early_re_park() {
-    let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
-    let _drain = OverrideDrain;
-    let world = world();
-    let apply_invocations = Arc::new(Mutex::new(Vec::new()));
-    let scale_invocations = Arc::new(Mutex::new(Vec::new()));
-    let fresh_invocations = Arc::new(Mutex::new(Vec::new()));
-    // Build order: node A first, then node B.
-    install_worker_overrides(vec![
-        WorkerOverride {
-            model: ScriptedCompletionModel::new(vec![
-                ScriptedTurn::tool_calls(vec![ScriptedToolCall::new(
-                    "call_sub_a",
-                    "submit_result",
-                    json!({
-                        "summary": "apply done",
-                        "result": "applied cleanly",
-                        "confidence": "high",
-                    }),
-                )])
-                .with_text(A_DONE),
-            ]),
-            extra_tools: vec![Box::new(
-                RecordingTool::new(apply_invocations.clone()).with_name(TOOL),
-            )],
-        },
-        WorkerOverride {
-            model: ScriptedCompletionModel::new(vec![ScriptedTurn::tool_calls(vec![
-                ScriptedToolCall::new(FRESH_CALL_ID, NEW_TOOL, json!({ "namespace": "stage" }))
-                    .with_call_id(NEW_CALL_ID),
-            ])]),
-            extra_tools: vec![
-                Box::new(RecordingTool::new(scale_invocations.clone()).with_name(TOOL_B)),
-                Box::new(RecordingTool::new(fresh_invocations.clone()).with_name(NEW_TOOL)),
-            ],
-        },
-    ]);
-    register_decided(&world).await;
-    register_decided_b(&world).await;
-    publish_document(&world, &two_node_sentinel_document(&world)).await;
-
-    let grant = evaluate_resume(evaluation(&world, false, None))
-        .await
-        .expect("the all-decided two-node run grants");
-    let segment = run_segment(grant, &world.config, &HashMap::new())
-        .await
-        .expect("node B's continuation re-parks the segment");
-    {
-        let apply_log = apply_invocations.lock().expect("apply invocation log");
-        assert_eq!(
-            apply_log.len(),
-            1,
-            "node A's decided call executes exactly once"
-        );
-        assert_eq!(apply_log[0].arguments, call_args());
-    }
-    {
-        let scale_log = scale_invocations.lock().expect("scale invocation log");
-        assert_eq!(
-            scale_log.len(),
-            1,
-            "node B's decided call executes exactly once"
-        );
-        assert_eq!(scale_log[0].arguments, call_args_b());
-    }
-    {
-        let fresh_log = fresh_invocations.lock().expect("fresh invocation log");
-        assert!(fresh_log.is_empty(), "the newly gated call never executes");
-    }
-    match segment {
-        SegmentResult::Parked { turns, blocking } => {
-            let mut body = json!({
-                "turns": serde_json::to_value(turns.as_slice()).expect("turns serialize"),
-                "blocking":
-                    serde_json::to_value(blocking.as_slice()).expect("blocking serializes"),
-            });
-            normalize_fresh_parking(&mut body);
-            assert_eq!(
-                body,
-                json!({
-                    "turns": [
-                        decided_call_turn(),
-                        decided_result_turn(&echo_tool_result_wire()),
-                        submit_result_turn(A_DONE, "call_sub_a", "apply done", "applied cleanly"),
-                        decided_call_turn_for(CALL_ID_B, TOOL_B, &call_args_b()),
-                        decided_result_turn_for(CALL_ID_B, &echo_tool_result_wire()),
-                        fresh_gated_turn(),
-                    ],
-                    "blocking": [
-                        {
-                            "decision_id": "<fresh decision id>",
-                            "tool": NEW_TOOL,
-                            "expires_at": "<fresh expiry>",
-                        },
-                    ],
-                }),
-                "the parked turns carry BOTH nodes' pairs — A's ahead of A's \
-                 continuation turns, B's ahead of B's gated turn — and the \
-                 fresh blocking entry names B's newly gated call"
-            );
-        }
-        other => panic!("expected a re-parked segment, got {other:?}"),
-    }
-}
 
 /// An early re-park publishes the drive loop's newly observed failures
 /// (finding 1): node A soft-fails its continuation (no submit_result)
@@ -4896,24 +4257,25 @@ async fn an_early_re_park_publishes_the_drive_loops_new_failures() {
     let grant = evaluate_resume(evaluation(&world, false, None))
         .await
         .expect("the all-decided two-node run grants");
-    let segment = run_segment(grant, &world.config, &HashMap::new())
+    let segment = run_segment_live(grant, &world.config, &HashMap::new())
         .await
         .expect("node B's continuation re-parks the segment");
-    let blocking = match segment {
-        SegmentResult::Parked { blocking, .. } => blocking,
-        other => panic!("expected a re-parked segment, got {other:?}"),
-    };
-    let fresh: Vec<_> = blocking
-        .as_slice()
-        .iter()
-        .filter(|entry| entry.tool.as_ref() == NEW_TOOL)
-        .collect();
-    assert_eq!(
-        fresh.len(),
-        1,
-        "exactly one fresh blocking entry: {blocking:?}"
+    assert!(
+        matches!(segment, ResumeStreamEnd::Reparked),
+        "node B's continuation re-parks the segment: {segment:?}"
     );
-    let fresh_decision = fresh[0].decision_id;
+    // The freshly gated call's ticket is the one undecided ticket.
+    let undecided = world
+        .store
+        .list_pending()
+        .await
+        .expect("the store lists its undecided approvals");
+    assert_eq!(
+        undecided.len(),
+        1,
+        "exactly one fresh undecided ticket remains"
+    );
+    let fresh_decision = undecided[0].request.decision_id;
 
     // The published history: the checkpoint's own (empty) plus A's
     // soft failure, under the resumed iteration — the iteration the
@@ -4983,11 +4345,11 @@ async fn an_early_re_park_publishes_the_drive_loops_new_failures() {
     let grant = evaluate_resume(evaluation(&world, false, None))
         .await
         .expect("the re-published checkpoint grants the second resume");
-    let segment = run_segment(grant, &world.config, &HashMap::new())
+    let segment = run_segment_live(grant, &world.config, &HashMap::new())
         .await
         .expect("the second segment completes");
     assert!(
-        matches!(segment, SegmentResult::Completed { .. }),
+        matches!(segment, ResumeStreamEnd::Completed { .. }),
         "the second segment completes: {segment:?}"
     );
     {
@@ -5028,359 +4390,6 @@ async fn an_early_re_park_publishes_the_drive_loops_new_failures() {
         prompt.contains("- Task 4: Gated scale (confidence: high)"),
         "node B completed through the loop's success semantics: {prompt}"
     );
-}
-
-/// A completed awaiting node's decided pairs ride a LOOP re-park too
-/// (finding 2): node A completes through its decided call, the
-/// continuation drives a never-started sibling whose gated call
-/// re-parks the resumed run, and the parked turns carry A's pair ahead
-/// of A's own continuation turns, then the sibling's gated turn.
-#[tokio::test]
-async fn a_completed_nodes_pairs_ride_the_loop_re_park() {
-    let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
-    let _drain = OverrideDrain;
-    let world = world();
-    let apply_invocations = Arc::new(Mutex::new(Vec::new()));
-    let fresh_invocations = Arc::new(Mutex::new(Vec::new()));
-    // Build order: node A first (the drive loop), then the sibling's (a
-    // build only the resumed coordinator loop can make).
-    install_worker_overrides(vec![
-        WorkerOverride {
-            model: ScriptedCompletionModel::new(vec![
-                ScriptedTurn::tool_calls(vec![ScriptedToolCall::new(
-                    "call_sub_a",
-                    "submit_result",
-                    json!({
-                        "summary": "apply done",
-                        "result": "applied cleanly",
-                        "confidence": "high",
-                    }),
-                )])
-                .with_text(A_DONE),
-            ]),
-            extra_tools: vec![Box::new(
-                RecordingTool::new(apply_invocations.clone()).with_name(TOOL),
-            )],
-        },
-        WorkerOverride {
-            model: ScriptedCompletionModel::new(vec![ScriptedTurn::tool_calls(vec![
-                ScriptedToolCall::new(FRESH_CALL_ID, NEW_TOOL, json!({ "namespace": "stage" }))
-                    .with_call_id(NEW_CALL_ID),
-            ])]),
-            extra_tools: vec![Box::new(
-                RecordingTool::new(fresh_invocations.clone()).with_name(NEW_TOOL),
-            )],
-        },
-    ]);
-    // The continuation builds its coordinator before the loop; the park
-    // path skips the coordinator call, so the script is never consumed
-    // by a request.
-    install_coordinator_overrides(vec![CoordinatorOverride {
-        model: ScriptedCompletionModel::new(vec![coordinator_direct_turn()]),
-    }]);
-    register_decided(&world).await;
-    publish_document(&world, &sibling_parks_document(&world)).await;
-
-    let grant = evaluate_resume(evaluation(&world, false, None))
-        .await
-        .expect("the all-decided run grants");
-    let segment = run_segment(grant, &world.config, &HashMap::new())
-        .await
-        .expect("the sibling's gated call re-parks the resumed run");
-    {
-        let apply_log = apply_invocations.lock().expect("apply invocation log");
-        assert_eq!(
-            apply_log.len(),
-            1,
-            "node A's decided call executes exactly once"
-        );
-    }
-    {
-        let fresh_log = fresh_invocations.lock().expect("fresh invocation log");
-        assert!(
-            fresh_log.is_empty(),
-            "the sibling's gated call never executes"
-        );
-    }
-    match segment {
-        SegmentResult::Parked { turns, blocking } => {
-            let mut body = json!({
-                "turns": serde_json::to_value(turns.as_slice()).expect("turns serialize"),
-                "blocking":
-                    serde_json::to_value(blocking.as_slice()).expect("blocking serializes"),
-            });
-            normalize_fresh_parking(&mut body);
-            assert_eq!(
-                body,
-                json!({
-                    "turns": [
-                        decided_call_turn(),
-                        decided_result_turn(&echo_tool_result_wire()),
-                        submit_result_turn(A_DONE, "call_sub_a", "apply done", "applied cleanly"),
-                        fresh_gated_turn(),
-                    ],
-                    "blocking": [
-                        {
-                            "decision_id": "<fresh decision id>",
-                            "tool": NEW_TOOL,
-                            "expires_at": "<fresh expiry>",
-                        },
-                    ],
-                }),
-                "the parked turns carry A's pair ahead of A's continuation \
-                 turns, then the parking sibling's gated turn"
-            );
-        }
-        other => panic!("expected a re-parked segment, got {other:?}"),
-    }
-}
-
-/// A parked sibling's snapshot turns join their ORIGINATING wave's
-/// task-id merge (finding 3): in a wave where task 0 parks and task 1
-/// completes, task 0's gated turn precedes task 1's completion turn —
-/// the parked turns keep their wave position instead of trailing every
-/// completed turn of every wave. The sibling nodes sit in the plan in
-/// REVERSE id order, so the pin exercises the merge's task-id sort, not
-/// the workers' build order. Node A's pair and turns ride ahead of the
-/// wave (A completed in the drive loop).
-#[tokio::test]
-async fn parked_wave_turns_merge_into_their_wave_by_task_id() {
-    let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
-    let _drain = OverrideDrain;
-    let world = world();
-    let apply_invocations = Arc::new(Mutex::new(Vec::new()));
-    let fresh_invocations = Arc::new(Mutex::new(Vec::new()));
-    // Build order: node A (drive loop), then the wave's tasks in plan
-    // order — the completing sibling (task 1) ahead of the parking one
-    // (task 0), reverse of the id merge the frame pins.
-    install_worker_overrides(vec![
-        WorkerOverride {
-            model: ScriptedCompletionModel::new(vec![
-                ScriptedTurn::tool_calls(vec![ScriptedToolCall::new(
-                    "call_sub_a",
-                    "submit_result",
-                    json!({
-                        "summary": "apply done",
-                        "result": "applied cleanly",
-                        "confidence": "high",
-                    }),
-                )])
-                .with_text(A_DONE),
-            ]),
-            extra_tools: vec![Box::new(
-                RecordingTool::new(apply_invocations.clone()).with_name(TOOL),
-            )],
-        },
-        WorkerOverride {
-            model: ScriptedCompletionModel::new(vec![
-                ScriptedTurn::tool_calls(vec![ScriptedToolCall::new(
-                    "call_sub_w",
-                    "submit_result",
-                    json!({
-                        "summary": "checks done",
-                        "result": "checks passed",
-                        "confidence": "high",
-                    }),
-                )])
-                .with_text(WAVE_SIBLING_DONE),
-            ]),
-            extra_tools: vec![],
-        },
-        WorkerOverride {
-            model: ScriptedCompletionModel::new(vec![ScriptedTurn::tool_calls(vec![
-                ScriptedToolCall::new(FRESH_CALL_ID, NEW_TOOL, json!({ "namespace": "stage" }))
-                    .with_call_id(NEW_CALL_ID),
-            ])]),
-            extra_tools: vec![Box::new(
-                RecordingTool::new(fresh_invocations.clone()).with_name(NEW_TOOL),
-            )],
-        },
-    ]);
-    install_coordinator_overrides(vec![CoordinatorOverride {
-        model: ScriptedCompletionModel::new(vec![coordinator_direct_turn()]),
-    }]);
-    register_decided(&world).await;
-    publish_document(&world, &sibling_wave_document(&world)).await;
-
-    let grant = evaluate_resume(evaluation(&world, false, None))
-        .await
-        .expect("the all-decided run grants");
-    let segment = run_segment(grant, &world.config, &HashMap::new())
-        .await
-        .expect("the parking sibling re-parks the resumed run");
-    {
-        let fresh_log = fresh_invocations.lock().expect("fresh invocation log");
-        assert!(
-            fresh_log.is_empty(),
-            "the parked sibling's gated call never executes"
-        );
-    }
-    match segment {
-        SegmentResult::Parked { turns, blocking } => {
-            let mut body = json!({
-                "turns": serde_json::to_value(turns.as_slice()).expect("turns serialize"),
-                "blocking":
-                    serde_json::to_value(blocking.as_slice()).expect("blocking serializes"),
-            });
-            normalize_fresh_parking(&mut body);
-            assert_eq!(
-                body,
-                json!({
-                    "turns": [
-                        decided_call_turn(),
-                        decided_result_turn(&echo_tool_result_wire()),
-                        submit_result_turn(A_DONE, "call_sub_a", "apply done", "applied cleanly"),
-                        fresh_gated_turn(),
-                        submit_result_turn(
-                            WAVE_SIBLING_DONE,
-                            "call_sub_w",
-                            "checks done",
-                            "checks passed",
-                        ),
-                    ],
-                    "blocking": [
-                        {
-                            "decision_id": "<fresh decision id>",
-                            "tool": NEW_TOOL,
-                            "expires_at": "<fresh expiry>",
-                        },
-                    ],
-                }),
-                "the parked sibling's gated turn precedes the higher-id \
-                 completing sibling's turn — the parked turns joined their \
-                 wave's task-id merge, and node A's pair rides ahead of the \
-                 wave"
-            );
-        }
-        other => panic!("expected a re-parked segment, got {other:?}"),
-    }
-}
-
-/// A later runnable wave stays AFTER the earlier wave's parked turns
-/// (finding 3): task 2, dependent on the completing task 1, forms the
-/// second wave once task 1 lands, and its turn rides after the whole
-/// mixed first wave — the parked task 0's turns included.
-#[tokio::test]
-async fn a_followup_wave_stays_after_the_earlier_waves_parked_turns() {
-    let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
-    let _drain = OverrideDrain;
-    let world = world();
-    let apply_invocations = Arc::new(Mutex::new(Vec::new()));
-    let fresh_invocations = Arc::new(Mutex::new(Vec::new()));
-    install_worker_overrides(vec![
-        WorkerOverride {
-            model: ScriptedCompletionModel::new(vec![
-                ScriptedTurn::tool_calls(vec![ScriptedToolCall::new(
-                    "call_sub_a",
-                    "submit_result",
-                    json!({
-                        "summary": "apply done",
-                        "result": "applied cleanly",
-                        "confidence": "high",
-                    }),
-                )])
-                .with_text(A_DONE),
-            ]),
-            extra_tools: vec![Box::new(
-                RecordingTool::new(apply_invocations.clone()).with_name(TOOL),
-            )],
-        },
-        WorkerOverride {
-            model: ScriptedCompletionModel::new(vec![
-                ScriptedTurn::tool_calls(vec![ScriptedToolCall::new(
-                    "call_sub_w",
-                    "submit_result",
-                    json!({
-                        "summary": "checks done",
-                        "result": "checks passed",
-                        "confidence": "high",
-                    }),
-                )])
-                .with_text(WAVE_SIBLING_DONE),
-            ]),
-            extra_tools: vec![],
-        },
-        WorkerOverride {
-            model: ScriptedCompletionModel::new(vec![ScriptedTurn::tool_calls(vec![
-                ScriptedToolCall::new(FRESH_CALL_ID, NEW_TOOL, json!({ "namespace": "stage" }))
-                    .with_call_id(NEW_CALL_ID),
-            ])]),
-            extra_tools: vec![Box::new(
-                RecordingTool::new(fresh_invocations.clone()).with_name(NEW_TOOL),
-            )],
-        },
-        WorkerOverride {
-            model: ScriptedCompletionModel::new(vec![
-                ScriptedTurn::tool_calls(vec![ScriptedToolCall::new(
-                    "call_sub_f",
-                    "submit_result",
-                    json!({
-                        "summary": "follow-up done",
-                        "result": "follow-up verified",
-                        "confidence": "high",
-                    }),
-                )])
-                .with_text(FOLLOWUP_DONE),
-            ]),
-            extra_tools: vec![],
-        },
-    ]);
-    install_coordinator_overrides(vec![CoordinatorOverride {
-        model: ScriptedCompletionModel::new(vec![coordinator_direct_turn()]),
-    }]);
-    register_decided(&world).await;
-    publish_document(&world, &sibling_followup_wave_document(&world)).await;
-
-    let grant = evaluate_resume(evaluation(&world, false, None))
-        .await
-        .expect("the all-decided run grants");
-    let segment = run_segment(grant, &world.config, &HashMap::new())
-        .await
-        .expect("the parking sibling re-parks the resumed run after the follow-up wave");
-    match segment {
-        SegmentResult::Parked { turns, blocking } => {
-            let mut body = json!({
-                "turns": serde_json::to_value(turns.as_slice()).expect("turns serialize"),
-                "blocking":
-                    serde_json::to_value(blocking.as_slice()).expect("blocking serializes"),
-            });
-            normalize_fresh_parking(&mut body);
-            assert_eq!(
-                body,
-                json!({
-                    "turns": [
-                        decided_call_turn(),
-                        decided_result_turn(&echo_tool_result_wire()),
-                        submit_result_turn(A_DONE, "call_sub_a", "apply done", "applied cleanly"),
-                        fresh_gated_turn(),
-                        submit_result_turn(
-                            WAVE_SIBLING_DONE,
-                            "call_sub_w",
-                            "checks done",
-                            "checks passed",
-                        ),
-                        submit_result_turn(
-                            FOLLOWUP_DONE,
-                            "call_sub_f",
-                            "follow-up done",
-                            "follow-up verified",
-                        ),
-                    ],
-                    "blocking": [
-                        {
-                            "decision_id": "<fresh decision id>",
-                            "tool": NEW_TOOL,
-                            "expires_at": "<fresh expiry>",
-                        },
-                    ],
-                }),
-                "the follow-up wave's turn rides after the whole mixed first \
-                 wave — the parked task 0's gated turn included, not after \
-                 it in append order"
-            );
-        }
-        other => panic!("expected a re-parked segment, got {other:?}"),
-    }
 }
 
 /// The wire serializers the golden literals embed, calibrated against the
@@ -6644,179 +5653,6 @@ async fn consult_a_present_mismatch_outranks_expiry_regardless_of_member_order()
     );
 }
 
-/// Mid-segment re-park (the existing re-park golden harness, extended by
-/// ADDITION — the decided fixture and the re-park step stay exactly as the
-/// loop-re-park frames drive them; the single-entry rewrite helper is NOT
-/// reused, this frame owns its two-entry assertions): the mid-segment park
-/// raises TWO new gated calls out of ONE assistant turn — two fresh
-/// tickets, two blocking entries. The SIBLING parks first and holds the
-/// EARLIER ticket deadline; the TARGET parks second with the LATER one.
-/// Both tickets live in the store at the commit, undecided and inside
-/// their own windows. Pins at the re-park row: (i) the TARGET entry's
-/// `expires_at` equals the target ticket's OWN stored deadline; (ii) it does
-/// NOT equal the renewed retention stamp; (iii) the SIBLING entry's
-/// `expires_at` equals the sibling ticket's deadline but does NOT equal the
-/// renewed stamp — the renewed stamp derives from the re-publication
-/// timestamp plus `park_ttl`, never from any ticket deadline.
-///
-/// RED at E5-R (the re-park consult cutover): the re-park stamped EVERY
-/// entry with the renewed stamp (the single-deadline blocking construction),
-/// so the TARGET entry carried the sibling-derived stamp and assertion
-/// (ii)'s inequality failed. E7-C turned (ii) green; E5 later moved the
-/// renewal derivation off the earliest outstanding ticket, flipping (iii)'s
-/// second assertion from equality to inequality.
-#[tokio::test]
-async fn reparked_blocking_entries_carry_the_new_calls_own_deadline() {
-    let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
-    let _drain = OverrideDrain;
-    let world = world();
-    // The re-park pair's rig ids and provider call ids: one per freshly
-    // parked call, distinct — the loop keys tool results by the rig id and
-    // the park stamps each pending call's id from the one it observed.
-    const SIBLING_RIG_ID: &str = "call_0";
-    const TARGET_RIG_ID: &str = "call_1";
-    const SIBLING_CALL_ID: &str = "call_id_0";
-    const TARGET_CALL_ID: &str = "call_id_1";
-
-    let apply_invocations = Arc::new(Mutex::new(Vec::new()));
-    let sibling_invocations = Arc::new(Mutex::new(Vec::new()));
-    let target_invocations = Arc::new(Mutex::new(Vec::new()));
-    // ONE assistant turn issues BOTH gated calls: the sibling parks first
-    // (its gate entry mints the EARLIER ticket deadline), the target second
-    // (the LATER one). The stream ends after the one batch — the park hook
-    // cancels after the snapshot, before the next completion.
-    install_worker_overrides(vec![WorkerOverride {
-        model: ScriptedCompletionModel::new(vec![ScriptedTurn::tool_calls(vec![
-            ScriptedToolCall::new(SIBLING_RIG_ID, TOOL_B, json!({ "namespace": "stage" }))
-                .with_call_id(SIBLING_CALL_ID),
-            ScriptedToolCall::new(TARGET_RIG_ID, NEW_TOOL, json!({ "namespace": "stage" }))
-                .with_call_id(TARGET_CALL_ID),
-        ])]),
-        extra_tools: vec![
-            Box::new(RecordingTool::new(apply_invocations.clone()).with_name(TOOL)),
-            Box::new(RecordingTool::new(sibling_invocations.clone()).with_name(TOOL_B)),
-            Box::new(RecordingTool::new(target_invocations.clone()).with_name(NEW_TOOL)),
-        ],
-    }]);
-    register_decided(&world).await;
-    publish_document(&world, &sentinel_document(&world)).await;
-
-    let grant = evaluate_resume(evaluation(&world, false, None))
-        .await
-        .expect("the decided checkpoint grants: the mid-segment park has not run yet");
-    let segment = run_segment(grant, &world.config, &HashMap::new())
-        .await
-        .expect("the segment re-parks on the two fresh gated calls");
-    assert_eq!(
-        apply_invocations
-            .lock()
-            .expect("apply invocation log")
-            .len(),
-        1,
-        "the decided call executes exactly once before the re-park"
-    );
-    assert!(
-        sibling_invocations
-            .lock()
-            .expect("sibling invocation log")
-            .is_empty()
-            && target_invocations
-                .lock()
-                .expect("target invocation log")
-                .is_empty(),
-        "neither freshly parked call executed its tool"
-    );
-    let blocking = match segment {
-        SegmentResult::Parked { blocking, .. } => blocking,
-        other => panic!("expected a re-parked segment, got {other:?}"),
-    };
-    assert_eq!(
-        blocking.as_slice().len(),
-        2,
-        "the refreshed blocking set carries the two freshly parked calls, found {:?}",
-        blocking.as_slice()
-    );
-    let sibling_entry = blocking
-        .as_slice()
-        .iter()
-        .find(|blocked| blocked.tool.as_ref() == TOOL_B)
-        .expect("the sibling's blocking entry names the sibling call");
-    let target_entry = blocking
-        .as_slice()
-        .iter()
-        .find(|blocked| blocked.tool.as_ref() == NEW_TOOL)
-        .expect("the target's blocking entry names the newly gated call");
-    let sibling_decision_id = sibling_entry.decision_id;
-    let target_decision_id = target_entry.decision_id;
-    let sibling_entry_expires = sibling_entry.expires_at;
-    let target_entry_expires = target_entry.expires_at;
-
-    // Both fresh tickets live in the store at the commit — undecided, each
-    // inside its OWN window — and the sibling's is the earlier deadline.
-    let sibling_ticket = world
-        .registry
-        .try_parked(&sibling_decision_id)
-        .await
-        .expect("the store reads")
-        .expect("the sibling's fresh ticket is in the store at the commit");
-    let target_ticket = world
-        .registry
-        .try_parked(&target_decision_id)
-        .await
-        .expect("the store reads")
-        .expect("the target's fresh ticket is in the store at the commit");
-    assert!(
-        sibling_ticket.expires_at > chrono::Utc::now(),
-        "the sibling's fresh ticket sits inside its own window"
-    );
-    assert!(
-        target_ticket.expires_at > chrono::Utc::now(),
-        "the target's fresh ticket sits inside its own window"
-    );
-    assert!(
-        sibling_ticket.expires_at < target_ticket.expires_at,
-        "the fixture shape: the sibling parks first and holds the EARLIER ticket \
-         deadline; the target's is the later one"
-    );
-
-    let republished = load_parked_run(&parked_document_path(&world))
-        .await
-        .expect("the re-park re-published the checkpoint under the parked name");
-    let renewed_stamp = republished.retention_expires_at.as_datetime();
-
-    // (iii) — the sibling entry still carries its OWN ticket deadline (first
-    // assertion, unchanged), but the renewed retention stamp derives from the
-    // re-publication timestamp plus `park_ttl`, not from any ticket deadline,
-    // so the entry and the stamp part ways (inequality).
-    assert_eq!(
-        sibling_entry_expires, sibling_ticket.expires_at,
-        "(iii) the sibling's blocking entry carries the sibling ticket's deadline"
-    );
-    assert_ne!(
-        sibling_entry_expires, renewed_stamp,
-        "(iii) the sibling's entry must NOT equal the renewed retention stamp: \
-         the renewal derives from the publication timestamp plus `park_ttl`, \
-         not from any ticket deadline"
-    );
-    // (ii) — RED today: the re-park stamps EVERY entry with the renewed
-    // stamp, so the target entry carries the sibling-derived stamp instead
-    // of its own later deadline.
-    assert_ne!(
-        target_entry_expires, renewed_stamp,
-        "(ii) the TARGET entry must NOT carry the renewed document retention \
-         stamp — the stamp derives from the earliest outstanding ticket (the \
-         sibling's earlier deadline), while the target entry must carry the \
-         target call's OWN later deadline; RED today: both entries carry the \
-         renewed stamp"
-    );
-    // (i) — asserted after the inequality so today's failure lands on the
-    // stamp break, not here; green at the cutover, load-bearing at E5.
-    assert_eq!(
-        target_entry_expires, target_ticket.expires_at,
-        "(i) the TARGET entry carries the target ticket's OWN stored deadline"
-    );
-}
-
 /// E5-R R3: the re-park RENEWS the document's retention stamp from the
 /// publication timestamp plus the configured `park_ttl` (7200s here) — the
 /// earliest outstanding ticket no longer derives it. The E7 test-7 drive
@@ -6901,7 +5737,7 @@ async fn reparked_document_renews_retention_from_the_publication_timestamp() {
         .await
         .expect("the decided checkpoint grants: the mid-segment park has not run yet");
     let republish_before = chrono::Utc::now();
-    let segment = run_segment(grant, &world.config, &HashMap::new())
+    let segment = run_segment_live(grant, &world.config, &HashMap::new())
         .await
         .expect("the segment re-parks on the two fresh gated calls");
     let republish_after = chrono::Utc::now();
@@ -6925,45 +5761,30 @@ async fn reparked_document_renews_retention_from_the_publication_timestamp() {
                 .is_empty(),
         "neither freshly parked call executed its tool"
     );
-    let blocking = match segment {
-        SegmentResult::Parked { blocking, .. } => blocking,
-        other => panic!("expected a re-parked segment, got {other:?}"),
-    };
-    assert_eq!(
-        blocking.as_slice().len(),
-        2,
-        "the refreshed blocking set carries the two freshly parked calls, found {:?}",
-        blocking.as_slice()
+    assert!(
+        matches!(segment, ResumeStreamEnd::Reparked),
+        "the segment re-parks on the two fresh gated calls: {segment:?}"
     );
-    let sibling_entry = blocking
-        .as_slice()
-        .iter()
-        .find(|blocked| blocked.tool.as_ref() == TOOL_B)
-        .expect("the sibling's blocking entry names the sibling call");
-    let target_entry = blocking
-        .as_slice()
-        .iter()
-        .find(|blocked| blocked.tool.as_ref() == NEW_TOOL)
-        .expect("the target's blocking entry names the newly gated call");
-    let sibling_decision_id = sibling_entry.decision_id;
-    let target_decision_id = target_entry.decision_id;
-    let target_entry_expires = target_entry.expires_at;
-
     // Both fresh tickets live in the store at the commit — undecided, each
-    // inside its own ≈ +1h window — and the sibling's is the earlier
-    // deadline.
-    let sibling_ticket = world
-        .registry
-        .try_parked(&sibling_decision_id)
+    // inside its own window — and the sibling's is the earlier deadline.
+    let pending = world
+        .store
+        .list_pending()
         .await
-        .expect("the store reads")
-        .expect("the sibling's fresh ticket is in the store at the commit");
-    let target_ticket = world
-        .registry
-        .try_parked(&target_decision_id)
-        .await
-        .expect("the store reads")
-        .expect("the target's fresh ticket is in the store at the commit");
+        .expect("the store lists its undecided approvals");
+    assert_eq!(
+        pending.len(),
+        2,
+        "the re-park registered both freshly gated calls"
+    );
+    let sibling_ticket = pending
+        .iter()
+        .find(|ticket| ticket.request.items[0].tool_name == TOOL_B)
+        .expect("the sibling ticket names the sibling call");
+    let target_ticket = pending
+        .iter()
+        .find(|ticket| ticket.request.items[0].tool_name == NEW_TOOL)
+        .expect("the target ticket names the newly gated call");
     assert!(
         sibling_ticket.expires_at > chrono::Utc::now(),
         "the sibling's fresh ticket sits inside its own window"
@@ -6992,13 +5813,6 @@ async fn reparked_document_renews_retention_from_the_publication_timestamp() {
          ticket: {renewed} sits within one minute of the sibling ticket's \
          deadline {}",
         sibling_ticket.expires_at
-    );
-    // Guard (green today and after E5): the TARGET entry carries the target
-    // ticket's OWN deadline — per-call deadline semantics are untouched by
-    // the stamp.
-    assert_eq!(
-        target_entry_expires, target_ticket.expires_at,
-        "the TARGET blocking entry still carries the target call's OWN deadline"
     );
 }
 

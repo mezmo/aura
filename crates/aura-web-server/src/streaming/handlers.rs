@@ -1172,7 +1172,16 @@ fn handle_orchestrator_event(
     ctx: &TurnContext,
     event: &OrchestratorEvent,
 ) -> Vec<Bytes> {
-    if !config.emit_custom_events {
+    // The control events (`task_blocked`, `run_parked`) are protocol surface,
+    // not optional telemetry: a client must always be able to observe a
+    // blocked call or a parked run, so they survive custom-event suppression.
+    // Every other orchestrator event stays behind the flag.
+    if !config.emit_custom_events
+        && !matches!(
+            event,
+            OrchestratorEvent::TaskBlocked { .. } | OrchestratorEvent::RunParked { .. }
+        )
+    {
         tracing::debug!(
             "Orchestrator event skipped (custom events disabled): {:?}",
             event
@@ -2885,6 +2894,65 @@ mod tests {
             assert!(
                 !events.is_empty(),
                 "OpenAI chunks must still flow with custom events off"
+            );
+        }
+
+        /// The control events survive custom-event suppression: a parked run
+        /// and a blocked task are protocol surface, not optional telemetry,
+        /// so the client always observes them even with `aura.*` custom
+        /// events off. Every other orchestrator event stays suppressed.
+        #[tokio::test(start_paused = true)]
+        async fn control_events_survive_custom_event_suppression() {
+            let events = run_scoped(false, SESSION_ID, |_| {
+                vec![
+                    Step::Item(Ok(StreamItem::OrchestratorEvent(
+                        OrchestratorEvent::TaskBlocked {
+                            task_id: 1,
+                            orchestrator_id: "orch-1".to_string(),
+                            worker_id: "operations".to_string(),
+                            tool_call_id: "call_blocked".to_string(),
+                            decision_id: "decision_blocked".to_string(),
+                            tool_name: "kubectl_apply".to_string(),
+                        },
+                    ))),
+                    Step::Item(Ok(StreamItem::OrchestratorEvent(
+                        OrchestratorEvent::RunParked {
+                            run_id: "run-parked".to_string(),
+                            decision_ids: vec!["decision_blocked".to_string()],
+                            retention_expires_at: aura_events::RetentionExpiresAt::from_datetime(
+                                chrono::Utc::now(),
+                            ),
+                            iteration: 1,
+                        },
+                    ))),
+                    Step::Item(Ok(StreamItem::OrchestratorEvent(
+                        OrchestratorEvent::TaskStarted {
+                            task_id: 1,
+                            description: "suppressed telemetry".to_string(),
+                            orchestrator_id: "orch-1".to_string(),
+                            worker_id: "operations".to_string(),
+                        },
+                    ))),
+                    Step::Item(items::text("done")),
+                ]
+            })
+            .await;
+
+            let types: Vec<&str> = events
+                .iter()
+                .filter_map(|event| event.event_type.as_deref())
+                .collect();
+            assert!(
+                types.contains(&"aura.orchestrator.task_blocked"),
+                "task_blocked survives telemetry-off: {types:?}"
+            );
+            assert!(
+                types.contains(&"aura.orchestrator.run_parked"),
+                "run_parked survives telemetry-off: {types:?}"
+            );
+            assert!(
+                !types.contains(&"aura.orchestrator.task_started"),
+                "ordinary orchestrator telemetry stays suppressed: {types:?}"
             );
         }
     }

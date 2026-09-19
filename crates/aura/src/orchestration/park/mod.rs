@@ -24,8 +24,14 @@ pub(crate) use continuation::ResumingDocumentHandle;
 #[allow(unused_imports)]
 pub(crate) use continuation::load_recorded_decisions;
 pub(crate) use document::{
-    PARKED_DOCUMENT_SUFFIX, ParkedRun, RESUMING_DOCUMENT_SUFFIX, RunStateForPark, load_parked_run,
+    PARKED_DOCUMENT_SUFFIX, ParkedRun, RESUMING_DOCUMENT_SUFFIX, RunStateForPark,
 };
+// `load_parked_run` is reached through this re-export by the park-tree
+// golden suites alone — the module is private outside `park`, and the
+// production resume path no longer re-loads the re-published checkpoint —
+// so its marker stays.
+#[allow(unused_imports)]
+pub(crate) use document::load_parked_run;
 pub(crate) use guard::{ParkGuard, ParkGuardMode};
 // The provider-valid context builder for the reconstruction direction
 // (P45, R5): the prelude names `CallId`, `NodePreflightInput`,

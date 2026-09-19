@@ -161,25 +161,6 @@ impl NonEmptyBlocking {
     }
 }
 
-/// Build a mandatory blocking set from outstanding `(decision_id, tool,
-/// deadline)` rows. The two re-park projections (the resume drive loop and
-/// the coordinator continuation) iterate different sources but emit the same
-/// entry shape, each entry carrying its own call's stored deadline; the
-/// empty-set refusal is the caller's error to phrase.
-pub(crate) fn blocking_from_calls<E>(
-    calls: impl Iterator<Item = (DecisionId, String, chrono::DateTime<chrono::Utc>)>,
-    empty: impl FnOnce() -> E,
-) -> Result<NonEmptyBlocking, E> {
-    let entries: Vec<BlockingEntry> = calls
-        .map(|(decision_id, tool_name, expires_at)| BlockingEntry {
-            decision_id,
-            tool: ParkedToolName::new(tool_name),
-            expires_at,
-        })
-        .collect();
-    NonEmptyBlocking::try_new(entries).map_err(|EmptyBlocking| empty())
-}
-
 /// The not-ready codes, declared in evaluation order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -874,43 +855,6 @@ pub async fn evaluate_resume(
     Ok(grant)
 }
 
-/// The turns of one executed segment, in order; never empty.
-#[derive(Debug, Clone)]
-pub struct SegmentTurns(Vec<rig::completion::Message>);
-
-impl SegmentTurns {
-    /// Take the segment's turns, rejecting an empty set.
-    pub fn try_new(turns: Vec<rig::completion::Message>) -> Result<Self, EmptySegment> {
-        if turns.is_empty() {
-            Err(EmptySegment)
-        } else {
-            Ok(Self(turns))
-        }
-    }
-
-    /// The turns in segment order.
-    #[must_use]
-    pub fn as_slice(&self) -> &[rig::completion::Message] {
-        &self.0
-    }
-}
-
-/// A segment carried no turns.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct EmptySegment;
-
-/// One executed resume segment's terminal data.
-#[derive(Debug, Clone)]
-pub enum SegmentResult {
-    Completed {
-        turns: SegmentTurns,
-    },
-    Parked {
-        turns: SegmentTurns,
-        blocking: NonEmptyBlocking,
-    },
-}
-
 /// Why a segment ended without terminal data.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -938,21 +882,8 @@ pub enum ResumeStreamEnd {
     Reparked,
 }
 
-/// Execute one segment for a granted run: the decided approvals' next agent
-/// turns, until the run completes or a new approval-required call parks. The
-/// segment is atomic data — no streaming to the client mid-segment. The
-/// orchestrator entry is the implementing seam; this wrapper keeps the
-/// endpoint's call surface in the resume module.
-pub async fn run_segment(
-    grant: ResumeGrant,
-    config: &AgentRuntimeConfig,
-    headers: &HashMap<String, String>,
-) -> Result<SegmentResult, SegmentError> {
-    crate::orchestration::Orchestrator::run_resume_segment(grant, config, headers).await
-}
-
-/// Drive one segment for a run the supervisor still owns: the borrowed,
-/// stream-shaped form of [`run_segment`].
+/// Drive one segment for a run the supervisor still owns: the stream-shaped
+/// resume seam.
 ///
 /// Events forward through `event_tx` — the same sender the normal
 /// completion path drives — and usage accumulates into the caller's
