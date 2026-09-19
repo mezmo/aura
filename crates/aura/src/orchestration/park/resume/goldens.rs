@@ -7174,7 +7174,7 @@ async fn s5_resumed_worker_uses_the_configured_per_call_timeout() {
         .expect("the all-decided run grants");
 
     let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<Result<StreamItem, StreamError>>(64);
-    let (entered, end) = tokio::join!(
+    let (_entered, end) = tokio::join!(
         async {
             tokio::time::timeout(S5_STALL_BOUND, stall.wait_entered())
                 .await

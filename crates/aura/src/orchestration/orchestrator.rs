@@ -5095,7 +5095,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 )
                 .await;
             let srd = submit_result_decision.clone();
-            let stream_result = Self::collect_segment_turns(
+            let stream_drive = Self::collect_segment_turns(
                 stream,
                 &self.usage_state,
                 self.config.stream_inactivity_timeout_secs(),
@@ -5104,8 +5104,28 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     let srd = srd.clone();
                     Box::pin(async move { srd.lock().await.is_some() })
                 },
-            )
-            .await;
+            );
+            let timeout_secs = self.config.per_call_timeout_secs();
+            let stream_result = if timeout_secs == 0 {
+                stream_drive.await
+            } else {
+                match tokio::time::timeout(Duration::from_secs(timeout_secs), stream_drive).await {
+                    Ok(result) => result,
+                    Err(_elapsed) => {
+                        tracing::warn!(
+                            "Resume segment timed out after {}s (per_call_timeout_secs={})",
+                            timeout_secs,
+                            timeout_secs,
+                        );
+                        Err(format!(
+                            "Resume segment timed out after {}s — the LLM provider did not \
+                             respond in time",
+                            timeout_secs
+                        )
+                        .into())
+                    }
+                }
+            };
             drop(park_registration);
 
             // Same cell contract as the live path: the cell is the source of
