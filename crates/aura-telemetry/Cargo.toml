@@ -22,6 +22,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 dirs = "6"
 
 [dev-dependencies]
+shimforge = "=0.1.3"
 tempfile = "3.10"
 trybuild = "1.0"
 wiremock = "0.6"
