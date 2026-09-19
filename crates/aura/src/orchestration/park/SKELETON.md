@@ -128,7 +128,7 @@ family per the contract's dispatch table:
 | ~~9~~ | ~~`crates/aura/src/orchestration/park/lifetime.rs` `RunExecutionScope::drain`~~ FILLED at commit `afe73e14` (2026-09-17; LIFETIME L1; literal `close()` + `wait().await` join barrier — drain is terminal for the scope, supervisor-use discipline lands with L2-L4) | L1 |
 | ~~10~~ | ~~`crates/aura/src/orchestration/park/resume/claim.rs` `rename_back_under_reservation`~~ FILLED at commit `2c5713f9` (2026-09-18; RESERVATION E4-F, reviewed RED `105535a6`; lease-fenced blocking tail, the safe ENOENT semantics, Unavailable/Internal classification — wired as the empty-resume recovery by E4-I `22347993`) | E4 |
 | ~~11~~ | ~~`crates/aura/src/orchestration/park/resume/evaluate.rs` `convert_reserved`~~ FILLED at commit `2c5713f9` (2026-09-18; RESERVATION E4-F; carrier-consuming conversion, no-ENOENT source, the grant owns the same reservation and its ONE execution scope — wired as the ordered entry's step 6 by E4-I `22347993`, which also retired the interim `claim_and_resume`/`authorize`/`admit`/`check_claim` pipeline and the unfenced `rename_back_to_parked`) | E4 |
-| 12 | `crates/aura/src/orchestration/park/resume/evaluate.rs` `run_segment_borrowed` (REPAIR-2 F3; 2026-09-15 alignment amendment recut its SIGNATURE; inputs: event sender; shared `UsageState`; `outer_budget`; output: `ResumeStreamEnd`; the one `todo!()` body is unchanged) | S3/S4 |
+| ~~12~~ | ~~`crates/aura/src/orchestration/park/resume/evaluate.rs` `run_segment_borrowed`~~ FILLED at commit `57b00b4d` (2026-09-18; S4-INT, Gate-A-accepted joint S3/S4 unit; the borrowed-grant stream driver — the atomic path is retired by S6) | S3/S4 |
 | ~~13~~ | ~~`crates/aura/src/session_store/memory.rs` `retained_rows`~~ FILLED at commit `0833493b` (2026-09-17; typed unsupported-operation answer — no park parity) | E1/E2 |
 | ~~14~~ | ~~`crates/aura/src/session_store/file.rs` `retained_rows`~~ FILLED at commit `0833493b` (2026-09-17; side-effect-free both-directory scan, decision-file-wins classification) | E2 |
 | ~~15~~ | ~~`crates/aura/src/session_store/fault_store.rs` `retained_rows`~~ FILLED at commit `6e222515` (2026-09-17; general-lane cfg(test) delegation) | E1/E2 |
@@ -136,9 +136,9 @@ family per the contract's dispatch table:
 | 17 | `crates/aura/src/orchestration/park/cleanup.rs` `inspect_checkpoint_presence` (REPAIR-2 F11; REPAIR-3 G6: renamed from `confirm_checkpoint_absence`, gains `Present`, takes the `CleanupReservation` carrier) | E6 |
 | 18 | `crates/aura/src/orchestration/park/cleanup.rs` `delete_expired_run` (REPAIR-2 F11; REPAIR-3 G6: takes the `CleanupReservation` carrier — the blocking tail retains the lease) | E6 |
 | 19 | `crates/aura/src/orchestration/park/cleanup.rs` `scan_checkpoint_root` (REPAIR-2 F11) | E6 |
-| 20 | `crates/aura/src/rig_builder.rs` `RigBuilder::prepare_agent_config` | S1 |
-| 21 | `crates/aura/src/orchestration/factory.rs` `OrchestratorFactory::resume_stream_with_timeout` | S3 |
-| 22 | `crates/aura-web-server/src/handlers.rs` `build_completion_config` Resume arm (REPAIR-1/R-5; provider/model, otel query, and message count from the resumed run's factory) | S2/S3 |
+| ~~20~~ | ~~`crates/aura/src/rig_builder.rs` `RigBuilder::prepare_agent_config`~~ FILLED at commit `b580dd43` (2026-09-18; S1, Gate-A-accepted; the fallible production config projection, consumed by the resume handler) | S1 |
+| ~~21~~ | ~~`crates/aura/src/orchestration/factory.rs` `OrchestratorFactory::resume_stream_with_timeout`~~ FILLED at commit `967954aa` (2026-09-18; S3, Gate-A-accepted joint S3/S4 unit; the factory supervisor consuming the grant by value) | S3 |
+| ~~22~~ | ~~`crates/aura-web-server/src/handlers.rs` `build_completion_config` Resume arm~~ FILLED at commit `6ee723a5` (2026-09-18; S2, Gate-A-accepted; the resume arm built through the production projection, then routed through the normal SSE completion by `83eaa954`) | S2/S3 |
 
 Count after the 2026-09-15 alignment amendments: 22 at the committed
 alignment baseline; R1's fill (commit `79fbf06d`, same day) removes row 1,
@@ -164,8 +164,16 @@ S1, 21 to S3, and 22 to S2/S3. E4's open scope is complete: the ordered
 entry runs on the shared reservation surface with empty-resume recovery
 fenced by it; E7's production consult cutover closed 2026-09-18
 (`6f14da4f`) and E5's publication-transaction retention stamp closed the
-same day (`079ffa53`) — the 9 rows stand with no E-family owner left open
-until CLEANUP (E6/E8, after SSE).
+same day (`079ffa53`) — the 9 rows stood with no E-family owner left open
+until CLEANUP (E6/E8, after SSE). The SSE wave then filled rows 20 (S1
+`b580dd43`), 22 (S2/S3 `6ee723a5`), 21 (S3 `967954aa`), and 12 (S3/S4
+`57b00b4d`), and S6 retired the atomic JSON projection (the public
+`run_segment` / `SegmentResult` / `SegmentTurns` surface in evaluate.rs, the
+handlers.rs projection helpers and atomic success body, and the
+orchestrator's atomic assembly) per the removal manifest's S2/S6 and S4/S6
+rows. The alignment inventory now holds **5 rows**: the EXCLUDED Redis holes
+5/16 (unsupported park backend; delete with the follow-up Redis-removal PR,
+no fill work owed) and the CLEANUP-only E6 rows 17/18/19.
 
 Holes REMOVED by REPAIR-2:
 - `RunReservationLease::drop` (old #7): the per-reservation `ReservationInner`

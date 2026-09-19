@@ -153,9 +153,12 @@ impl OrchestratorFactory {
         // reservation fence releases with the supervisor's drive. Dropping
         // the watch sender with no explicit signal is an unexplained abort
         // and fails safe by cancelling (#305) — a no-op on an ended run.
-        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let cancel_tx = crate::request_cancellation::RequestCancelToken::from(
+            tokio_util::sync::CancellationToken::new(),
+        );
         let scope = grant.execution_scope();
         let watcher_token = scope.cancellation().clone();
+        let bridge_token = cancel_tx.clone();
         let _watcher_handle = tokio::spawn(async move {
             tokio::select! {
                 biased;
@@ -163,18 +166,7 @@ impl OrchestratorFactory {
                     // The run's execution already ended: nothing left to
                     // bridge.
                 }
-                _ = async {
-                    let mut cancel_rx = cancel_rx;
-                    loop {
-                        if cancel_rx.changed().await.is_err() {
-                            return; // sender dropped: fail safe (#305)
-                        }
-                        if !*cancel_rx.borrow_and_update() {
-                            continue;
-                        }
-                        return; // external cancellation requested
-                    }
-                } => {}
+                _ = bridge_token.cancelled() => {}
             }
             watcher_token.cancel();
         });
@@ -656,8 +648,8 @@ mod tests {
         take_worker_override,
     };
     use crate::orchestration::{
-        OrchestrationConfig, OrchestratorEvent, ParkSnapshot, PendingCall, Plan, ResumeRunId, Task,
-        TaskState, WorkerConfig,
+        OrchestrationConfig, ParkSnapshot, PendingCall, Plan, ResumeRunId, Task, TaskState,
+        WorkerConfig,
     };
     use crate::provider_agent::{StreamError, StreamItem};
     use crate::session_store::{FileApprovalStore, InMemoryApprovalStore, InMemoryEventBus};
@@ -1046,7 +1038,7 @@ mod tests {
             },
             route: aura_config::DecisionRouteConfig::Webhook {
                 url: aura_config::WebhookUrl::new(url).unwrap(),
-                timeout_secs: 3600,
+                timeout_secs: Some(3600),
                 headers: HashMap::new(),
                 headers_from_request: HashMap::new(),
                 tool_headers_from_response: aura_config::ToolHeaderMappings::default(),
@@ -1080,6 +1072,7 @@ mod tests {
                 },
                 items: vec![ApprovalItem {
                     tool_name: RESUME_TOOL.to_string(),
+                    tool_namespace: None,
                     arguments: resume_args(),
                     tool_call_intent: None,
                 }],
@@ -1650,7 +1643,7 @@ mod tests {
             "the grant's execution scope stays live until the watch fires"
         );
 
-        cancel_tx.send(true).expect("the cancellation watch sends");
+        cancel_tx.cancel();
         let deadline = Instant::now() + RESUME_BOUND;
         while !scope.cancellation().is_cancelled() {
             assert!(
@@ -1915,9 +1908,11 @@ mod tests {
             assert!(
                 matches!(
                     item,
-                    Ok(StreamItem::OrchestratorEvent(
-                        OrchestratorEvent::RunParked { .. }
-                    ))
+                    Ok(StreamItem::AgentEvent(ref event))
+                        if matches!(
+                            event.payload,
+                            aura_events::agent::AgentEventPayload::RunParked { .. }
+                        )
                 ),
                 "the publication owner's RunParked rides the stream: got {item:?}"
             );
@@ -2056,7 +2051,7 @@ mod tests {
             // The tail spawns during the substitution; the run's own
             // cancellation fires WHILE it is still in flight.
             await_tail_spawned(&spawned).await;
-            cancel_tx.send(true).expect("the cancellation watch sends");
+            cancel_tx.cancel();
 
             // The cancelled run still reaches its stop within the bound.
             tokio::time::timeout(RESUME_BOUND, stream.next())
