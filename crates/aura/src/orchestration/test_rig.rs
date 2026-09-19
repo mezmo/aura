@@ -184,6 +184,10 @@ impl GetTokenUsage for ScriptedFinalResponse {
 pub(crate) struct ScriptedCompletionModel {
     script: Arc<Mutex<VecDeque<ScriptedTurn>>>,
     requests: Arc<Mutex<Vec<CompletionRequest>>>,
+    /// Optional model-level stall: the response holds after the request is
+    /// recorded, the deterministic stand-in for a provider that stops
+    /// answering mid-request. Inert unless built `with_stall`.
+    stall: Option<StallHook>,
 }
 
 impl ScriptedCompletionModel {
@@ -191,6 +195,29 @@ impl ScriptedCompletionModel {
         Self {
             script: Arc::new(Mutex::new(VecDeque::from(turns))),
             requests: Arc::new(Mutex::new(Vec::new())),
+            stall: None,
+        }
+    }
+
+    /// Arm the model-level stall: the next response records its request,
+    /// then holds until the hook releases. Mirrors [`RecordingTool`]'s
+    /// stall contract.
+    pub(crate) fn with_stall(mut self, stall: StallHook) -> Self {
+        self.stall = Some(stall);
+        self
+    }
+
+    /// Hold the response when stalled: notify `entered`, then wait for the
+    /// release flag, honoring a release that raced the waiter.
+    async fn hold_if_stalled(&self) {
+        if let Some(stall) = &self.stall {
+            stall.inner.entered.notify_one();
+            if !stall.inner.released.load(Ordering::Acquire) {
+                let notified = stall.inner.release.notified();
+                if !stall.inner.released.load(Ordering::Acquire) {
+                    notified.await;
+                }
+            }
         }
     }
 
@@ -280,6 +307,7 @@ impl CompletionModel for ScriptedCompletionModel {
         request: CompletionRequest,
     ) -> Result<CompletionResponse<Self::Response>, CompletionError> {
         let turn = self.record_and_take(request)?;
+        self.hold_if_stalled().await;
         Ok(CompletionResponse {
             choice: Self::turn_choice(&turn),
             usage: Usage::new(),
@@ -292,6 +320,7 @@ impl CompletionModel for ScriptedCompletionModel {
         request: CompletionRequest,
     ) -> Result<StreamingCompletionResponse<Self::StreamingResponse>, CompletionError> {
         let turn = self.record_and_take(request)?;
+        self.hold_if_stalled().await;
         Ok(Self::turn_stream(&turn))
     }
 }

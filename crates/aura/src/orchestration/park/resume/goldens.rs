@@ -7116,54 +7116,55 @@ fn s5_probe_call(rig_id: &str, args: Value) -> ScriptedToolCall {
 }
 
 /// Frame 1 (S5) — RED today (wiring absent). A parked run whose config
-/// sets per-call timeout 1s resumes with that exact deadline on its next
-/// gated call. The fixture value is distinct from every default (the
-/// config default is 120s; the fixture is 1s), so an implementation that
-/// keeps some other deadline cannot pass.
+/// sets per-call timeout 1s resumes with that exact deadline bounding its
+/// continuation's provider call. The fixture value is distinct from every
+/// default (the config default is 120s; the fixture is 1s), so an
+/// implementation that keeps some other deadline cannot pass.
 ///
 /// Vehicle: after the decided call executes, the resumed continuation's
-/// first turn issues an UNGATED probe tool call whose recording
-/// implementation holds open under a stall hook — the deterministic
-/// stand-in for a hung provider/turn. The configured per-call budget must
-/// kill that continuation stream at 1s and the segment must fault with an
-/// error naming the configured one-second deadline.
+/// FIRST provider request is stalled at the MODEL level — the scripted
+/// model records the request, then holds on a stall hook, the
+/// deterministic stand-in for a provider that stops answering
+/// mid-request. The configured per-call budget must kill that stream at
+/// 1s and the segment must fault with an error naming the configured
+/// one-second deadline.
+///
+/// Scope ruling (owner, recorded on P45): the per-call timeout bounds the
+/// PROVIDER CALL, matching the chat path's `stream_and_forward` wrap — the
+/// same authority the dispatch contract names ("the same fields the normal
+/// chat path reads"). Mid-tool-execution interruption is OUT of contract
+/// by design: the resumed run's tool invocations are tracked on the run's
+/// execution scope precisely so a tail outlives the segment
+/// (resume/DESIGN.md:336-348, streaming_request_hook.rs:367 — cancellation
+/// happens between operations, not mid-tool execution), and the S4 error
+/// arm's drain waits those tracked tasks out. A stalled TOOL is therefore
+/// not this frame's vehicle; a stalled PROVIDER RESPONSE is.
 ///
 /// RED today with reason: the resumed worker's continuation stream is
 /// started with a hard-coded `Duration::MAX` hook timeout and no
 /// `per_call_timeout_secs` wrap (orchestrator.rs, the segment's
 /// `stream_chat_message_with_timeout` call), so the configured deadline
-/// never bounds it — the stalled stream runs past the frame's bound and
-/// the outer timeout declares it. The bound keeps the RED bounded: the
-/// suite reads a deterministic failure, never a hang. After the fill the
-/// continuation faults within 1s and the pinned deadline text appears.
-///
-/// OWNER NOTE (recorded at repair, next commit): this vehicle stalls a
-/// TOOL invocation — mid-tool-execution interruption is out of contract
-/// by design (the resumed run's tools are tracked on the run's execution
-/// scope so a tail outlives the segment; the S4 drain waits them out), so
-/// the frame is re-scoped to a stalled PROVIDER RESPONSE in the following
-/// commit. The RED it records (no per-call wrap at the stream seam) is
-/// real and survives the re-scope.
+/// never bounds it — the stalled provider request runs past the frame's
+/// bound and the outer timeout declares it. The bound keeps the RED
+/// bounded: the suite reads a deterministic failure, never a hang. After
+/// the fill the continuation faults within 1s and the pinned deadline
+/// text appears.
 #[tokio::test]
 async fn s5_resumed_worker_uses_the_configured_per_call_timeout() {
     let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
     let _drain = OverrideDrain;
     let stall = StallHook::new();
     let world = world_with_per_call_timeout(1);
-    let probe_invocations = Arc::new(Mutex::new(Vec::new()));
+    let model = ScriptedCompletionModel::new(vec![ScriptedTurn::text(
+        "the resumed worker adapts and reports",
+    )])
+    .with_stall(stall.clone());
+    let requests = model.requests();
     install_worker_overrides(vec![WorkerOverride {
-        model: ScriptedCompletionModel::new(vec![ScriptedTurn::tool_calls(vec![s5_probe_call(
-            "call_probe_t",
-            json!({ "namespace": "s5-stall" }),
-        )])]),
-        extra_tools: vec![
-            Box::new(RecordingTool::new(Arc::new(Mutex::new(Vec::new()))).with_name(TOOL)),
-            Box::new(
-                RecordingTool::new(probe_invocations.clone())
-                    .with_name(PROBE_TOOL)
-                    .with_stall(stall),
-            ),
-        ],
+        model,
+        extra_tools: vec![Box::new(
+            RecordingTool::new(Arc::new(Mutex::new(Vec::new()))).with_name(TOOL),
+        )],
     }]);
     register_decided(&world).await;
     publish_document(&world, &sentinel_document(&world)).await;
@@ -7173,31 +7174,40 @@ async fn s5_resumed_worker_uses_the_configured_per_call_timeout() {
         .expect("the all-decided run grants");
 
     let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<Result<StreamItem, StreamError>>(64);
-    let end = tokio::time::timeout(
-        S5_STALL_BOUND,
-        run_segment_borrowed(
-            &grant,
-            &world.config,
-            &HashMap::new(),
-            event_tx,
-            crate::UsageState::new(),
-            None,
-        ),
-    )
-    .await;
+    let (entered, end) = tokio::join!(
+        async {
+            tokio::time::timeout(S5_STALL_BOUND, stall.wait_entered())
+                .await
+                .expect("the stalled provider request engaged within the bound")
+        },
+        async {
+            tokio::time::timeout(
+                S5_STALL_BOUND,
+                run_segment_borrowed(
+                    &grant,
+                    &world.config,
+                    &HashMap::new(),
+                    event_tx,
+                    crate::UsageState::new(),
+                    None,
+                ),
+            )
+            .await
+        },
+    );
     let end = match end {
         Ok(result) => result,
         Err(_elapsed) => panic!(
-            "RED with reason: the configured per-call timeout (1s) never bounds \x20
+            "RED with reason: the configured per-call timeout (1s) never bounds \
              the resumed worker's continuation stream — the segment starts it
              with a hard-coded `Duration::MAX` hook timeout and no
-             `per_call_timeout_secs` wrap, so a stalled invocation inside the
-             stream cannot be interrupted (the bound was reached)"
+             `per_call_timeout_secs` wrap, so a stalled provider request
+             cannot be interrupted (the bound was reached)"
         ),
     };
     let Err(fault) = end else {
         panic!(
-            "the stalled continuation must fault under the configured per-call \x20
+            "the stalled continuation must fault under the configured per-call \
              timeout — the segment instead finished or parked, which no honest
              fresh per-call budget can produce"
         )
@@ -7209,6 +7219,12 @@ async fn s5_resumed_worker_uses_the_configured_per_call_timeout() {
         "the continuation stream must carry the configured per-call deadline \
          (1s) in its error — the same config field the normal chat path \
          reads, not some resumed default: {text}"
+    );
+    assert_eq!(
+        requests.lock().expect("scripted request log").len(),
+        1,
+        "the deadline killed the in-flight provider request — the request \
+         the stalled model recorded is the bounded one"
     );
 }
 
