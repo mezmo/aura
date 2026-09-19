@@ -327,15 +327,17 @@ impl Agent {
                     .map(crate::config::SessionId::new),
             };
             let request_id = config_owned.request_id.clone().unwrap_or_default();
-            let gate: Arc<dyn crate::tool_wrapper::ToolWrapper> =
-                Arc::new(crate::hitl::HitlApprovalWrapper::new(
+            let gate: Arc<dyn crate::tool_wrapper::ToolWrapper> = Arc::new(
+                crate::hitl::HitlApprovalWrapper::new(
                     hitl.patterns.clone(),
                     hitl.route.clone(),
                     scope.clone(),
                     request_id.clone(),
                     config_owned.agent.name.clone(),
                     config_owned.instance_id.clone(),
-                ));
+                )
+                .with_exemptions(hitl.exemptions.clone()),
+            );
             config_owned.tool_wrapper = Some(match config_owned.tool_wrapper.take() {
                 Some(existing) => Arc::new(crate::tool_wrapper::ComposedWrapper::new(vec![
                     gate, existing,

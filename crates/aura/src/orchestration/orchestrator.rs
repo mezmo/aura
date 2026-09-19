@@ -943,7 +943,8 @@ impl Orchestrator {
                 request_id.clone(),
                 worker_config.agent.name.clone(),
                 worker_config.instance_id.clone(),
-            );
+            )
+            .with_exemptions(hitl.exemptions.clone());
             // The park arm needs the store-bearing route; webhook deployments
             // keep the live decision path.
             if let (
@@ -7516,6 +7517,7 @@ mod tests {
                 }
             };
             config.hitl = Some(crate::hitl::HitlRuntime {
+                exemptions: Arc::from([]),
                 patterns: Arc::from([GlobPattern::new("kubectl_*").unwrap()]),
                 route: Arc::new(route),
                 park_enabled,
@@ -7558,6 +7560,7 @@ mod tests {
             PendingApprovals::with_backend(store.clone(), Arc::new(InMemoryEventBus::new()));
         let config = AgentRuntimeConfig {
             hitl: Some(crate::hitl::HitlRuntime {
+                exemptions: Arc::from([]),
                 patterns: Arc::from([aura_config::GlobPattern::new("kubectl_*").unwrap()]),
                 route: Arc::new(crate::hitl::DecisionRoute::Conversational {
                     registry: registry.clone(),
@@ -7670,6 +7673,7 @@ mod tests {
         let registry = PendingApprovals::with_backend(store, Arc::new(InMemoryEventBus::new()));
         let config = AgentRuntimeConfig {
             hitl: Some(crate::hitl::HitlRuntime {
+                exemptions: Arc::from([]),
                 patterns: Arc::from([aura_config::GlobPattern::new("kubectl_*").unwrap()]),
                 route: Arc::new(crate::hitl::DecisionRoute::Conversational {
                     registry: registry.clone(),
@@ -8239,6 +8243,7 @@ mod tests {
         let request_id = format!("req_orphan_{}", uuid::Uuid::new_v4().simple());
         let config = AgentRuntimeConfig {
             hitl: Some(crate::hitl::HitlRuntime {
+                exemptions: Arc::from([]),
                 patterns: Arc::from([aura_config::GlobPattern::new("echo_tool").unwrap()]),
                 route: Arc::new(crate::hitl::DecisionRoute::Conversational {
                     registry: registry.clone(),
@@ -8527,6 +8532,7 @@ mod tests {
         )]);
         let config = AgentRuntimeConfig {
             hitl: Some(crate::hitl::HitlRuntime {
+                exemptions: Arc::from([]),
                 patterns: Arc::from([aura_config::GlobPattern::new("echo_tool").unwrap()]),
                 route: Arc::new(crate::hitl::DecisionRoute::Conversational {
                     registry: registry.clone(),

@@ -248,8 +248,12 @@ pub(crate) fn parked_document_dir(memory_dir: &str, session_id: Option<&str>) ->
 }
 
 /// Fingerprint the configuration a resume must not drift from: the HITL
-/// gating surface (globs, route, park flag), the agent's model and tool
-/// filter, and the per-worker model and tool configuration.
+/// gating surface (globs, exemptions, route, park flag), the agent's model and
+/// tool filter, and the per-worker model and tool configuration.
+///
+/// The exemptions key is omitted when there are none, so a config that sets no
+/// exemptions fingerprints independently of the field. Adding, changing or
+/// removing an exemption moves the hash.
 pub(crate) fn config_fingerprint(config: &AgentRuntimeConfig) -> String {
     let hitl = config.hitl.as_ref();
     let route = hitl.map(|h| match &*h.route {
@@ -262,15 +266,36 @@ pub(crate) fn config_fingerprint(config: &AgentRuntimeConfig) -> String {
             "timeout_secs": timeout.as_secs(),
         }),
     });
+    let mut gate = serde_json::Map::new();
+    gate.insert(
+        "patterns".to_string(),
+        json!(
+            hitl.map(|h| h
+                .patterns
+                .iter()
+                .map(|p| p.as_str().to_string())
+                .collect::<Vec<_>>())
+                .unwrap_or_default()
+        ),
+    );
+    gate.insert("route".to_string(), json!(route));
+    gate.insert(
+        "park_enabled".to_string(),
+        json!(hitl.is_some_and(|h| h.park_enabled)),
+    );
+    let exemptions = hitl
+        .map(|h| {
+            h.exemptions
+                .iter()
+                .map(|p| p.as_str().to_string())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if !exemptions.is_empty() {
+        gate.insert("exemptions".to_string(), json!(exemptions));
+    }
     let source = json!({
-        "hitl": {
-            "patterns": hitl
-                .map(|h| h.patterns.iter().map(|p| p.as_str().to_string())
-                    .collect::<Vec<_>>())
-                .unwrap_or_default(),
-            "route": route,
-            "park_enabled": hitl.is_some_and(|h| h.park_enabled),
-        },
+        "hitl": gate,
         "agent": {
             "llm": serde_json::to_value(&config.llm).ok(),
             "mcp_filter": &config.agent.mcp_filter,
@@ -706,9 +731,18 @@ mod tests {
     fn config_fingerprint_stable_and_sensitive() {
         use aura_config::GlobPattern;
 
+        fn exempting(pattern: &str, exempt: &str) -> crate::config::AgentRuntimeConfig {
+            let mut c = config(pattern);
+            if let Some(hitl) = c.hitl.as_mut() {
+                hitl.exemptions = Arc::from([GlobPattern::new(exempt).unwrap()]);
+            }
+            c
+        }
+
         fn config(pattern: &str) -> crate::config::AgentRuntimeConfig {
             crate::config::AgentRuntimeConfig {
                 hitl: Some(crate::hitl::HitlRuntime {
+                    exemptions: Arc::from([]),
                     patterns: Arc::from([GlobPattern::new(pattern).unwrap()]),
                     route: Arc::new(crate::hitl::DecisionRoute::Conversational {
                         registry: PendingApprovals::new(),
@@ -724,6 +758,16 @@ mod tests {
             config_fingerprint(&config("kubectl_*")),
             config_fingerprint(&config("kubectl_*")),
             "unchanged config is a stable hash"
+        );
+        assert_ne!(
+            config_fingerprint(&config("kubectl_*")),
+            config_fingerprint(&exempting("kubectl_*", "kubectl_get")),
+            "adding an exemption changes the hash"
+        );
+        assert_ne!(
+            config_fingerprint(&exempting("kubectl_*", "kubectl_get")),
+            config_fingerprint(&exempting("kubectl_*", "kubectl_describe")),
+            "a changed exemption changes the hash"
         );
         assert_ne!(
             config_fingerprint(&config("kubectl_*")),
