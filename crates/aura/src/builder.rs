@@ -134,6 +134,8 @@ pub struct Agent {
     /// Cached tool names for fallback parsing (avoids recomputing on each stream).
     /// Only populated when `fallback_tool_parsing` is enabled.
     pub(crate) fallback_tool_names: Vec<String>,
+    /// The `mcp_filter` effective for `fallback_tool_names`.
+    pub(crate) fallback_mcp_filter: Option<Vec<aura_config::GlobPattern>>,
     /// Configured context window size in tokens (from LLM TOML config).
     /// Used for usage percentage reporting in streaming events.
     pub(crate) context_window: Option<u64>,
@@ -404,11 +406,27 @@ impl Agent {
 
         // Ollama fallback: parse tool calls from text output when native tool_call
         // structures aren't used. Requires MCP tools to be available.
+        //
+        // Resolved the same way registration would (same filter, same
+        // sorted-server-id winner) so the model is only ever told about,
+        // and can only ever reach, a tool it would actually be registered
+        // with — never one `mcp_filter` excludes or another server shadows.
+        let fallback_mcp_filter: Option<Vec<aura_config::GlobPattern>> = config
+            .mcp_filter
+            .clone()
+            .or_else(|| config.agent.mcp_filter.clone());
         let fallback_tool_parsing = config.llm.is_fallback_tool_parsing_enabled();
         let fallback_tool_names = if fallback_tool_parsing {
             match &mcp_manager {
                 Some(mgr) => {
-                    let names = mgr.get_available_tool_names();
+                    let filter = fallback_mcp_filter.clone();
+                    let names: Vec<String> = mgr
+                        .resolve_winning_tools(|tool| match &filter {
+                            None => true,
+                            Some(patterns) => patterns.iter().any(|p| tool.is_match(p)),
+                        })
+                        .into_keys()
+                        .collect();
                     if names.is_empty() {
                         tracing::warn!(
                             "fallback_tool_parsing enabled but no MCP tools discovered - \
@@ -829,6 +847,7 @@ impl Agent {
             mcp_manager,
             fallback_tool_parsing,
             fallback_tool_names,
+            fallback_mcp_filter,
             context_window: config.llm.context_window(),
             scratchpad_budget: agent_scratchpad_budget,
             client_tool_names,
@@ -889,77 +908,104 @@ impl Agent {
             tracing::info!("MCP filter: {} pattern(s): {:?}", patterns.len(), patterns);
         }
 
-        // Add HTTP streamable tools using dynamic adaptors
+        // Register MCP tools in one pass across all transports, walked in
+        // sorted server-id order. Tools register under their bare name, so the
+        // first server to claim a name wins and later claims are refused —
+        // unsorted, that winner would vary between processes.
         if let Some(mcp_manager) = mcp_manager.as_deref() {
-            for (server_name, client) in &mcp_manager.streamable_clients {
-                if let Some(server_tools) = mcp_manager.streamable_tools.get(server_name) {
-                    let filtered_tools: Vec<_> = server_tools
-                        .iter()
-                        .filter(|t| config.tool_matches_filter(t))
-                        .collect();
-                    log_filtered_tools(
-                        "",
+            // Each transport tag is bound in the same expression that names its
+            // maps, so a tag cannot drift from the client it describes. A
+            // mistag would bypass the stdio fail-closed approver check.
+            let mut servers: Vec<(
+                &String,
+                &crate::mcp::McpClient,
+                &Vec<crate::mcp::AuraTool>,
+                &str,
+                crate::approver_headers::McpTransportKind,
+            )> = Vec::new();
+            for (name, client) in &mcp_manager.streamable_clients {
+                if let Some(tools) = mcp_manager.streamable_tools.get(name) {
+                    servers.push((
+                        name,
+                        client,
+                        tools,
                         "HTTP streamable",
-                        server_name,
-                        filtered_tools.len(),
-                        server_tools.len(),
-                    );
-
-                    let client_arc = Arc::new(client.clone());
-                    for mcp_tool in filtered_tools {
-                        tracing::info!("  Adding dynamic HTTP tool: {}", mcp_tool.name());
-
-                        let tool_adaptor = crate::mcp::McpToolAdaptor::new(
-                            mcp_tool.clone(),
-                            Arc::clone(&client_arc),
-                            crate::approver_headers::McpTransportKind::StreamableHttp,
-                        );
-
-                        // Wrap with tool_wrapper if configured
-                        builder_state = Self::add_mcp_tool(
-                            builder_state,
-                            tool_adaptor,
-                            mcp_tool.namespace().clone(),
-                            config,
-                        );
-                    }
+                        crate::approver_headers::McpTransportKind::StreamableHttp,
+                    ));
                 }
             }
-        }
-
-        // Add SSE tools using dynamic adaptors
-        if let Some(mcp_manager) = mcp_manager.as_deref() {
-            for (server_name, client) in &mcp_manager.sse_clients {
-                if let Some(server_tools) = mcp_manager.sse_tools.get(server_name) {
-                    let filtered_tools: Vec<_> = server_tools
-                        .iter()
-                        .filter(|t| config.tool_matches_filter(t))
-                        .collect();
-                    log_filtered_tools(
-                        "",
+            for (name, client) in &mcp_manager.sse_clients {
+                if let Some(tools) = mcp_manager.sse_tools.get(name) {
+                    servers.push((
+                        name,
+                        client,
+                        tools,
                         "SSE",
-                        server_name,
-                        filtered_tools.len(),
-                        server_tools.len(),
+                        crate::approver_headers::McpTransportKind::Sse,
+                    ));
+                }
+            }
+            for (name, client) in &mcp_manager.stdio_clients {
+                if let Some(tools) = mcp_manager.stdio_tools.get(name) {
+                    servers.push((
+                        name,
+                        client,
+                        tools,
+                        "STDIO",
+                        crate::approver_headers::McpTransportKind::Stdio,
+                    ));
+                }
+            }
+            // Server id alone decides the order — transport does not enter
+            // into it, so the rule states as "lowest server id wins".
+            servers.sort_by_key(|(server_id, ..)| *server_id);
+
+            let mut claimed: std::collections::HashMap<String, &str> =
+                std::collections::HashMap::new();
+            for (server_name, client, server_tools, label, transport_kind) in servers {
+                let filtered_tools: Vec<_> = server_tools
+                    .iter()
+                    .filter(|t| config.tool_matches_filter(t))
+                    .collect();
+                log_filtered_tools(
+                    "",
+                    label,
+                    server_name,
+                    filtered_tools.len(),
+                    server_tools.len(),
+                );
+
+                let client_arc = Arc::new(client.clone());
+                for mcp_tool in filtered_tools {
+                    let tool_name = mcp_tool.name().as_str();
+                    if let Some(winner) = claimed.get(tool_name) {
+                        tracing::warn!(
+                            "MCP tool '{}' from server '{}' is shadowed by the same name from \
+                             '{}' and will not be registered; scope the agent with \
+                             [agent].mcp_filter to pick one",
+                            tool_name,
+                            server_name,
+                            winner,
+                        );
+                        continue;
+                    }
+                    claimed.insert(tool_name.to_owned(), server_name);
+
+                    tracing::info!("  Adding dynamic {} tool: {}", label, tool_name);
+
+                    let tool_adaptor = crate::mcp::McpToolAdaptor::new(
+                        mcp_tool.clone(),
+                        Arc::clone(&client_arc),
+                        transport_kind,
                     );
 
-                    let client_arc = Arc::new(client.clone());
-                    for mcp_tool in filtered_tools {
-                        tracing::info!("  Adding dynamic SSE tool: {}", mcp_tool.name());
-
-                        let tool_adaptor = crate::mcp::McpToolAdaptor::new(
-                            mcp_tool.clone(),
-                            Arc::clone(&client_arc),
-                            crate::approver_headers::McpTransportKind::Sse,
-                        );
-
-                        builder_state = Self::add_mcp_tool(
-                            builder_state,
-                            tool_adaptor,
-                            mcp_tool.namespace().clone(),
-                            config,
-                        );
-                    }
+                    // Wrap with tool_wrapper if configured
+                    builder_state = Self::add_mcp_tool(
+                        builder_state,
+                        tool_adaptor,
+                        mcp_tool.namespace().clone(),
+                        config,
+                    );
                 }
             }
         }
@@ -1006,43 +1052,6 @@ impl Agent {
             }
 
             tracing::info!("All vector stores configured successfully");
-        }
-
-        // Add STDIO tools using dynamic adaptors
-        if let Some(mcp_manager) = mcp_manager.as_deref() {
-            for (server_name, client) in &mcp_manager.stdio_clients {
-                if let Some(server_tools) = mcp_manager.stdio_tools.get(server_name) {
-                    let filtered_tools: Vec<_> = server_tools
-                        .iter()
-                        .filter(|t| config.tool_matches_filter(t))
-                        .collect();
-                    log_filtered_tools(
-                        "",
-                        "STDIO",
-                        server_name,
-                        filtered_tools.len(),
-                        server_tools.len(),
-                    );
-
-                    let client_arc = Arc::new(client.clone());
-                    for mcp_tool in filtered_tools {
-                        tracing::info!("  Adding dynamic STDIO tool: {}", mcp_tool.name());
-
-                        let tool_adaptor = crate::mcp::McpToolAdaptor::new(
-                            mcp_tool.clone(),
-                            Arc::clone(&client_arc),
-                            crate::approver_headers::McpTransportKind::Stdio,
-                        );
-
-                        builder_state = Self::add_mcp_tool(
-                            builder_state,
-                            tool_adaptor,
-                            mcp_tool.namespace().clone(),
-                            config,
-                        );
-                    }
-                }
-            }
         }
 
         if let Some(ref scratchpad) = config.scratchpad_tools_config {
@@ -1406,6 +1415,7 @@ impl Agent {
             let executor = crate::fallback_tool_stream::FallbackToolExecutor::new(
                 mcp_manager,
                 self.fallback_tool_names.clone(),
+                self.fallback_mcp_filter.clone(),
             );
             return executor.wrap_stream(Box::pin(stream));
         }
@@ -2361,6 +2371,125 @@ mod tests {
                     .is_err(),
                 "a tool from a server outside the filter must not be registered",
             );
+        }
+    }
+
+    /// Tools register under their bare name, so two servers advertising the
+    /// same one leave a single winner. Registration walks all transports in
+    /// sorted server-id order and refuses later claims, so the winner is the
+    /// same on every run rather than whichever map happened to iterate first.
+    mod duplicate_tool_names {
+        use std::collections::HashMap;
+
+        use serde_json::json;
+
+        use super::transport_tagging::{UnpromptedModel, declared_tool};
+        use super::*;
+        use crate::mcp::client::tests::RecordingMcpServer;
+        use crate::mcp::{McpClient, McpManager};
+
+        async fn client_for(namespace: &str, server: &RecordingMcpServer) -> McpClient {
+            McpClient::new(
+                server.url.clone(),
+                namespace.into(),
+                &HashMap::new(),
+                "test/0",
+            )
+            .await
+            .expect("the loopback server completes the handshake")
+        }
+
+        /// Each server gets its own loopback, so which one a call reached
+        /// identifies the winner.
+        async fn compose_over(manager: McpManager) -> rig::agent::Agent<UnpromptedModel> {
+            let config = AgentRuntimeConfig::default();
+            let state = BuilderState::Initial(rig::agent::AgentBuilder::new(UnpromptedModel));
+            Agent::add_all_tools(state, &config, &Some(Arc::new(manager)), Vec::new())
+                .await
+                .expect("composition succeeds")
+                .build()
+        }
+
+        #[tokio::test]
+        async fn the_lowest_sorted_server_wins_a_shared_name() {
+            let sysdig = RecordingMcpServer::start().await;
+            let victoria = RecordingMcpServer::start().await;
+            let manager = McpManager {
+                streamable_clients: HashMap::from([
+                    (
+                        "victoria".to_owned(),
+                        client_for("victoria", &victoria).await,
+                    ),
+                    ("sysdig".to_owned(), client_for("sysdig", &sysdig).await),
+                ]),
+                streamable_tools: HashMap::from([
+                    (
+                        "victoria".to_owned(),
+                        vec![declared_tool("query_range", "victoria")],
+                    ),
+                    (
+                        "sysdig".to_owned(),
+                        vec![declared_tool("query_range", "sysdig")],
+                    ),
+                ]),
+                ..McpManager::with_sanitization(false)
+            };
+            let agent = compose_over(manager).await;
+
+            agent
+                .tool_server_handle
+                .call_tool("query_range", &json!({}).to_string())
+                .await
+                .expect("the surviving tool is callable");
+
+            assert_eq!(
+                sysdig.tool_calls().len(),
+                1,
+                "'sysdig' sorts before 'victoria', so it wins the name",
+            );
+            assert!(
+                victoria.tool_calls().is_empty(),
+                "the shadowed server must not receive the call",
+            );
+        }
+
+        /// Sorting spans transports. Registration used to run streamable, then
+        /// SSE, then stdio, so a streamable server won any collision no matter
+        /// what it was named; now the id decides.
+        #[tokio::test]
+        async fn a_lower_id_on_stdio_beats_a_higher_id_on_streamable() {
+            let aaa = RecordingMcpServer::start().await;
+            let zzz = RecordingMcpServer::start().await;
+            let manager = McpManager {
+                streamable_clients: HashMap::from([(
+                    "zzz".to_owned(),
+                    client_for("zzz", &zzz).await,
+                )]),
+                streamable_tools: HashMap::from([(
+                    "zzz".to_owned(),
+                    vec![declared_tool("query_range", "zzz")],
+                )]),
+                stdio_clients: HashMap::from([("aaa".to_owned(), client_for("aaa", &aaa).await)]),
+                stdio_tools: HashMap::from([(
+                    "aaa".to_owned(),
+                    vec![declared_tool("query_range", "aaa")],
+                )]),
+                ..McpManager::with_sanitization(false)
+            };
+            let agent = compose_over(manager).await;
+
+            agent
+                .tool_server_handle
+                .call_tool("query_range", &json!({}).to_string())
+                .await
+                .expect("the surviving tool is callable");
+
+            assert_eq!(
+                aaa.tool_calls().len(),
+                1,
+                "the lower server id wins even though it is on a later transport",
+            );
+            assert!(zzz.tool_calls().is_empty());
         }
     }
 
