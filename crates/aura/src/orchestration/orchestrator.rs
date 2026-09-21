@@ -1095,6 +1095,7 @@ impl Orchestrator {
             mcp_manager: self.mcp_manager.clone(),
             fallback_tool_parsing: false,
             fallback_tool_names: vec![],
+            fallback_mcp_filter: None,
             context_window: worker_config.llm.context_window(),
             scratchpad_budget: worker_config
                 .scratchpad_tools_config
@@ -2700,6 +2701,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 mcp_manager: None, // Coordinator doesn't have MCP tools
                 fallback_tool_parsing: false,
                 fallback_tool_names: vec![],
+                fallback_mcp_filter: None,
                 context_window: self.agent_config.llm.context_window(),
                 scratchpad_budget: None,
                 client_tool_names: Default::default(),

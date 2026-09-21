@@ -80,7 +80,7 @@ async fn test_stdio_mcp_connection_and_tool_execution() {
 
     // Verify tool execution via fallback path
     let result = manager
-        .execute_fallback_tool("echo", r#"{"message": "hello stdio"}"#)
+        .execute_fallback_tool("echo", r#"{"message": "hello stdio"}"#, None)
         .await
         .expect("Failed to execute echo tool");
     assert!(

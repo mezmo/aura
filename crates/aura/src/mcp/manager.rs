@@ -5,7 +5,7 @@ use crate::mcp::types::{AuraTool, ToolName};
 use aura_config::GlobPattern;
 use rig::completion::ToolDefinition;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use tracing::{debug, info, warn};
 
 /// MCP client for managing connections to MCP servers
@@ -933,6 +933,90 @@ impl McpManager {
         map
     }
 
+    /// Bare tool names advertised by more than one server, mapped to the
+    /// servers claiming them.
+    ///
+    /// Tools register under their bare name, so a name claimed twice resolves
+    /// to a single winner and the losing server's tool is unreachable.
+    pub fn colliding_tool_names(&self) -> BTreeMap<ToolName, Vec<String>> {
+        let mut claims: BTreeMap<ToolName, Vec<String>> = BTreeMap::new();
+        for (server_name, names) in self.tool_names_per_server() {
+            for name in names {
+                claims.entry(name).or_default().push(server_name.clone());
+            }
+        }
+        claims.retain(|_, servers| servers.len() > 1);
+        for servers in claims.values_mut() {
+            servers.sort();
+        }
+        claims
+    }
+
+    /// One human-readable line per colliding tool name, naming every server
+    /// that claims it and the one that wins.
+    pub fn collision_report(&self) -> Vec<String> {
+        self.colliding_tool_names()
+            .into_iter()
+            .map(|(tool, servers)| {
+                let winner = servers.first().map(String::as_str).unwrap_or("");
+                format!(
+                    "MCP tool '{}' is advertised by {} servers ({}); only '{}' will be reachable. \
+                     Scope each agent with [agent].mcp_filter, or rename the tool on all but one \
+                     server.",
+                    tool,
+                    servers.len(),
+                    servers.join(", "),
+                    winner,
+                )
+            })
+            .collect()
+    }
+
+    /// Resolve every bare tool name with at least one tool passing `filter`
+    /// to the server that would win its registration.
+    ///
+    /// Mirrors `Agent::add_all_tools`'s registration rule exactly: across
+    /// all transports, in sorted server-id order, the first server whose
+    /// tool passes `filter` claims the name — later claims are shadowed,
+    /// same as `colliding_tool_names` reports. A caller that resolves a bare
+    /// tool name to a server outside Rig's registered `ToolSet` (e.g.
+    /// fallback tool execution, which dispatches on whatever name a model
+    /// echoes back) must go through this, or it could reach a server the
+    /// filter excluded or that registration shadowed.
+    pub fn resolve_winning_tools(
+        &self,
+        mut filter: impl FnMut(&AuraTool) -> bool,
+    ) -> BTreeMap<String, (String, McpClient)> {
+        let mut servers: Vec<(&String, &McpClient, &Vec<AuraTool>)> = self
+            .streamable_clients
+            .iter()
+            .filter_map(|(name, client)| {
+                self.streamable_tools
+                    .get(name)
+                    .map(|tools| (name, client, tools))
+            })
+            .chain(self.sse_clients.iter().filter_map(|(name, client)| {
+                self.sse_tools.get(name).map(|tools| (name, client, tools))
+            }))
+            .chain(self.stdio_clients.iter().filter_map(|(name, client)| {
+                self.stdio_tools
+                    .get(name)
+                    .map(|tools| (name, client, tools))
+            }))
+            .collect();
+        servers.sort_by_key(|(server_id, ..)| *server_id);
+
+        let mut winners: BTreeMap<String, (String, McpClient)> = BTreeMap::new();
+        for (server_name, client, tools) in servers {
+            for tool in tools.iter().filter(|t| filter(t)) {
+                winners
+                    .entry(tool.name().to_string())
+                    .or_insert_with(|| (server_name.clone(), client.clone()));
+            }
+        }
+        winners
+    }
+
     pub fn get_tool_definition_by_server(&self, name: &str) -> Vec<AuraTool> {
         if let Some(tools) = self.streamable_tools.get(name) {
             tools.clone()
@@ -947,15 +1031,22 @@ impl McpManager {
 
     /// Execute a tool by name (used by Ollama text-to-tool fallback).
     ///
-    /// Called by `FallbackToolExecutor` when it detects tool calls in streamed text.
-    /// Routes to the appropriate MCP transport (HTTP Streamable, SSE, or STDIO).
+    /// Called by `FallbackToolExecutor` when it detects tool calls in streamed
+    /// text. Normal Rig tool execution goes through `Tool::call()` trait
+    /// implementations; this method exists specifically for the fallback
+    /// parsing path, which dispatches on whatever bare name the model echoed
+    /// back rather than through Rig's registered `ToolSet`.
     ///
-    /// Normal Rig tool execution goes through `Tool::call()` trait implementations;
-    /// this method exists specifically for the fallback parsing path.
+    /// `filter` must be the same effective `mcp_filter` the agent registered
+    /// tools under (`None` matches everything). Resolution otherwise uses
+    /// [`resolve_winning_tools`](Self::resolve_winning_tools), so a name the
+    /// filter excludes or that another server's tool shadows is unreachable
+    /// here exactly as it would be through normal registration.
     pub async fn execute_fallback_tool(
         &self,
         tool_name: &str,
         arguments: &str,
+        filter: Option<&[GlobPattern]>,
     ) -> Result<String, String> {
         // Parse arguments as JSON
         let args: Value = serde_json::from_str(arguments)
@@ -969,50 +1060,24 @@ impl McpManager {
         // `tool_name` is whatever the model echoed back — the bare tool
         // name, since that's the only thing ever sent to the model. The MCP
         // wire call dispatches by the same sanitized bare name (`inner.name`).
+        let Some((server_name, client)) = self
+            .resolve_winning_tools(|tool| match filter {
+                None => true,
+                Some(patterns) => patterns.iter().any(|p| tool.is_match(p)),
+            })
+            .remove(tool_name)
+        else {
+            return Err(format!("Tool '{}' not found", tool_name));
+        };
 
-        // Try HTTP Streamable clients first
-        for (server_name, client) in &self.streamable_clients {
-            if let Some(tools) = self.streamable_tools.get(server_name)
-                && let Some(tool) = tools.iter().find(|t| t.name() == tool_name)
-            {
-                info!(
-                    "Executing fallback tool '{}' via HTTP Streamable",
-                    tool_name
-                );
-                return client
-                    .call_tool(tool.name().as_str(), args_map, None)
-                    .await
-                    .map_err(|e| format!("Tool execution failed: {}", e));
-            }
-        }
-
-        // Try SSE clients
-        for (server_name, client) in &self.sse_clients {
-            if let Some(tools) = self.sse_tools.get(server_name)
-                && let Some(tool) = tools.iter().find(|t| t.name() == tool_name)
-            {
-                info!("Executing fallback tool '{}' via SSE", tool_name);
-                return client
-                    .call_tool(tool.name().as_str(), args_map, None)
-                    .await
-                    .map_err(|e| format!("Tool execution failed: {}", e));
-            }
-        }
-
-        // Try STDIO clients
-        for (server_name, client) in &self.stdio_clients {
-            if let Some(tools) = self.stdio_tools.get(server_name)
-                && let Some(tool) = tools.iter().find(|t| t.name() == tool_name)
-            {
-                info!("Executing fallback tool '{}' via STDIO", tool_name);
-                return client
-                    .call_tool(tool.name().as_str(), args_map, None)
-                    .await
-                    .map_err(|e| format!("Tool execution failed: {}", e));
-            }
-        }
-
-        Err(format!("Tool '{}' not found", tool_name))
+        info!(
+            "Executing fallback tool '{}' via server '{}'",
+            tool_name, server_name
+        );
+        client
+            .call_tool(tool_name, args_map, None)
+            .await
+            .map_err(|e| format!("Tool execution failed: {}", e))
     }
 }
 
@@ -1028,6 +1093,198 @@ mod tests {
     use crate::config::{McpConfig, McpServerConfig};
     use serde_json::json;
     use std::collections::HashMap;
+
+    /// Tools register under their bare name, so a name claimed by two servers
+    /// leaves one unreachable. The detector is what turns that from silent
+    /// into reported.
+    mod tool_name_collisions {
+        use super::*;
+
+        fn tool(name: &str, namespace: &str) -> AuraTool {
+            AuraTool::new(
+                rmcp::model::Tool::new(
+                    name.to_owned(),
+                    "test tool".to_owned(),
+                    std::sync::Arc::new(serde_json::Map::new()),
+                ),
+                namespace,
+            )
+        }
+
+        fn manager_with(servers: &[(&str, &[&str])]) -> McpManager {
+            let mut manager = McpManager::with_sanitization(false);
+            for (server, names) in servers {
+                manager.streamable_tools.insert(
+                    (*server).to_owned(),
+                    names.iter().map(|n| tool(n, server)).collect(),
+                );
+            }
+            manager
+        }
+
+        #[test]
+        fn disjoint_servers_report_nothing() {
+            let manager = manager_with(&[
+                ("github", &["list_repos", "get_pr"]),
+                ("k8s", &["get_pods"]),
+            ]);
+            assert!(manager.colliding_tool_names().is_empty());
+            assert!(manager.collision_report().is_empty());
+        }
+
+        #[test]
+        fn a_shared_name_names_every_claiming_server() {
+            let manager = manager_with(&[
+                ("victoria", &["query_range", "series"]),
+                ("sysdig", &["query_range"]),
+                ("k8s", &["get_pods"]),
+            ]);
+
+            let collisions = manager.colliding_tool_names();
+            assert_eq!(collisions.len(), 1, "only query_range collides");
+            assert_eq!(
+                collisions.get(&ToolName::new("query_range")),
+                Some(&vec!["sysdig".to_owned(), "victoria".to_owned()]),
+                "claiming servers are sorted, so the report does not vary per run",
+            );
+
+            let report = manager.collision_report();
+            assert_eq!(report.len(), 1);
+            assert!(report[0].contains("query_range"), "{}", report[0]);
+            assert!(report[0].contains("sysdig"), "{}", report[0]);
+            assert!(report[0].contains("victoria"), "{}", report[0]);
+        }
+
+        /// The winner named in the report has to be the one registration
+        /// actually keeps: first server in sorted id order.
+        #[test]
+        fn the_report_names_the_lowest_sorted_server_as_the_winner() {
+            let manager =
+                manager_with(&[("victoria", &["query_range"]), ("sysdig", &["query_range"])]);
+            let report = manager.collision_report();
+            assert!(
+                report[0].contains("only 'sysdig' will be reachable"),
+                "{}",
+                report[0],
+            );
+        }
+    }
+
+    /// `execute_fallback_tool` dispatches on a bare name a model echoed back,
+    /// outside Rig's registered `ToolSet`, so it has its own chance to
+    /// diverge from what `add_all_tools` actually registered. These pin it
+    /// to the same rule: sorted-server-id winner, and never a server the
+    /// filter excludes.
+    mod fallback_tool_resolution {
+        use super::*;
+        use crate::mcp::client::tests::RecordingMcpServer;
+
+        fn tool(name: &str, namespace: &str) -> AuraTool {
+            AuraTool::new(
+                rmcp::model::Tool::new(
+                    name.to_owned(),
+                    "test tool".to_owned(),
+                    std::sync::Arc::new(serde_json::Map::new()),
+                ),
+                namespace,
+            )
+        }
+
+        async fn client_for(namespace: &str, server: &RecordingMcpServer) -> McpClient {
+            McpClient::new(
+                server.url.clone(),
+                namespace.into(),
+                &HashMap::new(),
+                "test/0",
+            )
+            .await
+            .expect("the loopback server completes the handshake")
+        }
+
+        #[tokio::test]
+        async fn picks_the_same_winner_registration_would() {
+            let sysdig = RecordingMcpServer::start().await;
+            let victoria = RecordingMcpServer::start().await;
+            let manager = McpManager {
+                streamable_clients: HashMap::from([
+                    (
+                        "victoria".to_owned(),
+                        client_for("victoria", &victoria).await,
+                    ),
+                    ("sysdig".to_owned(), client_for("sysdig", &sysdig).await),
+                ]),
+                streamable_tools: HashMap::from([
+                    ("victoria".to_owned(), vec![tool("query_range", "victoria")]),
+                    ("sysdig".to_owned(), vec![tool("query_range", "sysdig")]),
+                ]),
+                ..McpManager::with_sanitization(false)
+            };
+
+            manager
+                .execute_fallback_tool("query_range", "{}", None)
+                .await
+                .expect("the surviving tool is callable");
+
+            assert_eq!(
+                sysdig.tool_calls().len(),
+                1,
+                "'sysdig' sorts before 'victoria', so it wins the name",
+            );
+            assert!(
+                victoria.tool_calls().is_empty(),
+                "the shadowed server must not receive the call",
+            );
+        }
+
+        /// The whole point of the filter parameter: a server that sorts
+        /// first must still be unreachable if its tool fails the filter.
+        #[tokio::test]
+        async fn never_reaches_a_server_the_filter_excludes() {
+            let internal = RecordingMcpServer::start().await;
+            let public = RecordingMcpServer::start().await;
+            let manager = McpManager {
+                streamable_clients: HashMap::from([
+                    (
+                        "aaa_internal".to_owned(),
+                        client_for("aaa_internal", &internal).await,
+                    ),
+                    ("public".to_owned(), client_for("public", &public).await),
+                ]),
+                streamable_tools: HashMap::from([
+                    (
+                        "aaa_internal".to_owned(),
+                        vec![tool("list_pods", "aaa_internal")],
+                    ),
+                    ("public".to_owned(), vec![tool("list_pods", "public")]),
+                ]),
+                ..McpManager::with_sanitization(false)
+            };
+
+            // "aaa_internal" sorts before "public" and would win by id alone;
+            // the filter must exclude it regardless.
+            let filter = vec![aura_config::GlobPattern::from("public:*")];
+            manager
+                .execute_fallback_tool("list_pods", "{}", Some(&filter))
+                .await
+                .expect("the filter-passing tool is callable");
+
+            assert_eq!(public.tool_calls().len(), 1);
+            assert!(
+                internal.tool_calls().is_empty(),
+                "a filtered-out server must be unreachable even though its id sorts first",
+            );
+        }
+
+        #[tokio::test]
+        async fn an_unknown_name_is_an_error() {
+            let manager = McpManager::with_sanitization(false);
+            let err = manager
+                .execute_fallback_tool("does_not_exist", "{}", None)
+                .await
+                .expect_err("no server advertises this name");
+            assert!(err.contains("does_not_exist"), "{err}");
+        }
+    }
 
     // ========================================
     // Connection Status Tests

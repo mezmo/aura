@@ -10,4 +10,5 @@ mod envelope;
 pub use client::CatalogClient;
 pub use envelope::{
     AgentEntry, CatalogEnvelope, McpServerEntry, McpServerStatus, ToolEntry, build_catalog,
+    build_catalog_from_manager,
 };

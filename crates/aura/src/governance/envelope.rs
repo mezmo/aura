@@ -115,28 +115,37 @@ impl From<&crate::mcp::AuraTool> for ToolEntry {
     }
 }
 
-/// Build a catalog envelope from a single config and its MCP manager.
+/// Build a catalog envelope from a single config, initializing its own MCP
+/// manager.
 ///
-/// This is the single-agent path used when only one config is loaded.
+/// This is the single-agent path used when only one config is loaded. A
+/// caller that already holds a manager for this config (e.g. because it
+/// just used one to check for tool-name collisions) should call
+/// [`build_catalog_from_manager`] instead — this function's own manager
+/// would otherwise repeat every connection, including spawning STDIO
+/// commands a second time.
 pub async fn build_catalog(config: &aura_config::Config) -> Option<CatalogEnvelope> {
-    if let Some(mcp_config) = &config.mcp
-        && let Ok(manager) = McpManager::initialize_from_config(mcp_config).await
-    {
-        let server_entries = build_server_entries(&manager);
-        let agent = build_agent_entry(config, server_entries);
-        let event_id = Uuid::new_v4().to_string();
-        let emitted_at = Utc::now();
-        let aura_version = env!("CARGO_PKG_VERSION").to_string();
-        return Some(CatalogEnvelope {
-            event: MCP_CATALOG_EVENT_NAME,
-            version: MCP_CATALOG_ENVELOPE_VERSION,
-            event_id,
-            emitted_at,
-            aura_version,
-            agent,
-        });
+    let mcp_config = config.mcp.as_ref()?;
+    let manager = McpManager::initialize_from_config(mcp_config).await.ok()?;
+    Some(build_catalog_from_manager(config, &manager))
+}
+
+/// Build a catalog envelope from a config and an already-initialized MCP
+/// manager, without connecting to any server.
+pub fn build_catalog_from_manager(
+    config: &aura_config::Config,
+    manager: &McpManager,
+) -> CatalogEnvelope {
+    let server_entries = build_server_entries(manager);
+    let agent = build_agent_entry(config, server_entries);
+    CatalogEnvelope {
+        event: MCP_CATALOG_EVENT_NAME,
+        version: MCP_CATALOG_ENVELOPE_VERSION,
+        event_id: Uuid::new_v4().to_string(),
+        emitted_at: Utc::now(),
+        aura_version: env!("CARGO_PKG_VERSION").to_string(),
+        agent,
     }
-    None
 }
 
 /// Build an agent entry from a config and its MCP manager.
