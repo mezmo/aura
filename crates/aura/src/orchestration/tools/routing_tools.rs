@@ -6,7 +6,7 @@
 //! The coordinator calls exactly one of these tools during the planning phase.
 //! A shared `RoutingDecision` captures the decision for the orchestrator to read.
 
-use crate::orchestration::types::{PlanningResponse, StepInput};
+use crate::orchestration::types::{PlanningResponse, StepInput, flatten_steps};
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use serde::{Deserialize, Serialize};
@@ -254,6 +254,17 @@ impl Tool for CreatePlanTool {
             });
         }
 
+        // Validate the shape now, while the model can still fix it: a plan
+        // that cannot be flattened must not be recorded as a routing decision.
+        if let Err(e) = flatten_steps(&args.steps) {
+            return Ok(CreatePlanOutput {
+                status: format!(
+                    "Error: {e}. The top-level `steps` list already runs in order, so use \
+                     `chain` only inside a `parallel` group, and call create_plan again."
+                ),
+            });
+        }
+
         let step_count = count_leaf_steps(&args.steps);
         *guard = Some(PlanningResponse::StepsPlan {
             goal: args.goal,
@@ -401,6 +412,45 @@ mod tests {
             }
             other => panic!("Expected Direct, got {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn test_create_plan_rejects_unflattenable_steps() {
+        let toolset = RoutingToolSet::new();
+        let leaf = |task: &str| StepInput::LeafTask {
+            task: task.to_string(),
+            worker: Some("operations".to_string()),
+        };
+        // chain > chain > parallel: one level deeper than flatten_steps allows.
+        let result = toolset
+            .create_plan
+            .call(CreatePlanArgs {
+                goal: "Nested".to_string(),
+                steps: vec![StepInput::SubChain {
+                    steps: vec![
+                        leaf("draft"),
+                        StepInput::SubChain {
+                            steps: vec![
+                                leaf("review"),
+                                StepInput::ParallelGroup {
+                                    items: vec![leaf("verify a"), leaf("verify b")],
+                                },
+                            ],
+                        },
+                    ],
+                }],
+                routing_rationale: "r".to_string(),
+                planning_summary: "s".to_string(),
+            })
+            .await
+            .unwrap();
+
+        assert!(result.status.starts_with("Error:"), "{}", result.status);
+        assert!(result.status.contains("nesting depth"), "{}", result.status);
+        assert!(
+            toolset.decision.lock().await.is_none(),
+            "a rejected plan must not be recorded as the routing decision"
+        );
     }
 
     #[tokio::test]
