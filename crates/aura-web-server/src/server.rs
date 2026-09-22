@@ -110,7 +110,8 @@ pub struct ServerArgs {
     /// SSE streaming request timeout in seconds.
     /// This is the maximum time a streaming request can run before being cancelled.
     /// Set higher for long-running tool operations (e.g., log analysis).
-    /// Set to 0 to disable timeout (not recommended for production).
+    /// Set to 0 to disable the bound (not recommended for production). No other
+    /// flag caps total run length.
     #[arg(long, env = "STREAMING_TIMEOUT_SECS", default_value = "900")]
     pub streaming_timeout_secs: u64,
 

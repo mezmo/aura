@@ -122,7 +122,7 @@ impl std::fmt::Display for PrepareError {
 /// delivery modes but the same observability instrumentation and stream processing.
 pub struct CompletionConfig {
     pub request_id: String,
-    pub timeout_duration: std::time::Duration,
+    pub timeout_duration: Option<std::time::Duration>,
     pub first_chunk_timeout: Option<std::time::Duration>,
     pub inactivity_timeout: Option<std::time::Duration>,
     pub stream_config: StreamConfig,
@@ -434,6 +434,16 @@ pub async fn chat_completions(
     }
 }
 
+/// A timeout flag as the window it configures, where zero means no window.
+///
+/// The streaming, first-chunk and inactivity flags each document zero as
+/// disabling themselves and are each an `Option` downstream, so the sentinel is
+/// resolved here rather than at every place that consults one. A flag whose
+/// zero means something else must not use this.
+fn optional_secs(secs: u64) -> Option<std::time::Duration> {
+    (secs > 0).then(|| std::time::Duration::from_secs(secs))
+}
+
 /// Build configuration for the spawned completion task from AppState and RequestSetup.
 pub fn build_completion_config(
     data: &AppState,
@@ -442,21 +452,9 @@ pub fn build_completion_config(
     emit_custom_events: bool,
     emit_reasoning: bool,
 ) -> CompletionConfig {
-    let timeout_duration = std::time::Duration::from_secs(data.streaming_timeout_secs);
-    let first_chunk_timeout = if data.first_chunk_timeout_secs > 0 {
-        Some(std::time::Duration::from_secs(
-            data.first_chunk_timeout_secs,
-        ))
-    } else {
-        None
-    };
-    let inactivity_timeout = if data.stream_inactivity_timeout_secs > 0 {
-        Some(std::time::Duration::from_secs(
-            data.stream_inactivity_timeout_secs,
-        ))
-    } else {
-        None
-    };
+    let timeout_duration = optional_secs(data.streaming_timeout_secs);
+    let first_chunk_timeout = optional_secs(data.first_chunk_timeout_secs);
+    let inactivity_timeout = optional_secs(data.stream_inactivity_timeout_secs);
     let request_id = setup.request_id.clone();
     let fallback_tool_parsing = setup.config.is_fallback_tool_parsing_enabled();
 
@@ -566,7 +564,7 @@ pub async fn execute_completion(
         .stream(
             &query,
             chat_history,
-            aura::streaming::RunOptions::bounded(Some(config.timeout_duration))
+            aura::streaming::RunOptions::bounded(config.timeout_duration)
                 .cancelled_by(&config.stream_shutdown_token),
             &config.request_id,
         )
@@ -636,7 +634,7 @@ pub async fn execute_completion(
                 stream,
                 chunk_tx,
                 cancel_tx,
-                Some(config.timeout_duration),
+                config.timeout_duration,
                 heartbeat_interval,
                 config.first_chunk_timeout,
                 config.inactivity_timeout,
@@ -1354,6 +1352,40 @@ mod tests {
     use std::time::Duration;
     use tokio_util::sync::CancellationToken;
 
+    /// `--streaming-timeout-secs 0` is documented as disabling the bound, so a
+    /// run configured that way has to outlive the first deadline check rather
+    /// than die on it.
+    #[test]
+    fn a_zero_configured_timeout_leaves_a_run_unbounded() {
+        let bound = optional_secs(0);
+        assert_eq!(bound, None, "zero disables the bound");
+
+        // What the run does with it: a deadline that never passes.
+        let deadline = aura::hooks::Deadline::new(bound, CancellationToken::new());
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(
+            aura::hooks::AgentHook::should_cancel(&deadline).is_none(),
+            "an unbounded run is not cancelled by its own deadline"
+        );
+    }
+
+    /// A configured bound still bounds the run, so the test above is not passing
+    /// for want of any window ever reaching the deadline.
+    #[test]
+    fn a_configured_timeout_still_expires() {
+        assert_eq!(optional_secs(1), Some(Duration::from_secs(1)));
+
+        // Sub-second, since the flag is in seconds and waiting one is not worth
+        // a unit test.
+        let deadline =
+            aura::hooks::Deadline::new(Some(Duration::from_millis(1)), CancellationToken::new());
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(
+            aura::hooks::AgentHook::should_cancel(&deadline).is_some(),
+            "a bound that has passed cancels the run"
+        );
+    }
+
     fn msg(role: Role, content: &str) -> ChatMessage {
         ChatMessage {
             role,
@@ -1487,7 +1519,7 @@ mod tests {
         };
         let config = CompletionConfig {
             request_id,
-            timeout_duration: Duration::from_secs(30),
+            timeout_duration: Some(Duration::from_secs(30)),
             first_chunk_timeout: None,
             inactivity_timeout: None,
             stream_config: StreamConfig::new(false, false, ToolResultMode::default(), 0),
