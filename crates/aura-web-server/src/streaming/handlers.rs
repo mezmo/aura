@@ -606,6 +606,10 @@ pub struct StreamOutcome {
 /// This is the non-streaming counterpart to `process_sse_stream_full`. It drives items through
 /// the same `process_stream_next` pipeline (which handles content accumulation, `\n\n` separators,
 /// context overflow errors, and usage tracking) but discards the SSE-formatted bytes.
+///
+/// No time-based window applies here. The first-chunk and inactivity timers live
+/// in `process_sse_stream_full`, so the run's own deadline is this path's only
+/// bound.
 pub async fn collect_stream_to_completion<S>(
     config: &StreamConfig,
     ctx: &TurnContext,
@@ -2194,6 +2198,7 @@ mod tests {
         /// Returns the termination and elapsed (virtual) seconds.
         async fn run_loop<S>(
             stream: S,
+            safety_net: Option<Duration>,
             inactivity: Option<Duration>,
             first_chunk: Option<Duration>,
             heartbeat: Duration,
@@ -2221,7 +2226,7 @@ mod tests {
                 stream,
                 chunk_tx,
                 cancel_tx,
-                Some(Duration::from_secs(900)),
+                safety_net,
                 heartbeat,
                 first_chunk,
                 inactivity,
@@ -2233,12 +2238,16 @@ mod tests {
 
         const HB_QUIET: Duration = Duration::from_secs(86_400);
 
+        /// What `--streaming-timeout-secs 900` reaches this layer as.
+        const SAFETY_NET: Option<Duration> = Some(Duration::from_secs(900));
+
         #[tokio::test(start_paused = true)]
         async fn mid_stream_hang_fails_at_window() {
             let stream = futures_util::stream::iter(vec![text_item("hi")])
                 .chain(futures_util::stream::pending());
             let (termination, elapsed) = run_loop(
                 Box::pin(stream),
+                SAFETY_NET,
                 Some(Duration::from_secs(30)),
                 None,
                 HB_QUIET,
@@ -2248,11 +2257,42 @@ mod tests {
             assert_eq!(elapsed, 30);
         }
 
+        /// `--streaming-timeout-secs 0` reaches this layer as no safety net, so a
+        /// run that outlasts any configured bound still finishes. Passing zero
+        /// through instead would make the timer ready on its first poll.
+        #[tokio::test(start_paused = true)]
+        async fn no_safety_net_lets_a_long_run_finish() {
+            let slow = futures_util::stream::once(async {
+                tokio::time::sleep(Duration::from_secs(10_000)).await;
+                text_item("hi")
+            });
+            let (termination, elapsed) = run_loop(Box::pin(slow), None, None, None, HB_QUIET).await;
+
+            assert_eq!(termination, StreamTermination::Complete);
+            assert_eq!(elapsed, 10_000, "the run outlived every configured bound");
+        }
+
+        /// The same run against a configured bound stops at it, so the test above
+        /// is not passing for want of anything to trip over.
+        #[tokio::test(start_paused = true)]
+        async fn a_safety_net_stops_the_same_long_run() {
+            let slow = futures_util::stream::once(async {
+                tokio::time::sleep(Duration::from_secs(10_000)).await;
+                text_item("hi")
+            });
+            let (termination, elapsed) =
+                run_loop(Box::pin(slow), SAFETY_NET, None, None, HB_QUIET).await;
+
+            assert_eq!(termination, StreamTermination::Timeout);
+            assert_eq!(elapsed, 900);
+        }
+
         #[tokio::test(start_paused = true)]
         async fn disabled_window_leaves_only_safety_net() {
             let stream = futures_util::stream::iter(vec![text_item("hi")])
                 .chain(futures_util::stream::pending());
-            let (termination, elapsed) = run_loop(Box::pin(stream), None, None, HB_QUIET).await;
+            let (termination, elapsed) =
+                run_loop(Box::pin(stream), SAFETY_NET, None, None, HB_QUIET).await;
             assert_eq!(termination, StreamTermination::Timeout);
             assert_eq!(elapsed, 900);
         }
@@ -2262,6 +2302,7 @@ mod tests {
             let stream = futures_util::stream::pending();
             let (termination, elapsed) = run_loop(
                 Box::pin(stream),
+                SAFETY_NET,
                 Some(Duration::from_secs(30)),
                 Some(Duration::from_secs(90)),
                 HB_QUIET,
@@ -2285,6 +2326,7 @@ mod tests {
             let stream = spaced.chain(futures_util::stream::pending());
             let (termination, elapsed) = run_loop(
                 Box::pin(stream),
+                SAFETY_NET,
                 Some(Duration::from_secs(30)),
                 None,
                 HB_QUIET,
@@ -2328,6 +2370,7 @@ mod tests {
             });
             let (termination, elapsed) = run_loop(
                 Box::pin(spaced),
+                SAFETY_NET,
                 Some(Duration::from_secs(30)),
                 None,
                 HB_QUIET,
@@ -2372,6 +2415,7 @@ mod tests {
             .chain(futures_util::stream::pending());
             let (termination, elapsed) = run_loop(
                 Box::pin(spaced),
+                SAFETY_NET,
                 Some(Duration::from_secs(30)),
                 None,
                 HB_QUIET,
@@ -2386,6 +2430,7 @@ mod tests {
             let stream = futures_util::stream::iter(vec![text_item("hi"), text_item("there")]);
             let (termination, _) = run_loop(
                 Box::pin(stream),
+                SAFETY_NET,
                 Some(Duration::from_secs(5)),
                 None,
                 HB_QUIET,
@@ -2506,6 +2551,7 @@ mod tests {
                 .chain(futures_util::stream::pending());
             let (termination, elapsed) = run_loop(
                 Box::pin(stream),
+                SAFETY_NET,
                 Some(Duration::from_secs(30)),
                 None,
                 Duration::from_secs(5),
