@@ -380,7 +380,7 @@ TOOL USAGE:
 
 Always verify your calculations before reporting results."
                     .to_string(),
-                mcp_filter: Some(vec!["mock_tool".to_string()]),
+                mcp_filter: Some(vec!["mock_tool".into()]),
                 vector_stores: vec![],
                 remotes: Vec::new(),
                 turn_depth: None,
@@ -407,7 +407,7 @@ TOOL USAGE:
 - Use chain_tool for multi-step processing sequences
 - Always report what you found"
                     .to_string(),
-                mcp_filter: Some(vec!["list_files".to_string(), "chain_tool".to_string()]),
+                mcp_filter: Some(vec!["list_files".into(), "chain_tool".into()]),
                 vector_stores: vec![],
                 remotes: Vec::new(),
                 turn_depth: None,

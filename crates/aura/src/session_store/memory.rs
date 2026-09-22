@@ -217,6 +217,7 @@ mod tests {
                 },
                 items: vec![ApprovalItem {
                     tool_name: "test_tool".to_string(),
+                    tool_namespace: None,
                     arguments: serde_json::json!({}),
                     tool_call_intent: None,
                 }],

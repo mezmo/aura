@@ -2,6 +2,7 @@ pub mod a2a;
 pub mod config;
 pub mod env;
 pub mod error;
+pub mod globpattern;
 pub mod lenient_bool;
 pub mod lenient_int;
 pub mod loader;
@@ -21,6 +22,7 @@ pub use a2a::{A2aConfig, A2aRemoteConfig, ASK_AGENT_TOOL_NAME};
 pub use config::*;
 pub use env::resolve_env_vars;
 pub use error::ConfigError;
+pub use globpattern::*;
 pub use loader::ConfigLoader;
 pub use orchestration::{
     ArtifactsConfig, OrchestrationConfig, TimeoutsConfig, ToolVisibility, WorkerConfig,

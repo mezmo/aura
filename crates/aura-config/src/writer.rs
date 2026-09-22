@@ -569,7 +569,7 @@ preamble = "You write"
         let orch = config.orchestration.expect("orchestration table");
         assert_eq!(
             orch.workers["operations"].mcp_filter.as_deref(),
-            Some(["logs_*".to_string(), "mezmo_*".to_string()].as_slice())
+            Some(["logs_*".into(), "mezmo_*".into()].as_slice())
         );
     }
 
@@ -583,7 +583,7 @@ preamble = "You write"
             config.orchestration.expect("orchestration table").workers["writer"]
                 .mcp_filter
                 .as_deref(),
-            Some(["k8s_*".to_string()].as_slice())
+            Some(["k8s_*".into()].as_slice())
         );
     }
 

@@ -2489,6 +2489,7 @@ mod tests {
                             aura_events::ApprovalPending {
                                 decision_id: "d1".into(),
                                 tool_name: "dangerous_apply".into(),
+                                tool_namespace: None,
                                 arguments: serde_json::json!({}),
                                 origin: aura_events::ApprovalOriginWire::ConfigGate {
                                     matched_pattern: "dangerous_*".into(),

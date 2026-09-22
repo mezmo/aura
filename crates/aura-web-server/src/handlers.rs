@@ -1453,6 +1453,7 @@ mod tests {
                         aura::ApprovalLifecycleEvent::Requested(aura_events::ApprovalRequested {
                             decision_id: aura::hitl::DecisionId::generate().to_string(),
                             tool_name: "dangerous_apply".to_string(),
+                            tool_namespace: None,
                             origin: aura_events::ApprovalOriginWire::ConfigGate {
                                 matched_pattern: "dangerous_*".to_string(),
                                 agent_name: "test-agent".to_string(),

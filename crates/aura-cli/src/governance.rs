@@ -4,7 +4,7 @@
 //! directly, without requiring a running web server.
 
 use anyhow::{Context, Result};
-use aura::governance::build_catalog;
+use aura::governance::build_catalog_from_manager;
 
 #[derive(Debug, clap::Subcommand)]
 pub enum GovernanceCommands {
@@ -49,11 +49,42 @@ async fn sync_all(confs: &[aura_config::Config]) -> Result<()> {
     Ok(())
 }
 
+/// Report bare tool names claimed by more than one MCP server.
+fn report_tool_name_collisions(config: &aura_config::Config, manager: &aura::McpManager) {
+    for line in manager.collision_report() {
+        tracing::warn!("agent '{}': {}", config.agent.name, line);
+        eprintln!("warning: agent '{}': {}", config.agent.name, line);
+    }
+}
+
 async fn sync_one(config: &aura_config::Config) -> Result<()> {
+    // Built once and shared: the collision check and the catalog both need
+    // every server's discovered tools, and MCP initialization is expensive
+    // (it spawns STDIO child processes and makes remote connections) —
+    // running it twice would do all of that twice.
+    let manager = match &config.mcp {
+        Some(mcp_config) => match aura::McpManager::initialize_from_config(mcp_config).await {
+            Ok(manager) => Some(manager),
+            Err(e) => {
+                eprintln!(
+                    "warning: agent '{}': could not check MCP tool names: {e}",
+                    config.agent.name
+                );
+                None
+            }
+        },
+        None => None,
+    };
+
+    if let Some(manager) = &manager {
+        report_tool_name_collisions(config, manager);
+    }
+
     if let Some(governance_config) = &config.governance
         && let Some(catalog_config) = &governance_config.catalog
-        && let Some(catalog) = build_catalog(config).await
+        && let Some(manager) = &manager
     {
+        let catalog = build_catalog_from_manager(config, manager);
         let client = aura::governance::CatalogClient::from_config(catalog_config, None)
             .context("Failed to create catalog client")?;
         client

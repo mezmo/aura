@@ -9,6 +9,7 @@
 use crate::hitl::HitlRuntime;
 use crate::scratchpad::ScratchpadToolsConfig;
 use crate::tool_wrapper::{ToolCallContext, ToolWrapper};
+use aura_config::GlobPattern;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -110,7 +111,7 @@ pub struct AgentRuntimeConfig {
     /// Glob patterns for filtering which MCP tools to include.
     /// When set, only tools matching at least one pattern are added
     /// (`None` = all tools, empty = none). Glob syntax: `*`, `?`.
-    pub mcp_filter: Option<Vec<String>>,
+    pub mcp_filter: Option<Vec<GlobPattern>>,
 
     /// Shared persistence for injecting `read_artifact` tool into workers.
     /// When set, workers get access to result artifacts via the read_artifact tool.
@@ -259,18 +260,19 @@ impl AgentRuntimeConfig {
             .or_else(|| self.orchestration.as_ref().and_then(|o| o.memory_dir()))
     }
 
-    /// Check if a tool name matches the mcp_filter patterns (glob syntax:
-    /// `*` any chars, `?` one char). No filter (`None`) passes everything;
-    /// an empty filter (`mcp_filter = []`) is the explicit no-tools
-    /// assignment and matches nothing.
+    /// Check if a tool matches the mcp_filter patterns (glob syntax: `*`
+    /// any chars, `?` one char; a pattern containing `:` scopes the glob to
+    /// a namespace — see [`crate::mcp::AuraTool::is_match`]). No filter
+    /// (`None`) passes everything; an empty filter (`mcp_filter = []`) is
+    /// the explicit no-tools assignment and matches nothing.
     ///
     /// Checks the extension field (`self.mcp_filter`, set by orchestrator)
     /// first, then falls back to `self.agent.mcp_filter`.
-    pub fn tool_matches_filter(&self, tool_name: &str) -> bool {
+    pub fn tool_matches_filter(&self, tool: &crate::mcp::AuraTool) -> bool {
         let effective = self.mcp_filter.as_ref().or(self.agent.mcp_filter.as_ref());
         match effective {
             None => true,
-            Some(patterns) => patterns.iter().any(|p| glob_match(p, tool_name)),
+            Some(patterns) => patterns.iter().any(|p| tool.is_match(p)),
         }
     }
 
@@ -307,10 +309,19 @@ impl AgentRuntimeConfig {
 mod tests {
     use super::*;
 
+    fn aura_tool(namespace: &str, tool_name: &str) -> crate::mcp::AuraTool {
+        let tool = rmcp::model::Tool::new(
+            tool_name.to_owned(),
+            "test tool".to_owned(),
+            std::sync::Arc::new(serde_json::Map::new()),
+        );
+        crate::mcp::AuraTool::new(tool, namespace)
+    }
+
     #[test]
     fn test_tool_matches_filter_none() {
         let config = AgentRuntimeConfig::default();
-        assert!(config.tool_matches_filter("any_tool"));
+        assert!(config.tool_matches_filter(&aura_tool("mezmo", "any_tool")));
     }
 
     #[test]
@@ -319,23 +330,31 @@ mod tests {
             mcp_filter: Some(vec![]),
             ..Default::default()
         };
-        assert!(!config.tool_matches_filter("any_tool"));
+        assert!(!config.tool_matches_filter(&aura_tool("mezmo", "any_tool")));
     }
 
     #[test]
     fn test_tool_matches_filter_patterns() {
         let config = AgentRuntimeConfig {
-            mcp_filter: Some(vec![
-                "mezmo_*".to_string(),
-                "QueryKnowledgeBases".to_string(),
-            ]),
+            mcp_filter: Some(vec!["mezmo_*".into(), "QueryKnowledgeBases".into()]),
             ..Default::default()
         };
 
-        assert!(config.tool_matches_filter("mezmo_logs"));
-        assert!(config.tool_matches_filter("mezmo_pipelines"));
-        assert!(config.tool_matches_filter("QueryKnowledgeBases"));
-        assert!(!config.tool_matches_filter("other_tool"));
+        assert!(config.tool_matches_filter(&aura_tool("mezmo", "mezmo_logs")));
+        assert!(config.tool_matches_filter(&aura_tool("mezmo", "mezmo_pipelines")));
+        assert!(config.tool_matches_filter(&aura_tool("kb", "QueryKnowledgeBases")));
+        assert!(!config.tool_matches_filter(&aura_tool("mezmo", "other_tool")));
+    }
+
+    #[test]
+    fn test_tool_matches_filter_namespace_scoped_pattern() {
+        let config = AgentRuntimeConfig {
+            mcp_filter: Some(vec!["k8s:*".into()]),
+            ..Default::default()
+        };
+
+        assert!(config.tool_matches_filter(&aura_tool("k8s", "get_pods")));
+        assert!(!config.tool_matches_filter(&aura_tool("mezmo", "get_pods")));
     }
 
     #[test]

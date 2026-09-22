@@ -1,4 +1,5 @@
 use crate::error::ConfigError;
+use crate::globpattern::GlobPattern;
 use crate::lenient_bool;
 use crate::lenient_int;
 use crate::orchestration::OrchestrationConfig;
@@ -992,7 +993,7 @@ pub struct AgentConfig {
     /// When set, only tools matching at least one pattern are added.
     /// Example: `mcp_filter = ["sin", "cos", "degreesToRadians"]`
     #[serde(default)]
-    pub mcp_filter: Option<Vec<String>>,
+    pub mcp_filter: Option<Vec<GlobPattern>>,
     /// Whether this agent (single-agent or orchestration coordinator) may
     /// invoke client-side tools advertised on the request. When false
     /// (default), client tools are not attached even if the request
@@ -1112,7 +1113,7 @@ pub struct AgentSettings {
     /// (`mcp_filter = []`) includes none.
     /// Can be set via `[agent].mcp_filter` in TOML for single-agent configs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mcp_filter: Option<Vec<String>>,
+    pub mcp_filter: Option<Vec<GlobPattern>>,
     /// Agent-level scratchpad configuration (applies to single-agent and to
     /// workers that don't provide an override).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1787,49 +1788,6 @@ impl<'de> Deserialize<'de> for WebhookUrl {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let raw = String::deserialize(deserializer)?;
         Self::new(raw).map_err(serde::de::Error::custom)
-    }
-}
-
-/// A tool-name glob pattern, compiled to a matcher at TOML load. Keeps its
-/// source text alongside the compiled matcher; the wire `matched_pattern` is the
-/// source string.
-#[derive(Debug, Clone)]
-pub struct GlobPattern {
-    source: String,
-    matcher: globset::GlobMatcher,
-}
-
-impl GlobPattern {
-    /// Compile a glob pattern from its source text.
-    pub fn new(source: impl Into<String>) -> Result<Self, globset::Error> {
-        let source = source.into();
-        let matcher = globset::Glob::new(&source)?.compile_matcher();
-        Ok(Self { source, matcher })
-    }
-
-    /// The original pattern text (the wire `matched_pattern`).
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.source
-    }
-
-    /// Whether `tool_name` matches this pattern.
-    #[must_use]
-    pub fn matches(&self, tool_name: &str) -> bool {
-        self.matcher.is_match(tool_name)
-    }
-}
-
-impl Serialize for GlobPattern {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&self.source)
-    }
-}
-
-impl<'de> Deserialize<'de> for GlobPattern {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let source = String::deserialize(deserializer)?;
-        Self::new(source).map_err(serde::de::Error::custom)
     }
 }
 
