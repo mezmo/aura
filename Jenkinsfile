@@ -1,6 +1,7 @@
 library 'magic-butler-catalogue'
 def PROJECT_NAME = 'aura'
-def DEFAULT_BRANCH = 'main'
+// One branch per release channel; see docs/design/release-channels.md.
+def RELEASE_BRANCHES = ['main', 'beta', 'nightly']
 def CURRENT_BRANCH = [env.CHANGE_BRANCH, env.BRANCH_NAME]?.find{branch -> branch != null}
 def DOCKER_REPO = "docker.io/mezmo"
 def BUILD_SLUG = slugify(env.BUILD_TAG)
@@ -37,14 +38,15 @@ pipeline {
     timeout time: 90, unit: 'MINUTES'
     timestamps()
     ansiColor 'xterm'
-    // On main, don't abort: a release build pushes a [skip ci] version commit
+    // On a release branch, don't abort: main pushes a [skip ci] version commit
     // that spawns a follow-on build, and aborting would mark the still-publishing
-    // release build as superseded. Non-main branches still abort stale builds.
-    disableConcurrentBuilds(abortPrevious: env.BRANCH_NAME != DEFAULT_BRANCH)
+    // release build as superseded. Serializing also stops an older build from
+    // moving a channel tag after a newer one. Other branches abort stale builds.
+    disableConcurrentBuilds(abortPrevious: !RELEASE_BRANCHES.contains(env.BRANCH_NAME))
     buildDiscarder(
       logRotator(
-        numToKeepStr: env.BRANCH_NAME == DEFAULT_BRANCH ? '30' : '5',
-        artifactNumToKeepStr: env.BRANCH_NAME == DEFAULT_BRANCH ? '30' : '5'
+        numToKeepStr: RELEASE_BRANCHES.contains(env.BRANCH_NAME) ? '30' : '5',
+        artifactNumToKeepStr: RELEASE_BRANCHES.contains(env.BRANCH_NAME) ? '30' : '5'
       )
     )
   }
@@ -94,7 +96,7 @@ pipeline {
         beforeAgent true
         not {
           anyOf {
-            branch DEFAULT_BRANCH
+            expression { RELEASE_BRANCHES.contains(env.BRANCH_NAME) }
             changeRequest()
             triggeredBy cause: "UserIdCause"
           }
@@ -341,7 +343,7 @@ pipeline {
         not {
           anyOf {
             changelog '\\[skip ci\\]'
-            expression { CURRENT_BRANCH == DEFAULT_BRANCH }
+            expression { RELEASE_BRANCHES.contains(CURRENT_BRANCH) }
           }
         }
       }
@@ -361,7 +363,7 @@ pipeline {
           // run is done with it.
           def startSha = sh(script: 'git rev-parse HEAD', returnStdout: true).trim()
           try {
-            sh "git checkout -B ${CURRENT_BRANCH}"
+            sh 'git checkout -B "$BRANCH_NAME"'
 
             // A breaking empty commit guarantees a version is computed, so the
             // verify path runs on every change request.
@@ -393,8 +395,12 @@ pipeline {
 
             sh "ARCHS=amd64 make build-packages"
 
+            // --branches makes the branch under test releasable. The branch
+            // reaches the shell as a quoted env var, never as interpolated
+            // text: a change request controls its own source branch name, and
+            // git permits ; $() ` and | in one.
             withCredentials(RELEASE_CREDENTIALS) {
-              withReport('Release Test', "npm run release:dry -- --repository-url=file://${env.WORKSPACE} --plugins @semantic-release/commit-analyzer @semantic-release/exec")
+              withReport('Release Test', 'npm run release:dry -- --repository-url="file://$WORKSPACE" --branches="$BRANCH_NAME" --plugins @semantic-release/commit-analyzer @semantic-release/exec')
             }
           } finally {
             sh "git reset --hard ${startSha}"
@@ -439,7 +445,7 @@ pipeline {
     stage('Release') {
       when {
         beforeAgent true
-        branch DEFAULT_BRANCH
+        expression { RELEASE_BRANCHES.contains(env.BRANCH_NAME) }
         not {
           anyOf {
             changelog '\\[skip ci\\]';
@@ -456,7 +462,28 @@ pipeline {
           }
 
           steps {
+            // The Jenkins checkout is detached, so the branch being released
+            // has no local ref and semantic-release fails with
+            // ERELEASEBRANCHES on an empty branch list.
             sh "git checkout -B ${CURRENT_BRANCH}"
+
+            // semantic-release keeps only the configured branches the repo
+            // actually has, and release:version reads the workspace as a
+            // file:// remote, so without a local main ref a prerelease branch
+            // fails the same way.
+            sh '''
+              set -eu
+              for branch in main nightly beta; do
+                if git show-ref --verify --quiet "refs/heads/${branch}"; then
+                  continue
+                fi
+                if git show-ref --verify --quiet "refs/remotes/origin/${branch}"; then
+                  git branch "${branch}" "refs/remotes/origin/${branch}"
+                  continue
+                fi
+                git fetch --no-tags --quiet origin "+refs/heads/${branch}:refs/heads/${branch}" || echo "note: ${branch} has no ref in this workspace" >&2
+              done
+            '''
 
             script {
               withCredentials(RELEASE_CREDENTIALS) {
@@ -472,7 +499,10 @@ pipeline {
 
         stage('Build Release Artifacts') {
           when {
-            expression { env.NEXT_RELEASE_VERSION }
+            allOf {
+              expression { env.NEXT_RELEASE_VERSION }
+              expression { env.BRANCH_NAME != 'nightly' }
+            }
           }
 
           parallel {
@@ -605,15 +635,17 @@ pipeline {
           }
 
           steps {
-            sh 'rm -rf dist'
-            sh 'mkdir -p dist'
-
-            unstash 'linux-release-artifacts'
-            unstash 'darwin-release-artifacts'
-
-            sh 'make release-artifacts PACKAGE_VERSION="$NEXT_RELEASE_VERSION"'
-
             script {
+              if (env.BRANCH_NAME != 'nightly') {
+                sh 'rm -rf dist'
+                sh 'mkdir -p dist'
+
+                unstash 'linux-release-artifacts'
+                unstash 'darwin-release-artifacts'
+
+                sh 'make release-artifacts PACKAGE_VERSION="$NEXT_RELEASE_VERSION"'
+              }
+
               docker.withRegistry(
                 'https://index.docker.io/v1/',
                 'dockerhub-token-mezmo'

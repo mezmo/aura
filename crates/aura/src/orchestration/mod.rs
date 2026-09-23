@@ -49,12 +49,14 @@ mod frame_validation_tests;
 mod observer_wrapper;
 mod orchestrator;
 mod overview;
+mod park;
 mod persistence;
 pub(crate) mod persistence_wrapper;
 mod prompt_constants;
-mod prompt_journal;
 mod stream_events;
 mod templates;
+#[cfg(test)]
+mod test_rig;
 pub mod tools;
 mod types;
 
@@ -68,7 +70,7 @@ pub use observer_wrapper::ObserverWrapper;
 pub use orchestrator::Orchestrator;
 pub use overview::{agent_info, agent_info_with_tools, summarize_tools, worker_overview};
 pub use persistence::{
-    ExecutionPersistence, RunManifest, RunStatus, TaskExecutionRecord, TaskSummary, ToolCallRecord,
+    ExecutionPersistence, RunManifest, RunStatus, TaskExecutionRecord, TaskSummary,
     build_session_context, load_session_manifests,
 };
 pub use persistence_wrapper::PersistenceWrapper;
@@ -80,8 +82,13 @@ pub use tools::ReadArtifactTool;
 pub use tools::wait_for::{StopReason, WaitForError, WaitForOutput, WaitForTool};
 pub use tools::{SubmitResultDecision, SubmitResultOutput, SubmitResultTool};
 
+pub(crate) use park::{CallKey, ParkGuard, RecordedDecisions, run_owner_id};
+// The worker-model injection seam: `provider_agent.rs`'s cfg(test) variant
+// wraps the rig's scripted agent type.
 pub use prompt_constants::{context, fields, sections};
+#[cfg(test)]
+pub(crate) use test_rig::ScriptedAgent;
 pub use types::{
-    Plan, PlanningResponse, RunId, StepInput, StructuredTaskOutput, Task, TaskIdentity, TaskJson,
-    TaskState, TaskStatus,
+    BlockedCell, CellOutcome, ParkSnapshot, PendingCall, Plan, PlanningResponse, RunId, StepInput,
+    StructuredTaskOutput, Task, TaskIdentity, TaskJson, TaskState, TaskStatus,
 };

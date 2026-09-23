@@ -82,7 +82,7 @@ aura/
 - OpenAI-compatible SSE streaming (`/v1/chat/completions`)
 - Custom `aura.*` events (opt-in via `AURA_CUSTOM_EVENTS=true`):
   - `aura.session_info`, `aura.mcp_status`, `aura.tool_requested`, `aura.tool_start`, `aura.tool_complete`, `aura.reasoning`, `aura.progress`, `aura.worker_phase`, `aura.tool_usage`, `aura.usage`, `aura.context_usage`, `aura.scratchpad_usage`
-  - `aura.usage` reports **cumulative provider-billed** tokens (Σ input + Σ output across every LLM turn), identical in single-agent and orchestration mode. `aura.context_usage` reports **context-window occupancy** — the provider's final-turn input/output (`context_tokens`/`response_tokens`) plus optional `context_window` — per-agent (single-agent emits one; orchestration emits one per worker + coordinator). Both derive from provider usage, not a local tokenizer. See `crates/aura/src/streaming_request_hook.rs` (`UsageState`) for the billed-vs-occupancy split
+  - `aura.usage` reports **cumulative provider-billed** tokens (Σ input + Σ output across every LLM turn), identical in single-agent and orchestration mode. `aura.context_usage` reports **context-window occupancy** — the provider's final-turn input/output (`context_tokens`/`response_tokens`) plus optional `context_window` — per-agent (single-agent emits one; orchestration emits one per worker plus one `main` reading for the conversation, taken from the first LLM turn of the request's first planning call — later inner turns and planning cycles carry the coordinator's scratch conversation and report nothing). Both derive from provider usage, not a local tokenizer. See `crates/aura/src/streaming_request_hook.rs` (`UsageState`) for the billed-vs-occupancy split
 - Request cancellation on timeout or client disconnect
 - Two-phase graceful shutdown: new requests rejected immediately (503), in-flight streams get configurable grace period (`SHUTDOWN_TIMEOUT_SECS`, default 30s)
 
@@ -106,6 +106,7 @@ aura/
 - Interactive terminal client with REPL, one-shot mode, and conversation persistence
 - **One-shot output contract** (`--query`): stdout is the **raw assistant response only** — no `●` markers, no markdown rendering, no tool-execution summaries, no response-summary header, no `backend.summarize` round-trip. Errors, permission prompts, and warnings go to stderr (with `error:` / `warning:` prefixes, no markers). Exit code 0 ⇒ stdout is the full response; non-zero ⇒ stderr explains and stdout is empty. The REPL retains rich formatting; the strict-output rules apply only to `--query` mode. See `crates/aura-cli/src/oneshot.rs`.
 - **Two backends:** standalone mode (default when `--api-url` absent) and HTTP mode (`--api-url`)
+- **Agent-config discovery** (standalone): `--config`/`AURA_CONFIG` → `./config.toml` → `~/.aura/agents/` → `~/.aura/agent.toml`. **First hit wins outright — locations are never merged**, so a local `config.toml` shadows the global agents completely (they are absent from `/model`; reach them with `--config ~/.aura/agents/`). No walk-up through parent directories, and `~/.aura/config.toml` is excluded (it is the legacy CLI-preferences name). Lives in `crates/aura-cli/src/agent_config.rs`; `aura init` offers to install into `~/.aura/agents/` (`--global`), prompting for the agent name that becomes both the filename and `[agent].name`
 - Standalone mode is enabled by the `standalone-cli` default feature; `--standalone` flag overrides `AURA_API_URL` env var but is mutually exclusive with the `--api-url` flag. HTTP-only builds: `--no-default-features`
 - `--model` works in both modes: HTTP passes it as starting model; standalone matches against agent.name/agent.alias in configs
 - `--system-prompt` works in both modes: standalone prompts for append/replace; HTTP prompts for AURA vs OpenAI-compatible service
@@ -114,6 +115,7 @@ aura/
 - **USE AT YOUR OWN RISK.** CLI advertises local tools to the server with `--enable-client-tools`; the server attaches them only when `[agent].enable_client_tools = true` (filtered by `client_tool_filter` globs). Both sides must opt in; single-agent configs only. Functionally equivalent to handing the LLM a shell prompt on the client machine. Full risk model and protocol details: https://docs.mezmo.com/aura/client-side-tools
 - Permission system (`.aura/permissions.json`, formerly `settings.json`) with allow/deny glob rules. Discovered by walking up from `$PWD` to find the closest `.aura/`. **Project-scoped only** — no global `~/.aura/permissions.json`. Legacy `settings.json` is still read with a deprecation warning; new rules saved at the prompt land in `permissions.json` and migrate any existing legacy rules forward.
 - CLI preferences live in `~/.aura/cli.toml` (global) and `<project>/.aura/cli.toml` (per-project override, walk-up discovered, merged on top of global per-field). Renamed from `~/.aura/config.toml` to avoid collision with AURA **agent** TOML configs; the old name is still read with a deprecation warning.
+- **Status line** under the input frame: `[status_line] segments = [...]` in `cli.toml` picks and orders `model`, `server`, `cwd`, `git`, `context`, `tokens`, `scratchpad`, `mcp` (all shown by default). Rendered locally from `ui::status_line` — no extra requests or tokens. Standalone mode shows `cwd`/`git`; HTTP mode shows `server` (the `--api-url` host) instead, keeping `cwd` only with `--enable-client-tools` (`AgentHost` in `ui::status_bar`). `context` shows the token count, or a meter/percentage when the agent's `[agent.llm].context_window` is set. In an orchestrated conversation it shows the conversation's context from the `main` `aura.context_usage` reading (the request's first planning call); mid-turn `aura.tool_usage` estimates are ignored there because they mix in worker turns.
 - `/model` command works in both modes — lists server models (HTTP) or loaded TOML configs (standalone)
 - Env vars: `AURA_API_URL`, `AURA_API_KEY`, `AURA_MODEL`, `AURA_EXTRA_HEADERS`, `AURA_LOG_FILE`
 - **Diagnostic logs**: opt-in via `--log-file <path>` / `AURA_LOG_FILE` / `cli.toml` `log_file` (precedence: CLI > env > project > global > none). Events are appended to the file (no rotation — user-managed) in **both REPL and one-shot mode**, so stdout stays a clean pipe. Default filter is `warn,aura=info,aura_cli=info,aura_config=info,rig::agent::prompt_request=info`; override with `RUST_LOG`.
@@ -182,6 +184,13 @@ make ci                     # Bundle: fmt-check + lint (test hook is empty)
 `cargo +nightly` (see `.makefiles/rust.mk`), so use `cargo +nightly fmt
 --check` — not `cargo fmt` — to match CI. See `CONTRIBUTING.md` for the
 full workflow.
+
+### Release channels
+
+One branch per channel: `nightly` (development, `X.Y.Z-nightly.N`), a
+per-cycle `beta` (`X.Y.Z-beta.N`), and `main` (stable `X.Y.Z`, what
+`latest`/Homebrew/the package repo follow). **Branch from and target
+`nightly`**, not `main`. See `docs/design/release-channels.md`.
 
 ## Code Comment Conventions
 

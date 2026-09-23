@@ -1,0 +1,39 @@
+# Multi-agent server, agent 1 of 3 — see README.md in this directory.
+#
+# Point CONFIG_PATH at the directory and every .toml in it is loaded as a
+# separate agent. Clients pick one with the OpenAI `model` field; the value
+# is the agent's `alias` when set, otherwise its `name`.
+#
+# Usage (from the repo root):
+#   CONFIG_PATH=examples/multi-agent/ DEFAULT_AGENT=sre cargo run --bin aura -- webserver
+#   curl -s localhost:8080/v1/models | jq '.data[].id'
+#   aura --api-url http://localhost:8080 --model sre
+
+[mcp]
+sanitize_schemas = true
+
+[mcp.servers.kubernetes]
+transport = "http_streamable"
+url = "http://localhost:8081/mcp"
+description = "Kubernetes cluster operations: pods, deployments, services, logs"
+
+[agent]
+name = "Kubernetes SRE Agent"
+# The id clients use in `model`. Must be unique across the directory;
+# without an alias the `name` is used instead.
+alias = "sre"
+# Shown in /v1/models and /aura/info.
+description = "Investigates Kubernetes workloads and cluster health"
+# `owned_by` in /v1/models (defaults to the provider name).
+model_owner = "mezmo"
+system_prompt = """
+You are a Kubernetes SRE assistant. Inspect cluster state with the
+available tools, prefer read-only operations, and always name namespaces
+and resources explicitly.
+"""
+turn_depth = 15
+
+[agent.llm]
+provider = "openai"
+api_key = "{{ env.OPENAI_API_KEY }}"
+model = "gpt-5.2"

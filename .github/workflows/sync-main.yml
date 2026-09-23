@@ -1,0 +1,157 @@
+name: "Sync main to channel branches"
+
+on:
+  schedule:
+    # Every six hours at :41. Off the hour because GitHub drops queued
+    # scheduled jobs when load peaks there, and out of the 01:00 hour the
+    # metrics snapshots occupy.
+    #
+    # GitHub runs schedule and workflow_dispatch only from the default
+    # branch, so this file has no effect until it is on main.
+    - cron: "41 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Branch to sync into"
+        required: false
+        default: "all"
+        type: choice
+        options: [all, nightly, beta]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  # Stable is the only channel that commits back — release.config.js drops the
+  # changelog and git plugins on nightly and beta — so every stable release
+  # leaves a CHANGELOG and version-bump commit on main alone. Hotfixes land
+  # there first as well. Both have to reach the channel branches.
+  sync:
+    name: "Sync main into ${{ matrix.target }}"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [nightly, beta]
+    concurrency:
+      group: sync-main-${{ matrix.target }}
+      cancel-in-progress: false
+    steps:
+      # No checkout. Every question here is one API call, and the common case
+      # is a no-op.
+      - name: "Open the sync pull request"
+        env:
+          # A pull request opened with GITHUB_TOKEN does not start workflows,
+          # so neither the CLA check nor pr-target-branch runs on it. Jenkins
+          # runs off webhooks and is unaffected.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TARGET: ${{ matrix.target }}
+          REQUESTED: ${{ github.event.inputs.target || 'all' }}
+          DESIGN_DOC: "https://github.com/mezmo/aura/blob/main/docs/design/release-channels.md"
+        run: |
+          set -euo pipefail
+
+          if [ "$REQUESTED" != "all" ] && [ "$REQUESTED" != "$TARGET" ]; then
+            echo "Run requested $REQUESTED; skipping $TARGET."
+            exit 0
+          fi
+
+          # Assigned first so an API failure fails the job. Testing the call
+          # inline would read a network or auth error as a missing branch and
+          # report a green no-op. Exact name match, because a ref pattern also
+          # matches refs/heads/hotfix/$TARGET.
+          branches="$(gh api "repos/${REPO}/branches?per_page=100" --paginate --jq '.[].name')"
+          if ! printf '%s\n' "$branches" | grep -Fxq "$TARGET"; then
+            echo "No $TARGET branch on the remote; nothing to sync."
+            exit 0
+          fi
+
+          # compare/{base}...{head} reports head's position relative to base.
+          compare() { gh api "repos/${REPO}/compare/${1}...${2}" --jq .status; }
+
+          position="$(compare "$TARGET" main)"
+          if [ "$position" = "identical" ] || [ "$position" = "behind" ]; then
+            echo "$TARGET already contains main."
+            exit 0
+          fi
+
+          # Between promotion and deletion, beta is contained in main and its
+          # candidate is already shipped. Merging main into it there would
+          # mutate a released candidate.
+          if [ "$TARGET" = "beta" ]; then
+            promoted="$(compare main beta)"
+            if [ "$promoted" = "identical" ] || [ "$promoted" = "behind" ]; then
+              echo "beta is contained in main; it is promoted and awaiting deletion."
+              exit 0
+            fi
+          fi
+
+          sync_branch="sync/main-to-${TARGET}"
+          MAIN_SHA="$(gh api "repos/${REPO}/commits/main" --jq .sha)"
+          export MAIN_SHA
+
+          # An open pull request may carry conflict resolutions pushed by a
+          # maintainer, so the branch is left exactly as it is.
+          open_pr="$(gh pr list --head "$sync_branch" --base "$TARGET" \
+            --state open --json number --jq '.[0].number // empty')"
+          if [ -n "$open_pr" ]; then
+            echo "Pull request #${open_pr} is open; leaving ${sync_branch} untouched."
+            exit 0
+          fi
+
+          # A closed pull request at this exact tip was already answered,
+          # whether declined or squash-merged. Reopening it every six hours
+          # would argue with the person who closed it.
+          settled="$(gh pr list --head "$sync_branch" --base "$TARGET" --state all \
+            --json number,headRefOid \
+            --jq '[.[] | select(.headRefOid == env.MAIN_SHA)] | .[0].number // empty')"
+          if [ -n "$settled" ]; then
+            echo "Pull request #${settled} already covered main at ${MAIN_SHA}; not reopening."
+            exit 0
+          fi
+
+          # The branch should be nothing but a pointer at main. Commits main
+          # does not have are someone's reconciliation work, which outranks
+          # any conclusion drawn from pull request state above.
+          if printf '%s\n' "$branches" | grep -Fxq "$sync_branch"; then
+            drift="$(compare main "$sync_branch")"
+            if [ "$drift" = "ahead" ] || [ "$drift" = "diverged" ]; then
+              echo "${sync_branch} carries commits main does not; leaving it alone."
+              exit 0
+            fi
+            gh api -X PATCH "repos/${REPO}/git/refs/heads/${sync_branch}" \
+              -f "sha=${MAIN_SHA}" -F force=true --silent
+          else
+            gh api -X POST "repos/${REPO}/git/refs" \
+              -f "ref=refs/heads/${sync_branch}" -f "sha=${MAIN_SHA}" --silent
+          fi
+
+          # shellcheck disable=SC2016  # backticks are markdown, not expansions
+          printf '%s\n' \
+            "Automated back-merge of \`main\` into \`${TARGET}\`." \
+            '' \
+            '`main` carries commits the channel branches never produce — the stable' \
+            '`CHANGELOG.md` and version bump from `semantic-release`, and any hotfix' \
+            'released from `main`. This pull request carries them back.' \
+            '' \
+            '**Merge with a merge commit.** Do not squash or rebase. Published history is' \
+            'never rewritten, and the merge commit is what keeps the `[skip ci]` version' \
+            "commit off the branch tip, where it would suppress the channel's release build." \
+            '' \
+            'Merging into `beta` changes the release candidate, so a new beta has to be' \
+            'validated before promotion.' \
+            '' \
+            'Opened by a workflow, so GitHub Actions checks do not start on it. Closing' \
+            'this pull request is respected — it is not reopened unless `main` advances.' \
+            '' \
+            "See [docs/design/release-channels.md](${DESIGN_DOC})." \
+            > "${RUNNER_TEMP}/sync-body.md"
+
+          gh pr create \
+            --base "$TARGET" \
+            --head "$sync_branch" \
+            --title "chore: sync main into ${TARGET}" \
+            --body-file "${RUNNER_TEMP}/sync-body.md"

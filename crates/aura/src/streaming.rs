@@ -124,8 +124,8 @@ pub trait StreamingAgent: Send + Sync {
     /// to MCP servers. Returns the number of cancelled requests.
     async fn cancel_and_close_mcp(&self, request_id: &str, reason: &str) -> usize;
 
-    /// Return the configured context window size in tokens (from TOML config).
-    /// Returns `None` if not configured (e.g., Orchestrator).
+    /// The configured context window size in tokens, `None` when the config
+    /// sets no window.
     fn context_window(&self) -> Option<u64> {
         None
     }

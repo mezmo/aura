@@ -21,7 +21,8 @@
 
 use crate::logging::{
     ATTR_GEN_AI_SYSTEM_INSTRUCTIONS, ATTR_INPUT_VALUE, ATTR_LLM_MODEL_NAME, ATTR_LLM_PROVIDER,
-    ATTR_LLM_SYSTEM, ATTR_LLM_TOKEN_COMPLETION, ATTR_LLM_TOKEN_PROMPT, ATTR_OUTPUT_VALUE,
+    ATTR_LLM_SYSTEM, ATTR_LLM_TOKEN_COMPLETION, ATTR_LLM_TOKEN_PROMPT,
+    ATTR_LLM_TOKEN_PROMPT_CACHE_READ, ATTR_LLM_TOKEN_PROMPT_CACHE_WRITE, ATTR_OUTPUT_VALUE,
     ATTR_TOOL_NAME, ATTR_TOOL_PARAMETERS,
 };
 use futures::future::BoxFuture;
@@ -181,6 +182,18 @@ fn transform_span(mut span: SpanData) -> SpanData {
             }
             "gen_ai.usage.output_tokens" => {
                 extra_attrs.push(KeyValue::new(ATTR_LLM_TOKEN_COMPLETION, kv.value.clone()));
+            }
+            "gen_ai.usage.cache_read_input_tokens" => {
+                extra_attrs.push(KeyValue::new(
+                    ATTR_LLM_TOKEN_PROMPT_CACHE_READ,
+                    kv.value.clone(),
+                ));
+            }
+            "gen_ai.usage.cache_creation_input_tokens" => {
+                extra_attrs.push(KeyValue::new(
+                    ATTR_LLM_TOKEN_PROMPT_CACHE_WRITE,
+                    kv.value.clone(),
+                ));
             }
             "gen_ai.tool.name" => {
                 extra_attrs.push(KeyValue::new(ATTR_TOOL_NAME, kv.value.clone()));
@@ -609,7 +622,8 @@ mod tests {
     fn test_translates_llm_attributes() {
         use crate::logging::{
             ATTR_LLM_MODEL_NAME, ATTR_LLM_PROVIDER, ATTR_LLM_SYSTEM, ATTR_LLM_TOKEN_COMPLETION,
-            ATTR_LLM_TOKEN_PROMPT,
+            ATTR_LLM_TOKEN_PROMPT, ATTR_LLM_TOKEN_PROMPT_CACHE_READ,
+            ATTR_LLM_TOKEN_PROMPT_CACHE_WRITE,
         };
 
         let span = make_span(
@@ -619,6 +633,8 @@ mod tests {
                 KeyValue::new("gen_ai.request.model", "gpt-4"),
                 KeyValue::new("gen_ai.usage.input_tokens", 100i64),
                 KeyValue::new("gen_ai.usage.output_tokens", 50i64),
+                KeyValue::new("gen_ai.usage.cache_read_input_tokens", 80i64),
+                KeyValue::new("gen_ai.usage.cache_creation_input_tokens", 15i64),
             ],
         );
         let result = transform_span(span);
@@ -638,6 +654,18 @@ mod tests {
         );
         assert!(find_attr(&result, "llm.token_count.prompt").is_some());
         assert!(find_attr(&result, "llm.token_count.completion").is_some());
+        assert_eq!(
+            find_attr(&result, "llm.token_count.prompt_details.cache_read")
+                .unwrap()
+                .to_string(),
+            "80"
+        );
+        assert_eq!(
+            find_attr(&result, "llm.token_count.prompt_details.cache_write")
+                .unwrap()
+                .to_string(),
+            "15"
+        );
 
         // Keys match logging.rs constants (drift guard)
         assert!(find_attr(&result, ATTR_LLM_SYSTEM).is_some());
@@ -645,10 +673,13 @@ mod tests {
         assert!(find_attr(&result, ATTR_LLM_MODEL_NAME).is_some());
         assert!(find_attr(&result, ATTR_LLM_TOKEN_PROMPT).is_some());
         assert!(find_attr(&result, ATTR_LLM_TOKEN_COMPLETION).is_some());
+        assert!(find_attr(&result, ATTR_LLM_TOKEN_PROMPT_CACHE_READ).is_some());
+        assert!(find_attr(&result, ATTR_LLM_TOKEN_PROMPT_CACHE_WRITE).is_some());
 
         // Originals stripped
         assert!(find_attr(&result, "gen_ai.system").is_none());
         assert!(find_attr(&result, "gen_ai.request.model").is_none());
+        assert!(find_attr(&result, "gen_ai.usage.cache_read_input_tokens").is_none());
     }
 
     /// Verify gen_ai.tool.* attributes are translated, keys match logging.rs constants.

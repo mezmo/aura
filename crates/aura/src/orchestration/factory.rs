@@ -108,6 +108,7 @@ impl OrchestratorFactory {
                                     crate::provider_agent::FinalResponseInfo {
                                         content: final_result,
                                         usage: Default::default(),
+                                        cache_usage: None,
                                     }
                                 ))).await;
                             }
@@ -145,6 +146,12 @@ impl OrchestratorFactory {
 impl StreamingAgent for OrchestratorFactory {
     fn get_provider_info(&self) -> (&str, &str) {
         self.agent_config.llm.model_info()
+    }
+
+    /// The coordinator's window: it holds the persistent conversation, so it
+    /// is the context a client measures the session against.
+    fn context_window(&self) -> Option<u64> {
+        self.agent_config.llm.context_window()
     }
 
     async fn stream(

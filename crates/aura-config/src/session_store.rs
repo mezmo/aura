@@ -2,19 +2,18 @@
 //! server uses and how to reach it (when not in-memory).
 //!
 //! Configured **only via environment variables** — never in agent TOML files.
-//! TOML configs are per-agent (a server loads N of them), while the session
-//! store is deployment infrastructure with exactly one instance per server;
-//! a TOML surface would ambiguously imply one store per agent config.
+//! TOML configs are per-agent; session store is per-server.
 //!
 //! See `docs/design/session-storage.md` §8.
 //!
-//! | Env var                                   | Meaning                                     |
-//! | ----------------------------------------- | ------------------------------------------- |
-//! | `AURA_SESSION_STORE`                      | backend: `memory` (default) or `redis`      |
-//! | `AURA_SESSION_STORE_URL`                  | `redis://` / `rediss://` (Valkey ok)        |
-//! | `AURA_SESSION_STORE_PREFIX`               | key/topic namespace (default `aura`)        |
-//! | `AURA_SESSION_STORE_CONNECT_TIMEOUT_SECS` | connection timeout (default 5)              |
-//! | `AURA_SESSION_STORE_TASK_TTL_SECS`        | A2A task TTL, 0 = no expiry (default 86400) |
+//! | Env var                                   | Meaning                                         |
+//! | ----------------------------------------- | ----------------------------------------------- |
+//! | `AURA_SESSION_STORE`                      | backend: `memory` (default), `redis`, or `file` |
+//! | `AURA_SESSION_STORE_URL`                  | `redis://` / `rediss://` (Valkey ok; `redis`)   |
+//! | `AURA_SESSION_STORE_PATH`                 | store root directory (`file`; required)         |
+//! | `AURA_SESSION_STORE_PREFIX`               | key/topic namespace (default `aura`)            |
+//! | `AURA_SESSION_STORE_CONNECT_TIMEOUT_SECS` | connection timeout (default 5)                  |
+//! | `AURA_SESSION_STORE_TASK_TTL_SECS`        | A2A task TTL, 0 = no expiry (default 86400)     |
 
 use crate::error::ConfigError;
 use std::fmt;
@@ -25,11 +24,13 @@ use std::time::Duration;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum SessionStoreBackend {
-    /// Process-local state (single-instance behavior).
+    /// Process-local state.
     #[default]
     Memory,
     /// Redis/Valkey-backed shared state.
     Redis,
+    /// File-backed approvals under a root directory.
+    File,
 }
 
 impl fmt::Display for SessionStoreBackend {
@@ -37,6 +38,7 @@ impl fmt::Display for SessionStoreBackend {
         let s = match self {
             SessionStoreBackend::Memory => "memory",
             SessionStoreBackend::Redis => "redis",
+            SessionStoreBackend::File => "file",
         };
         write!(f, "{s}")
     }
@@ -49,8 +51,9 @@ impl std::str::FromStr for SessionStoreBackend {
         match s.to_ascii_lowercase().as_str() {
             "memory" => Ok(SessionStoreBackend::Memory),
             "redis" | "valkey" => Ok(SessionStoreBackend::Redis),
+            "file" => Ok(SessionStoreBackend::File),
             other => Err(ConfigError::Validation(format!(
-                "unknown session store backend '{other}' (expected 'memory' or 'redis')"
+                "unknown session store backend '{other}' (expected 'memory', 'redis', or 'file')"
             ))),
         }
     }
@@ -59,11 +62,13 @@ impl std::str::FromStr for SessionStoreBackend {
 /// The effective session-store configuration for one server deployment.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum SessionStoreConfig {
-    /// Process-local state (single-instance behavior).
+    /// Process-local state.
     #[default]
     Memory,
     /// Redis/Valkey-backed shared state.
     Redis(RedisSessionStoreConfig),
+    /// Restart-durable approvals under a root directory.
+    File(FileSessionStoreConfig),
 }
 
 /// Connection settings for the Redis/Valkey backend.
@@ -71,12 +76,19 @@ pub enum SessionStoreConfig {
 pub struct RedisSessionStoreConfig {
     /// Backend connection URL (`redis://` or `rediss://`; Valkey compatible).
     pub url: String,
-    /// Key/topic namespace, so multiple deployments can share a cluster.
+    /// Key/topic namespace.
     pub key_prefix: String,
     /// Backend connection timeout.
     pub connect_timeout: Duration,
     /// A2A task record TTL in seconds.
     pub task_ttl_secs: Option<NonZeroU64>,
+}
+
+/// Settings for the file-backed approval store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileSessionStoreConfig {
+    /// Root directory holding the per-decision ticket and decision files.
+    pub path: String,
 }
 
 const DEFAULT_KEY_PREFIX: &str = "aura";
@@ -86,8 +98,9 @@ const DEFAULT_TASK_TTL_SECS: u64 = 86_400;
 impl SessionStoreConfig {
     /// Build the deployment's session-store configuration from the
     /// `AURA_SESSION_STORE*` environment variables, defaulting to in-memory
-    /// when unset. The Redis connection vars are only read (and the URL only
-    /// required) when the backend is `redis`.
+    /// when unset. Backend-specific vars are only read (and only required)
+    /// when their backend is selected: the URL for `redis`, the path for
+    /// `file`.
     pub fn from_env() -> Result<Self, ConfigError> {
         let backend = env_var("AURA_SESSION_STORE")
             .map(|raw| raw.parse())
@@ -96,6 +109,7 @@ impl SessionStoreConfig {
         match backend {
             SessionStoreBackend::Memory => Ok(Self::Memory),
             SessionStoreBackend::Redis => Ok(Self::Redis(RedisSessionStoreConfig::from_env()?)),
+            SessionStoreBackend::File => Ok(Self::File(FileSessionStoreConfig::from_env()?)),
         }
     }
 
@@ -105,6 +119,7 @@ impl SessionStoreConfig {
         match self {
             Self::Memory => SessionStoreBackend::Memory,
             Self::Redis(_) => SessionStoreBackend::Redis,
+            Self::File(_) => SessionStoreBackend::File,
         }
     }
 }
@@ -132,6 +147,19 @@ impl RedisSessionStoreConfig {
     }
 }
 
+impl FileSessionStoreConfig {
+    /// Read the file store's root directory from the environment. The path
+    /// is required.
+    fn from_env() -> Result<Self, ConfigError> {
+        let path = env_var("AURA_SESSION_STORE_PATH").ok_or_else(|| {
+            ConfigError::Validation(
+                "AURA_SESSION_STORE=file requires AURA_SESSION_STORE_PATH".to_string(),
+            )
+        })?;
+        Ok(Self { path })
+    }
+}
+
 /// Read an env var, treating unset and empty as absent.
 fn env_var(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.trim().is_empty())
@@ -156,11 +184,19 @@ mod tests {
         for var in [
             "AURA_SESSION_STORE",
             "AURA_SESSION_STORE_URL",
+            "AURA_SESSION_STORE_PATH",
             "AURA_SESSION_STORE_PREFIX",
             "AURA_SESSION_STORE_CONNECT_TIMEOUT_SECS",
             "AURA_SESSION_STORE_TASK_TTL_SECS",
         ] {
             unsafe { std::env::remove_var(var) };
+        }
+    }
+
+    fn expect_file(config: SessionStoreConfig) -> FileSessionStoreConfig {
+        match config {
+            SessionStoreConfig::File(file) => file,
+            other => panic!("expected the file backend, got {other:?}"),
         }
     }
 
@@ -222,6 +258,43 @@ mod tests {
             "valkey".parse::<SessionStoreBackend>().unwrap(),
             SessionStoreBackend::Redis
         );
+    }
+
+    #[test]
+    fn file_backend_reads_path() {
+        let _guard = test_env_lock::lock();
+        clear_env();
+        unsafe {
+            std::env::set_var("AURA_SESSION_STORE", "file");
+            std::env::set_var("AURA_SESSION_STORE_PATH", "/var/lib/aura/approvals");
+        }
+        let config = SessionStoreConfig::from_env();
+        clear_env();
+        let file = expect_file(config.unwrap());
+        assert_eq!(file.path, "/var/lib/aura/approvals");
+    }
+
+    #[test]
+    fn file_requires_path() {
+        let _guard = test_env_lock::lock();
+        clear_env();
+        unsafe { std::env::set_var("AURA_SESSION_STORE", "file") };
+        let err = SessionStoreConfig::from_env().unwrap_err();
+        clear_env();
+        assert!(err.to_string().contains("AURA_SESSION_STORE_PATH"));
+    }
+
+    #[test]
+    fn empty_path_is_treated_as_missing() {
+        let _guard = test_env_lock::lock();
+        clear_env();
+        unsafe {
+            std::env::set_var("AURA_SESSION_STORE", "file");
+            std::env::set_var("AURA_SESSION_STORE_PATH", "  ");
+        }
+        let err = SessionStoreConfig::from_env().unwrap_err();
+        clear_env();
+        assert!(err.to_string().contains("AURA_SESSION_STORE_PATH"));
     }
 
     #[test]

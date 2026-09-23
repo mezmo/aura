@@ -14,19 +14,22 @@
 //! Each test namespaces its keys under a unique prefix with a short TTL, so
 //! tests neither collide nor leave state behind.
 
+mod common;
+
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use a2a::{ListTasksRequest, Message, Part, Role, Task, TaskState, TaskStatus};
-use aura::hitl::{
-    AgentScope, ApprovalDecision, ApprovalItem, ApprovalOrigin, ApprovalOutcome, ApprovalRequest,
-    DecisionId, PROTOCOL_VERSION, ParkedApproval, PendingApprovals, ResolveError,
-};
+use aura::hitl::{ApprovalDecision, ApprovalOutcome, PendingApprovals, ResolveError};
 use aura::request_cancellation::RequestCancelToken;
 use aura::session_store::ParkedApprovalRecord;
 use aura_config::{RedisSessionStoreConfig, SessionStoreBackend};
 use aura_web_server::session_store::{RedisSessionStore, SessionStore};
 use bytes::Bytes;
 use futures_util::StreamExt;
+use tokio::io::AsyncWriteExt;
+
+use common::make_parked;
 
 fn redis_url() -> String {
     std::env::var("AURA_TEST_REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string())
@@ -333,46 +336,15 @@ async fn expired_task_is_gone_and_pruned_from_list() {
 // HITL approval store
 // ---------------------------------------------------------------------------
 
-fn make_parked(request_id: &str, ttl: Duration) -> ParkedApproval {
-    let now = chrono::Utc::now();
-    ParkedApproval {
-        request: ApprovalRequest {
-            version: PROTOCOL_VERSION,
-            decision_id: DecisionId::generate(),
-            request_id: request_id.to_string(),
-            scope: AgentScope::Single { session_id: None },
-            origin: ApprovalOrigin::ConfigGate {
-                matched_pattern: "kubectl_*".to_string(),
-                agent_name: "test-agent".to_string(),
-            },
-            items: vec![ApprovalItem {
-                tool_name: "kubectl_delete".to_string(),
-                arguments: serde_json::json!({"pod": "web-1"}),
-                tool_call_intent: Some("restarting to pick up the config change".to_string()),
-            }],
-        },
-        registered_at: now,
-        expires_at: now + chrono::Duration::from_std(ttl).unwrap(),
-    }
-}
+// The backend-agnostic battery lives in `tests/common`; each test below
+// wires it to two live Redis connections.
 
 #[tokio::test]
 async fn approval_register_get_roundtrip_preserves_record() {
     let config = test_config(60);
     let instance_a = connect(&config).await.approvals();
     let instance_b = connect(&config).await.approvals();
-
-    let parked = make_parked("req-1", Duration::from_secs(60));
-    let id = parked.request.decision_id;
-    let expected = ParkedApprovalRecord::from(&parked);
-    instance_a.register(parked).await.unwrap();
-
-    let restored = instance_b
-        .get(&id)
-        .await
-        .unwrap()
-        .expect("instance B sees approval");
-    assert_eq!(ParkedApprovalRecord::from(&restored), expected);
+    common::register_get_roundtrip(&instance_a, &instance_b).await;
 }
 
 #[tokio::test]
@@ -380,20 +352,25 @@ async fn approval_resolve_is_at_most_once_across_instances() {
     let config = test_config(60);
     let instance_a = connect(&config).await.approvals();
     let instance_b = connect(&config).await.approvals();
+    common::resolve_is_at_most_once(&instance_a, &instance_b).await;
+}
 
-    let parked = make_parked("req-2", Duration::from_secs(60));
+/// Redis-specific: the consumed ticket is gone from the store. The file
+/// backend instead moves the ticket into the decision file and retains it
+/// until `remove` (§2.5).
+#[tokio::test]
+async fn approval_resolve_removes_the_parked_record() {
+    let approvals = connect(&test_config(60)).await.approvals();
+    let parked = make_parked("req-consumed", Duration::from_secs(60));
     let id = parked.request.decision_id;
-    instance_a.register(parked).await.unwrap();
+    approvals.register(parked).await.unwrap();
 
-    instance_b
+    approvals
         .resolve(&id, ApprovalDecision::Approved)
         .await
-        .expect("first resolve wins");
-    assert_eq!(
-        instance_a.resolve(&id, ApprovalDecision::Approved).await,
-        Err(ResolveError::NotFound)
-    );
-    assert!(instance_a.get(&id).await.unwrap().is_none());
+        .unwrap();
+
+    assert!(approvals.get(&id).await.unwrap().is_none());
 }
 
 #[tokio::test]
@@ -401,20 +378,7 @@ async fn approval_concurrent_resolves_have_exactly_one_winner() {
     let config = test_config(60);
     let instance_a = connect(&config).await.approvals();
     let instance_b = connect(&config).await.approvals();
-
-    let parked = make_parked("req-3", Duration::from_secs(60));
-    let id = parked.request.decision_id;
-    instance_a.register(parked).await.unwrap();
-
-    let (a, b) = tokio::join!(
-        instance_a.resolve(&id, ApprovalDecision::Approved),
-        instance_b.resolve(&id, ApprovalDecision::Approved),
-    );
-    assert_eq!(
-        [a.is_ok(), b.is_ok()].iter().filter(|ok| **ok).count(),
-        1,
-        "exactly one resolver must win: {a:?} / {b:?}"
-    );
+    common::concurrent_resolves_have_exactly_one_winner(&instance_a, &instance_b).await;
 }
 
 /// A resolution leaves a durable decision record readable from any instance (issue #474).
@@ -423,29 +387,7 @@ async fn approval_resolve_records_decision_readable_cross_instance() {
     let config = test_config(60);
     let instance_a = connect(&config).await.approvals();
     let instance_b = connect(&config).await.approvals();
-
-    let parked = make_parked("req-durable", Duration::from_secs(60));
-    let id = parked.request.decision_id;
-    instance_a.register(parked).await.unwrap();
-
-    let denied = ApprovalDecision::Denied {
-        reason: Some("not now".to_string()),
-    };
-    instance_b.resolve(&id, denied.clone()).await.unwrap();
-
-    assert_eq!(
-        instance_a.decision(&id).await.unwrap(),
-        Some(denied.clone())
-    );
-    assert_eq!(
-        instance_a.resolve(&id, ApprovalDecision::Approved).await,
-        Err(ResolveError::NotFound)
-    );
-    assert_eq!(instance_a.decision(&id).await.unwrap(), Some(denied));
-    assert_eq!(
-        instance_a.decision(&DecisionId::generate()).await.unwrap(),
-        None
-    );
+    common::resolve_records_readable_decision(&instance_a, &instance_b).await;
 }
 
 /// The decision record's TTL keeps a margin past the parked record's.
@@ -471,32 +413,271 @@ async fn decision_record_outlives_parked_record_ttl() {
 #[tokio::test]
 async fn approval_remove_makes_resolve_not_found() {
     let approvals = connect(&test_config(60)).await.approvals();
-    let parked = make_parked("req-4", Duration::from_secs(60));
-    let id = parked.request.decision_id;
-    approvals.register(parked).await.unwrap();
-
-    approvals.remove(&id).await.unwrap();
-
-    assert_eq!(
-        approvals.resolve(&id, ApprovalDecision::Approved).await,
-        Err(ResolveError::NotFound)
-    );
+    common::remove_makes_resolve_not_found(&approvals).await;
 }
 
 #[tokio::test]
 async fn approval_cancel_request_removes_only_matching() {
     let approvals = connect(&test_config(60)).await.approvals();
-    let cancel = make_parked("req-cancel", Duration::from_secs(60));
-    let keep = make_parked("req-keep", Duration::from_secs(60));
-    let cancel_id = cancel.request.decision_id;
+    common::cancel_request_removes_only_matching(&approvals).await;
+}
+
+/// `cancel_request` returns exactly the records it cleared; a decided
+/// sibling of the same owner is absent, and a cleared ticket refuses a later
+/// resolve.
+#[tokio::test]
+async fn approval_cancel_request_returns_cleared_set() {
+    let config = test_config(60);
+    let approvals = connect(&config).await.approvals();
+    let undecided = make_parked("req-cancel-return", Duration::from_secs(60));
+    let undecided_id = undecided.request.decision_id;
+    let cleared_record = ParkedApprovalRecord::from(&undecided);
+    let decided = make_parked("req-cancel-return", Duration::from_secs(60));
+    let decided_id = decided.request.decision_id;
+    let keep = make_parked("req-cancel-return-keep", Duration::from_secs(60));
     let keep_id = keep.request.decision_id;
-    approvals.register(cancel).await.unwrap();
+    approvals.register(undecided).await.unwrap();
+    approvals.register(decided).await.unwrap();
     approvals.register(keep).await.unwrap();
+    approvals
+        .resolve(&decided_id, ApprovalDecision::Approved)
+        .await
+        .unwrap();
 
-    approvals.cancel_request("req-cancel").await.unwrap();
+    let cleared = approvals.cancel_request("req-cancel-return").await.unwrap();
 
-    assert!(approvals.get(&cancel_id).await.unwrap().is_none());
+    assert_eq!(cleared.len(), 1, "only the undecided ticket is cleared");
+    assert_eq!(
+        ParkedApprovalRecord::from(&cleared[0]),
+        cleared_record,
+        "the cleared record is returned unchanged"
+    );
     assert!(approvals.get(&keep_id).await.unwrap().is_some());
+    assert_eq!(
+        approvals
+            .resolve(&undecided_id, ApprovalDecision::Approved)
+            .await,
+        Err(ResolveError::NotFound),
+        "a cleared ticket resolves NotFound"
+    );
+
+    // Sequential discoverability, not a race pin: a registration added
+    // after the cancel returned keeps its index entry, and a second cancel
+    // still discovers and takes it. The true SMEMBERS-to-EXEC interleave is
+    // pinned by cancel_request_leaves_a_mid_sweep_registration_indexed.
+    let late = make_parked("req-cancel-return", Duration::from_secs(60));
+    let late_id = late.request.decision_id;
+    let late_record = ParkedApprovalRecord::from(&late);
+    approvals.register(late).await.unwrap();
+    let client = redis::Client::open(redis_url()).unwrap();
+    let mut raw = client.get_multiplexed_async_connection().await.unwrap();
+    let still_indexed: bool = redis::cmd("SISMEMBER")
+        .arg(format!(
+            "{}:approval:req:req-cancel-return",
+            config.key_prefix
+        ))
+        .arg(late_id.to_string())
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+    assert!(
+        still_indexed,
+        "the first cancel's SREM left the late registration's index entry"
+    );
+
+    let cleared_late = approvals.cancel_request("req-cancel-return").await.unwrap();
+
+    assert_eq!(
+        cleared_late.len(),
+        1,
+        "the post-cancel registration is discoverable"
+    );
+    assert_eq!(
+        ParkedApprovalRecord::from(&cleared_late[0]),
+        late_record,
+        "the late record is returned unchanged"
+    );
+    assert_eq!(
+        approvals
+            .resolve(&late_id, ApprovalDecision::Approved)
+            .await,
+        Err(ResolveError::NotFound),
+        "the second cancel GETDEL'd the late ticket"
+    );
+}
+
+/// `remove` drops a record it cannot decode: the entry is already GETDEL'd,
+/// so a corrupt payload must not fail the removal with a `Decode` error.
+#[tokio::test]
+async fn remove_tolerates_an_undecodable_record() {
+    let config = test_config(60);
+    let approvals = connect(&config).await.approvals();
+    let parked = make_parked("req-remove-corrupt", Duration::from_secs(60));
+    let id = parked.request.decision_id;
+    approvals.register(parked).await.unwrap();
+
+    // Corrupt the record in place, TTL-bounded; its index entry dies with
+    // the index key's own TTL.
+    let client = redis::Client::open(redis_url()).unwrap();
+    let mut raw = client.get_multiplexed_async_connection().await.unwrap();
+    redis::cmd("SET")
+        .arg(format!("{}:approval:{id}", config.key_prefix))
+        .arg("{not valid json")
+        .arg("EX")
+        .arg(60)
+        .query_async::<()>(&mut raw)
+        .await
+        .unwrap();
+
+    approvals
+        .remove(&id)
+        .await
+        .expect("a corrupt payload must not fail the removal");
+
+    assert!(approvals.get(&id).await.unwrap().is_none());
+}
+
+/// One corrupt record must not fail `cancel_request` for its whole request:
+/// with a list planted at one approval key the sweep still returns the valid
+/// sibling and sweeps its id from the index, while the wrong-typed key and
+/// its index entry stay in place for a later sweep to retry; the same holds
+/// when the planted record is non-UTF-8 bytes, which the sweep consumes.
+#[tokio::test]
+async fn cancel_request_skips_a_wrong_type_value_and_returns_valid_records() {
+    let config = test_config(60);
+    let approvals = connect(&config).await.approvals();
+    let req_index_key = format!("{}:approval:req:req-wrong-type", config.key_prefix);
+    let client = redis::Client::open(redis_url()).unwrap();
+    let mut raw = client.get_multiplexed_async_connection().await.unwrap();
+
+    let valid = make_parked("req-wrong-type", Duration::from_secs(60));
+    let valid_id = valid.request.decision_id;
+    let valid_record = ParkedApprovalRecord::from(&valid);
+    let corrupt = make_parked("req-wrong-type", Duration::from_secs(60));
+    let corrupt_id = corrupt.request.decision_id;
+    approvals.register(valid).await.unwrap();
+    approvals.register(corrupt).await.unwrap();
+    let corrupt_key = format!("{}:approval:{corrupt_id}", config.key_prefix);
+    redis::pipe()
+        .atomic()
+        .del(&corrupt_key)
+        .ignore()
+        .rpush(&corrupt_key, "planted list, not a record")
+        .ignore()
+        .expire(&corrupt_key, 60)
+        .ignore()
+        .query_async::<()>(&mut raw)
+        .await
+        .unwrap();
+
+    let cleared = approvals
+        .cancel_request("req-wrong-type")
+        .await
+        .expect("a wrong-typed record must not fail the sweep");
+
+    assert_eq!(cleared.len(), 1, "only the valid record is cleared");
+    assert_eq!(
+        ParkedApprovalRecord::from(&cleared[0]),
+        valid_record,
+        "the valid record is returned unchanged"
+    );
+    assert!(approvals.get(&valid_id).await.unwrap().is_none());
+    assert!(
+        !redis::cmd("SISMEMBER")
+            .arg(&req_index_key)
+            .arg(valid_id.to_string())
+            .query_async::<bool>(&mut raw)
+            .await
+            .unwrap(),
+        "the swept record's index entry went with it"
+    );
+    assert!(
+        redis::cmd("SISMEMBER")
+            .arg(&req_index_key)
+            .arg(corrupt_id.to_string())
+            .query_async::<bool>(&mut raw)
+            .await
+            .unwrap(),
+        "the wrong-typed id keeps its index entry"
+    );
+    assert_eq!(
+        redis::cmd("TYPE")
+            .arg(&corrupt_key)
+            .query_async::<String>(&mut raw)
+            .await
+            .unwrap(),
+        "list",
+        "the wrong-typed key is left in place"
+    );
+    assert_eq!(
+        redis::cmd("LRANGE")
+            .arg(&corrupt_key)
+            .arg(0)
+            .arg(-1)
+            .query_async::<Vec<String>>(&mut raw)
+            .await
+            .unwrap(),
+        ["planted list, not a record"],
+        "the planted list survives the sweep"
+    );
+
+    let cleared_again = approvals
+        .cancel_request("req-wrong-type")
+        .await
+        .expect("a retry over a wrong-typed key must not fail the sweep");
+    assert!(
+        cleared_again.is_empty(),
+        "a wrong-typed key alone clears nothing"
+    );
+    assert!(
+        redis::cmd("SISMEMBER")
+            .arg(&req_index_key)
+            .arg(corrupt_id.to_string())
+            .query_async::<bool>(&mut raw)
+            .await
+            .unwrap(),
+        "the retry keeps the wrong-typed id indexed"
+    );
+
+    let second_valid = make_parked("req-wrong-type", Duration::from_secs(60));
+    let second_record = ParkedApprovalRecord::from(&second_valid);
+    let non_utf8 = make_parked("req-wrong-type", Duration::from_secs(60));
+    let non_utf8_id = non_utf8.request.decision_id;
+    approvals.register(second_valid).await.unwrap();
+    approvals.register(non_utf8).await.unwrap();
+    redis::cmd("SET")
+        .arg(format!("{}:approval:{non_utf8_id}", config.key_prefix))
+        .arg(vec![0xff_u8, 0xfe, b'{'])
+        .arg("EX")
+        .arg(60)
+        .query_async::<()>(&mut raw)
+        .await
+        .unwrap();
+
+    let cleared = approvals
+        .cancel_request("req-wrong-type")
+        .await
+        .expect("a non-UTF-8 record must not fail the sweep");
+
+    assert_eq!(cleared.len(), 1, "only the valid record is cleared");
+    assert_eq!(
+        ParkedApprovalRecord::from(&cleared[0]),
+        second_record,
+        "the valid record is returned unchanged"
+    );
+    assert!(
+        approvals.get(&non_utf8_id).await.unwrap().is_none(),
+        "the non-UTF-8 record was consumed"
+    );
+    assert_eq!(
+        redis::cmd("SMEMBERS")
+            .arg(&req_index_key)
+            .query_async::<Vec<String>>(&mut raw)
+            .await
+            .unwrap(),
+        vec![corrupt_id.to_string()],
+        "the non-UTF-8 record's index entry was swept; the wrong-typed one remains"
+    );
 }
 
 #[tokio::test]
@@ -513,6 +694,243 @@ async fn approval_expires_with_its_record_ttl() {
         approvals.resolve(&id, ApprovalDecision::Approved).await,
         Err(ResolveError::NotFound)
     );
+}
+
+// ---------------------------------------------------------------------------
+// SMEMBERS-hold proxy: pin the sweep's SMEMBERS-to-pipe window
+// ---------------------------------------------------------------------------
+
+/// What a pump reports: the held SMEMBERS reply is in hand, or it failed.
+#[derive(Debug)]
+enum ProxyEvent {
+    Captured,
+    Failed(String),
+}
+
+/// A lockstep TCP proxy in front of the test server: each request frame is
+/// forwarded, then its response frame, so pipelined and MULTI/EXEC traffic
+/// stays ordered without interpreting payloads. Once armed, the first
+/// SMEMBERS on `needle` has its response withheld until `release` fires: a
+/// hard barrier with no sleeps. The store's pub/sub connection creates no
+/// subscriptions here, so no unsolicited frame breaks the lockstep. Every
+/// task dies with the test runtime.
+struct SmembersHoldProxy {
+    addr: std::net::SocketAddr,
+    armed: AtomicBool,
+    release: tokio::sync::Notify,
+    events: tokio::sync::mpsc::Sender<ProxyEvent>,
+}
+
+impl SmembersHoldProxy {
+    async fn start(
+        needle: String,
+    ) -> (
+        std::sync::Arc<Self>,
+        tokio::sync::mpsc::Receiver<ProxyEvent>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (events, rx) = tokio::sync::mpsc::channel(4);
+        let proxy = std::sync::Arc::new(Self {
+            addr: listener.local_addr().unwrap(),
+            armed: AtomicBool::new(false),
+            release: tokio::sync::Notify::new(),
+            events,
+        });
+        tokio::spawn({
+            let proxy = proxy.clone();
+            async move {
+                while let Ok((client, _)) = listener.accept().await {
+                    tokio::spawn(proxy.clone().pump(client, needle.clone()));
+                }
+            }
+        });
+        (proxy, rx)
+    }
+
+    /// The test server URL with only its `host:port` swapped for the proxy's,
+    /// so credentials, database, and options survive byte for byte.
+    fn url(&self) -> String {
+        let url = redis_url();
+        let lower = url.to_ascii_lowercase();
+        assert!(
+            !lower.contains("protocol=resp3") && !lower.contains("protocol=3"),
+            "the pin proxy forwards RESP2 only"
+        );
+        let endpoint = test_server_endpoint();
+        assert!(
+            url.contains(&endpoint),
+            "the test server URL must spell {endpoint}"
+        );
+        url.replacen(&endpoint, &self.addr.to_string(), 1)
+    }
+
+    async fn pump(self: std::sync::Arc<Self>, client: tokio::net::TcpStream, needle: String) {
+        use tokio::io::AsyncBufReadExt;
+        let run = async {
+            let server = tokio::net::TcpStream::connect(test_server_endpoint()).await?;
+            let (client_read, mut client_write) = client.into_split();
+            let (server_read, mut server_write) = server.into_split();
+            let mut client_read = tokio::io::BufReader::new(client_read);
+            let mut server_read = tokio::io::BufReader::new(server_read);
+            let (mut request, mut response) = (Vec::new(), Vec::new());
+            // EOF between frames is normal teardown; mid-frame it is a defect.
+            while !client_read.fill_buf().await?.is_empty() {
+                request.clear();
+                let args = read_frame(&mut client_read, &mut request).await?;
+                let hold = args.len() >= 2
+                    && args[0].eq_ignore_ascii_case(b"SMEMBERS")
+                    && args[1] == needle.as_bytes()
+                    && self.armed.swap(false, Ordering::AcqRel);
+                server_write.write_all(&request).await?;
+                response.clear();
+                read_frame(&mut server_read, &mut response).await?;
+                if hold {
+                    // The store's own response timeout fails the sweep
+                    // loudly if the release never comes.
+                    let _ = self.events.send(ProxyEvent::Captured).await;
+                    self.release.notified().await;
+                }
+                client_write.write_all(&response).await?;
+            }
+            Ok::<(), std::io::Error>(())
+        };
+        if let Err(err) = run.await {
+            let _ = self.events.send(ProxyEvent::Failed(err.to_string())).await;
+        }
+    }
+}
+
+/// The test server's `host:port`, resolved by the client's own URL parser.
+fn test_server_endpoint() -> String {
+    let info = redis::Client::open(redis_url())
+        .unwrap()
+        .get_connection_info()
+        .clone();
+    match info.addr {
+        redis::ConnectionAddr::Tcp(host, port) => format!("{host}:{port}"),
+        other => panic!("the pin proxy expects a plain TCP test server, got {other:?}"),
+    }
+}
+
+/// Append one RESP2 frame to `raw`, returning its bulk strings: for a
+/// command, its arguments. Arrays are consumed by element count, so nested
+/// replies (an `EXEC` result) stay one frame.
+async fn read_frame<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    raw: &mut Vec<u8>,
+) -> std::io::Result<Vec<Vec<u8>>> {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+    let invalid = || std::io::Error::new(std::io::ErrorKind::InvalidData, "bad RESP frame");
+    let mut bulks = Vec::new();
+    let mut pending = 1usize;
+    while pending > 0 {
+        pending -= 1;
+        let start = raw.len();
+        if reader.read_until(b'\n', raw).await? == 0 {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+        let line = &raw[start..];
+        let count = || -> std::io::Result<isize> {
+            std::str::from_utf8(&line[1..line.len().saturating_sub(2)])
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(invalid)
+        };
+        match line[0] {
+            b'+' | b'-' | b':' => {}
+            b'$' => {
+                let n = count()?;
+                if n >= 0 {
+                    let at = raw.len();
+                    raw.resize(at + n as usize + 2, 0);
+                    reader.read_exact(&mut raw[at..]).await?;
+                    bulks.push(raw[at..at + n as usize].to_vec());
+                }
+            }
+            b'*' => pending += count()?.max(0) as usize,
+            _ => return Err(invalid()),
+        }
+    }
+    Ok(bulks)
+}
+
+/// The sweep's SMEMBERS-to-pipe window, pinned end to end: a registration
+/// that lands after the sweep read the index but before its pipe executes
+/// keeps its index entry and stays discoverable by a later cancel. Under
+/// the old whole-index `DEL` this fails at the SISMEMBER assertion.
+#[tokio::test]
+async fn cancel_request_leaves_a_mid_sweep_registration_indexed() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let config = test_config(60);
+        let req_index_key = format!("{}:approval:req:req-mid-sweep", config.key_prefix);
+        let (proxy, mut events) = SmembersHoldProxy::start(req_index_key.clone()).await;
+        let proxied = RedisSessionStoreConfig {
+            url: proxy.url(),
+            ..config.clone()
+        };
+        let approvals = connect(&proxied).await.approvals();
+
+        let first = make_parked("req-mid-sweep", Duration::from_secs(60));
+        let first_id = first.request.decision_id;
+        approvals.register(first).await.unwrap();
+
+        // Arm after the fixture registration, so the held SMEMBERS is the
+        // sweep's own.
+        proxy.armed.store(true, Ordering::Release);
+        let sweep = tokio::spawn({
+            let approvals = approvals.clone();
+            async move { approvals.cancel_request("req-mid-sweep").await }
+        });
+        match events.recv().await {
+            Some(ProxyEvent::Captured) => {}
+            Some(ProxyEvent::Failed(err)) => panic!("the pin proxy failed: {err}"),
+            None => panic!("the pin proxy went away"),
+        }
+
+        // The racing registration completes end to end on a direct
+        // connection while the sweep is parked ahead of its pipe.
+        let late = make_parked("req-mid-sweep", Duration::from_secs(60));
+        let late_id = late.request.decision_id;
+        connect(&config)
+            .await
+            .approvals()
+            .register(late)
+            .await
+            .unwrap();
+        proxy.release.notify_one();
+
+        let cleared = sweep.await.unwrap().unwrap();
+        assert_eq!(
+            cleared.len(),
+            1,
+            "the sweep clears only what its SMEMBERS saw"
+        );
+        assert_eq!(cleared[0].request.decision_id, first_id);
+
+        let client = redis::Client::open(redis_url()).unwrap();
+        let mut raw = client.get_multiplexed_async_connection().await.unwrap();
+        let indexed: bool = redis::cmd("SISMEMBER")
+            .arg(&req_index_key)
+            .arg(late_id.to_string())
+            .query_async(&mut raw)
+            .await
+            .unwrap();
+        assert!(indexed, "the mid-sweep registration kept its index entry");
+
+        let cleared_late = approvals.cancel_request("req-mid-sweep").await.unwrap();
+        assert_eq!(
+            cleared_late.len(),
+            1,
+            "the mid-sweep registration stays discoverable"
+        );
+        assert_eq!(cleared_late[0].request.decision_id, late_id);
+        assert!(
+            events.try_recv().is_err(),
+            "the pin proxy reported a failure"
+        );
+    })
+    .await
+    .expect("the interleave pin completed within its budget");
 }
 
 // ---------------------------------------------------------------------------

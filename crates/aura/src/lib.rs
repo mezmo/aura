@@ -14,16 +14,12 @@ pub mod env_flags;
 pub mod error;
 pub mod fallback_tool_parser;
 pub mod fallback_tool_stream;
+pub mod governance;
 pub mod hitl;
 pub mod inactivity;
+pub mod instance_id;
 pub mod logging;
 pub mod mcp;
-pub mod mcp_dynamic;
-pub mod mcp_progress;
-pub mod mcp_response;
-pub mod mcp_sse;
-pub mod mcp_streamable_http;
-pub mod mcp_tool_execution;
 #[cfg(feature = "otel")]
 pub mod openinference_exporter;
 pub mod orchestration;
@@ -42,6 +38,8 @@ pub mod stream_events;
 pub mod streaming;
 pub mod streaming_request_hook;
 pub(crate) mod string_utils;
+#[cfg(all(test, feature = "otel"))]
+pub(crate) mod test_span_capture;
 pub mod tool_call_observer;
 pub mod tool_error_detection;
 pub mod tool_event_broker;
@@ -50,15 +48,16 @@ pub mod tools;
 pub mod turn_nudge;
 pub mod vector_dynamic;
 pub mod vector_store;
+pub mod webhook_utils;
 
 pub use builder::{Agent, AgentBuilder, FilesystemTools, build_streaming_agent};
 pub use config::{AgentRuntimeConfig, SessionId, ToolContextFactory};
 // Pure config types are owned by `aura-config` and re-exported here for
 // ergonomic consumption (`aura::LlmConfig`, etc.).
 pub use aura_config::{
-    AgentConfig, AgentSettings, EmbeddingConfig, LlmConfig, McpConfig, McpServerConfig,
-    ReasoningEffort, SkillConfig, TodoToolsConfig, ToolsConfig, VectorStoreConfig, VectorStoreType,
-    glob_match, lenient_int,
+    AgentConfig, AgentSettings, CatalogHmacConfig, CatalogWebhookConfig, EmbeddingConfig,
+    GovernanceConfig, LlmConfig, McpConfig, McpServerConfig, ReasoningEffort, SkillConfig,
+    TodoToolsConfig, ToolsConfig, VectorStoreConfig, VectorStoreType, glob_match, lenient_int,
 };
 pub use error::{BuilderError, BuilderResult};
 pub use orchestration::tools::{
@@ -97,9 +96,7 @@ pub use approval_event_broker::{
     ApprovalEventBroker, ApprovalLifecycleEvent, subscribe as approval_event_subscribe,
     unsubscribe as approval_event_unsubscribe,
 };
-pub use mcp::McpManager;
-pub use mcp_progress::ProgressEnabledHandler;
-pub use mcp_streamable_http::InFlightRequests;
+pub use mcp::{InFlightRequests, McpManager, ProgressEnabledHandler};
 pub use rag_tools::{AutoIngest, VectorIngestTool};
 pub use request_cancellation::{RequestCancellation, RequestId};
 pub use request_progress::{

@@ -28,6 +28,8 @@ pub struct RequestApprovalTool {
     scope: AgentScope,
     request_id: String,
     agent_name: String,
+    /// Instance ID of the AURA process that built this tool.
+    instance_id: String,
 }
 
 impl RequestApprovalTool {
@@ -37,12 +39,14 @@ impl RequestApprovalTool {
         scope: AgentScope,
         request_id: String,
         agent_name: String,
+        instance_id: String,
     ) -> Self {
         Self {
             route,
             scope,
             request_id,
             agent_name,
+            instance_id,
         }
     }
 }
@@ -144,6 +148,7 @@ impl Tool for RequestApprovalTool {
         let tool_call_intent = normalize_tool_call_intent(args.tool_call_intent.as_deref());
         let request = ApprovalRequest {
             version: PROTOCOL_VERSION,
+            instance_id: self.instance_id.clone(),
             decision_id: DecisionId::generate(),
             request_id: self.request_id.clone(),
             scope: self.scope.clone(),
@@ -310,6 +315,7 @@ mod tests {
             AgentScope::Single { session_id: None },
             request_id.clone(),
             "test-agent".to_string(),
+            "test-instance-id".to_string(),
         );
 
         // Subscribe before the call so the Requested event is captured.
@@ -448,5 +454,74 @@ mod tests {
             "items[].arguments must not contain _aura_reasoning, got: {}",
             item.arguments,
         );
+    }
+
+    /// Trace correlation for the agent-callable surface: the decision id must land on the tool's own execution span. Mirrors the equivalent coverage in `gate.rs`'s `decision_id_span` tests. Gated on `otel`: without the feature there is no span data to assert against.
+    #[cfg(feature = "otel")]
+    mod decision_id_span {
+
+        use std::sync::Arc;
+
+        use super::*;
+
+        use crate::test_span_capture::traced_as_execute_tool;
+
+        #[tokio::test]
+        async fn request_approval_tool_stamps_the_decision_id_on_the_execution_span() {
+            let store: Arc<dyn ApprovalStore> = Arc::new(InMemoryApprovalStore::new());
+            let bus: Arc<dyn EventBus> = Arc::new(InMemoryEventBus::new());
+            let registry = PendingApprovals::with_backend(store, bus);
+            let route = Arc::new(DecisionRoute::Conversational {
+                registry: registry.clone(),
+                timeout: std::time::Duration::from_secs(60),
+            });
+
+            let request_id = format!("req_tool_span_{}", uuid::Uuid::new_v4().simple());
+            let mut events = approval_event_broker::subscribe(&request_id).await;
+            let tool = RequestApprovalTool::new(
+                route,
+                AgentScope::Single { session_id: None },
+                request_id.clone(),
+                "test-agent".to_string(),
+                "test-instance-id".to_string(),
+            );
+            let args = RequestApprovalArgs {
+                action_description: "delete namespace".to_string(),
+                risk_rationale: "touches prod".to_string(),
+                context: None,
+                tool_call_intent: None,
+            };
+
+            let ((result, payload_id), span_id) = traced_as_execute_tool(async {
+                tokio::join!(tool.call(args), async {
+                    let event = events.recv().await.expect("requested event arrives");
+                    let id = match event {
+                        ApprovalLifecycleEvent::Requested(req) => {
+                            DecisionId::parse(&req.decision_id).expect("valid decision id")
+                        }
+                        other => panic!("expected Requested event, got {:?}", other),
+                    };
+                    registry
+                        .resolve(&id, ApprovalDecision::Approved)
+                        .await
+                        .expect("parked approval resolves");
+                    id
+                })
+            })
+            .await;
+
+            assert!(
+                result.is_ok(),
+                "an approved call must succeed: {:?}",
+                result
+            );
+            assert_eq!(
+                span_id.as_deref(),
+                Some(payload_id.to_string().as_str()),
+                "the execution span must carry the request_approval tool's decision id",
+            );
+
+            approval_event_broker::unsubscribe(&request_id).await;
+        }
     }
 }

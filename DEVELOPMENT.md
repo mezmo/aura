@@ -81,11 +81,24 @@ Make targets are composed from modular includes under `.makefiles/` (rust, docke
 | `make lint`            | Run clippy with warnings as errors             |
 | `make ci`              | Run fmt-check and lint (the `test` hook is empty; run `cargo test --workspace` separately) |
 | `make coverage`        | Run the test suite with code coverage          |
-| `make lint-commits`    | Lint commits on the current branch against main |
+| `make lint-commits`    | Lint commits on the current branch against its base (`nightly`, or the change request's target branch in CI; override with `COMMITLINT_BASE`) |
 | `make clean`           | Clean build artifacts                          |
 | `make docker-build`    | Build the Docker image (full release)          |
 | `make docker-test`     | Run the Docker build's lint/test stage         |
 | `make start` / `make stop` | Start/stop the Docker Compose setup        |
+
+### Docker image features
+
+The release image compiles `aura` and `aura-web-server` with no optional
+cargo features. The `CARGO_FEATURES` build arg accepts a comma-separated list
+of features shared by both packages (`aura-cli` and `aura-web-server`) and
+enables them for both binaries; a feature only one package defines fails the
+build. For example, the Redis/Valkey session store a multi-instance deployment
+needs:
+
+```bash
+docker build --build-arg CARGO_FEATURES=session-store-redis --target release -t aura:redis .
+```
 
 ## Testing
 
@@ -130,6 +143,12 @@ make test-integration-stdio-local
 # no other infra and no LLM key). To use an existing Redis/Valkey instead,
 # set AURA_TEST_REDIS_URL and run the cargo command directly.
 make test-integration-session-store-local
+
+# HITL header-forwarding tests (local only; needs mock-mcp up, same as the
+# base suite, but each test case spawns and tears down its own
+# aura-web-server against a generated per-case config, so there is no
+# separate -up/-down aura-web-server step).
+make test-integration-hitl-local
 ```
 
 Integration tests run single-threaded (`--test-threads=1`) due to LLM API rate limits.
@@ -150,6 +169,7 @@ Integration tests run single-threaded (`--test-threads=1`) due to LLM API rate l
 | `integration-orchestration-sre` | SRE orchestration (requires k8s-sre-mcp server config)   |
 | `integration-scratchpad`        | Scratchpad (separate from parent `integration`; requires scratchpad-test-mcp server config) |
 | `integration-session-store`     | Redis/Valkey session store (separate from parent `integration`; requires a live Redis/Valkey via `AURA_TEST_REDIS_URL`) |
+| `integration-hitl-header-forwarding` | HITL approver header forwarding (separate from parent `integration`; spawns a per-case aura-web-server) |
 | `integration-vector`            | Vector store / RAG (requires external Qdrant)            |
 
 Example, run only the streaming tests:
@@ -209,4 +229,5 @@ Worth reading before diving into the code:
 - [Streaming API Guide](https://docs.mezmo.com/aura/streaming-api-guide): SSE protocol, event types, and client handling.
 - [Request Lifecycle](https://docs.mezmo.com/aura/request-lifecycle): request flow, timeouts, cancellation, and shutdown.
 - [docs/rig-fork-changes.md](docs/rig-fork-changes.md): why AURA uses a Rig.rs fork, what changed, and tool execution ordering (important for `tool_event_broker.rs`).
+- [docs/adr/2026-07-29-release-channels.md](docs/adr/2026-07-29-release-channels.md) and [docs/design/release-channels.md](docs/design/release-channels.md): the `nightly` / `beta` / `main` release channels, what each publishes, and how a release is promoted.
 - [Tracing & Span Layout](https://docs.mezmo.com/aura/tracing-spans): OpenTelemetry span layout and trace parenting.

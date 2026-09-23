@@ -79,7 +79,7 @@
 //! child spans nest correctly under the trace root.
 //!
 //! Tool errors are only recorded on the `mcp.tool_call` child span (by
-//! `mcp_tool_execution.rs`), not on Rig's `execute_tool` parent.  This is
+//! `mcp/execution.rs`), not on Rig's `execute_tool` parent.  This is
 //! intentional: `mcp.tool_call` is the canonical TOOL span for Phoenix.
 //!
 //! ## Content recording
@@ -119,6 +119,12 @@ pub const ATTR_LLM_MODEL_NAME: &str = "llm.model_name";
 pub const ATTR_LLM_TOKEN_PROMPT: &str = "llm.token_count.prompt";
 /// Completion / output token count.
 pub const ATTR_LLM_TOKEN_COMPLETION: &str = "llm.token_count.completion";
+/// Prompt tokens served from the provider's prompt cache
+/// (a sub-count of `llm.token_count.prompt`).
+pub const ATTR_LLM_TOKEN_PROMPT_CACHE_READ: &str = "llm.token_count.prompt_details.cache_read";
+/// Prompt tokens written to the provider's prompt cache
+/// (a sub-count of `llm.token_count.prompt`).
+pub const ATTR_LLM_TOKEN_PROMPT_CACHE_WRITE: &str = "llm.token_count.prompt_details.cache_write";
 /// LLM call parameters (temperature, max_tokens, …) as a JSON object string.
 pub const ATTR_LLM_INVOCATION_PARAMETERS: &str = "llm.invocation_parameters";
 /// End-user identifier from the request.
@@ -146,7 +152,7 @@ pub const ATTR_OUTPUT_MIME_TYPE: &str = "output.mime_type";
 pub const ATTR_OUTPUT_LENGTH: &str = "output.length";
 pub const ATTR_OUTPUT_VALUE: &str = "output.value";
 
-// Tool-level attributes (used by `mcp_tool_execution.rs` and `openinference_exporter.rs`)
+// Tool-level attributes (used by `mcp/execution.rs` and `openinference_exporter.rs`)
 pub const ATTR_TOOL_NAME: &str = "tool.name";
 pub const ATTR_TOOL_PARAMETERS: &str = "tool.parameters";
 pub const ATTR_TOOL_PARAMETERS_COUNT: &str = "tool.parameters.count";
@@ -154,11 +160,15 @@ pub const ATTR_TOOL_RESULT: &str = "tool.result";
 pub const ATTR_TOOL_RESULT_LENGTH: &str = "tool.result.length";
 pub const ATTR_TOOL_CANCELLED: &str = "tool.cancelled";
 
-// HITL attribute (used by `hitl::route`)
+// HITL attributes (used by `hitl::route` and `mcp::execution`)
 
 /// Handle of the human approval decision gating a tool call — the same
 /// `decision_id` the approval payload and lifecycle events carry.
 pub const ATTR_DECISION_ID: &str = "decision_id";
+
+/// Comma-separated, sorted outbound header NAMES an approver override
+/// applied to a gated MCP call — never their values.
+pub const ATTR_APPLIED_HEADERS: &str = "applied_headers";
 
 // --- Content recording configuration ---
 
@@ -247,14 +257,11 @@ where
         ctx.field_format()
             .format_fields(field_writer.by_ref(), event)?;
 
-        // Check length and truncate if needed
-        if buf.len() > self.max_length {
-            writeln!(
-                writer,
-                "{}... ({} chars)",
-                &buf[..self.max_length],
-                buf.len()
-            )?;
+        // Check length and truncate if needed, on a char boundary: slicing at
+        // the raw byte limit panics when a multibyte character straddles it.
+        let (shown, truncated) = crate::string_utils::truncate_for_log(&buf, self.max_length);
+        if truncated {
+            writeln!(writer, "{shown}... ({} chars)", buf.len())?;
         } else {
             writeln!(writer, "{buf}")?;
         }
@@ -263,12 +270,16 @@ where
     }
 }
 
-/// Ensure aura_config warnings are always visible regardless of RUST_LOG setting.
+/// Keep operational warnings visible regardless of RUST_LOG setting.
 ///
-/// This is important for operational warnings like duplicate skill detection
-/// that should never be silently filtered.
-fn ensure_aura_config_warnings(filter: EnvFilter) -> EnvFilter {
-    filter.add_directive("aura_config=warn".parse().unwrap())
+/// This is important for warnings that must never be silently filtered:
+/// `aura_config` (duplicate skill detection) and `aura::hitl` (the
+/// cleartext-capture exposure warning), both of which the default
+/// per-binary `info` filter would otherwise drop.
+fn ensure_operational_warnings(filter: EnvFilter) -> EnvFilter {
+    filter
+        .add_directive("aura_config=warn".parse().unwrap())
+        .add_directive("aura::hitl=warn".parse().unwrap())
 }
 
 // ---------------------------------------------------------------------------
@@ -493,12 +504,12 @@ pub fn init_logging(debug: bool, verbose: bool, binary_name: &str) {
 
         // Create a custom formatting layer that truncates very long lines (e.g., API payloads)
         // Block execute_tool spans (and their events) from rig to avoid duplication
-        // Our aura::mcp_dynamic logs provide better tool execution visibility with truncation
+        // Our aura::mcp::dynamic logs provide better tool execution visibility with truncation
         let fmt_layer = fmt::layer()
             .event_format(TruncatingFormatter { max_length: 500 })
             .with_filter(tracing_subscriber::filter::filter_fn(|metadata| {
                 // Block execute_tool spans from rig::agent::prompt_request to prevent duplicate logs
-                // Our aura::mcp_dynamic provides tool execution logs with proper truncation
+                // Our aura::mcp::dynamic provides tool execution logs with proper truncation
                 // This also blocks events within the execute_tool span (like "executed tool X with args Y")
                 if metadata.target().starts_with("rig::agent::prompt_request")
                     && metadata.is_span()
@@ -519,7 +530,7 @@ pub fn init_logging(debug: bool, verbose: bool, binary_name: &str) {
         // Default: Only binary-specific info level logging on console
         let console_filter = EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| format!("{binary_name}=info").into());
-        let console_filter = ensure_aura_config_warnings(console_filter);
+        let console_filter = ensure_operational_warnings(console_filter);
 
         let registry =
             tracing_subscriber::registry().with(fmt::layer().with_filter(console_filter));
@@ -853,6 +864,93 @@ pub async fn shutdown_tracer() {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Minimal tracing-capture facility (same shape as the one in
+    /// `hitl::route` tests): a shared buffer that implements `io::Write` by
+    /// reference, so `Arc<CapturedLog>` satisfies `tracing_subscriber`'s
+    /// `MakeWriter`, and a filter's real select/not-select behavior is
+    /// observable without touching the global subscriber.
+    struct CapturedLog(std::sync::Mutex<Vec<u8>>);
+
+    impl std::io::Write for &CapturedLog {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The default console filter is `{binary}=info` plus the operational
+    /// directives; under EnvFilter semantics an unmatched target is silent,
+    /// so without the `aura::hitl=warn` directive the cleartext-capture
+    /// warning would never reach a default-mode console. Warn-level events
+    /// from that subtree must pass while its info-level noise stays dropped.
+    #[test]
+    fn default_console_filter_still_shows_hitl_warnings() {
+        use std::sync::Arc;
+
+        let buf = Arc::new(CapturedLog(std::sync::Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_env_filter(ensure_operational_warnings(EnvFilter::new(
+                "aura-web-server=info",
+            )))
+            .with_ansi(false)
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!(
+                target: "aura::hitl::route",
+                "cleartext capture warning under a default filter"
+            );
+            tracing::info!(target: "aura::hitl::route", "info noise stays filtered");
+        });
+
+        let log = String::from_utf8_lossy(&buf.0.lock().unwrap()).to_string();
+        assert!(
+            log.contains("cleartext capture warning under a default filter"),
+            "the hitl warning must survive the default filter, got log: {log}"
+        );
+        assert!(
+            !log.contains("info noise stays filtered"),
+            "the directive is warn-level, not a blanket enable, got log: {log}"
+        );
+    }
+
+    /// Console lines longer than the formatter's limit are cut on a char
+    /// boundary, including when a multibyte character straddles the byte
+    /// limit, so the output stays valid UTF-8.
+    #[test]
+    fn truncating_formatter_cuts_long_lines_on_char_boundaries() {
+        use std::sync::Arc;
+
+        // `—` is 3 bytes, so of any three consecutive limits that land inside
+        // the message, at least two fall mid-character.
+        for max_length in 60..63 {
+            let buf = Arc::new(CapturedLog(std::sync::Mutex::new(Vec::new())));
+            let subscriber = tracing_subscriber::fmt()
+                .event_format(TruncatingFormatter { max_length })
+                .with_writer(buf.clone())
+                .finish();
+
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::info!(target: "aura::logging", "{}", "—".repeat(100));
+            });
+
+            let log = String::from_utf8(buf.0.lock().unwrap().clone())
+                .expect("a truncated line must still be valid UTF-8");
+            let (shown, _) = log
+                .split_once("... (")
+                .unwrap_or_else(|| panic!("line was not truncated: {log}"));
+            assert!(
+                shown.len() <= max_length && shown.len() + 3 > max_length,
+                "expected a cut within one char of {max_length} bytes, got {} bytes",
+                shown.len()
+            );
+        }
+    }
 
     /// A prompt longer than `OTEL_CONTENT_MAX_LENGTH` must still serialize to
     /// valid JSON — truncating the finished JSON instead of the content would

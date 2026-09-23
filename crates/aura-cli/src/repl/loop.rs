@@ -26,17 +26,17 @@ use crate::repl::telemetry_notice::{FirstMessageConsent, consent_on_first_messag
 use crate::tools;
 use crate::ui::markdown::{render_markdown, render_summary};
 use crate::ui::prompt::{
-    WaveAnimation, cleanup_terminal, clear_display_events, clear_input_hint, drain_stdin,
-    erase_input_frame, extend_display_events, frame_lines, fresh_context_fill_ratio,
-    get_context_tokens, get_cumulative_tokens, get_selected_model, handle_ctrlc,
+    ContextWindowUsage, WaveAnimation, cleanup_terminal, clear_display_events, clear_input_hint,
+    drain_stdin, erase_input_frame, extend_display_events, frame_lines, fresh_context_fill_ratio,
+    fresh_context_window_usage, get_context_tokens, get_selected_model, handle_ctrlc,
     install_sigint_handler, is_expanded_output, is_processing, is_readline_active,
     last_mid_stream_history_entry, load_and_restore_sse_events, lock_term,
     overwrite_orch_task_header_unlocked, prepare_input_line, print_fields_tree,
     print_tool_call_expanded, print_user_echo, print_welcome_state_animated, push_display_event,
-    push_mid_stream_history, push_sse_event, random_bullet_color, rebuild_status_bar,
+    push_mid_stream_history, push_sse_event, random_bullet_color, record_session_event,
     redraw_input_frame, replay_event_log_global, reset_ctrlc_state, reset_input_geometry,
-    restore_terminal_mode, seed_model_cache, seed_status_bar_tokens, set_context_window_usage,
-    set_expanded_output, set_mid_stream_history, set_noncanonical_noecho, set_processing,
+    restore_terminal_mode, seed_model_cache, set_context_window_usage, set_expanded_output,
+    set_mid_stream_history, set_mid_turn_context_estimate, set_noncanonical_noecho, set_processing,
     set_readline_active, set_selected_model, set_startup_status, set_status_bar_tokens,
     set_stream_conv_dir, set_welcome_state, setup_terminal, stop_and_clear_animation,
     styled_prompt, take_pending_command, take_queued_input, task_color_for, text_lines,
@@ -66,9 +66,8 @@ const _: () = assert!(AUTO_COMPACT_FILL < 1.0);
 /// Whether to nudge at this fill, updating the armed flag.
 ///
 /// Hysteresis between [`COMPACT_NUDGE_FILL`] and [`COMPACT_NUDGE_REARM_FILL`]
-/// replaces the token-count bands used when the window size is unknown: a
-/// conversation hovering near the threshold nudges once, and compacting it
-/// re-arms the next one.
+/// means a conversation hovering near the threshold nudges once, and
+/// compacting it re-arms the next one.
 fn should_nudge_at_fill(fill: f64, armed: &mut bool) -> bool {
     if *armed && fill >= COMPACT_NUDGE_FILL {
         *armed = false;
@@ -78,6 +77,19 @@ fn should_nudge_at_fill(fill: f64, armed: &mut bool) -> bool {
         *armed = true;
     }
     false
+}
+
+/// The user message with the compaction nudge appended, telling the model how
+/// full its context window is so it can offer `CompactContext`.
+fn compaction_note(input: &str, usage: ContextWindowUsage) -> String {
+    format!(
+        "{input}\n\n[System note: The context window is {:.0}% full \
+         ({} of {} tokens). Ask the user if they'd like to compact the \
+         conversation using the CompactContext tool to free context space.]",
+        usage.fill() * 100.0,
+        usage.used,
+        usage.window,
+    )
 }
 
 /// Repaints the frame after a terminal resize while idle at the prompt.
@@ -112,9 +124,6 @@ impl ResizeWatcher {
                 if width == drawn_width {
                     continue;
                 }
-                // Re-pad the status to the new width before redrawing so it
-                // doesn't wrap (data-only; no lock needed).
-                rebuild_status_bar();
                 let _term = lock_term();
                 // Re-check under the lock: a turn may have started between the
                 // signal and acquiring the terminal write lock.
@@ -490,6 +499,23 @@ fn flush_live_reasoning(state: &Arc<Mutex<Option<LiveReasoning>>>) -> bool {
     was_top_level
 }
 
+/// Scrollback line for an `approval_requested` event. Route-neutral: the
+/// event carries no route, and a conversational `approval_pending` prompt
+/// appends below this line rather than replacing it, so the wording must
+/// not claim a route.
+fn approval_requested_line(requested: &aura_events::ApprovalRequested) -> String {
+    use aura_events::ApprovalOriginWire;
+    let origin = match &requested.origin {
+        ApprovalOriginWire::ConfigGate {
+            matched_pattern, ..
+        } => {
+            format!("config gate · {matched_pattern}")
+        }
+        ApprovalOriginWire::AgentRequested { .. } => "agent requested".to_string(),
+    };
+    format!("⏸ Approval requested — {} ({origin})", requested.tool_name)
+}
+
 /// Live worker reasoning blocks, one per concurrently-executing task.
 /// Keyed by `task_id` so interleaved deltas from same-wave workers each
 /// update their own tree row instead of contending for a single block.
@@ -634,9 +660,8 @@ pub fn run_repl(
     }
 
     // Context compaction state
-    let mut last_compact_prompt_threshold: u64 = 2_000_000;
     let mut compact_nudge_armed = true;
-    let mut compact_hint_pending = false;
+    let mut compact_hint: Option<ContextWindowUsage> = None;
 
     // Handle --resume flag: load conversation from disk
     if let Some(ref resume_id) = config.resume {
@@ -749,14 +774,8 @@ pub fn run_repl(
     let has_events = with_event_log(|log| !log.is_empty());
     if config.resume.is_some() && has_events {
         erase_input_frame();
+        // Replay seeds the token counters from the usage ledger.
         replay_event_log_global();
-        // Seed token counters from the authoritative usage JSONL after replay
-        // (replay resets + re-accumulates from view events; this ensures the
-        // JSONL totals are the final source of truth).
-        if let Some(ref store) = conv_store {
-            let (p, c) = store.load_usage_totals();
-            seed_status_bar_tokens(p, c);
-        }
         println!(
             "{}",
             "Resumed conversation. Continue below.".themed(AuraStyle::Success),
@@ -929,19 +948,10 @@ pub fn run_repl(
                 // unsent unless telemetry is Enabled).
                 telemetry.capture(aura_telemetry::events::ChatRequestStarted {});
 
-                // Append compaction hint to user message if pending
-                if compact_hint_pending {
-                    compact_hint_pending = false;
-                    let tokens = get_cumulative_tokens();
-                    let augmented = format!(
-                        "{}\n\n[System note: Context is at {} tokens. \
-                         Ask the user if they'd like to compact the conversation \
-                         using the CompactContext tool to free context space.]",
-                        input, tokens
-                    );
-                    conversation.add_user(&augmented);
-                } else {
-                    conversation.add_user(&input);
+                // Append the compaction nudge to the user message if one is pending
+                match compact_hint.take() {
+                    Some(usage) => conversation.add_user(&compaction_note(&input, usage)),
+                    None => conversation.add_user(&input),
                 }
 
                 // Persist: set conversation name from first user input
@@ -993,6 +1003,7 @@ pub fn run_repl(
                 let live_worker_reasoning: LiveWorkerReasoningMap =
                     Arc::new(Mutex::new(std::collections::HashMap::new()));
                 let worker_reasoning_seen = Arc::new(AtomicBool::new(false));
+                let session_info_seen = Arc::new(AtomicBool::new(false));
 
                 let (anim, stop_flag) = WaveAnimation::start(
                     "Thinking",
@@ -1146,6 +1157,7 @@ pub fn run_repl(
                             live_reasoning: live_reasoning.clone(),
                             live_worker_reasoning: live_worker_reasoning.clone(),
                             worker_reasoning_seen: worker_reasoning_seen.clone(),
+                            session_info_seen: session_info_seen.clone(),
                             stop_flag: stop_flag.clone(),
                             anim_cleared: anim_cleared.clone(),
                             cancel: cancel_flag.clone(),
@@ -1157,6 +1169,7 @@ pub fn run_repl(
                             approval_poster: approval_poster.clone(),
                             #[cfg(feature = "standalone-cli")]
                             pending_approvals: pending_approvals.clone(),
+                            turn_context_peak: 0,
                         };
                         backend
                             .stream_chat(
@@ -1175,6 +1188,15 @@ pub fn run_repl(
                     flush_live_reasoning(&live_reasoning);
                     flush_all_worker_reasoning(&live_worker_reasoning);
 
+                    // The window and MCP tally the status line now holds belong
+                    // to the selected model; remember which one so /resume can
+                    // tell whether they still apply.
+                    if session_info_seen.load(Ordering::Relaxed)
+                        && let Some(store) = &conv_store
+                    {
+                        store.save_turn_model(get_selected_model().as_deref());
+                    }
+
                     // Check for cancellation
                     if cancel_flag.load(Ordering::Relaxed) {
                         break 'tool_loop;
@@ -1184,12 +1206,11 @@ pub fn run_repl(
                         Ok(StreamResult::TextResponse(text)) => {
                             // Check for auto-compaction trigger (context pressure).
                             // Occupancy is bounded by the window, so it is
-                            // judged as a fill fraction; the token count only
-                            // applies when no window-relative reading exists.
-                            let under_pressure = match fresh_context_fill_ratio() {
-                                Some(fill) => fill >= AUTO_COMPACT_FILL,
-                                None => get_cumulative_tokens() >= 8_000_000,
-                            };
+                            // judged as a fill fraction; without a
+                            // window-relative reading there is no pressure to
+                            // act on.
+                            let under_pressure = fresh_context_fill_ratio()
+                                .is_some_and(|fill| fill >= AUTO_COMPACT_FILL);
                             if under_pressure
                                 && text.contains(
                                     "My tools returned more data than I can work with at once",
@@ -1926,6 +1947,8 @@ pub fn run_repl(
                             push_display_event(DisplayEvent::Usage {
                                 prompt_tokens,
                                 completion_tokens,
+                                cache_read_input_tokens: None,
+                                cache_creation_input_tokens: None,
                             });
                         }
 
@@ -1947,23 +1970,10 @@ pub fn run_repl(
                     conversation.add_assistant(&final_text);
 
                     // Nudge on the next turn once the context is filling up.
-                    match fresh_context_fill_ratio() {
-                        Some(fill) => {
-                            if should_nudge_at_fill(fill, &mut compact_nudge_armed) {
-                                compact_hint_pending = true;
-                            }
-                        }
-                        None => {
-                            let current_tokens = get_cumulative_tokens();
-                            if current_tokens >= last_compact_prompt_threshold {
-                                while last_compact_prompt_threshold <= current_tokens {
-                                    last_compact_prompt_threshold += 2_000_000;
-                                }
-                                compact_hint_pending = true;
-                                // Show "Context left: N%" in the status bar from now on
-                                crate::ui::prompt::set_auto_compact_ceiling(8_000_000);
-                            }
-                        }
+                    if let Some(usage) = fresh_context_window_usage()
+                        && should_nudge_at_fill(usage.fill(), &mut compact_nudge_armed)
+                    {
+                        compact_hint = Some(usage);
                     }
                 }
 
@@ -1977,11 +1987,21 @@ pub fn run_repl(
                             if let DisplayEvent::Usage {
                                 prompt_tokens,
                                 completion_tokens,
+                                cache_read_input_tokens,
+                                cache_creation_input_tokens,
                             } = event
                             {
+                                let cache_usage =
+                                    match (cache_read_input_tokens, cache_creation_input_tokens) {
+                                        (None, None) => None,
+                                        (read, creation) => {
+                                            Some((read.unwrap_or(0), creation.unwrap_or(0)))
+                                        }
+                                    };
                                 store.append_usage(
                                     *prompt_tokens,
                                     *completion_tokens,
+                                    cache_usage,
                                     get_selected_model().as_deref(),
                                 );
                             }
@@ -1996,7 +2016,7 @@ pub fn run_repl(
                 let queued = take_queued_input();
 
                 if !queued.is_empty() {
-                    if was_cancelled || compact_hint_pending {
+                    if was_cancelled || compact_hint.is_some() {
                         // Pre-fill readline so user can confirm/edit
                         // (also don't auto-submit when compact hint is pending,
                         // so the user can see the LLM's response first)
@@ -2204,6 +2224,8 @@ struct ReplStreamHandler {
     /// Set once the stream delivers an `aura.orchestrator.worker_reasoning`
     /// event; gates dropping the per-delta `aura.reasoning` worker mirror.
     worker_reasoning_seen: Arc<AtomicBool>,
+    /// Whether this request's stream has reported `aura.session_info`.
+    session_info_seen: Arc<AtomicBool>,
     stop_flag: Arc<AtomicBool>,
     anim_cleared: Arc<AtomicBool>,
     cancel: Arc<AtomicBool>,
@@ -2221,6 +2243,8 @@ struct ReplStreamHandler {
     /// `PendingApprovals::resolve()` instead of an HTTP POST.
     #[cfg(feature = "standalone-cli")]
     pending_approvals: Option<aura::hitl::PendingApprovals>,
+    /// Largest context size any `aura.tool_usage` reported this request.
+    turn_context_peak: u64,
 }
 
 impl ReplStreamHandler {
@@ -2449,13 +2473,33 @@ impl StreamHandler for ReplStreamHandler {
         prepare_input_line(&self.input_buf, Some(&self.cancel));
     }
 
-    fn on_usage(&mut self, prompt_tokens: u64, completion_tokens: u64) {
+    fn on_tool_usage(&mut self, prompt_tokens: u64, completion_tokens: u64) {
+        // Each tool-turn call re-sends the whole context, so its input+output
+        // is the provider's exact figure for context size at that point.
+        self.turn_context_peak = self
+            .turn_context_peak
+            .max(prompt_tokens + completion_tokens);
+        set_mid_turn_context_estimate(self.turn_context_peak);
+        update_status_bar();
+    }
+
+    fn on_usage(
+        &mut self,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        cache_usage: Option<(u64, u64)>,
+    ) {
         set_status_bar_tokens(prompt_tokens, completion_tokens);
+        if let Some((cache_read, _)) = cache_usage {
+            crate::ui::status_bar::add_status_bar_cached_tokens(cache_read);
+        }
         update_status_bar();
         if let Ok(mut events) = self.turn_events.lock() {
             events.push(DisplayEvent::Usage {
                 prompt_tokens,
                 completion_tokens,
+                cache_read_input_tokens: cache_usage.map(|(read, _)| read),
+                cache_creation_input_tokens: cache_usage.map(|(_, creation)| creation),
             });
         }
     }
@@ -2469,11 +2513,14 @@ impl StreamHandler for ReplStreamHandler {
     ) {
         // Orchestration workers report their own sub-context; only the
         // conversation-level agent's occupancy belongs on the status bar, and
-        // worker completion order is nondeterministic.
-        if agent_id == CONVERSATION_AGENT_ID {
-            set_context_window_usage(context_tokens, response_tokens, context_window);
-            update_status_bar();
+        // worker completion order is nondeterministic. The display event has
+        // no agent id and a replay applies every entry to the meter, so only
+        // the conversation agent's reading is recorded.
+        if agent_id != CONVERSATION_AGENT_ID {
+            return;
         }
+        set_context_window_usage(context_tokens, response_tokens, context_window);
+        update_status_bar();
         if let Ok(mut events) = self.turn_events.lock() {
             events.push(DisplayEvent::ContextUsage {
                 context_tokens,
@@ -2759,10 +2806,18 @@ impl StreamHandler for ReplStreamHandler {
     }
 
     fn on_orchestrator_event(&mut self, event_name: &str, val: &serde_json::Value) {
-        // Per-turn MCP connection status. Surfaced two ways:
-        //  1. Persistent status notices below the token line, rendered when
+        record_session_event(event_name, val);
+        if event_name == event_names::SESSION_INFO {
+            self.session_info_seen.store(true, Ordering::Relaxed);
+            update_status_bar();
+            return;
+        }
+
+        // Per-turn MCP connection status. Surfaced three ways:
+        //  1. The `mcp` status line segment (connected/total tally).
+        //  2. Persistent status notices below the status line, rendered when
         //     this turn's frame is redrawn at turn end (data-only).
-        //  2. Immediately in the scrollback, so the user can react — e.g. stop
+        //  3. Immediately in the scrollback, so the user can react — e.g. stop
         //     a doomed run — without waiting for the turn to finish.
         if event_name == event_names::MCP_STATUS {
             let notices = crate::api::mcp_status::notices_from_event(val);
@@ -2770,7 +2825,7 @@ impl StreamHandler for ReplStreamHandler {
                 return;
             }
 
-            // (1) Persistent status section.
+            // (2) Persistent status section.
             for notice in &notices {
                 // Prefixes are padded so message text aligns
                 // ("error:   " / "warning: ").
@@ -2783,7 +2838,7 @@ impl StreamHandler for ReplStreamHandler {
                 crate::ui::prompt::add_turn_notice(style, line);
             }
 
-            // (2) Immediate scrollback line(s). Mirror the on_tool_complete
+            // (3) Immediate scrollback line(s). Mirror the on_tool_complete
             // dance: stop the spinner, print above the frame, then restart
             // "Thinking" so feedback continues until the next event/response.
             let had_ptw = if let Ok(mut guard) = self.post_tool_wave.lock() {
@@ -2920,6 +2975,7 @@ impl StreamHandler for ReplStreamHandler {
         if !event_name.starts_with("aura.orchestrator.") {
             return;
         }
+        crate::ui::prompt::mark_orchestrated();
 
         // Worker reasoning deltas carry the `task_id` that demultiplexes
         // concurrent same-wave workers, so orchestrated runs render from
@@ -3375,6 +3431,48 @@ impl StreamHandler for ReplStreamHandler {
         prepare_input_line(&self.input_buf, Some(&self.cancel));
     }
 
+    fn on_approval_requested(&mut self, requested: &aura_events::ApprovalRequested) {
+        flush_live_reasoning(&self.live_reasoning);
+        flush_all_worker_reasoning(&self.live_worker_reasoning);
+
+        // Stop animation — same dance as on_approval_pending / on_approval_completed.
+        let had_ptw = if let Ok(mut guard) = self.post_tool_wave.lock() {
+            guard.take().map(|(a, _)| a.finish()).is_some()
+        } else {
+            false
+        };
+        if !had_ptw && !self.anim_cleared.load(Ordering::Relaxed) {
+            stop_and_clear_animation(&self.stop_flag);
+            self.anim_cleared.store(true, Ordering::Relaxed);
+        }
+
+        {
+            let _term = lock_term();
+            erase_input_frame();
+
+            let line = approval_requested_line(requested);
+            println!("{}", line.themed(AuraStyle::Warning));
+            crate::ui::prompt::increment_orch_scrollback();
+            println!();
+            crate::ui::prompt::increment_orch_scrollback();
+        }
+
+        // Park with an "Awaiting approval" animation until the decision lands.
+        let (wave_anim, wave_stop) = {
+            let _term = lock_term();
+            WaveAnimation::start(
+                "Awaiting approval",
+                vec![],
+                self.input_buf.clone(),
+                Some(self.cancel.clone()),
+            )
+        };
+        if let Ok(mut guard) = self.post_tool_wave.lock() {
+            *guard = Some((wave_anim, wave_stop));
+        }
+        prepare_input_line(&self.input_buf, Some(&self.cancel));
+    }
+
     fn on_approval_pending(&mut self, pending: &aura_events::ApprovalPending) {
         flush_live_reasoning(&self.live_reasoning);
         flush_all_worker_reasoning(&self.live_worker_reasoning);
@@ -3644,10 +3742,28 @@ impl StreamHandler for ReplStreamHandler {
 #[cfg(test)]
 mod tests {
     use super::{
-        COMMAND_ALIASES, COMPACT_NUDGE_FILL, ReplTelemetryLifecycle, command_hint,
-        should_nudge_at_fill,
+        COMMAND_ALIASES, COMPACT_NUDGE_FILL, ReplTelemetryLifecycle, approval_requested_line,
+        command_hint, compaction_note, should_nudge_at_fill,
     };
     use crate::repl::registry;
+    use crate::ui::prompt::ContextWindowUsage;
+    use std::num::NonZeroU64;
+
+    #[test]
+    fn compaction_note_reports_window_fill() {
+        let usage = ContextWindowUsage {
+            used: 150_000,
+            window: NonZeroU64::new(200_000).unwrap(),
+        };
+        let note = compaction_note("hello", usage);
+        assert!(
+            note.starts_with(
+                "hello\n\n[System note: The context window is 75% full (150000 of 200000 tokens)."
+            ),
+            "{note}"
+        );
+        assert!(note.contains("CompactContext"));
+    }
 
     #[test]
     fn nudges_once_while_the_context_stays_full() {
@@ -3841,6 +3957,65 @@ mod tests {
             assert!(
                 registry::lookup(target).is_some(),
                 "alias {bare:?} targets unknown command {target:?}",
+            );
+        }
+    }
+
+    fn approval_requested(
+        origin: aura_events::ApprovalOriginWire,
+    ) -> aura_events::ApprovalRequested {
+        aura_events::ApprovalRequested {
+            decision_id: "d-1".to_string(),
+            tool_name: "mock_tool".to_string(),
+            origin,
+            scope: aura_events::AgentScopeWire::Single { session_id: None },
+        }
+    }
+
+    #[test]
+    fn approval_requested_line_names_tool_and_config_gate_origin() {
+        let requested = approval_requested(aura_events::ApprovalOriginWire::ConfigGate {
+            matched_pattern: "mock_*".to_string(),
+            agent_name: "hitl-fast".to_string(),
+        });
+        assert_eq!(
+            approval_requested_line(&requested),
+            "⏸ Approval requested — mock_tool (config gate · mock_*)",
+        );
+    }
+
+    #[test]
+    fn approval_requested_line_names_agent_requested_origin() {
+        let requested = approval_requested(aura_events::ApprovalOriginWire::AgentRequested {
+            reason: "destructive".to_string(),
+            agent_name: "hitl-fast".to_string(),
+        });
+        assert_eq!(
+            approval_requested_line(&requested),
+            "⏸ Approval requested — mock_tool (agent requested)",
+        );
+    }
+
+    #[test]
+    fn approval_requested_line_makes_no_route_claim() {
+        // The event is route-agnostic and the conversational prompt appends
+        // below this line rather than replacing it, so route-specific
+        // wording (the Greptile finding on PR #616) contradicts scrollback
+        // on the other route.
+        for origin in [
+            aura_events::ApprovalOriginWire::ConfigGate {
+                matched_pattern: "mock_*".to_string(),
+                agent_name: String::new(),
+            },
+            aura_events::ApprovalOriginWire::AgentRequested {
+                reason: "destructive".to_string(),
+                agent_name: String::new(),
+            },
+        ] {
+            let line = approval_requested_line(&approval_requested(origin));
+            assert!(
+                !line.to_lowercase().contains("webhook"),
+                "line makes a route claim: {line}",
             );
         }
     }

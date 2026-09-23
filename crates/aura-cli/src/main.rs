@@ -8,6 +8,39 @@ use aura_cli::oneshot::run_oneshot;
 use aura_cli::permissions::PermissionChecker;
 use aura_cli::repl::r#loop::run_repl;
 use aura_cli::ui::pre_launch;
+use aura_cli::ui::prompt::AgentHost;
+
+/// Resolves loading the .env files into the current environment so config
+/// template resolution has overrides.
+///
+/// Returns whether the process is running standalone or not.
+fn resolve_env_config(args: &Args) -> bool {
+    // Loads .env so a config's {{ env.* }} references resolve without manual
+    // exporting. CWD first, then the config file's directory (init writes
+    // .env next to the config). dotenvy never overwrites — shell exports and
+    // earlier .env entries win.
+    dotenvy::dotenv().ok();
+
+    // `resolve_standalone` reads AURA_API_URL from the process environment, so
+    // it must run after the CWD `.env` is loaded.
+    #[cfg(feature = "standalone-cli")]
+    let is_standalone = aura_cli::cli::resolve_standalone(args);
+    #[cfg(not(feature = "standalone-cli"))]
+    let is_standalone = false;
+
+    // Then the agent config's own directory, so a config outside the working
+    // directory still gets the `.env` written beside it. A resolution failure
+    // is ignored here — the backend reports it.
+    #[cfg(feature = "standalone-cli")]
+    if is_standalone
+        && let Ok(path) = aura_cli::agent_config::resolve(args.agent_config.as_deref())
+        && let Some(dir) = aura_cli::agent_config::env_dir(&path)
+    {
+        dotenvy::from_path(dir.join(".env")).ok();
+    }
+
+    is_standalone
+}
 
 fn main() -> Result<()> {
     // Catch --config/--standalone before clap parses when standalone-cli is not enabled.
@@ -16,33 +49,25 @@ fn main() -> Result<()> {
 
     let args = Args::parse();
 
+    // Do this first since subcommands may depend on env var values
+    let is_standalone = resolve_env_config(&args);
+
     // Subcommands run before any backend/REPL setup (and before the tokio
-    // runtime exists — init uses blocking HTTP for model discovery).
+    // runtime exists — init and governance uses blocking HTTP for model discovery).
     match &args.command {
         Some(aura_cli::cli::Command::Init(init_args)) => {
             return aura_cli::init::run_init(init_args);
         }
         #[cfg(feature = "webserver")]
         Some(aura_cli::cli::Command::Webserver { args }) => return aura_cli::webserver::run(args),
+        #[cfg(feature = "standalone-cli")]
+        Some(aura_cli::cli::Command::Governance { command }) => {
+            let conf_path = aura_cli::agent_config::resolve(args.agent_config.as_deref())?;
+            let confs = aura_config::load_config(conf_path)?;
+            return aura_cli::governance::run(&confs, command);
+        }
         None => {}
     }
-
-    // Load .env so a config's {{ env.* }} references resolve without manual
-    // exporting. CWD first, then the config file's directory (init writes
-    // .env next to the config). dotenvy never overwrites — shell exports and
-    // earlier .env entries win.
-    dotenvy::dotenv().ok();
-    #[cfg(feature = "standalone-cli")]
-    if let Some(cfg) = &args.agent_config
-        && let Some(dir) = std::path::Path::new(cfg).parent()
-    {
-        dotenvy::from_path(dir.join(".env")).ok();
-    }
-
-    #[cfg(feature = "standalone-cli")]
-    let is_standalone = aura_cli::cli::resolve_standalone(&args);
-    #[cfg(not(feature = "standalone-cli"))]
-    let is_standalone = false;
 
     let mut config = AppConfig::load(&args)?;
 
@@ -100,6 +125,17 @@ fn main() -> Result<()> {
     // opts in. Read by the welcome printer in `repl::loop` and by
     // `render_queued_wave` in `ui::animation`.
     aura_cli::ui::prompt::set_pretty(config.pretty);
+    if let Some(segments) = config.status_line_segments.clone() {
+        aura_cli::ui::prompt::set_status_segments(segments);
+    }
+    aura_cli::ui::prompt::set_agent_host(if is_standalone {
+        AgentHost::Local
+    } else {
+        AgentHost::Remote {
+            server: aura_cli::ui::status_line::server_display(&config.api_url),
+            client_tools: config.enable_client_tools,
+        }
+    });
     let permissions = PermissionChecker::load(&std::env::current_dir()?)?;
     let mut backend = Backend::from_config(&rt, &config, &args, is_standalone)?;
 

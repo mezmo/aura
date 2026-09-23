@@ -6,7 +6,7 @@ Setup, build, test, and architecture documentation lives in [DEVELOPMENT.md](DEV
 
 ## The Short Version
 
-1. Fork the repo (external contributors) or branch from `main` (maintainers).
+1. Fork the repo (external contributors) or branch from `nightly` (maintainers).
 2. Make a focused change: one logical change per PR, with tests.
 3. Run `make fmt-check`, `cargo test --workspace`, and `make lint` before pushing.
 4. Write [Conventional Commits](#commit-messages); verify with `make lint-commits`.
@@ -31,11 +31,11 @@ Organizations with ten (10) or more contributors may contact [cla@mezmo.com](mai
 
 Environment setup, build instructions, project structure, and Make targets are documented in [DEVELOPMENT.md](DEVELOPMENT.md).
 
-1. Create a branch from the latest `main`:
+1. Create a branch from the latest `nightly`:
 
    ```bash
-   git checkout main
-   git pull origin main
+   git checkout nightly
+   git pull origin nightly
    git checkout -b feat/your-feature-name
    ```
 
@@ -53,7 +53,17 @@ Environment setup, build instructions, project structure, and Make targets are d
 
 4. Push your branch and open a pull request.
 
-All changes are merged to `main` via **rebase merging** to maintain a linear commit history, so every commit must follow the [commit message convention](#commit-messages).
+Contributions are merged to `nightly` via **rebase merging** to maintain a linear commit history, so every commit must follow the [commit message convention](#commit-messages).
+
+## Release Branches
+
+| Branch | Channel | What it is |
+| --- | --- | --- |
+| `nightly` | nightly | Where development lands; every releasable merge publishes `X.Y.Z-nightly.N`. |
+| `beta` | beta | A candidate cut from `nightly`, iterated as `X.Y.Z-beta.N`. Exists only during a release cycle. |
+| `main` | stable | What `latest`, the Homebrew tap, and the package repository follow. |
+
+**Branch from and target `nightly`**, not `main`. Maintainers move changes between channels. See [the design note](docs/design/release-channels.md) for the promotion workflow and the [ADR](docs/adr/2026-07-29-release-channels.md) for the rationale.
 
 ## Code Quality
 
@@ -120,7 +130,7 @@ Update your config.toml files accordingly.
 
 Before you submit:
 
-1. Rebase on the latest `main` (`git fetch origin && git rebase origin/main`).
+1. Rebase on the latest `nightly` (`git fetch origin && git rebase origin/nightly`).
 2. Run the quality checks above, plus `make lint-commits`.
 3. Update documentation if your change affects user-facing behavior, configuration, or APIs (see [Updating Documentation](#updating-documentation)).
 

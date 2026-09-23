@@ -1,0 +1,123 @@
+name: "Docker DVP metrics"
+
+on:
+  schedule:
+    # 01:35 UTC daily, after the other snapshot workflows. Docker publishes a
+    # new weekly report once a week and keeps only the last few, so checking
+    # daily is about not missing one rather than about daily resolution.
+    - cron: "35 1 * * *"
+  workflow_dispatch:
+    inputs:
+      period:
+        description: "Process only the report starting on this date (YYYY-MM-DD)."
+        required: false
+        type: string
+      dry_run:
+        description: "Build the payloads without sending them"
+        required: false
+        default: false
+        type: boolean
+  pull_request:
+    paths:
+      - "scripts/sync-docker-dvp-reports.sh"
+      - "scripts/lib/posthog-snapshot.sh"
+      - ".github/workflows/docker-dvp-metrics.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docker-dvp-metrics
+  cancel-in-progress: false
+
+jobs:
+  # Pull requests run code from the PR revision, which a contributor with push
+  # access controls before review, so this job gets no credentials at all.
+  # Unlike the other snapshots it cannot dry-run: the report catalogue is not
+  # public, so a dry run would need the Docker credentials this job must not
+  # have. Self-test covers what can be checked without them.
+  verify:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Self-test
+        run: scripts/sync-docker-dvp-reports.sh --selftest
+
+  sync:
+    # A manual dispatch names the ref it runs, so without the branch test this
+    # job would check out an unreviewed revision and hand it the credentials.
+    # The schedule only ever fires on the default branch, so a dispatch from
+    # anywhere else has nothing legitimate to do.
+    if: >-
+      github.event_name != 'pull_request' &&
+      (github.event_name != 'workflow_dispatch' ||
+       github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
+    runs-on: ubuntu-latest
+    # Each report is verified on its own, so the read-back budget is per report
+    # rather than per run.
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Self-test
+        run: scripts/sync-docker-dvp-reports.sh --selftest
+
+      - name: Sync Docker DVP reports
+        env:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_TOKEN: ${{ secrets.DOCKER_TOKEN }}
+          POSTHOG_PROJECT_API_KEY: ${{ secrets.POSTHOG_PROJECT_API_KEY }}
+          POSTHOG_API_READ_KEY: ${{ secrets.POSTHOG_API_READ_KEY }}
+          POSTHOG_PROJECT_ID: ${{ vars.POSTHOG_PROJECT_ID }}
+          # Inputs arrive as environment variables the script already reads, so
+          # nothing user-supplied is interpolated into a shell command.
+          PERIOD: ${{ inputs.period }}
+          DRY_RUN: ${{ inputs.dry_run && '1' || '0' }}
+        run: |
+          set -euo pipefail
+          args=()
+          [ -z "${PERIOD}" ] || args+=(--period "${PERIOD}")
+          scripts/sync-docker-dvp-reports.sh "${args[@]}"
+
+      - name: Sync Docker DVP audience
+        env:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_TOKEN: ${{ secrets.DOCKER_TOKEN }}
+          POSTHOG_PROJECT_API_KEY: ${{ secrets.POSTHOG_PROJECT_API_KEY }}
+          POSTHOG_API_READ_KEY: ${{ secrets.POSTHOG_API_READ_KEY }}
+          POSTHOG_PROJECT_ID: ${{ vars.POSTHOG_PROJECT_ID }}
+          REPORT_TYPE: technographic
+          PERIOD: ${{ inputs.period }}
+          DRY_RUN: ${{ inputs.dry_run && '1' || '0' }}
+        run: |
+          set -euo pipefail
+          args=()
+          [ -z "${PERIOD}" ] || args+=(--period "${PERIOD}")
+          scripts/sync-docker-dvp-reports.sh "${args[@]}"
+
+      - name: Report failure
+        if: failure() && github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_URL: "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        run: |
+          set -euo pipefail
+          title="Docker DVP metrics sync failed"
+          body=$(printf '%s\n\n%s\n' \
+              "The scheduled sync failed: ${RUN_URL}" \
+              "Re-run it from the Actions tab with workflow_dispatch. Reports are keyed by the period they describe, so a retry re-sends the same events and PostHog deduplicates them. Docker retains only the last few reports, so a period that ages out cannot be recovered.")
+          existing=$(gh issue list --state open --search "${title} in:title" \
+              --json number --jq '.[0].number // empty')
+          if [ -n "${existing}" ]; then
+              gh issue comment "${existing}" --body "${body}"
+          else
+              gh issue create --title "${title}" --body "${body}"
+          fi

@@ -54,6 +54,12 @@ pub(crate) enum ProviderAgent {
     Gemini(GeminiAgent),
     Ollama(OllamaAgent),
     OpenRouter(OpenRouterAgent),
+    /// Scripted-model agent (test-only): the worker-model injection seam the
+    /// park/reify rig queues through `install_worker_overrides` and the
+    /// orchestrator's cfg(test) prelude consumes. Never constructed outside
+    /// `cfg(test)`.
+    #[cfg(test)]
+    Scripted(crate::orchestration::ScriptedAgent),
 }
 
 impl ProviderAgent {
@@ -66,6 +72,142 @@ impl ProviderAgent {
             Self::Gemini(_) => "gemini",
             Self::Ollama(_) => "ollama",
             Self::OpenRouter(_) => "openrouter",
+            #[cfg(test)]
+            Self::Scripted(_) => "scripted",
+        }
+    }
+
+    /// Invoke a registered tool by name through the agent's tool server —
+    /// the same dynamic-tool path the multi-turn loop uses, so the tool's
+    /// full wrapper chain (persistence, observer, HITL gate) runs. The
+    /// returned string is the tool output as the loop delivers it to the
+    /// model: rig JSON-serializes tool outputs, so a plain string arrives
+    /// JSON-quoted.
+    pub async fn call_tool(
+        &self,
+        tool_name: &str,
+        args: &str,
+    ) -> Result<String, rig::tool::server::ToolServerError> {
+        match self {
+            Self::OpenAI(agent) => agent.tool_server_handle.call_tool(tool_name, args).await,
+            Self::Anthropic(agent) => agent.tool_server_handle.call_tool(tool_name, args).await,
+            Self::Bedrock(agent) => agent.tool_server_handle.call_tool(tool_name, args).await,
+            Self::Gemini(agent) => agent.tool_server_handle.call_tool(tool_name, args).await,
+            Self::Ollama(agent) => agent.tool_server_handle.call_tool(tool_name, args).await,
+            Self::OpenRouter(agent) => agent.tool_server_handle.call_tool(tool_name, args).await,
+            #[cfg(test)]
+            Self::Scripted(agent) => agent.tool_server_handle.call_tool(tool_name, args).await,
+        }
+    }
+
+    /// Stream a chat whose prompt is a full message — the continuation
+    /// resume submits the checkpointed tool-result prompt, not a plain
+    /// string. Carries the park-aware hook like [`Self::stream_chat_with_timeout`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn stream_chat_message_with_timeout(
+        &self,
+        prompt: rig::completion::Message,
+        chat_history: Vec<rig::completion::Message>,
+        max_depth: usize,
+        timeout: Duration,
+        request_id: &str,
+        scratchpad_budget: Option<ContextBudget>,
+        client_tool_names: HashSet<String>,
+    ) -> (
+        Pin<Box<dyn futures::Stream<Item = Result<StreamItem, StreamError>> + Send>>,
+        watch::Sender<bool>,
+        crate::streaming_request_hook::UsageState,
+    ) {
+        let (hook, cancel_tx, usage_state) =
+            StreamingRequestHook::with_scratchpad_budget(timeout, request_id, scratchpad_budget);
+        let hook = hook.with_client_tool_names(client_tool_names);
+
+        match self {
+            Self::OpenAI(agent) => {
+                let stream = agent
+                    .stream_chat(prompt, chat_history)
+                    .with_hook(hook)
+                    .multi_turn(max_depth)
+                    .await;
+                (
+                    Box::pin(stream.map::<Result<StreamItem, StreamError>, _>(map_stream_item)),
+                    cancel_tx,
+                    usage_state,
+                )
+            }
+            Self::Anthropic(agent) => {
+                let stream = agent
+                    .stream_chat(prompt, chat_history)
+                    .with_hook(hook)
+                    .multi_turn(max_depth)
+                    .await;
+                (
+                    Box::pin(stream.map::<Result<StreamItem, StreamError>, _>(map_stream_item)),
+                    cancel_tx,
+                    usage_state,
+                )
+            }
+            Self::Bedrock(agent) => {
+                let stream = agent
+                    .stream_chat(prompt, chat_history)
+                    .with_hook(hook)
+                    .multi_turn(max_depth)
+                    .await;
+                (
+                    Box::pin(stream.map::<Result<StreamItem, StreamError>, _>(map_stream_item)),
+                    cancel_tx,
+                    usage_state,
+                )
+            }
+            Self::Gemini(agent) => {
+                let stream = agent
+                    .stream_chat(prompt, chat_history)
+                    .with_hook(hook)
+                    .multi_turn(max_depth)
+                    .await;
+                (
+                    Box::pin(stream.map::<Result<StreamItem, StreamError>, _>(map_stream_item)),
+                    cancel_tx,
+                    usage_state,
+                )
+            }
+            Self::Ollama(agent) => {
+                let stream = agent
+                    .stream_chat(prompt, chat_history)
+                    .with_hook(hook)
+                    .multi_turn(max_depth)
+                    .await;
+                (
+                    Box::pin(stream.map::<Result<StreamItem, StreamError>, _>(map_stream_item)),
+                    cancel_tx,
+                    usage_state,
+                )
+            }
+            Self::OpenRouter(agent) => {
+                let stream = agent
+                    .stream_chat(prompt, chat_history)
+                    .with_hook(hook)
+                    .multi_turn(max_depth)
+                    .await;
+                (
+                    Box::pin(stream.map::<Result<StreamItem, StreamError>, _>(map_stream_item)),
+                    cancel_tx,
+                    usage_state,
+                )
+            }
+            #[cfg(test)]
+            Self::Scripted(agent) => {
+                let stream = agent
+                    .stream_chat(prompt, chat_history)
+                    .with_hook(hook)
+                    .multi_turn(max_depth)
+                    .await;
+                (
+                    Box::pin(stream.map::<Result<StreamItem, StreamError>, _>(map_stream_item)),
+                    cancel_tx,
+                    usage_state,
+                )
+            }
         }
     }
 
@@ -100,6 +242,11 @@ impl ProviderAgent {
                 Box::pin(stream.map::<Result<StreamItem, StreamError>, _>(map_stream_item))
             }
             Self::OpenRouter(agent) => {
+                let stream = agent.stream_prompt(query).multi_turn(max_depth).await;
+                Box::pin(stream.map::<Result<StreamItem, StreamError>, _>(map_stream_item))
+            }
+            #[cfg(test)]
+            Self::Scripted(agent) => {
                 let stream = agent.stream_prompt(query).multi_turn(max_depth).await;
                 Box::pin(stream.map::<Result<StreamItem, StreamError>, _>(map_stream_item))
             }
@@ -150,6 +297,14 @@ impl ProviderAgent {
                 Box::pin(stream.map::<Result<StreamItem, StreamError>, _>(map_stream_item))
             }
             Self::OpenRouter(agent) => {
+                let stream = agent
+                    .stream_chat(query, chat_history)
+                    .multi_turn(max_depth)
+                    .await;
+                Box::pin(stream.map::<Result<StreamItem, StreamError>, _>(map_stream_item))
+            }
+            #[cfg(test)]
+            Self::Scripted(agent) => {
                 let stream = agent
                     .stream_chat(query, chat_history)
                     .multi_turn(max_depth)
@@ -244,6 +399,19 @@ impl ProviderAgent {
                 )
             }
             Self::OpenRouter(agent) => {
+                let stream = agent
+                    .stream_prompt(query)
+                    .with_hook(hook)
+                    .multi_turn(max_depth)
+                    .await;
+                (
+                    Box::pin(stream.map::<Result<StreamItem, StreamError>, _>(map_stream_item)),
+                    cancel_tx,
+                    usage_state,
+                )
+            }
+            #[cfg(test)]
+            Self::Scripted(agent) => {
                 let stream = agent
                     .stream_prompt(query)
                     .with_hook(hook)
@@ -356,6 +524,19 @@ impl ProviderAgent {
                     usage_state,
                 )
             }
+            #[cfg(test)]
+            Self::Scripted(agent) => {
+                let stream = agent
+                    .stream_chat(query, chat_history)
+                    .with_hook(hook)
+                    .multi_turn(max_depth)
+                    .await;
+                (
+                    Box::pin(stream.map::<Result<StreamItem, StreamError>, _>(map_stream_item)),
+                    cancel_tx,
+                    usage_state,
+                )
+            }
         }
     }
 }
@@ -380,10 +561,11 @@ pub enum StreamItem {
     Final(FinalResponseInfo),
     /// Internal marker for final response (filtered out before returning to caller)
     FinalMarker,
-    /// Per-turn token usage from intermediate turns (not end-of-stream).
+    /// Per-turn token usage from intermediate turns (not end-of-stream),
+    /// with the turn's provider-reported prompt-cache split.
     /// Emitted on every Rig `Final` chunk so callers can capture usage
     /// even when they short-circuit before the terminal `FinalResponse`.
-    TurnUsage(Usage),
+    TurnUsage(Usage, Option<rig::completion::CacheUsage>),
     /// Orchestrator status event (plan progress, task status, etc.)
     OrchestratorEvent(OrchestratorEvent),
     /// Per-agent scratchpad usage report.
@@ -431,6 +613,8 @@ pub enum StreamItem {
 pub struct FinalResponseInfo {
     pub content: String,
     pub usage: Usage,
+    /// Prompt-cache split matching `usage`'s turn population.
+    pub cache_usage: Option<rig::completion::CacheUsage>,
 }
 
 /// Streamed assistant content (provider-agnostic).
@@ -529,7 +713,7 @@ fn map_stream_item<R: rig::completion::GetTokenUsage>(
                         output_tokens: 0,
                         total_tokens: 0,
                     });
-                    return Ok(StreamItem::TurnUsage(usage));
+                    return Ok(StreamItem::TurnUsage(usage, resp.cache_token_usage()));
                 }
             };
             Ok(StreamItem::StreamAssistantItem(mapped))
@@ -549,6 +733,7 @@ fn map_stream_item<R: rig::completion::GetTokenUsage>(
             Ok(StreamItem::Final(FinalResponseInfo {
                 content: final_resp.response().to_string(),
                 usage,
+                cache_usage: final_resp.cache_usage(),
             }))
         }
         // Handle any future variants added to the non-exhaustive enum

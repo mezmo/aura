@@ -14,7 +14,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use tracing::{error, info};
 
-use crate::mcp_streamable_http::McpClient;
+use crate::mcp::client::McpClient;
 use crate::request_cancellation::call_http_tool_cancellable;
 
 // ---------------------------------------------------------------------------
@@ -41,6 +41,17 @@ fn record_tool_call_input(span: &tracing::Span, args: &Value) {
             crate::logging::truncate_for_otel(&args_str),
         );
     }
+}
+
+/// Record the outbound header NAMES an approver override applies to this
+/// call, sorted and comma-joined, never the values.
+fn record_applied_headers(
+    span: &tracing::Span,
+    overrides: &crate::approver_headers::ApproverHeaders,
+) {
+    let mut names: Vec<&str> = overrides.captured_names().collect();
+    names.sort_unstable();
+    crate::logging::set_span_attribute(span, crate::logging::ATTR_APPLIED_HEADERS, names.join(","));
 }
 
 /// Record tool call result attributes on the current span.
@@ -106,6 +117,9 @@ pub async fn execute_mcp_tool(
 
     // OTel: record input attributes
     record_tool_call_input(&span, &args);
+    if let Some(overrides) = approver_overrides.as_ref() {
+        record_applied_headers(&span, overrides);
+    }
 
     // Log tool call initiation
     info!(
@@ -118,7 +132,7 @@ pub async fn execute_mcp_tool(
         serde_json::to_string(&args).unwrap_or_else(|_| "Invalid JSON".to_string())
     );
 
-    // Note: aura.tool_start is now emitted from mcp_streamable_http.rs call_tool_tracked()
+    // Note: aura.tool_start is now emitted from mcp/client.rs's call_tool_tracked()
     // using Rig 0.28's id parameter for correct correlation via the FIFO queue.
     // This eliminates thread-local context dependency.
 
@@ -167,14 +181,14 @@ pub async fn execute_mcp_tool(
 /// `Some(bounded)`, the message bounded to [`MAX_TOOL_ERROR_BYTES`] so a
 /// multi-KB transport/provider payload cannot flood a worker's context window.
 ///
-/// [`MAX_TOOL_ERROR_BYTES`]: crate::mcp_response::MAX_TOOL_ERROR_BYTES
+/// [`MAX_TOOL_ERROR_BYTES`]: crate::mcp::response::MAX_TOOL_ERROR_BYTES
 fn bound_transport_error(err_str: &str) -> Option<String> {
     if err_str.contains("Request cancelled") {
         None
     } else {
-        Some(crate::mcp_response::bound_error_content(
+        Some(crate::mcp::response::bound_error_content(
             err_str.to_string(),
-            crate::mcp_response::MAX_TOOL_ERROR_BYTES,
+            crate::mcp::response::MAX_TOOL_ERROR_BYTES,
         ))
     }
 }
@@ -262,12 +276,86 @@ mod tests {
         let huge = format!("Tool execution failed: {}", "stack frame\n".repeat(8000));
         let bounded = bound_transport_error(&huge).expect("non-cancel error must be bounded");
         assert!(
-            bounded.len() <= crate::mcp_response::MAX_TOOL_ERROR_BYTES + 128,
+            bounded.len() <= crate::mcp::response::MAX_TOOL_ERROR_BYTES + 128,
             "bounded transport error must stay near the budget; got {} bytes",
             bounded.len()
         );
         assert!(bounded.contains("[tool error truncated:"));
         // The leading context (where categorization keywords live) survives.
         assert!(bounded.starts_with("Tool execution failed:"));
+    }
+
+    /// Trace correlation: a gated call's `mcp.tool_call` span carries the captured override's header NAMES, never their values, and an ungated call's span carries neither. Gated on `otel`: without the feature there is no span data to assert against.
+    #[cfg(feature = "otel")]
+    mod applied_headers_span {
+
+        use opentelemetry::trace::TracerProvider as _;
+
+        use opentelemetry_sdk::trace::TracerProvider;
+        use serde_json::json;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        use super::*;
+        use crate::logging::ATTR_APPLIED_HEADERS;
+        use crate::mcp::client::tests::client_and_server;
+        use crate::test_span_capture::CapturedSpans;
+
+        /// Run `execute_mcp_tool` under a subscriber that exports to memory, returning the `applied_headers` attribute its `mcp.tool_call` span carries.
+        async fn applied_headers_on_call(
+            client: &McpClient,
+            overrides: Option<crate::approver_headers::ApproverHeaders>,
+        ) -> Option<String> {
+            let captured = CapturedSpans::default();
+            let provider = TracerProvider::builder()
+                .with_simple_exporter(captured.clone())
+                .build();
+            let _guard = tracing::subscriber::set_default(
+                tracing_subscriber::registry()
+                    .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("test"))),
+            );
+
+            execute_mcp_tool(client, "gated", json!({}), overrides)
+                .await
+                .expect("the call succeeds");
+
+            assert!(
+                captured.contains("mcp.tool_call"),
+                "the mcp.tool_call span was never exported",
+            );
+            captured.attribute("mcp.tool_call", ATTR_APPLIED_HEADERS)
+        }
+
+        /// A gated call carrying an override stamps its captured names, sorted and comma-joined, on the execution span, never a value. Configured out of order (`x-tenant` before `authorization`) to catch a regression to `"x-tenant,authorization"`.
+        #[tokio::test]
+        async fn gated_call_stamps_the_applied_header_names_never_values() {
+            let (_server, client) = client_and_server(&HashMap::new()).await;
+
+            let overrides = crate::approver_headers::tests::captured_overrides_multi(&[
+                ("x-tenant", "acme"),
+                ("authorization", "Bearer approver-secret"),
+            ]);
+            let attribute = applied_headers_on_call(&client, Some(overrides)).await;
+
+            assert_eq!(
+                attribute.as_deref(),
+                Some("authorization,x-tenant"),
+                "the span must name every applied header, sorted",
+            );
+            for value in ["acme", "Bearer approver-secret", "approver-secret"] {
+                assert!(
+                    !attribute.as_deref().unwrap().contains(value),
+                    "the span must never carry a header value, got: {attribute:?}",
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn ungated_call_records_no_applied_headers() {
+            let (_server, client) = client_and_server(&HashMap::new()).await;
+
+            let attribute = applied_headers_on_call(&client, None).await;
+
+            assert_eq!(attribute, None);
+        }
     }
 }

@@ -170,6 +170,18 @@ impl PendingApprovals {
         AwaitingDecision::new(id, rx, Instant::now() + timeout)
     }
 
+    /// Park-mode registration: persist the approval through the store
+    /// directly, failing on a store fault instead of parking anyway.
+    ///
+    /// Unlike [`Self::register`], no wake handle is created — nothing in this
+    /// process awaits the decision (the run is parked, and a later resume
+    /// consumes the recorded decision). A store error is returned to the
+    /// caller so the park arm can fail the gated call closed: a checkpoint
+    /// must never reference a decision id the store does not hold.
+    pub async fn register_durable(&self, parked: ParkedApproval) -> Result<(), SessionStoreError> {
+        self.0.store.register(parked).await
+    }
+
     /// Resolve a parked approval: durably record the decision in the store
     /// (at most once per `DecisionId`) and publish it on the bus, waking the
     /// parked await wherever it lives.
@@ -191,6 +203,14 @@ impl PendingApprovals {
             warn!(decision_id = %id, error = %err, "approval decision publish failed");
         }
         Ok(())
+    }
+
+    /// The parked approval record for an id, propagating a store fault.
+    pub async fn try_parked(
+        &self,
+        id: &DecisionId,
+    ) -> Result<Option<ParkedApproval>, SessionStoreError> {
+        self.0.store.get(id).await
     }
 
     /// The durably recorded decision for an already-resolved approval, if
@@ -242,11 +262,16 @@ impl PendingApprovals {
     }
 
     /// Cancel every approval parked under a request id (stream drop /
-    /// shutdown); their awaits resolve to `Cancelled`.
-    pub async fn cancel_request(&self, request_id: &str) {
+    /// shutdown); their awaits resolve to `Cancelled`. Returns the approvals
+    /// the store cleared, empty on a store fault.
+    pub async fn cancel_request(&self, request_id: &str) -> Vec<ParkedApproval> {
         self.cancel_request_local(request_id);
-        if let Err(err) = self.0.store.cancel_request(request_id).await {
-            warn!(request_id, error = %err, "approval store cancel_request failed");
+        match self.0.store.cancel_request(request_id).await {
+            Ok(cleared) => cleared,
+            Err(err) => {
+                warn!(request_id, error = %err, "approval store cancel_request failed");
+                Vec::new()
+            }
         }
     }
 }
@@ -349,6 +374,7 @@ mod tests {
     fn test_request(request_id: &str) -> ApprovalRequest {
         ApprovalRequest {
             version: PROTOCOL_VERSION,
+            instance_id: "test-instance".to_string(),
             decision_id: DecisionId::generate(),
             request_id: request_id.to_string(),
             scope: AgentScope::Single { session_id: None },

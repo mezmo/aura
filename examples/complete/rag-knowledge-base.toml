@@ -1,0 +1,102 @@
+# RAG — an orchestrated support agent that answers from vector stores.
+#
+# Two stores are configured:
+#   runbooks     Qdrant collection you populate yourself (any embedding
+#                pipeline that writes 1536-dim vectors for text-embedding-3-small)
+#   customer_kb  Amazon Bedrock Knowledge Base (managed; Bedrock owns the
+#                embeddings, so no embedding_model is configured for it)
+#
+# Every store becomes a `vector_search_<name>` tool. In orchestration mode a
+# worker sees NO stores unless it lists them in `vector_stores`, and the
+# coordinator sees only `coordinator_vector_stores`. This keeps retrieval
+# scoped: the knowledge worker searches both stores; the coordinator can
+# check runbooks while planning; the general worker has none.
+#
+# A third type, `in_memory`, is accepted by the config but is created empty
+# and cannot be populated from TOML — it exists for tests. Use Qdrant or
+# Bedrock KB for real data.
+#
+# Prerequisites:
+#   export OPENAI_API_KEY="sk-..."          # LLM + Qdrant embeddings
+#   export AWS_REGION="us-east-1"
+#   export AWS_PROFILE="default"            # credentials for the Bedrock KB
+#   export BEDROCK_KB_ID="ABCDEFGHIJ"       # your knowledge base id
+#   Qdrant (gRPC port) with a `runbooks` collection:
+#     docker run -p 6333:6333 -p 6334:6334 qdrant/qdrant
+#     export QDRANT_URL="http://localhost:6334"
+#
+# Usage:
+#   CONFIG_PATH=examples/complete/rag-knowledge-base.toml cargo run --bin aura -- webserver
+#
+# Docs: https://docs.mezmo.com/aura/configuration-reference#vector_stores
+
+[[vector_stores]]
+name = "runbooks"
+type = "qdrant"
+# Prepended to search results so the model knows what it is reading.
+context_prefix = "Internal SRE runbooks and postmortems"
+url = "{{ env.QDRANT_URL | default: 'http://localhost:6334' }}"
+collection_name = "runbooks"
+
+# Required for in_memory and qdrant stores; must match how the collection
+# was embedded.
+[vector_stores.embedding_model]
+provider = "openai"
+api_key = "{{ env.OPENAI_API_KEY }}"
+model = "text-embedding-3-small"
+
+[[vector_stores]]
+name = "customer_kb"
+type = "bedrock_kb"
+context_prefix = "Customer-facing product documentation"
+knowledge_base_id = "{{ env.BEDROCK_KB_ID | default: 'REPLACE_WITH_KB_ID' }}"
+region = "{{ env.AWS_REGION }}"
+profile = "{{ env.AWS_PROFILE | default: 'default' }}"
+# true for a Bedrock *managed* knowledge base; false (default) for a classic
+# vector-store-backed one. Wrong value → ValidationException at query time.
+managed = true
+
+[agent]
+name = "Support Researcher"
+model_owner = "mezmo"
+# In orchestration mode this is the coordinator's prompt.
+system_prompt = """
+You coordinate answers to product and operations questions. Break the
+question into lookups, send them to the knowledge worker, and compose a
+final answer that cites which store each fact came from. If the stores
+have no relevant content, say so instead of guessing.
+"""
+turn_depth = 10
+
+[agent.llm]
+provider = "openai"
+api_key = "{{ env.OPENAI_API_KEY }}"
+model = "gpt-5.2"
+
+[orchestration]
+enabled = true
+max_planning_cycles = 2
+allow_direct_answers = true
+# Stores the coordinator itself may search while planning.
+coordinator_vector_stores = ["runbooks"]
+
+[orchestration.worker.knowledge]
+description = "Searches runbooks and the customer knowledge base"
+preamble = """
+You are a research specialist. Search the vector stores available to you,
+quote the most relevant passages verbatim, and return them with the store
+name and any document identifiers. Do not summarize away specifics.
+"""
+# Store names must match [[vector_stores]].name. Omit or leave empty for a
+# worker with no retrieval access.
+vector_stores = ["runbooks", "customer_kb"]
+# This worker has no MCP tools; retrieval only.
+mcp_filter = []
+
+[orchestration.worker.general]
+description = "Reasons over material already retrieved; no store access"
+preamble = """
+You are an analyst. Work only from the material given to you in the task
+and produce a clear, structured conclusion.
+"""
+mcp_filter = []

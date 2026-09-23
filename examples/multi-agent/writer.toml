@@ -1,0 +1,23 @@
+# Multi-agent server, agent 2 of 3 — see README.md in this directory.
+#
+# A tool-less agent on a cheaper model, served from the same process as
+# sre.toml. Select it with `model = "writer"`.
+
+[agent]
+name = "Technical Writer"
+alias = "writer"
+description = "Drafts and edits runbooks, postmortems, and status updates"
+model_owner = "mezmo"
+system_prompt = """
+You are a technical writer for an SRE team. Turn notes into clear,
+structured documents: runbooks with numbered steps, postmortems with
+timeline / impact / root cause / action items, and status updates that a
+non-engineer can read. Ask for missing facts rather than inventing them.
+"""
+turn_depth = 3
+
+[agent.llm]
+provider = "openai"
+api_key = "{{ env.OPENAI_API_KEY }}"
+model = "gpt-4o-mini"
+temperature = 0.4

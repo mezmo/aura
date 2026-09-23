@@ -41,6 +41,7 @@ impl<'a> From<&'a ApprovalRequest> for ApprovalRequestWire<'a> {
     fn from(request: &'a ApprovalRequest) -> Self {
         Self {
             version: request.version,
+            instance_id: request.instance_id.as_str(),
             decision_id: request.decision_id,
             request_id: request.request_id.as_str(),
             scope: scope_to_wire(&request.scope),
@@ -124,6 +125,21 @@ pub fn completed_error(
         duration_ms: duration.as_millis() as u64,
         scope: scope_to_wire(scope),
     }
+}
+
+/// `approval_completed(cancelled)` for a parked approval nothing will consume.
+#[must_use]
+pub fn completed_cancelled(
+    decision_id: DecisionId,
+    scope: &AgentScope,
+    duration: Duration,
+) -> ApprovalCompleted {
+    completed(
+        decision_id,
+        &ApprovalOutcome::Cancelled(CancelReason::Shutdown),
+        scope,
+        duration,
+    )
 }
 
 fn origin_to_wire(origin: &ApprovalOrigin) -> ApprovalOriginWire {

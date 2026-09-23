@@ -54,6 +54,9 @@ pub(crate) mod guidance {
 pub(crate) mod corrections {
     pub const ROUTING_TOOL_REQUIRED: &str = "You must call one of the routing tools (respond_directly, create_plan, or request_clarification). Do not respond with text — call a tool.";
     pub const WORKER_SUBMIT_RESULT: &str = "[SYSTEM CORRECTION] You did not call the submit_result tool in your previous response. You MUST call submit_result to complete this task. Please try again.";
+    /// Stands in for an assistant turn that produced no text when that turn
+    /// is replayed as history.
+    pub const EMPTY_ASSISTANT_TURN: &str = "(the previous turn produced no text)";
 }
 
 /// User-facing suggestions when context overflow occurs.

@@ -1,0 +1,68 @@
+# Human-in-the-loop (conversational route) — gate destructive Kubernetes
+# tools behind the person who is already chatting with the agent.
+#
+# When a gated tool is called, the stream emits `aura.approval_requested`
+# and parks the call. The `aura` CLI shows an approve/deny prompt and answers
+# automatically; any other client answers by POSTing the decision to
+# `/v1/approvals/{decision_id}`. Requests must use `stream: true`.
+# For an approver who is NOT at the client (pager, chat-ops, policy
+# service), see hitl-webhook.toml.
+#
+# Prerequisites:
+#   export OPENAI_API_KEY="sk-..."
+#   Kubernetes context configured (kubectl access)
+#   Start the K8s MCP server WITHOUT --read-only so mutating tools exist:
+#     npx -y kubernetes-mcp-server@latest --port 8081
+#
+# Usage:
+#   AURA_CUSTOM_EVENTS=true CONFIG_PATH=examples/complete/hitl-conversational.toml \
+#     cargo run --bin aura -- webserver
+#   cargo run -p aura-cli -- --api-url http://localhost:8080
+#
+# Docs: https://docs.mezmo.com/aura/hitl
+
+# Presence of the [hitl] table enables gating; there is no `enabled` key.
+[hitl]
+# Glob patterns matched against MCP tool names. A tool is gated if it matches
+# ANY pattern. The built-in `request_approval` tool is never gated.
+require_approval = [
+  "*_delete",                 # pods_delete, resources_delete, ...
+  "pods_exec",
+  "resources_create_or_update",
+  "helm_install",
+  "helm_uninstall",
+]
+
+# [hitl.route] is required whenever [hitl] is present.
+[hitl.route]
+mode = "conversational"
+# How long a parked tool call waits for the user's answer (default 60).
+timeout_secs = 120
+
+[mcp]
+sanitize_schemas = true
+
+# Kubernetes — cluster inspection and management
+# https://github.com/containers/kubernetes-mcp-server
+[mcp.servers.kubernetes]
+transport = "http_streamable"
+url = "http://localhost:8081/mcp"
+description = "Kubernetes cluster operations: pods, deployments, services, logs"
+
+[agent]
+name = "Kubernetes Operator"
+model_owner = "mezmo"
+system_prompt = """
+You are a Kubernetes operations assistant. You may inspect any resource
+freely. Mutating operations (delete, exec, apply, helm) require the user's
+approval — the platform will pause the call and ask them; you do not need
+to ask yourself. State clearly what you are about to change and why before
+you call a mutating tool, so the approval prompt has context. If an
+approval is denied, stop and offer a read-only alternative.
+"""
+turn_depth = 20
+
+[agent.llm]
+provider = "openai"
+api_key = "{{ env.OPENAI_API_KEY }}"
+model = "gpt-5.2"

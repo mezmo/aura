@@ -246,6 +246,14 @@ pub enum DisplayEvent {
     Usage {
         prompt_tokens: u64,
         completion_tokens: u64,
+        /// Prompt tokens served from the provider's prompt cache
+        /// (a subset of `prompt_tokens`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_read_input_tokens: Option<u64>,
+        /// Prompt tokens written to the provider's prompt cache
+        /// (a subset of `prompt_tokens`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_creation_input_tokens: Option<u64>,
     },
     ContextUsage {
         context_tokens: u64,

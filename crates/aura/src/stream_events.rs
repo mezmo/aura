@@ -331,6 +331,7 @@ mod tests {
             21500,
             342,
             21842,
+            Some((18000, 2100)),
             CorrelationContext::new("sess_final", Some("trace_xyz".to_string())),
         );
         let sse = event.format_sse();
@@ -338,6 +339,8 @@ mod tests {
         assert!(sse.contains("\"prompt_tokens\":21500"));
         assert!(sse.contains("\"completion_tokens\":342"));
         assert!(sse.contains("\"total_tokens\":21842"));
+        assert!(sse.contains("\"cache_read_input_tokens\":18000"));
+        assert!(sse.contains("\"cache_creation_input_tokens\":2100"));
         assert!(sse.contains("\"session_id\":\"sess_final\""));
         assert!(sse.contains("\"trace_id\":\"trace_xyz\""));
     }
@@ -352,7 +355,7 @@ mod tests {
             AuraStreamEvent::tool_usage(vec![], 0, 0, 0, CorrelationContext::default());
         assert_eq!(tool_usage.event_name(), event_names::TOOL_USAGE);
 
-        let usage = AuraStreamEvent::usage(0, 0, 0, CorrelationContext::default());
+        let usage = AuraStreamEvent::usage(0, 0, 0, None, CorrelationContext::default());
         assert_eq!(usage.event_name(), event_names::USAGE);
     }
 

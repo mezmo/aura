@@ -3,7 +3,7 @@
 //! Integration tests for MCP progress notification forwarding.
 //!
 
-use aura::mcp_streamable_http::McpClient;
+use aura::mcp::McpClient;
 use aura::{request_progress_global, request_progress_subscribe, request_progress_unsubscribe};
 use std::collections::HashMap;
 use std::time::Duration;

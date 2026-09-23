@@ -19,7 +19,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::mcp_response::CallOutcome;
+use crate::mcp::CallOutcome;
 use crate::tool_wrapper::{
     ToolCallContext, ToolWrapper, TransformArgsResult, TransformOutputResult,
 };

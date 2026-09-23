@@ -9,6 +9,7 @@ use std::io::Write;
 
 use crate::aura_dir::{find_project_aura_dir_with_home, global_aura_dir};
 use crate::cli::Args;
+use crate::ui::status_line::Segment;
 
 const DEFAULT_API_URL: &str = "http://localhost:8080";
 
@@ -44,6 +45,14 @@ struct FileConfig {
     /// fields via `merge_telemetry`; env-var kill switches still override
     /// either.
     telemetry: Option<aura_telemetry::FileTelemetryConfig>,
+    /// `[status_line]` block — what the REPL's bottom status line shows.
+    status_line: Option<StatusLineFileConfig>,
+}
+
+#[derive(Debug, Deserialize, Default, Clone)]
+struct StatusLineFileConfig {
+    /// Segment names in display order; see [`Segment::name`].
+    segments: Option<Vec<String>>,
 }
 
 impl FileConfig {
@@ -63,7 +72,23 @@ impl FileConfig {
             style: other.style.or(self.style),
             log_file: other.log_file.or(self.log_file),
             telemetry: merge_telemetry(self.telemetry, other.telemetry),
+            status_line: merge_status_line(self.status_line, other.status_line),
         }
+    }
+}
+
+/// Merge the global and project `[status_line]` blocks per field.
+fn merge_status_line(
+    base: Option<StatusLineFileConfig>,
+    over: Option<StatusLineFileConfig>,
+) -> Option<StatusLineFileConfig> {
+    match (base, over) {
+        (None, None) => None,
+        (Some(b), None) => Some(b),
+        (None, Some(o)) => Some(o),
+        (Some(b), Some(o)) => Some(StatusLineFileConfig {
+            segments: o.segments.or(b.segments),
+        }),
     }
 }
 
@@ -133,6 +158,9 @@ pub struct AppConfig {
     /// `cli.toml` (the kill switch documented in `docs/telemetry.md`)
     /// without setting an env var.
     pub telemetry: Option<aura_telemetry::FileTelemetryConfig>,
+    /// Status line segments from layered `cli.toml`, in display order.
+    /// `None` means the built-in default set.
+    pub status_line_segments: Option<Vec<Segment>>,
 }
 
 impl AppConfig {
@@ -209,6 +237,22 @@ impl AppConfig {
         let style = file_config.style.clone();
         let telemetry = file_config.telemetry.clone();
 
+        // A misspelled segment is dropped with a warning; the rest of the
+        // list still applies so one typo doesn't blank the whole line.
+        let status_line_segments = file_config
+            .status_line
+            .and_then(|s| s.segments)
+            .map(|names| {
+                names
+                    .iter()
+                    .filter_map(|name| {
+                        name.parse::<Segment>()
+                            .inspect_err(|e| eprintln!("warning: cli.toml [status_line]: {e}"))
+                            .ok()
+                    })
+                    .collect()
+            });
+
         // Precedence: CLI flag / `AURA_LOG_FILE` env > project cli.toml > global
         // cli.toml > None (no logging). An explicitly empty string is treated as
         // unset so `AURA_LOG_FILE=` in CI can disable logging without removing
@@ -235,6 +279,7 @@ impl AppConfig {
             pretty: args.pretty,
             log_file,
             telemetry,
+            status_line_segments,
         })
     }
 
@@ -783,6 +828,59 @@ model = "global-model"
     }
 
     #[test]
+    fn status_line_segments_default_to_none() {
+        let (cwd, home) = empty_env();
+        let global = empty_global(&home);
+        let config = AppConfig::load_with_dirs(&default_args(), cwd.path(), Some(&global)).unwrap();
+        assert!(config.status_line_segments.is_none());
+    }
+
+    #[test]
+    fn status_line_segments_parse_in_order_and_skip_unknown_names() {
+        let (cwd, home) = empty_env();
+        let global = empty_global(&home);
+        fs::write(
+            global.join("cli.toml"),
+            r#"[status_line]
+segments = ["git", "bogus", "model"]
+"#,
+        )
+        .unwrap();
+
+        let config = AppConfig::load_with_dirs(&default_args(), cwd.path(), Some(&global)).unwrap();
+        assert_eq!(
+            config.status_line_segments,
+            Some(vec![Segment::Git, Segment::Model])
+        );
+    }
+
+    #[test]
+    fn project_status_line_segments_override_global() {
+        let (cwd, home) = empty_env();
+        let global = empty_global(&home);
+        fs::write(
+            global.join("cli.toml"),
+            r#"[status_line]
+segments = ["model", "cwd"]
+"#,
+        )
+        .unwrap();
+        let project_aura = cwd.path().join(".aura");
+        fs::create_dir(&project_aura).unwrap();
+        fs::write(
+            project_aura.join("cli.toml"),
+            r#"[status_line]
+segments = []
+"#,
+        )
+        .unwrap();
+
+        let config = AppConfig::load_with_dirs(&default_args(), cwd.path(), Some(&global)).unwrap();
+        // An explicitly empty project list hides every segment.
+        assert_eq!(config.status_line_segments, Some(vec![]));
+    }
+
+    #[test]
     fn project_cli_toml_found_via_walk_up_from_deep_subdir() {
         let (cwd, home) = empty_env();
         let global = empty_global(&home);
@@ -919,6 +1017,7 @@ model = "global-model"
             pretty: false,
             log_file: None,
             telemetry: None,
+            status_line_segments: None,
         };
         assert_eq!(
             config.chat_completions_url(),
@@ -943,6 +1042,7 @@ model = "global-model"
             pretty: false,
             log_file: None,
             telemetry: None,
+            status_line_segments: None,
         };
         assert_eq!(
             config.chat_completions_url(),
@@ -967,6 +1067,7 @@ model = "global-model"
             pretty: false,
             log_file: None,
             telemetry: None,
+            status_line_segments: None,
         };
         assert_eq!(config.models_url(), "https://api.example.com/v1/models");
     }
@@ -988,6 +1089,7 @@ model = "global-model"
             pretty: false,
             log_file: None,
             telemetry: None,
+            status_line_segments: None,
         };
         assert_eq!(config.models_url(), "https://api.example.com/v1/models");
     }

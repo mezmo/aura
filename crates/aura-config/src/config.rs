@@ -28,6 +28,9 @@ pub struct Config {
     /// it; presence of the table is the enable bit.
     #[serde(default)]
     pub hitl: Option<HitlConfig>,
+    /// Governance integration for catalog sync and policy endpoints.
+    #[serde(default)]
+    pub governance: Option<GovernanceConfig>,
 }
 
 /// Reasoning effort level for GPT-5 models
@@ -93,6 +96,9 @@ pub enum LlmConfig {
         /// Context window size in tokens.
         #[serde(default, deserialize_with = "lenient_int::deserialize_option_u64")]
         context_window: Option<u64>,
+        /// Anthropic prompt caching (`cache_control` breakpoints).
+        #[serde(default)]
+        prompt_caching: bool,
         /// Controls the randomness and creativity of the llm
         #[serde(default)]
         temperature: Option<f64>,
@@ -113,6 +119,9 @@ pub enum LlmConfig {
         /// Context window size in tokens.
         #[serde(default, deserialize_with = "lenient_int::deserialize_option_u64")]
         context_window: Option<u64>,
+        /// Bedrock prompt caching (`cachePoint` breakpoints).
+        #[serde(default)]
+        prompt_caching: bool,
         #[serde(default)]
         temperature: Option<f64>,
         /// Additional provider-specific parameters merged into the API request.
@@ -860,6 +869,14 @@ pub struct AgentConfig {
     #[serde(default)]
     #[serde(deserialize_with = "lenient_int::deserialize_option_usize")]
     pub nudge_turns_remaining: Option<usize>,
+    /// Stable seed for instance ID derivation.
+    ///
+    /// When set, this value is hashed with the agent name and the env seed
+    /// instead of the default `sha256(name, alias)`. Supports
+    /// `{{ env.* }}` templating so the value can come from an environment
+    /// variable without being committed to the config file.
+    #[serde(default)]
+    pub instance_seed: Option<String>,
 }
 
 fn default_turn_depth() -> Option<usize> {
@@ -893,6 +910,7 @@ impl Default for AgentConfig {
             skills: SkillsConfig::default(),
             nudge_last_turn: false,
             nudge_turns_remaining: None,
+            instance_seed: None,
         }
     }
 }
@@ -1087,6 +1105,7 @@ mod tests {
     fn test_hitl_timeout_conflict_disabled_per_call_timeout() {
         let hitl = HitlConfig {
             require_approval: vec![],
+            park: ParkConfig::default(),
             route: DecisionRouteConfig::Webhook {
                 url: WebhookUrl::new("http://localhost:9999").unwrap(),
                 timeout_secs: 300,
@@ -1119,6 +1138,7 @@ mod tests {
     fn test_hitl_timeout_conflict_route_timeout_less_than_per_call() {
         let hitl = HitlConfig {
             require_approval: vec![],
+            park: ParkConfig::default(),
             route: DecisionRouteConfig::Webhook {
                 url: WebhookUrl::new("http://localhost:9999").unwrap(),
                 timeout_secs: 30,
@@ -1134,6 +1154,7 @@ mod tests {
     fn test_hitl_timeout_conflict_route_timeout_equals_per_call() {
         let hitl = HitlConfig {
             require_approval: vec![],
+            park: ParkConfig::default(),
             route: DecisionRouteConfig::Webhook {
                 url: WebhookUrl::new("http://localhost:9999").unwrap(),
                 timeout_secs: 60,
@@ -1151,6 +1172,7 @@ mod tests {
     fn test_hitl_timeout_conflict_route_timeout_greater_than_per_call() {
         let hitl = HitlConfig {
             require_approval: vec![],
+            park: ParkConfig::default(),
             route: DecisionRouteConfig::Webhook {
                 url: WebhookUrl::new("http://localhost:9999").unwrap(),
                 timeout_secs: 120,
@@ -1169,10 +1191,57 @@ mod tests {
     fn test_hitl_timeout_conflict_conversational_variant() {
         let hitl = HitlConfig {
             require_approval: vec![],
+            park: ParkConfig::default(),
             route: DecisionRouteConfig::Conversational { timeout_secs: 120 },
         };
         let msg = hitl_timeout_conflict_warning(&hitl, 60).unwrap();
         assert!(msg.contains("120s"));
+    }
+
+    // -------------------------------------------------------------------
+    // [hitl.park]
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn hitl_park_defaults_to_disabled_when_table_absent() {
+        let toml = r#"
+require_approval = ["kubectl_*"]
+
+[route]
+mode = "conversational"
+timeout_secs = 60
+"#;
+        let hitl: HitlConfig = toml::from_str(toml).unwrap();
+        assert!(!hitl.park.enabled);
+    }
+
+    #[test]
+    fn hitl_park_parses_enabled_true() {
+        let toml = r#"
+require_approval = ["kubectl_*"]
+
+[route]
+mode = "conversational"
+
+[park]
+enabled = true
+"#;
+        let hitl: HitlConfig = toml::from_str(toml).unwrap();
+        assert!(hitl.park.enabled);
+    }
+
+    #[test]
+    fn hitl_park_table_present_but_enabled_omitted_is_disabled() {
+        let toml = r#"
+require_approval = []
+
+[route]
+mode = "conversational"
+
+[park]
+"#;
+        let hitl: HitlConfig = toml::from_str(toml).unwrap();
+        assert!(!hitl.park.enabled);
     }
 
     #[test]
@@ -1258,6 +1327,57 @@ tool_headers_from_response = { "Authorization" = "x-approver-token" }
         }
     }
 
+    /// An explicitly empty map is the same feature-off state as an absent
+    /// one, and survives a serialize round trip as an absent key.
+    #[test]
+    fn hitl_webhook_tool_headers_empty_map_is_feature_off() {
+        let toml = r#"
+require_approval = ["kubectl_*"]
+
+[route]
+mode = "webhook"
+url = "https://approvals.example.com/decide"
+tool_headers_from_response = {}
+"#;
+        let hitl: HitlConfig = toml::from_str(toml).unwrap();
+        match &hitl.route {
+            DecisionRouteConfig::Webhook {
+                tool_headers_from_response,
+                ..
+            } => assert!(tool_headers_from_response.is_empty()),
+            other => panic!("expected Webhook route, got {:?}", other),
+        }
+        let round_tripped = toml::to_string(&hitl).unwrap();
+        assert!(
+            !round_tripped.contains("tool_headers_from_response"),
+            "an empty map must not be emitted: {round_tripped}"
+        );
+    }
+
+    /// Both sides of a mapping are lowercased through the real TOML deserialization path, so a config spelled in header case resolves like one spelled in wire case.
+    #[test]
+    fn hitl_webhook_tool_headers_response_name_lowercased() {
+        let toml = r#"
+require_approval = ["kubectl_*"]
+
+[route]
+mode = "webhook"
+url = "https://approvals.example.com/decide"
+tool_headers_from_response = { "X-Forwarded-User" = "X-Approver-Id" }
+"#;
+        let hitl: HitlConfig = toml::from_str(toml).unwrap();
+        match hitl.route {
+            DecisionRouteConfig::Webhook {
+                tool_headers_from_response,
+                ..
+            } => assert_eq!(
+                tool_headers_from_response.iter().collect::<Vec<_>>(),
+                vec![("x-forwarded-user", "x-approver-id")]
+            ),
+            other => panic!("expected Webhook route, got {:?}", other),
+        }
+    }
+
     /// Reserved transport-owned names are rejected at parse.
     #[test]
     fn hitl_webhook_tool_headers_reserved_name_rejected() {
@@ -1327,6 +1447,17 @@ pub struct HitlConfig {
     pub require_approval: Vec<GlobPattern>,
     /// The decision route; required when `[hitl]` is present.
     pub route: DecisionRouteConfig,
+    /// `[hitl.park]` settings.
+    #[serde(default)]
+    pub park: ParkConfig,
+}
+
+/// `[hitl.park]` config table.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ParkConfig {
+    /// Park mode on or off (default off).
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 /// `[hitl.route]` table. The `Webhook` variant cannot parse without a valid
@@ -1352,9 +1483,6 @@ pub enum DecisionRouteConfig {
         #[serde(default)]
         headers_from_request: HashMap<String, String>,
         /// Outbound MCP header name → webhook approval-response header name.
-        /// Non-empty opts gated calls into approver identity forwarding.
-        /// Validated at parse (see [`ToolHeaderMappings`]); the validated
-        /// map is carried but not consumed until capture wiring lands.
         #[serde(default, skip_serializing_if = "ToolHeaderMappings::is_empty")]
         tool_headers_from_response: ToolHeaderMappings,
     },
@@ -1372,8 +1500,7 @@ pub const RESERVED_TOOL_HEADER_NAMES: [&str; 6] = [
 ];
 
 /// Validated `tool_headers_from_response` mapping: outbound MCP header
-/// name → webhook approval-response header name, both sides lowercased
-/// at parse so an override always replaces the frozen default header.
+/// name → webhook approval-response header name, both sides lowercased.
 /// Syntactically invalid header names, duplicates after lowercasing, and
 /// reserved transport-owned names (see [`RESERVED_TOOL_HEADER_NAMES`])
 /// are rejected at construction, so downstream code never holds an
@@ -1382,7 +1509,7 @@ pub const RESERVED_TOOL_HEADER_NAMES: [&str; 6] = [
 pub struct ToolHeaderMappings(HashMap<String, String>);
 
 impl ToolHeaderMappings {
-    /// True when no mapping is configured (the legacy, feature-off state).
+    /// True when no mapping is configured.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
@@ -1541,4 +1668,45 @@ impl<'de> Deserialize<'de> for GlobPattern {
         let source = String::deserialize(deserializer)?;
         Self::new(source).map_err(serde::de::Error::custom)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Governance configuration
+// ---------------------------------------------------------------------------
+
+/// `[governance]` config table for catalog sync and policy integration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GovernanceConfig {
+    /// Catalog webhook configuration for MCP tool discovery sync.
+    pub catalog: Option<CatalogWebhookConfig>,
+}
+
+/// `[governance.catalog]` webhook configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CatalogWebhookConfig {
+    /// Webhook endpoint URL (must start with http:// or https://).
+    pub url: WebhookUrl,
+    /// Request timeout in seconds (default: 30).
+    #[serde(default = "default_catalog_timeout_secs")]
+    pub timeout_secs: u64,
+    /// Static headers with environment variable interpolation.
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+    /// Outbound header name → inbound request header name mapping.
+    #[serde(default)]
+    pub headers_from_request: HashMap<String, String>,
+    /// Optional HMAC signing configuration.
+    #[serde(default)]
+    pub hmac: Option<CatalogHmacConfig>,
+}
+
+fn default_catalog_timeout_secs() -> u64 {
+    30
+}
+
+/// `[governance.catalog.hmac]` HMAC signing configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CatalogHmacConfig {
+    /// Primary HMAC secret (minimum 32 bytes). Supports env var interpolation.
+    pub secret: String,
 }

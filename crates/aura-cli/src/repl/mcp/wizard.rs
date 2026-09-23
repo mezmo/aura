@@ -15,8 +15,10 @@ use aura_config::config::McpServerConfig;
 
 use super::catalog::{CATALOG, CatalogEntry, Template};
 use crate::backend::Backend;
+use crate::backend::direct::DirectBackend;
 use crate::repl::registry::CommandContext;
 use crate::theme::{AuraStyle, Themed};
+use crate::ui::prompt::get_selected_model;
 
 /// How the wizard ended.
 enum WizardEnd {
@@ -33,25 +35,19 @@ pub(super) fn run(ctx: &mut CommandContext) {
     // The REPL loop hides the cursor around dispatch; this handler reads
     // input, so bring it back.
     let _ = crossterm::execute!(std::io::stdout(), crossterm::cursor::Show);
-    let Backend::Direct(direct) = ctx.backend else {
+    let backend = ctx.backend;
+    let Backend::Direct(direct) = backend else {
         println!(
             "/mcp add edits the local agent config, so it is only available in \
              standalone mode (run without --api-url)."
         );
         return;
     };
-    let config_path = direct.config_path().to_path_buf();
-    if !config_path.is_file() {
-        println!(
-            "The agent config was loaded from `{}`, which is not a single file. \
-             /mcp add can only edit a single-file config; add the server to one \
-             of the TOML files in that directory manually.",
-            config_path.display()
-        );
+    let Some(config_path) = target_file(ctx, direct) else {
         return;
-    }
+    };
 
-    match drive(ctx, &config_path) {
+    match drive(ctx, config_path) {
         WizardEnd::Written {
             name,
             starter_prompt,
@@ -81,6 +77,65 @@ pub(super) fn run(ctx: &mut CommandContext) {
         WizardEnd::Aborted => println!("\n/mcp add aborted — nothing was written."),
         WizardEnd::Failed(reason) => {
             println!("\n{} {reason}", "error:".themed(AuraStyle::Error));
+        }
+    }
+}
+
+/// The config file the server lands in. A lone agent, or a `/model`
+/// selection that names one, settles it without a question; otherwise the
+/// user picks the agent here. `None` means the user aborted the pick.
+fn target_file<'d>(ctx: &mut CommandContext, direct: &'d DirectBackend) -> Option<&'d Path> {
+    let selected = get_selected_model();
+    let matched = selected
+        .as_deref()
+        .and_then(|selected| direct.find_matching_model(selected));
+    if let Some(file) = direct.config_file_for(selected.as_deref()) {
+        if let (Some(selected), None, [only]) = (&selected, &matched, direct.agent_files()) {
+            println!(
+                "`{selected}` matches no loaded agent; using the only one, `{}`.",
+                only.id
+            );
+        }
+        return Some(file);
+    }
+    if let Some(selected) = selected {
+        println!("The selected model `{selected}` does not match any loaded agent.");
+    }
+    println!(
+        "{}",
+        format!(
+            "Several agents are loaded from {} — which one gets the server?",
+            direct.config_path().display()
+        )
+        .themed(AuraStyle::Heading)
+    );
+    // Hidden agents are listed too: `hidden` governs what `/model` and the
+    // server advertise, not which file the person at the keyboard may edit.
+    let agents = direct.agent_files();
+    for (i, agent) in agents.iter().enumerate() {
+        let file = agent
+            .path
+            .file_name()
+            .unwrap_or(agent.path.as_os_str())
+            .to_string_lossy();
+        let hidden = if agent.hidden { " (hidden)" } else { "" };
+        println!(
+            "  {} {}{} {} {}",
+            format!("{}.", i + 1).themed(AuraStyle::Muted),
+            agent.id.as_str().themed(AuraStyle::Heading),
+            hidden.themed(AuraStyle::Muted),
+            "—".themed(AuraStyle::Muted),
+            file.themed(AuraStyle::Muted),
+        );
+    }
+    loop {
+        let Some(answer) = ask(ctx, &format!("Agent [1-{}]: ", agents.len())) else {
+            println!("\n/mcp add aborted — nothing was written.");
+            return None;
+        };
+        match answer.parse::<usize>() {
+            Ok(n) if (1..=agents.len()).contains(&n) => return Some(&agents[n - 1].path),
+            _ => println!("Enter a number between 1 and {}.", agents.len()),
         }
     }
 }

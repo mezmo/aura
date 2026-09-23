@@ -141,6 +141,11 @@ pub struct AgentRuntimeConfig {
     /// single-agent and orchestration paths share one value.
     pub request_id: Option<String>,
 
+    /// Computed instance UUID for this agent, derived from agent config and
+    /// host identity. Threaded into HITL approval requests so webhook
+    /// receivers can identify which instance raised each approval.
+    pub instance_id: String,
+
     /// The `request_approval` tool, pre-built with the appropriate
     /// [`AgentScope`]. Orchestration workers set this in `create_worker` with
     /// `AgentScope::Worker`; single-agent mode sets it in `Agent::new` with
@@ -174,6 +179,7 @@ impl Clone for AgentRuntimeConfig {
             orchestration_submit_result: self.orchestration_submit_result.clone(),
             hitl: self.hitl.clone(),
             request_id: self.request_id.clone(),
+            instance_id: self.instance_id.clone(),
             hitl_request_approval_tool: self.hitl_request_approval_tool.clone(),
         }
     }
@@ -217,6 +223,7 @@ impl std::fmt::Debug for AgentRuntimeConfig {
             )
             .field("hitl", &self.hitl.as_ref().map(|_| "<hitl>"))
             .field("request_id", &self.request_id)
+            .field("instance_id", &self.instance_id)
             .field(
                 "hitl_request_approval_tool",
                 &self

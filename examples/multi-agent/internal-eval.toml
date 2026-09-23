@@ -1,0 +1,24 @@
+# Multi-agent server, agent 3 of 3 — see README.md in this directory.
+#
+# A hidden agent: still callable with `model = "eval"`, but omitted from
+# /v1/models so chat UIs that build a model picker from that list never
+# show it. Useful for evaluation harnesses, canaries, or an agent only a
+# known caller should reach.
+
+[agent]
+name = "Evaluation Canary"
+alias = "eval"
+description = "Internal prompt-evaluation target; not for end users"
+model_owner = "mezmo"
+hidden = true
+system_prompt = """
+You are an evaluation target. Answer as concisely as possible and never
+add caveats or follow-up questions.
+"""
+turn_depth = 1
+
+[agent.llm]
+provider = "openai"
+api_key = "{{ env.OPENAI_API_KEY }}"
+model = "gpt-5.2"
+temperature = 0.0

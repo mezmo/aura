@@ -1,0 +1,76 @@
+# Human-in-the-loop (webhook route) — gate destructive Kubernetes tools behind
+# an external approval service. Read-only tools run immediately; anything
+# matching `require_approval` is parked until the webhook answers.
+#
+# Use the webhook route when the approver is NOT the person chatting with the
+# agent (e.g. an on-call engineer paged through Slack/PagerDuty, or a policy
+# service). For an approver who is already at the client, see
+# hitl-conversational.toml.
+#
+# Prerequisites:
+#   export OPENAI_API_KEY="sk-..."
+#   Kubernetes context configured (kubectl access)
+#   Start the K8s MCP server WITHOUT --read-only so mutating tools exist:
+#     npx -y kubernetes-mcp-server@latest --port 8081
+#   An HTTP endpoint that accepts the approval request and replies allow/deny:
+#     export HITL_WEBHOOK_URL="https://approvals.example.com/aura"
+#   Optional but recommended — sign outbound webhook requests (HMAC-SHA256,
+#   min 32 bytes) and verify the response:
+#     export AURA_HITL_WEBHOOK_SECRET="$(openssl rand -hex 32)"
+#
+# Usage:
+#   CONFIG_PATH=examples/complete/hitl-webhook.toml cargo run --bin aura -- webserver
+#
+# Docs: https://docs.mezmo.com/aura/hitl
+
+# Presence of the [hitl] table enables gating; there is no `enabled` key.
+[hitl]
+# Glob patterns matched against MCP tool names. A tool is gated if it matches
+# ANY pattern. The built-in `request_approval` tool is never gated.
+require_approval = [
+  "*_delete",                 # pods_delete, resources_delete, ...
+  "pods_exec",
+  "resources_create_or_update",
+  "helm_install",
+  "helm_uninstall",
+]
+
+# [hitl.route] is required whenever [hitl] is present.
+[hitl.route]
+mode = "webhook"
+url = "{{ env.HITL_WEBHOOK_URL | default: 'https://approvals.example.com/aura' }}"
+# How long a parked tool call waits for the webhook before failing (default 300).
+timeout_secs = 300
+# Static headers sent on every webhook request.
+headers = { "x-aura-tenant" = "sre-prod" }
+# Forward headers from the inbound chat request to the webhook, so the approval
+# service can see who asked. Keys are webhook header names, values are inbound
+# request header names (matched case-insensitively).
+headers_from_request = { "authorization" = "authorization" }
+
+[mcp]
+sanitize_schemas = true
+
+# Kubernetes — cluster inspection and management
+# https://github.com/containers/kubernetes-mcp-server
+[mcp.servers.kubernetes]
+transport = "http_streamable"
+url = "http://localhost:8081/mcp"
+description = "Kubernetes cluster operations: pods, deployments, services, logs"
+
+[agent]
+name = "Kubernetes Operator"
+model_owner = "mezmo"
+system_prompt = """
+You are a Kubernetes operations assistant. You may inspect any resource
+freely. Mutating operations (delete, exec, apply, helm) require human
+approval — the platform will pause the call and ask; you do not need to
+ask yourself. If an approval is denied, explain what you intended to do
+and stop. Always name the namespace and resource explicitly.
+"""
+turn_depth = 20
+
+[agent.llm]
+provider = "openai"
+api_key = "{{ env.OPENAI_API_KEY }}"
+model = "gpt-5.2"

@@ -53,43 +53,52 @@ pub struct DirectBackend {
     extra_headers: HashMap<String, String>,
     /// Filesystem source of the loaded configs (file or directory).
     config_path: PathBuf,
+    agent_files: Vec<AgentFile>,
+}
+
+/// A loaded agent and the file that defines it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentFile {
+    /// Effective agent id (alias, else name).
+    pub id: String,
+    pub path: PathBuf,
+    /// `[agent].hidden`.
+    pub hidden: bool,
 }
 
 impl DirectBackend {
     /// Load configs and construct AppState, mirroring the web server's startup.
     pub async fn from_toml(
-        config_path: &str,
+        config_path: impl AsRef<Path>,
         extra_headers: Vec<(String, String)>,
     ) -> Result<Self> {
+        let config_path = config_path.as_ref();
+
         // Surface a friendly, actionable message when the config is simply
         // missing, instead of leaking a raw "No such file or directory" IO
-        // error. This is the common first-run case: `aura-cli` defaults to
-        // `config.toml` in the current directory when neither `--config` nor
-        // `--api-url` is given.
-        if !std::path::Path::new(config_path).exists() {
-            // Derive the program name from the running executable rather than
-            // hardcoding it, so the suggested command stays correct if the
-            // binary is renamed (e.g. `aura-cli` -> `aura`).
-            let prog = std::env::current_exe()
-                .ok()
-                .as_deref()
-                .and_then(std::path::Path::file_name)
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "aura".to_string());
-            anyhow::bail!(
-                "No agent config found at `{config_path}`.\n\n\
-                 Standalone mode needs a TOML agent config. To get started:\n  \
-                 • run `{prog} init` to generate one in the current directory\n  \
-                 • pass `--config <path>` to point at an existing config file or directory\n  \
-                 • set `--api-url <url>` (or AURA_API_URL) to connect to a running AURA web server instead"
-            );
+        // error.
+        if !config_path.exists() {
+            anyhow::bail!(crate::agent_config::missing_config_message(
+                std::slice::from_ref(&config_path)
+            ));
         }
 
-        let configs =
-            aura_config::load_config(config_path).context("Failed to load agent config")?;
-        if configs.is_empty() {
-            anyhow::bail!("No agent config found in {}", config_path);
+        let loaded =
+            aura_config::load_config_files(config_path).context("Failed to load agent config")?;
+        if loaded.is_empty() {
+            anyhow::bail!("No agent config found in {}", config_path.display());
         }
+        let (agent_files, configs): (Vec<AgentFile>, Vec<aura_config::Config>) = loaded
+            .into_iter()
+            .map(|(path, config)| {
+                let agent = AgentFile {
+                    id: config.agent_id().to_owned(),
+                    path,
+                    hidden: config.agent.hidden,
+                };
+                (agent, config)
+            })
+            .unzip();
 
         // Load the HITL webhook HMAC once at startup; a misconfiguration
         // fails the CLI boot rather than the first approval request.
@@ -99,6 +108,13 @@ impl DirectBackend {
             if let Some(hitl) = &config.hitl {
                 aura::hitl::validate_webhook_signing_config(hitl, hitl_webhook_hmac.as_ref())
                     .context("Invalid HITL webhook configuration")?;
+                aura::hitl::warn_on_cleartext_capture(hitl);
+                // The CLI's tracing subscriber is a no-op unless `log_file`
+                // is set, so the warning rides stderr as well — silent by
+                // default here would contradict the posture the ADR records.
+                if let Some(warning) = aura::hitl::cleartext_capture_warning(hitl) {
+                    eprintln!("warning: {warning}");
+                }
             }
         }
 
@@ -128,15 +144,35 @@ impl DirectBackend {
         Ok(Self {
             app_state,
             extra_headers: headers_map,
-            config_path: PathBuf::from(config_path),
+            config_path: config_path.to_path_buf(),
+            agent_files,
         })
     }
 
-    /// Path the agent configs were loaded from, as given at startup. May
-    /// be a directory (`load_config` accepts both) — writers must check
-    /// `is_file()` first.
+    /// Path the agent configs were loaded from — a file or a directory.
+    /// Writers edit one agent's file: see [`Self::config_file_for`].
     pub fn config_path(&self) -> &Path {
         &self.config_path
+    }
+
+    /// Every loaded agent with the file that defines it, in load order.
+    pub fn agent_files(&self) -> &[AgentFile] {
+        &self.agent_files
+    }
+
+    /// The file a writer should edit: the only loaded agent's file, or the
+    /// file of the agent `selected` names (any spelling
+    /// [`Self::find_matching_model`] accepts). `None` when several agents
+    /// are loaded and `selected` picks none of them.
+    pub fn config_file_for(&self, selected: Option<&str>) -> Option<&Path> {
+        if let [only] = self.agent_files.as_slice() {
+            return Some(&only.path);
+        }
+        let id = self.find_matching_model(selected?)?;
+        self.agent_files
+            .iter()
+            .find(|agent| agent.id == id)
+            .map(|agent| agent.path.as_path())
     }
 
     /// Return `true` if any loaded config enables client-side tools.
@@ -158,6 +194,11 @@ impl DirectBackend {
     /// without an HTTP round-trip to `/v1/approvals/{id}`.
     pub fn pending_approvals(&self) -> aura::hitl::PendingApprovals {
         self.app_state.pending_approvals.clone()
+    }
+
+    /// Access the loaded agent configs for governance operations.
+    pub fn configs(&self) -> &[aura_config::Config] {
+        &self.app_state.configs
     }
 
     /// Return the effective model ID for each loaded config.
@@ -495,12 +536,22 @@ mod tests {
             hitl_webhook_hmac: None,
             session_store: Arc::new(InMemorySessionStore::new()),
         });
+        // Synthetic: these configs were built in memory, not loaded from
+        // disk, so point at paths that cannot exist.
+        let agent_files = app_state
+            .configs
+            .iter()
+            .map(|c| AgentFile {
+                id: c.agent_id().to_owned(),
+                path: PathBuf::from(format!("/nonexistent/{}.toml", c.agent_id())),
+                hidden: c.agent.hidden,
+            })
+            .collect();
         DirectBackend {
             app_state,
             extra_headers: HashMap::new(),
-            // Synthetic: these configs were built in memory, not loaded
-            // from disk, so point at a path that cannot exist.
             config_path: PathBuf::from("/nonexistent/in-memory-test-config.toml"),
+            agent_files,
         }
     }
 
@@ -632,6 +683,58 @@ preamble = "p"
     // -----------------------------------------------------------------------
     // model_ids
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn config_file_for_single_config_ignores_selection() {
+        let backend = make_backend(vec![make_config("Only", None, "p")]);
+        let expected = Path::new("/nonexistent/Only.toml");
+        assert_eq!(backend.config_file_for(None), Some(expected));
+        assert_eq!(
+            backend.config_file_for(Some("something-else")),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn agent_files_keep_hidden_agents_and_flag_them() {
+        let mut ghost = make_config("Ghost", None, "p");
+        ghost.agent.hidden = true;
+        let backend = make_backend(vec![make_config("Seen", None, "p"), ghost]);
+        let flags: Vec<(&str, bool)> = backend
+            .agent_files()
+            .iter()
+            .map(|agent| (agent.id.as_str(), agent.hidden))
+            .collect();
+        assert_eq!(flags, vec![("Seen", false), ("Ghost", true)]);
+        // Hidden agents stay reachable by explicit selection.
+        assert_eq!(
+            backend.config_file_for(Some("ghost")),
+            Some(Path::new("/nonexistent/Ghost.toml"))
+        );
+    }
+
+    #[test]
+    fn config_file_for_multiple_configs_needs_a_matching_selection() {
+        let backend = make_backend(vec![
+            make_config("Alpha", Some("a"), "p"),
+            make_config("Beta", None, "p"),
+        ]);
+        assert_eq!(backend.config_file_for(None), None);
+        assert_eq!(backend.config_file_for(Some("gamma")), None);
+        assert_eq!(
+            backend.config_file_for(Some("a")),
+            Some(Path::new("/nonexistent/a.toml"))
+        );
+        // Name and alias both resolve, case-insensitively, to the alias-keyed file.
+        assert_eq!(
+            backend.config_file_for(Some("ALPHA")),
+            Some(Path::new("/nonexistent/a.toml"))
+        );
+        assert_eq!(
+            backend.config_file_for(Some("beta")),
+            Some(Path::new("/nonexistent/Beta.toml"))
+        );
+    }
 
     #[test]
     fn model_ids_uses_alias_when_present() {

@@ -23,6 +23,12 @@ done
 VERSION="${VERSION#v}"
 [ -n "${VERSION}" ] || { echo "${USAGE}" >&2; exit 1; }
 
+# Before any token or network use, so prerelease channels, which hold no tap
+# credentials, can run the same command chain.
+case "${VERSION}" in
+  *-*) echo "Prerelease ${VERSION}: the tap follows stable only, nothing to do"; exit 0 ;;
+esac
+
 TAP_REPO="mezmo/homebrew-tap"
 CHECKSUMS="${CHECKSUMS_FILE:-dist/checksums.txt}"
 TOKEN="${GH_TOKEN:-${GITHUB_TOKEN:-}}"

@@ -1,8 +1,11 @@
 // ---------------------------------------------------------------------------
-// Status bar rendering
+// Status area below the input frame: row sizing, the hint overlay, per-turn
+// notices, Ctrl-C handling, and the counters the status line reads. Row 0's
+// text itself is rendered by `status_line`.
 // ---------------------------------------------------------------------------
 
 use std::io::{self, Write};
+use std::num::NonZeroU64;
 use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -11,44 +14,198 @@ use crossterm::cursor;
 use crossterm::execute;
 use crossterm::terminal;
 
+use crate::api::mcp_status::{McpCounts, counts_from_event};
+use crate::event_names;
 use crate::theme::{AuraStyle, Themed};
 
 use super::animation::render_queued_wave;
 use super::state::{
-    AUTO_COMPACT_CEILING, CONTEXT_OCCUPANCY, CONTEXT_OCCUPANCY_FRESH, CTRLC_HINT_VISIBLE,
-    CTRLC_RESET_SKIP, CUMULATIVE_COMPLETION, CUMULATIVE_PROMPT, CUMULATIVE_SCRATCHPAD_EXTRACTED,
-    CUMULATIVE_SCRATCHPAD_INTERCEPTED, CURSOR_ROW, FRAME_LINES, LAST_CTRLC, PROCESSING,
-    QUEUED_INPUT, QUEUED_WAVE_POS, STATUS_BAR, STATUS_HINT, STATUS_ROWS, TURN_NOTICES, lock_term,
-    status_rows, term_size,
+    AGENT_HOST, CONTEXT_USED, CONTEXT_USED_FRESH, CTRLC_HINT_VISIBLE, CTRLC_RESET_SKIP,
+    CUMULATIVE_CACHE_READ, CUMULATIVE_COMPLETION, CUMULATIVE_PROMPT,
+    CUMULATIVE_SCRATCHPAD_EXTRACTED, CUMULATIVE_SCRATCHPAD_INTERCEPTED, CURSOR_ROW, CWD,
+    FRAME_LINES, LAST_CTRLC, MCP_COUNTS, MODEL_CONTEXT_LIMIT, ORCHESTRATED, PROCESSING,
+    QUEUED_INPUT, QUEUED_WAVE_POS, SESSION_MODEL, STATUS_HINT, STATUS_ROWS, STATUS_SEGMENTS,
+    TURN_NOTICES, get_selected_model, lock_term, status_rows, term_size,
 };
+use super::status_line::{self, ContextUsage, DEFAULT_SEGMENTS, Segment, Snapshot};
+use super::text::strip_control_chars;
 
-/// Format a number with comma separators (e.g. 1234 -> "1,234").
-fn format_number_with_commas(n: u64) -> String {
-    let s = n.to_string();
-    let mut result = String::new();
-    for (i, c) in s.chars().rev().enumerate() {
-        if i > 0 && i % 3 == 0 {
-            result.push(',');
+/// Right-aligned on the status line while the REPL is idle.
+const IDLE_RIGHT_TEXT: &str = "AURA, by Mezmo!";
+/// Right-aligned on the status line while a request is in flight.
+const BUSY_RIGHT_TEXT: &str = "esc to stop";
+
+/// Where the agent the status line describes is running.
+#[derive(Debug)]
+pub enum AgentHost {
+    /// In this process.
+    Local,
+    /// On an aura-web-server reached over HTTP.
+    Remote {
+        /// Server address in display form (see `status_line::server_display`).
+        server: String,
+        /// Whether this process runs local tools on the server's behalf.
+        client_tools: bool,
+    },
+}
+
+/// Install the segments the status line shows; only the first call takes
+/// effect.
+pub fn set_status_segments(segments: Vec<Segment>) {
+    let _ = STATUS_SEGMENTS.set(segments);
+}
+
+/// Record where the agent runs; only the first call takes effect.
+pub fn set_agent_host(host: AgentHost) {
+    let _ = AGENT_HOST.set(host);
+}
+
+/// Record the model and context window reported by `aura.session_info`.
+///
+/// A window already learned for the same model — from an earlier
+/// `session_info` or an `aura.context_usage` reading — survives an event that
+/// omits one, so the meter does not blink out at the start of every turn. A
+/// different model has a different window, so a model change forgets the old
+/// one unless the event reports a new one.
+pub fn set_session_info(model: String, context_limit: Option<u64>) {
+    let model_changed = SESSION_MODEL
+        .lock()
+        .map(|mut g| {
+            let changed = g.as_deref() != Some(model.as_str());
+            *g = Some(model);
+            changed
+        })
+        .unwrap_or(true);
+    match context_limit {
+        Some(limit) => MODEL_CONTEXT_LIMIT.store(limit, Ordering::Relaxed),
+        None if model_changed => MODEL_CONTEXT_LIMIT.store(0, Ordering::Relaxed),
+        None => {}
+    }
+}
+
+/// Record the tokens currently occupying the model's context.
+pub fn set_context_used(tokens: u64) {
+    CONTEXT_USED.store(tokens, Ordering::Relaxed);
+}
+
+/// Record a mid-turn context estimate taken from an `aura.tool_usage` reading.
+///
+/// Ignored in an orchestrated conversation: those readings come from every
+/// worker as well as the coordinator (the event carries no agent id), so only
+/// the conversation's own `aura.context_usage` reading describes its context
+/// there.
+pub fn set_mid_turn_context_estimate(tokens: u64) {
+    if ORCHESTRATED.load(Ordering::Relaxed) {
+        return;
+    }
+    set_context_used(tokens);
+}
+
+/// Record the latest MCP server tally.
+pub fn set_mcp_counts(counts: McpCounts) {
+    if let Ok(mut g) = MCP_COUNTS.lock() {
+        *g = Some(counts);
+    }
+}
+
+/// Record what the status line learns from a stream event: the model and
+/// context window from `aura.session_info`, the server tally from
+/// `aura.mcp_status`. Other events are ignored.
+pub fn record_session_event(event_name: &str, val: &serde_json::Value) {
+    if event_name == event_names::SESSION_INFO {
+        if let Some(model) = val.get("model").and_then(|m| m.as_str()) {
+            set_session_info(
+                model.to_owned(),
+                val.get("model_context_limit").and_then(|l| l.as_u64()),
+            );
         }
-        result.push(c);
-    }
-    result.chars().rev().collect()
-}
-
-/// Approximate token count from a byte count (~4 bytes per token).
-fn bytes_to_tokens(bytes: u64) -> u64 {
-    bytes / 4
-}
-
-/// Set the status bar text.
-pub fn set_status_bar(text: String) {
-    if let Ok(mut guard) = STATUS_BAR.lock() {
-        *guard = text;
+    } else if event_name == event_names::MCP_STATUS
+        && let Some(counts) = counts_from_event(val)
+    {
+        set_mcp_counts(counts);
     }
 }
 
-fn get_status_bar() -> String {
-    STATUS_BAR.lock().map(|g| g.clone()).unwrap_or_default()
+/// Record that this conversation is orchestrated.
+pub fn mark_orchestrated() {
+    ORCHESTRATED.store(true, Ordering::Relaxed);
+}
+
+/// Forget everything the status line learned from the previous
+/// conversation's stream — reported model, context window, MCP tally,
+/// context size, and whether it was orchestrated — so a fresh conversation
+/// starts blank rather than showing the old session's metadata until its
+/// first turn reports.
+pub fn reset_session_status() {
+    if let Ok(mut g) = SESSION_MODEL.lock() {
+        *g = None;
+    }
+    MODEL_CONTEXT_LIMIT.store(0, Ordering::Relaxed);
+    if let Ok(mut g) = MCP_COUNTS.lock() {
+        *g = None;
+    }
+    ORCHESTRATED.store(false, Ordering::Relaxed);
+    set_context_used(0);
+    CONTEXT_USED_FRESH.store(false, Ordering::Relaxed);
+}
+
+fn capture_snapshot() -> Snapshot {
+    // A remote agent's working tree is the server's, so the local directory
+    // and branch say nothing about it — except that client tools still run
+    // against the local directory, which keeps the cwd relevant.
+    let (server, show_cwd, show_git) = match AGENT_HOST.get() {
+        None | Some(AgentHost::Local) => (None, true, true),
+        Some(AgentHost::Remote {
+            server,
+            client_tools,
+        }) => (Some(server.clone()), *client_tools, false),
+    };
+    let cwd = if show_cwd {
+        CWD.get_or_init(|| std::env::current_dir().ok()).as_deref()
+    } else {
+        None
+    };
+    // Show the count once something has been reported, with the meter when
+    // the model's window is known. In an orchestrated conversation this is the
+    // persistent conversation's context, not any worker's.
+    let used = CONTEXT_USED.load(Ordering::Relaxed);
+    let limit = NonZeroU64::new(MODEL_CONTEXT_LIMIT.load(Ordering::Relaxed));
+    let context = (used > 0 || limit.is_some()).then_some(ContextUsage { used, limit });
+    Snapshot {
+        model: get_selected_model().or_else(|| SESSION_MODEL.lock().ok().and_then(|g| g.clone())),
+        server,
+        cwd: cwd.map(|p| status_line::abbreviate_home(p, dirs::home_dir().as_deref())),
+        git_branch: cwd.filter(|_| show_git).and_then(status_line::git_branch),
+        context,
+        prompt_tokens: CUMULATIVE_PROMPT.lock().map(|g| *g).unwrap_or(0),
+        completion_tokens: CUMULATIVE_COMPLETION.lock().map(|g| *g).unwrap_or(0),
+        cached_prompt_tokens: CUMULATIVE_CACHE_READ.lock().map(|g| *g).unwrap_or(0),
+        scratchpad_intercepted: CUMULATIVE_SCRATCHPAD_INTERCEPTED
+            .lock()
+            .map(|g| *g)
+            .unwrap_or(0),
+        scratchpad_extracted: CUMULATIVE_SCRATCHPAD_EXTRACTED
+            .lock()
+            .map(|g| *g)
+            .unwrap_or(0),
+        mcp: MCP_COUNTS.lock().ok().and_then(|g| *g),
+    }
+}
+
+/// The status line for the current REPL state, styled and fitted to the
+/// terminal width.
+fn status_line_now() -> String {
+    let (width, _) = term_size();
+    let right = if PROCESSING.load(Ordering::Relaxed) {
+        BUSY_RIGHT_TEXT
+    } else {
+        IDLE_RIGHT_TEXT
+    };
+    let segments = STATUS_SEGMENTS
+        .get()
+        .map(Vec::as_slice)
+        .unwrap_or(DEFAULT_SEGMENTS);
+    status_line::render(&capture_snapshot(), segments, width as usize, right)
 }
 
 /// Whether the status area is currently showing a hint overlay.
@@ -57,22 +214,14 @@ pub(crate) fn is_hint_active() -> bool {
 }
 
 /// Whether per-turn notices should currently be shown. Notices are hidden
-/// while a request is processing (the status area shows "esc to stop") and
-/// while a hint overlay is active.
+/// while a request is processing and while a hint overlay is active.
 fn notices_visible() -> bool {
     !PROCESSING.load(Ordering::Relaxed)
         && !is_hint_active()
         && TURN_NOTICES.lock().map(|g| !g.is_empty()).unwrap_or(false)
 }
 
-/// Whether the status lines are already styled (hint overlay or per-turn
-/// notices) and must therefore be printed verbatim rather than re-coloured
-/// `Muted` by the render sites.
-pub(crate) fn status_is_prestyled() -> bool {
-    is_hint_active() || notices_visible()
-}
-
-/// Number of status rows the notices require when idle: token line + a blank
+/// Number of status rows the notices require when idle: status line + a blank
 /// separator + one row per notice + a trailing (reserved) row. Returns the
 /// legacy default of 3 when no notices are visible.
 pub(crate) fn notice_status_rows() -> u16 {
@@ -94,56 +243,40 @@ pub(crate) fn desired_status_rows() -> u16 {
     notice_status_rows()
 }
 
-/// Return the lines to display in the status area.
+/// Return the styled lines to display in the status area.
 pub(crate) fn get_effective_status() -> Vec<String> {
     let hint = STATUS_HINT.lock().map(|g| g.clone()).unwrap_or_default();
     if !hint.is_empty() {
         return hint;
     }
 
-    let first = if PROCESSING.load(Ordering::Relaxed) {
-        "esc to stop".to_string()
-    } else {
-        let bar = get_status_bar();
-        if !bar.is_empty() {
-            bar
-        } else {
-            "? for help".to_string()
-        }
-    };
-
+    let first = status_line_now();
     if !notices_visible() {
         return vec![first];
     }
 
-    // Notices are present and idle: the whole status area renders verbatim
-    // (status_is_prestyled() is true), so pre-style the leading line as Muted
-    // to match its normal appearance, then a blank separator, then the
-    // already-styled notice lines.
     let notices = TURN_NOTICES.lock().map(|g| g.clone()).unwrap_or_default();
     let mut lines = Vec::with_capacity(notices.len() + 2);
-    lines.push(first.themed(AuraStyle::Muted).to_string());
+    lines.push(first);
     lines.push(String::new());
     lines.extend(notices);
     lines
 }
 
-/// Print a status line: pre-styled lines (hints / notices) are emitted as-is,
-/// others get the Muted style.
-pub(crate) fn print_status_line(line: &str, prestyled: bool) {
-    if prestyled {
-        print!("{line}");
-    } else {
-        print!("{}", line.themed(AuraStyle::Muted));
-    }
+/// Print one already-styled status line.
+pub(crate) fn print_status_line(line: &str) {
+    print!("{line}");
 }
 
-/// Append a per-turn status notice (error/warning) shown below the token line
-/// while idle. The `style` colours the whole line. The notice is data-only
-/// here — it becomes visible the next time the input frame is redrawn (i.e.
-/// once the in-flight request finishes), so this is safe to call mid-stream.
+/// Append a per-turn status notice (error/warning) shown below the status
+/// line while idle. The `style` colours the whole line. The notice is
+/// data-only here — it becomes visible the next time the input frame is
+/// redrawn (i.e. once the in-flight request finishes), so this is safe to
+/// call mid-stream.
 pub fn add_turn_notice(style: AuraStyle, message: impl AsRef<str>) {
-    let styled = message.as_ref().themed(style).to_string();
+    let styled = strip_control_chars(message.as_ref())
+        .themed(style)
+        .to_string();
     if let Ok(mut g) = TURN_NOTICES.lock() {
         g.push(styled);
     }
@@ -168,7 +301,6 @@ pub fn update_status_bar() {
 /// Inner implementation — caller must already hold `TERM_WRITE`.
 pub(crate) fn update_status_bar_unlocked() {
     let lines = get_effective_status();
-    let hint_active = status_is_prestyled();
     let queued = QUEUED_INPUT.lock().map(|g| g.clone()).unwrap_or_default();
     let show_queued = PROCESSING.load(Ordering::Relaxed) && !queued.is_empty();
     let sr = status_rows() as usize;
@@ -202,45 +334,32 @@ pub(crate) fn update_status_bar_unlocked() {
             let wave_pos = QUEUED_WAVE_POS.lock().map(|g| *g).unwrap_or(0.0);
             print!("{}", render_queued_wave(&queued, wave_pos));
         } else if let Some(line) = lines.get(i) {
-            print_status_line(line, hint_active);
+            print_status_line(line);
         }
     }
     let _ = execute!(stdout, cursor::RestorePosition);
     let _ = stdout.flush();
 }
 
-/// Accumulate token counts and update the status bar text.
+/// Accumulate a turn's billed token usage.
 pub fn set_status_bar_tokens(prompt_tokens: u64, completion_tokens: u64) {
-    let cumulative_prompt = CUMULATIVE_PROMPT
-        .lock()
-        .map(|mut g| {
-            *g += prompt_tokens;
-            *g
-        })
-        .unwrap_or(prompt_tokens);
-    let cumulative_completion = CUMULATIVE_COMPLETION
-        .lock()
-        .map(|mut g| {
-            *g += completion_tokens;
-            *g
-        })
-        .unwrap_or(completion_tokens);
-    let total = cumulative_prompt + cumulative_completion;
-
-    let left = build_status_left(cumulative_prompt, cumulative_completion, total);
-
-    let pressure = context_pressure_tokens(total);
-    let ceiling = AUTO_COMPACT_CEILING.load(Ordering::Relaxed);
-    let right = if ceiling > 0 && pressure < ceiling {
-        let remaining_pct = ((ceiling - pressure) as f64 / ceiling as f64 * 100.0).round() as u64;
-        format!("Context left: {remaining_pct}%")
-    } else {
-        "AURA, by Mezmo!".to_string()
-    };
-    set_status_bar(set_status_with_right_text(&left, &right));
+    if let Ok(mut g) = CUMULATIVE_PROMPT.lock() {
+        *g += prompt_tokens;
+    }
+    if let Ok(mut g) = CUMULATIVE_COMPLETION.lock() {
+        *g += completion_tokens;
+    }
 }
 
-/// Accumulate scratchpad savings and refresh the status bar.
+/// Accumulate prompt tokens the provider served from its prompt cache
+/// (a subset of the prompt tokens counted by `set_status_bar_tokens`).
+pub fn add_status_bar_cached_tokens(cache_read_tokens: u64) {
+    if let Ok(mut g) = CUMULATIVE_CACHE_READ.lock() {
+        *g += cache_read_tokens;
+    }
+}
+
+/// Accumulate scratchpad savings.
 pub fn add_scratchpad_usage(tokens_intercepted: u64, tokens_extracted: u64) {
     if let Ok(mut g) = CUMULATIVE_SCRATCHPAD_INTERCEPTED.lock() {
         *g += tokens_intercepted;
@@ -248,94 +367,6 @@ pub fn add_scratchpad_usage(tokens_intercepted: u64, tokens_extracted: u64) {
     if let Ok(mut g) = CUMULATIVE_SCRATCHPAD_EXTRACTED.lock() {
         *g += tokens_extracted;
     }
-    refresh_status_bar_from_counters();
-}
-
-/// Re-render the status bar from the current cumulative counters.
-fn refresh_status_bar_from_counters() {
-    let cumulative_prompt = CUMULATIVE_PROMPT.lock().map(|g| *g).unwrap_or(0);
-    let cumulative_completion = CUMULATIVE_COMPLETION.lock().map(|g| *g).unwrap_or(0);
-    let total = cumulative_prompt + cumulative_completion;
-
-    let left = build_status_left(cumulative_prompt, cumulative_completion, total);
-
-    let pressure = context_pressure_tokens(total);
-    let ceiling = AUTO_COMPACT_CEILING.load(Ordering::Relaxed);
-    let right = if ceiling > 0 && pressure < ceiling {
-        let remaining_pct = ((ceiling - pressure) as f64 / ceiling as f64 * 100.0).round() as u64;
-        format!("Context left: {remaining_pct}%")
-    } else {
-        "AURA, by Mezmo!".to_string()
-    };
-    set_status_bar(set_status_with_right_text(&left, &right));
-}
-
-/// Rebuild the idle status-bar text at the *current* terminal width.
-///
-/// The stored status string is pre-padded for right-alignment at the width it
-/// was built for ([`set_status_with_right_text`]), so after a resize it must be
-/// regenerated — otherwise reprinting it in a narrower window wraps to an extra
-/// row and scrolls the frame. Reproduces the pristine branding-only line until
-/// tokens have accrued (matching `setup_terminal`), then the token line.
-///
-/// Data-only (no terminal I/O); safe to call before taking the terminal lock.
-pub(crate) fn rebuild_status_bar() {
-    let prompt = CUMULATIVE_PROMPT.lock().map(|g| *g).unwrap_or(0);
-    let completion = CUMULATIVE_COMPLETION.lock().map(|g| *g).unwrap_or(0);
-    let intercepted = CUMULATIVE_SCRATCHPAD_INTERCEPTED
-        .lock()
-        .map(|g| *g)
-        .unwrap_or(0);
-    if prompt == 0 && completion == 0 && intercepted == 0 {
-        set_status_bar(set_status_with_right_text("", "AURA, by Mezmo!"));
-    } else {
-        refresh_status_bar_from_counters();
-    }
-}
-
-/// Build the left portion of the status bar text.
-fn build_status_left(cumulative_prompt: u64, cumulative_completion: u64, total: u64) -> String {
-    let base = format!(
-        "prompt: {} | completion: {} | context: {} tokens",
-        format_number_with_commas(cumulative_prompt),
-        format_number_with_commas(cumulative_completion),
-        format_number_with_commas(total),
-    );
-    let intercepted = CUMULATIVE_SCRATCHPAD_INTERCEPTED
-        .lock()
-        .map(|g| *g)
-        .unwrap_or(0);
-    let extracted = CUMULATIVE_SCRATCHPAD_EXTRACTED
-        .lock()
-        .map(|g| *g)
-        .unwrap_or(0);
-    if intercepted > 0 {
-        format!(
-            "{base} | scratchpad: intercepted ~{} tokens, extracted ~{} tokens",
-            format_number_with_commas(bytes_to_tokens(intercepted)),
-            format_number_with_commas(bytes_to_tokens(extracted)),
-        )
-    } else {
-        base
-    }
-}
-
-/// Combine left-aligned content with right-aligned text.
-pub(crate) fn set_status_with_right_text(left: &str, right: &str) -> String {
-    let (width, _) = term_size();
-    let left_len = left.len();
-    let right_len = right.len();
-    if left_len + right_len + 2 <= width as usize {
-        let gap = width as usize - left_len - right_len;
-        format!("{left}{}{right}", " ".repeat(gap))
-    } else {
-        left.to_string()
-    }
-}
-
-/// Set the token ceiling at which auto-compact will fire.
-pub fn set_auto_compact_ceiling(ceiling: u64) {
-    AUTO_COMPACT_CEILING.store(ceiling, Ordering::Relaxed);
 }
 
 /// Return the current cumulative total *billed* tokens (left-side display).
@@ -345,95 +376,113 @@ pub fn get_cumulative_tokens() -> u64 {
     prompt + completion
 }
 
-/// Tokens used to gauge context-window pressure: the reported context
-/// occupancy when available, otherwise the cumulative billed total as a
-/// pre-`aura.context_usage` fallback.
-fn context_pressure_tokens(cumulative_total: u64) -> u64 {
-    let occupancy = CONTEXT_OCCUPANCY.load(Ordering::Relaxed);
-    if occupancy > 0 {
-        occupancy
-    } else {
-        cumulative_total
-    }
-}
-
 /// Mark the occupancy reading as belonging to a previous turn.
 ///
 /// The reading itself is kept: it is the closest estimate available while the
-/// current turn streams, and dropping it would fall back to cumulative billed
-/// tokens, which exceed the window and blank the indicator. Decisions that must
-/// not act on a previous turn's context use
-/// [`fresh_context_fill_ratio`] instead.
+/// current turn streams, and dropping it would blank the indicator. Decisions
+/// that must not act on a previous turn's context use
+/// [`fresh_context_window_usage`] instead.
 pub fn begin_turn_context_tracking() {
-    CONTEXT_OCCUPANCY_FRESH.store(false, Ordering::Relaxed);
+    CONTEXT_USED_FRESH.store(false, Ordering::Relaxed);
 }
 
-/// Occupied fraction of the model's context window.
+/// Tokens occupying the model's context window, measured against that window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ContextWindowUsage {
+    pub used: u64,
+    pub window: NonZeroU64,
+}
+
+impl ContextWindowUsage {
+    /// Occupied fraction of the window.
+    pub fn fill(self) -> f64 {
+        self.used as f64 / self.window.get() as f64
+    }
+}
+
+/// Occupancy of the model's context window.
 ///
 /// `None` when either the occupancy or the window is unknown — no
-/// `aura.context_usage` has arrived, or the model's window was never
-/// configured — which callers treat as "fall back to token-count thresholds".
-pub fn context_fill_ratio() -> Option<f64> {
-    let occupancy = CONTEXT_OCCUPANCY.load(Ordering::Relaxed);
-    let window = AUTO_COMPACT_CEILING.load(Ordering::Relaxed);
-    (occupancy > 0 && window > 0).then(|| occupancy as f64 / window as f64)
+/// `aura.context_usage` has arrived, or neither it nor `aura.session_info`
+/// reported the model's window. Cumulative billed tokens are never a
+/// substitute: they grow with every turn of every agent and say nothing about
+/// what the window currently holds.
+pub fn context_window_usage() -> Option<ContextWindowUsage> {
+    let used = CONTEXT_USED.load(Ordering::Relaxed);
+    let window = NonZeroU64::new(MODEL_CONTEXT_LIMIT.load(Ordering::Relaxed))?;
+    (used > 0).then_some(ContextWindowUsage { used, window })
 }
 
-/// [`context_fill_ratio`] restricted to a reading the current turn reported.
+/// [`context_window_usage`] restricted to a reading the current turn reported.
 ///
 /// `None` once a turn passes without an `aura.context_usage` event, so callers
-/// fall back to token-count thresholds rather than acting on a fill fraction
-/// that describes an earlier turn's context.
-pub fn fresh_context_fill_ratio() -> Option<f64> {
-    if !CONTEXT_OCCUPANCY_FRESH.load(Ordering::Relaxed) {
+/// do not act on a fill that describes an earlier turn's context.
+pub fn fresh_context_window_usage() -> Option<ContextWindowUsage> {
+    if !CONTEXT_USED_FRESH.load(Ordering::Relaxed) {
         return None;
     }
-    context_fill_ratio()
+    context_window_usage()
 }
 
-/// Context-window pressure in tokens — used for auto-compaction decisions.
-/// Reflects actual context occupancy (not cumulative billed usage).
+/// Occupied fraction of the model's context window; see
+/// [`context_window_usage`].
+pub fn context_fill_ratio() -> Option<f64> {
+    context_window_usage().map(ContextWindowUsage::fill)
+}
+
+/// [`context_fill_ratio`] restricted to a reading the current turn reported;
+/// see [`fresh_context_window_usage`].
+pub fn fresh_context_fill_ratio() -> Option<f64> {
+    fresh_context_window_usage().map(ContextWindowUsage::fill)
+}
+
+/// Tokens occupying the model's context, as last reported by
+/// `aura.context_usage`; zero until a reading arrives.
 pub fn get_context_tokens() -> u64 {
-    context_pressure_tokens(get_cumulative_tokens())
+    CONTEXT_USED.load(Ordering::Relaxed)
 }
 
 /// Record context-window occupancy from an `aura.context_usage` event.
 ///
-/// Sets the absolute occupancy that drives the "Context left" indicator and
-/// auto-compaction, and, when the model's context window is known, points the
-/// ceiling at it so the percentage reflects the real window.
+/// Sets the absolute occupancy that drives the context segment and
+/// auto-compaction, and, when the event carries the model's context window,
+/// records it so the meter reflects the real window.
 pub fn set_context_window_usage(
     context_tokens: u64,
     response_tokens: u64,
     context_window: Option<u64>,
 ) {
-    CONTEXT_OCCUPANCY.store(context_tokens + response_tokens, Ordering::Relaxed);
-    CONTEXT_OCCUPANCY_FRESH.store(true, Ordering::Relaxed);
+    set_context_used(context_tokens + response_tokens);
+    CONTEXT_USED_FRESH.store(true, Ordering::Relaxed);
     if let Some(window) = context_window {
-        AUTO_COMPACT_CEILING.store(window, Ordering::Relaxed);
+        MODEL_CONTEXT_LIMIT.store(window, Ordering::Relaxed);
     }
-    refresh_status_bar_from_counters();
 }
 
 /// Seed cumulative token counters (used when resuming).
-pub fn seed_status_bar_tokens(prompt_tokens: u64, completion_tokens: u64) {
+pub fn seed_status_bar_tokens(prompt_tokens: u64, completion_tokens: u64, cache_read_tokens: u64) {
     if let Ok(mut g) = CUMULATIVE_PROMPT.lock() {
         *g = prompt_tokens;
     }
     if let Ok(mut g) = CUMULATIVE_COMPLETION.lock() {
         *g = completion_tokens;
     }
-    let total = prompt_tokens + completion_tokens;
-    let left = build_status_left(prompt_tokens, completion_tokens, total);
-    set_status_bar(set_status_with_right_text(&left, "AURA, by Mezmo!"));
+    if let Ok(mut g) = CUMULATIVE_CACHE_READ.lock() {
+        *g = cache_read_tokens;
+    }
 }
 
-/// Reset cumulative token counters to zero.
+/// Reset the cumulative token and scratchpad counters to zero. Replaying an
+/// event log rebuilds them, so repaint paths call this before a replay;
+/// conversation boundaries also call [`reset_session_status`].
 pub fn reset_status_bar_tokens() {
     if let Ok(mut g) = CUMULATIVE_PROMPT.lock() {
         *g = 0;
     }
     if let Ok(mut g) = CUMULATIVE_COMPLETION.lock() {
+        *g = 0;
+    }
+    if let Ok(mut g) = CUMULATIVE_CACHE_READ.lock() {
         *g = 0;
     }
     if let Ok(mut g) = CUMULATIVE_SCRATCHPAD_INTERCEPTED.lock() {
@@ -442,9 +491,6 @@ pub fn reset_status_bar_tokens() {
     if let Ok(mut g) = CUMULATIVE_SCRATCHPAD_EXTRACTED.lock() {
         *g = 0;
     }
-    CONTEXT_OCCUPANCY.store(0, Ordering::Relaxed);
-    CONTEXT_OCCUPANCY_FRESH.store(false, Ordering::Relaxed);
-    set_status_bar(set_status_with_right_text("", "AURA, by Mezmo!"));
 }
 
 // ---------------------------------------------------------------------------
@@ -514,20 +560,108 @@ pub fn reset_ctrlc_state() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+    use std::sync::{Mutex, MutexGuard};
+
+    // The status-line counters are process globals; tests that write them
+    // take turns so one test's reset does not land inside another's readings.
+    static STATE_LOCK: Mutex<()> = Mutex::new(());
+
+    fn state_lock() -> MutexGuard<'static, ()> {
+        STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn session_model() -> Option<String> {
+        SESSION_MODEL.lock().unwrap().clone()
+    }
+
+    #[test]
+    fn record_session_event_seeds_and_reset_clears() {
+        let _guard = state_lock();
+        record_session_event(
+            event_names::SESSION_INFO,
+            &json!({ "model": "gpt-4o", "model_context_limit": 128000 }),
+        );
+        record_session_event(
+            event_names::MCP_STATUS,
+            &json!({ "servers": [
+                { "server_name": "a", "status": "connected" },
+                { "server_name": "b", "status": "failed" }
+            ] }),
+        );
+        record_session_event("aura.progress", &json!({ "model": "other" }));
+        assert_eq!(session_model().as_deref(), Some("gpt-4o"));
+        assert_eq!(MODEL_CONTEXT_LIMIT.load(Ordering::Relaxed), 128000);
+        assert_eq!(
+            *MCP_COUNTS.lock().unwrap(),
+            Some(McpCounts {
+                connected: 1,
+                total: 2
+            })
+        );
+
+        reset_session_status();
+        assert_eq!(session_model(), None);
+        assert_eq!(MODEL_CONTEXT_LIMIT.load(Ordering::Relaxed), 0);
+        assert_eq!(*MCP_COUNTS.lock().unwrap(), None);
+    }
+
+    #[test]
+    fn session_info_without_a_window_keeps_the_known_one_for_the_same_model() {
+        let _guard = state_lock();
+        reset_session_status();
+        set_session_info("sonnet".to_owned(), Some(500_000));
+        // A later turn's session_info that omits the window (or a reading
+        // that reported it) leaves the meter's limit alone.
+        set_session_info("sonnet".to_owned(), None);
+        assert_eq!(MODEL_CONTEXT_LIMIT.load(Ordering::Relaxed), 500_000);
+        // A different model's window is unknown until something reports it.
+        set_session_info("haiku".to_owned(), None);
+        assert_eq!(MODEL_CONTEXT_LIMIT.load(Ordering::Relaxed), 0);
+        set_session_info("haiku".to_owned(), Some(200_000));
+        assert_eq!(MODEL_CONTEXT_LIMIT.load(Ordering::Relaxed), 200_000);
+        reset_session_status();
+    }
+
+    #[test]
+    fn orchestrated_conversation_shows_the_conversations_context() {
+        let _guard = state_lock();
+        reset_session_status();
+        mark_orchestrated();
+
+        // Worker tool turns stream mid-turn estimates that say nothing about
+        // the conversation's own context; they never reach the meter.
+        set_mid_turn_context_estimate(180_000);
+        assert_eq!(CONTEXT_USED.load(Ordering::Relaxed), 0);
+        assert_eq!(capture_snapshot().context, None);
+
+        // The conversation's own reading drives the meter.
+        set_context_window_usage(40_000, 1_200, Some(500_000));
+        assert_eq!(
+            capture_snapshot().context,
+            Some(ContextUsage {
+                used: 41_200,
+                limit: NonZeroU64::new(500_000),
+            })
+        );
+        reset_session_status();
+    }
 
     #[test]
     fn a_previous_turns_reading_still_displays_but_stops_driving_decisions() {
+        let _guard = state_lock();
         set_context_window_usage(100_000, 5_000, Some(200_000));
         assert_eq!(fresh_context_fill_ratio(), Some(0.525));
 
         // A later turn starts without reporting: the gauge keeps showing the
         // last known occupancy rather than blanking...
         begin_turn_context_tracking();
-        assert_eq!(CONTEXT_OCCUPANCY.load(Ordering::Relaxed), 105_000);
+        assert_eq!(CONTEXT_USED.load(Ordering::Relaxed), 105_000);
         assert_eq!(context_fill_ratio(), Some(0.525));
 
-        // ...while compaction decisions see no usable reading and fall back.
+        // ...while compaction decisions see no usable reading.
         assert_eq!(fresh_context_fill_ratio(), None);
+        assert_eq!(fresh_context_window_usage(), None);
 
         // A reading from the current turn drives decisions again.
         set_context_window_usage(150_000, 5_000, Some(200_000));

@@ -26,6 +26,8 @@ use crate::orchestration::{RunId, TaskIdentity};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ParkedApprovalRecord {
     pub version: u32,
+    #[serde(default)]
+    pub instance_id: String,
     pub decision_id: DecisionId,
     pub request_id: String,
     pub scope: ScopeRecord,
@@ -116,6 +118,7 @@ impl From<&ParkedApproval> for ParkedApprovalRecord {
         let request = &parked.request;
         Self {
             version: request.version,
+            instance_id: request.instance_id.clone(),
             decision_id: request.decision_id,
             request_id: request.request_id.clone(),
             scope: ScopeRecord::from(&request.scope),
@@ -134,6 +137,7 @@ impl TryFrom<ParkedApprovalRecord> for ParkedApproval {
         Ok(Self {
             request: ApprovalRequest {
                 version: record.version,
+                instance_id: record.instance_id,
                 decision_id: record.decision_id,
                 request_id: record.request_id,
                 scope: record.scope.try_into()?,
@@ -245,6 +249,7 @@ mod tests {
         ParkedApproval {
             request: ApprovalRequest {
                 version: PROTOCOL_VERSION,
+                instance_id: "test-instance".to_string(),
                 decision_id: DecisionId::generate(),
                 request_id: "req-1".to_string(),
                 scope,

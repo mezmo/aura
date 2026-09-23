@@ -21,6 +21,13 @@ pub enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<std::ffi::OsString>,
     },
+
+    /// Governance commands for policy integration and catalog sync.
+    #[cfg(feature = "standalone-cli")]
+    Governance {
+        #[command(subcommand)]
+        command: crate::governance::GovernanceCommands,
+    },
 }
 
 /// Aura CLI — interactive chat completions REPL
@@ -109,10 +116,10 @@ pub struct Args {
 
     /// Path to TOML agent config file or directory for standalone mode.
     /// When --api-url is not set, standalone mode is the default and this
-    /// flag selects which config to load. When omitted, defaults to
-    /// `config.toml` in the current directory.
+    /// flag selects which config to load. When omitted, the config is
+    /// discovered — see [`crate::agent_config`] for the search order.
     #[cfg(feature = "standalone-cli")]
-    #[arg(long = "config")]
+    #[arg(long = "config", env = "AURA_CONFIG")]
     pub agent_config: Option<String>,
 
     /// Path to a file for diagnostic logs. When unset, the CLI emits no
@@ -223,8 +230,11 @@ pub fn resolve_standalone(args: &Args) -> bool {
     }
 
     // --api-url is set and --standalone is not → HTTP mode.
-    // --config is ignored in HTTP mode; warn if it was passed.
-    if args.agent_config.is_some() {
+    // --config is ignored in HTTP mode; warn if it was passed. Only the raw
+    // flag warrants a warning — an exported AURA_CONFIG is ambient, and
+    // scolding every HTTP-mode invocation for it would be pure noise.
+    let config_from_flag = std::env::args().any(|a| a == "--config" || a.starts_with("--config="));
+    if config_from_flag {
         eprintln!(
             "warning: --config is ignored in HTTP mode (--api-url is set)\n\
              To run standalone with a config, omit --api-url or add --standalone."

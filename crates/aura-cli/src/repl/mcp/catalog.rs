@@ -98,6 +98,23 @@ pub(crate) const CATALOG: &[CatalogEntry] = &[
         starter_prompt: "Which Datadog monitors are currently alerting?",
     },
     CatalogEntry {
+        key: "linear",
+        description: "Linear issue tracking, projects, and cycles",
+        prerequisites: "Requires a Linear personal API key (Settings > Security & access > \
+                        API keys).\n\
+                        AURA will be able to read and write issues, projects, and cycles.",
+        template: Template::Http {
+            url: "https://mcp.linear.app/mcp",
+            headers: &[HeaderTemplate {
+                header: "Authorization",
+                value_template: "Bearer {{ env.LINEAR_API_KEY }}",
+                env_var: "LINEAR_API_KEY",
+                secret_prompt: "Linear API key",
+            }],
+        },
+        starter_prompt: "What issues are assigned to me right now?",
+    },
+    CatalogEntry {
         key: "kubernetes",
         description: "Kubernetes cluster inspection via kubernetes-mcp-server",
         prerequisites: "Requires Node.js (npx) and a working kubeconfig context.\n\

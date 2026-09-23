@@ -6,16 +6,18 @@ use std::sync::atomic::Ordering;
 
 use crate::api::types::DisplayEvent;
 use crate::backend::Backend;
+use crate::event_names;
 use crate::repl::conversations::ConversationStore;
 use crate::repl::history::ConversationHistory;
 use crate::repl::input_reader::{AuraHelper, HISTORY_COUNT, HISTORY_DEPTH};
 use crate::ui::prompt::{
     clear_display_events, clear_stream_events, clear_stream_panel_in_place, extend_display_events,
-    get_model_cache, get_model_matches, is_expanded_output, list_conversations,
-    load_and_restore_sse_events, print_help, print_welcome_state, redraw_input_frame,
-    replay_event_log_global, reset_status_bar_tokens, seed_model_cache, seed_status_bar_tokens,
-    set_expanded_output, set_mid_stream_history, set_selected_model, set_stream_conv_dir,
-    set_stream_show_all, set_welcome_state, toggle_stream_panel, with_event_log,
+    get_model_cache, get_model_matches, is_expanded_output, last_sse_event, list_conversations,
+    load_and_restore_sse_events, print_help, print_welcome_state, record_session_event,
+    redraw_input_frame, replay_event_log_global, reset_session_status, reset_status_bar_tokens,
+    seed_model_cache, set_expanded_output, set_mid_stream_history, set_selected_model,
+    set_stream_conv_dir, set_stream_show_all, set_welcome_state, toggle_stream_panel,
+    with_event_log,
 };
 use crate::ui::state::{RESUME_MATCHES, get_tab_select_index, set_tab_select_index};
 use crate::ui::welcome::WelcomeState;
@@ -94,6 +96,7 @@ pub(crate) fn handle_clear(
         crossterm::cursor::MoveTo(0, 0),
     );
     reset_status_bar_tokens();
+    reset_session_status();
     print_welcome_state();
 
     redraw_input_frame();
@@ -342,6 +345,9 @@ pub(crate) fn handle_resume(
             if let Some(s) = conv_store {
                 load_and_restore_sse_events(s.dir());
             }
+            // A different conversation: drop the previous one's reported
+            // model, window, MCP tally, and context size before replaying.
+            reset_session_status();
             // Restore selected model and model cache
             if let Some(s) = conv_store {
                 if let Some(model) = s.load_model() {
@@ -351,6 +357,23 @@ pub(crate) fn handle_resume(
                 }
                 if let Some(models) = s.load_models_cache() {
                     seed_model_cache(models);
+                }
+            }
+            // The display-event replay below carries no session metadata, so
+            // seed the model, window, and MCP tally from the resumed
+            // conversation's own last report — unless the selected model has
+            // changed since that turn, in which case they describe another
+            // model and stay blank until the next turn reports, as after
+            // /model. This runs after the selected model is restored because
+            // that forgets the window on a change.
+            if conv_store
+                .as_ref()
+                .is_some_and(ConversationStore::selected_model_matches_last_turn)
+            {
+                for name in [event_names::SESSION_INFO, event_names::MCP_STATUS] {
+                    if let Some(val) = last_sse_event(name) {
+                        record_session_event(name, &val);
+                    }
                 }
             }
             // Load per-conversation input history for the resumed conversation
@@ -371,12 +394,8 @@ pub(crate) fn handle_resume(
             set_welcome_state(WelcomeState::pick());
             // Replay the event log so the user sees the conversation
             crate::ui::prompt::erase_input_frame();
+            // Replay seeds the token counters from the usage ledger.
             replay_event_log_global();
-            // Seed token counters from authoritative usage JSONL after replay
-            if let Some(store) = conv_store {
-                let (p, c) = store.load_usage_totals();
-                seed_status_bar_tokens(p, c);
-            }
             println!(
                 "{}",
                 "Resumed conversation. Continue below.".themed(AuraStyle::Success),
@@ -454,7 +473,8 @@ pub(crate) fn handle_model(
     redraw_input_frame();
 }
 
-/// Returned tuple: (store, history, events, expanded, (prompt_tokens, completion_tokens))
+/// Returned tuple: (store, history, events, expanded,
+/// (prompt_tokens, completion_tokens, cache_read_tokens))
 #[allow(clippy::type_complexity)]
 pub(crate) fn resume_conversation(
     id_prefix: &str,
@@ -464,7 +484,7 @@ pub(crate) fn resume_conversation(
     ConversationHistory,
     Vec<DisplayEvent>,
     bool,
-    (u64, u64),
+    (u64, u64, u64),
 )> {
     match ConversationStore::find_by_prefix(id_prefix) {
         Ok(full_uuid) => {

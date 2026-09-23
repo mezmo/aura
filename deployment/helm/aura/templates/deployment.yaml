@@ -84,7 +84,19 @@ spec:
               value: {{ .Values.streaming.emitReasoning | quote }}
             - name: STREAMING_TIMEOUT_SECS
               value: {{ .Values.streaming.timeoutSecs | quote }}
-            # Server identifier from pod name
+            # Pod identity for instance ID derivation (downward API).
+            # POD_NAME and POD_NAMESPACE feed the K8s tier of the env_seed
+            # priority chain in aura::instance_id.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            # Legacy pod-name alias kept for backwards compatibility with
+            # any tooling that already reads SERVER_GUID.
             - name: SERVER_GUID
               valueFrom:
                 fieldRef:

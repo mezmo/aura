@@ -1,0 +1,86 @@
+# Reasoning / extended-thinking parameters — set per provider, side by side.
+#
+# These knobs live in different places and are rejected under the wrong
+# provider ([agent.llm] and every worker .llm reject unknown keys):
+#   openai      reasoning_effort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh"
+#   anthropic   [..llm.additional_params.thinking]  type + budget_tokens
+#   gemini      [..llm.additional_params]           provider thinking config
+#   ollama      [..llm.additional_params]           num_ctx, seed, top_p, ...
+# `additional_params` is merged into the provider request as-is; AURA does
+# not validate its contents.
+#
+# The coordinator runs on GPT-5 with high reasoning; one worker runs on
+# Claude with extended thinking; another runs GPT-5 with reasoning turned
+# down for cheap, fast lookups. Each worker's `.llm` is a complete config
+# with its own provider tag and credentials.
+#
+# Prerequisites:
+#   export OPENAI_API_KEY="sk-..."
+#   export ANTHROPIC_API_KEY="sk-ant-..."
+#
+# Usage:
+#   CONFIG_PATH=examples/complete/reasoning-models.toml cargo run --bin aura -- webserver
+
+[agent]
+name = "Analysis Coordinator"
+model_owner = "mezmo"
+system_prompt = """
+You coordinate analytical questions. Send anything that needs careful
+multi-step reasoning (trade-offs, root-cause arguments, design reviews)
+to deep-analysis. Send quick factual lookups and reformatting to fast.
+Answer trivial questions yourself.
+"""
+turn_depth = 6
+
+[agent.llm]
+provider = "openai"
+api_key = "{{ env.OPENAI_API_KEY }}"
+model = "gpt-5.2"
+# OpenAI-only key. "none" disables reasoning on models that allow it.
+reasoning_effort = "high"
+max_tokens = 16_000
+
+[orchestration]
+enabled = true
+max_planning_cycles = 2
+allow_direct_answers = true
+
+[orchestration.worker.deep-analysis]
+description = "Careful multi-step reasoning: trade-offs, root causes, design review"
+preamble = """
+You are a senior analyst. Think the problem through before answering.
+State your assumptions, weigh alternatives, and give a recommendation
+with the evidence that supports it.
+"""
+turn_depth = 4
+mcp_filter = []
+
+[orchestration.worker.deep-analysis.llm]
+provider = "anthropic"
+api_key = "{{ env.ANTHROPIC_API_KEY }}"
+model = "claude-sonnet-4-5-20250929"
+# Anthropic requires temperature 1.0 when thinking is enabled.
+temperature = 1.0
+# max_tokens must exceed the thinking budget.
+max_tokens = 16_000
+context_window = 200_000
+
+# Sent verbatim as the `thinking` field of the Messages API request.
+[orchestration.worker.deep-analysis.llm.additional_params.thinking]
+type = "enabled"
+budget_tokens = 8_000
+
+[orchestration.worker.fast]
+description = "Quick factual lookups, reformatting, short summaries"
+preamble = """
+You answer quickly and briefly. No preamble, no caveats.
+"""
+turn_depth = 2
+mcp_filter = []
+
+[orchestration.worker.fast.llm]
+provider = "openai"
+api_key = "{{ env.OPENAI_API_KEY }}"
+model = "gpt-5.2"
+reasoning_effort = "minimal"
+max_tokens = 2_000

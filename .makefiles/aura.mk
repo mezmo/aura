@@ -262,3 +262,29 @@ test-integration-session-store-local: $(REPORT_DIR) ## Start an ephemeral Valkey
 	test_exit=$$?; \
 	docker stop $(VALKEY_TEST_NAME) >/dev/null 2>&1 || true; \
 	exit $$test_exit
+
+# --- HITL header-forwarding integration tests (needs only mock-mcp; each ---
+# --- test case spawns and tears down its own aura-web-server) ---
+
+.PHONY:test-integration-hitl-local
+test-integration-hitl-local: $(REPORT_DIR) ## Start mock-mcp, run HITL header-forwarding integration tests, then cleanup
+	@echo "Starting mock-mcp for HITL header-forwarding testing..."
+	docker compose -f compose/base.yml -f compose/dev.yml up -d --build --force-recreate mock-mcp
+	@echo "Waiting for mock-mcp to be healthy..."
+	@timeout=90; while [ $$timeout -gt 0 ]; do \
+		mcp_status=$$(docker compose -f compose/base.yml -f compose/dev.yml ps mock-mcp --format '{{.Health}}' 2>/dev/null); \
+		if [ "$$mcp_status" = "healthy" ]; then \
+			echo "✅ mock-mcp is healthy"; \
+			break; \
+		fi; \
+		echo "Waiting... mock-mcp: $$mcp_status ($$timeout s remaining)"; \
+		sleep 2; \
+		timeout=$$((timeout - 2)); \
+	done; \
+	if [ "$$mcp_status" != "healthy" ]; then echo "❌ Timeout waiting for mock-mcp"; docker compose -f compose/base.yml -f compose/dev.yml down; exit 1; fi
+	@echo "Running HITL header-forwarding integration tests..."
+	@trap 'docker compose -f compose/base.yml -f compose/dev.yml down; exit 130' INT TERM; \
+	cargo test --package aura-web-server --features integration-hitl-header-forwarding --test hitl_header_forwarding_tests --no-fail-fast -- --test-threads=1; \
+	test_exit=$$?; \
+	docker compose -f compose/base.yml -f compose/dev.yml down; \
+	exit $$test_exit
