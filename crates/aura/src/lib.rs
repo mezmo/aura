@@ -13,6 +13,7 @@ pub mod env_flags;
 pub mod error;
 pub mod fallback_tool_parser;
 pub mod fallback_tool_stream;
+pub mod forwarded_headers;
 pub mod governance;
 pub mod hitl;
 pub mod hooks;
@@ -51,8 +52,8 @@ pub mod vector_store;
 pub mod webhook_utils;
 
 pub use builder::{
-    Agent, AgentBuilder, FilesystemTools, RunToolFactory, build_streaming_agent,
-    build_streaming_agent_with_tools, no_run_tools,
+    Agent, AgentBuilder, BeginRunError, FilesystemTools, PreparedAgent, RunToolFactory,
+    build_streaming_agent, build_streaming_agent_with_tools, no_run_tools,
 };
 pub use config::{AgentRuntimeConfig, SessionId, ToolContextFactory};
 // Pure config types are owned by `aura-config` and re-exported here for
@@ -63,6 +64,7 @@ pub use aura_config::{
     TodoToolsConfig, ToolsConfig, VectorStoreConfig, VectorStoreType, lenient_int,
 };
 pub use error::{BuilderError, BuilderResult};
+pub use forwarded_headers::ForwardedHeaders;
 pub use orchestration::tools::{
     CreatePlanTool, RequestClarificationTool, RespondDirectlyTool, RoutingDecision, RoutingToolSet,
 };
@@ -82,6 +84,7 @@ pub use rig::message::{AssistantContent, ToolCall as RigToolCall, ToolResultCont
 pub use rig::one_or_many::OneOrMany;
 pub use rig::tool::{Tool as RigTool, ToolDyn};
 pub use rig_builder::{RigBuilder, resolve_mcp_headers_in};
+pub use run_context::{BoundRun, RunContext, RunInProgress, RunLease};
 pub use scratchpad::{ScratchpadConfig, ScratchpadToolEntry};
 pub use streaming::StreamingAgent;
 
