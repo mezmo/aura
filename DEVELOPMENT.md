@@ -214,6 +214,7 @@ Prompt routing and execution model:
 - Direct Mode (`orchestration.enabled = false`): single `Agent` handles the turn.
 - Orchestration Mode (`orchestration.enabled = true`): `Orchestrator` coordinates worker execution.
 - Both `Agent` and `Orchestrator` implement `StreamingAgent`, so they are interchangeable at the API boundary.
+- An agent is two halves: `PreparedAgent` is built once from config (provider client, discovered tools, MCP connections) and `Agent` is one run of it, begun with `PreparedAgent::begin_run`. Per-run state (request id, scratchpad budget, turn-nudge counters) reaches tools through the prepared agent's `RunSlot`, and a prepared agent serves one run at a time; see `crates/aura/src/run.rs`. A prepared agent also forwards the `headers_from_request` values of the request that prepared it, and `begin_run` refuses a request that forwards different ones (`crates/aura/src/forwarded_headers.rs`). Today every request prepares a fresh agent; the split is what lets a session reuse one.
 
 Orchestrator components and loop:
 

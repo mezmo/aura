@@ -168,8 +168,8 @@ pub use aura_config::{ScratchpadConfig, ScratchpadToolEntry};
 pub struct ScratchpadToolsConfig {
     /// Shared storage for this request's scratchpad files.
     pub storage: Arc<ScratchpadStorage>,
-    /// Context budget tracker shared across all scratchpad tools.
-    pub budget: ContextBudget,
+    /// The prepared agent's run slot.
+    pub run: crate::run::RunSlot,
     /// Map of bare tool name → min_tokens threshold. Glob patterns from
     /// `[mcp.servers.<name>.scratchpad]` are expanded by `scratchpad_tool_map`
     /// when the agent is constructed for a request (per-server,

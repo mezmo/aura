@@ -42,12 +42,13 @@ impl std::fmt::Debug for dyn TokenCounter {
 /// The wrapped `CoreBPE` is borrowed from tiktoken-rs's process-wide
 /// `lazy_static` singletons (e.g. `o200k_base_singleton()`), so constructing
 /// a `TiktokenCounter` is effectively free — no vocabulary parsing, no
-/// HashMap allocation. The previous implementation called `o200k_base()` /
-/// `get_bpe_from_model()`, which rebuild a fresh `CoreBPE` from the embedded
-/// vocab file on every call (~3 MB include_str + ~200K HashMap inserts +
-/// ~20–40 MB heap, ~50–200 ms). With per-request `Agent::new()` and
-/// per-worker `create_worker()` paths in the hot path, that churn caused
-/// noticeable RSS bloat and host-level slowdown over long-running sessions.
+/// HashMap allocation. Building a `CoreBPE` from the embedded vocab file
+/// costs ~3 MB of `include_str`, ~200K HashMap inserts, ~20–40 MB of heap,
+/// and ~50–200 ms; the non-singleton tiktoken-rs constructors
+/// (`o200k_base()`, `get_bpe_from_model()`) pay that on every call, which
+/// on the per-request `PreparedAgent::prepare()` and per-worker
+/// `create_worker()` paths shows up as RSS bloat and host-level slowdown
+/// over a long-running process.
 pub struct TiktokenCounter {
     bpe: &'static tiktoken_rs::CoreBPE,
 }
@@ -257,6 +258,20 @@ impl ContextBudget {
     /// Get the per-call extraction token limit, if set.
     pub fn max_extraction_tokens(&self) -> Option<usize> {
         self.max_extraction_tokens
+    }
+
+    /// A budget with the same limits and no usage: the counters start over
+    /// from `initial_used`, as they did when this budget was created.
+    pub fn fresh(&self) -> Self {
+        Self {
+            max_extraction_tokens: self.max_extraction_tokens,
+            ..Self::new(
+                self.context_window,
+                self.safety_margin,
+                self.initial_used,
+                Arc::clone(&self.token_counter),
+            )
+        }
     }
 
     /// Usable token budget (context window minus safety margin).

@@ -52,14 +52,15 @@ use rig::client::CompletionClient;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-use crate::Agent;
 use crate::config::{AgentRuntimeConfig, LlmConfig};
 use crate::inactivity::{Liveness, STALL_MESSAGE, liveness_of};
 use crate::mcp::McpManager;
 use crate::provider_agent::{BuilderState, ProviderAgent, StreamError, StreamItem};
+use crate::run::RunSlot;
 use crate::scratchpad;
 use crate::string_utils::safe_truncate;
 use crate::tool_call_observer::ToolCallObserver;
+use crate::{Agent, PreparedAgent};
 
 use super::tools::RoutingToolSet;
 use super::tools::{InspectToolParamsTool, ListToolsTool, ReadArtifactTool};
@@ -747,6 +748,10 @@ impl Orchestrator {
             .or(self.agent_config.agent.scratchpad.as_ref())
             .cloned();
 
+        // The slot every wrapper and tool built below reaches this worker's
+        // run through; `begin_run` fills it once the worker is prepared.
+        let run = RunSlot::new();
+        let mut scratchpad_budget: Option<scratchpad::ContextBudget> = None;
         let mut scratchpad_tools = Vec::<Arc<dyn ToolWrapper>>::new();
         if let Some(ref sp_cfg) = effective_scratchpad
             && sp_cfg.enabled
@@ -829,10 +834,12 @@ impl Orchestrator {
                     context_window,
                     initial_used,
                     token_counter,
+                    run: run.clone(),
                 })
                 .await?;
 
                 scratchpad_tools.push(build.wrapper);
+                scratchpad_budget = Some(build.budget);
                 worker_config.scratchpad_tools_config = Some(build.tools_config);
             }
         }
@@ -881,10 +888,10 @@ impl Orchestrator {
         let mut wrappers: Vec<Arc<dyn ToolWrapper>> = vec![observer_wrapper, duplicate_guard];
         wrappers.extend(scratchpad_tools);
         wrappers.push(persistence_wrapper);
-        if let Some(ref state) = turn_nudge {
+        if turn_nudge.is_some() {
             wrappers.insert(
                 0,
-                Arc::new(crate::turn_nudge::TurnNudgeWrapper::new(state.clone())),
+                Arc::new(crate::turn_nudge::TurnNudgeWrapper::new(run.clone())),
             );
             tracing::info!(
                 "Worker {} turn-limit nudging enabled (last_turn={}, wrap_up_threshold={:?})",
@@ -918,12 +925,11 @@ impl Orchestrator {
                 task: super::TaskIdentity::new(task_id, worker_name.map(String::from)),
                 session_id: session_id_owned.map(crate::config::SessionId::new),
             };
-            let request_id = worker_config.request_id.clone().unwrap_or_default();
             let mut gate = crate::hitl::HitlApprovalWrapper::new(
                 hitl.patterns.clone(),
                 hitl.route.clone(),
                 scope.clone(),
-                request_id.clone(),
+                run.clone(),
                 worker_config.agent.name.clone(),
                 worker_config.instance_id.clone(),
             );
@@ -944,7 +950,7 @@ impl Orchestrator {
             worker_config.hitl_request_approval_tool = Some(crate::hitl::RequestApprovalTool::new(
                 hitl.route.clone(),
                 scope,
-                request_id,
+                run.clone(),
                 worker_config.agent.name.clone(),
                 worker_config.instance_id.clone(),
             ));
@@ -1021,7 +1027,6 @@ impl Orchestrator {
 
         // Orchestrator owns tool wrapping decision
         worker_config.tool_wrapper = Some(wrapper);
-        worker_config.turn_nudge = turn_nudge.clone();
 
         // Give workers access to result artifacts
         worker_config.orchestration_persistence = Some(self.persistence.clone());
@@ -1070,7 +1075,9 @@ impl Orchestrator {
         // never attached to workers (or the coordinator).
         let (provider_agent, model_name) = self.build_worker_provider_agent(&worker_config).await?;
 
-        let agent = Agent {
+        // A worker is prepared for exactly one task attempt, so its single
+        // run begins here, under the request that owns the orchestration.
+        let prepared = Arc::new(PreparedAgent {
             inner: provider_agent,
             model: model_name,
             max_depth: resolved_depth,
@@ -1079,15 +1086,18 @@ impl Orchestrator {
             fallback_tool_names: vec![],
             fallback_mcp_filter: None,
             context_window: worker_config.llm.context_window(),
-            scratchpad_budget: worker_config
-                .scratchpad_tools_config
-                .as_ref()
-                .map(|sp| sp.budget.clone()),
+            scratchpad_budget,
             client_tool_names: Default::default(),
             turn_nudge,
             system_prompt: preamble.clone(),
             invocation_parameters: crate::logging::llm_invocation_parameters(&worker_config.llm),
-        };
+            forwarded_headers: worker_config.forwarded_headers.clone(),
+            run,
+        });
+        let agent = prepared.begin_run(
+            worker_config.request_id.clone().unwrap_or_default(),
+            Some(&worker_config.forwarded_headers.as_request()),
+        )?;
 
         Ok(AgentWithPreamble {
             agent,
@@ -1442,7 +1452,7 @@ impl Orchestrator {
                 stream,
                 &self.usage_state,
                 self.config.stream_inactivity_timeout_secs(),
-                agent.scratchpad_budget.as_ref(),
+                agent.scratchpad_budget(),
                 phase,
                 event_tx,
                 stream_context,
@@ -2679,24 +2689,35 @@ Assign tasks to the worker whose tools best match the required operations."#,
         // post-execute continuation routing (13 calls in 5-prompt E2E suite).
         let max_depth = PLANNING_COORDINATOR_MAX_DEPTH;
 
+        // The coordinator has no run-scoped tool state, but it is still one
+        // run of one prepared agent, under the request that owns the
+        // orchestration.
+        let prepared = Arc::new(PreparedAgent {
+            inner: provider_agent,
+            model: model_name,
+            max_depth,
+            mcp_manager: None, // Coordinator doesn't have MCP tools
+            fallback_tool_parsing: false,
+            fallback_tool_names: vec![],
+            fallback_mcp_filter: None,
+            context_window: self.agent_config.llm.context_window(),
+            scratchpad_budget: None,
+            client_tool_names: Default::default(),
+            turn_nudge: None,
+            system_prompt: preamble.clone(),
+            invocation_parameters: crate::logging::llm_invocation_parameters(
+                &self.agent_config.llm,
+            ),
+            forwarded_headers: self.agent_config.forwarded_headers.clone(),
+            run: RunSlot::new(),
+        });
+        let agent = prepared.begin_run(
+            self.agent_config.request_id.clone().unwrap_or_default(),
+            Some(&self.agent_config.forwarded_headers.as_request()),
+        )?;
+
         Ok(AgentWithPreamble {
-            agent: Agent {
-                inner: provider_agent,
-                model: model_name,
-                max_depth,
-                mcp_manager: None, // Coordinator doesn't have MCP tools
-                fallback_tool_parsing: false,
-                fallback_tool_names: vec![],
-                fallback_mcp_filter: None,
-                context_window: self.agent_config.llm.context_window(),
-                scratchpad_budget: None,
-                client_tool_names: Default::default(),
-                turn_nudge: None,
-                system_prompt: preamble.clone(),
-                invocation_parameters: crate::logging::llm_invocation_parameters(
-                    &self.agent_config.llm,
-                ),
-            },
+            agent,
             preamble,
             escalation_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             submit_result_decision: Arc::new(Mutex::new(None)),
@@ -2968,7 +2989,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 }
             }
             let state =
-                Agent::add_all_tools(state, worker_config, &shared_mcp, wait_for_tools()).await?;
+                PreparedAgent::add_all_tools(state, worker_config, &shared_mcp, wait_for_tools())
+                    .await?;
             return Ok((
                 ProviderAgent::Scripted(state.build()),
                 "scripted".to_string(),
@@ -3020,9 +3042,13 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     builder = builder.max_tokens(max);
                 }
                 let state = BuilderState::Initial(builder);
-                let state =
-                    Agent::add_all_tools(state, worker_config, &shared_mcp, wait_for_tools())
-                        .await?;
+                let state = PreparedAgent::add_all_tools(
+                    state,
+                    worker_config,
+                    &shared_mcp,
+                    wait_for_tools(),
+                )
+                .await?;
                 Ok((ProviderAgent::OpenAI(state.build()), model.clone()))
             }
             LlmConfig::Anthropic {
@@ -3059,9 +3085,13 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     builder = builder.additional_params(params.clone());
                 }
                 let state = BuilderState::Initial(builder);
-                let state =
-                    Agent::add_all_tools(state, worker_config, &shared_mcp, wait_for_tools())
-                        .await?;
+                let state = PreparedAgent::add_all_tools(
+                    state,
+                    worker_config,
+                    &shared_mcp,
+                    wait_for_tools(),
+                )
+                .await?;
                 Ok((ProviderAgent::Anthropic(state.build()), model.clone()))
             }
             LlmConfig::Bedrock {
@@ -3106,9 +3136,13 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     builder = builder.additional_params(params.clone());
                 }
                 let state = BuilderState::Initial(builder);
-                let state =
-                    Agent::add_all_tools(state, worker_config, &shared_mcp, wait_for_tools())
-                        .await?;
+                let state = PreparedAgent::add_all_tools(
+                    state,
+                    worker_config,
+                    &shared_mcp,
+                    wait_for_tools(),
+                )
+                .await?;
                 Ok((ProviderAgent::Bedrock(state.build()), model.clone()))
             }
             LlmConfig::Gemini {
@@ -3138,9 +3172,13 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     builder = builder.additional_params(params.clone());
                 }
                 let state = BuilderState::Initial(builder);
-                let state =
-                    Agent::add_all_tools(state, worker_config, &shared_mcp, wait_for_tools())
-                        .await?;
+                let state = PreparedAgent::add_all_tools(
+                    state,
+                    worker_config,
+                    &shared_mcp,
+                    wait_for_tools(),
+                )
+                .await?;
                 Ok((ProviderAgent::Gemini(state.build()), model.clone()))
             }
             LlmConfig::Ollama {
@@ -3169,9 +3207,13 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 }
 
                 let state = BuilderState::Initial(builder);
-                let state =
-                    Agent::add_all_tools(state, worker_config, &shared_mcp, wait_for_tools())
-                        .await?;
+                let state = PreparedAgent::add_all_tools(
+                    state,
+                    worker_config,
+                    &shared_mcp,
+                    wait_for_tools(),
+                )
+                .await?;
                 Ok((ProviderAgent::Ollama(state.build()), model.clone()))
             }
             LlmConfig::OpenRouter {
@@ -3204,9 +3246,13 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     builder = builder.additional_params(params.clone());
                 }
                 let state = BuilderState::Initial(builder);
-                let state =
-                    Agent::add_all_tools(state, worker_config, &shared_mcp, wait_for_tools())
-                        .await?;
+                let state = PreparedAgent::add_all_tools(
+                    state,
+                    worker_config,
+                    &shared_mcp,
+                    wait_for_tools(),
+                )
+                .await?;
                 Ok((ProviderAgent::OpenRouter(state.build()), model.clone()))
             }
         }
@@ -3680,7 +3726,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             // their hook-carrying stream (`stream_chat_with_timeout`) seeds
             // the budget itself, from the prompt *and* the retry history.
             if park.is_none()
-                && let Some(ref budget) = worker.scratchpad_budget
+                && let Some(budget) = worker.scratchpad_budget()
             {
                 let task_prompt_tokens = budget.count_tokens(&prompt);
                 budget.record_usage(task_prompt_tokens);
@@ -3765,7 +3811,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             }
 
             // Emit per-agent ScratchpadUsage event if this worker used scratchpad.
-            if let (Some(budget), Some(tx)) = (worker.scratchpad_budget.as_ref(), event_tx) {
+            if let (Some(budget), Some(tx)) = (worker.scratchpad_budget(), event_tx) {
                 let agent_id = worker_name
                     .map(|n| n.to_string())
                     .unwrap_or_else(|| self.orchestrator_id.clone());
@@ -4008,7 +4054,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 worker.max_depth,
                 crate::streaming::RunOptions::default(),
                 &park.key,
-                worker.scratchpad_budget.clone(),
+                worker.scratchpad_budget().cloned(),
                 worker.client_tool_names.clone(),
             )
             .await
@@ -4017,7 +4063,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             stream,
             &self.usage_state,
             self.config.stream_inactivity_timeout_secs(),
-            worker.scratchpad_budget.as_ref(),
+            worker.scratchpad_budget(),
             "Worker resume",
             event_tx,
             worker_name.map(|name| StreamContext {

@@ -9,6 +9,7 @@ use super::schema::{
     format_schema,
 };
 use super::storage::{ScratchpadPathError, ScratchpadStorage};
+use crate::run::RunSlot;
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use serde::{Deserialize, Serialize};
@@ -33,6 +34,8 @@ pub enum ScratchpadToolError {
     NotJson,
     #[error("Key path not found: {0}")]
     KeyNotFound(String),
+    #[error("scratchpad tools are only available while a run is bound")]
+    NoRun,
 }
 
 impl From<ScratchpadPathError> for ScratchpadToolError {
@@ -188,6 +191,12 @@ pub(crate) fn check_and_record_budget(
     }
 }
 
+/// The bound run's budget. A read tool called with no run bound has nothing
+/// to count against and reports that instead of guessing.
+fn run_budget(run: &RunSlot) -> Result<ContextBudget, ScratchpadToolError> {
+    run.scratchpad_budget().ok_or(ScratchpadToolError::NoRun)
+}
+
 // ============================================================================
 // head — First N lines
 // ============================================================================
@@ -195,12 +204,13 @@ pub(crate) fn check_and_record_budget(
 #[derive(Clone)]
 pub struct HeadTool {
     storage: Arc<ScratchpadStorage>,
-    budget: ContextBudget,
+    /// The prepared agent's run slot.
+    run: RunSlot,
 }
 
 impl HeadTool {
-    pub fn new(storage: Arc<ScratchpadStorage>, budget: ContextBudget) -> Self {
-        Self { storage, budget }
+    pub fn new(storage: Arc<ScratchpadStorage>, run: RunSlot) -> Self {
+        Self { storage, run }
     }
 
     pub fn tool_definition() -> ToolDefinition {
@@ -252,6 +262,7 @@ impl Tool for HeadTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        let budget = run_budget(&self.run)?;
         tracing::debug!("scratchpad head: file={}, lines={}", args.file, args.lines);
         let content = read_scratchpad_file(&self.storage, &args.file).await?;
         let selected: String = content
@@ -265,7 +276,7 @@ impl Tool for HeadTool {
         // line numbers + footer add ~10-15% to the raw content's token count;
         // checking on the raw content would silently undercount.
         let numbered = add_line_numbers(&selected);
-        let meta = build_metadata(selected.lines().count(), &selected, &self.budget);
+        let meta = build_metadata(selected.lines().count(), &selected, &budget);
         let final_output = format!(
             "{}\n\n--- scratchpad head: showing {}/{} lines | {} ---",
             numbered,
@@ -274,7 +285,7 @@ impl Tool for HeadTool {
             meta
         );
 
-        if let Err(e) = check_and_record_budget(&self.budget, &final_output) {
+        if let Err(e) = check_and_record_budget(&budget, &final_output) {
             return Ok(format_budget_error(
                 e,
                 "head_too_large",
@@ -299,12 +310,13 @@ impl Tool for HeadTool {
 #[derive(Clone)]
 pub struct SliceTool {
     storage: Arc<ScratchpadStorage>,
-    budget: ContextBudget,
+    /// The prepared agent's run slot.
+    run: RunSlot,
 }
 
 impl SliceTool {
-    pub fn new(storage: Arc<ScratchpadStorage>, budget: ContextBudget) -> Self {
-        Self { storage, budget }
+    pub fn new(storage: Arc<ScratchpadStorage>, run: RunSlot) -> Self {
+        Self { storage, run }
     }
 
     pub fn tool_definition() -> ToolDefinition {
@@ -356,6 +368,7 @@ impl Tool for SliceTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        let budget = run_budget(&self.run)?;
         if args.start == 0 || args.end < args.start {
             return Err(ScratchpadToolError::InvalidArg(
                 "start must be >= 1 and end >= start".to_string(),
@@ -388,13 +401,13 @@ impl Tool for SliceTool {
             .join("\n");
 
         let actual_lines = selected.lines().count();
-        let meta = build_metadata(actual_lines, &selected, &self.budget);
+        let meta = build_metadata(actual_lines, &selected, &budget);
         let final_output = format!(
             "{}\n\n--- scratchpad slice: lines {}-{} of {} | {} ---",
             numbered, args.start, args.end, total_lines, meta
         );
 
-        if let Err(e) = check_and_record_budget(&self.budget, &final_output) {
+        if let Err(e) = check_and_record_budget(&budget, &final_output) {
             let suggested_end = args.start + (args.end - args.start) / 2;
             return Ok(format_budget_error(
                 e,
@@ -420,12 +433,13 @@ impl Tool for SliceTool {
 #[derive(Clone)]
 pub struct GrepTool {
     storage: Arc<ScratchpadStorage>,
-    budget: ContextBudget,
+    /// The prepared agent's run slot.
+    run: RunSlot,
 }
 
 impl GrepTool {
-    pub fn new(storage: Arc<ScratchpadStorage>, budget: ContextBudget) -> Self {
-        Self { storage, budget }
+    pub fn new(storage: Arc<ScratchpadStorage>, run: RunSlot) -> Self {
+        Self { storage, run }
     }
 
     pub fn tool_definition() -> ToolDefinition {
@@ -482,6 +496,7 @@ impl Tool for GrepTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        let budget = run_budget(&self.run)?;
         tracing::debug!(
             "scratchpad grep: file={}, pattern={}, context={}",
             args.file,
@@ -548,7 +563,7 @@ impl Tool for GrepTool {
             }
             // Token-count per section and accumulate (O(output_size) total)
             // rather than re-tokenizing the growing result each iteration.
-            let section_tokens = self.budget.count_tokens(&section);
+            let section_tokens = budget.count_tokens(&section);
             if accumulated_tokens + section_tokens > GREP_MAX_OUTPUT_TOKENS {
                 truncated = true;
                 break;
@@ -567,7 +582,7 @@ impl Tool for GrepTool {
 
         // Build the final formatted output FIRST (matched-region body +
         // footer), then budget-check on it.
-        let meta = build_metadata(result.lines().count(), &result, &self.budget);
+        let meta = build_metadata(result.lines().count(), &result, &budget);
         let final_output = format!(
             "{}\n--- scratchpad grep: {} matches in {} regions of {} | {} ---",
             result,
@@ -577,7 +592,7 @@ impl Tool for GrepTool {
             meta
         );
 
-        if let Err(e) = check_and_record_budget(&self.budget, &final_output) {
+        if let Err(e) = check_and_record_budget(&budget, &final_output) {
             return Ok(format_budget_error(
                 e,
                 "grep_too_large",
@@ -621,12 +636,13 @@ fn merge_ranges(ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
 #[derive(Clone)]
 pub struct SchemaTool {
     storage: Arc<ScratchpadStorage>,
-    budget: ContextBudget,
+    /// The prepared agent's run slot.
+    run: RunSlot,
 }
 
 impl SchemaTool {
-    pub fn new(storage: Arc<ScratchpadStorage>, budget: ContextBudget) -> Self {
-        Self { storage, budget }
+    pub fn new(storage: Arc<ScratchpadStorage>, run: RunSlot) -> Self {
+        Self { storage, run }
     }
 
     pub fn tool_definition() -> ToolDefinition {
@@ -679,6 +695,7 @@ impl Tool for SchemaTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        let budget = run_budget(&self.run)?;
         tracing::debug!(
             "scratchpad schema: file={}, max_depth={}",
             args.file,
@@ -701,13 +718,13 @@ impl Tool for SchemaTool {
         };
 
         // Build the final formatted output FIRST, then budget-check on it.
-        let meta = build_metadata(schema.lines().count(), &schema, &self.budget);
+        let meta = build_metadata(schema.lines().count(), &schema, &budget);
         let final_output = format!(
             "{}\n--- scratchpad schema: {} | {} ---",
             schema, args.file, meta
         );
 
-        if let Err(e) = check_and_record_budget(&self.budget, &final_output) {
+        if let Err(e) = check_and_record_budget(&budget, &final_output) {
             let suggestions = if is_markdown {
                 json!([
                     format!(
@@ -750,12 +767,13 @@ impl Tool for SchemaTool {
 #[derive(Clone)]
 pub struct GetInTool {
     storage: Arc<ScratchpadStorage>,
-    budget: ContextBudget,
+    /// The prepared agent's run slot.
+    run: RunSlot,
 }
 
 impl GetInTool {
-    pub fn new(storage: Arc<ScratchpadStorage>, budget: ContextBudget) -> Self {
-        Self { storage, budget }
+    pub fn new(storage: Arc<ScratchpadStorage>, run: RunSlot) -> Self {
+        Self { storage, run }
     }
 
     pub fn tool_definition() -> ToolDefinition {
@@ -802,6 +820,7 @@ impl GetInTool {
     /// Return a paginated slice of a string value's lines.
     fn get_in_paginated(
         &self,
+        budget: &ContextBudget,
         path: &str,
         lines: &[&str],
         total_lines: usize,
@@ -826,7 +845,7 @@ impl GetInTool {
 
         // Build the final formatted output FIRST, then budget-check on it.
         let numbered = add_line_numbers(&chunk);
-        let meta = build_metadata(end - offset, &chunk, &self.budget);
+        let meta = build_metadata(end - offset, &chunk, budget);
         let final_output = format!(
             "{}\n\n--- scratchpad get_in: $.{} (string, lines {}-{} of {}) | {} ---",
             numbered,
@@ -837,7 +856,7 @@ impl GetInTool {
             meta
         );
 
-        if let Err(e) = check_and_record_budget(&self.budget, &final_output) {
+        if let Err(e) = check_and_record_budget(budget, &final_output) {
             return Ok(format_budget_error(
                 e,
                 "get_in_too_large",
@@ -881,6 +900,7 @@ impl Tool for GetInTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        let budget = run_budget(&self.run)?;
         tracing::debug!("scratchpad get_in: file={}, path={}", args.file, args.path);
         let content = read_scratchpad_file(&self.storage, &args.file).await?;
         let root: serde_json::Value =
@@ -910,13 +930,13 @@ impl Tool for GetInTool {
                 serde_json::to_string_pretty(current).unwrap_or_else(|_| current.to_string());
 
             let numbered = add_line_numbers(&result);
-            let meta = build_metadata(result.lines().count(), &result, &self.budget);
+            let meta = build_metadata(result.lines().count(), &result, &budget);
             let final_output = format!(
                 "{}\n\n--- scratchpad get_in: $.{} | {} ---",
                 numbered, args.path, meta
             );
 
-            if let Err(e) = check_and_record_budget(&self.budget, &final_output) {
+            if let Err(e) = check_and_record_budget(&budget, &final_output) {
                 return Ok(format_budget_error(
                     e,
                     "get_in_too_large",
@@ -940,6 +960,7 @@ impl Tool for GetInTool {
 
         if args.offset.is_some() || args.limit.is_some() {
             return self.get_in_paginated(
+                &budget,
                 &args.path,
                 &lines,
                 total_lines,
@@ -950,13 +971,13 @@ impl Tool for GetInTool {
 
         // No pagination — build final formatted output, then budget-check.
         let numbered = add_line_numbers(raw_str);
-        let meta = build_metadata(total_lines, raw_str, &self.budget);
+        let meta = build_metadata(total_lines, raw_str, &budget);
         let final_output = format!(
             "{}\n\n--- scratchpad get_in: $.{} | {} ---",
             numbered, args.path, meta
         );
 
-        if let Err(e) = check_and_record_budget(&self.budget, &final_output) {
+        if let Err(e) = check_and_record_budget(&budget, &final_output) {
             return Ok(format_budget_error(
                 e,
                 "get_in_too_large",
@@ -983,12 +1004,13 @@ impl Tool for GetInTool {
 #[derive(Clone)]
 pub struct IterateOverTool {
     storage: Arc<ScratchpadStorage>,
-    budget: ContextBudget,
+    /// The prepared agent's run slot.
+    run: RunSlot,
 }
 
 impl IterateOverTool {
-    pub fn new(storage: Arc<ScratchpadStorage>, budget: ContextBudget) -> Self {
-        Self { storage, budget }
+    pub fn new(storage: Arc<ScratchpadStorage>, run: RunSlot) -> Self {
+        Self { storage, run }
     }
 
     pub fn tool_definition() -> ToolDefinition {
@@ -1061,6 +1083,7 @@ impl Tool for IterateOverTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        let budget = run_budget(&self.run)?;
         tracing::debug!(
             "scratchpad iterate_over: file={}, path={}, fields={}, offset={:?}, limit={:?}",
             args.file,
@@ -1136,13 +1159,13 @@ impl Tool for IterateOverTool {
                 total_items
             )
         };
-        let meta = build_metadata(result.lines().count(), &result, &self.budget);
+        let meta = build_metadata(result.lines().count(), &result, &budget);
         let final_output = format!(
             "{}\n\n--- scratchpad iterate_over: $.{} ({}, fields: [{}]) | {} ---",
             result, args.path, window_desc, args.fields, meta
         );
 
-        if let Err(e) = check_and_record_budget(&self.budget, &final_output) {
+        if let Err(e) = check_and_record_budget(&budget, &final_output) {
             let mut suggestions = Vec::new();
             // A retry is only proposed when it strictly narrows the window;
             // a single over-budget item needs fewer fields, not fewer items.
@@ -1180,12 +1203,13 @@ impl Tool for IterateOverTool {
 #[derive(Clone)]
 pub struct ItemSchemaTool {
     storage: Arc<ScratchpadStorage>,
-    budget: ContextBudget,
+    /// The prepared agent's run slot.
+    run: RunSlot,
 }
 
 impl ItemSchemaTool {
-    pub fn new(storage: Arc<ScratchpadStorage>, budget: ContextBudget) -> Self {
-        Self { storage, budget }
+    pub fn new(storage: Arc<ScratchpadStorage>, run: RunSlot) -> Self {
+        Self { storage, run }
     }
 
     pub fn tool_definition() -> ToolDefinition {
@@ -1251,6 +1275,7 @@ impl Tool for ItemSchemaTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        let budget = run_budget(&self.run)?;
         tracing::debug!(
             "scratchpad item_schema: file={}, path={}, offset={:?}, limit={:?}",
             args.file,
@@ -1328,13 +1353,13 @@ impl Tool for ItemSchemaTool {
         }
 
         // Build the final formatted output FIRST, then budget-check on it.
-        let meta = build_metadata(result.lines().count(), &result, &self.budget);
+        let meta = build_metadata(result.lines().count(), &result, &budget);
         let final_output = format!(
             "{}\n--- scratchpad item_schema: $.{} | {} ---",
             result, args.path, meta
         );
 
-        if let Err(e) = check_and_record_budget(&self.budget, &final_output) {
+        if let Err(e) = check_and_record_budget(&budget, &final_output) {
             // Suggest halving the current window (min 10) as a starting point.
             let suggested_limit = (window_size / 2).max(10);
             return Ok(format_budget_error(
@@ -1605,12 +1630,13 @@ fn format_navigation_failure(
 #[derive(Clone)]
 pub struct ReadTool {
     storage: Arc<ScratchpadStorage>,
-    budget: ContextBudget,
+    /// The prepared agent's run slot.
+    run: RunSlot,
 }
 
 impl ReadTool {
-    pub fn new(storage: Arc<ScratchpadStorage>, budget: ContextBudget) -> Self {
-        Self { storage, budget }
+    pub fn new(storage: Arc<ScratchpadStorage>, run: RunSlot) -> Self {
+        Self { storage, run }
     }
 
     pub fn tool_definition() -> ToolDefinition {
@@ -1651,6 +1677,7 @@ impl Tool for ReadTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        let budget = run_budget(&self.run)?;
         tracing::debug!("scratchpad read: file={}", args.file);
 
         // Pre-flight size check: skip loading a multi-MB file into memory
@@ -1660,7 +1687,7 @@ impl Tool for ReadTool {
         // budget check happens after the file is read; this is a fast-path
         // rejection only, biased toward the common case of obviously oversized
         // files. If the estimate already exceeds the per-call limit, bail out.
-        if let Some(limit) = self.budget.max_extraction_tokens()
+        if let Some(limit) = budget.max_extraction_tokens()
             && let Ok(path) = self.storage.validate_path(&args.file).await
             && let Ok(meta) = tokio::fs::metadata(&path).await
         {
@@ -1692,7 +1719,7 @@ impl Tool for ReadTool {
 
         // Build the final formatted output FIRST, then budget-check on it.
         let numbered = add_line_numbers(&content);
-        let meta = build_metadata(content.lines().count(), &content, &self.budget);
+        let meta = build_metadata(content.lines().count(), &content, &budget);
         let final_output = format!(
             "{}\n\n--- scratchpad read: {} ({} lines) | {} ---",
             numbered,
@@ -1701,7 +1728,7 @@ impl Tool for ReadTool {
             meta
         );
 
-        if let Err(e) = check_and_record_budget(&self.budget, &final_output) {
+        if let Err(e) = check_and_record_budget(&budget, &final_output) {
             return Ok(format_budget_error(
                 e,
                 "read_too_large",
@@ -1812,6 +1839,7 @@ pub fn emit_scratchpad_tool_events_enabled() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::run::RunSlot;
     use crate::scratchpad::context_budget::{TiktokenCounter, TokenCounter};
     use tempfile::TempDir;
 
@@ -1857,7 +1885,7 @@ mod tests {
         let (_tmp, storage, budget) = setup().await;
         storage.write_output("test", sample_json()).await.unwrap();
 
-        let tool = HeadTool::new(storage, budget);
+        let tool = HeadTool::new(storage, RunSlot::pinned_budget(budget));
         let result = tool
             .call(HeadArgs {
                 file: "test.json".to_string(),
@@ -1893,7 +1921,7 @@ mod tests {
         let tight_budget = ContextBudget::new(100_000, 0.20, 0, std::sync::Arc::new(counter))
             .with_max_extraction_tokens(raw_tokens + 1);
 
-        let tool = HeadTool::new(storage, tight_budget);
+        let tool = HeadTool::new(storage, RunSlot::pinned_budget(tight_budget));
         let result = tool
             .call(HeadArgs {
                 file: "preview.txt".to_string(),
@@ -1923,7 +1951,7 @@ mod tests {
         let (_tmp, storage, budget) = setup().await;
         storage.write_output("test", sample_json()).await.unwrap();
 
-        let tool = SliceTool::new(storage, budget);
+        let tool = SliceTool::new(storage, RunSlot::pinned_budget(budget));
         let result = tool
             .call(SliceArgs {
                 file: "test.json".to_string(),
@@ -1941,7 +1969,7 @@ mod tests {
         let (_tmp, storage, budget) = setup().await;
         storage.write_output("test", sample_json()).await.unwrap();
 
-        let tool = GrepTool::new(storage, budget);
+        let tool = GrepTool::new(storage, RunSlot::pinned_budget(budget));
         let result = tool
             .call(GrepArgs {
                 file: "test.json".to_string(),
@@ -1960,7 +1988,7 @@ mod tests {
         let (_tmp, storage, budget) = setup().await;
         storage.write_output("test", sample_json()).await.unwrap();
 
-        let tool = GrepTool::new(storage, budget);
+        let tool = GrepTool::new(storage, RunSlot::pinned_budget(budget));
         let long_pattern = "a".repeat(GREP_MAX_PATTERN_LEN + 1);
         let err = tool
             .call(GrepArgs {
@@ -1985,7 +2013,7 @@ mod tests {
         let huge_content = (0..100_000).map(|_| "aa").collect::<Vec<_>>().join("\n");
         storage.write_output("huge", &huge_content).await.unwrap();
 
-        let tool = GrepTool::new(storage, budget);
+        let tool = GrepTool::new(storage, RunSlot::pinned_budget(budget));
         let result = tool
             .call(GrepArgs {
                 file: "huge.txt".to_string(),
@@ -2011,7 +2039,7 @@ mod tests {
         let (_tmp, storage, budget) = setup().await;
         storage.write_output("test", sample_json()).await.unwrap();
 
-        let tool = GrepTool::new(storage, budget);
+        let tool = GrepTool::new(storage, RunSlot::pinned_budget(budget));
         let result = tool
             .call(GrepArgs {
                 file: "test.json".to_string(),
@@ -2036,7 +2064,7 @@ mod tests {
             .await
             .unwrap();
 
-        let tool = GrepTool::new(storage, budget);
+        let tool = GrepTool::new(storage, RunSlot::pinned_budget(budget));
         let result = tool
             .call(GrepArgs {
                 file: "metrics.json".to_string(),
@@ -2057,7 +2085,7 @@ mod tests {
         let (_tmp, storage, budget) = setup().await;
         storage.write_output("test", sample_json()).await.unwrap();
 
-        let tool = SchemaTool::new(storage, budget);
+        let tool = SchemaTool::new(storage, RunSlot::pinned_budget(budget));
         let result = tool
             .call(SchemaArgs {
                 file: "test.json".to_string(),
@@ -2074,7 +2102,7 @@ mod tests {
         let (_tmp, storage, budget) = setup().await;
         storage.write_output("test", sample_json()).await.unwrap();
 
-        let tool = GetInTool::new(storage, budget);
+        let tool = GetInTool::new(storage, RunSlot::pinned_budget(budget));
         let result = tool
             .call(GetInArgs {
                 file: "test.json".to_string(),
@@ -2097,7 +2125,7 @@ mod tests {
         let (_tmp, storage, budget) = setup().await;
         storage.write_output("test", sample_json()).await.unwrap();
 
-        let tool = GetInTool::new(storage, budget);
+        let tool = GetInTool::new(storage, RunSlot::pinned_budget(budget));
         let result = tool
             .call(GetInArgs {
                 file: "test.json".to_string(),
@@ -2134,7 +2162,7 @@ mod tests {
             serde_json::json!({ "kv_markdown": "### Section A\n- key: value" }).to_string();
         storage.write_output("test", &json_str).await.unwrap();
 
-        let tool = GetInTool::new(storage, budget);
+        let tool = GetInTool::new(storage, RunSlot::pinned_budget(budget));
         let result = tool
             .call(GetInArgs {
                 file: "test.json".to_string(),
@@ -2175,7 +2203,7 @@ mod tests {
             "test setup: expected a companion file for kv_markdown"
         );
 
-        let tool = GetInTool::new(storage, budget);
+        let tool = GetInTool::new(storage, RunSlot::pinned_budget(budget));
         let result = tool
             .call(GetInArgs {
                 file: "test.json".to_string(),
@@ -2216,7 +2244,7 @@ mod tests {
         let (_tmp, storage, budget) = setup().await;
         storage.write_output("test", sample_json()).await.unwrap();
 
-        let tool = GetInTool::new(storage, budget);
+        let tool = GetInTool::new(storage, RunSlot::pinned_budget(budget));
         let result = tool
             .call(GetInArgs {
                 file: "test.json".to_string(),
@@ -2240,7 +2268,7 @@ mod tests {
         let json = r#"{"kv_markdown": "line1\nline2\nline3\nline4\nline5"}"#;
         storage.write_output("md", json).await.unwrap();
 
-        let tool = GetInTool::new(storage, budget);
+        let tool = GetInTool::new(storage, RunSlot::pinned_budget(budget));
 
         // Without pagination, should return the raw string content
         let result = tool
@@ -2278,7 +2306,7 @@ mod tests {
         let json = r#"{"data": "a\nb\nc"}"#;
         storage.write_output("small", json).await.unwrap();
 
-        let tool = GetInTool::new(storage, budget);
+        let tool = GetInTool::new(storage, RunSlot::pinned_budget(budget));
         let result = tool
             .call(GetInArgs {
                 file: "small.json".to_string(),
@@ -2300,7 +2328,7 @@ mod tests {
         let json = r#"{"data": "line1\nline2\nline3\nline4\nline5"}"#;
         storage.write_output("ovf", json).await.unwrap();
 
-        let tool = GetInTool::new(storage, budget);
+        let tool = GetInTool::new(storage, RunSlot::pinned_budget(budget));
         // limit = usize::MAX would wrap when added to offset without
         // saturating_add. Should be clamped to total_lines instead.
         let result = tool
@@ -2326,7 +2354,7 @@ mod tests {
         let (_tmp, storage, budget) = setup().await;
         storage.write_output("test", sample_json()).await.unwrap();
 
-        let tool = IterateOverTool::new(storage, budget);
+        let tool = IterateOverTool::new(storage, RunSlot::pinned_budget(budget));
         let result = tool
             .call(IterateOverArgs {
                 file: "test.json".to_string(),
@@ -2348,7 +2376,7 @@ mod tests {
         let (_tmp, storage, budget) = setup().await;
         storage.write_output("test", sample_json()).await.unwrap();
 
-        let tool = IterateOverTool::new(storage, budget);
+        let tool = IterateOverTool::new(storage, RunSlot::pinned_budget(budget));
         let result = tool
             .call(IterateOverArgs {
                 file: "test.json".to_string(),
@@ -2368,7 +2396,7 @@ mod tests {
         let (_tmp, storage, budget) = setup().await;
         storage.write_output("test", sample_json()).await.unwrap();
 
-        let tool = IterateOverTool::new(storage, budget);
+        let tool = IterateOverTool::new(storage, RunSlot::pinned_budget(budget));
         let result = tool
             .call(IterateOverArgs {
                 file: "test.json".to_string(),
@@ -2400,7 +2428,7 @@ mod tests {
             .await
             .unwrap();
 
-        let tool = IterateOverTool::new(storage, budget);
+        let tool = IterateOverTool::new(storage, RunSlot::pinned_budget(budget));
         let result = tool
             .call(IterateOverArgs {
                 file: "trunc.json".to_string(),
@@ -2433,7 +2461,7 @@ mod tests {
             .await
             .unwrap();
 
-        let tool = IterateOverTool::new(storage, budget);
+        let tool = IterateOverTool::new(storage, RunSlot::pinned_budget(budget));
         let result = tool
             .call(IterateOverArgs {
                 file: "page.json".to_string(),
@@ -2460,7 +2488,7 @@ mod tests {
         let (_tmp, storage, budget) = setup().await;
         storage.write_output("test", sample_json()).await.unwrap();
 
-        let tool = IterateOverTool::new(storage, budget);
+        let tool = IterateOverTool::new(storage, RunSlot::pinned_budget(budget));
         let result = tool
             .call(IterateOverArgs {
                 file: "test.json".to_string(),
@@ -2481,7 +2509,7 @@ mod tests {
         let (_tmp, storage, budget) = setup().await;
         storage.write_output("test", sample_json()).await.unwrap();
 
-        let tool = IterateOverTool::new(storage, budget);
+        let tool = IterateOverTool::new(storage, RunSlot::pinned_budget(budget));
         let result = tool
             .call(IterateOverArgs {
                 file: "test.json".to_string(),
@@ -2502,7 +2530,7 @@ mod tests {
         let (_tmp, storage, budget) = setup().await;
         storage.write_output("test", sample_json()).await.unwrap();
 
-        let tool = IterateOverTool::new(storage, budget);
+        let tool = IterateOverTool::new(storage, RunSlot::pinned_budget(budget));
         // offset + usize::MAX must not wrap; window clamps to total items.
         let result = tool
             .call(IterateOverArgs {
@@ -2524,7 +2552,7 @@ mod tests {
         let (_tmp, storage, budget) = setup().await;
         storage.write_output("test", sample_json()).await.unwrap();
 
-        let tool = IterateOverTool::new(storage, budget);
+        let tool = IterateOverTool::new(storage, RunSlot::pinned_budget(budget));
         // offset=0 + limit covering the whole array reads as a full scan.
         let result = tool
             .call(IterateOverArgs {
@@ -2545,7 +2573,7 @@ mod tests {
         let (_tmp, storage, budget) = setup().await;
         storage.write_output("test", sample_json()).await.unwrap();
 
-        let tool = IterateOverTool::new(storage, budget);
+        let tool = IterateOverTool::new(storage, RunSlot::pinned_budget(budget));
         // Schema advertises minimum 1, but providers don't enforce it.
         let result = tool
             .call(IterateOverArgs {
@@ -2571,7 +2599,7 @@ mod tests {
         let json = format!(r#"{{"items":[{}]}}"#, items.join(","));
         storage.write_output("big", &json).await.unwrap();
 
-        let tool = IterateOverTool::new(storage, tiny_budget);
+        let tool = IterateOverTool::new(storage, RunSlot::pinned_budget(tiny_budget));
         let result = tool
             .call(IterateOverArgs {
                 file: "big.json".to_string(),
@@ -2605,7 +2633,7 @@ mod tests {
         let json = format!(r#"{{"items":[{{"id":1,"content":"{big}"}}]}}"#);
         storage.write_output("one", &json).await.unwrap();
 
-        let tool = IterateOverTool::new(storage, tiny_budget);
+        let tool = IterateOverTool::new(storage, RunSlot::pinned_budget(tiny_budget));
         let result = tool
             .call(IterateOverArgs {
                 file: "one.json".to_string(),
@@ -2638,7 +2666,7 @@ mod tests {
         let (_tmp, storage, budget) = setup().await;
         storage.write_output("test", sample_json()).await.unwrap();
 
-        let tool = ItemSchemaTool::new(storage, budget);
+        let tool = ItemSchemaTool::new(storage, RunSlot::pinned_budget(budget));
         let result = tool
             .call(ItemSchemaArgs {
                 file: "test.json".to_string(),
@@ -2668,7 +2696,7 @@ mod tests {
 }"#;
         storage.write_output("hetero", json).await.unwrap();
 
-        let tool = ItemSchemaTool::new(storage, budget);
+        let tool = ItemSchemaTool::new(storage, RunSlot::pinned_budget(budget));
         let result = tool
             .call(ItemSchemaArgs {
                 file: "hetero.json".to_string(),
@@ -2702,7 +2730,7 @@ mod tests {
 }"#;
         storage.write_output("paged", json).await.unwrap();
 
-        let tool = ItemSchemaTool::new(storage, budget);
+        let tool = ItemSchemaTool::new(storage, RunSlot::pinned_budget(budget));
         let result = tool
             .call(ItemSchemaArgs {
                 file: "paged.json".to_string(),
@@ -2730,7 +2758,7 @@ mod tests {
         let (_tmp, storage, budget) = setup().await;
         storage.write_output("test", sample_json()).await.unwrap();
 
-        let tool = ItemSchemaTool::new(storage, budget);
+        let tool = ItemSchemaTool::new(storage, RunSlot::pinned_budget(budget));
         let result = tool
             .call(ItemSchemaArgs {
                 file: "test.json".to_string(),
@@ -2758,7 +2786,7 @@ mod tests {
         let json = format!(r#"{{"items":[{}]}}"#, items.join(","));
         storage.write_output("big", &json).await.unwrap();
 
-        let tool = ItemSchemaTool::new(storage, tiny_budget);
+        let tool = ItemSchemaTool::new(storage, RunSlot::pinned_budget(tiny_budget));
         let result = tool
             .call(ItemSchemaArgs {
                 file: "big.json".to_string(),
@@ -2798,7 +2826,7 @@ mod tests {
         let (_tmp, storage, budget) = setup().await;
         storage.write_output("test", sample_json()).await.unwrap();
 
-        let tool = ReadTool::new(storage, budget);
+        let tool = ReadTool::new(storage, RunSlot::pinned_budget(budget));
         let result = tool
             .call(ReadArgs {
                 file: "test.json".to_string(),
@@ -2820,7 +2848,7 @@ mod tests {
         let large_content = "x".repeat(1000);
         storage.write_output("large", &large_content).await.unwrap();
 
-        let tool = ReadTool::new(storage, tiny_budget);
+        let tool = ReadTool::new(storage, RunSlot::pinned_budget(tiny_budget));
         let result = tool
             .call(ReadArgs {
                 file: "large.txt".to_string(),
@@ -2838,7 +2866,7 @@ mod tests {
     #[tokio::test]
     async fn test_path_traversal_rejected() {
         let (_tmp, storage, budget) = setup().await;
-        let tool = HeadTool::new(storage, budget);
+        let tool = HeadTool::new(storage, RunSlot::pinned_budget(budget));
         let result = tool
             .call(HeadArgs {
                 file: "../../etc/passwd".to_string(),
@@ -2856,7 +2884,7 @@ mod tests {
         let path = storage.dir().join("test.md");
         tokio::fs::write(&path, md).await.unwrap();
 
-        let tool = SchemaTool::new(storage, budget);
+        let tool = SchemaTool::new(storage, RunSlot::pinned_budget(budget));
         let result = tool
             .call(SchemaArgs {
                 file: "test.md".to_string(),
@@ -2885,7 +2913,7 @@ mod tests {
         let path = storage.dir().join("test.payload.json");
         tokio::fs::write(&path, &pretty).await.unwrap();
 
-        let tool = SchemaTool::new(storage, budget);
+        let tool = SchemaTool::new(storage, RunSlot::pinned_budget(budget));
         let result = tool
             .call(SchemaArgs {
                 file: "test.payload.json".to_string(),
@@ -2907,7 +2935,7 @@ mod tests {
             .await
             .unwrap();
 
-        let tool = GetInTool::new(storage, budget);
+        let tool = GetInTool::new(storage, RunSlot::pinned_budget(budget));
         let result = tool
             .call(GetInArgs {
                 file: "raw.json".to_string(),
@@ -2942,7 +2970,7 @@ mod tests {
             .await
             .unwrap();
 
-        let tool = GetInTool::new(storage, tiny_budget);
+        let tool = GetInTool::new(storage, RunSlot::pinned_budget(tiny_budget));
         // With offset/limit, the chunk should still exceed the tiny per-call limit
         let result = tool
             .call(GetInArgs {
@@ -2969,13 +2997,13 @@ mod tests {
     async fn test_tool_definition_matches_trait_definition() {
         let (_tmp, storage, budget) = setup().await;
 
-        let head = HeadTool::new(storage.clone(), budget.clone());
+        let head = HeadTool::new(storage.clone(), RunSlot::pinned_budget(budget.clone()));
         assert_eq!(
             HeadTool::tool_definition(),
             head.definition(String::new()).await
         );
 
-        let read = ReadTool::new(storage, budget);
+        let read = ReadTool::new(storage, RunSlot::pinned_budget(budget));
         assert_eq!(
             ReadTool::tool_definition(),
             read.definition(String::new()).await
@@ -3067,5 +3095,23 @@ mod tests {
         // MCP tools are covered by ObserverWrapper, never forwarded here.
         assert!(!should_forward_tool_event("some_mcp_tool", false));
         assert!(!should_forward_tool_event("some_mcp_tool", true));
+    }
+
+    /// A read tool has nothing to count against outside a run, and says so
+    /// rather than reading unbudgeted.
+    #[tokio::test]
+    async fn read_tools_refuse_when_no_run_is_bound() {
+        let (_tmp, storage, _budget) = setup().await;
+        storage.write_output("test", sample_json()).await.unwrap();
+
+        let tool = HeadTool::new(storage, RunSlot::new());
+        let err = tool
+            .call(HeadArgs {
+                file: "test.json".to_string(),
+                lines: 5,
+            })
+            .await
+            .expect_err("no run is bound");
+        assert!(matches!(err, ScratchpadToolError::NoRun), "got: {err}");
     }
 }
