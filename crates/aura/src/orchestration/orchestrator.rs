@@ -52,14 +52,15 @@ use rig::client::CompletionClient;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-use crate::Agent;
 use crate::config::{AgentRuntimeConfig, LlmConfig};
 use crate::inactivity::{Liveness, STALL_MESSAGE, liveness_of};
 use crate::mcp::McpManager;
 use crate::provider_agent::{BuilderState, ProviderAgent, StreamError, StreamItem};
+use crate::run_context::{BoundRun, RunContext};
 use crate::scratchpad;
 use crate::string_utils::safe_truncate;
 use crate::tool_call_observer::ToolCallObserver;
+use crate::{Agent, PreparedAgent};
 
 use super::tools::RoutingToolSet;
 use super::tools::{InspectToolParamsTool, ListToolsTool, ReadArtifactTool};
@@ -734,11 +735,6 @@ impl Orchestrator {
         }
 
         apply_worker_skills_override(&mut worker_config, worker_name);
-        // Workers are per-run ephemeral and receive no chat history, so their
-        // skill invocations are never rehydrated into the session — recording
-        // them would leak task-scoped loads across turns. Coordinator-side
-        // invocations keep the recorder from the top-level config.
-        worker_config.skill_recorder = None;
 
         // Per-worker scratchpad override falls back to [agent.scratchpad].
         // Each worker gets a FRESH ContextBudget scoped to its effective LLM —
@@ -748,6 +744,10 @@ impl Orchestrator {
             .or(self.agent_config.agent.scratchpad.as_ref())
             .cloned();
 
+        // The slot every wrapper and tool built below reaches this worker's
+        // run through; `begin_run_within` fills it once the worker is prepared.
+        let run = Arc::new(BoundRun::default());
+        let mut scratchpad_budget: Option<scratchpad::ContextBudget> = None;
         let mut scratchpad_tools = Vec::<Arc<dyn ToolWrapper>>::new();
         if let Some(ref sp_cfg) = effective_scratchpad
             && sp_cfg.enabled
@@ -830,10 +830,12 @@ impl Orchestrator {
                     context_window,
                     initial_used,
                     token_counter,
+                    run: Arc::clone(&run),
                 })
                 .await?;
 
                 scratchpad_tools.push(build.wrapper);
+                scratchpad_budget = Some(build.budget);
                 worker_config.scratchpad_tools_config = Some(build.tools_config);
             }
         }
@@ -882,10 +884,10 @@ impl Orchestrator {
         let mut wrappers: Vec<Arc<dyn ToolWrapper>> = vec![observer_wrapper, duplicate_guard];
         wrappers.extend(scratchpad_tools);
         wrappers.push(persistence_wrapper);
-        if let Some(ref state) = turn_nudge {
+        if turn_nudge.is_some() {
             wrappers.insert(
                 0,
-                Arc::new(crate::turn_nudge::TurnNudgeWrapper::new(state.clone())),
+                Arc::new(crate::turn_nudge::TurnNudgeWrapper::new(Arc::clone(&run))),
             );
             tracing::info!(
                 "Worker {} turn-limit nudging enabled (last_turn={}, wrap_up_threshold={:?})",
@@ -919,12 +921,10 @@ impl Orchestrator {
                 task: super::TaskIdentity::new(task_id, worker_name.map(String::from)),
                 session_id: session_id_owned.map(crate::config::SessionId::new),
             };
-            let request_id = worker_config.request_id.clone().unwrap_or_default();
             let mut gate = crate::hitl::HitlApprovalWrapper::new(
                 hitl.patterns.clone(),
                 hitl.route.clone(),
                 scope.clone(),
-                request_id.clone(),
                 worker_config.agent.name.clone(),
                 worker_config.instance_id.clone(),
             );
@@ -945,7 +945,6 @@ impl Orchestrator {
             worker_config.hitl_request_approval_tool = Some(crate::hitl::RequestApprovalTool::new(
                 hitl.route.clone(),
                 scope,
-                request_id,
                 worker_config.agent.name.clone(),
                 worker_config.instance_id.clone(),
             ));
@@ -1022,7 +1021,6 @@ impl Orchestrator {
 
         // Orchestrator owns tool wrapping decision
         worker_config.tool_wrapper = Some(wrapper);
-        worker_config.turn_nudge = turn_nudge.clone();
 
         // Give workers access to result artifacts
         worker_config.orchestration_persistence = Some(self.persistence.clone());
@@ -1069,12 +1067,16 @@ impl Orchestrator {
         // Build worker agent using shared MCP connections.
         // Client-side tools are not supported in orchestration mode and are
         // never attached to workers (or the coordinator).
-        let (provider_agent, model_name) = self.build_worker_provider_agent(&worker_config).await?;
+        let (provider_agent, model_name) = self
+            .build_worker_provider_agent(&worker_config, &run)
+            .await?;
 
-        let agent = Agent {
+        // A worker is prepared for exactly one task attempt, so its single
+        // run begins here, within the run that owns the orchestration.
+        let prepared = Arc::new(PreparedAgent {
             // A worker's gate and approval tool captured their run when
             // `create_worker` built them, inside that run, so there is nothing
-            // for `stream` to bind.
+            // for `begin_run_within` to bind.
             hitl_gate: None,
             hitl_approval_tool: None,
             inner: provider_agent,
@@ -1085,22 +1087,37 @@ impl Orchestrator {
             fallback_tool_names: vec![],
             fallback_mcp_filter: None,
             context_window: worker_config.llm.context_window(),
-            scratchpad_budget: worker_config
-                .scratchpad_tools_config
-                .as_ref()
-                .map(|sp| sp.budget.clone()),
+            scratchpad_budget,
             client_tool_names: Default::default(),
             turn_nudge,
             system_prompt: preamble.clone(),
             invocation_parameters: crate::logging::llm_invocation_parameters(&worker_config.llm),
             skills: worker_config.agent.skills.clone(),
-        };
+            forwarded_headers: worker_config.forwarded_headers.clone(),
+            run,
+            active: Default::default(),
+        });
+        // Workers are per-run ephemeral and receive no chat history, so their
+        // skill invocations are never rehydrated into the session — recording
+        // them would leak task-scoped loads across turns. Their runs record
+        // none; the coordinator's run records the request's.
+        let agent = prepared.begin_run_within(&self.orchestration_run(), None)?;
 
         Ok(AgentWithPreamble {
             agent,
             preamble,
             escalation_flag,
             submit_result_decision,
+        })
+    }
+
+    /// The run the orchestration serves, for its workers and coordinator to
+    /// begin theirs within. That is the run in scope; a test driving the
+    /// orchestrator outside one gets a run nobody observes, under the
+    /// request id the config carries.
+    fn orchestration_run(&self) -> Arc<RunContext> {
+        crate::run_context::current_run().unwrap_or_else(|| {
+            RunContext::channel(self.agent_config.request_id.clone().unwrap_or_default()).0
         })
     }
 
@@ -1449,7 +1466,7 @@ impl Orchestrator {
                 stream,
                 &self.usage_state,
                 self.config.stream_inactivity_timeout_secs(),
-                agent.scratchpad_budget.as_ref(),
+                agent.scratchpad_budget(),
                 phase,
                 event_tx,
                 stream_context,
@@ -2642,6 +2659,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
             }
         }
 
+        // The slot the coordinator's skill tools reach its run through;
+        // `begin_run_within` fills it once the coordinator is prepared.
+        let run = Arc::new(BoundRun::default());
+
         // Bundle all coordinator tools
         let coordinator_tools = CoordinatorTools {
             list_tools: if include_recon_tools {
@@ -2667,7 +2688,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             },
             skill_tools: crate::skill_tool::SkillToolset::new(
                 &self.agent_config.agent.skills,
-                self.agent_config.skill_recorder.clone(),
+                Some(Arc::clone(&run)),
             ),
         };
 
@@ -2689,27 +2710,38 @@ Assign tasks to the worker whose tools best match the required operations."#,
         // post-execute continuation routing (13 calls in 5-prompt E2E suite).
         let max_depth = PLANNING_COORDINATOR_MAX_DEPTH;
 
+        // The coordinator is one run of one prepared agent, under the request
+        // that owns the orchestration.
+        let prepared = Arc::new(PreparedAgent {
+            inner: provider_agent,
+            model: model_name,
+            max_depth,
+            mcp_manager: None, // Coordinator doesn't have MCP tools
+            fallback_tool_parsing: false,
+            fallback_tool_names: vec![],
+            fallback_mcp_filter: None,
+            context_window: self.agent_config.llm.context_window(),
+            scratchpad_budget: None,
+            client_tool_names: Default::default(),
+            turn_nudge: None,
+            system_prompt: preamble.clone(),
+            invocation_parameters: crate::logging::llm_invocation_parameters(
+                &self.agent_config.llm,
+            ),
+            skills: self.agent_config.agent.skills.clone(),
+            forwarded_headers: self.agent_config.forwarded_headers.clone(),
+            hitl_gate: None,
+            hitl_approval_tool: None,
+            run,
+            active: Default::default(),
+        });
+        let agent = prepared.begin_run_within(
+            &self.orchestration_run(),
+            self.agent_config.skill_recorder.clone(),
+        )?;
+
         Ok(AgentWithPreamble {
-            agent: Agent {
-                hitl_gate: None,
-                hitl_approval_tool: None,
-                inner: provider_agent,
-                model: model_name,
-                max_depth,
-                mcp_manager: None, // Coordinator doesn't have MCP tools
-                fallback_tool_parsing: false,
-                fallback_tool_names: vec![],
-                fallback_mcp_filter: None,
-                context_window: self.agent_config.llm.context_window(),
-                scratchpad_budget: None,
-                client_tool_names: Default::default(),
-                turn_nudge: None,
-                system_prompt: preamble.clone(),
-                invocation_parameters: crate::logging::llm_invocation_parameters(
-                    &self.agent_config.llm,
-                ),
-                skills: self.agent_config.agent.skills.clone(),
-            },
+            agent,
             preamble,
             escalation_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             submit_result_decision: Arc::new(Mutex::new(None)),
@@ -2922,6 +2954,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
     async fn build_worker_provider_agent(
         &self,
         worker_config: &AgentRuntimeConfig,
+        run: &Arc<BoundRun>,
     ) -> Result<(ProviderAgent, String), Box<dyn std::error::Error + Send + Sync>> {
         let preamble = worker_config.effective_preamble();
         let temperature = worker_config.llm.temperature();
@@ -2980,8 +3013,14 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     (None, _) => state = state.add_tool(shim),
                 }
             }
-            let state =
-                Agent::add_all_tools(state, worker_config, &shared_mcp, wait_for_tools()).await?;
+            let state = PreparedAgent::add_all_tools(
+                state,
+                worker_config,
+                &shared_mcp,
+                run,
+                wait_for_tools(),
+            )
+            .await?;
             return Ok((
                 ProviderAgent::Scripted(state.build()),
                 "scripted".to_string(),
@@ -3033,9 +3072,14 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     builder = builder.max_tokens(max);
                 }
                 let state = BuilderState::Initial(builder);
-                let state =
-                    Agent::add_all_tools(state, worker_config, &shared_mcp, wait_for_tools())
-                        .await?;
+                let state = PreparedAgent::add_all_tools(
+                    state,
+                    worker_config,
+                    &shared_mcp,
+                    run,
+                    wait_for_tools(),
+                )
+                .await?;
                 Ok((ProviderAgent::OpenAI(state.build()), model.clone()))
             }
             LlmConfig::Anthropic {
@@ -3072,9 +3116,14 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     builder = builder.additional_params(params.clone());
                 }
                 let state = BuilderState::Initial(builder);
-                let state =
-                    Agent::add_all_tools(state, worker_config, &shared_mcp, wait_for_tools())
-                        .await?;
+                let state = PreparedAgent::add_all_tools(
+                    state,
+                    worker_config,
+                    &shared_mcp,
+                    run,
+                    wait_for_tools(),
+                )
+                .await?;
                 Ok((ProviderAgent::Anthropic(state.build()), model.clone()))
             }
             LlmConfig::Bedrock {
@@ -3119,9 +3168,14 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     builder = builder.additional_params(params.clone());
                 }
                 let state = BuilderState::Initial(builder);
-                let state =
-                    Agent::add_all_tools(state, worker_config, &shared_mcp, wait_for_tools())
-                        .await?;
+                let state = PreparedAgent::add_all_tools(
+                    state,
+                    worker_config,
+                    &shared_mcp,
+                    run,
+                    wait_for_tools(),
+                )
+                .await?;
                 Ok((ProviderAgent::Bedrock(state.build()), model.clone()))
             }
             LlmConfig::Gemini {
@@ -3151,9 +3205,14 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     builder = builder.additional_params(params.clone());
                 }
                 let state = BuilderState::Initial(builder);
-                let state =
-                    Agent::add_all_tools(state, worker_config, &shared_mcp, wait_for_tools())
-                        .await?;
+                let state = PreparedAgent::add_all_tools(
+                    state,
+                    worker_config,
+                    &shared_mcp,
+                    run,
+                    wait_for_tools(),
+                )
+                .await?;
                 Ok((ProviderAgent::Gemini(state.build()), model.clone()))
             }
             LlmConfig::Ollama {
@@ -3182,9 +3241,14 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 }
 
                 let state = BuilderState::Initial(builder);
-                let state =
-                    Agent::add_all_tools(state, worker_config, &shared_mcp, wait_for_tools())
-                        .await?;
+                let state = PreparedAgent::add_all_tools(
+                    state,
+                    worker_config,
+                    &shared_mcp,
+                    run,
+                    wait_for_tools(),
+                )
+                .await?;
                 Ok((ProviderAgent::Ollama(state.build()), model.clone()))
             }
             LlmConfig::OpenRouter {
@@ -3217,9 +3281,14 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     builder = builder.additional_params(params.clone());
                 }
                 let state = BuilderState::Initial(builder);
-                let state =
-                    Agent::add_all_tools(state, worker_config, &shared_mcp, wait_for_tools())
-                        .await?;
+                let state = PreparedAgent::add_all_tools(
+                    state,
+                    worker_config,
+                    &shared_mcp,
+                    run,
+                    wait_for_tools(),
+                )
+                .await?;
                 Ok((ProviderAgent::OpenRouter(state.build()), model.clone()))
             }
         }
@@ -3693,7 +3762,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             // their hook-carrying stream (`stream_chat_with_timeout`) seeds
             // the budget itself, from the prompt *and* the retry history.
             if park.is_none()
-                && let Some(ref budget) = worker.scratchpad_budget
+                && let Some(budget) = worker.scratchpad_budget()
             {
                 let task_prompt_tokens = budget.count_tokens(&prompt);
                 budget.record_usage(task_prompt_tokens);
@@ -3778,7 +3847,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             }
 
             // Emit per-agent ScratchpadUsage event if this worker used scratchpad.
-            if let (Some(budget), Some(tx)) = (worker.scratchpad_budget.as_ref(), event_tx) {
+            if let (Some(budget), Some(tx)) = (worker.scratchpad_budget(), event_tx) {
                 let agent_id = worker_name
                     .map(|n| n.to_string())
                     .unwrap_or_else(|| self.orchestrator_id.clone());
@@ -4021,7 +4090,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 worker.max_depth,
                 crate::streaming::RunOptions::default(),
                 &park.key,
-                worker.scratchpad_budget.clone(),
+                worker.scratchpad_budget().cloned(),
                 worker.client_tool_names.clone(),
             )
             .await
@@ -4030,7 +4099,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             stream,
             &self.usage_state,
             self.config.stream_inactivity_timeout_secs(),
-            worker.scratchpad_budget.as_ref(),
+            worker.scratchpad_budget(),
             "Worker resume",
             event_tx,
             worker_name.map(|name| StreamContext {
