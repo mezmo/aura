@@ -345,6 +345,25 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
         warn_timeout_relationships(id, config, &args);
     }
 
+    // Tool-name collisions are a config fault the request path can only warn
+    // about per request, so report them once here where an operator is
+    // watching. Pre-filter and non-gating: an agent's `mcp_filter` may well
+    // resolve a collision reported below.
+    for config in &configs {
+        let Some(mcp_config) = &config.mcp else {
+            continue;
+        };
+        let id = config.agent.alias.as_deref().unwrap_or(&config.agent.name);
+        match aura::McpManager::initialize_from_config(mcp_config).await {
+            Ok(manager) => {
+                for line in manager.collision_report() {
+                    warn!("agent '{}': {}", id, line);
+                }
+            }
+            Err(e) => warn!("agent '{}': could not check MCP tool names: {}", id, e),
+        }
+    }
+
     // Validate DEFAULT_AGENT matches a loaded config
     if let Some(ref default_agent) = args.default_agent {
         let exists = configs

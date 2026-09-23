@@ -58,6 +58,11 @@ fn generate_fallback_tool_id() -> String {
 pub struct FallbackToolExecutor {
     mcp_manager: Arc<McpManager>,
     available_tools: Vec<String>,
+    /// The same effective `mcp_filter` used to register tools, re-applied at
+    /// execution time so a fallback-parsed call resolves to the identical
+    /// server normal registration would have picked. See
+    /// `McpManager::resolve_winning_tools`.
+    mcp_filter: Option<Vec<aura_config::GlobPattern>>,
 }
 
 impl FallbackToolExecutor {
@@ -66,11 +71,18 @@ impl FallbackToolExecutor {
     /// # Arguments
     /// * `mcp_manager` - MCP manager for executing discovered tools
     /// * `available_tools` - Tool names to match against (only these will be executed)
+    /// * `mcp_filter` - The agent's effective `mcp_filter`, exactly as passed
+    ///   to registration; execution re-applies it so a fallback call can't
+    ///   reach a server the filter excluded
     ///
     /// # Note
     /// If `available_tools` is empty, no tool calls will ever be detected.
     /// The caller (`Agent::maybe_wrap_with_fallback`) should skip wrapping in this case.
-    pub fn new(mcp_manager: Arc<McpManager>, available_tools: Vec<String>) -> Self {
+    pub fn new(
+        mcp_manager: Arc<McpManager>,
+        available_tools: Vec<String>,
+        mcp_filter: Option<Vec<aura_config::GlobPattern>>,
+    ) -> Self {
         debug!(
             tool_count = available_tools.len(),
             "Fallback tool executor created"
@@ -78,6 +90,7 @@ impl FallbackToolExecutor {
         Self {
             mcp_manager,
             available_tools,
+            mcp_filter,
         }
     }
 
@@ -162,7 +175,11 @@ impl FallbackToolExecutor {
                                 ));
 
                                 let tool_result = executor_clone.mcp_manager
-                                    .execute_fallback_tool(&parsed_call.name, &parsed_call.arguments)
+                                    .execute_fallback_tool(
+                                        &parsed_call.name,
+                                        &parsed_call.arguments,
+                                        executor_clone.mcp_filter.as_deref(),
+                                    )
                                     .await;
 
                                 match tool_result {

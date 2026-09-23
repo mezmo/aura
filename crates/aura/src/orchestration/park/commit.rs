@@ -325,6 +325,7 @@ mod tests {
                 },
                 items: vec![ApprovalItem {
                     tool_name: "kubectl_apply".to_string(),
+                    tool_namespace: None,
                     arguments: serde_json::json!({ "namespace": "prod" }),
                     tool_call_intent: None,
                 }],
@@ -704,12 +705,10 @@ mod tests {
     /// gating or tool surface changes.
     #[test]
     fn config_fingerprint_stable_and_sensitive() {
-        use aura_config::GlobPattern;
-
         fn config(pattern: &str) -> crate::config::AgentRuntimeConfig {
             crate::config::AgentRuntimeConfig {
                 hitl: Some(crate::hitl::HitlRuntime {
-                    patterns: Arc::from([GlobPattern::new(pattern).unwrap()]),
+                    patterns: Arc::from([pattern.into()]),
                     route: Arc::new(crate::hitl::DecisionRoute::Conversational {
                         registry: PendingApprovals::new(),
                         timeout: Duration::from_secs(120),

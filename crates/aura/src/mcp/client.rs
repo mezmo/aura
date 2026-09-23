@@ -28,6 +28,7 @@ use tracing::{debug, error, info, warn};
 use crate::approver_headers::ApproverHeaders;
 use crate::mcp::progress::ProgressEnabledHandler;
 use crate::mcp::response::extract_tool_result;
+use crate::mcp::types::ToolNamespace;
 use crate::tool_event_broker::{ToolName, peek_tool_call_id};
 use aura_events::AgentContext;
 use aura_events::agent::{AgentEvent, AgentEventPayload};
@@ -368,6 +369,8 @@ impl InFlightRequests {
 pub struct McpClient {
     client: Arc<RunningService<RoleClient, ProgressEnabledHandler>>,
     server_url: String,
+    /// The `[mcp.servers.<key>]` config key this connection fronts.
+    namespace: ToolNamespace,
     /// Tracks in-flight MCP requests for cancellation support
     in_flight: Arc<InFlightRequests>,
     current_call: Arc<RwLock<Option<CallContext>>>,
@@ -387,6 +390,7 @@ impl Clone for McpClient {
         Self {
             client: self.client.clone(),
             server_url: self.server_url.clone(),
+            namespace: self.namespace.clone(),
             in_flight: self.in_flight.clone(),
             current_call: self.current_call.clone(),
         }
@@ -401,6 +405,7 @@ impl McpClient {
     pub(crate) async fn from_transport<T>(
         transport: T,
         server_url: String,
+        namespace: ToolNamespace,
         user_agent: &str,
     ) -> Result<Self>
     where
@@ -417,6 +422,7 @@ impl McpClient {
         Ok(Self {
             client: Arc::new(client),
             server_url,
+            namespace,
             in_flight: Arc::new(InFlightRequests::new()),
             current_call,
         })
@@ -427,6 +433,7 @@ impl McpClient {
     /// in `forwarded_headers` replaces the header for that server alone.
     pub async fn new(
         server_url: String,
+        namespace: ToolNamespace,
         forwarded_headers: &HashMap<String, String>,
         user_agent: &str,
     ) -> Result<Self> {
@@ -475,7 +482,14 @@ impl McpClient {
             },
         );
 
-        let client = match Self::from_transport(transport, server_url.clone(), user_agent).await {
+        let client = match Self::from_transport(
+            transport,
+            server_url.clone(),
+            namespace,
+            user_agent,
+        )
+        .await
+        {
             Ok(client) => client,
             Err(e) => {
                 // Surface the real HTTP status when the transport captured one,
@@ -759,6 +773,11 @@ impl McpClient {
 
     pub fn server_url(&self) -> &str {
         &self.server_url
+    }
+
+    /// The MCP server this connection fronts.
+    pub fn namespace(&self) -> &ToolNamespace {
+        &self.namespace
     }
 
     /// Execute a tool with explicit tracking for later cancellation via `cancel_all_for_request`.
@@ -1247,7 +1266,7 @@ pub(crate) mod tests {
         headers: &HashMap<String, String>,
     ) -> (RecordingMcpServer, McpClient) {
         let server = RecordingMcpServer::start().await;
-        let client = McpClient::new(server.url.clone(), headers, "test/0")
+        let client = McpClient::new(server.url.clone(), "test".into(), headers, "test/0")
             .await
             .expect("the loopback server completes the handshake");
         (server, client)
@@ -1273,9 +1292,14 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn handshake_announces_the_user_agent_on_both_layers() {
         let server = RecordingMcpServer::start().await;
-        McpClient::new(server.url.clone(), &HashMap::new(), "mezmo-aura/prod")
-            .await
-            .expect("the loopback server completes the handshake");
+        McpClient::new(
+            server.url.clone(),
+            "test".into(),
+            &HashMap::new(),
+            "mezmo-aura/prod",
+        )
+        .await
+        .expect("the loopback server completes the handshake");
 
         let initialize = server.initialize();
         assert_eq!(
@@ -1300,7 +1324,7 @@ pub(crate) mod tests {
     async fn per_server_user_agent_header_overrides_the_configured_one() {
         let server = RecordingMcpServer::start().await;
         let headers = HashMap::from([("User-Agent".to_owned(), "proxy-friendly/2".to_owned())]);
-        McpClient::new(server.url.clone(), &headers, "aura/0.0.0")
+        McpClient::new(server.url.clone(), "test".into(), &headers, "aura/0.0.0")
             .await
             .expect("the loopback server completes the handshake");
 
