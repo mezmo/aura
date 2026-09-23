@@ -25,8 +25,11 @@
 //!   the registry; decisions arrive via `POST /v1/approvals/{decision_id}`
 //!   (web-server) or in-process `PendingApprovals::resolve()` (CLI standalone).
 //!
-//! Single-agent mode composes the gate and tool in [`Agent::new`](crate::builder::Agent::new);
-//! orchestration workers compose them per-task in `create_worker`.
+//! Single-agent mode composes the gate and tool in
+//! [`PreparedAgent::prepare`](crate::builder::PreparedAgent::prepare);
+//! orchestration workers compose them per-task in `create_worker`. Both
+//! stamp the request id of the run they serve, reached through a
+//! [`RunSlot`](crate::run::RunSlot).
 
 mod decision;
 mod events;

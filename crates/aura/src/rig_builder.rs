@@ -8,9 +8,10 @@
 //! handles request-scoped MCP header resolution (`headers_from_request`) so the
 //! web server can inject per-request credentials into MCP calls.
 
-use crate::builder::{Agent, ClientTool, build_streaming_agent};
+use crate::builder::{Agent, ClientTool, PreparedAgent, build_streaming_agent};
 use crate::config::{AgentRuntimeConfig, WorkerSkills};
 use crate::error::BuilderError;
+use crate::forwarded_headers::ForwardedHeaders;
 use crate::hitl::PendingApprovals;
 use crate::streaming::StreamingAgent;
 use aura_config::{AgentSettings, Config, McpConfig, McpServerConfig};
@@ -92,6 +93,7 @@ impl RigBuilder {
                 )
             }),
             instance_id: crate::instance_id::instance_id(&self.config.agent).to_string(),
+            forwarded_headers: ForwardedHeaders::resolve(&self.config, req_headers),
             ..Default::default()
         }
     }
@@ -130,11 +132,40 @@ impl RigBuilder {
         Ok(agent_config)
     }
 
-    /// Build an agent with optional request headers, additional tools, and client-side tools.
+    /// Prepare an agent with optional request headers, additional tools, and client-side tools.
+    ///
+    /// The result is the reusable half of an agent: it holds no run state, so
+    /// one prepared agent can serve a session's turns through
+    /// [`PreparedAgent::begin_run`]. It does forward `req_headers` wherever
+    /// `headers_from_request` says to, and `begin_run` refuses a request that
+    /// forwards different values, so a session whose credentials change
+    /// prepares a new agent.
     ///
     /// - `req_headers`: HTTP headers for MCP `headers_from_request` resolution. Pass `None` when not in an HTTP context.
     /// - `additional_tools`: Extra rig tools the agent will execute itself (e.g. CLI/library-supplied tools). Pass `vec![]` when none needed.
     /// - `client_tools`: Passthrough tools the LLM may call but the *client* executes. Pass `None` when client-side tools are not in use.
+    /// - `session_id`: The chat session the agent serves; scopes its HITL approvals.
+    pub async fn prepare_agent(
+        &self,
+        req_headers: Option<&HashMap<String, String>>,
+        additional_tools: Vec<Box<dyn rig::tool::ToolDyn>>,
+        client_tools: Option<Vec<ClientTool>>,
+        session_id: Option<String>,
+    ) -> Result<Arc<PreparedAgent>, BuilderError> {
+        let mut agent_config = self.discovered_agent_config(req_headers)?;
+        resolve_mcp_headers(&mut agent_config, req_headers);
+        agent_config.session_id = session_id;
+        PreparedAgent::prepare(&agent_config, additional_tools, client_tools)
+            .await
+            .map(Arc::new)
+            .map_err(|e| BuilderError::AgentError(format!("Failed to build agent: {e}")))
+    }
+
+    /// Prepare an agent and begin its run for `request_id`.
+    ///
+    /// See [`Self::prepare_agent`] for the parameters. Each call prepares a
+    /// fresh agent; callers that want to reuse one across requests call
+    /// `prepare_agent` once and `begin_run` per request.
     pub async fn build_agent(
         &self,
         req_headers: Option<&HashMap<String, String>>,
@@ -143,12 +174,11 @@ impl RigBuilder {
         request_id: Option<String>,
         session_id: Option<String>,
     ) -> Result<Agent, BuilderError> {
-        let mut agent_config = self.discovered_agent_config(req_headers)?;
-        resolve_mcp_headers(&mut agent_config, req_headers);
-        agent_config.request_id = request_id;
-        agent_config.session_id = session_id;
-        Agent::new(&agent_config, additional_tools, client_tools)
-            .await
+        let prepared = self
+            .prepare_agent(req_headers, additional_tools, client_tools, session_id)
+            .await?;
+        prepared
+            .begin_run(request_id.unwrap_or_default(), req_headers)
             .map_err(|e| BuilderError::AgentError(format!("Failed to build agent: {e}")))
     }
 

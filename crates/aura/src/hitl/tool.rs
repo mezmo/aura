@@ -16,6 +16,7 @@ use serde_json::Value;
 use super::decision::{AgentScope, ApprovalDecision, ApprovalOrigin, ApprovalOutcome, DecisionId};
 use super::protocol::{ApprovalItem, ApprovalRequest, PROTOCOL_VERSION};
 use super::route::{ApprovalError, DecisionRoute};
+use crate::run::RunSlot;
 
 /// The `request_approval` tool. Constructs an
 /// [`ApprovalOrigin::AgentRequested`] and dispatches through the shared
@@ -26,7 +27,8 @@ use super::route::{ApprovalError, DecisionRoute};
 pub struct RequestApprovalTool {
     route: Arc<DecisionRoute>,
     scope: AgentScope,
-    request_id: String,
+    /// The prepared agent's run slot.
+    run: RunSlot,
     agent_name: String,
     /// Instance ID of the AURA process that built this tool.
     instance_id: String,
@@ -37,14 +39,14 @@ impl RequestApprovalTool {
     pub fn new(
         route: Arc<DecisionRoute>,
         scope: AgentScope,
-        request_id: String,
+        run: RunSlot,
         agent_name: String,
         instance_id: String,
     ) -> Self {
         Self {
             route,
             scope,
-            request_id,
+            run,
             agent_name,
             instance_id,
         }
@@ -144,13 +146,14 @@ impl Tool for RequestApprovalTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        let request_id = self.run.request_id_or_empty();
         // Blank reasoning collapses to absent, consistent with the config_gate path.
         let tool_call_intent = normalize_tool_call_intent(args.tool_call_intent.as_deref());
         let request = ApprovalRequest {
             version: PROTOCOL_VERSION,
             instance_id: self.instance_id.clone(),
             decision_id: DecisionId::generate(),
-            request_id: self.request_id.clone(),
+            request_id: request_id.clone(),
             scope: self.scope.clone(),
             origin: ApprovalOrigin::AgentRequested {
                 reason: args.risk_rationale.clone(),
@@ -163,9 +166,8 @@ impl Tool for RequestApprovalTool {
                 tool_call_intent,
             }],
         };
-        let cancel =
-            crate::request_cancellation::RequestCancellation::token_for_id(&self.request_id)
-                .unwrap_or_else(crate::request_cancellation::RequestCancelToken::unbound);
+        let cancel = crate::request_cancellation::RequestCancellation::token_for_id(&request_id)
+            .unwrap_or_else(crate::request_cancellation::RequestCancelToken::unbound);
         approval_outcome_to_tool_result(
             self.route.decide(request, &cancel).await,
             &args.action_description,
@@ -314,7 +316,7 @@ mod tests {
         let tool = RequestApprovalTool::new(
             route.clone(),
             AgentScope::Single { session_id: None },
-            request_id.clone(),
+            RunSlot::pinned_request(request_id.clone()),
             "test-agent".to_string(),
             "test-instance-id".to_string(),
         );
@@ -482,7 +484,7 @@ mod tests {
             let tool = RequestApprovalTool::new(
                 route,
                 AgentScope::Single { session_id: None },
-                request_id.clone(),
+                RunSlot::pinned_request(request_id.clone()),
                 "test-agent".to_string(),
                 "test-instance-id".to_string(),
             );

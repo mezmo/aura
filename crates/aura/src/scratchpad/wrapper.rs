@@ -1,10 +1,10 @@
 //! ScratchpadWrapper — intercepts large MCP tool outputs and writes them
 //! to the scratchpad directory, returning a summary pointer to the LLM.
 
-use super::context_budget::ContextBudget;
 use super::storage::ScratchpadStorage;
 use crate::mcp::CallOutcome;
 use crate::orchestration::persistence_wrapper::strip_artifact_footer;
+use crate::run::RunSlot;
 use crate::tool_wrapper::{ToolCallContext, ToolWrapper, TransformOutputResult};
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -41,34 +41,34 @@ pub(crate) fn build_file_pointer(headline: &str, file_ref: &str) -> String {
 /// ToolWrapper that intercepts large outputs from flagged tools and writes
 /// them to scratchpad files, replacing the output with a compact pointer.
 pub struct ScratchpadWrapper {
-    /// Map of bare tool name → `min_tokens` threshold. Resolved per-request
-    /// during `Agent::new` (single-agent) or `Orchestrator::create_worker`
-    /// (orchestration) by `scratchpad::scratchpad_tool_map` — server-aware,
-    /// glob patterns expanded against each server's tool list. Runtime
-    /// lookup is an exact `HashMap::get`.
+    /// Map of bare tool name → `min_tokens` threshold.
     scratchpad_tools: HashMap<String, usize>,
     /// Storage backend for writing scratchpad files.
     storage: Arc<ScratchpadStorage>,
-    /// Budget tracker for recording intercepted tokens.
-    budget: ContextBudget,
+    /// The prepared agent's run slot.
+    run: RunSlot,
 }
 
 impl ScratchpadWrapper {
     pub fn new(
         scratchpad_tools: HashMap<String, usize>,
         storage: Arc<ScratchpadStorage>,
-        budget: ContextBudget,
+        run: RunSlot,
     ) -> Self {
         Self {
             scratchpad_tools,
             storage,
-            budget,
+            run,
         }
     }
 }
 
 #[async_trait]
 impl ToolWrapper for ScratchpadWrapper {
+    /// Counts and records against the budget of the run bound when the call
+    /// happens. Exact-name lookup against `scratchpad_tools`, which
+    /// `scratchpad::scratchpad_tool_map` resolves from the per-server glob
+    /// patterns when the agent is prepared.
     async fn transform_output(
         &self,
         output: String,
@@ -101,7 +101,24 @@ impl ToolWrapper for ScratchpadWrapper {
         // and all.
         let content = strip_artifact_footer(&output);
 
-        let output_tokens = self.budget.count_tokens(content);
+        // With no run bound there is no budget to count against, and a
+        // flagged tool's output is presumed large enough to need one.
+        // Withhold it rather than pass through the overflow scratchpad
+        // exists to prevent — the same choice the read tools make with
+        // `ScratchpadToolError::NoRun`.
+        let Some(budget) = self.run.scratchpad_budget() else {
+            tracing::warn!(
+                "Scratchpad: {} output withheld — no run is bound",
+                ctx.tool_name
+            );
+            return TransformOutputResult::new(format!(
+                "[scratchpad: {} output withheld: no run is bound to count it against. \
+                 Retry the tool call.]",
+                ctx.tool_name
+            ));
+        };
+
+        let output_tokens = budget.count_tokens(content);
         if output_tokens < min_tokens {
             tracing::debug!(
                 "Scratchpad: {} output (~{} tokens) below threshold ({}), passing through",
@@ -193,7 +210,7 @@ impl ToolWrapper for ScratchpadWrapper {
                     pointer.push_str(&tool_list);
                 }
 
-                self.budget.record_intercepted(token_count);
+                budget.record_intercepted(token_count);
 
                 tracing::debug!(
                     "Scratchpad: intercepted {} output (~{} tokens) → {} ({} companions)",
@@ -230,6 +247,7 @@ impl ToolWrapper for ScratchpadWrapper {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scratchpad::ContextBudget;
     use crate::scratchpad::context_budget::{TiktokenCounter, TokenCounter};
     use crate::tool_wrapper::ToolCallContext;
     use tempfile::TempDir;
@@ -266,7 +284,8 @@ mod tests {
 
         let counter = TiktokenCounter::default_counter();
         let budget = ContextBudget::new(128_000, 0.20, 0, std::sync::Arc::new(counter));
-        let wrapper = ScratchpadWrapper::new(tools, storage.clone(), budget);
+        let wrapper =
+            ScratchpadWrapper::new(tools, storage.clone(), RunSlot::pinned_budget(budget));
 
         let large_output = (0..500)
             .map(|i| format!("entry_{} ", i))
@@ -308,7 +327,7 @@ mod tests {
         let tools = HashMap::from([("echo_large".to_string(), 10)]);
         let counter = TiktokenCounter::default_counter();
         let budget = ContextBudget::new(128_000, 0.20, 0, std::sync::Arc::new(counter));
-        let wrapper = ScratchpadWrapper::new(tools, storage, budget);
+        let wrapper = ScratchpadWrapper::new(tools, storage, RunSlot::pinned_budget(budget));
 
         let large_output = (0..200).map(|i| format!("entry_{i} ")).collect::<String>();
         let mut ctx = ToolCallContext::new("echo_large");
@@ -341,7 +360,8 @@ mod tests {
 
         let counter = TiktokenCounter::default_counter();
         let budget = ContextBudget::new(128_000, 0.20, 0, std::sync::Arc::new(counter));
-        let wrapper = ScratchpadWrapper::new(tools, storage.clone(), budget);
+        let wrapper =
+            ScratchpadWrapper::new(tools, storage.clone(), RunSlot::pinned_budget(budget));
 
         // Use varied content to avoid tokenizer compression of repeated chars
         let large_output = (0..500).map(|i| format!("item_{} ", i)).collect::<String>();
@@ -391,7 +411,8 @@ mod tests {
         let tools = HashMap::from([("execute_range_query".to_string(), 10)]);
         let counter = TiktokenCounter::default_counter();
         let budget = ContextBudget::new(128_000, 0.20, 0, std::sync::Arc::new(counter));
-        let wrapper = ScratchpadWrapper::new(tools, storage.clone(), budget);
+        let wrapper =
+            ScratchpadWrapper::new(tools, storage.clone(), RunSlot::pinned_budget(budget));
 
         // Valid JSON payload, large enough to be intercepted...
         let items: String = (0..200)
@@ -446,7 +467,11 @@ mod tests {
 
         let counter = TiktokenCounter::default_counter();
         let budget = ContextBudget::new(128_000, 0.20, 0, std::sync::Arc::new(counter));
-        let wrapper = ScratchpadWrapper::new(tools, storage.clone(), budget.clone());
+        let wrapper = ScratchpadWrapper::new(
+            tools,
+            storage.clone(),
+            RunSlot::pinned_budget(budget.clone()),
+        );
 
         let small_output = "small result".to_string();
         let ctx = ToolCallContext::new("search_knowledge_base");
@@ -484,7 +509,7 @@ mod tests {
 
         let counter = TiktokenCounter::default_counter();
         let budget = ContextBudget::new(128_000, 0.20, 0, std::sync::Arc::new(counter));
-        let wrapper = ScratchpadWrapper::new(tools, storage, budget);
+        let wrapper = ScratchpadWrapper::new(tools, storage, RunSlot::pinned_budget(budget));
 
         let large_output = "x".repeat(500);
         let ctx = ToolCallContext::new("other_tool");
@@ -512,7 +537,8 @@ mod tests {
 
         let counter = TiktokenCounter::default_counter();
         let budget = ContextBudget::new(128_000, 0.20, 0, std::sync::Arc::new(counter));
-        let wrapper = ScratchpadWrapper::new(tools, storage.clone(), budget);
+        let wrapper =
+            ScratchpadWrapper::new(tools, storage.clone(), RunSlot::pinned_budget(budget));
 
         let large_output = (0..500).map(|i| format!("line_{} ", i)).collect::<String>();
         for tool_name in ["load_skill", "read_skill_file"] {
@@ -550,7 +576,8 @@ mod tests {
         // Set threshold to exactly the token count — should be intercepted (>=)
         let tools = HashMap::from([("tool_at_boundary".to_string(), exact_tokens)]);
         let budget = ContextBudget::new(128_000, 0.20, 0, Arc::new(counter));
-        let wrapper = ScratchpadWrapper::new(tools, storage.clone(), budget);
+        let wrapper =
+            ScratchpadWrapper::new(tools, storage.clone(), RunSlot::pinned_budget(budget));
 
         let mut ctx = ToolCallContext::new("tool_at_boundary");
         ctx.task_id = Some(1);
@@ -570,7 +597,8 @@ mod tests {
         let tools_above = HashMap::from([("tool_at_boundary".to_string(), exact_tokens + 1)]);
         let counter2 = TiktokenCounter::default_counter();
         let budget2 = ContextBudget::new(128_000, 0.20, 0, Arc::new(counter2));
-        let wrapper2 = ScratchpadWrapper::new(tools_above, storage, budget2);
+        let wrapper2 =
+            ScratchpadWrapper::new(tools_above, storage, RunSlot::pinned_budget(budget2));
 
         let result2 = wrapper2
             .transform_output(content.clone(), &ok(), &ctx, None)
@@ -598,7 +626,8 @@ mod tests {
         let expected_tokens = counter.count_tokens(&content);
 
         let budget = ContextBudget::new(128_000, 0.20, 0, Arc::new(counter));
-        let wrapper = ScratchpadWrapper::new(tools, storage, budget.clone());
+        let wrapper =
+            ScratchpadWrapper::new(tools, storage, RunSlot::pinned_budget(budget.clone()));
 
         let mut ctx = ToolCallContext::new("counted_tool");
         ctx.task_id = Some(1);
@@ -634,7 +663,8 @@ mod tests {
         let tools = HashMap::from([("failing_tool".to_string(), 10)]);
         let counter = TiktokenCounter::default_counter();
         let budget = ContextBudget::new(128_000, 0.20, 0, Arc::new(counter));
-        let wrapper = ScratchpadWrapper::new(tools, storage, budget.clone());
+        let wrapper =
+            ScratchpadWrapper::new(tools, storage, RunSlot::pinned_budget(budget.clone()));
 
         let large_output = (0..200).map(|i| format!("item_{} ", i)).collect::<String>();
         let mut ctx = ToolCallContext::new("failing_tool");
@@ -688,7 +718,8 @@ mod tests {
         let tools = HashMap::from([("nested_call".to_string(), 10)]);
         let counter = TiktokenCounter::default_counter();
         let budget = ContextBudget::new(128_000, 0.20, 0, std::sync::Arc::new(counter));
-        let wrapper = ScratchpadWrapper::new(tools, storage.clone(), budget);
+        let wrapper =
+            ScratchpadWrapper::new(tools, storage.clone(), RunSlot::pinned_budget(budget));
 
         // Outer JSON whose `payload` value is itself an escaped JSON string
         // long enough to trigger companion extraction (>= COMPANION_MIN_LINES
@@ -752,7 +783,8 @@ mod tests {
 
         let counter = TiktokenCounter::default_counter();
         let budget = ContextBudget::new(128_000, 0.20, 0, std::sync::Arc::new(counter));
-        let wrapper = ScratchpadWrapper::new(tools, storage.clone(), budget);
+        let wrapper =
+            ScratchpadWrapper::new(tools, storage.clone(), RunSlot::pinned_budget(budget));
 
         // JSON with a large markdown string value that will be extracted as a companion
         let md_lines = (0..15)
