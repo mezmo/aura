@@ -80,17 +80,22 @@ valid_date() {
 # 4xx alone: an auth or project error repeated four times is noise, and the
 # status is worth naming because every likely cause is a misconfiguration
 # rather than an outage.
+#
+# The body goes to a file rather than stdout: curl truncates a file before each
+# retry, but on stdout a retried 504's body ("upstream request timeout") stays
+# in front of the eventual 200's JSON, and jq fails to parse the pair.
 hogql_request() {
-    local query=$1 response status body
-    response=$(jq -n --arg q "${query}" '{query: {kind: "HogQLQuery", query: $q}}' \
+    local query=$1 out status body
+    out=$(mktemp)
+    status=$(jq -n --arg q "${query}" '{query: {kind: "HogQLQuery", query: $q}}' \
         | curl --silent --show-error --retry 3 --retry-delay 2 --max-time 60 \
-            --write-out '\n%{http_code}' \
+            --write-out '%{http_code}' --output "${out}" \
             --header "Authorization: Bearer ${POSTHOG_API_READ_KEY}" \
             --header 'Content-Type: application/json' \
             --data-binary @- \
             "${POSTHOG_API_HOST%/}/api/projects/${POSTHOG_PROJECT_ID}/query/")
-    status=${response##*$'\n'}
-    body=${response%$'\n'*}
+    body=$(cat "${out}")
+    rm -f "${out}"
     if [ "${status}" != 200 ]; then
         echo "error: PostHog query API returned ${status} for project ${POSTHOG_PROJECT_ID}" >&2
         echo "       ${body}" >&2
