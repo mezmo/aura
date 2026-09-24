@@ -9,19 +9,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
+pub use aura_events::run::RunCancelReason;
+
 pub struct ToolCall<'a> {
     pub name: &'a str,
-}
-
-/// Why a hook ended a run.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RunCancelReason {
-    /// The run outlived the bound it was started with.
-    Deadline { after: std::time::Duration },
-    /// Something outside the run cancelled it.
-    External,
-    /// The model called a tool the caller executes, so the run yields to it.
-    ClientTool,
 }
 
 /// Something watching one run.
