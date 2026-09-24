@@ -11,7 +11,6 @@ use crate::hitl::HitlRuntime;
 use crate::scratchpad::ScratchpadToolsConfig;
 use crate::tool_wrapper::{ToolCallContext, ToolWrapper};
 use aura_config::GlobPattern;
-use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 // Re-export the pure config types from `aura-config` so existing
@@ -40,28 +39,7 @@ pub enum WorkerSkills {
     Override(Vec<SkillConfig>),
 }
 
-/// Identifier for a chat session — the conversational context an agent runs in.
-///
-/// Threaded from the web server's `chat_session_id`, but meaningful for any
-/// agent run, including library use without the web layer; not every run has
-/// one. An opaque, branded string. Serializes as the bare string.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct SessionId(String);
-
-impl SessionId {
-    /// Wrap a session-id string. Accepts a `&str` or an owned `String`.
-    #[must_use]
-    pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
-    }
-
-    /// Borrow the underlying id as a string slice.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
+pub use aura_events::SessionId;
 
 /// Runtime build context for constructing agents.
 ///

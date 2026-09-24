@@ -476,6 +476,7 @@ impl StreamingRequestHook {
             RunCancelReason::ClientTool => {
                 tracing::info!("Run yielding to a client tool during {}", context)
             }
+            other => tracing::info!("Run cancelled ({:?}) during {}", other, context),
         }
         cancel_sig.cancel();
     }
