@@ -128,15 +128,6 @@ impl Drop for TaskCancelGuard {
     /// this composes with the explicit removals.
     fn drop(&mut self) {
         lock_cancel_state(&self.state).remove(&self.task_id);
-        // The streaming hook keys a tool-call FIFO under this request id, and
-        // a run cancelled between a tool call and its result leaves an entry
-        // behind. The broker is async, so this runs as its own task — which a
-        // runtime already shutting down may never poll, leaving the entry for
-        // the process to reclaim.
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            let request_id = self.request_id.clone();
-            handle.spawn(async move { aura::tool_event_unsubscribe(&request_id).await });
-        }
         RequestCancellation::unregister(&self.request_id);
     }
 }

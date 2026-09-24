@@ -76,6 +76,7 @@ impl RunOptions {
 /// usage it accumulates.
 pub struct AgentRun {
     events: BoxStream<'static, Result<StreamItem, StreamError>>,
+    agent_events: Option<tokio::sync::mpsc::Receiver<aura_events::agent::AgentEvent>>,
     cancel: CancellationToken,
     usage: UsageState,
     guard: DropGuard,
@@ -93,9 +94,29 @@ impl AgentRun {
             // from being that token.
             guard: cancel.clone().drop_guard(),
             events,
+            agent_events: None,
             cancel,
             usage,
         }
+    }
+
+    /// Hands the run's events to its observer. A run whose producers emit
+    /// through [`crate::run_context::RunContext::emit`] pairs the sender it
+    /// scopes with the receiver named here.
+    #[must_use]
+    pub fn observed_by(
+        mut self,
+        receiver: tokio::sync::mpsc::Receiver<aura_events::agent::AgentEvent>,
+    ) -> Self {
+        self.agent_events = Some(receiver);
+        self
+    }
+
+    /// Takes the run's events, which one observer reads.
+    pub fn take_agent_events(
+        &mut self,
+    ) -> Option<tokio::sync::mpsc::Receiver<aura_events::agent::AgentEvent>> {
+        self.agent_events.take()
     }
 
     /// Orchestration races this token, so cancelling it stops a run at once.

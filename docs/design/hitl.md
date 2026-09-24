@@ -564,7 +564,7 @@ Verdicts against `mshearer/hitl-v1-config-gate` @ `52f37e6`.
 | `RequestApprovalTool` surface | keep | constructs `ApprovalOrigin::AgentRequested`; attached only when the client does not advertise its own `request_approval` |
 | Webhook HTTP client + fail-closed error handling | keep | becomes the `Webhook` route arm |
 | `request_approval` excluded from glob matching | keep | |
-| SSE routing via `tool_event_broker` + request id | keep, but ungate | approval events must reach the client regardless of `AURA_CUSTOM_EVENTS` (see event gating above) |
+| SSE routing via the run's event channel | keep, but ungate | approval events must reach the client regardless of `AURA_CUSTOM_EVENTS` (see event gating above) |
 | Unit tests | mostly keep | assertions updated only where the compiler forces it |
 | `hitl.rs` single file | rework | module tree above |
 | `ApprovalRequest` / `ApprovalItem` shape | rework | `decision_id`, `origin`, scope on agent; `task` and per-item `matched_pattern` removed |

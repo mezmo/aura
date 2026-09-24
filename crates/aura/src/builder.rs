@@ -1691,7 +1691,7 @@ impl StreamingAgent for Agent {
         options: crate::streaming::RunOptions,
         request_id: &str,
     ) -> crate::streaming::AgentRun {
-        let run = crate::run_context::RunContext::new(request_id);
+        let (run, run_events) = crate::run_context::RunContext::channel(request_id);
 
         // Rig runs tools on its own server task, so bind the run where a tool
         // call can still find it.
@@ -1712,6 +1712,7 @@ impl StreamingAgent for Agent {
                 .await
         }
         .map_stream(move |stream| Box::pin(crate::run_context::scope_stream(run, stream)))
+        .observed_by(run_events)
     }
 
     async fn cancel_and_close_mcp(&self, request_id: &str, reason: &str) -> usize {
