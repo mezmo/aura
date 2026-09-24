@@ -49,7 +49,7 @@ impl OrchestratorFactory {
         query: String,
         chat_history: Vec<rig::completion::Message>,
         tokens: RunTokens,
-        request_id: String,
+        run: std::sync::Arc<crate::run_context::RunContext>,
         usage_state: crate::UsageState,
         outer_budget: Option<Duration>,
     ) -> BoxStream<'static, Result<StreamItem, StreamError>> {
@@ -59,7 +59,7 @@ impl OrchestratorFactory {
         let (event_tx, event_rx) =
             tokio::sync::mpsc::channel::<Result<StreamItem, StreamError>>(100);
 
-        let run = crate::run_context::RunContext::new(request_id.clone());
+        let run_id = std::sync::Arc::clone(run.id());
         let RunTokens { cancel, finished } = tokens;
         let cancel_token_clone = cancel.clone();
         // Marks the run finished on every exit path, which is what lets the
@@ -136,7 +136,7 @@ impl OrchestratorFactory {
                         tracing::info!("Orchestration cancelled");
                         if let Some(ref mcp_manager) = orchestrator.mcp_manager {
                             let cancelled = mcp_manager
-                                .cancel_and_close_all(&request_id, "Client disconnected or timeout")
+                                .cancel_and_close_all(run_id.as_ref(), "Client disconnected or timeout")
                                 .await;
                             if cancelled > 0 {
                                 tracing::info!("Cancelled {} MCP request(s) during orchestration shutdown", cancelled);
@@ -200,6 +200,7 @@ impl StreamingAgent for OrchestratorFactory {
         // streaming handler (reader) so aura.usage reflects the aggregate of
         // all orchestration LLM turns.
         let usage_state = crate::UsageState::new();
+        let (run, run_events) = crate::run_context::RunContext::channel(request_id);
         let stream = self.spawn_orchestration_stream(
             query.to_string(),
             chat_history,
@@ -207,12 +208,12 @@ impl StreamingAgent for OrchestratorFactory {
                 cancel: cancel_token.clone(),
                 finished,
             },
-            request_id.to_string(),
+            run,
             usage_state.clone(),
             timeout,
         );
 
-        crate::streaming::AgentRun::new(stream, cancel_token, usage_state)
+        crate::streaming::AgentRun::new(stream, cancel_token, usage_state).observed_by(run_events)
     }
 
     async fn cancel_and_close_mcp(&self, _request_id: &str, _reason: &str) -> usize {

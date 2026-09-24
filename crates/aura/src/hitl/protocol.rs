@@ -22,14 +22,7 @@ pub struct ApprovalRequest {
     pub instance_id: String,
     /// The handle a decision resolves against.
     pub decision_id: DecisionId,
-    /// The global request id (SSE routing + MCP cancellation), modeled as the
-    /// existing bare `String` id used throughout the codebase.
-    ///
-    /// A `RequestId` newtype is deliberately not introduced. Unlike RunId /
-    /// SessionId / TaskIdentity it has no single owning module, and it threads
-    /// through SSE routing, the tool event broker, and MCP cancellation, so
-    /// branding it is a cross-cutting refactor out of scope here. The design
-    /// note's `RequestId` typing is aspirational.
+    /// The id of the request this approval was raised under.
     pub request_id: String,
     /// Who is asking.
     pub scope: AgentScope,

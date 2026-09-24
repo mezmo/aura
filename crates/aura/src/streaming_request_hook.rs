@@ -52,7 +52,7 @@ use tokio_util::sync::CancellationToken;
 use crate::orchestration::BlockedCell;
 use crate::run_context::current_run;
 use crate::scratchpad::{self, ContextBudget};
-use crate::tool_event_broker::{TokenUsage, ToolCallId, ToolName};
+use aura_events::{TokenUsage, ToolCallId, ToolName};
 
 /// Maximum pending tool IDs before warning. Prevents unbounded growth if
 /// usage events never fire (e.g., provider doesn't return token counts).
@@ -68,15 +68,14 @@ pub(crate) const PARK_CANCEL_REASON: &str = "parked";
 /// Blocked cells of the worker streams in park mode, keyed by the per-stream
 /// id the orchestrator passes as the hook's `request_id`. The hook is built
 /// inside the streaming layer and cannot take the cell as a parameter, so it
-/// travels through this request-keyed global like the tool-event broker.
+/// travels through this request-keyed global.
 static PARK_CELLS: OnceLock<std::sync::RwLock<HashMap<String, Arc<BlockedCell>>>> = OnceLock::new();
 
 fn park_cells() -> &'static std::sync::RwLock<HashMap<String, Arc<BlockedCell>>> {
     PARK_CELLS.get_or_init(|| std::sync::RwLock::new(HashMap::new()))
 }
 
-/// A worker stream's park-cell registration; dropping it removes the cell
-/// and the stream's tool-event subscription.
+/// A worker stream's park-cell registration; dropping it removes the cell.
 pub(crate) struct ParkCellRegistration(String);
 
 impl ParkCellRegistration {
@@ -95,25 +94,26 @@ impl Drop for ParkCellRegistration {
             .write()
             .expect("park cell registry poisoned")
             .remove(&self.0);
-        // The hook keyed its tool-event FIFO under the same id; the broker is
-        // async, so that cleanup runs as its own task when a runtime exists.
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            let key = std::mem::take(&mut self.0);
-            handle.spawn(async move { crate::tool_event_broker::unsubscribe(&key).await });
-        }
     }
 }
 
-/// The run whose tool-call queue this stream may use, which is the run only
-/// when the stream *is* the run.
+/// The run whose tool-call queue and tool events this stream may use, which is
+/// the run only when the stream *is* the run.
 ///
 /// MCP reads the queue under the run id, its only identity, so a queue filled
 /// by some other stream of the same run would hand a tool call the id of a
 /// sibling's. An orchestration worker streams under a key of its own and so
-/// correlates nothing, which is the behaviour before the queue moved onto the
-/// run. #732 is what would change that.
+/// correlates nothing until #732. Its tool events stay off the run for the same
+/// reason, and orchestration reports the worker's calls itself.
 fn queue_owner(stream_id: &str) -> Option<Arc<crate::run_context::RunContext>> {
     current_run().filter(|run| run.id().as_ref() == stream_id)
+}
+
+/// Sends a tool event raised by this stream to the run [`queue_owner`] gives it.
+async fn emit_from_stream(stream_id: &str, event: AgentEvent) {
+    if let Some(run) = queue_owner(stream_id) {
+        let _ = run.emit(event).await;
+    }
 }
 
 /// The blocked cell for `key`, if this stream is in park mode.
@@ -582,7 +582,7 @@ where
                     if let Some(run) = queue_owner(&request_id) {
                         run.push_tool_call(id.clone());
                     }
-                    let _ = crate::agent_events::emit(
+                    emit_from_stream(
                         &request_id,
                         AgentEvent::single_agent(AgentEventPayload::ToolRequested {
                             tool_call_id: id,
@@ -723,7 +723,7 @@ where
                         tool_ids.len(),
                         tool_ids
                     );
-                    let _ = crate::agent_events::emit(
+                    emit_from_stream(
                         &request_id,
                         AgentEvent::single_agent(AgentEventPayload::ToolUsage {
                             tool_call_ids: tool_ids,
@@ -758,12 +758,45 @@ mod tests {
     /// queue filled by another stream of the same run hands a tool call a
     /// sibling's id. Only the stream that *is* the run may fill it.
     mod queue_ownership {
-        use super::super::queue_owner;
+        use super::super::{emit_from_stream, queue_owner};
         use crate::run_context::{RunContext, with_run};
+        use aura_events::agent::{AgentEvent, AgentEventPayload};
+        use aura_events::{ToolCallId, ToolName};
+
+        fn requested(id: &str) -> AgentEvent {
+            AgentEvent::single_agent(AgentEventPayload::ToolRequested {
+                tool_call_id: ToolCallId::new(id),
+                tool_name: ToolName::new("lookup"),
+                arguments: serde_json::json!({}),
+            })
+        }
+
+        /// A park-mode worker streams under its task attempt inside the run's
+        /// scope, and its tool events must not reach the run as the run's own.
+        #[tokio::test]
+        async fn only_the_run_s_own_stream_sends_it_tool_events() {
+            let (run, mut events) = RunContext::channel("req_1");
+            with_run(run, async {
+                emit_from_stream("req_1:task:0:attempt:1", requested("worker")).await;
+                emit_from_stream("req_1", requested("own")).await;
+            })
+            .await;
+
+            let first = events.try_recv().expect("the run's own event arrives");
+            assert!(
+                matches!(
+                    &first.payload,
+                    AgentEventPayload::ToolRequested { tool_call_id, .. }
+                        if tool_call_id.as_str() == "own"
+                ),
+                "the worker's event reached the run: {first:?}"
+            );
+            assert!(events.try_recv().is_err(), "nothing else reaches the run");
+        }
 
         #[tokio::test]
         async fn the_run_s_own_stream_owns_the_queue() {
-            let run = RunContext::new("req_1");
+            let run = RunContext::detached("req_1");
             let owned = with_run(run, async { queue_owner("req_1").is_some() }).await;
             assert!(owned);
         }
@@ -771,7 +804,7 @@ mod tests {
         /// An orchestration worker streams under its task attempt.
         #[tokio::test]
         async fn a_worker_s_stream_owns_no_queue() {
-            let run = RunContext::new("req_1");
+            let run = RunContext::detached("req_1");
             let owned = with_run(run, async {
                 queue_owner("req_1:task:0:attempt:1").is_some()
             })

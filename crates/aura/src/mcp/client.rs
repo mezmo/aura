@@ -29,8 +29,8 @@ use crate::approver_headers::ApproverHeaders;
 use crate::mcp::progress::ProgressEnabledHandler;
 use crate::mcp::response::extract_tool_result;
 use crate::mcp::types::ToolNamespace;
-use crate::tool_event_broker::ToolName;
 use aura_events::AgentContext;
+use aura_events::ToolName;
 use aura_events::agent::{AgentEvent, AgentEventPayload};
 
 /// Custom HTTP client that captures the underlying HTTP status when a request
@@ -939,9 +939,9 @@ impl McpClient {
             && let Some(tool_call_id) = call.run.peek_tool_call()
         {
             let agent = call.agent.clone();
-            let _ = crate::agent_events::emit(
-                http_request_id,
-                AgentEvent::new(
+            let _ = call
+                .run
+                .emit(AgentEvent::new(
                     agent,
                     AgentEventPayload::ToolStart {
                         arguments: None,
@@ -950,9 +950,8 @@ impl McpClient {
                         tool_name: ToolName::new(tool_name),
                         progress_token: progress_token.clone(),
                     },
-                ),
-            )
-            .await;
+                ))
+                .await;
             debug!(
                 "Emitted tool_start for tool '{}' (tool_call_id={}, progress_token={:?})",
                 tool_name, tool_call_id, progress_token
@@ -1090,7 +1089,7 @@ pub(crate) mod tests {
 
     fn owner(request_id: &str) -> CallContext {
         CallContext {
-            run: crate::run_context::RunContext::new(request_id),
+            run: crate::run_context::RunContext::detached(request_id),
             agent: AgentContext::single_agent(),
         }
     }
@@ -1635,7 +1634,10 @@ pub(crate) mod tests {
         );
 
         client
-            .bind_call(crate::run_context::RunContext::new("req-1"), worker.clone())
+            .bind_call(
+                crate::run_context::RunContext::detached("req-1"),
+                worker.clone(),
+            )
             .await;
         assert_eq!(
             client.call_for("req-1").await.map(|call| call.agent),
@@ -1665,7 +1667,7 @@ pub(crate) mod tests {
 
         client
             .bind_call(
-                crate::run_context::RunContext::new("req_bound"),
+                crate::run_context::RunContext::detached("req_bound"),
                 AgentContext::single_agent(),
             )
             .await;
@@ -1679,13 +1681,13 @@ pub(crate) mod tests {
         let (_server, client) = client_and_server(&requester_headers()).await;
         client
             .bind_call(
-                crate::run_context::RunContext::new("req_bound"),
+                crate::run_context::RunContext::detached("req_bound"),
                 AgentContext::single_agent(),
             )
             .await;
 
         let seen = crate::run_context::with_run(
-            crate::run_context::RunContext::new("req_scoped"),
+            crate::run_context::RunContext::detached("req_scoped"),
             async { client.run_id().await },
         )
         .await;
@@ -1709,16 +1711,19 @@ pub(crate) mod tests {
             .await
             .expect("the untracked call succeeds");
 
-        crate::run_context::with_run(crate::run_context::RunContext::new("http-req-1"), async {
-            client
-                .call_tool(
-                    "tracked",
-                    no_args(),
-                    Some(captured_overrides("x-forwarded-user", "bob")),
-                )
-                .await
-                .expect("the tracked call succeeds");
-        })
+        crate::run_context::with_run(
+            crate::run_context::RunContext::detached("http-req-1"),
+            async {
+                client
+                    .call_tool(
+                        "tracked",
+                        no_args(),
+                        Some(captured_overrides("x-forwarded-user", "bob")),
+                    )
+                    .await
+                    .expect("the tracked call succeeds");
+            },
+        )
         .await;
 
         let calls = server.tool_calls();

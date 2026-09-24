@@ -2,8 +2,7 @@ use a2a::VERSION;
 use aura::RigBuilder;
 use aura::{
     RequestCancellation, ResponseContent, StreamingAgent, UsageState, approval_event_subscribe,
-    approval_event_unsubscribe, request_progress_subscribe, tool_event_subscribe,
-    tool_usage_subscribe,
+    approval_event_unsubscribe,
 };
 use aura_events::{AgentInfo, ServerInfo};
 use axum::Json;
@@ -43,8 +42,6 @@ impl RequestResourceGuard {
 
 impl Drop for RequestResourceGuard {
     fn drop(&mut self) {
-        use aura::{request_progress_unsubscribe, tool_event_unsubscribe, tool_usage_unsubscribe};
-
         // Synchronous so parked awaits cancel even when the runtime is
         // shutting down and the spawn below never polls.
         self.pending_approvals
@@ -61,9 +58,6 @@ impl Drop for RequestResourceGuard {
                     pending_approvals.cancel_request(&id).await;
                     RequestCancellation::unregister(&id);
                     approval_event_unsubscribe(&id).await;
-                    request_progress_unsubscribe(&id).await;
-                    tool_event_unsubscribe(&id).await;
-                    tool_usage_unsubscribe(&id).await;
                 },
                 tracing::Span::current(),
             );
@@ -160,9 +154,7 @@ enum DeliveryChannels {
     Sse {
         chunk_tx: mpsc::Sender<Result<Bytes, String>>,
         heartbeat_interval: std::time::Duration,
-        progress_rx: mpsc::Receiver<aura::ProgressNotification>,
-        tool_event_rx: mpsc::Receiver<aura::ToolLifecycleEvent>,
-        tool_usage_rx: mpsc::Receiver<aura::ToolUsageEvent>,
+        agent_events: Option<mpsc::Receiver<aura_events::agent::AgentEvent>>,
         approval_event_rx: mpsc::Receiver<aura::ApprovalLifecycleEvent>,
     },
 }
@@ -595,25 +587,13 @@ pub async fn execute_completion(
         rehydrated_skills,
     } = setup;
 
-    // Orchestration spawns inside `stream`, so SSE side-channel
-    // receivers must be subscribed before stream startup.
-    let delivery_channels = match delivery {
-        DeliveryMode::Collect { result_tx } => DeliveryChannels::Collect { result_tx },
-        DeliveryMode::Sse {
-            chunk_tx,
-            heartbeat_interval,
-        } => DeliveryChannels::Sse {
-            chunk_tx,
-            heartbeat_interval,
-            progress_rx: request_progress_subscribe(&config.request_id).await,
-            tool_event_rx: tool_event_subscribe(&config.request_id).await,
-            tool_usage_rx: tool_usage_subscribe(&config.request_id).await,
-            approval_event_rx: approval_event_subscribe(&config.request_id).await,
-        },
-    };
+    // Approvals still travel by request id, so the subscription exists before
+    // orchestration spawns inside `stream` and can publish one. The collect
+    // path never reads it.
+    let approval_event_rx = approval_event_subscribe(&config.request_id).await;
 
     // Create stream with timeout — single path for both Agent and Orchestrator
-    let run = streaming_agent
+    let mut run = streaming_agent
         .stream(
             &query,
             chat_history,
@@ -624,6 +604,21 @@ pub async fn execute_completion(
         .await;
     let cancel_tx = run.cancel_token();
     let usage_state = run.usage().clone();
+
+    // The run's events are buffered from the moment it starts, so taking the
+    // receiver after `stream` returns loses nothing it already emitted.
+    let delivery_channels = match delivery {
+        DeliveryMode::Collect { result_tx } => DeliveryChannels::Collect { result_tx },
+        DeliveryMode::Sse {
+            chunk_tx,
+            heartbeat_interval,
+        } => DeliveryChannels::Sse {
+            chunk_tx,
+            heartbeat_interval,
+            agent_events: run.take_agent_events(),
+            approval_event_rx,
+        },
+    };
     let stream = run.into_events();
 
     let response_content = config.response_content.clone();
@@ -663,17 +658,13 @@ pub async fn execute_completion(
         DeliveryChannels::Sse {
             chunk_tx,
             heartbeat_interval,
-            progress_rx,
-            tool_event_rx,
-            tool_usage_rx,
+            agent_events,
             approval_event_rx,
         } => {
             let callbacks = StreamingCallbacks {
                 request_id: config.request_id.clone(),
                 agent: streaming_agent.clone(),
-                tool_event_rx,
-                progress_rx,
-                tool_usage_rx,
+                agent_events,
                 approval_event_rx,
                 usage_state: usage_state.clone(),
                 response_content,
