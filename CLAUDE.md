@@ -126,6 +126,7 @@ aura/
 
 ### Shared Event Types (`aura-events`)
 - Lightweight crate defining `AuraStreamEvent` and `OrchestrationStreamEvent` enums
+- `run::RunEvent` is a run's own envelope: `RunId`, optional `SessionId`, a dense `SequenceNumber`, a `Timestamp`, and either an `agent::AgentEvent` or a `RunLifecycleEvent` (started, observer attached/detached, claims exhausted, liveness decided, parked, finished, cancelled, failed). There is one run id; see the module doc. No producer emits it yet
 - Both `Serialize + Deserialize` — used by the web server (producer) and CLI (consumer)
 - No agent, MCP, or provider dependencies — only `serde` and `serde_json`
 - `ProgressToken` type uses a local wire-compatible definition by default; enables `rmcp-types` feature for direct rmcp interop (used by the `aura` crate)
