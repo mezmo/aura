@@ -10,13 +10,16 @@
 //!
 //! - [`AuraStreamEvent`] — Base aura events (tool lifecycle, usage, reasoning, progress)
 //! - [`OrchestrationStreamEvent`] — Multi-agent orchestration events
+//! - [`agent::AgentEvent`] — What a running agent emits, before any wire projection
+//! - [`run::SessionEvent`] — One session's ordered stream: its agents' events and its runs' lifecycle
 //!
-//! Both enums derive `Serialize + Deserialize` so they can be used for
+//! All derive `Serialize + Deserialize` so they can be used for
 //! producing SSE (server) and parsing SSE (client) with the same types.
 
 pub mod agent;
 pub mod event_names;
 pub mod orchestration;
+pub mod run;
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -133,6 +136,62 @@ macro_rules! string_newtype {
             }
         }
     };
+}
+
+// Path-based so submodules can invoke it regardless of declaration order.
+pub(crate) use string_newtype;
+
+string_newtype! {
+    /// Identifier for a session: an agent's identity over time, and the key
+    /// its [`SessionEvent`](run::SessionEvent) stream is ordered under.
+    SessionId
+}
+
+/// Identifier for one run: a unit of work within a session, from a prompt to
+/// a terminal state.
+///
+/// This is the epic's "unique agent id for that run". It is not
+/// [`AgentContext::agent_id`], which is [`CONVERSATION_AGENT_ID`] or a worker
+/// name and attributes an event *within* a run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct RunId(uuid::Uuid);
+
+impl RunId {
+    /// A fresh id. Version 7, so ids order by when they were minted.
+    pub fn mint() -> Self {
+        Self(uuid::Uuid::now_v7())
+    }
+
+    pub fn as_uuid(&self) -> &uuid::Uuid {
+        &self.0
+    }
+}
+
+impl From<uuid::Uuid> for RunId {
+    fn from(uuid: uuid::Uuid) -> Self {
+        Self(uuid)
+    }
+}
+
+impl From<RunId> for uuid::Uuid {
+    fn from(id: RunId) -> Self {
+        id.0
+    }
+}
+
+impl std::str::FromStr for RunId {
+    type Err = uuid::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        uuid::Uuid::from_str(s).map(Self)
+    }
+}
+
+impl std::fmt::Display for RunId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
 }
 
 string_newtype! {

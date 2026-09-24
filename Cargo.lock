@@ -327,6 +327,7 @@ dependencies = [
  "rmcp",
  "serde",
  "serde_json",
+ "uuid",
 ]
 
 [[package]]
