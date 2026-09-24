@@ -85,7 +85,7 @@ valid_date() {
 # retry, but on stdout a retried 504's body ("upstream request timeout") stays
 # in front of the eventual 200's JSON, and jq fails to parse the pair.
 hogql_request() {
-    local query=$1 out status body
+    local query=$1 out status body rc=0
     out=$(mktemp)
     status=$(jq -n --arg q "${query}" '{query: {kind: "HogQLQuery", query: $q}}' \
         | curl --silent --show-error --retry 3 --retry-delay 2 --max-time 60 \
@@ -93,9 +93,12 @@ hogql_request() {
             --header "Authorization: Bearer ${POSTHOG_API_READ_KEY}" \
             --header 'Content-Type: application/json' \
             --data-binary @- \
-            "${POSTHOG_API_HOST%/}/api/projects/${POSTHOG_PROJECT_ID}/query/")
+            "${POSTHOG_API_HOST%/}/api/projects/${POSTHOG_PROJECT_ID}/query/") || rc=$?
     body=$(cat "${out}")
     rm -f "${out}"
+    if [ "${rc}" -ne 0 ]; then
+        return "${rc}"
+    fi
     if [ "${status}" != 200 ]; then
         echo "error: PostHog query API returned ${status} for project ${POSTHOG_PROJECT_ID}" >&2
         echo "       ${body}" >&2
@@ -104,6 +107,55 @@ hogql_request() {
         return 1
     fi
     printf '%s\n' "${body}"
+}
+
+# Self-test for hogql_request through a real curl retry: a local server answers
+# the first query with a 504 and every later one with a 200, and the row read
+# back must be the 200's alone. Callers run this from their own selftest.
+hogql_retry_selftest() {
+    local tmp=$1 pid got port=""
+    python3 - "${tmp}/hogql.port" <<'PY' &
+import http.server, os, sys
+
+seen = []
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        seen.append(1)
+        if len(seen) == 1:
+            code, body = 504, b"upstream request timeout"
+        else:
+            code, body = 200, b'{"results": [[3, 7]]}'
+        self.send_response(code)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+with open(sys.argv[1] + ".tmp", "w") as f:
+    f.write(str(server.server_address[1]))
+os.rename(sys.argv[1] + ".tmp", sys.argv[1])
+server.serve_forever()
+PY
+    pid=$!
+    for _ in $(seq 50); do
+        [ -s "${tmp}/hogql.port" ] && { port=$(cat "${tmp}/hogql.port"); break; }
+        sleep 0.1
+    done
+    got=""
+    if [ -n "${port}" ]; then
+        got=$(POSTHOG_API_HOST="http://127.0.0.1:${port}" POSTHOG_API_READ_KEY=selftest \
+              hogql_row "SELECT 1" 2>&1) || true
+    fi
+    kill "${pid}" 2>/dev/null || true
+    wait "${pid}" 2>/dev/null || true
+    [ -n "${port}" ] || { echo "selftest: the stub PostHog server did not start" >&2; exit 1; }
+    [ "${got}" = $'3\t7' ] \
+        || { echo "selftest: a retried query read back '${got}', want the 200's row alone" >&2; exit 1; }
 }
 
 hogql_scalar() {
