@@ -375,6 +375,38 @@ CSV
     got=$(jq -r '.batch[0].distinct_id' <<<"${payload}")
     [ "${got}" = "docker-dvp:mezmo/aura" ] || { echo "selftest: distinct_id = ${got}" >&2; exit 1; }
 
+    # Every report gets a JWT minted for it rather than one shared across the
+    # run, and --period still narrows the list. The stubs run in a subshell so
+    # the real functions survive for anything after this.
+    printf '%s\t%s\n' 2026-08-17 u1 2026-08-24 u2 2026-08-31 u3 > "${tmp}/reports.tsv"
+    got=$(
+        docker_jwt() {
+            echo x >> "${tmp}/logins"
+            echo "jwt-$(wc -l < "${tmp}/logins" | tr -d ' ')"
+        }
+        sync_report() { printf '%s=%s\n' "$1" "$3" >> "${tmp}/synced"; }
+        ROOT_DIR="${tmp}" PERIOD=""
+        sync_reports "${tmp}/reports.tsv"
+        echo "${SYNCED}"
+        cat "${tmp}/synced"
+    )
+    want=$'3\n2026-08-17=jwt-1\n2026-08-24=jwt-2\n2026-08-31=jwt-3'
+    [ "${got}" = "${want}" ] \
+        || { echo "selftest: reports did not each get a fresh JWT:"$'\n'"${got}" >&2; exit 1; }
+    rm -f "${tmp}/logins" "${tmp}/synced"
+    got=$(
+        docker_jwt() { echo jwt; }
+        sync_report() { printf '%s\n' "$1" >> "${tmp}/synced"; }
+        ROOT_DIR="${tmp}" PERIOD="2026-08-24"
+        sync_reports "${tmp}/reports.tsv"
+        echo "${SYNCED}"
+        cat "${tmp}/synced"
+    )
+    [ "${got}" = $'1\n2026-08-24' ] \
+        || { echo "selftest: --period did not narrow the reports:"$'\n'"${got}" >&2; exit 1; }
+
+    hogql_retry_selftest "${tmp}"
+
     echo "selftest: ok"
 }
 
@@ -431,6 +463,25 @@ sync_report() {
     verify_snapshot "${ends}" "${rows}" "${counted}" "${probes}"
 }
 
+# Sync every report in a "period<TAB>url" list that --period selects, and set
+# SYNCED to how many that was.
+#
+# Each report waits minutes for its PostHog read-back, so a JWT minted at the
+# start of the run expires a few reports in. Mint a fresh one for every report
+# instead.
+sync_reports() {
+    local list=$1 period url jwt
+    SYNCED=0
+    while IFS=$'\t' read -r period url; do
+        [ -z "${PERIOD}" ] || [ "${PERIOD}" = "${period}" ] || continue
+        WORK_DIR="${ROOT_DIR}/${period}"
+        mkdir -p "${WORK_DIR}"
+        jwt=$(docker_jwt)
+        sync_report "${period}" "${url}" "${jwt}"
+        SYNCED=$((SYNCED + 1))
+    done < "${list}"
+}
+
 main() {
     ROOT_DIR=$(mktemp -d)
     trap 'rm -rf "${ROOT_DIR}"' EXIT
@@ -459,18 +510,8 @@ main() {
     fi
     echo "Docker DVP: ${available} ${DVP_GRANULARITY} report(s) available for ${DOCKER_NAMESPACE}"
 
-    # Each report waits minutes for its PostHog read-back, so a JWT minted at
-    # the start of the run expires a few reports in. Mint a fresh one for
-    # every report instead.
-    local period url synced=0
-    while IFS=$'\t' read -r period url; do
-        [ -z "${PERIOD}" ] || [ "${PERIOD}" = "${period}" ] || continue
-        WORK_DIR="${ROOT_DIR}/${period}"
-        mkdir -p "${WORK_DIR}"
-        jwt=$(docker_jwt)
-        sync_report "${period}" "${url}" "${jwt}"
-        synced=$((synced + 1))
-    done < "${ROOT_DIR}/reports.tsv"
+    sync_reports "${ROOT_DIR}/reports.tsv"
+    local synced=${SYNCED}
 
     if [ "${synced}" -eq 0 ]; then
         echo "error: no report matches --period ${PERIOD}" >&2
