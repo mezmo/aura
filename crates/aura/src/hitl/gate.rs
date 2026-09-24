@@ -19,6 +19,7 @@ use super::route::{ApprovalError, DecisionRoute, GateDecision};
 use crate::orchestration::{
     BlockedCell, CallKey, ParkGuard, PendingCall, RecordedDecisions, run_owner_id,
 };
+use crate::run::RunSlot;
 use crate::tool_wrapper::{PreCallOutcome, ToolCallContext, ToolWrapper};
 
 /// The placeholder tool result a parked call returns.
@@ -46,8 +47,8 @@ pub struct HitlApprovalWrapper {
     route: Arc<DecisionRoute>,
     /// Who this wrapper speaks for, stamped onto every request it raises.
     scope: AgentScope,
-    /// Global request id, for SSE event routing.
-    request_id: String,
+    /// The prepared agent's run slot.
+    run: RunSlot,
     /// `[agent].name` of the config that built this agent.
     agent_name: String,
     /// Instance ID of the AURA process that built this wrapper.
@@ -67,7 +68,7 @@ impl HitlApprovalWrapper {
         patterns: Arc<[GlobPattern]>,
         route: Arc<DecisionRoute>,
         scope: AgentScope,
-        request_id: String,
+        run: RunSlot,
         agent_name: String,
         instance_id: String,
     ) -> Self {
@@ -75,7 +76,7 @@ impl HitlApprovalWrapper {
             patterns,
             route,
             scope,
-            request_id,
+            run,
             agent_name,
             instance_id,
             park: None,
@@ -220,13 +221,12 @@ impl HitlApprovalWrapper {
         park.guard.record(std::slice::from_ref(&call));
 
         // The lifecycle pair goes to the live request, not the owner id.
+        let request_id = self.run.request_id_or_empty();
+        let _ =
+            crate::agent_events::emit(&request_id, super::events::requested_event(&parked.request))
+                .await;
         let _ = crate::agent_events::emit(
-            &self.request_id,
-            super::events::requested_event(&parked.request),
-        )
-        .await;
-        let _ = crate::agent_events::emit(
-            &self.request_id,
+            &request_id,
             super::events::pending_event(&parked.request, &parked.expires_at),
         )
         .await;
@@ -294,11 +294,14 @@ impl ToolWrapper for HitlApprovalWrapper {
         if let Some(park) = &self.park {
             return self.park_pre_call(park, matched, args, ctx).await;
         }
+        let request_id = self.run.request_id_or_empty();
+        let cancel = crate::request_cancellation::RequestCancellation::token_for_id(&request_id)
+            .unwrap_or_else(crate::request_cancellation::RequestCancelToken::unbound);
         let request = ApprovalRequest {
             version: PROTOCOL_VERSION,
             instance_id: self.instance_id.clone(),
             decision_id: DecisionId::generate(),
-            request_id: self.request_id.clone(),
+            request_id,
             scope: self.scope.clone(),
             origin: ApprovalOrigin::ConfigGate {
                 matched_pattern: matched.to_string(),
@@ -311,9 +314,6 @@ impl ToolWrapper for HitlApprovalWrapper {
                 tool_call_intent: ctx.tool_call_intent.clone(),
             }],
         };
-        let cancel =
-            crate::request_cancellation::RequestCancellation::token_for_id(&self.request_id)
-                .unwrap_or_else(crate::request_cancellation::RequestCancelToken::unbound);
         approval_result_to_pre_call(self.route.decide_for_gate(request, &cancel).await)
     }
 }
@@ -364,7 +364,7 @@ mod tests {
                 timeout: Duration::from_secs(1),
             }),
             AgentScope::Single { session_id: None },
-            "t".into(),
+            RunSlot::pinned_request("t"),
             "test-agent".to_string(),
             "test-instance-id".to_string(),
         );
@@ -388,7 +388,7 @@ mod tests {
                 timeout: Duration::from_secs(1),
             }),
             AgentScope::Single { session_id: None },
-            "t".into(),
+            RunSlot::pinned_request("t"),
             "test-agent".to_string(),
             "test-instance-id".to_string(),
         );
@@ -426,7 +426,7 @@ mod tests {
                 timeout: Duration::from_secs(2),
             }),
             AgentScope::Single { session_id: None },
-            "req-test".into(),
+            RunSlot::pinned_request("req-test"),
             "test-agent".to_string(),
             "test-instance-id".to_string(),
         );
@@ -529,7 +529,7 @@ mod tests {
                 Arc::from(["kubectl_*".into()]),
                 route.clone(),
                 worker_scope(),
-                request_id.to_string(),
+                RunSlot::pinned_request(request_id),
                 "test-agent".to_string(),
                 "test-instance".to_string(),
             )
@@ -734,7 +734,7 @@ mod tests {
                 Arc::from(["kubectl_*".into()]),
                 route,
                 worker_scope(),
-                "req-guard".to_string(),
+                RunSlot::pinned_request("req-guard"),
                 "test-agent".to_string(),
                 "test-instance".to_string(),
             )
@@ -802,7 +802,7 @@ mod tests {
                 Arc::from(["kubectl_*".into()]),
                 route,
                 AgentScope::Single { session_id: None },
-                "req-recorded".to_string(),
+                RunSlot::pinned_request("req-recorded"),
                 "test-agent".to_string(),
                 "test-instance".to_string(),
             )
@@ -1132,7 +1132,7 @@ mod tests {
                 Arc::from(["kubectl_*".into()]),
                 Arc::new(route),
                 AgentScope::Single { session_id: None },
-                request_id.to_string(),
+                RunSlot::pinned_request(request_id),
                 "test-agent".to_string(),
                 "test-instance-id".to_string(),
             );

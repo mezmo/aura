@@ -892,7 +892,7 @@ mod tests {
         let scratchpad: Arc<dyn ToolWrapper> = Arc::new(ScratchpadWrapper::new(
             scratchpad_tools,
             storage.clone(),
-            budget,
+            crate::run::RunSlot::pinned_budget(budget),
         ));
 
         let persistence_inner = Arc::new(Mutex::new(ExecutionPersistence::disabled()));
@@ -1455,7 +1455,7 @@ mod tests {
             Arc::from(["kubectl_*".into()]),
             route,
             scope,
-            request_id.clone(),
+            crate::run::RunSlot::pinned_request(request_id.clone()),
             "test-agent".to_string(),
             "test-instance-id".to_string(),
         ));

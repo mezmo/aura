@@ -5,7 +5,8 @@
 //! `Agent::count_turns` tracks the turn number (one `StreamItem::TurnUsage`
 //! per rig turn); [`TurnNudgeWrapper`] appends a notice to MCP tool output
 //! and [`NudgedTool`] to scratchpad read tool output, which rig feeds back
-//! as the next turn's prompt. Enabled via `[agent].nudge_last_turn` and
+//! as the next turn's prompt. Both reach the counters of the run they serve
+//! through a [`RunSlot`]. Enabled via `[agent].nudge_last_turn` and
 //! `[agent].nudge_turns_remaining`.
 
 use std::sync::Arc;
@@ -15,9 +16,10 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use crate::mcp::CallOutcome;
+use crate::run::RunSlot;
 use crate::tool_wrapper::{ToolCallContext, ToolWrapper, TransformOutputResult};
 
-/// Shared turn-limit tracking for one agent stream.
+/// Turn-limit tracking for one run of an agent.
 pub struct TurnNudgeState {
     /// Total turns rig will execute before `MaxDepthError`.
     max_turns: usize,
@@ -59,16 +61,41 @@ impl TurnNudgeState {
         if !nudge_last_turn && nudge_turns_remaining.is_none() {
             return None;
         }
-        Some(Arc::new(Self {
-            // Rig's streaming loop breaks when its pre-increment counter
-            // exceeds max_depth + 1, i.e. it runs max_depth + 2 turns.
-            max_turns: max_depth + 2,
+        // Rig's streaming loop breaks when its pre-increment counter
+        // exceeds max_depth + 1, i.e. it runs max_depth + 2 turns.
+        Some(Self::with_limits(
+            max_depth + 2,
             nudge_last_turn,
-            wrap_up_threshold: nudge_turns_remaining,
+            nudge_turns_remaining,
+            has_submit_tool,
+        ))
+    }
+
+    /// Tracking against these limits with no turns completed.
+    fn with_limits(
+        max_turns: usize,
+        nudge_last_turn: bool,
+        wrap_up_threshold: Option<usize>,
+        has_submit_tool: bool,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            max_turns,
+            nudge_last_turn,
+            wrap_up_threshold,
             has_submit_tool,
             turns_completed: AtomicUsize::new(0),
             last_nudged_turn: AtomicUsize::new(0),
-        }))
+        })
+    }
+
+    /// Tracking with the same limits and no turns completed.
+    pub fn fresh(&self) -> Arc<Self> {
+        Self::with_limits(
+            self.max_turns,
+            self.nudge_last_turn,
+            self.wrap_up_threshold,
+            self.has_submit_tool,
+        )
     }
 
     /// Reset counters at stream start.
@@ -150,14 +177,28 @@ impl TurnNudgeState {
     }
 }
 
+/// Append the bound run's nudge, if one is due, to `tool`'s output. The
+/// output passes through untouched when no run is bound or the bound run has
+/// nudging off.
+fn append_nudge(run: &RunSlot, tool: &str, output: String) -> String {
+    match run.turn_nudge().and_then(|state| state.nudge_message()) {
+        Some(nudge) => {
+            tracing::debug!(tool, "appending turn-limit nudge to tool output");
+            format!("{output}{nudge}")
+        }
+        None => output,
+    }
+}
+
 /// ToolWrapper that appends turn-limit nudges to tool output.
 pub struct TurnNudgeWrapper {
-    state: Arc<TurnNudgeState>,
+    /// The prepared agent's run slot.
+    run: RunSlot,
 }
 
 impl TurnNudgeWrapper {
-    pub fn new(state: Arc<TurnNudgeState>) -> Self {
-        Self { state }
+    pub fn new(run: RunSlot) -> Self {
+        Self { run }
     }
 }
 
@@ -170,13 +211,7 @@ impl ToolWrapper for TurnNudgeWrapper {
         ctx: &ToolCallContext,
         _extracted: Option<&Value>,
     ) -> TransformOutputResult {
-        match self.state.nudge_message() {
-            Some(nudge) => {
-                tracing::debug!(tool = %ctx.tool_name, "appending turn-limit nudge to tool output");
-                TransformOutputResult::new(format!("{output}{nudge}"))
-            }
-            None => TransformOutputResult::new(output),
-        }
+        TransformOutputResult::new(append_nudge(&self.run, &ctx.tool_name, output))
     }
 }
 
@@ -186,12 +221,13 @@ impl ToolWrapper for TurnNudgeWrapper {
 #[derive(Clone)]
 pub struct NudgedTool<T> {
     inner: T,
-    state: Option<Arc<TurnNudgeState>>,
+    /// The prepared agent's run slot.
+    run: RunSlot,
 }
 
 impl<T> NudgedTool<T> {
-    pub fn new(inner: T, state: Option<Arc<TurnNudgeState>>) -> Self {
-        Self { inner, state }
+    pub fn new(inner: T, run: RunSlot) -> Self {
+        Self { inner, run }
     }
 }
 
@@ -214,13 +250,7 @@ where
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         let output = self.inner.call(args).await?;
-        match self.state.as_ref().and_then(|s| s.nudge_message()) {
-            Some(nudge) => {
-                tracing::debug!(tool = %self.inner.name(), "appending turn-limit nudge to tool output");
-                Ok(format!("{output}{nudge}"))
-            }
-            None => Ok(output),
-        }
+        Ok(append_nudge(&self.run, &self.inner.name(), output))
     }
 }
 
@@ -331,6 +361,29 @@ mod tests {
         assert!(state.nudge_message().is_none());
     }
 
+    #[test]
+    fn fresh_keeps_the_limits_and_starts_the_count_over() {
+        let seed = TurnNudgeState::new(true, None, 1).unwrap(); // 3 turns total
+        advance(&seed, 1); // turn 2, remaining 1
+        assert!(seed.nudge_message().is_some());
+
+        let run = seed.fresh();
+        assert!(
+            run.nudge_message().is_none(),
+            "a fresh run is back in turn 1"
+        );
+        advance(&run, 1);
+        assert!(
+            run.nudge_message().is_some(),
+            "the fresh run nudges at the same limit as the seed",
+        );
+        assert_eq!(
+            seed.turns_completed.load(Ordering::Acquire),
+            1,
+            "advancing the fresh run leaves the seed untouched",
+        );
+    }
+
     #[derive(Clone)]
     struct EchoTool;
 
@@ -358,7 +411,7 @@ mod tests {
         use rig::tool::Tool;
 
         let state = TurnNudgeState::new(true, None, 1).unwrap(); // 3 turns total
-        let tool = NudgedTool::new(EchoTool, Some(state.clone()));
+        let tool = NudgedTool::new(EchoTool, RunSlot::pinned_nudge(state.clone()));
 
         // Turn 1 (remaining 2): output passes through untouched.
         let out = tool.call("hello".to_string()).await.unwrap();
@@ -376,12 +429,61 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nudged_tool_without_state_is_passthrough() {
+    async fn nudged_tool_without_a_run_is_passthrough() {
         use rig::tool::Tool;
 
-        let tool = NudgedTool::new(EchoTool, None);
+        let tool = NudgedTool::new(EchoTool, RunSlot::new());
         assert_eq!(tool.name(), "echo");
         let out = tool.call("hello".to_string()).await.unwrap();
         assert_eq!(out, "hello");
+    }
+
+    /// The wrapper and tool hold the slot, not the counters, so the nudge
+    /// follows whichever run is bound when the call happens.
+    #[tokio::test]
+    async fn nudged_tool_follows_the_run_bound_at_call_time() {
+        use crate::run::{BoundRun, RunState};
+        use rig::tool::Tool;
+
+        let slot = RunSlot::new();
+        let tool = NudgedTool::new(EchoTool, slot.clone());
+        let seed = TurnNudgeState::new(true, None, 1).unwrap(); // 3 turns total
+
+        let first = BoundRun::bind(
+            slot.clone(),
+            RunState {
+                turn_nudge: Some(seed.fresh()),
+                ..RunState::default()
+            },
+        )
+        .unwrap();
+        first
+            .state()
+            .turn_nudge
+            .as_ref()
+            .unwrap()
+            .record_turn_completed();
+        assert!(
+            tool.call("hello".to_string())
+                .await
+                .unwrap()
+                .contains("FINAL TURN"),
+            "the first run is on its penultimate turn",
+        );
+        drop(first);
+
+        let _second = BoundRun::bind(
+            slot.clone(),
+            RunState {
+                turn_nudge: Some(seed.fresh()),
+                ..RunState::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            tool.call("hello".to_string()).await.unwrap(),
+            "hello",
+            "the second run starts its count over",
+        );
     }
 }
