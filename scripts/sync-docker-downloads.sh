@@ -191,6 +191,8 @@ selftest() {
     got=$(jq -r '.batch[0].properties["$process_person_profile"]' <<<"${payload}")
     [ "${got}" = "false" ] || { echo "selftest: person profiles not suppressed" >&2; exit 1; }
 
+    hogql_retry_selftest "${tmp}"
+
     echo "selftest: ok"
 }
 
