@@ -14,6 +14,14 @@ use aura_cli::ui::prompt::AgentHost;
 /// template resolution has overrides.
 ///
 /// Returns whether the process is running standalone or not.
+#[cfg_attr(
+    not(feature = "standalone-cli"),
+    expect(
+        unused_variables,
+        reason = "an HTTP-only build never runs standalone, so it loads only the \
+                  working directory's .env and has no config path to read from args"
+    )
+)]
 fn resolve_env_config(args: &Args) -> bool {
     // Loads .env so a config's {{ env.* }} references resolve without manual
     // exporting. CWD first, then the config file's directory (init writes
