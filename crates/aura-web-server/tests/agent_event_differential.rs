@@ -1,11 +1,17 @@
-//! Proves the agent event schema reaches consumers unchanged.
+//! Proves an approval [`AgentEvent`] reaches consumers unchanged.
 //!
-//! Each case drives `process_sse_stream_full` twice over the same logical
-//! sequence — once publishing to the request-scoped brokers directly, once
-//! publishing [`AgentEvent`]s through [`aura::agent_events`] — and asserts the
-//! SSE frames are byte-identical. Only the producer side differs; both runs
-//! subscribe the way `handlers::stream_chat_completion` does, so the broker
-//! registry and its request-id routing are under test rather than stubbed.
+//! Approvals are the one family still projected onto a request-scoped broker:
+//! the config gate is built before the run exists and runs on rig's tool-server
+//! task, so it cannot reach the run's channel. Every other payload travels the
+//! run's own channel and is projected by `run_event_sse`, which its own tests
+//! cover.
+//!
+//! The case here drives `process_sse_stream_full` twice over the same logical
+//! sequence — once publishing to the broker directly, once publishing an
+//! [`AgentEvent`] through [`aura::agent_events`] — and asserts the SSE frames
+//! are byte-identical. Only the producer side differs, and the run subscribes
+//! the way `handlers::stream_chat_completion` does, so the broker registry and
+//! its request-id routing are under test rather than stubbed.
 //!
 //! A variant that loses a field in translation fails here.
 
@@ -13,18 +19,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aura::agent_events::Routed;
-use aura::tool_event_broker::publish_tool_requested;
 use aura::{
-    ApprovalLifecycleEvent, NumberOrString, Progress, ProgressNotification, ProgressToken,
-    ResponseContent, StreamError, StreamItem, StreamingAgent, TokenUsage, ToolCallId, ToolName,
-    UsageState,
+    ApprovalLifecycleEvent, ResponseContent, StreamingAgent, UsageState, approval_event_subscribe,
+    approval_event_unsubscribe,
 };
-use aura::{
-    approval_event_subscribe, approval_event_unsubscribe, publish_tool_start, publish_tool_usage,
-    request_progress_subscribe, request_progress_unsubscribe, tool_event_subscribe,
-    tool_event_unsubscribe, tool_usage_subscribe, tool_usage_unsubscribe,
-};
-use aura_events::TokenCount;
 use aura_events::agent::{AgentEvent, AgentEventPayload};
 use aura_test_utils::mock_agent::{MockAgent, Step, items};
 use aura_test_utils::sse::{SseEvent, parse_sse_stream};
@@ -36,36 +34,17 @@ use bytes::Bytes;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-const TOOL_ID: &str = "call_abc123";
 const TOOL_NAME: &str = "list_files";
-const TOOL_ARGS: &str = r#"{"path":"/mock"}"#;
 const SESSION_ID: &str = "cs-differential";
 
-fn token() -> ProgressToken {
-    ProgressToken(NumberOrString::Number(7))
-}
-
-fn args() -> serde_json::Value {
-    serde_json::json!({ "path": "/mock" })
-}
-
-fn usage() -> TokenUsage {
-    TokenUsage {
-        prompt_tokens: TokenCount::new(10),
-        completion_tokens: TokenCount::new(5),
-        total_tokens: TokenCount::new(15),
-    }
-}
-
-/// Subscribes exactly as the production handler does, so events reach the
-/// stream through the global brokers keyed by `request_id`.
+/// Subscribes exactly as the production handler does, so an approval reaches
+/// the stream through the global broker keyed by `request_id`.
 async fn callbacks_for(request_id: &str) -> StreamingCallbacks {
     StreamingCallbacks {
         request_id: request_id.to_string(),
         agent: Arc::new(MockAgent::pending()),
-        tool_event_rx: tool_event_subscribe(request_id).await,
-        progress_rx: request_progress_subscribe(request_id).await,
-        tool_usage_rx: tool_usage_subscribe(request_id).await,
+        // The mock's run has no observer; this case is about the broker path.
+        agent_events: None,
         approval_event_rx: approval_event_subscribe(request_id).await,
         usage_state: UsageState::new(),
         response_content: ResponseContent::new(),
@@ -78,22 +57,7 @@ async fn callbacks_for(request_id: &str) -> StreamingCallbacks {
     }
 }
 
-async fn unsubscribe_all(request_id: &str) {
-    tool_event_unsubscribe(request_id).await;
-    request_progress_unsubscribe(request_id).await;
-    tool_usage_unsubscribe(request_id).await;
-    approval_event_unsubscribe(request_id).await;
-}
-
 async fn run(request_id: &str, steps: Vec<Step>) -> Vec<SseEvent> {
-    run_as(request_id, steps, false).await
-}
-
-/// `orchestration` swaps the turn's agent context to the coordinator. The two
-/// paths only agree on `agent_id` by accident under the single-agent context,
-/// where the broker path's absent agent and the schema path's stamped one are
-/// the same value.
-async fn run_as(request_id: &str, steps: Vec<Step>, orchestration: bool) -> Vec<SseEvent> {
     let callbacks = callbacks_for(request_id).await;
     let config = StreamConfig::new(true, false, ToolResultMode::Aura, 0);
     let ctx = TurnContext::new(
@@ -103,11 +67,6 @@ async fn run_as(request_id: &str, steps: Vec<Step>, orchestration: bool) -> Vec<
         None,
         SESSION_ID,
     );
-    let ctx = if orchestration {
-        ctx.with_orchestration()
-    } else {
-        ctx
-    };
 
     let stream = MockAgent::scripted(steps)
         .stream(
@@ -146,7 +105,7 @@ async fn run_as(request_id: &str, steps: Vec<Step>, orchestration: bool) -> Vec<
     assert_eq!(termination, StreamTermination::Complete);
 
     let body = collector.await.expect("collector should not panic");
-    unsubscribe_all(request_id).await;
+    approval_event_unsubscribe(request_id).await;
 
     let (events, done) = parse_sse_stream(&body);
     assert!(done, "stream should terminate with [DONE]");
@@ -193,204 +152,6 @@ fn emit(
             assert_eq!(routed, Routed::Delivered, "event should reach a consumer");
         })
     }
-}
-
-fn tool_result_ok() -> Result<StreamItem, StreamError> {
-    items::tool_result(TOOL_ID, "README.md\nsrc/")
-}
-
-/// A worker context is one the fallback cannot produce: the SSE handler stamps
-/// the turn's own agent when a frame carries none, and under orchestration that
-/// is the coordinator. Asserting on a worker id is therefore the only shape
-/// that fails if the adapter drops or fabricates `agent`.
-#[tokio::test(start_paused = true)]
-async fn a_carried_agent_beats_the_handlers_fallback() {
-    let events = run_as(
-        "req_schema_agent_ctx",
-        vec![
-            Step::effect(emit(AgentEvent::new(
-                aura_events::AgentContext::worker("log_worker", None, "coordinator"),
-                AgentEventPayload::ToolProgress {
-                    progress_token: token(),
-                    progress: Progress::ratio(1.0, 4.0),
-                    message: Some("half".to_string()),
-                },
-            ))),
-            Step::item(items::text("done")),
-        ],
-        true,
-    )
-    .await;
-
-    let progress = events
-        .iter()
-        .find(|e| e.event_type.as_deref() == Some("aura.progress"))
-        .expect("a progress frame");
-    assert!(
-        progress.data.contains(r#""agent_id":"log_worker""#),
-        "the carried agent must reach the frame, got: {}",
-        progress.data
-    );
-    assert!(
-        !progress.data.contains(r#""agent_id":"coordinator""#),
-        "the handler fallback must not override a carried agent, got: {}",
-        progress.data
-    );
-}
-
-#[tokio::test(start_paused = true)]
-async fn tool_requested_matches() {
-    assert_paths_agree(
-        "tool_requested",
-        vec![
-            Step::effect(|request_id: String| async move {
-                publish_tool_requested(
-                    &request_id,
-                    ToolCallId::new(TOOL_ID),
-                    ToolName::new(TOOL_NAME),
-                    args(),
-                )
-                .await;
-            }),
-            Step::item(items::text("done")),
-        ],
-        vec![
-            Step::effect(emit(AgentEvent::single_agent(
-                AgentEventPayload::ToolRequested {
-                    tool_call_id: ToolCallId::new(TOOL_ID),
-                    tool_name: ToolName::new(TOOL_NAME),
-                    arguments: args(),
-                },
-            ))),
-            Step::item(items::text("done")),
-        ],
-    )
-    .await;
-}
-
-#[tokio::test(start_paused = true)]
-async fn a_full_tool_turn_matches() {
-    assert_paths_agree(
-        "full_turn",
-        vec![
-            Step::effect(|request_id: String| async move {
-                publish_tool_requested(
-                    &request_id,
-                    ToolCallId::new(TOOL_ID),
-                    ToolName::new(TOOL_NAME),
-                    args(),
-                )
-                .await;
-            }),
-            Step::item(items::tool_call(TOOL_ID, TOOL_NAME, TOOL_ARGS)),
-            Step::effect(|request_id: String| async move {
-                publish_tool_start(
-                    &request_id,
-                    ToolCallId::new(TOOL_ID),
-                    ToolName::new(TOOL_NAME),
-                    Some(token()),
-                )
-                .await;
-            }),
-            Step::effect(|request_id: String| async move {
-                aura::request_progress::publish(
-                    &request_id,
-                    ProgressNotification {
-                        progress_token: token(),
-                        progress: Progress::ratio(50.0, 100.0),
-                        message: Some("halfway".to_string()),
-                        agent: None,
-                    },
-                )
-                .await;
-            }),
-            Step::item(tool_result_ok()),
-            Step::item(items::text("Here are the files.")),
-        ],
-        vec![
-            Step::effect(emit(AgentEvent::single_agent(
-                AgentEventPayload::ToolRequested {
-                    tool_call_id: ToolCallId::new(TOOL_ID),
-                    tool_name: ToolName::new(TOOL_NAME),
-                    arguments: args(),
-                },
-            ))),
-            Step::item(items::tool_call(TOOL_ID, TOOL_NAME, TOOL_ARGS)),
-            Step::effect(emit(AgentEvent::single_agent(
-                AgentEventPayload::ToolStart {
-                    arguments: None,
-                    task_id: None,
-                    tool_call_id: ToolCallId::new(TOOL_ID),
-                    tool_name: ToolName::new(TOOL_NAME),
-                    progress_token: Some(token()),
-                },
-            ))),
-            Step::effect(emit(AgentEvent::single_agent(
-                AgentEventPayload::ToolProgress {
-                    progress_token: token(),
-                    progress: Progress::ratio(50.0, 100.0),
-                    message: Some("halfway".to_string()),
-                },
-            ))),
-            Step::item(tool_result_ok()),
-            Step::item(items::text("Here are the files.")),
-        ],
-    )
-    .await;
-}
-
-#[tokio::test(start_paused = true)]
-async fn progress_without_a_message_matches() {
-    let build_broker = vec![
-        Step::effect(|request_id: String| async move {
-            aura::request_progress::publish(
-                &request_id,
-                ProgressNotification {
-                    progress_token: token(),
-                    progress: Progress::indeterminate(3.0),
-                    message: None,
-                    agent: None,
-                },
-            )
-            .await;
-        }),
-        Step::item(items::text("done")),
-    ];
-    let build_schema = vec![
-        Step::effect(emit(AgentEvent::single_agent(
-            AgentEventPayload::ToolProgress {
-                progress_token: token(),
-                progress: Progress::indeterminate(3.0),
-                message: None,
-            },
-        ))),
-        Step::item(items::text("done")),
-    ];
-
-    assert_paths_agree("progress_no_message", build_broker, build_schema).await;
-}
-
-#[tokio::test(start_paused = true)]
-async fn tool_usage_matches() {
-    assert_paths_agree(
-        "tool_usage",
-        vec![
-            Step::effect(|request_id: String| async move {
-                publish_tool_usage(&request_id, vec![ToolCallId::new(TOOL_ID)], usage()).await;
-            }),
-            Step::item(items::text("done")),
-        ],
-        vec![
-            Step::effect(emit(AgentEvent::single_agent(
-                AgentEventPayload::ToolUsage {
-                    tool_call_ids: vec![ToolCallId::new(TOOL_ID)],
-                    usage: usage(),
-                },
-            ))),
-            Step::item(items::text("done")),
-        ],
-    )
-    .await;
 }
 
 #[tokio::test(start_paused = true)]

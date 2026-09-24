@@ -28,12 +28,11 @@ use super::types::{
     FunctionCallChunk, MessageRole, StreamConfig, ToolCallChunk, ToolResultMode, ToolResultStatus,
     TurnContext, TurnState, detect_tool_error, format_sse_chunk, truncate_result,
 };
-use aura::stream_events::{AgentContext, AuraStreamEvent, CorrelationContext};
+use aura::stream_events::{AuraStreamEvent, CorrelationContext};
 use aura::{
     ApprovalLifecycleEvent, EventContext, OrchestrationStreamEvent, PASSTHROUGH_MARKER,
-    ProgressNotification, RequestCancellation, ResponseContent, StreamError, StreamItem,
-    StreamedAssistantContent, StreamedUserContent, StreamingAgent, ToolCall, ToolCallId,
-    ToolLifecycleEvent, ToolResult, ToolUsageEvent, UsageState,
+    RequestCancellation, ResponseContent, StreamError, StreamItem, StreamedAssistantContent,
+    StreamedUserContent, StreamingAgent, ToolCall, ToolCallId, ToolResult, UsageState,
 };
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
@@ -47,12 +46,8 @@ pub struct StreamingCallbacks {
     pub request_id: String,
     /// Agent reference for MCP cleanup (cancel_and_close_mcp)
     pub agent: Arc<dyn StreamingAgent>,
-    /// MCP tool event receiver (for aura.tool_requested and aura.tool_start events)
-    pub tool_event_rx: mpsc::Receiver<ToolLifecycleEvent>,
-    /// MCP progress event receiver (for aura.progress events)
-    pub progress_rx: mpsc::Receiver<ProgressNotification>,
-    /// Tool usage event receiver (for aura.tool_usage events from hook)
-    pub tool_usage_rx: mpsc::Receiver<ToolUsageEvent>,
+    /// The run's own events.
+    pub agent_events: Option<mpsc::Receiver<aura_events::agent::AgentEvent>>,
     /// HITL approval lifecycle event receiver (always emitted, not gated by AURA_CUSTOM_EVENTS)
     pub approval_event_rx: mpsc::Receiver<ApprovalLifecycleEvent>,
     /// Shared usage state for reading final usage at stream end
@@ -203,10 +198,10 @@ where
     let mut first_chunk_received = false;
 
     // Disarmed so the first-chunk timeout alone governs the pre-response window.
-    // The progress, tool, approval, and usage arms also touch it: during
-    // orchestrated runs worker liveness reaches this loop through those
-    // channels rather than as stream items. Heartbeats prove the client
-    // link, not the provider, so they deliberately never touch it.
+    // The run-event and approval arms also touch it, because during orchestrated
+    // runs worker liveness reaches this loop through them rather than as stream
+    // items. Heartbeats prove the client link, not the provider, so they
+    // deliberately never touch it.
     let mut inactivity =
         aura::inactivity::InactivityDeadline::new_disarmed(inactivity_timeout.unwrap_or_default());
 
@@ -265,68 +260,26 @@ where
                 }
             }
 
-            // MCP progress notification (only emit if custom events enabled)
-            notification = callbacks.progress_rx.recv(), if emit_custom_events => {
-                if let Some(notification) = notification {
-                    inactivity.touch();
-                    let event = AuraStreamEvent::progress(
-                        notification.message.clone().unwrap_or_else(|| {
-                            format!("Progress: {}", notification.progress)
-                        }),
-                        "mcp_progress",
-                        notification.percent(),
-                        Some(notification.progress_token.clone()),
-                        notification.agent.clone().unwrap_or_else(|| ctx.agent_context.clone()),
-                        ctx.correlation.clone(),
-                    );
-                    tracing::debug!(
-                        "Emitting aura.progress event: token={:?}, progress={}",
-                        notification.progress_token,
-                        notification.progress
-                    );
-                    if tx.send(Ok(Bytes::from(event.format_sse()))).await.is_err() {
-                        tracing::info!("Client disconnected during progress notification");
-                        break StreamTermination::Disconnected;
-                    }
+            // The run's own events, projected onto the wire schema.
+            run_event = async {
+                match callbacks.agent_events.as_mut() {
+                    Some(events) => events.recv().await,
+                    None => std::future::pending().await,
                 }
-            }
-
-            // MCP tool lifecycle events (requested when LLM decides, start when MCP begins)
-            tool_event = callbacks.tool_event_rx.recv(), if emit_custom_events => {
-                if let Some(tool_event) = tool_event {
-                    inactivity.touch();
-                    let sse_event = match tool_event {
-                        ToolLifecycleEvent::Requested { tool_id, tool_name, arguments, agent } => {
-                            tracing::debug!(
-                                "Emitting aura.tool_requested event: tool_id={}, tool_name={}",
-                                tool_id, tool_name
-                            );
-                            AuraStreamEvent::tool_requested(
-                                tool_id.as_str(),
-                                tool_name.as_str(),
-                                arguments,
-                                agent.unwrap_or_else(|| ctx.agent_context.clone()),
-                                ctx.correlation.clone(),
-                            )
+            }, if emit_custom_events => {
+                match run_event {
+                    Some(event) => {
+                        inactivity.touch();
+                        if let Some(sse_event) = run_event_sse(event, ctx.correlation.clone())
+                            && tx.send(Ok(Bytes::from(sse_event.format_sse()))).await.is_err()
+                        {
+                            tracing::info!("Client disconnected during a run event");
+                            break StreamTermination::Disconnected;
                         }
-                        ToolLifecycleEvent::Start { tool_id, tool_name, progress_token, agent } => {
-                            tracing::debug!(
-                                "Emitting aura.tool_start event: tool_id={}, tool_name={}, progress_token={:?}",
-                                tool_id, tool_name, progress_token
-                            );
-                            AuraStreamEvent::tool_start(
-                                tool_id.as_str(),
-                                tool_name.as_str(),
-                                progress_token,
-                                agent.unwrap_or_else(|| ctx.agent_context.clone()),
-                                ctx.correlation.clone(),
-                            )
-                        }
-                    };
-                    if tx.send(Ok(Bytes::from(sse_event.format_sse()))).await.is_err() {
-                        tracing::info!("Client disconnected during tool event");
-                        break StreamTermination::Disconnected;
                     }
+                    // The run dropped its sender, so this arm must stop being
+                    // ready rather than spin on a closed channel.
+                    None => callbacks.agent_events = None,
                 }
             }
 
@@ -347,22 +300,6 @@ where
                     };
                     if tx.send(Ok(Bytes::from(event.format_sse()))).await.is_err() {
                         tracing::info!("Client disconnected during approval event");
-                        break StreamTermination::Disconnected;
-                    }
-                }
-            }
-
-            // Tool usage events from hook (associates tool_ids with usage snapshot)
-            tool_usage = callbacks.tool_usage_rx.recv(), if emit_custom_events => {
-                if let Some(usage_event) = tool_usage {
-                    inactivity.touch();
-                    tracing::debug!(
-                        "Emitting aura.tool_usage event: tool_ids={:?}, prompt_tokens={}",
-                        usage_event.tool_ids, usage_event.usage.prompt_tokens
-                    );
-                    let sse_event = tool_usage_sse(usage_event, ctx.agent_context.clone(), ctx.correlation.clone());
-                    if tx.send(Ok(Bytes::from(sse_event.format_sse()))).await.is_err() {
-                        tracing::info!("Client disconnected during tool_usage event");
                         break StreamTermination::Disconnected;
                     }
                 }
@@ -502,23 +439,72 @@ fn resolve_billed_usage(
     }
 }
 
-fn tool_usage_sse(
-    event: ToolUsageEvent,
-    agent: AgentContext,
+/// Projects one of the run's events onto the wire schema. `None` for a payload
+/// the loop delivers another way — content rides the `StreamItem` stream.
+fn run_event_sse(
+    event: aura_events::agent::AgentEvent,
     correlation: CorrelationContext,
-) -> AuraStreamEvent {
-    AuraStreamEvent::tool_usage(
-        event
-            .tool_ids
-            .into_iter()
-            .map(ToolCallId::into_string)
-            .collect(),
-        event.usage.prompt_tokens.get(),
-        event.usage.completion_tokens.get(),
-        event.usage.total_tokens.get(),
-        event.agent.unwrap_or(agent),
-        correlation,
-    )
+) -> Option<AuraStreamEvent> {
+    use aura_events::agent::AgentEventPayload as Payload;
+
+    let aura_events::agent::AgentEvent { agent, payload } = event;
+    match payload {
+        Payload::ToolRequested {
+            tool_call_id,
+            tool_name,
+            arguments,
+            ..
+        } => Some(AuraStreamEvent::tool_requested(
+            tool_call_id.as_str(),
+            tool_name.as_str(),
+            arguments,
+            agent,
+            correlation,
+        )),
+
+        Payload::ToolStart {
+            tool_call_id,
+            tool_name,
+            progress_token,
+            ..
+        } => Some(AuraStreamEvent::tool_start(
+            tool_call_id.as_str(),
+            tool_name.as_str(),
+            progress_token,
+            agent,
+            correlation,
+        )),
+
+        Payload::ToolProgress {
+            progress_token,
+            progress,
+            message,
+        } => Some(AuraStreamEvent::progress(
+            message.unwrap_or_else(|| format!("Progress: {progress}")),
+            "mcp_progress",
+            progress.percent(),
+            Some(progress_token),
+            agent,
+            correlation,
+        )),
+
+        Payload::ToolUsage {
+            tool_call_ids,
+            usage,
+        } => Some(AuraStreamEvent::tool_usage(
+            tool_call_ids
+                .into_iter()
+                .map(ToolCallId::into_string)
+                .collect(),
+            usage.prompt_tokens.get(),
+            usage.completion_tokens.get(),
+            usage.total_tokens.get(),
+            agent,
+            correlation,
+        )),
+
+        _ => None,
+    }
 }
 
 /// Send final usage events, finish chunk, and [DONE] marker to the client.
@@ -529,18 +515,15 @@ async fn send_final_events(
     state: &TurnState,
     tx: &mpsc::Sender<Result<Bytes, String>>,
 ) {
-    // Drain any pending tool_usage events before emitting final aura.usage
-    if emit_custom_events {
-        while let Ok(usage_event) = callbacks.tool_usage_rx.try_recv() {
-            let sse_event = tool_usage_sse(
-                usage_event,
-                ctx.agent_context.clone(),
-                ctx.correlation.clone(),
-            );
-            if tx
-                .send(Ok(Bytes::from(sse_event.format_sse())))
-                .await
-                .is_err()
+    // Drain the run's remaining events before the final usage totals, since the
+    // hook emits its tool usage as the stream completes, after the loop has left.
+    if emit_custom_events && let Some(events) = callbacks.agent_events.as_mut() {
+        while let Ok(event) = events.try_recv() {
+            if let Some(sse_event) = run_event_sse(event, ctx.correlation.clone())
+                && tx
+                    .send(Ok(Bytes::from(sse_event.format_sse())))
+                    .await
+                    .is_err()
             {
                 return; // Client disconnected
             }
@@ -1616,8 +1599,80 @@ fn build_final_chunk(ctx: &TurnContext, state: &TurnState) -> Vec<Bytes> {
 
 #[cfg(test)]
 mod tests {
+    /// The projection from a run's event onto the wire schema.
+    mod run_events {
+        use super::super::run_event_sse;
+        use aura::stream_events::CorrelationContext;
+        use aura_events::agent::{AgentEvent, AgentEventPayload};
+        use aura_events::{AgentContext, NumberOrString, Progress, ProgressToken};
+
+        fn correlation() -> CorrelationContext {
+            CorrelationContext {
+                session_id: "cs-test".to_string(),
+                trace_id: None,
+            }
+        }
+
+        /// A worker's event stays the worker's. Under orchestration the turn's
+        /// own agent is the coordinator, so a worker id is the shape that fails
+        /// if the projection drops `agent` or stamps the turn's in its place.
+        #[test]
+        fn a_carried_agent_reaches_the_frame() {
+            let event = AgentEvent::new(
+                AgentContext::worker("log_worker", None, "coordinator"),
+                AgentEventPayload::ToolProgress {
+                    progress_token: ProgressToken(NumberOrString::Number(7)),
+                    progress: Progress::ratio(1.0, 4.0),
+                    message: Some("half".to_string()),
+                },
+            );
+
+            let frame = run_event_sse(event, correlation())
+                .expect("progress is a side channel and has a frame")
+                .format_sse();
+
+            assert!(
+                frame.contains(r#""agent_id":"log_worker""#),
+                "the carried agent must reach the frame, got: {frame}"
+            );
+            assert!(
+                !frame.contains(r#""agent_id":"coordinator""#),
+                "nothing may override a carried agent, got: {frame}"
+            );
+        }
+
+        /// A progress event with no message of its own renders one from the raw
+        /// counts rather than going out blank.
+        #[test]
+        fn progress_without_a_message_renders_its_counts() {
+            let event = AgentEvent::single_agent(AgentEventPayload::ToolProgress {
+                progress_token: ProgressToken(NumberOrString::Number(7)),
+                progress: Progress::ratio(3.0, 4.0),
+                message: None,
+            });
+
+            let frame = run_event_sse(event, correlation())
+                .expect("progress has a frame")
+                .format_sse();
+
+            assert!(frame.contains("Progress: 3/4"), "got: {frame}");
+        }
+
+        /// Content reaches consumers on the `StreamItem` stream, so the
+        /// projection must not also put it on the wire as a side channel.
+        #[test]
+        fn content_has_no_side_channel_frame() {
+            let event = AgentEvent::single_agent(AgentEventPayload::TextDelta {
+                content: "hello".to_string(),
+            });
+
+            assert!(run_event_sse(event, correlation()).is_none());
+        }
+    }
+
     use super::*;
-    use aura::{Progress, ToolName};
+    use aura::ToolName;
+    use aura_events::Progress;
     use aura_events::event_names;
 
     /// Verify handle_tool_call does NOT emit aura.tool_requested events directly.
@@ -1640,7 +1695,7 @@ mod tests {
             model_str: "gpt-4".to_string(),
             created_timestamp: 1234567890,
             max_tokens: None,
-            agent_context: AgentContext::single_agent(),
+            agent_context: aura::stream_events::AgentContext::single_agent(),
             correlation: CorrelationContext::new("test-session", None),
         };
 
@@ -1698,7 +1753,7 @@ mod tests {
             model_str: "gpt-4".to_string(),
             created_timestamp: 1234567890,
             max_tokens: None,
-            agent_context: AgentContext::single_agent(),
+            agent_context: aura::stream_events::AgentContext::single_agent(),
             correlation: CorrelationContext::new("test-session", None),
         };
         let worker = aura_events::AgentContext::worker("log-analyst", None, "coordinator");
@@ -1749,7 +1804,7 @@ mod tests {
             model_str: "gpt-4".to_string(),
             created_timestamp: 1234567890,
             max_tokens: None,
-            agent_context: AgentContext::single_agent(),
+            agent_context: aura::stream_events::AgentContext::single_agent(),
             correlation: CorrelationContext::new("test-session", None),
         };
 
@@ -2228,28 +2283,23 @@ mod tests {
         use std::sync::Arc;
         use tokio_util::sync::CancellationToken;
 
-        /// Event senders must outlive the loop: a closed channel's `recv()`
-        /// arm is permanently ready with `None`, which starves paused time.
+        /// The approval sender must outlive the loop: a closed channel's
+        /// `recv()` arm is permanently ready with `None`, which starves paused
+        /// time. The run's own arm disables itself instead.
         #[derive(Clone)]
         struct EventSenders {
-            _tool_event_tx: mpsc::Sender<ToolLifecycleEvent>,
-            _progress_tx: mpsc::Sender<ProgressNotification>,
-            _tool_usage_tx: mpsc::Sender<ToolUsageEvent>,
+            _run_events_tx: mpsc::Sender<aura_events::agent::AgentEvent>,
             _approval_tx: mpsc::Sender<ApprovalLifecycleEvent>,
         }
 
         fn callbacks() -> (StreamingCallbacks, EventSenders) {
-            let (tool_event_tx, tool_event_rx) = mpsc::channel(8);
-            let (progress_tx, progress_rx) = mpsc::channel(8);
-            let (tool_usage_tx, tool_usage_rx) = mpsc::channel(8);
+            let (run_events_tx, run_events) = mpsc::channel(8);
             let (approval_tx, approval_event_rx) = mpsc::channel(8);
             (
                 StreamingCallbacks {
                     request_id: "req_inactivity_test".to_string(),
                     agent: Arc::new(MockAgent::pending()),
-                    tool_event_rx,
-                    progress_rx,
-                    tool_usage_rx,
+                    agent_events: Some(run_events),
                     approval_event_rx,
                     usage_state: aura::UsageState::new(),
                     response_content: ResponseContent::new(),
@@ -2258,9 +2308,7 @@ mod tests {
                     rehydrated_skills: vec![],
                 },
                 EventSenders {
-                    _tool_event_tx: tool_event_tx,
-                    _progress_tx: progress_tx,
-                    _tool_usage_tx: tool_usage_tx,
+                    _run_events_tx: run_events_tx,
                     _approval_tx: approval_tx,
                 },
             )
@@ -2517,6 +2565,58 @@ mod tests {
             (termination, start.elapsed().as_secs())
         }
 
+        /// A run that ends drops its sender, and a closed channel's `recv()` is
+        /// permanently ready with `None`. The arm has to retire itself, or it
+        /// starves the timers it shares the `select!` with and the loop never
+        /// reaches its inactivity deadline.
+        ///
+        /// Only the run's sender is dropped here; the approval arm has no such
+        /// guard and its sender is what keeps that arm quiet.
+        #[tokio::test(start_paused = true)]
+        async fn a_finished_runs_closed_channel_does_not_starve_the_timers() {
+            let stream = futures_util::stream::iter(vec![text_item("hi")])
+                .chain(futures_util::stream::pending());
+            let (cb, senders) = callbacks();
+            let EventSenders {
+                _run_events_tx,
+                _approval_tx,
+            } = senders;
+            drop(_run_events_tx);
+
+            let config = StreamConfig::new(true, false, ToolResultMode::None, 0);
+            let ctx = TurnContext::new(
+                "test-id".to_string(),
+                "test-model".to_string(),
+                0,
+                None,
+                "test-session",
+            );
+            let (chunk_tx, mut chunk_rx) = mpsc::channel(64);
+            tokio::spawn(async move { while chunk_rx.recv().await.is_some() {} });
+            let start = tokio::time::Instant::now();
+
+            let termination = process_sse_stream_full(
+                &config,
+                &ctx,
+                Box::pin(stream),
+                chunk_tx,
+                CancellationToken::new(),
+                Some(Duration::from_secs(900)),
+                HB_QUIET,
+                None,
+                Some(Duration::from_secs(30)),
+                cb,
+            )
+            .await;
+
+            assert_eq!(termination, StreamTermination::Timeout);
+            assert_eq!(
+                start.elapsed().as_secs(),
+                30,
+                "the inactivity window must still expire on time"
+            );
+        }
+
         #[tokio::test(start_paused = true)]
         async fn progress_notifications_carry_liveness() {
             // One stream item arms the window; MCP progress every 20s keeps a
@@ -2530,15 +2630,16 @@ mod tests {
                     for n in 0..3i64 {
                         tokio::time::sleep(Duration::from_secs(20)).await;
                         let _ = s
-                            ._progress_tx
-                            .send(aura::ProgressNotification {
-                                progress_token: aura::ProgressToken(aura::NumberOrString::Number(
-                                    n,
-                                )),
-                                progress: Progress::ratio(n as f64, 3.0),
-                                message: Some("working".into()),
-                                agent: None,
-                            })
+                            ._run_events_tx
+                            .send(aura_events::agent::AgentEvent::single_agent(
+                                aura_events::agent::AgentEventPayload::ToolProgress {
+                                    progress_token: aura::ProgressToken(
+                                        aura::NumberOrString::Number(n),
+                                    ),
+                                    progress: Progress::ratio(n as f64, 3.0),
+                                    message: Some("working".into()),
+                                },
+                            ))
                             .await;
                     }
                 },
@@ -2601,7 +2702,7 @@ mod tests {
     /// the SSE frames it produced.
     mod harness {
         use super::*;
-        use aura::ProgressNotification;
+        use aura_events::agent::AgentEvent;
         use aura_test_utils::mock_agent::{MockAgent, Step};
         use aura_test_utils::sse::{SseEvent, parse_sse_stream};
         use serde_json::Value;
@@ -2611,33 +2712,25 @@ mod tests {
         pub(super) const SESSION_ID: &str = "cs-tool-events";
 
         /// Must outlive the loop, for the reason given on
-        /// [`inactivity::EventSenders`]; the two live senders additionally feed
+        /// [`inactivity::EventSenders`]; the run sender additionally feeds
         /// scripted steps.
         pub(super) struct Senders {
-            pub(super) tool_event_tx: mpsc::Sender<ToolLifecycleEvent>,
-            pub(super) progress_tx: mpsc::Sender<ProgressNotification>,
-            _tool_usage_tx: mpsc::Sender<ToolUsageEvent>,
+            pub(super) run_events_tx: mpsc::Sender<AgentEvent>,
             _approval_tx: mpsc::Sender<ApprovalLifecycleEvent>,
         }
 
         fn channels() -> (Senders, StreamingCallbacks) {
-            let (tool_event_tx, tool_event_rx) = mpsc::channel(16);
-            let (progress_tx, progress_rx) = mpsc::channel(16);
-            let (tool_usage_tx, tool_usage_rx) = mpsc::channel(16);
+            let (run_events_tx, run_events) = mpsc::channel(16);
             let (approval_tx, approval_event_rx) = mpsc::channel(16);
             (
                 Senders {
-                    tool_event_tx,
-                    progress_tx,
-                    _tool_usage_tx: tool_usage_tx,
+                    run_events_tx,
                     _approval_tx: approval_tx,
                 },
                 StreamingCallbacks {
                     request_id: "req_tool_events".to_string(),
                     agent: Arc::new(MockAgent::pending()),
-                    tool_event_rx,
-                    progress_rx,
-                    tool_usage_rx,
+                    agent_events: Some(run_events),
                     approval_event_rx,
                     usage_state: UsageState::new(),
                     response_content: ResponseContent::new(),
@@ -2737,7 +2830,8 @@ mod tests {
     mod tool_events {
         use super::harness::{SESSION_ID, Senders, payload, run_scoped, run_with};
         use super::*;
-        use aura::{NumberOrString, ProgressNotification, ProgressToken};
+        use aura::{NumberOrString, ProgressToken};
+        use aura_events::agent::{AgentEvent, AgentEventPayload};
         use aura_test_utils::mock_agent::{Step, items};
         use aura_test_utils::sse::{SseEvent, events_by_type};
         use serde_json::{Value, json};
@@ -2747,16 +2841,15 @@ mod tests {
         const TOOL_ARGS: &str = r#"{"path":"/mock"}"#;
 
         fn tool_requested(senders: &Senders) -> Step {
-            let tx = senders.tool_event_tx.clone();
+            let tx = senders.run_events_tx.clone();
             Step::effect(move |_| {
                 let tx = tx.clone();
                 async move {
-                    tx.send(ToolLifecycleEvent::Requested {
-                        tool_id: ToolCallId::new(TOOL_ID),
+                    tx.send(AgentEvent::single_agent(AgentEventPayload::ToolRequested {
+                        tool_call_id: ToolCallId::new(TOOL_ID),
                         tool_name: ToolName::new(TOOL_NAME),
                         arguments: json!({ "path": "/mock" }),
-                        agent: None,
-                    })
+                    }))
                     .await
                     .expect("tool event channel open");
                 }
@@ -2764,16 +2857,17 @@ mod tests {
         }
 
         fn tool_start(senders: &Senders) -> Step {
-            let tx = senders.tool_event_tx.clone();
+            let tx = senders.run_events_tx.clone();
             Step::effect(move |_| {
                 let tx = tx.clone();
                 async move {
-                    tx.send(ToolLifecycleEvent::Start {
-                        tool_id: ToolCallId::new(TOOL_ID),
+                    tx.send(AgentEvent::single_agent(AgentEventPayload::ToolStart {
+                        tool_call_id: ToolCallId::new(TOOL_ID),
                         tool_name: ToolName::new(TOOL_NAME),
                         progress_token: Some(ProgressToken(NumberOrString::Number(7))),
-                        agent: None,
-                    })
+                        arguments: None,
+                        task_id: None,
+                    }))
                     .await
                     .expect("tool event channel open");
                 }
@@ -2781,16 +2875,15 @@ mod tests {
         }
 
         fn progress(senders: &Senders) -> Step {
-            let tx = senders.progress_tx.clone();
+            let tx = senders.run_events_tx.clone();
             Step::effect(move |_| {
                 let tx = tx.clone();
                 async move {
-                    tx.send(ProgressNotification {
+                    tx.send(AgentEvent::single_agent(AgentEventPayload::ToolProgress {
                         progress_token: ProgressToken(NumberOrString::Number(7)),
                         progress: Progress::ratio(50.0, 100.0),
                         message: Some("halfway".to_string()),
-                        agent: None,
-                    })
+                    }))
                     .await
                     .expect("progress channel open");
                 }
@@ -2942,17 +3035,18 @@ mod tests {
         async fn progress_without_a_message_renders_its_counts() {
             async fn message_for(progress: Progress) -> String {
                 let events = run_with(|s| {
-                    let tx = s.progress_tx.clone();
+                    let tx = s.run_events_tx.clone();
                     vec![
                         Step::effect(move |_| {
                             let tx = tx.clone();
                             async move {
-                                tx.send(ProgressNotification {
-                                    progress_token: ProgressToken(NumberOrString::Number(7)),
-                                    progress,
-                                    message: None,
-                                    agent: None,
-                                })
+                                tx.send(AgentEvent::single_agent(
+                                    AgentEventPayload::ToolProgress {
+                                        progress_token: ProgressToken(NumberOrString::Number(7)),
+                                        progress,
+                                        message: None,
+                                    },
+                                ))
                                 .await
                                 .expect("progress channel open");
                             }

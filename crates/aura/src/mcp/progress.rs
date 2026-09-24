@@ -9,12 +9,13 @@
  *
  * When an MCP server sends a `notifications/progress` message:
  * 1. `ProgressEnabledHandler.on_progress()` receives the notification
- * 2. The notification is published to the request-scoped `RequestProgressBroker`
- * 3. Web server SSE handlers receive progress only for their specific request
+ * 2. The handler finds the call that owns the progress token and emits the
+ *    notification on that call's run
+ * 3. The run's observer, such as the web server's SSE loop, forwards it
  *
  * # Security
  *
- * Progress notifications are scoped to the HTTP request that initiated the tool call.
+ * Progress notifications reach only the run that made the tool call.
  * This prevents cross-customer data leakage in multi-tenant deployments.
  */
 
@@ -173,9 +174,8 @@ impl ClientHandler for ProgressEnabledHandler {
             if let Some(CallContext { run, agent }) = call {
                 let req_id = run.id().as_ref();
 
-                let routed = crate::agent_events::emit(
-                    req_id,
-                    AgentEvent::new(
+                let routed = run
+                    .emit(AgentEvent::new(
                         agent,
                         AgentEventPayload::ToolProgress {
                             progress_token: params.progress_token.clone(),
@@ -185,10 +185,9 @@ impl ClientHandler for ProgressEnabledHandler {
                             },
                             message: params.message.clone(),
                         },
-                    ),
-                )
-                .await;
-                if routed == crate::agent_events::Routed::Delivered {
+                    ))
+                    .await;
+                if routed {
                     debug!(
                         "Progress notification routed to request '{}': progress={}, message={:?}",
                         req_id, params.progress, params.message
@@ -234,7 +233,7 @@ mod tests {
 
     fn call(request_id: &str) -> CallContext {
         CallContext {
-            run: crate::run_context::RunContext::new(request_id),
+            run: crate::run_context::RunContext::detached(request_id),
             agent: aura_events::AgentContext::single_agent(),
         }
     }

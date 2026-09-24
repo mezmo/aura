@@ -4,7 +4,6 @@
 //!
 
 use aura::mcp::McpClient;
-use aura::{request_progress_global, request_progress_subscribe, request_progress_unsubscribe};
 use std::collections::HashMap;
 use std::time::Duration;
 use tokio::time::timeout;
@@ -148,87 +147,4 @@ async fn test_call_tool_without_progress_still_works() {
         "Result should contain response from mock_tool, got: {}",
         result
     );
-}
-
-#[tokio::test]
-async fn test_request_progress_broker_accessible() {
-    let broker = request_progress_global();
-    let test_request_id = "test_req_123";
-    let _rx = broker.subscribe(test_request_id).await;
-
-    assert!(
-        broker.active_subscriptions().await >= 1,
-        "Should have at least 1 subscription after subscribing"
-    );
-
-    broker.unsubscribe(test_request_id).await;
-}
-
-/// Verifies progress notifications only go to the correct request (no cross-request leakage).
-#[tokio::test]
-async fn test_request_progress_isolation() {
-    use aura::{NumberOrString, Progress, ProgressNotification, ProgressToken};
-    use std::sync::Arc;
-
-    let mut rx1 = request_progress_subscribe("req_1").await;
-    let mut rx2 = request_progress_subscribe("req_2").await;
-
-    let notification = ProgressNotification {
-        progress_token: ProgressToken(NumberOrString::String(Arc::from("token_1"))),
-        progress: Progress::ratio(50.0, 100.0),
-        message: Some("Progress for request 1".to_string()),
-        agent: None,
-    };
-
-    let broker = request_progress_global();
-    let sent = broker.publish("req_1", notification).await;
-    assert!(sent, "Should successfully publish to req_1");
-
-    let received = tokio::time::timeout(Duration::from_millis(100), rx1.recv())
-        .await
-        .expect("Should receive within timeout")
-        .expect("Should have notification");
-    assert_eq!(received.message, Some("Progress for request 1".to_string()));
-
-    // req_2 should NOT receive anything
-    let result = tokio::time::timeout(Duration::from_millis(50), rx2.recv()).await;
-    assert!(
-        result.is_err(),
-        "req_2 should NOT receive progress meant for req_1"
-    );
-
-    request_progress_unsubscribe("req_1").await;
-    request_progress_unsubscribe("req_2").await;
-}
-
-#[tokio::test]
-async fn test_unsubscribe_stops_progress() {
-    use aura::{NumberOrString, Progress, ProgressNotification, ProgressToken};
-
-    let request_id = "req_cancel_test";
-    let mut rx = request_progress_subscribe(request_id).await;
-
-    let broker = request_progress_global();
-    let notification = ProgressNotification {
-        progress_token: ProgressToken(NumberOrString::Number(1)),
-        progress: Progress::ratio(10.0, 100.0),
-        message: Some("Step 1".to_string()),
-        agent: None,
-    };
-    broker.publish(request_id, notification).await;
-
-    let received = rx.recv().await;
-    assert!(received.is_some(), "Should receive first notification");
-
-    request_progress_unsubscribe(request_id).await;
-
-    let notification2 = ProgressNotification {
-        progress_token: ProgressToken(NumberOrString::Number(1)),
-        progress: Progress::ratio(20.0, 100.0),
-        message: Some("Step 2 - should not be received".to_string()),
-        agent: None,
-    };
-    let sent = broker.publish(request_id, notification2).await;
-
-    assert!(!sent, "Should not be able to send after unsubscribe");
 }

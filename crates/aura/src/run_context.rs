@@ -16,23 +16,58 @@ use std::task::{Context, Poll};
 
 use futures::Stream;
 
-use crate::tool_event_broker::ToolCallId;
+use aura_events::agent::AgentEvent;
+use tokio::sync::mpsc;
 
-/// One run, and the state its own work needs to correlate.
+use aura_events::ToolCallId;
+
+/// Events a run may buffer before its observer reads them.
+pub const EVENT_CHANNEL_CAPACITY: usize = 1024;
+
+/// One run — what its own work needs to correlate, and where its events go.
 pub struct RunContext {
     id: Arc<str>,
     tool_calls: Mutex<VecDeque<ToolCallId>>,
+    events: mpsc::Sender<AgentEvent>,
 }
 
 /// Pending tool ids before warning, in case results never arrive to pop them.
 const MAX_PENDING_TOOL_CALLS: usize = 256;
 
 impl RunContext {
-    pub fn new(id: impl Into<Arc<str>>) -> Arc<Self> {
-        Arc::new(Self {
+    /// A run and the receiver its observer reads.
+    pub fn channel(id: impl Into<Arc<str>>) -> (Arc<Self>, mpsc::Receiver<AgentEvent>) {
+        let (events, receiver) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
+        let run = Arc::new(Self {
             id: id.into(),
             tool_calls: Mutex::new(VecDeque::new()),
-        })
+            events,
+        });
+        (run, receiver)
+    }
+
+    /// A run nobody observes, for a test that needs one to exist without
+    /// reading what it emits. Production names a run it can reach an observer
+    /// through, or names none.
+    #[cfg(test)]
+    pub fn detached(id: impl Into<Arc<str>>) -> Arc<Self> {
+        Self::channel(id).0
+    }
+
+    /// Hands an event to whoever is observing the run. `false` when nothing is
+    /// reading, which a producer that only wanted it logged can ignore.
+    pub async fn emit(&self, event: AgentEvent) -> bool {
+        let payload = std::mem::discriminant(&event.payload);
+        let delivered = self.events.send(event).await.is_ok();
+
+        if !delivered {
+            tracing::debug!(
+                run_id = %self.id,
+                ?payload,
+                "nobody is observing this run, so its event reached no consumer"
+            );
+        }
+        delivered
     }
 
     pub fn id(&self) -> &Arc<str> {
@@ -84,6 +119,25 @@ tokio::task_local! {
     static RUN: Arc<RunContext>;
 }
 
+/// Hands an event to the run in scope. `false` when no run is in scope or
+/// nothing is reading, which a producer that only wanted it logged can ignore.
+///
+/// Work that runs outside the scope — a notification on the transport task, a
+/// spawned sweep — reaches its run through what it already holds and calls
+/// [`RunContext::emit`] on it.
+pub async fn emit(event: AgentEvent) -> bool {
+    match current_run() {
+        Some(run) => run.emit(event).await,
+        None => {
+            tracing::debug!(
+                payload = ?std::mem::discriminant(&event.payload),
+                "no run is in scope, so this event reached no consumer"
+            );
+            false
+        }
+    }
+}
+
 pub fn current_run() -> Option<Arc<RunContext>> {
     RUN.try_with(Arc::clone).ok()
 }
@@ -127,7 +181,16 @@ mod tests {
     use futures::StreamExt;
 
     fn run(id: &str) -> Arc<RunContext> {
-        RunContext::new(id)
+        RunContext::detached(id)
+    }
+
+    #[tokio::test]
+    async fn a_scope_established_inside_a_spawn_holds() {
+        let (run, _rx) = RunContext::channel("spawned");
+        let seen = tokio::spawn(with_run(run, async { current_run_id() }))
+            .await
+            .unwrap();
+        assert_eq!(seen.as_deref(), Some("spawned"));
     }
 
     #[tokio::test]
