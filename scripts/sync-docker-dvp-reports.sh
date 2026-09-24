@@ -120,8 +120,8 @@ require_tools() {
 # Exchange the personal access token for a session JWT.
 #
 # The token is not a bearer credential: passing it to the analytics API is
-# rejected. The JWT it buys is short lived, which is why one is minted per run
-# rather than cached anywhere.
+# rejected. The JWT it buys lives for well under half an hour, which is why one
+# is never cached anywhere.
 docker_jwt() {
     local body status
     body=$(jq -n --arg u "${DOCKER_USERNAME}" --arg p "${DOCKER_TOKEN}" \
@@ -459,11 +459,15 @@ main() {
     fi
     echo "Docker DVP: ${available} ${DVP_GRANULARITY} report(s) available for ${DOCKER_NAMESPACE}"
 
+    # Each report waits minutes for its PostHog read-back, so a JWT minted at
+    # the start of the run expires a few reports in. Mint a fresh one for
+    # every report instead.
     local period url synced=0
     while IFS=$'\t' read -r period url; do
         [ -z "${PERIOD}" ] || [ "${PERIOD}" = "${period}" ] || continue
         WORK_DIR="${ROOT_DIR}/${period}"
         mkdir -p "${WORK_DIR}"
+        jwt=$(docker_jwt)
         sync_report "${period}" "${url}" "${jwt}"
         synced=$((synced + 1))
     done < "${ROOT_DIR}/reports.tsv"
