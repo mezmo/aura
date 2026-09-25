@@ -2109,14 +2109,15 @@ async fn re_park_registers_the_fresh_ticket_under_the_original_bound_run_id() {
 /// config and the SSE side subscribes under — never the run owner id.
 /// Today `run_segment_borrowed` overwrites `config.request_id` with
 /// `run_owner_id(...)` before the orchestrator builds (the gov-500
-/// stamp), so the resumed worker's gate publishes its `Requested` under
-/// `run:<id>` and a subscriber keyed on the fresh id — exactly the key
-/// the web-server handler subscribes for this request — never sees it.
-/// RED until the overwrite is deleted: the re-parked call's gate-entry
-/// `Requested` must arrive on the fresh channel, naming the fresh
-/// ticket's decision id. The `Completed` leg is structurally suppressed
-/// on a pending reply (`GateDecision::to_outcome` — a 207 has no
-/// terminal outcome), so a re-parking segment emits `Requested` only.
+/// stamp), so before the fill the resumed worker's gate published its
+/// `Requested` under `run:<id>` and a subscriber keyed on the fresh id —
+/// exactly the key the web-server handler subscribes for this request —
+/// never saw it. Regression frame (red until the 1ea05b70 fill): the
+/// re-parked call's gate-entry `Requested` must arrive on the fresh
+/// channel, naming the fresh ticket's decision id. The `Completed` leg is
+/// structurally suppressed on a pending reply (`GateDecision::to_outcome`
+/// — a 207 has no terminal outcome), so a re-parking segment emits
+/// `Requested` only.
 #[tokio::test]
 async fn a1_resumed_gate_requested_publishes_on_the_fresh_request_id_channel() {
     let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
@@ -2312,17 +2313,17 @@ impl rig::tool::Tool for ArmProbingTool {
     }
 }
 
-/// A1 (aura#271, card P45): the resumed MCP manager must be ARMED with
-/// the config's fresh request id the way the chat path arms it
+/// A1 (aura#271, card P45): regression frame (red until the 1ea05b70
+/// fill). The resumed MCP manager must be ARMED with the config's fresh
+/// request id the way the chat path arms it
 /// (`mcp_manager.set_current_request`, factory.rs) — BEFORE the
 /// segment's execution window opens — and the segment close
-/// (`close_segment_mcp`) must cancel under that same fresh id. Today
-/// `run_segment_borrowed`'s overwrite hands the orchestrator
-/// `config.request_id = run:<run_id>` AND `for_resume_segment` never arms
-/// the manager, so resumed MCP calls run untracked and the close cancels
-/// under the conflated run owner id. RED until the overwrite is deleted
-/// and the arm lands. F5 is merged into this frame: the one
-/// `McpManager`-level observation seam pins both keys.
+/// (`close_segment_mcp`) must cancel under that same fresh id. Before the
+/// fill, `run_segment_borrowed`'s overwrite handed the orchestrator
+/// `config.request_id = run:<run_id>` AND `for_resume_segment` never
+/// armed the manager, so resumed MCP calls ran untracked and the close
+/// cancelled under the conflated run owner id. F5 is merged into this
+/// frame: the one `McpManager`-level observation seam pins both keys.
 ///
 /// ORDERING (Gate A repair): the arm is proven by a MID-SEGMENT probe,
 /// not a post-completion read — the decided call's stand-in tool samples

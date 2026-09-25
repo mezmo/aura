@@ -4947,11 +4947,12 @@ mod tests {
             }
         }
 
-        /// F2(a) — RED today: a park-armed worker ask POSTs a body whose
+        /// F2(a) — regression frame for the A1 split (red until the
+        /// 1ea05b70 fill): a park-armed worker ask POSTs a body whose
         /// `request_id` is the run owner id, minted inside
-        /// `build_approval_post` from the scope's `run_id`. Today the body
-        /// carries the fresh `req_test_...` verbatim. The split's other
-        /// half rides the same frame (green today, must stay green): the
+        /// `build_approval_post` from the scope's `run_id`; before the
+        /// fill the body carried the fresh `req_test_...` verbatim. The
+        /// split's other half rides the same frame (always green): the
         /// gate's `Requested`/`Completed` lifecycle events stay on the
         /// FRESH request id's broker channel.
         #[tokio::test]
@@ -5016,7 +5017,8 @@ mod tests {
             crate::approval_event_broker::unsubscribe(&request_id).await;
         }
 
-        /// F2(b) — RED today: the poll-delivery notify leg (the parked
+        /// F2(b) — regression frame for the A1 split (red until the
+        /// 1ea05b70 fill): the poll-delivery notify leg (the parked
         /// row's ack POST) derives its body's `request_id` from the scope's
         /// run id the same way the park-armed ask does.
         #[tokio::test]
