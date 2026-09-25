@@ -148,6 +148,10 @@ pub struct Agent {
     pub(crate) client_tool_names: HashSet<String>,
     /// Turn-limit nudge state shared with this agent's `TurnNudgeWrapper`.
     pub(crate) turn_nudge: Option<Arc<crate::turn_nudge::TurnNudgeState>>,
+    /// The HITL config gate.
+    pub(crate) hitl_gate: Option<Arc<crate::hitl::HitlApprovalWrapper>>,
+    /// The `request_approval` tool.
+    pub(crate) hitl_approval_tool: Option<crate::hitl::RequestApprovalTool>,
     /// Assembled system prompt handed to the provider builder
     /// (preamble + skill catalog, etc.).
     pub(crate) system_prompt: String,
@@ -317,6 +321,8 @@ impl Agent {
         // HITL gate for single-agent mode. Orchestration workers wire their
         // own gate in create_worker with per-task AgentScope::Worker; this
         // covers single-agent only (AgentScope::Single).
+        let mut hitl_gate = None;
+        let mut hitl_approval_tool = None;
         if !config_owned.orchestration_enabled()
             && let Some(ref hitl) = config_owned.hitl
         {
@@ -327,28 +333,31 @@ impl Agent {
                     .map(crate::config::SessionId::new),
             };
             let request_id = config_owned.request_id.clone().unwrap_or_default();
-            let gate: Arc<dyn crate::tool_wrapper::ToolWrapper> =
-                Arc::new(crate::hitl::HitlApprovalWrapper::new(
-                    hitl.patterns.clone(),
-                    hitl.route.clone(),
-                    scope.clone(),
-                    request_id.clone(),
-                    config_owned.agent.name.clone(),
-                    config_owned.instance_id.clone(),
-                ));
+            let wrapper = Arc::new(crate::hitl::HitlApprovalWrapper::new(
+                hitl.patterns.clone(),
+                hitl.route.clone(),
+                scope.clone(),
+                request_id.clone(),
+                config_owned.agent.name.clone(),
+                config_owned.instance_id.clone(),
+            ));
+            hitl_gate = Some(Arc::clone(&wrapper));
+            let gate: Arc<dyn crate::tool_wrapper::ToolWrapper> = wrapper;
             config_owned.tool_wrapper = Some(match config_owned.tool_wrapper.take() {
                 Some(existing) => Arc::new(crate::tool_wrapper::ComposedWrapper::new(vec![
                     gate, existing,
                 ])),
                 None => gate,
             });
-            config_owned.hitl_request_approval_tool = Some(crate::hitl::RequestApprovalTool::new(
+            let approval_tool = crate::hitl::RequestApprovalTool::new(
                 hitl.route.clone(),
                 scope,
                 request_id,
                 config_owned.agent.name.clone(),
                 config_owned.instance_id.clone(),
-            ));
+            );
+            hitl_approval_tool = Some(approval_tool.clone());
+            config_owned.hitl_request_approval_tool = Some(approval_tool);
         }
 
         // Scratchpad bonus only applies when scratchpad was actually wired up
@@ -852,6 +861,8 @@ impl Agent {
             scratchpad_budget: agent_scratchpad_budget,
             client_tool_names,
             turn_nudge,
+            hitl_gate,
+            hitl_approval_tool,
             system_prompt,
             invocation_parameters: crate::logging::llm_invocation_parameters(&config.llm),
             skills: config.agent.skills.clone(),
@@ -1693,8 +1704,15 @@ impl StreamingAgent for Agent {
     ) -> crate::streaming::AgentRun {
         let (run, run_events) = crate::run_context::RunContext::channel(request_id);
 
-        // Rig runs tools on its own server task, so bind the run where a tool
-        // call can still find it.
+        // The gate and the approval tool are built with the agent, before any
+        // run exists, and rig runs tools on its own server task. So bind the run
+        // where a tool call can still find it.
+        if let Some(gate) = &self.hitl_gate {
+            gate.bind_run(std::sync::Arc::clone(&run));
+        }
+        if let Some(tool) = &self.hitl_approval_tool {
+            tool.bind_run(std::sync::Arc::clone(&run));
+        }
         if let Some(mcp_manager) = &self.mcp_manager {
             mcp_manager
                 .bind_call(
@@ -2162,10 +2180,10 @@ mod tests {
 
         use super::transport_tagging::{UnpromptedModel, declared_tool};
         use super::*;
-        use crate::approval_event_broker::ApprovalLifecycleEvent;
         use crate::hitl::{AgentScope, DecisionRoute, HitlApprovalWrapper, PendingApprovals};
         use crate::mcp::client::tests::RecordingMcpServer;
         use crate::mcp::{McpClient, McpManager};
+        use aura_events::agent::AgentEventPayload;
 
         /// A manager offering one HTTP-streamable tool, keyed by `namespace`.
         /// HTTP rather than stdio so the transport's fail-closed check cannot
@@ -2202,7 +2220,14 @@ mod tests {
         /// A config carrying a real `HitlApprovalWrapper`. The conversational
         /// route parks in-process and expires quickly: the approval event is
         /// published before the wait, so no decision has to arrive.
-        fn gated_config(request_id: &str, pattern: &str) -> AgentRuntimeConfig {
+        /// The gate is bound to `run` here rather than left to find one,
+        /// because rig calls the tool on its server task and no scope reaches
+        /// there.
+        fn gated_config(
+            request_id: &str,
+            pattern: &str,
+            run: Arc<crate::run_context::RunContext>,
+        ) -> AgentRuntimeConfig {
             let gate = HitlApprovalWrapper::new(
                 Arc::from([pattern.into()]),
                 Arc::new(DecisionRoute::Conversational {
@@ -2214,6 +2239,7 @@ mod tests {
                 "test-agent".to_owned(),
                 "test-instance-id".to_owned(),
             );
+            gate.bind_run(run);
             AgentRuntimeConfig {
                 tool_wrapper: Some(Arc::new(gate)),
                 ..Default::default()
@@ -2226,8 +2252,9 @@ mod tests {
             pattern: &str,
             namespace: &str,
             tool: &str,
+            run: Arc<crate::run_context::RunContext>,
         ) -> rig::agent::Agent<UnpromptedModel> {
-            let config = gated_config(request_id, pattern);
+            let config = gated_config(request_id, pattern, run);
             let manager = Some(Arc::new(manager_serving(server, namespace, tool).await));
             let state = BuilderState::Initial(rig::agent::AgentBuilder::new(UnpromptedModel));
             Agent::add_all_tools(state, &config, &manager, Vec::new())
@@ -2242,10 +2269,11 @@ mod tests {
         #[tokio::test]
         async fn a_namespace_scoped_pattern_gates_a_tool_from_that_server() {
             let request_id = "req_ns_gating_match";
-            let mut rx = crate::approval_event_broker::subscribe(request_id).await;
             let server = RecordingMcpServer::start().await;
+            let (run, mut rx) = crate::run_context::RunContext::channel(request_id);
             let agent =
-                compose_gated_agent(&server, request_id, "github:*", "github", "list_repos").await;
+                compose_gated_agent(&server, request_id, "github:*", "github", "list_repos", run)
+                    .await;
 
             // The parked approval expires unanswered; the call's own outcome is
             // not what this test is about.
@@ -2257,10 +2285,9 @@ mod tests {
             let event = rx
                 .try_recv()
                 .expect("a tool matching the namespace-scoped pattern must raise an approval");
-            crate::approval_event_broker::unsubscribe(request_id).await;
 
-            let ApprovalLifecycleEvent::Requested(requested) = event else {
-                panic!("the gate must raise Requested first, got: {event:?}");
+            let AgentEventPayload::ApprovalRequested(requested) = event.payload else {
+                panic!("the gate must raise Requested first");
             };
             assert_eq!(requested.tool_name, "list_repos");
             assert_eq!(
@@ -2276,10 +2303,11 @@ mod tests {
         #[tokio::test]
         async fn a_namespace_scoped_pattern_ignores_a_tool_from_another_server() {
             let request_id = "req_ns_gating_miss";
-            let mut rx = crate::approval_event_broker::subscribe(request_id).await;
             let server = RecordingMcpServer::start().await;
+            let (run, mut rx) = crate::run_context::RunContext::channel(request_id);
             let agent =
-                compose_gated_agent(&server, request_id, "github:*", "k8s", "list_repos").await;
+                compose_gated_agent(&server, request_id, "github:*", "k8s", "list_repos", run)
+                    .await;
 
             agent
                 .tool_server_handle
@@ -2288,7 +2316,6 @@ mod tests {
                 .expect("a tool outside the pattern's namespace runs ungated");
 
             let raised = rx.try_recv();
-            crate::approval_event_broker::unsubscribe(request_id).await;
             assert!(
                 raised.is_err(),
                 "a tool from another server must not be gated, got: {raised:?}",

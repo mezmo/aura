@@ -17,7 +17,7 @@ use super::events;
 use super::protocol::{ApprovalDecisionWire, ApprovalRequest, ApprovalRequestWire};
 use super::registry::PendingApprovals;
 use super::signing::{SigningContext, WebhookHmac, authorize_ingress};
-use crate::agent_events::emit;
+use crate::run_context::emit;
 
 /// Maximum time to wait for a TCP connection to the approval webhook before
 /// failing closed. Without this, an unreachable host can hang the connect
@@ -226,11 +226,10 @@ async fn webhook_round_trip<T>(
     cancelled: impl FnOnce() -> T,
     event_outcome: impl FnOnce(&T) -> ApprovalOutcome,
 ) -> Result<T, ApprovalError> {
-    let request_id = request.request_id.clone();
     let decision_id = request.decision_id;
     let scope = request.scope.clone();
 
-    let _ = emit(&request_id, events::requested_event(request)).await;
+    let _ = emit(events::requested_event(request)).await;
 
     let raced = tokio::select! {
         biased;
@@ -253,7 +252,7 @@ async fn webhook_round_trip<T>(
             events::completed_error_event(decision_id, err.to_string(), &scope, started.elapsed())
         }
     };
-    let _ = emit(&request_id, completed).await;
+    let _ = emit(completed).await;
     result
 }
 
@@ -309,7 +308,6 @@ impl DecisionRoute {
         cancel: &crate::request_cancellation::RequestCancelToken,
     ) -> Result<ApprovalOutcome, ApprovalError> {
         let started = Instant::now();
-        let request_id = request.request_id.clone();
         let decision_id = request.decision_id;
         let scope = request.scope.clone();
 
@@ -326,8 +324,8 @@ impl DecisionRoute {
                 // either must find the parked record already resolvable.
                 let handle = registry.register(request, *timeout).await;
 
-                let _ = emit(&request_id, requested).await;
-                let _ = emit(&request_id, pending).await;
+                let _ = emit(requested).await;
+                let _ = emit(pending).await;
 
                 let mut outcome = handle.outcome(cancel).await;
                 if matches!(
@@ -349,7 +347,7 @@ impl DecisionRoute {
 
                 let completed =
                     events::completed_event(decision_id, &outcome, &scope, started.elapsed());
-                let _ = emit(&request_id, completed).await;
+                let _ = emit(completed).await;
 
                 Ok(outcome)
             }
@@ -1172,6 +1170,7 @@ mod tests {
         let decision_id = request.decision_id;
         let cancel = crate::request_cancellation::RequestCancelToken::unbound();
 
+        // No run in scope, since this case asserts on the registry.
         let decide_handle = tokio::spawn({
             let cancel = cancel.clone();
             async move { route.decide(request, &cancel).await }
@@ -1223,7 +1222,7 @@ mod tests {
     #[tokio::test]
     async fn conversational_resolve_at_requested_event_succeeds() {
         let request_id = format!("req_test_{}", uuid::Uuid::new_v4().simple());
-        let mut rx = crate::approval_event_broker::subscribe(&request_id).await;
+        let (run, mut rx) = crate::run_context::RunContext::channel(request_id.as_str());
 
         let (registry, route) = conv_route(Duration::from_secs(60));
         let request = single_request(
@@ -1236,9 +1235,11 @@ mod tests {
         let decision_id = request.decision_id;
 
         let cancel = crate::request_cancellation::RequestCancelToken::unbound();
+        // The scope goes inside the spawn, because task-locals do not cross
+        // one and the route emits through the ambient run.
         let decide_handle = tokio::spawn({
             let cancel = cancel.clone();
-            async move { route.decide(request, &cancel).await }
+            crate::run_context::with_run(run, async move { route.decide(request, &cancel).await })
         });
 
         let first = tokio::time::timeout(Duration::from_secs(1), rx.recv())
@@ -1246,8 +1247,8 @@ mod tests {
             .expect("requested event should arrive")
             .expect("requested event channel open");
         assert!(matches!(
-            first,
-            crate::approval_event_broker::ApprovalLifecycleEvent::Requested(_)
+            first.payload,
+            aura_events::agent::AgentEventPayload::ApprovalRequested(_)
         ));
 
         // An approver reacting to `Requested` immediately must find the
@@ -1262,8 +1263,6 @@ mod tests {
             outcome,
             ApprovalOutcome::Decided(ApprovalDecision::Approved)
         );
-
-        crate::approval_event_broker::unsubscribe(&request_id).await;
     }
 
     mod webhook_signing {
@@ -2221,7 +2220,7 @@ mod tests {
     #[tokio::test]
     async fn webhook_route_emits_requested_and_completed_on_channel_error() {
         let request_id = format!("req_test_{}", uuid::Uuid::new_v4().simple());
-        let mut rx = crate::approval_event_broker::subscribe(&request_id).await;
+        let (run, mut rx) = crate::run_context::RunContext::channel(request_id.as_str());
         let route = super::DecisionRoute::Webhook {
             client: super::WebhookClient::new(
                 super::build_webhook_client(),
@@ -2248,7 +2247,7 @@ mod tests {
         };
 
         let cancel = crate::request_cancellation::RequestCancelToken::unbound();
-        let result = route.decide(request, &cancel).await;
+        let result = crate::run_context::with_run(run, route.decide(request, &cancel)).await;
         assert!(result.is_err(), "discard-port webhook should fail closed");
 
         let first = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
@@ -2256,25 +2255,23 @@ mod tests {
             .expect("requested event should arrive")
             .expect("requested event channel open");
         assert!(matches!(
-            first,
-            crate::approval_event_broker::ApprovalLifecycleEvent::Requested(_)
+            first.payload,
+            aura_events::agent::AgentEventPayload::ApprovalRequested(_)
         ));
 
         let second = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
             .await
             .expect("completed event should arrive")
             .expect("completed event channel open");
-        match second {
-            crate::approval_event_broker::ApprovalLifecycleEvent::Completed(completed) => {
+        match second.payload {
+            aura_events::agent::AgentEventPayload::ApprovalCompleted(completed) => {
                 assert!(matches!(
                     completed.outcome,
                     aura_events::ApprovalOutcomeWire::Errored { .. }
                 ));
             }
-            other => panic!("expected completed event, got {:?}", other),
+            other => panic!("expected completed event, got {other:?}"),
         }
-
-        crate::approval_event_broker::unsubscribe(&request_id).await;
     }
 
     // -----------------------------------------------------------------

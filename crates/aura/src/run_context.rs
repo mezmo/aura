@@ -115,6 +115,35 @@ impl std::fmt::Debug for RunContext {
     }
 }
 
+/// A run held for work that runs outside its scope.
+#[derive(Default)]
+pub struct BoundRun(Mutex<Option<Arc<RunContext>>>);
+
+impl BoundRun {
+    /// A slot holding the run in scope, for work built inside one.
+    pub fn captured() -> Self {
+        Self(Mutex::new(current_run()))
+    }
+
+    /// Replaces any run already bound. One slot is enough while an agent is
+    /// built per request and owns the tools it gates.
+    pub fn bind(&self, run: Arc<RunContext>) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(run);
+    }
+
+    /// The bound run, or the ambient one for a caller already inside it.
+    pub fn get(&self) -> Option<Arc<RunContext>> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+            .or_else(current_run)
+    }
+}
+
 tokio::task_local! {
     static RUN: Arc<RunContext>;
 }
@@ -173,6 +202,20 @@ impl<S: Stream + Unpin> Stream for ScopedStream<S> {
         let run = Arc::clone(&this.run);
         RUN.sync_scope(run, || Pin::new(&mut this.inner).poll_next(cx))
     }
+}
+
+/// Runs `f` with a fresh run in scope and returns what it emitted, for a test
+/// that asserts on a run's events without standing up an observer.
+#[cfg(test)]
+pub(crate) async fn observing<F: Future>(id: &str, f: F) -> (F::Output, Vec<AgentEvent>) {
+    let (run, mut events) = RunContext::channel(id);
+    let out = with_run(run, f).await;
+
+    let mut seen = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        seen.push(event);
+    }
+    (out, seen)
 }
 
 #[cfg(test)]

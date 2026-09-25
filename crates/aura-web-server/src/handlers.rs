@@ -1,9 +1,6 @@
 use a2a::VERSION;
 use aura::RigBuilder;
-use aura::{
-    RequestCancellation, ResponseContent, StreamingAgent, UsageState, approval_event_subscribe,
-    approval_event_unsubscribe,
-};
+use aura::{RequestCancellation, ResponseContent, StreamingAgent, UsageState};
 use aura_events::{AgentInfo, ServerInfo};
 use axum::Json;
 use axum::body::Body;
@@ -57,7 +54,6 @@ impl Drop for RequestResourceGuard {
                 async move {
                     pending_approvals.cancel_request(&id).await;
                     RequestCancellation::unregister(&id);
-                    approval_event_unsubscribe(&id).await;
                 },
                 tracing::Span::current(),
             );
@@ -155,7 +151,6 @@ enum DeliveryChannels {
         chunk_tx: mpsc::Sender<Result<Bytes, String>>,
         heartbeat_interval: std::time::Duration,
         agent_events: Option<mpsc::Receiver<aura_events::agent::AgentEvent>>,
-        approval_event_rx: mpsc::Receiver<aura::ApprovalLifecycleEvent>,
     },
 }
 
@@ -587,11 +582,6 @@ pub async fn execute_completion(
         rehydrated_skills,
     } = setup;
 
-    // Approvals still travel by request id, so the subscription exists before
-    // orchestration spawns inside `stream` and can publish one. The collect
-    // path never reads it.
-    let approval_event_rx = approval_event_subscribe(&config.request_id).await;
-
     // Create stream with timeout — single path for both Agent and Orchestrator
     let mut run = streaming_agent
         .stream(
@@ -616,7 +606,6 @@ pub async fn execute_completion(
             chunk_tx,
             heartbeat_interval,
             agent_events: run.take_agent_events(),
-            approval_event_rx,
         },
     };
     let stream = run.into_events();
@@ -659,13 +648,11 @@ pub async fn execute_completion(
             chunk_tx,
             heartbeat_interval,
             agent_events,
-            approval_event_rx,
         } => {
             let callbacks = StreamingCallbacks {
                 request_id: config.request_id.clone(),
                 agent: streaming_agent.clone(),
                 agent_events,
-                approval_event_rx,
                 usage_state: usage_state.clone(),
                 response_content,
                 model_name: model_str,
@@ -1451,11 +1438,7 @@ mod tests {
     use super::*;
     use crate::types::{ChatMessage, ChatMessageFunctionCall, ChatMessageToolCall, Role};
     use aura::skill_tool::{LOAD_SKILL_TOOL_NAME, READ_SKILL_FILE_TOOL_NAME};
-    use aura_test_utils::mock_agent::MockAgent;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::time::Duration;
-    use tokio_util::sync::CancellationToken;
 
     fn msg(role: Role, content: &str) -> ChatMessage {
         ChatMessage {
@@ -1544,107 +1527,6 @@ mod tests {
         let req = chat_request_with_stream(None);
 
         validate_hitl_delivery_mode(&config, &req).unwrap();
-    }
-
-    #[tokio::test]
-    async fn sse_approval_subscription_exists_before_stream_startup() {
-        let request_id = format!("req_test_{}", Uuid::new_v4().simple());
-        let published = Arc::new(AtomicBool::new(false));
-        let agent: Arc<dyn StreamingAgent> = Arc::new(MockAgent::pending().on_stream_start({
-            let published = Arc::clone(&published);
-            move |request_id| {
-                let published = Arc::clone(&published);
-                async move {
-                    let event =
-                        aura::ApprovalLifecycleEvent::Requested(aura_events::ApprovalRequested {
-                            decision_id: aura::hitl::DecisionId::generate().to_string(),
-                            tool_name: "dangerous_apply".to_string(),
-                            tool_namespace: None,
-                            origin: aura_events::ApprovalOriginWire::ConfigGate {
-                                matched_pattern: "dangerous_*".to_string(),
-                                agent_name: "test-agent".to_string(),
-                            },
-                            scope: aura_events::AgentScopeWire::Single { session_id: None },
-                        });
-                    published.store(
-                        aura::approval_event_broker::publish(&request_id, event).await,
-                        Ordering::SeqCst,
-                    );
-                }
-            }
-        }));
-        let setup = RequestSetup {
-            query: "trigger approval".to_string(),
-            chat_history: vec![],
-            streaming_agent: agent,
-            config: make_test_config(),
-            completion_id: "chatcmpl-test".to_string(),
-            model_str: "test/fake".to_string(),
-            created_timestamp: 1_700_000_000,
-            chat_session_id: "cs-test".to_string(),
-            has_client_tools: false,
-            request_id: request_id.clone(),
-            user_id: None,
-            metadata_json: None,
-            tools_json: vec![],
-            rehydrated_skills: vec![],
-        };
-        let config = CompletionConfig {
-            request_id,
-            timeout_duration: Duration::from_secs(30),
-            first_chunk_timeout: None,
-            inactivity_timeout: None,
-            stream_config: StreamConfig::new(false, false, ToolResultMode::default(), 0),
-            turn_context: TurnContext::new(
-                "chatcmpl-test".to_string(),
-                "test/fake".to_string(),
-                1_700_000_000,
-                None,
-                "cs-test",
-            ),
-            stream_shutdown_token: CancellationToken::new(),
-            active_requests: Arc::new(ActiveRequestTracker::default()),
-            provider: "test".to_string(),
-            model: "fake".to_string(),
-            query_for_otel: "trigger approval".to_string(),
-            message_count: 1,
-            response_content: ResponseContent::new(),
-            pending_approvals: aura::hitl::PendingApprovals::new(),
-        };
-        let (chunk_tx, mut chunk_rx) = mpsc::channel(8);
-
-        let task = tokio::spawn(execute_completion(
-            setup,
-            config,
-            DeliveryMode::Sse {
-                chunk_tx,
-                heartbeat_interval: Duration::from_secs(60),
-            },
-        ));
-
-        let mut saw_approval_event = false;
-        for _ in 0..8 {
-            let chunk = tokio::time::timeout(Duration::from_secs(1), chunk_rx.recv())
-                .await
-                .expect("SSE chunk should arrive")
-                .expect("SSE channel should stay open")
-                .expect("SSE chunk should be successful");
-            let text = std::str::from_utf8(&chunk).expect("SSE chunk is UTF-8");
-            if text.contains("aura.approval_requested") {
-                saw_approval_event = true;
-                break;
-            }
-        }
-        task.abort();
-
-        assert!(
-            published.load(Ordering::SeqCst),
-            "approval publish during stream startup should find an active subscriber",
-        );
-        assert!(
-            saw_approval_event,
-            "startup approval event should be delivered over SSE",
-        );
     }
 
     #[test]

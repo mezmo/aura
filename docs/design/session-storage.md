@@ -72,7 +72,7 @@ or **across a request and a later poll**, all of which live in per-pod memory to
 | Web chat history                                | client-supplied `messages[]`                                   | —                 | n/a               | n/a (stateless)     |
 | `chat_session_id`                               | correlation string (tracing + `aura.session_info`)             | no state          | —                 | just an ID          |
 | `request_cancellation` registry                 | `OnceLock<HashMap<RequestId, CancellationToken>>`              | request-scoped    | no                | no                  |
-| `tool_event_broker` / `approval_event_broker`   | `OnceLock<HashMap<request_id, Sender>>`                        | request-scoped    | no                | no                  |
+| A run's event channel                           | `mpsc::Sender` on the `RunContext` its task scopes             | run-scoped        | no                | no                  |
 | **HITL `PendingApprovals`**                     | `Arc<Mutex<BTreeMap<DecisionId, PendingEntry>>>` on `AppState` | **yes**           | no                | **no** ← gap        |
 | **A2A `SharedTaskStore` + `task_cancel_state`** | `Arc<InMemoryTaskStore>` / `Arc<Mutex<HashMap>>`               | **yes**           | no                | **no** ← gap        |
 | Scratchpad / orchestration artifacts            | `{memory_dir}/...` (`tokio::fs`, often `/tmp`, no PVC)         | pod-local         | no                | no                  |
@@ -139,11 +139,11 @@ with a code comment pointing at "durable parking".
 
 ### Explicitly out of scope (later iterations)
 
-- **Request-scoped brokers** (`tool_event_broker`, `approval_event_broker`,
-  `request_cancellation`). These correlate events _within a single live SSE stream_,
-  which is always anchored to one pod for its lifetime. They are correct as pod-local
-  state and must **not** be externalized. They only enter the picture as the _bus_
-  targets for cross-pod wake/fan-out (§6), not as stored state.
+- **A run's event channel** and the `request_cancellation` registry. These
+  correlate events _within a single live SSE stream_, which is always anchored to
+  one pod for its lifetime. They are correct as pod-local state and must **not** be
+  externalized. They only enter the picture as the _bus_ targets for cross-pod
+  wake/fan-out (§6), not as stored state.
 - **Scratchpad / orchestration artifacts** under `memory_dir`. Today these are pod-local
   disk (often `/tmp`, no PVC). Making them durable/shared is a separate object-storage
   discussion (S3/GCS/PVC), not session state. Noted here so it is not forgotten.
