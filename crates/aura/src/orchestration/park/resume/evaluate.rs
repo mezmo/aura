@@ -905,18 +905,11 @@ pub async fn run_segment_borrowed(
     usage_state: UsageState,
     outer_budget: Option<Duration>,
 ) -> Result<ResumeStreamEnd, SegmentError> {
-    let mut config = config.clone();
-    // The resume segment's HITL gate stamps every wire POST with the
-    // config's `request_id`, and the chat path's `req_<uuid>` value is
-    // runtime state that never persists. Left unset, a re-park's authorize
-    // POST carries an empty `request_id`, which the governance schema
-    // rejects (surfacing as an opaque HTTP 500). Stamp the run owner id —
-    // the same id the park bridge re-mints parked rows to — so resumed wire
-    // POSTs name the checkpointed run (the gov-500 rule; precedent
-    // `Orchestrator::run_resume_segment`).
-    config.request_id = Some(crate::orchestration::park::run_owner_id(
-        &grant.checkpoint().run_id,
-    ));
+    // The authorize POST's wire stamp derives from the worker scope's run id
+    // inside `build_approval_post`, so nothing here stamps the config: it
+    // keeps the fresh `req_<uuid>` end-to-end, and the request-scoped
+    // channels — broker, SSE, cancellation, MCP — stay routed under it (the
+    // gov-500 rule holds at the POST seam).
     // Header re-resolution is a deliberate no-op here: S1's
     // `prepare_agent_config` already resolved `headers_from_request`
     // forwarding once against the resume caller into this config, and the
@@ -925,7 +918,7 @@ pub async fn run_segment_borrowed(
     let _ = headers;
     crate::orchestration::Orchestrator::run_resume_segment_borrowed(
         grant,
-        &config,
+        config,
         event_tx,
         usage_state,
         outer_budget,

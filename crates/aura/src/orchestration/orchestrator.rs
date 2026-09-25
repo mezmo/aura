@@ -796,6 +796,19 @@ impl Orchestrator {
             None
         };
 
+        // Arm MCP tracking under the config's request id — the same arm the
+        // chat path applies — so the segment's MCP calls are routable from
+        // before the first worker/tool runs. A resume segment is expected to
+        // carry a fresh request id; one without leaves MCP untracked.
+        if let Some(ref mcp_manager) = mcp_manager {
+            match config.request_id.as_deref() {
+                Some(request_id) => mcp_manager.set_current_request(request_id).await,
+                None => tracing::warn!(
+                    "the resume segment has no request_id; its MCP calls run untracked"
+                ),
+            }
+        }
+
         let checkpoint = grant.checkpoint();
         let Some(memory_dir) = config.effective_memory_dir().map(str::to_string) else {
             return Err(fault(

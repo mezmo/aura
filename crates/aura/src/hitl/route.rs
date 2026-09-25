@@ -15,7 +15,7 @@ use aura_config::{
 };
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 
-use super::decision::{ApprovalDecision, ApprovalOutcome, DecisionId};
+use super::decision::{AgentScope, ApprovalDecision, ApprovalOutcome, DecisionId};
 use super::events;
 use super::protocol::{
     ApprovalDecisionWire, ApprovalRequest, ApprovalRequestWire, PollDecisionWire,
@@ -1024,7 +1024,29 @@ impl WebhookClient {
         // Serialize the wire view, not the domain request: it keeps `scope` /
         // `origin` as the flat `aura_events` DTOs instead of leaking Rust enum
         // variant names onto the webhook contract.
+        //
+        // The body's `request_id` is minted scope-and-mode-gated: a worker on
+        // a park-armed ask (the decide-live `ParkArmed` POST or the `Notify`
+        // ack leg) names the run owner — the same id the park bridge re-mints
+        // parked rows to, so the receiver correlates the POST with the
+        // checkpointed run. Every other scope/mode pair rides `request.
+        // request_id` verbatim: Single carries no run id, and Hold keeps the
+        // verbatim id per the ruling. Derived before either serialization
+        // path, so the HMAC signs the derived stamp when egress is signed.
+        let wire_request_id = match (&request.scope, mode) {
+            (AgentScope::Worker { run_id, .. }, AskMode::ParkArmed | AskMode::Notify) => {
+                Some(crate::orchestration::run_owner_id(&run_id.to_string()))
+            }
+            _ => None,
+        };
         let wire = ApprovalRequestWire::from(request);
+        let wire = match wire_request_id.as_deref() {
+            Some(derived) => ApprovalRequestWire {
+                request_id: derived,
+                ..wire
+            },
+            None => wire,
+        };
         let response_type = mode.response_type();
         let Some(hmac) = self.egress_hmac()? else {
             let builder = self.apply_row_headers(
