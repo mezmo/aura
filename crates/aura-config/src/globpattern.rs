@@ -68,9 +68,11 @@ pub enum GlobPatternError {
 /// expected — never that a run grew too long, since every character in an
 /// over-long run is itself legal.
 ///
-/// A bracket class counts as one character however many it lists, matching
-/// what it accepts. Wildcards, alternate boundaries, and the namespace
-/// separator all end a run, so each run is measured on its own.
+/// A run is a maximal sequence of literal characters. Every glob construct
+/// ends one — wildcards, a bracket class and its contents, alternate
+/// boundaries, and the namespace separator — so the cap bounds literal text
+/// and never the constructs around it. A malformed construct such as an
+/// unclosed class is left for the grammar, which names it.
 fn check_literal_runs(source: &str) -> Result<(), GlobPatternError> {
     let is_literal = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '/' | '.');
 
@@ -85,10 +87,9 @@ fn check_literal_runs(source: &str) -> Result<(), GlobPatternError> {
             run += 1;
             end = i + 1;
         } else if c == '[' {
-            run += 1;
-            end = i + 1;
-            for (j, d) in chars.by_ref() {
-                end = j + 1;
+            runs.push((run, end));
+            run = 0;
+            for (_, d) in chars.by_ref() {
                 if d == ']' {
                     break;
                 }
@@ -331,22 +332,37 @@ mod tests {
         );
     }
 
-    /// A bracket class matches exactly one character however many it lists,
-    /// so its contents are not a literal run.
+    /// A bracket class is a glob construct: its contents are not literal
+    /// text, and it ends the run beside it, the same as `?`.
     #[test]
-    fn a_long_character_class_is_not_a_literal_run() {
+    fn a_character_class_ends_the_run_and_is_not_counted() {
         let wide = format!("[{}]", "abcdefghijklmnopqrstuvwxyz".repeat(3));
         assert!(
             GlobPattern::new(&wide).is_ok(),
-            "a class listing more than the cap still matches one character"
+            "a class listing more than the cap is not a literal run"
         );
-        // It counts as the one character it matches, so a run around it is
-        // measured with the class included.
-        let padded = format!("{}{wide}", "x".repeat(MAX_LITERAL_RUN));
-        assert!(matches!(
-            GlobPattern::new(&padded),
-            Err(GlobPatternError::LiteralRunTooLong { found: 65, .. })
-        ));
+
+        let at_cap = "x".repeat(MAX_LITERAL_RUN);
+        for pattern in [format!("{at_cap}[abc]"), format!("{at_cap}?")] {
+            assert!(
+                GlobPattern::new(&pattern).is_ok(),
+                "{pattern:.20}… is a full run plus one glob construct"
+            );
+        }
+    }
+
+    /// A malformed construct is reported by the grammar, not mistaken for a
+    /// long literal run beside it.
+    #[test]
+    fn an_unclosed_class_is_reported_as_a_parse_error() {
+        let pattern = format!("{}[", "x".repeat(MAX_LITERAL_RUN));
+        assert!(
+            matches!(
+                GlobPattern::new(&pattern),
+                Err(GlobPatternError::ParseError(_))
+            ),
+            "an unclosed class must surface as the grammar's error"
+        );
     }
 
     #[test]
