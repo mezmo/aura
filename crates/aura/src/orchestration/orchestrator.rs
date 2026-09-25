@@ -4402,8 +4402,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
         outer_budget: Option<Duration>,
     ) -> Result<ResumeStreamEnd, SegmentError> {
         // The config arrives already prepared by `run_segment_borrowed`:
-        // the run-owner `request_id` stamp and the deliberate header
-        // no-op both happened there, before the orchestrator build.
+        // the fresh `req_<uuid>` rides it untouched (the wire stamp
+        // derives at the POST seam), and the deliberate header no-op
+        // happened there, before the orchestrator build.
         let mut orchestrator = Self::for_resume_segment(grant, config).await?;
         // Share the caller's usage handle so the resumed turns accumulate
         // into the state the streaming handler reads, exactly as the live
