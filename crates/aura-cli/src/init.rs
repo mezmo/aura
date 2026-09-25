@@ -112,10 +112,17 @@ pub struct InitArgs {
 pub fn run_init(args: &InitArgs) -> Result<()> {
     let is_tty = std::io::stdin().is_terminal();
     let interactive = !args.non_interactive && is_tty;
+    let stdin: Box<dyn std::io::BufRead> = if is_tty {
+        // The terminal editor opens stdin directly. Keeping another Stdin
+        // handle here can hold its global input lock while readline starts.
+        Box::new(std::io::empty())
+    } else {
+        Box::new(std::io::BufReader::new(std::io::stdin()))
+    };
     let mut prompter = Prompter {
         interactive,
         is_tty,
-        stdin: std::io::stdin().lock(),
+        stdin,
     };
     if prompter.interactive {
         println!(
