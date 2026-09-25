@@ -1073,6 +1073,9 @@ pub enum SkillRouterMode {
     Shadow,
     /// Route and preload the selected skills into the agent's context.
     Inject,
+    /// Route and preload the selected skills as the agent's only skills: no
+    /// catalog and no skill tools.
+    Exclusive,
 }
 
 /// One System One decision-model stage of the skill router.

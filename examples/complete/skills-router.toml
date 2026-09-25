@@ -8,13 +8,17 @@
 # scores the whole catalog with a small, fast model tuned for recall; stage 2
 # rescores only that shortlist with a bigger model tuned for precision.
 #
-# `mode = "shadow"` routes and logs every decision without touching the
-# agent's context — run it first, fit the thresholds against
-# `decision_log`, then switch to `mode = "inject"` to preload the selected
-# skills' full SKILL.md bodies into the coordinator's and each worker's
-# system prompt (`load_skill` stays available for the rest of the catalog).
+# Modes:
+#   shadow    — route and log every decision; the agent's context is untouched.
+#               Run this first and fit the thresholds against `decision_log`.
+#   inject    — preload the selected skills' full SKILL.md bodies into the
+#               coordinator's and each worker's system prompt; the catalog and
+#               `load_skill` stay available for the rest.
+#   exclusive — the selected bodies are the agent's only skills: no catalog,
+#               no `load_skill`/`read_skill_file`, nothing for the LLM to
+#               deliberate over. Skill resource files are unreachable here.
 # A router that is down never fails a request: the agent keeps the on-demand
-# `load_skill` path.
+# `load_skill` path in every mode.
 #
 # Prerequisites:
 #   export OPENAI_API_KEY="sk-..."
@@ -59,7 +63,7 @@ model = "gpt-5.2"
 source = "examples/complete/skills"
 
 [agent.skill_router]
-mode = "shadow"                 # "shadow" logs only; "inject" preloads the selection
+mode = "shadow"                 # shadow | inject | exclusive (see above)
 timeout_ms = 5000               # per-stage HTTP timeout; a timeout falls back to load_skill
 decision_log = "skill-router-decisions.jsonl"   # optional JSONL, one line per decision
 

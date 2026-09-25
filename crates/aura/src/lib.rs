@@ -109,7 +109,8 @@ pub use request_progress::{
 };
 pub use rmcp::model::{NumberOrString, ProgressToken};
 pub use skill_router::{
-    SkillRouter, SkillRoutingDecision, SkillRoutingOutcome, SkillRoutingSubject,
+    PreloadStyle, SkillPlan, SkillRouter, SkillRoutingDecision, SkillRoutingOutcome,
+    SkillRoutingSubject,
 };
 pub use skill_tool::{LoadSkillTool, ReadSkillFileTool, SkillToolset, render_skill_catalog};
 pub use stream_events::{

@@ -1076,32 +1076,49 @@ impl Orchestrator {
             preamble.push_str(scratchpad::SCRATCHPAD_PREAMBLE);
         }
 
-        // Workers bypass Agent::build's catalog append (their preamble is the
-        // worker template override), so the skill catalog lands here instead.
-        if let Some(catalog) = crate::skill_tool::render_skill_catalog(&worker_config.agent.skills)
-            && let Some(ref mut preamble) = worker_config.preamble_override
-        {
-            preamble.push_str(&catalog);
-        }
-
-        // Skill routing scores the worker's catalog against its task. In
-        // inject mode the selected skills are preloaded after the catalog so
-        // the worker still sees `load_skill` for the rest.
-        if let (Some(router), Some(task)) = (self.skill_router.as_ref(), task_description)
-            && let Some(section) = router
-                .preload_section(
-                    crate::skill_router::SkillRoutingSubject::Worker {
-                        task_id,
-                        worker_name: worker_name.map(String::from),
-                    },
-                    worker_config.request_id.as_deref(),
-                    task,
-                    &worker_config.agent.skills,
-                )
-                .await
-            && let Some(ref mut preamble) = worker_config.preamble_override
-        {
-            preamble.push_str(&section);
+        // Skill routing scores the worker's catalog against its task and
+        // decides the worker's skill surface. Workers bypass Agent::build's
+        // catalog append (their preamble is the worker template override), so
+        // the catalog lands here when the plan keeps on-demand loading;
+        // clearing `agent.skills` is what drops the skill tools in
+        // `add_all_tools`.
+        let plan = match (self.skill_router.as_ref(), task_description) {
+            (Some(router), Some(task)) => {
+                router
+                    .plan(
+                        crate::skill_router::SkillRoutingSubject::Worker {
+                            task_id,
+                            worker_name: worker_name.map(String::from),
+                        },
+                        worker_config.request_id.as_deref(),
+                        task,
+                        &worker_config.agent.skills,
+                    )
+                    .await
+            }
+            _ => crate::skill_router::SkillPlan::OnDemand,
+        };
+        let (catalog, preloaded) = match plan {
+            crate::skill_router::SkillPlan::OnDemand => (
+                crate::skill_tool::render_skill_catalog(&worker_config.agent.skills),
+                None,
+            ),
+            crate::skill_router::SkillPlan::Augment(section) => (
+                crate::skill_tool::render_skill_catalog(&worker_config.agent.skills),
+                Some(section),
+            ),
+            crate::skill_router::SkillPlan::Exclusive(section) => {
+                worker_config.agent.skills = Vec::new();
+                (None, section)
+            }
+        };
+        if let Some(ref mut preamble) = worker_config.preamble_override {
+            if let Some(catalog) = catalog {
+                preamble.push_str(&catalog);
+            }
+            if let Some(section) = preloaded {
+                preamble.push_str(&section);
+            }
         }
 
         tracing::debug!(
@@ -2624,21 +2641,33 @@ Assign tasks to the worker whose tools best match the required operations."#,
             include_recon_tools,
             include_history_tools,
         );
-        if let Some(catalog) =
-            crate::skill_tool::render_skill_catalog(&self.agent_config.agent.skills)
-        {
+        // Skill routing decides the coordinator's skill surface; see
+        // `create_worker` for the plan-to-surface mapping.
+        let plan = match (self.skill_router.as_ref(), query) {
+            (Some(router), Some(query)) => {
+                router
+                    .plan(
+                        crate::skill_router::SkillRoutingSubject::Coordinator,
+                        self.agent_config.request_id.as_deref(),
+                        query,
+                        &self.agent_config.agent.skills,
+                    )
+                    .await
+            }
+            _ => crate::skill_router::SkillPlan::OnDemand,
+        };
+        let (coordinator_skills, preloaded): (&[aura_config::SkillConfig], Option<String>) =
+            match plan {
+                crate::skill_router::SkillPlan::OnDemand => (&self.agent_config.agent.skills, None),
+                crate::skill_router::SkillPlan::Augment(section) => {
+                    (&self.agent_config.agent.skills, Some(section))
+                }
+                crate::skill_router::SkillPlan::Exclusive(section) => (&[], section),
+            };
+        if let Some(catalog) = crate::skill_tool::render_skill_catalog(coordinator_skills) {
             preamble.push_str(&catalog);
         }
-        if let (Some(router), Some(query)) = (self.skill_router.as_ref(), query)
-            && let Some(section) = router
-                .preload_section(
-                    crate::skill_router::SkillRoutingSubject::Coordinator,
-                    self.agent_config.request_id.as_deref(),
-                    query,
-                    &self.agent_config.agent.skills,
-                )
-                .await
-        {
+        if let Some(section) = preloaded {
             preamble.push_str(&section);
         }
         let temperature = self.agent_config.llm.temperature();
@@ -2729,7 +2758,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 None
             },
             skill_tools: crate::skill_tool::SkillToolset::new(
-                &self.agent_config.agent.skills,
+                coordinator_skills,
                 self.agent_config.skill_recorder.clone(),
             ),
         };
@@ -9220,6 +9249,69 @@ mod tests {
             assert!(!worker.preamble.contains("## Preloaded skills"));
             assert!(!worker.preamble.contains("BODY-OF-alpha"));
             assert!(worker.preamble.contains("- alpha: alpha things"));
+        }
+
+        #[tokio::test]
+        async fn exclusive_mode_drops_catalog_and_keeps_only_selected() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let skills = write_skills(dir.path());
+            let url = fake_system_one(vec![("alpha", 0.9), ("beta", 0.2)]).await;
+            let orchestrator = Orchestrator::new(config(SkillRouterMode::Exclusive, url, skills))
+                .await
+                .unwrap();
+
+            let worker = orchestrator
+                .create_worker(1, 1, None, Some("do the alpha thing"), None, None)
+                .await
+                .unwrap();
+            assert!(worker.preamble.contains("## Skills for this request"));
+            assert!(worker.preamble.contains("BODY-OF-alpha"));
+            assert!(!worker.preamble.contains("BODY-OF-beta"));
+            assert!(!worker.preamble.contains("Available skills"));
+            assert!(!worker.preamble.contains("load_skill"));
+
+            let coordinator = orchestrator
+                .create_coordinator(RoutingToolSet::new(), true, Some("do the alpha thing"))
+                .await
+                .unwrap();
+            assert!(coordinator.preamble.contains("BODY-OF-alpha"));
+            assert!(!coordinator.preamble.contains("Available skills"));
+            assert!(!coordinator.preamble.contains("load_skill"));
+        }
+
+        #[tokio::test]
+        async fn exclusive_mode_with_empty_selection_has_no_skill_surface() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let skills = write_skills(dir.path());
+            let url = fake_system_one(vec![("alpha", 0.1), ("beta", 0.1)]).await;
+            let orchestrator = Orchestrator::new(config(SkillRouterMode::Exclusive, url, skills))
+                .await
+                .unwrap();
+            let worker = orchestrator
+                .create_worker(1, 1, None, Some("unrelated"), None, None)
+                .await
+                .unwrap();
+            assert!(!worker.preamble.contains("Skill"));
+            assert!(!worker.preamble.contains("BODY-OF"));
+        }
+
+        #[tokio::test]
+        async fn exclusive_mode_falls_back_to_on_demand_when_router_is_down() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let skills = write_skills(dir.path());
+            let orchestrator = Orchestrator::new(config(
+                SkillRouterMode::Exclusive,
+                "http://127.0.0.1:1".to_string(),
+                skills,
+            ))
+            .await
+            .unwrap();
+            let worker = orchestrator
+                .create_worker(1, 1, None, Some("do the alpha thing"), None, None)
+                .await
+                .unwrap();
+            assert!(worker.preamble.contains("- alpha: alpha things"));
+            assert!(worker.preamble.contains("load_skill"));
         }
 
         #[tokio::test]

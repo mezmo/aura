@@ -73,6 +73,26 @@ pub struct SkillRoutingDecision {
     pub total_latency_ms: u64,
 }
 
+/// The skill surface an agent should be built with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkillPlan {
+    /// Catalog in the preamble plus the `load_skill`/`read_skill_file` tools.
+    OnDemand,
+    /// The on-demand surface plus this preamble section of preloaded bodies.
+    Augment(String),
+    /// Only this preamble section of preloaded bodies: no catalog, no tools.
+    Exclusive(Option<String>),
+}
+
+/// Wording of the preloaded-skills section.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreloadStyle {
+    /// The skill tools stay available alongside the section.
+    Augment,
+    /// The section is the agent's entire skill surface.
+    Exclusive,
+}
+
 /// What routing produced for one prompt.
 #[derive(Debug, Clone)]
 pub enum SkillRoutingOutcome {
@@ -286,25 +306,39 @@ impl SkillRouter {
         SkillRoutingOutcome::Routed(Box::new(decision))
     }
 
-    /// Route and, in inject mode, render the preamble section that preloads
-    /// the selected skills. `None` in shadow mode, when routing is
-    /// unavailable, or when nothing was selected.
-    pub async fn preload_section(
+    /// Route and turn the decision into what the agent's skill surface
+    /// should be.
+    ///
+    /// Shadow mode and an unavailable router keep the on-demand surface.
+    /// Inject mode keeps it and adds the selected bodies. Exclusive mode
+    /// replaces it with the selected bodies alone, even when the selection is
+    /// empty, so the LLM never sees a skill catalog or the skill tools.
+    pub async fn plan(
         &self,
         subject: SkillRoutingSubject,
         request_id: Option<&str>,
         prompt: &str,
         skills: &[SkillConfig],
-    ) -> Option<String> {
+    ) -> SkillPlan {
         let SkillRoutingOutcome::Routed(decision) =
             self.route(subject, request_id, prompt, skills).await
         else {
-            return None;
+            return SkillPlan::OnDemand;
         };
-        if self.config.mode != SkillRouterMode::Inject {
-            return None;
+        match self.config.mode {
+            SkillRouterMode::Shadow => SkillPlan::OnDemand,
+            SkillRouterMode::Inject => {
+                match render_preloaded_skills(&decision.selected, skills, PreloadStyle::Augment)
+                    .await
+                {
+                    Some(section) => SkillPlan::Augment(section),
+                    None => SkillPlan::OnDemand,
+                }
+            }
+            SkillRouterMode::Exclusive => SkillPlan::Exclusive(
+                render_preloaded_skills(&decision.selected, skills, PreloadStyle::Exclusive).await,
+            ),
         }
-        render_preloaded_skills(&decision.selected, skills).await
     }
 
     async fn score_stage(
@@ -419,9 +453,13 @@ impl SkillRouter {
 
 /// Render the preamble section carrying the full body of each selected
 /// skill, or `None` when nothing was selected or nothing could be read.
+///
+/// Resource files are listed only in the augment style: the exclusive style
+/// ships without `read_skill_file`, so there is no tool to fetch them with.
 pub async fn render_preloaded_skills(
     selected: &[SkillName],
     skills: &[SkillConfig],
+    style: PreloadStyle,
 ) -> Option<String> {
     let mut section = String::new();
     for skill in skills.iter().filter(|s| selected.contains(&s.name)) {
@@ -439,23 +477,33 @@ pub async fn render_preloaded_skills(
         };
         let body = crate::skill_tool::strip_frontmatter(&content).trim();
         section.push_str(&format!("\n### Skill: {}\n\n{body}\n", skill.name));
-        let resources = crate::skill_tool::list_skill_resources(&skill.path).await;
-        if !resources.is_empty() {
-            section.push_str("\nSkill resources (fetch with `read_skill_file`):\n");
-            for resource in resources {
-                section.push_str(&format!("- {resource}\n"));
+        if style == PreloadStyle::Augment {
+            let resources = crate::skill_tool::list_skill_resources(&skill.path).await;
+            if !resources.is_empty() {
+                section.push_str("\nSkill resources (fetch with `read_skill_file`):\n");
+                for resource in resources {
+                    section.push_str(&format!("- {resource}\n"));
+                }
             }
         }
     }
     if section.is_empty() {
         return None;
     }
-    Some(format!(
-        "\n\n## Preloaded skills\n\n\
-         The skills below were selected for this request and are already loaded. \
-         Follow them without calling `load_skill` for them; `load_skill` remains \
-         available for any other catalog entry.\n{section}"
-    ))
+    let intro = match style {
+        PreloadStyle::Augment => {
+            "\n\n## Preloaded skills\n\n\
+             The skills below were selected for this request and are already loaded. \
+             Follow them without calling `load_skill` for them; `load_skill` remains \
+             available for any other catalog entry.\n"
+        }
+        PreloadStyle::Exclusive => {
+            "\n\n## Skills for this request\n\n\
+             Follow the skills below where they apply. They are the complete set for \
+             this request; there is nothing further to load.\n"
+        }
+    };
+    Some(format!("{intro}{section}"))
 }
 
 #[cfg(test)]
@@ -499,9 +547,13 @@ mod tests {
         std::fs::write(a.join("references/REF.md"), "ref").unwrap();
         let skills = vec![skill("alpha", "a", a), skill("beta", "b", b)];
 
-        let section = render_preloaded_skills(&[SkillName::new("alpha").unwrap()], &skills)
-            .await
-            .unwrap();
+        let section = render_preloaded_skills(
+            &[SkillName::new("alpha").unwrap()],
+            &skills,
+            PreloadStyle::Augment,
+        )
+        .await
+        .unwrap();
         assert!(section.contains("## Preloaded skills"));
         assert!(section.contains("### Skill: alpha"));
         assert!(section.contains("Do alpha."));
@@ -518,7 +570,33 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let a = write_skill(dir.path(), "alpha", "body");
         let skills = vec![skill("alpha", "a", a)];
-        assert!(render_preloaded_skills(&[], &skills).await.is_none());
+        assert!(
+            render_preloaded_skills(&[], &skills, PreloadStyle::Augment)
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn exclusive_style_omits_resources_and_tool_mentions() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let a = write_skill(dir.path(), "alpha", "# Alpha\n\nDo alpha.");
+        std::fs::create_dir_all(a.join("references")).unwrap();
+        std::fs::write(a.join("references/REF.md"), "ref").unwrap();
+        let skills = vec![skill("alpha", "a", a)];
+
+        let section = render_preloaded_skills(
+            &[SkillName::new("alpha").unwrap()],
+            &skills,
+            PreloadStyle::Exclusive,
+        )
+        .await
+        .unwrap();
+        assert!(section.contains("## Skills for this request"));
+        assert!(section.contains("Do alpha."));
+        assert!(!section.contains("REF.md"));
+        assert!(!section.contains("load_skill"));
+        assert!(!section.contains("read_skill_file"));
     }
 
     #[tokio::test]
@@ -545,11 +623,12 @@ mod tests {
             }
             SkillRoutingOutcome::Routed(_) => panic!("unreachable server must not route"),
         }
-        assert!(
+        assert_eq!(
             router
-                .preload_section(SkillRoutingSubject::Agent, None, "hello", &skills)
-                .await
-                .is_none()
+                .plan(SkillRoutingSubject::Agent, None, "hello", &skills)
+                .await,
+            SkillPlan::OnDemand,
+            "an unreachable router keeps on-demand loading in every mode"
         );
     }
 
