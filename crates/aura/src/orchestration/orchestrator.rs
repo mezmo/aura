@@ -1104,10 +1104,14 @@ impl Orchestrator {
                 crate::skill_tool::render_skill_catalog(&worker_config.agent.skills),
                 None,
             ),
-            crate::skill_router::SkillPlan::Augment(section) => (
-                crate::skill_tool::render_skill_catalog(&worker_config.agent.skills),
-                Some(section),
-            ),
+            crate::skill_router::SkillPlan::Augment { section, selected } => {
+                let catalog = crate::skill_tool::render_skill_catalog_with_preloaded(
+                    &worker_config.agent.skills,
+                    &selected,
+                );
+                worker_config.preloaded_skills = selected;
+                (catalog, Some(section))
+            }
             crate::skill_router::SkillPlan::Exclusive { section, selected } => {
                 worker_config.agent.skills = selected;
                 worker_config.skills_preloaded = true;
@@ -2669,11 +2673,15 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     self.agent_config.skill_recorder.clone(),
                 ),
             ),
-            crate::skill_router::SkillPlan::Augment(section) => (
-                crate::skill_tool::render_skill_catalog(&self.agent_config.agent.skills),
-                Some(section),
-                crate::skill_tool::SkillToolset::new(
+            crate::skill_router::SkillPlan::Augment { section, selected } => (
+                crate::skill_tool::render_skill_catalog_with_preloaded(
                     &self.agent_config.agent.skills,
+                    &selected,
+                ),
+                Some(section),
+                crate::skill_tool::SkillToolset::with_preloaded(
+                    &self.agent_config.agent.skills,
+                    &selected,
                     self.agent_config.skill_recorder.clone(),
                 ),
             ),
@@ -9240,8 +9248,14 @@ mod tests {
             assert!(worker.preamble.contains("BODY-OF-alpha"));
             assert!(!worker.preamble.contains("BODY-OF-beta"));
             assert!(
-                worker.preamble.contains("- beta: beta things"),
+                worker.preamble.contains("- beta: beta things\n"),
                 "catalog must still list unselected skills for load_skill"
+            );
+            assert!(
+                worker
+                    .preamble
+                    .contains("- alpha: alpha things [already loaded below"),
+                "catalog must mark the preloaded skill"
             );
 
             let coordinator = orchestrator

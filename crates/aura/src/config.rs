@@ -110,6 +110,10 @@ pub struct AgentRuntimeConfig {
     /// `read_skill_file` alone rather than the full skill tool pair.
     pub skills_preloaded: bool,
 
+    /// The subset of `agent.skills` whose bodies are already in the preamble
+    /// while the catalog and `load_skill` stay available.
+    pub preloaded_skills: Vec<aura_config::skills::SkillName>,
+
     /// Glob patterns for filtering which MCP tools to include.
     /// When set, only tools matching at least one pattern are added
     /// (`None` = all tools, empty = none). Glob syntax: `*`, `?`.
@@ -180,6 +184,7 @@ impl Clone for AgentRuntimeConfig {
             tool_context_factory: self.tool_context_factory.clone(),
             preamble_override: self.preamble_override.clone(),
             skills_preloaded: self.skills_preloaded,
+            preloaded_skills: self.preloaded_skills.clone(),
             mcp_filter: self.mcp_filter.clone(),
             orchestration_persistence: self.orchestration_persistence.clone(),
             session_id: self.session_id.clone(),
@@ -215,6 +220,7 @@ impl std::fmt::Debug for AgentRuntimeConfig {
             )
             .field("preamble_override", &self.preamble_override)
             .field("skills_preloaded", &self.skills_preloaded)
+            .field("preloaded_skills", &self.preloaded_skills)
             .field("mcp_filter", &self.mcp_filter)
             .field(
                 "orchestration_persistence",

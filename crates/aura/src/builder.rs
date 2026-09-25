@@ -1151,7 +1151,11 @@ impl Agent {
         let toolset = if config.skills_preloaded {
             SkillToolset::read_only(&config.agent.skills, config.skill_recorder.clone())
         } else {
-            SkillToolset::new(&config.agent.skills, config.skill_recorder.clone())
+            SkillToolset::with_preloaded(
+                &config.agent.skills,
+                &config.preloaded_skills,
+                config.skill_recorder.clone(),
+            )
         };
         if let Some(toolset) = toolset {
             tracing::info!(

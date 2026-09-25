@@ -14,6 +14,7 @@ use crate::config::{SessionId, SkillConfig};
 use crate::session_store::{
     SKILL_INVOCATION_RECORD_VERSION, SkillInvocation, SkillInvocationRecord, SkillInvocationStore,
 };
+use aura_config::skills::SkillName;
 use rig::{completion::ToolDefinition, tool::Tool};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -109,6 +110,8 @@ impl std::fmt::Debug for SkillInvocationRecorder {
 pub struct LoadSkillTool {
     skills: Arc<[SkillConfig]>,
     recorder: Option<Arc<SkillInvocationRecorder>>,
+    /// Skills whose bodies already sit in the system prompt.
+    preloaded: Arc<[SkillName]>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -187,6 +190,18 @@ pub(crate) async fn list_skill_resources(skill_dir: &Path) -> Vec<String> {
 /// Render the system-prompt skill catalog, or `None` when no skills are
 /// configured.
 pub fn render_skill_catalog(skills: &[SkillConfig]) -> Option<String> {
+    render_skill_catalog_with_preloaded(skills, &[])
+}
+
+/// Text appended to a catalog entry whose body is already in the prompt.
+pub const PRELOADED_MARK: &str = " [already loaded below — do not call `load_skill` for it]";
+
+/// Render the catalog, marking `preloaded` entries so the model does not
+/// load a body it already holds.
+pub fn render_skill_catalog_with_preloaded(
+    skills: &[SkillConfig],
+    preloaded: &[SkillName],
+) -> Option<String> {
     if skills.is_empty() {
         return None;
     }
@@ -194,7 +209,12 @@ pub fn render_skill_catalog(skills: &[SkillConfig]) -> Option<String> {
         "\n\nAvailable skills (use the `load_skill` tool to load before answering):\n",
     );
     for skill in skills {
-        catalog.push_str(&format!("- {}: {}\n", skill.name, skill.description));
+        let mark = if preloaded.contains(&skill.name) {
+            PRELOADED_MARK
+        } else {
+            ""
+        };
+        catalog.push_str(&format!("- {}: {}{mark}\n", skill.name, skill.description));
     }
     Some(catalog)
 }
@@ -371,10 +391,22 @@ impl SkillToolset {
         skills: &[SkillConfig],
         recorder: Option<Arc<SkillInvocationRecorder>>,
     ) -> Option<Self> {
+        Self::with_preloaded(skills, &[], recorder)
+    }
+
+    /// Build both skill tools with `load_skill` answering a pointer instead
+    /// of the body for `preloaded` skills, or `None` when no skills are
+    /// configured. Both share `skills` and `recorder`.
+    pub fn with_preloaded(
+        skills: &[SkillConfig],
+        preloaded: &[SkillName],
+        recorder: Option<Arc<SkillInvocationRecorder>>,
+    ) -> Option<Self> {
         let mut toolset = Self::read_only(skills, recorder.clone())?;
         toolset.load = Some(LoadSkillTool {
             skills: Arc::clone(&toolset.read_file.skills),
             recorder,
+            preloaded: preloaded.into(),
         });
         Some(toolset)
     }
@@ -408,6 +440,7 @@ impl LoadSkillTool {
         Self {
             skills: skills.into(),
             recorder: None,
+            preloaded: Arc::from([]),
         }
     }
 
@@ -416,7 +449,12 @@ impl LoadSkillTool {
         let mut desc =
             String::from("Load detailed instructions for a specific skill. Available skills:\n");
         for skill in self.skills.iter() {
-            desc.push_str(&format!("- {}: {}\n", skill.name, skill.description));
+            let mark = if self.preloaded.contains(&skill.name) {
+                PRELOADED_MARK
+            } else {
+                ""
+            };
+            desc.push_str(&format!("- {}: {}{mark}\n", skill.name, skill.description));
         }
         desc
     }
@@ -452,6 +490,21 @@ impl Tool for LoadSkillTool {
             .iter()
             .find(|s| s.name == args.name)
             .ok_or_else(|| SkillError::UnknownSkill(args.name.clone()))?;
+
+        // A preloaded body is already in the system prompt; answering with a
+        // pointer keeps the second copy out of the context window. Nothing is
+        // recorded: the pointer carries no content worth replaying next turn.
+        if self.preloaded.contains(&skill.name) {
+            tracing::info!(
+                "Skill '{}' requested via load_skill but already preloaded; returning pointer",
+                skill.name
+            );
+            return Ok(format!(
+                "Skill '{}' is already loaded: its full instructions are in your system \
+                 prompt under \"### Skill: {}\". Follow that section; nothing further to load.",
+                skill.name, skill.name
+            ));
+        }
 
         let result = render_load_skill_output(skill).await?;
         if let Some(recorder) = &self.recorder {
@@ -580,6 +633,33 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result, "# Test Skill\nThis is test content.");
+    }
+
+    #[tokio::test]
+    async fn test_load_skill_preloaded_returns_pointer_not_body() {
+        let dir = TempDir::new().unwrap();
+        let configs = make_skill_configs(dir.path());
+        let preloaded = [SkillName::new("test-skill").unwrap()];
+        let toolset = SkillToolset::with_preloaded(&configs, &preloaded, None).unwrap();
+        let load = toolset.load.unwrap();
+
+        let result = load
+            .call(LoadSkillArgs {
+                name: "test-skill".to_string(),
+            })
+            .await
+            .unwrap();
+        assert!(result.contains("already loaded"));
+        assert!(result.contains("### Skill: test-skill"));
+        assert!(!result.contains("This is test content."));
+
+        let description = load.definition(String::new()).await.description;
+        assert!(description.contains("- test-skill: A test skill [already loaded below"));
+
+        let catalog = render_skill_catalog_with_preloaded(&configs, &preloaded).unwrap();
+        assert!(catalog.contains("- test-skill: A test skill [already loaded below"));
+        let plain = render_skill_catalog(&configs).unwrap();
+        assert!(!plain.contains("already loaded"));
     }
 
     #[tokio::test]

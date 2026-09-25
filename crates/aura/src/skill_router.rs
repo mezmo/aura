@@ -78,8 +78,12 @@ pub struct SkillRoutingDecision {
 pub enum SkillPlan {
     /// Catalog in the preamble plus the `load_skill`/`read_skill_file` tools.
     OnDemand,
-    /// The on-demand surface plus this preamble section of preloaded bodies.
-    Augment(String),
+    /// The on-demand surface plus this preamble section of preloaded bodies;
+    /// `selected` names the skills the section holds.
+    Augment {
+        section: String,
+        selected: Vec<SkillName>,
+    },
     /// This preamble section of preloaded bodies plus `read_skill_file` over
     /// `selected`: no catalog, no `load_skill`.
     Exclusive {
@@ -341,7 +345,10 @@ impl SkillRouter {
                 match render_preloaded_skills(&decision.selected, skills, PreloadStyle::Augment)
                     .await
                 {
-                    Some(section) => SkillPlan::Augment(section),
+                    Some(section) => SkillPlan::Augment {
+                        section,
+                        selected: decision.selected.clone(),
+                    },
                     None => SkillPlan::OnDemand,
                 }
             }
