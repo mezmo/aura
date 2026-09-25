@@ -4818,4 +4818,278 @@ mod tests {
              byte-for-byte identical requests\n--- bare ---\n{captured_bare}\n--- empty ---\n{captured_empty}"
         );
     }
+
+    // -----------------------------------------------------------------
+    // A1 id-channel split (aura#271, card P45; ruling 2026-09-25)
+    // -----------------------------------------------------------------
+
+    /// The A1 frames pin WHICH request id each channel of an authorize ask
+    /// carries. The POST body's `request_id` derives from the worker
+    /// scope's run id (`run:{run_id}`) for the park-armed asks only
+    /// (`ParkArmed` and `Notify`); every other channel — the broker's
+    /// lifecycle events, the single-agent and Hold wire contracts — keeps
+    /// the fresh `request.request_id` verbatim.
+    mod a1_id_channel {
+        use super::super::{
+            AskMode, EgressSigning, GateDecision, PollSettings, WebhookClient, build_webhook_client,
+        };
+        use super::*;
+
+        /// The fixed run id every A1 frame's worker scope names.
+        const A1_RUN: &str = "0199c0de-2711-7000-8000-000000000271";
+
+        fn a1_run_id() -> crate::orchestration::RunId {
+            A1_RUN.parse().expect("the a1 run id parses")
+        }
+
+        fn a1_worker_request(request_id: &str) -> ApprovalRequest {
+            ApprovalRequest {
+                version: PROTOCOL_VERSION,
+                instance_id: "test-instance".to_string(),
+                decision_id: DecisionId::generate(),
+                request_id: request_id.to_string(),
+                scope: AgentScope::Worker {
+                    run_id: a1_run_id(),
+                    task: crate::orchestration::TaskIdentity::new(
+                        3,
+                        Some("operations".to_string()),
+                    ),
+                    session_id: None,
+                },
+                origin: ApprovalOrigin::ConfigGate {
+                    matched_pattern: "kubectl_*".to_string(),
+                    agent_name: "test-agent".to_string(),
+                },
+                items: vec![ApprovalItem {
+                    tool_name: "kubectl_delete".to_string(),
+                    arguments: json!({ "namespace": "stage" }),
+                    tool_call_intent: None,
+                }],
+            }
+        }
+
+        fn a1_single_request(request_id: &str) -> ApprovalRequest {
+            ApprovalRequest {
+                version: PROTOCOL_VERSION,
+                instance_id: "test-instance".to_string(),
+                decision_id: DecisionId::generate(),
+                request_id: request_id.to_string(),
+                scope: AgentScope::Single { session_id: None },
+                origin: ApprovalOrigin::ConfigGate {
+                    matched_pattern: "kubectl_*".to_string(),
+                    agent_name: "test-agent".to_string(),
+                },
+                items: vec![ApprovalItem {
+                    tool_name: "kubectl_delete".to_string(),
+                    arguments: json!({ "namespace": "stage" }),
+                    tool_call_intent: None,
+                }],
+            }
+        }
+
+        /// The JSON body of one captured raw POST.
+        fn post_body(captured: &str) -> serde_json::Value {
+            let (_, body) = captured
+                .split_once("\r\n\r\n")
+                .expect("the captured POST carries a body section");
+            serde_json::from_str(body)
+                .unwrap_or_else(|e| panic!("the captured POST body parses as JSON ({e}): {body}"))
+        }
+
+        /// The poll-delivery client a park-capable route carries (poll
+        /// settings present, so `can_park` holds), built the way the
+        /// webhook_signing fixtures build theirs: unsigned, loopback, no
+        /// operator headers.
+        fn a1_poll_client(port: u16) -> WebhookClient {
+            let url = format!("http://127.0.0.1:{port}");
+            WebhookClient {
+                client: build_webhook_client(),
+                url: aura_config::WebhookUrl::new(url.clone()).unwrap(),
+                headers: reqwest::header::HeaderMap::new(),
+                signing: EgressSigning::Disabled,
+                tool_header_mappings: aura_config::ToolHeaderMappings::default(),
+                delivery: aura_config::WebhookDelivery::Poll,
+                poll: Some(PollSettings {
+                    poll_url: aura_config::WebhookUrl::new(url).unwrap(),
+                    request_timeout: Duration::from_secs(5),
+                }),
+            }
+        }
+
+        fn a1_webhook_route(client: WebhookClient) -> DecisionRoute {
+            DecisionRoute::Webhook {
+                client,
+                registry: PendingApprovals::new(),
+                timeout: Duration::from_secs(5),
+                egress_capture: Ok(()),
+            }
+        }
+
+        /// F2(a) — RED today: a park-armed worker ask POSTs a body whose
+        /// `request_id` is the run owner id, minted inside
+        /// `build_approval_post` from the scope's `run_id`. Today the body
+        /// carries the fresh `req_test_...` verbatim. The split's other
+        /// half rides the same frame (green today, must stay green): the
+        /// gate's `Requested`/`Completed` lifecycle events stay on the
+        /// FRESH request id's broker channel.
+        #[tokio::test]
+        async fn park_armed_worker_ask_post_body_names_the_run_owner() {
+            let (port, mut rx) = spawn_capturing_webhook(1).await;
+            let route = a1_webhook_route(a1_poll_client(port));
+            let cancel = crate::request_cancellation::RequestCancelToken::unbound();
+            let request_id = "req_test_a1_park_armed".to_string();
+            let mut events = crate::approval_event_broker::subscribe(&request_id).await;
+
+            let decision = route
+                .decide_for_gate(
+                    a1_worker_request(&request_id),
+                    &cancel,
+                    AskMode::ParkArmed,
+                    chrono::Utc::now(),
+                )
+                .await
+                .expect("the mock receiver's instant approval resolves the ask");
+            assert!(
+                matches!(decision, GateDecision::Approved { .. }),
+                "the machine decision applies in-request: {decision:?}"
+            );
+
+            let captured = rx.recv().await.expect("the park-armed ask POSTs once");
+            assert!(
+                captured.contains("response_type=poll"),
+                "the park-armed ask sends response_type=poll: {captured}"
+            );
+            let body = post_body(&captured);
+            assert_eq!(
+                body["request_id"].as_str(),
+                Some(crate::orchestration::run_owner_id(A1_RUN).as_str()),
+                "A1 (aura#271): a park-armed worker ask's authorize body derives its \
+                 request_id from the scope's run id as run:{{run_id}}; the fresh \
+                 request.request_id must not ride the wire body"
+            );
+
+            // The split's fresh-id half: both lifecycle events arrive on the
+            // subscriber keyed by the FRESH request id.
+            match tokio::time::timeout(Duration::from_millis(250), events.recv()).await {
+                Ok(Some(crate::approval_event_broker::ApprovalLifecycleEvent::Requested(
+                    event,
+                ))) => {
+                    assert_eq!(
+                        event.tool_name, "kubectl_delete",
+                        "the gate-entry Requested names the gated call"
+                    );
+                }
+                other => panic!(
+                    "A1: the gate-entry Requested must stay on the fresh request id's \
+                     broker channel; got {other:?}"
+                ),
+            }
+            match tokio::time::timeout(Duration::from_millis(250), events.recv()).await {
+                Ok(Some(crate::approval_event_broker::ApprovalLifecycleEvent::Completed(_))) => {}
+                other => panic!(
+                    "A1: the machine decision's Completed must stay on the fresh request \
+                     id's broker channel; got {other:?}"
+                ),
+            }
+            crate::approval_event_broker::unsubscribe(&request_id).await;
+        }
+
+        /// F2(b) — RED today: the poll-delivery notify leg (the parked
+        /// row's ack POST) derives its body's `request_id` from the scope's
+        /// run id the same way the park-armed ask does.
+        #[tokio::test]
+        async fn notify_leg_post_body_names_the_run_owner() {
+            let (port, mut rx) = spawn_capturing_webhook(1).await;
+            let client = a1_poll_client(port);
+
+            client
+                .notify(&a1_worker_request("req_test_a1_notify"), None)
+                .await
+                .expect("the ack leg delivers on the mock receiver's 2xx");
+
+            let captured = rx.recv().await.expect("the notify leg POSTs once");
+            let body = post_body(&captured);
+            assert_eq!(
+                body["request_id"].as_str(),
+                Some(crate::orchestration::run_owner_id(A1_RUN).as_str()),
+                "A1 (aura#271): the notify leg's authorize body derives its request_id \
+                 from the scope's run id as run:{{run_id}}"
+            );
+        }
+
+        /// F3(a) — GREEN regression: the single-agent surface keeps the
+        /// fresh request id verbatim on the wire. Strengthens the
+        /// `single_agent_request_wire_shape` pin (a serde-value shape
+        /// assertion) with a POST-body assertion through the live Hold ask.
+        #[tokio::test]
+        async fn single_agent_ask_post_body_keeps_the_fresh_request_id() {
+            let (port, mut rx) = spawn_capturing_webhook(1).await;
+            let route = a1_webhook_route(WebhookClient::new(
+                build_webhook_client(),
+                aura_config::WebhookUrl::new(format!("http://127.0.0.1:{port}")).unwrap(),
+            ));
+            let cancel = crate::request_cancellation::RequestCancelToken::unbound();
+
+            let outcome = route
+                .decide(a1_single_request("req_test_a1_single"), &cancel)
+                .await
+                .expect("the sync hold ask resolves the mock decision");
+            assert_eq!(
+                outcome,
+                ApprovalOutcome::Decided(ApprovalDecision::Approved),
+                "the mock receiver's approval resolves the hold ask"
+            );
+
+            let captured = rx.recv().await.expect("the hold ask POSTs once");
+            assert!(
+                captured.contains("response_type=sync"),
+                "the single-agent hold ask sends response_type=sync: {captured}"
+            );
+            let body = post_body(&captured);
+            assert_eq!(
+                body["request_id"].as_str(),
+                Some("req_test_a1_single"),
+                "A1 (aura#271): the single-agent wire contract keeps request.request_id \
+                 verbatim; the run-owner mint never applies to a Single scope"
+            );
+        }
+
+        /// F3(b) — GREEN regression: a Hold ask keeps the fresh request id
+        /// verbatim even under a worker scope — the mint is mode-gated (the
+        /// park-armed asks only); the webhook-sync contract is unchanged.
+        #[tokio::test]
+        async fn hold_ask_post_body_keeps_the_fresh_request_id_under_worker_scope() {
+            let (port, mut rx) = spawn_capturing_webhook(1).await;
+            let route = a1_webhook_route(a1_poll_client(port));
+            let cancel = crate::request_cancellation::RequestCancelToken::unbound();
+
+            let decision = route
+                .decide_for_gate(
+                    a1_worker_request("req_test_a1_hold"),
+                    &cancel,
+                    AskMode::Hold,
+                    chrono::Utc::now(),
+                )
+                .await
+                .expect("the sync hold ask resolves the mock decision");
+            assert!(
+                matches!(decision, GateDecision::Approved { .. }),
+                "the mock receiver's approval resolves the hold ask: {decision:?}"
+            );
+
+            let captured = rx.recv().await.expect("the hold ask POSTs once");
+            assert!(
+                captured.contains("response_type=sync"),
+                "the unarmed hold ask sends response_type=sync even on a park-capable \
+                 route: {captured}"
+            );
+            let body = post_body(&captured);
+            assert_eq!(
+                body["request_id"].as_str(),
+                Some("req_test_a1_hold"),
+                "A1 (aura#271): a Hold ask keeps request.request_id verbatim under a \
+                 worker scope; only the park-armed asks mint the run owner id into the body"
+            );
+        }
+    }
 }

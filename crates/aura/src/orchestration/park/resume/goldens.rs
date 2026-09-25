@@ -2103,6 +2103,247 @@ async fn re_park_registers_the_fresh_ticket_under_the_original_bound_run_id() {
     );
 }
 
+/// A1 (aura#271, card P45; Mike's 2026-09-25 ruling): the resume
+/// segment's gate lifecycle events ride the LIVE request id channel —
+/// the fresh `req_<uuid>` the resume caller stamped into the World's
+/// config and the SSE side subscribes under — never the run owner id.
+/// Today `run_segment_borrowed` overwrites `config.request_id` with
+/// `run_owner_id(...)` before the orchestrator builds (the gov-500
+/// stamp), so the resumed worker's gate publishes its `Requested` under
+/// `run:<id>` and a subscriber keyed on the fresh id — exactly the key
+/// the web-server handler subscribes for this request — never sees it.
+/// RED until the overwrite is deleted: the re-parked call's gate-entry
+/// `Requested` must arrive on the fresh channel, naming the fresh
+/// ticket's decision id. The `Completed` leg is structurally suppressed
+/// on a pending reply (`GateDecision::to_outcome` — a 207 has no
+/// terminal outcome), so a re-parking segment emits `Requested` only.
+#[tokio::test]
+async fn a1_resumed_gate_requested_publishes_on_the_fresh_request_id_channel() {
+    let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
+    let _drain = OverrideDrain;
+    let world = world();
+    let invocations = Arc::new(Mutex::new(Vec::new()));
+    // The decided tool's recording registration and the sentinel prompt
+    // are fixture requirements, mirroring the re-park frame above: the
+    // frame pins the event channel only.
+    let apply_invocations = Arc::new(Mutex::new(Vec::new()));
+    install_worker_overrides(vec![WorkerOverride {
+        model: ScriptedCompletionModel::new(vec![ScriptedTurn::tool_calls(vec![
+            ScriptedToolCall::new(FRESH_CALL_ID, NEW_TOOL, json!({ "namespace": "stage" }))
+                .with_call_id(NEW_CALL_ID),
+        ])]),
+        extra_tools: vec![
+            Box::new(RecordingTool::new(apply_invocations).with_name(TOOL)),
+            Box::new(RecordingTool::new(invocations).with_name(NEW_TOOL)),
+        ],
+    }]);
+    register_decided(&world).await;
+    publish_document(&world, &sentinel_document(&world)).await;
+
+    let mut events = crate::approval_event_broker::subscribe(REQUEST_ID).await;
+    let grant = evaluate_resume(evaluation(&world, false, None))
+        .await
+        .expect("the all-decided run grants");
+    let segment = run_segment_live(grant, &world.config, &HashMap::new())
+        .await
+        .expect("the segment re-parks");
+    assert!(
+        matches!(segment, ResumeStreamEnd::Reparked),
+        "the freshly gated call re-parks: {segment:?}"
+    );
+
+    // The fresh gated call's stored ticket, for the decision-id match.
+    let undecided = world
+        .store
+        .list_pending()
+        .await
+        .expect("the store lists its undecided approvals");
+    let fresh = undecided
+        .iter()
+        .find(|ticket| {
+            ticket
+                .request
+                .items
+                .first()
+                .is_some_and(|item| item.tool_name == NEW_TOOL)
+        })
+        .expect("the re-parked fresh ticket is stored")
+        .request
+        .decision_id;
+
+    // Drain until the fresh call's own Requested arrives: the shared
+    // golden REQUEST_ID also carries OTHER resume machinery's lifecycle
+    // publications (consult teardowns, sweeps) from concurrently-running
+    // frames, and the fresh decision id is minted inside THIS segment —
+    // only the event naming it is this frame's target. Everything else on
+    // the channel is skipped.
+    let mut requested = None;
+    loop {
+        match tokio::time::timeout(Duration::from_millis(300), events.recv()).await {
+            Ok(Some(crate::approval_event_broker::ApprovalLifecycleEvent::Requested(event)))
+                if event.decision_id == fresh.to_string() =>
+            {
+                requested = Some(event);
+                break;
+            }
+            Ok(Some(_)) => continue,
+            Ok(None) | Err(_) => break,
+        }
+    }
+    let Some(event) = requested else {
+        panic!(
+            "A1 (aura#271): the resumed gate's Requested for the fresh call ({fresh}) \
+             must reach the fresh request id's subscriber ({REQUEST_ID}); today the \
+             resume path's config overwrite publishes it under the run owner id and \
+             the SSE channel never sees it"
+        );
+    };
+    assert_eq!(
+        event.tool_name, NEW_TOOL,
+        "the gate-entry Requested on the fresh channel names the re-parked call"
+    );
+    crate::approval_event_broker::unsubscribe(REQUEST_ID).await;
+}
+
+/// A1 regression pin (ruling #4): the re-parked ROW itself keeps the run
+/// owner id — the 207 bridge's re-mint (gate.rs `park_207_bridge`) is
+/// UNCHANGED by the id-channel split. GREEN today and must stay green
+/// after the fill: only the wire body's mint and the live channels move;
+/// the parked row's ownership key still names the run.
+#[tokio::test]
+async fn a1_reparked_row_keeps_the_run_owner_request_id() {
+    let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
+    let _drain = OverrideDrain;
+    let world = world();
+    let invocations = Arc::new(Mutex::new(Vec::new()));
+    let apply_invocations = Arc::new(Mutex::new(Vec::new()));
+    install_worker_overrides(vec![WorkerOverride {
+        model: ScriptedCompletionModel::new(vec![ScriptedTurn::tool_calls(vec![
+            ScriptedToolCall::new(FRESH_CALL_ID, NEW_TOOL, json!({ "namespace": "stage" }))
+                .with_call_id(NEW_CALL_ID),
+        ])]),
+        extra_tools: vec![
+            Box::new(RecordingTool::new(apply_invocations).with_name(TOOL)),
+            Box::new(RecordingTool::new(invocations).with_name(NEW_TOOL)),
+        ],
+    }]);
+    register_decided(&world).await;
+    publish_document(&world, &sentinel_document(&world)).await;
+
+    let grant = evaluate_resume(evaluation(&world, false, None))
+        .await
+        .expect("the all-decided run grants");
+    let segment = run_segment_live(grant, &world.config, &HashMap::new())
+        .await
+        .expect("the segment re-parks");
+    assert!(
+        matches!(segment, ResumeStreamEnd::Reparked),
+        "the freshly gated call re-parks: {segment:?}"
+    );
+
+    let undecided = world
+        .store
+        .list_pending()
+        .await
+        .expect("the store lists its undecided approvals");
+    let fresh = undecided
+        .iter()
+        .find(|ticket| {
+            ticket
+                .request
+                .items
+                .first()
+                .is_some_and(|item| item.tool_name == NEW_TOOL)
+        })
+        .expect("the re-parked fresh ticket is stored");
+    assert_eq!(
+        fresh.request.request_id,
+        run_owner_id(RUN),
+        "A1 ruling #4: the 207 bridge's re-mint keeps parking rows under the run \
+         owner id; the id-channel split must not move the ownership key"
+    );
+}
+
+/// A1 (aura#271, card P45): the resumed MCP manager must be ARMED with
+/// the config's fresh request id the way the chat path arms it
+/// (`mcp_manager.set_current_request`, factory.rs), and the segment close
+/// (`close_segment_mcp`) must cancel under that same fresh id. Today
+/// `run_segment_borrowed`'s overwrite hands the orchestrator
+/// `config.request_id = run:<run_id>` AND `for_resume_segment` never arms
+/// the manager, so resumed MCP calls run untracked and the close cancels
+/// under the conflated run owner id. RED until the overwrite is deleted
+/// and the arm lands: both observation records must name the World's
+/// fresh `REQUEST_ID`. F5 is merged into this frame: the one
+/// `McpManager`-level observation seam pins both the arm key and the
+/// close key, and the two assertions share one segment drive.
+///
+/// The world carries one UNREACHABLE HTTP-streamable server (loopback
+/// port 1 refuses immediately; the manager.rs precedent): the manager is
+/// `Some` — so the arm and the close both run — with zero connected
+/// clients. The manager-level call keys are what this frame pins; the
+/// per-client fan-out is pinned by the mcp client's own tests.
+#[tokio::test]
+async fn a1_resumed_segment_arms_and_closes_mcp_under_the_fresh_request_id() {
+    let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
+    let _drain = OverrideDrain;
+    let mut world = world();
+    world.config.mcp = Some(aura_config::McpConfig {
+        servers: HashMap::from([(
+            "unreachable".to_string(),
+            aura_config::McpServerConfig::HttpStreamable {
+                url: "http://127.0.0.1:1/mcp".to_string(),
+                headers: HashMap::new(),
+                description: None,
+                headers_from_request: HashMap::new(),
+                scratchpad: HashMap::new(),
+                user_agent: None,
+            },
+        )]),
+        ..Default::default()
+    });
+    let invocations = Arc::new(Mutex::new(Vec::new()));
+    let apply_invocations = Arc::new(Mutex::new(Vec::new()));
+    install_worker_overrides(vec![WorkerOverride {
+        model: ScriptedCompletionModel::new(vec![ScriptedTurn::tool_calls(vec![
+            ScriptedToolCall::new(FRESH_CALL_ID, NEW_TOOL, json!({ "namespace": "stage" }))
+                .with_call_id(NEW_CALL_ID),
+        ])]),
+        extra_tools: vec![
+            Box::new(RecordingTool::new(apply_invocations).with_name(TOOL)),
+            Box::new(RecordingTool::new(invocations).with_name(NEW_TOOL)),
+        ],
+    }]);
+    register_decided(&world).await;
+    publish_document(&world, &sentinel_document(&world)).await;
+
+    crate::mcp::a1_observation::reset();
+    let grant = evaluate_resume(evaluation(&world, false, None))
+        .await
+        .expect("the all-decided run grants");
+    let segment = run_segment_live(grant, &world.config, &HashMap::new())
+        .await
+        .expect("the segment re-parks");
+    assert!(
+        matches!(segment, ResumeStreamEnd::Reparked),
+        "the freshly gated call re-parks: {segment:?}"
+    );
+
+    assert_eq!(
+        crate::mcp::a1_observation::last_armed(),
+        Some(REQUEST_ID.to_string()),
+        "A1 (aura#271): for_resume_segment must arm the resumed MCP manager with the \
+         config's FRESH request id, the way the chat path arms it; today nothing arms \
+         the manager and resumed MCP calls run untracked"
+    );
+    assert_eq!(
+        crate::mcp::a1_observation::last_cancel_key(),
+        Some(REQUEST_ID.to_string()),
+        "A1 (aura#271): close_segment_mcp must cancel under the config's FRESH request \
+         id; today the resume path's config overwrite makes it cancel under the \
+         conflated run owner id"
+    );
+}
+
 /// The two-node consumed-subset lifecycle (fix-contract steps 6 and 8): a
 /// checkpoint with TWO awaiting nodes, both decided. Resume 1 drives node A
 /// only — its decided call executes once through the substitution, the
