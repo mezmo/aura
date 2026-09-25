@@ -14,9 +14,8 @@
 //! # Cancellation
 //!
 //! When disconnect is detected (via channel send failure or heartbeat), we:
-//! 1. Signal cancellation via `cancel_tx`
-//! 2. Cancel request via `RequestCancellation::cancel()`
-//! 3. Cancel MCP requests and close connections via `agent.cancel_and_close_mcp()`
+//! 1. Signal cancellation via `cancel_tx`, the run's own token
+//! 2. Cancel MCP requests and close connections via `agent.cancel_and_close_mcp()`
 
 use crate::streaming::types::openai::UsageInfo;
 use aura_events::agent::{AgentEvent, AgentEventPayload};
@@ -30,9 +29,9 @@ use super::types::{
 };
 use aura::stream_events::{AuraStreamEvent, CorrelationContext};
 use aura::{
-    ApprovalLifecycleEvent, EventContext, OrchestrationStreamEvent, PASSTHROUGH_MARKER,
-    RequestCancellation, ResponseContent, StreamError, StreamItem, StreamedAssistantContent,
-    StreamedUserContent, StreamingAgent, ToolCall, ToolCallId, ToolResult, UsageState,
+    EventContext, OrchestrationStreamEvent, PASSTHROUGH_MARKER, ResponseContent, StreamError,
+    StreamItem, StreamedAssistantContent, StreamedUserContent, StreamingAgent, ToolCall,
+    ToolCallId, ToolResult, UsageState,
 };
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
@@ -48,8 +47,6 @@ pub struct StreamingCallbacks {
     pub agent: Arc<dyn StreamingAgent>,
     /// The run's own events.
     pub agent_events: Option<mpsc::Receiver<aura_events::agent::AgentEvent>>,
-    /// HITL approval lifecycle event receiver (always emitted, not gated by AURA_CUSTOM_EVENTS)
-    pub approval_event_rx: mpsc::Receiver<ApprovalLifecycleEvent>,
     /// Shared usage state for reading final usage at stream end
     pub usage_state: UsageState,
     /// Shared response content for OTel span recording at stream end
@@ -198,10 +195,8 @@ where
     let mut first_chunk_received = false;
 
     // Disarmed so the first-chunk timeout alone governs the pre-response window.
-    // The run-event and approval arms also touch it, because during orchestrated
-    // runs worker liveness reaches this loop through them rather than as stream
-    // items. Heartbeats prove the client link, not the provider, so they
-    // deliberately never touch it.
+    // Heartbeats prove the client link, not the provider, so they deliberately
+    // never touch it.
     let mut inactivity =
         aura::inactivity::InactivityDeadline::new_disarmed(inactivity_timeout.unwrap_or_default());
 
@@ -261,16 +256,27 @@ where
             }
 
             // The run's own events, projected onto the wire schema.
+            //
+            // This arm stays unconditional. The run's channel is bounded and its
+            // sender awaits, so gating the only reader on emit_custom_events lets a
+            // full channel stall the producer — issue 229. run_event_sse decides
+            // what reaches the client instead.
             run_event = async {
                 match callbacks.agent_events.as_mut() {
                     Some(events) => events.recv().await,
                     None => std::future::pending().await,
                 }
-            }, if emit_custom_events => {
+            } => {
                 match run_event {
                     Some(event) => {
+                        // Every run event counts as liveness, whether or not it
+                        // reaches the client. Orchestration reports worker
+                        // liveness as run events rather than stream items, and
+                        // a display setting must not decide whether a run is
+                        // alive.
                         inactivity.touch();
-                        if let Some(sse_event) = run_event_sse(event, ctx.correlation.clone())
+                        if let Some(sse_event) =
+                            run_event_sse(event, ctx.correlation.clone(), emit_custom_events)
                             && tx.send(Ok(Bytes::from(sse_event.format_sse()))).await.is_err()
                         {
                             tracing::info!("Client disconnected during a run event");
@@ -280,28 +286,6 @@ where
                     // The run dropped its sender, so this arm must stop being
                     // ready rather than spin on a closed channel.
                     None => callbacks.agent_events = None,
-                }
-            }
-
-            // HITL approval lifecycle events are protocol, not optional telemetry.
-            approval_event = callbacks.approval_event_rx.recv() => {
-                if let Some(approval_event) = approval_event {
-                    inactivity.touch();
-                    let event = match approval_event {
-                        ApprovalLifecycleEvent::Requested(requested) => {
-                            AuraStreamEvent::ApprovalRequested(requested)
-                        }
-                        ApprovalLifecycleEvent::Pending(pending) => {
-                            AuraStreamEvent::ApprovalPending(pending)
-                        }
-                        ApprovalLifecycleEvent::Completed(completed) => {
-                            AuraStreamEvent::ApprovalCompleted(completed)
-                        }
-                    };
-                    if tx.send(Ok(Bytes::from(event.format_sse()))).await.is_err() {
-                        tracing::info!("Client disconnected during approval event");
-                        break StreamTermination::Disconnected;
-                    }
                 }
             }
 
@@ -379,13 +363,11 @@ where
 
         StreamTermination::Disconnected => {
             cancel_tx.cancel();
-            RequestCancellation::cancel(&callbacks.request_id, "client disconnected");
             cancel_mcp(&callbacks, "client disconnected").await;
         }
 
         StreamTermination::Timeout => {
             cancel_tx.cancel();
-            RequestCancellation::cancel(&callbacks.request_id, "timeout");
             cancel_mcp(&callbacks, "timeout").await;
             send_final_events(emit_custom_events, &mut callbacks, ctx, &state, &tx).await;
         }
@@ -393,7 +375,6 @@ where
         StreamTermination::Shutdown => {
             // [DONE] before MCP cleanup so client gets clean termination regardless of MCP latency
             cancel_tx.cancel();
-            RequestCancellation::cancel(&callbacks.request_id, "server shutdown");
             send_final_events(emit_custom_events, &mut callbacks, ctx, &state, &tx).await;
             cancel_mcp(&callbacks, "server shutdown").await;
         }
@@ -441,14 +422,35 @@ fn resolve_billed_usage(
 
 /// Projects one of the run's events onto the wire schema. `None` for a payload
 /// the loop delivers another way — content rides the `StreamItem` stream.
+///
+/// `custom_events` gates the tool telemetry only. Approvals are protocol, and
+/// a client that never sees one cannot answer it, so the run stalls.
 fn run_event_sse(
     event: aura_events::agent::AgentEvent,
     correlation: CorrelationContext,
+    custom_events: bool,
 ) -> Option<AuraStreamEvent> {
     use aura_events::agent::AgentEventPayload as Payload;
 
     let aura_events::agent::AgentEvent { agent, payload } = event;
     match payload {
+        Payload::ApprovalRequested(requested) => {
+            Some(AuraStreamEvent::ApprovalRequested(requested))
+        }
+        Payload::ApprovalPending(pending) => Some(AuraStreamEvent::ApprovalPending(pending)),
+        Payload::ApprovalCompleted(completed) => {
+            Some(AuraStreamEvent::ApprovalCompleted(completed))
+        }
+
+        Payload::ToolRequested { .. }
+        | Payload::ToolStart { .. }
+        | Payload::ToolProgress { .. }
+        | Payload::ToolUsage { .. }
+            if !custom_events =>
+        {
+            None
+        }
+
         Payload::ToolRequested {
             tool_call_id,
             tool_name,
@@ -503,7 +505,38 @@ fn run_event_sse(
             correlation,
         )),
 
-        _ => None,
+        // Listed rather than folded into the wildcard below. `AgentEventPayload`
+        // is `#[non_exhaustive]` across the crate boundary, so the wildcard is
+        // mandatory and exhaustiveness checking cannot flag a new variant that
+        // needs a frame here. Naming the ones that deliberately get none keeps
+        // the wildcard's reach to variants this projection has never seen.
+        Payload::SessionInfo { .. }
+        | Payload::McpStatus { .. }
+        | Payload::TextDelta { .. }
+        | Payload::Reasoning { .. }
+        | Payload::ToolComplete { .. }
+        | Payload::WorkerPhase { .. }
+        | Payload::Usage { .. }
+        | Payload::ContextUsage { .. }
+        | Payload::ScratchpadUsage { .. }
+        | Payload::PlanCreated { .. }
+        | Payload::DirectAnswer { .. }
+        | Payload::ClarificationNeeded { .. }
+        | Payload::TaskStarted { .. }
+        | Payload::TaskCompleted { .. }
+        | Payload::TaskBlocked { .. }
+        | Payload::RunParked { .. }
+        | Payload::IterationComplete { .. }
+        | Payload::ReplanStarted { .. }
+        | Payload::Synthesizing { .. } => None,
+
+        unknown => {
+            tracing::debug!(
+                payload = ?std::mem::discriminant(&unknown),
+                "a run event this projection does not know reached no frame"
+            );
+            None
+        }
     }
 }
 
@@ -517,9 +550,10 @@ async fn send_final_events(
 ) {
     // Drain the run's remaining events before the final usage totals, since the
     // hook emits its tool usage as the stream completes, after the loop has left.
-    if emit_custom_events && let Some(events) = callbacks.agent_events.as_mut() {
+    if let Some(events) = callbacks.agent_events.as_mut() {
         while let Ok(event) = events.try_recv() {
-            if let Some(sse_event) = run_event_sse(event, ctx.correlation.clone())
+            if let Some(sse_event) =
+                run_event_sse(event, ctx.correlation.clone(), emit_custom_events)
                 && tx
                     .send(Ok(Bytes::from(sse_event.format_sse())))
                     .await
@@ -1627,7 +1661,7 @@ mod tests {
                 },
             );
 
-            let frame = run_event_sse(event, correlation())
+            let frame = run_event_sse(event, correlation(), true)
                 .expect("progress is a side channel and has a frame")
                 .format_sse();
 
@@ -1651,11 +1685,49 @@ mod tests {
                 message: None,
             });
 
-            let frame = run_event_sse(event, correlation())
+            let frame = run_event_sse(event, correlation(), true)
                 .expect("progress has a frame")
                 .format_sse();
 
             assert!(frame.contains("Progress: 3/4"), "got: {frame}");
+        }
+
+        fn approval() -> AgentEvent {
+            AgentEvent::single_agent(AgentEventPayload::ApprovalRequested(
+                aura_events::ApprovalRequested {
+                    decision_id: "dec_1".to_string(),
+                    tool_name: "kubectl_apply".to_string(),
+                    tool_namespace: None,
+                    origin: aura_events::ApprovalOriginWire::ConfigGate {
+                        matched_pattern: "kubectl_*".to_string(),
+                        agent_name: "ops".to_string(),
+                    },
+                    scope: aura_events::AgentScopeWire::Single { session_id: None },
+                },
+            ))
+        }
+
+        /// An approval is protocol rather than telemetry. A client that never
+        /// sees one cannot answer it, so the run stalls waiting on a human who
+        /// was never asked. It goes out whether or not custom events are on.
+        #[test]
+        fn an_approval_reaches_the_wire_with_custom_events_off() {
+            assert!(
+                run_event_sse(approval(), correlation(), false).is_some(),
+                "an approval must not be gated by AURA_CUSTOM_EVENTS"
+            );
+        }
+
+        /// Tool telemetry is opt-in, which is the distinction the gate draws.
+        #[test]
+        fn tool_telemetry_stays_off_with_custom_events_off() {
+            let event = AgentEvent::single_agent(AgentEventPayload::ToolProgress {
+                progress_token: ProgressToken(NumberOrString::Number(7)),
+                progress: Progress::ratio(1.0, 2.0),
+                message: None,
+            });
+
+            assert!(run_event_sse(event, correlation(), false).is_none());
         }
 
         /// Content reaches consumers on the `StreamItem` stream, so the
@@ -1666,7 +1738,7 @@ mod tests {
                 content: "hello".to_string(),
             });
 
-            assert!(run_event_sse(event, correlation()).is_none());
+            assert!(run_event_sse(event, correlation(), true).is_none());
         }
     }
 
@@ -2283,24 +2355,19 @@ mod tests {
         use std::sync::Arc;
         use tokio_util::sync::CancellationToken;
 
-        /// The approval sender must outlive the loop: a closed channel's
-        /// `recv()` arm is permanently ready with `None`, which starves paused
-        /// time. The run's own arm disables itself instead.
+        /// The run's event sender, for tests that inject events.
         #[derive(Clone)]
         struct EventSenders {
             _run_events_tx: mpsc::Sender<aura_events::agent::AgentEvent>,
-            _approval_tx: mpsc::Sender<ApprovalLifecycleEvent>,
         }
 
         fn callbacks() -> (StreamingCallbacks, EventSenders) {
             let (run_events_tx, run_events) = mpsc::channel(8);
-            let (approval_tx, approval_event_rx) = mpsc::channel(8);
             (
                 StreamingCallbacks {
                     request_id: "req_inactivity_test".to_string(),
                     agent: Arc::new(MockAgent::pending()),
                     agent_events: Some(run_events),
-                    approval_event_rx,
                     usage_state: aura::UsageState::new(),
                     response_content: ResponseContent::new(),
                     model_name: "test/fake".to_string(),
@@ -2309,7 +2376,6 @@ mod tests {
                 },
                 EventSenders {
                     _run_events_tx: run_events_tx,
-                    _approval_tx: approval_tx,
                 },
             )
         }
@@ -2523,18 +2589,19 @@ mod tests {
             assert_eq!(termination, StreamTermination::Complete);
         }
 
-        /// Like `run_loop`, but with custom events on and the senders handed
-        /// to a driver task so event arms can carry the liveness.
+        /// Like `run_loop`, but with the senders handed to a driver task so run
+        /// events can carry the liveness.
         async fn run_loop_with_events<S, F>(
             stream: S,
             inactivity: Option<Duration>,
+            custom_events: bool,
             drive: impl FnOnce(EventSenders) -> F,
         ) -> (StreamTermination, u64)
         where
             S: futures_util::Stream<Item = Result<StreamItem, StreamError>> + Unpin,
             F: std::future::Future<Output = ()> + Send + 'static,
         {
-            let config = StreamConfig::new(true, false, ToolResultMode::None, 0);
+            let config = StreamConfig::new(custom_events, false, ToolResultMode::None, 0);
             let ctx = TurnContext::new(
                 "test-id".to_string(),
                 "test-model".to_string(),
@@ -2569,18 +2636,13 @@ mod tests {
         /// permanently ready with `None`. The arm has to retire itself, or it
         /// starves the timers it shares the `select!` with and the loop never
         /// reaches its inactivity deadline.
-        ///
-        /// Only the run's sender is dropped here; the approval arm has no such
-        /// guard and its sender is what keeps that arm quiet.
+
         #[tokio::test(start_paused = true)]
         async fn a_finished_runs_closed_channel_does_not_starve_the_timers() {
             let stream = futures_util::stream::iter(vec![text_item("hi")])
                 .chain(futures_util::stream::pending());
             let (cb, senders) = callbacks();
-            let EventSenders {
-                _run_events_tx,
-                _approval_tx,
-            } = senders;
+            let EventSenders { _run_events_tx } = senders;
             drop(_run_events_tx);
 
             let config = StreamConfig::new(true, false, ToolResultMode::None, 0);
@@ -2621,32 +2683,37 @@ mod tests {
         async fn progress_notifications_carry_liveness() {
             // One stream item arms the window; MCP progress every 20s keeps a
             // 30s window alive until the driver stops at 60s; stall at 90s.
-            let stream = futures_util::stream::iter(vec![text_item("hi")])
-                .chain(futures_util::stream::pending());
-            let (termination, elapsed) = run_loop_with_events(
-                Box::pin(stream),
-                Some(Duration::from_secs(30)),
-                |s| async move {
-                    for n in 0..3i64 {
-                        tokio::time::sleep(Duration::from_secs(20)).await;
-                        let _ = s
-                            ._run_events_tx
-                            .send(aura_events::agent::AgentEvent::single_agent(
-                                aura_events::agent::AgentEventPayload::ToolProgress {
-                                    progress_token: aura::ProgressToken(
-                                        aura::NumberOrString::Number(n),
-                                    ),
-                                    progress: Progress::ratio(n as f64, 3.0),
-                                    message: Some("working".into()),
-                                },
-                            ))
-                            .await;
-                    }
-                },
-            )
-            .await;
-            assert_eq!(termination, StreamTermination::Timeout);
-            assert_eq!(elapsed, 90);
+            // Custom events off hides the progress from the client, not from
+            // the deadline.
+            for custom_events in [true, false] {
+                let stream = futures_util::stream::iter(vec![text_item("hi")])
+                    .chain(futures_util::stream::pending());
+                let (termination, elapsed) = run_loop_with_events(
+                    Box::pin(stream),
+                    Some(Duration::from_secs(30)),
+                    custom_events,
+                    |s| async move {
+                        for n in 0..3i64 {
+                            tokio::time::sleep(Duration::from_secs(20)).await;
+                            let _ = s
+                                ._run_events_tx
+                                .send(aura_events::agent::AgentEvent::single_agent(
+                                    aura_events::agent::AgentEventPayload::ToolProgress {
+                                        progress_token: aura::ProgressToken(
+                                            aura::NumberOrString::Number(n),
+                                        ),
+                                        progress: Progress::ratio(n as f64, 3.0),
+                                        message: Some("working".into()),
+                                    },
+                                ))
+                                .await;
+                        }
+                    },
+                )
+                .await;
+                assert_eq!(termination, StreamTermination::Timeout);
+                assert_eq!(elapsed, 90, "custom_events={custom_events}");
+            }
         }
 
         #[tokio::test(start_paused = true)]
@@ -2656,23 +2723,26 @@ mod tests {
             let (termination, elapsed) = run_loop_with_events(
                 Box::pin(stream),
                 Some(Duration::from_secs(30)),
+                true,
                 |s| async move {
                     tokio::time::sleep(Duration::from_secs(25)).await;
                     let _ = s
-                        ._approval_tx
-                        .send(ApprovalLifecycleEvent::Pending(
-                            aura_events::ApprovalPending {
-                                decision_id: "d1".into(),
-                                tool_name: "dangerous_apply".into(),
-                                tool_namespace: None,
-                                arguments: serde_json::json!({}),
-                                origin: aura_events::ApprovalOriginWire::ConfigGate {
-                                    matched_pattern: "dangerous_*".into(),
-                                    agent_name: "test-agent".into(),
+                        ._run_events_tx
+                        .send(aura_events::agent::AgentEvent::single_agent(
+                            aura_events::agent::AgentEventPayload::ApprovalPending(
+                                aura_events::ApprovalPending {
+                                    decision_id: "d1".into(),
+                                    tool_name: "dangerous_apply".into(),
+                                    tool_namespace: None,
+                                    arguments: serde_json::json!({}),
+                                    origin: aura_events::ApprovalOriginWire::ConfigGate {
+                                        matched_pattern: "dangerous_*".into(),
+                                        agent_name: "test-agent".into(),
+                                    },
+                                    scope: aura_events::AgentScopeWire::Single { session_id: None },
+                                    expires_at: "2026-01-01T00:00:00Z".into(),
                                 },
-                                scope: aura_events::AgentScopeWire::Single { session_id: None },
-                                expires_at: "2026-01-01T00:00:00Z".into(),
-                            },
+                            ),
                         ))
                         .await;
                 },
@@ -2711,27 +2781,19 @@ mod tests {
 
         pub(super) const SESSION_ID: &str = "cs-tool-events";
 
-        /// Must outlive the loop, for the reason given on
-        /// [`inactivity::EventSenders`]; the run sender additionally feeds
-        /// scripted steps.
+        /// The run sender feeds scripted steps.
         pub(super) struct Senders {
             pub(super) run_events_tx: mpsc::Sender<AgentEvent>,
-            _approval_tx: mpsc::Sender<ApprovalLifecycleEvent>,
         }
 
         fn channels() -> (Senders, StreamingCallbacks) {
             let (run_events_tx, run_events) = mpsc::channel(16);
-            let (approval_tx, approval_event_rx) = mpsc::channel(16);
             (
-                Senders {
-                    run_events_tx,
-                    _approval_tx: approval_tx,
-                },
+                Senders { run_events_tx },
                 StreamingCallbacks {
                     request_id: "req_tool_events".to_string(),
                     agent: Arc::new(MockAgent::pending()),
                     agent_events: Some(run_events),
-                    approval_event_rx,
                     usage_state: UsageState::new(),
                     response_content: ResponseContent::new(),
                     model_name: "test/fake".to_string(),
