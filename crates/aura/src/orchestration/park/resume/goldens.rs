@@ -2107,12 +2107,12 @@ async fn re_park_registers_the_fresh_ticket_under_the_original_bound_run_id() {
 /// segment's gate lifecycle events ride the LIVE request id channel —
 /// the fresh `req_<uuid>` the resume caller stamped into the World's
 /// config and the SSE side subscribes under — never the run owner id.
-/// Today `run_segment_borrowed` overwrites `config.request_id` with
-/// `run_owner_id(...)` before the orchestrator builds (the gov-500
-/// stamp), so before the fill the resumed worker's gate published its
+/// Before the 1ea05b70 fill, `run_segment_borrowed` overwrote
+/// `config.request_id` with `run_owner_id(...)` before the orchestrator
+/// built (the gov-500 stamp), so the resumed worker's gate published its
 /// `Requested` under `run:<id>` and a subscriber keyed on the fresh id —
 /// exactly the key the web-server handler subscribes for this request —
-/// never saw it. Regression frame (red until the 1ea05b70 fill): the
+/// never saw it. Regression frame (red until the fill): the
 /// re-parked call's gate-entry `Requested` must arrive on the fresh
 /// channel, naming the fresh ticket's decision id. The `Completed` leg is
 /// structurally suppressed on a pending reply (`GateDecision::to_outcome`
