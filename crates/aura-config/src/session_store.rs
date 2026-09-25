@@ -6,14 +6,15 @@
 //!
 //! See `docs/design/session-storage.md` §8.
 //!
-//! | Env var                                   | Meaning                                         |
-//! | ----------------------------------------- | ----------------------------------------------- |
-//! | `AURA_SESSION_STORE`                      | backend: `memory` (default), `redis`, or `file` |
-//! | `AURA_SESSION_STORE_URL`                  | `redis://` / `rediss://` (Valkey ok; `redis`)   |
-//! | `AURA_SESSION_STORE_PATH`                 | store root directory (`file`; required)         |
-//! | `AURA_SESSION_STORE_PREFIX`               | key/topic namespace (default `aura`)            |
-//! | `AURA_SESSION_STORE_CONNECT_TIMEOUT_SECS` | connection timeout (default 5)                  |
-//! | `AURA_SESSION_STORE_TASK_TTL_SECS`        | A2A task TTL, 0 = no expiry (default 86400)     |
+//! | Env var                                   | Meaning                                             |
+//! | ----------------------------------------- | --------------------------------------------------- |
+//! | `AURA_SESSION_STORE`                      | backend: `memory` (default), `redis`, or `file`     |
+//! | `AURA_SESSION_STORE_URL`                  | `redis://` / `rediss://` (Valkey ok; `redis`)       |
+//! | `AURA_SESSION_STORE_PATH`                 | store root directory (`file`; required)             |
+//! | `AURA_SESSION_STORE_PREFIX`               | key/topic namespace (default `aura`)                |
+//! | `AURA_SESSION_STORE_CONNECT_TIMEOUT_SECS` | connection timeout (default 5)                      |
+//! | `AURA_SESSION_STORE_TASK_TTL_SECS`        | A2A task TTL, 0 = no expiry (default 86400)         |
+//! | `AURA_SESSION_STORE_SKILLS_TTL_SECS`      | skill-invocation TTL, 0 = no expiry (default 86400) |
 
 use crate::error::ConfigError;
 use std::fmt;
@@ -82,18 +83,23 @@ pub struct RedisSessionStoreConfig {
     pub connect_timeout: Duration,
     /// A2A task record TTL in seconds.
     pub task_ttl_secs: Option<NonZeroU64>,
+    /// Per-session skill-invocation TTL in seconds.
+    pub skills_ttl_secs: Option<NonZeroU64>,
 }
 
-/// Settings for the file-backed approval store.
+/// Settings for the file-backed session store.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileSessionStoreConfig {
-    /// Root directory holding the per-decision ticket and decision files.
+    /// Root directory holding the approval, decision, and skill-log files.
     pub path: String,
+    /// Per-session skill-invocation TTL in seconds.
+    pub skills_ttl_secs: Option<NonZeroU64>,
 }
 
 const DEFAULT_KEY_PREFIX: &str = "aura";
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_TASK_TTL_SECS: u64 = 86_400;
+const DEFAULT_SKILLS_TTL_SECS: u64 = 86_400;
 
 impl SessionStoreConfig {
     /// Build the deployment's session-store configuration from the
@@ -143,20 +149,30 @@ impl RedisSessionStoreConfig {
             task_ttl_secs: NonZeroU64::new(
                 env_var_u64("AURA_SESSION_STORE_TASK_TTL_SECS")?.unwrap_or(DEFAULT_TASK_TTL_SECS),
             ),
+            skills_ttl_secs: NonZeroU64::new(
+                env_var_u64("AURA_SESSION_STORE_SKILLS_TTL_SECS")?
+                    .unwrap_or(DEFAULT_SKILLS_TTL_SECS),
+            ),
         })
     }
 }
 
 impl FileSessionStoreConfig {
-    /// Read the file store's root directory from the environment. The path
-    /// is required.
+    /// Read the file store's root directory and skill-log TTL from the
+    /// environment. The path is required.
     fn from_env() -> Result<Self, ConfigError> {
         let path = env_var("AURA_SESSION_STORE_PATH").ok_or_else(|| {
             ConfigError::Validation(
                 "AURA_SESSION_STORE=file requires AURA_SESSION_STORE_PATH".to_string(),
             )
         })?;
-        Ok(Self { path })
+        Ok(Self {
+            path,
+            skills_ttl_secs: NonZeroU64::new(
+                env_var_u64("AURA_SESSION_STORE_SKILLS_TTL_SECS")?
+                    .unwrap_or(DEFAULT_SKILLS_TTL_SECS),
+            ),
+        })
     }
 }
 
@@ -188,6 +204,7 @@ mod tests {
             "AURA_SESSION_STORE_PREFIX",
             "AURA_SESSION_STORE_CONNECT_TIMEOUT_SECS",
             "AURA_SESSION_STORE_TASK_TTL_SECS",
+            "AURA_SESSION_STORE_SKILLS_TTL_SECS",
         ] {
             unsafe { std::env::remove_var(var) };
         }
@@ -226,6 +243,7 @@ mod tests {
             std::env::set_var("AURA_SESSION_STORE_PREFIX", "aura:env");
             std::env::set_var("AURA_SESSION_STORE_CONNECT_TIMEOUT_SECS", "2");
             std::env::set_var("AURA_SESSION_STORE_TASK_TTL_SECS", "3600");
+            std::env::set_var("AURA_SESSION_STORE_SKILLS_TTL_SECS", "7200");
         }
         let config = SessionStoreConfig::from_env();
         clear_env();
@@ -234,6 +252,7 @@ mod tests {
         assert_eq!(redis.key_prefix, "aura:env");
         assert_eq!(redis.connect_timeout, Duration::from_secs(2));
         assert_eq!(redis.task_ttl_secs, NonZeroU64::new(3600));
+        assert_eq!(redis.skills_ttl_secs, NonZeroU64::new(7200));
     }
 
     #[test]
@@ -250,6 +269,7 @@ mod tests {
         assert_eq!(redis.key_prefix, "aura");
         assert_eq!(redis.connect_timeout, Duration::from_secs(5));
         assert_eq!(redis.task_ttl_secs, NonZeroU64::new(86_400));
+        assert_eq!(redis.skills_ttl_secs, NonZeroU64::new(86_400));
     }
 
     #[test]
@@ -267,11 +287,32 @@ mod tests {
         unsafe {
             std::env::set_var("AURA_SESSION_STORE", "file");
             std::env::set_var("AURA_SESSION_STORE_PATH", "/var/lib/aura/approvals");
+            std::env::set_var("AURA_SESSION_STORE_SKILLS_TTL_SECS", "7200");
         }
         let config = SessionStoreConfig::from_env();
         clear_env();
         let file = expect_file(config.unwrap());
         assert_eq!(file.path, "/var/lib/aura/approvals");
+        assert_eq!(file.skills_ttl_secs, NonZeroU64::new(7200));
+    }
+
+    #[test]
+    fn file_backend_defaults_skills_ttl_and_zero_disables_it() {
+        let _guard = test_env_lock::lock();
+        clear_env();
+        unsafe {
+            std::env::set_var("AURA_SESSION_STORE", "file");
+            std::env::set_var("AURA_SESSION_STORE_PATH", "/var/lib/aura/approvals");
+        }
+        let defaulted = SessionStoreConfig::from_env();
+        unsafe { std::env::set_var("AURA_SESSION_STORE_SKILLS_TTL_SECS", "0") };
+        let disabled = SessionStoreConfig::from_env();
+        clear_env();
+        assert_eq!(
+            expect_file(defaulted.unwrap()).skills_ttl_secs,
+            NonZeroU64::new(86_400)
+        );
+        assert_eq!(expect_file(disabled.unwrap()).skills_ttl_secs, None);
     }
 
     #[test]
@@ -342,10 +383,13 @@ mod tests {
             std::env::set_var("AURA_SESSION_STORE", "redis");
             std::env::set_var("AURA_SESSION_STORE_URL", "redis://envhost:6379");
             std::env::set_var("AURA_SESSION_STORE_TASK_TTL_SECS", "0");
+            std::env::set_var("AURA_SESSION_STORE_SKILLS_TTL_SECS", "0");
         }
         let config = SessionStoreConfig::from_env();
         clear_env();
-        assert_eq!(expect_redis(config.unwrap()).task_ttl_secs, None);
+        let redis = expect_redis(config.unwrap());
+        assert_eq!(redis.task_ttl_secs, None);
+        assert_eq!(redis.skills_ttl_secs, None);
     }
 
     #[test]
