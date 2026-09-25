@@ -397,10 +397,15 @@ from the run id, never read it from config; `req_<uuid>` flows from the HTTP
 layer only, and durable records (parked rows, checkpoint, decision store)
 never key on it.
 
-Rebase note: the resume arm is `McpManager::set_current_request`
-(manager.rs; chat-path precedent factory.rs). Nightly's `f3bdbd61` (agent
-event schema) removed that setter in favor of an MCP `CallContext` the
-client holds (request + agent under one lock, events attributed to the
-request that named them). When this stack rebases onto current nightly, the
-`for_resume_segment` arm maps onto the `CallContext` seam: the resumed
-segment's MCP client context must carry the fresh request id.
+Rebase note (EXECUTED in the #690 restack, aura#271 N3): the arm was
+`McpManager::set_current_request` (manager.rs; chat-path precedent
+factory.rs). Nightly's `f3bdbd61` (agent event schema) removed that
+setter in favor of an MCP `CallContext` the client holds (request +
+agent under one lock, events attributed to the request that named
+them). The restack mapped the `for_resume_segment` arm onto that
+`CallContext` seam: the factory's resume supervisor scopes the drive
+with the request's observable run (`RunContext::channel_on` keyed by
+the fresh request id, its receiver pumped into the SSE channel), and
+`for_resume_segment` binds that run — so the resumed segment's MCP
+client context carries the fresh request id AND its run-scoped
+emissions reach the consumer.

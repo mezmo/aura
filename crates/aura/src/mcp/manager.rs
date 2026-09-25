@@ -1098,7 +1098,7 @@ impl Default for McpManager {
 
 /// TEST-ONLY observation seam for the A1 id-channel split (aura#271, card
 /// P45; Mike's 2026-09-25 ruling): records, PER MANAGER, the request ids
-/// the MCP arm ([`McpManager::set_current_request`]) and the all-servers
+/// the MCP arm ([`McpManager::bind_call`]) and the all-servers
 /// close ([`McpManager::cancel_and_close_all`]) last ran under, so the
 /// resume goldens can pin that a resumed segment ARMS (before its first
 /// tool executes) and CLOSES the manager under the config's FRESH request

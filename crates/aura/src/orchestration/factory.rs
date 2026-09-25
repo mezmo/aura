@@ -130,7 +130,7 @@ impl OrchestratorFactory {
         &self,
         grant: ResumeGrant,
         timeout: Duration,
-        _request_id: &str,
+        request_id: &str,
     ) -> (
         BoxStream<'static, Result<StreamItem, StreamError>>,
         crate::request_cancellation::RequestCancelToken,
@@ -153,9 +153,9 @@ impl OrchestratorFactory {
         // reservation fence releases with the supervisor's drive. Dropping
         // the watch sender with no explicit signal is an unexplained abort
         // and fails safe by cancelling (#305) — a no-op on an ended run.
-        let cancel_tx = crate::request_cancellation::RequestCancelToken::from(
-            tokio_util::sync::CancellationToken::new(),
-        );
+        let cancel_cancellation = tokio_util::sync::CancellationToken::new();
+        let cancel_tx =
+            crate::request_cancellation::RequestCancelToken::from(cancel_cancellation.clone());
         let scope = grant.execution_scope();
         let watcher_token = scope.cancellation().clone();
         let bridge_token = cancel_tx.clone();
@@ -179,117 +179,140 @@ impl OrchestratorFactory {
         // stream. The grant stays OWNED here across cancellation — the
         // segment drive future borrows it and is never cancelled, so the
         // grant is never moved into a cancellable select arm.
+        // The resumed request's run: observable from here (its receiver is
+        // pumped into the same SSE channel the segment events ride) and
+        // keyed by the config's FRESH request id — the chat path's channel
+        // shape, so MCP binding and run-scoped emission during the resumed
+        // segment reach the consumer instead of a dropped receiver (Gate A
+        // finding 1, aura#271 N3).
+        let (run, mut run_events) =
+            crate::run_context::RunContext::channel_on(request_id, cancel_cancellation.clone());
         let agent_config = self.agent_config.clone();
         let usage_state = crate::UsageState::new();
         let supervisor_state = usage_state.clone();
-        let _supervisor_handle = tokio::spawn(async move {
-            let segment_headers = HashMap::new();
-            let drive = run_segment_borrowed(
-                &grant,
-                &agent_config,
-                // The EMPTY headers map is deliberate: S1's
-                // `prepare_agent_config` already resolved
-                // `headers_from_request` forwarding once against the resume
-                // caller into this config; re-resolution is a no-op.
-                &segment_headers,
-                event_tx.clone(),
-                supervisor_state,
-                outer_budget,
-            );
-            tokio::pin!(drive);
-            // Drive the segment to its end, watching for the consumer's
-            // disconnect: the returned stream is the only reader of
-            // `event_tx`, so its drop closes the channel. A disconnect
-            // cancels the grant's ONE scope — the segment's sole
-            // cancellation path — and the drive then runs to its cancelled
-            // end: the drive future is never dropped here, so the grant
-            // keeps its owner. The disconnect arm disables itself after it
-            // fires (a closed channel reports closed immediately), leaving
-            // the drive arm as the loop's only exit.
-            let mut disconnected = false;
-            let probe = event_tx.clone();
-            let end = loop {
-                tokio::select! {
-                    end = &mut drive => break end,
-                    _ = probe.closed(), if !disconnected => {
-                        scope.cancel();
-                        disconnected = true;
-                    }
+        let pump_tx = event_tx.clone();
+        let _events_pump = tokio::spawn(async move {
+            while let Some(event) = run_events.recv().await {
+                if pump_tx
+                    .send(Ok(StreamItem::AgentEvent(Box::new(event))))
+                    .await
+                    .is_err()
+                {
+                    break;
                 }
-            };
-
-            match end {
-                // The run completed within the segment: the normal factory
-                // finalization — chunked answer text and ONE `Final`, the
-                // same shape the chat path emits, racing cancellation so a
-                // cancelled run truncates its final instead of stranding
-                // the supervisor. The driver emitted no terminal of its
-                // own; this is the only one.
-                Ok(ResumeStreamEnd::Completed { final_answer }) => {
-                    let mut cancelled = false;
-                    for chunk in final_answer
-                        .chars()
-                        .collect::<Vec<_>>()
-                        .chunks(STREAM_CHUNK_SIZE)
-                    {
-                        let text: String = chunk.iter().collect();
-                        tokio::select! {
-                            biased;
-                            _ = scope.cancellation().cancelled() => {
-                                cancelled = true;
-                                break;
-                            }
-                            _ = event_tx.send(Ok(StreamItem::StreamAssistantItem(
-                                crate::provider_agent::StreamedAssistantContent::Text(text),
-                            ))) => {}
+            }
+        });
+        let _supervisor_handle = tokio::spawn(crate::run_context::with_run(
+            std::sync::Arc::clone(&run),
+            async move {
+                let segment_headers = HashMap::new();
+                let drive = run_segment_borrowed(
+                    &grant,
+                    &agent_config,
+                    // The EMPTY headers map is deliberate: S1's
+                    // `prepare_agent_config` already resolved
+                    // `headers_from_request` forwarding once against the resume
+                    // caller into this config; re-resolution is a no-op.
+                    &segment_headers,
+                    event_tx.clone(),
+                    supervisor_state,
+                    outer_budget,
+                );
+                tokio::pin!(drive);
+                // Drive the segment to its end, watching for the consumer's
+                // disconnect: the returned stream is the only reader of
+                // `event_tx`, so its drop closes the channel. A disconnect
+                // cancels the grant's ONE scope — the segment's sole
+                // cancellation path — and the drive then runs to its cancelled
+                // end: the drive future is never dropped here, so the grant
+                // keeps its owner. The disconnect arm disables itself after it
+                // fires (a closed channel reports closed immediately), leaving
+                // the drive arm as the loop's only exit.
+                let mut disconnected = false;
+                let probe = event_tx.clone();
+                let end = loop {
+                    tokio::select! {
+                        end = &mut drive => break end,
+                        _ = probe.closed(), if !disconnected => {
+                            scope.cancel();
+                            disconnected = true;
                         }
                     }
-                    if !cancelled {
+                };
+
+                match end {
+                    // The run completed within the segment: the normal factory
+                    // finalization — chunked answer text and ONE `Final`, the
+                    // same shape the chat path emits, racing cancellation so a
+                    // cancelled run truncates its final instead of stranding
+                    // the supervisor. The driver emitted no terminal of its
+                    // own; this is the only one.
+                    Ok(ResumeStreamEnd::Completed { final_answer }) => {
+                        let mut cancelled = false;
+                        for chunk in final_answer
+                            .chars()
+                            .collect::<Vec<_>>()
+                            .chunks(STREAM_CHUNK_SIZE)
+                        {
+                            let text: String = chunk.iter().collect();
+                            tokio::select! {
+                                biased;
+                                _ = scope.cancellation().cancelled() => {
+                                    cancelled = true;
+                                    break;
+                                }
+                                _ = event_tx.send(Ok(StreamItem::StreamAssistantItem(
+                                    crate::provider_agent::StreamedAssistantContent::Text(text),
+                                ))) => {}
+                            }
+                        }
+                        if !cancelled {
+                            tokio::select! {
+                                biased;
+                                _ = scope.cancellation().cancelled() => {}
+                                _ = event_tx.send(Ok(StreamItem::Final(
+                                    crate::provider_agent::FinalResponseInfo {
+                                        content: final_answer,
+                                        usage: Default::default(),
+                                        cache_usage: None,
+                                    },
+                                ))) => {}
+                            }
+                        }
+                    }
+                    // A fresh park: the publication owner already emitted the
+                    // ONE `RunParked` while the segment was live. The normal
+                    // terminal stream policy adds nothing.
+                    Ok(ResumeStreamEnd::Reparked) => {}
+                    // The segment faulted: the fault rides the error arm as the
+                    // stream's terminal `Err` (never unwrapped). The segment's
+                    // `Diagnostic` prose is the stream error's content.
+                    Err(segment_fault) => {
+                        let fault: StreamError = match segment_fault {
+                            SegmentError::Continuation(diagnostic) => diagnostic.to_string().into(),
+                        };
                         tokio::select! {
                             biased;
                             _ = scope.cancellation().cancelled() => {}
-                            _ = event_tx.send(Ok(StreamItem::Final(
-                                crate::provider_agent::FinalResponseInfo {
-                                    content: final_answer,
-                                    usage: Default::default(),
-                                    cache_usage: None,
-                                },
-                            ))) => {}
+                            _ = event_tx.send(Err(fault)) => {}
                         }
                     }
                 }
-                // A fresh park: the publication owner already emitted the
-                // ONE `RunParked` while the segment was live. The normal
-                // terminal stream policy adds nothing.
-                Ok(ResumeStreamEnd::Reparked) => {}
-                // The segment faulted: the fault rides the error arm as the
-                // stream's terminal `Err` (never unwrapped). The segment's
-                // `Diagnostic` prose is the stream error's content.
-                Err(segment_fault) => {
-                    let fault: StreamError = match segment_fault {
-                        SegmentError::Continuation(diagnostic) => diagnostic.to_string().into(),
-                    };
-                    tokio::select! {
-                        biased;
-                        _ = scope.cancellation().cancelled() => {}
-                        _ = event_tx.send(Err(fault)) => {}
-                    }
-                }
-            }
 
-            // Every exit arm (completed, reparked, fault, cancelled)
-            // reaches the same drain: signal the grant's scope first so
-            // cancellation-aware tracked tails exit early, then join every
-            // tracked child before the task ends. The scope local — and
-            // with it the grant's reservation lease — drops last, so the
-            // fence releases only after the drain ends, never at a stream
-            // drop or a terminal send. NO MCP close runs here: the
-            // supervisor owns no MCP handle (the manager lives inside the
-            // segment's orchestrator); MCP cancel-and-close is the driver's
-            // exit-arm duty.
-            scope.cancel();
-            scope.drain().await;
-        });
+                // Every exit arm (completed, reparked, fault, cancelled)
+                // reaches the same drain: signal the grant's scope first so
+                // cancellation-aware tracked tails exit early, then join every
+                // tracked child before the task ends. The scope local — and
+                // with it the grant's reservation lease — drops last, so the
+                // fence releases only after the drain ends, never at a stream
+                // drop or a terminal send. NO MCP close runs here: the
+                // supervisor owns no MCP handle (the manager lives inside the
+                // segment's orchestrator); MCP cancel-and-close is the driver's
+                // exit-arm duty.
+                scope.cancel();
+                scope.drain().await;
+            },
+        ));
 
         // Convert receiver to stream — the chat path's same unfold.
         let stream = stream::unfold(event_rx, |mut rx| async move {
@@ -633,7 +656,6 @@ mod tests {
     use tokio::time::{Instant, sleep};
     use tokio_util::sync::CancellationToken;
 
-    use super::*;
     use crate::config::AgentRuntimeConfig;
     use crate::hitl::{
         AgentScope, ApprovalDecision, ApprovalItem, ApprovalOrigin, ApprovalRequest, DecisionId,
@@ -1897,24 +1919,41 @@ mod tests {
 
             // The re-parked exit arm: the RunParked event (the publication
             // owner's ONE terminal) rides the stream BEFORE the segment
-            // body ends, with the tracked tail still in flight.
-            let parked = tokio::time::timeout(RESUME_BOUND, stream.next()).await;
-            let Ok(Some(item)) = parked else {
-                panic!(
-                    "a re-parking run publishes its checkpoint and emits \
-                        RunParked within the bound: settled {parked:?}"
-                )
-            };
+            // body ends, with the tracked tail still in flight. Lifecycle
+            // events the re-parked run emits through its run (the fresh
+            // gate's ApprovalRequested) may interleave ahead of it — the
+            // run's events and the segment events share the channel by
+            // design — so the frame scans for RunParked within the bound
+            // rather than asserting it is the first item.
+            let parked = tokio::time::timeout(RESUME_BOUND, async {
+                let mut observed = false;
+                loop {
+                    match stream.next().await {
+                        Some(Ok(StreamItem::AgentEvent(ref event)))
+                            if matches!(
+                                event.payload,
+                                aura_events::agent::AgentEventPayload::RunParked { .. }
+                            ) =>
+                        {
+                            observed = true;
+                            break;
+                        }
+                        // The stream ending first is a failed delivery:
+                        // the frame must observe RunParked, not merely
+                        // settle inside the bound.
+                        None => break,
+                        Some(_) => continue,
+                    }
+                }
+                observed
+            })
+            .await;
+            let observed = parked.expect(
+                "a re-parking run publishes its checkpoint and emits RunParked within the bound",
+            );
             assert!(
-                matches!(
-                    item,
-                    Ok(StreamItem::AgentEvent(ref event))
-                        if matches!(
-                            event.payload,
-                            aura_events::agent::AgentEventPayload::RunParked { .. }
-                        )
-                ),
-                "the publication owner's RunParked rides the stream: got {item:?}"
+                observed,
+                "the stream delivered RunParked before it ended; a closed stream is a failed delivery"
             );
 
             // The supervisor is BLOCKED on the drain BEFORE the release

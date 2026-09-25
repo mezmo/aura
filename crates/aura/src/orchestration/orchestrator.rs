@@ -328,45 +328,6 @@ fn flush_segment_turn(
     });
 }
 
-/// The assistant tool-call turn R2 prepends per decided call: the decided
-/// call re-issued on the wire, keyed by the original call id — the park
-/// records `ToolCall.id` as the pending call's id, and the provider's own
-/// call id did not survive the checkpoint.
-fn decided_call_turn(call: &PendingCall) -> rig::completion::Message {
-    rig::completion::Message::Assistant {
-        id: None,
-        content: rig::OneOrMany::one(rig::message::AssistantContent::ToolCall(
-            rig::message::ToolCall {
-                id: call.call_id.clone(),
-                call_id: None,
-                function: rig::message::ToolFunction {
-                    name: call.tool_name.clone(),
-                    arguments: call.arguments.clone(),
-                },
-                signature: None,
-                additional_params: None,
-            },
-        )),
-    }
-}
-
-/// The tool-result turn R2 prepends per decided call: the substitution's
-/// outcome in the chain's wire form, keyed by the original call id — the
-/// same slot the checkpointed placeholder occupied.
-fn decided_result_turn(call: &PendingCall, wire: &str) -> rig::completion::Message {
-    rig::completion::Message::User {
-        content: rig::OneOrMany::one(rig::message::UserContent::ToolResult(
-            rig::message::ToolResult {
-                id: call.call_id.clone(),
-                call_id: None,
-                content: rig::OneOrMany::one(rig::message::ToolResultContent::text(
-                    wire.to_string(),
-                )),
-            },
-        )),
-    }
-}
-
 /// Spawns a task that cancels `cancel_token` once `timeout` passes.
 ///
 /// It also stops early on either of two signals. `finished` resolves when the
@@ -858,15 +819,23 @@ impl Orchestrator {
             None
         };
 
-        // Arm MCP tracking under the config's request id — the same arm the
-        // chat path applies — so the segment's MCP calls are routable from
-        // before the first worker/tool runs. A resume segment is expected to
-        // carry a fresh request id; one without leaves MCP untracked.
+        // Arm MCP tracking under the run in scope — the same arm the chat
+        // path applies. The factory's resume supervisor scopes the drive
+        // with the request's observable run (keyed by the config's FRESH
+        // request id), so the segment's MCP calls are tracked AND their
+        // run-scoped emissions reach the consumer (Gate A finding 1,
+        // aura#271 N3: a synthesized channel with a dropped receiver is
+        // not an equivalent arm). An orchestrator built outside any run
+        // leaves MCP untracked and says so.
         if let Some(ref mcp_manager) = mcp_manager {
-            match config.request_id.as_deref() {
-                Some(request_id) => mcp_manager.set_current_request(request_id).await,
+            match crate::run_context::current_run() {
+                Some(run) => {
+                    mcp_manager
+                        .bind_call(run, aura_events::AgentContext::coordinator())
+                        .await;
+                }
                 None => tracing::warn!(
-                    "the resume segment has no request_id; its MCP calls run untracked"
+                    "the resume segment built outside any run; its MCP calls run untracked"
                 ),
             }
         }

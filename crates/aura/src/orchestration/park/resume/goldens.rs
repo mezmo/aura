@@ -2108,12 +2108,12 @@ async fn re_park_registers_the_fresh_ticket_under_the_original_bound_run_id() {
 /// segment's gate lifecycle events ride the LIVE request id channel —
 /// the fresh `req_<uuid>` the resume caller stamped into the World's
 /// config and the SSE side subscribes under — never the run owner id.
-/// Today `run_segment_borrowed` overwrites `config.request_id` with
-/// `run_owner_id(...)` before the orchestrator builds (the gov-500
-/// stamp), so before the fill the resumed worker's gate published its
+/// Before the 1ea05b70 fill, `run_segment_borrowed` overwrote
+/// `config.request_id` with `run_owner_id(...)` before the orchestrator
+/// built (the gov-500 stamp), so the resumed worker's gate published its
 /// `Requested` under `run:<id>` and a subscriber keyed on the fresh id —
 /// exactly the key the web-server handler subscribes for this request —
-/// never saw it. Regression frame (red until the 1ea05b70 fill): the
+/// never saw it. Regression frame (red until the fill): the
 /// re-parked call's gate-entry `Requested` must arrive on the fresh
 /// channel, naming the fresh ticket's decision id. The `Completed` leg is
 /// structurally suppressed on a pending reply (`GateDecision::to_outcome`
@@ -2326,7 +2326,8 @@ impl rig::tool::Tool for ArmProbingTool {
 /// A1 (aura#271, card P45): regression frame (red until the 1ea05b70
 /// fill). The resumed MCP manager must be ARMED with the config's fresh
 /// request id the way the chat path arms it
-/// (`mcp_manager.set_current_request`, factory.rs) — BEFORE the
+/// (`mcp_manager.bind_call` on the request's observable run,
+/// orchestrator.rs `for_resume_segment`) — BEFORE the
 /// segment's execution window opens — and the segment close
 /// (`close_segment_mcp`) must cancel under that same fresh id. Before the
 /// fill, `run_segment_borrowed`'s overwrite handed the orchestrator
@@ -2390,9 +2391,15 @@ async fn a1_resumed_segment_arms_and_closes_mcp_under_the_fresh_request_id() {
     let grant = evaluate_resume(evaluation(&world, false, None))
         .await
         .expect("the all-decided run grants");
-    let segment = run_segment_live(grant, &world.config, &HashMap::new())
-        .await
-        .expect("the segment re-parks");
+    // The frame drives the segment inside the request's run — the
+    // production shape (the factory's resume supervisor scopes the drive
+    // the same way), so the arm binds an observable run keyed by the
+    // config's FRESH request id.
+    let (run, _events) = crate::run_context::RunContext::channel(REQUEST_ID);
+    let segment =
+        crate::run_context::with_run(run, run_segment_live(grant, &world.config, &HashMap::new()))
+            .await
+            .expect("the segment re-parks");
     assert!(
         matches!(segment, ResumeStreamEnd::Reparked),
         "the freshly gated call re-parks: {segment:?}"
