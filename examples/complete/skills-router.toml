@@ -14,9 +14,10 @@
 #   inject    — preload the selected skills' full SKILL.md bodies into the
 #               coordinator's and each worker's system prompt; the catalog and
 #               `load_skill` stay available for the rest.
-#   exclusive — the selected bodies are the agent's only skills: no catalog,
-#               no `load_skill`/`read_skill_file`, nothing for the LLM to
-#               deliberate over. Skill resource files are unreachable here.
+#   exclusive — the selected bodies are the agent's only skills: no catalog
+#               and no `load_skill`, nothing for the LLM to deliberate over.
+#               `read_skill_file` stays, scoped to the selected skills, so
+#               their resource files remain reachable.
 # A router that is down never fails a request: the agent keeps the on-demand
 # `load_skill` path in every mode.
 #

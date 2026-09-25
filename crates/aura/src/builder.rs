@@ -1148,16 +1148,25 @@ impl Agent {
             builder_state = builder_state.add_tools_dyn(additional_tools);
         }
 
-        if let Some(toolset) =
+        let toolset = if config.skills_preloaded {
+            SkillToolset::read_only(&config.agent.skills, config.skill_recorder.clone())
+        } else {
             SkillToolset::new(&config.agent.skills, config.skill_recorder.clone())
-        {
+        };
+        if let Some(toolset) = toolset {
             tracing::info!(
-                "Adding skill tools (load_skill, read_skill_file) with {} skills",
+                "Adding skill tools ({}read_skill_file) with {} skills",
+                if toolset.load.is_some() {
+                    "load_skill, "
+                } else {
+                    ""
+                },
                 config.agent.skills.len(),
             );
-            builder_state = builder_state
-                .add_tool(toolset.load)
-                .add_tool(toolset.read_file);
+            if let Some(load) = toolset.load {
+                builder_state = builder_state.add_tool(load);
+            }
+            builder_state = builder_state.add_tool(toolset.read_file);
         }
 
         Ok(builder_state)

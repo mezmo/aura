@@ -1079,9 +1079,10 @@ impl Orchestrator {
         // Skill routing scores the worker's catalog against its task and
         // decides the worker's skill surface. Workers bypass Agent::build's
         // catalog append (their preamble is the worker template override), so
-        // the catalog lands here when the plan keeps on-demand loading;
-        // clearing `agent.skills` is what drops the skill tools in
-        // `add_all_tools`.
+        // the catalog lands here when the plan keeps on-demand loading. An
+        // exclusive plan narrows `agent.skills` to the selection and marks
+        // them preloaded, which is what makes `add_all_tools` attach
+        // `read_skill_file` alone.
         let plan = match (self.skill_router.as_ref(), task_description) {
             (Some(router), Some(task)) => {
                 router
@@ -1107,8 +1108,9 @@ impl Orchestrator {
                 crate::skill_tool::render_skill_catalog(&worker_config.agent.skills),
                 Some(section),
             ),
-            crate::skill_router::SkillPlan::Exclusive(section) => {
-                worker_config.agent.skills = Vec::new();
+            crate::skill_router::SkillPlan::Exclusive { section, selected } => {
+                worker_config.agent.skills = selected;
+                worker_config.skills_preloaded = true;
                 (None, section)
             }
         };
@@ -2586,7 +2588,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
             state = state.add_tool(list_prior_runs);
         }
         if let Some(toolset) = tools.skill_tools {
-            state = state.add_tool(toolset.load);
+            if let Some(load) = toolset.load {
+                state = state.add_tool(load);
+            }
             state = state.add_tool(toolset.read_file);
         }
         state.build()
@@ -2656,15 +2660,33 @@ Assign tasks to the worker whose tools best match the required operations."#,
             }
             _ => crate::skill_router::SkillPlan::OnDemand,
         };
-        let (coordinator_skills, preloaded): (&[aura_config::SkillConfig], Option<String>) =
-            match plan {
-                crate::skill_router::SkillPlan::OnDemand => (&self.agent_config.agent.skills, None),
-                crate::skill_router::SkillPlan::Augment(section) => {
-                    (&self.agent_config.agent.skills, Some(section))
-                }
-                crate::skill_router::SkillPlan::Exclusive(section) => (&[], section),
-            };
-        if let Some(catalog) = crate::skill_tool::render_skill_catalog(coordinator_skills) {
+        let (catalog, preloaded, skill_tools) = match plan {
+            crate::skill_router::SkillPlan::OnDemand => (
+                crate::skill_tool::render_skill_catalog(&self.agent_config.agent.skills),
+                None,
+                crate::skill_tool::SkillToolset::new(
+                    &self.agent_config.agent.skills,
+                    self.agent_config.skill_recorder.clone(),
+                ),
+            ),
+            crate::skill_router::SkillPlan::Augment(section) => (
+                crate::skill_tool::render_skill_catalog(&self.agent_config.agent.skills),
+                Some(section),
+                crate::skill_tool::SkillToolset::new(
+                    &self.agent_config.agent.skills,
+                    self.agent_config.skill_recorder.clone(),
+                ),
+            ),
+            crate::skill_router::SkillPlan::Exclusive { section, selected } => (
+                None,
+                section,
+                crate::skill_tool::SkillToolset::read_only(
+                    &selected,
+                    self.agent_config.skill_recorder.clone(),
+                ),
+            ),
+        };
+        if let Some(catalog) = catalog {
             preamble.push_str(&catalog);
         }
         if let Some(section) = preloaded {
@@ -2757,10 +2779,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             } else {
                 None
             },
-            skill_tools: crate::skill_tool::SkillToolset::new(
-                coordinator_skills,
-                self.agent_config.skill_recorder.clone(),
-            ),
+            skill_tools,
         };
 
         let provider_agent = self
@@ -9269,6 +9288,7 @@ mod tests {
             assert!(!worker.preamble.contains("BODY-OF-beta"));
             assert!(!worker.preamble.contains("Available skills"));
             assert!(!worker.preamble.contains("load_skill"));
+            assert!(worker.preamble.contains("read_skill_file"));
 
             let coordinator = orchestrator
                 .create_coordinator(RoutingToolSet::new(), true, Some("do the alpha thing"))
@@ -9277,6 +9297,21 @@ mod tests {
             assert!(coordinator.preamble.contains("BODY-OF-alpha"));
             assert!(!coordinator.preamble.contains("Available skills"));
             assert!(!coordinator.preamble.contains("load_skill"));
+        }
+
+        #[test]
+        fn read_only_toolset_has_no_load_tool() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let skills = write_skills(dir.path());
+            let toolset = crate::skill_tool::SkillToolset::read_only(&skills[..1], None).unwrap();
+            assert!(toolset.load.is_none());
+            assert!(crate::skill_tool::SkillToolset::read_only(&[], None).is_none());
+            assert!(
+                crate::skill_tool::SkillToolset::new(&skills, None)
+                    .unwrap()
+                    .load
+                    .is_some()
+            );
         }
 
         #[tokio::test]

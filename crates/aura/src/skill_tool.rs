@@ -358,9 +358,9 @@ pub async fn render_read_skill_file_output(
     Ok(content)
 }
 
-/// The skill tool pair sharing a single skill list.
+/// The skill tools sharing a single skill list.
 pub struct SkillToolset {
-    pub load: LoadSkillTool,
+    pub load: Option<LoadSkillTool>,
     pub read_file: ReadSkillFileTool,
 }
 
@@ -371,16 +371,30 @@ impl SkillToolset {
         skills: &[SkillConfig],
         recorder: Option<Arc<SkillInvocationRecorder>>,
     ) -> Option<Self> {
+        let mut toolset = Self::read_only(skills, recorder.clone())?;
+        toolset.load = Some(LoadSkillTool {
+            skills: Arc::clone(&toolset.read_file.skills),
+            recorder,
+        });
+        Some(toolset)
+    }
+
+    /// Build `read_skill_file` alone, for skills whose bodies the agent
+    /// already holds, or `None` when no skills are configured.
+    /// The tool shares `recorder` with the rest of the request.
+    pub fn read_only(
+        skills: &[SkillConfig],
+        recorder: Option<Arc<SkillInvocationRecorder>>,
+    ) -> Option<Self> {
         if skills.is_empty() {
             return None;
         }
-        let skills: Arc<[SkillConfig]> = skills.into();
         Some(Self {
-            load: LoadSkillTool {
-                skills: Arc::clone(&skills),
-                recorder: recorder.clone(),
+            load: None,
+            read_file: ReadSkillFileTool {
+                skills: skills.into(),
+                recorder,
             },
-            read_file: ReadSkillFileTool { skills, recorder },
         })
     }
 }

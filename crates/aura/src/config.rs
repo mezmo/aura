@@ -106,6 +106,10 @@ pub struct AgentRuntimeConfig {
     /// When set, this replaces agent.system_prompt entirely.
     pub preamble_override: Option<String>,
 
+    /// Whether `agent.skills` are already in the preamble, so the agent gets
+    /// `read_skill_file` alone rather than the full skill tool pair.
+    pub skills_preloaded: bool,
+
     /// Glob patterns for filtering which MCP tools to include.
     /// When set, only tools matching at least one pattern are added
     /// (`None` = all tools, empty = none). Glob syntax: `*`, `?`.
@@ -175,6 +179,7 @@ impl Clone for AgentRuntimeConfig {
             tool_wrapper: self.tool_wrapper.clone(),
             tool_context_factory: self.tool_context_factory.clone(),
             preamble_override: self.preamble_override.clone(),
+            skills_preloaded: self.skills_preloaded,
             mcp_filter: self.mcp_filter.clone(),
             orchestration_persistence: self.orchestration_persistence.clone(),
             session_id: self.session_id.clone(),
@@ -209,6 +214,7 @@ impl std::fmt::Debug for AgentRuntimeConfig {
                 &self.tool_context_factory.as_ref().map(|_| "<factory>"),
             )
             .field("preamble_override", &self.preamble_override)
+            .field("skills_preloaded", &self.skills_preloaded)
             .field("mcp_filter", &self.mcp_filter)
             .field(
                 "orchestration_persistence",
