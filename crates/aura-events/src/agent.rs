@@ -134,6 +134,13 @@ pub enum AgentEventPayload {
         cache_creation_input_tokens: Option<TokenCount>,
     },
 
+    /// The run's answer, and what the provider billed for producing it.
+    Completed {
+        content: String,
+        #[serde(flatten)]
+        usage: TokenUsage,
+    },
+
     /// Context-window occupancy, not billing.
     ContextUsage {
         context_tokens: TokenCount,
@@ -380,5 +387,31 @@ mod tests {
             panic!("expected ToolRequested");
         };
         assert_eq!(arguments, json!({ "path": "/mock", "depth": 2 }));
+    }
+
+    #[test]
+    fn a_completed_run_carries_its_answer_and_billing() {
+        let json = serde_json::to_value(AgentEventPayload::Completed {
+            content: "the answer".to_string(),
+            usage: TokenUsage {
+                prompt_tokens: TokenCount::new(10),
+                completion_tokens: TokenCount::new(5),
+                total_tokens: TokenCount::new(15),
+            },
+        })
+        .expect("serializes");
+
+        // Flattened like every other usage-carrying payload, so a consumer reads
+        // one token shape across the schema.
+        assert_eq!(json["prompt_tokens"], 10);
+        assert_eq!(json["total_tokens"], 15);
+
+        let AgentEventPayload::Completed { content, usage } =
+            serde_json::from_value(json).expect("round-trips")
+        else {
+            panic!("expected Completed");
+        };
+        assert_eq!(content, "the answer");
+        assert_eq!(usage.total_tokens.get(), 15);
     }
 }
