@@ -16,8 +16,8 @@ type EffectHook = Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = ()> + Send>>
 
 /// Pause inserted after each scripted step.
 ///
-/// `process_sse_stream_full` races the stream against the tool/progress/approval
-/// channels in an unbiased `tokio::select!`, so a step that lands while the
+/// `process_sse_stream_full` races the stream against the run's event channel
+/// in an unbiased `tokio::select!`, so a step that lands while the
 /// previous one is still queued would be ordered arbitrarily. Pausing lets the
 /// consumer drain before the next step becomes ready. Under
 /// `#[tokio::test(start_paused = true)]` the runtime auto-advances, so this
@@ -27,7 +27,6 @@ const SETTLE: Duration = Duration::from_millis(10);
 /// One step of a [`MockAgent`] script.
 pub enum Step {
     Item(Result<StreamItem, StreamError>),
-    /// Typically a publish to a request-scoped broker.
     Effect(EffectHook),
 }
 
@@ -36,8 +35,7 @@ impl Step {
         Self::Item(item)
     }
 
-    /// Passed the current call's `request_id`, so brokers keyed by request can
-    /// be published to from inside the script.
+    /// Passed the current call's `request_id`.
     pub fn effect<F, Fut>(effect: F) -> Self
     where
         F: Fn(String) -> Fut + Send + Sync + 'static,

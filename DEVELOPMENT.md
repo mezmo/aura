@@ -228,6 +228,6 @@ Worth reading before diving into the code:
 
 - [Streaming API Guide](https://docs.mezmo.com/aura/streaming-api-guide): SSE protocol, event types, and client handling.
 - [Request Lifecycle](https://docs.mezmo.com/aura/request-lifecycle): request flow, timeouts, cancellation, and shutdown.
-- [docs/rig-fork-changes.md](docs/rig-fork-changes.md): why AURA uses a Rig.rs fork, what changed, and tool execution ordering (important for `tool_event_broker.rs`).
+- [docs/rig-fork-changes.md](docs/rig-fork-changes.md): why AURA uses a Rig.rs fork, what changed, and tool execution ordering (important for the tool-call queue on `run_context.rs`).
 - [docs/adr/2026-07-29-release-channels.md](docs/adr/2026-07-29-release-channels.md) and [docs/design/release-channels.md](docs/design/release-channels.md): the `nightly` / `beta` / `main` release channels, what each publishes, and how a release is promoted.
 - [Tracing & Span Layout](https://docs.mezmo.com/aura/tracing-spans): OpenTelemetry span layout and trace parenting.

@@ -152,12 +152,12 @@ export AWS_REGION="your-region"       # For Knowledge Base
 - `provider_agent.rs` - Type-erased streaming across providers
 - `stream_events.rs` - Custom aura SSE events
 - `request_cancellation.rs` - Request lifecycle management
-- `tool_event_broker.rs` - FIFO queue for tool_call_id correlation (see critical assumption below)
+- `run_context.rs` - The run a task is working on: its event channel, and the FIFO queue for tool_call_id correlation (see critical assumption below)
 - `orchestration/` - Multi-agent coordinator, workers, DAG execution, orchestration SSE events
 
 ### Critical Assumption: Rig Sequential Tool Execution
 
-The `tool_event_broker` uses a FIFO queue for correlating `tool_call_id` between hook and MCP execution contexts. **This relies on Rig 0.28 streaming mode executing tools sequentially.**
+`RunContext` holds a FIFO queue for correlating `tool_call_id` between hook and MCP execution contexts. **This relies on Rig 0.28 streaming mode executing tools sequentially.**
 
 **If upgrading Rig**, verify this assumption by reviewing:
 - `rig-core/src/agent/prompt_request/streaming.rs`

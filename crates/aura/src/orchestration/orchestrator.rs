@@ -625,11 +625,7 @@ impl Orchestrator {
             .filter(|hitl| hitl.park_enabled)
             .and_then(|hitl| match &*hitl.route {
                 crate::hitl::DecisionRoute::Conversational { registry, .. } => {
-                    Some(ParkGuard::new(
-                        registry.clone(),
-                        run_id_str.clone(),
-                        agent_config.request_id.clone().unwrap_or_default(),
-                    ))
+                    Some(ParkGuard::new(registry.clone(), run_id_str.clone()))
                 }
                 crate::hitl::DecisionRoute::Webhook { .. } => None,
             });
@@ -1076,6 +1072,11 @@ impl Orchestrator {
         let (provider_agent, model_name) = self.build_worker_provider_agent(&worker_config).await?;
 
         let agent = Agent {
+            // A worker's gate and approval tool captured their run when
+            // `create_worker` built them, inside that run, so there is nothing
+            // for `stream` to bind.
+            hitl_gate: None,
+            hitl_approval_tool: None,
             inner: provider_agent,
             model: model_name,
             max_depth: resolved_depth,
@@ -1167,14 +1168,14 @@ impl Orchestrator {
             return;
         };
         let scope = self.worker_scope(task_id, worker_name).await;
-        let request_id = self.agent_config.request_id.clone().unwrap_or_default();
         for call in pending {
             registry.remove(&call.decision_id).await;
             if let Some(ref scope) = scope {
-                let _ = crate::agent_events::emit(
-                    &request_id,
-                    crate::hitl::completed_cancelled_event(call.decision_id, scope, Duration::ZERO),
-                )
+                crate::run_context::emit(crate::hitl::completed_cancelled_event(
+                    call.decision_id,
+                    scope,
+                    Duration::ZERO,
+                ))
                 .await;
             }
             tracing::warn!(
@@ -2690,6 +2691,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
         Ok(AgentWithPreamble {
             agent: Agent {
+                hitl_gate: None,
+                hitl_approval_tool: None,
                 inner: provider_agent,
                 model: model_name,
                 max_depth,
@@ -5292,8 +5295,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         let crate::hitl::DecisionRoute::Conversational { registry, .. } = &*hitl.route else {
             return;
         };
-        let request_id = self.agent_config.request_id.clone().unwrap_or_default();
-        super::park::cancel_run_approvals(registry, run_id, &request_id)
+        super::park::cancel_run_approvals(registry, run_id, crate::run_context::current_run())
             .await
             .ok();
     }
@@ -7440,7 +7442,7 @@ mod tests {
         use crate::session_store::{InMemoryApprovalStore, InMemoryEventBus};
 
         let request_id = format!("req_cancel_{}", uuid::Uuid::new_v4().simple());
-        let mut events = crate::approval_event_broker::subscribe(&request_id).await;
+        let (run, mut events) = crate::run_context::RunContext::channel(request_id.as_str());
 
         let store: Arc<dyn crate::session_store::ApprovalStore> =
             Arc::new(InMemoryApprovalStore::new());
@@ -7496,9 +7498,12 @@ mod tests {
             });
         }
 
-        orchestrator
-            .cancel_parked_approvals(3, Some("operations"), &pending)
-            .await;
+        // The orchestrator emits through the ambient run, as its own body does.
+        crate::run_context::with_run(
+            run,
+            orchestrator.cancel_parked_approvals(3, Some("operations"), &pending),
+        )
+        .await;
 
         for call in &pending {
             assert!(
@@ -7508,10 +7513,11 @@ mod tests {
             );
         }
         for expected in &pending {
-            match tokio::time::timeout(Duration::from_secs(1), events.recv()).await {
-                Ok(Some(crate::approval_event_broker::ApprovalLifecycleEvent::Completed(
-                    completed,
-                ))) => {
+            match tokio::time::timeout(Duration::from_secs(1), events.recv())
+                .await
+                .map(|event| event.map(|event| event.payload))
+            {
+                Ok(Some(aura_events::agent::AgentEventPayload::ApprovalCompleted(completed))) => {
                     assert_eq!(completed.decision_id, expected.decision_id.to_string());
                     assert!(matches!(
                         completed.outcome,
@@ -7521,8 +7527,6 @@ mod tests {
                 other => panic!("expected Completed(cancelled) event, got {other:?}"),
             }
         }
-
-        crate::approval_event_broker::unsubscribe(&request_id).await;
     }
 
     // ====================================================================
@@ -7822,8 +7826,10 @@ mod tests {
             .request_id
             .clone()
             .unwrap_or_default();
-        let mut events = crate::approval_event_broker::subscribe(&request_id).await;
-        arm_guard(&orchestrator, &plan).await;
+        let (run, mut events) = crate::run_context::RunContext::channel(request_id.as_str());
+        // Arming inside the scope is what gives the guard the run its drop
+        // sweep reports to.
+        crate::run_context::with_run(Arc::clone(&run), arm_guard(&orchestrator, &plan)).await;
 
         // A read-only session root makes the checkpoint write fail.
         let session_root = dir.path().join("park-sess");
@@ -7831,8 +7837,9 @@ mod tests {
 
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(32);
         let chat_history = vec![rig::completion::Message::user("deploy the service")];
-        let result = orchestrator
-            .park_run(
+        let result = crate::run_context::with_run(
+            Arc::clone(&run),
+            orchestrator.park_run(
                 "deploy the service",
                 &chat_history,
                 &[],
@@ -7843,8 +7850,9 @@ mod tests {
                 &plan,
                 &records,
                 &event_tx,
-            )
-            .await;
+            ),
+        )
+        .await;
 
         set_mode(&session_root, 0o755);
 
@@ -7879,10 +7887,11 @@ mod tests {
 
         // One completed(cancelled) per decision from the immediate sweep…
         for _ in &pending {
-            match tokio::time::timeout(Duration::from_secs(1), events.recv()).await {
-                Ok(Some(crate::approval_event_broker::ApprovalLifecycleEvent::Completed(
-                    completed,
-                ))) => {
+            match tokio::time::timeout(Duration::from_secs(1), events.recv())
+                .await
+                .map(|event| event.map(|event| event.payload))
+            {
+                Ok(Some(aura_events::agent::AgentEventPayload::ApprovalCompleted(completed))) => {
                     assert!(matches!(
                         completed.outcome,
                         aura_events::ApprovalOutcomeWire::Cancelled { .. }
@@ -7900,8 +7909,6 @@ mod tests {
                 .is_err(),
             "the drop sweep does not double-report cancelled approvals"
         );
-
-        crate::approval_event_broker::unsubscribe(&request_id).await;
     }
 
     #[tokio::test]
@@ -7914,7 +7921,7 @@ mod tests {
             .request_id
             .clone()
             .unwrap_or_default();
-        let mut events = crate::approval_event_broker::subscribe(&request_id).await;
+        let (run, mut events) = crate::run_context::RunContext::channel(request_id.as_str());
 
         // The human decides the first call before the commit is attempted.
         let decided = pending[0].decision_id;
@@ -7924,7 +7931,7 @@ mod tests {
             .await
             .unwrap();
 
-        arm_guard(&orchestrator, &plan).await;
+        crate::run_context::with_run(Arc::clone(&run), arm_guard(&orchestrator, &plan)).await;
 
         // A read-only session root makes the checkpoint write fail.
         let session_root = dir.path().join("park-sess");
@@ -7932,8 +7939,9 @@ mod tests {
 
         let (event_tx, _event_rx) = tokio::sync::mpsc::channel(32);
         let chat_history = vec![rig::completion::Message::user("deploy the service")];
-        let result = orchestrator
-            .park_run(
+        let result = crate::run_context::with_run(
+            Arc::clone(&run),
+            orchestrator.park_run(
                 "deploy the service",
                 &chat_history,
                 &[],
@@ -7944,8 +7952,9 @@ mod tests {
                 &plan,
                 &records,
                 &event_tx,
-            )
-            .await;
+            ),
+        )
+        .await;
 
         set_mode(&session_root, 0o755);
 
@@ -7962,10 +7971,11 @@ mod tests {
 
         // Exactly one cancelled event — the sibling's; the decided
         // approval stays silent.
-        match tokio::time::timeout(Duration::from_secs(1), events.recv()).await {
-            Ok(Some(crate::approval_event_broker::ApprovalLifecycleEvent::Completed(
-                completed,
-            ))) => {
+        match tokio::time::timeout(Duration::from_secs(1), events.recv())
+            .await
+            .map(|event| event.map(|event| event.payload))
+        {
+            Ok(Some(aura_events::agent::AgentEventPayload::ApprovalCompleted(completed))) => {
                 assert_eq!(completed.decision_id, sibling.to_string());
                 assert!(matches!(
                     completed.outcome,
@@ -7989,8 +7999,6 @@ mod tests {
             registry.recorded_decision(&decided).await.is_some(),
             "the recorded decision survives the guard's drop"
         );
-
-        crate::approval_event_broker::unsubscribe(&request_id).await;
     }
 
     #[tokio::test]
@@ -8005,13 +8013,14 @@ mod tests {
             .request_id
             .clone()
             .unwrap_or_default();
-        let mut events = crate::approval_event_broker::subscribe(&request_id).await;
-        arm_guard(&orchestrator, &plan).await;
+        let (run, mut events) = crate::run_context::RunContext::channel(request_id.as_str());
+        crate::run_context::with_run(Arc::clone(&run), arm_guard(&orchestrator, &plan)).await;
 
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(32);
         let chat_history = vec![rig::completion::Message::user("deploy the service")];
-        let result = orchestrator
-            .park_run(
+        let result = crate::run_context::with_run(
+            Arc::clone(&run),
+            orchestrator.park_run(
                 "deploy the service",
                 &chat_history,
                 &[],
@@ -8022,8 +8031,9 @@ mod tests {
                 &plan,
                 &records,
                 &event_tx,
-            )
-            .await;
+            ),
+        )
+        .await;
 
         let err = result.expect_err("the store fault must fail the commit");
         assert!(
@@ -8056,10 +8066,11 @@ mod tests {
 
         // One completed(cancelled) per decision from the immediate sweep…
         for _ in &pending {
-            match tokio::time::timeout(Duration::from_secs(1), events.recv()).await {
-                Ok(Some(crate::approval_event_broker::ApprovalLifecycleEvent::Completed(
-                    completed,
-                ))) => {
+            match tokio::time::timeout(Duration::from_secs(1), events.recv())
+                .await
+                .map(|event| event.map(|event| event.payload))
+            {
+                Ok(Some(aura_events::agent::AgentEventPayload::ApprovalCompleted(completed))) => {
                     assert!(matches!(
                         completed.outcome,
                         aura_events::ApprovalOutcomeWire::Cancelled { .. }
@@ -8077,8 +8088,6 @@ mod tests {
                 .is_err(),
             "the drop sweep does not double-report cancelled approvals"
         );
-
-        crate::approval_event_broker::unsubscribe(&request_id).await;
     }
 
     // ====================================================================
@@ -8184,9 +8193,7 @@ mod tests {
     async fn assert_orphaned(
         result: Result<TaskOutcome, StreamError>,
         store: &Arc<crate::session_store::InMemoryApprovalStore>,
-        events: &mut tokio::sync::mpsc::Receiver<
-            crate::approval_event_broker::ApprovalLifecycleEvent,
-        >,
+        events: &mut tokio::sync::mpsc::Receiver<aura_events::agent::AgentEvent>,
         expected_events: usize,
         underlying: &str,
     ) {
@@ -8206,10 +8213,11 @@ mod tests {
 
         let mut decision_ids = Vec::new();
         while decision_ids.len() < expected_events {
-            match tokio::time::timeout(Duration::from_secs(1), events.recv()).await {
-                Ok(Some(crate::approval_event_broker::ApprovalLifecycleEvent::Completed(
-                    completed,
-                ))) => {
+            match tokio::time::timeout(Duration::from_secs(1), events.recv())
+                .await
+                .map(|event| event.map(|event| event.payload))
+            {
+                Ok(Some(aura_events::agent::AgentEventPayload::ApprovalCompleted(completed))) => {
                     assert!(matches!(
                         completed.outcome,
                         aura_events::ApprovalOutcomeWire::Cancelled { .. }
@@ -8217,7 +8225,7 @@ mod tests {
                     decision_ids.push(completed.decision_id);
                 }
                 // The park arm's Requested/Pending pair precedes the sweep's
-                // Completed events on the same broker.
+                // Completed events on the same channel.
                 Ok(Some(_)) => continue,
                 other => panic!("expected completed(cancelled), got {other:?}"),
             }
@@ -8252,7 +8260,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (orchestrator, store, _registry, request_id) =
             override_park_orchestrator(dir.path(), 1).await;
-        let mut events = crate::approval_event_broker::subscribe(&request_id).await;
+        let (run, mut events) = crate::run_context::RunContext::channel(request_id.as_str());
 
         // Depth 1 gives the loop three turns (the rig's +1 safety net), so
         // the gated call must land on the third: the first two turns burn
@@ -8287,17 +8295,19 @@ mod tests {
             worker_name: Some("operations"),
         };
         let (event_tx, _event_rx) = tokio::sync::mpsc::channel(32);
-        let result = orchestrator
-            .execute_task(0, &params, Some(&event_tx), None, None)
-            .await;
+        // The orchestrator's own body runs inside the run; these call it
+        // directly, so the scope is established here instead.
+        let result = crate::run_context::with_run(
+            Arc::clone(&run),
+            orchestrator.execute_task(0, &params, Some(&event_tx), None, None),
+        )
+        .await;
 
         assert_orphaned(result, &store, &mut events, 1, "MaxDepthError").await;
         assert!(
             gated_invocations.lock().unwrap().is_empty(),
             "the parked call must never have reached the inner tool"
         );
-
-        crate::approval_event_broker::unsubscribe(&request_id).await;
     }
 
     /// Provider stream error: the scripted turn issues the gated call and
@@ -8309,7 +8319,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (orchestrator, store, _registry, request_id) =
             override_park_orchestrator(dir.path(), 4).await;
-        let mut events = crate::approval_event_broker::subscribe(&request_id).await;
+        let (run, mut events) = crate::run_context::RunContext::channel(request_id.as_str());
 
         let (_model, gated_invocations) =
             gated_worker_override(vec![ScriptedTurn::tool_calls_then_stream_failure(vec![
@@ -8329,9 +8339,13 @@ mod tests {
             worker_name: Some("operations"),
         };
         let (event_tx, _event_rx) = tokio::sync::mpsc::channel(32);
-        let result = orchestrator
-            .execute_task(0, &params, Some(&event_tx), None, None)
-            .await;
+        // The orchestrator's own body runs inside the run; these call it
+        // directly, so the scope is established here instead.
+        let result = crate::run_context::with_run(
+            Arc::clone(&run),
+            orchestrator.execute_task(0, &params, Some(&event_tx), None, None),
+        )
+        .await;
 
         assert_orphaned(
             result,
@@ -8345,8 +8359,6 @@ mod tests {
             gated_invocations.lock().unwrap().is_empty(),
             "the parked call must never have reached the inner tool"
         );
-
-        crate::approval_event_broker::unsubscribe(&request_id).await;
     }
 
     // ====================================================================

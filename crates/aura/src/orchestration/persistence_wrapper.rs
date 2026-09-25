@@ -1422,7 +1422,6 @@ mod tests {
     /// cleaned args) and return the production-built parked `ApprovalItem`
     /// plus the args the inner tool executed with.
     async fn run_config_gate_tool(reasoning: Option<&str>) -> (ApprovalItem, Value) {
-        use crate::approval_event_broker::{self, ApprovalLifecycleEvent};
         use crate::hitl::{
             AgentScope, ApprovalDecision, DecisionId, DecisionRoute, HitlApprovalWrapper,
             PendingApprovals,
@@ -1432,6 +1431,7 @@ mod tests {
             ApprovalStore, EventBus, InMemoryApprovalStore, InMemoryEventBus,
         };
         use crate::tool_wrapper::{ComposedWrapper, ToolCallContext, ToolWrapper, WrappedTool};
+        use aura_events::agent::AgentEventPayload;
 
         let store: Arc<dyn ApprovalStore> = Arc::new(InMemoryApprovalStore::new());
         let bus: Arc<dyn EventBus> = Arc::new(InMemoryEventBus::new());
@@ -1451,7 +1451,7 @@ mod tests {
 
         let request_id = format!("req_w2_{}", uuid::Uuid::new_v4().simple());
 
-        let gate: Arc<dyn ToolWrapper> = Arc::new(HitlApprovalWrapper::new(
+        let gate = Arc::new(HitlApprovalWrapper::new(
             Arc::from(["kubectl_*".into()]),
             route,
             scope,
@@ -1459,6 +1459,11 @@ mod tests {
             "test-agent".to_string(),
             "test-instance-id".to_string(),
         ));
+        // `WrappedTool` runs `pre_call` in its own task, which no scope
+        // crosses, so the gate is bound the way `stream` binds it.
+        let (run, mut rx) = crate::run_context::RunContext::channel(request_id.as_str());
+        gate.bind_run(run);
+        let gate: Arc<dyn ToolWrapper> = gate;
         let persistence: Arc<dyn ToolWrapper> = Arc::new(test_wrapper(Arc::new(Mutex::new(
             ExecutionPersistence::disabled(),
         ))));
@@ -1474,9 +1479,6 @@ mod tests {
                 ToolCallContext::new(tool_name).with_task_context(2, initiator.clone(), 1)
             });
 
-        // Subscribe before the spawn so the Requested event is not missed.
-        let mut rx = approval_event_broker::subscribe(&request_id).await;
-
         let mut args = serde_json::json!({
             "namespace": "prod",
             "resource": "deploy/web"
@@ -1491,11 +1493,11 @@ mod tests {
             .await
             .expect("requested event should arrive")
             .expect("event channel open");
-        let decision_id = match event {
-            ApprovalLifecycleEvent::Requested(req) => {
+        let decision_id = match event.payload {
+            AgentEventPayload::ApprovalRequested(req) => {
                 DecisionId::parse(&req.decision_id).expect("valid decision id")
             }
-            other => panic!("expected Requested event, got {:?}", other),
+            other => panic!("expected Requested event, got {other:?}"),
         };
 
         let parked = store
@@ -1519,8 +1521,6 @@ mod tests {
             .unwrap()
             .take()
             .expect("inner tool was called");
-
-        approval_event_broker::unsubscribe(&request_id).await;
 
         (item, executed)
     }

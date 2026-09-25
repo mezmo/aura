@@ -5,8 +5,6 @@
 //! in web services or other applications that need to build agents
 //! programmatically.
 
-pub mod agent_events;
-pub mod approval_event_broker;
 pub mod approver_headers;
 pub mod bedrock_embedding;
 pub mod builder;
@@ -94,10 +92,6 @@ pub type AuraToolCall = provider_agent::ToolCall;
 #[deprecated(since = "1.2.0", note = "use ToolResult instead")]
 pub type AuraToolResult = provider_agent::ToolResult;
 
-pub use approval_event_broker::{
-    ApprovalEventBroker, ApprovalLifecycleEvent, subscribe as approval_event_subscribe,
-    unsubscribe as approval_event_unsubscribe,
-};
 pub use aura_events::{TokenUsage, ToolCallId, ToolName};
 pub use mcp::{InFlightRequests, McpManager, ProgressEnabledHandler};
 pub use rag_tools::{AutoIngest, VectorIngestTool};
