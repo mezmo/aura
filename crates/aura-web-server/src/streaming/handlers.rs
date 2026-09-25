@@ -1435,6 +1435,7 @@ fn handle_orchestrator_event(
             OrchestrationStreamEvent::tool_call_completed(
                 *task_id,
                 tool_call_id.as_ref(),
+                worker_id.as_str(),
                 success,
                 *duration_ms,
                 maybe_truncate(result, config.tool_result_max_length),
@@ -1654,6 +1655,62 @@ mod tests {
     /// An MCP server's error reaches `handle_tool_result` with the prefix
     /// `aura::mcp::response` applies, and must be reported as a failure rather
     /// than a successful result carrying the error text.
+    /// Both halves of a worker's tool call must name that worker in the frame
+    /// the client reads. The envelope alone is not enough: `event_context`
+    /// comes from the turn, so only an explicit `worker_id` reaches the wire.
+    #[test]
+    fn orchestration_tool_frames_carry_the_worker_id() {
+        use aura_events::agent::{AgentEvent, AgentEventPayload, ToolOutcome};
+
+        let config = StreamConfig::new(true, false, ToolResultMode::None, 0);
+        let ctx = TurnContext {
+            completion_id: "test-123".to_string(),
+            model_str: "gpt-4".to_string(),
+            created_timestamp: 1234567890,
+            max_tokens: None,
+            agent_context: AgentContext::single_agent(),
+            correlation: CorrelationContext::new("test-session", None),
+        };
+        let worker = aura_events::AgentContext::worker("log-analyst", None, "coordinator");
+
+        let started = AgentEvent::new(
+            worker.clone(),
+            AgentEventPayload::ToolStart {
+                task_id: Some(0),
+                tool_call_id: "call_1".into(),
+                tool_name: "search".into(),
+                arguments: None,
+                progress_token: None,
+            },
+        );
+        let completed = AgentEvent::new(
+            worker,
+            AgentEventPayload::ToolComplete {
+                task_id: Some(0),
+                tool_call_id: "call_1".into(),
+                tool_name: "search".into(),
+                duration_ms: 42,
+                outcome: ToolOutcome::Success {
+                    result: "ok".to_string(),
+                },
+            },
+        );
+
+        let render = |event| {
+            handle_orchestrator_event(&config, &ctx, &event)
+                .iter()
+                .filter_map(|b| std::str::from_utf8(b).ok().map(str::to_owned))
+                .collect::<String>()
+        };
+
+        for (label, frame) in [("start", render(started)), ("complete", render(completed))] {
+            assert!(
+                frame.contains(r#""worker_id":"log-analyst""#),
+                "the {label} frame must name the worker, got: {frame}"
+            );
+        }
+    }
+
     #[test]
     fn test_handle_tool_result_reports_mcp_error_as_failure() {
         let config = StreamConfig::new(true, false, ToolResultMode::Aura, 0);
