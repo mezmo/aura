@@ -27,7 +27,7 @@ peg::parser! {
         // 1 and 64 characters, per SPE-986.
         rule glob_match()      = wildcard() / class_match() / alt_match()
         rule glob_element()    = literal_char()* glob_match() (literal_char() / glob_match())*
-        rule literal_element() = literal_char()*<1,64>
+        rule literal_element() = literal_char()+
         rule element()         = glob_element() / literal_element()
 
         // These define the fully quallifed glob pattern supported in Aura config. The namespace
@@ -39,10 +39,19 @@ peg::parser! {
     }
 }
 
+/// Longest unbroken run of literal characters allowed anywhere in a pattern.
+pub const MAX_LITERAL_RUN: usize = 64;
+
 #[derive(Debug, thiserror::Error)]
 pub enum GlobPatternError {
     #[error("glob pattern failed to compile: {0}")]
     GlobsetError(#[from] globset::Error),
+
+    #[error(
+        "tool name pattern has a run of {found} literal characters ending at \
+         column {column}; the limit is {MAX_LITERAL_RUN}"
+    )]
+    LiteralRunTooLong { found: usize, column: usize },
 
     #[error(
         "invalid tool name pattern at column {}: expected a name character \
@@ -50,6 +59,33 @@ pub enum GlobPatternError {
         .0.location.column
     )]
     ParseError(#[from] peg::error::ParseError<peg::str::LineCol>),
+}
+
+/// Reject a literal run longer than [`MAX_LITERAL_RUN`].
+///
+/// The grammar bounds a pure-literal element but leaves the literal runs
+/// inside a glob element unbounded, so a single wildcard anywhere would
+/// otherwise lift the limit. Checking the source directly applies one rule to
+/// every run, and reports the length as the cause — which the grammar's
+/// character-class error cannot, since every character in an over-long run is
+/// itself legal.
+fn check_literal_runs(source: &str) -> Result<(), GlobPatternError> {
+    let is_literal = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '/' | '.');
+    let mut run = 0usize;
+    for (i, c) in source.char_indices() {
+        if is_literal(c) {
+            run += 1;
+            if run > MAX_LITERAL_RUN {
+                return Err(GlobPatternError::LiteralRunTooLong {
+                    found: run,
+                    column: i + 1,
+                });
+            }
+        } else {
+            run = 0;
+        }
+    }
+    Ok(())
 }
 
 /// A glob pattern matching MCP tool names, optionally namespace-qualified as
@@ -65,6 +101,7 @@ impl GlobPattern {
     /// Compile a glob pattern from its source text.
     pub fn new(source: impl Into<String>) -> Result<Self, GlobPatternError> {
         let source = source.into();
+        check_literal_runs(&source)?;
         let (parsed_ns, parsed_name) = glob_parser::fq_glob_pattern(&source)?;
         let ns_matcher = parsed_ns
             .map(Glob::new)
@@ -128,6 +165,11 @@ mod tests {
 
     #[test]
     fn test_glob_parser() {
+        // Shape only: length is not the grammar's to enforce, because a run
+        // can span a glob element the grammar cannot bound without losing the
+        // ability to say *why* it refused. `GlobPattern::new` owns the cap —
+        // see `literal_run_cap_applies_with_and_without_glob_constructs`.
+        let over_cap = "a".repeat(MAX_LITERAL_RUN + 1);
         let test_cases = [
             // literal tool names
             ("get_user", None, Some("get_user")),
@@ -142,7 +184,7 @@ mod tests {
             ("+user", None, None),
             ("us+er", None, None),
             ("us\\er", None, None),
-            (&"a".repeat(65), None, None),
+            (&over_cap, None, Some(&over_cap)),
             ("café", None, None),
             (" get_user", None, None),
             ("get_user ", None, None),
@@ -217,6 +259,58 @@ mod tests {
                 }
             };
         }
+    }
+
+    /// The cap binds on every literal run, not only on a pattern that happens
+    /// to contain no glob construct. A wildcard used to lift it entirely.
+    #[test]
+    fn literal_run_cap_applies_with_and_without_glob_constructs() {
+        let at_cap = "x".repeat(MAX_LITERAL_RUN);
+        let over = "x".repeat(MAX_LITERAL_RUN + 1);
+
+        assert!(
+            GlobPattern::new(&at_cap).is_ok(),
+            "the cap itself is allowed"
+        );
+        assert!(GlobPattern::new(format!("{at_cap}*")).is_ok());
+
+        for pattern in [
+            over.clone(),
+            format!("{over}*"),
+            format!("*{over}"),
+            format!("{over}:tool"),
+            format!("tool:{over}"),
+            format!("{at_cap}x*"),
+        ] {
+            assert!(
+                matches!(
+                    GlobPattern::new(&pattern),
+                    Err(GlobPatternError::LiteralRunTooLong { .. })
+                ),
+                "{pattern:.20}… must be refused for its literal run length"
+            );
+        }
+    }
+
+    /// A run broken by a glob construct starts over, so two legal runs either
+    /// side of a wildcard are fine even though their total exceeds the cap.
+    #[test]
+    fn literal_runs_are_measured_per_run_not_per_pattern() {
+        let half = "x".repeat(MAX_LITERAL_RUN);
+        assert!(GlobPattern::new(format!("{half}*{half}")).is_ok());
+    }
+
+    /// The message names the length, not the character set: every character
+    /// in an over-long run is itself legal, so blaming the class misdirects.
+    #[test]
+    fn literal_run_error_names_the_length() {
+        let err = GlobPattern::new("x".repeat(MAX_LITERAL_RUN + 1))
+            .expect_err("an over-long run is refused");
+        let message = err.to_string();
+        assert!(
+            message.contains("literal characters") && message.contains("limit is 64"),
+            "expected a length-based message, got: {message}"
+        );
     }
 
     #[test]
