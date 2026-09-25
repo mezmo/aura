@@ -284,6 +284,7 @@ fn tool_event_to_orchestrator_event(event: crate::tool_call_observer::ToolEvent)
         crate::tool_call_observer::ToolEvent::CallCompleted {
             tool_call_id,
             tool_name,
+            tool_initiator_id,
             result,
             duration_ms,
         } => {
@@ -292,13 +293,16 @@ fn tool_event_to_orchestrator_event(event: crate::tool_call_observer::ToolEvent)
                 crate::tool_call_observer::ToolOutcome::Success(content) => content,
                 crate::tool_call_observer::ToolOutcome::Error { message, .. } => message,
             };
-            by_coordinator(AgentEventPayload::ToolComplete {
-                task_id: extract_task_id(&tool_call_id),
-                tool_call_id: tool_call_id.into(),
-                tool_name: tool_name.into(),
-                duration_ms,
-                outcome: outcome_of(success, result_str),
-            })
+            by_worker(
+                &tool_initiator_id,
+                AgentEventPayload::ToolComplete {
+                    task_id: extract_task_id(&tool_call_id),
+                    tool_call_id: tool_call_id.into(),
+                    tool_name: tool_name.into(),
+                    duration_ms,
+                    outcome: outcome_of(success, result_str),
+                },
+            )
         }
     }
 }
@@ -5629,6 +5633,35 @@ mod tests {
                 .collect(),
             other => panic!("expected assistant message, got {other:?}"),
         }
+    }
+
+    /// A worker's tool call and its completion must name the same agent. The
+    /// envelope's agent id becomes the wire `worker_id`, so a completion
+    /// attributed to the coordinator splits the pair across two agents in the
+    /// client's view.
+    #[test]
+    fn tool_events_attribute_both_halves_to_the_initiating_worker() {
+        use crate::tool_call_observer::ToolEvent;
+
+        let started = tool_event_to_orchestrator_event(ToolEvent::call_started(
+            "task1_search_0",
+            "search",
+            "log-analyst",
+            serde_json::json!({}),
+        ));
+        let completed = tool_event_to_orchestrator_event(ToolEvent::call_completed_success(
+            "task1_search_0",
+            "search",
+            "log-analyst",
+            "result",
+            42,
+        ));
+
+        assert_eq!(started.agent.agent_id, "log-analyst");
+        assert_eq!(
+            completed.agent.agent_id, "log-analyst",
+            "the completion must name the worker, not the coordinator"
+        );
     }
 
     /// Blank assistant turns must be replayed as non-empty text so providers
