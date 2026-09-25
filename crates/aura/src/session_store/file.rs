@@ -11,7 +11,7 @@
 //! Store contract (park/reify §2.5):
 //!
 //! - `resolve` refuses past the approval's `expires_at`, uniformly with an
-//!   unknown id; expiry is enforced only by `resolve`.
+//!   unknown id.
 //! - `resolve` *moves* the approval into the decision file rather than deleting
 //!   it: `get` returns the approval before and after the decision, `decision`
 //!   returns the recorded decision, and both are retained until `remove`.
@@ -20,6 +20,11 @@
 //! - `cancel_request` removes undecided approvals by owner (request) id and
 //!   returns them; decided entries are retained until their consumer removes
 //!   them.
+//! - `list_pending` scans the undecided approvals for the poll reconciler:
+//!   corrupt files are warn-and-skipped per id, expired records are
+//!   unlinked, and an approval file left behind a complete decision file
+//!   is unlinked (one behind an undecodable decision file is kept, as the
+//!   only intact record).
 //!
 //! Decision ids are validated as UUIDs before path building, so none address
 //! outside the root.
@@ -83,8 +88,8 @@ impl FileApprovalStore {
     /// cannot hold files must fail at startup, not on the first approval.
     pub fn open(root: impl AsRef<Path>) -> Result<Self, SessionStoreError> {
         let root = root.as_ref();
-        fs::create_dir_all(root.join(APPROVALS_DIR)).map_err(connect_err)?;
-        fs::create_dir_all(root.join(DECISIONS_DIR)).map_err(connect_err)?;
+        private_dir(&root.join(APPROVALS_DIR)).map_err(connect_err)?;
+        private_dir(&root.join(DECISIONS_DIR)).map_err(connect_err)?;
         let inner = Arc::new(Inner {
             root: root.to_path_buf(),
             lock: Mutex::new(()),
@@ -128,7 +133,7 @@ impl Inner {
     fn probe_writable_sync(&self) -> io::Result<()> {
         for dir in [self.approvals_dir(), self.decisions_dir()] {
             let probe = dir.join(format!(".{}.probe", uuid::Uuid::new_v4()));
-            fs::write(&probe, b"")
+            write_private(&probe, b"")
                 .and_then(|()| fs::remove_file(&probe))
                 .map_err(|err| {
                     io::Error::new(err.kind(), format!("{} not writable: {err}", dir.display()))
@@ -191,7 +196,11 @@ impl Inner {
         .expect("resolved entry serializes to JSON");
 
         let decision_path = self.decision_path(&id);
-        let mut file = match fs::File::create_new(&decision_path) {
+        let mut file = match private_file()
+            .write(true)
+            .create_new(true)
+            .open(&decision_path)
+        {
             Ok(file) => file,
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
                 return Err(ResolveError::NotFound);
@@ -325,6 +334,81 @@ impl Inner {
         }
         Ok(cleared)
     }
+
+    fn list_pending_sync(&self) -> Result<Vec<ParkedApproval>, SessionStoreError> {
+        let _guard = self.lock();
+        let entries = match fs::read_dir(self.approvals_dir()) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) => return Err(request_err(err)),
+        };
+        let now = chrono::Utc::now();
+
+        let mut pending = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(request_err)?;
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                // A mid-publish temp file, never a stored approval.
+                continue;
+            }
+            let bytes = match fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(request_err(err)),
+            };
+            let parked = match decode_approval(&bytes) {
+                Ok(parked) => parked,
+                Err(err) => {
+                    tracing::warn!(
+                        path = %path.display(), error = %err,
+                        "undecodable approval file skipped by list_pending"
+                    );
+                    continue;
+                }
+            };
+            // resolve writes the decision before its best-effort approval
+            // unlink, so a decision file here marks an already-decided id:
+            // the reconciler must not re-poll it. A decision file that
+            // decodes as a complete entry makes the approval file residue
+            // (which carries the row's credentials), retried for removal on
+            // every scan until it is gone; a decision file that does not
+            // decode (a write interrupted before its sync) leaves the
+            // approval file in place as the only intact record.
+            let decision_path = self.decision_path(&parked.request.decision_id.to_string());
+            match fs::read(&decision_path) {
+                Ok(bytes) => {
+                    if serde_json::from_slice::<ResolvedEntry>(&bytes).is_ok() {
+                        if let Err(err) = fs::remove_file(&path)
+                            && err.kind() != io::ErrorKind::NotFound
+                        {
+                            tracing::warn!(
+                                path = %path.display(), error = %err,
+                                "decided approval file not removed by list_pending"
+                            );
+                        }
+                    } else {
+                        tracing::warn!(
+                            path = %decision_path.display(),
+                            "incomplete decision file; approval file kept for recovery"
+                        );
+                    }
+                    continue;
+                }
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => return Err(request_err(err)),
+            }
+            if parked.expires_at > now {
+                pending.push(parked);
+            } else if let Err(err) = fs::remove_file(&path) {
+                tracing::warn!(
+                    path = %path.display(), error = %err,
+                    "expired approval file not removed by list_pending"
+                );
+            }
+        }
+        Ok(pending)
+    }
 }
 
 #[async_trait]
@@ -385,6 +469,13 @@ impl ApprovalStore for FileApprovalStore {
             .await
             .map_err(join_err)?
     }
+
+    async fn list_pending(&self) -> Result<Vec<ParkedApproval>, SessionStoreError> {
+        let inner = Arc::clone(&self.inner);
+        spawn_blocking(move || inner.list_pending_sync())
+            .await
+            .map_err(join_err)?
+    }
 }
 
 /// Validate decision id as canonical UUID for path safety.
@@ -408,11 +499,53 @@ fn publish(path: &Path, payload: &[u8]) -> Result<(), SessionStoreError> {
         name.to_string_lossy(),
         uuid::Uuid::new_v4()
     ));
-    let written = fs::write(&tmp, payload).and_then(|()| fs::rename(&tmp, path));
+    let written = write_private(&tmp, payload).and_then(|()| fs::rename(&tmp, path));
     if let Err(err) = written {
         let _ = fs::remove_file(&tmp);
         return Err(request_err(err));
     }
+    Ok(())
+}
+
+/// Open options that create files readable by the owner only.
+fn private_file() -> fs::OpenOptions {
+    let mut options = fs::OpenOptions::new();
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    options
+}
+
+/// Write `payload` to a new or truncated owner-only file. A file that
+/// already exists at `path` is tightened to owner-only after truncation
+/// and before the payload is written, so a permissive leftover never
+/// holds new content.
+pub(crate) fn write_private(path: &Path, payload: &[u8]) -> io::Result<()> {
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut file = private_file()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)?;
+    #[cfg(unix)]
+    file.set_permissions(<fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600))?;
+    file.write_all(payload)
+}
+
+/// Create `path` and any missing parents as owner-only directories. A
+/// `path` that already exists is tightened to owner-only, so a directory
+/// created under a permissive umask by an earlier version stops exposing
+/// the records inside it the next time the store or park path opens.
+pub(crate) fn private_dir(path: &Path) -> io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder.create(path)?;
+    #[cfg(unix)]
+    fs::set_permissions(
+        path,
+        <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+    )?;
     Ok(())
 }
 
@@ -449,5 +582,43 @@ fn decode_err(reason: impl std::fmt::Display) -> SessionStoreError {
 fn join_err(err: JoinError) -> SessionStoreError {
     SessionStoreError::Request {
         reason: format!("file store task failed: {err}"),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod private_mode_tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::{private_dir, write_private};
+
+    fn mode_of(path: &std::path::Path) -> u32 {
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn private_dir_tightens_an_existing_permissive_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("approvals");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(mode_of(&target), 0o755, "fixture is permissive");
+
+        private_dir(&target).unwrap();
+
+        assert_eq!(mode_of(&target), 0o700);
+    }
+
+    #[test]
+    fn write_private_tightens_a_permissive_leftover_before_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join(".leftover.tmp");
+        std::fs::write(&target, b"stale").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(mode_of(&target), 0o644, "fixture is permissive");
+
+        write_private(&target, b"fresh").unwrap();
+
+        assert_eq!(mode_of(&target), 0o600);
+        assert_eq!(std::fs::read(&target).unwrap(), b"fresh");
     }
 }
