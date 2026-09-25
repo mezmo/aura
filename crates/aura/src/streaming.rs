@@ -33,7 +33,8 @@
 //! }
 //! ```
 
-use crate::provider_agent::{StreamError, StreamItem};
+use crate::provider_agent::{StreamError, StreamItem, StreamedAssistantContent};
+use crate::run_context::RunContext;
 use crate::streaming_request_hook::UsageState;
 use async_trait::async_trait;
 use futures::stream::BoxStream;
@@ -168,6 +169,63 @@ impl AgentRun {
             _guard: self.guard,
             inner: self.events,
         })
+    }
+}
+
+/// Copies a run's content onto its event stream as the items pass, so an
+/// observer of the run sees what an agent is saying and not only what it is
+/// doing.
+///
+/// The `StreamItem` stream stays the content path every consumer reads; this
+/// puts the same content where a consumer built on the run's events can reach
+/// it, without changing what the existing ones see. The run is passed rather
+/// than read from scope because this wraps the stream from outside it.
+pub fn tee_content<S>(
+    run: std::sync::Arc<RunContext>,
+    inner: S,
+) -> impl futures::Stream<Item = Result<StreamItem, StreamError>>
+where
+    S: futures::Stream<Item = Result<StreamItem, StreamError>>,
+{
+    async_stream::stream! {
+        for await item in inner {
+            if let Ok(item) = &item
+                && let Some(payload) = content_of(item)
+            {
+                run.emit(aura_events::agent::AgentEvent::single_agent(payload)).await;
+            }
+            yield item;
+        }
+    }
+}
+
+/// The content an item carries, or `None` for an item that carries none. Tool
+/// lifecycle and progress reach the run from their producers instead, so an
+/// item that only marks them has nothing to copy.
+fn content_of(item: &StreamItem) -> Option<aura_events::agent::AgentEventPayload> {
+    use aura_events::agent::AgentEventPayload as Payload;
+
+    match item {
+        StreamItem::StreamAssistantItem(StreamedAssistantContent::Text(content)) => {
+            Some(Payload::TextDelta {
+                content: content.clone(),
+            })
+        }
+        StreamItem::StreamAssistantItem(StreamedAssistantContent::ReasoningDelta {
+            delta, ..
+        }) => Some(Payload::Reasoning {
+            content: delta.clone(),
+            task_id: None,
+        }),
+        StreamItem::Final(final_response) => Some(Payload::Completed {
+            content: final_response.content.clone(),
+            usage: aura_events::TokenUsage {
+                prompt_tokens: aura_events::TokenCount::new(final_response.usage.input_tokens),
+                completion_tokens: aura_events::TokenCount::new(final_response.usage.output_tokens),
+                total_tokens: aura_events::TokenCount::new(final_response.usage.total_tokens),
+            },
+        }),
+        _ => None,
     }
 }
 
@@ -384,6 +442,98 @@ mod tests {
 
         shared.cancel();
         assert!(run_token.is_cancelled());
+    }
+
+    mod content {
+        use super::*;
+        use crate::provider_agent::FinalResponseInfo;
+        use aura_events::agent::AgentEventPayload as Payload;
+
+        fn say(content: &str) -> Result<StreamItem, StreamError> {
+            Ok(StreamItem::StreamAssistantItem(
+                StreamedAssistantContent::Text(content.to_string()),
+            ))
+        }
+
+        fn finish(content: &str) -> Result<StreamItem, StreamError> {
+            Ok(StreamItem::Final(FinalResponseInfo {
+                content: content.to_string(),
+                usage: rig::completion::Usage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    total_tokens: 15,
+                },
+                cache_usage: None,
+            }))
+        }
+
+        async fn teed(items: Vec<Result<StreamItem, StreamError>>) -> (usize, Vec<Payload>) {
+            let (run, mut events) = RunContext::channel("run_tee");
+            let passed = tee_content(run, futures::stream::iter(items))
+                .collect::<Vec<_>>()
+                .await
+                .len();
+
+            let mut seen = Vec::new();
+            while let Ok(event) = events.try_recv() {
+                seen.push(event.payload);
+            }
+            (passed, seen)
+        }
+
+        /// The items still reach the consumer that reads them today; the copy is
+        /// additional, not a diversion.
+        #[tokio::test]
+        async fn every_item_still_passes_through() {
+            let (passed, _) = teed(vec![say("a"), say("b"), finish("ab")]).await;
+            assert_eq!(passed, 3);
+        }
+
+        #[tokio::test]
+        async fn text_reaches_the_run_in_order() {
+            let (_, seen) = teed(vec![say("Hello "), say("world")]).await;
+
+            let deltas: Vec<_> = seen
+                .iter()
+                .filter_map(|payload| match payload {
+                    Payload::TextDelta { content } => Some(content.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(deltas, vec!["Hello ", "world"]);
+        }
+
+        /// The final item carries the whole answer and its billed usage, which is
+        /// what an observer needs to close out a run it only watched.
+        #[tokio::test]
+        async fn the_final_item_reaches_the_run_as_a_completed_run() {
+            let (_, seen) = teed(vec![say("hi"), finish("hi there")]).await;
+
+            let completed = seen
+                .iter()
+                .find_map(|payload| match payload {
+                    Payload::Completed { content, usage } => {
+                        Some((content.as_str(), usage.total_tokens.get()))
+                    }
+                    _ => None,
+                })
+                .expect("a completed run");
+            assert_eq!(completed, ("hi there", 15));
+        }
+
+        /// A run nobody observes has dropped its receiver, so the copy fails and
+        /// the items must still pass.
+        #[tokio::test]
+        async fn an_unobserved_run_still_streams_its_items() {
+            let (run, events) = RunContext::channel("run_unobserved");
+            drop(events);
+
+            let passed = tee_content(run, futures::stream::iter(vec![say("a"), finish("a")]))
+                .collect::<Vec<_>>()
+                .await
+                .len();
+            assert_eq!(passed, 2);
+        }
     }
 
     /// Decorating the stream must not drop the guard along the way.

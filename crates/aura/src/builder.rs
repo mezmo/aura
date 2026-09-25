@@ -1737,7 +1737,12 @@ impl StreamingAgent for Agent {
         };
 
         started
-            .map_stream(move |stream| Box::pin(crate::run_context::scope_stream(run, stream)))
+            .map_stream(move |stream| {
+                Box::pin(crate::run_context::scope_stream(
+                    std::sync::Arc::clone(&run),
+                    Box::pin(crate::streaming::tee_content(run, stream)),
+                ))
+            })
             .observed_by(run_events)
     }
 
