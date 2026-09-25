@@ -63,29 +63,47 @@ pub enum GlobPatternError {
 
 /// Reject a literal run longer than [`MAX_LITERAL_RUN`].
 ///
-/// The grammar bounds a pure-literal element but leaves the literal runs
-/// inside a glob element unbounded, so a single wildcard anywhere would
-/// otherwise lift the limit. Checking the source directly applies one rule to
-/// every run, and reports the length as the cause — which the grammar's
-/// character-class error cannot, since every character in an over-long run is
-/// itself legal.
+/// Length is measured here rather than in the grammar because a run may span
+/// a glob element, and because peg can only report which characters it
+/// expected — never that a run grew too long, since every character in an
+/// over-long run is itself legal.
+///
+/// A bracket class counts as one character however many it lists, matching
+/// what it accepts. Wildcards, alternate boundaries, and the namespace
+/// separator all end a run, so each run is measured on its own.
 fn check_literal_runs(source: &str) -> Result<(), GlobPatternError> {
     let is_literal = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '/' | '.');
+
+    // (length, column of the run's last character)
+    let mut runs: Vec<(usize, usize)> = Vec::new();
     let mut run = 0usize;
-    for (i, c) in source.char_indices() {
+    let mut end = 0usize;
+    let mut chars = source.char_indices();
+
+    while let Some((i, c)) = chars.next() {
         if is_literal(c) {
             run += 1;
-            if run > MAX_LITERAL_RUN {
-                return Err(GlobPatternError::LiteralRunTooLong {
-                    found: run,
-                    column: i + 1,
-                });
+            end = i + 1;
+        } else if c == '[' {
+            run += 1;
+            end = i + 1;
+            for (j, d) in chars.by_ref() {
+                end = j + 1;
+                if d == ']' {
+                    break;
+                }
             }
         } else {
+            runs.push((run, end));
             run = 0;
         }
     }
-    Ok(())
+    runs.push((run, end));
+
+    match runs.iter().find(|(len, _)| *len > MAX_LITERAL_RUN) {
+        Some(&(found, column)) => Err(GlobPatternError::LiteralRunTooLong { found, column }),
+        None => Ok(()),
+    }
 }
 
 /// A glob pattern matching MCP tool names, optionally namespace-qualified as
@@ -261,8 +279,8 @@ mod tests {
         }
     }
 
-    /// The cap binds on every literal run, not only on a pattern that happens
-    /// to contain no glob construct. A wildcard used to lift it entirely.
+    /// The cap binds on every literal run, whatever glob constructs surround
+    /// it — not only on a pattern that contains none.
     #[test]
     fn literal_run_cap_applies_with_and_without_glob_constructs() {
         let at_cap = "x".repeat(MAX_LITERAL_RUN);
@@ -302,15 +320,33 @@ mod tests {
 
     /// The message names the length, not the character set: every character
     /// in an over-long run is itself legal, so blaming the class misdirects.
+    /// It reports the run's full length, so the reader knows how much to cut.
     #[test]
-    fn literal_run_error_names_the_length() {
-        let err = GlobPattern::new("x".repeat(MAX_LITERAL_RUN + 1))
-            .expect_err("an over-long run is refused");
+    fn literal_run_error_names_the_full_length() {
+        let err = GlobPattern::new("x".repeat(100)).expect_err("an over-long run is refused");
         let message = err.to_string();
         assert!(
-            message.contains("literal characters") && message.contains("limit is 64"),
-            "expected a length-based message, got: {message}"
+            message.contains("100 literal characters") && message.contains("limit is 64"),
+            "expected the full run length, got: {message}"
         );
+    }
+
+    /// A bracket class matches exactly one character however many it lists,
+    /// so its contents are not a literal run.
+    #[test]
+    fn a_long_character_class_is_not_a_literal_run() {
+        let wide = format!("[{}]", "abcdefghijklmnopqrstuvwxyz".repeat(3));
+        assert!(
+            GlobPattern::new(&wide).is_ok(),
+            "a class listing more than the cap still matches one character"
+        );
+        // It counts as the one character it matches, so a run around it is
+        // measured with the class included.
+        let padded = format!("{}{wide}", "x".repeat(MAX_LITERAL_RUN));
+        assert!(matches!(
+            GlobPattern::new(&padded),
+            Err(GlobPatternError::LiteralRunTooLong { found: 65, .. })
+        ));
     }
 
     #[test]
