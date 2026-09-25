@@ -368,3 +368,39 @@ response holds the claim, so later resumes answer 409 `running` with no
 expiry-based release (`check_claim` precedes the consult,
 evaluate.rs:677-683); (b) the substitution's `call_tool` executions run
 before the stream starts, outside `per_call_timeout`.
+
+## The A1 id-channel ruling (2026-09-25)
+
+The identifier discipline this module obeys (Mike's ruling; the outline of
+record's section 8): every identity is minted once at its origin or derived
+at the point of use, never copied into a field that serves a second purpose.
+The SSE phase checkpoint's round-1 BLOCKING came from violating that rule:
+`run_segment_borrowed` stamped the run-owner id over `config.request_id`,
+colliding the wire stamp with every request-scoped channel.
+
+The mapping under A1:
+
+| Surface | Key | Value |
+| --- | --- | --- |
+| Authorize POST body, `Worker` scope on `ParkArmed`/`Notify` | `request_id` | `run:{run_id}`, derived from `scope.run_id` inside `build_approval_post` |
+| Authorize POST body, `Hold` or `Single` | `request_id` | verbatim `request.request_id` (unchanged contract) |
+| Broker topics (Requested/Completed/Pending) | topic | the fresh `req_<uuid>` |
+| SSE side-channel subscriptions | key | the fresh `req_<uuid>` |
+| Parked row's stored request id | field | `run:{run_id}` (the 207 bridge's re-mint, unchanged) |
+| Store file keys | filename | `decision_id` |
+| Checkpoint path | path | `{memory_dir}/{session_id}/parked/{run_id}.json` |
+| Park-commit / initial-path guard sweeps | owner key | `run:{run_id}` derived from the run id |
+| Request-teardown sweep, MCP tracking/cancel | key | the fresh `req_<uuid>` |
+
+Priority rule on any conflict: the derivation wins — recompute `run:<id>`
+from the run id, never read it from config; `req_<uuid>` flows from the HTTP
+layer only, and durable records (parked rows, checkpoint, decision store)
+never key on it.
+
+Rebase note: the resume arm is `McpManager::set_current_request`
+(manager.rs; chat-path precedent factory.rs). Nightly's `f3bdbd61` (agent
+event schema) removed that setter in favor of an MCP `CallContext` the
+client holds (request + agent under one lock, events attributed to the
+request that named them). When this stack rebases onto current nightly, the
+`for_resume_segment` arm maps onto the `CallContext` seam: the resumed
+segment's MCP client context must carry the fresh request id.

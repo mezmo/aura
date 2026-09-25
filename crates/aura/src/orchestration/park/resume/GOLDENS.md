@@ -254,3 +254,31 @@ internals.
   the failed node; the failure-history line under the resumed
   iteration) are exact and carry the load; a stream-error failure
   faults the segment instead of soft-failing.
+
+## The A1 id-channel frames (2026-09-25)
+
+Nine frames pin Mike's A1 ruling (the DESIGN.md section of the same name).
+They arrived red (e40468c6, repaired e7cbae7b) and turned green with the
+fill (1ea05b70):
+
+- `a1_resumed_gate_requested_publishes_on_the_fresh_request_id_channel`
+  (goldens.rs): a resumed re-park's gate-entry `Requested` reaches the
+  broker subscriber keyed on the fresh request id. (`Completed` is
+  structurally suppressed on a pending 207 reply; its split is pinned at
+  the route level.)
+- `a1_reparked_row_keeps_the_run_owner_request_id` (goldens.rs): the
+  stored row keeps the bridge's run-owner re-mint.
+- `a1_resumed_segment_arms_and_closes_mcp_under_the_fresh_request_id`
+  (goldens.rs): an `ArmProbingTool` samples the manager's armed request id
+  at the first scripted tool's execution — a fill arming only inside
+  `close_segment_mcp` fails — and the close key is checked after
+  completion. Observation rides the `cfg(test)`-only
+  `mcp::manager::a1_observation` seam (records keyed by manager address).
+- `hitl::route::tests::a1_id_channel`: `park_armed_worker_ask_post_body_
+  names_the_run_owner` and `notify_leg_post_body_names_the_run_owner` pin
+  the derived wire stamp on both park-armed legs;
+  `single_agent_ask_post_body_keeps_the_fresh_request_id`,
+  `hold_ask_post_body_keeps_the_fresh_request_id_under_worker_scope`,
+  `single_scope_park_armed_ask_post_body_keeps_the_fresh_request_id`, and
+  `single_scope_notify_leg_post_body_keeps_the_fresh_request_id` pin the
+  ruling's boundaries (the mint is scope-gated AND mode-gated).
