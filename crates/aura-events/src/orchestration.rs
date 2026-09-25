@@ -495,11 +495,11 @@ mod tests {
         )
     }
 
-    /// A completion frame from a server that predates `worker_id` still
-    /// parses, with the worker empty. The enum is untagged, so without the
-    /// default the frame would fail to bind as `ToolCallCompleted`.
+    /// A completion frame without `worker_id` parses with an empty worker.
+    /// The enum is untagged, so the default lets the frame bind as
+    /// `ToolCallCompleted`.
     #[test]
-    fn tool_call_completed_without_worker_id_still_parses() {
+    fn tool_call_completed_without_worker_id_has_an_empty_worker() {
         let json = r#"{"task_id":0,"tool_call_id":"call_1","success":true,"duration_ms":42,"result":"ok","agent_id":"coordinator","session_id":"s1"}"#;
 
         let parsed: OrchestrationStreamEvent =
