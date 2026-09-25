@@ -768,7 +768,7 @@ impl McpManager {
     /// After calling this, all MCP clients become unusable until reinitialized.
     pub async fn cancel_and_close_all(&self, http_request_id: &str, reason: &str) -> usize {
         #[cfg(test)]
-        a1_observation::record_cancel_key(http_request_id);
+        a1_observation::record_cancel_key(self, http_request_id);
         let mut total_cancelled = 0;
 
         for (server_name, client) in &self.streamable_clients {
@@ -810,7 +810,7 @@ impl McpManager {
     /// Set the current HTTP request ID for cancellation tracking.
     pub async fn set_current_request(&self, http_request_id: &str) {
         #[cfg(test)]
-        a1_observation::record_armed(http_request_id);
+        a1_observation::record_armed(self, http_request_id);
         for client in self.streamable_clients.values() {
             client.set_current_request(http_request_id).await;
         }
@@ -1029,47 +1029,95 @@ impl Default for McpManager {
 }
 
 /// TEST-ONLY observation seam for the A1 id-channel split (aura#271, card
-/// P45; Mike's 2026-09-25 ruling): records the request ids the MCP arm
-/// ([`McpManager::set_current_request`]) and the all-servers close
-/// ([`McpManager::cancel_and_close_all`]) last ran under, so the resume
-/// goldens can pin that a resumed segment ARMS and CLOSES the manager
-/// under the config's FRESH request id — not the conflated run owner id
-/// the resume path's config overwrite used to stamp. Never compiled into
-/// production builds; the reexport discipline follows the S6 wave's
-/// test-only-reexport precedent (see `hitl/mod.rs`
-/// `webhook_client_from_config`).
+/// P45; Mike's 2026-09-25 ruling): records, PER MANAGER, the request ids
+/// the MCP arm ([`McpManager::set_current_request`]) and the all-servers
+/// close ([`McpManager::cancel_and_close_all`]) last ran under, so the
+/// resume goldens can pin that a resumed segment ARMS (before its first
+/// tool executes) and CLOSES the manager under the config's FRESH request
+/// id — not the conflated run owner id the resume path's config overwrite
+/// used to stamp.
+///
+/// Records are keyed by the recording manager's own identity, so
+/// concurrently-live managers never overwrite one another's observations
+/// (the readers correlate by request-id VALUE, which is unique to the
+/// driving frame); `reset()` clears the table before a frame drives the
+/// surface it pins. Never compiled into production builds; the reexport
+/// discipline follows the S6 wave's test-only-reexport precedent (see
+/// `hitl/mod.rs` `webhook_client_from_config`).
 #[cfg(test)]
 pub(crate) mod a1_observation {
-    use std::sync::Mutex;
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, Mutex};
 
-    static LAST_ARMED: Mutex<Option<String>> = Mutex::new(None);
-    static LAST_CANCEL_KEY: Mutex<Option<String>> = Mutex::new(None);
+    use super::McpManager;
 
-    /// Clear both records before a frame drives the surface it pins.
+    /// One manager's observation slots: the last armed id and the last
+    /// close key that manager ran under.
+    #[derive(Default)]
+    struct ManagerRecord {
+        armed: Option<String>,
+        cancel_key: Option<String>,
+    }
+
+    static RECORDS: LazyLock<Mutex<HashMap<usize, ManagerRecord>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    fn key(manager: &McpManager) -> usize {
+        std::ptr::from_ref(manager) as usize
+    }
+
+    /// Clear every manager's records before a frame drives the surface it
+    /// pins.
     pub(crate) fn reset() {
-        *LAST_ARMED.lock().expect("a1 seam: armed record") = None;
-        *LAST_CANCEL_KEY.lock().expect("a1 seam: cancel record") = None;
+        RECORDS.lock().expect("a1 seam: records table").clear();
     }
 
-    /// The request id the arm last set, if any manager armed one.
-    pub(crate) fn last_armed() -> Option<String> {
-        LAST_ARMED.lock().expect("a1 seam: armed record").clone()
-    }
-
-    /// The request id the close last cancelled under, if any manager closed.
-    pub(crate) fn last_cancel_key() -> Option<String> {
-        LAST_CANCEL_KEY
+    pub(crate) fn record_armed(manager: &McpManager, id: &str) {
+        RECORDS
             .lock()
-            .expect("a1 seam: cancel record")
-            .clone()
+            .expect("a1 seam: records table")
+            .entry(key(manager))
+            .or_default()
+            .armed = Some(id.to_owned());
     }
 
-    pub(crate) fn record_armed(id: &str) {
-        *LAST_ARMED.lock().expect("a1 seam: armed record") = Some(id.to_owned());
+    pub(crate) fn record_cancel_key(manager: &McpManager, id: &str) {
+        RECORDS
+            .lock()
+            .expect("a1 seam: records table")
+            .entry(key(manager))
+            .or_default()
+            .cancel_key = Some(id.to_owned());
     }
 
-    pub(crate) fn record_cancel_key(id: &str) {
-        *LAST_CANCEL_KEY.lock().expect("a1 seam: cancel record") = Some(id.to_owned());
+    /// The request ids any recorded manager has ARMED under since the last
+    /// reset — the mid-segment probe reads this to prove the arm landed
+    /// before the segment's first tool executed. Sorted and deduped so
+    /// failure messages are deterministic.
+    pub(crate) fn armed_ids() -> Vec<String> {
+        let mut ids: Vec<String> = RECORDS
+            .lock()
+            .expect("a1 seam: records table")
+            .values()
+            .filter_map(|record| record.armed.clone())
+            .collect();
+        ids.sort();
+        ids.dedup();
+        ids
+    }
+
+    /// The request ids any recorded manager has CLOSED under since the
+    /// last reset, sorted and deduped for deterministic failure messages.
+    pub(crate) fn closed_ids() -> Vec<String> {
+        let mut ids: Vec<String> = RECORDS
+            .lock()
+            .expect("a1 seam: records table")
+            .values()
+            .filter_map(|record| record.cancel_key.clone())
+            .collect();
+        ids.sort();
+        ids.dedup();
+        ids
     }
 }
 

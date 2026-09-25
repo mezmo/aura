@@ -2264,18 +2264,73 @@ async fn a1_reparked_row_keeps_the_run_owner_request_id() {
     );
 }
 
+/// One [`ArmProbingTool`] observation: the invocation's arguments plus the
+/// armed request ids the MCP observation seam carried at invocation time.
+type ArmProbe = (Value, Vec<String>);
+
+/// The decided gated call's stand-in for the A1 MCP frame: records each
+/// invocation's arguments together with a MID-SEGMENT sample of the MCP
+/// arm observation seam (`a1_observation::armed_ids()` at invocation
+/// time). The substitution's execution of the decided call is the FIRST
+/// scripted tool the segment runs, so the sample proves ORDERING: an arm
+/// that landed before the segment's execution window is already visible
+/// to the probe, while a fill that arms only at close (inside
+/// `close_segment_mcp`) leaves the probe empty of the fresh id even
+/// though the post-completion record would name it.
+struct ArmProbingTool {
+    /// One observation per invocation.
+    samples: Arc<Mutex<Vec<ArmProbe>>>,
+}
+
+impl rig::tool::Tool for ArmProbingTool {
+    const NAME: &'static str = "a1_arm_probe";
+
+    type Error = std::convert::Infallible;
+    type Args = FreeformArgs;
+    type Output = String;
+
+    fn name(&self) -> String {
+        TOOL.to_string()
+    }
+
+    async fn definition(&self, _prompt: String) -> rig::completion::ToolDefinition {
+        rig::completion::ToolDefinition {
+            name: self.name(),
+            description: "Test stand-in: records the call and the MCP arm state at \
+                          invocation time."
+                .to_string(),
+            parameters: json!({ "type": "object", "properties": {} }),
+        }
+    }
+
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        self.samples.lock().expect("a1 arm-probe sample log").push((
+            Value::Object(args.fields),
+            crate::mcp::a1_observation::armed_ids(),
+        ));
+        Ok(ECHO_TOOL_RESULT.to_string())
+    }
+}
+
 /// A1 (aura#271, card P45): the resumed MCP manager must be ARMED with
 /// the config's fresh request id the way the chat path arms it
-/// (`mcp_manager.set_current_request`, factory.rs), and the segment close
+/// (`mcp_manager.set_current_request`, factory.rs) — BEFORE the
+/// segment's execution window opens — and the segment close
 /// (`close_segment_mcp`) must cancel under that same fresh id. Today
 /// `run_segment_borrowed`'s overwrite hands the orchestrator
 /// `config.request_id = run:<run_id>` AND `for_resume_segment` never arms
 /// the manager, so resumed MCP calls run untracked and the close cancels
 /// under the conflated run owner id. RED until the overwrite is deleted
-/// and the arm lands: both observation records must name the World's
-/// fresh `REQUEST_ID`. F5 is merged into this frame: the one
-/// `McpManager`-level observation seam pins both the arm key and the
-/// close key, and the two assertions share one segment drive.
+/// and the arm lands. F5 is merged into this frame: the one
+/// `McpManager`-level observation seam pins both keys.
+///
+/// ORDERING (Gate A repair): the arm is proven by a MID-SEGMENT probe,
+/// not a post-completion read — the decided call's stand-in tool samples
+/// the seam at invocation time (the first scripted tool the segment
+/// executes), so a fill that arms only inside `close_segment_mcp` —
+/// leaving the execution window untracked — FAILS the probe even though
+/// the post-completion records would name the right id. The close key is
+/// verified after the segment completes.
 ///
 /// The world carries one UNREACHABLE HTTP-streamable server (loopback
 /// port 1 refuses immediately; the manager.rs precedent): the manager is
@@ -2301,16 +2356,20 @@ async fn a1_resumed_segment_arms_and_closes_mcp_under_the_fresh_request_id() {
         )]),
         ..Default::default()
     });
-    let invocations = Arc::new(Mutex::new(Vec::new()));
-    let apply_invocations = Arc::new(Mutex::new(Vec::new()));
+    let arm_samples = Arc::new(Mutex::new(Vec::new()));
+    // Tripwire: the fresh gated call re-parks at the gate and must never
+    // execute; the recording log staying empty is that guard.
+    let fresh_invocations = Arc::new(Mutex::new(Vec::new()));
     install_worker_overrides(vec![WorkerOverride {
         model: ScriptedCompletionModel::new(vec![ScriptedTurn::tool_calls(vec![
             ScriptedToolCall::new(FRESH_CALL_ID, NEW_TOOL, json!({ "namespace": "stage" }))
                 .with_call_id(NEW_CALL_ID),
         ])]),
         extra_tools: vec![
-            Box::new(RecordingTool::new(apply_invocations).with_name(TOOL)),
-            Box::new(RecordingTool::new(invocations).with_name(NEW_TOOL)),
+            Box::new(ArmProbingTool {
+                samples: arm_samples.clone(),
+            }),
+            Box::new(RecordingTool::new(fresh_invocations.clone()).with_name(NEW_TOOL)),
         ],
     }]);
     register_decided(&world).await;
@@ -2327,20 +2386,49 @@ async fn a1_resumed_segment_arms_and_closes_mcp_under_the_fresh_request_id() {
         matches!(segment, ResumeStreamEnd::Reparked),
         "the freshly gated call re-parks: {segment:?}"
     );
+    assert!(
+        fresh_invocations
+            .lock()
+            .expect("fresh invocation log")
+            .is_empty(),
+        "the re-parked fresh call never executes; the probe below is the segment's \
+         first and only tool execution"
+    );
 
+    // The mid-segment probe: the substitution's execution of the decided
+    // call — the segment's first scripted tool — must already see the arm
+    // under the fresh request id. A late arm (inside close_segment_mcp)
+    // leaves the execution window untracked and fails here.
+    let probe = arm_samples.lock().expect("a1 arm-probe sample log").clone();
     assert_eq!(
-        crate::mcp::a1_observation::last_armed(),
-        Some(REQUEST_ID.to_string()),
-        "A1 (aura#271): for_resume_segment must arm the resumed MCP manager with the \
-         config's FRESH request id, the way the chat path arms it; today nothing arms \
-         the manager and resumed MCP calls run untracked"
+        probe.len(),
+        1,
+        "the substitution executed the decided call exactly once: the probe ran \
+         inside the segment (samples: {probe:?})"
     );
     assert_eq!(
-        crate::mcp::a1_observation::last_cancel_key(),
-        Some(REQUEST_ID.to_string()),
+        probe[0].0,
+        call_args(),
+        "the probed invocation is the decided call's substitution"
+    );
+    let fresh = REQUEST_ID.to_string();
+    assert!(
+        probe[0].1.contains(&fresh),
+        "A1 (aura#271): the MCP arm under the FRESH request id ({REQUEST_ID}) must be \
+         recorded BEFORE the segment's first tool executes; today nothing arms the \
+         resumed manager, so every MCP call in the execution window runs untracked \
+         (armed ids the probe observed: {:?})",
+        probe[0].1
+    );
+
+    // The close half, verified after completion: the teardown cancels
+    // under the same fresh id, not the conflated run owner id.
+    let closed = crate::mcp::a1_observation::closed_ids();
+    assert!(
+        closed.contains(&fresh),
         "A1 (aura#271): close_segment_mcp must cancel under the config's FRESH request \
          id; today the resume path's config overwrite makes it cancel under the \
-         conflated run owner id"
+         conflated run owner id (observed close keys: {closed:?})"
     );
 }
 

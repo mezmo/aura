@@ -5091,5 +5091,69 @@ mod tests {
                  worker scope; only the park-armed asks mint the run owner id into the body"
             );
         }
+
+        /// F3(c) — GREEN boundary pin: the single-agent surface keeps the
+        /// fresh request id verbatim even on the PARK-ARMED ask. F3(a)
+        /// drives `decide`, which is Hold-only; this frame drives the
+        /// production ParkArmed POST path with a Single scope, so a fill
+        /// that wrongly derives the run owner id on ParkArmed regardless
+        /// of scope (Single carries no run id) cannot pass silently.
+        #[tokio::test]
+        async fn single_scope_park_armed_ask_post_body_keeps_the_fresh_request_id() {
+            let (port, mut rx) = spawn_capturing_webhook(1).await;
+            let route = a1_webhook_route(a1_poll_client(port));
+            let cancel = crate::request_cancellation::RequestCancelToken::unbound();
+
+            let decision = route
+                .decide_for_gate(
+                    a1_single_request("req_test_a1_single_park_armed"),
+                    &cancel,
+                    AskMode::ParkArmed,
+                    chrono::Utc::now(),
+                )
+                .await
+                .expect("the park-armed ask resolves the mock receiver's instant decision");
+            assert!(
+                matches!(decision, GateDecision::Approved { .. }),
+                "the machine decision applies in-request: {decision:?}"
+            );
+
+            let captured = rx.recv().await.expect("the park-armed ask POSTs once");
+            assert!(
+                captured.contains("response_type=poll"),
+                "the park-armed ask sends response_type=poll: {captured}"
+            );
+            let body = post_body(&captured);
+            assert_eq!(
+                body["request_id"].as_str(),
+                Some("req_test_a1_single_park_armed"),
+                "A1 (aura#271): the run-owner mint is scope-gated to Worker; a Single \
+                 scope has no run id and must keep request.request_id verbatim even on \
+                 the park-armed ask"
+            );
+        }
+
+        /// F3(d) — GREEN boundary pin: the notify leg (the parked row's
+        /// ack POST) keeps the fresh request id verbatim under a Single
+        /// scope — the mint's scope gate must hold on the Notify leg too.
+        #[tokio::test]
+        async fn single_scope_notify_leg_post_body_keeps_the_fresh_request_id() {
+            let (port, mut rx) = spawn_capturing_webhook(1).await;
+            let client = a1_poll_client(port);
+
+            client
+                .notify(&a1_single_request("req_test_a1_single_notify"), None)
+                .await
+                .expect("the ack leg delivers on the mock receiver's 2xx");
+
+            let captured = rx.recv().await.expect("the notify leg POSTs once");
+            let body = post_body(&captured);
+            assert_eq!(
+                body["request_id"].as_str(),
+                Some("req_test_a1_single_notify"),
+                "A1 (aura#271): the notify leg keeps request.request_id verbatim under a \
+                 Single scope; the run-owner mint never applies where no run id exists"
+            );
+        }
     }
 }
