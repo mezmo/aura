@@ -70,6 +70,16 @@ impl RunOptions {
         self.cancel = Some(parent.child_token());
         self
     }
+
+    /// The run stops on exactly `cancel`, for a caller that took the token out
+    /// of these options to build the run around it.
+    #[must_use]
+    pub fn on_token(timeout: Option<Duration>, cancel: CancellationToken) -> Self {
+        Self {
+            timeout,
+            cancel: Some(cancel),
+        }
+    }
 }
 
 /// A started run: the events it produces, the token that cancels it, and the

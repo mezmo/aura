@@ -95,7 +95,7 @@ pub type AuraToolResult = provider_agent::ToolResult;
 pub use aura_events::{TokenUsage, ToolCallId, ToolName};
 pub use mcp::{InFlightRequests, McpManager, ProgressEnabledHandler};
 pub use rag_tools::{AutoIngest, VectorIngestTool};
-pub use request_cancellation::{RequestCancellation, RequestId};
+pub use request_cancellation::{RequestCancelToken, RequestId};
 pub use rmcp::model::{NumberOrString, ProgressToken};
 pub use skill_tool::{LoadSkillTool, ReadSkillFileTool, SkillToolset, render_skill_catalog};
 pub use stream_events::{

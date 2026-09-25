@@ -200,7 +200,8 @@ impl StreamingAgent for OrchestratorFactory {
         // streaming handler (reader) so aura.usage reflects the aggregate of
         // all orchestration LLM turns.
         let usage_state = crate::UsageState::new();
-        let (run, run_events) = crate::run_context::RunContext::channel(request_id);
+        let (run, run_events) =
+            crate::run_context::RunContext::channel_on(request_id, cancel_token.clone());
         let stream = self.spawn_orchestration_stream(
             query.to_string(),
             chat_history,

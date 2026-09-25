@@ -177,12 +177,16 @@ impl Tool for RequestApprovalTool {
                 tool_call_intent,
             }],
         };
-        let cancel =
-            crate::request_cancellation::RequestCancellation::token_for_id(&self.request_id)
-                .unwrap_or_else(crate::request_cancellation::RequestCancelToken::unbound);
+        let run = self.run();
+        let cancel = run
+            .as_ref()
+            .map(|run| {
+                crate::request_cancellation::RequestCancelToken::from(run.cancel_token().clone())
+            })
+            .unwrap_or_else(crate::request_cancellation::RequestCancelToken::unbound);
         // `DecisionRoute` emits the lifecycle itself; the scope is how those
         // events find the run, since rig calls this off it.
-        let decided = match self.run() {
+        let decided = match run {
             Some(run) => {
                 crate::run_context::with_run(run, self.route.decide(request, &cancel)).await
             }
