@@ -219,6 +219,8 @@ pub enum OrchestrationStreamEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         task_id: Option<usize>,
         tool_call_id: String,
+        #[serde(default)]
+        worker_id: String,
         #[serde(flatten)]
         outcome: CompletionOutcome,
         #[serde(flatten)]
@@ -461,6 +463,7 @@ impl OrchestrationStreamEvent {
     pub fn tool_call_completed(
         task_id: Option<usize>,
         tool_call_id: impl Into<String>,
+        worker_id: impl Into<String>,
         success: bool,
         duration_ms: u64,
         result: Option<String>,
@@ -469,6 +472,7 @@ impl OrchestrationStreamEvent {
         Self::ToolCallCompleted {
             task_id,
             tool_call_id: tool_call_id.into(),
+            worker_id: worker_id.into(),
             outcome: CompletionOutcome {
                 success,
                 duration_ms,
@@ -489,6 +493,52 @@ mod tests {
             AgentContext::coordinator(),
             CorrelationContext::new("test-session", None),
         )
+    }
+
+    /// A completion frame from a server that predates `worker_id` still
+    /// parses, with the worker empty. The enum is untagged, so without the
+    /// default the frame would fail to bind as `ToolCallCompleted`.
+    #[test]
+    fn tool_call_completed_without_worker_id_still_parses() {
+        let json = r#"{"task_id":0,"tool_call_id":"call_1","success":true,"duration_ms":42,"result":"ok","agent_id":"coordinator","session_id":"s1"}"#;
+
+        let parsed: OrchestrationStreamEvent =
+            serde_json::from_str(json).expect("should deserialize");
+
+        let OrchestrationStreamEvent::ToolCallCompleted {
+            tool_call_id,
+            worker_id,
+            ..
+        } = parsed
+        else {
+            panic!("expected ToolCallCompleted, got {parsed:?}");
+        };
+        assert_eq!(tool_call_id, "call_1");
+        assert_eq!(worker_id, "");
+    }
+
+    /// A completion frame naming its worker binds back to `ToolCallCompleted`
+    /// rather than to an earlier variant that also carries `worker_id`.
+    #[test]
+    fn tool_call_completed_round_trips_its_worker() {
+        let event = OrchestrationStreamEvent::tool_call_completed(
+            Some(0),
+            "call_1",
+            "log-analyst",
+            true,
+            42,
+            Some("ok".to_string()),
+            ctx(),
+        );
+        let json = serde_json::to_string(&event).expect("should serialize");
+
+        let parsed: OrchestrationStreamEvent =
+            serde_json::from_str(&json).expect("should deserialize");
+
+        let OrchestrationStreamEvent::ToolCallCompleted { worker_id, .. } = parsed else {
+            panic!("expected ToolCallCompleted, got {parsed:?}");
+        };
+        assert_eq!(worker_id, "log-analyst");
     }
 
     /// The enum is untagged, so a field omitted on the wire must still

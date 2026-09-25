@@ -226,6 +226,7 @@ mod tests {
         let event = OrchestrationStreamEvent::tool_call_completed(
             Some(0),
             "call_1",
+            "log-analyst",
             true,
             42,
             Some("30.0".to_string()),
@@ -236,5 +237,6 @@ mod tests {
         assert!(sse.starts_with(&format!("event: {}\n", event_names::TOOL_CALL_COMPLETED)));
         assert!(sse.contains("\"result\":\"30.0\""));
         assert!(sse.contains("\"success\":true"));
+        assert!(sse.contains("\"worker_id\":\"log-analyst\""));
     }
 }
