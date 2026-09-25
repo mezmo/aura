@@ -126,6 +126,7 @@ aura/
 
 ### Shared Event Types (`aura-events`)
 - Lightweight crate defining `AuraStreamEvent` and `OrchestrationStreamEvent` enums
+- `run::RunEvent` is a run's own envelope: `RunId`, optional `SessionId`, a dense `SequenceNumber`, a `Timestamp`, and either an `agent::AgentEvent` or a `RunLifecycleEvent` (started, observer attached/detached, claims exhausted, liveness decided, parked, finished, cancelled, failed). There is one run id; see the module doc. No producer emits it yet
 - Both `Serialize + Deserialize` — used by the web server (producer) and CLI (consumer)
 - No agent, MCP, or provider dependencies — only `serde` and `serde_json`
 - `ProgressToken` type uses a local wire-compatible definition by default; enables `rmcp-types` feature for direct rmcp interop (used by the `aura` crate)
@@ -149,6 +150,9 @@ export AWS_REGION="your-region"       # For Knowledge Base
 - **Rig Fork**: `mezmo/rig` branch `mshearer/LOG-23351-openai-reasoning`
 
 ### Key Modules
+- `builder.rs` - `PreparedAgent` (built once from config: provider client, tools, MCP connections) and `Agent` (one run of it, via `PreparedAgent::begin_run`)
+- `run.rs` - `RunSlot`, the single bound-run slot through which prepare-time tools and wrappers (turn nudge, scratchpad, HITL) reach the current run's state; a prepared agent serves one run at a time, enforced by `begin_run`
+- `forwarded_headers.rs` - `ForwardedHeaders`, the `headers_from_request` values a prepared agent's MCP connections and HITL route were opened with; `begin_run` refuses a request that forwards different values, so a prepared agent never runs under another request's credentials
 - `provider_agent.rs` - Type-erased streaming across providers
 - `stream_events.rs` - Custom aura SSE events
 - `request_cancellation.rs` - Request lifecycle management

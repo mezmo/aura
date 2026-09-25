@@ -8,7 +8,7 @@ use rmcp::{
     RoleClient,
     model::{
         CallToolRequestParam, CancelledNotificationParam, ClientRequest, ProgressNotificationParam,
-        Request, RequestId, Tool,
+        ProgressToken, Request, RequestId, Tool,
     },
     serve_client,
     service::{PeerRequestOptions, RunningService},
@@ -373,7 +373,41 @@ pub struct McpClient {
     namespace: ToolNamespace,
     /// Tracks in-flight MCP requests for cancellation support
     in_flight: Arc<InFlightRequests>,
-    current_call: Arc<RwLock<Option<CallContext>>>,
+    /// Which call each in-flight progress token belongs to, shared with the
+    /// progress handler.
+    token_owners: Arc<Mutex<HashMap<ProgressToken, CallContext>>>,
+    /// The call this client serves.
+    bound_call: Arc<RwLock<Option<CallContext>>>,
+}
+
+/// A call's claim on its progress token.
+struct ProgressTokenGuard {
+    owners: Arc<Mutex<HashMap<ProgressToken, CallContext>>>,
+    token: Option<ProgressToken>,
+}
+
+impl Drop for ProgressTokenGuard {
+    /// Releases the token when the call ends, including a call whose future is
+    /// dropped mid-await.
+    ///
+    /// A server that trails a notification past its call's result then finds no
+    /// owner and is counted unowned. Holding the entry on to catch that would
+    /// grow the map for the client's lifetime.
+    fn drop(&mut self) {
+        if let Some(token) = self.token.take() {
+            owners_of(&self.owners).remove(&token);
+        }
+    }
+}
+
+/// A poisoned map only means a holder panicked mid-update; the entries are
+/// still sound, so recover rather than propagate.
+fn owners_of(
+    owners: &Mutex<HashMap<ProgressToken, CallContext>>,
+) -> std::sync::MutexGuard<'_, HashMap<ProgressToken, CallContext>> {
+    owners
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// The request an MCP client is currently serving, and the agent on whose
@@ -392,7 +426,8 @@ impl Clone for McpClient {
             server_url: self.server_url.clone(),
             namespace: self.namespace.clone(),
             in_flight: self.in_flight.clone(),
-            current_call: self.current_call.clone(),
+            token_owners: self.token_owners.clone(),
+            bound_call: self.bound_call.clone(),
         }
     }
 }
@@ -412,8 +447,13 @@ impl McpClient {
         T: rmcp::transport::Transport<RoleClient> + Send + 'static,
         T::Error: std::error::Error + Send + Sync + 'static,
     {
-        let current_call = Arc::new(RwLock::new(None));
-        let handler = ProgressEnabledHandler::new(Arc::clone(&current_call), user_agent);
+        let token_owners = Arc::new(Mutex::new(HashMap::new()));
+        let bound_call = Arc::new(RwLock::new(None));
+        let handler = ProgressEnabledHandler::new(
+            Arc::clone(&token_owners),
+            Arc::clone(&bound_call),
+            user_agent,
+        );
 
         let client = serve_client(handler, transport)
             .await
@@ -424,7 +464,8 @@ impl McpClient {
             server_url,
             namespace,
             in_flight: Arc::new(InFlightRequests::new()),
-            current_call,
+            token_owners,
+            bound_call,
         })
     }
 
@@ -509,38 +550,65 @@ impl McpClient {
         Ok(client)
     }
 
-    /// Request id and agent are stored together so a reader sees one
-    /// request's id paired with that same request's agent.
-    pub async fn set_current_call(&self, request_id: &str, agent: AgentContext) {
-        *self.current_call.write().await = Some(CallContext {
+    /// Binds this client to the call it serves for that call's duration.
+    ///
+    /// Request id and agent are stored together so a reader sees one request's
+    /// id paired with that same request's agent.
+    pub async fn bind_call(&self, request_id: &str, agent: AgentContext) {
+        *self.bound_call.write().await = Some(CallContext {
             request_id: request_id.to_string(),
             agent,
         });
-        debug!("Set current call for MCP client: {}", request_id);
+        debug!("Bound MCP client to call: {}", request_id);
     }
 
     pub async fn clear_current_call(&self) {
-        let mut guard = self.current_call.write().await;
+        let mut guard = self.bound_call.write().await;
         if let Some(call) = guard.take() {
             debug!("Cleared current call: {}", call.request_id);
         }
     }
 
-    pub async fn get_current_request(&self) -> Option<String> {
-        let guard = self.current_call.read().await;
-        guard.as_ref().map(|call| call.request_id.clone())
+    /// The run in task-local scope, or the bound one otherwise.
+    ///
+    /// Rig executes tools on a long-lived server task, so a tool call reaches
+    /// here with no scope around it and finds its run through the binding. One
+    /// binding is enough because a client serves one run, an agent being built
+    /// per request and owning its manager. Sharing a manager across runs — warm
+    /// MCP reuse, #578 — makes this answer last-writer-wins, and wants per-run
+    /// tool instances or a rig-side change rather than another field here.
+    pub async fn run_id(&self) -> Option<Arc<str>> {
+        match crate::run_context::current_run_id() {
+            Some(id) => Some(id),
+            None => self
+                .bound_call
+                .read()
+                .await
+                .as_ref()
+                .map(|call| Arc::from(call.request_id.as_str())),
+        }
     }
 
     /// The agent named for `request_id`. A client serving a different request,
     /// or none, yields the single-agent context — the same value the SSE
     /// handler stamps on a frame that arrives without an agent.
     async fn agent_for(&self, request_id: &str) -> AgentContext {
-        let guard = self.current_call.read().await;
+        let guard = self.bound_call.read().await;
         guard
             .as_ref()
             .filter(|call| call.request_id == request_id)
             .map(|call| call.agent.clone())
             .unwrap_or_else(AgentContext::single_agent)
+    }
+
+    /// Ties a progress token to the call that minted it, so notifications
+    /// arriving on the transport task can be routed back.
+    async fn own_progress_token(&self, token: ProgressToken, request_id: &str) {
+        let call = CallContext {
+            request_id: request_id.to_string(),
+            agent: self.agent_for(request_id).await,
+        };
+        owners_of(&self.token_owners).insert(token, call);
     }
 
     pub async fn discover_tools(&self) -> Result<Vec<Tool>> {
@@ -572,14 +640,14 @@ impl McpClient {
         Ok(tools_response.tools)
     }
 
-    /// Execute a tool. Auto-tracks for cancellation if `set_current_request` was called.
+    /// Execute a tool, tracking it for cancellation when called inside a run.
     pub async fn call_tool(
         &self,
         tool_name: &str,
         arguments: HashMap<String, Value>,
         approver_overrides: Option<ApproverHeaders>,
     ) -> Result<String> {
-        if let Some(http_request_id) = self.get_current_request().await {
+        if let Some(http_request_id) = self.run_id().await {
             info!(
                 "Tool '{}' executing WITH automatic tracking (http_request_id={})",
                 tool_name, http_request_id
@@ -655,6 +723,18 @@ impl McpClient {
             .context("Failed to send tool call request")?;
 
         let progress_token = handle.progress_token.clone();
+        // The transport task cannot read the run's task-local, so tie the token
+        // to the run here, while still inside it.
+        if let Some(run_id) = self.run_id().await {
+            self.own_progress_token(progress_token.clone(), &run_id)
+                .await;
+        }
+        // Held from here so a run cancelled mid-await, which drops this future
+        // before it returns, still releases the entry.
+        let _token_guard = ProgressTokenGuard {
+            owners: Arc::clone(&self.token_owners),
+            token: Some(progress_token.clone()),
+        };
         info!(
             "Tool '{}' started with progress token: {:?}",
             tool_name, progress_token
@@ -687,10 +767,8 @@ impl McpClient {
             debug!("Progress stream ended for '{}'", tool_name_for_task);
         });
 
-        let response = handle
-            .await_response()
-            .await
-            .context(format!("Tool '{}' execution failed", tool_name))?;
+        let response = handle.await_response().await;
+        let response = response.context(format!("Tool '{}' execution failed", tool_name))?;
 
         match response {
             rmcp::model::ServerResult::CallToolResult(result) => {
@@ -731,6 +809,15 @@ impl McpClient {
             )
             .await
             .context("Failed to send tool call request")?;
+
+        if let Some(run_id) = self.run_id().await {
+            self.own_progress_token(handle.progress_token.clone(), &run_id)
+                .await;
+        }
+        let _token_guard = ProgressTokenGuard {
+            owners: Arc::clone(&self.token_owners),
+            token: Some(handle.progress_token.clone()),
+        };
 
         // Extract what we need for cancellation before moving handle
         let request_id = handle.id.clone();
@@ -810,6 +897,22 @@ impl McpClient {
             .await
             .context("Failed to send tool call request")?;
 
+        // First thing after the send, because rmcp mints the token inside that
+        // call and the request is already on the wire when it returns. A
+        // notification answering before this lands routes through the client's
+        // bound call instead, which is this one.
+        //
+        // Unconditional, unlike the paths that discover their run: this one is
+        // handed the request id by its caller.
+        self.own_progress_token(handle.progress_token.clone(), http_request_id)
+            .await;
+        // Held from here so a run cancelled mid-await, which drops this future
+        // before it returns, still releases the entry.
+        let _token_guard = ProgressTokenGuard {
+            owners: Arc::clone(&self.token_owners),
+            token: Some(handle.progress_token.clone()),
+        };
+
         // Track this request for potential cancellation
         let mcp_request_id = handle.id.clone();
         self.in_flight
@@ -860,7 +963,6 @@ impl McpClient {
         // Await the tool result
         let result = handle.await_response().await;
 
-        // Remove from tracking (completed or failed)
         self.in_flight
             .remove(http_request_id, &mcp_request_id)
             .await;
@@ -951,7 +1053,9 @@ impl McpClient {
     pub async fn cancel_and_close(&self, http_request_id: &str, reason: &str) -> usize {
         let count = self.cancel_all_for_request(http_request_id, reason).await;
 
-        // Also clear the call to stop routing any straggler progress notifications
+        // Drop this call's token ownership so straggler notifications stop
+        // routing, then clear the binding.
+        owners_of(&self.token_owners).retain(|_, call| call.request_id != http_request_id);
         self.clear_current_call().await;
 
         // Forcefully close connection - server is ignoring cancellation anyway
@@ -975,6 +1079,58 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::approver_headers::tests::captured_overrides;
+
+    fn owner(request_id: &str) -> CallContext {
+        CallContext {
+            request_id: request_id.to_string(),
+            agent: AgentContext::single_agent(),
+        }
+    }
+
+    /// A cancelled run drops the tool future mid-await, so a release placed
+    /// after the await never runs. The guard is what covers that path, and an
+    /// entry left behind outlives its call for the client's lifetime.
+    #[test]
+    fn a_dropped_call_releases_its_progress_token() {
+        let owners: Arc<Mutex<HashMap<ProgressToken, CallContext>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let token = ProgressToken(rmcp::model::NumberOrString::Number(7));
+
+        owners_of(&owners).insert(token.clone(), owner("req_1"));
+        {
+            let _guard = ProgressTokenGuard {
+                owners: Arc::clone(&owners),
+                token: Some(token.clone()),
+            };
+            assert!(owners_of(&owners).contains_key(&token));
+            // The future is dropped here rather than returning.
+        }
+
+        assert!(
+            !owners_of(&owners).contains_key(&token),
+            "the entry goes with the call that owned it"
+        );
+    }
+
+    /// One call's guard must not take another call's entry.
+    #[test]
+    fn a_guard_releases_only_its_own_token() {
+        let owners: Arc<Mutex<HashMap<ProgressToken, CallContext>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let mine = ProgressToken(rmcp::model::NumberOrString::Number(1));
+        let theirs = ProgressToken(rmcp::model::NumberOrString::Number(2));
+
+        owners_of(&owners).insert(mine.clone(), owner("req_1"));
+        owners_of(&owners).insert(theirs.clone(), owner("req_2"));
+
+        drop(ProgressTokenGuard {
+            owners: Arc::clone(&owners),
+            token: Some(mine.clone()),
+        });
+
+        assert!(!owners_of(&owners).contains_key(&mine));
+        assert!(owners_of(&owners).contains_key(&theirs));
+    }
 
     #[tokio::test]
     async fn test_in_flight_requests_tracking() {
@@ -1471,7 +1627,7 @@ pub(crate) mod tests {
             "an unnamed client falls back to the single-agent context"
         );
 
-        client.set_current_call("req-1", worker.clone()).await;
+        client.bind_call("req-1", worker.clone()).await;
         assert_eq!(client.agent_for("req-1").await, worker);
         assert_eq!(
             client.agent_for("req-2").await,
@@ -1487,7 +1643,42 @@ pub(crate) mod tests {
         );
     }
 
-    /// `set_current_request` selects the tracked branch, so this is the same entry point a gated call takes in the server and the branch choice must not decide whether identity is delivered.
+    /// Rig executes tools on a long-lived server task, so a real tool call runs
+    /// with no run in task-local scope. Binding is the only thing that lets it
+    /// find its run, and without it the call silently takes the untracked
+    /// branch and stops emitting `aura.tool_start`.
+    #[tokio::test]
+    async fn a_bound_run_is_found_where_no_scope_reaches() {
+        let (_server, client) = client_and_server(&requester_headers()).await;
+
+        assert_eq!(client.run_id().await, None, "no scope, nothing bound");
+
+        client
+            .bind_call("req_bound", AgentContext::single_agent())
+            .await;
+        assert_eq!(client.run_id().await.as_deref(), Some("req_bound"));
+    }
+
+    /// A scope still wins, so a call made inside one is attributed to that run
+    /// rather than whatever the client was last bound to.
+    #[tokio::test]
+    async fn a_scope_takes_precedence_over_the_binding() {
+        let (_server, client) = client_and_server(&requester_headers()).await;
+        client
+            .bind_call("req_bound", AgentContext::single_agent())
+            .await;
+
+        let seen = crate::run_context::with_run_id("req_scoped".to_string(), async {
+            client.run_id().await
+        })
+        .await;
+
+        assert_eq!(seen.as_deref(), Some("req_scoped"));
+    }
+
+    /// Being inside a run selects the tracked branch, so this is the same entry
+    /// point a gated call takes in the server and the branch choice must not
+    /// decide whether identity is delivered.
     #[tokio::test]
     async fn call_tool_delivers_the_override_on_either_branch() {
         let (server, client) = client_and_server(&requester_headers()).await;
@@ -1501,17 +1692,17 @@ pub(crate) mod tests {
             .await
             .expect("the untracked call succeeds");
 
-        client
-            .set_current_call("http-req-1", AgentContext::single_agent())
-            .await;
-        client
-            .call_tool(
-                "tracked",
-                no_args(),
-                Some(captured_overrides("x-forwarded-user", "bob")),
-            )
-            .await
-            .expect("the tracked call succeeds");
+        crate::run_context::with_run_id("http-req-1".to_string(), async {
+            client
+                .call_tool(
+                    "tracked",
+                    no_args(),
+                    Some(captured_overrides("x-forwarded-user", "bob")),
+                )
+                .await
+                .expect("the tracked call succeeds");
+        })
+        .await;
 
         let calls = server.tool_calls();
         assert_eq!(calls[0].header_values("x-forwarded-user"), vec!["alice"]);

@@ -13,15 +13,17 @@
 //! # Usage
 //!
 //! ```ignore
-//! use aura::{StreamingAgent, StreamItem, StreamError};
-//! use tokio_util::sync::CancellationToken;
+//! use aura::streaming::{RunOptions, StreamingAgent};
+//! use aura::{StreamError, StreamItem};
+//! use futures::StreamExt;
 //!
 //! async fn handle_request(agent: impl StreamingAgent, query: &str) {
-//!     let cancel_token = CancellationToken::new();
-//!     let stream = agent.stream(query, vec![], cancel_token, "req_123").await?;
+//!     // The default leaves the run unbounded and lets it mint its own token.
+//!     let run = agent.stream(query, vec![], RunOptions::default(), "req_123").await;
+//!     let mut items = run.into_events();
 //!
 //!     // Process stream items (convert to SSE, etc.)
-//!     while let Some(item) = stream.next().await {
+//!     while let Some(item) = items.next().await {
 //!         match item {
 //!             Ok(StreamItem::StreamAssistantItem(content)) => { /* ... */ }
 //!             Ok(StreamItem::StreamUserItem(content)) => { /* ... */ }
@@ -37,7 +39,131 @@ use async_trait::async_trait;
 use futures::stream::BoxStream;
 use rig::completion::Message;
 use std::time::Duration;
-use tokio_util::sync::CancellationToken;
+use tokio_util::sync::{CancellationToken, DropGuard};
+
+/// How a run is bounded and cancelled.
+///
+/// A caller that must be able to cancel before `stream` returns, or that wants
+/// the run to stop when a token it already holds is cancelled, names that
+/// token; otherwise the run mints one and hands it back on the handle.
+#[derive(Default)]
+pub struct RunOptions {
+    pub timeout: Option<Duration>,
+    /// Private because the run cancels this when its stream is dropped, which
+    /// a token shared with anything else must not be subject to.
+    /// [`RunOptions::cancelled_by`] is what makes it a child.
+    cancel: Option<CancellationToken>,
+}
+
+impl RunOptions {
+    /// The bound and the token, for an implementation building a run.
+    #[must_use]
+    pub fn into_parts(self) -> (Option<Duration>, Option<CancellationToken>) {
+        (self.timeout, self.cancel)
+    }
+
+    #[must_use]
+    pub fn bounded(timeout: Option<Duration>) -> Self {
+        Self {
+            timeout,
+            cancel: None,
+        }
+    }
+
+    /// The run stops when `parent` does, and stopping the run leaves `parent`
+    /// alone — a caller's token is often shared, so the run takes a child of it.
+    #[must_use]
+    pub fn cancelled_by(mut self, parent: &CancellationToken) -> Self {
+        self.cancel = Some(parent.child_token());
+        self
+    }
+}
+
+/// A started run: the events it produces, the token that cancels it, and the
+/// usage it accumulates.
+pub struct AgentRun {
+    events: BoxStream<'static, Result<StreamItem, StreamError>>,
+    cancel: CancellationToken,
+    usage: UsageState,
+    guard: DropGuard,
+}
+
+impl AgentRun {
+    pub fn new(
+        events: BoxStream<'static, Result<StreamItem, StreamError>>,
+        cancel: CancellationToken,
+        usage: UsageState,
+    ) -> Self {
+        Self {
+            // On the run's own token, because that is what its work watches.
+            // `RunOptions::cancelled_by` is what keeps a caller's shared token
+            // from being that token.
+            guard: cancel.clone().drop_guard(),
+            events,
+            cancel,
+            usage,
+        }
+    }
+
+    /// Orchestration races this token, so cancelling it stops a run at once.
+    /// A single agent reads it from the streaming hook's callbacks, so a run
+    /// stalled with no provider output needs its MCP calls cancelled too.
+    pub fn cancel_token(&self) -> CancellationToken {
+        self.cancel.clone()
+    }
+
+    pub fn usage(&self) -> &UsageState {
+        &self.usage
+    }
+
+    /// Wraps the run's stream, keeping the cancellation and usage that belong
+    /// with it. A layer that decorates the stream has no reason to take the
+    /// handle apart and rebuild it.
+    #[must_use]
+    pub fn map_stream<F>(self, f: F) -> Self
+    where
+        F: FnOnce(
+            BoxStream<'static, Result<StreamItem, StreamError>>,
+        ) -> BoxStream<'static, Result<StreamItem, StreamError>>,
+    {
+        Self {
+            events: f(self.events),
+            ..self
+        }
+    }
+
+    /// Dropping the returned stream cancels the run.
+    ///
+    /// A consumer that goes away without draining — an aborted task, a dropped
+    /// stream — would otherwise leave the run spending provider turns nobody
+    /// reads, and a run started with no timeout has nothing else to stop it.
+    /// The guard moves with the stream, so the run outlives the handle for as
+    /// long as something is reading it.
+    pub fn into_events(self) -> BoxStream<'static, Result<StreamItem, StreamError>> {
+        Box::pin(CancelOnDrop {
+            _guard: self.guard,
+            inner: self.events,
+        })
+    }
+}
+
+/// Cancels its run when dropped, by holding the guard for as long as the stream
+/// it wraps.
+struct CancelOnDrop<S> {
+    inner: S,
+    _guard: DropGuard,
+}
+
+impl<S: futures::Stream + Unpin> futures::Stream for CancelOnDrop<S> {
+    type Item = S::Item;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_next(cx)
+    }
+}
 
 /// Trait for agents that produce streaming completions.
 ///
@@ -64,59 +190,20 @@ pub trait StreamingAgent: Send + Sync {
     /// needs to know the concrete agent type.
     fn get_provider_info(&self) -> (&str, &str);
 
-    /// Stream a completion response.
+    /// Start a run.
     ///
-    /// Returns a stream of `StreamItem`s. The caller is responsible for:
-    /// - Converting items to SSE bytes (via handlers)
-    /// - Sending to the client
-    /// - Handling cancellation on disconnect
+    /// `options` bounds the run and may hand it a token the caller already
+    /// holds. The returned handle owns the events, the token that cancels them,
+    /// and the usage they accumulate.
     ///
-    /// # Arguments
-    ///
-    /// * `query` - The user's query/message
-    /// * `chat_history` - Previous messages in the conversation
-    /// * `cancel_token` - Token for cancellation (e.g., on client disconnect)
-    /// * `request_id` - HTTP request ID for MCP progress routing and tool correlation
-    ///
-    /// # Returns
-    ///
-    /// A boxed stream of `StreamItem` results, or an error if streaming cannot start.
+    /// `request_id` correlates MCP progress and tool events for this run.
     async fn stream(
         &self,
         query: &str,
         chat_history: Vec<Message>,
-        cancel_token: CancellationToken,
+        options: RunOptions,
         request_id: &str,
-    ) -> Result<BoxStream<'static, Result<StreamItem, StreamError>>, StreamError>;
-
-    /// Stream with timeout support.
-    ///
-    /// This is the primary entry point for production use. It wraps the stream
-    /// with timeout handling and integrates with the cancellation hook.
-    ///
-    /// # Arguments
-    ///
-    /// * `query` - The user's query/message
-    /// * `chat_history` - Previous messages in the conversation
-    /// * `timeout` - Maximum duration for the entire stream
-    /// * `request_id` - Request ID for MCP cancellation correlation
-    ///
-    /// # Returns
-    ///
-    /// A tuple of (stream, cancel_sender, usage_state) where cancel_sender can
-    /// be used to signal cancellation to the underlying provider and usage_state
-    /// tracks token consumption via Rig hooks.
-    async fn stream_with_timeout(
-        &self,
-        query: &str,
-        chat_history: Vec<Message>,
-        timeout: Duration,
-        request_id: &str,
-    ) -> (
-        BoxStream<'static, Result<StreamItem, StreamError>>,
-        tokio::sync::watch::Sender<bool>,
-        UsageState,
-    );
+    ) -> AgentRun;
 
     /// Cancel in-flight MCP requests and close connections.
     ///
@@ -148,5 +235,134 @@ pub trait StreamingAgent: Send + Sync {
     /// phase, so there is nothing to report at the agent level.
     fn system_prompt(&self) -> Option<&str> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::StreamExt;
+    use std::sync::Arc;
+
+    fn empty_run() -> (AgentRun, CancellationToken) {
+        let cancel = CancellationToken::new();
+        let run = AgentRun::new(
+            Box::pin(futures::stream::empty()),
+            cancel.clone(),
+            UsageState::new(),
+        );
+        (run, cancel)
+    }
+
+    /// A caller that takes a run and drops it without consuming has still
+    /// started it — for orchestration the work is already spawned, and with no
+    /// timeout nothing else would stop it.
+    #[test]
+    fn dropping_the_handle_cancels_the_run() {
+        let (run, cancel) = empty_run();
+        assert!(!cancel.is_cancelled());
+
+        drop(run);
+        assert!(cancel.is_cancelled());
+    }
+
+    /// The guard moves to the stream, so the run outlives the handle for as
+    /// long as someone is reading it.
+    #[tokio::test]
+    async fn the_run_survives_the_handle_while_its_stream_is_held() {
+        let (run, cancel) = empty_run();
+        let mut events = run.into_events();
+
+        assert!(!cancel.is_cancelled(), "the stream still holds the run");
+        assert!(events.next().await.is_none());
+        assert!(!cancel.is_cancelled());
+
+        drop(events);
+        assert!(cancel.is_cancelled());
+    }
+
+    /// An orchestration run is a spawned task feeding a channel. Dropping the
+    /// stream stops that task, so a consumer that goes away does not leave it
+    /// spending provider turns nobody reads.
+    #[tokio::test]
+    async fn dropping_a_spawned_run_stops_its_task() {
+        let cancel = CancellationToken::new();
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<StreamItem, StreamError>>(4);
+
+        let token = cancel.clone();
+        let worked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&worked);
+        let task = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    () = token.cancelled() => break,
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(1)) => {
+                        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        if tx.send(Ok(StreamItem::FinalMarker)).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        let run = AgentRun::new(
+            Box::pin(futures::stream::unfold(rx, |mut rx| async move {
+                rx.recv().await.map(|item| (item, rx))
+            })),
+            cancel.clone(),
+            UsageState::new(),
+        );
+
+        drop(run.into_events());
+        // Asserted before awaiting, so this isolates the guard: the channel
+        // closing would stop the task either way.
+        assert!(cancel.is_cancelled(), "dropping the stream cancels the run");
+        // Bounded, so a task that keeps running fails here rather than hanging.
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("the task ends rather than running on")
+            .expect("the task does not panic");
+    }
+
+    /// A caller's token is often shared, so one run's stream going away must
+    /// stop that run and nothing else.
+    #[test]
+    fn dropping_a_run_leaves_the_token_it_inherited_alone() {
+        let shared = CancellationToken::new();
+        let options = RunOptions::default().cancelled_by(&shared);
+        let run = AgentRun::new(
+            Box::pin(futures::stream::empty()),
+            options.into_parts().1.expect("a child of the shared token"),
+            UsageState::new(),
+        );
+
+        drop(run);
+        assert!(
+            !shared.is_cancelled(),
+            "the caller's token outlives one run"
+        );
+    }
+
+    /// Cancelling the caller's token still stops the run.
+    #[test]
+    fn cancelling_the_inherited_token_stops_the_run() {
+        let shared = CancellationToken::new();
+        let options = RunOptions::default().cancelled_by(&shared);
+        let run_token = options.into_parts().1.expect("a child of the shared token");
+
+        shared.cancel();
+        assert!(run_token.is_cancelled());
+    }
+
+    /// Decorating the stream must not drop the guard along the way.
+    #[test]
+    fn mapping_the_stream_keeps_the_run_alive() {
+        let (run, cancel) = empty_run();
+        let mapped = run.map_stream(|stream| Box::pin(stream));
+
+        assert!(!cancel.is_cancelled());
+        drop(mapped);
+        assert!(cancel.is_cancelled());
     }
 }

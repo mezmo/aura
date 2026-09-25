@@ -6,11 +6,11 @@
 //! persistence handles, shared chat history, scratchpad runtime state, and the
 //! session id.
 
+use crate::forwarded_headers::ForwardedHeaders;
 use crate::hitl::HitlRuntime;
 use crate::scratchpad::ScratchpadToolsConfig;
 use crate::tool_wrapper::{ToolCallContext, ToolWrapper};
 use aura_config::GlobPattern;
-use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 // Re-export the pure config types from `aura-config` so existing
@@ -39,28 +39,7 @@ pub enum WorkerSkills {
     Override(Vec<SkillConfig>),
 }
 
-/// Identifier for a chat session — the conversational context an agent runs in.
-///
-/// Threaded from the web server's `chat_session_id`, but meaningful for any
-/// agent run, including library use without the web layer; not every run has
-/// one. An opaque, branded string. Serializes as the bare string.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct SessionId(String);
-
-impl SessionId {
-    /// Wrap a session-id string. Accepts a `&str` or an owned `String`.
-    #[must_use]
-    pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
-    }
-
-    /// Borrow the underlying id as a string slice.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
+pub use aura_events::SessionId;
 
 /// Runtime build context for constructing agents.
 ///
@@ -125,9 +104,6 @@ pub struct AgentRuntimeConfig {
     /// `Some` when scratchpad is wired up for this agent or worker.
     pub scratchpad_tools_config: Option<ScratchpadToolsConfig>,
 
-    /// Shared turn-limit nudge state for this agent's tool calls.
-    pub turn_nudge: Option<Arc<crate::turn_nudge::TurnNudgeState>>,
-
     /// Shared decision state for worker `submit_result` tool.
     /// When set, workers get the `submit_result` tool for structured output.
     pub orchestration_submit_result: Option<crate::orchestration::SubmitResultDecision>,
@@ -137,20 +113,20 @@ pub struct AgentRuntimeConfig {
     /// `None` disables approval gating.
     pub hitl: Option<HitlRuntime>,
 
-    /// Request id (`req_…`) for this build, used to stamp HITL approval requests
-    /// and route their SSE events. Threaded from the web server so the
-    /// single-agent and orchestration paths share one value.
+    /// Request id (`req_…`) of the request this build serves. Threaded from
+    /// the web server so the single-agent and orchestration paths share one
+    /// value.
     pub request_id: Option<String>,
+
+    /// The request headers this build forwards; see [`ForwardedHeaders`].
+    pub forwarded_headers: ForwardedHeaders,
 
     /// Computed instance UUID for this agent, derived from agent config and
     /// host identity. Threaded into HITL approval requests so webhook
     /// receivers can identify which instance raised each approval.
     pub instance_id: String,
 
-    /// The `request_approval` tool, pre-built with the appropriate
-    /// [`AgentScope`]. Orchestration workers set this in `create_worker` with
-    /// `AgentScope::Worker`; single-agent mode sets it in `Agent::new` with
-    /// `AgentScope::Single`. `None` when `[hitl]` is not configured.
+    /// The `request_approval` tool, pre-built with its [`AgentScope`].
     ///
     /// [`AgentScope`]: crate::hitl::AgentScope
     pub hitl_request_approval_tool: Option<crate::hitl::RequestApprovalTool>,
@@ -176,10 +152,10 @@ impl Clone for AgentRuntimeConfig {
             orchestration_persistence: self.orchestration_persistence.clone(),
             session_id: self.session_id.clone(),
             scratchpad_tools_config: self.scratchpad_tools_config.clone(),
-            turn_nudge: self.turn_nudge.clone(),
             orchestration_submit_result: self.orchestration_submit_result.clone(),
             hitl: self.hitl.clone(),
             request_id: self.request_id.clone(),
+            forwarded_headers: self.forwarded_headers.clone(),
             instance_id: self.instance_id.clone(),
             hitl_request_approval_tool: self.hitl_request_approval_tool.clone(),
         }
@@ -214,7 +190,6 @@ impl std::fmt::Debug for AgentRuntimeConfig {
                     .map(|_| "<persistence>"),
             )
             .field("session_id", &self.session_id)
-            .field("turn_nudge", &self.turn_nudge.as_ref().map(|_| "<state>"))
             .field(
                 "orchestration_submit_result",
                 &self
@@ -224,6 +199,7 @@ impl std::fmt::Debug for AgentRuntimeConfig {
             )
             .field("hitl", &self.hitl.as_ref().map(|_| "<hitl>"))
             .field("request_id", &self.request_id)
+            .field("forwarded_headers", &self.forwarded_headers)
             .field("instance_id", &self.instance_id)
             .field(
                 "hitl_request_approval_tool",

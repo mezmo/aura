@@ -37,7 +37,8 @@
 //!     .build_streaming_agent_with_headers(None, None, None)
 //!     .await?;
 //!
-//! let stream = agent.stream(query, history, cancel_token, "req_123").await?;
+//! let run = agent.stream(query, history, RunOptions::default(), "req_123").await;
+//! let stream = run.into_events();
 //! ```
 
 mod config;
@@ -86,7 +87,7 @@ pub(crate) use park::{CallKey, ParkGuard, RecordedDecisions, run_owner_id};
 // wraps the rig's scripted agent type.
 pub use prompt_constants::{context, fields, sections};
 #[cfg(test)]
-pub(crate) use test_rig::ScriptedAgent;
+pub(crate) use test_rig::{ScriptedAgent, ScriptedCompletionModel, ScriptedTurn};
 pub use types::{
     BlockedCell, CellOutcome, ParkSnapshot, PendingCall, Plan, PlanningResponse, RunId, StepInput,
     StructuredTaskOutput, Task, TaskIdentity, TaskJson, TaskState, TaskStatus,

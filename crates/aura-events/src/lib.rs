@@ -10,13 +10,16 @@
 //!
 //! - [`AuraStreamEvent`] — Base aura events (tool lifecycle, usage, reasoning, progress)
 //! - [`OrchestrationStreamEvent`] — Multi-agent orchestration events
+//! - [`agent::AgentEvent`] — What a running agent emits, before any wire projection
+//! - [`run::RunEvent`] — One run's ordered stream: its agent's events and its own lifecycle
 //!
-//! Both enums derive `Serialize + Deserialize` so they can be used for
+//! All derive `Serialize + Deserialize` so they can be used for
 //! producing SSE (server) and parsing SSE (client) with the same types.
 
 pub mod agent;
 pub mod event_names;
 pub mod orchestration;
+pub mod run;
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -133,6 +136,25 @@ macro_rules! string_newtype {
             }
         }
     };
+}
+
+// Path-based so submodules can invoke it regardless of declaration order.
+pub(crate) use string_newtype;
+
+string_newtype! {
+    /// Identifier for a chat session — the conversational context an agent
+    /// runs in. Not every run has one.
+    SessionId
+}
+
+string_newtype! {
+    /// Identifier for one run of an agent: the unit a
+    /// [`RunEvent`](run::RunEvent) stream belongs to.
+    ///
+    /// This is the epic's "unique agent id for that run". It is not
+    /// [`AgentContext::agent_id`], which is [`CONVERSATION_AGENT_ID`] or a
+    /// worker name and attributes an event *within* a run.
+    RunId
 }
 
 string_newtype! {

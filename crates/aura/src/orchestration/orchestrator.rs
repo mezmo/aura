@@ -49,17 +49,18 @@ use std::time::{Duration, Instant};
 
 use aura_config::GlobPattern;
 use rig::client::CompletionClient;
-use tokio::sync::{Mutex, watch};
+use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-use crate::Agent;
 use crate::config::{AgentRuntimeConfig, LlmConfig};
 use crate::inactivity::{Liveness, STALL_MESSAGE, liveness_of};
 use crate::mcp::McpManager;
 use crate::provider_agent::{BuilderState, ProviderAgent, StreamError, StreamItem};
+use crate::run::RunSlot;
 use crate::scratchpad;
 use crate::string_utils::safe_truncate;
 use crate::tool_call_observer::ToolCallObserver;
+use crate::{Agent, PreparedAgent};
 
 use super::tools::RoutingToolSet;
 use super::tools::{InspectToolParamsTool, ListToolsTool, ReadArtifactTool};
@@ -190,46 +191,28 @@ fn apply_worker_skills_override(
     }
 }
 
-/// Spawns a task that monitors for external cancellation or timeout,
-/// cancelling the provided token when either occurs.
+/// Spawns a task that cancels `cancel_token` once `timeout` passes.
+///
+/// It also stops early on either of two signals. `finished` resolves when the
+/// run's task ends, so the watcher does not sleep out its full duration; a
+/// finished run has not been cancelled, which is why that is a separate token.
+/// An already-cancelled `cancel_token` needs nothing further and only logs.
 ///
 /// Returns a `JoinHandle` for the watcher task. The handle is intentionally
 /// fire-and-forget in production (the task self-terminates via `select!`),
 /// but callers in tests should `.await` it to assert post-conditions.
-///
-/// Cleanup: when the caller drops the sender side of `cancel_rx` after an
-/// explicit signal, `rx.changed()` returns `Err`, the `select!` resolves,
-/// and the sleep future is dropped (cancelling the timer via tokio's
-/// standard drop semantics). A drop with no explicit signal is treated as
-/// an unexplained abort — see the loop body below.
 #[must_use = "task runs independently; bind with `let _handle =` to document fire-and-forget intent"]
-pub(super) fn spawn_cancellation_watcher(
-    cancel_rx: watch::Receiver<bool>,
+pub(super) fn spawn_timeout_watcher(
     timeout: Duration,
     cancel_token: CancellationToken,
+    finished: CancellationToken,
     request_id: String,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         tokio::select! {
-            was_cancelled = async {
-                let mut rx = cancel_rx;
-                loop {
-                    // A closed channel means the outer stream can no longer
-                    // signal cancellation. Fail safe by cancelling the
-                    // orchestration token (#305) — cancelling an
-                    // already-finished inner task is a no-op.
-                    if rx.changed().await.is_err() {
-                        return true;
-                    }
-                    if *rx.borrow_and_update() {
-                        return true; // External cancellation requested
-                    }
-                }
-            } => {
-                if was_cancelled {
-                    tracing::info!("External cancellation triggered for {}", request_id);
-                    cancel_token.cancel();
-                }
+            () = finished.cancelled() => {}
+            () = cancel_token.cancelled() => {
+                tracing::info!("Run cancelled for {}", request_id);
             }
             _ = tokio::time::sleep(timeout) => {
                 tracing::warn!("Timeout reached, cancelling orchestration");
@@ -466,8 +449,8 @@ pub struct Orchestrator {
     /// Accumulated token usage across all LLM calls in this orchestration run
     /// (planning, workers, continuation routing).
     ///
-    /// Cloned from a handle owned by `OrchestratorFactory::stream_with_timeout`
-    /// so the streaming handler can read the final totals and emit `aura.usage`.
+    /// Cloned from the handle `OrchestratorFactory::stream` puts on the run, so
+    /// the streaming handler can read the final totals and emit `aura.usage`.
     /// In orchestration mode we aggregate additively via
     /// [`crate::UsageState::accumulate_usage`] so the reported prompt/completion
     /// totals reflect *billed* tokens across every internal LLM turn, not just
@@ -765,6 +748,10 @@ impl Orchestrator {
             .or(self.agent_config.agent.scratchpad.as_ref())
             .cloned();
 
+        // The slot every wrapper and tool built below reaches this worker's
+        // run through; `begin_run` fills it once the worker is prepared.
+        let run = RunSlot::new();
+        let mut scratchpad_budget: Option<scratchpad::ContextBudget> = None;
         let mut scratchpad_tools = Vec::<Arc<dyn ToolWrapper>>::new();
         if let Some(ref sp_cfg) = effective_scratchpad
             && sp_cfg.enabled
@@ -847,10 +834,12 @@ impl Orchestrator {
                     context_window,
                     initial_used,
                     token_counter,
+                    run: run.clone(),
                 })
                 .await?;
 
                 scratchpad_tools.push(build.wrapper);
+                scratchpad_budget = Some(build.budget);
                 worker_config.scratchpad_tools_config = Some(build.tools_config);
             }
         }
@@ -899,10 +888,10 @@ impl Orchestrator {
         let mut wrappers: Vec<Arc<dyn ToolWrapper>> = vec![observer_wrapper, duplicate_guard];
         wrappers.extend(scratchpad_tools);
         wrappers.push(persistence_wrapper);
-        if let Some(ref state) = turn_nudge {
+        if turn_nudge.is_some() {
             wrappers.insert(
                 0,
-                Arc::new(crate::turn_nudge::TurnNudgeWrapper::new(state.clone())),
+                Arc::new(crate::turn_nudge::TurnNudgeWrapper::new(run.clone())),
             );
             tracing::info!(
                 "Worker {} turn-limit nudging enabled (last_turn={}, wrap_up_threshold={:?})",
@@ -936,12 +925,11 @@ impl Orchestrator {
                 task: super::TaskIdentity::new(task_id, worker_name.map(String::from)),
                 session_id: session_id_owned.map(crate::config::SessionId::new),
             };
-            let request_id = worker_config.request_id.clone().unwrap_or_default();
             let mut gate = crate::hitl::HitlApprovalWrapper::new(
                 hitl.patterns.clone(),
                 hitl.route.clone(),
                 scope.clone(),
-                request_id.clone(),
+                run.clone(),
                 worker_config.agent.name.clone(),
                 worker_config.instance_id.clone(),
             );
@@ -962,7 +950,7 @@ impl Orchestrator {
             worker_config.hitl_request_approval_tool = Some(crate::hitl::RequestApprovalTool::new(
                 hitl.route.clone(),
                 scope,
-                request_id,
+                run.clone(),
                 worker_config.agent.name.clone(),
                 worker_config.instance_id.clone(),
             ));
@@ -1039,7 +1027,6 @@ impl Orchestrator {
 
         // Orchestrator owns tool wrapping decision
         worker_config.tool_wrapper = Some(wrapper);
-        worker_config.turn_nudge = turn_nudge.clone();
 
         // Give workers access to result artifacts
         worker_config.orchestration_persistence = Some(self.persistence.clone());
@@ -1088,7 +1075,9 @@ impl Orchestrator {
         // never attached to workers (or the coordinator).
         let (provider_agent, model_name) = self.build_worker_provider_agent(&worker_config).await?;
 
-        let agent = Agent {
+        // A worker is prepared for exactly one task attempt, so its single
+        // run begins here, under the request that owns the orchestration.
+        let prepared = Arc::new(PreparedAgent {
             inner: provider_agent,
             model: model_name,
             max_depth: resolved_depth,
@@ -1097,15 +1086,18 @@ impl Orchestrator {
             fallback_tool_names: vec![],
             fallback_mcp_filter: None,
             context_window: worker_config.llm.context_window(),
-            scratchpad_budget: worker_config
-                .scratchpad_tools_config
-                .as_ref()
-                .map(|sp| sp.budget.clone()),
+            scratchpad_budget,
             client_tool_names: Default::default(),
             turn_nudge,
             system_prompt: preamble.clone(),
             invocation_parameters: crate::logging::llm_invocation_parameters(&worker_config.llm),
-        };
+            forwarded_headers: worker_config.forwarded_headers.clone(),
+            run,
+        });
+        let agent = prepared.begin_run(
+            worker_config.request_id.clone().unwrap_or_default(),
+            Some(&worker_config.forwarded_headers.as_request()),
+        )?;
 
         Ok(AgentWithPreamble {
             agent,
@@ -1445,19 +1437,22 @@ impl Orchestrator {
         let timeout_secs = self.config.per_call_timeout_secs();
         let stream_future = async {
             let stream = match park_key {
-                Some(key) => {
-                    agent
-                        .stream_chat_with_timeout(prompt, history, Duration::MAX, key)
-                        .await
-                        .0
-                }
+                Some(key) => agent
+                    .stream_chat_with_timeout(
+                        prompt,
+                        history,
+                        crate::streaming::RunOptions::default(),
+                        key,
+                    )
+                    .await
+                    .into_events(),
                 None => agent.stream_chat(prompt, history).await,
             };
             Self::drive_forward_loop(
                 stream,
                 &self.usage_state,
                 self.config.stream_inactivity_timeout_secs(),
-                agent.scratchpad_budget.as_ref(),
+                agent.scratchpad_budget(),
                 phase,
                 event_tx,
                 stream_context,
@@ -2694,24 +2689,35 @@ Assign tasks to the worker whose tools best match the required operations."#,
         // post-execute continuation routing (13 calls in 5-prompt E2E suite).
         let max_depth = PLANNING_COORDINATOR_MAX_DEPTH;
 
+        // The coordinator has no run-scoped tool state, but it is still one
+        // run of one prepared agent, under the request that owns the
+        // orchestration.
+        let prepared = Arc::new(PreparedAgent {
+            inner: provider_agent,
+            model: model_name,
+            max_depth,
+            mcp_manager: None, // Coordinator doesn't have MCP tools
+            fallback_tool_parsing: false,
+            fallback_tool_names: vec![],
+            fallback_mcp_filter: None,
+            context_window: self.agent_config.llm.context_window(),
+            scratchpad_budget: None,
+            client_tool_names: Default::default(),
+            turn_nudge: None,
+            system_prompt: preamble.clone(),
+            invocation_parameters: crate::logging::llm_invocation_parameters(
+                &self.agent_config.llm,
+            ),
+            forwarded_headers: self.agent_config.forwarded_headers.clone(),
+            run: RunSlot::new(),
+        });
+        let agent = prepared.begin_run(
+            self.agent_config.request_id.clone().unwrap_or_default(),
+            Some(&self.agent_config.forwarded_headers.as_request()),
+        )?;
+
         Ok(AgentWithPreamble {
-            agent: Agent {
-                inner: provider_agent,
-                model: model_name,
-                max_depth,
-                mcp_manager: None, // Coordinator doesn't have MCP tools
-                fallback_tool_parsing: false,
-                fallback_tool_names: vec![],
-                fallback_mcp_filter: None,
-                context_window: self.agent_config.llm.context_window(),
-                scratchpad_budget: None,
-                client_tool_names: Default::default(),
-                turn_nudge: None,
-                system_prompt: preamble.clone(),
-                invocation_parameters: crate::logging::llm_invocation_parameters(
-                    &self.agent_config.llm,
-                ),
-            },
+            agent,
             preamble,
             escalation_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             submit_result_decision: Arc::new(Mutex::new(None)),
@@ -2983,7 +2989,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 }
             }
             let state =
-                Agent::add_all_tools(state, worker_config, &shared_mcp, wait_for_tools()).await?;
+                PreparedAgent::add_all_tools(state, worker_config, &shared_mcp, wait_for_tools())
+                    .await?;
             return Ok((
                 ProviderAgent::Scripted(state.build()),
                 "scripted".to_string(),
@@ -3035,9 +3042,13 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     builder = builder.max_tokens(max);
                 }
                 let state = BuilderState::Initial(builder);
-                let state =
-                    Agent::add_all_tools(state, worker_config, &shared_mcp, wait_for_tools())
-                        .await?;
+                let state = PreparedAgent::add_all_tools(
+                    state,
+                    worker_config,
+                    &shared_mcp,
+                    wait_for_tools(),
+                )
+                .await?;
                 Ok((ProviderAgent::OpenAI(state.build()), model.clone()))
             }
             LlmConfig::Anthropic {
@@ -3074,9 +3085,13 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     builder = builder.additional_params(params.clone());
                 }
                 let state = BuilderState::Initial(builder);
-                let state =
-                    Agent::add_all_tools(state, worker_config, &shared_mcp, wait_for_tools())
-                        .await?;
+                let state = PreparedAgent::add_all_tools(
+                    state,
+                    worker_config,
+                    &shared_mcp,
+                    wait_for_tools(),
+                )
+                .await?;
                 Ok((ProviderAgent::Anthropic(state.build()), model.clone()))
             }
             LlmConfig::Bedrock {
@@ -3121,9 +3136,13 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     builder = builder.additional_params(params.clone());
                 }
                 let state = BuilderState::Initial(builder);
-                let state =
-                    Agent::add_all_tools(state, worker_config, &shared_mcp, wait_for_tools())
-                        .await?;
+                let state = PreparedAgent::add_all_tools(
+                    state,
+                    worker_config,
+                    &shared_mcp,
+                    wait_for_tools(),
+                )
+                .await?;
                 Ok((ProviderAgent::Bedrock(state.build()), model.clone()))
             }
             LlmConfig::Gemini {
@@ -3153,9 +3172,13 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     builder = builder.additional_params(params.clone());
                 }
                 let state = BuilderState::Initial(builder);
-                let state =
-                    Agent::add_all_tools(state, worker_config, &shared_mcp, wait_for_tools())
-                        .await?;
+                let state = PreparedAgent::add_all_tools(
+                    state,
+                    worker_config,
+                    &shared_mcp,
+                    wait_for_tools(),
+                )
+                .await?;
                 Ok((ProviderAgent::Gemini(state.build()), model.clone()))
             }
             LlmConfig::Ollama {
@@ -3184,9 +3207,13 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 }
 
                 let state = BuilderState::Initial(builder);
-                let state =
-                    Agent::add_all_tools(state, worker_config, &shared_mcp, wait_for_tools())
-                        .await?;
+                let state = PreparedAgent::add_all_tools(
+                    state,
+                    worker_config,
+                    &shared_mcp,
+                    wait_for_tools(),
+                )
+                .await?;
                 Ok((ProviderAgent::Ollama(state.build()), model.clone()))
             }
             LlmConfig::OpenRouter {
@@ -3219,9 +3246,13 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     builder = builder.additional_params(params.clone());
                 }
                 let state = BuilderState::Initial(builder);
-                let state =
-                    Agent::add_all_tools(state, worker_config, &shared_mcp, wait_for_tools())
-                        .await?;
+                let state = PreparedAgent::add_all_tools(
+                    state,
+                    worker_config,
+                    &shared_mcp,
+                    wait_for_tools(),
+                )
+                .await?;
                 Ok((ProviderAgent::OpenRouter(state.build()), model.clone()))
             }
         }
@@ -3695,7 +3726,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             // their hook-carrying stream (`stream_chat_with_timeout`) seeds
             // the budget itself, from the prompt *and* the retry history.
             if park.is_none()
-                && let Some(ref budget) = worker.scratchpad_budget
+                && let Some(budget) = worker.scratchpad_budget()
             {
                 let task_prompt_tokens = budget.count_tokens(&prompt);
                 budget.record_usage(task_prompt_tokens);
@@ -3780,7 +3811,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             }
 
             // Emit per-agent ScratchpadUsage event if this worker used scratchpad.
-            if let (Some(budget), Some(tx)) = (worker.scratchpad_budget.as_ref(), event_tx) {
+            if let (Some(budget), Some(tx)) = (worker.scratchpad_budget(), event_tx) {
                 let agent_id = worker_name
                     .map(|n| n.to_string())
                     .unwrap_or_else(|| self.orchestrator_id.clone());
@@ -4015,23 +4046,24 @@ Assign tasks to the worker whose tools best match the required operations."#,
         let srd = submit_result_decision.clone();
         let park_registration =
             crate::streaming_request_hook::ParkCellRegistration::new(&park.key, park.cell.clone());
-        let (stream, _cancel_tx, _usage_state) = worker
+        let stream = worker
             .inner
             .stream_chat_message_with_timeout(
                 current_prompt,
                 continuation.history.clone(),
                 worker.max_depth,
-                Duration::MAX,
+                crate::streaming::RunOptions::default(),
                 &park.key,
-                worker.scratchpad_budget.clone(),
+                worker.scratchpad_budget().cloned(),
                 worker.client_tool_names.clone(),
             )
-            .await;
+            .await
+            .into_events();
         let stream_result = Self::drive_forward_loop(
             stream,
             &self.usage_state,
             self.config.stream_inactivity_timeout_secs(),
-            worker.scratchpad_budget.as_ref(),
+            worker.scratchpad_budget(),
             "Worker resume",
             event_tx,
             worker_name.map(|name| StreamContext {
@@ -6515,120 +6547,44 @@ mod tests {
     // Cancellation watcher tests
     // ========================================================================
 
+    /// A finished run is not a cancelled one, so the watcher has to stop on a
+    /// signal that leaves the run's own token untouched.
     #[tokio::test(start_paused = true)]
-    async fn test_watcher_unexplained_drop_triggers_failsafe_cancel() {
-        let (cancel_tx, cancel_rx) = watch::channel(false);
+    async fn watcher_stops_when_the_run_ends() {
         let cancel_token = CancellationToken::new();
-        let handle = spawn_cancellation_watcher(
-            cancel_rx,
+        let finished = CancellationToken::new();
+        let handle = spawn_timeout_watcher(
             Duration::from_secs(300),
             cancel_token.clone(),
+            finished.clone(),
             "test-normal".to_string(),
         );
 
-        // A bare drop with no explicit `false` first means the outer task
-        // ended without going through its normal completion path (e.g.
-        // aborted during shutdown) — the watcher must fail safe and cancel.
-        drop(cancel_tx);
-        tokio::task::yield_now().await;
-        handle.await.unwrap();
-        assert!(cancel_token.is_cancelled());
-    }
+        finished.cancel();
 
-    #[tokio::test(start_paused = true)]
-    async fn test_watcher_external_cancel_triggers_token() {
-        let (cancel_tx, cancel_rx) = watch::channel(false);
-        let cancel_token = CancellationToken::new();
-        let handle = spawn_cancellation_watcher(
-            cancel_rx,
-            Duration::from_secs(300),
-            cancel_token.clone(),
-            "test-cancel".to_string(),
+        let start = tokio::time::Instant::now();
+        handle.await.unwrap();
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "watcher should exit when the run ends, not wait out its timeout"
         );
-
-        cancel_tx.send(true).unwrap();
-        tokio::task::yield_now().await;
-        handle.await.unwrap();
-        assert!(cancel_token.is_cancelled());
+        assert!(
+            !cancel_token.is_cancelled(),
+            "a run that finished was never cancelled"
+        );
     }
 
     #[tokio::test(start_paused = true)]
-    async fn test_watcher_timeout_triggers_cancellation() {
-        // Keep sender alive so only the timeout path can fire
-        let (_cancel_tx, cancel_rx) = watch::channel(false);
+    async fn watcher_cancels_on_timeout() {
         let cancel_token = CancellationToken::new();
-        let handle = spawn_cancellation_watcher(
-            cancel_rx,
+        let handle = spawn_timeout_watcher(
             Duration::from_secs(60),
             cancel_token.clone(),
+            CancellationToken::new(),
             "test-timeout".to_string(),
         );
 
         tokio::time::advance(Duration::from_secs(61)).await;
-        tokio::task::yield_now().await;
-        handle.await.unwrap();
-        assert!(cancel_token.is_cancelled());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn test_watcher_unexplained_drop_before_timeout_cancels_promptly() {
-        let (cancel_tx, cancel_rx) = watch::channel(false);
-        let cancel_token = CancellationToken::new();
-        let handle = spawn_cancellation_watcher(
-            cancel_rx,
-            Duration::from_secs(60),
-            cancel_token.clone(),
-            "test-abort-mid-stream".to_string(),
-        );
-
-        // Advance to T=30s, then drop the sender with no prior explicit
-        // signal — the production scenario of an outer task aborted mid-
-        // stream (e.g. during shutdown). The watcher must fail safe and
-        // cancel promptly rather than assume normal completion.
-        tokio::time::advance(Duration::from_secs(30)).await;
-        tokio::task::yield_now().await;
-        drop(cancel_tx);
-        tokio::task::yield_now().await;
-
-        let start = tokio::time::Instant::now();
-        handle.await.unwrap();
-        let elapsed = start.elapsed();
-
-        assert!(
-            cancel_token.is_cancelled(),
-            "an unexplained sender drop must fail safe and cancel"
-        );
-        // Task should exit promptly on sender drop, not wait for remaining 30s timeout
-        assert!(
-            elapsed < Duration::from_secs(1),
-            "task should exit promptly after sender drop, not wait for timeout; elapsed: {:?}",
-            elapsed
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn test_watcher_false_signal_does_not_cancel() {
-        let (cancel_tx, cancel_rx) = watch::channel(false);
-        let cancel_token = CancellationToken::new();
-        let handle = spawn_cancellation_watcher(
-            cancel_rx,
-            Duration::from_secs(300),
-            cancel_token.clone(),
-            "test-false-signal".to_string(),
-        );
-
-        // Send false — triggers rx.changed() but borrow_and_update() sees false,
-        // so the loop continues waiting
-        cancel_tx.send(false).unwrap();
-        tokio::task::yield_now().await;
-        assert!(
-            !cancel_token.is_cancelled(),
-            "false signal should not cancel"
-        );
-
-        // Bare drop with no final explicit signal — fail safe and cancel.
-        drop(cancel_tx);
-        tokio::task::yield_now().await;
         handle.await.unwrap();
         assert!(cancel_token.is_cancelled());
     }
