@@ -180,8 +180,12 @@ impl AgentRun {
 /// puts the same content where a consumer built on the run's events can reach
 /// it, without changing what the existing ones see. The run is passed rather
 /// than read from scope because this wraps the stream from outside it.
+///
+/// `agent` is whose content this stream carries. An orchestrated run's answer
+/// is the coordinator's, not that of any worker that fed it.
 pub fn tee_content<S>(
     run: std::sync::Arc<RunContext>,
+    agent: aura_events::AgentContext,
     inner: S,
 ) -> impl futures::Stream<Item = Result<StreamItem, StreamError>>
 where
@@ -192,7 +196,8 @@ where
             if let Ok(item) = &item
                 && let Some(payload) = content_of(item)
             {
-                run.emit(aura_events::agent::AgentEvent::single_agent(payload)).await;
+                run.emit(aura_events::agent::AgentEvent::new(agent.clone(), payload))
+                    .await;
             }
             yield item;
         }
@@ -468,17 +473,27 @@ mod tests {
         }
 
         async fn teed(items: Vec<Result<StreamItem, StreamError>>) -> (usize, Vec<Payload>) {
+            let (_, passed, seen) = teed_as(aura_events::AgentContext::single_agent(), items).await;
+            (passed, seen)
+        }
+
+        async fn teed_as(
+            agent: aura_events::AgentContext,
+            items: Vec<Result<StreamItem, StreamError>>,
+        ) -> (Vec<aura_events::AgentContext>, usize, Vec<Payload>) {
             let (run, mut events) = RunContext::channel("run_tee");
-            let passed = tee_content(run, futures::stream::iter(items))
+            let passed = tee_content(run, agent, futures::stream::iter(items))
                 .collect::<Vec<_>>()
                 .await
                 .len();
 
-            let mut seen = Vec::new();
+            let mut agents = Vec::new();
+            let mut payloads = Vec::new();
             while let Ok(event) = events.try_recv() {
-                seen.push(event.payload);
+                agents.push(event.agent);
+                payloads.push(event.payload);
             }
-            (passed, seen)
+            (agents, passed, payloads)
         }
 
         /// The items still reach the consumer that reads them today; the copy is
@@ -521,6 +536,30 @@ mod tests {
             assert_eq!(completed, ("hi there", 15));
         }
 
+        /// An orchestrated run's answer is the coordinator's. A worker feeds it,
+        /// so attributing the content to whoever produced the item would name the
+        /// wrong agent to an observer deciding who said what.
+        #[tokio::test]
+        async fn orchestrated_content_is_the_coordinators() {
+            let (agents, _, seen) = teed_as(
+                aura_events::AgentContext::coordinator(),
+                vec![say("the answer"), finish("the answer")],
+            )
+            .await;
+
+            assert!(
+                !seen.is_empty(),
+                "the coordinator's content reaches the run"
+            );
+            for agent in &agents {
+                assert_eq!(
+                    agent,
+                    &aura_events::AgentContext::coordinator(),
+                    "every copied item is attributed to the coordinator"
+                );
+            }
+        }
+
         /// A run nobody observes has dropped its receiver, so the copy fails and
         /// the items must still pass.
         #[tokio::test]
@@ -528,10 +567,14 @@ mod tests {
             let (run, events) = RunContext::channel("run_unobserved");
             drop(events);
 
-            let passed = tee_content(run, futures::stream::iter(vec![say("a"), finish("a")]))
-                .collect::<Vec<_>>()
-                .await
-                .len();
+            let passed = tee_content(
+                run,
+                aura_events::AgentContext::single_agent(),
+                futures::stream::iter(vec![say("a"), finish("a")]),
+            )
+            .collect::<Vec<_>>()
+            .await
+            .len();
             assert_eq!(passed, 2);
         }
     }

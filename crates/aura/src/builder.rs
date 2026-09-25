@@ -1740,7 +1740,11 @@ impl StreamingAgent for Agent {
             .map_stream(move |stream| {
                 Box::pin(crate::run_context::scope_stream(
                     std::sync::Arc::clone(&run),
-                    Box::pin(crate::streaming::tee_content(run, stream)),
+                    Box::pin(crate::streaming::tee_content(
+                        run,
+                        aura_events::AgentContext::single_agent(),
+                        stream,
+                    )),
                 ))
             })
             .observed_by(run_events)

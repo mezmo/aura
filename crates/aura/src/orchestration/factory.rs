@@ -33,6 +33,35 @@ struct RunTokens {
     finished: Option<CancellationToken>,
 }
 
+/// The response an orchestrated run finishes with.
+///
+/// Orchestration accumulates usage across every worker and coordinator turn, so
+/// the totals come from the run rather than from one response. The cache counts
+/// come with them, because a reader that finds usage on the response takes the
+/// split from there too, and a split from a different turn population would not
+/// be a subset of the prompt tokens it sits beside.
+fn final_response(
+    content: String,
+    usage_state: &crate::UsageState,
+) -> crate::provider_agent::FinalResponseInfo {
+    let (input_tokens, output_tokens, total_tokens) = usage_state.get_final_usage();
+
+    crate::provider_agent::FinalResponseInfo {
+        content,
+        usage: rig::completion::Usage {
+            input_tokens,
+            output_tokens,
+            total_tokens,
+        },
+        cache_usage: usage_state.get_cache_usage().map(
+            |(cache_read_input_tokens, cache_creation_input_tokens)| rig::completion::CacheUsage {
+                cache_read_input_tokens,
+                cache_creation_input_tokens,
+            },
+        ),
+    }
+}
+
 impl OrchestratorFactory {
     pub fn new(agent_config: AgentRuntimeConfig) -> Self {
         Self { agent_config }
@@ -80,7 +109,7 @@ impl OrchestratorFactory {
                 };
                 // Share the caller's usage handle so accumulate_usage() writes
                 // are visible to the streaming handler (UsageState is Arc-backed).
-                orchestrator.usage_state = usage_state;
+                orchestrator.usage_state = usage_state.clone();
                 orchestrator.outer_budget = outer_budget;
 
                 // Surface per-server connection status so degraded/unavailable
@@ -120,11 +149,7 @@ impl OrchestratorFactory {
                                 }
 
                                 let _ = event_tx.send(Ok(StreamItem::Final(
-                                    crate::provider_agent::FinalResponseInfo {
-                                        content: final_result,
-                                        usage: Default::default(),
-                                        cache_usage: None,
-                                    }
+                                    final_response(final_result, &usage_state)
                                 ))).await;
                             }
                             Err(e) => {
@@ -209,10 +234,18 @@ impl StreamingAgent for OrchestratorFactory {
                 cancel: cancel_token.clone(),
                 finished,
             },
-            run,
+            std::sync::Arc::clone(&run),
             usage_state.clone(),
             timeout,
         );
+
+        // The answer an orchestrated run produces is the coordinator's, so it
+        // is attributed there rather than to any worker that fed it.
+        let stream = Box::pin(crate::streaming::tee_content(
+            run,
+            aura_events::AgentContext::coordinator(),
+            stream,
+        ));
 
         crate::streaming::AgentRun::new(stream, cancel_token, usage_state).observed_by(run_events)
     }
@@ -220,5 +253,47 @@ impl StreamingAgent for OrchestratorFactory {
     async fn cancel_and_close_mcp(&self, _request_id: &str, _reason: &str) -> usize {
         // No-op: cancellation is handled inside the spawned task via cancel_token.
         0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A reader that finds usage on the response takes the cache split from
+    /// there too, so the response carries the run's split with its totals.
+    #[test]
+    fn an_orchestrated_response_reports_what_the_run_billed() {
+        let usage = crate::UsageState::new();
+        usage.accumulate_usage(5_000, 200);
+        usage.accumulate_usage(8_000, 400);
+        usage.store_cache_usage(4_000, 1_000);
+
+        let response = final_response("the answer".to_string(), &usage);
+
+        assert_eq!(response.content, "the answer");
+        assert_eq!(response.usage.input_tokens, 13_000);
+        assert_eq!(response.usage.output_tokens, 600);
+        assert_eq!(response.usage.total_tokens, 13_600);
+
+        let cache = response
+            .cache_usage
+            .expect("a run that used the cache says so");
+        assert_eq!(cache.cache_read_input_tokens, 4_000);
+        assert_eq!(cache.cache_creation_input_tokens, 1_000);
+    }
+
+    /// A run that never touched the cache reports none, rather than zeros that
+    /// would read as a cache miss.
+    #[test]
+    fn a_response_from_a_run_without_cache_reports_none() {
+        let usage = crate::UsageState::new();
+        usage.accumulate_usage(10, 5);
+
+        assert!(
+            final_response("hi".to_string(), &usage)
+                .cache_usage
+                .is_none()
+        );
     }
 }
