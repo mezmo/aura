@@ -514,6 +514,7 @@ fn run_event_sse(
         | Payload::McpStatus { .. }
         | Payload::TextDelta { .. }
         | Payload::Reasoning { .. }
+        | Payload::Completed { .. }
         | Payload::ToolComplete { .. }
         | Payload::WorkerPhase { .. }
         | Payload::Usage { .. }
