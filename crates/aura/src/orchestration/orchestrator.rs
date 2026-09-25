@@ -41,6 +41,7 @@
 //! - `IterationComplete` - when the post-execute coordinator decision completes
 //! - `Synthesizing` - when task results are being consolidated for the coordinator
 
+use aura_events::CONVERSATION_AGENT_ID;
 use aura_events::agent::{AgentEvent, AgentEventPayload};
 use aura_events::orchestration::RoutingMode;
 use std::sync::Arc;
@@ -498,11 +499,6 @@ struct StreamCallParams<'a> {
     event_tx: Option<&'a tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>>,
     context_agent: Option<&'a str>,
 }
-
-/// Agent id for the conversation-level context an orchestration run carries,
-/// matching the single-agent id so clients key context pressure the same way
-/// in both modes.
-const COORDINATOR_AGENT_ID: &str = "main";
 
 /// Every exit path of a stream loop must route its turns through
 /// [`TurnTally::record`]: a turn counted locally but not into the shared
@@ -1318,7 +1314,7 @@ impl Orchestrator {
                     {
                         let (task_id, worker_id) = match stream_context.as_ref() {
                             Some(w) => (Some(w.task_id), w.worker_id),
-                            None => (None, "main"),
+                            None => (None, CONVERSATION_AGENT_ID),
                         };
                         forward_internal_tool_started(
                             event_tx,
@@ -1602,7 +1598,7 @@ impl Orchestrator {
                             forward_internal_tool_started(
                                 event_tx,
                                 None,
-                                "main",
+                                CONVERSATION_AGENT_ID,
                                 &tc.id,
                                 &tc.name,
                                 &tc.arguments,
@@ -1962,13 +1958,14 @@ impl Orchestrator {
                         // persistent conversation — the chat history plus the
                         // planning prompt — so its occupancy is the
                         // conversation's, reported under the same agent id
-                        // single-agent mode uses. Continuation cycles carry
-                        // the turn's scratch conversation, discarded when the
-                        // turn ends, and so do routing-correction attempts
-                        // (the skipped reply plus the correction), so neither
-                        // reports.
+                        // single-agent mode uses so clients key context
+                        // pressure the same way in both modes. Continuation
+                        // cycles carry the turn's scratch conversation,
+                        // discarded when the turn ends, and so do
+                        // routing-correction attempts (the skipped reply plus
+                        // the correction), so neither reports.
                         context_agent: (previous.is_none() && attempt == 1)
-                            .then_some(COORDINATOR_AGENT_ID),
+                            .then_some(CONVERSATION_AGENT_ID),
                     },
                     &coordinator_state.routing_decision,
                 )

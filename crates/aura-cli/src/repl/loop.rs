@@ -1,4 +1,5 @@
 use anyhow::Result;
+use aura_events::CONVERSATION_AGENT_ID;
 use crossterm::cursor;
 use crossterm::execute;
 use crossterm::style::Stylize;
@@ -43,10 +44,6 @@ use crate::ui::prompt::{
     update_status_bar, update_status_bar_unlocked, with_event_log, with_event_log_mut,
 };
 use crate::ui::welcome::WelcomeState;
-
-/// Agent id carrying the conversation's own context — `"main"` in single-agent
-/// mode and for an orchestration coordinator; workers report other ids.
-const CONVERSATION_AGENT_ID: &str = "main";
 
 /// Context fill at which an over-long tool result is retried against a
 /// compacted conversation.
@@ -281,7 +278,8 @@ fn rewrite_worker_reasoning_body_inplace(state: &LiveReasoning, body_text: &str)
 ///
 /// `agent_id` is appended when it identifies the coordinator or some other
 /// non-default agent (e.g., `● Reasoning - coordinator`); single-agent
-/// deployments with `agent_id == "main"` render just `● Reasoning`.
+/// deployments, whose id is [`CONVERSATION_AGENT_ID`], render just
+/// `● Reasoning`.
 ///
 /// Caller must already hold `lock_term()`.
 fn open_top_level_reasoning_block(state: &mut LiveReasoning, agent_id: &str) {
@@ -290,7 +288,7 @@ fn open_top_level_reasoning_block(state: &mut LiveReasoning, agent_id: &str) {
     } else {
         agent_id
     });
-    let header = if agent_id == "main" || agent_id.is_empty() {
+    let header = if agent_id == CONVERSATION_AGENT_ID || agent_id.is_empty() {
         "Reasoning".to_string()
     } else {
         format!("Reasoning - {agent_id}")
@@ -3220,9 +3218,10 @@ impl StreamHandler for ReplStreamHandler {
                     } else {
                         &tool_initiator_id
                     };
-                    // Coordinator-owned calls (worker "main") belong to no
-                    // task: render at the top level, outside any task tree.
-                    if get_str(val, "worker_id") == "main" {
+                    // Coordinator-owned calls carry the conversation's id as
+                    // their worker and belong to no task: render at the top
+                    // level, outside any task tree.
+                    if get_str(val, "worker_id") == CONVERSATION_AGENT_ID {
                         crate::ui::orchestrator::register_orch_top_level_tool(
                             match_id,
                             &tool_display,

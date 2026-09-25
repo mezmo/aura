@@ -242,6 +242,11 @@ impl std::fmt::Display for Progress {
 /// same way.
 pub const COORDINATOR_AGENT_ID: &str = "coordinator";
 
+/// The agent id of the conversation itself: a lone agent, or an orchestrated
+/// run's conversation-level context. Distinct from [`COORDINATOR_AGENT_ID`],
+/// the coordinator's place in the agent hierarchy.
+pub const CONVERSATION_AGENT_ID: &str = "main";
+
 /// Context identifying which agent emitted an event.
 ///
 /// For single-agent deployments, use `AgentContext::single_agent()` which sets
@@ -264,10 +269,11 @@ pub struct AgentContext {
 }
 
 impl AgentContext {
-    /// Create a default single-agent context with agent_id = "main"
+    /// Create a default single-agent context, identified as
+    /// [`CONVERSATION_AGENT_ID`].
     pub fn single_agent() -> Self {
         Self {
-            agent_id: "main".to_string(),
+            agent_id: CONVERSATION_AGENT_ID.to_string(),
             agent_name: None,
             parent_agent_id: None,
         }
@@ -286,7 +292,7 @@ impl AgentContext {
     /// Create a single-agent context with a custom name
     pub fn single_agent_with_name(name: impl Into<String>) -> Self {
         Self {
-            agent_id: "main".to_string(),
+            agent_id: CONVERSATION_AGENT_ID.to_string(),
             agent_name: Some(name.into()),
             parent_agent_id: None,
         }
@@ -296,10 +302,10 @@ impl AgentContext {
     ///
     /// Several payload variants are emitted by both modes, so the projection
     /// that turns an event into a frame reads this rather than the variant.
-    /// An orchestration run names its coordinator-owned calls `"main"` too, so
-    /// the parent is what separates them.
+    /// An orchestration run names its coordinator-owned calls
+    /// [`CONVERSATION_AGENT_ID`] too, so the parent is what separates them.
     pub fn is_single_agent(&self) -> bool {
-        self.agent_id == "main" && self.parent_agent_id.is_none()
+        self.agent_id == CONVERSATION_AGENT_ID && self.parent_agent_id.is_none()
     }
 
     /// Create a worker agent context with parent hierarchy

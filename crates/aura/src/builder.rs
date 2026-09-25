@@ -1384,8 +1384,10 @@ impl Agent {
         let Some(budget) = self.scratchpad_budget.clone() else {
             return stream;
         };
-        let tail = futures::stream::once(async move { scratchpad_usage_event(&budget, "main") })
-            .filter_map(|opt| async move { opt.map(Ok) });
+        let tail = futures::stream::once(async move {
+            scratchpad_usage_event(&budget, aura_events::CONVERSATION_AGENT_ID)
+        })
+        .filter_map(|opt| async move { opt.map(Ok) });
         Box::pin(stream.chain(tail))
     }
 
