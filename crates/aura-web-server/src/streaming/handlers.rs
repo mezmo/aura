@@ -1634,6 +1634,41 @@ fn build_final_chunk(ctx: &TurnContext, state: &TurnState) -> Vec<Bytes> {
 
 #[cfg(test)]
 mod tests {
+    /// Which source `aura.usage` is resolved from.
+    mod billed_usage {
+        use super::super::resolve_billed_usage;
+        use crate::streaming::types::openai::UsageInfo;
+        use aura::UsageState;
+
+        /// `resolve_billed_usage` reads the final response's usage when it carries
+        /// any and the run's accumulated usage otherwise. A run whose response
+        /// carries that same accumulated usage must report the same numbers
+        /// either way, cache split included.
+        #[test]
+        fn both_sources_agree_on_what_a_run_billed() {
+            let state = UsageState::new();
+            state.accumulate_usage(120, 30);
+            state.store_cache_usage(7, 3);
+            let (prompt, completion, total) = state.get_final_usage();
+
+            let from_state = resolve_billed_usage(&None, None, &state);
+            let from_response = resolve_billed_usage(
+                &Some(UsageInfo {
+                    prompt_tokens: prompt,
+                    completion_tokens: completion,
+                    total_tokens: total,
+                }),
+                state.get_cache_usage(),
+                &state,
+            );
+
+            assert_eq!(
+                from_response, from_state,
+                "carrying usage on the response must not change what a run reports"
+            );
+        }
+    }
+
     /// The projection from a run's event onto the wire schema.
     mod run_events {
         use super::super::run_event_sse;
@@ -1985,10 +2020,10 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_billed_usage_falls_back_to_hook_for_orchestration() {
-        // Orchestration emits StreamItem::Final with zero usage and accumulates
-        // billed tokens through UsageState::accumulate_usage, so resolve must
-        // fall back to the hook total when Final carries no aggregated usage.
+    fn test_resolve_billed_usage_falls_back_when_the_response_reports_zero() {
+        // A response that reports nothing leaves the hook's accumulated total as
+        // the only account of what the run billed, so resolve reads it from
+        // there rather than reporting zero.
         let usage_state = UsageState::new();
         usage_state.accumulate_usage(5000, 200); // planning
         usage_state.accumulate_usage(8000, 400); // worker + synthesis
