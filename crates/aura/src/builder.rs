@@ -1702,7 +1702,13 @@ impl StreamingAgent for Agent {
         options: crate::streaming::RunOptions,
         request_id: &str,
     ) -> crate::streaming::AgentRun {
-        let (run, run_events) = crate::run_context::RunContext::channel(request_id);
+        // The run is built on the token it will stop on, so the work that awaits
+        // cancellation finds it there from the start.
+        let (timeout, cancel) = options.into_parts();
+        let cancel = cancel.unwrap_or_default();
+        let (run, run_events) =
+            crate::run_context::RunContext::channel_on(request_id, cancel.clone());
+        let options = crate::streaming::RunOptions::on_token(timeout, cancel);
 
         // The gate and the approval tool are built with the agent, before any
         // run exists, and rig runs tools on its own server task. So bind the run
@@ -1722,15 +1728,17 @@ impl StreamingAgent for Agent {
                 .await;
         }
 
-        if chat_history.is_empty() {
+        let started = if chat_history.is_empty() {
             self.stream_prompt_with_timeout(query, options, request_id)
                 .await
         } else {
             self.stream_chat_with_timeout(query, chat_history, options, request_id)
                 .await
-        }
-        .map_stream(move |stream| Box::pin(crate::run_context::scope_stream(run, stream)))
-        .observed_by(run_events)
+        };
+
+        started
+            .map_stream(move |stream| Box::pin(crate::run_context::scope_stream(run, stream)))
+            .observed_by(run_events)
     }
 
     async fn cancel_and_close_mcp(&self, request_id: &str, reason: &str) -> usize {

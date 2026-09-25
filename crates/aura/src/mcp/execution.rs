@@ -15,7 +15,6 @@ use std::collections::HashMap;
 use tracing::{error, info};
 
 use crate::mcp::client::McpClient;
-use crate::request_cancellation::call_http_tool_cancellable;
 
 // ---------------------------------------------------------------------------
 // OTel recording helpers (keep tracing concerns out of business logic)
@@ -154,7 +153,9 @@ pub async fn execute_mcp_tool(
         _ => HashMap::new(),
     };
 
-    let result = call_http_tool_cancellable(client, tool_name, args_map, approver_overrides).await;
+    let result = client
+        .call_tool(tool_name, args_map, approver_overrides)
+        .await;
 
     // OTel: record result attributes
     record_tool_call_result(&span, &result);

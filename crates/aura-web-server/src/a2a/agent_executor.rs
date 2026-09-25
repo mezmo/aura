@@ -16,7 +16,7 @@ use a2a::{
 };
 use a2a_server::{AgentExecutor, ExecutorContext, TaskStore};
 use aura::RigBuilder;
-use aura::{RequestCancellation, StreamItem, StreamedAssistantContent, StreamingAgent};
+use aura::{StreamItem, StreamedAssistantContent, StreamingAgent};
 use futures_util::StreamExt;
 use futures_util::stream::BoxStream;
 use serde_json::Value;
@@ -112,23 +112,20 @@ fn lock_cancel_state(state: &TaskCancelState) -> MutexGuard<'_, HashMap<String, 
     })
 }
 
-/// Owns one execution's cancel-map entry and its cancellation-registry
-/// registration.
+/// Owns one execution's cancel-map entry.
 struct TaskCancelGuard {
     state: Arc<TaskCancelState>,
     task_id: String,
-    request_id: String,
 }
 
 impl Drop for TaskCancelGuard {
-    /// Releases both on any generator exit — loop break, early return, panic,
+    /// Releases it on any generator exit — loop break, early return, panic,
     /// or a consumer that stops polling after a terminal event and drops the
     /// generator where it stands, which cleanup at the end of the body would
     /// never reach. Releasing what another path already took is a no-op, so
     /// this composes with the explicit removals.
     fn drop(&mut self) {
         lock_cancel_state(&self.state).remove(&self.task_id);
-        RequestCancellation::unregister(&self.request_id);
     }
 }
 
@@ -292,7 +289,6 @@ impl AgentExecutor for AuraAgentExecutor {
             let _cancel_guard = TaskCancelGuard {
                 state: task_cancel_state.clone(),
                 task_id: task_id.clone(),
-                request_id: request_id.clone(),
             };
             lock_cancel_state(&task_cancel_state).insert(
                 task_id.clone(),
@@ -324,9 +320,6 @@ impl AgentExecutor for AuraAgentExecutor {
             // build any history for this context that can be used in further aura reasoning
             let history = get_history_for_context(task_store.clone(), &request_id, &context_id, &task_id).await?;
 
-            // Register with the global cancellation registry for parity with the OpenAI handler
-            // and to let any future code address this request by id.
-            RequestCancellation::register(request_id.clone());
             // The agent exists now, so a cancel from here can close its MCP calls.
             // A missing entry means `cancel()` already ran while the build was in
             // flight, with no agent to close — so the run does it instead.
@@ -552,7 +545,6 @@ impl AgentExecutor for AuraAgentExecutor {
                 &task_cancel_state,
                 &task_id,
             );
-            RequestCancellation::unregister(&request_id);
 
             // Shutdown is the one cancel the executor cleans up after itself;
             // `cancel()` drives its own.
@@ -601,7 +593,6 @@ impl AgentExecutor for AuraAgentExecutor {
                         .await;
                 }
                 entry.token.cancel();
-                RequestCancellation::unregister(&entry.request_id);
             }
 
             Ok(StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
@@ -922,20 +913,17 @@ mod tests {
     }
 
     /// A consumer that stops polling after a terminal event drops the
-    /// execution generator mid-body, so the entry and the registry
-    /// registration have to be released by the guard rather than by cleanup
-    /// the generator never reaches.
+    /// execution generator mid-body, so the entry has to be released by the
+    /// guard rather than by cleanup the generator never reaches.
     #[test]
-    fn dropping_the_cancel_guard_releases_the_entry_and_registration() {
+    fn dropping_the_cancel_guard_releases_the_entry() {
         let task_id = format!("t_{}", uuid::Uuid::new_v4());
         let request_id = format!("a2a_{task_id}");
         let state: Arc<TaskCancelState> = Arc::new(Mutex::new(HashMap::new()));
 
-        RequestCancellation::register(request_id.clone());
         let guard = TaskCancelGuard {
             state: state.clone(),
             task_id: task_id.clone(),
-            request_id: request_id.clone(),
         };
         lock_cancel_state(&state).insert(
             task_id.clone(),
@@ -945,12 +933,11 @@ mod tests {
                 request_id: request_id.clone(),
             },
         );
-        assert!(RequestCancellation::token_for_id(&request_id).is_some());
+        assert!(lock_cancel_state(&state).contains_key(&task_id));
 
         drop(guard);
 
         assert!(!lock_cancel_state(&state).contains_key(&task_id));
-        assert!(RequestCancellation::token_for_id(&request_id).is_none());
     }
 
     /// Every way a run's loop can end, and the status each one answers with.
@@ -1080,7 +1067,6 @@ mod tests {
             let _guard = TaskCancelGuard {
                 state: state.clone(),
                 task_id: task_id.clone(),
-                request_id: request_id.clone(),
             };
             lock_cancel_state(&state).insert(
                 task_id.clone(),
@@ -1100,26 +1086,21 @@ mod tests {
     }
 
     /// `cancel()` takes the entry before the generator unwinds, so the guard
-    /// has to tolerate finding both already released.
+    /// has to tolerate finding it already released.
     #[test]
     fn dropping_the_cancel_guard_after_an_explicit_cleanup_is_a_noop() {
         let task_id = format!("t_{}", uuid::Uuid::new_v4());
-        let request_id = format!("a2a_{task_id}");
         let state: Arc<TaskCancelState> = Arc::new(Mutex::new(HashMap::new()));
 
-        RequestCancellation::register(request_id.clone());
         let guard = TaskCancelGuard {
             state: state.clone(),
             task_id: task_id.clone(),
-            request_id: request_id.clone(),
         };
         lock_cancel_state(&state).remove(&task_id);
-        RequestCancellation::unregister(&request_id);
 
         drop(guard);
 
         assert!(!lock_cancel_state(&state).contains_key(&task_id));
-        assert!(RequestCancellation::token_for_id(&request_id).is_none());
     }
 
     fn at(secs: i64) -> Option<chrono::DateTime<chrono::Utc>> {

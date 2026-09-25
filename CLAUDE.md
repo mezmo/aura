@@ -151,7 +151,7 @@ export AWS_REGION="your-region"       # For Knowledge Base
 ### Key Modules
 - `provider_agent.rs` - Type-erased streaming across providers
 - `stream_events.rs` - Custom aura SSE events
-- `request_cancellation.rs` - Request lifecycle management
+- `request_cancellation.rs` - The signal that stops a run, as awaiting work sees it
 - `run_context.rs` - The run a task is working on: its event channel, and the FIFO queue for tool_call_id correlation (see critical assumption below)
 - `orchestration/` - Multi-agent coordinator, workers, DAG execution, orchestration SSE events
 

@@ -1,6 +1,6 @@
 use a2a::VERSION;
 use aura::RigBuilder;
-use aura::{RequestCancellation, ResponseContent, StreamingAgent, UsageState};
+use aura::{ResponseContent, StreamingAgent, UsageState};
 use aura_events::{AgentInfo, ServerInfo};
 use axum::Json;
 use axum::body::Body;
@@ -22,7 +22,7 @@ use crate::streaming::{
 };
 use crate::types::*;
 
-/// RAII guard for request-scoped subscriptions. Ensures cleanup even on panic.
+/// Guard over a request's pending approvals.
 struct RequestResourceGuard {
     request_id: String,
     pending_approvals: aura::hitl::PendingApprovals,
@@ -38,6 +38,7 @@ impl RequestResourceGuard {
 }
 
 impl Drop for RequestResourceGuard {
+    /// Cancels the request's approvals, on panic as well as on return.
     fn drop(&mut self) {
         // Synchronous so parked awaits cancel even when the runtime is
         // shutting down and the spawn below never polls.
@@ -53,7 +54,6 @@ impl Drop for RequestResourceGuard {
             let cleanup = tracing::Instrument::instrument(
                 async move {
                     pending_approvals.cancel_request(&id).await;
-                    RequestCancellation::unregister(&id);
                 },
                 tracing::Span::current(),
             );
@@ -556,7 +556,6 @@ pub async fn execute_completion(
     delivery: DeliveryMode,
 ) {
     let _active_guard = ActiveRequestGuard::new(config.active_requests.clone());
-    let _cancellation = RequestCancellation::register(config.request_id.clone());
 
     let _resource_guard =
         RequestResourceGuard::new(config.request_id.clone(), config.pending_approvals.clone());

@@ -71,7 +71,6 @@ or **across a request and a later poll**, all of which live in per-pod memory to
 | CLI conversations                               | `~/.aura/conversations/<uuid>/` (client disk)                  | —                 | yes               | n/a (client-side)   |
 | Web chat history                                | client-supplied `messages[]`                                   | —                 | n/a               | n/a (stateless)     |
 | `chat_session_id`                               | correlation string (tracing + `aura.session_info`)             | no state          | —                 | just an ID          |
-| `request_cancellation` registry                 | `OnceLock<HashMap<RequestId, CancellationToken>>`              | request-scoped    | no                | no                  |
 | A run's event channel                           | `mpsc::Sender` on the `RunContext` its task scopes             | run-scoped        | no                | no                  |
 | **HITL `PendingApprovals`**                     | `Arc<Mutex<BTreeMap<DecisionId, PendingEntry>>>` on `AppState` | **yes**           | no                | **no** ← gap        |
 | **A2A `SharedTaskStore` + `task_cancel_state`** | `Arc<InMemoryTaskStore>` / `Arc<Mutex<HashMap>>`               | **yes**           | no                | **no** ← gap        |
@@ -139,11 +138,11 @@ with a code comment pointing at "durable parking".
 
 ### Explicitly out of scope (later iterations)
 
-- **A run's event channel** and the `request_cancellation` registry. These
-  correlate events _within a single live SSE stream_, which is always anchored to
-  one pod for its lifetime. They are correct as pod-local state and must **not** be
-  externalized. They only enter the picture as the _bus_ targets for cross-pod
-  wake/fan-out (§6), not as stored state.
+- **A run's event channel and its cancellation token**, both held by the
+  `RunContext` its task scopes. These correlate events _within a single live SSE
+  stream_, which is always anchored to one pod for its lifetime. They are correct
+  as pod-local state and must **not** be externalized. They only enter the picture
+  as the _bus_ targets for cross-pod wake/fan-out (§6), not as stored state.
 - **Scratchpad / orchestration artifacts** under `memory_dir`. Today these are pod-local
   disk (often `/tmp`, no PVC). Making them durable/shared is a separate object-storage
   discussion (S3/GCS/PVC), not session state. Noted here so it is not forgotten.
@@ -647,8 +646,7 @@ phases 2 and 3 are independent and can land in either order; phase 4 needs both.
   decision through its store poll (#474).
 - **Teardown latency behind store I/O.** The request `Drop` guard cancels wake handles
   synchronously (`cancel_request_local`), but the spawned cleanup task awaits
-  `ApprovalStore::cancel_request` before `RequestCancellation::unregister` and the
-  event-broker unsubscribes run. A slow networked store stretches that tail cleanup —
+  `ApprovalStore::cancel_request`. A slow networked store stretches that tail cleanup —
   bounded in phase 3 by the `ConnectionManager`'s response timeout (set from the
   configured connect timeout), which caps every store command client-side.
 - **Trace context across the bus.** Bus payloads carry no OTel trace context, so on a
