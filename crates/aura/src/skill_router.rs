@@ -193,11 +193,16 @@ impl SkillRouter {
     /// itself is unaffected.
     pub fn new(config: SkillRouterConfig) -> Self {
         let decision_log = config.decision_log.as_ref().and_then(|path| {
-            match std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-            {
+            let parent_ready = match path.parent() {
+                Some(parent) if !parent.as_os_str().is_empty() => std::fs::create_dir_all(parent),
+                _ => Ok(()),
+            };
+            match parent_ready.and_then(|()| {
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+            }) {
                 Ok(file) => Some(Mutex::new(file)),
                 Err(e) => {
                     tracing::warn!(
@@ -643,6 +648,26 @@ mod tests {
             ),
             "an unreachable router keeps on-demand loading in every mode"
         );
+    }
+
+    #[test]
+    fn decision_log_parent_directory_is_created() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let log = dir.path().join("nested/run/decisions.jsonl");
+        let router = SkillRouter::new(SkillRouterConfig {
+            mode: SkillRouterMode::Shadow,
+            timeout_ms: 500,
+            decision_log: Some(log.clone()),
+            stage1: SkillRouterStage {
+                url: "http://127.0.0.1:1".to_string(),
+                model: "kev-latest".to_string(),
+                threshold: 0.5,
+                api_key: None,
+            },
+            stage2: None,
+        });
+        assert!(router.decision_log.is_some());
+        assert!(log.exists());
     }
 
     #[tokio::test]
