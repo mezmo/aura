@@ -435,6 +435,10 @@ impl Config {
             orch.validate_worker_names()?;
         }
 
+        if let Some(router) = &self.agent.skill_router {
+            router.validate()?;
+        }
+
         Ok(())
     }
 
@@ -986,6 +990,10 @@ pub struct AgentConfig {
     /// `[orchestration.worker.<name>.skills]`.
     #[serde(default)]
     pub skills: SkillsConfig,
+    /// Decision-model routing over the discovered skills. Parsed from
+    /// `[agent.skill_router]`.
+    #[serde(default)]
+    pub skill_router: Option<SkillRouterConfig>,
     /// Nudge the agent on its final turn to submit its results instead of
     /// calling more tools (default: false).
     #[serde(default, deserialize_with = "lenient_bool::deserialize_bool")]
@@ -1034,6 +1042,7 @@ impl Default for AgentConfig {
             scratchpad: None,
             hidden: bool::default(),
             skills: SkillsConfig::default(),
+            skill_router: None,
             nudge_last_turn: false,
             nudge_turns_remaining: None,
             instance_seed: None,
@@ -1053,6 +1062,87 @@ pub struct SkillConfig {
     pub description: String,
     /// Absolute path to the skill directory
     pub path: std::path::PathBuf,
+}
+
+/// How the skill router's selection is used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SkillRouterMode {
+    /// Route and log the decision; the agent's context is left unchanged.
+    #[default]
+    Shadow,
+    /// Route and preload the selected skills into the agent's context.
+    Inject,
+}
+
+/// One System One decision-model stage of the skill router.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkillRouterStage {
+    /// Base URL of a server exposing `POST /v1/systemone` (TypeSafe Jev or
+    /// a local Kev instance).
+    pub url: String,
+    /// Model name sent in the request body.
+    #[serde(default = "default_skill_router_model")]
+    pub model: String,
+    /// Minimum `P(yes)` for a skill to pass this stage, in `[0, 1]`.
+    pub threshold: f64,
+    /// Optional bearer token for the `Authorization` header.
+    #[serde(default)]
+    pub api_key: Option<String>,
+}
+
+fn default_skill_router_model() -> String {
+    "kev-latest".to_string()
+}
+
+fn default_skill_router_timeout_ms() -> u64 {
+    5_000
+}
+
+/// The `[agent.skill_router]` TOML table: decision-model skill routing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkillRouterConfig {
+    #[serde(default)]
+    pub mode: SkillRouterMode,
+    /// Per-request HTTP timeout for each stage.
+    #[serde(default = "default_skill_router_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Optional JSONL file that receives one line per routing decision.
+    #[serde(default)]
+    pub decision_log: Option<std::path::PathBuf>,
+    /// Recall stage.
+    pub stage1: SkillRouterStage,
+    /// Precision stage.
+    #[serde(default)]
+    pub stage2: Option<SkillRouterStage>,
+}
+
+impl SkillRouterConfig {
+    pub fn validate(&self) -> Result<(), crate::ConfigError> {
+        let stages = std::iter::once(("stage1", &self.stage1))
+            .chain(self.stage2.as_ref().map(|s| ("stage2", s)));
+        for (label, stage) in stages {
+            if stage.url.trim().is_empty() {
+                return Err(crate::ConfigError::Validation(format!(
+                    "[agent.skill_router.{label}] url cannot be empty"
+                )));
+            }
+            if !(0.0..=1.0).contains(&stage.threshold) || stage.threshold.is_nan() {
+                return Err(crate::ConfigError::Validation(format!(
+                    "[agent.skill_router.{label}] threshold must be within [0, 1], got {}",
+                    stage.threshold
+                )));
+            }
+        }
+        if self.timeout_ms == 0 {
+            return Err(crate::ConfigError::Validation(
+                "[agent.skill_router] timeout_ms must be greater than 0".to_string(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Agent behavior settings (runtime-facing subset of [`AgentConfig`]).
@@ -1092,6 +1182,9 @@ pub struct AgentSettings {
     /// On-demand skill definitions loaded via the load_skill tool
     #[serde(default)]
     pub skills: Vec<SkillConfig>,
+    /// Decision-model routing over `skills`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_router: Option<SkillRouterConfig>,
     /// Nudge the agent on its final turn to submit its results instead of
     /// calling more tools.
     #[serde(default)]
@@ -1114,6 +1207,7 @@ impl Default for AgentSettings {
             enable_client_tools: false,
             client_tool_filter: None,
             skills: Vec::new(),
+            skill_router: None,
             nudge_last_turn: false,
             nudge_turns_remaining: None,
         }

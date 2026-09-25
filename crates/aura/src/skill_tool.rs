@@ -137,7 +137,7 @@ pub struct LoadSkillArgs {
 }
 
 /// Strip YAML frontmatter from content, returning only the body.
-fn strip_frontmatter(content: &str) -> &str {
+pub(crate) fn strip_frontmatter(content: &str) -> &str {
     let trimmed = content.trim_start();
     if !trimmed.starts_with("---") {
         return content;
@@ -158,7 +158,7 @@ fn strip_frontmatter(content: &str) -> &str {
 /// Scans the spec-defined `references/`, `scripts/`, and `assets/`
 /// subdirectories one level deep and returns sorted relative paths like
 /// `references/REFERENCE.md`. Missing subdirectories are skipped.
-async fn list_skill_resources(skill_dir: &Path) -> Vec<String> {
+pub(crate) async fn list_skill_resources(skill_dir: &Path) -> Vec<String> {
     let Ok(canonical_dir) = skill_dir.canonicalize() else {
         return Vec::new();
     };

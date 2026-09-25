@@ -452,6 +452,75 @@ model = "gpt-4"
     }
 
     #[test]
+    fn test_skill_router_table_parses_with_defaults() {
+        let config = r#"
+[agent]
+name = "Test"
+system_prompt = "Test"
+
+[agent.llm]
+provider = "openai"
+api_key = "test"
+model = "gpt-4"
+
+[agent.skill_router]
+mode = "inject"
+
+[agent.skill_router.stage1]
+url = "http://127.0.0.1:8011"
+threshold = 0.45
+"#;
+        let config = load_config_from_str(config).unwrap();
+        let router = config.agent.skill_router.expect("router table parsed");
+        assert_eq!(router.mode, crate::SkillRouterMode::Inject);
+        assert_eq!(router.timeout_ms, 5_000);
+        assert_eq!(router.stage1.model, "kev-latest");
+        assert!(router.stage2.is_none());
+        assert!(router.decision_log.is_none());
+    }
+
+    #[test]
+    fn test_skill_router_absent_by_default() {
+        let config = r#"
+[agent]
+name = "Test"
+system_prompt = "Test"
+
+[agent.llm]
+provider = "openai"
+api_key = "test"
+model = "gpt-4"
+"#;
+        let config = load_config_from_str(config).unwrap();
+        assert!(config.agent.skill_router.is_none());
+    }
+
+    #[test]
+    fn test_skill_router_rejects_threshold_out_of_range() {
+        let config = r#"
+[agent]
+name = "Test"
+system_prompt = "Test"
+
+[agent.llm]
+provider = "openai"
+api_key = "test"
+model = "gpt-4"
+
+[agent.skill_router.stage1]
+url = "http://127.0.0.1:8011"
+threshold = 0.45
+
+[agent.skill_router.stage2]
+url = "http://127.0.0.1:8009"
+threshold = 1.5
+"#;
+        let err = load_config_from_str(config).unwrap_err().to_string();
+        assert!(err.contains("stage2"), "{err}");
+        assert!(err.contains("within [0, 1]"), "{err}");
+    }
+
+    #[test]
     fn test_worker_empty_skill_source_fails_validation() {
         let config = r#"
 [agent]

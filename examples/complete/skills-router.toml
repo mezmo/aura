@@ -1,0 +1,77 @@
+# Skill routing — the skills agent from skills-agent.toml, plus a local
+# decision model that picks which skills to preload for each request.
+#
+# Skill selection is multi-label, so the router asks a System One decision
+# model (TypeSafe Jev, or a local Kev server exposing the same
+# `POST /v1/systemone` API) one independent yes/no question per skill and
+# thresholds each calibrated probability. Two stages form a funnel: stage 1
+# scores the whole catalog with a small, fast model tuned for recall; stage 2
+# rescores only that shortlist with a bigger model tuned for precision.
+#
+# `mode = "shadow"` routes and logs every decision without touching the
+# agent's context — run it first, fit the thresholds against
+# `decision_log`, then switch to `mode = "inject"` to preload the selected
+# skills' full SKILL.md bodies into the coordinator's and each worker's
+# system prompt (`load_skill` stays available for the rest of the catalog).
+# A router that is down never fails a request: the agent keeps the on-demand
+# `load_skill` path.
+#
+# Prerequisites:
+#   export OPENAI_API_KEY="sk-..."
+#   Kubernetes context configured (kubectl access)
+#   Start the K8s MCP server:
+#     npx -y kubernetes-mcp-server@latest --port 8081 --read-only
+#   Start local Kev decision models (https://github.com/jaredpalmer/kev):
+#     uv run --extra serve python -m kev.serve --run jaredpalmer/kev-0.8b --port 8011
+#     uv run --extra serve python -m kev.serve --run jaredpalmer/kev-4b   --port 8009
+#
+# Usage (run from the repo root):
+#   CONFIG_PATH=examples/complete/skills-router.toml cargo run --bin aura -- webserver
+#
+# Offline threshold fitting against a labelled prompt set:
+#   cargo run -p aura --example skill_router_eval -- \
+#     examples/complete/skills-router.toml cases.jsonl
+
+[mcp]
+sanitize_schemas = true
+
+[mcp.servers.kubernetes]
+transport = "http_streamable"
+url = "http://localhost:8081/mcp"
+description = "Kubernetes cluster operations: pods, deployments, services, logs, events"
+
+[agent]
+name = "SRE Assistant"
+model_owner = "mezmo"
+system_prompt = """
+You are an SRE assistant with access to a Kubernetes cluster and a library
+of skills. Follow any preloaded skill that matches the request; for other
+catalog entries call `load_skill` first. Cite which skill you followed.
+"""
+turn_depth = 15
+
+[agent.llm]
+provider = "openai"
+api_key = "{{ env.OPENAI_API_KEY }}"
+model = "gpt-5.2"
+
+[[agent.skills.local]]
+source = "examples/complete/skills"
+
+[agent.skill_router]
+mode = "shadow"                 # "shadow" logs only; "inject" preloads the selection
+timeout_ms = 5000               # per-stage HTTP timeout; a timeout falls back to load_skill
+decision_log = "skill-router-decisions.jsonl"   # optional JSONL, one line per decision
+
+# Recall stage: every skill in the catalog, generous threshold.
+[agent.skill_router.stage1]
+url = "http://127.0.0.1:8011"
+model = "kev-latest"
+threshold = 0.45
+# api_key = "{{ env.KEV_API_KEY }}"   # sent as a bearer token when the server requires one
+
+# Precision stage: only the stage-1 shortlist. Omit the table for single-stage routing.
+[agent.skill_router.stage2]
+url = "http://127.0.0.1:8009"
+model = "kev-latest"
+threshold = 0.5

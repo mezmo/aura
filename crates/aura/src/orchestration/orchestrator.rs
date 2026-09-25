@@ -463,6 +463,9 @@ pub struct Orchestrator {
     /// Execution persistence for debugging and retry intelligence
     persistence: Arc<Mutex<ExecutionPersistence>>,
 
+    /// Decision-model skill router shared by the coordinator and every worker.
+    skill_router: Option<Arc<crate::skill_router::SkillRouter>>,
+
     /// Accumulated token usage across all LLM calls in this orchestration run
     /// (planning, workers, continuation routing).
     ///
@@ -664,6 +667,12 @@ impl Orchestrator {
             orchestration_config.max_plan_parse_retries,
         );
 
+        let skill_router = agent_config
+            .agent
+            .skill_router
+            .clone()
+            .map(|cfg| Arc::new(crate::skill_router::SkillRouter::new(cfg)));
+
         Ok(Self {
             orchestrator_id,
             config: orchestration_config,
@@ -671,6 +680,7 @@ impl Orchestrator {
             tool_call_observer,
             mcp_manager,
             persistence,
+            skill_router,
             usage_state: crate::UsageState::new(),
             outer_budget: None,
             park_guard,
@@ -691,11 +701,15 @@ impl Orchestrator {
     /// `park_cell` arms the gate's park arm for this worker. `recorded`
     /// arms the recorded-decisions consult (the resume path); `None` on the
     /// live path leaves the gate byte-identical.
+    ///
+    /// `task_description` is what the skill router scores the worker's
+    /// skills against; `None` skips routing for this worker.
     async fn create_worker(
         &self,
         task_id: usize,
         attempt: usize,
         worker_name: Option<&str>,
+        task_description: Option<&str>,
         park_cell: Option<&Arc<BlockedCell>>,
         recorded: Option<&Arc<RecordedDecisions>>,
     ) -> Result<AgentWithPreamble, Box<dyn std::error::Error + Send + Sync>> {
@@ -1068,6 +1082,26 @@ impl Orchestrator {
             && let Some(ref mut preamble) = worker_config.preamble_override
         {
             preamble.push_str(&catalog);
+        }
+
+        // Skill routing scores the worker's catalog against its task. In
+        // inject mode the selected skills are preloaded after the catalog so
+        // the worker still sees `load_skill` for the rest.
+        if let (Some(router), Some(task)) = (self.skill_router.as_ref(), task_description)
+            && let Some(section) = router
+                .preload_section(
+                    crate::skill_router::SkillRoutingSubject::Worker {
+                        task_id,
+                        worker_name: worker_name.map(String::from),
+                    },
+                    worker_config.request_id.as_deref(),
+                    task,
+                    &worker_config.agent.skills,
+                )
+                .await
+            && let Some(ref mut preamble) = worker_config.preamble_override
+        {
+            preamble.push_str(&section);
         }
 
         tracing::debug!(
@@ -2552,10 +2586,13 @@ Assign tasks to the worker whose tools best match the required operations."#,
     ///
     /// The three routing tools are also added to the
     /// coordinator agent, enabling structured routing decisions via tool calling.
+    /// `query` is what the skill router scores the coordinator's skills
+    /// against; `None` skips routing.
     async fn create_coordinator(
         &self,
         routing_tools: RoutingToolSet,
         allow_recon_tools: bool,
+        query: Option<&str>,
     ) -> Result<AgentWithPreamble, Box<dyn std::error::Error + Send + Sync>> {
         use crate::vector_dynamic::DynamicVectorSearchTool;
         use crate::vector_store::VectorStoreManager;
@@ -2591,6 +2628,18 @@ Assign tasks to the worker whose tools best match the required operations."#,
             crate::skill_tool::render_skill_catalog(&self.agent_config.agent.skills)
         {
             preamble.push_str(&catalog);
+        }
+        if let (Some(router), Some(query)) = (self.skill_router.as_ref(), query)
+            && let Some(section) = router
+                .preload_section(
+                    crate::skill_router::SkillRoutingSubject::Coordinator,
+                    self.agent_config.request_id.as_deref(),
+                    query,
+                    &self.agent_config.agent.skills,
+                )
+                .await
+        {
+            preamble.push_str(&section);
         }
         let temperature = self.agent_config.llm.temperature();
 
@@ -3672,6 +3721,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     task_id,
                     attempt,
                     *worker_name,
+                    Some(task_description),
                     park.as_ref().map(|p| &p.cell),
                     None,
                 )
@@ -3977,6 +4027,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 task_id,
                 attempt,
                 worker_name,
+                None,
                 Some(&park.cell),
                 Some(&resume.recorded),
             )
@@ -4431,7 +4482,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
             agent: coordinator,
             preamble: coordinator_preamble,
             ..
-        } = self.create_coordinator(routing_toolset, true).await?;
+        } = self
+            .create_coordinator(routing_toolset, true, Some(query))
+            .await?;
 
         let mut coordinator_state = CoordinatorState {
             agent: coordinator,
@@ -8996,5 +9049,216 @@ mod tests {
         );
         assert!(resume_invocations.lock().unwrap().is_empty());
         assert!(park_invocations.lock().unwrap().is_empty());
+    }
+
+    /// Wiring of the decision-model skill router into worker and
+    /// coordinator preambles, against a fake System One server.
+    mod skill_router_wiring {
+        use super::*;
+        use aura_config::skills::SkillName;
+        use aura_config::{SkillConfig, SkillRouterConfig, SkillRouterMode, SkillRouterStage};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        /// Serve `/v1/systemone` answering every question with the given
+        /// probability (0.1 when the skill is not listed). Returns the base URL.
+        async fn fake_system_one(probabilities: Vec<(&'static str, f64)>) -> String {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut socket, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let probabilities = probabilities.clone();
+                    tokio::spawn(async move {
+                        let mut buf = Vec::new();
+                        let mut chunk = [0u8; 4096];
+                        let body_start = loop {
+                            let n = socket.read(&mut chunk).await.unwrap_or(0);
+                            if n == 0 {
+                                return;
+                            }
+                            buf.extend_from_slice(&chunk[..n]);
+                            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                break pos + 4;
+                            }
+                        };
+                        let head = String::from_utf8_lossy(&buf[..body_start]).to_string();
+                        let content_length: usize = head
+                            .lines()
+                            .find_map(|l| {
+                                l.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|v| v.trim().parse().unwrap())
+                            })
+                            .unwrap_or(0);
+                        while buf.len() < body_start + content_length {
+                            let n = socket.read(&mut chunk).await.unwrap_or(0);
+                            if n == 0 {
+                                break;
+                            }
+                            buf.extend_from_slice(&chunk[..n]);
+                        }
+                        let request: serde_json::Value =
+                            serde_json::from_slice(&buf[body_start..]).unwrap();
+                        let answers: serde_json::Map<String, serde_json::Value> =
+                            request["questions"]
+                                .as_object()
+                                .unwrap()
+                                .keys()
+                                .map(|name| {
+                                    let p = probabilities
+                                        .iter()
+                                        .find(|(n, _)| *n == name)
+                                        .map(|(_, p)| *p)
+                                        .unwrap_or(0.1);
+                                    (name.clone(), serde_json::json!({"type": "noul", "noul": p}))
+                                })
+                                .collect();
+                        let body = serde_json::json!({
+                            "model": "kev-latest",
+                            "answers": answers,
+                            "latency_ms": 12.5
+                        })
+                        .to_string();
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = socket.write_all(response.as_bytes()).await;
+                        let _ = socket.shutdown().await;
+                    });
+                }
+            });
+            format!("http://{addr}")
+        }
+
+        fn write_skills(dir: &std::path::Path) -> Vec<SkillConfig> {
+            ["alpha", "beta"]
+                .iter()
+                .map(|name| {
+                    let skill_dir = dir.join(name);
+                    std::fs::create_dir_all(&skill_dir).unwrap();
+                    std::fs::write(
+                        skill_dir.join("SKILL.md"),
+                        format!("---\nname: {name}\ndescription: {name} things\n---\n# {name}\n\nBODY-OF-{name}\n"),
+                    )
+                    .unwrap();
+                    SkillConfig {
+                        name: SkillName::new(*name).unwrap(),
+                        description: format!("{name} things"),
+                        path: skill_dir,
+                    }
+                })
+                .collect()
+        }
+
+        fn config(
+            mode: SkillRouterMode,
+            url: String,
+            skills: Vec<SkillConfig>,
+        ) -> AgentRuntimeConfig {
+            let mut config = AgentRuntimeConfig::default();
+            config.agent.skills = skills;
+            config.agent.skill_router = Some(SkillRouterConfig {
+                mode,
+                timeout_ms: 2_000,
+                decision_log: None,
+                stage1: SkillRouterStage {
+                    url,
+                    model: "kev-latest".to_string(),
+                    threshold: 0.5,
+                    api_key: None,
+                },
+                stage2: None,
+            });
+            config
+        }
+
+        #[tokio::test]
+        async fn inject_mode_preloads_selected_skills() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let skills = write_skills(dir.path());
+            let url = fake_system_one(vec![("alpha", 0.9), ("beta", 0.2)]).await;
+            let orchestrator = Orchestrator::new(config(SkillRouterMode::Inject, url, skills))
+                .await
+                .unwrap();
+
+            let worker = orchestrator
+                .create_worker(1, 1, None, Some("do the alpha thing"), None, None)
+                .await
+                .unwrap();
+            assert!(worker.preamble.contains("## Preloaded skills"));
+            assert!(worker.preamble.contains("BODY-OF-alpha"));
+            assert!(!worker.preamble.contains("BODY-OF-beta"));
+            assert!(
+                worker.preamble.contains("- beta: beta things"),
+                "catalog must still list unselected skills for load_skill"
+            );
+
+            let coordinator = orchestrator
+                .create_coordinator(RoutingToolSet::new(), true, Some("do the alpha thing"))
+                .await
+                .unwrap();
+            assert!(coordinator.preamble.contains("BODY-OF-alpha"));
+            assert!(!coordinator.preamble.contains("BODY-OF-beta"));
+        }
+
+        #[tokio::test]
+        async fn shadow_mode_leaves_preambles_unchanged() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let skills = write_skills(dir.path());
+            let url = fake_system_one(vec![("alpha", 0.9), ("beta", 0.9)]).await;
+            let orchestrator = Orchestrator::new(config(SkillRouterMode::Shadow, url, skills))
+                .await
+                .unwrap();
+
+            let worker = orchestrator
+                .create_worker(1, 1, None, Some("do the alpha thing"), None, None)
+                .await
+                .unwrap();
+            assert!(!worker.preamble.contains("## Preloaded skills"));
+            assert!(!worker.preamble.contains("BODY-OF-alpha"));
+            assert!(worker.preamble.contains("- alpha: alpha things"));
+        }
+
+        #[tokio::test]
+        async fn no_task_description_skips_routing() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let skills = write_skills(dir.path());
+            // An unreachable router would also be tolerated, but with no task
+            // text routing must not even be attempted.
+            let orchestrator = Orchestrator::new(config(
+                SkillRouterMode::Inject,
+                "http://127.0.0.1:1".to_string(),
+                skills,
+            ))
+            .await
+            .unwrap();
+            let worker = orchestrator
+                .create_worker(1, 1, None, None, None, None)
+                .await
+                .unwrap();
+            assert!(!worker.preamble.contains("## Preloaded skills"));
+        }
+
+        #[tokio::test]
+        async fn unreachable_router_keeps_on_demand_loading() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let skills = write_skills(dir.path());
+            let orchestrator = Orchestrator::new(config(
+                SkillRouterMode::Inject,
+                "http://127.0.0.1:1".to_string(),
+                skills,
+            ))
+            .await
+            .unwrap();
+            let worker = orchestrator
+                .create_worker(1, 1, None, Some("do the alpha thing"), None, None)
+                .await
+                .unwrap();
+            assert!(!worker.preamble.contains("## Preloaded skills"));
+            assert!(worker.preamble.contains("- alpha: alpha things"));
+        }
     }
 }
