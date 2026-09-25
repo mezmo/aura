@@ -98,3 +98,13 @@ aura-events = { path = "../aura-events" }
 tower = "0.5"
 http-body-util = "0.1"
 tempfile = "3"
+
+# Exhaustively explores interleavings of the task-cancel map, which a stress
+# test cannot reach: the window is one mutex release and reacquire wide.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(aura_loom)'] }
+
+# Not a dev-dependency: the lib itself swaps in loom's mutex under this cfg,
+# which is never set by a normal build.
+[target.'cfg(aura_loom)'.dependencies]
+loom = "0.7"

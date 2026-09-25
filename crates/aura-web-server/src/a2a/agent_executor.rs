@@ -1,5 +1,12 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::Arc;
+// Under `--cfg aura_loom` the cancel map's mutex is loom's, so its model can
+// explore every interleaving of the code that locks it. The cfg is ours rather
+// than loom's usual `loom`, which tokio also reacts to.
+#[cfg(aura_loom)]
+use loom::sync::{Mutex, MutexGuard};
+#[cfg(not(aura_loom))]
+use std::sync::{Mutex, MutexGuard};
 
 use a2a::{
     A2AError, AgentCapabilities, AgentCard, AgentInterface, AgentSkill, Artifact, ListTasksRequest,
@@ -35,13 +42,62 @@ pub struct AuraAgentExecutor {
     task_cancel_state: Arc<TaskCancelState>,
 }
 
+/// A live execution's cancellation handle and what a cancel needs to clean up.
 struct TaskCancelEntry {
     token: CancellationToken,
-    agent: Arc<dyn StreamingAgent>,
+    agent: Option<Arc<dyn StreamingAgent>>,
     request_id: String,
 }
 
-/// The live executions' cancel handles, keyed by task id.
+/// Whether `cancel()` got to a task before the code asking.
+///
+/// It takes the entry before firing the token, so an absent entry means a cancel
+/// has already run and a present one means it has not.
+#[derive(PartialEq, Eq)]
+enum CancelRaced {
+    Yes,
+    No,
+}
+
+/// Hands the built agent to the task's entry, reporting whether a cancel beat it.
+///
+/// One lock acquisition, because a cancel landing between the write and the
+/// answer would take the entry with the agent set, close its MCP calls, and
+/// leave the caller to close them again.
+fn claim_agent(
+    state: &TaskCancelState,
+    task_id: &str,
+    agent: &Arc<dyn StreamingAgent>,
+) -> CancelRaced {
+    match lock_cancel_state(state).get_mut(task_id) {
+        Some(entry) => {
+            entry.agent = Some(Arc::clone(agent));
+            CancelRaced::No
+        }
+        None => CancelRaced::Yes,
+    }
+}
+
+/// Whether shutdown is what stopped this run, so the executor drives its MCP
+/// cleanup and emits the terminal status itself.
+///
+/// Three things have to hold. The run stopped on its token rather than reaching
+/// the end of its stream; shutdown had fired; and `cancel()` was not the one
+/// that fired it, since that path cleans up after itself.
+fn shutdown_stopped_this_run(
+    stopped_by_cancel: bool,
+    shutdown: &CancellationToken,
+    state: &TaskCancelState,
+    task_id: &str,
+) -> bool {
+    // Takes the entry, because taking it is what claims the cleanup. Reading
+    // and then taking would let a cancel land between, leaving both to close
+    // the same agent and both to emit a terminal status.
+    let claimed = lock_cancel_state(state).remove(task_id).is_some();
+    stopped_by_cancel && shutdown.is_cancelled() && claimed
+}
+
+/// The live executions, keyed by task id.
 type TaskCancelState = Mutex<HashMap<String, TaskCancelEntry>>;
 
 /// Lock the cancel map, taking a poisoned lock's contents rather than
@@ -70,6 +126,15 @@ impl Drop for TaskCancelGuard {
     /// this composes with the explicit removals.
     fn drop(&mut self) {
         lock_cancel_state(&self.state).remove(&self.task_id);
+        // The streaming hook keys a tool-call FIFO under this request id, and
+        // a run cancelled between a tool call and its result leaves an entry
+        // behind. The broker is async, so this runs as its own task — which a
+        // runtime already shutting down may never poll, leaving the entry for
+        // the process to reclaim.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let request_id = self.request_id.clone();
+            handle.spawn(async move { aura::tool_event_unsubscribe(&request_id).await });
+        }
         RequestCancellation::unregister(&self.request_id);
     }
 }
@@ -226,6 +291,25 @@ impl AgentExecutor for AuraAgentExecutor {
             }));
 
             let request_id = format!("a2a_{}", task_id);
+
+            // Registered before the agent build and history fetch, both of which
+            // await, so a cancelTask during those has a token to cancel. Its
+            // guard comes first, because those paths can return early.
+            let cancel_token = stream_shutdown_token.child_token();
+            let _cancel_guard = TaskCancelGuard {
+                state: task_cancel_state.clone(),
+                task_id: task_id.clone(),
+                request_id: request_id.clone(),
+            };
+            lock_cancel_state(&task_cancel_state).insert(
+                task_id.clone(),
+                TaskCancelEntry {
+                    token: cancel_token.clone(),
+                    agent: None,
+                    request_id: request_id.clone(),
+                },
+            );
+
             let session_id = Some(context_id.clone());
             let builder = RigBuilder::new(config, pending_approvals).with_hitl_hmac(hitl_hmac);
             let agent = match builder
@@ -247,28 +331,30 @@ impl AgentExecutor for AuraAgentExecutor {
             // build any history for this context that can be used in further aura reasoning
             let history = get_history_for_context(task_store.clone(), &request_id, &context_id, &task_id).await?;
 
-            let cancel_token = stream_shutdown_token.child_token();
             // Register with the global cancellation registry for parity with the OpenAI handler
             // and to let any future code address this request by id.
             RequestCancellation::register(request_id.clone());
-            let _cancel_guard = TaskCancelGuard {
-                state: task_cancel_state.clone(),
-                task_id: task_id.clone(),
-                request_id: request_id.clone(),
-            };
-            lock_cancel_state(&task_cancel_state).insert(task_id.clone(), TaskCancelEntry {
-                token: cancel_token.clone(),
-                agent: agent.clone(),
-                request_id: request_id.clone(),
-            });
+            // The agent exists now, so a cancel from here can close its MCP calls.
+            // A missing entry means `cancel()` already ran while the build was in
+            // flight, with no agent to close — so the run does it instead.
+            if claim_agent(&task_cancel_state, &task_id, &agent) == CancelRaced::Yes {
+                agent
+                    .cancel_and_close_mcp(&request_id, "A2A cancelTask during build")
+                    .await;
+            }
 
-            let mut stream = match agent.stream(&text, history, cancel_token.clone(), &request_id).await {
-                Ok(s) => s,
-                Err(e) => {
-                    yield Ok(fail_status(&task_id, &context_id, &e.to_string()));
-                    return;
-                }
-            };
+            // A2A tasks have their own lifetime, so the run is unbounded here and
+            // ends on cancelTask or shutdown.
+            let run = agent
+                .stream(
+                    &text,
+                    history,
+                    aura::streaming::RunOptions::default()
+                        .cancelled_by(&cancel_token),
+                    &request_id,
+                )
+                .await;
+            let mut stream = run.into_events();
 
             // RAII guard: drop on any generator exit (loop break, early return, panic,
             // consumer drop) produces exactly one decrement. Replaces the manual
@@ -280,10 +366,17 @@ impl AgentExecutor for AuraAgentExecutor {
             let mut success = true; // assume everything is successful
 
             let mut reasoning_num = 0;
+            // Read after the loop, because a token cancelled once the stream has
+            // already ended says nothing about how this run finished.
+            let mut stopped_by_cancel = false;
             loop {
                 let next = tokio::select! {
                     biased;
-                    _ = cancel_token.cancelled() => break,
+                    // A child of the shutdown token, so this covers both.
+                    () = cancel_token.cancelled() => {
+                        stopped_by_cancel = true;
+                        break;
+                    }
                     next = stream.next() => next,
                 };
                 let Some(item) = next else { break };
@@ -459,14 +552,16 @@ impl AgentExecutor for AuraAgentExecutor {
                 }
             }
 
-            // If cancel_token fired but our entry is still in the map, the cancel came
-            // from the parent stream_shutdown_token (server shutdown), not from our
-            // cancel() hook — cancel() removes its entry before firing the token.
-            // In that case the executor has to drive MCP cleanup itself and emit a
-            // terminal Canceled status (the OpenAI handler does the equivalent in its
-            // Shutdown post-loop arm).
-            let entry_still_present = lock_cancel_state(&task_cancel_state).remove(&task_id).is_some();
-            let shutdown_initiated_cancel = cancel_token.is_cancelled() && entry_still_present;
+            // Shutdown is the one cancel the executor cleans up after itself:
+            // `cancel()` drives its own, and a run that finished needs none. So
+            // this run has to have stopped on its token, with shutdown the reason
+            // it fired rather than `cancel()`.
+            let shutdown_initiated_cancel = shutdown_stopped_this_run(
+                stopped_by_cancel,
+                &stream_shutdown_token,
+                &task_cancel_state,
+                &task_id,
+            );
             RequestCancellation::unregister(&request_id);
 
             if shutdown_initiated_cancel {
@@ -490,7 +585,7 @@ impl AgentExecutor for AuraAgentExecutor {
 
             // Skip Completed if cancel() or the shutdown path already emitted Canceled —
             // yielding here would clobber it.
-            if success && !cancel_token.is_cancelled() {
+            if success && !stopped_by_cancel {
                 yield Ok(StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
                     task_id,
                     context_id,
@@ -520,10 +615,12 @@ impl AgentExecutor for AuraAgentExecutor {
             if let Some(entry) = entry {
                 // Send notifications/cancelled to in-flight MCP tool calls. No-op in
                 // orchestration mode (workers manage their own MCP cancellation).
-                entry
-                    .agent
-                    .cancel_and_close_mcp(&entry.request_id, "A2A cancelTask")
-                    .await;
+                // A run cancelled before its agent was built has no MCP calls yet.
+                if let Some(agent) = &entry.agent {
+                    agent
+                        .cancel_and_close_mcp(&entry.request_id, "A2A cancelTask")
+                        .await;
+                }
                 entry.token.cancel();
                 RequestCancellation::unregister(&entry.request_id);
             }
@@ -865,7 +962,7 @@ mod tests {
             task_id.clone(),
             TaskCancelEntry {
                 token: CancellationToken::new(),
-                agent: Arc::new(MockAgent::pending()),
+                agent: Some(Arc::new(MockAgent::pending())),
                 request_id: request_id.clone(),
             },
         );
@@ -875,6 +972,121 @@ mod tests {
 
         assert!(!lock_cancel_state(&state).contains_key(&task_id));
         assert!(RequestCancellation::token_for_id(&request_id).is_none());
+    }
+
+    /// Shutdown fires for every live run at once, so a run that had already
+    /// reached the end of its stream must not be reported as cancelled by it.
+    #[test]
+    fn shutdown_does_not_claim_a_run_that_already_finished() {
+        // Claiming takes the entry, so each case starts from its own.
+        let registered = || {
+            let task_id = format!("t_{}", uuid::Uuid::new_v4());
+            let state: Arc<TaskCancelState> = Arc::new(Mutex::new(HashMap::new()));
+            lock_cancel_state(&state).insert(
+                task_id.clone(),
+                TaskCancelEntry {
+                    token: CancellationToken::new(),
+                    agent: None,
+                    request_id: format!("a2a_{task_id}"),
+                },
+            );
+            (state, task_id)
+        };
+        let down = || {
+            let token = CancellationToken::new();
+            token.cancel();
+            token
+        };
+
+        let (state, task_id) = registered();
+        assert!(
+            !shutdown_stopped_this_run(false, &CancellationToken::new(), &state, &task_id),
+            "nothing has stopped anything yet"
+        );
+
+        let (state, task_id) = registered();
+        assert!(
+            !shutdown_stopped_this_run(false, &down(), &state, &task_id),
+            "a run that ran to the end of its stream completed, whatever \
+             shutdown did afterwards"
+        );
+
+        let (state, task_id) = registered();
+        assert!(
+            shutdown_stopped_this_run(true, &down(), &state, &task_id),
+            "a run that stopped on its token with its entry intact was stopped \
+             by shutdown"
+        );
+
+        // What `cancel()` does: take the entry, then fire the token.
+        let (state, task_id) = registered();
+        lock_cancel_state(&state).remove(&task_id);
+        assert!(
+            !shutdown_stopped_this_run(true, &down(), &state, &task_id),
+            "cancel() cleans up after itself"
+        );
+    }
+
+    /// Covers the contract in both directions. `loom_tests` covers the
+    /// interleaving, which this cannot reach.
+    #[test]
+    fn claiming_the_agent_reports_a_cancel_that_already_ran() {
+        let task_id = format!("t_{}", uuid::Uuid::new_v4());
+        let request_id = format!("a2a_{task_id}");
+        let state: Arc<TaskCancelState> = Arc::new(Mutex::new(HashMap::new()));
+        let agent: Arc<dyn StreamingAgent> = Arc::new(MockAgent::pending());
+
+        lock_cancel_state(&state).insert(
+            task_id.clone(),
+            TaskCancelEntry {
+                token: CancellationToken::new(),
+                agent: None,
+                request_id,
+            },
+        );
+
+        assert!(claim_agent(&state, &task_id, &agent) == CancelRaced::No);
+        assert!(
+            lock_cancel_state(&state)
+                .get(&task_id)
+                .is_some_and(|entry| entry.agent.is_some()),
+            "the entry carries the agent a later cancel closes"
+        );
+
+        // What `cancel()` does: take the entry, leaving nothing to claim.
+        lock_cancel_state(&state).remove(&task_id);
+        assert!(claim_agent(&state, &task_id, &agent) == CancelRaced::Yes);
+    }
+
+    /// The guard is created before the entry, because the agent build and the
+    /// history fetch can both return early and would otherwise leave it behind.
+    #[test]
+    fn an_early_return_before_the_run_releases_the_entry() {
+        let task_id = format!("t_{}", uuid::Uuid::new_v4());
+        let request_id = format!("a2a_{task_id}");
+        let state: Arc<TaskCancelState> = Arc::new(Mutex::new(HashMap::new()));
+
+        {
+            let _guard = TaskCancelGuard {
+                state: state.clone(),
+                task_id: task_id.clone(),
+                request_id: request_id.clone(),
+            };
+            lock_cancel_state(&state).insert(
+                task_id.clone(),
+                TaskCancelEntry {
+                    token: CancellationToken::new(),
+                    agent: None,
+                    request_id: request_id.clone(),
+                },
+            );
+            // The build fails here and the generator returns.
+        }
+
+        assert!(
+            !lock_cancel_state(&state).contains_key(&task_id),
+            "a run that never started leaves no entry"
+        );
     }
 
     /// `cancel()` takes the entry before the generator unwinds, so the guard
@@ -1096,5 +1308,119 @@ mod tests {
             turns(&history),
             vec![("user", "hi".to_owned()), ("assistant", "hello".to_owned()),]
         );
+    }
+}
+
+/// Exhaustive interleaving checks for the task-cancel map.
+///
+/// Run with `RUSTFLAGS="--cfg aura_loom" cargo test -p aura-web-server loom_`.
+/// A stress test cannot reach these windows: the one that matters is a single
+/// mutex release and reacquire wide.
+#[cfg(all(test, aura_loom))]
+mod loom_tests {
+    use super::*;
+    use aura_test_utils::mock_agent::MockAgent;
+
+    /// A cancel and the post-loop shutdown check race. Exactly one of them
+    /// takes responsibility for closing the agent and emitting a terminal
+    /// status; both doing so would send the client two.
+    #[test]
+    fn loom_a_cancel_racing_the_shutdown_check_yields_one_closer() {
+        loom::model(|| {
+            let shutdown = CancellationToken::new();
+            shutdown.cancel();
+
+            let state: loom::sync::Arc<TaskCancelState> =
+                loom::sync::Arc::new(Mutex::new(HashMap::new()));
+            lock_cancel_state(&state).insert(
+                "t1".to_string(),
+                TaskCancelEntry {
+                    token: CancellationToken::new(),
+                    agent: None,
+                    request_id: "a2a_t1".to_string(),
+                },
+            );
+
+            let closes = loom::sync::Arc::new(loom::sync::atomic::AtomicUsize::new(0));
+
+            let post_loop = {
+                let (state, closes, shutdown) = (state.clone(), closes.clone(), shutdown.clone());
+                loom::thread::spawn(move || {
+                    if shutdown_stopped_this_run(true, &shutdown, &state, "t1") {
+                        closes.fetch_add(1, loom::sync::atomic::Ordering::SeqCst);
+                    }
+                })
+            };
+
+            let canceller = {
+                let (state, closes) = (state.clone(), closes.clone());
+                loom::thread::spawn(move || {
+                    if lock_cancel_state(&state).remove("t1").is_some() {
+                        closes.fetch_add(1, loom::sync::atomic::Ordering::SeqCst);
+                    }
+                })
+            };
+
+            post_loop.join().unwrap();
+            canceller.join().unwrap();
+
+            assert_eq!(
+                closes.load(loom::sync::atomic::Ordering::SeqCst),
+                1,
+                "exactly one side takes responsibility for the terminal status"
+            );
+        });
+    }
+
+    /// A cancel and a claim race. Exactly one of them takes responsibility for
+    /// closing the agent — the claim when it finds the entry already gone, the
+    /// cancel when it finds the entry carrying an agent. The close itself is
+    /// async and outside the model; this is the branch that decides who runs it.
+    #[test]
+    fn loom_a_cancel_racing_a_claim_yields_one_closer() {
+        loom::model(|| {
+            let state: loom::sync::Arc<TaskCancelState> =
+                loom::sync::Arc::new(Mutex::new(HashMap::new()));
+            lock_cancel_state(&state).insert(
+                "t1".to_string(),
+                TaskCancelEntry {
+                    token: CancellationToken::new(),
+                    agent: None,
+                    request_id: "a2a_t1".to_string(),
+                },
+            );
+
+            let closes = loom::sync::Arc::new(loom::sync::atomic::AtomicUsize::new(0));
+
+            let claimer = {
+                let (state, closes) = (state.clone(), closes.clone());
+                loom::thread::spawn(move || {
+                    let agent: Arc<dyn StreamingAgent> = Arc::new(MockAgent::pending());
+                    if claim_agent(&state, "t1", &agent) == CancelRaced::Yes {
+                        closes.fetch_add(1, loom::sync::atomic::Ordering::SeqCst);
+                    }
+                })
+            };
+
+            let canceller = {
+                let (state, closes) = (state.clone(), closes.clone());
+                loom::thread::spawn(move || {
+                    // What `cancel()` does: take the entry, close what it holds.
+                    let entry = lock_cancel_state(&state).remove("t1");
+                    if entry.is_some_and(|entry| entry.agent.is_some()) {
+                        closes.fetch_add(1, loom::sync::atomic::Ordering::SeqCst);
+                    }
+                })
+            };
+
+            claimer.join().unwrap();
+            canceller.join().unwrap();
+
+            assert_eq!(
+                closes.load(loom::sync::atomic::Ordering::SeqCst),
+                1,
+                "exactly one side takes responsibility for closing the agent"
+            );
+        });
     }
 }

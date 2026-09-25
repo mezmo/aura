@@ -57,6 +57,10 @@ coverage: $(DOCKER_ENV) $(REPORT_DIR) $(GRCOV_BIN) ## Run the local test suite w
 nextest: $(DOCKER_ENV) $(NEXTEST_BIN) $(REPORT_DIR)
 	$(RUN) cargo nextest run --workspace --all-targets --features integration $(if $(IS_CI),-P ci,)
 
+.PHONY:test-loom
+test-loom: $(DOCKER_ENV) ## Run the loom interleaving models (not part of `test`; they explore, so they are slow)
+	$(RUN) env RUSTFLAGS="--cfg aura_loom" cargo test -p aura-web-server --lib loom_
+
 .PHONY:lint-rust
 lint-rust: | $(DOCKER_ENV) $(REPORT_DIR)  ## lint rust code via clippy
 	$(RUN) cargo clippy $(if $(IS_CI),-q,) --all-targets --all-features $(if $(IS_CI),--message-format=json,) -- -D warnings $(if $(IS_CI),> $(REPORT_DIR)/clippy.json,)
