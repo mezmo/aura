@@ -14,6 +14,8 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
+use tokio_util::sync::CancellationToken;
+
 use futures::Stream;
 
 use aura_events::agent::AgentEvent;
@@ -29,19 +31,31 @@ pub struct RunContext {
     id: Arc<str>,
     tool_calls: Mutex<VecDeque<ToolCallId>>,
     events: mpsc::Sender<AgentEvent>,
+    cancel: CancellationToken,
 }
 
 /// Pending tool ids before warning, in case results never arrive to pop them.
 const MAX_PENDING_TOOL_CALLS: usize = 256;
 
 impl RunContext {
-    /// A run and the receiver its observer reads.
+    /// A run and the receiver its observer reads, on a token of its own.
     pub fn channel(id: impl Into<Arc<str>>) -> (Arc<Self>, mpsc::Receiver<AgentEvent>) {
+        Self::channel_on(id, CancellationToken::new())
+    }
+
+    /// A run on `cancel`, for a caller that already holds the token the run is
+    /// to stop on — a child of its own caller's, so one run ending leaves the
+    /// others alone.
+    pub fn channel_on(
+        id: impl Into<Arc<str>>,
+        cancel: CancellationToken,
+    ) -> (Arc<Self>, mpsc::Receiver<AgentEvent>) {
         let (events, receiver) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
         let run = Arc::new(Self {
             id: id.into(),
             tool_calls: Mutex::new(VecDeque::new()),
             events,
+            cancel,
         });
         (run, receiver)
     }
@@ -72,6 +86,11 @@ impl RunContext {
 
     pub fn id(&self) -> &Arc<str> {
         &self.id
+    }
+
+    /// The token that cancels this run.
+    pub fn cancel_token(&self) -> &CancellationToken {
+        &self.cancel
     }
 
     fn queue(&self) -> std::sync::MutexGuard<'_, VecDeque<ToolCallId>> {
@@ -236,6 +255,35 @@ mod tests {
         assert_eq!(seen.as_deref(), Some("spawned"));
     }
 
+    /// A run built on the caller's token stops when the caller does. The work
+    /// that awaits cancellation reads the token off the run, so a run holding a
+    /// different token than the one the handler fires would leave a gated call
+    /// waiting on a signal nobody sends.
+    #[tokio::test]
+    async fn a_run_stops_on_the_token_it_was_built_on() {
+        let caller = CancellationToken::new();
+        let (run, _events) = RunContext::channel_on("run_on_token", caller.clone());
+        assert!(!run.cancel_token().is_cancelled());
+
+        caller.cancel();
+        assert!(run.cancel_token().is_cancelled());
+    }
+
+    /// A run given no token has one of its own, so nothing reads a token that
+    /// cancels something else.
+    #[tokio::test]
+    async fn a_run_given_no_token_has_its_own() {
+        let (a, _ea) = RunContext::channel("run_a");
+        let (b, _eb) = RunContext::channel("run_b");
+
+        a.cancel_token().cancel();
+        assert!(a.cancel_token().is_cancelled());
+        assert!(
+            !b.cancel_token().is_cancelled(),
+            "one run's token is its own"
+        );
+    }
+
     #[tokio::test]
     async fn there_is_no_run_outside_a_run() {
         assert!(current_run().is_none());
@@ -341,8 +389,6 @@ mod tests {
         assert_eq!(run.pop_tool_call(), None);
     }
 
-    /// Two runs each keep their own calls, which is what the request-keyed
-    /// registry was for.
     #[test]
     fn one_runs_calls_are_invisible_to_another() {
         let a = run("run_a");
@@ -373,8 +419,7 @@ mod tests {
         );
     }
 
-    /// Interleaving is what the request-keyed queues had to get right, so the
-    /// order holds across a longer run rather than only a pair.
+    /// The order holds across a longer run, not only a pair.
     #[test]
     fn a_long_sequence_keeps_its_order() {
         let run = run("run_many");

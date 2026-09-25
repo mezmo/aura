@@ -41,7 +41,7 @@ use tokio::sync::mpsc;
 
 /// Context for cancellation and cleanup callbacks.
 pub struct StreamingCallbacks {
-    /// Request ID for cancellation registry
+    /// The request's id.
     pub request_id: String,
     /// Agent reference for MCP cleanup (cancel_and_close_mcp)
     pub agent: Arc<dyn StreamingAgent>,

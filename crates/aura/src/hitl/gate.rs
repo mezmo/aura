@@ -336,9 +336,12 @@ impl ToolWrapper for HitlApprovalWrapper {
                 tool_call_intent: ctx.tool_call_intent.clone(),
             }],
         };
-        let cancel =
-            crate::request_cancellation::RequestCancellation::token_for_id(&self.request_id)
-                .unwrap_or_else(crate::request_cancellation::RequestCancelToken::unbound);
+        let cancel = self
+            .run()
+            .map(|run| {
+                crate::request_cancellation::RequestCancelToken::from(run.cancel_token().clone())
+            })
+            .unwrap_or_else(crate::request_cancellation::RequestCancelToken::unbound);
         // `DecisionRoute` emits the lifecycle itself; the scope is how those
         // events find the run, since rig calls this off it.
         let decision = match self.run() {
@@ -962,6 +965,73 @@ mod tests {
                 "the route must not be consulted on the no-task-id fault, got: {msg}",
             );
         }
+    }
+
+    /// The gate awaits the run's own token, so stopping the run releases a call
+    /// waiting on a human. Sourcing the token from anywhere else — an unbound
+    /// stand-in, a registry the run never registered with — leaves the call
+    /// parked until its approval times out, with nobody left to answer it.
+    #[tokio::test]
+    async fn stopping_the_run_releases_a_call_waiting_on_approval() {
+        use crate::hitl::PendingApprovals;
+
+        let registry = PendingApprovals::new();
+        let route = Arc::new(DecisionRoute::Conversational {
+            registry,
+            // Long enough that only cancellation can end the wait.
+            timeout: Duration::from_secs(3_600),
+        });
+        let gate = Arc::new(HitlApprovalWrapper::new(
+            Arc::from(["kubectl_*".into()]),
+            route,
+            AgentScope::Single { session_id: None },
+            "req_run_cancel".into(),
+            "test-agent".to_string(),
+            "test-instance-id".to_string(),
+        ));
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (run, mut events) =
+            crate::run_context::RunContext::channel_on("req_run_cancel", cancel.clone());
+        gate.bind_run(run);
+
+        let gated = Arc::clone(&gate);
+        let call = tokio::spawn(async move {
+            let args = serde_json::json!({ "namespace": "prod" });
+            let ctx = ToolCallContext::new("kubectl_apply");
+            gated.pre_call(&args, &ctx).await
+        });
+
+        // The route registers the approval and raises it before parking on the
+        // decision, so the pending event arriving is what says the call is
+        // waiting rather than still on its way there.
+        for expected in ["requested", "pending"] {
+            let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
+                .await
+                .unwrap_or_else(|_| panic!("the gate raises {expected} before parking"))
+                .expect("the run's channel stays open");
+            let raised = matches!(
+                event.payload,
+                aura_events::agent::AgentEventPayload::ApprovalRequested(_)
+                    | aura_events::agent::AgentEventPayload::ApprovalPending(_)
+            );
+            assert!(
+                raised,
+                "expected an approval event, got {:?}",
+                event.payload
+            );
+        }
+        cancel.cancel();
+
+        let err = tokio::time::timeout(Duration::from_secs(5), call)
+            .await
+            .expect("stopping the run must release the call, not leave it parked")
+            .expect("the call task did not panic")
+            .expect_err("a cancelled approval fails the call closed");
+        assert!(
+            err.to_string().contains("approval cancelled"),
+            "the failure must name the cancellation, got: {err}"
+        );
     }
 
     #[test]
