@@ -570,6 +570,21 @@ struct ForwardedRun {
     last_turn: rig::completion::Usage,
 }
 
+const EMPTY_WORKER_RESULT: &str = "The worker produced no output and did not call submit_result.";
+
+/// The failure text for a worker that finished without calling `submit_result`.
+///
+/// Such a worker reports its raw final reply as the failure, which a turn that
+/// produced no text leaves blank — the plan then renders a bare "Failed:" and
+/// the run reads as if nothing went wrong. Name the condition instead.
+fn soft_failure_reason(result: String) -> String {
+    if result.trim().is_empty() {
+        EMPTY_WORKER_RESULT.to_string()
+    } else {
+        result
+    }
+}
+
 /// Replay an assistant turn as conversation history.
 ///
 /// Anthropic-family providers reject a message whose text block is empty
@@ -3345,7 +3360,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
                             if success {
                                 t.complete(final_result);
                             } else {
-                                t.fail(final_result, FailureCategory::SoftFailure);
+                                t.fail(
+                                    soft_failure_reason(final_result),
+                                    FailureCategory::SoftFailure,
+                                );
                             }
                             t.structured_output = exec_result.structured_output;
                         }
@@ -5629,6 +5647,25 @@ mod tests {
                 .collect(),
             other => panic!("expected assistant message, got {other:?}"),
         }
+    }
+
+    /// A worker that returns nothing must fail with a reason, not a bare
+    /// "Failed:".
+    #[test]
+    fn soft_failure_reason_names_an_empty_result() {
+        for blank in ["", " ", "\n\t "] {
+            assert_eq!(
+                soft_failure_reason(blank.to_string()),
+                EMPTY_WORKER_RESULT,
+                "blank {blank:?} must be replaced",
+            );
+        }
+    }
+
+    #[test]
+    fn soft_failure_reason_keeps_the_worker_text() {
+        let text = "Cloned the repo but the push was rejected.";
+        assert_eq!(soft_failure_reason(text.to_string()), text);
     }
 
     /// Blank assistant turns must be replayed as non-empty text so providers
