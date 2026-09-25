@@ -292,6 +292,20 @@ where
                                 ctx.correlation.clone(),
                             )
                         }
+                        ToolLifecycleEvent::AgentAnswer { remote, success, text, elapsed_ms } => {
+                            tracing::debug!(
+                                "Emitting aura.remote_agent_answer event: remote={}, success={}",
+                                remote, success
+                            );
+                            AuraStreamEvent::remote_agent_answer(
+                                remote,
+                                success,
+                                text,
+                                elapsed_ms,
+                                ctx.agent_context.clone(),
+                                ctx.correlation.clone(),
+                            )
+                        }
                     };
                     if tx.send(Ok(Bytes::from(sse_event.format_sse()))).await.is_err() {
                         tracing::info!("Client disconnected during tool event");
