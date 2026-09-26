@@ -170,8 +170,8 @@ impl ClientHandler for ProgressEnabledHandler {
             // One lookup, so the id and the agent describe the same call.
             let call = self.owner_of(&params.progress_token).await;
 
-            if let Some(CallContext { request_id, agent }) = call {
-                let req_id = &request_id;
+            if let Some(CallContext { run, agent }) = call {
+                let req_id = run.id().as_ref();
 
                 let routed = crate::agent_events::emit(
                     req_id,
@@ -234,7 +234,7 @@ mod tests {
 
     fn call(request_id: &str) -> CallContext {
         CallContext {
-            request_id: request_id.to_string(),
+            run: crate::run_context::RunContext::new(request_id),
             agent: aura_events::AgentContext::single_agent(),
         }
     }
@@ -317,7 +317,7 @@ mod tests {
             handler
                 .owner_of(&token(1))
                 .await
-                .map(|call| call.request_id),
+                .map(|call| call.run.id().to_string()),
             Some("run_a".to_string()),
             "an unclaimed token belongs to the call this client serves"
         );
@@ -328,7 +328,7 @@ mod tests {
             handler
                 .owner_of(&token(1))
                 .await
-                .map(|call| call.request_id),
+                .map(|call| call.run.id().to_string()),
             Some("run_a_tool".to_string()),
             "a claim is more precise than the binding"
         );
@@ -341,11 +341,17 @@ mod tests {
         let handler = handler_owning(&[(1, "run_a"), (2, "run_b")]);
 
         assert_eq!(
-            handler.owner_of(&token(1)).await.map(|c| c.request_id),
+            handler
+                .owner_of(&token(1))
+                .await
+                .map(|c| c.run.id().to_string()),
             Some("run_a".to_string())
         );
         assert_eq!(
-            handler.owner_of(&token(2)).await.map(|c| c.request_id),
+            handler
+                .owner_of(&token(2))
+                .await
+                .map(|c| c.run.id().to_string()),
             Some("run_b".to_string())
         );
     }
@@ -361,13 +367,19 @@ mod tests {
 
         owners.lock().unwrap().insert(token(7), call("run_a_tool"));
         assert_eq!(
-            handler.owner_of(&token(7)).await.map(|c| c.request_id),
+            handler
+                .owner_of(&token(7))
+                .await
+                .map(|c| c.run.id().to_string()),
             Some("run_a_tool".to_string())
         );
 
         owners.lock().unwrap().remove(&token(7));
         assert_eq!(
-            handler.owner_of(&token(7)).await.map(|c| c.request_id),
+            handler
+                .owner_of(&token(7))
+                .await
+                .map(|c| c.run.id().to_string()),
             Some("run_a".to_string()),
             "the binding outlives the tokens of the calls it serves"
         );

@@ -2,7 +2,7 @@
 
 //! Tool-event properties that only a real provider and MCP server establish:
 //! progress tokens minted during MCP execution correlating with the
-//! `aura.tool_start` that announced them, and the broker's FIFO `tool_call_id`
+//! `aura.tool_start` that announced them, and the run's FIFO `tool_call_id`
 //! correlation across a multi-tool turn — which holds only while rig executes
 //! streamed tool calls sequentially.
 //!
