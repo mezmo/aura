@@ -4995,7 +4995,14 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
                 let routing_rationale = resp.routing_rationale().to_string();
                 let planning_summary = resp.planning_summary().unwrap_or_default().to_string();
-                let new_plan = resp.into_plan().expect("StepsPlan always converts to plan");
+                let Some(new_plan) = resp.into_plan() else {
+                    // create_plan validates the shape before recording the
+                    // decision, so this is unreachable in practice; fail the
+                    // request rather than panic the runtime if it is not.
+                    return Err("Planning produced a plan Aura cannot flatten; \
+                                see the orchestrator log for the reason"
+                        .into());
+                };
 
                 Self::emit_event(
                     event_tx,
