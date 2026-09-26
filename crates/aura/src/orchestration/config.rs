@@ -267,6 +267,26 @@ mod tests {
     }
 
     #[test]
+    fn test_coordinator_preamble_preserves_telemetry_lookback_policy() {
+        let prompt = "TELEMETRY LOOKBACK: Unless specified, inspect last 5 minutes of telemetry.";
+        let preamble = build_coordinator_preamble(prompt, true, false);
+        assert!(preamble.contains("last 5 minutes of telemetry"));
+    }
+
+    #[test]
+    fn test_worker_preamble_preserves_telemetry_lookback_policy() {
+        let config = OrchestrationConfig {
+            worker_system_prompt: Some(
+                "Unless a different window is specified, query metrics over the last 5 minutes by default."
+                    .to_string(),
+            ),
+            ..Default::default()
+        };
+        let preamble = build_worker_preamble(&config);
+        assert!(preamble.contains("last 5 minutes by default"));
+    }
+
+    #[test]
     fn test_build_vector_store_context_empty() {
         let stores: Vec<VectorStoreConfig> = vec![];
         let context = build_vector_store_context(&stores);
