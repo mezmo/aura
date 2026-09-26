@@ -84,6 +84,7 @@ Through compatible [MCP](https://modelcontextprotocol.io) servers and built-in i
 | [Argo CD](https://www.youtube.com/watch?v=3fvTiybcpqk) | Inspect applications, sync status, and hook logs, and re-run syncs |
 | [AWS](https://www.youtube.com/watch?v=o_M1MtHFYwU) | Inspect cloud resources, logs, metrics, and operational state |
 | Azure | Inspect cloud resources, deployments, monitoring, and operational state |
+| [Checkly](examples/complete/incident-response-checkly.toml) | Inspect synthetic check results and assets, re-run checks, and manage checks and check groups |
 | [ClickHouse](https://www.youtube.com/watch?v=5WIJmQ0nDwI) | Query system tables for disk, merge, and replication health |
 | Confluence | Search and maintain operational runbooks |
 | [Dash0](https://www.youtube.com/watch?v=W7G3jlGVBH0) | Query hosted OpenTelemetry traces, metrics, and logs |
