@@ -828,15 +828,22 @@ impl McpManager {
     }
 
     /// Bind these clients to the call they serve and the agent it belongs to.
-    pub async fn bind_call(&self, http_request_id: &str, agent: aura_events::AgentContext) {
+    pub async fn bind_call(
+        &self,
+        run: std::sync::Arc<crate::run_context::RunContext>,
+        agent: aura_events::AgentContext,
+    ) {
         let mut total_clients = 0;
         for client in self.clients() {
-            client.bind_call(http_request_id, agent.clone()).await;
+            client
+                .bind_call(std::sync::Arc::clone(&run), agent.clone())
+                .await;
             total_clients += 1;
         }
         debug!(
             "Bound {} MCP client(s) to call: {}",
-            total_clients, http_request_id
+            total_clients,
+            run.id()
         );
     }
 

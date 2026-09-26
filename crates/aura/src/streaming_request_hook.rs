@@ -50,10 +50,9 @@ use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
 use crate::orchestration::BlockedCell;
+use crate::run_context::current_run;
 use crate::scratchpad::{self, ContextBudget};
-use crate::tool_event_broker::{
-    TokenUsage, ToolCallId, ToolName, pop_tool_call_id, push_tool_call_id,
-};
+use crate::tool_event_broker::{TokenUsage, ToolCallId, ToolName};
 
 /// Maximum pending tool IDs before warning. Prevents unbounded growth if
 /// usage events never fire (e.g., provider doesn't return token counts).
@@ -103,6 +102,18 @@ impl Drop for ParkCellRegistration {
             handle.spawn(async move { crate::tool_event_broker::unsubscribe(&key).await });
         }
     }
+}
+
+/// The run whose tool-call queue this stream may use, which is the run only
+/// when the stream *is* the run.
+///
+/// MCP reads the queue under the run id, its only identity, so a queue filled
+/// by some other stream of the same run would hand a tool call the id of a
+/// sibling's. An orchestration worker streams under a key of its own and so
+/// correlates nothing, which is the behaviour before the queue moved onto the
+/// run. #732 is what would change that.
+fn queue_owner(stream_id: &str) -> Option<Arc<crate::run_context::RunContext>> {
+    current_run().filter(|run| run.id().as_ref() == stream_id)
 }
 
 /// The blocked cell for `key`, if this stream is in park mode.
@@ -568,7 +579,9 @@ where
                 // Rig 0.28+ passes correct tool_call_id; register for event correlation
                 if let Some(id) = &tool_call_id {
                     let id = ToolCallId::new(id);
-                    push_tool_call_id(&request_id, id.clone()).await;
+                    if let Some(run) = queue_owner(&request_id) {
+                        run.push_tool_call(id.clone());
+                    }
                     let _ = crate::agent_events::emit(
                         &request_id,
                         AgentEvent::single_agent(AgentEventPayload::ToolRequested {
@@ -627,7 +640,10 @@ where
                 // Only pop if on_tool_call pushed (i.e., tool_call_id was Some).
                 // This maintains push/pop symmetry and prevents popping IDs belonging
                 // to other tool calls when a tool arrives without an ID.
-                if had_tool_call_id && pop_tool_call_id(&request_id).await.is_none() {
+                if had_tool_call_id
+                    && let Some(run) = queue_owner(&request_id)
+                    && run.pop_tool_call().is_none()
+                {
                     tracing::warn!(
                         "Queue desync: pop returned None for tool '{}' on request '{}' \
                          (possible duplicate on_tool_result or Rig version issue)",
@@ -738,6 +754,40 @@ where
 
 #[cfg(test)]
 mod tests {
+    /// MCP reads the tool-call queue under the run id, its only identity, so a
+    /// queue filled by another stream of the same run hands a tool call a
+    /// sibling's id. Only the stream that *is* the run may fill it.
+    mod queue_ownership {
+        use super::super::queue_owner;
+        use crate::run_context::{RunContext, with_run};
+
+        #[tokio::test]
+        async fn the_run_s_own_stream_owns_the_queue() {
+            let run = RunContext::new("req_1");
+            let owned = with_run(run, async { queue_owner("req_1").is_some() }).await;
+            assert!(owned);
+        }
+
+        /// An orchestration worker streams under its task attempt.
+        #[tokio::test]
+        async fn a_worker_s_stream_owns_no_queue() {
+            let run = RunContext::new("req_1");
+            let owned = with_run(run, async {
+                queue_owner("req_1:task:0:attempt:1").is_some()
+            })
+            .await;
+            assert!(
+                !owned,
+                "a stream that is not the run leaves its queue alone"
+            );
+        }
+
+        #[tokio::test]
+        async fn no_run_owns_nothing() {
+            assert!(queue_owner("req_1").is_none());
+        }
+    }
+
     use super::*;
     use std::time::Duration;
 
