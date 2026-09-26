@@ -59,6 +59,7 @@ impl OrchestratorFactory {
         let (event_tx, event_rx) =
             tokio::sync::mpsc::channel::<Result<StreamItem, StreamError>>(100);
 
+        let run = crate::run_context::RunContext::new(request_id.clone());
         let RunTokens { cancel, finished } = tokens;
         let cancel_token_clone = cancel.clone();
         // Marks the run finished on every exit path, which is what lets the
@@ -68,7 +69,7 @@ impl OrchestratorFactory {
         // Capture parent span so child spans nest correctly in tracing.
         let parent_span = tracing::Span::current();
         tokio::spawn(tracing::Instrument::instrument(
-            crate::run_context::with_run_id(request_id.clone(), async move {
+            crate::run_context::with_run(std::sync::Arc::clone(&run), async move {
                 let _done_guard = done_guard;
                 let mut orchestrator = match Orchestrator::new(agent_config).await {
                     Ok(o) => o,
@@ -89,7 +90,10 @@ impl OrchestratorFactory {
                     // Workers share this manager, and their tool calls run on
                     // rig's server task where the run's scope does not reach.
                     mcp_manager
-                        .bind_call(&request_id, aura_events::AgentContext::coordinator())
+                        .bind_call(
+                            std::sync::Arc::clone(&run),
+                            aura_events::AgentContext::coordinator(),
+                        )
                         .await;
                     let snapshot = mcp_manager.server_status_snapshot();
                     if !snapshot.is_empty() {

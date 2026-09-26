@@ -118,9 +118,9 @@ pub use tool_call_observer::{RetryHint, ToolCallObserver, ToolEvent, ToolOutcome
 pub use tool_error_detection::{DetectedToolError, ToolResultStatus, detect_tool_error};
 pub use tool_event_broker::{
     TokenUsage, ToolCallId, ToolEventBroker, ToolLifecycleEvent, ToolName, ToolUsageEvent,
-    global as tool_event_global, peek_tool_call_id, pop_tool_call_id, publish_tool_start,
-    publish_tool_usage, push_tool_call_id, subscribe as tool_event_subscribe, tool_usage_subscribe,
-    tool_usage_unsubscribe, unsubscribe as tool_event_unsubscribe,
+    global as tool_event_global, publish_tool_start, publish_tool_usage,
+    subscribe as tool_event_subscribe, tool_usage_subscribe, tool_usage_unsubscribe,
+    unsubscribe as tool_event_unsubscribe,
 };
 pub use tool_wrapper::{
     ComposedWrapper, ToolCallContext, ToolWrapper, TransformArgsResult, TransformOutputResult,
