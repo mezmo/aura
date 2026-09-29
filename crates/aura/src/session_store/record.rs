@@ -40,14 +40,29 @@ pub struct ParkedApprovalRecord {
     pub items: Vec<ApprovalItem>,
     pub registered_at: Timestamp,
     pub expires_at: Timestamp,
-    /// The channel the row was parked under. Required on every row: absence
-    /// is a decode failure, never a guessed authority.
+    /// The channel the row was parked under. Transitional decode (L7, row
+    /// 27): interactive rows shipped before the authority stamp existed
+    /// persist no `authority` field and decode as
+    /// [`ApprovalAuthority::Conversational`] — the only channel those rows
+    /// ever had. New rows always write the field (Serialize is unchanged),
+    /// and an explicit but unknown value is still a decode failure.
+    #[serde(default = "default_authority")]
     pub authority: ApprovalAuthority,
     /// Resolved egress headers the parked row's notify POST authenticates
     /// with (lowercased name → value). Additive: absent on rows stored before
     /// poll-delivery egress capture existed, decoding to `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub egress_headers: Option<BTreeMap<String, String>>,
+}
+
+/// The transitional decode default for `authority` (L7, row 27): a stored
+/// row with no `authority` field predates the stamp and was parked by the
+/// conversational route, so absence reads as that route. The default lives
+/// here at the storage boundary — not as a `Default` on
+/// [`ApprovalAuthority`] — so no other use of the enum gains a silent
+/// fallback.
+fn default_authority() -> ApprovalAuthority {
+    ApprovalAuthority::Conversational
 }
 
 /// The names of an optional pair map, for names-only Debug rendering.
@@ -408,8 +423,14 @@ mod tests {
         }
     }
 
+    /// L7 transitional decode (row 27): a current row serialized with its
+    /// `authority` field removed — the shape a shipped interactive row
+    /// persists — decodes as `Conversational`, never fails the scan that
+    /// finds it. (The literal shipped-row shape is pinned by
+    /// `shipped_record_without_authority_decodes_as_conversational`, and an
+    /// explicit unknown value by `unknown_explicit_authority_fails_decode`.)
     #[test]
-    fn a_record_without_authority_is_a_decode_failure() {
+    fn a_record_without_authority_decodes_as_conversational() {
         let record = ParkedApprovalRecord::from(&parked(
             AgentScope::Single { session_id: None },
             ApprovalOrigin::ConfigGate {
@@ -422,11 +443,59 @@ mod tests {
             .as_object_mut()
             .expect("the record is an object")
             .remove("authority");
+        let stored: ParkedApprovalRecord = serde_json::from_value(value)
+            .expect("an absent authority decodes as the conversational channel");
+        assert_eq!(stored.authority, ApprovalAuthority::Conversational);
+        let restored = ParkedApproval::try_from(stored).expect("the restored row is domain-valid");
+        assert_eq!(restored.authority, ApprovalAuthority::Conversational);
+    }
+
+    /// L7 (row 27): interactive records shipped before the authority stamp
+    /// existed persist no `authority` field, and their channel is by
+    /// definition the conversational one — the row must decode, never fail
+    /// the scan that finds it.
+    #[test]
+    fn shipped_record_without_authority_decodes_as_conversational() {
+        let shipped_json = r#"{
+            "version": 1,
+            "instance_id": "test-instance",
+            "decision_id": "0191e8c0-1111-7000-8000-000000000002",
+            "request_id": "req-shipped",
+            "scope": { "kind": "single", "session_id": null },
+            "origin": { "kind": "config_gate", "matched_pattern": "kubectl_*", "agent_name": "t" },
+            "items": [],
+            "registered_at": "2026-08-01T00:00:00Z",
+            "expires_at": "2026-08-01T01:00:00Z"
+        }"#;
+
+        let record: ParkedApprovalRecord = serde_json::from_str(shipped_json)
+            .expect("a shipped interactive row decodes; absence means conversational");
+        assert_eq!(record.authority, ApprovalAuthority::Conversational);
+        let restored = ParkedApproval::try_from(record).expect("the restored row is domain-valid");
+        assert_eq!(restored.authority, ApprovalAuthority::Conversational);
+    }
+
+    /// An explicit but unknown authority stays a decode failure: compat
+    /// covers only the absent field, never a value no route ever wrote.
+    #[test]
+    fn unknown_explicit_authority_fails_decode() {
+        let record = ParkedApprovalRecord::from(&parked(
+            AgentScope::Single { session_id: None },
+            ApprovalOrigin::ConfigGate {
+                matched_pattern: "*".to_string(),
+                agent_name: "test-agent".to_string(),
+            },
+        ));
+        let mut value = serde_json::to_value(&record).expect("record serializes to a JSON object");
+        value
+            .as_object_mut()
+            .expect("the record is an object")
+            .insert("authority".to_string(), serde_json::json!("carrier_pigeon"));
         let err = serde_json::from_value::<ParkedApprovalRecord>(value)
-            .expect_err("absent authority must not decode to a guessed route");
+            .expect_err("an unknown authority must not decode");
         assert!(
-            err.to_string().contains("authority"),
-            "the refusal names the missing field, got: {err}"
+            err.to_string().contains("carrier_pigeon"),
+            "the refusal names the unknown variant, got: {err}"
         );
     }
 
