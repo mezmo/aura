@@ -110,19 +110,9 @@ impl ConfigLoader {
         // Layer 1: Load TOML files (lowest priority among files)
         for toml_file in &self.toml_files {
             tracing::debug!("Loading TOML file: {}", toml_file.display());
-            match load_config_from_str(&std::fs::read_to_string(toml_file)?) {
-                Ok(file_config) => {
-                    config = merge_configs(config, file_config)?;
-                    tracing::debug!("Merged TOML config from: {}", toml_file.display());
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to load TOML config from {}: {}",
-                        toml_file.display(),
-                        e
-                    );
-                }
-            }
+            let file_config = load_config_from_str(&std::fs::read_to_string(toml_file)?)?;
+            config = merge_configs(config, file_config)?;
+            tracing::debug!("Merged TOML config from: {}", toml_file.display());
         }
 
         // Layer 2: Load JSON files
