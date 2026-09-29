@@ -86,7 +86,7 @@ pub(crate) async fn read_full_request(socket: &mut tokio::net::TcpStream) -> Str
 
 pub use gate::HitlApprovalWrapper;
 pub use outcome::ApprovalAuthority;
-pub use poller::{PollReconciler, PollerHandle};
+pub use poller::{PollReconciler, PollerExit, PollerHandle};
 pub use protocol::{ApprovalDecisionWire, ApprovalItem, ApprovalRequest, PROTOCOL_VERSION};
 pub use registry::{ParkedApproval, PendingApprovals, ResolveError};
 // Re-exported so config-fingerprint tests construct the poll client the
