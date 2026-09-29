@@ -58,6 +58,9 @@ pub enum SessionStoreError {
     /// A stored record failed to decode.
     #[error("session store record failed to decode: {reason}")]
     Decode { reason: String },
+    /// The backend does not implement the requested operation.
+    #[error("session store does not support '{operation}'")]
+    Unsupported { operation: &'static str },
 }
 
 /// Durable storage for parked conversational HITL approvals, over the
@@ -101,9 +104,17 @@ pub trait ApprovalStore: Send + Sync {
         request_id: &str,
     ) -> Result<Vec<ParkedApproval>, SessionStoreError>;
 
-    /// List every parked approval that is undecided and non-expired
+    /// Scans the store for approval rows that are still pending: every
+    /// parked approval that is undecided and non-expired
     /// (`expires_at > now`). No ordering guarantee.
-    async fn list_pending(&self) -> Result<Vec<ParkedApproval>, SessionStoreError>;
+    ///
+    /// The default returns the store's `Unsupported` error so a backend
+    /// without a scan implementation fails loudly instead of reporting an
+    /// empty pending set, which the reconciler would read as no awaiting
+    /// decisions.
+    async fn list_pending(&self) -> Result<Vec<ParkedApproval>, SessionStoreError> {
+        todo!()
+    }
 }
 
 /// Distinct skill-invocation records one session may hold.

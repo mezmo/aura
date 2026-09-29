@@ -929,7 +929,7 @@ mod tests {
         ) -> DecisionRouteConfig {
             DecisionRouteConfig::Webhook {
                 url: WebhookUrl::new("https://approvals.example.com/hook").unwrap(),
-                timeout_secs: 300,
+                timeout_secs: Some(300),
                 headers,
                 headers_from_request: HashMap::new(),
                 tool_headers_from_response: ToolHeaderMappings::default(),
