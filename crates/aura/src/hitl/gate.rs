@@ -876,7 +876,7 @@ mod tests {
                 park: aura_config::ParkConfig { enabled: true },
                 route: aura_config::DecisionRouteConfig::Webhook {
                     url: WebhookUrl::new("http://127.0.0.1:9").unwrap(),
-                    timeout_secs: 60,
+                    timeout_secs: Some(60),
                     headers: std::collections::HashMap::new(),
                     headers_from_request: std::collections::HashMap::new(),
                     tool_headers_from_response: aura_config::ToolHeaderMappings::default(),
@@ -957,7 +957,7 @@ mod tests {
                 park: aura_config::ParkConfig { enabled: true },
                 route: aura_config::DecisionRouteConfig::Webhook {
                     url: WebhookUrl::new("https://approvals.example.com/hook").unwrap(),
-                    timeout_secs: 60,
+                    timeout_secs: Some(60),
                     headers: static_headers,
                     headers_from_request: std::collections::HashMap::from([(
                         "authorization".to_string(),
@@ -1183,7 +1183,7 @@ mod tests {
                 park: aura_config::ParkConfig::default(),
                 route: aura_config::DecisionRouteConfig::Webhook {
                     url: WebhookUrl::new("https://approvals.example.com/hook").unwrap(),
-                    timeout_secs: 60,
+                    timeout_secs: Some(60),
                     headers: Default::default(),
                     headers_from_request: Default::default(),
                     tool_headers_from_response: crate::approver_headers::tests::mappings(&[(

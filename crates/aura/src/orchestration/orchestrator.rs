@@ -7388,7 +7388,7 @@ mod tests {
     ) -> aura_config::DecisionRouteConfig {
         aura_config::DecisionRouteConfig::Webhook {
             url: aura_config::WebhookUrl::new("https://approvals.example.com/").unwrap(),
-            timeout_secs: 5,
+            timeout_secs: Some(5),
             headers: std::collections::HashMap::new(),
             headers_from_request: std::collections::HashMap::new(),
             tool_headers_from_response: aura_config::ToolHeaderMappings::default(),
@@ -8543,7 +8543,7 @@ mod tests {
             park: aura_config::ParkConfig { enabled: true },
             route: aura_config::DecisionRouteConfig::Webhook {
                 url: aura_config::WebhookUrl::new("http://127.0.0.1:9").unwrap(),
-                timeout_secs: 3600,
+                timeout_secs: Some(3600),
                 headers: std::collections::HashMap::new(),
                 headers_from_request: std::collections::HashMap::new(),
                 tool_headers_from_response: aura_config::ToolHeaderMappings::default(),
