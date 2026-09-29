@@ -19,9 +19,11 @@
 //! prunes per id, never the whole index key; `SWEEP_TAKE_SCRIPT` states what
 //! each id yields.
 //! `list_pending` SCANs the parked-record keys in batches (never KEYS),
-//! skipping decision and index keys by segment and wrong-typed or
-//! undecodable records per key; the native TTL is the primary expiry, with
-//! a post-decode filter as defense in depth.
+//! building its MATCH pattern with the configured key prefix
+//! glob-escaped, so a prefix loaded with metacharacters still addresses
+//! the store's literal keys; the scan skips decision and index keys by
+//! segment and wrong-typed or undecodable records per key. The native TTL
+//! is the primary expiry, with a post-decode filter as defense in depth.
 
 use std::sync::LazyLock;
 
@@ -285,7 +287,7 @@ impl ApprovalStore for RedisApprovalStore {
 
     async fn list_pending(&self) -> Result<Vec<ParkedApproval>, SessionStoreError> {
         let mut conn = self.conn.clone();
-        let pattern = format!("{}:approval:*", self.key_prefix);
+        let pattern = scan_pattern(&self.key_prefix);
 
         // SCAN in batches, never KEYS: a scan must not block the server.
         // A mutating keyspace can hand a key back twice; dedupe before GET.
@@ -376,6 +378,26 @@ fn record_ttl_secs(parked: &ParkedApproval) -> u64 {
     u64::try_from(remaining).unwrap_or(0).max(MIN_TTL_SECS)
 }
 
+/// The `list_pending` SCAN MATCH pattern for `key_prefix`: the prefix with
+/// its glob metacharacters backslash-escaped — a deployment is free to
+/// load the prefix with them, and an unescaped pattern would stop matching
+/// the store's own literal keys — then the literal `:approval:` segment
+/// and a trailing `*` over the record ids. The returned keys are stripped
+/// with the unescaped literal prefix, which a MATCH hit guarantees
+/// equals it.
+fn scan_pattern(key_prefix: &str) -> String {
+    const METACHARACTERS: [char; 5] = ['\\', '[', ']', '*', '?'];
+    let mut pattern = String::with_capacity(key_prefix.len() + ":approval:*".len());
+    for ch in key_prefix.chars() {
+        if METACHARACTERS.contains(&ch) {
+            pattern.push('\\');
+        }
+        pattern.push(ch);
+    }
+    pattern.push_str(":approval:*");
+    pattern
+}
+
 fn decode(json: &str) -> Result<ParkedApproval, SessionStoreError> {
     let record: ParkedApprovalRecord =
         serde_json::from_str(json).map_err(|e| SessionStoreError::Decode {
@@ -408,5 +430,24 @@ fn swept_record_json(id: &str, value: redis::Value) -> Option<String> {
             );
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::scan_pattern;
+
+    /// A prefix free of metacharacters passes through untouched, and one
+    /// loaded with every metacharacter the MATCH glob gives meaning to
+    /// (`\`, `[`, `]`, `*`, `?`) comes out backslash-escaped, so the
+    /// pattern matches the store's literal keys.
+    #[test]
+    fn scan_pattern_escapes_glob_metacharacters_in_prefix() {
+        assert_eq!(scan_pattern("aura:test"), "aura:test:approval:*");
+        assert_eq!(
+            scan_pattern(r"au\[?*]ra"),
+            r"au\\\[\?\*\]ra:approval:*",
+            "each metacharacter gains one backslash; ordinary characters are untouched"
+        );
     }
 }
