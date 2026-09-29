@@ -61,6 +61,14 @@ impl PollReconciler {
     /// `headers_from_request` values are per-row: each parked approval
     /// carries its own request-scoped resolved values, which the notify
     /// overlays without mutating this client.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the webhook route's interval is zero. Config validation
+    /// refuses a zero `hitl.route.poll_interval_secs` at admission; this is
+    /// the defensive loud refusal for a config that reached here without
+    /// that admission — never a silent clamp to another interval, and never
+    /// a silent `None` that disables the reconciler.
     #[must_use]
     pub fn from_config(
         config: &HitlConfig,
@@ -78,6 +86,13 @@ impl PollReconciler {
         else {
             return None;
         };
+        if *poll_interval_secs == 0 {
+            panic!(
+                "`hitl.route.poll_interval_secs` must be greater than zero: \
+                 config validation refuses zero at admission, so this backstop \
+                 never clamps or silently disables the reconciler"
+            );
+        }
         Some(Self {
             client: webhook_client_from_config(&config.route, hmac, None)?,
             store,
@@ -216,6 +231,17 @@ impl PollReconciler {
     }
 }
 
+/// How a spawned reconciler loop's task ended, as joined by
+/// [`PollerHandle::stop`].
+#[derive(Debug)]
+pub enum PollerExit {
+    /// The loop left through its cancel token and joined cleanly.
+    Cancelled,
+    /// The loop's task died of a panic; the join carried the panic back
+    /// to the handle owner.
+    Panicked,
+}
+
 /// Stop/join handle for a spawned [`PollReconciler`].
 pub struct PollerHandle {
     token: CancellationToken,
@@ -223,16 +249,37 @@ pub struct PollerHandle {
 }
 
 impl PollerHandle {
-    /// Cancel the loop and await its exit. The in-flight tick completes
-    /// first — a notify or poll request already under way is never cut.
-    pub async fn stop(self) {
+    /// Cancel the loop and await its exit, reporting how the task ended.
+    /// The in-flight tick completes first — a notify or poll request
+    /// already under way is never cut.
+    ///
+    /// The join outcome decides the answer: a task that died of a panic
+    /// joins with a panic error and reports [`PollerExit::Panicked`] (the
+    /// panic is logged here before the exit is returned); only a loop that
+    /// left through its cancel token reports [`PollerExit::Cancelled`].
+    /// The loop has no abort path today, so a non-panic join error — a
+    /// cancelled task — cannot arise and is treated as the clean half of
+    /// the contract, with a warning.
+    #[must_use]
+    pub async fn stop(self) -> PollerExit {
         self.token.cancel();
-        let _ = self.task.await;
+        match self.task.await {
+            Ok(()) => PollerExit::Cancelled,
+            Err(join) if join.is_panic() => {
+                warn!(panic = %join, "poll reconciler loop died of a panic");
+                PollerExit::Panicked
+            }
+            Err(join) => {
+                warn!(error = %join, "poll reconciler loop ended without a panic");
+                PollerExit::Cancelled
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use async_trait::async_trait;
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
     use tokio::sync::mpsc;
@@ -242,7 +289,7 @@ mod tests {
     use super::super::read_full_request;
     use super::super::registry::ParkedApproval;
     use super::*;
-    use crate::session_store::{FileApprovalStore, InMemoryApprovalStore};
+    use crate::session_store::{FileApprovalStore, InMemoryApprovalStore, SessionStoreError};
 
     const INSTANCE_ID: &str = "poll-instance";
 
@@ -638,7 +685,7 @@ mod tests {
         assert!(read.starts_with("GET "), "boot one reads status: {read}");
         let notify = rx.recv().await.unwrap();
         assert!(notify.starts_with("POST "), "boot one notifies: {notify}");
-        handle_a.stop().await;
+        let _ = handle_a.stop().await;
 
         // Boot two: a fresh reconciler over the same store root — notified
         // markers are gone, so the reboot re-notifies the undecided row and
@@ -728,6 +775,118 @@ mod tests {
         })
         .await
         .expect("the loop must end when the shutdown token cancels");
+    }
+
+    // ====================================================================
+    // Loop lifecycle: panic observation + stop/join surfacing
+    // ====================================================================
+
+    /// A store whose pending scan panics: the seam that drives the
+    /// spawned loop's task into a panic on its first tick. The interval's
+    /// first tick fires immediately and the token is fresh, so the tick
+    /// arm is the only ready select branch — the panic lands before any
+    /// cancel exists to race it.
+    struct PanickingScanStore;
+
+    #[async_trait]
+    impl ApprovalStore for PanickingScanStore {
+        async fn list_pending(&self) -> Result<Vec<ParkedApproval>, SessionStoreError> {
+            panic!("list_pending blew up (test seam)");
+        }
+        async fn register(&self, _parked: ParkedApproval) -> Result<(), SessionStoreError> {
+            unreachable!("the panicking-scan battery never registers");
+        }
+        async fn get(&self, _id: &DecisionId) -> Result<Option<ParkedApproval>, SessionStoreError> {
+            unreachable!("the panicking-scan battery never reads a row");
+        }
+        async fn resolve(
+            &self,
+            _id: &DecisionId,
+            _decision: ResolvedDecision,
+        ) -> Result<(), ResolveError> {
+            unreachable!("the panicking-scan battery never resolves");
+        }
+        async fn decision(
+            &self,
+            _id: &DecisionId,
+        ) -> Result<Option<ResolvedDecision>, SessionStoreError> {
+            unreachable!("the panicking-scan battery never reads a decision");
+        }
+        async fn remove(&self, _id: &DecisionId) -> Result<(), SessionStoreError> {
+            unreachable!("the panicking-scan battery never removes");
+        }
+        async fn cancel_request(
+            &self,
+            _request_id: &str,
+        ) -> Result<Vec<ParkedApproval>, SessionStoreError> {
+            unreachable!("the panicking-scan battery never cancels");
+        }
+    }
+
+    /// A loop whose tick panics must be observable from its handle: the
+    /// task is dead before any cancel fires, so the join inside `stop`
+    /// carries a panic — the handle must report [`PollerExit::Panicked`],
+    /// never a clean [`PollerExit::Cancelled`]. Nothing today records the
+    /// join outcome, so this pins red until the fill implements the
+    /// contract on `stop`.
+    #[tokio::test]
+    async fn stop_reports_a_loop_that_died_of_a_panic_as_a_panic() {
+        let store: Arc<dyn ApprovalStore> = Arc::new(PanickingScanStore);
+        let reconciler = reconciler_with(store, "http://127.0.0.1:1");
+        let handle = reconciler.spawn(&CancellationToken::new());
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !handle.task.is_finished() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the panicking first tick must finish the task");
+
+        let exit = handle.stop().await;
+        assert!(
+            matches!(exit, PollerExit::Panicked),
+            "a loop dead of a panic must surface as Panicked, got {exit:?}"
+        );
+    }
+
+    /// The other side of the exit contract: a loop that leaves through
+    /// its cancel token — never having panicked — reports
+    /// [`PollerExit::Cancelled`], so a panicked join can never hide among
+    /// clean exits.
+    #[tokio::test]
+    async fn stop_reports_a_cleanly_cancelled_loop_as_cancelled() {
+        let store: Arc<dyn ApprovalStore> = Arc::new(InMemoryApprovalStore::new());
+        let reconciler = reconciler_with(store, "http://127.0.0.1:1");
+        let handle = reconciler.spawn(&CancellationToken::new());
+
+        let exit = handle.stop().await;
+        assert!(
+            matches!(exit, PollerExit::Cancelled),
+            "a cleanly cancelled loop must report Cancelled, got {exit:?}"
+        );
+    }
+
+    /// `from_config` refuses a zero poll interval loudly, matching the
+    /// documented-panic precedent of the webhook-timeout resolver: config
+    /// admission already rejects zero at validation, and the reconciler
+    /// is the defensive backstop — no silent clamp to some other
+    /// interval, and no silent `None` that disables the reconciler. The
+    /// panic names the config admission contract it is backing up.
+    #[test]
+    #[should_panic(expected = "`hitl.route.poll_interval_secs` must be greater than zero")]
+    fn from_config_refuses_a_zero_poll_interval_loudly() {
+        let store: Arc<dyn ApprovalStore> = Arc::new(InMemoryApprovalStore::new());
+        let registry = PendingApprovals::new();
+        let mut config = poll_config();
+        if let aura_config::DecisionRouteConfig::Webhook {
+            poll_interval_secs, ..
+        } = &mut config.route
+        {
+            *poll_interval_secs = 0;
+        }
+        let _ =
+            PollReconciler::from_config(&config, None, INSTANCE_ID.to_string(), store, &registry);
     }
 
     // ====================================================================
