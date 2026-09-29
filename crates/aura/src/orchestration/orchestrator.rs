@@ -9356,6 +9356,26 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn exclusive_mode_falls_back_to_on_demand_on_an_invalid_probability() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let skills = write_skills(dir.path());
+            let url = fake_system_one(vec![("alpha", 1.5), ("beta", 0.2)]).await;
+            let orchestrator = Orchestrator::new(config(SkillRouterMode::Exclusive, url, skills))
+                .await
+                .unwrap();
+            let worker = orchestrator
+                .create_worker(1, 1, None, Some("do the alpha thing"), None, None)
+                .await
+                .unwrap();
+            assert!(
+                worker.preamble.contains("Available skills"),
+                "a stage answering outside [0, 1] is unavailable, not a selection"
+            );
+            assert!(worker.preamble.contains("load_skill"));
+            assert!(!worker.preamble.contains("BODY-OF-alpha"));
+        }
+
+        #[tokio::test]
         async fn exclusive_mode_falls_back_to_on_demand_when_router_is_down() {
             let dir = tempfile::TempDir::new().unwrap();
             let skills = write_skills(dir.path());

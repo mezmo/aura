@@ -123,6 +123,12 @@ enum StageError {
     },
     #[error("{url} returned no noul answer for skill '{skill}'")]
     MissingAnswer { url: String, skill: SkillName },
+    #[error("{url} returned noul {value} for skill '{skill}', outside [0, 1]")]
+    InvalidProbability {
+        url: String,
+        skill: SkillName,
+        value: f64,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -434,6 +440,16 @@ impl SkillRouter {
                     url: url.clone(),
                     skill: skill.name.clone(),
                 })?;
+            // A calibrated probability outside [0, 1] (or NaN) means the
+            // server is not speaking the protocol; the stage is treated as
+            // unavailable rather than letting garbage narrow the surface.
+            if !(0.0..=1.0).contains(&p) {
+                return Err(StageError::InvalidProbability {
+                    url: url.clone(),
+                    skill: skill.name.clone(),
+                    value: p,
+                });
+            }
             probabilities.insert(skill.name.clone(), p);
             if p >= stage.threshold {
                 selected.push(skill.name.clone());
