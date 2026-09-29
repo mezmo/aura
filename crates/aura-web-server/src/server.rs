@@ -529,11 +529,6 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
             ),
         ));
     }
-    let pollers: Vec<aura::hitl::PollerHandle> = reconcilers
-        .into_iter()
-        .map(|reconciler| reconciler.spawn(&shutdown_token))
-        .collect();
-
     let app = Router::new()
         .route("/health", get(handlers::health))
         .route("/aura/info", get(handlers::info))
@@ -591,6 +586,12 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
     };
 
     let listener = tokio::net::TcpListener::bind(format!("{}:{}", args.host, args.port)).await?;
+
+    // Spawned after the bind succeeds, so a failed bind returns with no handles to join.
+    let pollers: Vec<aura::hitl::PollerHandle> = reconcilers
+        .into_iter()
+        .map(|reconciler| reconciler.spawn(&shutdown_token))
+        .collect();
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
