@@ -346,25 +346,31 @@ impl SkillRouter {
                     .await
                 {
                     Some(section) => SkillPlan::Augment {
-                        section,
-                        selected: decision.selected.clone(),
+                        selected: section.loaded,
+                        section: section.text,
                     },
                     None => SkillPlan::OnDemand,
                 }
             }
-            SkillRouterMode::Exclusive => SkillPlan::Exclusive {
-                section: render_preloaded_skills(
-                    &decision.selected,
-                    skills,
-                    PreloadStyle::Exclusive,
-                )
-                .await,
-                selected: skills
-                    .iter()
-                    .filter(|s| decision.selected.contains(&s.name))
-                    .cloned()
-                    .collect(),
-            },
+            SkillRouterMode::Exclusive => {
+                // The surface is only what was actually read: a selected
+                // skill whose body could not be loaded has no catalog entry
+                // or `load_skill` to fall back on, so it is dropped rather
+                // than left as a name `read_skill_file` accepts but the LLM
+                // has no instructions for.
+                let section =
+                    render_preloaded_skills(&decision.selected, skills, PreloadStyle::Exclusive)
+                        .await;
+                let loaded = section.as_ref().map(|s| s.loaded.as_slice()).unwrap_or(&[]);
+                SkillPlan::Exclusive {
+                    selected: skills
+                        .iter()
+                        .filter(|s| loaded.contains(&s.name))
+                        .cloned()
+                        .collect(),
+                    section: section.map(|s| s.text),
+                }
+            }
         }
     }
 
@@ -478,14 +484,27 @@ impl SkillRouter {
     }
 }
 
+/// A rendered preloaded-skills preamble section.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreloadedSection {
+    pub text: String,
+    /// The skills whose bodies `text` holds, catalog order.
+    pub loaded: Vec<SkillName>,
+}
+
 /// Render the preamble section carrying the full body of each selected
 /// skill, or `None` when nothing was selected or nothing could be read.
+///
+/// A selected skill whose `SKILL.md` cannot be read is left out of both the
+/// text and `loaded`, so callers that scope tools or mark skills as
+/// preloaded see only what the LLM actually holds.
 pub async fn render_preloaded_skills(
     selected: &[SkillName],
     skills: &[SkillConfig],
     style: PreloadStyle,
-) -> Option<String> {
+) -> Option<PreloadedSection> {
     let mut section = String::new();
+    let mut loaded = Vec::new();
     for skill in skills.iter().filter(|s| selected.contains(&s.name)) {
         let path = skill.path.join("SKILL.md");
         let content = match tokio::fs::read_to_string(&path).await {
@@ -501,6 +520,7 @@ pub async fn render_preloaded_skills(
         };
         let body = crate::skill_tool::strip_frontmatter(&content).trim();
         section.push_str(&format!("\n### Skill: {}\n\n{body}\n", skill.name));
+        loaded.push(skill.name.clone());
         let resources = crate::skill_tool::list_skill_resources(&skill.path).await;
         if !resources.is_empty() {
             section.push_str("\nSkill resources (fetch with `read_skill_file`):\n");
@@ -526,7 +546,10 @@ pub async fn render_preloaded_skills(
              file with `read_skill_file` only when a skill directs you to it.\n"
         }
     };
-    Some(format!("{intro}{section}"))
+    Some(PreloadedSection {
+        text: format!("{intro}{section}"),
+        loaded,
+    })
 }
 
 #[cfg(test)]
@@ -577,6 +600,8 @@ mod tests {
         )
         .await
         .unwrap();
+        assert_eq!(section.loaded, vec![SkillName::new("alpha").unwrap()]);
+        let section = section.text;
         assert!(section.contains("## Preloaded skills"));
         assert!(section.contains("### Skill: alpha"));
         assert!(section.contains("Do alpha."));
@@ -585,6 +610,33 @@ mod tests {
         assert!(
             !section.contains("name: alpha"),
             "frontmatter must be stripped"
+        );
+    }
+
+    #[tokio::test]
+    async fn preload_drops_a_selected_skill_whose_body_cannot_be_read() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let a = write_skill(dir.path(), "alpha", "# Alpha\n\nDo alpha.");
+        let skills = vec![
+            skill("alpha", "a", a),
+            skill("ghost", "g", dir.path().join("ghost")),
+        ];
+        let selected = [
+            SkillName::new("alpha").unwrap(),
+            SkillName::new("ghost").unwrap(),
+        ];
+
+        let section = render_preloaded_skills(&selected, &skills, PreloadStyle::Exclusive)
+            .await
+            .unwrap();
+        assert_eq!(section.loaded, vec![SkillName::new("alpha").unwrap()]);
+        assert!(!section.text.contains("ghost"));
+
+        assert!(
+            render_preloaded_skills(&selected[1..], &skills, PreloadStyle::Augment)
+                .await
+                .is_none(),
+            "nothing readable means no section"
         );
     }
 
@@ -614,7 +666,8 @@ mod tests {
             PreloadStyle::Exclusive,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .text;
         assert!(section.contains("## Skills for this request"));
         assert!(section.contains("Do alpha."));
         assert!(section.contains("- references/REF.md"));
