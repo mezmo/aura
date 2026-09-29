@@ -9244,6 +9244,10 @@ mod tests {
 
         #[tokio::test]
         async fn inject_mode_preloads_selected_skills() {
+            // `create_worker` consumes the process-global worker override
+            // queue; hold the same lock the park tests serialize on so a
+            // scripted worker installed by one of them is never taken here.
+            let _serial = WORKER_OVERRIDE_LOCK.lock().await;
             let dir = tempfile::TempDir::new().unwrap();
             let skills = write_skills(dir.path());
             let url = fake_system_one(vec![("alpha", 0.9), ("beta", 0.2)]).await;
@@ -9279,6 +9283,8 @@ mod tests {
 
         #[tokio::test]
         async fn shadow_mode_leaves_preambles_unchanged() {
+            // See the first wiring test for why this lock is held.
+            let _serial = WORKER_OVERRIDE_LOCK.lock().await;
             let dir = tempfile::TempDir::new().unwrap();
             let skills = write_skills(dir.path());
             let url = fake_system_one(vec![("alpha", 0.9), ("beta", 0.9)]).await;
@@ -9297,6 +9303,8 @@ mod tests {
 
         #[tokio::test]
         async fn exclusive_mode_drops_catalog_and_keeps_only_selected() {
+            // See the first wiring test for why this lock is held.
+            let _serial = WORKER_OVERRIDE_LOCK.lock().await;
             let dir = tempfile::TempDir::new().unwrap();
             let skills = write_skills(dir.path());
             let url = fake_system_one(vec![("alpha", 0.9), ("beta", 0.2)]).await;
@@ -9341,6 +9349,8 @@ mod tests {
 
         #[tokio::test]
         async fn exclusive_mode_with_empty_selection_has_no_skill_surface() {
+            // See the first wiring test for why this lock is held.
+            let _serial = WORKER_OVERRIDE_LOCK.lock().await;
             let dir = tempfile::TempDir::new().unwrap();
             let skills = write_skills(dir.path());
             let url = fake_system_one(vec![("alpha", 0.1), ("beta", 0.1)]).await;
@@ -9357,6 +9367,8 @@ mod tests {
 
         #[tokio::test]
         async fn exclusive_mode_falls_back_to_on_demand_on_an_invalid_probability() {
+            // See the first wiring test for why this lock is held.
+            let _serial = WORKER_OVERRIDE_LOCK.lock().await;
             let dir = tempfile::TempDir::new().unwrap();
             let skills = write_skills(dir.path());
             let url = fake_system_one(vec![("alpha", 1.5), ("beta", 0.2)]).await;
@@ -9377,6 +9389,8 @@ mod tests {
 
         #[tokio::test]
         async fn exclusive_mode_falls_back_to_on_demand_when_router_is_down() {
+            // See the first wiring test for why this lock is held.
+            let _serial = WORKER_OVERRIDE_LOCK.lock().await;
             let dir = tempfile::TempDir::new().unwrap();
             let skills = write_skills(dir.path());
             let orchestrator = Orchestrator::new(config(
@@ -9396,6 +9410,8 @@ mod tests {
 
         #[tokio::test]
         async fn no_task_description_skips_routing() {
+            // See the first wiring test for why this lock is held.
+            let _serial = WORKER_OVERRIDE_LOCK.lock().await;
             let dir = tempfile::TempDir::new().unwrap();
             let skills = write_skills(dir.path());
             // An unreachable router would also be tolerated, but with no task
@@ -9416,6 +9432,8 @@ mod tests {
 
         #[tokio::test]
         async fn unreachable_router_keeps_on_demand_loading() {
+            // See the first wiring test for why this lock is held.
+            let _serial = WORKER_OVERRIDE_LOCK.lock().await;
             let dir = tempfile::TempDir::new().unwrap();
             let skills = write_skills(dir.path());
             let orchestrator = Orchestrator::new(config(
