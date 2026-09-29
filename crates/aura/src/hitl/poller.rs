@@ -64,11 +64,7 @@ impl PollReconciler {
     ///
     /// # Panics
     ///
-    /// Panics when the webhook route's interval is zero. Config validation
-    /// refuses a zero `hitl.route.poll_interval_secs` at admission; this is
-    /// the defensive loud refusal for a config that reached here without
-    /// that admission — never a silent clamp to another interval, and never
-    /// a silent `None` that disables the reconciler.
+    /// Panics when the webhook route's interval is zero.
     #[must_use]
     pub fn from_config(
         config: &HitlConfig,
@@ -251,15 +247,9 @@ pub struct PollerHandle {
 impl PollerHandle {
     /// Cancel the loop and await its exit, reporting how the task ended.
     /// The in-flight tick completes first — a notify or poll request
-    /// already under way is never cut.
-    ///
-    /// The join outcome decides the answer: a task that died of a panic
-    /// joins with a panic error and reports [`PollerExit::Panicked`] (the
-    /// panic is logged here before the exit is returned); only a loop that
-    /// left through its cancel token reports [`PollerExit::Cancelled`].
-    /// The loop has no abort path today, so a non-panic join error — a
-    /// cancelled task — cannot arise and is treated as the clean half of
-    /// the contract, with a warning.
+    /// already under way is never cut. A panic join is logged here, then
+    /// reported as [`PollerExit::Panicked`]; with no abort path, any other
+    /// join error is warned and reported as the clean [`PollerExit::Cancelled`].
     #[must_use]
     pub async fn stop(self) -> PollerExit {
         self.token.cancel();
