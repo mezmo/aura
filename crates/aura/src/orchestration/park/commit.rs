@@ -994,4 +994,50 @@ mod tests {
             "credential values must not enter the fingerprint"
         );
     }
+
+    #[test]
+    fn config_fingerprint_neutral_to_timeout_presence() {
+        use std::collections::HashMap;
+
+        fn runtime_with_webhook_timeout(
+            timeout_secs: Option<u64>,
+        ) -> crate::config::AgentRuntimeConfig {
+            let hitl = aura_config::HitlConfig {
+                require_approval: vec![],
+                park: aura_config::ParkConfig::default(),
+                route: aura_config::DecisionRouteConfig::Webhook {
+                    url: aura_config::WebhookUrl::new("https://approvals.example.com/hook")
+                        .unwrap(),
+                    timeout_secs,
+                    headers: HashMap::new(),
+                    headers_from_request: HashMap::new(),
+                    tool_headers_from_response: aura_config::ToolHeaderMappings::default(),
+                    delivery: aura_config::WebhookDelivery::Sync,
+                    poll_url: None,
+                    poll_interval_secs: 10,
+                    poll_request_timeout_secs: 30,
+                },
+            };
+            crate::config::AgentRuntimeConfig {
+                hitl: Some(crate::hitl::HitlRuntime::from_config(
+                    &hitl,
+                    &PendingApprovals::new(),
+                    None,
+                    None,
+                )),
+                ..crate::config::AgentRuntimeConfig::default()
+            }
+        }
+
+        assert_eq!(
+            config_fingerprint(&runtime_with_webhook_timeout(None)),
+            config_fingerprint(&runtime_with_webhook_timeout(Some(300))),
+            "omitted and explicit-default webhook timeouts must fingerprint identically"
+        );
+        assert_ne!(
+            config_fingerprint(&runtime_with_webhook_timeout(None)),
+            config_fingerprint(&runtime_with_webhook_timeout(Some(45))),
+            "a nondefault explicit webhook timeout must move the fingerprint"
+        );
+    }
 }

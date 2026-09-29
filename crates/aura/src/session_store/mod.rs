@@ -164,3 +164,64 @@ pub trait EventBus: Send + Sync {
     /// backend closes the topic.
     async fn subscribe(&self, topic: &str) -> Result<Subscription, SessionStoreError>;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct ScanlessStore;
+
+    #[async_trait]
+    impl ApprovalStore for ScanlessStore {
+        async fn register(&self, _parked: ParkedApproval) -> Result<(), SessionStoreError> {
+            Ok(())
+        }
+
+        async fn get(&self, _id: &DecisionId) -> Result<Option<ParkedApproval>, SessionStoreError> {
+            Ok(None)
+        }
+
+        async fn resolve(
+            &self,
+            _id: &DecisionId,
+            _decision: ResolvedDecision,
+        ) -> Result<(), ResolveError> {
+            Ok(())
+        }
+
+        async fn decision(
+            &self,
+            _id: &DecisionId,
+        ) -> Result<Option<ResolvedDecision>, SessionStoreError> {
+            Ok(None)
+        }
+
+        async fn remove(&self, _id: &DecisionId) -> Result<(), SessionStoreError> {
+            Ok(())
+        }
+
+        async fn cancel_request(
+            &self,
+            _request_id: &str,
+        ) -> Result<Vec<ParkedApproval>, SessionStoreError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn list_pending_default_returns_unsupported() {
+        let err = match ScanlessStore.list_pending().await {
+            Err(err) => err,
+            Ok(pending) => panic!(
+                "the default list_pending must fail loudly, never report a set of {}",
+                pending.len()
+            ),
+        };
+        assert_eq!(
+            err,
+            SessionStoreError::Unsupported {
+                operation: "list_pending"
+            }
+        );
+    }
+}
