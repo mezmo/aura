@@ -586,12 +586,6 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
 
     let listener = tokio::net::TcpListener::bind(format!("{}:{}", args.host, args.port)).await?;
 
-    // Spawned after the bind succeeds, so a failed bind returns with no handles to join.
-    let pollers: Vec<aura::hitl::PollerHandle> = reconcilers
-        .into_iter()
-        .map(|reconciler| reconciler.spawn(&shutdown_token))
-        .collect();
-
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
     use tokio::signal::unix::{SignalKind, signal};
@@ -652,6 +646,13 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
             let _ = shutdown_tx.send(());
         }
     });
+
+    // Spawned once all fallible setup (bind, signal registration) has
+    // completed; every path out of `run` with spawned loops joins them at teardown.
+    let pollers: Vec<aura::hitl::PollerHandle> = reconcilers
+        .into_iter()
+        .map(|reconciler| reconciler.spawn(&shutdown_token))
+        .collect();
 
     let serve_result = axum::serve(listener, app)
         .with_graceful_shutdown(async {
