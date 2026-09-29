@@ -3699,7 +3699,14 @@ Assign tasks to the worker whose tools best match the required operations."#,
         // so the live prompt-building and retry loop below do not apply.
         if let (Some(continuation), Some(resume)) = (continuation, resume) {
             return self
-                .resume_task(task_id, *worker_name, continuation, resume, event_tx)
+                .resume_task(
+                    task_id,
+                    *worker_name,
+                    task_description,
+                    continuation,
+                    resume,
+                    event_tx,
+                )
                 .await;
         }
         if continuation.is_some() != resume.is_some() {
@@ -4064,6 +4071,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         &self,
         task_id: usize,
         worker_name: Option<&str>,
+        task_description: &str,
         continuation: &TaskContinuation,
         resume: &ResumeContext,
         event_tx: Option<&tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>>,
@@ -4073,6 +4081,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
             return Err("cannot resume a task without park mode enabled".into());
         };
 
+        // The task text goes back in so the skill router rebuilds the same
+        // skill surface the parked conversation was produced under; without
+        // it an exclusive-mode worker would resume with the full catalog.
         let AgentWithPreamble {
             agent: worker,
             preamble: _,
@@ -4083,7 +4094,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 task_id,
                 attempt,
                 worker_name,
-                None,
+                Some(task_description),
                 Some(&park.cell),
                 Some(&resume.recorded),
             )
