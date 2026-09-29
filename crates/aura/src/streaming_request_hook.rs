@@ -504,7 +504,9 @@ where
                     "Parked approval pending — cancelling stream (reason: {})",
                     PARK_CANCEL_REASON
                 );
+                // `cancel_with_reason` only labels the cancellation; `cancel` stops the run.
                 cancel_sig.cancel_with_reason(PARK_CANCEL_REASON);
+                cancel_sig.cancel();
                 return;
             }
 
