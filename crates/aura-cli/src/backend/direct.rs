@@ -970,4 +970,53 @@ preamble = "p"
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].function.name, "Shell");
     }
+
+    #[tokio::test]
+    async fn direct_backend_refuses_poll_delivery() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.toml");
+        std::fs::write(
+            &path,
+            "[agent]\nname = \"Poll Refusal\"\nsystem_prompt = \"p\"\n\n\
+             [agent.llm]\nprovider = \"openai\"\napi_key = \"test-key\"\nmodel = \"gpt-4o\"\n\n\
+             [hitl]\nrequire_approval = [\"kubectl_*\"]\n\n\
+             [hitl.park]\nenabled = true\n\n\
+             [hitl.route]\nmode = \"webhook\"\n\
+             url = \"https://approvals.example.com/decide\"\ndelivery = \"poll\"\n",
+        )
+        .unwrap();
+
+        let err = match DirectBackend::from_toml(&path, vec![]).await {
+            Err(err) => err,
+            Ok(_) => panic!("a poll-delivery config must fail the direct backend boot"),
+        };
+        assert!(
+            format!("{err:#}").contains("hitl.route.delivery"),
+            "the load error must carry the admission diagnostic: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_backend_refuses_park_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.toml");
+        std::fs::write(
+            &path,
+            "[agent]\nname = \"Park Refusal\"\nsystem_prompt = \"p\"\n\n\
+             [agent.llm]\nprovider = \"openai\"\napi_key = \"test-key\"\nmodel = \"gpt-4o\"\n\n\
+             [hitl]\nrequire_approval = [\"kubectl_*\"]\n\n\
+             [hitl.park]\nenabled = true\n\n\
+             [hitl.route]\nmode = \"conversational\"\n",
+        )
+        .unwrap();
+
+        let err = match DirectBackend::from_toml(&path, vec![]).await {
+            Err(err) => err,
+            Ok(_) => panic!("a park-enabled config must fail the direct backend boot"),
+        };
+        assert!(
+            format!("{err:#}").contains("hitl.park.enabled"),
+            "the load error must carry the admission diagnostic: {err:#}"
+        );
+    }
 }

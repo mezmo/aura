@@ -2206,6 +2206,33 @@ mod tests {
             .unwrap();
         }
 
+        #[test]
+        fn boot_validation_sync_route_with_plaintext_poll_url_passes() {
+            use super::super::validate_webhook_signing_config;
+
+            let config = aura_config::HitlConfig {
+                require_approval: vec![],
+                park: aura_config::ParkConfig::default(),
+                route: aura_config::DecisionRouteConfig::Webhook {
+                    url: aura_config::WebhookUrl::new("https://approvals.example.com/aura")
+                        .unwrap(),
+                    timeout_secs: Some(300),
+                    headers: HashMap::new(),
+                    headers_from_request: HashMap::new(),
+                    tool_headers_from_response: aura_config::ToolHeaderMappings::default(),
+                    delivery: aura_config::WebhookDelivery::default(),
+                    poll_url: Some(
+                        aura_config::WebhookUrl::new("http://status.example.com/aura").unwrap(),
+                    ),
+                    poll_interval_secs: 10,
+                    poll_request_timeout_secs: 30,
+                },
+            };
+
+            validate_webhook_signing_config(&config, Some(&test_hmac()))
+                .expect("sync delivery never reads poll_url, so a plaintext one is inert");
+        }
+
         fn webhook_config(
             url: &str,
             tool_headers_from_response: aura_config::ToolHeaderMappings,
