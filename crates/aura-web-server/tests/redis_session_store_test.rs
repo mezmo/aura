@@ -492,6 +492,39 @@ async fn approval_list_pending_skips_wrong_typed_and_undecodable_keys() {
     assert_eq!(ids, [live_id], "only the genuine record is listed");
 }
 
+/// The `list_pending` SCAN builds its MATCH pattern from the configured
+/// key prefix, which a deployment is free to load with glob
+/// metacharacters: the pattern must escape them, or it stops matching the
+/// store's own literal keys (here `?`, `[`, `]`, and `*` make the
+/// unescaped pattern match everything except the literal prefix, so the
+/// scan never returns the record this store registered — while `get`,
+/// which addresses the literal key, still finds it).
+#[tokio::test]
+async fn scan_pattern_escapes_glob_metacharacters_in_prefix() {
+    let config = RedisSessionStoreConfig {
+        key_prefix: format!("au?[ra]*{}", uuid::Uuid::new_v4()),
+        ..test_config(60)
+    };
+    let approvals = connect(&config).await.approvals();
+    let parked = make_parked("req-glob-prefix", Duration::from_secs(60));
+    let id = parked.request.decision_id;
+    approvals.register(parked).await.unwrap();
+
+    assert!(
+        approvals.get(&id).await.unwrap().is_some(),
+        "precondition: the record is addressable at its literal key"
+    );
+
+    let pending = approvals.list_pending().await.unwrap();
+    let ids: Vec<_> = pending.iter().map(|p| p.request.decision_id).collect();
+    assert_eq!(
+        ids,
+        [id],
+        "the MATCH pattern must escape glob metacharacters in the prefix, \
+         so it matches the store's literal keys"
+    );
+}
+
 /// `cancel_request` returns exactly the records it cleared; a decided
 /// sibling of the same owner is absent, and a cleared ticket refuses a later
 /// resolve.

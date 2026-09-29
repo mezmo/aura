@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aura::SessionId;
-use aura::hitl::{ApprovalDecision, ResolveError, ResolvedDecision};
+use aura::hitl::{ApprovalDecision, DecisionId, ResolveError, ResolvedDecision};
 use aura::session_store::{
     ApprovalStore, FileApprovalStore, FileSkillInvocationStore, InMemoryApprovalStore,
     MAX_SKILL_RECORDS_PER_SESSION, ParkedApprovalRecord, SKILL_INVOCATION_RECORD_VERSION,
@@ -607,6 +607,111 @@ async fn list_pending_skips_a_stale_decided_approval() {
 
     let ids: Vec<_> = pending.iter().map(|p| p.request.decision_id).collect();
     assert_eq!(ids, [live_id], "the decided residue must not be listed");
+}
+
+// ---------------------------------------------------------------------------
+// Scan structure (row #683): enumeration faults, per-file decode, vanishing
+// paths, and the sweep's destructive contract
+// ---------------------------------------------------------------------------
+
+/// An `approvals/` directory that cannot be enumerated surfaces the
+/// enumeration error — an unreadable directory must never read as an empty
+/// pending list, which the reconciler would take for "nothing to do".
+#[tokio::test]
+async fn list_pending_reports_enumeration_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = FileApprovalStore::open(dir.path()).unwrap();
+    let approvals = dir.path().join("approvals");
+    std::fs::remove_dir_all(&approvals).unwrap();
+    std::fs::write(&approvals, b"not a directory").unwrap();
+
+    let err = match store.list_pending().await {
+        Ok(_) => panic!("an unreadable approvals directory must not read as a list"),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(err, SessionStoreError::Request { .. }),
+        "expected the enumeration fault to surface, got {err:?}"
+    );
+}
+
+/// One corrupt record among valid ones is skip-and-continue under the
+/// current scan semantics — warn per file, the scan keeps going — so the
+/// valid records are still listed and the corrupt file is left in place.
+/// The corrupt file sits at a canonical `{decision_id}.json` name, so the
+/// skip is pinned to the decode failure itself, not a filename filter.
+#[tokio::test]
+async fn list_pending_preserves_per_file_decode_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = FileApprovalStore::open(dir.path()).unwrap();
+    let parked = make_parked("req-decode-skip", Duration::from_secs(60));
+    let id = parked.request.decision_id;
+    store.register(parked).await.unwrap();
+    let corrupt = dir
+        .path()
+        .join("approvals")
+        .join(format!("{}.json", DecisionId::generate()));
+    std::fs::write(&corrupt, b"not json").unwrap();
+
+    let pending = store.list_pending().await.unwrap();
+
+    let ids: Vec<_> = pending.iter().map(|p| p.request.decision_id).collect();
+    assert_eq!(ids, [id], "the corrupt record must not fail the scan");
+    assert!(corrupt.exists(), "the undecodable file is left in place");
+}
+
+/// A path that vanishes between the directory snapshot and its read — a
+/// racing resolve or remove — reads as `NotFound` and is skipped without
+/// error. A dangling symlink at a canonical name is the deterministic
+/// stand-in for that vanishing: enumerated by the scan, gone at read time.
+#[cfg(unix)]
+#[tokio::test]
+async fn benign_notfound_race_is_skipped() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = FileApprovalStore::open(dir.path()).unwrap();
+    let parked = make_parked("req-vanished", Duration::from_secs(60));
+    let id = parked.request.decision_id;
+    store.register(parked).await.unwrap();
+    let vanished = dir
+        .path()
+        .join("approvals")
+        .join(format!("{}.json", DecisionId::generate()));
+    std::os::unix::fs::symlink("resolved-and-gone", &vanished).unwrap();
+
+    let pending = store.list_pending().await.unwrap();
+
+    let ids: Vec<_> = pending.iter().map(|p| p.request.decision_id).collect();
+    assert_eq!(ids, [id], "a vanished path is skipped, not an error");
+}
+
+/// The sweep's destructive contract (row #683's audit), end to end: a
+/// sweep that cleared an expired record must not shadow a later
+/// registration of the same decision id — the replaced record is listed
+/// and retained by the next scan. The concurrent interleaving (a stale
+/// sweep snapshot must not unlink a replaced file) is pinned in-crate
+/// against the `unlink_if_unchanged` seam, now private to
+/// `aura::session_store::file`.
+#[tokio::test]
+async fn stale_sweep_cannot_unlink_a_replaced_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let registrar = FileApprovalStore::open(dir.path()).unwrap();
+    let sweeper = FileApprovalStore::open(dir.path()).unwrap();
+
+    let mut expired = make_parked("req-replaced", Duration::from_secs(60));
+    expired.expires_at = chrono::Utc::now() - chrono::Duration::seconds(1);
+    let id = expired.request.decision_id;
+    registrar.register(expired).await.unwrap();
+    assert!(sweeper.list_pending().await.unwrap().is_empty());
+
+    let mut fresh = make_parked("req-replaced", Duration::from_secs(60));
+    fresh.request.decision_id = id;
+    registrar.register(fresh).await.unwrap();
+
+    let pending = sweeper.list_pending().await.unwrap();
+    let ids: Vec<_> = pending.iter().map(|p| p.request.decision_id).collect();
+    assert_eq!(ids, [id], "the replaced record is pending again");
+    let path = dir.path().join("approvals").join(format!("{id}.json"));
+    assert!(path.exists(), "the fresh record survives the later scan");
 }
 
 /// A read-only `approvals/` directory must not fail `resolve`: the decision

@@ -32,7 +32,10 @@
 //! outside the root.
 //! Temp-file plus rename prevents partial files after crashes. A `std::sync::Mutex`
 //! serializes operations for the single writing process; no operation awaits
-//! while holding it.
+//! while holding it, and `list_pending` holds it only to snapshot the
+//! directory listing — its per-file reads, decodes, and unlinks run outside,
+//! with every unlink rechecking file identity so a mid-scan registration
+//! survives a stale sweep decision.
 //!
 //! Store operations run sync on the blocking pool rather than over
 //! `tokio::fs`, which is itself one `spawn_blocking` per call: a whole
@@ -318,26 +321,33 @@ impl Inner {
                 .try_exists()
                 .map_err(request_err)?
             {
-                stale_decided.push(path);
+                stale_decided.push((path, bytes));
                 continue;
             }
-            candidates.push((path, parked));
+            candidates.push((path, parked, bytes));
         }
 
-        // Phase 2 removes; a file that survives drops its record from the
-        // returned set so a later cancel can clear it again.
+        // Phase 2 removes; each removal rechecks the file still holds the
+        // bytes phase 1 decoded, so a registration that rewrote the path
+        // mid-cancel keeps its record for a later cancel. A file that
+        // survives drops its record from the returned set so a later
+        // cancel can clear it again.
         let mut cleared = Vec::new();
-        for (path, parked) in candidates {
-            match fs::remove_file(&path) {
-                Ok(()) => cleared.push(parked),
+        for (path, parked, bytes) in candidates {
+            match unlink_if_unchanged(&path, &bytes) {
+                Ok(true) => cleared.push(parked),
+                Ok(false) => tracing::warn!(
+                    path = %path.display(), decision_id = %parked.request.decision_id,
+                    "approval file changed under cancel_request; a later cancel can clear it"
+                ),
                 Err(err) => tracing::warn!(
                     path = %path.display(), decision_id = %parked.request.decision_id, error = %err,
                     "approval file not removed by cancel_request; a later cancel can clear it"
                 ),
             }
         }
-        for path in stale_decided {
-            if let Err(err) = fs::remove_file(&path) {
+        for (path, bytes) in stale_decided {
+            if let Err(err) = unlink_if_unchanged(&path, &bytes) {
                 tracing::warn!(
                     path = %path.display(), error = %err,
                     "stale decided approval file not removed by cancel_request"
@@ -348,22 +358,36 @@ impl Inner {
     }
 
     fn list_pending_sync(&self) -> Result<Vec<ParkedApproval>, SessionStoreError> {
-        let _guard = self.lock();
-        let entries = match fs::read_dir(self.approvals_dir()) {
-            Ok(entries) => entries,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(err) => return Err(request_err(err)),
+        // Snapshot the directory listing under the lock; every per-file
+        // read and decode runs outside it (row #683). The lock serializes
+        // store operations, not file decoding, and the unlink paths below
+        // recheck file identity (`unlink_if_unchanged`) rather than
+        // trusting the snapshot, so a registration that lands mid-scan
+        // cannot lose its record to a stale sweep decision.
+        let paths: Vec<PathBuf> = {
+            let _guard = self.lock();
+            let entries = match fs::read_dir(self.approvals_dir()) {
+                Ok(entries) => entries,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+                Err(err) => return Err(request_err(err)),
+            };
+            let mut paths = Vec::new();
+            for entry in entries {
+                let entry = entry.map_err(request_err)?;
+                let path = entry.path();
+                if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                    // A mid-publish temp file, never a stored approval.
+                    continue;
+                }
+                paths.push(path);
+            }
+            paths
         };
+
         let now = chrono::Utc::now();
 
         let mut pending = Vec::new();
-        for entry in entries {
-            let entry = entry.map_err(request_err)?;
-            let path = entry.path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
-                // A mid-publish temp file, never a stored approval.
-                continue;
-            }
+        for path in paths {
             let bytes = match fs::read(&path) {
                 Ok(bytes) => bytes,
                 Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
@@ -389,11 +413,9 @@ impl Inner {
             // approval file in place as the only intact record.
             let decision_path = self.decision_path(&parked.request.decision_id.to_string());
             match fs::read(&decision_path) {
-                Ok(bytes) => {
-                    if serde_json::from_slice::<ResolvedEntry>(&bytes).is_ok() {
-                        if let Err(err) = fs::remove_file(&path)
-                            && err.kind() != io::ErrorKind::NotFound
-                        {
+                Ok(decision_bytes) => {
+                    if serde_json::from_slice::<ResolvedEntry>(&decision_bytes).is_ok() {
+                        if let Err(err) = unlink_if_unchanged(&path, &bytes) {
                             tracing::warn!(
                                 path = %path.display(), error = %err,
                                 "decided approval file not removed by list_pending"
@@ -412,7 +434,7 @@ impl Inner {
             }
             if parked.expires_at > now {
                 pending.push(parked);
-            } else if let Err(err) = fs::remove_file(&path) {
+            } else if let Err(err) = unlink_if_unchanged(&path, &bytes) {
                 tracing::warn!(
                     path = %path.display(), error = %err,
                     "expired approval file not removed by list_pending"
@@ -517,6 +539,31 @@ fn publish(path: &Path, payload: &[u8]) -> Result<(), SessionStoreError> {
         return Err(request_err(err));
     }
     Ok(())
+}
+
+/// Unlink `path` only if it still holds exactly `expected` — the identity
+/// recheck behind every removal this store drives from a previously-read
+/// record (the sweep and expiry paths in `list_pending` and
+/// `cancel_request`). A sweep decides to unlink from bytes it decoded
+/// earlier, and a concurrent registration can rewrite the same path with
+/// a fresh record before the unlink lands; re-reading and byte-comparing
+/// first means a replaced (or vanished) file is left for the next scan to
+/// re-decide. `Ok(true)` means the file was unlinked here.
+fn unlink_if_unchanged(path: &Path, expected: &[u8]) -> io::Result<bool> {
+    let unchanged = match fs::read(path) {
+        Ok(current) => current == expected,
+        // A path that vanished since the sweep read it is a benign race.
+        Err(err) if err.kind() == io::ErrorKind::NotFound => false,
+        Err(err) => return Err(err),
+    };
+    if !unchanged {
+        return Ok(false);
+    }
+    match fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err),
+    }
 }
 
 /// Open options that create files readable by the owner only.
@@ -632,5 +679,82 @@ mod private_mode_tests {
 
         assert_eq!(mode_of(&target), 0o600);
         assert_eq!(std::fs::read(&target).unwrap(), b"fresh");
+    }
+}
+
+/// The concurrent half of the sweep's destructive contract (row #683's
+/// audit); the end-to-end recovery half is the aura-web-server battery's
+/// `stale_sweep_cannot_unlink_a_replaced_record`. Every sweep-driven
+/// unlink re-reads the file and compares it against the bytes the sweep
+/// decoded (`unlink_if_unchanged`, the exact code path the scan's expiry
+/// and residue unlinks take), so the interleaving — stale record read,
+/// replace with a fresh record, unlink — is driven directly through
+/// that seam.
+#[cfg(test)]
+mod unlink_recheck_tests {
+    use crate::hitl::{
+        AgentScope, ApprovalAuthority, ApprovalItem, ApprovalOrigin, ApprovalRequest, DecisionId,
+        PROTOCOL_VERSION, ParkedApproval,
+    };
+    use crate::session_store::ApprovalStore;
+
+    use super::{FileApprovalStore, unlink_if_unchanged};
+
+    /// A representative parked approval for `decision_id`, expiring far
+    /// out — the battery fixture's shape.
+    fn make_parked(decision_id: DecisionId) -> ParkedApproval {
+        let now = chrono::Utc::now();
+        ParkedApproval {
+            request: ApprovalRequest {
+                version: PROTOCOL_VERSION,
+                instance_id: "test-instance".to_string(),
+                decision_id,
+                request_id: "req-replaced".to_string(),
+                scope: AgentScope::Single { session_id: None },
+                origin: ApprovalOrigin::ConfigGate {
+                    matched_pattern: "kubectl_*".to_string(),
+                    agent_name: "test-agent".to_string(),
+                },
+                items: vec![ApprovalItem {
+                    tool_name: "kubectl_delete".to_string(),
+                    arguments: serde_json::json!({"pod": "web-1"}),
+                    tool_call_intent: Some("restarting to pick up the config change".to_string()),
+                }],
+            },
+            registered_at: now,
+            expires_at: now + chrono::Duration::hours(1),
+            authority: ApprovalAuthority::WebhookPoll,
+            egress_headers: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stale_sweep_snapshot_cannot_unlink_a_replaced_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileApprovalStore::open(dir.path()).unwrap();
+        let id = DecisionId::generate();
+
+        // The snapshot a sweep decoded, and the racing registration that
+        // rewrites the same path with a fresh record.
+        store.register(make_parked(id)).await.unwrap();
+        let path = dir.path().join("approvals").join(format!("{id}.json"));
+        let stale = std::fs::read(&path).unwrap();
+        store.register(make_parked(id)).await.unwrap();
+        let current = std::fs::read(&path).unwrap();
+        assert_ne!(
+            stale, current,
+            "fixture: the racing registration rewrote it"
+        );
+
+        assert!(
+            !unlink_if_unchanged(&path, &stale).unwrap(),
+            "a stale snapshot must not unlink the replaced record"
+        );
+        assert!(path.exists(), "the replaced record is retained");
+        assert!(
+            unlink_if_unchanged(&path, &current).unwrap(),
+            "the identity the file holds still unlinks"
+        );
+        assert!(!path.exists(), "the matched record is unlinked");
     }
 }
