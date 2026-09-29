@@ -252,7 +252,7 @@ mod tests {
             park: aura_config::ParkConfig::default(),
             route: aura_config::DecisionRouteConfig::Webhook {
                 url: aura_config::WebhookUrl::new("http://127.0.0.1:1").unwrap(),
-                timeout_secs: 300,
+                timeout_secs: Some(300),
                 headers: std::collections::HashMap::new(),
                 headers_from_request: std::collections::HashMap::new(),
                 tool_headers_from_response: aura_config::ToolHeaderMappings::default(),
@@ -779,7 +779,7 @@ mod tests {
                 park: aura_config::ParkConfig::default(),
                 route: aura_config::DecisionRouteConfig::Webhook {
                     url: aura_config::WebhookUrl::new("http://127.0.0.1:1").unwrap(),
-                    timeout_secs: 300,
+                    timeout_secs: Some(300),
                     headers: static_headers,
                     headers_from_request: HashMap::new(),
                     tool_headers_from_response: if identity_mapping {
