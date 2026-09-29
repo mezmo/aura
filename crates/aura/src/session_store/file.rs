@@ -99,24 +99,10 @@ struct Inner {
     root: PathBuf,
     lock: Mutex<()>,
     /// One lock per approval path, keyed by this store's own constructed
-    /// paths — identical strings for one id within an instance, and one
-    /// map per instance, so the serialization claimed over it is
-    /// same-instance only. An entry lives only while a parked approval
-    /// exists at its path — growth is bounded by the approvals in flight
-    /// — and every destroy of the file evicts its entry refcount-guarded
-    /// (`evict_path_lock`): the destructive commit in
-    /// `unlink_if_unchanged`, resolve's best-effort approval unlink, and
-    /// `remove`'s removes. The last two run under the store op lock, which
-    /// already serializes them against registration, so their eviction is
-    /// the only per-path-map work they need. A NotFound miss on those
-    /// unlinks is another op's destroy, whose own eviction covered the
-    /// entry. Every observation of a vanished path evicts the entry
-    /// refcount-guarded — a path that is gone was destroyed by someone,
-    /// and the changed-but-alive case is the only one that keeps its
-    /// entry for a later commit. One real destroy sees the entry gone:
-    /// its own eviction, or — when a waiter cloned in-flight holds the
-    /// count above one and the eviction is blocked — the trailing
-    /// waiter's own vanished-path observation retries it.
+    /// paths — one map per instance, so the serialization claimed over it
+    /// is same-instance only. An entry lives only while a parked approval
+    /// exists at its path, so growth is bounded by the approvals in
+    /// flight. Mechanism: `with_path_lock`, `evict_path_lock`.
     path_locks: Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>,
 }
 
@@ -205,8 +191,6 @@ impl Inner {
         let id = canonical_id(&parked.request.decision_id)?;
         let payload = serde_json::to_vec(&ParkedApprovalRecord::from(&parked))
             .expect("approval record serializes to JSON");
-        // Publish under the per-path lock so a destructive commit's
-        // compare+remove window cannot overlap the rename.
         let path = self.approval_path(&id);
         self.with_path_lock(&path, || publish(&path, &payload))
     }
@@ -418,12 +402,6 @@ impl Inner {
     }
 
     fn list_pending_sync(&self) -> Result<Vec<ParkedApproval>, SessionStoreError> {
-        // Snapshot the directory listing under the lock; every per-file
-        // read and decode runs outside it. The store lock serializes
-        // store operations, not file decoding, and the unlinks below
-        // commit under the per-path lock (`unlink_if_unchanged`), so a
-        // registration that lands mid-scan cannot lose its record to a
-        // stale sweep decision.
         let paths: Vec<PathBuf> = {
             let _guard = self.lock();
             let entries = fs::read_dir(self.approvals_dir()).map_err(request_err)?;
@@ -598,37 +576,19 @@ fn publish(path: &Path, payload: &[u8]) -> Result<(), SessionStoreError> {
 }
 
 impl Inner {
-    /// Unlink `path` only if it still holds exactly `expected` — the identity
-    /// recheck behind every removal this store drives from a previously-read
-    /// record (the sweep and expiry paths in `list_pending` and
-    /// `cancel_request`). The first compare runs without locks so a stale
-    /// decision bails cheaply; passing it, the per-path lock is taken and the
-    /// compare redone inside it, making the commit's compare+remove window
-    /// indivisible against same-instance registrations, which publish under
-    /// the same per-path lock. A registration landing in the unlocked window
-    /// between the two compares therefore survives: the locked re-compare
-    /// sees its bytes and abandons the unlink. A file replaced before the
-    /// commit is left for the next scan to re-decide; this is a
-    /// same-instance guarantee only — separate store handles keep separate
-    /// lock maps and make no cross-process claim. `Ok(true)` means the file
-    /// was unlinked here.
-    ///
-    /// Every observation of a vanished path is a destroy and evicts the
-    /// path's lock entry — at the lock-free first compare, at the locked
-    /// recheck, and on the remove itself: the path is gone, so someone
-    /// destroyed it, and that destroyer's own eviction may have been
-    /// refcount-blocked by an in-flight waiter clone. The trailing waiter
-    /// that finds the path vanished retries the eviction (at the first
-    /// compare immediately; otherwise after the critical section), with the
-    /// refcount guard still protecting in-flight waiters exactly as before.
-    /// Only a changed-but-alive record keeps its entry, for its next commit.
+    /// Unlink `path` only if it still holds exactly `expected`; `Ok(true)`
+    /// means the file was unlinked here. The compare is redone under the
+    /// per-path lock, so a same-instance registration landing between
+    /// compare and remove survives — a same-instance guarantee only;
+    /// separate store handles keep separate lock maps and make no
+    /// cross-process claim. A vanished path was destroyed by someone whose
+    /// own eviction may have been refcount-blocked, so every vanished-path
+    /// observation retries the eviction.
     fn unlink_if_unchanged(&self, path: &Path, expected: &[u8]) -> io::Result<bool> {
         match compare_bytes(path, expected)? {
             ByteCompare::Unchanged => {}
             ByteCompare::Changed => return Ok(false),
             ByteCompare::Vanished => {
-                // Destroyed before this commit reached the per-path lock;
-                // nothing to unlink, but the destroy semantics stand.
                 self.evict_path_lock(path);
                 return Ok(false);
             }
@@ -678,14 +638,8 @@ impl Inner {
 /// What an identity compare found at `path` against the bytes a sweep
 /// decoded.
 enum ByteCompare {
-    /// The file holds exactly the expected bytes: the commit may unlink.
     Unchanged,
-    /// The file is alive but holds different bytes — someone republished
-    /// the path. Not a destroy: the commit abandons the unlink and the
-    /// path's lock entry stays.
     Changed,
-    /// The file is gone — destroyed by someone. Vanish carries destroy
-    /// semantics: the commit evicts the path's lock entry for it.
     Vanished,
 }
 
