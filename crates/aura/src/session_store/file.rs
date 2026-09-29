@@ -101,8 +101,17 @@ struct Inner {
     /// One lock per approval path, keyed by this store's own constructed
     /// paths — identical strings for one id within an instance, and one
     /// map per instance, so the serialization claimed over it is
-    /// same-instance only. Entries are never evicted: growth is bounded
-    /// by the distinct approvals this single writing process materializes.
+    /// same-instance only. An entry lives only while a parked approval
+    /// exists at its path — growth is bounded by the approvals in flight
+    /// — and every destroy of the file evicts its entry refcount-guarded
+    /// (`evict_path_lock`): the destructive commit in
+    /// `unlink_if_unchanged`, resolve's best-effort approval unlink, and
+    /// `remove`'s removes. The last two run under the store op lock, which
+    /// already serializes them against registration, so their eviction is
+    /// the only per-path-map work they need. A NotFound miss on those
+    /// unlinks is another op's destroy, whose own eviction covered the
+    /// entry. A waiter cloned in-flight holds the count above one and the
+    /// entry stays for a later destroy.
     path_locks: Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>,
 }
 
@@ -263,9 +272,15 @@ impl Inner {
             return Err(ResolveError::Store(request_err(err)));
         }
         // After sync commit, removing the approval file is best-effort.
-        // Failure leaves a stale approval file; resolve succeeded.
-        match fs::remove_file(self.approval_path(&id)) {
-            Ok(()) => {}
+        // Failure leaves a stale approval file; resolve succeeded. The
+        // store op lock already serializes this unlink against
+        // registration, so no per-path lock is involved — a real destroy
+        // here needs only the entry eviction.
+        let approval_path = self.approval_path(&id);
+        match fs::remove_file(&approval_path) {
+            Ok(()) => self.evict_path_lock(&approval_path),
+            // A NotFound miss is another op's destroy; that destroyer's
+            // own eviction covered the map entry.
             Err(err) if err.kind() == io::ErrorKind::NotFound => {}
             Err(err) => tracing::warn!(
                 decision_id = %id,
@@ -297,12 +312,17 @@ impl Inner {
     fn remove_sync(&self, id: &DecisionId) -> Result<(), SessionStoreError> {
         let _guard = self.lock();
         let id = canonical_id(id)?;
-        // Remove both halves; missing halves are fine (idempotent).
+        // Remove both halves; missing halves are fine (idempotent). The
+        // op lock already serializes these unlinks against registration,
+        // so a remove here needs only the entry eviction — the decision
+        // half never materializes an entry, making its evict a no-op. A
+        // NotFound miss is another op's destroy; that destroyer's own
+        // eviction covered the map entry.
         for path in [self.approval_path(&id), self.decision_path(&id)] {
-            if let Err(err) = fs::remove_file(&path)
-                && err.kind() != io::ErrorKind::NotFound
-            {
-                return Err(request_err(err));
+            match fs::remove_file(&path) {
+                Ok(()) => self.evict_path_lock(&path),
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => return Err(request_err(err)),
             }
         }
         Ok(())
@@ -586,23 +606,52 @@ impl Inner {
     /// before the commit is left for the next scan to re-decide; this is a
     /// same-instance guarantee only — separate store handles keep separate
     /// lock maps and make no cross-process claim. `Ok(true)` means the file
-    /// was unlinked here.
+    /// was unlinked here. Only a destroy — the remove or a benign
+    /// NotFound-vanish inside the commit — evicts the path's lock entry; a
+    /// changed-but-alive record keeps its entry for its next commit.
     fn unlink_if_unchanged(&self, path: &Path, expected: &[u8]) -> io::Result<bool> {
         if !bytes_unchanged(path, expected)? {
             return Ok(false);
         }
         #[cfg(test)]
         unlink_interleave::fire(path);
-        self.with_path_lock(path, || {
+        let (unlinked, destroyed) = self.with_path_lock(path, || {
             if !bytes_unchanged(path, expected)? {
-                return Ok(false);
+                return Ok((false, false));
             }
             match fs::remove_file(path) {
-                Ok(()) => Ok(true),
-                Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+                Ok(()) => Ok((true, true)),
+                Err(err) if err.kind() == io::ErrorKind::NotFound => Ok((false, true)),
                 Err(err) => Err(err),
             }
-        })
+        })?;
+        if destroyed {
+            self.evict_path_lock(path);
+        }
+        Ok(unlinked)
+    }
+
+    /// Drop a destroyed path's lock entry when only the map itself still
+    /// holds it. The count is read and the entry removed in one map-lock
+    /// critical section — the same lock every waiter clones under — so a
+    /// count of one is stable: no waiter is in flight and the entry can
+    /// go, while more means a waiter holds a clone across its critical
+    /// section and the entry stays for a later destroy to evict. Because
+    /// clones and removal are serialized on the same lock, an entry
+    /// removed at count one leaves its mutex unreachable — every later
+    /// lookup inserts a fresh lock instead of joining a dead one, so two
+    /// locks for one path never coexist.
+    fn evict_path_lock(&self, path: &Path) {
+        let mut map = self
+            .path_locks
+            .lock()
+            .expect("file approval store path-lock map poisoned");
+        if map
+            .get(path)
+            .is_some_and(|lock| Arc::strong_count(lock) == 1)
+        {
+            map.remove(path);
+        }
     }
 }
 
@@ -790,8 +839,8 @@ mod unlink_recheck_tests {
     use std::sync::Arc;
 
     use crate::hitl::{
-        AgentScope, ApprovalAuthority, ApprovalItem, ApprovalOrigin, ApprovalRequest, DecisionId,
-        PROTOCOL_VERSION, ParkedApproval,
+        AgentScope, ApprovalAuthority, ApprovalDecision, ApprovalItem, ApprovalOrigin,
+        ApprovalRequest, DecisionId, PROTOCOL_VERSION, ParkedApproval, ResolvedDecision,
     };
     use crate::session_store::{ApprovalStore, ParkedApprovalRecord};
 
@@ -912,6 +961,97 @@ mod unlink_recheck_tests {
         assert_eq!(
             on_disk, fresh_payload,
             "the surviving record is the fresh registration, not the swept stale one"
+        );
+    }
+
+    /// The destroy that evicts: a registration materializes its path's
+    /// lock entry, and the expiry sweep's commit destroys the record and
+    /// evicts the entry with it, so the map holds nothing beyond the
+    /// approvals actually parked. Single-threaded end to end — the
+    /// refcount is one at eviction because nothing else holds a clone.
+    #[test]
+    fn a_sweep_destroy_evicts_the_destroyed_path_lock_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileApprovalStore::open(dir.path()).unwrap();
+        let id = DecisionId::generate();
+
+        let mut expired = make_parked(id);
+        expired.expires_at = chrono::Utc::now() - chrono::Duration::seconds(1);
+        store.inner.register_sync(expired).unwrap();
+        let path = dir.path().join("approvals").join(format!("{id}.json"));
+        assert!(
+            store
+                .inner
+                .path_locks
+                .lock()
+                .expect("file approval store path-lock map poisoned")
+                .contains_key(&path),
+            "fixture: the registration materialized the path's lock entry"
+        );
+
+        let pending = store.inner.list_pending_sync().unwrap();
+
+        assert!(
+            pending.is_empty(),
+            "fixture: the expired record is not pending"
+        );
+        assert!(
+            !path.exists(),
+            "fixture: the sweep destroyed the expired record"
+        );
+        assert!(
+            store
+                .inner
+                .path_locks
+                .lock()
+                .expect("file approval store path-lock map poisoned")
+                .is_empty(),
+            "the destroyed path's lock entry is evicted"
+        );
+    }
+
+    /// The resolve-side half of the same eviction contract: a registered
+    /// approval materializes its path's lock entry, and resolve's
+    /// best-effort approval unlink — reached under the store op lock, with
+    /// no per-path lock involved — destroys the file and evicts the entry
+    /// with it, so the map holds nothing beyond the approvals actually
+    /// parked. Single-threaded end to end — the refcount is one at
+    /// eviction because nothing else holds a clone.
+    #[test]
+    fn a_resolve_destroy_evicts_the_destroyed_path_lock_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileApprovalStore::open(dir.path()).unwrap();
+        let id = DecisionId::generate();
+
+        store.inner.register_sync(make_parked(id)).unwrap();
+        let path = dir.path().join("approvals").join(format!("{id}.json"));
+        assert!(
+            store
+                .inner
+                .path_locks
+                .lock()
+                .expect("file approval store path-lock map poisoned")
+                .contains_key(&path),
+            "fixture: the registration materialized the path's lock entry"
+        );
+
+        store
+            .inner
+            .resolve_sync(&id, ResolvedDecision::from(ApprovalDecision::Approved))
+            .unwrap();
+
+        assert!(
+            !path.exists(),
+            "fixture: resolve destroyed the approval file"
+        );
+        assert!(
+            store
+                .inner
+                .path_locks
+                .lock()
+                .expect("file approval store path-lock map poisoned")
+                .is_empty(),
+            "the resolved path's lock entry is evicted"
         );
     }
 }
