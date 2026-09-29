@@ -33,9 +33,13 @@
 //! Temp-file plus rename prevents partial files after crashes. A `std::sync::Mutex`
 //! serializes operations for the single writing process; no operation awaits
 //! while holding it, and `list_pending` holds it only to snapshot the
-//! directory listing — its per-file reads, decodes, and unlinks run outside,
-//! with every unlink rechecking file identity so a mid-scan registration
-//! survives a stale sweep decision.
+//! directory listing — its per-file reads and decodes run outside it.
+//! Publishes and destructive commits also serialize per path on a separate
+//! lock map, so a compare+remove commit never overlaps a same-instance
+//! registration's rename at one approval path and cannot erase the record
+//! the registration published. The per-path locks are per store instance:
+//! two handles on one root stay independent, and no cross-process claim
+//! is made.
 //!
 //! Store operations run sync on the blocking pool rather than over
 //! `tokio::fs`, which is itself one `spawn_blocking` per call: a whole
@@ -53,6 +57,7 @@
 
 mod skill_store;
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -88,10 +93,17 @@ pub struct FileApprovalStore {
     inner: Arc<Inner>,
 }
 
-/// The shared store state: root directory and operation lock.
+/// The shared store state: root directory, operation lock, and the
+/// per-path destructive-commit locks.
 struct Inner {
     root: PathBuf,
     lock: Mutex<()>,
+    /// One lock per approval path, keyed by this store's own constructed
+    /// paths — identical strings for one id within an instance, and one
+    /// map per instance, so the serialization claimed over it is
+    /// same-instance only. Entries are never evicted: growth is bounded
+    /// by the distinct approvals this single writing process materializes.
+    path_locks: Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>,
 }
 
 impl FileApprovalStore {
@@ -105,6 +117,7 @@ impl FileApprovalStore {
         let inner = Arc::new(Inner {
             root: root.to_path_buf(),
             lock: Mutex::new(()),
+            path_locks: Mutex::new(HashMap::new()),
         });
         inner.probe_writable_sync().map_err(connect_err)?;
         Ok(Self { inner })
@@ -140,6 +153,25 @@ impl Inner {
         self.lock.lock().expect("file approval store lock poisoned")
     }
 
+    /// Run `f` holding the per-path lock for `path` — the primitive that
+    /// makes a destructive commit indivisible against same-instance
+    /// publishes. The map lock guards only the lookup; it is released
+    /// before `f` runs, so unrelated paths never wait on each other.
+    fn with_path_lock<R>(&self, path: &Path, f: impl FnOnce() -> R) -> R {
+        let lock = {
+            let mut map = self
+                .path_locks
+                .lock()
+                .expect("file approval store path-lock map poisoned");
+            Arc::clone(
+                map.entry(path.to_path_buf())
+                    .or_insert_with(|| Arc::new(Mutex::new(()))),
+            )
+        };
+        let _guard = lock.lock().expect("file approval store path lock poisoned");
+        f()
+    }
+
     /// Create and unlink an empty probe file in each store directory. This
     /// catches permission and mount faults, not a full disk.
     fn probe_writable_sync(&self) -> io::Result<()> {
@@ -159,7 +191,10 @@ impl Inner {
         let id = canonical_id(&parked.request.decision_id)?;
         let payload = serde_json::to_vec(&ParkedApprovalRecord::from(&parked))
             .expect("approval record serializes to JSON");
-        publish(&self.approval_path(&id), &payload)
+        // Publish under the per-path lock so a destructive commit's
+        // compare+remove window cannot overlap the rename.
+        let path = self.approval_path(&id);
+        self.with_path_lock(&path, || publish(&path, &payload))
     }
 
     fn get_sync(&self, id: &DecisionId) -> Result<Option<ParkedApproval>, SessionStoreError> {
@@ -334,7 +369,7 @@ impl Inner {
         // cancel can clear it again.
         let mut cleared = Vec::new();
         for (path, parked, bytes) in candidates {
-            match unlink_if_unchanged(&path, &bytes) {
+            match self.unlink_if_unchanged(&path, &bytes) {
                 Ok(true) => cleared.push(parked),
                 Ok(false) => tracing::warn!(
                     path = %path.display(), decision_id = %parked.request.decision_id,
@@ -347,7 +382,7 @@ impl Inner {
             }
         }
         for (path, bytes) in stale_decided {
-            if let Err(err) = unlink_if_unchanged(&path, &bytes) {
+            if let Err(err) = self.unlink_if_unchanged(&path, &bytes) {
                 tracing::warn!(
                     path = %path.display(), error = %err,
                     "stale decided approval file not removed by cancel_request"
@@ -359,18 +394,14 @@ impl Inner {
 
     fn list_pending_sync(&self) -> Result<Vec<ParkedApproval>, SessionStoreError> {
         // Snapshot the directory listing under the lock; every per-file
-        // read and decode runs outside it (row #683). The lock serializes
-        // store operations, not file decoding, and the unlink paths below
-        // recheck file identity (`unlink_if_unchanged`) rather than
-        // trusting the snapshot, so a registration that lands mid-scan
-        // cannot lose its record to a stale sweep decision.
+        // read and decode runs outside it. The store lock serializes
+        // store operations, not file decoding, and the unlinks below
+        // commit under the per-path lock (`unlink_if_unchanged`), so a
+        // registration that lands mid-scan cannot lose its record to a
+        // stale sweep decision.
         let paths: Vec<PathBuf> = {
             let _guard = self.lock();
-            let entries = match fs::read_dir(self.approvals_dir()) {
-                Ok(entries) => entries,
-                Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-                Err(err) => return Err(request_err(err)),
-            };
+            let entries = fs::read_dir(self.approvals_dir()).map_err(request_err)?;
             let mut paths = Vec::new();
             for entry in entries {
                 let entry = entry.map_err(request_err)?;
@@ -415,7 +446,7 @@ impl Inner {
             match fs::read(&decision_path) {
                 Ok(decision_bytes) => {
                     if serde_json::from_slice::<ResolvedEntry>(&decision_bytes).is_ok() {
-                        if let Err(err) = unlink_if_unchanged(&path, &bytes) {
+                        if let Err(err) = self.unlink_if_unchanged(&path, &bytes) {
                             tracing::warn!(
                                 path = %path.display(), error = %err,
                                 "decided approval file not removed by list_pending"
@@ -434,7 +465,7 @@ impl Inner {
             }
             if parked.expires_at > now {
                 pending.push(parked);
-            } else if let Err(err) = unlink_if_unchanged(&path, &bytes) {
+            } else if let Err(err) = self.unlink_if_unchanged(&path, &bytes) {
                 tracing::warn!(
                     path = %path.display(), error = %err,
                     "expired approval file not removed by list_pending"
@@ -541,28 +572,92 @@ fn publish(path: &Path, payload: &[u8]) -> Result<(), SessionStoreError> {
     Ok(())
 }
 
-/// Unlink `path` only if it still holds exactly `expected` — the identity
-/// recheck behind every removal this store drives from a previously-read
-/// record (the sweep and expiry paths in `list_pending` and
-/// `cancel_request`). A sweep decides to unlink from bytes it decoded
-/// earlier, and a concurrent registration can rewrite the same path with
-/// a fresh record before the unlink lands; re-reading and byte-comparing
-/// first means a replaced (or vanished) file is left for the next scan to
-/// re-decide. `Ok(true)` means the file was unlinked here.
-fn unlink_if_unchanged(path: &Path, expected: &[u8]) -> io::Result<bool> {
-    let unchanged = match fs::read(path) {
-        Ok(current) => current == expected,
-        // A path that vanished since the sweep read it is a benign race.
-        Err(err) if err.kind() == io::ErrorKind::NotFound => false,
-        Err(err) => return Err(err),
-    };
-    if !unchanged {
-        return Ok(false);
+impl Inner {
+    /// Unlink `path` only if it still holds exactly `expected` — the identity
+    /// recheck behind every removal this store drives from a previously-read
+    /// record (the sweep and expiry paths in `list_pending` and
+    /// `cancel_request`). The first compare runs without locks so a stale
+    /// decision bails cheaply; passing it, the per-path lock is taken and the
+    /// compare redone inside it, making the commit's compare+remove window
+    /// indivisible against same-instance registrations, which publish under
+    /// the same per-path lock. A registration landing in the unlocked window
+    /// between the two compares therefore survives: the locked re-compare
+    /// sees its bytes and abandons the unlink. A file replaced (or vanished)
+    /// before the commit is left for the next scan to re-decide; this is a
+    /// same-instance guarantee only — separate store handles keep separate
+    /// lock maps and make no cross-process claim. `Ok(true)` means the file
+    /// was unlinked here.
+    fn unlink_if_unchanged(&self, path: &Path, expected: &[u8]) -> io::Result<bool> {
+        if !bytes_unchanged(path, expected)? {
+            return Ok(false);
+        }
+        #[cfg(test)]
+        unlink_interleave::fire(path);
+        self.with_path_lock(path, || {
+            if !bytes_unchanged(path, expected)? {
+                return Ok(false);
+            }
+            match fs::remove_file(path) {
+                Ok(()) => Ok(true),
+                Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+                Err(err) => Err(err),
+            }
+        })
     }
-    match fs::remove_file(path) {
-        Ok(()) => Ok(true),
+}
+
+/// Whether `path` currently holds exactly `expected`; a vanished path
+/// reads as changed — a benign race with a resolve or remove.
+fn bytes_unchanged(path: &Path, expected: &[u8]) -> io::Result<bool> {
+    match fs::read(path) {
+        Ok(current) => Ok(current == expected),
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(err) => Err(err),
+    }
+}
+
+/// Deterministic interleaving point for the sweep's destructive boundary:
+/// the moment between `unlink_if_unchanged`'s unlocked identity compare
+/// and its per-path-locked commit, where a registration can publish fresh
+/// bytes at the swept path. A test-installed hook fires there, on the
+/// calling thread. The hook may take the per-path lock — it is not yet
+/// held — but must not re-enter the store's operation lock:
+/// `list_pending` reaches the boundary lock-free, `cancel_request` holds
+/// that lock across its unlinks.
+#[cfg(test)]
+mod unlink_interleave {
+    use std::path::Path;
+    use std::sync::Mutex;
+
+    type Hook = Box<dyn Fn(&Path) + Send>;
+
+    static HOOK: Mutex<Option<Hook>> = Mutex::new(None);
+
+    /// Uninstalls the hook on drop, so a failed test cannot leak it into
+    /// the rest of the battery.
+    pub(super) struct HookGuard;
+
+    impl Drop for HookGuard {
+        fn drop(&mut self) {
+            *HOOK.lock().expect("unlink interleave slot poisoned") = None;
+        }
+    }
+
+    /// Fire `hook` at every compare/remove boundary until the returned
+    /// guard drops.
+    pub(super) fn install(hook: Hook) -> HookGuard {
+        *HOOK.lock().expect("unlink interleave slot poisoned") = Some(hook);
+        HookGuard
+    }
+
+    pub(super) fn fire(path: &Path) {
+        // The hook runs outside the slot lock so a boundary reached from
+        // inside a hook nests instead of deadlocking.
+        let hook = HOOK.lock().expect("unlink interleave slot poisoned").take();
+        if let Some(hook) = hook {
+            hook(path);
+            *HOOK.lock().expect("unlink interleave slot poisoned") = Some(hook);
+        }
     }
 }
 
@@ -682,23 +777,25 @@ mod private_mode_tests {
     }
 }
 
-/// The concurrent half of the sweep's destructive contract (row #683's
-/// audit); the end-to-end recovery half is the aura-web-server battery's
+/// The concurrent half of the sweep's destructive contract; the
+/// end-to-end recovery half is the aura-web-server battery's
 /// `stale_sweep_cannot_unlink_a_replaced_record`. Every sweep-driven
-/// unlink re-reads the file and compares it against the bytes the sweep
-/// decoded (`unlink_if_unchanged`, the exact code path the scan's expiry
+/// unlink checks the file against the bytes the sweep decoded
+/// (`unlink_if_unchanged`, the exact code path the scan's expiry
 /// and residue unlinks take), so the interleaving — stale record read,
 /// replace with a fresh record, unlink — is driven directly through
 /// that seam.
 #[cfg(test)]
 mod unlink_recheck_tests {
+    use std::sync::Arc;
+
     use crate::hitl::{
         AgentScope, ApprovalAuthority, ApprovalItem, ApprovalOrigin, ApprovalRequest, DecisionId,
         PROTOCOL_VERSION, ParkedApproval,
     };
-    use crate::session_store::ApprovalStore;
+    use crate::session_store::{ApprovalStore, ParkedApprovalRecord};
 
-    use super::{FileApprovalStore, unlink_if_unchanged};
+    use super::{FileApprovalStore, unlink_interleave};
 
     /// A representative parked approval for `decision_id`, expiring far
     /// out — the battery fixture's shape.
@@ -747,14 +844,106 @@ mod unlink_recheck_tests {
         );
 
         assert!(
-            !unlink_if_unchanged(&path, &stale).unwrap(),
+            !store.inner.unlink_if_unchanged(&path, &stale).unwrap(),
             "a stale snapshot must not unlink the replaced record"
         );
         assert!(path.exists(), "the replaced record is retained");
         assert!(
-            unlink_if_unchanged(&path, &current).unwrap(),
+            store.inner.unlink_if_unchanged(&path, &current).unwrap(),
             "the identity the file holds still unlinks"
         );
         assert!(!path.exists(), "the matched record is unlinked");
+    }
+
+    /// The boundary the recheck alone cannot close: a registration that
+    /// publishes fresh bytes at the swept path after the identity compare
+    /// but before the remove owns the path, so its record must survive —
+    /// the sweep's unlink decision was made from the stale bytes. The
+    /// interleaving is forced through the test seam at that exact
+    /// boundary, single-threaded, same store instance: no timing luck.
+    #[test]
+    fn a_registration_landing_between_compare_and_remove_survives_the_sweep() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileApprovalStore::open(dir.path()).unwrap();
+        let id = DecisionId::generate();
+
+        // The record the sweep will decide to unlink: expired.
+        let mut expired = make_parked(id);
+        expired.expires_at = chrono::Utc::now() - chrono::Duration::seconds(1);
+        store.inner.register_sync(expired).unwrap();
+        let path = dir.path().join("approvals").join(format!("{id}.json"));
+        let stale = std::fs::read(&path).unwrap();
+
+        // The racing registration: a live record at the same path, published
+        // by the same store instance exactly while the sweep sits between
+        // its compare and its remove.
+        let fresh = make_parked(id);
+        let fresh_payload = serde_json::to_vec(&ParkedApprovalRecord::from(&fresh)).unwrap();
+        assert_ne!(
+            stale, fresh_payload,
+            "fixture: the racing registration publishes different bytes"
+        );
+        let fired = Arc::new(AtomicBool::new(false));
+        let registrar = Arc::clone(&store.inner);
+        let swept_path = path.clone();
+        let to_publish = fresh.clone();
+        let fired_flag = Arc::clone(&fired);
+        let _boundary = unlink_interleave::install(Box::new(move |boundary: &std::path::Path| {
+            // Other tests reach this boundary concurrently; only the
+            // swept path belongs to this interleaving.
+            if boundary != swept_path.as_path() {
+                return;
+            }
+            // The hook contract is repeatable; this pin fires it once.
+            registrar.register_sync(to_publish.clone()).unwrap();
+            fired_flag.store(true, Ordering::SeqCst);
+        }));
+
+        store.inner.list_pending_sync().unwrap();
+
+        assert!(
+            fired.load(Ordering::SeqCst),
+            "fixture: the boundary hook ran"
+        );
+        let on_disk = std::fs::read(&path)
+            .expect("the registration published mid-compare survives the sweep's unlink");
+        assert_eq!(
+            on_disk, fresh_payload,
+            "the surviving record is the fresh registration, not the swept stale one"
+        );
+    }
+}
+
+/// The missing-directory half of the enumeration-errors-surface contract:
+/// an `approvals/` directory that vanishes after open — external cleanup,
+/// a misconfigured mount — must surface the enumeration fault to the poll
+/// reconciler, never an empty pending set it would read as "nothing to
+/// do". The not-a-directory half is pinned in the aura-web-server battery
+/// (`list_pending_reports_enumeration_error`).
+#[cfg(test)]
+mod list_pending_missing_dir_tests {
+    use crate::session_store::SessionStoreError;
+
+    use super::FileApprovalStore;
+
+    #[test]
+    fn list_pending_reports_a_missing_approvals_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileApprovalStore::open(dir.path()).unwrap();
+        std::fs::remove_dir_all(dir.path().join("approvals")).unwrap();
+
+        let err = match store.inner.list_pending_sync() {
+            Ok(pending) => panic!(
+                "an absent approvals directory must not read as a pending set of {}",
+                pending.len()
+            ),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, SessionStoreError::Request { .. }),
+            "expected the enumeration fault to surface, got {err:?}"
+        );
     }
 }

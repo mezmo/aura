@@ -610,7 +610,7 @@ async fn list_pending_skips_a_stale_decided_approval() {
 }
 
 // ---------------------------------------------------------------------------
-// Scan structure (row #683): enumeration faults, per-file decode, vanishing
+// Scan structure: enumeration faults, per-file decode, vanishing
 // paths, and the sweep's destructive contract
 // ---------------------------------------------------------------------------
 
@@ -684,13 +684,12 @@ async fn benign_notfound_race_is_skipped() {
     assert_eq!(ids, [id], "a vanished path is skipped, not an error");
 }
 
-/// The sweep's destructive contract (row #683's audit), end to end: a
-/// sweep that cleared an expired record must not shadow a later
-/// registration of the same decision id — the replaced record is listed
-/// and retained by the next scan. The concurrent interleaving (a stale
-/// sweep snapshot must not unlink a replaced file) is pinned in-crate
-/// against the `unlink_if_unchanged` seam, now private to
-/// `aura::session_store::file`.
+/// The sweep's destructive contract, end to end: a sweep that cleared an
+/// expired record must not shadow a later registration of the same
+/// decision id — the replaced record is listed and retained by the next
+/// scan. The concurrent interleaving (a stale sweep snapshot must not
+/// unlink a replaced file) is pinned in-crate against the
+/// `unlink_if_unchanged` seam in `aura::session_store::file`.
 #[tokio::test]
 async fn stale_sweep_cannot_unlink_a_replaced_record() {
     let dir = tempfile::tempdir().unwrap();
