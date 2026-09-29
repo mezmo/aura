@@ -1064,17 +1064,16 @@ pub struct SkillConfig {
     pub path: std::path::PathBuf,
 }
 
-/// How the skill router's selection is used.
+/// The `mode` value of `[agent.skill_router]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum SkillRouterMode {
-    /// Route and log the decision; the agent's context is left unchanged.
+    /// Decisions are logged only.
     #[default]
     Shadow,
-    /// Route and preload the selected skills into the agent's context.
+    /// Selected skills are preloaded alongside the on-demand catalog.
     Inject,
-    /// Route and preload the selected skills as the agent's only skills: no
-    /// catalog and no skill tools.
+    /// Selected skills are the agent's whole skill set.
     Exclusive,
 }
 

@@ -106,12 +106,11 @@ pub struct AgentRuntimeConfig {
     /// When set, this replaces agent.system_prompt entirely.
     pub preamble_override: Option<String>,
 
-    /// Whether `agent.skills` are already in the preamble, so the agent gets
-    /// `read_skill_file` alone rather than the full skill tool pair.
+    /// Whether every entry of `agent.skills` already has its body in the
+    /// preamble.
     pub skills_preloaded: bool,
 
-    /// The subset of `agent.skills` whose bodies are already in the preamble
-    /// while the catalog and `load_skill` stay available.
+    /// The entries of `agent.skills` whose bodies are already in the preamble.
     pub preloaded_skills: Vec<aura_config::skills::SkillName>,
 
     /// Glob patterns for filtering which MCP tools to include.

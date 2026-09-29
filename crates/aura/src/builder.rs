@@ -1148,6 +1148,11 @@ impl Agent {
             builder_state = builder_state.add_tools_dyn(additional_tools);
         }
 
+        // Skill tools follow what the preamble already holds. When every
+        // skill body is preloaded there is nothing left to load, so the
+        // agent gets `read_skill_file` alone for the skills' resource files.
+        // Otherwise it gets the full pair, with `load_skill` answering a
+        // pointer instead of a second copy for the bodies already preloaded.
         let toolset = if config.skills_preloaded {
             SkillToolset::read_only(&config.agent.skills, config.skill_recorder.clone())
         } else {

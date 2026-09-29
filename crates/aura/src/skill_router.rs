@@ -73,19 +73,19 @@ pub struct SkillRoutingDecision {
     pub total_latency_ms: u64,
 }
 
-/// The skill surface an agent should be built with.
+/// What routing decided to preload for an agent.
 #[derive(Debug, Clone)]
 pub enum SkillPlan {
-    /// Catalog in the preamble plus the `load_skill`/`read_skill_file` tools.
+    /// Nothing preloaded.
     OnDemand,
-    /// The on-demand surface plus this preamble section of preloaded bodies;
-    /// `selected` names the skills the section holds.
+    /// `section` is a preamble section holding the bodies of `selected`, a
+    /// subset of the catalog.
     Augment {
         section: String,
         selected: Vec<SkillName>,
     },
-    /// This preamble section of preloaded bodies plus `read_skill_file` over
-    /// `selected`: no catalog, no `load_skill`.
+    /// `section` is a preamble section holding the bodies of `selected`, the
+    /// agent's whole skill set.
     Exclusive {
         section: Option<String>,
         selected: Vec<SkillConfig>,
@@ -320,14 +320,15 @@ impl SkillRouter {
         SkillRoutingOutcome::Routed(Box::new(decision))
     }
 
-    /// Route and turn the decision into what the agent's skill surface
-    /// should be.
+    /// Route and turn the decision into what the agent should preload.
     ///
-    /// Shadow mode and an unavailable router keep the on-demand surface.
-    /// Inject mode keeps it and adds the selected bodies. Exclusive mode
-    /// replaces it with the selected bodies plus `read_skill_file` for their
-    /// resources, even when the selection is empty, so the LLM never sees a
-    /// skill catalog or `load_skill`.
+    /// Shadow mode and an unavailable router preload nothing, which leaves
+    /// the caller's on-demand surface (catalog plus `load_skill` and
+    /// `read_skill_file`) intact. Inject mode adds the selected bodies on
+    /// top of that surface. Exclusive mode makes the selected bodies the
+    /// whole skill set, even when the selection is empty: the caller drops
+    /// the catalog and `load_skill` and keeps `read_skill_file` scoped to
+    /// the selection for its resource files.
     pub async fn plan(
         &self,
         subject: SkillRoutingSubject,
