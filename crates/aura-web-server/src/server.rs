@@ -660,10 +660,6 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
         })
         .await;
 
-    // Teardown joins: the loops are children of the shutdown token, which
-    // the signal task cancelled above, so each `stop` joins promptly. A
-    // loop that died of a panic mid-run is loud here; `Cancelled` is the
-    // quiet norm. Joined on both serve outcomes, success or error.
     for handle in pollers {
         if let aura::hitl::PollerExit::Panicked = handle.stop().await {
             warn!("poll reconciler loop died of a panic mid-run");
