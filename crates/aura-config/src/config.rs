@@ -414,16 +414,10 @@ impl Config {
             && let DecisionRouteConfig::Webhook {
                 delivery: WebhookDelivery::Poll,
                 poll_interval_secs,
+                poll_request_timeout_secs,
                 ..
             } = &hitl.route
         {
-            if !hitl.park.enabled {
-                return Err(crate::ConfigError::Validation(
-                    "`hitl.route.delivery = \"poll\"` requires `hitl.park.enabled = true`: \
-                     poll approvals may be long-lived and requests are never held open"
-                        .to_string(),
-                ));
-            }
             if *poll_interval_secs == 0 {
                 return Err(crate::ConfigError::Validation(
                     "`hitl.route.poll_interval_secs` must be greater than zero: \
@@ -431,6 +425,29 @@ impl Config {
                         .to_string(),
                 ));
             }
+            if *poll_request_timeout_secs == 0 {
+                return Err(crate::ConfigError::Validation(
+                    "`hitl.route.poll_request_timeout_secs` must be greater than zero: \
+                     each poll attempt holds an HTTP request open for this long"
+                        .to_string(),
+                ));
+            }
+            return Err(crate::ConfigError::Validation(
+                "`hitl.route.delivery = \"poll\"` is not available: \
+                 poll delivery is disabled; use sync delivery (the default) \
+                 or a conversational route"
+                    .to_string(),
+            ));
+        }
+
+        if let Some(hitl) = &self.hitl
+            && hitl.park.enabled
+        {
+            return Err(crate::ConfigError::Validation(
+                "`hitl.park.enabled = true` is not available: \
+                 park mode is disabled; leave `hitl.park.enabled` off (the default)"
+                    .to_string(),
+            ));
         }
 
         if let (Some(hitl), Some(orch)) = (
@@ -2017,7 +2034,12 @@ impl DecisionRouteConfig {
     /// variant before calling this method.
     #[must_use]
     pub fn effective_webhook_timeout_secs(&self) -> u64 {
-        todo!()
+        match self {
+            Self::Webhook { timeout_secs, .. } => timeout_secs.unwrap_or(300),
+            Self::Conversational { .. } => panic!(
+                "effective_webhook_timeout_secs is defined only for webhook routes, got {self:?}"
+            ),
+        }
     }
 }
 

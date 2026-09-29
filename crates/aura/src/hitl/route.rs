@@ -1113,10 +1113,12 @@ pub struct PlaintextWebhookUrlError {
 }
 
 /// Boot-time guard: with an HMAC secret configured, a plaintext `http://`
-/// webhook URL must fail startup, not the first approval request — and the
-/// poll status endpoint (`poll_url`, when configured) is held to the same
-/// rule. Call this for every `[hitl]` config once the secret has been loaded;
-/// the request-time `Misconfigured` rejection inside [`WebhookClient`] acts
+/// webhook URL must fail startup, not the first approval request — and, for
+/// a poll-delivery route, the poll status endpoint (`poll_url`, when
+/// configured) is held to the same rule. A sync route never reads
+/// `poll_url`, so its value is not signed traffic. Call this for every
+/// `[hitl]` config once the secret has been loaded; the request-time
+/// `Misconfigured` rejection inside [`WebhookClient`] acts
 /// as defense in depth for paths that skip startup validation.
 pub fn validate_webhook_signing_config(
     config: &HitlConfig,
@@ -1134,6 +1136,7 @@ pub fn validate_webhook_signing_config(
         // A None poll_url resolves to `url`, already checked above.
         DecisionRouteConfig::Webhook {
             poll_url: Some(poll_url),
+            delivery: WebhookDelivery::Poll,
             ..
         } if poll_url.as_str().starts_with("http://") => Err(PlaintextWebhookUrlError {
             url: poll_url.as_str().to_string(),
