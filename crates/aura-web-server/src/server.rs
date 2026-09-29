@@ -652,23 +652,23 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
         }
     });
 
-    axum::serve(listener, app)
+    let serve_result = axum::serve(listener, app)
         .with_graceful_shutdown(async {
             shutdown_rx.await.ok();
         })
-        .await?;
+        .await;
 
     // Teardown joins: the loops are children of the shutdown token, which
     // the signal task cancelled above, so each `stop` joins promptly. A
     // loop that died of a panic mid-run is loud here; `Cancelled` is the
-    // quiet norm.
+    // quiet norm. Joined on both serve outcomes, success or error.
     for handle in pollers {
         if let aura::hitl::PollerExit::Panicked = handle.stop().await {
             warn!("poll reconciler loop died of a panic mid-run");
         }
     }
 
-    Ok(())
+    serve_result
 }
 
 /// The reconciler boot guard's conflict scan: the first duplicate
