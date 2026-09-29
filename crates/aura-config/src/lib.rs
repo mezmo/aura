@@ -1,3 +1,4 @@
+pub mod a2a;
 pub mod config;
 pub mod env;
 pub mod error;
@@ -17,6 +18,7 @@ mod config_test;
 #[cfg(test)]
 mod test_env_lock;
 
+pub use a2a::{A2aConfig, A2aRemoteConfig, ASK_AGENT_TOOL_NAME};
 pub use config::*;
 pub use env::resolve_env_vars;
 pub use error::ConfigError;
