@@ -228,6 +228,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn invalid_layer_fails_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let invalid = dir.path().join("invalid.toml");
+        std::fs::write(
+            &invalid,
+            "[agent\nname = \"Broken\"\nsystem_prompt = \"p\"\n",
+        )
+        .unwrap();
+        let valid = dir.path().join("valid.toml");
+        std::fs::write(
+            &valid,
+            "[agent]\nname = \"Valid\"\nsystem_prompt = \"p\"\n\n\
+             [agent.llm]\nprovider = \"openai\"\napi_key = \"k\"\nmodel = \"gpt-4o\"\n",
+        )
+        .unwrap();
+
+        ConfigLoader::new()
+            .with_toml_file(&invalid)
+            .with_toml_file(&valid)
+            .build()
+            .expect_err("an invalid layer must fail the build, not warn-and-skip");
+    }
+
+    #[test]
     fn test_config_loader_builder() {
         // Test that we can build a config loader with various layers
         let loader = ConfigLoader::new()

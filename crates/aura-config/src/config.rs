@@ -1436,6 +1436,18 @@ mode = "conversational"
         )
     }
 
+    /// A full config TOML with a conversational route and the literal
+    /// `park_table` block (empty for no `[hitl.park]` table).
+    fn conversational_config_toml(park_table: &str) -> String {
+        format!(
+            "[agent]\nname = \"Test\"\nsystem_prompt = \"test\"\n\n\
+             [agent.llm]\nprovider = \"openai\"\napi_key = \"test\"\nmodel = \"gpt-4o\"\n\n\
+             [hitl]\nrequire_approval = [\"kubectl_*\"]\n\n\
+             {park_table}\
+             [hitl.route]\nmode = \"conversational\"\n"
+        )
+    }
+
     fn poll_fields(route: &DecisionRouteConfig) -> (WebhookDelivery, Option<String>, u64, u64) {
         let DecisionRouteConfig::Webhook {
             delivery,
@@ -1493,28 +1505,87 @@ mode = "conversational"
         );
     }
 
+    fn webhook_timeout_secs(route: &DecisionRouteConfig) -> Option<u64> {
+        let DecisionRouteConfig::Webhook { timeout_secs, .. } = route else {
+            panic!("expected Webhook route, got {route:?}");
+        };
+        *timeout_secs
+    }
+
+    #[test]
+    fn webhook_timeout_omission_distinguishable_from_explicit_300() {
+        let omitted: HitlConfig = toml::from_str(&hitl_toml("")).unwrap();
+        let explicit: HitlConfig = toml::from_str(&hitl_toml("timeout_secs = 300")).unwrap();
+        assert_eq!(webhook_timeout_secs(&omitted.route), None);
+        assert_eq!(webhook_timeout_secs(&explicit.route), Some(300));
+    }
+
+    #[test]
+    fn webhook_timeout_round_trip_preserves_presence() {
+        let omitted: HitlConfig = toml::from_str(&hitl_toml("")).unwrap();
+        let serialized = toml::to_string(&omitted).unwrap();
+        assert!(
+            !serialized.contains("timeout_secs"),
+            "an omitted timeout must not be emitted: {serialized}"
+        );
+        let round_tripped: HitlConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(webhook_timeout_secs(&round_tripped.route), None);
+
+        let explicit: HitlConfig = toml::from_str(&hitl_toml("timeout_secs = 300")).unwrap();
+        let serialized = toml::to_string(&explicit).unwrap();
+        assert!(
+            serialized.contains("timeout_secs = 300"),
+            "an explicit timeout must survive serialization: {serialized}"
+        );
+        let round_tripped: HitlConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(webhook_timeout_secs(&round_tripped.route), Some(300));
+    }
+
+    #[test]
+    fn webhook_timeout_resolver_defaults_to_300_on_none() {
+        let hitl: HitlConfig = toml::from_str(&hitl_toml("")).unwrap();
+        assert_eq!(hitl.route.effective_webhook_timeout_secs(), 300);
+    }
+
+    #[test]
+    fn webhook_timeout_resolver_returns_explicit_value() {
+        let hitl: HitlConfig = toml::from_str(&hitl_toml("timeout_secs = 45")).unwrap();
+        assert_eq!(hitl.route.effective_webhook_timeout_secs(), 45);
+    }
+
+    #[test]
+    #[should_panic(expected = "effective_webhook_timeout_secs is defined only for webhook routes")]
+    fn webhook_timeout_resolver_panics_on_conversational() {
+        let route = DecisionRouteConfig::Conversational { timeout_secs: 60 };
+        let _ = route.effective_webhook_timeout_secs();
+    }
+
     #[test]
     fn validate_rejects_poll_delivery_without_park() {
         let err = crate::load_config_from_str(&poll_config_toml(false, "delivery = \"poll\""))
             .expect_err("poll delivery without park mode must be rejected");
         let msg = err.to_string();
         assert!(
-            msg.contains("hitl.route.delivery") && msg.contains("hitl.park.enabled"),
-            "error must name both keys: {msg}"
+            msg.contains("hitl.route.delivery"),
+            "error must name the refused key: {msg}"
         );
     }
 
-    /// Poll delivery + `headers_from_request` is valid: the resolved
-    /// values are captured at request-scoped route construction and
-    /// persisted on the parked approval record, so the background
-    /// reconciler does NOT need to reconstruct them after a restart.
+    /// Poll delivery is refused even with `headers_from_request`: the
+    /// mapping's persist-at-rest semantics do not make the delivery mode
+    /// itself admissible.
     #[test]
-    fn validate_accepts_poll_delivery_with_headers_from_request() {
-        crate::load_config_from_str(&poll_config_toml(
+    fn validate_refuses_poll_delivery_with_headers_from_request() {
+        let err = crate::load_config_from_str(&poll_config_toml(
             true,
             "delivery = \"poll\"\nheaders_from_request = { \"authorization\" = \"authorization\" }",
         ))
-        .expect("headers_from_request with poll delivery is valid: values persist at rest");
+        .expect_err("poll delivery is refused regardless of header mappings");
+        assert!(
+            err.to_string().contains("hitl.route.delivery"),
+            "error must name the refused key: {}",
+            err
+        );
     }
 
     #[test]
@@ -1531,16 +1602,133 @@ mode = "conversational"
         );
     }
 
-    /// `tool_headers_from_response` (approver identity) stays allowed with
-    /// poll delivery.
+    /// `tool_headers_from_response` (approver identity) does not make poll
+    /// delivery admissible either.
     #[test]
-    fn validate_accepts_poll_delivery_with_park() {
-        crate::load_config_from_str(&poll_config_toml(
+    fn validate_refuses_poll_delivery_with_park() {
+        let err = crate::load_config_from_str(&poll_config_toml(
             true,
             "delivery = \"poll\"\n\
              tool_headers_from_response = { \"X-Forwarded-User\" = \"X-Approver-Id\" }",
         ))
-        .expect("poll delivery with park mode and no request-derived headers is valid");
+        .expect_err("poll delivery with park mode is refused");
+        assert!(
+            err.to_string().contains("hitl.route.delivery"),
+            "error must name the refused key: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn validate_sync_default_passes() {
+        crate::load_config_from_str(&poll_config_toml(false, ""))
+            .expect("webhook with delivery omitted and park off must stay admissible");
+    }
+
+    #[test]
+    fn validate_sync_explicit_passes() {
+        crate::load_config_from_str(&poll_config_toml(false, "delivery = \"sync\""))
+            .expect("explicit sync delivery with park off must stay admissible");
+    }
+
+    #[test]
+    fn validate_conversational_park_off_passes() {
+        crate::load_config_from_str(&conversational_config_toml(
+            "[hitl.park]\nenabled = false\n\n",
+        ))
+        .expect("conversational route with park explicitly off must stay admissible");
+    }
+
+    #[test]
+    fn validate_sync_with_zero_poll_knobs_still_passes() {
+        crate::load_config_from_str(&poll_config_toml(
+            false,
+            "delivery = \"sync\"\npoll_interval_secs = 0\npoll_request_timeout_secs = 0",
+        ))
+        .expect("the poll knobs are inert under sync delivery and must stay admissible");
+    }
+
+    #[test]
+    fn validate_park_table_present_enabled_omitted_passes() {
+        crate::load_config_from_str(&conversational_config_toml("[hitl.park]\n\n"))
+            .expect("a present [hitl.park] table with enabled omitted is admissible");
+    }
+
+    #[test]
+    fn validate_park_table_absent_passes() {
+        crate::load_config_from_str(&conversational_config_toml(""))
+            .expect("an absent [hitl.park] table is admissible");
+    }
+
+    #[test]
+    fn validate_refuses_poll_delivery_even_with_park() {
+        let err = crate::load_config_from_str(&poll_config_toml(true, "delivery = \"poll\""))
+            .expect_err("poll delivery must be refused even with park enabled");
+        assert!(
+            err.to_string().contains("hitl.route.delivery"),
+            "error must name the refused key: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn validate_refuses_park_enabled_conversational() {
+        let err = crate::load_config_from_str(&conversational_config_toml(
+            "[hitl.park]\nenabled = true\n\n",
+        ))
+        .expect_err("park enabled on a conversational route must be refused");
+        assert!(
+            err.to_string().contains("hitl.park.enabled"),
+            "error must name the refused key: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn validate_refuses_park_enabled_sync_webhook() {
+        let err = crate::load_config_from_str(&poll_config_toml(true, ""))
+            .expect_err("park enabled on a sync webhook route must be refused");
+        assert!(
+            err.to_string().contains("hitl.park.enabled"),
+            "error must name the refused key: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn validate_poll_interval_zero_diagnostic_precedes_availability() {
+        let err = crate::load_config_from_str(&poll_config_toml(
+            false,
+            "delivery = \"poll\"\npoll_interval_secs = 0",
+        ))
+        .expect_err("a zero poll interval must be diagnosed, not the delivery refusal");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("hitl.route.poll_interval_secs"),
+            "error must name the interval key: {msg}"
+        );
+        assert!(
+            !msg.contains("hitl.route.delivery"),
+            "the interval diagnostic must precede the availability refusal: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_poll_request_timeout_zero_diagnostic_precedes_availability() {
+        let err = crate::load_config_from_str(&poll_config_toml(
+            false,
+            "delivery = \"poll\"\npoll_interval_secs = 5\npoll_request_timeout_secs = 0",
+        ))
+        .expect_err("a zero poll request timeout must be diagnosed, not the delivery refusal");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("hitl.route.poll_request_timeout_secs"),
+            "error must name the request-timeout key: {msg}"
+        );
+        assert!(
+            !msg.contains("hitl.route.delivery"),
+            "the request-timeout diagnostic must precede the availability refusal: {msg}"
+        );
     }
 
     #[test]
