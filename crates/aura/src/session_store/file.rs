@@ -110,8 +110,13 @@ struct Inner {
     /// already serializes them against registration, so their eviction is
     /// the only per-path-map work they need. A NotFound miss on those
     /// unlinks is another op's destroy, whose own eviction covered the
-    /// entry. A waiter cloned in-flight holds the count above one and the
-    /// entry stays for a later destroy.
+    /// entry. Every observation of a vanished path evicts the entry
+    /// refcount-guarded — a path that is gone was destroyed by someone,
+    /// and the changed-but-alive case is the only one that keeps its
+    /// entry for a later commit. One real destroy sees the entry gone:
+    /// its own eviction, or — when a waiter cloned in-flight holds the
+    /// count above one and the eviction is blocked — the trailing
+    /// waiter's own vanished-path observation retries it.
     path_locks: Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>,
 }
 
@@ -602,29 +607,44 @@ impl Inner {
     /// indivisible against same-instance registrations, which publish under
     /// the same per-path lock. A registration landing in the unlocked window
     /// between the two compares therefore survives: the locked re-compare
-    /// sees its bytes and abandons the unlink. A file replaced (or vanished)
-    /// before the commit is left for the next scan to re-decide; this is a
+    /// sees its bytes and abandons the unlink. A file replaced before the
+    /// commit is left for the next scan to re-decide; this is a
     /// same-instance guarantee only — separate store handles keep separate
     /// lock maps and make no cross-process claim. `Ok(true)` means the file
-    /// was unlinked here. Only a destroy — the remove or a benign
-    /// NotFound-vanish inside the commit — evicts the path's lock entry; a
-    /// changed-but-alive record keeps its entry for its next commit.
+    /// was unlinked here.
+    ///
+    /// Every observation of a vanished path is a destroy and evicts the
+    /// path's lock entry — at the lock-free first compare, at the locked
+    /// recheck, and on the remove itself: the path is gone, so someone
+    /// destroyed it, and that destroyer's own eviction may have been
+    /// refcount-blocked by an in-flight waiter clone. The trailing waiter
+    /// that finds the path vanished retries the eviction (at the first
+    /// compare immediately; otherwise after the critical section), with the
+    /// refcount guard still protecting in-flight waiters exactly as before.
+    /// Only a changed-but-alive record keeps its entry, for its next commit.
     fn unlink_if_unchanged(&self, path: &Path, expected: &[u8]) -> io::Result<bool> {
-        if !bytes_unchanged(path, expected)? {
-            return Ok(false);
+        match compare_bytes(path, expected)? {
+            ByteCompare::Unchanged => {}
+            ByteCompare::Changed => return Ok(false),
+            ByteCompare::Vanished => {
+                // Destroyed before this commit reached the per-path lock;
+                // nothing to unlink, but the destroy semantics stand.
+                self.evict_path_lock(path);
+                return Ok(false);
+            }
         }
         #[cfg(test)]
         unlink_interleave::fire(path);
-        let (unlinked, destroyed) = self.with_path_lock(path, || {
-            if !bytes_unchanged(path, expected)? {
-                return Ok((false, false));
-            }
-            match fs::remove_file(path) {
-                Ok(()) => Ok((true, true)),
-                Err(err) if err.kind() == io::ErrorKind::NotFound => Ok((false, true)),
-                Err(err) => Err(err),
-            }
-        })?;
+        let (unlinked, destroyed) =
+            self.with_path_lock(path, || match compare_bytes(path, expected)? {
+                ByteCompare::Unchanged => match fs::remove_file(path) {
+                    Ok(()) => Ok((true, true)),
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => Ok((false, true)),
+                    Err(err) => Err(err),
+                },
+                ByteCompare::Changed => Ok((false, false)),
+                ByteCompare::Vanished => Ok((false, true)),
+            })?;
         if destroyed {
             self.evict_path_lock(path);
         }
@@ -655,12 +675,29 @@ impl Inner {
     }
 }
 
-/// Whether `path` currently holds exactly `expected`; a vanished path
-/// reads as changed — a benign race with a resolve or remove.
-fn bytes_unchanged(path: &Path, expected: &[u8]) -> io::Result<bool> {
+/// What an identity compare found at `path` against the bytes a sweep
+/// decoded.
+enum ByteCompare {
+    /// The file holds exactly the expected bytes: the commit may unlink.
+    Unchanged,
+    /// The file is alive but holds different bytes — someone republished
+    /// the path. Not a destroy: the commit abandons the unlink and the
+    /// path's lock entry stays.
+    Changed,
+    /// The file is gone — destroyed by someone. Vanish carries destroy
+    /// semantics: the commit evicts the path's lock entry for it.
+    Vanished,
+}
+
+/// Compare `path`'s current bytes against `expected`, keeping a
+/// changed-but-alive file distinct from a vanished one — the two demand
+/// opposite lock-entry outcomes (keep vs evict), so NotFound must never
+/// collapse into "changed".
+fn compare_bytes(path: &Path, expected: &[u8]) -> io::Result<ByteCompare> {
     match fs::read(path) {
-        Ok(current) => Ok(current == expected),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+        Ok(current) if current == expected => Ok(ByteCompare::Unchanged),
+        Ok(_) => Ok(ByteCompare::Changed),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(ByteCompare::Vanished),
         Err(err) => Err(err),
     }
 }
@@ -1007,6 +1044,72 @@ mod unlink_recheck_tests {
                 .expect("file approval store path-lock map poisoned")
                 .is_empty(),
             "the destroyed path's lock entry is evicted"
+        );
+    }
+
+    /// The leak the vanished-path compares close: a destroyer whose
+    /// eviction is refcount-blocked by an in-flight waiter clone leaves
+    /// the path's lock entry behind, and the trailing waiter that next
+    /// observes the path — now vanished — retries the eviction. Forced
+    /// deterministically, single-threaded: the waiter is a clone held
+    /// straight off the map, the destroyer is the sweep through
+    /// `list_pending_sync`, and the trailing waiter is the same commit
+    /// seam re-run against the gone path, where the lock-free first
+    /// compare is what observes the vanish.
+    #[test]
+    fn a_trailing_waiter_on_a_vanished_path_retries_the_blocked_eviction() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileApprovalStore::open(dir.path()).unwrap();
+        let id = DecisionId::generate();
+
+        let mut expired = make_parked(id);
+        expired.expires_at = chrono::Utc::now() - chrono::Duration::seconds(1);
+        store.inner.register_sync(expired).unwrap();
+        let path = dir.path().join("approvals").join(format!("{id}.json"));
+        let snapshot = std::fs::read(&path).unwrap();
+
+        // The in-flight waiter: a clone of the path's lock entry held
+        // across the destroyer's commit, keeping the refcount above one.
+        let held = store
+            .inner
+            .path_locks
+            .lock()
+            .expect("file approval store path-lock map poisoned")
+            .get(&path)
+            .cloned()
+            .expect("fixture: the registration materialized the path's lock entry");
+
+        store.inner.list_pending_sync().unwrap();
+
+        assert!(!path.exists(), "fixture: the sweep destroyed the record");
+        assert!(
+            store
+                .inner
+                .path_locks
+                .lock()
+                .expect("file approval store path-lock map poisoned")
+                .contains_key(&path),
+            "fixture: the held clone refcount-blocked the destroy's eviction"
+        );
+
+        // The trailing waiter: it decoded the record before the destroy
+        // and now commits against a path that no longer exists. The
+        // vanished-path observation carries destroy semantics and evicts
+        // what the blocked destroy left behind.
+        drop(held);
+        let unlinked = store.inner.unlink_if_unchanged(&path, &snapshot).unwrap();
+        assert!(
+            !unlinked,
+            "the trailing waiter unlinked nothing — the file was already gone"
+        );
+        assert!(
+            store
+                .inner
+                .path_locks
+                .lock()
+                .expect("file approval store path-lock map poisoned")
+                .is_empty(),
+            "the trailing waiter's vanished-path observation evicted the blocked entry"
         );
     }
 
