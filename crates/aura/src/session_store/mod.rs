@@ -113,7 +113,9 @@ pub trait ApprovalStore: Send + Sync {
     /// empty pending set, which the reconciler would read as no awaiting
     /// decisions.
     async fn list_pending(&self) -> Result<Vec<ParkedApproval>, SessionStoreError> {
-        todo!()
+        Err(SessionStoreError::Unsupported {
+            operation: "list_pending",
+        })
     }
 }
 
