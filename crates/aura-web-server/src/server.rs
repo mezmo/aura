@@ -240,7 +240,9 @@ fn warn_timeout_relationships(agent_id: &str, config: &aura_config::Config, args
     }
     if let Some(hitl) = config.hitl.as_ref() {
         let route_timeout = match &hitl.route {
-            aura_config::DecisionRouteConfig::Webhook { timeout_secs, .. } => *timeout_secs,
+            aura_config::DecisionRouteConfig::Webhook { .. } => {
+                hitl.route.effective_webhook_timeout_secs()
+            }
             aura_config::DecisionRouteConfig::Conversational { timeout_secs, .. } => *timeout_secs,
         };
         if let Some(msg) = hitl_route_vs_server_window_warning(route_timeout, server_inactivity) {

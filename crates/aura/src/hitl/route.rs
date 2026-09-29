@@ -63,7 +63,6 @@ impl HitlRuntime {
     ) -> Self {
         let route = match &config.route {
             DecisionRouteConfig::Webhook {
-                timeout_secs,
                 headers_from_request,
                 ..
             } => {
@@ -81,7 +80,7 @@ impl HitlRuntime {
                 DecisionRoute::Webhook {
                     client,
                     registry: pending_approvals.clone(),
-                    timeout: Duration::from_secs(*timeout_secs),
+                    timeout: Duration::from_secs(config.route.effective_webhook_timeout_secs()),
                     egress_capture,
                 }
             }
@@ -1462,7 +1461,7 @@ mod tests {
                 park: aura_config::ParkConfig::default(),
                 route: aura_config::DecisionRouteConfig::Webhook {
                     url: aura_config::WebhookUrl::new("https://approvals.example.com/").unwrap(),
-                    timeout_secs: 60,
+                    timeout_secs: Some(60),
                     headers: std::collections::HashMap::new(),
                     headers_from_request: std::collections::HashMap::new(),
                     tool_headers_from_response: aura_config::ToolHeaderMappings::default(),
@@ -2155,7 +2154,7 @@ mod tests {
                 park: aura_config::ParkConfig::default(),
                 route: aura_config::DecisionRouteConfig::Webhook {
                     url: aura_config::WebhookUrl::new(url).unwrap(),
-                    timeout_secs: 300,
+                    timeout_secs: Some(300),
                     headers: HashMap::new(),
                     headers_from_request: HashMap::new(),
                     tool_headers_from_response: aura_config::ToolHeaderMappings::default(),
@@ -2216,7 +2215,7 @@ mod tests {
                 park: aura_config::ParkConfig::default(),
                 route: aura_config::DecisionRouteConfig::Webhook {
                     url: aura_config::WebhookUrl::new(url).unwrap(),
-                    timeout_secs: 300,
+                    timeout_secs: Some(300),
                     headers: HashMap::new(),
                     headers_from_request: HashMap::new(),
                     tool_headers_from_response,
@@ -2813,7 +2812,7 @@ mod tests {
                 park: aura_config::ParkConfig::default(),
                 route: aura_config::DecisionRouteConfig::Webhook {
                     url: aura_config::WebhookUrl::new(url).unwrap(),
-                    timeout_secs: 300,
+                    timeout_secs: Some(300),
                     headers: HashMap::new(),
                     headers_from_request: HashMap::new(),
                     tool_headers_from_response: aura_config::ToolHeaderMappings::default(),

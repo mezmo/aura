@@ -587,7 +587,7 @@ fn hitl_timeout_conflict_warning(hitl: &HitlConfig, per_call_timeout_secs: u64) 
         return None;
     }
     let route_timeout = match &hitl.route {
-        DecisionRouteConfig::Webhook { timeout_secs, .. } => *timeout_secs,
+        DecisionRouteConfig::Webhook { .. } => hitl.route.effective_webhook_timeout_secs(),
         DecisionRouteConfig::Conversational { timeout_secs, .. } => *timeout_secs,
     };
     if route_timeout >= per_call_timeout_secs {
@@ -1257,7 +1257,7 @@ mod tests {
             park: ParkConfig::default(),
             route: DecisionRouteConfig::Webhook {
                 url: WebhookUrl::new("http://localhost:9999").unwrap(),
-                timeout_secs: 300,
+                timeout_secs: Some(300),
                 headers: HashMap::new(),
                 headers_from_request: HashMap::new(),
                 tool_headers_from_response: ToolHeaderMappings::default(),
@@ -1294,7 +1294,7 @@ mod tests {
             park: ParkConfig::default(),
             route: DecisionRouteConfig::Webhook {
                 url: WebhookUrl::new("http://localhost:9999").unwrap(),
-                timeout_secs: 30,
+                timeout_secs: Some(30),
                 headers: HashMap::new(),
                 headers_from_request: HashMap::new(),
                 tool_headers_from_response: ToolHeaderMappings::default(),
@@ -1314,7 +1314,7 @@ mod tests {
             park: ParkConfig::default(),
             route: DecisionRouteConfig::Webhook {
                 url: WebhookUrl::new("http://localhost:9999").unwrap(),
-                timeout_secs: 60,
+                timeout_secs: Some(60),
                 headers: HashMap::new(),
                 headers_from_request: HashMap::new(),
                 tool_headers_from_response: ToolHeaderMappings::default(),
@@ -1336,7 +1336,7 @@ mod tests {
             park: ParkConfig::default(),
             route: DecisionRouteConfig::Webhook {
                 url: WebhookUrl::new("http://localhost:9999").unwrap(),
-                timeout_secs: 120,
+                timeout_secs: Some(120),
                 headers: HashMap::new(),
                 headers_from_request: HashMap::new(),
                 tool_headers_from_response: ToolHeaderMappings::default(),
@@ -1782,8 +1782,8 @@ pub enum DecisionRouteConfig {
     /// (default timeout 300s).
     Webhook {
         url: WebhookUrl,
-        #[serde(default = "default_webhook_timeout_secs")]
-        timeout_secs: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_secs: Option<u64>,
         /// Static webhook headers.
         #[serde(default)]
         headers: HashMap<String, String>,
@@ -1811,6 +1811,26 @@ pub enum DecisionRouteConfig {
         )]
         poll_request_timeout_secs: u64,
     },
+}
+
+impl DecisionRouteConfig {
+    /// Effective webhook decision timeout in seconds for this route.
+    ///
+    /// This is the single default-resolution site for the webhook timeout: a
+    /// webhook route whose `timeout_secs` key was omitted resolves to the
+    /// default of 300 seconds, and an explicit value is returned as written.
+    /// Serialization never applies the default, so an omitted key round-trips
+    /// as omitted.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the route is not the webhook variant. The webhook timeout
+    /// is defined only for webhook routes; callers must have matched that
+    /// variant before calling this method.
+    #[must_use]
+    pub fn effective_webhook_timeout_secs(&self) -> u64 {
+        todo!()
+    }
 }
 
 /// How the webhook route delivers an approval decision.
@@ -1920,10 +1940,6 @@ impl<'de> Deserialize<'de> for ToolHeaderMappings {
 
 fn default_conversational_timeout_secs() -> u64 {
     60
-}
-
-fn default_webhook_timeout_secs() -> u64 {
-    300
 }
 
 fn default_poll_interval_secs() -> u64 {

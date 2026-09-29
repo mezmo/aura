@@ -1554,7 +1554,7 @@ mod tests {
     fn non_streaming_webhook_hitl_is_allowed() {
         let config = make_hitl_config(aura_config::DecisionRouteConfig::Webhook {
             url: aura_config::WebhookUrl::new("http://127.0.0.1:8080/approve").unwrap(),
-            timeout_secs: 300,
+            timeout_secs: Some(300),
             headers: std::collections::HashMap::new(),
             headers_from_request: std::collections::HashMap::new(),
             tool_headers_from_response: aura_config::ToolHeaderMappings::default(),
