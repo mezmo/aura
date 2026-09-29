@@ -40,8 +40,8 @@ pub struct ParkedApprovalRecord {
     pub items: Vec<ApprovalItem>,
     pub registered_at: Timestamp,
     pub expires_at: Timestamp,
-    /// The channel the row was parked under. Transitional decode (L7, row
-    /// 27): interactive rows shipped before the authority stamp existed
+    /// The channel the row was parked under. Transitional decode:
+    /// interactive rows shipped before the authority stamp existed
     /// persist no `authority` field and decode as
     /// [`ApprovalAuthority::Conversational`] — the only channel those rows
     /// ever had. New rows always write the field (Serialize is unchanged),
@@ -55,7 +55,7 @@ pub struct ParkedApprovalRecord {
     pub egress_headers: Option<BTreeMap<String, String>>,
 }
 
-/// The transitional decode default for `authority` (L7, row 27): a stored
+/// The transitional decode default for `authority`: a stored
 /// row with no `authority` field predates the stamp and was parked by the
 /// conversational route, so absence reads as that route. The default lives
 /// here at the storage boundary — not as a `Default` on
@@ -423,7 +423,7 @@ mod tests {
         }
     }
 
-    /// L7 transitional decode (row 27): a current row serialized with its
+    /// Transitional decode: a current row serialized with its
     /// `authority` field removed — the shape a shipped interactive row
     /// persists — decodes as `Conversational`, never fails the scan that
     /// finds it. (The literal shipped-row shape is pinned by
@@ -450,7 +450,7 @@ mod tests {
         assert_eq!(restored.authority, ApprovalAuthority::Conversational);
     }
 
-    /// L7 (row 27): interactive records shipped before the authority stamp
+    /// Interactive records shipped before the authority stamp
     /// existed persist no `authority` field, and their channel is by
     /// definition the conversational one — the row must decode, never fail
     /// the scan that finds it.
@@ -598,9 +598,8 @@ mod tests {
     #[test]
     fn legacy_row_without_egress_headers_is_readable() {
         // A row from before egress capture existed carries the required
-        // authority (this PR made it required at write) but no
-        // `egress_headers` key at all: the additive field must still
-        // decode to `None`.
+        // authority but no `egress_headers` key at all: the additive field
+        // must still decode to `None`.
         let legacy_json = r#"{
             "version": 1,
             "instance_id": "test-instance",
