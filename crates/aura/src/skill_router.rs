@@ -201,12 +201,7 @@ impl SkillRouter {
                 Some(parent) if !parent.as_os_str().is_empty() => std::fs::create_dir_all(parent),
                 _ => Ok(()),
             };
-            match parent_ready.and_then(|()| {
-                std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(path)
-            }) {
+            match parent_ready.and_then(|()| open_decision_log(path)) {
                 Ok(file) => Some(Mutex::new(file)),
                 Err(e) => {
                     tracing::warn!(
@@ -457,7 +452,12 @@ impl SkillRouter {
     }
 
     fn record(&self, decision: &SkillRoutingDecision) {
-        let (prompt_preview, _) = crate::string_utils::safe_truncate(&decision.prompt, 120);
+        // The prompt is request content: it reaches the tracing event only
+        // under the same gate as every other prompt/completion attribute.
+        // The decision log keeps it regardless, since fitting thresholds
+        // from real traffic is the log's whole purpose.
+        let prompt_preview = crate::logging::should_record_content()
+            .then(|| crate::string_utils::safe_truncate(&decision.prompt, 120).0);
         tracing::info!(
             subject = ?decision.subject,
             mode = ?decision.mode,
@@ -482,6 +482,20 @@ impl SkillRouter {
             tracing::warn!("Skill router: failed to append decision log: {e}");
         }
     }
+}
+
+/// Open (creating if needed) the append-only decision log. Every record
+/// carries a full user prompt, so on Unix the file is created owner-only
+/// rather than inheriting the process umask.
+fn open_decision_log(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    options.open(path)
 }
 
 /// A rendered preloaded-skills preamble section.
@@ -708,6 +722,29 @@ mod tests {
             ),
             "an unreachable router keeps on-demand loading in every mode"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn decision_log_is_created_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::TempDir::new().unwrap();
+        let log = dir.path().join("decisions.jsonl");
+        let router = SkillRouter::new(SkillRouterConfig {
+            mode: SkillRouterMode::Shadow,
+            timeout_ms: 500,
+            decision_log: Some(log.clone()),
+            stage1: SkillRouterStage {
+                url: "http://127.0.0.1:1".to_string(),
+                model: "kev-latest".to_string(),
+                threshold: 0.5,
+                api_key: None,
+            },
+            stage2: None,
+        });
+        assert!(router.decision_log.is_some());
+        let mode = std::fs::metadata(&log).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "decision log must not be group/world readable");
     }
 
     #[test]
