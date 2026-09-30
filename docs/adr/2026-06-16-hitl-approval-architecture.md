@@ -2,6 +2,7 @@
 # Human-in-the-loop approval gating for agent tool calls
 
 - Status: **accepted**
+- Amended by: [2026-09-30 park and resume decrees](2026-09-30-271-park-resume-decrees.md) (the #271 wave's rulings; nothing here before that date changed)
 - Deciders: Mike Shearer
 - Date: 2026-06-16
 
