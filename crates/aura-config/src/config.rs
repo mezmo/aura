@@ -3,7 +3,7 @@ use crate::globpattern::GlobPattern;
 use crate::lenient_bool;
 use crate::lenient_int;
 use crate::orchestration::OrchestrationConfig;
-use crate::scratchpad::{ScratchpadConfig, ScratchpadToolEntry};
+use crate::scratchpad::{ScratchpadConfig, ScratchpadRules};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
@@ -729,7 +729,7 @@ pub enum McpServerConfig {
         description: Option<String>,
         /// Per-tool scratchpad interception thresholds (glob-matched on tool name).
         #[serde(default)]
-        scratchpad: HashMap<String, ScratchpadToolEntry>,
+        scratchpad: ScratchpadRules,
         /// Client identity for this server alone.
         #[serde(default)]
         user_agent: Option<McpUserAgent>,
@@ -745,7 +745,7 @@ pub enum McpServerConfig {
         headers_from_request: HashMap<String, String>,
         /// Per-tool scratchpad interception thresholds (glob-matched on tool name).
         #[serde(default)]
-        scratchpad: HashMap<String, ScratchpadToolEntry>,
+        scratchpad: ScratchpadRules,
         /// Client identity for this server alone.
         #[serde(default)]
         user_agent: Option<McpUserAgent>,
@@ -761,7 +761,7 @@ pub enum McpServerConfig {
         headers_from_request: HashMap<String, String>,
         /// Per-tool scratchpad interception thresholds (glob-matched on tool name).
         #[serde(default)]
-        scratchpad: HashMap<String, ScratchpadToolEntry>,
+        scratchpad: ScratchpadRules,
         /// Client identity for this server alone.
         #[serde(default)]
         user_agent: Option<McpUserAgent>,
@@ -770,7 +770,7 @@ pub enum McpServerConfig {
 
 impl McpServerConfig {
     /// Get the per-tool scratchpad thresholds for this server.
-    pub fn scratchpad(&self) -> &HashMap<String, ScratchpadToolEntry> {
+    pub fn scratchpad(&self) -> &ScratchpadRules {
         match self {
             McpServerConfig::Stdio { scratchpad, .. } => scratchpad,
             McpServerConfig::HttpStreamable { scratchpad, .. } => scratchpad,
@@ -787,7 +787,7 @@ impl McpServerConfig {
     }
 
     /// Get the per-tool scratchpad thresholds for this server, mutably.
-    pub fn scratchpad_mut(&mut self) -> &mut HashMap<String, ScratchpadToolEntry> {
+    pub fn scratchpad_mut(&mut self) -> &mut ScratchpadRules {
         match self {
             McpServerConfig::Stdio { scratchpad, .. } => scratchpad,
             McpServerConfig::HttpStreamable { scratchpad, .. } => scratchpad,
@@ -963,10 +963,8 @@ pub struct AgentConfig {
     #[serde(default)]
     pub enable_client_tools: bool,
     /// Glob patterns selecting which client-side tools this agent can call.
-    /// `None` or empty means all client tools are available when
-    /// `enable_client_tools = true`.
     #[serde(default)]
-    pub client_tool_filter: Option<Vec<String>>,
+    pub client_tool_filter: Option<Vec<GlobPattern>>,
     /// LLM configuration for this agent.
     ///
     /// Parsed from the `[agent.llm]` TOML table. Workers inherit this config
@@ -1085,10 +1083,8 @@ pub struct AgentSettings {
     #[serde(default)]
     pub enable_client_tools: bool,
     /// Glob patterns selecting which client-side tools this agent can call.
-    /// `None` or empty means all client tools are available when
-    /// `enable_client_tools = true`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub client_tool_filter: Option<Vec<String>>,
+    pub client_tool_filter: Option<Vec<GlobPattern>>,
     /// On-demand skill definitions loaded via the load_skill tool
     #[serde(default)]
     pub skills: Vec<SkillConfig>,
@@ -1120,88 +1116,82 @@ impl Default for AgentSettings {
     }
 }
 
-/// Simple glob pattern matching for tool name filtering.
-///
-/// Supports:
-/// - `*` matches any sequence of characters (including empty)
-/// - `?` matches exactly one character
-///
-/// Examples:
-/// - `mezmo_*` matches `mezmo_logs`, `mezmo_pipelines`
-/// - `*Query*` matches `ListQuery`, `QueryKnowledgeBases`
-/// - `tool_?` matches `tool_a`, `tool_b`
-pub fn glob_match(pattern: &str, text: &str) -> bool {
-    let pattern: Vec<char> = pattern.chars().collect();
-    let text: Vec<char> = text.chars().collect();
-
-    fn match_recursive(pattern: &[char], text: &[char]) -> bool {
-        match (pattern.first(), text.first()) {
-            // Both exhausted - match!
-            (None, None) => true,
-            // Pattern exhausted but text remains - no match
-            (None, Some(_)) => false,
-            // Wildcard * - try matching zero or more characters
-            (Some('*'), _) => {
-                // Try matching zero characters (skip *)
-                if match_recursive(&pattern[1..], text) {
-                    return true;
-                }
-                // Try matching one character and continue with *
-                if !text.is_empty() && match_recursive(pattern, &text[1..]) {
-                    return true;
-                }
-                false
-            }
-            // Text exhausted but pattern has non-* remaining - check for trailing *s
-            (Some(p), None) => *p == '*' && match_recursive(&pattern[1..], text),
-            // Single character wildcard ?
-            (Some('?'), Some(_)) => match_recursive(&pattern[1..], &text[1..]),
-            // Literal character match
-            (Some(p), Some(t)) => *p == *t && match_recursive(&pattern[1..], &text[1..]),
-        }
-    }
-
-    match_recursive(&pattern, &text)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_glob_match_exact() {
-        assert!(glob_match("hello", "hello"));
-        assert!(!glob_match("hello", "world"));
+    fn client_tool_filter_patterns_are_compiled_at_load() {
+        let toml = r#"
+            [agent]
+            name = "test"
+            system_prompt = "test"
+            client_tool_filter = ["Read", "Find*"]
+        "#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let patterns = config.agent.client_tool_filter.expect("filter present");
+        assert_eq!(patterns.len(), 2);
+        assert!(patterns[1].matches(None, "FindFiles"));
+        assert!(!patterns[1].matches(None, "Shell"));
     }
 
     #[test]
-    fn test_glob_match_star() {
-        assert!(glob_match("mezmo_*", "mezmo_logs"));
-        assert!(glob_match("mezmo_*", "mezmo_pipelines"));
-        assert!(glob_match("mezmo_*", "mezmo_")); // empty suffix
-        assert!(!glob_match("mezmo_*", "other_logs"));
+    fn client_tool_filter_rejects_a_pattern_the_grammar_does_not_accept() {
+        let toml = r#"
+            [agent]
+            name = "test"
+            system_prompt = "test"
+            client_tool_filter = ["Read me"]
+        "#;
+        let err = toml::from_str::<Config>(toml).expect_err("a space is not a name character");
+        assert!(
+            err.to_string().contains("invalid tool name pattern"),
+            "{err}"
+        );
     }
 
     #[test]
-    fn test_glob_match_star_middle() {
-        assert!(glob_match("*Query*", "QueryKnowledgeBases"));
-        assert!(glob_match("*Query*", "ListQuery"));
-        assert!(glob_match("*Query*", "Query"));
-        assert!(!glob_match("*Query*", "ListKnowledge"));
+    fn scratchpad_pattern_keys_are_compiled_at_load() {
+        let toml = r#"
+            [agent]
+            name = "test"
+            system_prompt = "test"
+
+            [mcp.servers.demo]
+            transport = "http_streamable"
+            url = "http://localhost:8080/mcp"
+
+            [mcp.servers.demo.scratchpad]
+            "query_*" = { min_tokens = 2048 }
+        "#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let server = &config.mcp.expect("mcp table").servers["demo"];
+        let entry = server
+            .scratchpad()
+            .get("query_*")
+            .expect("pattern key survives the round trip");
+        assert_eq!(entry.min_tokens, 2048);
     }
 
     #[test]
-    fn test_glob_match_question() {
-        assert!(glob_match("tool_?", "tool_a"));
-        assert!(glob_match("tool_?", "tool_1"));
-        assert!(!glob_match("tool_?", "tool_ab")); // too long
-        assert!(!glob_match("tool_?", "tool_")); // too short
-    }
+    fn scratchpad_rejects_a_pattern_key_the_grammar_does_not_accept() {
+        let toml = r#"
+            [agent]
+            name = "test"
+            system_prompt = "test"
 
-    #[test]
-    fn test_glob_match_star_only() {
-        assert!(glob_match("*", "anything"));
-        assert!(glob_match("*", ""));
+            [mcp.servers.demo]
+            transport = "http_streamable"
+            url = "http://localhost:8080/mcp"
+
+            [mcp.servers.demo.scratchpad]
+            "query tools" = { min_tokens = 2048 }
+        "#;
+        let err = toml::from_str::<Config>(toml).expect_err("a space is not a name character");
+        assert!(
+            err.to_string().contains("invalid tool name pattern"),
+            "{err}"
+        );
     }
 
     #[test]

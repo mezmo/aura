@@ -19,7 +19,7 @@ use std::sync::Arc;
 pub use aura_config::{
     AgentSettings, EmbeddingConfig, LlmConfig, McpConfig, McpServerConfig, McpUserAgent,
     OrchestrationConfig, ReasoningEffort, SkillConfig, SkillName, TodoToolsConfig, ToolsConfig,
-    VectorStoreConfig, VectorStoreType, default_mcp_user_agent, glob_match,
+    VectorStoreConfig, VectorStoreType, default_mcp_user_agent,
 };
 
 /// Type alias for tool context factory function.
@@ -106,9 +106,7 @@ pub struct AgentRuntimeConfig {
     /// When set, this replaces agent.system_prompt entirely.
     pub preamble_override: Option<String>,
 
-    /// Glob patterns for filtering which MCP tools to include.
-    /// When set, only tools matching at least one pattern are added
-    /// (`None` = all tools, empty = none). Glob syntax: `*`, `?`.
+    /// Glob patterns selecting which MCP tools to include.
     pub mcp_filter: Option<Vec<GlobPattern>>,
 
     /// Shared persistence for injecting `read_artifact` tool into workers.
@@ -264,11 +262,12 @@ impl AgentRuntimeConfig {
             .or_else(|| self.orchestration.as_ref().and_then(|o| o.memory_dir()))
     }
 
-    /// Check if a tool matches the mcp_filter patterns (glob syntax: `*`
-    /// any chars, `?` one char; a pattern containing `:` scopes the glob to
-    /// a namespace — see [`crate::mcp::AuraTool::is_match`]). No filter
-    /// (`None`) passes everything; an empty filter (`mcp_filter = []`) is
-    /// the explicit no-tools assignment and matches nothing.
+    /// Check if a tool matches the mcp_filter patterns. A pattern containing
+    /// `:` scopes the glob to a namespace — see
+    /// [`crate::mcp::AuraTool::is_match`] — and [`GlobPattern::new`] documents
+    /// the syntax. No filter (`None`) passes everything; an empty filter
+    /// (`mcp_filter = []`) is the explicit no-tools assignment and matches
+    /// nothing.
     ///
     /// Checks the extension field (`self.mcp_filter`, set by orchestrator)
     /// first, then falls back to `self.agent.mcp_filter`.
@@ -289,11 +288,15 @@ impl AgentRuntimeConfig {
     ///
     /// Reads `[agent].client_tool_filter` from the TOML config. Client-side
     /// tools are only supported in single-agent mode.
+    ///
+    /// Client tools are named by the CLI, not discovered from an MCP server,
+    /// so there is no namespace to scope against and a `<ns>:<name>` pattern
+    /// never matches here.
     pub fn client_tool_matches_filter(&self, tool_name: &str) -> bool {
         match self.agent.client_tool_filter.as_ref() {
             None => true,
             Some(patterns) if patterns.is_empty() => true,
-            Some(patterns) => patterns.iter().any(|p| glob_match(p, tool_name)),
+            Some(patterns) => patterns.iter().any(|p| p.matches(None, tool_name)),
         }
     }
 
@@ -383,7 +386,7 @@ mod tests {
     fn test_client_tool_matches_filter_patterns() {
         let config = AgentRuntimeConfig {
             agent: AgentSettings {
-                client_tool_filter: Some(vec!["Read".to_string(), "Find*".to_string()]),
+                client_tool_filter: Some(vec!["Read".into(), "Find*".into()]),
                 ..AgentSettings::default()
             },
             ..Default::default()

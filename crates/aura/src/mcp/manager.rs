@@ -1308,7 +1308,7 @@ mod tests {
             headers: HashMap::new(),
             description: None,
             headers_from_request: HashMap::new(),
-            scratchpad: HashMap::new(),
+            scratchpad: aura_config::ScratchpadRules::default(),
             user_agent: user_agent.map(|token| McpUserAgent::new(token).unwrap()),
         };
         let config = McpConfig {
@@ -1358,7 +1358,7 @@ mod tests {
                 headers: HashMap::new(),
                 description: None,
                 headers_from_request: HashMap::new(),
-                scratchpad: HashMap::new(),
+                scratchpad: aura_config::ScratchpadRules::default(),
                 user_agent: None,
             },
         );
@@ -1433,7 +1433,7 @@ mod tests {
                 headers: HashMap::new(),
                 description: None,
                 headers_from_request: HashMap::new(),
-                scratchpad: HashMap::new(),
+                scratchpad: aura_config::ScratchpadRules::default(),
                 user_agent: None,
             },
         );
@@ -1515,7 +1515,7 @@ mod tests {
                 headers: HashMap::new(),
                 description: None,
                 headers_from_request: HashMap::new(),
-                scratchpad: HashMap::new(),
+                scratchpad: aura_config::ScratchpadRules::default(),
                 user_agent: None,
             },
         );
