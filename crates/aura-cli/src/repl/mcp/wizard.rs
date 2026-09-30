@@ -10,8 +10,8 @@ use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
-use aura_config::ScratchpadToolEntry;
 use aura_config::config::McpServerConfig;
+use aura_config::{GlobPattern, ScratchpadRules, ScratchpadToolEntry};
 
 use super::catalog::{CATALOG, CatalogEntry, Template};
 use crate::backend::Backend;
@@ -412,7 +412,8 @@ fn verify_server(
 fn enable_scratchpad(config_path: &Path, server: &mut McpServerConfig) {
     let entry = ScratchpadToolEntry::default();
     let min_tokens = entry.min_tokens;
-    server.scratchpad_mut().insert("*".to_string(), entry);
+    let every_tool = GlobPattern::new("*").expect("`*` is a valid glob pattern");
+    server.scratchpad_mut().insert(every_tool, entry);
     if agent_scratchpad_enabled(config_path) {
         println!(
             "\nTool outputs over {min_tokens} tokens will be diverted to the \
@@ -779,7 +780,7 @@ fn collect_catalog(
                 args: args.iter().map(|s| s.to_string()).collect(),
                 env: HashMap::new(),
                 description: Some(entry.description.to_string()),
-                scratchpad: HashMap::new(),
+                scratchpad: ScratchpadRules::default(),
                 user_agent: None,
             },
             Vec::new(),
@@ -823,7 +824,7 @@ fn collect_custom(ctx: &mut CommandContext, config_path: &Path) -> Option<Collec
                 args,
                 env: HashMap::new(),
                 description: None,
-                scratchpad: HashMap::new(),
+                scratchpad: ScratchpadRules::default(),
                 user_agent: None,
             },
             Vec::new(),
@@ -888,7 +889,7 @@ fn collect_custom(ctx: &mut CommandContext, config_path: &Path) -> Option<Collec
                 headers,
                 description: None,
                 headers_from_request: HashMap::new(),
-                scratchpad: HashMap::new(),
+                scratchpad: ScratchpadRules::default(),
                 user_agent: None,
             }
         };
@@ -913,7 +914,7 @@ fn http_streamable(
         headers,
         description: (!description.is_empty()).then(|| description.to_string()),
         headers_from_request: HashMap::new(),
-        scratchpad: HashMap::new(),
+        scratchpad: ScratchpadRules::default(),
         user_agent: None,
     }
 }
@@ -1191,7 +1192,7 @@ mod tests {
                         args: args.iter().map(|s| s.to_string()).collect(),
                         env: HashMap::new(),
                         description: Some(entry.description.to_string()),
-                        scratchpad: HashMap::new(),
+                        scratchpad: ScratchpadRules::default(),
                         user_agent: None,
                     },
                     (),
@@ -1419,7 +1420,7 @@ mod tests {
         );
         server
             .scratchpad_mut()
-            .insert("*".to_string(), ScratchpadToolEntry::default());
+            .insert("*".into(), ScratchpadToolEntry::default());
         let rendered = aura_config::writer::upsert_mcp_server_in_str("", "srv", &server).unwrap();
         assert!(rendered.contains("min_tokens = 5120"), "{rendered}");
     }

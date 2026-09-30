@@ -231,7 +231,7 @@ model = "claude-3-sonnet-20240229"
             args: vec![],
             env: HashMap::new(),
             description: None,
-            scratchpad: HashMap::new(),
+            scratchpad: crate::ScratchpadRules::default(),
             user_agent: None,
         }
     }
@@ -242,7 +242,7 @@ model = "claude-3-sonnet-20240229"
             headers,
             description: Some("Example server".to_owned()),
             headers_from_request: HashMap::new(),
-            scratchpad: HashMap::new(),
+            scratchpad: crate::ScratchpadRules::default(),
             user_agent: None,
         }
     }
@@ -273,7 +273,7 @@ model = "claude-3-sonnet-20240229"
                     headers: HashMap::new(),
                     description: None,
                     headers_from_request: HashMap::new(),
-                    scratchpad: HashMap::new(),
+                    scratchpad: crate::ScratchpadRules::default(),
                     user_agent: None,
                 },
             ),
@@ -431,10 +431,10 @@ url = "https://old.example.com/mcp"
             args: vec![],
             env: HashMap::new(),
             description: None,
-            scratchpad: HashMap::from([(
-                "*".to_owned(),
-                crate::ScratchpadToolEntry { min_tokens: 5120 },
-            )]),
+            scratchpad: crate::ScratchpadRules::from_iter([crate::ScratchpadRule {
+                pattern: "*".into(),
+                entry: crate::ScratchpadToolEntry { min_tokens: 5120 },
+            }]),
             user_agent: None,
         };
         let updated = upsert_mcp_server_in_str(BASE_CONFIG, "srv", &server).unwrap();
@@ -457,7 +457,7 @@ url = "https://old.example.com/mcp"
                 "Authorization".to_owned(),
                 "authorization".to_owned(),
             )]),
-            scratchpad: HashMap::new(),
+            scratchpad: crate::ScratchpadRules::default(),
             user_agent: None,
         };
         let updated = upsert_mcp_server_in_str(BASE_CONFIG, "srv", &server).unwrap();

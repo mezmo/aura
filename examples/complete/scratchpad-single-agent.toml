@@ -45,10 +45,12 @@ url = "http://localhost:8081/mcp"
 description = "Kubernetes cluster operations: pods, deployments, services, logs, events"
 
 # Per-tool interception thresholds for this server, in tokens. Keys are glob
-# patterns (`*` and `?`) matched against tool names; the longest matching
-# pattern wins. A server with no entries here is never intercepted, so a
-# catch-all `"*"` entry is what turns scratchpad on for the whole server.
-# `min_tokens` defaults to 5120 when omitted (`"*" = {}`).
+# patterns matched against tool names — `*`, `?`, `[abc]` and `{a,b}` — and the
+# longest matching pattern wins. Patterns are compiled when the config loads,
+# so a malformed one fails startup rather than silently never matching. A
+# server with no entries here is never intercepted, so a catch-all `"*"` entry
+# is what turns scratchpad on for the whole server. `min_tokens` defaults to
+# 5120 when omitted (`"*" = {}`).
 [mcp.servers.kubernetes.scratchpad]
 "*" = { min_tokens = 5_120 }          # everything on this server
 "pods_log" = { min_tokens = 1_500 }   # logs are big and rarely needed in full

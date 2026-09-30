@@ -85,6 +85,9 @@ config = { version = "0.14", features = ["toml"] }  # Alternative for custom han
 dotenvy = "0.15"
 regex = "1.11"
 
+# Glob matching for tool-name patterns
+globset = "0.4"
+
 # HMAC root of trust for HITL webhook signing/verification
 hmac = "0.13"
 sha2 = "0.11"
