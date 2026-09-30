@@ -39,8 +39,9 @@ turn_depth = 15
 
 # Attach client tools offered on the request (default: false).
 enable_client_tools = true
-# Glob patterns (`*`, `?`) against client tool names. Omitted or empty
-# means every advertised tool is attached.
+# Glob patterns against client tool names — `*`, `?`, `[abc]`, `{a,b}`.
+# Compiled when the config loads, so a malformed pattern fails startup.
+# Omitted or empty means every advertised tool is attached.
 client_tool_filter = ["Read", "ListFiles", "SearchFiles", "FindFiles", "FileInfo"]
 
 [agent.llm]

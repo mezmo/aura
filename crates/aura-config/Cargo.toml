@@ -26,12 +26,12 @@ dotenvy = { workspace = true }
 regex = { workspace = true }
 
 # Glob matching for HITL tool-name patterns
-globset = "0.4"
+globset = { workspace = true }
 
 # Directory perms validation
 tempfile = "3"
 
-# [dev-dependencies]
+# Grammar for GlobPattern config validation
 peg = "0.8.6"
 
 [features]

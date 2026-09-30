@@ -118,6 +118,13 @@ pub struct GlobPattern {
 
 impl GlobPattern {
     /// Compile a glob pattern from its source text.
+    ///
+    /// The accepted constructs are `*` (any run of characters, including
+    /// none), `?` (exactly one), `[abc]` / `[!abc]` (one character from, or
+    /// not from, a set), and `{a,b}` (either alternative, not nestable).
+    /// Literal characters are limited to `a-z A-Z 0-9 _ - / .`, which excludes
+    /// every wildcard character and so leaves nothing to escape, and a literal
+    /// run may be at most [`MAX_LITERAL_RUN`] characters.
     pub fn new(source: impl Into<String>) -> Result<Self, GlobPatternError> {
         let source = source.into();
         check_literal_runs(&source)?;
@@ -142,6 +149,8 @@ impl GlobPattern {
     }
 
     /// Whether a tool's namespace and name match this pattern.
+    ///
+    /// Matching is case-sensitive and anchored at both ends.
     #[must_use]
     pub fn matches(&self, tool_ns: Option<&str>, tool_name: &str) -> bool {
         let ns_matches = match &self.ns_matcher {
@@ -377,6 +386,28 @@ mod tests {
 
         assert!(!GlobPattern::new("*:list_users")?.matches(None, "list_users"));
         assert!(!GlobPattern::new("github:list_users")?.matches(None, "list_users"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn glob_pattern_anchors_at_both_ends() -> Result<(), GlobPatternError> {
+        let prefix = GlobPattern::new("mezmo_*")?;
+        assert!(prefix.matches(None, "mezmo_logs"));
+        assert!(prefix.matches(None, "mezmo_"), "`*` matches the empty tail");
+        assert!(!prefix.matches(None, "other_logs"));
+
+        let surrounded = GlobPattern::new("*Query*")?;
+        assert!(surrounded.matches(None, "QueryKnowledgeBases"));
+        assert!(surrounded.matches(None, "ListQuery"));
+        assert!(surrounded.matches(None, "Query"), "both stars may be empty");
+        assert!(!surrounded.matches(None, "ListKnowledge"));
+
+        let single = GlobPattern::new("tool_?")?;
+        assert!(single.matches(None, "tool_a"));
+        assert!(single.matches(None, "tool_1"));
+        assert!(!single.matches(None, "tool_ab"), "`?` is exactly one char");
+        assert!(!single.matches(None, "tool_"), "`?` is not optional");
 
         Ok(())
     }
