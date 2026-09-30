@@ -41,11 +41,10 @@ pub struct ParkedApprovalRecord {
     pub registered_at: Timestamp,
     pub expires_at: Timestamp,
     /// The channel the row was parked under. Transitional decode:
-    /// interactive rows shipped before the authority stamp existed
-    /// persist no `authority` field and decode as
-    /// [`ApprovalAuthority::Conversational`] — the only channel those rows
-    /// ever had. New rows always write the field (Serialize is unchanged),
-    /// and an explicit but unknown value is still a decode failure.
+    /// rows stored before the authority stamp existed decode as
+    /// [`ApprovalAuthority::Conversational`]. New rows always write the
+    /// field (Serialize is unchanged), and an explicit but unknown
+    /// value is still a decode failure.
     #[serde(default = "default_authority")]
     pub authority: ApprovalAuthority,
     /// Resolved egress headers the parked row's notify POST authenticates
@@ -55,12 +54,10 @@ pub struct ParkedApprovalRecord {
     pub egress_headers: Option<BTreeMap<String, String>>,
 }
 
-/// The transitional decode default for `authority`: a stored
-/// row with no `authority` field predates the stamp and was parked by the
-/// conversational route, so absence reads as that route. The default lives
-/// here at the storage boundary — not as a `Default` on
-/// [`ApprovalAuthority`] — so no other use of the enum gains a silent
-/// fallback.
+/// The transitional decode default for `authority` (see the field).
+/// The default lives here at the storage boundary — not as a `Default`
+/// on [`ApprovalAuthority`] — so no other use of the enum gains a
+/// silent fallback.
 fn default_authority() -> ApprovalAuthority {
     ApprovalAuthority::Conversational
 }

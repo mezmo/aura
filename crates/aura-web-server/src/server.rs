@@ -662,9 +662,7 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
         .await;
 
     for handle in pollers {
-        if let aura::hitl::PollerExit::Panicked = handle.stop().await {
-            warn!("poll reconciler loop died of a panic mid-run");
-        }
+        let _ = handle.stop().await;
     }
 
     serve_result
