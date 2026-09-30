@@ -99,10 +99,9 @@ struct Inner {
     root: PathBuf,
     lock: Mutex<()>,
     /// One lock per approval path, keyed by this store's own constructed
-    /// paths — one map per instance, so the serialization claimed over it
-    /// is same-instance only. An entry lives only while a parked approval
-    /// exists at its path, so growth is bounded by the approvals in
-    /// flight. Mechanism: `with_path_lock`, `evict_path_lock`.
+    /// paths. An entry lives only while a parked approval exists at its
+    /// path, so growth is bounded by the approvals in flight.
+    /// Mechanism: `with_path_lock`, `evict_path_lock`.
     path_locks: Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>,
 }
 
@@ -304,9 +303,7 @@ impl Inner {
         // Remove both halves; missing halves are fine (idempotent). The
         // op lock already serializes these unlinks against registration,
         // so a remove here needs only the entry eviction — the decision
-        // half never materializes an entry, making its evict a no-op. A
-        // NotFound miss is another op's destroy; that destroyer's own
-        // eviction covered the map entry.
+        // half never materializes an entry, making its evict a no-op.
         for path in [self.approval_path(&id), self.decision_path(&id)] {
             match fs::remove_file(&path) {
                 Ok(()) => self.evict_path_lock(&path),
@@ -579,11 +576,9 @@ impl Inner {
     /// Unlink `path` only if it still holds exactly `expected`; `Ok(true)`
     /// means the file was unlinked here. The compare is redone under the
     /// per-path lock, so a same-instance registration landing between
-    /// compare and remove survives — a same-instance guarantee only;
-    /// separate store handles keep separate lock maps and make no
-    /// cross-process claim. A vanished path was destroyed by someone whose
-    /// own eviction may have been refcount-blocked, so every vanished-path
-    /// observation retries the eviction.
+    /// compare and remove survives. A vanished path was destroyed by
+    /// someone whose own eviction may have been refcount-blocked, so every
+    /// vanished-path observation retries the eviction.
     fn unlink_if_unchanged(&self, path: &Path, expected: &[u8]) -> io::Result<bool> {
         match compare_bytes(path, expected)? {
             ByteCompare::Unchanged => {}
@@ -854,6 +849,7 @@ mod unlink_recheck_tests {
                 },
                 items: vec![ApprovalItem {
                     tool_name: "kubectl_delete".to_string(),
+                    tool_namespace: None,
                     arguments: serde_json::json!({"pod": "web-1"}),
                     tool_call_intent: Some("restarting to pick up the config change".to_string()),
                 }],
