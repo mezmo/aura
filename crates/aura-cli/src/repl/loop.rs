@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use tokio::runtime::Runtime;
 
 use crate::api::mcp_status::McpNotice;
-use crate::api::stream::{StreamHandler, StreamOutcome, StreamResult};
+use crate::api::stream::{StreamHandler, StreamOutcome, StreamResult, StreamTermination};
 use crate::api::types::{DisplayEvent, ShellCallDetail, ToolCallInfo, snake_to_pascal_case};
 use crate::backend::Backend;
 use crate::config::AppConfig;
@@ -1203,9 +1203,41 @@ pub fn run_repl(
                     match result {
                         Ok(StreamOutcome {
                             received,
-                            termination: _,
+                            ref termination,
                         }) => match received {
                             StreamResult::TextResponse(text) => {
+                                // An ambiguous end (EOF without [DONE], a
+                                // malformed event body, or a transport error)
+                                // still carries whatever text was received:
+                                // it flows the normal response path below,
+                                // with one warning line so the partial is
+                                // never mistaken for a completed answer.
+                                if matches!(
+                                    termination,
+                                    StreamTermination::EofWithoutDone
+                                        | StreamTermination::Malformed { .. }
+                                        | StreamTermination::StreamError { .. }
+                                ) {
+                                    let detail = match termination {
+                                        StreamTermination::Malformed { detail } => {
+                                            format!(" ({detail})")
+                                        }
+                                        StreamTermination::StreamError { detail } => {
+                                            format!(" ({detail})")
+                                        }
+                                        _ => String::new(),
+                                    };
+                                    let _term = lock_term();
+                                    erase_input_frame();
+                                    println!(
+                                        "{} {}",
+                                        "⏸ Stream ended without completing"
+                                            .themed(AuraStyle::Warning),
+                                        detail.themed(AuraStyle::Muted),
+                                    );
+                                    crate::ui::prompt::increment_orch_scrollback();
+                                }
+
                                 // Check for auto-compaction trigger (context pressure).
                                 // Occupancy is bounded by the window, so it is
                                 // judged as a fill fraction; without a
@@ -1347,6 +1379,35 @@ pub fn run_repl(
                                 tool_calls,
                                 server_results,
                             } => {
+                                // Tool calls are only actionable when the
+                                // stream completed: an ambiguous end may have
+                                // truncated the delta accumulation, so
+                                // executing the half-received calls is unsafe.
+                                // Preserve any received text through the
+                                // normal history path and end the turn.
+                                if !matches!(termination, StreamTermination::Done) {
+                                    if !text.is_empty() {
+                                        conversation.add_assistant(&text);
+                                    }
+                                    if matches!(
+                                        termination,
+                                        StreamTermination::EofWithoutDone
+                                            | StreamTermination::Malformed { .. }
+                                            | StreamTermination::StreamError { .. }
+                                    ) {
+                                        let _term = lock_term();
+                                        erase_input_frame();
+                                        println!(
+                                            "{}",
+                                            "⏸ Stream ended without completing; no tool \
+                                             calls were executed"
+                                                .themed(AuraStyle::Warning)
+                                        );
+                                        crate::ui::prompt::increment_orch_scrollback();
+                                    }
+                                    break 'tool_loop;
+                                }
+
                                 // Stop any running animations before tool execution
                                 if let Ok(mut guard) = post_tool_wave.lock()
                                     && let Some((ptw_anim, _)) = guard.take()

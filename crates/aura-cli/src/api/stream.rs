@@ -409,8 +409,23 @@ where
                     // Consumers (REPL status notices, one-shot stderr) handle
                     // these via the orchestrator-event callback; on_raw_event
                     // above also captures them into the stream panel.
-                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&event.data) {
-                        handler.on_orchestrator_event(event_name, &val);
+                    //
+                    // A named event whose body is not JSON at all is a
+                    // malformed-protocol report: no consumer could ever read
+                    // it, and silently skipping it would disguise a broken
+                    // stream as a clean end. Typed-decode failures of known
+                    // event names stay skipped above — that is the
+                    // forward-compatibility tolerance for newer servers.
+                    match serde_json::from_str::<serde_json::Value>(&event.data) {
+                        Ok(val) => {
+                            handler.on_orchestrator_event(event_name, &val);
+                        }
+                        Err(e) => {
+                            termination = StreamTermination::Malformed {
+                                detail: format!("{event_name}: {e}"),
+                            };
+                            break;
+                        }
                     }
                 }
             }

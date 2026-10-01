@@ -25,7 +25,7 @@ use anyhow::Result;
 use tokio::runtime::Runtime;
 
 use crate::api::mcp_status::{McpNotice, notices_from_event};
-use crate::api::stream::{StreamHandler, StreamResult};
+use crate::api::stream::{StreamHandler, StreamResult, StreamTermination};
 use crate::api::types::ToolCallInfo;
 use crate::backend::Backend;
 use crate::config::AppConfig;
@@ -111,6 +111,9 @@ pub fn run_oneshot(
         None
     };
     let mut final_text = String::new();
+    // Set when a stream ended ambiguously (see the match below): the
+    // received text still prints, but the process exits non-zero.
+    let mut stream_ended_ambiguously = false;
 
     // One-shot has no ConversationStore — generate a single process-lifetime
     // UUID so all turns within this invocation share a chat session.
@@ -150,82 +153,99 @@ pub fn run_oneshot(
         });
 
         match stream_result {
-            Ok(outcome) => match outcome.received {
-                StreamResult::TextResponse(text) => {
-                    final_text = text;
-                    break Ok(());
-                }
-                StreamResult::ToolCalls {
-                    text,
-                    tool_calls,
-                    server_results,
-                } => {
-                    if approval_required.load(Ordering::Relaxed) {
+            Ok(outcome) => {
+                let termination = outcome.termination;
+                match outcome.received {
+                    StreamResult::TextResponse(text) => {
+                        final_text = text;
+                        // An ambiguous end (EOF without [DONE], a malformed
+                        // event body, or a transport error) still prints the
+                        // received text, but the exit code must say the
+                        // response never completed.
+                        if matches!(
+                            termination,
+                            StreamTermination::EofWithoutDone
+                                | StreamTermination::Malformed { .. }
+                                | StreamTermination::StreamError { .. }
+                        ) {
+                            stream_ended_ambiguously = true;
+                        }
                         break Ok(());
                     }
-                    let tool_call_infos: Vec<ToolCallInfo> = tool_calls
-                        .iter()
-                        .map(|tc| ToolCallInfo {
-                            id: tc.id.clone(),
-                            call_type: "function".to_string(),
-                            function: crate::api::types::FunctionCallInfo {
-                                name: tc.name.clone(),
-                                arguments: tc.arguments.clone(),
-                            },
-                        })
-                        .collect();
-
-                    let text_content = if text.is_empty() { None } else { Some(text) };
-                    conversation.add_assistant_with_tool_calls(text_content, tool_call_infos);
-
-                    for tc in &tool_calls {
-                        // Server-side tools (MCP, RAG, etc.) ran on the agent
-                        // side; their results arrive on `aura.tool_complete`
-                        // events and are buffered into `server_results`. We
-                        // simply forward them into the conversation so the
-                        // next turn sees the tool output.
-                        if !tools::is_local_tool(&tc.name) {
-                            let result = match server_results.get(&tc.id).cloned() {
-                                Some(r) => r,
-                                None => {
-                                    // Plain stderr line — no markers, no
-                                    // theming. Pipe consumers won't see this.
-                                    eprintln!(
-                                        "warning: no result for server tool '{}' \
-                                     (set AURA_CUSTOM_EVENTS=true on the server)",
-                                        tc.name
-                                    );
-                                    tools::missing_server_result_message(&tc.name)
-                                }
-                            };
-                            conversation.add_tool_result(&tc.id, &tc.name, &result);
-                            continue;
+                    StreamResult::ToolCalls {
+                        text,
+                        tool_calls,
+                        server_results,
+                    } => {
+                        if approval_required.load(Ordering::Relaxed) {
+                            break Ok(());
                         }
 
-                        // Local tool execution. Permission prompts and warnings
-                        // emit on stderr inside `PermissionChecker`, so stdout
-                        // remains untouched. The result text is fed back to
-                        // the model, never printed here.
-                        let perm = permissions.check(&tc.name, &tc.arguments);
-                        let tool_result = match perm {
-                            crate::permissions::PermissionResult::Allowed => {
-                                tools::execute_tool(&tc.name, &tc.arguments)
-                                    .unwrap_or_else(|e| format!("Error: {e}"))
+                        // Tool calls are only actionable when the stream
+                        // completed: an ambiguous or cancelled end may have
+                        // truncated the delta accumulation, and executing
+                        // half-received calls is unsafe.
+                        if !matches!(termination, StreamTermination::Done) {
+                            if matches!(
+                                termination,
+                                StreamTermination::EofWithoutDone
+                                    | StreamTermination::Malformed { .. }
+                                    | StreamTermination::StreamError { .. }
+                            ) {
+                                stream_ended_ambiguously = true;
                             }
-                            crate::permissions::PermissionResult::Denied(reason) => {
-                                let rules = permissions.describe_rules();
-                                tools::permission_denied_message(
-                                    &tc.name,
-                                    &reason,
-                                    rules.as_deref(),
-                                )
+                            break Ok(());
+                        }
+                        let tool_call_infos: Vec<ToolCallInfo> = tool_calls
+                            .iter()
+                            .map(|tc| ToolCallInfo {
+                                id: tc.id.clone(),
+                                call_type: "function".to_string(),
+                                function: crate::api::types::FunctionCallInfo {
+                                    name: tc.name.clone(),
+                                    arguments: tc.arguments.clone(),
+                                },
+                            })
+                            .collect();
+
+                        let text_content = if text.is_empty() { None } else { Some(text) };
+                        conversation.add_assistant_with_tool_calls(text_content, tool_call_infos);
+
+                        for tc in &tool_calls {
+                            // Server-side tools (MCP, RAG, etc.) ran on the agent
+                            // side; their results arrive on `aura.tool_complete`
+                            // events and are buffered into `server_results`. We
+                            // simply forward them into the conversation so the
+                            // next turn sees the tool output.
+                            if !tools::is_local_tool(&tc.name) {
+                                let result = match server_results.get(&tc.id).cloned() {
+                                    Some(r) => r,
+                                    None => {
+                                        // Plain stderr line — no markers, no
+                                        // theming. Pipe consumers won't see this.
+                                        eprintln!(
+                                            "warning: no result for server tool '{}' \
+                                     (set AURA_CUSTOM_EVENTS=true on the server)",
+                                            tc.name
+                                        );
+                                        tools::missing_server_result_message(&tc.name)
+                                    }
+                                };
+                                conversation.add_tool_result(&tc.id, &tc.name, &result);
+                                continue;
                             }
-                            crate::permissions::PermissionResult::Prompt => {
-                                if permissions.prompt_tool_permission(&tc.name, &tc.arguments) {
+
+                            // Local tool execution. Permission prompts and warnings
+                            // emit on stderr inside `PermissionChecker`, so stdout
+                            // remains untouched. The result text is fed back to
+                            // the model, never printed here.
+                            let perm = permissions.check(&tc.name, &tc.arguments);
+                            let tool_result = match perm {
+                                crate::permissions::PermissionResult::Allowed => {
                                     tools::execute_tool(&tc.name, &tc.arguments)
                                         .unwrap_or_else(|e| format!("Error: {e}"))
-                                } else {
-                                    let reason = "denied by user".to_string();
+                                }
+                                crate::permissions::PermissionResult::Denied(reason) => {
                                     let rules = permissions.describe_rules();
                                     tools::permission_denied_message(
                                         &tc.name,
@@ -233,15 +253,29 @@ pub fn run_oneshot(
                                         rules.as_deref(),
                                     )
                                 }
-                            }
-                        };
+                                crate::permissions::PermissionResult::Prompt => {
+                                    if permissions.prompt_tool_permission(&tc.name, &tc.arguments) {
+                                        tools::execute_tool(&tc.name, &tc.arguments)
+                                            .unwrap_or_else(|e| format!("Error: {e}"))
+                                    } else {
+                                        let reason = "denied by user".to_string();
+                                        let rules = permissions.describe_rules();
+                                        tools::permission_denied_message(
+                                            &tc.name,
+                                            &reason,
+                                            rules.as_deref(),
+                                        )
+                                    }
+                                }
+                            };
 
-                        conversation.add_tool_result(&tc.id, &tc.name, &tool_result);
+                            conversation.add_tool_result(&tc.id, &tc.name, &tool_result);
+                        }
+
+                        continue;
                     }
-
-                    continue;
                 }
-            },
+            }
             Err(e) => break Err(e),
         }
     };
@@ -265,6 +299,10 @@ pub fn run_oneshot(
                 if !final_text.ends_with('\n') {
                     println!();
                 }
+            }
+            if stream_ended_ambiguously {
+                eprintln!("error: the stream ended without a completed response");
+                std::process::exit(1);
             }
         }
         Err(e) => {
