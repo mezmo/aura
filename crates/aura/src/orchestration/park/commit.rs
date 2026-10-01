@@ -156,6 +156,7 @@ pub(crate) async fn commit_from_run_state(
         retention_expires_at,
         config_fingerprint(config),
         identity_hash.clone(),
+        &frozen_request_egress(config),
     )?;
     let parked_dir = parked_document_dir(memory_dir, state.session_id);
     publish(&document, &parked_dir, state.run_id, scope).await?;
@@ -163,6 +164,20 @@ pub(crate) async fn commit_from_run_state(
         retention_expires_at,
         refreshed,
     })
+}
+
+/// The original request's resolved `headers_from_request` egress values, as
+/// the park commit freezes them into the checkpoint: the route's resolved
+/// headers verbatim on the webhook arm, empty on the conversational arm (no
+/// egress exists there). A resumed run seeds its route from the frozen map,
+/// so new gated asks authenticate under the original request's identity.
+fn frozen_request_egress(config: &AgentRuntimeConfig) -> http::HeaderMap {
+    config
+        .hitl
+        .as_ref()
+        .and_then(|hitl| hitl.route.park_egress().ok())
+        .map(|headers| headers.into_owned())
+        .unwrap_or_default()
 }
 
 /// Publish a checkpoint by temp write and same-directory rename.
@@ -427,6 +442,7 @@ mod tests {
             executed: vec![],
             config_fingerprint: "f".to_string(),
             identity_hash: None,
+            request_egress: HashMap::new(),
         };
 
         let dest = publish(&document, &parked_dir, run_id, None).await.unwrap();
@@ -485,6 +501,7 @@ mod tests {
             executed: vec![],
             config_fingerprint: "f".to_string(),
             identity_hash: None,
+            request_egress: HashMap::new(),
         };
 
         let tmp = parked_dir.join(format!(".{run_id}.tmp"));
@@ -707,6 +724,7 @@ mod tests {
             RetentionExpiresAt::from_datetime(chrono::Utc::now() + chrono::Duration::hours(1)),
             config_fingerprint(&AgentRuntimeConfig::default()),
             None,
+            &http::HeaderMap::new(),
         )
         .unwrap();
         let (recorded, ids) = crate::orchestration::park::load_recorded_decisions(
@@ -925,6 +943,123 @@ mod tests {
              park_ttl (7200s), never now + decision_window (30 minutes): got \
              {stamp}, expected within [{lower}, {upper}]"
         );
+    }
+
+    /// The park commit freezes the original request's resolved
+    /// `headers_from_request` egress into the checkpoint, so a resumed run's
+    /// route can seed its new gated asks under the original request's
+    /// identity. The conversational route (no egress exists there) and a
+    /// config without HITL freeze an empty map.
+    #[tokio::test]
+    async fn park_commit_freezes_the_request_egress_into_the_document() {
+        use std::collections::HashMap;
+
+        fn config_with_resolved_egress(
+            req_headers: Option<&HashMap<String, String>>,
+        ) -> crate::config::AgentRuntimeConfig {
+            let hitl = aura_config::HitlConfig {
+                require_approval: vec![],
+                park: aura_config::ParkConfig::default(),
+                route: aura_config::DecisionRouteConfig::Webhook {
+                    url: aura_config::WebhookUrl::new("https://approvals.example.com/hook")
+                        .unwrap(),
+                    timeout_secs: None,
+                    headers: HashMap::new(),
+                    headers_from_request: HashMap::from([(
+                        "x-tenant-egress".to_string(),
+                        "x-tenant-egress".to_string(),
+                    )]),
+                    tool_headers_from_response: aura_config::ToolHeaderMappings::default(),
+                    delivery: aura_config::WebhookDelivery::Sync,
+                    poll_url: None,
+                    poll_interval_secs: 10,
+                    poll_request_timeout_secs: 30,
+                    receiver_wait_timeout_secs: 900,
+                },
+            };
+            crate::config::AgentRuntimeConfig {
+                hitl: Some(crate::hitl::HitlRuntime::from_config(
+                    &hitl,
+                    &PendingApprovals::new(),
+                    None,
+                    req_headers,
+                )),
+                ..crate::config::AgentRuntimeConfig::default()
+            }
+        }
+
+        let egress_value = "Bearer rig-egress-sentinel".to_string();
+        let config = config_with_resolved_egress(Some(&HashMap::from([(
+            "x-tenant-egress".to_string(),
+            egress_value.clone(),
+        )])));
+
+        let dir = tempfile::tempdir().unwrap();
+        let memory_dir = dir.path().join("memory").to_string_lossy().into_owned();
+        let (registry, _store) = conv_registry();
+        let run_id = "0191e8c0-aaaa-7000-8000-0000000000e1";
+
+        let mut plan = Plan::new("Deploy");
+        plan.add_task(Task::new(0, "Gated apply", "r"));
+        plan.tasks[0].state = TaskState::AwaitingApproval {
+            pending: vec![PendingCall {
+                decision_id: DecisionId::generate(),
+                tool_name: "kubectl_apply".to_string(),
+                arguments: serde_json::json!({ "namespace": "prod" }),
+                call_id: "c1".to_string(),
+            }],
+        };
+        let mut records = ParkedTaskRecords::new();
+        records.insert(
+            0,
+            crate::orchestration::park::ParkedTaskRecord {
+                attempt: 1,
+                snapshot: crate::orchestration::ParkSnapshot {
+                    history: vec![rig::completion::Message::user("apply it")],
+                    current_prompt: rig::completion::Message::user("tool results"),
+                },
+            },
+        );
+
+        let state = RunStateForPark {
+            run_id,
+            session_id: None,
+            query: "Deploy",
+            chat_history: &[],
+            coordinator_conversation: &[],
+            routing_decision: None,
+            iteration: 1,
+            planning_ms: 0,
+            failure_history: &[],
+        };
+        let inputs = ParkCommitInputs {
+            state,
+            plan: &plan,
+            records: &records,
+            registry: &registry,
+            memory_dir: &memory_dir,
+            config: &config,
+            park_ttl: aura_config::ParkTtl::try_new(7200).expect("park ttl validates"),
+            identity_hash: None,
+        };
+        commit_from_run_state(&inputs, None).await.unwrap();
+
+        let document =
+            load_parked_run(&parked_document_dir(&memory_dir, None).join(format!("{run_id}.json")))
+                .await
+                .unwrap();
+        assert_eq!(
+            document.request_egress.get("x-tenant-egress"),
+            Some(&egress_value),
+            "the checkpoint freezes the original request's resolved egress value"
+        );
+
+        // No HITL runtime: nothing to freeze, and the document still loads.
+        let bare_inputs = ParkCommitInputs {
+            config: &crate::config::AgentRuntimeConfig::default(),
+            ..inputs
+        };
+        commit_from_run_state(&bare_inputs, None).await.unwrap();
     }
 
     /// The sweep cancels exactly what the store still holds: the undecided

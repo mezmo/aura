@@ -10,6 +10,7 @@
 use std::io;
 use std::path::Path;
 
+use http::HeaderMap;
 use rig::completion::Message;
 use serde::{Deserialize, Serialize};
 
@@ -122,6 +123,13 @@ pub(crate) struct ParkedRun {
     /// Hex sha256 of the bound identity header's value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity_hash: Option<String>,
+    /// The original request's resolved `headers_from_request` egress values,
+    /// frozen at park time. A resumed run's route seeds itself from these,
+    /// so new gated asks (and re-parks) authenticate to the receiver under
+    /// the original request's identity. Empty for conversational routes and
+    /// checkpoints written before the field existed.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub request_egress: std::collections::HashMap<String, String>,
 }
 
 impl ParkedRun {
@@ -157,6 +165,7 @@ pub(crate) struct RunStateForPark<'a> {
 /// resume must not be written. `identity_hash` carries the hex sha256 of the
 /// bound identity header's value; `None` serializes nothing, so the v1 wire
 /// form is unchanged for runs parked without identity binding.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_document(
     state: &RunStateForPark<'_>,
     plan: &Plan,
@@ -165,6 +174,7 @@ pub(crate) fn build_document(
     retention_expires_at: RetentionExpiresAt,
     config_fingerprint: String,
     identity_hash: Option<String>,
+    request_egress: &HeaderMap,
 ) -> io::Result<ParkedRun> {
     let mut tasks = Vec::with_capacity(plan.tasks.len());
     for t in &plan.tasks {
@@ -227,6 +237,10 @@ pub(crate) fn build_document(
         executed: Vec::new(),
         config_fingerprint,
         identity_hash,
+        request_egress: request_egress
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_str().unwrap_or("").to_string()))
+            .collect(),
     })
 }
 
@@ -339,6 +353,7 @@ mod tests {
             retention("2026-09-02T15:00:00+00:00"),
             "fingerprint".to_string(),
             None,
+            &HeaderMap::new(),
         )
         .unwrap();
 
@@ -400,6 +415,7 @@ mod tests {
             retention("2026-09-02T15:00:00+00:00"),
             "fingerprint".to_string(),
             None,
+            &HeaderMap::new(),
         )
         .unwrap();
 
@@ -431,6 +447,7 @@ mod tests {
             retention("2026-09-02T15:00:00+00:00"),
             "fingerprint".to_string(),
             None,
+            &HeaderMap::new(),
         )
         .unwrap_err();
         assert!(err.to_string().contains("task 0"), "{err}");

@@ -110,6 +110,47 @@ impl HitlRuntime {
             park_ttl: config.park.park_ttl,
         }
     }
+
+    /// Seed the route with the checkpoint's frozen request egress: a resumed
+    /// run's NEW gated asks authenticate to the receiver under the original
+    /// request's identity (the frozen headers), never the resume POST's —
+    /// which carries none. No-op on the conversational route (no egress
+    /// exists there) and when the frozen map is empty.
+    #[must_use]
+    pub fn with_frozen_egress(&self, frozen: &HashMap<String, String>) -> Self {
+        if frozen.is_empty() {
+            return self.clone();
+        }
+        let mut headers = HeaderMap::new();
+        for (name, value) in frozen {
+            if let (Ok(name), Ok(value)) = (
+                HeaderName::try_from(name.as_str()),
+                HeaderValue::try_from(value.as_str()),
+            ) {
+                headers.insert(name, value);
+            }
+        }
+        let route = match self.route.as_ref() {
+            DecisionRoute::Webhook {
+                client,
+                registry,
+                timeout,
+                ..
+            } => Arc::new(DecisionRoute::Webhook {
+                client: client.with_resolved_headers(headers),
+                registry: registry.clone(),
+                timeout: *timeout,
+                egress_capture: Ok(()),
+            }),
+            DecisionRoute::Conversational { .. } => Arc::clone(&self.route),
+        };
+        Self {
+            patterns: Arc::clone(&self.patterns),
+            route,
+            park_enabled: self.park_enabled,
+            park_ttl: self.park_ttl,
+        }
+    }
 }
 
 /// Build the webhook route's client for a `[hitl.route]` config: the one
@@ -600,6 +641,7 @@ pub(crate) fn build_webhook_client() -> reqwest::Client {
 }
 
 /// HMAC signing state for the webhook route.
+#[derive(Clone)]
 enum EgressSigning {
     /// Unsigned egress.
     Disabled,
@@ -612,6 +654,7 @@ enum EgressSigning {
 /// Per-attempt settings for the poll-delivery legs ([`WebhookClient::notify`]
 /// and [`WebhookClient::poll_decision`]): where to poll and how long one
 /// attempt may take.
+#[derive(Clone)]
 struct PollSettings {
     /// Status endpoint to GET: the configured `poll_url`, or the route `url`
     /// when unconfigured.
@@ -779,6 +822,21 @@ impl WebhookClient {
     /// for poll delivery, also the at-rest egress values parked rows carry.
     pub(crate) fn resolved_headers(&self) -> &HeaderMap {
         &self.headers
+    }
+
+    /// Rebuild this client with `headers` as its resolved webhook headers —
+    /// the resume path's frozen-egress seed. Everything else (signing,
+    /// delivery, poll settings) rides forward unchanged.
+    pub(crate) fn with_resolved_headers(&self, headers: HeaderMap) -> Self {
+        Self {
+            client: self.client.clone(),
+            url: self.url.clone(),
+            headers,
+            signing: self.signing.clone(),
+            tool_header_mappings: self.tool_header_mappings.clone(),
+            delivery: self.delivery,
+            poll: self.poll.clone(),
+        }
     }
 
     /// Builds an unsigned client. Deliberately does NOT read the environment
@@ -2206,6 +2264,67 @@ mod tests {
                 delivery: aura_config::WebhookDelivery::Sync,
                 poll: None,
             }
+        }
+
+        /// A resume-shaped runtime: the webhook route resolved its egress
+        /// against a request that carried none (the bare resume POST), so
+        /// egress capture fails closed exactly as the resume build produces.
+        fn resume_shaped_runtime() -> super::super::HitlRuntime {
+            let headers_from_request = std::collections::HashMap::from([(
+                "x-tenant-egress".to_string(),
+                "x-tenant-egress".to_string(),
+            )]);
+            let route = super::DecisionRoute::Webhook {
+                client: loopback_client(
+                    "http://127.0.0.1:1/authorize",
+                    EgressSigning::Disabled,
+                    user_mapping(),
+                ),
+                registry: PendingApprovals::new(),
+                timeout: Duration::from_secs(300),
+                egress_capture: crate::webhook_utils::check_egress_capture(
+                    &HeaderMap::new(),
+                    &headers_from_request,
+                ),
+            };
+            super::super::HitlRuntime {
+                patterns: Vec::new().into(),
+                route: std::sync::Arc::new(route),
+                park_enabled: true,
+                park_ttl: aura_config::ParkTtl::try_new(7200).expect("park ttl validates"),
+            }
+        }
+
+        /// The frozen-egress seed: a resumed run's NEW gated asks
+        /// authenticate to the receiver under the ORIGINAL request's frozen
+        /// identity, never the resume POST's (which carries none). The
+        /// unseeded resume-shaped route fails egress capture; the seeded one
+        /// resolves the frozen values.
+        #[test]
+        fn frozen_egress_seeds_the_route_for_new_asks() {
+            let runtime = resume_shaped_runtime();
+            assert!(
+                runtime.route.park_egress().is_err(),
+                "fixture shape: the resume POST carries no egress, so the \
+                 unseeded route fails egress capture"
+            );
+
+            let frozen = std::collections::HashMap::from([(
+                "x-tenant-egress".to_string(),
+                "Bearer rig-egress-sentinel".to_string(),
+            )]);
+            let seeded = runtime.with_frozen_egress(&frozen);
+            let egress = seeded
+                .route
+                .park_egress()
+                .expect("the frozen seed satisfies egress capture");
+            assert_eq!(
+                egress
+                    .get("x-tenant-egress")
+                    .and_then(|value| value.to_str().ok()),
+                Some("Bearer rig-egress-sentinel"),
+                "the seeded route egresses under the original request's identity"
+            );
         }
 
         /// [`loopback_client`] with poll delivery: the ack/status legs run

@@ -432,6 +432,7 @@ mod tests {
             executed: vec![],
             config_fingerprint: "f".to_string(),
             identity_hash: None,
+            request_egress: std::collections::HashMap::new(),
         }
     }
 

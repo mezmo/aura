@@ -1033,6 +1033,7 @@ fn parked_document(
         executed,
         config_fingerprint: fingerprint,
         identity_hash,
+        request_egress: std::collections::HashMap::new(),
     }
 }
 

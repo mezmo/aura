@@ -864,8 +864,23 @@ impl Orchestrator {
             })?,
         ));
 
+        // The frozen-egress seed: the resume POST carries no request-scoped
+        // headers, so the config's route resolved its egress against nothing
+        // (capture fails closed). The checkpoint froze the ORIGINAL request's
+        // resolved values at park time; seed the route from them, so a new
+        // gated ask during the resumed segment — a re-plan's call, a
+        // re-park's registration — authenticates to the receiver under the
+        // original request's identity. Checkpoints written before the field
+        // existed (empty map) keep the fail-closed behavior.
+        let mut agent_config = config.clone();
+        if !checkpoint.request_egress.is_empty()
+            && let Some(ref hitl) = agent_config.hitl
+        {
+            agent_config.hitl = Some(hitl.with_frozen_egress(&checkpoint.request_egress));
+        }
+
         Ok(Self::assemble(
-            config.clone(),
+            agent_config,
             orchestration_config,
             mcp_manager,
             persistence,
