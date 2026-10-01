@@ -493,11 +493,28 @@ pub struct AuraServer {
     /// Accumulated stderr, drained continuously so the child's pipe never
     /// blocks; read back to explain a health-check timeout.
     stderr_log: Arc<Mutex<String>>,
+    /// Accumulated stdout — the tracing console layer's destination in this
+    /// server — drained for the same reason.
+    stdout_log: Arc<Mutex<String>>,
 }
 
 impl AuraServer {
     pub fn base_url(&self) -> String {
         format!("http://127.0.0.1:{}", self.port)
+    }
+
+    /// The server's accumulated stderr — the diagnosable trail (tracing
+    /// lines, park/resume faults) for assertions that fail mid-flow.
+    pub fn stderr(&self) -> String {
+        self.stderr_log.lock().expect("stderr log mutex").clone()
+    }
+
+    /// The server's accumulated stdout, where the tracing console layer
+    /// writes — combined with stderr for a full diagnostic dump.
+    pub fn logs(&self) -> String {
+        let mut combined = self.stdout_log.lock().expect("stdout log mutex").clone();
+        combined.push_str(&self.stderr());
+        combined
     }
 
     /// Spawn `aura-web-server` against `config_toml` (config file named
@@ -555,11 +572,29 @@ impl AuraServer {
             .env("PORT", port.to_string())
             .env("RUST_LOG", "warn")
             .envs(extra_env.iter().map(|(k, v)| (*k, v.clone())))
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
             .expect("spawn aura-web-server (did `cargo build -p aura-web-server` succeed?)");
+
+        let stdout_log = Arc::new(Mutex::new(String::new()));
+        let stdout = child.stdout.take().expect("stdout was piped");
+        let stdout_sink = Arc::clone(&stdout_log);
+        tokio::spawn(async move {
+            let mut reader = tokio::io::BufReader::new(stdout);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                use tokio::io::AsyncBufReadExt;
+                if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                    break;
+                }
+                let mut log = stdout_sink.lock().expect("stdout log mutex");
+                log.push_str(line.trim_end_matches('\n'));
+                log.push('\n');
+            }
+        });
 
         let stderr_log = Arc::new(Mutex::new(String::new()));
         let stderr = child.stderr.take().expect("stderr was piped");
@@ -584,6 +619,7 @@ impl AuraServer {
             child,
             config_path,
             stderr_log,
+            stdout_log,
         };
         if server.is_healthy_within(HEALTH_TIMEOUT).await {
             Ok(server)

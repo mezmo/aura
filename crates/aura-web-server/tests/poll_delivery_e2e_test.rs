@@ -195,29 +195,38 @@ fn build_receiver_response(captured: &str, decided: bool) -> String {
 // ---------------------------------------------------------------------------
 
 /// Spawn a rig server: the rig config plus the store/instance env the
-/// reconciler identity depends on.
+/// reconciler identity depends on. `debug_logs` raises the child's RUST_LOG
+/// above the harness default (warn) for the resume battery's diagnosis.
 async fn spawn_rig_server(
     receiver: &MockGovernanceReceiver,
     store_root: &std::path::Path,
     instance_id: &str,
 ) -> common::AuraServer {
+    spawn_rig_server_with_logs(receiver, store_root, instance_id, false).await
+}
+
+async fn spawn_rig_server_with_logs(
+    receiver: &MockGovernanceReceiver,
+    store_root: &std::path::Path,
+    instance_id: &str,
+    debug_logs: bool,
+) -> common::AuraServer {
     let config_toml = rig_config_toml(&mcp_url(), &store_root.join("memory"), receiver);
-    AuraServer::start(
-        &config_toml,
-        "aura-poll-e2e-",
-        &[
-            ("AURA_INSTANCE_ID", instance_id.to_string()),
-            ("AURA_SESSION_STORE", "file".to_string()),
-            (
-                "AURA_SESSION_STORE_PATH",
-                store_root
-                    .to_str()
-                    .expect("store root is UTF-8")
-                    .to_string(),
-            ),
-        ],
-    )
-    .await
+    let mut env: Vec<(&str, String)> = vec![
+        ("AURA_INSTANCE_ID", instance_id.to_string()),
+        ("AURA_SESSION_STORE", "file".to_string()),
+        (
+            "AURA_SESSION_STORE_PATH",
+            store_root
+                .to_str()
+                .expect("store root is UTF-8")
+                .to_string(),
+        ),
+    ];
+    if debug_logs {
+        env.push(("RUST_LOG", "debug".to_string()));
+    }
+    AuraServer::start(&config_toml, "aura-poll-e2e-", &env).await
 }
 
 /// A minimal orchestrated single-worker rig: `memory_dir` (the park commit
@@ -755,7 +764,7 @@ async fn resume_endpoint_streams_the_decided_run_over_sse() {
     let store_dir = tempfile::tempdir().expect("temp store dir");
     let store_root = store_dir.path().to_path_buf();
     let receiver = MockGovernanceReceiver::start().await;
-    let server = spawn_rig_server(&receiver, &store_root, "poll-e2e-resume").await;
+    let server = spawn_rig_server_with_logs(&receiver, &store_root, "poll-e2e-resume", false).await;
 
     let (decision_id, run_id, chat_session_id) = park(&receiver, &server, &store_root).await;
 
@@ -803,7 +812,9 @@ async fn resume_endpoint_streams_the_decided_run_over_sse() {
         body.contains(IDENTITY_VALUE),
         "the resumed answer carries the gated call's raw output with the \
          approver identity the poll-200 docked; a stream that dies before the \
-         answer (or answers the parked message instead) fails here. body:\n{body}"
+         answer (or answers the parked message instead) fails here. body:\n{body}\n\
+         server logs:\n{}",
+        server.logs()
     );
     assert!(
         !body.contains("awaiting human approval"),

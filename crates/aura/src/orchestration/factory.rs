@@ -1566,8 +1566,9 @@ mod tests {
         );
 
         // Arm B: a ZERO timeout projects `None` — the budget does not
-        // engage, so the coordinator replans normally (three decision
-        // turns; the fourth is never requested, max three fresh cycles).
+        // engage, so the coordinator replans under the checkpoint's CARRIED
+        // budget (a checkpoint at iteration 1 of 3 leaves cycles 2 and 3:
+        // both decision turns consumed, the third never requested).
         let arm_b_world = granted_world(|orchestration| {
             orchestration.timeouts.per_call_timeout_secs = 5;
         });
@@ -1615,9 +1616,10 @@ mod tests {
                 .lock()
                 .expect("coordinator request log")
                 .len(),
-            3,
-            "the projected None budget never disturbs the coordinator loop — all \
-             three decision turns consumed, the fourth never requested"
+            2,
+            "the projected None budget never disturbs the coordinator loop — the \
+             carried budget's two remaining decision turns consumed, the third \
+             never requested"
         );
         assert!(
             arm_b_text.contains("Replan budget exhausted"),

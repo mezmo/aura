@@ -669,7 +669,13 @@ pub async fn execute_completion(
             let cancel_tx = run.cancel_token();
             let usage_state = run.usage().clone();
             let agent_events = run.take_agent_events();
-            (agent, run.into_events(), cancel_tx, usage_state, agent_events)
+            (
+                agent,
+                run.into_events(),
+                cancel_tx,
+                usage_state,
+                agent_events,
+            )
         }
         CompletionInput::Resume { factory, grant } => {
             let (stream, cancel_tx, usage_state) = factory

@@ -2927,6 +2927,71 @@ async fn denied_call_steers_without_executing_and_rides_the_denial_pair() {
     );
 }
 
+/// B-pin (aura#271 S2/S3 repairs; Mike's 2026-10-01 ruling): the resumed
+/// coordinator loop carries the checkpoint's iteration budget. A run parked
+/// at iteration 2 of 3 resumes its end-of-iteration decision at
+/// ITERATION 3 — the one remaining cycle — instead of restarting the
+/// budget at 1. This test reverses the prior fresh-cycles design (the
+/// resumed loop once seeded `iteration: 0`).
+#[tokio::test]
+async fn resumed_loop_carries_the_checkpoint_iteration_budget() {
+    let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
+    let _drain = OverrideDrain;
+    let world = world();
+    let invocations = Arc::new(Mutex::new(Vec::new()));
+    let model = ScriptedCompletionModel::new(vec![ScriptedTurn::text(FINAL_TEXT)]);
+    install_worker_overrides(vec![WorkerOverride {
+        model,
+        extra_tools: vec![Box::new(
+            RecordingTool::new(invocations.clone()).with_name(TOOL),
+        )],
+    }]);
+    let coordinator_model = ScriptedCompletionModel::new(vec![coordinator_direct_turn()]);
+    let coordinator_requests = coordinator_model.requests();
+    install_coordinator_overrides(vec![CoordinatorOverride {
+        model: coordinator_model,
+    }]);
+    register_decided(&world).await;
+    let mut document = sentinel_document(&world);
+    document.iteration = 2;
+    publish_document(&world, &document).await;
+
+    let grant = evaluate_resume(evaluation(&world, false, None))
+        .await
+        .expect("the all-decided run grants");
+    let segment = run_segment_live(grant, &world.config, &HashMap::new())
+        .await
+        .expect("the segment completes");
+    assert!(
+        matches!(segment, ResumeStreamEnd::Completed { .. }),
+        "the segment completes: {segment:?}"
+    );
+
+    let recorded = coordinator_requests
+        .lock()
+        .expect("coordinator request log")
+        .clone();
+    assert!(
+        !recorded.is_empty(),
+        "the coordinator drove the end-of-iteration decision"
+    );
+    let prompts: Vec<String> = recorded
+        .iter()
+        .map(|request| {
+            serde_json::to_string(&request.chat_history).expect("the decision context serializes")
+        })
+        .collect();
+    assert!(
+        prompts.iter().any(|p| p.contains("ITERATION 3 of 3")),
+        "the resumed decision point numbers the carried cycle (iteration 2 of 3 \
+         parks → one remaining cycle), got: {prompts:?}"
+    );
+    assert!(
+        prompts.iter().all(|p| !p.contains("ITERATION 1 of")),
+        "the resumed loop must not restart the budget at 1, got: {prompts:?}"
+    );
+}
+
 // ====================================================================
 // Correction fold, A3: fault and parity rows (fix-contract steps 2-5)
 // ====================================================================
@@ -4368,9 +4433,10 @@ async fn resumed_coordinator_replans_when_a_resumed_worker_fails() {
     );
     assert!(
         prompt.contains(&format!(
-            "- Iteration 1: \"Gated apply\" (worker: operations) — [soft_failure] {FAILED_TEXT}"
+            "- Iteration 2: \"Gated apply\" (worker: operations) — [soft_failure] {FAILED_TEXT}"
         )),
-        "the failure history records the failure under the first fresh iteration: {prompt}"
+        "the failure history records the failure under the resumed loop's carried \
+         iteration (checkpoint 1 + 1): {prompt}"
     );
     // The loop-continuation leg: the coordinator actually continued past
     // the failure — a replacement build or a final answer, whichever it
@@ -6694,12 +6760,13 @@ async fn s5_resumed_worker_call_counters_start_fresh_from_the_configuration() {
 /// decision turn, its final answer carrying that stopping reason.
 ///
 /// Arm B: the same fixture under a timeout large enough to fund its
-/// slices (600s) replans normally — three exact decision turns consumed,
-/// the fourth never requested (the fresh cycle budget S4 frame 11 pins
-/// does that stopping; the outer chain does not). The only input
-/// difference between the arms is the factory timeout argument, so the
-/// budget the coordinator reads is the projected outer value, through the
-/// normal chain.
+/// slices (600s) replans normally under the checkpoint's CARRIED budget —
+/// a checkpoint at iteration 1 of 3 leaves cycles 2 and 3, so exactly two
+/// decision turns consume, the third never requested (the carried cycle
+/// budget the resumed-loop pin bounds does that stopping; the outer chain
+/// does not). The only input difference between the arms is the factory
+/// timeout argument, so the budget the coordinator reads is the projected
+/// outer value, through the normal chain.
 #[tokio::test]
 async fn s5_resumed_coordinator_receives_the_outer_server_timeout_through_the_normal_chain() {
     let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
@@ -6807,10 +6874,10 @@ async fn s5_resumed_coordinator_receives_the_outer_server_timeout_through_the_no
             .lock()
             .expect("coordinator request log")
             .len(),
-        3,
+        2,
         "the projector's None-unbounded shape — a budget that fits its slices \
-         — never disturbs the resumed coordinator loop: three decision turns \
-         consumed, the fourth never requested"
+         — never disturbs the resumed coordinator loop: the carried budget's \
+         two remaining decision turns consume, the third never requested"
     );
     assert!(
         arm_b_text.contains("Replan budget exhausted"),
@@ -7420,15 +7487,17 @@ async fn s4_conversion_tail_lease_clone_holds_until_the_supervisor_drain_ends() 
     );
 }
 
-/// Frame 11 (S4): the resumed coordinator increments a fresh local cycle
-/// counter before each iteration; three fresh cycles are permitted and
-/// the fourth fresh cycle stops. The fixture's checkpoint deliberately
-/// carries a high historical iteration — evidence-only numbering, so the
-/// counter the resumed loop bounds is the fresh one: the resumed run
-/// still consumes three full coordinator decision turns (then stops at
-/// the fourth) regardless of the checkpoint carrying iteration 8.
+/// Frame 11 (S4), re-pinned 2026-10-01 (Mike's budget-carry ruling, which
+/// reversed the fresh-cycles design this frame once pinned): the resumed
+/// coordinator loop carries the checkpoint's iteration budget. The
+/// fixture's checkpoint deliberately carries iteration 8 of 3 — a budget
+/// already exhausted — so the restored plan's ONE end-of-iteration
+/// decision is all the run gets: its create_plan terminalizes through
+/// the exhausted arm and the second scripted turn is never requested.
+/// The boundary's other side (a checkpoint at iteration 2 of 3 resumes
+/// its decision at ITERATION 3, never 1) is the resumed-loop pin above.
 #[tokio::test]
-async fn s4_coordinator_cycle_counter_allows_three_fresh_cycles() {
+async fn s4_exhausted_checkpoint_iteration_exhausts_the_resumed_budget() {
     let _serial = WORKER_OVERRIDE_SERIAL.lock().await;
     let _drain = OverrideDrain;
     let world = world();
@@ -7520,22 +7589,26 @@ async fn s4_coordinator_cycle_counter_allows_three_fresh_cycles() {
     )
     .await
     .expect("the resumed run completes and never dead-ends on history");
+    let final_text = match &end {
+        ResumeStreamEnd::Completed { final_answer } => final_answer.clone(),
+        other => panic!("the resumed run completes under the carried counter: {other:?}"),
+    };
     assert!(
-        matches!(end, ResumeStreamEnd::Completed { .. }),
-        "the resumed run completes under the fresh counter: {end:?}"
+        final_text.contains("Replan budget exhausted"),
+        "the exhausted budget's stopping reason rides the final answer: {final_text}"
     );
 
-    // Three fresh cycles permitted; the fourth (the fourth scripted
-    // coordinator turn) is never requested.
+    // The exhausted budget admits exactly ONE decision turn (the restored
+    // plan's); the second scripted turn is never requested.
     let recorded = coordinator_requests
         .lock()
         .expect("coordinator request log")
         .len();
     assert_eq!(
-        recorded, 3,
-        "the resumed coordinator runs three FRESH cycles and stops at the \
-         fourth request — the checkpoint carrying iteration 8 must neither \
-         shorten nor extend the fresh budget (found {recorded})"
+        recorded, 1,
+        "a checkpoint carrying iteration 8 of 3 has no remaining budget: the \
+         restored plan's single decision turn is all the run gets — no fresh \
+         restart (found {recorded})"
     );
 }
 

@@ -5157,13 +5157,14 @@ Assign tasks to the worker whose tools best match the required operations."#,
             }
         });
 
-        // The resumed coordinator counts FRESH cycles (three, per
-        // `max_planning_cycles`), so the checkpoint's historical iteration
-        // stays evidence-only and can neither shorten nor extend the resumed
-        // run's budget.
+        // The resumed coordinator carries the checkpoint's iteration budget
+        // (Mike's 2026-10-01 ruling, reversing the prior fresh-cycles
+        // design): a run parked at iteration 2 of 3 resumes with one
+        // remaining cycle. The checkpoint's historical failure entries stay
+        // evidence-only; the iteration counter is the budget.
         let seed = LoopSeed {
-            iteration: 0,
-            planning_ms: 0,
+            iteration: checkpoint.iteration,
+            planning_ms: checkpoint.planning_ms,
             failure_history: checkpoint.failure_history.clone(),
             known_failed_tasks,
         };

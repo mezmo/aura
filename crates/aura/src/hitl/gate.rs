@@ -514,7 +514,14 @@ impl ToolWrapper for HitlApprovalWrapper {
                 // A model-issued gated call after the continuation re-parks
                 // normally: fall through to the live ask (the armed poll-ask
                 // on an admitted parking route; the Hold ask otherwise).
-                None => {}
+                None => {
+                    tracing::debug!(
+                        tool_name = %ctx.tool_name,
+                        task_id = ?ctx.task_id,
+                        strict = recorded.is_strict(task_id),
+                        "recorded-decisions consult missed; falling through to the live ask",
+                    );
+                }
             }
         }
         if self.park.is_some() {
