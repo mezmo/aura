@@ -102,6 +102,12 @@ aura/
 - `webserver` is a clap subcommand whose trailing args go straight to `aura_web_server::server::{parse_args, serve}`, which then owns the process
 - `aura-web-server` is a deprecated shim that delegates to `server::serve`. To retire it: drop the `[[bin]]`, `tests/deprecation_shim.rs`, the dist artifacts in `.makefiles/rust.mk`, the nfpm entry in `scripts/build-packages.sh`, and the Dockerfile release copy
 
+### Slack Ingress (`aura webserver --enable-slack`)
+- The web server answers Slack @mentions and DMs over Socket Mode: no public URL, the server dials `wss.slack.com` with an app-level token. Deployment-scoped like A2A: `--enable-slack`/`AURA_ENABLE_SLACK`, `--slack-bot-token`/`AURA_SLACK_BOT_TOKEN` (`xoxb-`), `--slack-app-token`/`AURA_SLACK_APP_TOKEN` (`xapp-`, scope `connections:write`), `--slack-agent`/`AURA_SLACK_AGENT` (falls back to `--default-agent` or the only loaded config), `--slack-concurrency`
+- Lives in `crates/aura-web-server/src/slack/`: `api.rs` (the five Web API calls), `events.rs` (frames, accept rules, dedupe), `socket_mode.rs` (connect/ack/reconnect loop), `runner.rs` (dispatcher + per-message agent run, same in-process path as the A2A executor). Thread history is rebuilt from `conversations.replies` on every message; nothing is stored
+- Slack-driven runs count as active requests, so the two-phase shutdown drains or aborts them like HTTP streams. HITL is not supported on this path: the conversational route has no terminal to prompt in, so use an agent config without `[hitl]`
+- App manifest needs a bot user with `app_mentions:read`, `chat:write`, `channels:history`, `groups:history`, `im:history`, `reactions:write`, the `app_mention` and `message.im` bot events, and Socket Mode enabled
+
 ### CLI (`aura-cli`)
 - Interactive terminal client with REPL, one-shot mode, and conversation persistence
 - **One-shot output contract** (`--query`): stdout is the **raw assistant response only** — no `●` markers, no markdown rendering, no tool-execution summaries, no response-summary header, no `backend.summarize` round-trip. Errors, permission prompts, and warnings go to stderr (with `error:` / `warning:` prefixes, no markers). Exit code 0 ⇒ stdout is the full response; non-zero ⇒ stderr explains and stdout is empty. The REPL retains rich formatting; the strict-output rules apply only to `--query` mode. See `crates/aura-cli/src/oneshot.rs`.
