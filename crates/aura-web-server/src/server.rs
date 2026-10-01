@@ -163,6 +163,40 @@ pub struct ServerArgs {
     /// /.well-known/agent-card.json. Disabled by default.
     #[arg(long, env = "AURA_ENABLE_A2A", action = clap::ArgAction::SetTrue)]
     pub enable_a2a: bool,
+
+    /// Enable the Slack ingress: the server connects to Slack over Socket
+    /// Mode and answers @mentions and direct messages in a thread. Needs
+    /// --slack-bot-token and --slack-app-token. Disabled by default.
+    #[arg(long, env = "AURA_ENABLE_SLACK", action = clap::ArgAction::SetTrue)]
+    pub enable_slack: bool,
+
+    /// Slack bot user OAuth token (`xoxb-...`) the ingress reads threads
+    /// and posts replies with.
+    #[arg(long, env = "AURA_SLACK_BOT_TOKEN", hide_env_values = true, value_parser = parse_bot_token)]
+    pub slack_bot_token: Option<crate::slack::BotToken>,
+
+    /// Slack app-level token (`xapp-...`, scope `connections:write`) the
+    /// ingress opens its Socket Mode connection with.
+    #[arg(long, env = "AURA_SLACK_APP_TOKEN", hide_env_values = true, value_parser = parse_app_token)]
+    pub slack_app_token: Option<crate::slack::AppToken>,
+
+    /// Agent name or alias the Slack ingress runs. Falls back to
+    /// --default-agent, or to the only loaded configuration.
+    #[arg(long, env = "AURA_SLACK_AGENT")]
+    pub slack_agent: Option<String>,
+
+    /// Maximum Slack messages the ingress answers concurrently; further
+    /// messages wait for a slot.
+    #[arg(long, env = "AURA_SLACK_CONCURRENCY", default_value = "4")]
+    pub slack_concurrency: usize,
+}
+
+fn parse_bot_token(raw: &str) -> Result<crate::slack::BotToken, String> {
+    crate::slack::BotToken::new(raw.to_owned()).map_err(|e| e.to_string())
+}
+
+fn parse_app_token(raw: &str) -> Result<crate::slack::AppToken, String> {
+    crate::slack::AppToken::new(raw.to_owned()).map_err(|e| e.to_string())
 }
 
 /// Parse `argv` (leading program path ignored), titling `--help`/`--version`
