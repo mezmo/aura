@@ -133,6 +133,100 @@ pub async fn register_get_roundtrip(
 }
 
 /// The first resolve wins; a second resolve of the same id is `NotFound`.
+/// Ownership: resolve is authority-gated on every backend, in both
+/// directions — the ingress (conversational) cannot resolve a poller
+/// row, the poller cannot resolve an interactive row — and a refused
+/// row stays parked with no decision recorded, until its own channel
+/// resolves it.
+pub async fn resolve_rejects_the_other_channels_rows_both_directions(
+    instance_a: &Arc<dyn ApprovalStore>,
+    instance_b: &Arc<dyn ApprovalStore>,
+) {
+    // Direction one: the poller cannot consume an interactive row.
+    let interactive = make_parked("req-d3-interactive", Duration::from_secs(60));
+    let interactive_id = interactive.request.decision_id;
+    instance_a.register(interactive).await.unwrap();
+    match instance_b
+        .resolve(
+            &interactive_id,
+            ApprovalAuthority::WebhookPoll,
+            ApprovalDecision::Approved.into(),
+        )
+        .await
+    {
+        Err(ResolveError::NotFound) => {}
+        other => panic!("the poller's resolve of an interactive row is rejected: {other:?}"),
+    }
+    let still = instance_a
+        .get(&interactive_id)
+        .await
+        .unwrap()
+        .expect("the refused row stays parked");
+    assert_eq!(
+        still.authority,
+        ApprovalAuthority::Conversational,
+        "the row keeps its own channel"
+    );
+    assert!(
+        instance_a
+            .decision(&interactive_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "no decision is recorded by a refused resolve"
+    );
+    instance_b
+        .resolve(
+            &interactive_id,
+            ApprovalAuthority::Conversational,
+            ApprovalDecision::Approved.into(),
+        )
+        .await
+        .expect("the row's own channel resolves it");
+
+    // Direction two: the ingress cannot consume a poller row.
+    let mut polled = make_parked("req-d3-polled", Duration::from_secs(60));
+    polled.authority = ApprovalAuthority::WebhookPoll;
+    let polled_id = polled.request.decision_id;
+    instance_a.register(polled).await.unwrap();
+    match instance_b
+        .resolve(
+            &polled_id,
+            ApprovalAuthority::Conversational,
+            ApprovalDecision::Denied {
+                reason: Some("not now".to_string()),
+            }
+            .into(),
+        )
+        .await
+    {
+        Err(ResolveError::NotFound) => {}
+        other => panic!("the ingress resolve of a poller row is rejected: {other:?}"),
+    }
+    let still = instance_a
+        .get(&polled_id)
+        .await
+        .unwrap()
+        .expect("the refused row stays parked");
+    assert_eq!(
+        still.authority,
+        ApprovalAuthority::WebhookPoll,
+        "the row keeps its own channel"
+    );
+    assert!(
+        instance_a.decision(&polled_id).await.unwrap().is_none(),
+        "no decision is recorded by a refused resolve"
+    );
+    instance_b
+        .resolve(
+            &polled_id,
+            ApprovalAuthority::WebhookPoll,
+            ApprovalDecision::Approved.into(),
+        )
+        .await
+        .expect("the row's own channel resolves it");
+}
+
 pub async fn resolve_is_at_most_once(
     instance_a: &Arc<dyn ApprovalStore>,
     instance_b: &Arc<dyn ApprovalStore>,

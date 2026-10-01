@@ -361,6 +361,19 @@ async fn approval_resolve_is_at_most_once_across_instances() {
     common::resolve_is_at_most_once(&instance_a, &instance_b).await;
 }
 
+/// Ownership on the Redis backend: the resolve script's atomic
+/// arbitration checks the row's authority, so the ingress cannot
+/// consume a poller row and the poller cannot consume an interactive
+/// row — each reads exactly like an absent row until its own channel
+/// resolves it.
+#[tokio::test]
+async fn approval_resolve_rejects_the_other_channels_rows() {
+    let config = test_config(60);
+    let instance_a = connect(&config).await.approvals();
+    let instance_b = connect(&config).await.approvals();
+    common::resolve_rejects_the_other_channels_rows_both_directions(&instance_a, &instance_b).await;
+}
+
 /// Redis-specific: the consumed ticket is gone from the store. The file
 /// backend instead moves the ticket into the decision file and retains it
 /// until `remove` (§2.5).

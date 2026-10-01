@@ -72,6 +72,15 @@ async fn file_battery_resolve_is_at_most_once() {
     common::resolve_is_at_most_once(&instance_a, &instance_b).await;
 }
 
+/// Ownership on the file backend: resolve is authority-gated in both
+/// directions, and a refused row stays parked for its own channel.
+#[tokio::test]
+async fn file_battery_resolve_rejects_the_other_channels_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let (instance_a, instance_b) = file_pair(&dir);
+    common::resolve_rejects_the_other_channels_rows_both_directions(&instance_a, &instance_b).await;
+}
+
 #[tokio::test]
 async fn file_battery_concurrent_resolves_have_exactly_one_winner() {
     let dir = tempfile::tempdir().unwrap();
@@ -150,6 +159,14 @@ async fn memory_battery_register_get_roundtrip() {
 async fn memory_battery_resolve_is_at_most_once() {
     let (instance_a, instance_b) = memory_pair();
     common::resolve_is_at_most_once(&instance_a, &instance_b).await;
+}
+
+/// Ownership on the memory backend: resolve is authority-gated in both
+/// directions, and a refused row stays parked for its own channel.
+#[tokio::test]
+async fn memory_battery_resolve_rejects_the_other_channels_rows() {
+    let (instance_a, instance_b) = memory_pair();
+    common::resolve_rejects_the_other_channels_rows_both_directions(&instance_a, &instance_b).await;
 }
 
 #[tokio::test]
