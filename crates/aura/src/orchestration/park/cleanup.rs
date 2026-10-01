@@ -8,8 +8,12 @@
 #![allow(dead_code)] // the E6/E8 fills construct and drive this surface;
 // the marker comes off when the sweep activates
 
+use std::collections::HashSet;
+use std::io;
 use std::path::Path;
 
+use super::commit::cancel_run_approvals;
+use super::document::{PARKED_DOCUMENT_SUFFIX, ParkedRun, RESUMING_DOCUMENT_SUFFIX};
 use super::lifetime::ReservationTable;
 use super::resume::claim::{ResumeDocuments, ValidatedResumePath};
 use super::resume::evaluate::Diagnostic;
@@ -105,16 +109,49 @@ pub(crate) enum RunCleanupOutcome {
 /// pre-deletion check the sweep runs under an acquired run reservation,
 /// after re-reading the clock. The blocking reread tail holds the
 /// carrier's lease reference through the work.
-#[expect(
-    unused_variables,
-    reason = "todo!() body; filled by P45 wave fill units"
-)]
 pub(crate) async fn inspect_checkpoint_presence(
     cleanup: &CleanupReservation,
 ) -> CheckpointPresence {
-    todo!(
-        "P45 wave fill unit E6: re-read both checkpoint names under the reservation and classify present vs confirmed absent vs inaccessible vs corrupt"
-    )
+    let docs = cleanup.documents().clone();
+    let lease = cleanup.reservation().clone();
+    tokio::task::spawn_blocking(move || {
+        let _lease = lease;
+        let parked = inspect_one_checkpoint(docs.parked());
+        let resuming = inspect_one_checkpoint(docs.resuming());
+        if matches!(parked, Ok(Some(_))) || matches!(resuming, Ok(Some(_))) {
+            return CheckpointPresence::Present;
+        }
+        if let Err(fault) = parked {
+            return fault;
+        }
+        if let Err(fault) = resuming {
+            return fault;
+        }
+        CheckpointPresence::ConfirmedAbsent
+    })
+    .await
+    .unwrap_or_else(|e| {
+        CheckpointPresence::Inaccessible(Diagnostic::new(format!(
+            "checkpoint presence task did not complete: {e}"
+        )))
+    })
+}
+
+fn inspect_one_checkpoint(path: &Path) -> Result<Option<ParkedRun>, CheckpointPresence> {
+    match std::fs::read(path) {
+        Ok(bytes) => match serde_json::from_slice::<ParkedRun>(&bytes) {
+            Ok(document) => Ok(Some(document)),
+            Err(e) => Err(CheckpointPresence::Corrupt(Diagnostic::new(format!(
+                "checkpoint {} does not decode as a ParkedRun: {e}",
+                path.display()
+            )))),
+        },
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(CheckpointPresence::Inaccessible(Diagnostic::new(format!(
+            "checkpoint {} could not be read: {e}",
+            path.display()
+        )))),
+    }
 }
 
 /// Delete one expired run's evidence under the carrier's reservation,
@@ -123,17 +160,45 @@ pub(crate) async fn inspect_checkpoint_presence(
 /// midway leaves the expired checkpoint to answer `409 expired` and the
 /// next sweep can retry. The blocking deletion tail retains the carrier's
 /// lease reference through the work.
-#[expect(
-    unused_variables,
-    reason = "todo!() body; filled by P45 wave fill units"
-)]
 pub(crate) async fn delete_expired_run(
     cleanup: &CleanupReservation,
     registry: &PendingApprovals,
 ) -> RunCleanupOutcome {
-    todo!(
-        "P45 wave fill unit E6: evidence-first, checkpoint-last deletion with retry-on-failure retention, fenced by the cleanup reservation"
-    )
+    let run_id = cleanup.reservation().run_id().to_string();
+    let approval_handle = cancel_run_approvals(registry, &run_id, &run_id, None, None);
+    if let Err(e) = approval_handle.await {
+        return RunCleanupOutcome::RetainedForRetry(Diagnostic::new(format!(
+            "approval cancellation for run {run_id} did not complete: {e}"
+        )));
+    }
+
+    let docs = cleanup.documents().clone();
+    let lease = cleanup.reservation().clone();
+    let deletion = tokio::task::spawn_blocking(move || -> io::Result<()> {
+        let _lease = lease;
+        delete_checkpoint_if_present(docs.parked())?;
+        delete_checkpoint_if_present(docs.resuming())?;
+        Ok(())
+    })
+    .await;
+
+    match deletion {
+        Ok(Ok(())) => RunCleanupOutcome::Removed,
+        Ok(Err(e)) => RunCleanupOutcome::RetainedForRetry(Diagnostic::new(format!(
+            "checkpoint deletion for run {run_id} failed: {e}"
+        ))),
+        Err(e) => RunCleanupOutcome::RetainedForRetry(Diagnostic::new(format!(
+            "checkpoint deletion task for run {run_id} did not complete: {e}"
+        ))),
+    }
+}
+
+fn delete_checkpoint_if_present(path: &Path) -> io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 /// Scan one owned checkpoint root for retained run documents: the sweep's
@@ -141,14 +206,36 @@ pub(crate) async fn delete_expired_run(
 /// under a lock. Each entry names a candidate run whose approval rows the
 /// store's retained scan supplies; grouping and classification belong to
 /// the sweep.
-#[expect(
-    unused_variables,
-    reason = "todo!() body; filled by P45 wave fill units"
-)]
 pub(crate) async fn scan_checkpoint_root(root: &Path) -> Result<Vec<String>, Diagnostic> {
-    todo!(
-        "P45 wave fill unit E6: enumerate one owned checkpoint root's run documents; a missing or unreadable root is a diagnostic, never confirmed absence"
-    )
+    let root = root.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let entries = std::fs::read_dir(&root).map_err(|e| {
+            Diagnostic::new(format!(
+                "checkpoint root {} could not be read: {e}",
+                root.display()
+            ))
+        })?;
+        let mut ids = HashSet::new();
+        for entry in entries {
+            let entry = entry.map_err(|e| {
+                Diagnostic::new(format!(
+                    "checkpoint root {} entry could not be read: {e}",
+                    root.display()
+                ))
+            })?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if let Some(run_id) = name
+                .strip_suffix(RESUMING_DOCUMENT_SUFFIX)
+                .or_else(|| name.strip_suffix(PARKED_DOCUMENT_SUFFIX))
+            {
+                ids.insert(run_id.to_string());
+            }
+        }
+        Ok(ids.into_iter().collect())
+    })
+    .await
+    .map_err(|e| Diagnostic::new(format!("checkpoint scan task did not complete: {e}")))?
 }
 
 #[cfg(test)]
