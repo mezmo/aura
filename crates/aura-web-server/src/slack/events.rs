@@ -3,12 +3,32 @@
 use serde::Deserialize;
 use std::collections::{HashSet, VecDeque};
 
+/// Why Slack is closing a Socket Mode connection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DisconnectReason {
+    RefreshRequested,
+    Warning,
+    LinkDisabled,
+    Other(String),
+}
+
+impl From<String> for DisconnectReason {
+    fn from(raw: String) -> Self {
+        match raw.as_str() {
+            "refresh_requested" => Self::RefreshRequested,
+            "warning" => Self::Warning,
+            "link_disabled" => Self::LinkDisabled,
+            _ => Self::Other(raw),
+        }
+    }
+}
+
 /// One frame off the Socket Mode WebSocket.
 #[derive(Debug)]
 pub enum Frame {
     Hello,
     Disconnect {
-        reason: String,
+        reason: DisconnectReason,
     },
     /// Anything Slack expects an acknowledgement for.
     Envelope {
@@ -40,7 +60,7 @@ pub fn parse_frame(text: &str) -> Result<Frame, serde_json::Error> {
     let frame = match (raw.kind.as_str(), raw.envelope_id) {
         ("hello", _) => Frame::Hello,
         ("disconnect", _) => Frame::Disconnect {
-            reason: raw.reason.unwrap_or_default(),
+            reason: raw.reason.unwrap_or_default().into(),
         },
         ("events_api", Some(envelope_id)) => {
             let event = raw
@@ -260,7 +280,13 @@ mod tests {
             Frame::Hello
         ));
         match parse_frame(r#"{"type":"disconnect","reason":"refresh_requested"}"#).unwrap() {
-            Frame::Disconnect { reason } => assert_eq!(reason, "refresh_requested"),
+            Frame::Disconnect { reason } => assert_eq!(reason, DisconnectReason::RefreshRequested),
+            other => panic!("{other:?}"),
+        }
+        match parse_frame(r#"{"type":"disconnect","reason":"maintenance"}"#).unwrap() {
+            Frame::Disconnect { reason } => {
+                assert_eq!(reason, DisconnectReason::Other("maintenance".to_owned()));
+            }
             other => panic!("{other:?}"),
         }
     }
