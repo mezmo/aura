@@ -11,6 +11,7 @@ mod rebuild;
 mod recorded_decisions;
 pub(crate) mod resume;
 mod retention;
+pub mod sweep;
 
 pub(crate) use commit::{
     ParkCommitInputs, cancel_run_approvals, commit_from_run_state, run_owner_id,

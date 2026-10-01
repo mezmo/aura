@@ -83,6 +83,10 @@ pub use tools::wait_for::{StopReason, WaitForError, WaitForOutput, WaitForTool};
 pub use tools::{SubmitResultDecision, SubmitResultOutput, SubmitResultTool};
 
 pub(crate) use park::{CallKey, ParkGuard, RecordedDecisions, run_owner_id};
+// The park retention sweep engine and its lifecycle handle: the web server
+// wires one engine per park-enabled config and drives the startup pass and
+// the cadence loop.
+pub use park::sweep::{ParkSweep, SweepExit, SweepHandle};
 // The park-owned execution lifetime: the shared run-reservation fence and
 // the scope detached park work registers under. `RunExecutionScope` rides
 // the public `ToolCallContext` field, and `ReservationFault` is the error

@@ -618,6 +618,46 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
             ),
         ));
     }
+    // The shared run-reservation table: every park-owned execution, the
+    // resume endpoint, and the retention sweep fence on the SAME table. It
+    // is created once before the router so the sweep receives a clone of the
+    // table the handlers use.
+    let resume_claims = Arc::new(aura::orchestration::ResumeClaimTable::new());
+
+    // Park retention sweep: one engine per park-enabled config, sharing the
+    // reservation table above and the session store's approval backend. The
+    // startup pass runs before the listener binds; the cadence loop spawns
+    // after bind and joins at teardown.
+    let approval_store = session_store.approvals();
+    let mut park_sweeps = Vec::new();
+    for config in configs_arc.iter() {
+        let Some(hitl) = &config.hitl else {
+            continue;
+        };
+        if !hitl.park.enabled {
+            continue;
+        }
+        let Some(memory_dir) = config.effective_memory_dir() else {
+            // `bootstrap_park_guard` already refused this; skip defensively.
+            continue;
+        };
+        let label = config.agent.alias.as_deref().unwrap_or(&config.agent.name);
+        park_sweeps.push(aura::orchestration::ParkSweep::new(
+            Arc::clone(&resume_claims),
+            app_state.pending_approvals.clone(),
+            Arc::clone(&approval_store),
+            memory_dir.to_string(),
+            hitl.park.park_ttl,
+            label.to_string(),
+        ));
+    }
+
+    // Startup pass: every park-enabled config gets one full sweep before the
+    // server accepts any request.
+    for sweep in &park_sweeps {
+        sweep.run_pass().await;
+    }
+
     let app = Router::new()
         .route("/health", get(handlers::health))
         .route("/aura/info", get(handlers::info))
@@ -634,9 +674,9 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
         .layer(axum::extract::Extension(handlers::IngressHmac(
             ingress_hmac,
         )))
-        .layer(axum::extract::Extension(handlers::ResumeClaims(Arc::new(
-            aura::orchestration::ResumeClaimTable::new(),
-        ))))
+        .layer(axum::extract::Extension(handlers::ResumeClaims(
+            Arc::clone(&resume_claims),
+        )))
         .layer(TraceLayer::new_for_http())
         .layer(middleware::from_fn_with_state(
             app_state.clone(),
@@ -751,6 +791,11 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
         .map(|reconciler| reconciler.spawn(&shutdown_token))
         .collect();
 
+    let park_sweep_handles: Vec<aura::orchestration::SweepHandle> = park_sweeps
+        .into_iter()
+        .map(|sweep| sweep.spawn(&shutdown_token))
+        .collect();
+
     let serve_result = axum::serve(listener, app)
         .with_graceful_shutdown(async {
             shutdown_rx.await.ok();
@@ -758,6 +803,9 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
         .await;
 
     for handle in pollers {
+        let _ = handle.stop().await;
+    }
+    for handle in park_sweep_handles {
         let _ = handle.stop().await;
     }
 

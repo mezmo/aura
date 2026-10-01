@@ -2,11 +2,9 @@
 //! encapsulated evidence-first deletion order, and the sweep seam.
 //!
 //! Types and seams only — E6 (retention sweep and orphan classification)
-//! and E8 (server bootstrap activation) own every body. Nothing here is
-//! wired into the server yet: cleanup activates only after the lifetime,
-//! reservation, consult, and retention bodies are filled and green.
-#![allow(dead_code)] // the E6/E8 fills construct and drive this surface;
-// the marker comes off when the sweep activates
+//! and E8 (server bootstrap activation) own every body. The retention
+//! sweep in `sweep.rs` is what activates this surface; the module-level
+//! `dead_code` allow has been removed because the seam is now live.
 
 use std::collections::HashSet;
 use std::io;
@@ -52,14 +50,19 @@ pub(crate) struct CleanupReservation {
 }
 
 /// Why a run is not cleanup-eligible: the admission itself is the
-/// eligibility proof, so a live occupation (an executing run) is the one
-/// refusal — retention revalidation under the acquired fence is E6's
-/// body.
+/// eligibility proof, so a live occupation (an executing run) is the
+/// primary refusal. A malformed session/run path is also refused here
+/// because the checkpoint paths cannot be safely derived — retention
+/// revalidation under the acquired fence is E6's body.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CleanupAdmissionFault {
     /// A live reservation holds the run: execution is active and cleanup
     /// must not proceed. Nothing changed.
     Executing,
+    /// The validated resume path could not be constructed from the
+    /// candidate's session and run id, so the checkpoint paths cannot be
+    /// derived safely. Nothing changed.
+    MalformedPath(String),
 }
 
 impl CleanupReservation {
@@ -78,6 +81,21 @@ impl CleanupReservation {
             .admit(path.run.run_id())
             .map_err(|_| CleanupAdmissionFault::Executing)?;
         let docs = ResumeDocuments::for_path(path, memory_dir);
+        Ok(Self { reservation, docs })
+    }
+
+    /// Acquire a sessionless run for cleanup: the same reservation fence as
+    /// [`Self::acquire`], but the checkpoint paths live under the root-level
+    /// `{memory_dir}/parked/` directory.
+    pub(crate) fn acquire_sessionless(
+        table: &ReservationTable,
+        run: &super::resume::claim::ResumeRunId,
+        memory_dir: &str,
+    ) -> Result<Self, CleanupAdmissionFault> {
+        let reservation = table
+            .admit(run.run_id())
+            .map_err(|_| CleanupAdmissionFault::Executing)?;
+        let docs = ResumeDocuments::for_sessionless(run, memory_dir);
         Ok(Self { reservation, docs })
     }
 

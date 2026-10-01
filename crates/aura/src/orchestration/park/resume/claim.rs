@@ -137,10 +137,21 @@ impl ResumeDocuments {
     /// Derive the two filenames from a validated path and the memory root.
     #[must_use]
     pub fn for_path(path: &ValidatedResumePath, memory_dir: &str) -> Self {
-        let dir = parked_document_dir(memory_dir, Some(path.session.as_ref()));
+        Self::for_session(Some(path.session.as_ref()), &path.run, memory_dir)
+    }
+
+    /// Derive the two filenames for a sessionless run. The sweep uses this
+    /// for runs whose checkpoint lives directly under `{memory_dir}/parked/`.
+    #[must_use]
+    pub(crate) fn for_sessionless(run: &ResumeRunId, memory_dir: &str) -> Self {
+        Self::for_session(None, run, memory_dir)
+    }
+
+    fn for_session(session: Option<&str>, run: &ResumeRunId, memory_dir: &str) -> Self {
+        let dir = parked_document_dir(memory_dir, session);
         Self {
-            parked: dir.join(format!("{}{PARKED_DOCUMENT_SUFFIX}", path.run)),
-            resuming: dir.join(format!("{}{RESUMING_DOCUMENT_SUFFIX}", path.run)),
+            parked: dir.join(format!("{}{PARKED_DOCUMENT_SUFFIX}", run)),
+            resuming: dir.join(format!("{}{RESUMING_DOCUMENT_SUFFIX}", run)),
         }
     }
 
@@ -279,6 +290,14 @@ impl ResumeClaimTable {
     #[must_use]
     pub(crate) fn is_live(&self, run: &ResumeRunId) -> bool {
         self.reservations.is_live(run.run_id())
+    }
+
+    /// The shared reservation table the claim table fences on. The retention
+    /// sweep needs the same table requests use so its `Executing` refusal
+    /// matches real live runs.
+    #[must_use]
+    pub(crate) fn reservation_table(&self) -> &ReservationTable {
+        &self.reservations
     }
 
     /// Arm this table's fenced-tail rendezvous for the lease-lifetime golden:
