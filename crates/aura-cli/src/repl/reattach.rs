@@ -15,16 +15,17 @@ use std::time::{Duration, SystemTime};
 /// The park state recorded from a `RunParked` event: the reattach
 /// target and its advertised retention deadline.
 #[derive(Debug, Clone)]
-#[allow(dead_code, reason = "wired by the W6c fill commit")]
 pub(crate) struct ParkedRun {
     pub run_id: String,
+    /// The chat session the run belongs to, resolved exactly as the
+    /// parking turn resolved it — the resume route is per-session.
+    pub session_id: String,
     pub retention_expires_at: String,
     pub decision_ids: Vec<String>,
 }
 
 /// How a reattach wait ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code, reason = "wired by the W6c fill commit")]
 pub(crate) enum ReattachEnd {
     /// A resumed segment completed with this final text.
     Completed(String),
@@ -54,13 +55,11 @@ pub(crate) enum ReattachEnd {
 /// delays it returns. A successful 200 resets the transient budget (the
 /// failures must be consecutive); a fresh park resets the retryable
 /// cadence (each gate waits afresh).
-#[allow(dead_code, reason = "wired by the W6c fill commit")]
 pub(crate) struct ReattachSchedule {
     retryable_step: u32,
     transient_failures: u32,
 }
 
-#[allow(dead_code, reason = "wired by the W6c fill commit")]
 impl ReattachSchedule {
     pub(crate) fn new() -> Self {
         Self {
@@ -72,16 +71,18 @@ impl ReattachSchedule {
     /// The delay before the next poll after a retryable `parked` or
     /// `running` row: one second growing to five, then steady five.
     pub(crate) fn next_retryable_delay(&mut self) -> Duration {
-        let _ = &mut self.retryable_step;
-        todo!("filled with the retryable cadence in the W6c fill commit")
+        self.retryable_step += 1;
+        Duration::from_secs(self.retryable_step.min(5) as u64)
     }
 
     /// Record one transient transport or 503 failure. Returns the delay
     /// to wait before the next attempt (`1, 2, 4, 8, 10` seconds), or
     /// `None` once five consecutive failures have accumulated.
     pub(crate) fn record_transient(&mut self) -> Option<Duration> {
-        let _ = &mut self.transient_failures;
-        todo!("filled with the transient budget in the W6c fill commit")
+        const DELAYS: [u64; 5] = [1, 2, 4, 8, 10];
+        self.transient_failures += 1;
+        let idx = usize::try_from(self.transient_failures - 1).ok()?;
+        DELAYS.get(idx).copied().map(Duration::from_secs)
     }
 
     /// A 200 stream was accepted: the transient failures are no longer
@@ -98,35 +99,41 @@ impl Default for ReattachSchedule {
 }
 
 /// Parse the park's advertised retention deadline into an absolute cap.
-/// An undecodable stamp yields no cap: the deadline is an RFC 3339
-/// instant by construction on the wire, so garbage means a broken event,
-/// and the honest bound is the schedule alone.
-#[allow(dead_code, reason = "wired by the W6c fill commit")]
+/// An undecodable stamp yields no cap — and the driver then refuses to
+/// wait at all (any outcome that would wait ends the reattach instead):
+/// the deadline is an RFC 3339 instant by construction on the wire, so
+/// garbage means a broken event, and an unbounded poll is never
+/// substituted for a bound we cannot know.
 pub(crate) fn retention_cap_from(expires_at: &str) -> Option<SystemTime> {
-    let _ = expires_at;
-    todo!("filled with the deadline parse in the W6c fill commit")
+    let parsed = chrono::DateTime::parse_from_rfc3339(expires_at).ok()?;
+    Some(SystemTime::UNIX_EPOCH + Duration::from_secs(u64::try_from(parsed.timestamp()).ok()?))
 }
 
 /// The session's latest observed park, recorded by the `RunParked`
 /// rendering and consumed by the automatic reattach (the in-turn
 /// driver) and the manual `/resume-run` re-arm.
-#[allow(dead_code, reason = "wired by the W6c fill commit")]
 pub(crate) fn latest_park_slot() -> &'static std::sync::Mutex<Option<ParkedRun>> {
     static SLOT: std::sync::Mutex<Option<ParkedRun>> = std::sync::Mutex::new(None);
     &SLOT
 }
 
-/// A manual `/resume-run` request staged by the command layer for the
-/// main REPL loop, which owns the turn machinery the reattach needs.
-#[allow(dead_code, reason = "wired by the W6c fill commit")]
-pub(crate) fn pending_manual_resume() -> &'static std::sync::Mutex<Option<String>> {
-    static SLOT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
-    &SLOT
+/// Monotonic counter of park recordings: a consumer snapshots it before
+/// a stream (or a resume POST) and treats a changed epoch as "this
+/// request parked", so a stale park from an earlier turn can never
+/// drive a later turn's reattach while the record itself stays
+/// available for the manual `/resume-run` re-arm.
+pub(crate) fn park_epoch() -> &'static std::sync::atomic::AtomicU64 {
+    static EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    &EPOCH
+}
+
+/// Read the current park epoch.
+pub(crate) fn current_park_epoch() -> u64 {
+    park_epoch().load(std::sync::atomic::Ordering::SeqCst)
 }
 
 /// The one fixed message a complete reify failure appends to chat
 /// history, per the client failure contract.
-#[allow(dead_code, reason = "wired by the W6c fill commit")]
 pub(crate) const REIFY_FAILED_MESSAGE: &str =
     "I could not resume the paused run. You can continue the conversation.";
 
@@ -141,18 +148,14 @@ mod tests {
         for _ in 0..10 {
             delays.push(schedule.next_retryable_delay());
         }
-        let expected = [
-            1, 2, 3, 4, 5, 5, 5, 5, 5, 5,
-        ]
-        .map(Duration::from_secs);
+        let expected = [1, 2, 3, 4, 5, 5, 5, 5, 5, 5].map(Duration::from_secs);
         assert_eq!(delays, expected);
     }
 
     #[test]
     fn transient_budget_walks_the_five_delays_then_exhausts() {
         let mut schedule = ReattachSchedule::new();
-        let delays: Vec<Duration> =
-            std::iter::from_fn(|| schedule.record_transient()).collect();
+        let delays: Vec<Duration> = std::iter::from_fn(|| schedule.record_transient()).collect();
         let expected = [1, 2, 4, 8, 10].map(Duration::from_secs);
         assert_eq!(delays, expected);
         // The budget stays exhausted on further calls.
@@ -174,7 +177,7 @@ mod tests {
         let as_unix = cap
             .duration_since(SystemTime::UNIX_EPOCH)
             .expect("after the epoch");
-        assert_eq!(as_unix.as_secs(), 1_790_177_600);
+        assert_eq!(as_unix.as_secs(), 1_790_856_000);
     }
 
     #[test]

@@ -266,6 +266,22 @@ where
         // The event name tells us which variant to expect; serde's untagged
         // deserialization handles the JSON → enum mapping.
         if event_name.starts_with("aura.") {
+            // A named event whose body is not JSON at all is a
+            // malformed-protocol report — for known and unknown names
+            // alike: no consumer could ever read it, and silently
+            // skipping it would disguise a broken stream as a clean
+            // end. Valid JSON that fails a known event's typed schema
+            // stays tolerated below: that is the forward-compatibility
+            // allowance for newer servers.
+            let named_value = match serde_json::from_str::<serde_json::Value>(&event.data) {
+                Ok(value) => value,
+                Err(e) => {
+                    termination = StreamTermination::Malformed {
+                        detail: format!("{event_name}: {e}"),
+                    };
+                    break;
+                }
+            };
             match event_name.as_str() {
                 event_names::TOOL_REQUESTED => {
                     if let Ok(AuraStreamEvent::ToolRequested {
@@ -409,24 +425,7 @@ where
                     // Consumers (REPL status notices, one-shot stderr) handle
                     // these via the orchestrator-event callback; on_raw_event
                     // above also captures them into the stream panel.
-                    //
-                    // A named event whose body is not JSON at all is a
-                    // malformed-protocol report: no consumer could ever read
-                    // it, and silently skipping it would disguise a broken
-                    // stream as a clean end. Typed-decode failures of known
-                    // event names stay skipped above — that is the
-                    // forward-compatibility tolerance for newer servers.
-                    match serde_json::from_str::<serde_json::Value>(&event.data) {
-                        Ok(val) => {
-                            handler.on_orchestrator_event(event_name, &val);
-                        }
-                        Err(e) => {
-                            termination = StreamTermination::Malformed {
-                                detail: format!("{event_name}: {e}"),
-                            };
-                            break;
-                        }
-                    }
+                    handler.on_orchestrator_event(event_name, &named_value);
                 }
             }
             continue;
@@ -713,18 +712,30 @@ mod tests {
     #[tokio::test]
     async fn termination_malformed_named_event_body_is_reported() {
         // A named aura.* event whose body is not JSON at all is a
-        // malformed-protocol report: no consumer could ever read it.
-        let (result, _) = run_stream(vec![
-            sse("aura.orchestrator.session_info", "{not json"),
+        // malformed-protocol report — for unknown AND known names alike.
+        for name in ["aura.orchestrator.session_info", "aura.usage"] {
+            let (result, _) = run_stream(vec![sse(name, "{not json"), sse("", "[DONE]")]).await;
+            let outcome = result.unwrap();
+            assert!(
+                matches!(outcome.termination, StreamTermination::Malformed { .. }),
+                "{name}: expected Malformed, got {:?}",
+                outcome.termination
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_decode_failure_of_a_known_name_stays_tolerated() {
+        // Valid JSON that fails the known schema is the
+        // forward-compatibility allowance: skipped, not malformed.
+        let (result, caps) = run_stream(vec![
+            sse(event_names::USAGE, r#"{"prompt_tokens": "not a number"}"#),
             sse("", "[DONE]"),
         ])
         .await;
         let outcome = result.unwrap();
-        assert!(
-            matches!(outcome.termination, StreamTermination::Malformed { .. }),
-            "expected Malformed, got {:?}",
-            outcome.termination
-        );
+        assert!(matches!(outcome.termination, StreamTermination::Done));
+        assert!(caps.usages.is_empty());
     }
 
     // -----------------------------------------------------------------------

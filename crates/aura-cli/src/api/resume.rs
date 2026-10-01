@@ -55,7 +55,24 @@ impl ResumeOutcome {
     pub fn from_refusal(status: u16, body: &str) -> Self {
         match status {
             404 => Self::NotFound,
-            503 => Self::Unavailable,
+            503 => {
+                // Only the typed availability row is transient: an
+                // undecodable or differently-typed 503 fails closed —
+                // treating an unknown fault as retryable would spend the
+                // transient budget on a permanent condition.
+                #[derive(serde::Deserialize)]
+                struct ErrorBody {
+                    error: ErrorDetail,
+                }
+                #[derive(serde::Deserialize)]
+                struct ErrorDetail {
+                    error_type: String,
+                }
+                match serde_json::from_str::<ErrorBody>(body) {
+                    Ok(row) if row.error.error_type == "reify_unavailable" => Self::Unavailable,
+                    _ => Self::ReifyFailed,
+                }
+            }
             409 => {
                 #[derive(serde::Deserialize)]
                 struct Row {
@@ -193,12 +210,23 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_decodes_from_503_regardless_of_body() {
+    fn unavailable_decodes_only_from_the_typed_503_row() {
         let outcome = ResumeOutcome::from_refusal(
             503,
             "{\"error\":{\"message\":\"approval storage is temporarily unavailable; retry the resume\",\"error_type\":\"reify_unavailable\"}}",
         );
         assert!(matches!(outcome, ResumeOutcome::Unavailable));
+    }
+
+    #[test]
+    fn an_undecodable_or_differently_typed_503_fails_closed() {
+        let untyped = ResumeOutcome::from_refusal(503, "gateway hiccup");
+        assert!(matches!(untyped, ResumeOutcome::ReifyFailed));
+        let mistyped = ResumeOutcome::from_refusal(
+            503,
+            "{\"error\":{\"message\":\"else\",\"error_type\":\"something_else\"}}",
+        );
+        assert!(matches!(mistyped, ResumeOutcome::ReifyFailed));
     }
 
     #[test]
@@ -230,7 +258,10 @@ mod tests {
     fn retryable_and_transient_classifications() {
         assert!(ResumeOutcome::from_refusal(409, &parked_row()).is_retryable());
         assert!(ResumeOutcome::from_refusal(409, &conflict("running")).is_retryable());
-        assert!(ResumeOutcome::from_refusal(503, "").is_transient());
+        assert!(
+            ResumeOutcome::from_refusal(503, r#"{"error":{"error_type":"reify_unavailable"}}"#)
+                .is_transient()
+        );
         assert!(!ResumeOutcome::from_refusal(404, "").is_retryable());
         assert!(!ResumeOutcome::from_refusal(409, &conflict("expired")).is_retryable());
     }

@@ -184,8 +184,13 @@ pub fn run_oneshot(
                         // Tool calls are only actionable when the stream
                         // completed: an ambiguous or cancelled end may have
                         // truncated the delta accumulation, and executing
-                        // half-received calls is unsafe.
+                        // half-received calls is unsafe. The received text
+                        // still prints — it is what the stream actually
+                        // delivered.
                         if !matches!(termination, StreamTermination::Done) {
+                            if !text.is_empty() {
+                                final_text = text;
+                            }
                             if matches!(
                                 termination,
                                 StreamTermination::EofWithoutDone

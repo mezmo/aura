@@ -810,6 +810,18 @@ pub fn run_repl(
     // leaving it uninitialized lets the compiler prove complete coverage.
     let exit_reason: aura_telemetry::events::ExitReason;
 
+    // Approval poster: HTTP mode can POST decisions to the server's
+    // /v1/approvals/{id} ingress; standalone mode has no HTTP server to
+    // POST to. Shared by every turn, the reattach driver, and the
+    // /resume-run command's gate rendering.
+    let approval_poster = match backend {
+        Backend::Http(_) => Some(crate::api::approval::ApprovalPoster::new(Arc::new(
+            config.clone(),
+        ))),
+        #[cfg(feature = "standalone-cli")]
+        Backend::Direct(_) => None,
+    };
+
     loop {
         // Frame is already drawn (by setup or previous iteration).
         // Restore normal terminal mode and show cursor for readline.
@@ -899,6 +911,7 @@ pub fn run_repl(
                         telemetry,
                         rt,
                         backend,
+                        approval_poster: &approval_poster,
                     };
                     match registry::dispatch(&input, &mut ctx) {
                         Some(CommandOutcome::Exit) => {
@@ -1046,6 +1059,11 @@ pub fn run_repl(
                 };
                 let mut tool_loop_error: Option<anyhow::Error> = None;
                 let mut final_text = String::new();
+                // Set when a reattach wait was user-released: the turn's
+                // partial persists through the normal path, but no
+                // further model requests serve it — a released wait
+                // abandons silently.
+                let mut reattach_released = false;
                 let mut did_compact = false;
                 let mut auto_compact_count: u32 = 0;
 
@@ -1118,17 +1136,6 @@ pub fn run_repl(
                 // when the LLM is inside an Update group.
                 let in_update_group = Arc::new(AtomicBool::new(false));
 
-                // Approval poster: HTTP mode can POST decisions to the
-                // server's /v1/approvals/{id} ingress; standalone mode
-                // has no HTTP server to POST to.
-                let approval_poster = match backend {
-                    Backend::Http(_) => Some(crate::api::approval::ApprovalPoster::new(Arc::new(
-                        config.clone(),
-                    ))),
-                    #[cfg(feature = "standalone-cli")]
-                    Backend::Direct(_) => None,
-                };
-
                 // In-process approval registry: standalone mode resolves
                 // conversational approvals directly via the shared registry.
                 #[cfg(feature = "standalone-cli")]
@@ -1148,27 +1155,39 @@ pub fn run_repl(
                             .unwrap_or(&fallback_session_uuid),
                         crate::api::session::SessionKind::Chat,
                     );
+                    // One handler factory per iteration: the stream, and
+                    // any reattach a park triggers, render through the
+                    // same machinery under the session this request runs
+                    // under.
+                    let make_handler_session = chat_session_id.clone();
+                    let mut make_handler = || ReplStreamHandler {
+                        pending_args: pending_args.clone(),
+                        turn_events: turn_events.clone(),
+                        live_reasoning: live_reasoning.clone(),
+                        live_worker_reasoning: live_worker_reasoning.clone(),
+                        worker_reasoning_seen: worker_reasoning_seen.clone(),
+                        session_info_seen: session_info_seen.clone(),
+                        stop_flag: stop_flag.clone(),
+                        anim_cleared: anim_cleared.clone(),
+                        cancel: cancel_flag.clone(),
+                        post_tool_wave: post_tool_wave.clone(),
+                        input_buf: input_buf.clone(),
+                        orch_state: orch_state.clone(),
+                        needs_blank: needs_blank.clone(),
+                        in_update_group: in_update_group.clone(),
+                        approval_poster: approval_poster.clone(),
+                        #[cfg(feature = "standalone-cli")]
+                        pending_approvals: pending_approvals.clone(),
+                        turn_context_peak: 0,
+                        chat_session_id: make_handler_session.clone(),
+                    };
+                    // Only THIS stream's RunParked may drive the
+                    // reattach: the epoch snapshot distinguishes a park
+                    // recorded during this request from a stale record,
+                    // which stays available for a manual re-arm.
+                    let epoch_before_stream = crate::repl::reattach::current_park_epoch();
                     let result = rt.block_on(async {
-                        let mut handler = ReplStreamHandler {
-                            pending_args: pending_args.clone(),
-                            turn_events: turn_events.clone(),
-                            live_reasoning: live_reasoning.clone(),
-                            live_worker_reasoning: live_worker_reasoning.clone(),
-                            worker_reasoning_seen: worker_reasoning_seen.clone(),
-                            session_info_seen: session_info_seen.clone(),
-                            stop_flag: stop_flag.clone(),
-                            anim_cleared: anim_cleared.clone(),
-                            cancel: cancel_flag.clone(),
-                            post_tool_wave: post_tool_wave.clone(),
-                            input_buf: input_buf.clone(),
-                            orch_state: orch_state.clone(),
-                            needs_blank: needs_blank.clone(),
-                            in_update_group: in_update_group.clone(),
-                            approval_poster: approval_poster.clone(),
-                            #[cfg(feature = "standalone-cli")]
-                            pending_approvals: pending_approvals.clone(),
-                            turn_context_peak: 0,
-                        };
+                        let mut handler = make_handler();
                         backend
                             .stream_chat(
                                 conversation.messages(),
@@ -1195,6 +1214,46 @@ pub fn run_repl(
                         store.save_turn_model(get_selected_model().as_deref());
                     }
 
+                    // A targeted RunParked ended this stream: drive the
+                    // bounded reattach through the same machinery. The
+                    // wait consumes the turn; its outcome is the turn's
+                    // final text — the resumed answer, or the fixed
+                    // reify-failure message with the received partial
+                    // preserved — and the epilogue persists it through
+                    // the normal response/history path.
+                    let parked_this_stream =
+                        crate::repl::reattach::current_park_epoch() != epoch_before_stream;
+                    let parked_run = parked_this_stream
+                        .then(|| {
+                            crate::repl::reattach::latest_park_slot()
+                                .lock()
+                                .ok()
+                                .and_then(|g| g.clone())
+                        })
+                        .flatten();
+                    if let Some(park) = parked_run {
+                        let (text, user_released) = drive_reattach(
+                            rt,
+                            backend,
+                            park,
+                            &cancel_flag,
+                            &approval_poster,
+                            &mut make_handler,
+                        );
+                        // A released wait consumed the user's escape:
+                        // the turn ends through the normal path with the
+                        // preserved partial, not the cancellation path
+                        // that would discard it — and no further model
+                        // request (the response summarizer included)
+                        // serves the released turn.
+                        if user_released {
+                            cancel_flag.store(false, Ordering::Relaxed);
+                            reattach_released = true;
+                        }
+                        final_text = text;
+                        break 'tool_loop;
+                    }
+
                     // Check for cancellation
                     if cancel_flag.load(Ordering::Relaxed) {
                         break 'tool_loop;
@@ -1209,9 +1268,13 @@ pub fn run_repl(
                                 // An ambiguous end (EOF without [DONE], a
                                 // malformed event body, or a transport error)
                                 // still carries whatever text was received:
-                                // it flows the normal response path below,
-                                // with one warning line so the partial is
-                                // never mistaken for a completed answer.
+                                // it becomes the turn's final text through
+                                // the normal response path, with one warning
+                                // line so the partial is never mistaken for
+                                // a completed answer. The turn ENDS here —
+                                // an explicitly incomplete stream must not
+                                // trigger further model requests (the
+                                // auto-compaction retry included).
                                 if matches!(
                                     termination,
                                     StreamTermination::EofWithoutDone
@@ -1236,6 +1299,8 @@ pub fn run_repl(
                                         detail.themed(AuraStyle::Muted),
                                     );
                                     crate::ui::prompt::increment_orch_scrollback();
+                                    final_text = text;
+                                    break 'tool_loop;
                                 }
 
                                 // Check for auto-compaction trigger (context pressure).
@@ -1989,6 +2054,7 @@ pub fn run_repl(
 
                         let (summary, usage, displayed_text) = if is_multi_line
                             && config.enable_final_response_summary
+                            && !reattach_released
                         {
                             let (summarize_anim, _) = WaveAnimation::start(
                                 "Thinking",
@@ -2131,6 +2197,7 @@ pub fn run_repl(
                         telemetry,
                         rt,
                         backend,
+                        approval_poster: &approval_poster,
                     };
                     match (pending.command.handler)(&mut ctx, &pending.args) {
                         CommandOutcome::Exit => {
@@ -2297,7 +2364,7 @@ impl<'a> ReplTelemetryLifecycle<'a> {
 /// "Thinking" animation, tool-call rendering, reasoning blocks, and the
 /// orchestrator task tree. State is shared via `Arc` so each turn's stream
 /// mutates the same terminal-display state the REPL reads between turns.
-struct ReplStreamHandler {
+pub(crate) struct ReplStreamHandler {
     pending_args:
         Arc<Mutex<std::collections::HashMap<String, BTreeMap<String, serde_json::Value>>>>,
     turn_events: Arc<Mutex<Vec<DisplayEvent>>>,
@@ -2327,9 +2394,46 @@ struct ReplStreamHandler {
     pending_approvals: Option<aura::hitl::PendingApprovals>,
     /// Largest context size any `aura.tool_usage` reported this request.
     turn_context_peak: u64,
+    /// The chat session this stream's requests run under — recorded on
+    /// the park so reattachment targets the same session route.
+    chat_session_id: String,
 }
 
 impl ReplStreamHandler {
+    /// A handler over fresh state, for the manual `/resume-run`
+    /// re-entry: the command layer has no live turn to share, so the
+    /// resumed segment renders through its own (identical) machinery.
+    /// The automatic in-turn reattach shares the turn's real state via
+    /// the handler factory instead.
+    pub(crate) fn fresh_for_manual_resume(
+        approval_poster: Option<crate::api::approval::ApprovalPoster>,
+        chat_session_id: String,
+    ) -> Self {
+        Self {
+            pending_args: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            turn_events: Arc::new(Mutex::new(Vec::new())),
+            live_reasoning: Arc::new(Mutex::new(None)),
+            live_worker_reasoning: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            worker_reasoning_seen: Arc::new(AtomicBool::new(false)),
+            session_info_seen: Arc::new(AtomicBool::new(false)),
+            stop_flag: Arc::new(AtomicBool::new(false)),
+            anim_cleared: Arc::new(AtomicBool::new(true)),
+            cancel: Arc::new(AtomicBool::new(false)),
+            post_tool_wave: Arc::new(Mutex::new(None)),
+            input_buf: Arc::new(Mutex::new(String::new())),
+            orch_state: Arc::new(Mutex::new(OrchDisplayState {
+                tasks: std::collections::HashMap::new(),
+            })),
+            needs_blank: Arc::new(AtomicBool::new(false)),
+            in_update_group: Arc::new(AtomicBool::new(false)),
+            approval_poster,
+            #[cfg(feature = "standalone-cli")]
+            pending_approvals: None,
+            turn_context_peak: 0,
+            chat_session_id,
+        }
+    }
+
     /// Renumber handler-owned row records (task headers, live reasoning
     /// bodies) after a tree-gap insertion moved rows at/below `shift.at`
     /// down. The statically-tracked records were already renumbered by
@@ -3439,6 +3543,22 @@ impl StreamHandler for ReplStreamHandler {
 
                     println!();
                     crate::ui::prompt::increment_orch_scrollback();
+
+                    // Record the reattach target for the in-turn driver
+                    // (and the manual /resume-run re-arm): one handle per
+                    // run, seeded only from this targeted event.
+                    if !run_id.is_empty()
+                        && let Ok(mut slot) = crate::repl::reattach::latest_park_slot().lock()
+                    {
+                        *slot = Some(crate::repl::reattach::ParkedRun {
+                            run_id,
+                            session_id: self.chat_session_id.clone(),
+                            retention_expires_at,
+                            decision_ids,
+                        });
+                        crate::repl::reattach::park_epoch()
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
                 }
                 event_names::TASK_COMPLETED => {
                     let worker_id = get_str(val, "worker_id");
@@ -3898,6 +4018,253 @@ impl StreamHandler for ReplStreamHandler {
             *guard = Some((wave_anim, wave_stop));
         }
         prepare_input_line(&self.input_buf, Some(&self.cancel));
+    }
+}
+
+/// How a sliced wait ended.
+enum WaitOut {
+    Slept,
+    Cancelled,
+    CapReached,
+}
+
+/// Sleep `delay` in slices, staying responsive to cancellation and the
+/// retention cap. A `None` cap is an unknown bound, not an absent one:
+/// the wait is refused rather than run unbounded.
+fn wait_out(
+    delay: std::time::Duration,
+    cancel: &AtomicBool,
+    cap: Option<std::time::SystemTime>,
+) -> WaitOut {
+    let deadline = std::time::Instant::now() + delay;
+    while std::time::Instant::now() < deadline {
+        if cancel.load(Ordering::Relaxed) {
+            return WaitOut::Cancelled;
+        }
+        match cap {
+            None => return WaitOut::CapReached,
+            Some(cap) if std::time::SystemTime::now() >= cap => {
+                return WaitOut::CapReached;
+            }
+            Some(_) => {}
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    WaitOut::Slept
+}
+
+/// Render a retryable `parked` row's outstanding calls as a gate — a
+/// state, not an error: the run advanced and waits again.
+fn render_blocking_gate(
+    blocking: &[crate::api::resume::BlockingCall],
+    approval_poster: &Option<crate::api::approval::ApprovalPoster>,
+) {
+    let _term = lock_term();
+    println!(
+        "{}  {}",
+        "⏸ Still parked".themed(AuraStyle::Warning),
+        "waiting on approvals".themed(AuraStyle::Muted),
+    );
+    crate::ui::prompt::increment_orch_scrollback();
+    for call in blocking {
+        let link = approval_poster
+            .as_ref()
+            .map(|p| p.approval_url(&call.decision_id))
+            .unwrap_or_else(|| call.decision_id.clone());
+        println!(
+            "  {} {} {} {} {}",
+            "approve:".themed(AuraStyle::Muted),
+            link.themed(AuraStyle::Primary),
+            "—".themed(AuraStyle::Muted),
+            call.tool.as_str().themed(AuraStyle::Muted),
+            format!("(expires {})", call.expires_at).themed(AuraStyle::Muted),
+        );
+        crate::ui::prompt::increment_orch_scrollback();
+    }
+    println!();
+    crate::ui::prompt::increment_orch_scrollback();
+}
+
+/// Drive the bounded reattach for one parked run: poll the
+/// run-resource POST on the contract schedule (retryable rows at one
+/// second growing to five, five consecutive transient failures at
+/// 1/2/4/8/10 second delays, the advertised retention deadline as the
+/// total cap), render every resumed segment through the same REPL
+/// handler machinery, and stop automatic retries after an accepted
+/// stream ends ambiguously.
+///
+/// Returns the turn's final text (the resumed answer, the received
+/// partial plus the fixed message, or the fixed message alone) and
+/// whether the user cancelled the wait (no failure message is added in
+/// that case — the received partial alone is preserved).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn drive_reattach(
+    rt: &tokio::runtime::Runtime,
+    backend: &Backend,
+    park: crate::repl::reattach::ParkedRun,
+    cancel_flag: &Arc<AtomicBool>,
+    approval_poster: &Option<crate::api::approval::ApprovalPoster>,
+    make_handler: &mut impl FnMut() -> ReplStreamHandler,
+) -> (String, bool) {
+    use crate::api::resume::ResumeOutcome;
+    use crate::repl::reattach::{REIFY_FAILED_MESSAGE, ReattachEnd, ReattachSchedule};
+
+    /// Append one segment's received text to the running partial.
+    /// Concatenation is verbatim — segments of one run's answer are
+    /// parts of the same stream, and only content actually received is
+    /// saved: no separator is invented between them.
+    fn accumulate(partial: &mut String, received: StreamResult) {
+        let text = match received {
+            StreamResult::TextResponse(text) => text,
+            StreamResult::ToolCalls { text, .. } => text,
+        };
+        partial.push_str(&text);
+    }
+
+    let mut cap = crate::repl::reattach::retention_cap_from(&park.retention_expires_at);
+    let mut park = park;
+    let mut schedule = ReattachSchedule::new();
+    let mut partial = String::new();
+
+    let end = loop {
+        if let Some(cap) = cap
+            && std::time::SystemTime::now() >= cap
+        {
+            break ReattachEnd::RetentionCap;
+        }
+        if cancel_flag.load(Ordering::Relaxed) {
+            break ReattachEnd::Cancelled;
+        }
+
+        // The park record is peeks-only here: epoch change (not slot
+        // emptiness) says THIS request parked, and the record stays
+        // available for a later manual re-arm.
+        let epoch_before = crate::repl::reattach::current_park_epoch();
+        let mut handler = make_handler();
+        let outcome = rt.block_on(backend.stream_resume(
+            &park.session_id,
+            &park.run_id,
+            cancel_flag.clone(),
+            &mut handler,
+        ));
+        // A POST may have consumed request time past the deadline:
+        // re-check before any wait or further poll.
+        if let Some(cap) = cap
+            && std::time::SystemTime::now() >= cap
+        {
+            break ReattachEnd::RetentionCap;
+        }
+
+        let retryable_wait = |schedule: &mut ReattachSchedule| schedule.next_retryable_delay();
+        let transient_wait = |schedule: &mut ReattachSchedule| schedule.record_transient();
+
+        match outcome {
+            // Transport errors and 503s share the transient budget.
+            Err(_) | Ok(ResumeOutcome::Unavailable) => match transient_wait(&mut schedule) {
+                Some(delay) => match wait_out(delay, cancel_flag, cap) {
+                    WaitOut::Slept => continue,
+                    WaitOut::Cancelled => break ReattachEnd::Cancelled,
+                    WaitOut::CapReached => break ReattachEnd::RetentionCap,
+                },
+                None => break ReattachEnd::TransientBudget,
+            },
+            Ok(ResumeOutcome::Parked { blocking }) => {
+                render_blocking_gate(&blocking, approval_poster);
+                let delay = retryable_wait(&mut schedule);
+                match wait_out(delay, cancel_flag, cap) {
+                    WaitOut::Slept => continue,
+                    WaitOut::Cancelled => break ReattachEnd::Cancelled,
+                    WaitOut::CapReached => break ReattachEnd::RetentionCap,
+                }
+            }
+            Ok(ResumeOutcome::Running) => {
+                let delay = retryable_wait(&mut schedule);
+                match wait_out(delay, cancel_flag, cap) {
+                    WaitOut::Slept => continue,
+                    WaitOut::Cancelled => break ReattachEnd::Cancelled,
+                    WaitOut::CapReached => break ReattachEnd::RetentionCap,
+                }
+            }
+            Ok(ResumeOutcome::Streamed(outcome)) => {
+                // The POST was accepted: transient failures are no
+                // longer consecutive.
+                schedule.reset_transient();
+                let reparked = crate::repl::reattach::current_park_epoch() != epoch_before;
+                if reparked
+                    && let Some(new_park) = crate::repl::reattach::latest_park_slot()
+                        .lock()
+                        .ok()
+                        .and_then(|g| g.clone())
+                {
+                    // A fresh park: the handler's arm rendered the new
+                    // gate, the segment's received text stays in the
+                    // running partial, and the renewed checkpoint's
+                    // retention deadline re-arms the total cap. The new
+                    // gate still waits on the fresh cadence before the
+                    // next poll — an unknown renewed bound refuses the
+                    // wait instead of polling unbounded.
+                    accumulate(&mut partial, outcome.received);
+                    park = new_park;
+                    cap = crate::repl::reattach::retention_cap_from(&park.retention_expires_at);
+                    schedule = ReattachSchedule::new();
+                    let delay = schedule.next_retryable_delay();
+                    match wait_out(delay, cancel_flag, cap) {
+                        WaitOut::Slept => continue,
+                        WaitOut::Cancelled => break ReattachEnd::Cancelled,
+                        WaitOut::CapReached => break ReattachEnd::RetentionCap,
+                    }
+                }
+                match outcome.termination {
+                    StreamTermination::Done => match outcome.received {
+                        StreamResult::TextResponse(text) => {
+                            let mut text_all = std::mem::take(&mut partial);
+                            text_all.push_str(&text);
+                            break ReattachEnd::Completed(text_all);
+                        }
+                        // An orchestration resume ends in text or a
+                        // re-park; client tool calls here mean the
+                        // segment ended oddly — treat the received text
+                        // as the partial and stop.
+                        StreamResult::ToolCalls { text, .. } => {
+                            accumulate(&mut partial, StreamResult::TextResponse(text));
+                            break ReattachEnd::AmbiguousStream;
+                        }
+                    },
+                    StreamTermination::Cancelled => {
+                        accumulate(&mut partial, outcome.received);
+                        break ReattachEnd::Cancelled;
+                    }
+                    // After acceptance, an ambiguous end stops all
+                    // automatic retries; the received partial is kept.
+                    _ => {
+                        accumulate(&mut partial, outcome.received);
+                        break ReattachEnd::AmbiguousStream;
+                    }
+                }
+            }
+            Ok(
+                ResumeOutcome::Interrupted
+                | ResumeOutcome::ConfigChanged
+                | ResumeOutcome::Mismatch
+                | ResumeOutcome::Expired,
+            ) => break ReattachEnd::Terminal,
+            Ok(ResumeOutcome::NotFound) => break ReattachEnd::NotFound,
+            Ok(ResumeOutcome::ReifyFailed) => break ReattachEnd::ReifyFailed,
+        }
+    };
+
+    match end {
+        ReattachEnd::Completed(text) => (text, false),
+        ReattachEnd::Cancelled => (partial, true),
+        ReattachEnd::AmbiguousStream => {
+            let text = if partial.is_empty() {
+                REIFY_FAILED_MESSAGE.to_string()
+            } else {
+                format!("{partial}\n\n{REIFY_FAILED_MESSAGE}")
+            };
+            (text, false)
+        }
+        _ => (REIFY_FAILED_MESSAGE.to_string(), false),
     }
 }
 
