@@ -38,6 +38,26 @@ use super::signing::WebhookHmac;
 use crate::approver_headers::ApproverHeaders;
 use crate::session_store::{AcknowledgeOutcome, ApprovalStore};
 
+/// The reconciler's wall clock, read immediately before each request a
+/// row issues. A field-shaped seam so the decision-deadline checks test
+/// deterministically; the production constructor installs `Utc::now`.
+/// The file store's `open_with_clock` split is the precedent.
+type PollClock = Arc<dyn Fn() -> chrono::DateTime<chrono::Utc> + Send + Sync>;
+
+/// How many DIFFERENT rows may move concurrently within one reconcile
+/// pass. The cap bounds egress and task count against a large shared
+/// store — each in-flight row holds at most one request (one request
+/// timeout worst case) — not throughput; parked sets are pod-local
+/// under the single-writer posture.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "constant lands with the fan-out fill; this seam commit adds it for the red tests"
+    )
+)]
+const MAX_CONCURRENT_ROW_POLLS: usize = 8;
+
 /// The poll-delivery reconciler for one process: a private webhook client,
 /// the shared approval store it scans, the ingress registry it resolves
 /// through, and the identity mapping its poll-200 captures against. Built
@@ -50,6 +70,14 @@ pub struct PollReconciler {
     instance_id: String,
     interval: Duration,
     tool_header_mappings: ToolHeaderMappings,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "read by the fan-out fill's deadline checks; the seam commit lands it for the red tests"
+        )
+    )]
+    clock: PollClock,
 }
 
 impl PollReconciler {
@@ -104,7 +132,17 @@ impl PollReconciler {
             instance_id,
             interval: Duration::from_secs(*poll_interval_secs),
             tool_header_mappings: tool_headers_from_response.clone(),
+            clock: Arc::new(chrono::Utc::now),
         })
+    }
+
+    /// Test seam: override the wall clock the deadline checks read.
+    /// Mirrors the file store's `open_with_clock` split — the production
+    /// constructor always installs `Utc::now`.
+    #[cfg(test)]
+    fn with_clock(mut self, clock: PollClock) -> Self {
+        self.clock = clock;
+        self
     }
 
     /// Spawn the tick loop on the current runtime. The loop stops when
@@ -440,6 +478,400 @@ mod tests {
         id: &DecisionId,
     ) -> Option<ResolvedDecision> {
         store.decision(id).await.unwrap()
+    }
+
+    async fn write_response(socket: &mut tokio::net::TcpStream, status: &str, body: &str) {
+        let response = format!(
+            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n\
+             content-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        socket.write_all(response.as_bytes()).await.ok();
+        socket.shutdown().await.ok();
+    }
+
+    /// A test clock the test advances manually: reading the clock
+    /// returns the knob's current instant (starts at `Utc::now`).
+    fn adjustable_clock() -> (
+        PollClock,
+        Arc<std::sync::Mutex<chrono::DateTime<chrono::Utc>>>,
+    ) {
+        let knob = Arc::new(std::sync::Mutex::new(chrono::Utc::now()));
+        let clock: PollClock = {
+            let knob = Arc::clone(&knob);
+            Arc::new(move || *knob.lock().unwrap())
+        };
+        (clock, knob)
+    }
+
+    /// Gate receiver: every connection is its own task, so held and
+    /// fast rows proceed concurrently. A GET whose captured text
+    /// contains a hold marker is held until the gate opens, then served
+    /// `held_response`; every other request is served at once (GET 204,
+    /// POST 200). Captured request texts land on the channel.
+    async fn gate_receiver(
+        hold_markers: Vec<String>,
+        held_response: (&'static str, String),
+    ) -> (
+        String,
+        mpsc::Receiver<String>,
+        tokio::sync::watch::Sender<bool>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (tx, rx) = mpsc::channel(64);
+        let (gate, gate_open) = tokio::sync::watch::channel(false);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let tx = tx.clone();
+                let mut gate_open = gate_open.clone();
+                let markers = hold_markers.clone();
+                let held = held_response.clone();
+                tokio::spawn(async move {
+                    let captured = read_full_request(&mut socket).await;
+                    let is_get = captured.starts_with("GET ");
+                    let is_held = is_get && markers.iter().any(|marker| captured.contains(marker));
+                    if tx.send(captured).await.is_err() {
+                        return;
+                    }
+                    if is_held {
+                        while !*gate_open.borrow_and_update() {
+                            if gate_open.changed().await.is_err() {
+                                return;
+                            }
+                        }
+                        write_response(&mut socket, held.0, &held.1).await;
+                        return;
+                    }
+                    if is_get {
+                        write_response(&mut socket, "204 No Content", "").await;
+                    } else {
+                        write_response(&mut socket, "200 OK", "").await;
+                    }
+                });
+            }
+        });
+        (url, rx, gate)
+    }
+
+    /// Counting receiver: each connection task sleeps `hold_get` before
+    /// answering a GET (204) and answers a POST (200) at once, tracking
+    /// the peak number of simultaneously in-flight connections.
+    async fn counting_receiver(
+        hold_get: Duration,
+    ) -> (
+        String,
+        mpsc::Receiver<String>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (tx, rx) = mpsc::channel(64);
+        let inflight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let task_inflight = Arc::clone(&inflight);
+        let task_peak = Arc::clone(&peak);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let tx = tx.clone();
+                let inflight = Arc::clone(&task_inflight);
+                let peak = Arc::clone(&task_peak);
+                let hold_get = hold_get;
+                tokio::spawn(async move {
+                    let current = inflight.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    peak.fetch_max(current, std::sync::atomic::Ordering::SeqCst);
+                    let captured = read_full_request(&mut socket).await;
+                    if tx.send(captured.clone()).await.is_err() {
+                        return;
+                    }
+                    if captured.starts_with("GET ") {
+                        tokio::time::sleep(hold_get).await;
+                        write_response(&mut socket, "204 No Content", "").await;
+                    } else {
+                        write_response(&mut socket, "200 OK", "").await;
+                    }
+                    inflight.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                });
+            }
+        });
+        (url, rx, peak)
+    }
+
+    /// T1 slow-row progress: a held GET on one row does not stop other
+    /// rows from being read and acknowledged in the same pass. Red
+    /// pre-fill: the serial loop blocks behind the held row (the held
+    /// row registers first, matching the store's insertion order).
+    #[tokio::test]
+    async fn tick_a_held_row_does_not_block_other_rows_in_the_pass() {
+        let store: Arc<dyn ApprovalStore> = Arc::new(InMemoryApprovalStore::new());
+        let held = park_pending(&store, INSTANCE_ID).await;
+        let b = park_pending(&store, INSTANCE_ID).await;
+        let c = park_pending(&store, INSTANCE_ID).await;
+        let (url, mut rx, gate) =
+            gate_receiver(vec![held.to_string()], ("204 No Content", String::new())).await;
+        let reconciler = reconciler_with(store, &url);
+
+        let pass = tokio::spawn(async move { reconciler.tick().await });
+        let observed = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut seen_b = false;
+            let mut seen_c = false;
+            while !(seen_b && seen_c) {
+                let captured = rx.recv().await.expect("capture channel open");
+                seen_b |= captured.contains(&b.to_string());
+                seen_c |= captured.contains(&c.to_string());
+            }
+        })
+        .await;
+        assert!(
+            observed.is_ok(),
+            "other rows must progress while one row's read is held"
+        );
+        gate.send(true).expect("gate channel open");
+        tokio::time::timeout(Duration::from_secs(5), pass)
+            .await
+            .expect("pass completes once the gate opens")
+            .expect("tick task joins");
+    }
+
+    /// T2 concurrency cap: with more rows than the bound, peak in-flight
+    /// requests never exceed `MAX_CONCURRENT_ROW_POLLS`, and the pass
+    /// genuinely overlaps rows (peak above one — this assert is the red
+    /// signal; the cap alone would hold on serial code too). Red
+    /// pre-fill: the serial loop peaks at exactly one.
+    #[tokio::test]
+    async fn tick_caps_concurrent_rows_and_overlaps_them() {
+        let store: Arc<dyn ApprovalStore> = Arc::new(InMemoryApprovalStore::new());
+        for _ in 0..(MAX_CONCURRENT_ROW_POLLS + 4) {
+            park_pending(&store, INSTANCE_ID).await;
+        }
+        let (url, _rx, peak) = counting_receiver(Duration::from_millis(100)).await;
+        let reconciler = reconciler_with(store, &url);
+
+        tokio::time::timeout(Duration::from_secs(10), reconciler.tick())
+            .await
+            .expect("pass completes");
+
+        let peak = peak.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            peak <= MAX_CONCURRENT_ROW_POLLS,
+            "the concurrency cap holds: {peak}"
+        );
+        assert!(peak > 1, "rows genuinely overlap within a pass: {peak}");
+    }
+
+    /// T3 queued expiry: a row whose decision deadline passes while it
+    /// is queued behind the cap is never read or notified when its turn
+    /// comes, and its stored evidence is untouched — still pending,
+    /// still requiring notification. The store's own clock still sees
+    /// the row live (far real expiry); only the poller's clock moved.
+    /// Red pre-fill: the loop has no deadline check, so the queued row
+    /// is read anyway.
+    #[tokio::test]
+    async fn tick_skips_a_row_that_expires_while_queued() {
+        let (clock, knob) = adjustable_clock();
+        let store: Arc<dyn ApprovalStore> = Arc::new(InMemoryApprovalStore::new());
+        for _ in 0..MAX_CONCURRENT_ROW_POLLS {
+            park_pending(&store, INSTANCE_ID).await;
+        }
+        let queued = DecisionId::generate();
+        store
+            .register(ParkedApproval {
+                request: parked_request(queued, INSTANCE_ID),
+                registered_at: chrono::Utc::now(),
+                expires_at: chrono::Utc::now() + chrono::Duration::seconds(10),
+                authority: ApprovalAuthority::WebhookPoll,
+                egress_headers: None,
+                acknowledgment: AcknowledgmentState::RequiresNotification,
+            })
+            .await
+            .expect("queued row registers");
+        let (url, mut rx, gate) =
+            gate_receiver(vec!["GET".to_string()], ("204 No Content", String::new())).await;
+        let reconciler = reconciler_with(store.clone(), &url).with_clock(clock);
+
+        let pass = tokio::spawn(async move { reconciler.tick().await });
+        let mut inflight_gets = 0;
+        while inflight_gets < MAX_CONCURRENT_ROW_POLLS {
+            let captured = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("rows reach the receiver")
+                .expect("capture channel open");
+            if captured.starts_with("GET ") {
+                inflight_gets += 1;
+            }
+        }
+        // Expire the queued row on the poller's clock only, before its
+        // slot frees.
+        *knob.lock().unwrap() = chrono::Utc::now() + chrono::Duration::seconds(11);
+        gate.send(true).expect("gate channel open");
+        tokio::time::timeout(Duration::from_secs(10), pass)
+            .await
+            .expect("pass completes")
+            .expect("tick task joins");
+
+        let still = store.get(&queued).await.unwrap().expect("queued row kept");
+        assert!(
+            still.acknowledgment.is_requires_notification(),
+            "no store write touches the skipped row"
+        );
+        while let Ok(captured) = rx.try_recv() {
+            assert!(
+                !captured.contains(&queued.to_string()),
+                "an expired queued row gets no read and no notify: {captured}"
+            );
+        }
+    }
+
+    /// T4 expiry between GET and POST: the status read returns NotYet
+    /// after the row's decision deadline has passed — the notify POST is
+    /// withheld and the row is left exactly as it was. Red pre-fill:
+    /// the loop posts immediately after an undecided read.
+    #[tokio::test]
+    async fn tick_withholds_the_notify_post_when_the_deadline_passes_during_the_read() {
+        let (clock, knob) = adjustable_clock();
+        let store: Arc<dyn ApprovalStore> = Arc::new(InMemoryApprovalStore::new());
+        let id = park_pending(&store, INSTANCE_ID).await;
+        let (url, mut rx, gate) =
+            gate_receiver(vec![id.to_string()], ("204 No Content", String::new())).await;
+        let reconciler = reconciler_with(store.clone(), &url).with_clock(clock);
+
+        let pass = tokio::spawn(async move { reconciler.tick().await });
+        let captured = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the read reaches the receiver")
+            .expect("capture channel open");
+        assert!(
+            captured.starts_with("GET "),
+            "the read precedes the notify: {captured}"
+        );
+        // The deadline passes while the GET is held in flight.
+        *knob.lock().unwrap() = chrono::Utc::now() + chrono::Duration::hours(2);
+        gate.send(true).expect("gate channel open");
+        tokio::time::timeout(Duration::from_secs(5), pass)
+            .await
+            .expect("pass completes")
+            .expect("tick task joins");
+
+        let leaked = rx.try_recv();
+        assert!(
+            leaked.is_err(),
+            "no notify POST after the deadline: {leaked:?}"
+        );
+        let still = store.get(&id).await.unwrap().expect("row kept");
+        assert!(
+            still.acknowledgment.is_requires_notification(),
+            "the withheld POST leaves the row unacknowledged"
+        );
+    }
+
+    /// T5 late response: a decided read that lands after the poller's
+    /// clock passed the deadline still flows to the store's atomic
+    /// arbitration — the store's own deadline and ownership checks
+    /// decide, never the poller. The row resolves through the decided
+    /// path and never posts its request. Contract pin, green on both
+    /// sides of the fill.
+    #[tokio::test]
+    async fn tick_forwards_a_late_decided_read_to_the_store_arbitration() {
+        let (clock, knob) = adjustable_clock();
+        let store: Arc<dyn ApprovalStore> = Arc::new(InMemoryApprovalStore::new());
+        let id = park_pending(&store, INSTANCE_ID).await;
+        let (url, mut rx, gate) = gate_receiver(
+            vec![id.to_string()],
+            ("200 OK", r#"{"approved":true}"#.to_string()),
+        )
+        .await;
+        let reconciler = reconciler_with(store.clone(), &url).with_clock(clock);
+
+        let pass = tokio::spawn(async move { reconciler.tick().await });
+        let captured = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the read reaches the receiver")
+            .expect("capture channel open");
+        assert!(captured.starts_with("GET "), "the read is held: {captured}");
+        // The deadline passes on the poller's clock while the read is
+        // in flight; the decided response lands after it.
+        *knob.lock().unwrap() = chrono::Utc::now() + chrono::Duration::hours(2);
+        gate.send(true).expect("gate channel open");
+        tokio::time::timeout(Duration::from_secs(5), pass)
+            .await
+            .expect("pass completes")
+            .expect("tick task joins");
+
+        let decision = store_decision(&store, &id)
+            .await
+            .expect("the store arbitrates the late decision");
+        assert!(
+            matches!(decision, ResolvedDecision::Approved { .. }),
+            "the decision recorded is the polled one"
+        );
+        let leaked = rx.try_recv();
+        assert!(
+            leaked.is_err(),
+            "a decided row never posts its request: {leaked:?}"
+        );
+    }
+
+    /// T6 shutdown: cancelling mid-pass starts no new rows — the rows
+    /// queued behind the cap issue no request — while the in-flight
+    /// reads complete once released and stop() joins promptly. Red
+    /// pre-fill: the serial loop keeps processing the remaining rows
+    /// inside the same pass after cancellation.
+    #[tokio::test]
+    async fn cancel_mid_pass_starts_no_new_rows_and_joins_promptly() {
+        let store: Arc<dyn ApprovalStore> = Arc::new(InMemoryApprovalStore::new());
+        let mut ids = Vec::new();
+        for _ in 0..(MAX_CONCURRENT_ROW_POLLS + 4) {
+            ids.push(park_pending(&store, INSTANCE_ID).await);
+        }
+        let (url, mut rx, gate) =
+            gate_receiver(vec!["GET".to_string()], ("204 No Content", String::new())).await;
+        let shutdown = CancellationToken::new();
+        let reconciler = reconciler_with(store, &url);
+        let handle = reconciler.spawn(&shutdown);
+
+        // Let the cap fill with held reads.
+        let mut captures: Vec<String> = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while captures.iter().filter(|c| c.starts_with("GET ")).count()
+                < MAX_CONCURRENT_ROW_POLLS
+            {
+                captures.push(rx.recv().await.expect("capture channel open"));
+            }
+        })
+        .await
+        .expect("the cap fills with held reads");
+        shutdown.cancel();
+        gate.send(true).expect("gate channel open");
+        let started = std::time::Instant::now();
+        tokio::time::timeout(Duration::from_secs(5), handle.stop())
+            .await
+            .expect("stop must not hang");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "stop returned promptly"
+        );
+        while let Ok(captured) = rx.try_recv() {
+            captures.push(captured);
+        }
+
+        let read_ids = ids
+            .iter()
+            .filter(|id| {
+                captures
+                    .iter()
+                    .any(|c| c.starts_with("GET ") && c.contains(&id.to_string()))
+            })
+            .count();
+        assert_eq!(
+            read_ids, MAX_CONCURRENT_ROW_POLLS,
+            "exactly the admitted rows were read; queued rows issue no request after cancel"
+        );
     }
 
     /// The tick loop against a scripted receiver: the status read runs
