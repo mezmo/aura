@@ -187,7 +187,7 @@ pub struct ServerArgs {
 
     /// Maximum Slack messages the ingress answers concurrently; further
     /// messages wait for a slot.
-    #[arg(long, env = "AURA_SLACK_CONCURRENCY", default_value = "4")]
+    #[arg(long, env = "AURA_SLACK_CONCURRENCY", default_value = "4", value_parser = parse_concurrency)]
     pub slack_concurrency: usize,
 }
 
@@ -197,6 +197,14 @@ fn parse_bot_token(raw: &str) -> Result<crate::slack::BotToken, String> {
 
 fn parse_app_token(raw: &str) -> Result<crate::slack::AppToken, String> {
     crate::slack::AppToken::new(raw.to_owned()).map_err(|e| e.to_string())
+}
+
+fn parse_concurrency(raw: &str) -> Result<usize, String> {
+    match raw.parse::<usize>() {
+        Ok(0) => Err("must be at least 1".to_owned()),
+        Ok(n) => Ok(n),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 /// Parse `argv` (leading program path ignored), titling `--help`/`--version`
@@ -506,6 +514,29 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
         hitl_webhook_hmac: ingress_hmac.clone(),
         session_store: session_store.clone(),
     });
+
+    if args.enable_slack {
+        let (Some(bot_token), Some(app_token)) =
+            (args.slack_bot_token.clone(), args.slack_app_token.clone())
+        else {
+            error!("--enable-slack needs both --slack-bot-token and --slack-app-token");
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "slack ingress enabled without both tokens",
+            ));
+        };
+        crate::slack::start(
+            app_state.clone(),
+            crate::slack::SlackApi::new(bot_token, app_token),
+            args.slack_agent.as_deref(),
+            args.slack_concurrency,
+        )
+        .await
+        .map_err(|e| {
+            error!("Slack ingress failed to start: {e}");
+            std::io::Error::other(format!("slack ingress error: {e}"))
+        })?;
+    }
 
     info!(
         "Starting server on {}:{} (shutdown_timeout={shutdown_timeout:?})",

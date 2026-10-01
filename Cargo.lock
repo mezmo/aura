@@ -399,6 +399,7 @@ dependencies = [
  "redis",
  "reqwest",
  "rig-core",
+ "rustls 0.23.40",
  "serde",
  "serde_json",
  "tempfile",
