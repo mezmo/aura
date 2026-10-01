@@ -4,5 +4,6 @@ pub mod a2a;
 pub mod handlers;
 pub mod server;
 pub mod session_store;
+pub mod slack;
 pub mod streaming;
 pub mod types;
