@@ -126,4 +126,18 @@ pub(crate) const CATALOG: &[CatalogEntry] = &[
         },
         starter_prompt: "What pods are running in my cluster, and are any of them unhealthy?",
     },
+    CatalogEntry {
+        key: "youcom",
+        description: "You.com web search and research (keyless free tier, no credentials)",
+        prerequisites: "No credentials needed: this uses You.com's keyless free tier \
+                        (rate-limited web search). \
+                        AURA will be able to search the web through \
+                        the you-search and you-discover tools.",
+        template: Template::Http {
+            url: "https://api.you.com/mcp?profile=free",
+            headers: &[],
+        },
+        starter_prompt: "Search the web for recent CVEs affecting containerd and summarize \
+                        the advisories.",
+    },
 ];
