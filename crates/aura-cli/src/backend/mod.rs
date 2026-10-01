@@ -8,7 +8,7 @@ use std::sync::atomic::AtomicBool;
 
 use anyhow::Result;
 
-use crate::api::stream::{StreamHandler, StreamResult};
+use crate::api::stream::{StreamHandler, StreamOutcome};
 use crate::api::types::{Message, ToolDefinition};
 use crate::cli::Args;
 use crate::config::AppConfig;
@@ -58,7 +58,7 @@ impl Backend {
         session_id: &str,
         cancel: Arc<AtomicBool>,
         handler: &mut impl StreamHandler,
-    ) -> Result<StreamResult> {
+    ) -> Result<StreamOutcome> {
         match self {
             Self::Http(http) => {
                 http.stream_chat(messages, tools, session_id, cancel, handler)

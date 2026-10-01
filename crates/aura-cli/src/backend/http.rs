@@ -4,7 +4,7 @@ use std::sync::atomic::AtomicBool;
 use anyhow::Result;
 
 use crate::api::client::ChatClient;
-use crate::api::stream::{StreamHandler, StreamResult, process_stream};
+use crate::api::stream::{StreamHandler, StreamOutcome, process_stream};
 use crate::api::types::{Message, ToolDefinition};
 use crate::config::AppConfig;
 
@@ -30,7 +30,7 @@ impl HttpBackend {
         session_id: &str,
         cancel: Arc<AtomicBool>,
         handler: &mut impl StreamHandler,
-    ) -> Result<StreamResult> {
+    ) -> Result<StreamOutcome> {
         let response = self
             .client
             .send_streaming(messages, tools, session_id)

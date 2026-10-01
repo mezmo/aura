@@ -182,7 +182,7 @@ pub async fn process_stream(
     response: Response,
     cancel: Arc<AtomicBool>,
     handler: &mut impl StreamHandler,
-) -> Result<StreamResult> {
+) -> Result<StreamOutcome> {
     let stream = response.bytes_stream().eventsource();
     process_sse_events(stream, cancel, handler).await
 }
@@ -195,12 +195,13 @@ pub async fn process_stream(
 /// - `cancel`: when set to `true`, the stream is abandoned early
 /// - `handler`: a [`StreamHandler`] whose methods are invoked as events arrive
 ///
-/// Returns a `StreamResult` — either `TextResponse` or `ToolCalls`.
+/// Returns a `StreamOutcome` — what was accumulated before the stream
+/// ended (`TextResponse` or `ToolCalls`) plus how the stream ended.
 pub async fn process_sse_events<S, E>(
     mut stream: S,
     cancel: Arc<AtomicBool>,
     handler: &mut impl StreamHandler,
-) -> Result<StreamResult>
+) -> Result<StreamOutcome>
 where
     S: futures_util::Stream<Item = Result<eventsource_stream::Event, E>> + Unpin,
     E: std::fmt::Display,
@@ -219,25 +220,37 @@ where
         std::collections::HashMap::new(); // index -> (id, name, arguments)
     let mut finish_reason: Option<String> = None;
 
+    let termination;
     loop {
         if cancel.load(Ordering::Relaxed) {
+            termination = StreamTermination::Cancelled;
             break;
         }
 
         let event = tokio::select! {
             biased;
-            _ = wait_for_cancel(&cancel) => break,
+            _ = wait_for_cancel(&cancel) => {
+                termination = StreamTermination::Cancelled;
+                break;
+            }
             event = stream.next() => match event {
                 Some(Ok(event)) => event,
                 Some(Err(e)) => {
                     eprintln!("SSE stream error: {}", e);
+                    termination = StreamTermination::StreamError {
+                        detail: e.to_string(),
+                    };
                     break;
                 }
-                None => break,
+                None => {
+                    termination = StreamTermination::EofWithoutDone;
+                    break;
+                }
             },
         };
 
         if event.data == "[DONE]" {
+            termination = StreamTermination::Done;
             break;
         }
 
@@ -446,31 +459,37 @@ where
     }
 
     // Determine result based on finish_reason and accumulated tool calls
-    if finish_reason.as_deref() == Some("tool_calls") && !tool_call_accumulators.is_empty() {
-        let mut tool_calls: Vec<(usize, AccumulatedToolCall)> = tool_call_accumulators
-            .into_iter()
-            .map(|(idx, (id, name, args))| {
-                (
-                    idx,
-                    AccumulatedToolCall {
-                        id,
-                        name,
-                        arguments: args,
-                    },
-                )
-            })
-            .collect();
-        tool_calls.sort_by_key(|(idx, _)| *idx);
-        let tool_calls = tool_calls.into_iter().map(|(_, tc)| tc).collect();
+    let received =
+        if finish_reason.as_deref() == Some("tool_calls") && !tool_call_accumulators.is_empty() {
+            let mut tool_calls: Vec<(usize, AccumulatedToolCall)> = tool_call_accumulators
+                .into_iter()
+                .map(|(idx, (id, name, args))| {
+                    (
+                        idx,
+                        AccumulatedToolCall {
+                            id,
+                            name,
+                            arguments: args,
+                        },
+                    )
+                })
+                .collect();
+            tool_calls.sort_by_key(|(idx, _)| *idx);
+            let tool_calls = tool_calls.into_iter().map(|(_, tc)| tc).collect();
 
-        Ok(StreamResult::ToolCalls {
-            text: full_response,
-            tool_calls,
-            server_results,
-        })
-    } else {
-        Ok(StreamResult::TextResponse(full_response))
-    }
+            StreamResult::ToolCalls {
+                text: full_response,
+                tool_calls,
+                server_results,
+            }
+        } else {
+            StreamResult::TextResponse(full_response)
+        };
+
+    Ok(StreamOutcome {
+        received,
+        termination,
+    })
 }
 
 #[cfg(test)]
@@ -614,7 +633,7 @@ mod tests {
     /// Drive process_sse_events with a vec of synthetic events and tracking callbacks.
     async fn run_stream(
         events: Vec<eventsource_stream::Event>,
-    ) -> (Result<StreamResult>, Captures) {
+    ) -> (Result<StreamOutcome>, Captures) {
         let event_stream = stream::iter(
             events
                 .into_iter()
@@ -624,6 +643,73 @@ mod tests {
         let mut caps = Captures::default();
         let result = process_sse_events(event_stream, no_cancel(), &mut caps).await;
         (result, caps)
+    }
+
+    /// Drive process_sse_events with raw result items, for streams that
+    /// surface transport errors mid-flight.
+    async fn run_stream_raw(
+        items: Vec<Result<eventsource_stream::Event, std::io::Error>>,
+    ) -> Result<StreamOutcome> {
+        let event_stream = stream::iter(items);
+        process_sse_events(event_stream, no_cancel(), &mut NoopHandler).await
+    }
+
+    // -----------------------------------------------------------------------
+    // Termination classification tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn termination_done_is_reported_after_done_sentinel() {
+        let (result, _) =
+            run_stream(vec![sse("", &text_chunk("hello", None)), sse("", "[DONE]")]).await;
+        let outcome = result.unwrap();
+        assert!(matches!(outcome.termination, StreamTermination::Done));
+    }
+
+    #[tokio::test]
+    async fn termination_eof_without_done_preserves_received_partial() {
+        let (result, _) = run_stream(vec![sse("", &text_chunk("partial", None))]).await;
+        let outcome = result.unwrap();
+        assert!(matches!(
+            outcome.termination,
+            StreamTermination::EofWithoutDone
+        ));
+        match outcome.received {
+            StreamResult::TextResponse(text) => assert_eq!(text, "partial"),
+            other => panic!("expected TextResponse, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn termination_stream_error_is_reported_with_detail() {
+        let items = vec![
+            Ok(sse("", &text_chunk("before", None))),
+            Err(std::io::Error::other("connection reset")),
+        ];
+        let outcome = run_stream_raw(items).await.unwrap();
+        match outcome.termination {
+            StreamTermination::StreamError { detail } => {
+                assert!(detail.contains("connection reset"));
+            }
+            other => panic!("expected StreamError, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn termination_malformed_named_event_body_is_reported() {
+        // A named aura.* event whose body is not JSON at all is a
+        // malformed-protocol report: no consumer could ever read it.
+        let (result, _) = run_stream(vec![
+            sse("aura.orchestrator.session_info", "{not json"),
+            sse("", "[DONE]"),
+        ])
+        .await;
+        let outcome = result.unwrap();
+        assert!(
+            matches!(outcome.termination, StreamTermination::Malformed { .. }),
+            "expected Malformed, got {:?}",
+            outcome.termination
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -639,7 +725,7 @@ mod tests {
             sse("", "[DONE]"),
         ];
         let (result, caps) = run_stream(events).await;
-        match result.unwrap() {
+        match result.unwrap().received {
             StreamResult::TextResponse(text) => assert_eq!(text, "Hello world!"),
             other => panic!("expected TextResponse, got {:?}", other),
         }
@@ -649,7 +735,7 @@ mod tests {
     #[tokio::test]
     async fn empty_stream_returns_empty_text() {
         let (result, _) = run_stream(vec![]).await;
-        match result.unwrap() {
+        match result.unwrap().received {
             StreamResult::TextResponse(text) => assert_eq!(text, ""),
             other => panic!("expected TextResponse, got {:?}", other),
         }
@@ -663,7 +749,7 @@ mod tests {
             sse("", &text_chunk("after", None)),
         ];
         let (result, caps) = run_stream(events).await;
-        match result.unwrap() {
+        match result.unwrap().received {
             StreamResult::TextResponse(text) => assert_eq!(text, "before"),
             other => panic!("expected TextResponse, got {:?}", other),
         }
@@ -688,7 +774,7 @@ mod tests {
             sse("", "[DONE]"),
         ];
         let (result, _) = run_stream(events).await;
-        match result.unwrap() {
+        match result.unwrap().received {
             StreamResult::ToolCalls { tool_calls, .. } => {
                 assert_eq!(tool_calls.len(), 1);
                 assert_eq!(tool_calls[0].id, "call_1");
@@ -719,7 +805,7 @@ mod tests {
             sse("", "[DONE]"),
         ];
         let (result, _) = run_stream(events).await;
-        match result.unwrap() {
+        match result.unwrap().received {
             StreamResult::ToolCalls { tool_calls, .. } => {
                 assert_eq!(tool_calls.len(), 2);
                 assert_eq!(tool_calls[0].name, "Read");
@@ -740,7 +826,7 @@ mod tests {
             sse("", "[DONE]"),
         ];
         let (result, _) = run_stream(events).await;
-        match result.unwrap() {
+        match result.unwrap().received {
             StreamResult::ToolCalls {
                 text, tool_calls, ..
             } => {
@@ -762,7 +848,7 @@ mod tests {
             sse("", "[DONE]"),
         ];
         let (result, _) = run_stream(events).await;
-        match result.unwrap() {
+        match result.unwrap().received {
             StreamResult::TextResponse(_) => {}
             other => panic!("expected TextResponse for stop, got {:?}", other),
         }
@@ -866,7 +952,7 @@ mod tests {
             sse("", "[DONE]"),
         ];
         let (result, _) = run_stream(events).await;
-        match result.unwrap() {
+        match result.unwrap().received {
             StreamResult::ToolCalls { server_results, .. } => {
                 assert_eq!(
                     server_results.get("call_fail").unwrap(),
@@ -904,7 +990,7 @@ mod tests {
             sse("", "[DONE]"),
         ];
         let (result, _) = run_stream(events).await;
-        match result.unwrap() {
+        match result.unwrap().received {
             StreamResult::ToolCalls { server_results, .. } => {
                 assert_eq!(server_results.get("call_99").unwrap(), "file_output");
             }
@@ -1062,7 +1148,7 @@ mod tests {
         ];
         let (result, caps) = run_stream(events).await;
         // Should not panic, should get the valid token
-        match result.unwrap() {
+        match result.unwrap().received {
             StreamResult::TextResponse(text) => assert_eq!(text, "ok"),
             other => panic!("expected TextResponse, got {:?}", other),
         }
@@ -1086,10 +1172,11 @@ mod tests {
         let result = process_sse_events(event_stream, cancel, &mut NoopHandler)
             .await
             .unwrap();
-        match result {
+        match result.received {
             StreamResult::TextResponse(text) => assert_eq!(text, ""),
             other => panic!("expected empty TextResponse on cancel, got {:?}", other),
         }
+        assert!(matches!(result.termination, StreamTermination::Cancelled));
     }
 
     #[tokio::test]

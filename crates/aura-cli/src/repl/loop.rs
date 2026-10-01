@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use tokio::runtime::Runtime;
 
 use crate::api::mcp_status::McpNotice;
-use crate::api::stream::{StreamHandler, StreamResult};
+use crate::api::stream::{StreamHandler, StreamOutcome, StreamResult};
 use crate::api::types::{DisplayEvent, ShellCallDetail, ToolCallInfo, snake_to_pascal_case};
 use crate::backend::Backend;
 use crate::config::AppConfig;
@@ -1201,274 +1201,263 @@ pub fn run_repl(
                     }
 
                     match result {
-                        Ok(StreamResult::TextResponse(text)) => {
-                            // Check for auto-compaction trigger (context pressure).
-                            // Occupancy is bounded by the window, so it is
-                            // judged as a fill fraction; without a
-                            // window-relative reading there is no pressure to
-                            // act on.
-                            let under_pressure = fresh_context_fill_ratio()
-                                .is_some_and(|fill| fill >= AUTO_COMPACT_FILL);
-                            if under_pressure
-                                && text.contains(
-                                    "My tools returned more data than I can work with at once",
-                                )
-                            {
-                                auto_compact_count += 1;
+                        Ok(StreamOutcome {
+                            received,
+                            termination: _,
+                        }) => match received {
+                            StreamResult::TextResponse(text) => {
+                                // Check for auto-compaction trigger (context pressure).
+                                // Occupancy is bounded by the window, so it is
+                                // judged as a fill fraction; without a
+                                // window-relative reading there is no pressure to
+                                // act on.
+                                let under_pressure = fresh_context_fill_ratio()
+                                    .is_some_and(|fill| fill >= AUTO_COMPACT_FILL);
+                                if under_pressure
+                                    && text.contains(
+                                        "My tools returned more data than I can work with at once",
+                                    )
+                                {
+                                    auto_compact_count += 1;
 
-                                if auto_compact_count <= 2 {
-                                    // Auto-compact and retry
-                                    let removed = conversation.compact();
+                                    if auto_compact_count <= 2 {
+                                        // Auto-compact and retry
+                                        let removed = conversation.compact();
 
-                                    // Stop any running animations
-                                    if let Ok(mut guard) = post_tool_wave.lock()
-                                        && let Some((ptw_anim, _)) = guard.take()
-                                    {
-                                        ptw_anim.finish();
-                                    }
-                                    if !anim_cleared.load(Ordering::Relaxed) {
-                                        if let Some(a) = anim.take() {
-                                            a.finish();
+                                        // Stop any running animations
+                                        if let Ok(mut guard) = post_tool_wave.lock()
+                                            && let Some((ptw_anim, _)) = guard.take()
+                                        {
+                                            ptw_anim.finish();
                                         }
-                                        anim_cleared.store(true, Ordering::Relaxed);
-                                    }
-                                    erase_input_frame();
-
-                                    println!(
-                                        "{} {}",
-                                        "●"
-                                            .with(random_bullet_color())
-                                            .attribute(crossterm::style::Attribute::Bold),
-                                        "Auto-compacting context"
-                                            .attribute(crossterm::style::Attribute::Bold),
-                                    );
-                                    println!(
-                                        "{} Context limit reached — removed {} messages ({} tokens in context)",
-                                        "└─".themed(AuraStyle::Connector),
-                                        removed,
-                                        get_context_tokens(),
-                                    );
-                                    println!();
-
-                                    if let Ok(mut events) = turn_events.lock() {
-                                        events.push(DisplayEvent::Compacted {
-                                            messages_removed: removed,
-                                        });
-                                    }
-                                    did_compact = true;
-
-                                    // Restart thinking animation and retry with compacted context
-                                    let (new_anim, new_stop) = WaveAnimation::start(
-                                        "Thinking",
-                                        vec![],
-                                        input_buf.clone(),
-                                        Some(cancel_flag.clone()),
-                                    );
-                                    drop(new_stop);
-                                    if let Ok(mut guard) = post_tool_wave.lock() {
-                                        *guard = Some((new_anim, stop_flag.clone()));
-                                    }
-                                    prepare_input_line(&input_buf, Some(&cancel_flag));
-
-                                    continue 'tool_loop;
-                                } else {
-                                    // 3rd attempt: history-free fallback
-                                    // Compact client-side one more time
-                                    let removed = conversation.compact();
-
-                                    if let Ok(mut guard) = post_tool_wave.lock()
-                                        && let Some((ptw_anim, _)) = guard.take()
-                                    {
-                                        ptw_anim.finish();
-                                    }
-                                    if !anim_cleared.load(Ordering::Relaxed) {
-                                        if let Some(a) = anim.take() {
-                                            a.finish();
+                                        if !anim_cleared.load(Ordering::Relaxed) {
+                                            if let Some(a) = anim.take() {
+                                                a.finish();
+                                            }
+                                            anim_cleared.store(true, Ordering::Relaxed);
                                         }
-                                        anim_cleared.store(true, Ordering::Relaxed);
-                                    }
-                                    erase_input_frame();
+                                        erase_input_frame();
 
-                                    println!(
-                                        "{} {}",
-                                        "●"
-                                            .with(random_bullet_color())
-                                            .attribute(crossterm::style::Attribute::Bold),
-                                        "Auto-compacting context (recovery mode)"
-                                            .attribute(crossterm::style::Attribute::Bold),
-                                    );
-                                    println!(
-                                        "{} Removed {} more messages. Sending minimal recovery request.",
-                                        "└─".themed(AuraStyle::Connector),
-                                        removed,
-                                    );
-                                    println!();
+                                        println!(
+                                            "{} {}",
+                                            "●"
+                                                .with(random_bullet_color())
+                                                .attribute(crossterm::style::Attribute::Bold),
+                                            "Auto-compacting context"
+                                                .attribute(crossterm::style::Attribute::Bold),
+                                        );
+                                        println!(
+                                            "{} Context limit reached — removed {} messages ({} tokens in context)",
+                                            "└─".themed(AuraStyle::Connector),
+                                            removed,
+                                            get_context_tokens(),
+                                        );
+                                        println!();
 
-                                    if let Ok(mut events) = turn_events.lock() {
-                                        events.push(DisplayEvent::Compacted {
-                                            messages_removed: removed,
-                                        });
-                                    }
-                                    did_compact = true;
+                                        if let Ok(mut events) = turn_events.lock() {
+                                            events.push(DisplayEvent::Compacted {
+                                                messages_removed: removed,
+                                            });
+                                        }
+                                        did_compact = true;
 
-                                    // Send a minimal history-free message so the LLM can recover
-                                    conversation.add_assistant(&text);
-                                    conversation.add_user(
+                                        // Restart thinking animation and retry with compacted context
+                                        let (new_anim, new_stop) = WaveAnimation::start(
+                                            "Thinking",
+                                            vec![],
+                                            input_buf.clone(),
+                                            Some(cancel_flag.clone()),
+                                        );
+                                        drop(new_stop);
+                                        if let Ok(mut guard) = post_tool_wave.lock() {
+                                            *guard = Some((new_anim, stop_flag.clone()));
+                                        }
+                                        prepare_input_line(&input_buf, Some(&cancel_flag));
+
+                                        continue 'tool_loop;
+                                    } else {
+                                        // 3rd attempt: history-free fallback
+                                        // Compact client-side one more time
+                                        let removed = conversation.compact();
+
+                                        if let Ok(mut guard) = post_tool_wave.lock()
+                                            && let Some((ptw_anim, _)) = guard.take()
+                                        {
+                                            ptw_anim.finish();
+                                        }
+                                        if !anim_cleared.load(Ordering::Relaxed) {
+                                            if let Some(a) = anim.take() {
+                                                a.finish();
+                                            }
+                                            anim_cleared.store(true, Ordering::Relaxed);
+                                        }
+                                        erase_input_frame();
+
+                                        println!(
+                                            "{} {}",
+                                            "●"
+                                                .with(random_bullet_color())
+                                                .attribute(crossterm::style::Attribute::Bold),
+                                            "Auto-compacting context (recovery mode)"
+                                                .attribute(crossterm::style::Attribute::Bold),
+                                        );
+                                        println!(
+                                            "{} Removed {} more messages. Sending minimal recovery request.",
+                                            "└─".themed(AuraStyle::Connector),
+                                            removed,
+                                        );
+                                        println!();
+
+                                        if let Ok(mut events) = turn_events.lock() {
+                                            events.push(DisplayEvent::Compacted {
+                                                messages_removed: removed,
+                                            });
+                                        }
+                                        did_compact = true;
+
+                                        // Send a minimal history-free message so the LLM can recover
+                                        conversation.add_assistant(&text);
+                                        conversation.add_user(
                                         "The conversation context was too large so it has been \
                                          compacted automatically. Please continue where you left off."
                                     );
 
-                                    // Restart animation and retry
-                                    let (new_anim, new_stop) = WaveAnimation::start(
-                                        "Thinking",
-                                        vec![],
-                                        input_buf.clone(),
-                                        Some(cancel_flag.clone()),
-                                    );
-                                    drop(new_stop);
-                                    if let Ok(mut guard) = post_tool_wave.lock() {
-                                        *guard = Some((new_anim, stop_flag.clone()));
+                                        // Restart animation and retry
+                                        let (new_anim, new_stop) = WaveAnimation::start(
+                                            "Thinking",
+                                            vec![],
+                                            input_buf.clone(),
+                                            Some(cancel_flag.clone()),
+                                        );
+                                        drop(new_stop);
+                                        if let Ok(mut guard) = post_tool_wave.lock() {
+                                            *guard = Some((new_anim, stop_flag.clone()));
+                                        }
+                                        prepare_input_line(&input_buf, Some(&cancel_flag));
+
+                                        continue 'tool_loop;
                                     }
-                                    prepare_input_line(&input_buf, Some(&cancel_flag));
-
-                                    continue 'tool_loop;
                                 }
-                            }
 
-                            final_text = text;
-                            break 'tool_loop;
-                        }
-                        Ok(StreamResult::ToolCalls {
-                            text,
-                            tool_calls,
-                            server_results,
-                        }) => {
-                            // Stop any running animations before tool execution
-                            if let Ok(mut guard) = post_tool_wave.lock()
-                                && let Some((ptw_anim, _)) = guard.take()
-                            {
-                                ptw_anim.finish();
+                                final_text = text;
+                                break 'tool_loop;
                             }
-                            if !anim_cleared.load(Ordering::Relaxed) {
-                                if let Some(a) = anim.take() {
-                                    a.finish();
+                            StreamResult::ToolCalls {
+                                text,
+                                tool_calls,
+                                server_results,
+                            } => {
+                                // Stop any running animations before tool execution
+                                if let Ok(mut guard) = post_tool_wave.lock()
+                                    && let Some((ptw_anim, _)) = guard.take()
+                                {
+                                    ptw_anim.finish();
                                 }
-                                anim_cleared.store(true, Ordering::Relaxed);
-                            }
-                            erase_input_frame();
+                                if !anim_cleared.load(Ordering::Relaxed) {
+                                    if let Some(a) = anim.take() {
+                                        a.finish();
+                                    }
+                                    anim_cleared.store(true, Ordering::Relaxed);
+                                }
+                                erase_input_frame();
 
-                            // Convert AccumulatedToolCalls to ToolCallInfo for history
-                            let tool_call_infos: Vec<ToolCallInfo> = tool_calls
-                                .iter()
-                                .map(|tc| ToolCallInfo {
-                                    id: tc.id.clone(),
-                                    call_type: "function".to_string(),
-                                    function: crate::api::types::FunctionCallInfo {
-                                        name: tc.name.clone(),
-                                        arguments: tc.arguments.clone(),
-                                    },
-                                })
-                                .collect();
+                                // Convert AccumulatedToolCalls to ToolCallInfo for history
+                                let tool_call_infos: Vec<ToolCallInfo> = tool_calls
+                                    .iter()
+                                    .map(|tc| ToolCallInfo {
+                                        id: tc.id.clone(),
+                                        call_type: "function".to_string(),
+                                        function: crate::api::types::FunctionCallInfo {
+                                            name: tc.name.clone(),
+                                            arguments: tc.arguments.clone(),
+                                        },
+                                    })
+                                    .collect();
 
-                            // Add assistant message with tool calls to history
-                            let text_content = if text.is_empty() { None } else { Some(text) };
-                            conversation
-                                .add_assistant_with_tool_calls(text_content, tool_call_infos);
+                                // Add assistant message with tool calls to history
+                                let text_content = if text.is_empty() { None } else { Some(text) };
+                                conversation
+                                    .add_assistant_with_tool_calls(text_content, tool_call_infos);
 
-                            // Execute each tool call, collecting info for grouped display
-                            let mut batch_tools: Vec<(
-                                String,
-                                String,
-                                String,
-                                std::time::Duration,
-                            )> = Vec::new();
-                            for tc in &tool_calls {
-                                // Special handling for CompactContext — needs direct
-                                // access to conversation and event_log
-                                if tc.name == "CompactContext" {
-                                    let removed = conversation.compact();
-                                    let result_msg = format!(
-                                        "Context compacted: removed {} messages. \
+                                // Execute each tool call, collecting info for grouped display
+                                let mut batch_tools: Vec<(
+                                    String,
+                                    String,
+                                    String,
+                                    std::time::Duration,
+                                )> = Vec::new();
+                                for tc in &tool_calls {
+                                    // Special handling for CompactContext — needs direct
+                                    // access to conversation and event_log
+                                    if tc.name == "CompactContext" {
+                                        let removed = conversation.compact();
+                                        let result_msg = format!(
+                                            "Context compacted: removed {} messages. \
                                          Conversation history has been pruned to the most \
                                          recent half. The system prompt is preserved.",
-                                        removed
-                                    );
+                                            removed
+                                        );
 
-                                    println!(
-                                        "{} {}",
-                                        "●"
-                                            .with(random_bullet_color())
-                                            .attribute(crossterm::style::Attribute::Bold),
-                                        "CompactContext()".themed(AuraStyle::Primary),
-                                    );
-                                    println!(
-                                        "{} {}",
-                                        "└─".themed(AuraStyle::Connector),
-                                        result_msg.as_str().themed(AuraStyle::Muted),
-                                    );
+                                        println!(
+                                            "{} {}",
+                                            "●"
+                                                .with(random_bullet_color())
+                                                .attribute(crossterm::style::Attribute::Bold),
+                                            "CompactContext()".themed(AuraStyle::Primary),
+                                        );
+                                        println!(
+                                            "{} {}",
+                                            "└─".themed(AuraStyle::Connector),
+                                            result_msg.as_str().themed(AuraStyle::Muted),
+                                        );
 
-                                    if let Ok(mut events) = turn_events.lock() {
-                                        events.push(DisplayEvent::Compacted {
-                                            messages_removed: removed,
-                                        });
-                                    }
-                                    did_compact = true;
-
-                                    conversation.add_tool_result(&tc.id, &tc.name, &result_msg);
-                                    continue;
-                                }
-
-                                // --- Update tool grouping ---
-                                if tc.name == "Update" {
-                                    // Finalize any previous active Update
-                                    if let Some(prev) = active_update.take() {
-                                        finalize_update(prev, &turn_events);
-                                    }
-
-                                    let args: serde_json::Value =
-                                        serde_json::from_str(&tc.arguments).unwrap_or_default();
-                                    let file_path =
-                                        args["file_path"].as_str().unwrap_or("?").to_string();
-
-                                    // Show what we're about to do before asking permission
-                                    let display =
-                                        tools::format_tool_call_display(&tc.name, &tc.arguments);
-                                    println!(
-                                        "{} {}",
-                                        "●"
-                                            .with(random_bullet_color())
-                                            .attribute(crossterm::style::Attribute::Bold),
-                                        display.themed(AuraStyle::Primary),
-                                    );
-
-                                    // Check permissions for Update
-                                    let perm = permissions.check(&tc.name, &tc.arguments);
-                                    match perm {
-                                        crate::permissions::PermissionResult::Denied(reason) => {
-                                            in_update_group.store(false, Ordering::Relaxed);
-                                            eprintln!(
-                                                "  {}",
-                                                reason.as_str().themed(AuraStyle::Warning)
-                                            );
-                                            let rules = permissions.describe_rules();
-                                            let denied_msg = tools::permission_denied_message(
-                                                &tc.name,
-                                                &reason,
-                                                rules.as_deref(),
-                                            );
-                                            conversation.add_tool_result(
-                                                &tc.id,
-                                                &tc.name,
-                                                &denied_msg,
-                                            );
-                                            continue;
+                                        if let Ok(mut events) = turn_events.lock() {
+                                            events.push(DisplayEvent::Compacted {
+                                                messages_removed: removed,
+                                            });
                                         }
-                                        crate::permissions::PermissionResult::Prompt => {
-                                            if !permissions
-                                                .prompt_tool_permission(&tc.name, &tc.arguments)
-                                            {
+                                        did_compact = true;
+
+                                        conversation.add_tool_result(&tc.id, &tc.name, &result_msg);
+                                        continue;
+                                    }
+
+                                    // --- Update tool grouping ---
+                                    if tc.name == "Update" {
+                                        // Finalize any previous active Update
+                                        if let Some(prev) = active_update.take() {
+                                            finalize_update(prev, &turn_events);
+                                        }
+
+                                        let args: serde_json::Value =
+                                            serde_json::from_str(&tc.arguments).unwrap_or_default();
+                                        let file_path =
+                                            args["file_path"].as_str().unwrap_or("?").to_string();
+
+                                        // Show what we're about to do before asking permission
+                                        let display = tools::format_tool_call_display(
+                                            &tc.name,
+                                            &tc.arguments,
+                                        );
+                                        println!(
+                                            "{} {}",
+                                            "●"
+                                                .with(random_bullet_color())
+                                                .attribute(crossterm::style::Attribute::Bold),
+                                            display.themed(AuraStyle::Primary),
+                                        );
+
+                                        // Check permissions for Update
+                                        let perm = permissions.check(&tc.name, &tc.arguments);
+                                        match perm {
+                                            crate::permissions::PermissionResult::Denied(
+                                                reason,
+                                            ) => {
                                                 in_update_group.store(false, Ordering::Relaxed);
-                                                let reason = "denied by user".to_string();
+                                                eprintln!(
+                                                    "  {}",
+                                                    reason.as_str().themed(AuraStyle::Warning)
+                                                );
                                                 let rules = permissions.describe_rules();
                                                 let denied_msg = tools::permission_denied_message(
                                                     &tc.name,
@@ -1482,76 +1471,65 @@ pub fn run_repl(
                                                 );
                                                 continue;
                                             }
+                                            crate::permissions::PermissionResult::Prompt => {
+                                                if !permissions
+                                                    .prompt_tool_permission(&tc.name, &tc.arguments)
+                                                {
+                                                    in_update_group.store(false, Ordering::Relaxed);
+                                                    let reason = "denied by user".to_string();
+                                                    let rules = permissions.describe_rules();
+                                                    let denied_msg =
+                                                        tools::permission_denied_message(
+                                                            &tc.name,
+                                                            &reason,
+                                                            rules.as_deref(),
+                                                        );
+                                                    conversation.add_tool_result(
+                                                        &tc.id,
+                                                        &tc.name,
+                                                        &denied_msg,
+                                                    );
+                                                    continue;
+                                                }
+                                            }
+                                            crate::permissions::PermissionResult::Allowed => {}
                                         }
-                                        crate::permissions::PermissionResult::Allowed => {}
+
+                                        // Snapshot the file
+                                        let snapshot = std::fs::read_to_string(&file_path).ok();
+
+                                        active_update = Some(UpdateContext {
+                                            file_path,
+                                            snapshot,
+                                            shell_calls: Vec::new(),
+                                            commands_used: Vec::new(),
+                                            start_time: std::time::Instant::now(),
+                                        });
+
+                                        let result_msg = format!(
+                                            "Update context started for {}. Use Shell calls to make changes.",
+                                            active_update.as_ref().unwrap().file_path
+                                        );
+                                        conversation.add_tool_result(&tc.id, &tc.name, &result_msg);
+                                        continue;
                                     }
 
-                                    // Snapshot the file
-                                    let snapshot = std::fs::read_to_string(&file_path).ok();
-
-                                    active_update = Some(UpdateContext {
-                                        file_path,
-                                        snapshot,
-                                        shell_calls: Vec::new(),
-                                        commands_used: Vec::new(),
-                                        start_time: std::time::Instant::now(),
-                                    });
-
-                                    let result_msg = format!(
-                                        "Update context started for {}. Use Shell calls to make changes.",
-                                        active_update.as_ref().unwrap().file_path
-                                    );
-                                    conversation.add_tool_result(&tc.id, &tc.name, &result_msg);
-                                    continue;
-                                }
-
-                                // --- Shell within an active Update group ---
-                                if tc.name == "Shell" && active_update.is_some() {
-                                    // Run the full permission check — Update
-                                    // approval does not implicitly trust
-                                    // arbitrary Shell commands. The user must
-                                    // allow each command (or pattern)
-                                    // explicitly.
-                                    let shell_perm = permissions.check("Shell", &tc.arguments);
-                                    match shell_perm {
-                                        crate::permissions::PermissionResult::Denied(reason) => {
-                                            eprintln!(
-                                                "  {}",
-                                                reason.as_str().themed(AuraStyle::Warning)
-                                            );
-                                            let rules = permissions.describe_rules();
-                                            let denied_msg = tools::permission_denied_message(
-                                                "Shell",
-                                                &reason,
-                                                rules.as_deref(),
-                                            );
-                                            conversation.add_tool_result(
-                                                &tc.id,
-                                                &tc.name,
-                                                &denied_msg,
-                                            );
-                                            continue;
-                                        }
-                                        crate::permissions::PermissionResult::Prompt => {
-                                            // Show the Shell call so the user
-                                            // has context for what they're
-                                            // approving — display is normally
-                                            // suppressed inside Update groups.
-                                            let display = tools::format_tool_call_display(
-                                                &tc.name,
-                                                &tc.arguments,
-                                            );
-                                            println!(
-                                                "{} {}",
-                                                "●"
-                                                    .with(random_bullet_color())
-                                                    .attribute(crossterm::style::Attribute::Bold),
-                                                display.themed(AuraStyle::Primary),
-                                            );
-                                            if !permissions
-                                                .prompt_tool_permission(&tc.name, &tc.arguments)
-                                            {
-                                                let reason = "denied by user".to_string();
+                                    // --- Shell within an active Update group ---
+                                    if tc.name == "Shell" && active_update.is_some() {
+                                        // Run the full permission check — Update
+                                        // approval does not implicitly trust
+                                        // arbitrary Shell commands. The user must
+                                        // allow each command (or pattern)
+                                        // explicitly.
+                                        let shell_perm = permissions.check("Shell", &tc.arguments);
+                                        match shell_perm {
+                                            crate::permissions::PermissionResult::Denied(
+                                                reason,
+                                            ) => {
+                                                eprintln!(
+                                                    "  {}",
+                                                    reason.as_str().themed(AuraStyle::Warning)
+                                                );
                                                 let rules = permissions.describe_rules();
                                                 let denied_msg = tools::permission_denied_message(
                                                     "Shell",
@@ -1565,59 +1543,98 @@ pub fn run_repl(
                                                 );
                                                 continue;
                                             }
+                                            crate::permissions::PermissionResult::Prompt => {
+                                                // Show the Shell call so the user
+                                                // has context for what they're
+                                                // approving — display is normally
+                                                // suppressed inside Update groups.
+                                                let display = tools::format_tool_call_display(
+                                                    &tc.name,
+                                                    &tc.arguments,
+                                                );
+                                                println!(
+                                                    "{} {}",
+                                                    "●".with(random_bullet_color()).attribute(
+                                                        crossterm::style::Attribute::Bold
+                                                    ),
+                                                    display.themed(AuraStyle::Primary),
+                                                );
+                                                if !permissions
+                                                    .prompt_tool_permission(&tc.name, &tc.arguments)
+                                                {
+                                                    let reason = "denied by user".to_string();
+                                                    let rules = permissions.describe_rules();
+                                                    let denied_msg =
+                                                        tools::permission_denied_message(
+                                                            "Shell",
+                                                            &reason,
+                                                            rules.as_deref(),
+                                                        );
+                                                    conversation.add_tool_result(
+                                                        &tc.id,
+                                                        &tc.name,
+                                                        &denied_msg,
+                                                    );
+                                                    continue;
+                                                }
+                                            }
+                                            crate::permissions::PermissionResult::Allowed => {}
                                         }
-                                        crate::permissions::PermissionResult::Allowed => {}
+
+                                        let start = std::time::Instant::now();
+                                        let tool_result =
+                                            tools::execute_tool("Shell", &tc.arguments)
+                                                .unwrap_or_else(|e| format!("Error: {e}"));
+                                        let duration = start.elapsed();
+
+                                        // Record in the update context
+                                        let cmd_name = tools::extract_command_name(&tc.arguments);
+                                        let args_val: serde_json::Value =
+                                            serde_json::from_str(&tc.arguments).unwrap_or_default();
+                                        let full_cmd =
+                                            args_val["command"].as_str().unwrap_or("").to_string();
+
+                                        if let Some(ref mut ctx) = active_update {
+                                            if !cmd_name.is_empty()
+                                                && !ctx.commands_used.contains(&cmd_name)
+                                            {
+                                                ctx.commands_used.push(cmd_name.clone());
+                                            }
+                                            ctx.shell_calls.push(ShellCallDetail {
+                                                command_name: cmd_name,
+                                                full_command: full_cmd,
+                                                result: tool_result.clone(),
+                                                duration,
+                                            });
+                                        }
+
+                                        // Add result to conversation (LLM needs feedback)
+                                        conversation.add_tool_result(
+                                            &tc.id,
+                                            &tc.name,
+                                            &tool_result,
+                                        );
+                                        // Suppress display — grouped under Update
+                                        continue;
                                     }
 
-                                    let start = std::time::Instant::now();
-                                    let tool_result = tools::execute_tool("Shell", &tc.arguments)
-                                        .unwrap_or_else(|e| format!("Error: {e}"));
-                                    let duration = start.elapsed();
+                                    // --- Non-Update, non-grouped tools ---
 
-                                    // Record in the update context
-                                    let cmd_name = tools::extract_command_name(&tc.arguments);
-                                    let args_val: serde_json::Value =
-                                        serde_json::from_str(&tc.arguments).unwrap_or_default();
-                                    let full_cmd =
-                                        args_val["command"].as_str().unwrap_or("").to_string();
-
-                                    if let Some(ref mut ctx) = active_update {
-                                        if !cmd_name.is_empty()
-                                            && !ctx.commands_used.contains(&cmd_name)
-                                        {
-                                            ctx.commands_used.push(cmd_name.clone());
-                                        }
-                                        ctx.shell_calls.push(ShellCallDetail {
-                                            command_name: cmd_name,
-                                            full_command: full_cmd,
-                                            result: tool_result.clone(),
-                                            duration,
-                                        });
+                                    // If there's an active Update and we hit a non-Shell tool,
+                                    // finalize the Update first.
+                                    if let Some(prev) = active_update.take() {
+                                        finalize_update(prev, &turn_events);
+                                        in_update_group.store(false, Ordering::Relaxed);
                                     }
 
-                                    // Add result to conversation (LLM needs feedback)
-                                    conversation.add_tool_result(&tc.id, &tc.name, &tool_result);
-                                    // Suppress display — grouped under Update
-                                    continue;
-                                }
-
-                                // --- Non-Update, non-grouped tools ---
-
-                                // If there's an active Update and we hit a non-Shell tool,
-                                // finalize the Update first.
-                                if let Some(prev) = active_update.take() {
-                                    finalize_update(prev, &turn_events);
-                                    in_update_group.store(false, Ordering::Relaxed);
-                                }
-
-                                // For non-local tools (server-side), use the cached result
-                                // from aura.tool_complete events instead of executing locally.
-                                // Display was already shown from on_tool_complete callback.
-                                if !tools::is_local_tool(&tc.name) {
-                                    let result = match server_results.get(&tc.id).cloned() {
-                                        Some(r) => r,
-                                        None => {
-                                            eprintln!(
+                                    // For non-local tools (server-side), use the cached result
+                                    // from aura.tool_complete events instead of executing locally.
+                                    // Display was already shown from on_tool_complete callback.
+                                    if !tools::is_local_tool(&tc.name) {
+                                        let result = match server_results.get(&tc.id).cloned() {
+                                            Some(r) => r,
+                                            None => {
+                                                eprintln!(
                                                 "{} {}",
                                                 "└─".themed(AuraStyle::Warning),
                                                 format!(
@@ -1626,55 +1643,43 @@ pub fn run_repl(
                                                 )
                                                 .themed(AuraStyle::Warning),
                                             );
-                                            tools::missing_server_result_message(&tc.name)
-                                        }
-                                    };
-                                    conversation.add_tool_result(&tc.id, &tc.name, &result);
-                                    continue;
-                                }
-
-                                // Show the tool call if permission will be prompted,
-                                // so the user has context for what they're approving.
-                                let perm = permissions.check(&tc.name, &tc.arguments);
-                                if matches!(perm, crate::permissions::PermissionResult::Prompt) {
-                                    let display =
-                                        tools::format_tool_call_display(&tc.name, &tc.arguments);
-                                    println!(
-                                        "{} {}",
-                                        "●"
-                                            .with(random_bullet_color())
-                                            .attribute(crossterm::style::Attribute::Bold),
-                                        display.themed(AuraStyle::Primary),
-                                    );
-                                }
-
-                                // Execute the tool (with permission check)
-                                let start = std::time::Instant::now();
-                                let tool_result = match perm {
-                                    crate::permissions::PermissionResult::Allowed => {
-                                        tools::execute_tool(&tc.name, &tc.arguments)
-                                            .unwrap_or_else(|e| format!("Error: {e}"))
+                                                tools::missing_server_result_message(&tc.name)
+                                            }
+                                        };
+                                        conversation.add_tool_result(&tc.id, &tc.name, &result);
+                                        continue;
                                     }
-                                    crate::permissions::PermissionResult::Denied(reason) => {
-                                        eprintln!(
-                                            "  {}",
-                                            reason.as_str().themed(AuraStyle::Warning)
-                                        );
-                                        let rules = permissions.describe_rules();
-                                        tools::permission_denied_message(
+
+                                    // Show the tool call if permission will be prompted,
+                                    // so the user has context for what they're approving.
+                                    let perm = permissions.check(&tc.name, &tc.arguments);
+                                    if matches!(perm, crate::permissions::PermissionResult::Prompt)
+                                    {
+                                        let display = tools::format_tool_call_display(
                                             &tc.name,
-                                            &reason,
-                                            rules.as_deref(),
-                                        )
+                                            &tc.arguments,
+                                        );
+                                        println!(
+                                            "{} {}",
+                                            "●"
+                                                .with(random_bullet_color())
+                                                .attribute(crossterm::style::Attribute::Bold),
+                                            display.themed(AuraStyle::Primary),
+                                        );
                                     }
-                                    crate::permissions::PermissionResult::Prompt => {
-                                        if permissions
-                                            .prompt_tool_permission(&tc.name, &tc.arguments)
-                                        {
+
+                                    // Execute the tool (with permission check)
+                                    let start = std::time::Instant::now();
+                                    let tool_result = match perm {
+                                        crate::permissions::PermissionResult::Allowed => {
                                             tools::execute_tool(&tc.name, &tc.arguments)
                                                 .unwrap_or_else(|e| format!("Error: {e}"))
-                                        } else {
-                                            let reason = "denied by user".to_string();
+                                        }
+                                        crate::permissions::PermissionResult::Denied(reason) => {
+                                            eprintln!(
+                                                "  {}",
+                                                reason.as_str().themed(AuraStyle::Warning)
+                                            );
                                             let rules = permissions.describe_rules();
                                             tools::permission_denied_message(
                                                 &tc.name,
@@ -1682,100 +1687,118 @@ pub fn run_repl(
                                                 rules.as_deref(),
                                             )
                                         }
-                                    }
-                                };
-                                let duration = start.elapsed();
+                                        crate::permissions::PermissionResult::Prompt => {
+                                            if permissions
+                                                .prompt_tool_permission(&tc.name, &tc.arguments)
+                                            {
+                                                tools::execute_tool(&tc.name, &tc.arguments)
+                                                    .unwrap_or_else(|e| format!("Error: {e}"))
+                                            } else {
+                                                let reason = "denied by user".to_string();
+                                                let rules = permissions.describe_rules();
+                                                tools::permission_denied_message(
+                                                    &tc.name,
+                                                    &reason,
+                                                    rules.as_deref(),
+                                                )
+                                            }
+                                        }
+                                    };
+                                    let duration = start.elapsed();
 
-                                // Record DisplayEvent for expand/replay
-                                let parsed_args: BTreeMap<String, serde_json::Value> =
-                                    serde_json::from_str(&tc.arguments).unwrap_or_default();
-                                if let Ok(mut events) = turn_events.lock() {
-                                    events.push(DisplayEvent::ToolCall {
-                                        tool_name: tc.name.clone(),
-                                        arguments: parsed_args,
+                                    // Record DisplayEvent for expand/replay
+                                    let parsed_args: BTreeMap<String, serde_json::Value> =
+                                        serde_json::from_str(&tc.arguments).unwrap_or_default();
+                                    if let Ok(mut events) = turn_events.lock() {
+                                        events.push(DisplayEvent::ToolCall {
+                                            tool_name: tc.name.clone(),
+                                            arguments: parsed_args,
+                                            duration,
+                                            result: Some(tool_result.clone()),
+                                        });
+                                    }
+
+                                    // Collect for grouped summary display
+                                    let display_name =
+                                        tools::extract_tool_display_name(&tc.name, &tc.arguments);
+                                    batch_tools.push((
+                                        tc.name.clone(),
+                                        display_name,
+                                        tc.arguments.clone(),
                                         duration,
-                                        result: Some(tool_result.clone()),
-                                    });
+                                    ));
+
+                                    // Add tool result to conversation history
+                                    conversation.add_tool_result(&tc.id, &tc.name, &tool_result);
                                 }
 
-                                // Collect for grouped summary display
-                                let display_name =
-                                    tools::extract_tool_display_name(&tc.name, &tc.arguments);
-                                batch_tools.push((
-                                    tc.name.clone(),
-                                    display_name,
-                                    tc.arguments.clone(),
-                                    duration,
-                                ));
-
-                                // Add tool result to conversation history
-                                conversation.add_tool_result(&tc.id, &tc.name, &tool_result);
-                            }
-
-                            // Print summaries for batch of local tools
-                            if !batch_tools.is_empty() {
-                                #[allow(clippy::type_complexity)]
-                                let mut groups: Vec<(
-                                    String,
-                                    Vec<String>,
-                                    Option<String>,
-                                    Option<std::time::Duration>,
-                                )> = Vec::new();
-                                for (name, display, args, dur) in &batch_tools {
-                                    if let Some(group) =
-                                        groups.iter_mut().find(|(n, _, _, _)| n == name)
-                                    {
-                                        group.1.push(display.clone());
-                                    } else {
-                                        groups.push((
-                                            name.clone(),
-                                            vec![display.clone()],
-                                            Some(args.clone()),
-                                            Some(*dur),
-                                        ));
+                                // Print summaries for batch of local tools
+                                if !batch_tools.is_empty() {
+                                    #[allow(clippy::type_complexity)]
+                                    let mut groups: Vec<(
+                                        String,
+                                        Vec<String>,
+                                        Option<String>,
+                                        Option<std::time::Duration>,
+                                    )> = Vec::new();
+                                    for (name, display, args, dur) in &batch_tools {
+                                        if let Some(group) =
+                                            groups.iter_mut().find(|(n, _, _, _)| n == name)
+                                        {
+                                            group.1.push(display.clone());
+                                        } else {
+                                            groups.push((
+                                                name.clone(),
+                                                vec![display.clone()],
+                                                Some(args.clone()),
+                                                Some(*dur),
+                                            ));
+                                        }
+                                    }
+                                    for (name, displays, first_args, first_duration) in &groups {
+                                        if displays.len() == 1 {
+                                            let args_str = first_args.as_deref().unwrap_or("{}");
+                                            let args_map: std::collections::BTreeMap<
+                                                String,
+                                                serde_json::Value,
+                                            > = serde_json::from_str(args_str).unwrap_or_default();
+                                            crate::ui::prompt::print_tool_call_summary(
+                                                name,
+                                                &args_map,
+                                                *first_duration,
+                                            );
+                                        } else {
+                                            // Multiple calls: grouped summary
+                                            let header = tools::format_tool_group_header(
+                                                name,
+                                                displays.len(),
+                                            );
+                                            tools::print_tool_group(&header, displays, false);
+                                        }
+                                        println!();
                                     }
                                 }
-                                for (name, displays, first_args, first_duration) in &groups {
-                                    if displays.len() == 1 {
-                                        let args_str = first_args.as_deref().unwrap_or("{}");
-                                        let args_map: std::collections::BTreeMap<
-                                            String,
-                                            serde_json::Value,
-                                        > = serde_json::from_str(args_str).unwrap_or_default();
-                                        crate::ui::prompt::print_tool_call_summary(
-                                            name,
-                                            &args_map,
-                                            *first_duration,
-                                        );
-                                    } else {
-                                        // Multiple calls: grouped summary
-                                        let header =
-                                            tools::format_tool_group_header(name, displays.len());
-                                        tools::print_tool_group(&header, displays, false);
-                                    }
-                                    println!();
+
+                                // Restart thinking animation for next iteration
+                                let (new_anim, new_stop) = WaveAnimation::start(
+                                    "Thinking",
+                                    vec![],
+                                    input_buf.clone(),
+                                    Some(cancel_flag.clone()),
+                                );
+                                // The new animation has its own internal stop flag.
+                                // Callbacks will stop it via ptw_anim.finish(), not stop_flag.
+                                drop(new_stop);
+                                // Store the new animation so it gets cleaned up properly
+                                if let Ok(mut guard) = post_tool_wave.lock() {
+                                    *guard = Some((new_anim, stop_flag.clone()));
                                 }
-                            }
+                                prepare_input_line(&input_buf, Some(&cancel_flag));
 
-                            // Restart thinking animation for next iteration
-                            let (new_anim, new_stop) = WaveAnimation::start(
-                                "Thinking",
-                                vec![],
-                                input_buf.clone(),
-                                Some(cancel_flag.clone()),
-                            );
-                            // The new animation has its own internal stop flag.
-                            // Callbacks will stop it via ptw_anim.finish(), not stop_flag.
-                            drop(new_stop);
-                            // Store the new animation so it gets cleaned up properly
-                            if let Ok(mut guard) = post_tool_wave.lock() {
-                                *guard = Some((new_anim, stop_flag.clone()));
+                                // Continue the tool loop
+                                continue 'tool_loop;
                             }
-                            prepare_input_line(&input_buf, Some(&cancel_flag));
-
-                            // Continue the tool loop
-                            continue 'tool_loop;
-                        }
+                        },
                         Err(e) => {
                             tool_loop_error = Some(e);
                             break 'tool_loop;

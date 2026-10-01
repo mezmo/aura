@@ -28,7 +28,7 @@ use aura_web_server::types::{
     ChatMessageToolCall, ClientFunctionDefinition, ClientToolDefinition, Role,
 };
 
-use crate::api::stream::{StreamHandler, StreamResult, process_sse_events};
+use crate::api::stream::{StreamHandler, StreamOutcome, process_sse_events};
 use crate::api::types::{Message, ModelEntry, ToolCallInfo, ToolDefinition};
 use crate::ui::prompt::get_selected_model;
 
@@ -334,7 +334,7 @@ impl DirectBackend {
         session_id: &str,
         cancel: Arc<AtomicBool>,
         handler: &mut impl StreamHandler,
-    ) -> Result<StreamResult> {
+    ) -> Result<StreamOutcome> {
         let selected = get_selected_model();
         let mut req = Self::build_chat_request(messages, tools, selected);
 
