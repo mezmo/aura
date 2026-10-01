@@ -138,6 +138,22 @@ pub struct AppState {
     pub session_store: Arc<dyn SessionStore>,
 }
 
+impl AppState {
+    /// The configuration a request for `requested_model` runs under: the
+    /// only loaded one regardless of the request, else the one whose alias
+    /// or name matches the request, else the default agent's.
+    pub fn resolve_config(&self, requested_model: Option<&str>) -> Option<aura_config::Config> {
+        if self.configs.len() == 1 {
+            return self.configs.first().cloned();
+        }
+        let name = requested_model.or(self.default_agent.as_deref())?;
+        self.configs
+            .iter()
+            .find(|c| c.agent.alias.as_deref().unwrap_or(&c.agent.name) == name)
+            .cloned()
+    }
+}
+
 /// OpenAI-compatible message role
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
