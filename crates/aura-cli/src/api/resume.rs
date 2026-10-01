@@ -10,7 +10,7 @@
 use crate::api::stream::StreamOutcome;
 
 /// One outstanding parked call from a 409 `parked` row's `blocking` set.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 pub struct BlockingCall {
     pub decision_id: String,
     pub tool: String,
@@ -46,13 +46,42 @@ pub enum ResumeOutcome {
 }
 
 impl ResumeOutcome {
-    /// Decode a pre-stream response body into the typed outcome.
+    /// Decode a pre-stream refusal response into the typed outcome.
     ///
-    /// `streamed` is the already-parsed 200 outcome; `status` and `body`
-    /// carry the refusal otherwise.
+    /// `status` and `body` carry the refusal; a 200 never reaches this
+    /// function (it streams instead). Unknown 409 codes and undecodable
+    /// bodies fail closed to the terminal failed shape — never retryable,
+    /// never transient.
     pub fn from_refusal(status: u16, body: &str) -> Self {
-        let _ = (status, body);
-        todo!("filled with the refusal decode in the W6b fill commit")
+        match status {
+            404 => Self::NotFound,
+            503 => Self::Unavailable,
+            409 => {
+                #[derive(serde::Deserialize)]
+                struct Row {
+                    code: String,
+                    #[serde(default)]
+                    blocking: Vec<BlockingCall>,
+                }
+                match serde_json::from_str::<Row>(body) {
+                    Ok(row) => match row.code.as_str() {
+                        "parked" => Self::Parked {
+                            blocking: row.blocking,
+                        },
+                        "running" => Self::Running,
+                        "interrupted" => Self::Interrupted,
+                        "config_changed" => Self::ConfigChanged,
+                        "mismatch" => Self::Mismatch,
+                        "expired" => Self::Expired,
+                        _ => Self::ReifyFailed,
+                    },
+                    Err(_) => Self::ReifyFailed,
+                }
+            }
+            // 500 `reify_failed` and anything else the client does not
+            // know: terminal.
+            _ => Self::ReifyFailed,
+        }
     }
 
     /// Retryable 409 rows: polling again after a delay can still reach a

@@ -309,8 +309,10 @@ impl AppConfig {
     /// `POST /v1/sessions/{session_id}/runs/{run_id}` — opens the resume
     /// stream for a parked orchestration run.
     pub fn resume_url(&self, session_id: &str, run_id: &str) -> String {
-        let _ = (session_id, run_id);
-        todo!("filled with the URL builder in the W6b fill commit")
+        format!(
+            "{}/v1/sessions/{session_id}/runs/{run_id}",
+            self.api_url.trim_end_matches('/')
+        )
     }
 
     /// Build the health endpoint URL from the base URL.
