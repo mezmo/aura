@@ -1256,6 +1256,7 @@ mod tests {
                     }),
                     park_enabled: true,
                     park_ttl: aura_config::ParkTtl::default(),
+                    headers_from_request: std::collections::HashMap::new(),
                 }),
                 ..crate::config::AgentRuntimeConfig::default()
             }
@@ -1313,6 +1314,13 @@ mod tests {
                     }),
                     park_enabled: true,
                     park_ttl: aura_config::ParkTtl::default(),
+                    headers_from_request: match &route {
+                        DecisionRouteConfig::Webhook {
+                            headers_from_request,
+                            ..
+                        } => headers_from_request.clone(),
+                        DecisionRouteConfig::Conversational { .. } => HashMap::new(),
+                    },
                 }),
                 ..crate::config::AgentRuntimeConfig::default()
             }

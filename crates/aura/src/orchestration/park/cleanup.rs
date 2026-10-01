@@ -10,7 +10,7 @@ use std::collections::HashSet;
 use std::io;
 use std::path::Path;
 
-use super::commit::cancel_run_approvals;
+use super::commit::run_owner_id;
 use super::document::{PARKED_DOCUMENT_SUFFIX, ParkedRun, RESUMING_DOCUMENT_SUFFIX};
 use super::lifetime::ReservationTable;
 use super::resume::claim::{ResumeDocuments, ValidatedResumePath};
@@ -183,10 +183,9 @@ pub(crate) async fn delete_expired_run(
     registry: &PendingApprovals,
 ) -> RunCleanupOutcome {
     let run_id = cleanup.reservation().run_id().to_string();
-    let approval_handle = cancel_run_approvals(registry, &run_id, &run_id, None, None);
-    if let Err(e) = approval_handle.await {
+    if let Err(e) = registry.cancel_request_strict(&run_owner_id(&run_id)).await {
         return RunCleanupOutcome::RetainedForRetry(Diagnostic::new(format!(
-            "approval cancellation for run {run_id} did not complete: {e}"
+            "approval cancellation for run {run_id} failed: {e}"
         )));
     }
 
@@ -194,8 +193,11 @@ pub(crate) async fn delete_expired_run(
     let lease = cleanup.reservation().clone();
     let deletion = tokio::task::spawn_blocking(move || -> io::Result<()> {
         let _lease = lease;
-        delete_checkpoint_if_present(docs.parked())?;
+        // Delete the resuming name first and the canonical parked name LAST:
+        // a midway failure must leave the parked document readable so the run
+        // keeps answering 409 expired on retry.
         delete_checkpoint_if_present(docs.resuming())?;
+        delete_checkpoint_if_present(docs.parked())?;
         Ok(())
     })
     .await;
@@ -261,6 +263,7 @@ mod tests {
     use std::collections::HashMap;
     use std::path::Path;
     use std::str::FromStr;
+    use std::sync::Arc;
 
     use super::{
         CheckpointPresence, CleanupAdmissionFault, CleanupReservation, RunCleanupOutcome,
@@ -279,6 +282,7 @@ mod tests {
     use crate::orchestration::park::resume::claim::{ResumeDocuments, ValidatedResumePath};
     use crate::orchestration::park::retention::RetentionExpiresAt;
     use crate::orchestration::{PendingCall, RunId, TaskIdentity, TaskStatus};
+    use crate::session_store::{FaultInjectingStore, FileApprovalStore, InMemoryEventBus};
 
     /// Session segment every fixture path validates through.
     const SESSION: &str = "sess-cleanup";
@@ -451,6 +455,16 @@ mod tests {
         decision_id
     }
 
+    /// A registry backed by a file approval store so the cleanup path's
+    /// `cancel_request_strict` has a strict implementation available. The
+    /// default in-memory backend refuses strict cancellation, which is the
+    /// correct fail-closed posture for backends without park parity.
+    fn file_registry(root: &Path) -> PendingApprovals {
+        let store: Arc<dyn crate::session_store::ApprovalStore> =
+            Arc::new(FileApprovalStore::open(root.join("approvals")).unwrap());
+        PendingApprovals::with_backend(store, Arc::new(InMemoryEventBus::new()))
+    }
+
     // Live-surface pin: `CleanupReservation::acquire` refuses a run that
     // holds a live execution reservation, mapping the live admission fault to
     // `CleanupAdmissionFault::Executing`. The reservation table and the
@@ -583,7 +597,7 @@ mod tests {
     async fn delete_is_idempotent_when_checkpoint_is_already_gone() {
         let dir = tempfile::tempdir().expect("temp memory root");
         let memory_dir = dir.path().to_string_lossy().to_string();
-        let registry = PendingApprovals::new();
+        let registry = file_registry(dir.path());
         let decision_id = stage_run_approval(&registry, RUN_A).await;
         assert!(
             registry.try_parked(&decision_id).await.unwrap().is_some(),
@@ -614,7 +628,7 @@ mod tests {
         let docs = documents(&memory_dir, SESSION, RUN_A);
         assert!(docs.parked().is_file(), "fixture: parked document exists");
 
-        let registry = PendingApprovals::new();
+        let registry = file_registry(dir.path());
         let decision_id = stage_run_approval(&registry, RUN_A).await;
         assert!(
             registry.try_parked(&decision_id).await.unwrap().is_some(),
@@ -697,5 +711,100 @@ mod tests {
         assert!(root.is_file(), "fixture: root is a file");
         let result = scan_checkpoint_root(&root).await;
         assert!(result.is_err(), "unreadable root returns a diagnostic");
+    }
+
+    // `delete_expired_run` — a store fault during durable approval
+    // cancellation is fail-strict for cleanup: the checkpoint is retained so
+    // the next sweep can retry, and the durable approval evidence stays.
+
+    #[tokio::test]
+    async fn delete_retains_checkpoint_when_approval_cancellation_faults() {
+        let dir = tempfile::tempdir().expect("temp memory root");
+        let memory_dir = dir.path().to_string_lossy().to_string();
+        stage_parked_document(&memory_dir, SESSION, RUN_A).await;
+        let docs = documents(&memory_dir, SESSION, RUN_A);
+        assert!(docs.parked().is_file(), "fixture: parked document exists");
+
+        let store = Arc::new(FaultInjectingStore::failing_cancel_request());
+        let registry = PendingApprovals::with_backend(
+            store,
+            Arc::new(crate::session_store::InMemoryEventBus::new()),
+        );
+        let decision_id = stage_run_approval(&registry, RUN_A).await;
+        assert!(
+            registry.try_parked(&decision_id).await.unwrap().is_some(),
+            "fixture: approval evidence staged"
+        );
+
+        let table = ReservationTable::new();
+        let cleanup = CleanupReservation::acquire(&table, &path(SESSION, RUN_A), &memory_dir)
+            .expect("cleanup reservation admits");
+        let outcome = delete_expired_run(&cleanup, &registry).await;
+        assert!(
+            matches!(outcome, RunCleanupOutcome::RetainedForRetry(_)),
+            "a cancellation fault retains the checkpoint: {outcome:?}"
+        );
+        assert!(
+            docs.parked().is_file(),
+            "checkpoint is retained when cancellation faults"
+        );
+        assert!(
+            registry.try_parked(&decision_id).await.unwrap().is_some(),
+            "approval evidence is retained when cancellation faults"
+        );
+    }
+
+    // `delete_expired_run` — deletion order: the resuming name is deleted
+    // first and the canonical parked name LAST. If the resuming unlink fails,
+    // the parked document must still be present to answer 409 expired.
+
+    #[tokio::test]
+    async fn delete_retains_parked_when_resuming_unlink_fails() {
+        let dir = tempfile::tempdir().expect("temp memory root");
+        let memory_dir = dir.path().to_string_lossy().to_string();
+        stage_parked_document(&memory_dir, SESSION, RUN_A).await;
+        stage_resuming_document(&memory_dir, SESSION, RUN_A).await;
+        let docs = documents(&memory_dir, SESSION, RUN_A);
+        assert!(docs.parked().is_file(), "fixture: parked document exists");
+        assert!(
+            docs.resuming().is_file(),
+            "fixture: resuming document exists"
+        );
+
+        // Replace the resuming file with a directory so its unlink fails
+        // structurally before the parked name is touched.
+        stage_directory_at(docs.resuming());
+        assert!(
+            docs.resuming().is_dir(),
+            "fixture: resuming path must be a directory so unlink fails"
+        );
+
+        let registry = file_registry(dir.path());
+        let table = ReservationTable::new();
+        let cleanup = CleanupReservation::acquire(&table, &path(SESSION, RUN_A), &memory_dir)
+            .expect("cleanup reservation admits");
+        let outcome = delete_expired_run(&cleanup, &registry).await;
+
+        // The resuming path is a directory, so its unlink fails first. Capture
+        // that error to pin the diagnostic to the resuming checkpoint rather
+        // than the later parked one.
+        let resuming_unlink_err = std::fs::remove_file(docs.resuming()).unwrap_err();
+        let expected = format!("checkpoint deletion for run {RUN_A} failed: {resuming_unlink_err}");
+        let RunCleanupOutcome::RetainedForRetry(diag) = outcome else {
+            panic!("a resuming unlink failure must retain the checkpoint, got {outcome:?}");
+        };
+        assert_eq!(
+            diag.as_ref(),
+            expected,
+            "diagnostic must name the resuming checkpoint's deletion failure"
+        );
+        assert!(
+            docs.parked().is_file(),
+            "parked checkpoint is kept when resuming deletion fails"
+        );
+        assert!(
+            docs.resuming().is_dir(),
+            "resuming path stays as the failure fixture"
+        );
     }
 }

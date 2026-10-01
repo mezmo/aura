@@ -876,7 +876,15 @@ impl Orchestrator {
         if !checkpoint.request_egress.is_empty()
             && let Some(ref hitl) = agent_config.hitl
         {
-            agent_config.hitl = Some(hitl.with_frozen_egress(&checkpoint.request_egress));
+            agent_config.hitl = Some(
+                hitl.with_frozen_egress(&checkpoint.request_egress)
+                    .map_err(|e| {
+                        fault(format!(
+                            "frozen egress restoration failed for run {}: {e}",
+                            checkpoint.run_id
+                        ))
+                    })?,
+            );
         }
 
         Ok(Self::assemble(
@@ -8882,6 +8890,7 @@ mod tests {
                 }),
                 park_enabled: true,
                 park_ttl: aura_config::ParkTtl::default(),
+                headers_from_request: std::collections::HashMap::new(),
             }),
             request_id: Some(request_id.clone()),
             ..AgentRuntimeConfig::default()
@@ -9002,6 +9011,7 @@ mod tests {
                 }),
                 park_enabled: true,
                 park_ttl: aura_config::ParkTtl::default(),
+                headers_from_request: std::collections::HashMap::new(),
             }),
             memory_dir: Some(memory_dir.to_string_lossy().into_owned()),
             session_id: Some("park-sess".to_string()),
@@ -9221,6 +9231,7 @@ mod tests {
                 }),
                 park_enabled: true,
                 park_ttl: aura_config::ParkTtl::default(),
+                headers_from_request: std::collections::HashMap::new(),
             }),
             memory_dir: Some(memory_dir.clone()),
             session_id: Some(SESSION.to_string()),
@@ -9402,6 +9413,7 @@ mod tests {
                 }),
                 park_enabled: true,
                 park_ttl: aura_config::ParkTtl::default(),
+                headers_from_request: std::collections::HashMap::new(),
             }),
             memory_dir: Some(memory_dir.clone()),
             session_id: Some(session.to_string()),

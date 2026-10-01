@@ -472,6 +472,84 @@ impl Inner {
         Ok(cleared)
     }
 
+    /// Strict variant of [`Inner::cancel_request_sync`]: any fault while
+    /// reading, classifying, or unlinking an approval turns into a store
+    /// error so the caller knows the cancellation may be incomplete.
+    fn cancel_request_strict_sync(
+        &self,
+        request_id: &str,
+    ) -> Result<Vec<ParkedApproval>, SessionStoreError> {
+        let _guard = self.lock();
+        let entries = match fs::read_dir(self.approvals_dir()) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) => return Err(request_err(err)),
+        };
+
+        let mut candidates = Vec::new();
+        let mut stale_decided = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(request_err)?;
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            let bytes = match fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(request_err(err)),
+            };
+            let parked = match decode_approval(&bytes) {
+                Ok(parked) => parked,
+                Err(err) => {
+                    return Err(decode_err(format!(
+                        "approval file {} is undecodable and blocks strict cancellation: {err}",
+                        path.display()
+                    )));
+                }
+            };
+            if parked.request.request_id != request_id {
+                continue;
+            }
+            if self
+                .decision_path(&parked.request.decision_id.to_string())
+                .try_exists()
+                .map_err(request_err)?
+            {
+                stale_decided.push((path, bytes));
+                continue;
+            }
+            candidates.push((path, parked, bytes));
+        }
+
+        let mut cleared = Vec::new();
+        for (path, parked, bytes) in candidates {
+            match self.unlink_if_unchanged(&path, &bytes) {
+                Ok(true) => cleared.push(parked),
+                Ok(false) => {
+                    return Err(request_err(format!(
+                        "approval file {} changed under strict cancellation",
+                        path.display()
+                    )));
+                }
+                Err(err) => return Err(request_err(err)),
+            }
+        }
+        for (path, bytes) in stale_decided {
+            match self.unlink_if_unchanged(&path, &bytes) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Err(request_err(format!(
+                        "stale approval file {} changed under strict cancellation",
+                        path.display()
+                    )));
+                }
+                Err(err) => return Err(request_err(err)),
+            }
+        }
+        Ok(cleared)
+    }
+
     fn list_pending_sync(&self) -> Result<Vec<ParkedApproval>, SessionStoreError> {
         let paths: Vec<PathBuf> = {
             let _guard = self.lock();
@@ -854,6 +932,17 @@ impl ApprovalStore for FileApprovalStore {
             .map_err(join_err)?
     }
 
+    async fn cancel_request_strict(
+        &self,
+        request_id: &str,
+    ) -> Result<Vec<ParkedApproval>, SessionStoreError> {
+        let inner = Arc::clone(&self.inner);
+        let request_id = request_id.to_owned();
+        spawn_blocking(move || inner.cancel_request_strict_sync(&request_id))
+            .await
+            .map_err(join_err)?
+    }
+
     async fn list_pending(&self) -> Result<Vec<ParkedApproval>, SessionStoreError> {
         let inner = Arc::clone(&self.inner);
         spawn_blocking(move || inner.list_pending_sync())
@@ -1166,7 +1255,7 @@ mod unlink_recheck_tests {
         AgentScope, ApprovalAuthority, ApprovalDecision, ApprovalItem, ApprovalOrigin,
         ApprovalRequest, DecisionId, PROTOCOL_VERSION, ParkedApproval, ResolvedDecision,
     };
-    use crate::session_store::{ApprovalStore, ParkedApprovalRecord};
+    use crate::session_store::{ApprovalStore, ParkedApprovalRecord, SessionStoreError};
 
     use super::{FileApprovalStore, TerminalRecord, unlink_interleave};
 
@@ -1474,6 +1563,61 @@ mod unlink_recheck_tests {
                 .expect("file approval store path-lock map poisoned")
                 .is_empty(),
             "the resolved path's lock entry is evicted"
+        );
+    }
+
+    /// The stale-decided arm of strict cancellation must treat a record that
+    /// changes between classification and unlink as an incomplete
+    /// cancellation. The race is forced through the same interleaving seam the
+    /// other unlink-recheck tests use: a fresh payload is published at the
+    /// boundary between `unlink_if_unchanged`'s lock-free compare (which saw
+    /// the stale bytes) and its locked remove (which must then see changed
+    /// bytes and refuse).
+    #[tokio::test]
+    async fn strict_cancel_rejects_a_changed_stale_approval_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileApprovalStore::open(dir.path()).unwrap();
+        let id = DecisionId::generate();
+        let parked = make_parked(id);
+        store.register(parked.clone()).await.unwrap();
+        write_terminal_record(&dir, &parked);
+
+        let path = dir.path().join("approvals").join(format!("{id}.json"));
+        let stale = std::fs::read(&path).unwrap();
+
+        // A fresh registration at the same path, ready to be published by the
+        // boundary hook after the stale-decided arm has classified the record.
+        let fresh = make_parked(id);
+        let fresh_payload = serde_json::to_vec(&ParkedApprovalRecord::from(&fresh)).unwrap();
+        assert_ne!(
+            stale, fresh_payload,
+            "fixture: the fresh payload differs from the stale one"
+        );
+
+        let swept_path = path.clone();
+        let _boundary = unlink_interleave::install(Box::new(move |boundary: &std::path::Path| {
+            if boundary != swept_path.as_path() {
+                return;
+            }
+            std::fs::write(boundary, &fresh_payload)
+                .expect("boundary hook publishes the fresh payload");
+        }));
+
+        let result = store.cancel_request_strict("req-replaced").await;
+        let err = match result {
+            Ok(cleared) => panic!(
+                "a changed stale approval must fail strict cancellation, but cleared {}",
+                cleared.len()
+            ),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, SessionStoreError::Request { .. }),
+            "expected a request error naming the changed record, got {err:?}"
+        );
+        assert!(
+            path.exists(),
+            "the changed stale approval file is retained for retry"
         );
     }
 }

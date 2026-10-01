@@ -16,6 +16,7 @@ pub(crate) struct FaultInjectingStore {
     inner: InMemoryApprovalStore,
     fail_register: bool,
     fail_get_once: AtomicBool,
+    fail_cancel_request: bool,
 }
 
 impl FaultInjectingStore {
@@ -29,6 +30,13 @@ impl FaultInjectingStore {
     pub(crate) fn failing_first_get() -> Self {
         Self {
             fail_get_once: AtomicBool::new(true),
+            ..Default::default()
+        }
+    }
+
+    pub(crate) fn failing_cancel_request() -> Self {
+        Self {
+            fail_cancel_request: true,
             ..Default::default()
         }
     }
@@ -86,6 +94,18 @@ impl ApprovalStore for FaultInjectingStore {
         request_id: &str,
     ) -> Result<Vec<ParkedApproval>, SessionStoreError> {
         self.inner.cancel_request(request_id).await
+    }
+
+    async fn cancel_request_strict(
+        &self,
+        _request_id: &str,
+    ) -> Result<Vec<ParkedApproval>, SessionStoreError> {
+        if self.fail_cancel_request {
+            return Err(SessionStoreError::Request {
+                reason: "disk on fire".to_string(),
+            });
+        }
+        self.inner.cancel_request_strict(_request_id).await
     }
 
     async fn list_pending(&self) -> Result<Vec<ParkedApproval>, SessionStoreError> {

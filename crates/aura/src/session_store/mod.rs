@@ -163,6 +163,25 @@ pub trait ApprovalStore: Send + Sync {
         request_id: &str,
     ) -> Result<Vec<ParkedApproval>, SessionStoreError>;
 
+    /// Strict variant of [`Self::cancel_request`]: store faults and any
+    /// incomplete removal are propagated to the caller instead of being
+    /// logged and ignored. Cleanup paths use this so they do not proceed
+    /// to checkpoint deletion while durable approval evidence may remain.
+    ///
+    /// Strict cancellation is opt-in per backend: the default returns
+    /// [`SessionStoreError::UnsupportedOperation`] so a backend without a
+    /// dedicated strict implementation fails closed rather than silently
+    /// answering Ok while durable evidence may remain.
+    async fn cancel_request_strict(
+        &self,
+        _request_id: &str,
+    ) -> Result<Vec<ParkedApproval>, SessionStoreError> {
+        Err(SessionStoreError::UnsupportedOperation {
+            operation: "cancel_request_strict",
+            reason: "this backend implements no strict cancellation".to_string(),
+        })
+    }
+
     /// Scans the store for approval rows that are still pending: every
     /// parked approval that is undecided and non-expired
     /// (`expires_at > now`). No ordering guarantee.
@@ -329,6 +348,24 @@ mod tests {
             SessionStoreError::UnsupportedOperation {
                 operation: "list_pending",
                 reason: "this backend implements no pending scan".to_string(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_request_strict_default_returns_unsupported() {
+        let err = match ScanlessStore.cancel_request_strict("any-request").await {
+            Err(err) => err,
+            Ok(cleared) => panic!(
+                "the default cancel_request_strict must fail closed, never report a cleared set of {}",
+                cleared.len()
+            ),
+        };
+        assert_eq!(
+            err,
+            SessionStoreError::UnsupportedOperation {
+                operation: "cancel_request_strict",
+                reason: "this backend implements no strict cancellation".to_string(),
             }
         );
     }

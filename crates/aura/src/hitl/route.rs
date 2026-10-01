@@ -50,6 +50,10 @@ pub struct HitlRuntime {
     /// publication stamp consumes. Nonzero by construction, so a park
     /// commit never has to re-derive or re-check it.
     pub park_ttl: ParkTtl,
+    /// The validated `headers_from_request` mapping from the route config,
+    /// retained so a resumed run can re-verify that frozen egress values
+    /// cover every required destination.
+    pub headers_from_request: HashMap<String, String>,
 }
 
 impl HitlRuntime {
@@ -103,11 +107,19 @@ impl HitlRuntime {
                 timeout: Duration::from_secs(*timeout_secs),
             },
         };
+        let headers_from_request = match &config.route {
+            DecisionRouteConfig::Webhook {
+                headers_from_request,
+                ..
+            } => headers_from_request.clone(),
+            DecisionRouteConfig::Conversational { .. } => HashMap::new(),
+        };
         Self {
             patterns: Arc::from(config.require_approval.clone()),
             route: Arc::new(route),
             park_enabled: config.park.enabled,
             park_ttl: config.park.park_ttl,
+            headers_from_request,
         }
     }
 
@@ -116,20 +128,49 @@ impl HitlRuntime {
     /// request's identity (the frozen headers), never the resume POST's —
     /// which carries none. No-op on the conversational route (no egress
     /// exists there) and when the frozen map is empty.
-    #[must_use]
-    pub fn with_frozen_egress(&self, frozen: &HashMap<String, String>) -> Self {
+    ///
+    /// Returns an error when the frozen map is malformed or incomplete: every
+    /// stored entry must be a valid header, and every configured
+    /// `headers_from_request` destination must be present. A partial or
+    /// corrupted frozen egress must not silently open the route.
+    pub fn with_frozen_egress(
+        &self,
+        frozen: &HashMap<String, String>,
+    ) -> Result<Self, FrozenEgressError> {
         if frozen.is_empty() {
-            return self.clone();
+            return Ok(self.clone());
         }
+
         let mut headers = HeaderMap::new();
         for (name, value) in frozen {
-            if let (Ok(name), Ok(value)) = (
-                HeaderName::try_from(name.as_str()),
-                HeaderValue::try_from(value.as_str()),
-            ) {
-                headers.insert(name, value);
-            }
+            let name = HeaderName::from_bytes(name.as_bytes()).map_err(|e| {
+                FrozenEgressError::InvalidHeader {
+                    name: name.clone(),
+                    reason: e.to_string(),
+                }
+            })?;
+            let value = HeaderValue::from_str(value)
+                .ok()
+                .filter(|value| value.to_str().is_ok())
+                .ok_or_else(|| FrozenEgressError::InvalidHeader {
+                    name: name.to_string(),
+                    reason: "value is not a valid visible-ASCII header value".to_string(),
+                })?;
+            headers.insert(name, value);
         }
+
+        let missing: Vec<String> = self
+            .headers_from_request
+            .keys()
+            .map(|destination| destination.to_lowercase())
+            .filter(|destination| !headers.contains_key(destination))
+            .collect();
+        if !missing.is_empty() {
+            return Err(FrozenEgressError::Incomplete(
+                crate::webhook_utils::EgressCaptureError::new(missing),
+            ));
+        }
+
         let route = match self.route.as_ref() {
             DecisionRoute::Webhook {
                 client,
@@ -144,13 +185,26 @@ impl HitlRuntime {
             }),
             DecisionRoute::Conversational { .. } => Arc::clone(&self.route),
         };
-        Self {
+        Ok(Self {
             patterns: Arc::clone(&self.patterns),
             route,
             park_enabled: self.park_enabled,
             park_ttl: self.park_ttl,
-        }
+            headers_from_request: self.headers_from_request.clone(),
+        })
     }
+}
+
+/// Why a frozen egress map cannot restore the route.
+#[derive(Debug, thiserror::Error)]
+pub enum FrozenEgressError {
+    /// A stored header name or value is not valid HTTP.
+    #[error("frozen egress contains invalid header '{name}': {reason}")]
+    InvalidHeader { name: String, reason: String },
+    /// A configured `headers_from_request` destination is missing from the
+    /// frozen map.
+    #[error("frozen egress is incomplete: {0}")]
+    Incomplete(#[from] crate::webhook_utils::EgressCaptureError),
 }
 
 /// Build the webhook route's client for a `[hitl.route]` config: the one
@@ -2292,6 +2346,7 @@ mod tests {
                 route: std::sync::Arc::new(route),
                 park_enabled: true,
                 park_ttl: aura_config::ParkTtl::try_new(7200).expect("park ttl validates"),
+                headers_from_request: headers_from_request.clone(),
             }
         }
 
@@ -2313,17 +2368,62 @@ mod tests {
                 "x-tenant-egress".to_string(),
                 "Bearer rig-egress-sentinel".to_string(),
             )]);
-            let seeded = runtime.with_frozen_egress(&frozen);
-            let egress = seeded
-                .route
-                .park_egress()
+            let seeded = runtime
+                .with_frozen_egress(&frozen)
                 .expect("the frozen seed satisfies egress capture");
+            let egress = seeded.route.park_egress().expect("egress is present");
             assert_eq!(
                 egress
                     .get("x-tenant-egress")
                     .and_then(|value| value.to_str().ok()),
                 Some("Bearer rig-egress-sentinel"),
                 "the seeded route egresses under the original request's identity"
+            );
+        }
+
+        /// A malformed stored header name refuses the resume instead of
+        /// silently dropping the entry and proceeding as if egress were OK.
+        #[test]
+        fn frozen_egress_refuses_invalid_header_name() {
+            let runtime = resume_shaped_runtime();
+            let frozen = std::collections::HashMap::from([(
+                "not a valid header name!!!".to_string(),
+                "value".to_string(),
+            )]);
+            assert!(
+                runtime.with_frozen_egress(&frozen).is_err(),
+                "an invalid frozen header name must refuse the resume"
+            );
+        }
+
+        /// A malformed stored header value refuses the resume instead of
+        /// silently dropping the entry and proceeding as if egress were OK.
+        #[test]
+        fn frozen_egress_refuses_invalid_header_value() {
+            let runtime = resume_shaped_runtime();
+            let frozen = std::collections::HashMap::from([(
+                "x-tenant-egress".to_string(),
+                "bad\r\nvalue".to_string(),
+            )]);
+            assert!(
+                runtime.with_frozen_egress(&frozen).is_err(),
+                "an invalid frozen header value must refuse the resume"
+            );
+        }
+
+        /// An incomplete frozen map (a required mapped destination missing)
+        /// refuses the resume instead of opening the route without the
+        /// required authentication header.
+        #[test]
+        fn frozen_egress_refuses_incomplete_map() {
+            let runtime = resume_shaped_runtime();
+            let frozen = std::collections::HashMap::from([(
+                "x-other-egress".to_string(),
+                "value".to_string(),
+            )]);
+            assert!(
+                runtime.with_frozen_egress(&frozen).is_err(),
+                "a missing mapped destination must refuse the resume"
             );
         }
 

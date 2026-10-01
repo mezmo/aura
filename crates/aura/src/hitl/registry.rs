@@ -345,6 +345,16 @@ impl PendingApprovals {
             }
         }
     }
+
+    /// Strict variant of [`Self::cancel_request`]: a store fault propagates
+    /// so cleanup paths can retain checkpoint evidence rather than delete it.
+    pub async fn cancel_request_strict(
+        &self,
+        request_id: &str,
+    ) -> Result<Vec<ParkedApproval>, SessionStoreError> {
+        self.cancel_request_local(request_id);
+        self.0.store.cancel_request_strict(request_id).await
+    }
 }
 
 impl Default for PendingApprovals {

@@ -755,6 +755,7 @@ mod tests {
                 }),
                 park_enabled: true,
                 park_ttl: aura_config::ParkTtl::default(),
+                headers_from_request: std::collections::HashMap::new(),
             }),
             memory_dir: Some(dir.join("memory").to_string_lossy().into_owned()),
             session_id: Some(SESSION.to_string()),

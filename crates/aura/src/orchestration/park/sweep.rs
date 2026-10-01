@@ -27,6 +27,7 @@ use super::cleanup::{
 };
 use super::document::ParkedRun;
 use super::resume::claim::{ResumeClaimTable, ResumeRunId, ValidatedResumePath};
+use super::resume::evaluate::Diagnostic;
 
 /// Cadence between completed passes.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
@@ -89,7 +90,17 @@ impl ParkSweep {
     /// evidence is warned and kept.
     pub async fn run_pass(&self) {
         let now = Utc::now();
-        let roots = enumerate_checkpoint_roots(&self.memory_dir);
+        let roots = match enumerate_checkpoint_roots(&self.memory_dir) {
+            Ok(roots) => roots,
+            Err(diagnostic) => {
+                warn!(
+                    agent = %self.label,
+                    error = %diagnostic,
+                    "park retention sweep could not enumerate checkpoint roots"
+                );
+                return;
+            }
+        };
 
         // Collect candidates from checkpoint scans.
         let mut candidates: HashMap<String, Candidate> = HashMap::new();
@@ -348,7 +359,9 @@ impl SweepHandle {
 /// sessionless root `{memory_dir}/parked/` plus every direct subdirectory
 /// that contains a `parked/` child. Missing roots are omitted — a config with
 /// no parked evidence yet contributes no candidates.
-fn enumerate_checkpoint_roots(memory_dir: &str) -> Vec<(Option<String>, PathBuf)> {
+fn enumerate_checkpoint_roots(
+    memory_dir: &str,
+) -> Result<Vec<(Option<String>, PathBuf)>, Diagnostic> {
     let root = Path::new(memory_dir);
     let mut roots = Vec::new();
 
@@ -359,9 +372,21 @@ fn enumerate_checkpoint_roots(memory_dir: &str) -> Vec<(Option<String>, PathBuf)
 
     let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
-        Err(_) => return roots,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(roots),
+        Err(e) => {
+            return Err(Diagnostic::new(format!(
+                "memory root {} could not be read: {e}",
+                root.display()
+            )));
+        }
     };
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = entry.map_err(|e| {
+            Diagnostic::new(format!(
+                "memory root {} entry could not be read: {e}",
+                root.display()
+            ))
+        })?;
         let path = entry.path();
         if !path.is_dir() {
             continue;
@@ -376,7 +401,7 @@ fn enumerate_checkpoint_roots(memory_dir: &str) -> Vec<(Option<String>, PathBuf)
         }
     }
 
-    roots
+    Ok(roots)
 }
 
 /// Extract the run id from a scope, if any. Single scopes carry no run id.
@@ -770,6 +795,52 @@ mod tests {
         assert!(
             registry.try_parked(&decision_id).await.unwrap().is_some(),
             "registry evidence for corrupt checkpoint is kept"
+        );
+    }
+
+    /// `enumerate_checkpoint_roots` returns a diagnostic when the memory root
+    /// itself is unreadable, so a sweep never treats an unreadable root as
+    /// empty and silently fresh.
+    #[test]
+    fn enumerate_roots_diagnoses_unreadable_memory_root() {
+        let dir = tempfile::tempdir().expect("temp memory root");
+        let root = dir.path().join("memory-root-file");
+        std::fs::write(&root, b"not a directory").expect("stage file at memory root path");
+        assert!(root.is_file(), "fixture: memory root is a file");
+        let result = super::enumerate_checkpoint_roots(root.to_string_lossy().as_ref());
+        assert!(
+            result.is_err(),
+            "an unreadable memory root returns a diagnostic"
+        );
+    }
+
+    /// A missing memory root is benign: retained orphan rows still age and
+    /// are swept, rather than the pass returning early and leaving them
+    /// behind forever.
+    #[tokio::test]
+    async fn pass_sweeps_aged_orphans_when_memory_root_is_missing() {
+        let dir = tempfile::tempdir().expect("temp memory root");
+        // Use a separate, non-existent path for checkpoint roots while the
+        // approval store lives under the temp directory.
+        let missing_memory = dir
+            .path()
+            .join("no-such-memory")
+            .to_string_lossy()
+            .to_string();
+        let (registry, store) = make_registry(dir.path());
+        let registered_at = chrono::Utc::now() - chrono::Duration::seconds(7201);
+        let decision_id = stage_run_approval(&registry, RUN_A, registered_at).await;
+
+        assert!(
+            !Path::new(&missing_memory).exists(),
+            "fixture: memory dir is absent"
+        );
+        let sweep = sweep(registry.clone(), store.clone(), &missing_memory, 3600);
+        sweep.run_pass().await;
+
+        assert!(
+            registry.try_parked(&decision_id).await.unwrap().is_none(),
+            "aged orphan rows are swept even when the memory root is missing"
         );
     }
 }

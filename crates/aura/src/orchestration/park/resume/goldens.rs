@@ -6276,10 +6276,16 @@ async fn expired_refusal_renders_and_retains_evidence_for_sweep() {
             .is_some(),
         "the expired refusal keeps the undecided approval for the sweep"
     );
-    let retry = evaluate_resume(evaluation(&world, false, None)).await;
-    assert!(
-        matches!(retry, Err(ResumeRefusal::Conflict(_))),
-        "a retried resume of the same expired run renders the same expired row: {retry:?}"
+    let retry = evaluate_resume(evaluation(&world, false, None))
+        .await
+        .expect_err("a retried resume of the same expired run refuses");
+    assert_conflict(
+        retry,
+        json!({
+            "code": "expired",
+            "detail": "the decision window closed before every pending call was decided",
+            "blocking": [entry(decision(), TOOL, TICKET_STAMP)],
+        }),
     );
 }
 
