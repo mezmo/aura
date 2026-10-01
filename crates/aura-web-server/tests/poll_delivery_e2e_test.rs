@@ -21,8 +21,10 @@
 //! The flow is proven through durable resolve with the run still parked: the
 //! parked run ends with the orchestrator's parked message and no tool output,
 //! and the decision landing in the store (carrying the captured approver
-//! identity) is the terminal state asserted here. Re-execution belongs to
-//! the resume endpoint, which this rig does not start.
+//! identity) is the terminal state asserted here. Re-execution is the resume
+//! battery at the bottom: the decided run answers a POST to the resume
+//! endpoint with a 200 SSE stream whose text is the resumed answer, not a
+//! re-park.
 //!
 //! The park arm requires an orchestration worker scope, so the rig config
 //! enables `[orchestration]` (a single-agent config would fail the gated call
@@ -291,8 +293,11 @@ tool_headers_from_response = {{ "{IDENTITY_NAME}" = "{IDENTITY_NAME}" }}
 // ---------------------------------------------------------------------------
 
 /// Drive one chat completion with the egress header attached — the request
-/// the gate's egress capture reads `x-tenant-egress` from.
-async fn send_chat(server: &AuraServer) -> Value {
+/// the gate's egress capture reads `x-tenant-egress` from. Returns the
+/// response JSON plus the chat session id the request minted, so callers
+/// can address the parked run through the resume endpoint.
+async fn send_chat(server: &AuraServer) -> (Value, String) {
+    let chat_session_id = format!("poll-e2e-{}", uuid::Uuid::new_v4());
     let client = reqwest::Client::new();
     let response = client
         .post(format!("{}/v1/chat/completions", server.base_url()))
@@ -303,7 +308,7 @@ async fn send_chat(server: &AuraServer) -> Value {
             "stream": false,
             "metadata": {
                 "account_id": "test-account",
-                "chat_session_id": format!("poll-e2e-{}", uuid::Uuid::new_v4())
+                "chat_session_id": chat_session_id
             }
         }))
         .timeout(CHAT_TIMEOUT)
@@ -316,7 +321,26 @@ async fn send_chat(server: &AuraServer) -> Value {
         200,
         "expected 200 OK from /v1/chat/completions"
     );
-    response.json().await.expect("response body is valid JSON")
+    let json = response.json().await.expect("response body is valid JSON");
+    (json, chat_session_id)
+}
+
+/// The run id from the parked completion's terminal message — the message is
+/// pinned to start `Run {run_id} parked:`, so the id is the span between
+/// `Run ` and ` parked`.
+fn run_id_from_parked_message(content: &str) -> String {
+    let after = content
+        .strip_prefix("Run ")
+        .unwrap_or_else(|| panic!("the parked message starts with 'Run ': {content}"));
+    let run_id = after
+        .split_once(" parked")
+        .map(|(run_id, _)| run_id)
+        .unwrap_or_else(|| panic!("the parked message names its run before ' parked': {content}"));
+    assert!(
+        !run_id.contains(' '),
+        "the run id is one token, got: {run_id} (message: {content})"
+    );
+    run_id.to_string()
 }
 
 /// `{root}/approvals` and `{root}/decisions`: the file backend's layout, read
@@ -461,13 +485,18 @@ fn ensure_unsigned_mode() {
 /// decision-ask POST names the row's decision id and authenticates with its
 /// own egress value, and is the ONLY POST (the 207 is the receiver's ack, so
 /// the reconciler never re-POSTs). Returns the decision id of the parked
-/// approval.
-async fn park(receiver: &MockGovernanceReceiver, server: &AuraServer, store_root: &Path) -> String {
+/// approval, the parked run's id, and the chat session id that addressed it.
+async fn park(
+    receiver: &MockGovernanceReceiver,
+    server: &AuraServer,
+    store_root: &Path,
+) -> (String, String, String) {
     // The parked run's terminal completion: the orchestrator's parked
     // message replaces any tool relay, so the gated call's output never
     // reaches the client.
-    let response = send_chat(server).await;
+    let (response, chat_session_id) = send_chat(server).await;
     let content = assistant_text(&response);
+    let run_id = run_id_from_parked_message(content);
     assert!(
         content.contains("parked") && content.contains("awaiting human approval"),
         "the parked run must end with the orchestrator's parked message, got: {content}"
@@ -528,7 +557,7 @@ async fn park(receiver: &MockGovernanceReceiver, server: &AuraServer, store_root
         "the gate applies the resolved egress value: {ask}"
     );
 
-    decision_id
+    (decision_id, run_id, chat_session_id)
 }
 
 // ---------------------------------------------------------------------------
@@ -549,7 +578,7 @@ async fn poll_flow_parks_and_resolves_with_the_run_still_parked() {
     let receiver = MockGovernanceReceiver::start().await;
     let server = spawn_rig_server(&receiver, &store_root, "poll-e2e-single").await;
 
-    let decision_id = park(&receiver, &server, &store_root).await;
+    let (decision_id, _run_id, _chat_session_id) = park(&receiver, &server, &store_root).await;
 
     // The 207 is the receiver's acknowledgment: the row is born notified, so
     // no second POST may follow the gate's single decision ask.
@@ -703,6 +732,85 @@ async fn restart_resolves_the_parked_approval_on_a_rebooted_server() {
     );
 
     second_boot.stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// Resume: the decided run answers the resume endpoint over SSE
+// ---------------------------------------------------------------------------
+
+/// Wall-clock budget for one resumed turn: the continuation consults the
+/// decided row, executes the gated call, and composes the answer — one
+/// model call past the park, so its budget sits above CHAT_TIMEOUT's
+/// single-turn allowance.
+const RESUME_TIMEOUT: Duration = Duration::from_secs(150);
+
+/// The resume battery: park through the poll flow, decide the receiver, let
+/// the reconciler land the durable decision, then POST the resume endpoint.
+/// The answer must be a 200 SSE stream whose text is the RESUMED answer —
+/// the gated call's raw output carrying the approver identity the poll-200
+/// docked — never a re-park and never the parked message.
+#[tokio::test]
+async fn resume_endpoint_streams_the_decided_run_over_sse() {
+    ensure_unsigned_mode();
+    let store_dir = tempfile::tempdir().expect("temp store dir");
+    let store_root = store_dir.path().to_path_buf();
+    let receiver = MockGovernanceReceiver::start().await;
+    let server = spawn_rig_server(&receiver, &store_root, "poll-e2e-resume").await;
+
+    let (decision_id, run_id, chat_session_id) = park(&receiver, &server, &store_root).await;
+
+    // Decide and let the reconciler resolve durably: the resume evaluation
+    // consults the DECIDED rows, so the decision must be in the store before
+    // the POST or the run would answer a refusal, not a stream.
+    receiver.set_decided();
+    let decision_record = wait_for_decision_file(&store_root).await;
+    assert!(
+        decision_record.contains(decision_id.as_str()),
+        "the durable decision names the parked approval, got: {decision_record}"
+    );
+
+    // The resume POST itself: no body, no session-scoped headers — the
+    // validated path is the whole request surface.
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!(
+            "{}/v1/sessions/{chat_session_id}/runs/{run_id}",
+            server.base_url()
+        ))
+        .timeout(RESUME_TIMEOUT)
+        .send()
+        .await
+        .expect("resume request reaches the server");
+    assert_eq!(
+        response.status(),
+        200,
+        "a decided, unclaimed, unexpired run answers 200 over SSE"
+    );
+    assert!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("text/event-stream")),
+        "the resume answer is an SSE stream"
+    );
+
+    let body = response
+        .text()
+        .await
+        .expect("the resume stream reaches its end");
+    assert!(
+        body.contains(IDENTITY_VALUE),
+        "the resumed answer carries the gated call's raw output with the \
+         approver identity the poll-200 docked; a stream that dies before the \
+         answer (or answers the parked message instead) fails here. body:\n{body}"
+    );
+    assert!(
+        !body.contains("awaiting human approval"),
+        "a decided run resumes; it never re-parks. body:\n{body}"
+    );
+
+    server.stop().await;
 }
 
 // ---------------------------------------------------------------------------
