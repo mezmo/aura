@@ -644,36 +644,48 @@ pub async fn execute_completion(
         rehydrated_skills,
     } = setup;
 
-    // The chat arm yields exactly the agent, query, and history the request
-    // was prepared with; the resume arm enters through the factory's
-    // grant-consuming stream (S2/S3).
-    let (streaming_agent, query, chat_history) = match completion {
+    // Both arms converge on the pieces the shared delivery tail consumes:
+    // the agent surface (status queries and MCP cancel), the event stream,
+    // the run's cancellation token, the usage accumulator, and the
+    // run-scoped event receiver when there is one. The chat arm starts a
+    // run through the prepared agent; the resume arm enters through the
+    // factory's grant-consuming stream, whose run events ride the main
+    // stream, so it carries no side-channel receiver.
+    let (agent, stream, cancel_tx, usage_state, agent_events) = match completion {
         CompletionInput::Chat {
             agent,
             query,
             history,
-        } => (agent, query, history),
-        CompletionInput::Resume { .. } => todo!(
-            "P45 S2/S3: the factory's resume_stream_with_timeout consumes the grant and \
-             returns the resumed stream"
-        ),
+        } => {
+            let mut run = agent
+                .stream(
+                    &query,
+                    history,
+                    aura::streaming::RunOptions::bounded(Some(config.timeout_duration))
+                        .cancelled_by(&config.stream_shutdown_token),
+                    &config.request_id,
+                )
+                .await;
+            let cancel_tx = run.cancel_token();
+            let usage_state = run.usage().clone();
+            let agent_events = run.take_agent_events();
+            (agent, run.into_events(), cancel_tx, usage_state, agent_events)
+        }
+        CompletionInput::Resume { factory, grant } => {
+            let (stream, cancel_tx, usage_state) = factory
+                .resume_stream_with_timeout(grant, config.timeout_duration, &config.request_id)
+                .await;
+            let agent: Arc<dyn StreamingAgent> = factory;
+            (
+                agent,
+                stream,
+                cancel_tx.as_token().clone(),
+                usage_state,
+                None,
+            )
+        }
     };
 
-    // Create stream with timeout — single path for both Agent and Orchestrator
-    let mut run = streaming_agent
-        .stream(
-            &query,
-            chat_history,
-            aura::streaming::RunOptions::bounded(Some(config.timeout_duration))
-                .cancelled_by(&config.stream_shutdown_token),
-            &config.request_id,
-        )
-        .await;
-    let cancel_tx = run.cancel_token();
-    let usage_state = run.usage().clone();
-
-    // The run's events are buffered from the moment it starts, so taking the
-    // receiver after `stream` returns loses nothing it already emitted.
     let delivery_channels = match delivery {
         DeliveryMode::Collect { result_tx } => DeliveryChannels::Collect { result_tx },
         DeliveryMode::Sse {
@@ -682,10 +694,9 @@ pub async fn execute_completion(
         } => DeliveryChannels::Sse {
             chunk_tx,
             heartbeat_interval,
-            agent_events: run.take_agent_events(),
+            agent_events,
         },
     };
-    let stream = run.into_events();
 
     let response_content = config.response_content.clone();
     let otel_ctx = StreamOtelContext {
@@ -700,7 +711,7 @@ pub async fn execute_completion(
         tools_json,
         message_count: config.message_count,
         response_content: config.response_content,
-        system_prompt: streaming_agent.system_prompt().map(str::to_string),
+        system_prompt: agent.system_prompt().map(str::to_string),
         orchestration_enabled,
     };
     otel_ctx.record_input();
@@ -728,7 +739,7 @@ pub async fn execute_completion(
         } => {
             let callbacks = StreamingCallbacks {
                 request_id: config.request_id.clone(),
-                agent: streaming_agent.clone(),
+                agent: agent.clone(),
                 agent_events,
                 usage_state: usage_state.clone(),
                 response_content,
