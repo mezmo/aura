@@ -1749,22 +1749,18 @@ mode = "conversational"
         );
     }
 
-    /// Poll delivery is refused even with `headers_from_request`: the
-    /// mapping's persist-at-rest semantics do not make the delivery mode
-    /// itself admissible.
+    /// Poll delivery + `headers_from_request` is valid: the resolved
+    /// values are captured at request-scoped route construction and
+    /// persisted on the parked approval record, so the background
+    /// reconciler does NOT need to reconstruct them after a restart.
     #[test]
-    fn validate_refuses_poll_delivery_with_headers_from_request() {
-        let err = crate::load_config_from_str(&orchestrated_config_toml(
+    fn validate_accepts_poll_delivery_with_headers_from_request() {
+        crate::load_config_from_str(&orchestrated_config_toml(
             true,
             3600,
             "delivery = \"poll\"\nheaders_from_request = { \"authorization\" = \"authorization\" }",
         ))
-        .expect_err("poll delivery is refused regardless of header mappings");
-        assert!(
-            err.to_string().contains("hitl.route.delivery"),
-            "error must name the refused key: {}",
-            err
-        );
+        .expect("headers_from_request with poll delivery is valid: values persist at rest");
     }
 
     #[test]
@@ -1818,22 +1814,17 @@ mode = "conversational"
         );
     }
 
-    /// `tool_headers_from_response` (approver identity) does not make poll
-    /// delivery admissible either.
+    /// `tool_headers_from_response` (approver identity) stays allowed with
+    /// poll delivery.
     #[test]
-    fn validate_refuses_poll_delivery_with_park() {
-        let err = crate::load_config_from_str(&orchestrated_config_toml(
+    fn validate_accepts_poll_delivery_with_park() {
+        crate::load_config_from_str(&orchestrated_config_toml(
             true,
             3600,
             "delivery = \"poll\"\n\
              tool_headers_from_response = { \"X-Forwarded-User\" = \"X-Approver-Id\" }",
         ))
-        .expect_err("poll delivery with park mode is refused");
-        assert!(
-            err.to_string().contains("hitl.route.delivery"),
-            "error must name the refused key: {}",
-            err
-        );
+        .expect("poll delivery with park mode and no request-derived headers is valid");
     }
 
     #[test]
