@@ -24,9 +24,10 @@
 //!   them.
 //! - `list_pending` scans the undecided approvals for the poll reconciler:
 //!   corrupt files are warn-and-skipped per id, expired records are
-//!   unlinked, and an approval file left behind a complete decision file
-//!   is unlinked (one behind an undecodable decision file is kept, as the
-//!   only intact record).
+//!   filtered but kept in place for the read-or-expire consult to
+//!   terminalize (F02), and an approval file left behind a complete
+//!   decision file is unlinked (one behind an undecodable decision file
+//!   is kept, as the only intact record).
 //!
 //! Decision ids are validated as UUIDs before path building, so none address
 //! outside the root.
@@ -535,12 +536,22 @@ impl Inner {
                 Err(err) if err.kind() == io::ErrorKind::NotFound => {}
                 Err(err) => return Err(request_err(err)),
             }
+            // An expired undecided row is filtered from the scan and
+            // LEFT IN PLACE: the read-or-expire consult is the one
+            // boundary that terminalizes it, writing the durable
+            // `TimedOut` record and stripping the row's credentials in
+            // the same ceremony resolve uses. Once that decision file
+            // exists, the decided-residue arm above cleans the approval
+            // file on every later scan — so no credential outlives the
+            // consult — while evidence cannot be erased ahead of the
+            // resume that must publish the timeout (F02). Eventual
+            // terminal-record cleanup belongs to retention, not here.
             if parked.expires_at > now {
                 pending.push(parked);
-            } else if let Err(err) = self.unlink_if_unchanged(&path, &bytes) {
-                tracing::warn!(
-                    path = %path.display(), error = %err,
-                    "expired approval file not removed by list_pending"
+            } else {
+                tracing::debug!(
+                    decision_id = %parked.request.decision_id,
+                    "expired approval kept for the read-or-expire consult"
                 );
             }
         }
@@ -1143,10 +1154,10 @@ mod private_mode_tests {
 /// end-to-end recovery half is the aura-web-server battery's
 /// `stale_sweep_cannot_unlink_a_replaced_record`. Every sweep-driven
 /// unlink checks the file against the bytes the sweep decoded
-/// (`unlink_if_unchanged`, the exact code path the scan's expiry
-/// and residue unlinks take), so the interleaving — stale record read,
-/// replace with a fresh record, unlink — is driven directly through
-/// that seam.
+/// (`unlink_if_unchanged`, the exact code path the scan's residue
+/// unlink takes; the expiry arm keeps evidence for the consult), so
+/// the interleaving — stale record read, replace with a fresh record,
+/// unlink — is driven directly through that seam.
 #[cfg(test)]
 mod unlink_recheck_tests {
     use std::sync::Arc;
@@ -1157,7 +1168,7 @@ mod unlink_recheck_tests {
     };
     use crate::session_store::{ApprovalStore, ParkedApprovalRecord};
 
-    use super::{FileApprovalStore, unlink_interleave};
+    use super::{FileApprovalStore, TerminalRecord, unlink_interleave};
 
     /// A representative parked approval for `decision_id`, expiring far
     /// out — the battery fixture's shape.
@@ -1187,6 +1198,26 @@ mod unlink_recheck_tests {
             egress_headers: None,
             acknowledgment: crate::hitl::AcknowledgmentState::RequiresNotification,
         }
+    }
+
+    /// Publish the durable terminal record for `parked` under `dir` —
+    /// the state the scan's decided-residue arm keys on. Once the
+    /// decision exists, the approval file is residue the sweep unlinks;
+    /// the expiry arm alone keeps evidence for the consult.
+    fn write_terminal_record(dir: &tempfile::TempDir, parked: &ParkedApproval) {
+        let entry = super::ResolvedEntry {
+            approval: ParkedApprovalRecord::from(parked),
+            decision: TerminalRecord::TimedOut {
+                deadline: parked.expires_at,
+            },
+        };
+        let decisions = dir.path().join("decisions");
+        std::fs::create_dir_all(&decisions).unwrap();
+        std::fs::write(
+            decisions.join(format!("{}.json", parked.request.decision_id)),
+            serde_json::to_vec(&entry).unwrap(),
+        )
+        .unwrap();
     }
 
     #[tokio::test]
@@ -1233,10 +1264,13 @@ mod unlink_recheck_tests {
         let store = FileApprovalStore::open(dir.path()).unwrap();
         let id = DecisionId::generate();
 
-        // The record the sweep will decide to unlink: expired.
+        // The record the sweep will decide to unlink: expired and
+        // already terminalized, so the scan's decided-residue arm owns
+        // its unlink (the expiry arm keeps evidence for the consult).
         let mut expired = make_parked(id);
         expired.expires_at = chrono::Utc::now() - chrono::Duration::seconds(1);
-        store.inner.register_sync(expired).unwrap();
+        store.inner.register_sync(expired.clone()).unwrap();
+        write_terminal_record(&dir, &expired);
         let path = dir.path().join("approvals").join(format!("{id}.json"));
         let stale = std::fs::read(&path).unwrap();
 
@@ -1280,10 +1314,11 @@ mod unlink_recheck_tests {
     }
 
     /// The destroy that evicts: a registration materializes its path's
-    /// lock entry, and the expiry sweep's commit destroys the record and
-    /// evicts the entry with it, so the map holds nothing beyond the
-    /// approvals actually parked. Single-threaded end to end — the
-    /// refcount is one at eviction because nothing else holds a clone.
+    /// lock entry, and the residue sweep's commit destroys the decided
+    /// record and evicts the entry with it, so the map holds nothing
+    /// beyond the approvals actually parked. Single-threaded end to
+    /// end — the refcount is one at eviction because nothing else holds
+    /// a clone.
     #[test]
     fn a_sweep_destroy_evicts_the_destroyed_path_lock_entry() {
         let dir = tempfile::tempdir().unwrap();
@@ -1292,7 +1327,8 @@ mod unlink_recheck_tests {
 
         let mut expired = make_parked(id);
         expired.expires_at = chrono::Utc::now() - chrono::Duration::seconds(1);
-        store.inner.register_sync(expired).unwrap();
+        store.inner.register_sync(expired.clone()).unwrap();
+        write_terminal_record(&dir, &expired);
         let path = dir.path().join("approvals").join(format!("{id}.json"));
         assert!(
             store
@@ -1342,7 +1378,8 @@ mod unlink_recheck_tests {
 
         let mut expired = make_parked(id);
         expired.expires_at = chrono::Utc::now() - chrono::Duration::seconds(1);
-        store.inner.register_sync(expired).unwrap();
+        store.inner.register_sync(expired.clone()).unwrap();
+        write_terminal_record(&dir, &expired);
         let path = dir.path().join("approvals").join(format!("{id}.json"));
         let snapshot = std::fs::read(&path).unwrap();
 

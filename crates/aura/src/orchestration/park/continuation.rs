@@ -546,6 +546,85 @@ mod tests {
         );
     }
 
+    /// F02 regression, the scan-before-resume ordering: a webhook row
+    /// whose decision deadline has passed (the store's injected clock)
+    /// while the run's retention window stays valid survives the
+    /// production pending scan, and the resume consult addresses it
+    /// `TimedOut` — durable feedback for the resumed run, never a
+    /// missing-approval mismatch. The goldens frame
+    /// `consult_a_timed_out_member_addresses_its_call_and_the_ready_bundle_resumes`
+    /// carries the run side from here: the recorded timeout feeds the
+    /// tool-error path and no protected call executes.
+    #[tokio::test]
+    async fn a_scan_before_resume_cannot_erase_a_retained_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let knob = Arc::new(std::sync::Mutex::new(chrono::Utc::now()));
+        let clock = {
+            let knob = Arc::clone(&knob);
+            Arc::new(move || *knob.lock().unwrap())
+        };
+        let store = Arc::new(
+            crate::session_store::FileApprovalStore::open_with_clock(dir.path(), clock).unwrap(),
+        );
+        let registry = PendingApprovals::with_backend(
+            store.clone(),
+            Arc::new(crate::session_store::InMemoryEventBus::new()),
+        );
+        let decision_id = DecisionId::generate();
+        let args = serde_json::json!({ "namespace": "prod" });
+        let mut row = approval(decision_id, args.clone());
+        // Near for real time, so registration and the document's
+        // retention window stay valid; the injected clock moves past it.
+        row.expires_at = chrono::Utc::now() + chrono::Duration::seconds(30);
+        let deadline = row.expires_at;
+        registry.register_durable(row).await.unwrap();
+        let doc = parked_run(vec![pending_call(decision_id, args.clone())]);
+
+        // The decision deadline passes on the store's clock only.
+        *knob.lock().unwrap() = chrono::Utc::now() + chrono::Duration::minutes(5);
+
+        // The production pending scan runs first — the poller's own
+        // read — and must not erase the row's evidence.
+        use crate::session_store::ApprovalStore as _;
+        assert!(
+            store.list_pending().await.unwrap().is_empty(),
+            "the expired row is filtered from the scan"
+        );
+
+        // The resume consult terminalizes what the scan left in place.
+        let (recorded, consumed) = load_recorded_decisions(&registry, &doc, chrono::Utc::now())
+            .await
+            .expect("the consult terminalizes the expired row, not a mismatch");
+        assert!(
+            consumed.is_empty(),
+            "a timed-out member is never a consumed decision: {consumed:?}"
+        );
+        match recorded.take(&CallKey::new(3, "kubectl_apply", &args)) {
+            Some(AddressedApproval::TimedOut { deadline: got }) => assert_eq!(
+                got, deadline,
+                "the timeout carries the stored row's own deadline"
+            ),
+            other => panic!("the recorded outcome is the durable timeout: {other:?}"),
+        }
+
+        // The terminal record is durable and the credential-carrying row
+        // is gone — written and removed by the consult's ceremony.
+        assert!(
+            dir.path()
+                .join("decisions")
+                .join(format!("{decision_id}.json"))
+                .exists(),
+            "the durable TimedOut record exists"
+        );
+        assert!(
+            !dir.path()
+                .join("approvals")
+                .join(format!("{decision_id}.json"))
+                .exists(),
+            "the consult removed the credential-carrying row"
+        );
+    }
+
     /// A pending call whose approval is gone from the store is a mismatch
     /// (the 2.6 mismatch row names a missing approval); one still parked but
     /// undecided is the parked row inside the window and the expired row

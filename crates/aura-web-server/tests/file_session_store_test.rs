@@ -336,25 +336,75 @@ async fn resolve_moves_the_approval_into_the_decision_file() {
     );
 }
 
-/// An expired undecided approval leaves the store on the scan that finds
-/// it, so no credential outlives the decision window.
+/// The expired-evidence contract (F02): the pending scan filters an
+/// expired undecided row but never deletes its evidence — the
+/// read-or-expire consult is the boundary that terminalizes it, writing
+/// the durable `TimedOut` record and removing the credential-carrying
+/// row in the same ceremony resolve uses. No credential outlives the
+/// consult, and evidence cannot be erased ahead of the resume that must
+/// publish the timeout.
 #[tokio::test]
-async fn list_pending_unlinks_expired_approval_files() {
+async fn list_pending_keeps_expired_evidence_for_the_consult() {
     let dir = tempfile::tempdir().unwrap();
     let store = FileApprovalStore::open(dir.path()).unwrap();
     let mut expired = make_parked("req-expired", Duration::from_secs(60));
     expired.expires_at = chrono::Utc::now() - chrono::Duration::seconds(1);
+    let deadline = expired.expires_at;
     let id = expired.request.decision_id;
     store.register(expired).await.unwrap();
 
+    // The scan filters the row without erasing it.
     assert!(store.list_pending().await.unwrap().is_empty());
+    assert!(
+        dir.path()
+            .join("approvals")
+            .join(format!("{id}.json"))
+            .exists(),
+        "the expired approval file survives the scan for the consult"
+    );
+
+    // The consult terminalizes: durable TimedOut carrying the row's own
+    // deadline, with the approval file removed by the same step.
+    match store
+        .read_or_expire(&id, ApprovalAuthority::Conversational)
+        .await
+        .unwrap()
+    {
+        ApprovalRead::Addressed {
+            outcome: AddressedApproval::TimedOut { deadline: got },
+            ..
+        } => assert_eq!(got, deadline, "the timeout carries the row's deadline"),
+        _ => panic!("the consult addresses the expired row TimedOut"),
+    }
+    assert!(
+        dir.path()
+            .join("decisions")
+            .join(format!("{id}.json"))
+            .exists(),
+        "the durable terminal record exists"
+    );
     assert!(
         !dir.path()
             .join("approvals")
             .join(format!("{id}.json"))
             .exists(),
-        "the expired approval file was unlinked"
+        "the consult removed the credential-carrying row"
     );
+
+    // The terminal winner replays for every later consult, and later
+    // scans stay empty with no residue to clean.
+    match store
+        .read_or_expire(&id, ApprovalAuthority::Conversational)
+        .await
+        .unwrap()
+    {
+        ApprovalRead::Addressed {
+            outcome: AddressedApproval::TimedOut { .. },
+            ..
+        } => {}
+        _ => panic!("the terminal winner replays"),
+    }
+    assert!(store.list_pending().await.unwrap().is_empty());
 }
 
 /// Rows hold credentials, so the store's directories and files are
