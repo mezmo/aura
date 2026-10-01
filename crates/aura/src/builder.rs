@@ -1116,10 +1116,14 @@ impl Agent {
         // Add read_artifact tool when orchestration persistence is available.
         // When the scratchpad is active, hand it the budget + storage so a
         // large artifact is returned as an in-place pointer (explored with the
-        // scratchpad read tools).
+        // scratchpad read tools); otherwise cap what it returns inline.
         if let Some(ref persistence) = config.orchestration_persistence {
+            let (provider, model) = config.llm.model_info();
             let mut read_artifact =
-                crate::orchestration::ReadArtifactTool::new(persistence.clone());
+                crate::orchestration::ReadArtifactTool::new(persistence.clone()).with_inline_cap(
+                    crate::orchestration::inline_cap_tokens(config.llm.context_window()),
+                    crate::scratchpad::token_counter_for_provider(provider, model),
+                );
             if let Some(ref scratchpad) = config.scratchpad_tools_config {
                 let read_root = scratchpad.storage.read_root().to_path_buf();
                 let run_path = persistence.lock().await.run_path().to_path_buf();

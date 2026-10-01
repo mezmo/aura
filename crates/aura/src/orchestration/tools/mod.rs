@@ -15,7 +15,7 @@ pub mod wait_for;
 pub use inspect_tool_params::InspectToolParamsTool;
 pub use list_prior_runs::ListPriorRunsTool;
 pub use list_tools::ListToolsTool;
-pub use read_artifact::ReadArtifactTool;
+pub use read_artifact::{ReadArtifactTool, inline_cap_tokens};
 pub use routing_tools::{
     CreatePlanTool, RequestClarificationTool, RespondDirectlyTool, RoutingDecision, RoutingToolSet,
 };

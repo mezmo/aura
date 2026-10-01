@@ -11,12 +11,51 @@ use crate::orchestration::persistence::ExecutionPersistence;
 use crate::scratchpad::storage::{ContentFormat, ScratchpadPathError};
 use crate::scratchpad::tools::check_and_record_budget;
 use crate::scratchpad::wrapper::build_file_pointer;
-use crate::scratchpad::{ContextBudget, ScratchpadStorage};
+use crate::scratchpad::{ContextBudget, ScratchpadStorage, TokenCounter};
+
+/// Fraction of the context window one unbudgeted read may fill.
+const INLINE_CAP_WINDOW_FRACTION: f64 = 0.25;
+
+/// Inline cap, in tokens, for a caller with no known context window.
+pub const DEFAULT_INLINE_CAP_TOKENS: usize = 32_000;
+
+/// Upper bound on bytes per token across any realistic content and tokenizer.
+const MAX_BYTES_PER_TOKEN: usize = 32;
+
+/// Inline cap, in tokens, for a `read_artifact` with no scratchpad budget.
+pub fn inline_cap_tokens(context_window: Option<u64>) -> usize {
+    context_window
+        .map(|w| ((w as f64) * INLINE_CAP_WINDOW_FRACTION) as usize)
+        .unwrap_or(DEFAULT_INLINE_CAP_TOKENS)
+}
 
 #[derive(Clone)]
 struct ReadArtifactScratchpad {
     budget: ContextBudget,
     storage: Arc<ScratchpadStorage>,
+}
+
+#[derive(Clone)]
+struct InlineCap {
+    max_tokens: usize,
+    token_counter: Arc<dyn TokenCounter>,
+}
+
+impl InlineCap {
+    /// Whether `content` fits the cap.
+    ///
+    /// A token is at least one byte, so content no longer than the cap in
+    /// bytes fits without tokenizing; content past `MAX_BYTES_PER_TOKEN`
+    /// bytes per allowed token cannot fit and is rejected without tokenizing.
+    fn fits(&self, content: &str) -> bool {
+        if content.len() <= self.max_tokens {
+            return true;
+        }
+        if content.len() > self.max_tokens.saturating_mul(MAX_BYTES_PER_TOKEN) {
+            return false;
+        }
+        self.token_counter.count_tokens(content) <= self.max_tokens
+    }
 }
 
 /// Reads full content of a result artifact file.
@@ -27,6 +66,7 @@ struct ReadArtifactScratchpad {
 pub struct ReadArtifactTool {
     persistence: Arc<Mutex<ExecutionPersistence>>,
     scratchpad: Option<ReadArtifactScratchpad>,
+    inline_cap: Option<InlineCap>,
 }
 
 impl ReadArtifactTool {
@@ -34,7 +74,21 @@ impl ReadArtifactTool {
         Self {
             persistence,
             scratchpad: None,
+            inline_cap: None,
         }
+    }
+
+    /// Bound, in tokens, on content returned inline without a scratchpad.
+    pub fn with_inline_cap(
+        mut self,
+        max_tokens: usize,
+        token_counter: Arc<dyn TokenCounter>,
+    ) -> Self {
+        self.inline_cap = Some(InlineCap {
+            max_tokens,
+            token_counter,
+        });
+        self
     }
 
     /// With scratchpad, oversized artifacts are returned as a pointer.
@@ -48,7 +102,8 @@ impl ReadArtifactTool {
     }
 
     /// Decide how to surface artifact `content`:
-    /// - scratchpad inactive → inline;
+    /// - scratchpad inactive → inline, or a bounded preview when an inline
+    ///   cap is set and the content exceeds it;
     /// - fits the budget → inline, recorded against the budget;
     /// - too large → a pointer to the artifact in place (or, if the artifact
     ///   can't be referenced in place, a compact "too large" notice).
@@ -57,7 +112,10 @@ impl ReadArtifactTool {
     /// by the caller); it's used to build the in-place `file=` reference.
     async fn surface_content(&self, filename: &str, abs_path: &Path, content: String) -> String {
         let Some(sp) = &self.scratchpad else {
-            return content;
+            return match &self.inline_cap {
+                Some(cap) if !cap.fits(&content) => capped_preview(filename, &content, cap),
+                _ => content,
+            };
         };
 
         if check_and_record_budget(&sp.budget, &content).is_ok() {
@@ -108,6 +166,31 @@ impl ReadArtifactTool {
             }
         }
     }
+}
+
+/// Head of `content` plus a notice that the artifact exceeded the inline cap.
+///
+/// The preview is cut by bytes, not lines (a minified JSON artifact can be a
+/// single line), at a quarter of the cap; since a token is at least one byte,
+/// the preview stays well under the cap in tokens.
+fn capped_preview(filename: &str, content: &str, cap: &InlineCap) -> String {
+    let mut end = (cap.max_tokens / 4).min(content.len());
+    while !content.is_char_boundary(end) {
+        end -= 1;
+    }
+    let head = &content[..end];
+    let head = match head.rfind('\n') {
+        Some(nl) if nl > 0 => &head[..=nl],
+        _ => head,
+    };
+    format!(
+        "{head}\n[artifact '{filename}' is too large to return inline ({bytes} bytes, \
+         {lines} lines); showing the first {shown} bytes. If more is needed, process it in \
+         a narrower task.]",
+        bytes = content.len(),
+        lines = content.lines().count(),
+        shown = head.len(),
+    )
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -673,5 +756,154 @@ mod tests {
             result.content, big,
             "no-scratchpad path must inline verbatim"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Inline cap (no scratchpad budget)
+    // ------------------------------------------------------------------
+
+    /// Counter that refuses to tokenize anything larger than `max_len` bytes,
+    /// proving oversized content is rejected without a full tokenizer pass.
+    struct BoundedCounter {
+        max_len: usize,
+    }
+
+    impl TokenCounter for BoundedCounter {
+        fn count_tokens(&self, text: &str) -> usize {
+            assert!(
+                text.len() <= self.max_len,
+                "tokenizer called on {} bytes",
+                text.len()
+            );
+            TiktokenCounter::default_counter().count_tokens(text)
+        }
+    }
+
+    async fn setup_capped_tool(content: &str, max_tokens: usize) -> (ReadArtifactTool, TempDir) {
+        let temp_dir = TempDir::new().unwrap();
+        let persistence = ExecutionPersistence::new(temp_dir.path().join("memory"), None)
+            .await
+            .unwrap();
+        persistence
+            .write_result_artifact(0, Some("research"), 1, content)
+            .await
+            .unwrap();
+        let tool = ReadArtifactTool::new(Arc::new(Mutex::new(persistence)))
+            .with_inline_cap(max_tokens, Arc::new(TiktokenCounter::default_counter()));
+        (tool, temp_dir)
+    }
+
+    async fn read_result(tool: &ReadArtifactTool) -> ReadArtifactOutput {
+        tool.call(ReadArtifactArgs {
+            filename: "task-0-research-iter-1-result.txt".to_string(),
+            run_id: None,
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_inline_cap_inlines_content_under_cap() {
+        let (tool, _dir) = setup_capped_tool("a short result", 1_000).await;
+        let result = read_result(&tool).await;
+        assert_eq!(result.content, "a short result");
+    }
+
+    #[tokio::test]
+    async fn test_inline_cap_previews_content_over_cap() {
+        let big: String = (0..2_000).map(|i| format!("line number {i}\n")).collect();
+        let (tool, _dir) = setup_capped_tool(&big, 500).await;
+        let result = read_result(&tool).await;
+
+        assert!(result.found);
+        assert!(result.content.starts_with("line number 0\n"));
+        assert!(
+            result.content.contains("too large to return inline"),
+            "expected a cap notice, got: {}",
+            result.content
+        );
+        let tokens = TiktokenCounter::default_counter().count_tokens(&result.content);
+        assert!(tokens < 500, "capped output is {tokens} tokens");
+    }
+
+    #[tokio::test]
+    async fn test_inline_cap_bounds_single_line_preview() {
+        let big = format!("[{}]", "{\"k\":\"value\"},".repeat(5_000));
+        let (tool, _dir) = setup_capped_tool(&big, 500).await;
+        let result = read_result(&tool).await;
+
+        assert!(result.content.starts_with("[{\"k\":"));
+        assert!(result.content.contains("too large to return inline"));
+        let tokens = TiktokenCounter::default_counter().count_tokens(&result.content);
+        assert!(tokens < 500, "capped output is {tokens} tokens");
+    }
+
+    #[tokio::test]
+    async fn test_inline_cap_rejects_huge_content_without_tokenizing() {
+        let big = "x".repeat(2_000_000);
+        let temp_dir = TempDir::new().unwrap();
+        let persistence = ExecutionPersistence::new(temp_dir.path().join("memory"), None)
+            .await
+            .unwrap();
+        persistence
+            .write_result_artifact(0, Some("research"), 1, &big)
+            .await
+            .unwrap();
+        let tool = ReadArtifactTool::new(Arc::new(Mutex::new(persistence)))
+            .with_inline_cap(1_000, Arc::new(BoundedCounter { max_len: 100_000 }));
+
+        let result = read_result(&tool).await;
+        assert!(result.content.contains("too large to return inline"));
+        assert!(result.content.len() < 10_000);
+    }
+
+    #[tokio::test]
+    async fn test_scratchpad_takes_precedence_over_inline_cap() {
+        let big: String = (0..2_000).map(|i| format!("line number {i}\n")).collect();
+        let (tool, _storage, _dir) = setup_scratchpad_tool(&big, 50).await;
+        let tool = tool.with_inline_cap(500, Arc::new(TiktokenCounter::default_counter()));
+
+        let result = read_result(&tool).await;
+        assert!(result.content.contains("head file="));
+        assert!(!result.content.contains("too large to return inline"));
+    }
+
+    #[tokio::test]
+    async fn test_inline_cap_applies_to_cross_run_reads() {
+        let temp_dir = TempDir::new().unwrap();
+        let memory_dir = temp_dir.path().join("memory");
+        let session_id = "session_cap".to_string();
+        let big: String = (0..2_000).map(|i| format!("xrun line {i}\n")).collect();
+
+        let run_a = ExecutionPersistence::new(&memory_dir, Some(session_id.clone()))
+            .await
+            .unwrap();
+        let run_a_id = run_a.run_id().to_string();
+        run_a
+            .write_result_artifact(0, Some("sre"), 1, &big)
+            .await
+            .unwrap();
+
+        let run_b = ExecutionPersistence::new(&memory_dir, Some(session_id))
+            .await
+            .unwrap();
+        let tool = ReadArtifactTool::new(Arc::new(Mutex::new(run_b)))
+            .with_inline_cap(500, Arc::new(TiktokenCounter::default_counter()));
+
+        let result = tool
+            .call(ReadArtifactArgs {
+                filename: "task-0-sre-iter-1-result.txt".to_string(),
+                run_id: Some(run_a_id),
+            })
+            .await
+            .unwrap();
+        assert!(result.content.starts_with("xrun line 0\n"));
+        assert!(result.content.contains("too large to return inline"));
+    }
+
+    #[test]
+    fn test_inline_cap_tokens_scales_with_context_window() {
+        assert_eq!(inline_cap_tokens(Some(200_000)), 50_000);
+        assert_eq!(inline_cap_tokens(None), DEFAULT_INLINE_CAP_TOKENS);
     }
 }
