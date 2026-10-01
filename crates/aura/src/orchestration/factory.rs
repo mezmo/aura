@@ -1245,7 +1245,6 @@ mod tests {
             claims: &world.claims,
             bind_identity: false,
             presented_identity: None,
-            request_id: format!("req_{}", uuid::Uuid::new_v4().simple()),
             now: chrono::Utc::now(),
         })
         .await

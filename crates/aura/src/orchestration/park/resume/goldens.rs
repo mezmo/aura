@@ -1121,7 +1121,6 @@ fn evaluation<'a>(
         claims: &world.claims,
         bind_identity,
         presented_identity: presented,
-        request_id: REQUEST_ID.to_string(),
         now: chrono::Utc::now(),
     }
 }
@@ -5828,16 +5827,16 @@ async fn consult_blocking_entries_carry_each_calls_own_deadline() {
 /// Both members addressed (one decided, one timed-out), the caller's `now`
 /// past the document's retention stamp. The checkpoint must still expire:
 /// the terminal `409 expired` row (both members addressed, so nothing
-/// blocks), the parked checkpoint unlinked, the durable addressed terminal
-/// records retained as evidence, and a retried resume of the same run
-/// answers the absent row.
+/// blocks), the parked checkpoint retained for the sweep, the durable
+/// addressed terminal records retained as evidence, and a retried resume of
+/// the same run renders the same expired row with the evidence still present.
 ///
 /// RED today: the consult pins the addressed bundle to members addressed
 /// `TimedOut` only after the cutover — the interim consult carries the
 /// addressed member as an outstanding undecided call, so the expired row's
 /// blocking set is not empty.
 #[tokio::test]
-async fn consult_a_retention_expired_all_addressed_checkpoint_still_expires_and_tears_down() {
+async fn consult_a_retention_expired_all_addressed_checkpoint_still_expires_and_retains_evidence() {
     let world = world();
     register_decided(&world).await;
     let b_expires = chrono::Utc::now() - chrono::Duration::hours(1);
@@ -5868,11 +5867,11 @@ async fn consult_a_retention_expired_all_addressed_checkpoint_still_expires_and_
         }),
     );
     assert!(
-        !parked_document_path(&world).exists() && !resuming_document_path(&world).exists(),
-        "the expired teardown unlinked the parked checkpoint"
+        parked_document_path(&world).exists() && !resuming_document_path(&world).exists(),
+        "the expired refusal keeps the parked checkpoint for the sweep"
     );
     // Retained-evidence semantics: the durable terminal records survive the
-    // resume-path expired teardown and stay readable. A was decided through
+    // resume-path expired refusal and stay readable. A was decided through
     // the store and B timed out on its own stored deadline; both wrote a
     // durable decision file, and the file store's cancel sweep excludes any
     // id whose decision file is present (session_store/file.rs
@@ -5890,9 +5889,13 @@ async fn consult_a_retention_expired_all_addressed_checkpoint_still_expires_and_
         );
     }
     let retry = evaluate_resume(evaluation(&world, false, None)).await;
-    assert!(
-        matches!(retry, Err(ResumeRefusal::DocumentAbsent)),
-        "a retried resume of the same run answers the absent row: {retry:?}"
+    assert_conflict(
+        retry.expect_err("a retried resume of the same expired run still refuses"),
+        json!({
+            "code": "expired",
+            "detail": "the decision window closed before every pending call was decided",
+            "blocking": [],
+        }),
     );
 }
 
@@ -6230,12 +6233,13 @@ async fn reparked_document_renews_retention_from_the_publication_timestamp() {
     );
 }
 
-/// Regression guard (green today): the expired arms unlink the parked
-/// checkpoint, sweep the undecided approvals, tolerate a retried resume of
-/// the already-unlinked run (the NotFound-tolerant unlink keeps the arms
-/// idempotent), and the retry answers the absent row.
+/// Regression guard (green today): the expired arm renders the terminal
+/// `409 expired` row, leaves the parked checkpoint in place for the sweep,
+/// leaves undecided approvals as retained evidence, and a retried resume of
+/// the same expired run renders the same row again with the evidence still
+/// present.
 #[tokio::test]
-async fn expired_teardown_unlinks_sweeps_and_stays_idempotent() {
+async fn expired_refusal_renders_and_retains_evidence_for_sweep() {
     let world = world();
     register_undecided(&world).await;
     // One undecided member past its document's retention stamp.
@@ -6260,8 +6264,8 @@ async fn expired_teardown_unlinks_sweeps_and_stays_idempotent() {
         other => panic!("expected the expired row, got {other:?}"),
     }
     assert!(
-        !parked_document_path(&world).exists() && !resuming_document_path(&world).exists(),
-        "the expired teardown unlinked the parked checkpoint"
+        parked_document_path(&world).exists() && !resuming_document_path(&world).exists(),
+        "the expired refusal keeps the parked checkpoint for the sweep"
     );
     assert!(
         world
@@ -6269,13 +6273,13 @@ async fn expired_teardown_unlinks_sweeps_and_stays_idempotent() {
             .try_parked(&decision())
             .await
             .expect("the store reads")
-            .is_none(),
-        "the expired teardown swept the undecided approval"
+            .is_some(),
+        "the expired refusal keeps the undecided approval for the sweep"
     );
     let retry = evaluate_resume(evaluation(&world, false, None)).await;
     assert!(
-        matches!(retry, Err(ResumeRefusal::DocumentAbsent)),
-        "a retried resume of the same run answers the absent row: {retry:?}"
+        matches!(retry, Err(ResumeRefusal::Conflict(_))),
+        "a retried resume of the same expired run renders the same expired row: {retry:?}"
     );
 }
 
@@ -7617,16 +7621,16 @@ async fn s4_exhausted_checkpoint_iteration_exhausts_the_resumed_budget() {
 /// fabrication — and the caller's `now` past the document's retention
 /// stamp, with the caller inside nothing else. The checkpoint must still
 /// expire: the terminal `409 expired` conflict row, the parked checkpoint
-/// unlinked, the durable decided terminal records retained as evidence, and
-/// a retried resume of the same run answers the absent row — never a ready
-/// grant.
+/// retained for the sweep, the durable decided terminal records retained as
+/// evidence, and a retried resume of the same run renders the same expired
+/// row with the evidence still present — never a ready grant.
 ///
 /// RED today: the all-decided interim consult never checks the retention
 /// stamp and returns the ready grant. (Test 4's decided+timed-out mix runs
-/// the teardown arms today because the interim consult reads the timed-out
+/// the refusal arms today because the interim consult reads the timed-out
 /// member as undecided; this frame is the leg that does not.)
 #[tokio::test]
-async fn consult_an_all_decided_retention_expired_checkpoint_expires_and_tears_down() {
+async fn consult_an_all_decided_retention_expired_checkpoint_expires_and_retains_evidence() {
     let world = world();
     register_decided_pivot_pair(
         &world,
@@ -7639,9 +7643,9 @@ async fn consult_an_all_decided_retention_expired_checkpoint_expires_and_tears_d
     let refusal = evaluate_resume(evaluation(&world, false, None))
         .await
         .expect_err(
-            "the retention-expired all-decided checkpoint must expire and tear \
-             down, never grant — RED today: the all-decided interim consult \
-             never checks the retention stamp and returns the ready grant",
+            "the retention-expired all-decided checkpoint must expire and \
+             retain evidence, never grant — RED today: the all-decided interim \
+             consult never checks the retention stamp and returns the ready grant",
         );
     assert_conflict(
         refusal,
@@ -7652,14 +7656,14 @@ async fn consult_an_all_decided_retention_expired_checkpoint_expires_and_tears_d
         }),
     );
     assert!(
-        !parked_document_path(&world).exists() && !resuming_document_path(&world).exists(),
-        "the expired teardown unlinked the parked checkpoint"
+        parked_document_path(&world).exists() && !resuming_document_path(&world).exists(),
+        "the expired refusal keeps the parked checkpoint for the sweep"
     );
     // Retained-evidence semantics: both members decided through the store,
     // so both wrote a durable decision file. The file store's cancel sweep
     // excludes any id whose decision file is present (session_store/file.rs
     // `cancel_request_sync`'s `stale_decided` branch), so the expired
-    // teardown leaves the terminal records readable and `try_parked` still
+    // refusal leaves the terminal records readable and `try_parked` still
     // answers `Some`.
     for id in [decision(), decision_pivot_2()] {
         assert!(
@@ -7673,8 +7677,12 @@ async fn consult_an_all_decided_retention_expired_checkpoint_expires_and_tears_d
         );
     }
     let retry = evaluate_resume(evaluation(&world, false, None)).await;
-    assert!(
-        matches!(retry, Err(ResumeRefusal::DocumentAbsent)),
-        "a retried resume of the same run answers the absent row: {retry:?}"
+    assert_conflict(
+        retry.expect_err("a retried resume of the same expired run still refuses"),
+        json!({
+            "code": "expired",
+            "detail": EXPIRED_DETAIL,
+            "blocking": [],
+        }),
     );
 }

@@ -9341,7 +9341,6 @@ mod tests {
             claims: &claims,
             bind_identity: true,
             presented_identity: presented,
-            request_id: format!("req_resume_{}", uuid::Uuid::new_v4().simple()),
             now: chrono::Utc::now(),
         };
 
@@ -9512,7 +9511,6 @@ mod tests {
             claims: &claims,
             bind_identity: false,
             presented_identity: None,
-            request_id: format!("req_l3a_{}", uuid::Uuid::new_v4().simple()),
             now: chrono::Utc::now(),
         };
         let grant = evaluate_resume(evaluation)

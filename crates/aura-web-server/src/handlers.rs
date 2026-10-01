@@ -1679,7 +1679,6 @@ pub async fn resume_run(
         claims: &claims.0,
         bind_identity,
         presented_identity,
-        request_id: request_id.clone(),
         now: chrono::Utc::now(),
     };
     let grant = match evaluate_resume(evaluation).await {

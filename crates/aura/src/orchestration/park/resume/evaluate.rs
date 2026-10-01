@@ -17,11 +17,10 @@ use sha2::{Digest, Sha256};
 use crate::config::AgentRuntimeConfig;
 use crate::hitl::{DecisionId, PendingApprovals};
 use crate::provider_agent::{StreamError, StreamItem};
-use crate::request_cancellation::RequestId;
 use crate::streaming_request_hook::UsageState;
 
 use super::super::RecordedDecisions;
-use super::super::commit::{cancel_run_approvals, config_fingerprint};
+use super::super::commit::config_fingerprint;
 use super::super::continuation::{RehydrateError, load_recorded_decisions};
 use super::super::document::{ParkedRun, load_parked_run};
 use super::super::lifetime::{ReservationFault, RunExecutionScope, RunReservationLease};
@@ -401,8 +400,6 @@ pub struct ResumeEvaluation<'a> {
     pub bind_identity: bool,
     /// The presented identity header's raw value, before any hashing.
     pub presented_identity: Option<&'a str>,
-    /// The request id the run's sweep events publish under.
-    pub request_id: RequestId,
     pub now: chrono::DateTime<chrono::Utc>,
 }
 
@@ -720,10 +717,10 @@ async fn consult_decisions(
 /// member consult runs under it, (5) a pending or refused outcome releases
 /// the reservation with no execution, and (6) a ready outcome converts the
 /// SAME reservation into the grant, renaming parked to resuming with no
-/// ownerless gap and no second acquisition. An expired refusal tears the run
-/// down before rendering: the checkpoint is unlinked and the run's undecided
-/// tickets are swept under the bundle's request id, so the row the client
-/// sees matches the state left behind.
+/// ownerless gap and no second acquisition. An expired refusal renders the
+/// conflict row from the same consult evidence but leaves teardown to the
+/// retention sweep: the checkpoint and any undecided approval evidence stay
+/// exactly as found, so the row the client sees matches the retained state.
 pub async fn evaluate_resume(
     evaluation: ResumeEvaluation<'_>,
 ) -> Result<ResumeGrant, ResumeRefusal> {
@@ -735,7 +732,6 @@ pub async fn evaluate_resume(
         claims,
         bind_identity,
         presented_identity,
-        request_id,
         now,
     } = evaluation;
     let docs = ResumeDocuments::for_path(&path, memory_dir);
@@ -805,39 +801,6 @@ pub async fn evaluate_resume(
     let (recorded, consumed) = match consult_decisions(&document, store, now).await {
         Ok(recorded) => recorded,
         Err(ConsultFault::Expired(blocking)) => {
-            let parked_path = docs.parked().to_path_buf();
-            let parked_display = parked_path.display().to_string();
-            let removed = tokio::task::spawn_blocking(move || std::fs::remove_file(&parked_path))
-                .await
-                .map_err(|e| {
-                    ResumeRefusal::Fault(Diagnostic::new(format!(
-                        "the expired checkpoint's unlink task did not complete: {e}"
-                    )))
-                })?;
-            match removed {
-                Ok(()) => {}
-                // Already gone: the teardown stays idempotent for a retried
-                // resume of the same expired run.
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => {
-                    return Err(ResumeRefusal::Fault(Diagnostic::new(format!(
-                        "unlinking the expired checkpoint {parked_display} failed: {e}"
-                    ))));
-                }
-            }
-            if let Err(e) = cancel_run_approvals(
-                store,
-                &path.run.to_string(),
-                &request_id,
-                crate::run_context::current_run(),
-                None,
-            )
-            .await
-            {
-                return Err(ResumeRefusal::Fault(Diagnostic::new(format!(
-                    "the approval sweep for the expired run did not complete: {e}"
-                ))));
-            }
             return Err(ResumeRefusal::Conflict(ResumeConflictRow::expired(
                 blocking,
             )));
