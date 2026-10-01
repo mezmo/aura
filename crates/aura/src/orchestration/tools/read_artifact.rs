@@ -118,11 +118,22 @@ impl ReadArtifactTool {
             };
         };
 
-        if check_and_record_budget(&sp.budget, &content).is_ok() {
+        // Past `MAX_BYTES_PER_TOKEN` bytes per allowed token the content
+        // cannot fit, so skip tokenizing it and estimate its size instead.
+        let allowed = sp
+            .budget
+            .max_extraction_tokens()
+            .unwrap_or_else(|| sp.budget.usable_budget());
+        let oversized = content.len() > allowed.saturating_mul(MAX_BYTES_PER_TOKEN);
+        if !oversized && check_and_record_budget(&sp.budget, &content).is_ok() {
             return content;
         }
 
-        let tokens = sp.budget.count_tokens(&content);
+        let tokens = if oversized {
+            content.len() / 4
+        } else {
+            sp.budget.count_tokens(&content)
+        };
         let line_count = content.lines().count();
         let (format, _) = ContentFormat::detect_and_parse(&content);
         match sp.storage.relative_ref(abs_path).await {
@@ -899,6 +910,38 @@ mod tests {
             .unwrap();
         assert!(result.content.starts_with("xrun line 0\n"));
         assert!(result.content.contains("too large to return inline"));
+    }
+
+    #[tokio::test]
+    async fn test_scratchpad_rejects_huge_content_without_tokenizing() {
+        let big = "y\n".repeat(1_000_000);
+        let temp_dir = TempDir::new().unwrap();
+        let persistence = ExecutionPersistence::new(temp_dir.path().join("memory"), None)
+            .await
+            .unwrap();
+        let run_dir = persistence.run_path().to_path_buf();
+        let storage = Arc::new(
+            ScratchpadStorage::in_dir(&persistence.iteration_path())
+                .await
+                .unwrap()
+                .with_read_root(run_dir),
+        );
+        persistence
+            .write_result_artifact(0, Some("research"), 1, &big)
+            .await
+            .unwrap();
+        let budget = ContextBudget::new(
+            128_000,
+            0.20,
+            0,
+            Arc::new(BoundedCounter { max_len: 100_000 }),
+        )
+        .with_max_extraction_tokens(1_000);
+        let tool = ReadArtifactTool::new(Arc::new(Mutex::new(persistence)))
+            .with_scratchpad(budget, storage);
+
+        let result = read_result(&tool).await;
+        assert!(result.content.contains("head file="));
     }
 
     #[test]
