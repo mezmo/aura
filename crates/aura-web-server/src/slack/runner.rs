@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use aura::{Message, RigBuilder, StreamItem};
+use aura::{Message, RigBuilder, StreamItem, ToolDyn};
 use futures_util::StreamExt;
 use tokio::sync::{Semaphore, mpsc};
 use tracing::{Instrument, debug, error, info, warn};
@@ -12,6 +12,7 @@ use super::api::{BotIdentity, SlackApi, SlackApiError, SlackMessage};
 use super::events::{
     Event, EventCallback, HUMAN_SUBTYPES, Inbound, SeenMessages, accept, strip_mentions,
 };
+use super::search::{self, SlackSearchTool};
 use super::socket_mode;
 use crate::types::{ActiveRequestGuard, AppState};
 
@@ -349,13 +350,16 @@ impl SlackIngress {
             Some(thread) => format!("slack:{}:{thread}", inbound.channel),
             None => format!("slack:{}", inbound.channel),
         };
-        let agent = RigBuilder::new(self.config.clone(), self.state.pending_approvals.clone())
+        let (config, tools) = run_setup(&self.config, &self.api, inbound);
+        debug!(request_id, search = !tools.is_empty(), "slack run tools");
+        let agent = RigBuilder::new(config, self.state.pending_approvals.clone())
             .with_hitl_hmac(self.state.hitl_webhook_hmac.clone())
-            .build_streaming_agent_with_headers(
+            .build_streaming_agent_with_tools(
                 None,
                 Some(session_id),
                 None,
                 Some(request_id.to_owned()),
+                tools,
             )
             .await
             .map_err(|e| RunError::Build(e.to_string()))?;
@@ -395,6 +399,24 @@ impl SlackIngress {
         }
         outcome
     }
+}
+
+/// The config and per-run tools for answering `inbound`. A message that
+/// carried an action token gets the search tool built on it and a system
+/// prompt that asks for citations; any other message gets the agent config
+/// as written and no extra tools, rather than a search tool that fails.
+fn run_setup(
+    config: &aura_config::Config,
+    api: &SlackApi,
+    inbound: &Inbound,
+) -> (aura_config::Config, Vec<Box<dyn ToolDyn>>) {
+    let mut config = config.clone();
+    let Some(token) = &inbound.action_token else {
+        return (config, Vec::new());
+    };
+    config.agent.system_prompt.push_str(search::CITATION_PROMPT);
+    let tool = SlackSearchTool::new(api.clone(), token.clone());
+    (config, vec![Box::new(tool)])
 }
 
 /// Drain the run and return the text of its final response.
@@ -714,5 +736,52 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, RunError::TimedOut), "{err}");
+    }
+
+    fn inbound(action_token: Option<&str>) -> Inbound {
+        Inbound {
+            channel: "C1".to_owned(),
+            ts: "1.0".to_owned(),
+            thread_ts: None,
+            user: "U1".to_owned(),
+            text: "where did we discuss gizmo".to_owned(),
+            is_dm: false,
+            unaddressed_reply: false,
+            action_token: action_token.map(|t| super::super::api::ActionToken::new(t.to_owned())),
+        }
+    }
+
+    fn config() -> aura_config::Config {
+        aura_config::Config {
+            memory_dir: None,
+            mcp: None,
+            vector_stores: vec![],
+            tools: None,
+            orchestration: None,
+            hitl: None,
+            governance: None,
+            agent: aura_config::AgentConfig {
+                name: "slack-bot".to_owned(),
+                system_prompt: "Be brief.".to_owned(),
+                ..aura_config::AgentConfig::default()
+            },
+        }
+    }
+
+    #[test]
+    fn search_tool_and_citation_prompt_exist_only_with_an_action_token() {
+        let api = SlackApi::new(
+            super::super::api::BotToken::new("xoxb-bot".to_owned()).unwrap(),
+            super::super::api::AppToken::new("xapp-app".to_owned()).unwrap(),
+        );
+        let (plain, tools) = run_setup(&config(), &api, &inbound(None));
+        assert!(tools.is_empty());
+        assert_eq!(plain.agent.system_prompt, "Be brief.");
+
+        let (with, tools) = run_setup(&config(), &api, &inbound(Some("tok")));
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name(), search::TOOL_NAME);
+        assert!(with.agent.system_prompt.starts_with("Be brief."));
+        assert!(with.agent.system_prompt.ends_with(search::CITATION_PROMPT));
     }
 }
