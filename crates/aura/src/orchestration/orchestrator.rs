@@ -677,6 +677,13 @@ impl Orchestrator {
         tools
     }
 
+    /// The names of the run's own tools, as the planner lists them under
+    /// every worker: the planner sees names only, so it costs one throwaway
+    /// build of the tools.
+    fn run_tool_names(&self) -> Vec<String> {
+        (self.run_tools)().iter().map(|tool| tool.name()).collect()
+    }
+
     /// Create a worker agent for task execution.
     ///
     /// Workers are regular agents that execute individual tasks.
@@ -2284,7 +2291,7 @@ Each worker has specialized capabilities. Assign tasks to the most appropriate w
             r#"
 
 AVAILABLE WORKERS:
-NOTE: Worker names below are role assignments, not callable tool names. Only the tools listed under each worker are MCP tools that workers can execute.
+NOTE: Worker names below are role assignments, not callable tool names. Only the tools listed under each worker are tools that worker can execute.
 
 {}
 
@@ -2339,7 +2346,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             r#"
 
 AVAILABLE WORKERS:
-NOTE: Worker names below are role assignments, not callable tool names. Only the tools listed under each worker are MCP tools that workers can execute.
+NOTE: Worker names below are role assignments, not callable tool names. Only the tools listed under each worker are tools that worker can execute.
 
 {}
 
@@ -2379,14 +2386,17 @@ Assign tasks to the worker whose tools best match the required operations."#,
     ///
     /// Returns an empty Vec if no MCP manager is present.
     fn get_all_tool_names(&self) -> Vec<String> {
-        let Some(ref mcp_manager) = self.mcp_manager else {
-            return Vec::new();
-        };
-
-        let mut names: Vec<String> = mcp_manager
-            .tool_definitions_iter()
-            .map(|tool| tool.name().to_string())
-            .collect();
+        let mut names: Vec<String> = self
+            .mcp_manager
+            .as_ref()
+            .map(|mcp_manager| {
+                mcp_manager
+                    .tool_definitions_iter()
+                    .map(|tool| tool.name().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.extend(self.run_tool_names());
 
         // Remove duplicates while preserving order
         let mut seen = std::collections::HashSet::new();
@@ -2435,6 +2445,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             .map(|m| m.all_tools())
             .unwrap_or_default();
         let mut worker_tools = std::collections::HashMap::new();
+        let run_tool_names = self.run_tool_names();
 
         for (worker_name, worker_config) in &self.config.workers {
             // Omitted filter = every MCP tool (backwards compatibility);
@@ -2455,6 +2466,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
             for store_name in &worker_config.vector_stores {
                 matching_tools.push(format!("vector_search_{}", store_name));
             }
+            // The run's own tools reach every worker, filter or not.
+            matching_tools.extend(run_tool_names.iter().cloned());
 
             worker_tools.insert(worker_name.clone(), matching_tools);
         }
@@ -7442,6 +7455,31 @@ mod tests {
         assert_eq!(first[0].name(), Marker::NAME);
         assert_eq!(second[0].name(), Marker::NAME);
         assert_eq!(built.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        // The planner's inventory lists them under a worker that has no MCP
+        // tools at all, and the recon tool's name list carries them too.
+        let worker: aura_config::WorkerConfig = serde_json::from_value(serde_json::json!({
+            "description": "searches",
+            "preamble": "You search.",
+            "mcp_filter": []
+        }))
+        .unwrap();
+        orchestrator
+            .config
+            .workers
+            .insert("finder".to_owned(), worker);
+        let inventory = orchestrator.resolve_worker_tools();
+        assert_eq!(inventory["finder"], vec![Marker::NAME.to_owned()]);
+        assert!(
+            orchestrator
+                .get_all_tool_names()
+                .contains(&Marker::NAME.to_owned())
+        );
+        assert!(
+            orchestrator
+                .build_workers_section_with_tools()
+                .contains("Tools: run_marker")
+        );
     }
 
     #[tokio::test]

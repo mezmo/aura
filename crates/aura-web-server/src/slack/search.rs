@@ -14,8 +14,8 @@ pub const TOOL_NAME: &str = "slack_search";
 const DEFAULT_LIMIT: usize = 10;
 /// Searches one Slack message may spend, across every agent answering it.
 pub const SEARCHES_PER_MESSAGE: usize = 6;
-/// Characters of one hit's text kept for the model.
-const MAX_HIT_CHARS: usize = 600;
+/// Characters of hit text one page may carry in total.
+const MAX_PAGE_CHARS: usize = 12_000;
 
 /// The system-prompt addition that goes with the tool.
 pub const CITATION_PROMPT: &str = "\n\nA `slack_search` tool, where you have it, searches this \
@@ -93,11 +93,11 @@ pub struct SearchResult {
     pub text: String,
 }
 
-impl From<SearchHit> for SearchResult {
-    /// Names fall back to ids, and a long message is cut to
-    /// `MAX_HIT_CHARS` so a page of hits cannot crowd out the model's next
-    /// turn; the permalink still reaches the whole message.
-    fn from(hit: SearchHit) -> Self {
+impl SearchResult {
+    /// Names fall back to ids, and a message longer than `max_chars` is cut
+    /// so a page of hits cannot crowd out the model's next turn; the
+    /// permalink still reaches the whole message.
+    fn render(hit: SearchHit, max_chars: usize) -> Self {
         Self {
             permalink: hit.permalink,
             channel: hit.channel_name.unwrap_or(hit.channel_id),
@@ -108,9 +108,16 @@ impl From<SearchHit> for SearchResult {
             is_author_bot: hit.is_author_bot,
             ts: hit.message_ts,
             thread_ts: hit.thread_ts,
-            text: truncate(hit.content, MAX_HIT_CHARS),
+            text: truncate(hit.content, max_chars),
         }
     }
+}
+
+/// The text each hit may keep when a page holds up to `limit` hits: the
+/// page budget split evenly, so a smaller page leaves each hit more room
+/// and a page of one returns a long message nearly whole.
+fn chars_per_hit(limit: usize) -> usize {
+    MAX_PAGE_CHARS / limit.clamp(1, MAX_SEARCH_HITS)
 }
 
 /// `text` cut at a character boundary with a marker when it ran over.
@@ -171,7 +178,9 @@ impl RigTool for SlackSearchTool {
                           OR chains usually return nothing. Slack filters such as \
                           `in:<#C123>`, `from:<@U123>`, `before:2025-01-31` go inside the \
                           query. Each result carries a permalink to cite. Returns one page; \
-                          pass `cursor` to continue. Rate limited per person and budgeted \
+                          pass `cursor` to continue. Long messages are cut to fit the page, \
+                          and a smaller `limit` leaves each hit more text: `limit: 1` returns \
+                          a long message nearly whole. Rate limited per person and budgeted \
                           per message, so one plain query first, then page or reword once."
                 .to_owned(),
             parameters: serde_json::json!({
@@ -185,7 +194,9 @@ impl RigTool for SlackSearchTool {
                         "type": "integer",
                         "minimum": 1,
                         "maximum": MAX_SEARCH_HITS,
-                        "description": format!("Results per page, default {DEFAULT_LIMIT}")
+                        "description": format!(
+                            "Results per page, default {DEFAULT_LIMIT}; smaller pages keep more text per hit"
+                        )
                     },
                     "cursor": {
                         "type": "string",
@@ -202,17 +213,23 @@ impl RigTool for SlackSearchTool {
         if !self.budget.take() {
             return Err(SearchError::BudgetSpent);
         }
+        let limit = args.limit.unwrap_or(DEFAULT_LIMIT);
         let page = self
             .api
             .assistant_search_context(
                 &self.action_token,
                 &args.query,
-                args.limit.unwrap_or(DEFAULT_LIMIT),
+                limit,
                 args.cursor.as_deref(),
             )
             .await?;
+        let max_chars = chars_per_hit(limit);
         Ok(SearchOutput {
-            results: page.messages.into_iter().map(SearchResult::from).collect(),
+            results: page
+                .messages
+                .into_iter()
+                .map(|hit| SearchResult::render(hit, max_chars))
+                .collect(),
             next_cursor: page.next_cursor,
         })
     }
@@ -253,11 +270,11 @@ mod tests {
     #[test]
     fn long_hits_are_cut_at_a_character_boundary() {
         let mut long = hit(None, None);
-        long.content = "é".repeat(MAX_HIT_CHARS + 5);
-        let text = SearchResult::from(long).text;
-        assert_eq!(text.chars().count(), MAX_HIT_CHARS + 1);
+        long.content = "é".repeat(105);
+        let text = SearchResult::render(long, 100).text;
+        assert_eq!(text.chars().count(), 101);
         assert!(text.ends_with('…'));
-        let short = SearchResult::from(hit(None, None)).text;
+        let short = SearchResult::render(hit(None, None), 100).text;
         assert_eq!(short, "hello");
     }
 
@@ -310,15 +327,23 @@ mod tests {
 
     #[test]
     fn results_prefer_names_and_fall_back_to_ids() {
-        let named = SearchResult::from(hit(Some("proj-gizmo"), Some("Jen")));
+        let named = SearchResult::render(hit(Some("proj-gizmo"), Some("Jen")), 100);
         assert_eq!(named.channel, "proj-gizmo");
         assert_eq!(named.author, "Jen");
-        let bare = SearchResult::from(hit(None, None));
+        let bare = SearchResult::render(hit(None, None), 100);
         assert_eq!(bare.channel, "C1");
         assert_eq!(bare.author, "U7");
         let mut nobody = hit(None, None);
         nobody.author_user_id = None;
-        assert_eq!(SearchResult::from(nobody).author, "unknown");
+        assert_eq!(SearchResult::render(nobody, 100).author, "unknown");
+    }
+
+    #[test]
+    fn a_smaller_page_keeps_more_text_per_hit() {
+        assert_eq!(chars_per_hit(1), MAX_PAGE_CHARS);
+        assert_eq!(chars_per_hit(10), MAX_PAGE_CHARS / 10);
+        assert_eq!(chars_per_hit(0), MAX_PAGE_CHARS);
+        assert_eq!(chars_per_hit(500), MAX_PAGE_CHARS / MAX_SEARCH_HITS);
     }
 
     #[tokio::test]
