@@ -50,7 +50,9 @@ pub mod vector_dynamic;
 pub mod vector_store;
 pub mod webhook_utils;
 
-pub use builder::{Agent, AgentBuilder, FilesystemTools, build_streaming_agent};
+pub use builder::{
+    Agent, AgentBuilder, FilesystemTools, build_streaming_agent, build_streaming_agent_with_tools,
+};
 pub use config::{AgentRuntimeConfig, SessionId, ToolContextFactory};
 // Pure config types are owned by `aura-config` and re-exported here for
 // ergonomic consumption (`aura::LlmConfig`, etc.).
