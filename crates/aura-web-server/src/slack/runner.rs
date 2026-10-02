@@ -9,7 +9,9 @@ use tokio::sync::{Semaphore, mpsc};
 use tracing::{Instrument, debug, error, info, warn};
 
 use super::api::{BotIdentity, SlackApi, SlackApiError, SlackMessage};
-use super::events::{EventCallback, HUMAN_SUBTYPES, Inbound, SeenMessages, accept, strip_mentions};
+use super::events::{
+    Event, EventCallback, HUMAN_SUBTYPES, Inbound, SeenMessages, accept, strip_mentions,
+};
 use super::socket_mode;
 use crate::types::{ActiveRequestGuard, AppState};
 
@@ -120,15 +122,24 @@ async fn dispatch(ingress: Arc<SlackIngress>, mut events: mpsc::Receiver<EventCa
                 None => return,
             },
         };
+        let received = describe(&callback.event);
         let Some(inbound) = accept(callback.event, &ingress.identity.user_id) else {
+            if received.is_empty() {
+                debug!("slack event ignored: not a message kind the ingress handles");
+            } else {
+                info!(event = %received, "slack message ignored by the accept rules");
+            }
             continue;
         };
         if !seen.insert(&inbound.channel, &inbound.ts) {
+            debug!(event = %received, "slack message already seen");
             continue;
         }
         if inbound.unaddressed_reply {
+            info!(event = %received, "slack thread reply received, probing participation");
             probe_then_queue(&ingress, inbound);
         } else {
+            info!(event = %received, "slack message accepted");
             queue_answer(&ingress, inbound, None);
         }
     }
@@ -159,10 +170,20 @@ fn probe_then_queue(ingress: &Arc<SlackIngress>, inbound: Inbound) {
         };
         match earlier {
             Ok(earlier) if bot_took_part_before(&earlier, &ingress.identity, &inbound.ts) => {
+                info!(
+                    channel = inbound.channel,
+                    ts = inbound.ts,
+                    "slack thread reply accepted: the bot had posted in that thread"
+                );
                 let kept = trim_for_history(earlier, &ingress.identity, &inbound.ts);
                 queue_answer(&ingress, inbound, Some(kept));
             }
-            Ok(_) => {}
+            Ok(earlier) => info!(
+                channel = inbound.channel,
+                ts = inbound.ts,
+                thread_messages = earlier.len(),
+                "slack thread reply ignored: the bot had not posted in that thread"
+            ),
             Err(e) => warn!(
                 channel = inbound.channel,
                 ts = inbound.ts,
@@ -171,6 +192,25 @@ fn probe_then_queue(ingress: &Arc<SlackIngress>, inbound: Inbound) {
             ),
         }
     }));
+}
+
+/// One line naming a message event for the log: kind, channel, ts, thread,
+/// subtype. Empty for event kinds the ingress does not handle.
+fn describe(event: &Event) -> String {
+    let (kind, m) = match event {
+        Event::AppMention(m) => ("app_mention", m),
+        Event::Message(m) => ("message", m),
+        Event::Other => return String::new(),
+    };
+    format!(
+        "{kind} channel={} type={} ts={} thread_ts={} subtype={} bot_id={}",
+        m.channel,
+        m.channel_type.as_deref().unwrap_or("-"),
+        m.ts,
+        m.thread_ts.as_deref().unwrap_or("-"),
+        m.subtype.as_deref().unwrap_or("-"),
+        m.bot_id.as_deref().unwrap_or("-"),
+    )
 }
 
 /// Spawn the task that waits for an answer slot and answers. `earlier` is
