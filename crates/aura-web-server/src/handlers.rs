@@ -1,7 +1,7 @@
 use a2a::VERSION;
 use aura::RigBuilder;
 use aura::{ResponseContent, StreamingAgent, UsageState};
-use aura_events::{AgentInfo, ServerInfo};
+use aura_events::{AgentInfo, NativeToolOverview, ServerInfo};
 use axum::Json;
 use axum::body::Body;
 use axum::extract::{Query, State};
@@ -1171,6 +1171,19 @@ impl ToolDetail {
     }
 }
 
+/// Name and description of each tool `factory` builds, for `/aura/info`.
+async fn native_tool_overviews(factory: aura::RunToolFactory) -> Vec<NativeToolOverview> {
+    let mut tools = Vec::new();
+    for tool in factory() {
+        let definition = tool.definition(String::new()).await;
+        tools.push(NativeToolOverview {
+            name: definition.name,
+            description: Some(definition.description),
+        });
+    }
+    tools
+}
+
 /// `GET /aura/info`: aura-native introspection. Off `/v1/` to keep the OpenAI surface clean.
 ///
 /// `?detail=tools` (or `tools:summary`) additionally connects to every visible
@@ -1201,10 +1214,20 @@ pub async fn info(
             .filter_map(|(k, v)| v.to_str().ok().map(|val| (k.to_string(), val.to_string())))
             .collect();
 
-        let mut agents: Vec<AgentInfo> = futures_util::future::join_all(visible.map(|config| {
-            aura::agent_info_with_tools(config, Some(&req_headers), INFO_TOOL_DISCOVERY_TIMEOUT)
-        }))
-        .await;
+        let req_headers = &req_headers;
+        let state = &state;
+        let mut agents: Vec<AgentInfo> =
+            futures_util::future::join_all(visible.map(|config| async move {
+                let mut info = aura::agent_info_with_tools(
+                    config,
+                    Some(req_headers),
+                    INFO_TOOL_DISCOVERY_TIMEOUT,
+                )
+                .await;
+                info.tools = native_tool_overviews(state.run_tools(config)).await;
+                info
+            }))
+            .await;
 
         if detail == ToolDetail::Summary {
             agents.iter_mut().for_each(aura::summarize_tools);
@@ -2018,6 +2041,14 @@ model = "gpt-4o"
         configs: Vec<aura_config::Config>,
         default_agent: Option<&str>,
     ) -> Arc<AppState> {
+        info_state(configs, default_agent, None)
+    }
+
+    fn info_state(
+        configs: Vec<aura_config::Config>,
+        default_agent: Option<&str>,
+        slack_api: Option<crate::slack::SlackApi>,
+    ) -> Arc<AppState> {
         Arc::new(AppState {
             configs: Arc::new(configs),
             tool_result_mode: crate::streaming::ToolResultMode::None,
@@ -2033,7 +2064,7 @@ model = "gpt-4o"
             active_requests: Arc::new(crate::types::ActiveRequestTracker::new()),
             default_agent: default_agent.map(str::to_owned),
             additional_tools: Arc::new(Vec::new),
-            slack_api: None,
+            slack_api,
             debug_provider_errors: false,
             pending_approvals: aura::hitl::PendingApprovals::new(),
             hitl_webhook_hmac: None,
@@ -2281,6 +2312,56 @@ url = "http://127.0.0.1:9"
         let server = &body["agents"][0]["mcp_servers"]["dead"];
         assert_eq!(server["transport"], "http_streamable");
         assert!(server.get("tools").is_none(), "{body}");
+    }
+
+    /// The post tool is listed under the agent that opted in, only while the
+    /// server has a Slack client, and never without `detail`.
+    #[tokio::test]
+    async fn test_info_lists_slack_tools_for_opted_in_agents_only() {
+        let configs = || {
+            vec![
+                info_config("poster", "enable_slack_tools = true", ""),
+                solo_info_config("quiet"),
+            ]
+        };
+        let api = crate::slack::SlackApi::new(
+            crate::slack::BotToken::new("xoxb-t".to_owned()).unwrap(),
+            crate::slack::AppToken::new("xapp-t".to_owned()).unwrap(),
+        );
+        let tools_query = || {
+            Query(InfoQuery {
+                detail: Some("tools".to_string()),
+            })
+        };
+        let names = |agent: &AgentInfo| -> Vec<String> {
+            agent.tools.iter().map(|t| t.name.clone()).collect()
+        };
+
+        let state = info_state(configs(), None, Some(api.clone()));
+        let parsed =
+            parse_info_response(info(State(state), HeaderMap::new(), tools_query()).await).await;
+        assert_eq!(names(&parsed.agents[0]), [crate::slack::POST_TOOL_NAME]);
+        assert!(
+            parsed.agents[0].tools[0]
+                .description
+                .as_deref()
+                .unwrap_or_default()
+                .contains("permalink")
+        );
+        assert!(names(&parsed.agents[1]).is_empty());
+
+        let state = info_state(configs(), None, Some(api));
+        let resp = info(State(state), HeaderMap::new(), Query(InfoQuery::default())).await;
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(body["agents"][0].get("tools").is_none(), "{body}");
+
+        let state = info_state(configs(), None, None);
+        let parsed =
+            parse_info_response(info(State(state), HeaderMap::new(), tools_query()).await).await;
+        assert!(parsed.agents.iter().all(|agent| agent.tools.is_empty()));
     }
 
     /// An unreachable server reports no tools under either detail level, and
