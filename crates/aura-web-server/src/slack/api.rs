@@ -201,6 +201,28 @@ impl SlackApi {
         Ok(messages)
     }
 
+    /// Up to `limit` top-level messages in `channel` older than `before_ts`,
+    /// oldest first.
+    pub async fn conversations_history(
+        &self,
+        channel: &str,
+        before_ts: &str,
+        limit: usize,
+    ) -> Result<Vec<SlackMessage>, SlackApiError> {
+        let params = [
+            ("channel", channel.to_owned()),
+            ("latest", before_ts.to_owned()),
+            ("inclusive", "false".to_owned()),
+            ("limit", limit.to_string()),
+        ];
+        let page: RepliesPage = self
+            .call("conversations.history", &self.bot_token.0, &params)
+            .await?;
+        let mut messages = page.messages;
+        messages.reverse();
+        Ok(messages)
+    }
+
     /// Post `text` into `channel`, inside `thread_ts` when given. Returns
     /// the new message's `ts`.
     pub async fn post_message(
@@ -392,6 +414,33 @@ mod tests {
         let ts: Vec<&str> = messages.iter().map(|m| m.ts.as_str()).collect();
         assert_eq!(ts, ["1", "2", "3"]);
         assert_eq!(messages[1].bot_id.as_deref(), Some("B1"));
+    }
+
+    #[tokio::test]
+    async fn history_is_bounded_before_the_message_and_oldest_first() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/conversations.history"))
+            .and(body_string_contains("latest=9.0"))
+            .and(body_string_contains("inclusive=false"))
+            .and(body_string_contains("limit=50"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "messages": [
+                    {"ts": "8.0", "user": "U1", "text": "newest"},
+                    {"ts": "7.0", "bot_id": "B1", "text": "older"}
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let messages = api(&server)
+            .conversations_history("D1", "9.0", 50)
+            .await
+            .unwrap();
+        let ts: Vec<&str> = messages.iter().map(|m| m.ts.as_str()).collect();
+        assert_eq!(ts, ["7.0", "8.0"]);
     }
 
     #[tokio::test]
