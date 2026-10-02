@@ -2,12 +2,12 @@
 //! message being answered.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use aura::{RigTool, RigToolDefinition};
 use serde::{Deserialize, Serialize};
 
 use super::api::{ActionToken, MAX_SEARCH_HITS, SearchHit, SlackApi, SlackApiError};
+use super::budget::Budget;
 
 pub const TOOL_NAME: &str = "slack_search";
 /// Page size when the agent names none.
@@ -26,37 +26,17 @@ few searches shared by everyone working on it, so spend one plain query first an
 reword once at most. Plain words or a natural-language question find things; quoted phrases \
 and OR chains usually return nothing.";
 
-/// Searches left for one Slack message.
-pub struct SearchBudget(AtomicUsize);
-
-impl SearchBudget {
-    pub fn new(searches: usize) -> Arc<Self> {
-        Arc::new(Self(AtomicUsize::new(searches)))
-    }
-
-    /// Spend one search; `false` when none are left. Several tools built
-    /// for the same message share one budget, so a worker that has not
-    /// searched yet still finds it spent once its siblings have.
-    fn take(&self) -> bool {
-        self.0
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
-                left.checked_sub(1)
-            })
-            .is_ok()
-    }
-}
-
 pub struct SlackSearchTool {
     api: SlackApi,
     action_token: ActionToken,
-    budget: Arc<SearchBudget>,
+    budget: Arc<Budget>,
 }
 
 impl SlackSearchTool {
     /// A search tool for the message that carried `action_token`, drawing
     /// on `budget`. The tool is the only holder of the token besides the
     /// event it came from, so dropping the run's agents drops the token.
-    pub fn new(api: SlackApi, action_token: ActionToken, budget: Arc<SearchBudget>) -> Self {
+    pub fn new(api: SlackApi, action_token: ActionToken, budget: Arc<Budget>) -> Self {
         Self {
             api,
             action_token,
@@ -243,14 +223,10 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn tool(server: &MockServer, token: &str) -> SlackSearchTool {
-        tool_with_budget(server, token, SearchBudget::new(SEARCHES_PER_MESSAGE))
+        tool_with_budget(server, token, Budget::new(SEARCHES_PER_MESSAGE))
     }
 
-    fn tool_with_budget(
-        server: &MockServer,
-        token: &str,
-        budget: Arc<SearchBudget>,
-    ) -> SlackSearchTool {
+    fn tool_with_budget(server: &MockServer, token: &str, budget: Arc<Budget>) -> SlackSearchTool {
         let api = SlackApi::new(
             BotToken::new("xoxb-bot".to_owned()).unwrap(),
             AppToken::new("xapp-app".to_owned()).unwrap(),
@@ -291,7 +267,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let budget = SearchBudget::new(2);
+        let budget = Budget::new(2);
         let one = tool_with_budget(&server, "t", Arc::clone(&budget));
         let two = tool_with_budget(&server, "t", Arc::clone(&budget));
         one.call(args("a")).await.unwrap();

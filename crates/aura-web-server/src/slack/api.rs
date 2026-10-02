@@ -150,6 +150,13 @@ pub struct SearchHit {
     pub permalink: String,
 }
 
+/// A message the bot posted: where it landed and its id there.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct Posted {
+    pub channel: String,
+    pub ts: String,
+}
+
 /// One page of search hits plus the cursor for the next page.
 #[derive(Debug, Clone)]
 pub struct SearchPage {
@@ -295,26 +302,37 @@ impl SlackApi {
         Ok(messages)
     }
 
-    /// Post `text` into `channel`, inside `thread_ts` when given. Returns
-    /// the new message's `ts`.
+    /// Post `text` into `channel`, inside `thread_ts` when given. `channel`
+    /// goes to Slack as written, an id or a `#name`; Slack resolves a name
+    /// and the result carries the id it resolved to.
     pub async fn post_message(
         &self,
         channel: &str,
         thread_ts: Option<&str>,
         text: &str,
-    ) -> Result<String, SlackApiError> {
-        #[derive(Deserialize)]
-        struct Posted {
-            ts: String,
-        }
+    ) -> Result<Posted, SlackApiError> {
         let mut params = vec![("channel", channel.to_owned()), ("text", text.to_owned())];
         if let Some(thread_ts) = thread_ts {
             params.push(("thread_ts", thread_ts.to_owned()));
         }
-        let posted: Posted = self
-            .call("chat.postMessage", &self.bot_token.0, &params)
+        self.call("chat.postMessage", &self.bot_token.0, &params)
+            .await
+    }
+
+    /// The permalink of the message `ts` in `channel` (an id).
+    pub async fn get_permalink(&self, channel: &str, ts: &str) -> Result<String, SlackApiError> {
+        #[derive(Deserialize)]
+        struct Permalink {
+            permalink: String,
+        }
+        let params = [
+            ("channel", channel.to_owned()),
+            ("message_ts", ts.to_owned()),
+        ];
+        let link: Permalink = self
+            .call("chat.getPermalink", &self.bot_token.0, &params)
             .await?;
-        Ok(posted.ts)
+        Ok(link.permalink)
     }
 
     /// React to a message. A reaction that is already there is not an error.
@@ -575,25 +593,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn post_message_threads_and_returns_ts() {
+    async fn post_message_threads_and_returns_where_it_landed() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/chat.postMessage"))
+            .and(body_string_contains("channel=%23general"))
             .and(body_string_contains("thread_ts=1.0"))
             .and(body_string_contains("text=hi+there"))
             .respond_with(
                 ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({"ok": true, "ts": "2.0"})),
+                    .set_body_json(serde_json::json!({"ok": true, "channel": "C1", "ts": "2.0"})),
             )
             .expect(1)
             .mount(&server)
             .await;
 
-        let ts = api(&server)
-            .post_message("C1", Some("1.0"), "hi there")
+        let posted = api(&server)
+            .post_message("#general", Some("1.0"), "hi there")
             .await
             .unwrap();
-        assert_eq!(ts, "2.0");
+        assert_eq!(
+            posted,
+            Posted {
+                channel: "C1".to_owned(),
+                ts: "2.0".to_owned()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn get_permalink_asks_for_the_message_by_channel_and_ts() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat.getPermalink"))
+            .and(header("authorization", "Bearer xoxb-bot"))
+            .and(body_string_contains("channel=C1"))
+            .and(body_string_contains("message_ts=2.0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true, "channel": "C1",
+                "permalink": "https://x.slack.com/archives/C1/p20"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let link = api(&server).get_permalink("C1", "2.0").await.unwrap();
+        assert_eq!(link, "https://x.slack.com/archives/C1/p20");
     }
 
     #[tokio::test]
