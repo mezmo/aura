@@ -134,7 +134,7 @@ impl Inbound {
 
 /// Subtypes that are still a person's message: a file upload with a
 /// caption, and a thread reply also sent to the channel.
-const HUMAN_SUBTYPES: [&str; 2] = ["file_share", "thread_broadcast"];
+pub(super) const HUMAN_SUBTYPES: [&str; 2] = ["file_share", "thread_broadcast"];
 
 /// Decide whether `event` is something the bot answers. Mentions anywhere
 /// and direct messages qualify; the bot's own messages and system subtypes
