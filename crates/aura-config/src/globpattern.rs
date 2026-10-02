@@ -1,5 +1,6 @@
 use globset::{Glob, GlobMatcher};
 use serde::*;
+use std::fmt::Debug;
 
 peg::parser! {
     grammar glob_parser() for str {
@@ -109,7 +110,7 @@ fn check_literal_runs(source: &str) -> Result<(), GlobPatternError> {
 
 /// A glob pattern matching MCP tool names, optionally namespace-qualified as
 /// `<namespace>:<name>`.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct GlobPattern {
     source: String,
     name_matcher: GlobMatcher,
@@ -175,6 +176,14 @@ impl<'de> Deserialize<'de> for GlobPattern {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let source = String::deserialize(deserializer)?;
         Self::new(source).map_err(serde::de::Error::custom)
+    }
+}
+
+impl Debug for GlobPattern {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GlobPattern")
+            .field("source", &self.source)
+            .finish()
     }
 }
 
