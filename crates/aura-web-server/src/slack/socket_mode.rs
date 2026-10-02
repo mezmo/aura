@@ -115,7 +115,7 @@ pub async fn serve_connection(
                     let forwarded = tokio::select! {
                         biased;
                         () = shutdown.cancelled() => return Ok(Disconnected::Shutdown),
-                        forwarded = events.send(event) => forwarded,
+                        forwarded = events.send(*event) => forwarded,
                     };
                     if forwarded.is_err() {
                         return Err(SocketModeError::ConsumerGone);
