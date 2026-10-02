@@ -417,23 +417,31 @@ fn thread_history(replies: &[SlackMessage], bot: &BotIdentity, current_ts: &str)
     turns.into_iter().skip(skip).collect()
 }
 
-/// The chat turn `message` becomes: the bot's own messages are assistant
-/// turns whatever subtype Slack stamps on them, `bot_message` included;
-/// people's messages, plain or with a human subtype, are user turns with
-/// the bot's handle stripped; empty messages and system subtypes (joins,
-/// edits, deletions) are no turn at all.
+/// Whether `message` becomes a chat turn at all: it has text, and it is
+/// either the bot's own, whatever subtype Slack stamps on it
+/// (`bot_message` included), or a person's, plain or with a human subtype.
+/// Empty messages and system subtypes (joins, edits, deletions) do not.
+fn is_turn(message: &SlackMessage, bot: &BotIdentity) -> bool {
+    !message.text.trim().is_empty()
+        && (from_bot(message, bot)
+            || message
+                .subtype
+                .as_deref()
+                .is_none_or(|subtype| HUMAN_SUBTYPES.contains(&subtype)))
+}
+
+/// The chat turn `message` becomes, per `is_turn`: the bot's own messages
+/// are assistant turns, people's are user turns with the bot's handle
+/// stripped.
 fn turn_of(message: &SlackMessage, bot: &BotIdentity) -> Option<Message> {
-    if message.text.trim().is_empty() {
+    if !is_turn(message, bot) {
         return None;
     }
-    if from_bot(message, bot) {
-        return Some(Message::assistant(&message.text));
-    }
-    let from_person = message
-        .subtype
-        .as_deref()
-        .is_none_or(|subtype| HUMAN_SUBTYPES.contains(&subtype));
-    from_person.then(|| Message::user(strip_mentions(&message.text, &bot.user_id)))
+    Some(if from_bot(message, bot) {
+        Message::assistant(&message.text)
+    } else {
+        Message::user(strip_mentions(&message.text, &bot.user_id))
+    })
 }
 
 /// Keep exactly what `thread_history` would turn into history for a reply
@@ -445,7 +453,7 @@ fn trim_for_history(
     bot: &BotIdentity,
     before_ts: &str,
 ) -> Vec<SlackMessage> {
-    messages.retain(|m| m.ts.as_str() < before_ts && turn_of(m, bot).is_some());
+    messages.retain(|m| m.ts.as_str() < before_ts && is_turn(m, bot));
     let excess = messages.len().saturating_sub(HISTORY_LIMIT);
     messages.drain(..excess);
     messages
