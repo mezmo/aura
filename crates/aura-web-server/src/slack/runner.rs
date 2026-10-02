@@ -159,7 +159,7 @@ fn probe_then_queue(ingress: &Arc<SlackIngress>, inbound: Inbound) {
         };
         match earlier {
             Ok(earlier) if bot_took_part_before(&earlier, &ingress.identity, &inbound.ts) => {
-                let kept = trim_for_history(earlier, &inbound.ts);
+                let kept = trim_for_history(earlier, &ingress.identity, &inbound.ts);
                 queue_answer(&ingress, inbound, Some(kept));
             }
             Ok(_) => {}
@@ -401,42 +401,51 @@ enum RunError {
     Cancelled,
 }
 
-/// Map earlier messages, oldest first, onto chat history: the bot's own messages
-/// become assistant turns, everyone else's become user turns with the
-/// bot's handle stripped. Only messages older than the one being answered
-/// (`current_ts`) count, so replies that landed while it waited for a slot
-/// do not precede it; empty messages and system subtypes (joins, edits,
-/// deletions) are left out, while the bot's own replies pass whatever
-/// subtype Slack stamps on them, `bot_message` included. Only the newest
+/// Map earlier messages, oldest first, onto chat history: each message
+/// becomes the turn `turn_of` gives it, only messages older than the one
+/// being answered (`current_ts`) count, so replies that landed while it
+/// waited for a slot do not precede it, and only the newest
 /// `HISTORY_LIMIT` turns are kept. Slack timestamps are fixed-width
 /// `seconds.micros`, so string order is time order.
 fn thread_history(replies: &[SlackMessage], bot: &BotIdentity, current_ts: &str) -> Vec<Message> {
     let turns: Vec<Message> = replies
         .iter()
-        .filter(|m| m.ts.as_str() < current_ts && !m.text.trim().is_empty())
-        .filter_map(|m| {
-            let from_person = m
-                .subtype
-                .as_deref()
-                .is_none_or(|subtype| HUMAN_SUBTYPES.contains(&subtype));
-            if from_bot(m, bot) {
-                Some(Message::assistant(&m.text))
-            } else if from_person {
-                Some(Message::user(strip_mentions(&m.text, &bot.user_id)))
-            } else {
-                None
-            }
-        })
+        .filter(|m| m.ts.as_str() < current_ts)
+        .filter_map(|m| turn_of(m, bot))
         .collect();
     let skip = turns.len().saturating_sub(HISTORY_LIMIT);
     turns.into_iter().skip(skip).collect()
 }
 
-/// Keep only what `thread_history` can use: messages older than `before_ts`,
-/// and of those the newest `HISTORY_LIMIT`. A queued reply holds this
-/// while it waits for a slot, so a long thread must not travel whole.
-fn trim_for_history(mut messages: Vec<SlackMessage>, before_ts: &str) -> Vec<SlackMessage> {
-    messages.retain(|m| m.ts.as_str() < before_ts);
+/// The chat turn `message` becomes: the bot's own messages are assistant
+/// turns whatever subtype Slack stamps on them, `bot_message` included;
+/// people's messages, plain or with a human subtype, are user turns with
+/// the bot's handle stripped; empty messages and system subtypes (joins,
+/// edits, deletions) are no turn at all.
+fn turn_of(message: &SlackMessage, bot: &BotIdentity) -> Option<Message> {
+    if message.text.trim().is_empty() {
+        return None;
+    }
+    if from_bot(message, bot) {
+        return Some(Message::assistant(&message.text));
+    }
+    let from_person = message
+        .subtype
+        .as_deref()
+        .is_none_or(|subtype| HUMAN_SUBTYPES.contains(&subtype));
+    from_person.then(|| Message::user(strip_mentions(&message.text, &bot.user_id)))
+}
+
+/// Keep exactly what `thread_history` would turn into history for a reply
+/// at `before_ts`: messages older than it that become a turn, and of those
+/// the newest `HISTORY_LIMIT`. A queued reply holds this while it waits
+/// for a slot, so a long thread must not travel whole.
+fn trim_for_history(
+    mut messages: Vec<SlackMessage>,
+    bot: &BotIdentity,
+    before_ts: &str,
+) -> Vec<SlackMessage> {
+    messages.retain(|m| m.ts.as_str() < before_ts && turn_of(m, bot).is_some());
     let excess = messages.len().saturating_sub(HISTORY_LIMIT);
     messages.drain(..excess);
     messages
@@ -604,7 +613,7 @@ mod tests {
         let thread: Vec<SlackMessage> = (0..HISTORY_LIMIT + 20)
             .map(|i| msg(&format!("{i:04}"), Some("U1"), None, &format!("m{i}")))
             .collect();
-        let kept = trim_for_history(thread, "0110");
+        let kept = trim_for_history(thread, &bot(), "0110");
         assert_eq!(kept.len(), HISTORY_LIMIT);
         assert_eq!(kept.first().unwrap().ts, "0010");
         assert_eq!(kept.last().unwrap().ts, "0109");
@@ -613,9 +622,33 @@ mod tests {
             msg("1", Some("U1"), None, "a"),
             msg("3", Some("U1"), None, "c"),
         ];
-        let kept = trim_for_history(short, "2");
+        let kept = trim_for_history(short, &bot(), "2");
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].ts, "1");
+    }
+
+    #[test]
+    fn trimming_counts_turns_not_raw_messages() {
+        // Every other message is a join, so 2 * HISTORY_LIMIT raw messages
+        // older than the reply hold exactly HISTORY_LIMIT turns.
+        let thread: Vec<SlackMessage> = (0..2 * HISTORY_LIMIT + 10)
+            .map(|i| {
+                let mut m = msg(&format!("{i:04}"), Some("U1"), None, &format!("m{i}"));
+                if i % 2 == 1 {
+                    m.subtype = Some("channel_join".to_owned());
+                }
+                m
+            })
+            .collect();
+        let kept = trim_for_history(thread.clone(), &bot(), "0200");
+        assert_eq!(kept.len(), HISTORY_LIMIT);
+        assert!(kept.iter().all(|m| m.subtype.is_none()));
+        assert_eq!(kept.first().unwrap().ts, "0000");
+        assert_eq!(kept.last().unwrap().ts, "0198");
+        assert_eq!(
+            thread_history(&kept, &bot(), "0200").len(),
+            thread_history(&thread, &bot(), "0200").len()
+        );
     }
 
     #[tokio::test]
