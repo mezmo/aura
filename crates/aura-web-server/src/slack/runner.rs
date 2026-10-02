@@ -9,10 +9,11 @@ use tokio::sync::{Semaphore, mpsc};
 use tracing::{Instrument, debug, error, info, warn};
 
 use super::api::{BotIdentity, SlackApi, SlackApiError, SlackMessage};
+use super::budget::Budget;
 use super::events::{
     Event, EventCallback, HUMAN_SUBTYPES, Inbound, SeenMessages, accept, strip_mentions,
 };
-use super::search::{self, SearchBudget, SlackSearchTool};
+use super::search::{self, SlackSearchTool};
 use super::socket_mode;
 use crate::types::{ActiveRequestGuard, AppState};
 
@@ -441,7 +442,7 @@ fn run_setup(
     };
     let api = api.clone();
     let token = token.clone();
-    let budget = SearchBudget::new(search::SEARCHES_PER_MESSAGE);
+    let budget = Budget::new(search::SEARCHES_PER_MESSAGE);
     let factory: RunToolFactory = Arc::new(move || {
         let tool = SlackSearchTool::new(api.clone(), token.clone(), Arc::clone(&budget));
         vec![Box::new(tool) as Box<dyn ToolDyn>]
