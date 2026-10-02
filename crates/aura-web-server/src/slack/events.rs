@@ -124,6 +124,8 @@ pub struct Inbound {
     pub text: String,
     /// Direct message to the bot, as opposed to a channel mention.
     pub is_dm: bool,
+    /// A thread reply in a channel that did not mention the bot.
+    pub unaddressed_reply: bool,
 }
 
 impl Inbound {
@@ -141,19 +143,26 @@ impl Inbound {
 /// caption, and a thread reply also sent to the channel.
 pub(super) const HUMAN_SUBTYPES: [&str; 2] = ["file_share", "thread_broadcast"];
 
-/// Decide whether `event` is something the bot answers. Mentions anywhere
-/// and direct messages qualify; the bot's own messages and system subtypes
-/// such as edits, deletions, and joins do not.
+/// Decide whether `event` is something the bot answers. Mentions anywhere,
+/// direct messages, and replies inside channel threads qualify; the bot's
+/// own messages, top-level channel chatter, and system subtypes such as
+/// edits, deletions, and joins do not. A thread reply that does not mention
+/// the bot is marked `unaddressed_reply`: the caller answers it only when
+/// the bot already took part in that thread, which the event alone cannot
+/// show. A reply that does mention the bot also arrives as `app_mention`,
+/// and the `(channel, ts)` dedupe keeps whichever came first.
 pub fn accept(event: Event, self_user_id: &str) -> Option<Inbound> {
-    let (message, is_dm) = match event {
-        Event::AppMention(m) => (m, false),
-        Event::Message(m) => {
-            let is_dm = m.channel_type.as_deref() == Some("im");
-            if !is_dm {
-                return None;
+    let mention = format!("<@{self_user_id}");
+    let (message, is_dm, unaddressed_reply) = match event {
+        Event::AppMention(m) => (m, false, false),
+        Event::Message(m) => match m.channel_type.as_deref() {
+            Some("im") => (m, true, false),
+            Some("channel" | "group") if m.thread_ts.is_some() => {
+                let addressed = m.text.contains(&mention);
+                (m, false, !addressed)
             }
-            (m, true)
-        }
+            _ => return None,
+        },
         Event::Other => return None,
     };
     if message.bot_id.is_some()
@@ -179,6 +188,7 @@ pub fn accept(event: Event, self_user_id: &str) -> Option<Inbound> {
         user,
         text,
         is_dm,
+        unaddressed_reply,
     })
 }
 
@@ -212,8 +222,7 @@ pub fn strip_mentions(text: &str, self_user_id: &str) -> String {
     out.trim().to_owned()
 }
 
-/// Bounded memory of `(channel, ts)` pairs already answered; the oldest
-/// pair is forgotten once `capacity` is reached.
+/// Bounded memory of `(channel, ts)` pairs already answered.
 #[derive(Debug)]
 pub struct SeenMessages {
     order: VecDeque<(String, String)>,
@@ -231,7 +240,8 @@ impl SeenMessages {
         }
     }
 
-    /// Record the message; `true` when it was not seen before.
+    /// Record the message; `true` when it was not seen before. Once the set
+    /// holds `capacity` pairs, recording a new one forgets the oldest.
     pub fn insert(&mut self, channel: &str, ts: &str) -> bool {
         let key = (channel.to_owned(), ts.to_owned());
         if !self.set.insert(key.clone()) {
@@ -379,19 +389,44 @@ mod tests {
         assert!(accept(dm(None, None, None), SELF).is_none());
     }
 
-    #[test]
-    fn channel_messages_without_a_mention_are_ignored() {
-        let channel_message = Event::Message(MessageEvent {
+    fn channel_message(text: &str, thread_ts: Option<&str>, channel_type: &str) -> Event {
+        Event::Message(MessageEvent {
             channel: "C1".to_owned(),
             ts: "3.0".to_owned(),
             user: Some("U1".to_owned()),
-            text: "just chatting".to_owned(),
-            thread_ts: None,
+            text: text.to_owned(),
+            thread_ts: thread_ts.map(str::to_owned),
             subtype: None,
             bot_id: None,
-            channel_type: Some("channel".to_owned()),
-        });
-        assert!(accept(channel_message, SELF).is_none());
+            channel_type: Some(channel_type.to_owned()),
+        })
+    }
+
+    #[test]
+    fn top_level_channel_messages_without_a_mention_are_ignored() {
+        assert!(accept(channel_message("just chatting", None, "channel"), SELF).is_none());
+    }
+
+    #[test]
+    fn thread_replies_in_channels_are_accepted_as_unaddressed() {
+        let reply = accept(channel_message("and then?", Some("1.0"), "channel"), SELF).unwrap();
+        assert!(reply.unaddressed_reply);
+        assert!(!reply.is_dm);
+        assert_eq!(reply.reply_thread(), Some("1.0"));
+
+        let private = accept(channel_message("same here", Some("1.0"), "group"), SELF).unwrap();
+        assert!(private.unaddressed_reply);
+
+        let addressed = accept(
+            channel_message("<@UBOT> and then?", Some("1.0"), "channel"),
+            SELF,
+        )
+        .unwrap();
+        assert!(!addressed.unaddressed_reply);
+        assert_eq!(addressed.text, "and then?");
+
+        let mention = accept(mention("<@UBOT> hi"), SELF).unwrap();
+        assert!(!mention.unaddressed_reply);
     }
 
     #[test]
