@@ -122,13 +122,18 @@ pub struct Inbound {
     pub thread_ts: Option<String>,
     pub user: String,
     pub text: String,
+    /// Direct message to the bot, as opposed to a channel mention.
+    pub is_dm: bool,
 }
 
 impl Inbound {
-    /// The thread the reply goes into: the message's own thread, or the
-    /// message itself as a new thread parent.
-    pub fn reply_thread(&self) -> &str {
-        self.thread_ts.as_deref().unwrap_or(&self.ts)
+    /// Where the reply goes: the message's own thread when it has one; in a
+    /// channel, a new thread under the message; in a DM at top level, the
+    /// conversation itself (`None`), since a DM is already one conversation.
+    pub fn reply_thread(&self) -> Option<&str> {
+        self.thread_ts
+            .as_deref()
+            .or((!self.is_dm).then_some(self.ts.as_str()))
     }
 }
 
@@ -173,6 +178,7 @@ pub fn accept(event: Event, self_user_id: &str) -> Option<Inbound> {
         thread_ts: message.thread_ts,
         user,
         text,
+        is_dm,
     })
 }
 
@@ -350,7 +356,8 @@ mod tests {
         let inbound = accept(mention("<@UBOT> what's up <@U2|dan>?"), SELF).unwrap();
         assert_eq!(inbound.text, "what's up <@U2|dan>?");
         assert_eq!(inbound.user, "U1");
-        assert_eq!(inbound.reply_thread(), "1.0");
+        assert_eq!(inbound.reply_thread(), Some("1.0"));
+        assert!(!inbound.is_dm);
     }
 
     #[test]
@@ -393,7 +400,20 @@ mod tests {
         if let Event::AppMention(m) = &mut event {
             m.thread_ts = Some("0.5".to_owned());
         }
-        assert_eq!(accept(event, SELF).unwrap().reply_thread(), "0.5");
+        assert_eq!(accept(event, SELF).unwrap().reply_thread(), Some("0.5"));
+    }
+
+    #[test]
+    fn direct_messages_reply_at_top_level_unless_threaded() {
+        let top_level = accept(dm(Some("U1"), None, None), SELF).unwrap();
+        assert!(top_level.is_dm);
+        assert_eq!(top_level.reply_thread(), None);
+
+        let mut threaded = dm(Some("U1"), None, None);
+        if let Event::Message(m) = &mut threaded {
+            m.thread_ts = Some("1.5".to_owned());
+        }
+        assert_eq!(accept(threaded, SELF).unwrap().reply_thread(), Some("1.5"));
     }
 
     #[test]
