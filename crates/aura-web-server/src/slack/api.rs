@@ -4,8 +4,11 @@ use reqwest::Client;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use std::fmt;
+use std::time::Duration;
 
 pub const DEFAULT_BASE_URL: &str = "https://slack.com/api";
+/// Deadline for one Web API call, connect and response included.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Hard stop on `conversations.replies` pagination for one thread.
 const MAX_REPLY_PAGES: usize = 50;
@@ -131,8 +134,16 @@ struct ResponseMetadata {
 
 impl SlackApi {
     pub fn new(bot_token: BotToken, app_token: AppToken) -> Self {
+        Self::with_timeout(bot_token, app_token, REQUEST_TIMEOUT)
+    }
+
+    /// `new` with a different per-call deadline.
+    pub fn with_timeout(bot_token: BotToken, app_token: AppToken, timeout: Duration) -> Self {
         Self {
-            http: Client::new(),
+            http: Client::builder()
+                .timeout(timeout)
+                .build()
+                .expect("reqwest client with a timeout builds"),
             base_url: DEFAULT_BASE_URL.to_owned(),
             bot_token,
             app_token,
@@ -361,6 +372,29 @@ mod tests {
 
         let url = api(&server).connections_open().await.unwrap();
         assert_eq!(url, "wss://wss.slack.com/link/?ticket=1");
+    }
+
+    #[tokio::test]
+    async fn a_stalled_response_is_a_transport_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/auth.test"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_secs(5))
+                    .set_body_json(serde_json::json!({"ok": true})),
+            )
+            .mount(&server)
+            .await;
+
+        let api = SlackApi::with_timeout(
+            BotToken::new("xoxb-bot".to_owned()).unwrap(),
+            AppToken::new("xapp-app".to_owned()).unwrap(),
+            Duration::from_millis(100),
+        )
+        .with_base_url(server.uri());
+        let err = api.auth_test().await.unwrap_err();
+        assert!(matches!(err, SlackApiError::Transport { .. }), "{err}");
     }
 
     #[tokio::test]
