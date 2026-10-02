@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use aura::{Message, RigBuilder, StreamItem, ToolDyn};
+use aura::{Message, RigBuilder, RunToolFactory, StreamItem, ToolDyn, no_run_tools};
 use futures_util::StreamExt;
 use tokio::sync::{Semaphore, mpsc};
 use tracing::{Instrument, debug, error, info, warn};
@@ -12,7 +12,7 @@ use super::api::{BotIdentity, SlackApi, SlackApiError, SlackMessage};
 use super::events::{
     Event, EventCallback, HUMAN_SUBTYPES, Inbound, SeenMessages, accept, strip_mentions,
 };
-use super::search::{self, SlackSearchTool};
+use super::search::{self, SearchBudget, SlackSearchTool};
 use super::socket_mode;
 use crate::types::{ActiveRequestGuard, AppState};
 
@@ -351,7 +351,11 @@ impl SlackIngress {
             None => format!("slack:{}", inbound.channel),
         };
         let (config, tools) = run_setup(&self.config, &self.api, inbound);
-        debug!(request_id, search = !tools.is_empty(), "slack run tools");
+        debug!(
+            request_id,
+            search = inbound.action_token.is_some(),
+            "slack run tools"
+        );
         let agent = RigBuilder::new(config, self.state.pending_approvals.clone())
             .with_hitl_hmac(self.state.hitl_webhook_hmac.clone())
             .build_streaming_agent_with_tools(
@@ -401,25 +405,34 @@ impl SlackIngress {
     }
 }
 
-/// The config and per-run tools for answering `inbound`. Every run's
-/// system prompt gains a line saying where the message came from and who
-/// sent it, since neither the text nor the history carries that. A message
-/// that carried an action token also gets the search tool built on it and
-/// the citation instruction; any other message gets no extra tools, rather
-/// than a search tool that fails.
+/// The config and per-run tool factory for answering `inbound`. Every
+/// run's system prompt gains a line saying where the message came from and
+/// who sent it, since neither the text nor the history carries that. A
+/// message that carried an action token also gets the citation instruction
+/// and a factory that builds a search tool on that token for each agent
+/// the run creates (one in single-agent mode, one per worker under
+/// orchestration), all drawing on one search budget for the message; any
+/// other message gets a factory that builds nothing, rather than a search
+/// tool that fails.
 fn run_setup(
     config: &aura_config::Config,
     api: &SlackApi,
     inbound: &Inbound,
-) -> (aura_config::Config, Vec<Box<dyn ToolDyn>>) {
+) -> (aura_config::Config, RunToolFactory) {
     let mut config = config.clone();
     config.agent.system_prompt.push_str(&run_context(inbound));
     let Some(token) = &inbound.action_token else {
-        return (config, Vec::new());
+        return (config, no_run_tools());
     };
     config.agent.system_prompt.push_str(search::CITATION_PROMPT);
-    let tool = SlackSearchTool::new(api.clone(), token.clone());
-    (config, vec![Box::new(tool)])
+    let api = api.clone();
+    let token = token.clone();
+    let budget = SearchBudget::new(search::SEARCHES_PER_MESSAGE);
+    let factory: RunToolFactory = Arc::new(move || {
+        let tool = SlackSearchTool::new(api.clone(), token.clone(), Arc::clone(&budget));
+        vec![Box::new(tool) as Box<dyn ToolDyn>]
+    });
+    (config, factory)
 }
 
 /// Where `inbound` was sent and by whom, in Slack's own reference syntax
@@ -795,7 +808,7 @@ mod tests {
             super::super::api::AppToken::new("xapp-app".to_owned()).unwrap(),
         );
         let (plain, tools) = run_setup(&config(), &api, &inbound(None));
-        assert!(tools.is_empty());
+        assert!(tools().is_empty());
         assert_eq!(
             plain.agent.system_prompt,
             format!("Be brief.{}", run_context(&inbound(None)))
@@ -803,8 +816,11 @@ mod tests {
         assert!(!plain.agent.system_prompt.contains("slack_search"));
 
         let (with, tools) = run_setup(&config(), &api, &inbound(Some("tok")));
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0].name(), search::TOOL_NAME);
+        let first = tools();
+        let second = tools();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].name(), search::TOOL_NAME);
+        assert_eq!(second[0].name(), search::TOOL_NAME);
         assert!(with.agent.system_prompt.starts_with("Be brief."));
         assert!(with.agent.system_prompt.ends_with(search::CITATION_PROMPT));
         assert!(with.agent.system_prompt.contains("<#C1>"));

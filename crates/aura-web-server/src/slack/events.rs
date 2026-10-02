@@ -120,7 +120,7 @@ pub struct MessageEvent {
     pub assistant_thread: Option<AssistantThread>,
 }
 
-/// The `assistant_thread` object some message events carry.
+/// A message event's `assistant_thread` object.
 #[derive(Debug, Deserialize)]
 pub struct AssistantThread {
     #[serde(default)]

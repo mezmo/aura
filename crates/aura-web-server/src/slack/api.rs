@@ -71,8 +71,7 @@ impl fmt::Debug for AppToken {
     }
 }
 
-/// The per-message token on a Slack event that names its sender to
-/// `assistant.search.context`.
+/// A Slack per-message action token.
 #[derive(Clone, PartialEq, Eq, Deserialize)]
 #[serde(transparent)]
 pub struct ActionToken(String);

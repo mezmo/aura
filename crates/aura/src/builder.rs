@@ -1788,17 +1788,27 @@ pub async fn build_streaming_agent(
     config: &crate::config::AgentRuntimeConfig,
     client_tools: Option<Vec<ClientTool>>,
 ) -> Result<Arc<dyn StreamingAgent>, Box<dyn std::error::Error + Send + Sync>> {
-    build_streaming_agent_with_tools(config, client_tools, Vec::new()).await
+    build_streaming_agent_with_tools(config, client_tools, no_run_tools()).await
 }
 
-/// [`build_streaming_agent`] plus `additional_tools`, rig tools the agent
-/// executes itself that exist for this one run. Like client tools they
-/// attach only in single-agent mode: an orchestrated config drops them
-/// with a warning, since workers are built from the config alone.
+/// Builds the rig tools that exist for one run.
+pub type RunToolFactory = Arc<dyn Fn() -> Vec<Box<dyn rig::tool::ToolDyn>> + Send + Sync>;
+
+/// A factory that yields no tools.
+pub fn no_run_tools() -> RunToolFactory {
+    Arc::new(Vec::new)
+}
+
+/// [`build_streaming_agent`] plus `run_tools`, the rig tools the agent
+/// executes itself that exist for this one run. A boxed tool cannot be
+/// cloned, so they come from a factory: in single-agent mode it is called
+/// once and its tools join the agent's; in orchestration mode it is called
+/// once per worker and every worker gets its own instances, while the
+/// coordinator, whose tool set is routing only, gets none.
 pub async fn build_streaming_agent_with_tools(
     config: &crate::config::AgentRuntimeConfig,
     client_tools: Option<Vec<ClientTool>>,
-    additional_tools: Vec<Box<dyn rig::tool::ToolDyn>>,
+    run_tools: RunToolFactory,
 ) -> Result<Arc<dyn StreamingAgent>, Box<dyn std::error::Error + Send + Sync>> {
     use crate::orchestration::OrchestratorFactory;
 
@@ -1811,14 +1821,7 @@ pub async fn build_streaming_agent_with_tools(
                  will be ignored. Use a non-orchestrated agent config to enable them."
             );
         }
-        if !additional_tools.is_empty() {
-            tracing::warn!(
-                count = additional_tools.len(),
-                "Per-run tools were supplied but orchestration is enabled — \
-                 they attach only in single-agent configurations and will be ignored."
-            );
-        }
-        let factory = OrchestratorFactory::new(config.clone());
+        let factory = OrchestratorFactory::new(config.clone()).with_run_tools(run_tools);
         Ok(Arc::new(factory))
     } else {
         // Standard single-agent mode: gate client tools on the agent's TOML opt-in
@@ -1840,7 +1843,7 @@ pub async fn build_streaming_agent_with_tools(
         } else {
             None
         };
-        let agent = Agent::new(config, additional_tools, attached).await?;
+        let agent = Agent::new(config, run_tools(), attached).await?;
         Ok(Arc::new(agent))
     }
 }

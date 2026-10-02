@@ -462,6 +462,9 @@ pub struct Orchestrator {
 
     /// Run-scoped park guard (park mode).
     park_guard: Option<Arc<ParkGuard>>,
+
+    /// Builds the run's own tools.
+    pub(super) run_tools: crate::builder::RunToolFactory,
 }
 
 /// The task and worker a stream's reasoning is attributed to.
@@ -652,7 +655,26 @@ impl Orchestrator {
             usage_state: crate::UsageState::new(),
             outer_budget: None,
             park_guard,
+            run_tools: crate::builder::no_run_tools(),
         })
+    }
+
+    /// The tools a worker executes itself beside its MCP tools: `wait_for`
+    /// when an MCP manager exists, plus fresh instances of the run's own
+    /// tools. Called once per worker built.
+    fn worker_own_tools(&self) -> Vec<Box<dyn rig::tool::ToolDyn>> {
+        let mut tools: Vec<Box<dyn rig::tool::ToolDyn>> = self
+            .mcp_manager
+            .as_ref()
+            .map(|mcp| {
+                vec![
+                    Box::new(super::tools::wait_for::WaitForTool::new(Arc::clone(mcp)))
+                        as Box<dyn rig::tool::ToolDyn>,
+                ]
+            })
+            .unwrap_or_default();
+        tools.extend((self.run_tools)());
+        tools
     }
 
     /// Create a worker agent for task execution.
@@ -2929,17 +2951,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         let shared_mcp: Option<Arc<McpManager>> = self.mcp_manager.clone();
 
         // Box<dyn ToolDyn> is not Clone, so each provider arm constructs its own instance.
-        let wait_for_tools = || -> Vec<Box<dyn rig::tool::ToolDyn>> {
-            shared_mcp
-                .as_ref()
-                .map(|mcp| {
-                    vec![
-                        Box::new(super::tools::wait_for::WaitForTool::new(Arc::clone(mcp)))
-                            as Box<dyn rig::tool::ToolDyn>,
-                    ]
-                })
-                .unwrap_or_default()
-        };
+        let wait_for_tools = || self.worker_own_tools();
 
         // Test-only model injection (park/reify rig): a queued override builds
         // this worker from a scripted model. The override's extra tools go
@@ -7396,6 +7408,49 @@ mod tests {
 
     /// `park_enabled` requires the flag AND the conversational route — the
     /// webhook arm of park mode is out of V1 scope.
+    #[tokio::test]
+    async fn workers_get_fresh_instances_of_the_run_tools() {
+        use rig::tool::Tool as _;
+
+        #[derive(Debug, serde::Deserialize)]
+        struct NoArgs {}
+        struct Marker;
+        impl rig::tool::Tool for Marker {
+            const NAME: &'static str = "run_marker";
+            type Error = std::convert::Infallible;
+            type Args = NoArgs;
+            type Output = String;
+            async fn definition(&self, _p: String) -> rig::completion::ToolDefinition {
+                rig::completion::ToolDefinition {
+                    name: Self::NAME.to_owned(),
+                    description: String::new(),
+                    parameters: serde_json::json!({"type": "object"}),
+                }
+            }
+            async fn call(&self, _a: Self::Args) -> Result<Self::Output, Self::Error> {
+                Ok(String::new())
+            }
+        }
+
+        let mut orchestrator = Orchestrator::new(AgentRuntimeConfig::default())
+            .await
+            .unwrap();
+        assert!(orchestrator.worker_own_tools().is_empty());
+
+        let built = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&built);
+        orchestrator.run_tools = Arc::new(move || {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            vec![Box::new(Marker) as Box<dyn rig::tool::ToolDyn>]
+        });
+        let first = orchestrator.worker_own_tools();
+        let second = orchestrator.worker_own_tools();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].name(), Marker::NAME);
+        assert_eq!(second[0].name(), Marker::NAME);
+        assert_eq!(built.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
     #[tokio::test]
     async fn park_enabled_requires_flag_and_conversational_route() {
         fn config(park_enabled: bool, conversational: bool) -> AgentRuntimeConfig {
