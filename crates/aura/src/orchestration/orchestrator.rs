@@ -458,7 +458,6 @@ pub struct Orchestrator {
     /// Run-scoped park guard (park mode).
     park_guard: Option<Arc<ParkGuard>>,
 
-    /// Builds the run's own tools.
     pub(super) run_tools: crate::builder::RunToolFactory,
 }
 
@@ -2406,15 +2405,26 @@ Assign tasks to the worker whose tools best match the required operations."#,
     /// Used by the `inspect_tool_params` reconnaissance tool.
     ///
     /// Returns an empty HashMap if no MCP manager is present.
-    fn get_all_tool_schemas(&self) -> std::collections::HashMap<String, serde_json::Value> {
-        let Some(ref mcp_manager) = self.mcp_manager else {
-            return std::collections::HashMap::new();
-        };
-
-        mcp_manager
-            .tool_definitions_iter()
-            .map(|tool| (tool.name().to_string(), tool.input_schema()))
-            .collect()
+    /// Every tool's parameter schema by name, for the coordinator's
+    /// `inspect_tool_params`: the MCP tools' schemas, plus the run's own
+    /// tools' definitions, which are built once and asked for their
+    /// definition since a `ToolDyn` yields it asynchronously.
+    async fn get_all_tool_schemas(&self) -> std::collections::HashMap<String, serde_json::Value> {
+        let mut schemas: std::collections::HashMap<String, serde_json::Value> = self
+            .mcp_manager
+            .as_ref()
+            .map(|mcp_manager| {
+                mcp_manager
+                    .tool_definitions_iter()
+                    .map(|tool| (tool.name().to_string(), tool.input_schema()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for tool in (self.run_tools)() {
+            let definition = tool.definition(String::new()).await;
+            schemas.insert(definition.name, definition.parameters);
+        }
+        schemas
     }
 
     /// Resolve which tools each worker can access based on their mcp_filter.
@@ -2578,7 +2588,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
         // Capture tool information for reconnaissance tools
         let tool_names = self.get_all_tool_names();
-        let tool_schemas = self.get_all_tool_schemas();
+        let tool_schemas = self.get_all_tool_schemas().await;
 
         // Create reconnaissance tools
         let list_tool = ListToolsTool::new(tool_names);
@@ -7481,6 +7491,8 @@ mod tests {
                 .get_all_tool_names()
                 .contains(&Marker::NAME.to_owned())
         );
+        let schemas = orchestrator.get_all_tool_schemas().await;
+        assert_eq!(schemas[Marker::NAME], serde_json::json!({"type": "object"}));
         assert!(
             orchestrator
                 .build_workers_section_with_tools()
