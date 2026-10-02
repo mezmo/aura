@@ -21,6 +21,8 @@ const SEEN_CAPACITY: usize = 1024;
 const ACK_REACTION: &str = "eyes";
 /// Newest thread messages carried into the agent's history.
 const HISTORY_LIMIT: usize = 100;
+/// Messages allowed to wait for an answer slot, per unit of concurrency.
+const WAIT_FACTOR: usize = 8;
 const EMPTY_REPLY: &str = "_(the agent returned no text)_";
 const FAILED_REPLY: &str = "Sorry, I hit an error answering that. The server log has the details.";
 
@@ -42,6 +44,7 @@ struct SlackIngress {
     config: aura_config::Config,
     state: Arc<AppState>,
     slots: Semaphore,
+    waiting: Arc<Semaphore>,
 }
 
 /// Verify the tokens, pick the agent, and spawn the Socket Mode loop plus
@@ -77,6 +80,7 @@ pub async fn start(
         config,
         state: Arc::clone(&state),
         slots: Semaphore::new(concurrency),
+        waiting: Arc::new(Semaphore::new(concurrency * WAIT_FACTOR)),
     });
     let (tx, rx) = mpsc::channel(EVENT_QUEUE);
     tokio::spawn(socket_mode::run(api, tx, state.shutdown_token.clone()));
@@ -94,9 +98,11 @@ fn install_crypto_provider() {
 }
 
 /// Hand each accepted, first-seen message to its own task, until shutdown
-/// begins. A task counts as an active request from the moment it is
-/// spawned, waiting for a slot included, so the drain covers it; its handle
-/// is tracked so a straggler can be aborted.
+/// begins. At most `concurrency * WAIT_FACTOR` messages may be waiting for
+/// an answer slot; past that a message is logged and dropped, with no
+/// reaction, rather than queued without bound. A task counts as an active
+/// request from the moment it is spawned, waiting included, so the drain
+/// covers it; its handle is tracked so a straggler can be aborted.
 async fn dispatch(ingress: Arc<SlackIngress>, mut events: mpsc::Receiver<EventCallback>) {
     let mut seen = SeenMessages::new(SEEN_CAPACITY);
     let shutdown = ingress.state.shutdown_token.clone();
@@ -115,6 +121,14 @@ async fn dispatch(ingress: Arc<SlackIngress>, mut events: mpsc::Receiver<EventCa
         if !seen.insert(&inbound.channel, &inbound.ts) {
             continue;
         }
+        let Ok(waiting) = Arc::clone(&ingress.waiting).try_acquire_owned() else {
+            warn!(
+                channel = inbound.channel,
+                ts = inbound.ts,
+                "slack message dropped: too many waiting for an answer slot"
+            );
+            continue;
+        };
         let ingress = Arc::clone(&ingress);
         let tracker = Arc::clone(&ingress.state.active_requests);
         let active = ActiveRequestGuard::new(Arc::clone(&tracker));
@@ -125,6 +139,7 @@ async fn dispatch(ingress: Arc<SlackIngress>, mut events: mpsc::Receiver<EventCa
                 () = ingress.state.shutdown_token.cancelled() => return,
                 slot = ingress.slots.acquire() => slot,
             };
+            drop(waiting);
             if slot.is_ok() {
                 ingress.answer(inbound).await;
             }
@@ -138,6 +153,16 @@ async fn dispatch(ingress: Arc<SlackIngress>, mut events: mpsc::Receiver<EventCa
 impl SlackIngress {
     async fn answer(&self, inbound: Inbound) {
         let request_id = format!("slack_{}_{}", inbound.channel, inbound.ts);
+        let earlier = match self.earlier_messages(&inbound).await {
+            Ok(earlier) => earlier,
+            Err(e) => {
+                error!(request_id, error = %e, "could not read slack history");
+                return;
+            }
+        };
+        if inbound.unaddressed_reply && !earlier.iter().any(|m| from_bot(m, &self.identity)) {
+            return;
+        }
         if let Err(e) = self
             .api
             .add_reaction(&inbound.channel, &inbound.ts, ACK_REACTION)
@@ -146,7 +171,7 @@ impl SlackIngress {
             warn!(request_id, error = %e, "could not react to slack message");
         }
 
-        let reply = match self.run_agent(&inbound, &request_id).await {
+        let reply = match self.run_agent(&inbound, &earlier, &request_id).await {
             Ok(text) if text.trim().is_empty() => EMPTY_REPLY.to_owned(),
             Ok(text) => text,
             // The server is going down; a reply would race the shutdown and
@@ -172,24 +197,36 @@ impl SlackIngress {
         }
     }
 
-    /// Run the agent over the thread so far and return its final text.
-    async fn run_agent(&self, inbound: &Inbound, request_id: &str) -> Result<String, RunError> {
-        // A thread is its own conversation wherever it is; a top-level DM
-        // message continues the DM; a top-level channel mention starts fresh.
-        let earlier = match (&inbound.thread_ts, inbound.is_dm) {
+    /// The conversation a message continues. A thread is its own
+    /// conversation wherever it is; a top-level DM message continues the DM;
+    /// a top-level channel mention starts fresh.
+    async fn earlier_messages(
+        &self,
+        inbound: &Inbound,
+    ) -> Result<Vec<SlackMessage>, SlackApiError> {
+        match (&inbound.thread_ts, inbound.is_dm) {
             (Some(thread_ts), _) => {
                 self.api
                     .conversations_replies(&inbound.channel, thread_ts)
-                    .await?
+                    .await
             }
             (None, true) => {
                 self.api
                     .conversations_history(&inbound.channel, &inbound.ts, HISTORY_LIMIT)
-                    .await?
+                    .await
             }
-            (None, false) => Vec::new(),
-        };
-        let history = thread_history(&earlier, &self.identity, &inbound.ts);
+            (None, false) => Ok(Vec::new()),
+        }
+    }
+
+    /// Run the agent over the conversation so far and return its final text.
+    async fn run_agent(
+        &self,
+        inbound: &Inbound,
+        earlier: &[SlackMessage],
+        request_id: &str,
+    ) -> Result<String, RunError> {
+        let history = thread_history(earlier, &self.identity, &inbound.ts);
         let session_id = match inbound.reply_thread() {
             Some(thread) => format!("slack:{}:{thread}", inbound.channel),
             None => format!("slack:{}", inbound.channel),
@@ -300,13 +337,11 @@ fn thread_history(replies: &[SlackMessage], bot: &BotIdentity, current_ts: &str)
         .iter()
         .filter(|m| m.ts.as_str() < current_ts && !m.text.trim().is_empty())
         .filter_map(|m| {
-            let from_bot = m.user.as_deref() == Some(&bot.user_id)
-                || (m.bot_id.is_some() && m.bot_id == bot.bot_id);
             let from_person = m
                 .subtype
                 .as_deref()
                 .is_none_or(|subtype| HUMAN_SUBTYPES.contains(&subtype));
-            if from_bot {
+            if from_bot(m, bot) {
                 Some(Message::assistant(&m.text))
             } else if from_person {
                 Some(Message::user(strip_mentions(&m.text, &bot.user_id)))
@@ -317,6 +352,12 @@ fn thread_history(replies: &[SlackMessage], bot: &BotIdentity, current_ts: &str)
         .collect();
     let skip = turns.len().saturating_sub(HISTORY_LIMIT);
     turns.into_iter().skip(skip).collect()
+}
+
+/// Whether the bot wrote `message`, by its user id or its bot id.
+fn from_bot(message: &SlackMessage, bot: &BotIdentity) -> bool {
+    message.user.as_deref() == Some(&bot.user_id)
+        || (message.bot_id.is_some() && message.bot_id == bot.bot_id)
 }
 
 #[cfg(test)]
@@ -422,6 +463,27 @@ mod tests {
         install_crypto_provider();
         install_crypto_provider();
         assert!(rustls::crypto::CryptoProvider::get_default().is_some());
+    }
+
+    #[test]
+    fn bot_participation_is_detected_by_user_or_bot_id() {
+        let people_only = [
+            msg("1", Some("U1"), None, "q"),
+            msg("2", Some("U2"), None, "a"),
+        ];
+        assert!(!people_only.iter().any(|m| from_bot(m, &bot())));
+        let with_bot_user = [
+            msg("1", Some("U1"), None, "q"),
+            msg("2", Some("UBOT"), None, "a"),
+        ];
+        assert!(with_bot_user.iter().any(|m| from_bot(m, &bot())));
+        let with_bot_id = [
+            msg("1", Some("U1"), None, "q"),
+            msg("2", None, Some("BBOT"), "a"),
+        ];
+        assert!(with_bot_id.iter().any(|m| from_bot(m, &bot())));
+        let other_bot = [msg("2", None, Some("BOTHER"), "a")];
+        assert!(!other_bot.iter().any(|m| from_bot(m, &bot())));
     }
 
     #[tokio::test]
