@@ -159,7 +159,8 @@ fn probe_then_queue(ingress: &Arc<SlackIngress>, inbound: Inbound) {
         };
         match earlier {
             Ok(earlier) if bot_took_part_before(&earlier, &ingress.identity, &inbound.ts) => {
-                queue_answer(&ingress, inbound, Some(earlier));
+                let kept = trim_for_history(earlier, &inbound.ts);
+                queue_answer(&ingress, inbound, Some(kept));
             }
             Ok(_) => {}
             Err(e) => warn!(
@@ -424,6 +425,16 @@ fn thread_history(replies: &[SlackMessage], bot: &BotIdentity, current_ts: &str)
     turns.into_iter().skip(skip).collect()
 }
 
+/// Keep only what `thread_history` can use: messages older than `before_ts`,
+/// and of those the newest `HISTORY_LIMIT`. A queued reply holds this
+/// while it waits for a slot, so a long thread must not travel whole.
+fn trim_for_history(mut messages: Vec<SlackMessage>, before_ts: &str) -> Vec<SlackMessage> {
+    messages.retain(|m| m.ts.as_str() < before_ts);
+    let excess = messages.len().saturating_sub(HISTORY_LIMIT);
+    messages.drain(..excess);
+    messages
+}
+
 /// Whether the bot wrote `message`, by its user id or its bot id.
 fn from_bot(message: &SlackMessage, bot: &BotIdentity) -> bool {
     message.user.as_deref() == Some(&bot.user_id)
@@ -579,6 +590,25 @@ mod tests {
         ];
         assert!(!bot_took_part_before(&thread, &bot(), "3"));
         assert!(bot_took_part_before(&thread, &bot(), "5"));
+    }
+
+    #[test]
+    fn trimming_keeps_the_newest_messages_older_than_the_reply() {
+        let thread: Vec<SlackMessage> = (0..HISTORY_LIMIT + 20)
+            .map(|i| msg(&format!("{i:04}"), Some("U1"), None, &format!("m{i}")))
+            .collect();
+        let kept = trim_for_history(thread, "0110");
+        assert_eq!(kept.len(), HISTORY_LIMIT);
+        assert_eq!(kept.first().unwrap().ts, "0010");
+        assert_eq!(kept.last().unwrap().ts, "0109");
+
+        let short = vec![
+            msg("1", Some("U1"), None, "a"),
+            msg("3", Some("U1"), None, "c"),
+        ];
+        let kept = trim_for_history(short, "2");
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].ts, "1");
     }
 
     #[tokio::test]
