@@ -165,7 +165,7 @@ impl SlackIngress {
         };
         if let Err(e) = self
             .api
-            .post_message(&inbound.channel, Some(inbound.reply_thread()), &reply)
+            .post_message(&inbound.channel, inbound.reply_thread(), &reply)
             .await
         {
             error!(request_id, error = %e, "could not post slack reply");
@@ -174,17 +174,26 @@ impl SlackIngress {
 
     /// Run the agent over the thread so far and return its final text.
     async fn run_agent(&self, inbound: &Inbound, request_id: &str) -> Result<String, RunError> {
-        let history = match &inbound.thread_ts {
-            Some(thread_ts) => {
-                let replies = self
-                    .api
+        // A thread is its own conversation wherever it is; a top-level DM
+        // message continues the DM; a top-level channel mention starts fresh.
+        let earlier = match (&inbound.thread_ts, inbound.is_dm) {
+            (Some(thread_ts), _) => {
+                self.api
                     .conversations_replies(&inbound.channel, thread_ts)
-                    .await?;
-                thread_history(&replies, &self.identity, &inbound.ts)
+                    .await?
             }
-            None => Vec::new(),
+            (None, true) => {
+                self.api
+                    .conversations_history(&inbound.channel, &inbound.ts, HISTORY_LIMIT)
+                    .await?
+            }
+            (None, false) => Vec::new(),
         };
-        let session_id = format!("slack:{}:{}", inbound.channel, inbound.reply_thread());
+        let history = thread_history(&earlier, &self.identity, &inbound.ts);
+        let session_id = match inbound.reply_thread() {
+            Some(thread) => format!("slack:{}:{thread}", inbound.channel),
+            None => format!("slack:{}", inbound.channel),
+        };
         let agent = RigBuilder::new(self.config.clone(), self.state.pending_approvals.clone())
             .with_hitl_hmac(self.state.hitl_webhook_hmac.clone())
             .build_streaming_agent_with_headers(
@@ -277,7 +286,7 @@ enum RunError {
     Cancelled,
 }
 
-/// Map a thread, oldest first, onto chat history: the bot's own messages
+/// Map earlier messages, oldest first, onto chat history: the bot's own messages
 /// become assistant turns, everyone else's become user turns with the
 /// bot's handle stripped. Only messages older than the one being answered
 /// (`current_ts`) count, so replies that landed while it waited for a slot
