@@ -8,7 +8,7 @@
 //! handles request-scoped MCP header resolution (`headers_from_request`) so the
 //! web server can inject per-request credentials into MCP calls.
 
-use crate::builder::{Agent, ClientTool, build_streaming_agent};
+use crate::builder::{Agent, ClientTool, build_streaming_agent_with_tools};
 use crate::config::{AgentRuntimeConfig, WorkerSkills};
 use crate::error::BuilderError;
 use crate::hitl::PendingApprovals;
@@ -183,13 +183,35 @@ impl RigBuilder {
         client_tools: Option<Vec<ClientTool>>,
         request_id: Option<String>,
     ) -> Result<Arc<dyn StreamingAgent>, BuilderError> {
+        self.build_streaming_agent_with_tools(
+            req_headers,
+            session_id,
+            client_tools,
+            request_id,
+            Vec::new(),
+        )
+        .await
+    }
+
+    /// [`Self::build_streaming_agent_with_headers`] plus `additional_tools`:
+    /// rig tools the agent executes itself that exist for this one run,
+    /// attached in single-agent mode only (see
+    /// [`build_streaming_agent_with_tools`]).
+    pub async fn build_streaming_agent_with_tools(
+        &self,
+        req_headers: Option<&HashMap<String, String>>,
+        session_id: Option<String>,
+        client_tools: Option<Vec<ClientTool>>,
+        request_id: Option<String>,
+        additional_tools: Vec<Box<dyn rig::tool::ToolDyn>>,
+    ) -> Result<Arc<dyn StreamingAgent>, BuilderError> {
         let mut agent_config = self.discovered_agent_config(req_headers)?;
         resolve_mcp_headers(&mut agent_config, req_headers);
         agent_config.session_id = session_id;
         agent_config.request_id = request_id;
         agent_config.skill_recorder = self.skill_recorder.clone();
 
-        build_streaming_agent(&agent_config, client_tools)
+        build_streaming_agent_with_tools(&agent_config, client_tools, additional_tools)
             .await
             .map_err(|e| BuilderError::AgentError(format!("Failed to build streaming agent: {e}")))
     }
