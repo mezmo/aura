@@ -14,8 +14,10 @@ const DEFAULT_LIMIT: usize = 10;
 pub const CITATION_PROMPT: &str = "\n\nYou have a `slack_search` tool that searches this Slack \
 workspace with the permissions of the person you are talking to. When an answer draws on a \
 result, cite it inline as <permalink|short label> so Slack renders a link, and never invent a \
-permalink. Each call returns one page; ask for the next page only when the first did not \
-answer the question, because searches are rate limited per person.";
+permalink. Searches are rate limited per person at about ten a minute, so spend at most two \
+on one question: one plain query, then the next page or one reworded query if the first \
+missed. Plain words or a natural-language question find things; quoted phrases and OR chains \
+usually return nothing.";
 
 /// One run's search tool, built on the token from the message that
 /// started the run.
@@ -117,11 +119,13 @@ impl RigTool for SlackSearchTool {
         RigToolDefinition {
             name: TOOL_NAME.to_owned(),
             description: "Search messages in this Slack workspace's public channels as the \
-                          person you are talking to, with their visibility. Use a natural \
-                          language question for semantic search or keywords for exact \
-                          matches; Slack filters such as `in:<#C123>`, `from:<@U123>`, \
-                          `before:2025-01-31` go inside the query. Each result carries a \
-                          permalink to cite. Returns one page; pass `cursor` to continue."
+                          person you are talking to, with their visibility. Write the query \
+                          as plain words or a natural-language question; quoted phrases and \
+                          OR chains usually return nothing. Slack filters such as \
+                          `in:<#C123>`, `from:<@U123>`, `before:2025-01-31` go inside the \
+                          query. Each result carries a permalink to cite. Returns one page; \
+                          pass `cursor` to continue. Rate limited per person, so at most two \
+                          calls per question."
                 .to_owned(),
             parameters: serde_json::json!({
                 "type": "object",
