@@ -1788,6 +1788,18 @@ pub async fn build_streaming_agent(
     config: &crate::config::AgentRuntimeConfig,
     client_tools: Option<Vec<ClientTool>>,
 ) -> Result<Arc<dyn StreamingAgent>, Box<dyn std::error::Error + Send + Sync>> {
+    build_streaming_agent_with_tools(config, client_tools, Vec::new()).await
+}
+
+/// [`build_streaming_agent`] plus `additional_tools`, rig tools the agent
+/// executes itself that exist for this one run. Like client tools they
+/// attach only in single-agent mode: an orchestrated config drops them
+/// with a warning, since workers are built from the config alone.
+pub async fn build_streaming_agent_with_tools(
+    config: &crate::config::AgentRuntimeConfig,
+    client_tools: Option<Vec<ClientTool>>,
+    additional_tools: Vec<Box<dyn rig::tool::ToolDyn>>,
+) -> Result<Arc<dyn StreamingAgent>, Box<dyn std::error::Error + Send + Sync>> {
     use crate::orchestration::OrchestratorFactory;
 
     if config.orchestration_enabled() {
@@ -1797,6 +1809,13 @@ pub async fn build_streaming_agent(
                 "Client-side tools were supplied but orchestration is enabled — \
                  client tools are only supported in single-agent configurations and \
                  will be ignored. Use a non-orchestrated agent config to enable them."
+            );
+        }
+        if !additional_tools.is_empty() {
+            tracing::warn!(
+                count = additional_tools.len(),
+                "Per-run tools were supplied but orchestration is enabled — \
+                 they attach only in single-agent configurations and will be ignored."
             );
         }
         let factory = OrchestratorFactory::new(config.clone());
@@ -1821,7 +1840,7 @@ pub async fn build_streaming_agent(
         } else {
             None
         };
-        let agent = Agent::new(config, vec![], attached).await?;
+        let agent = Agent::new(config, additional_tools, attached).await?;
         Ok(Arc::new(agent))
     }
 }
