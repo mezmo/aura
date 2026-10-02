@@ -215,25 +215,32 @@ fn queue_answer(ingress: &Arc<SlackIngress>, inbound: Inbound, earlier: Option<V
 
 impl SlackIngress {
     /// Answer one message. A conversation handed in from a probe is as old
-    /// as that probe's read: messages posted while the reply waited for a
-    /// slot are not in it, which is accepted over reading a long thread
-    /// twice.
+    /// as that probe's read and already trimmed to what history uses:
+    /// messages posted while the reply waited for a slot are not in it,
+    /// which is accepted over reading a long thread twice, and the probe's
+    /// participation verdict stands, since the trimmed read may no longer
+    /// hold the bot turn that earned it. A conversation read here is
+    /// checked here.
     async fn answer(&self, inbound: Inbound, prefetched: Option<Vec<SlackMessage>>) {
         let request_id = format!("slack_{}_{}", inbound.channel, inbound.ts);
         let earlier = match prefetched {
             Some(earlier) => earlier,
-            None => match self.earlier_messages(&inbound).await {
-                Ok(earlier) => earlier,
-                Err(e) => {
-                    error!(request_id, error = %e, "could not read slack history");
+            None => {
+                let earlier = match self.earlier_messages(&inbound).await {
+                    Ok(earlier) => earlier,
+                    Err(e) => {
+                        error!(request_id, error = %e, "could not read slack history");
+                        return;
+                    }
+                };
+                if inbound.unaddressed_reply
+                    && !bot_took_part_before(&earlier, &self.identity, &inbound.ts)
+                {
                     return;
                 }
-            },
+                earlier
+            }
         };
-        if inbound.unaddressed_reply && !bot_took_part_before(&earlier, &self.identity, &inbound.ts)
-        {
-            return;
-        }
         if let Err(e) = self
             .api
             .add_reaction(&inbound.channel, &inbound.ts, ACK_REACTION)
