@@ -2404,16 +2404,11 @@ Assign tasks to the worker whose tools best match the required operations."#,
         names
     }
 
-    /// Get tool schemas for inspect_tool_params.
-    ///
-    /// Returns a map of tool name -> input_schema JSON value.
-    /// Used by the `inspect_tool_params` reconnaissance tool.
-    ///
-    /// Returns an empty HashMap if no MCP manager is present.
     /// Every tool's parameter schema by name, for the coordinator's
-    /// `inspect_tool_params`: the MCP tools' schemas, plus the run's own
-    /// tools' definitions, which are built once and asked for their
-    /// definition since a `ToolDyn` yields it asynchronously.
+    /// `inspect_tool_params`: the MCP tools' schemas when a manager exists,
+    /// plus the run's own tools' definitions, which are built once and
+    /// asked for their definition since a `ToolDyn` yields it
+    /// asynchronously.
     async fn get_all_tool_schemas(&self) -> std::collections::HashMap<String, serde_json::Value> {
         let mut schemas: std::collections::HashMap<String, serde_json::Value> = self
             .mcp_manager
