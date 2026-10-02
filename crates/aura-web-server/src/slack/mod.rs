@@ -3,6 +3,7 @@
 mod api;
 mod events;
 mod runner;
+mod search;
 mod socket_mode;
 
 pub use api::{
