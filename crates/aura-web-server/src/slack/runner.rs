@@ -6,7 +6,7 @@ use std::time::Duration;
 use aura::{Message, RigBuilder, StreamItem};
 use futures_util::StreamExt;
 use tokio::sync::{Semaphore, mpsc};
-use tracing::{Instrument, error, info, warn};
+use tracing::{Instrument, debug, error, info, warn};
 
 use super::api::{BotIdentity, SlackApi, SlackApiError, SlackMessage};
 use super::events::{EventCallback, HUMAN_SUBTYPES, Inbound, SeenMessages, accept, strip_mentions};
@@ -23,6 +23,9 @@ const ACK_REACTION: &str = "eyes";
 const HISTORY_LIMIT: usize = 100;
 /// Messages allowed to wait for an answer slot, per unit of concurrency.
 const WAIT_FACTOR: usize = 8;
+/// Thread-participation probes (one `conversations.replies` call each)
+/// allowed in flight at once.
+const PROBE_LIMIT: usize = 16;
 const EMPTY_REPLY: &str = "_(the agent returned no text)_";
 const FAILED_REPLY: &str = "Sorry, I hit an error answering that. The server log has the details.";
 
@@ -45,6 +48,7 @@ struct SlackIngress {
     state: Arc<AppState>,
     slots: Semaphore,
     waiting: Arc<Semaphore>,
+    probes: Arc<Semaphore>,
 }
 
 /// Verify the tokens, pick the agent, and spawn the Socket Mode loop plus
@@ -81,6 +85,7 @@ pub async fn start(
         state: Arc::clone(&state),
         slots: Semaphore::new(concurrency),
         waiting: Arc::new(Semaphore::new(concurrency * WAIT_FACTOR)),
+        probes: Arc::new(Semaphore::new(PROBE_LIMIT)),
     });
     let (tx, rx) = mpsc::channel(EVENT_QUEUE);
     tokio::spawn(socket_mode::run(api, tx, state.shutdown_token.clone()));
@@ -97,12 +102,12 @@ fn install_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
-/// Hand each accepted, first-seen message to its own task, until shutdown
-/// begins. At most `concurrency * WAIT_FACTOR` messages may be waiting for
-/// an answer slot; past that a message is logged and dropped, with no
-/// reaction, rather than queued without bound. A task counts as an active
-/// request from the moment it is spawned, waiting included, so the drain
-/// covers it; its handle is tracked so a straggler can be aborted.
+/// Route each accepted, first-seen message until shutdown begins. A
+/// mention or DM is queued for an answer at once. A thread reply that did
+/// not mention the bot is probed first, off the answer queue and under its
+/// own small bound, and queued only when the bot had already taken part in
+/// that thread, so busy unrelated threads cost a few history reads and
+/// never displace addressed messages.
 async fn dispatch(ingress: Arc<SlackIngress>, mut events: mpsc::Receiver<EventCallback>) {
     let mut seen = SeenMessages::new(SEEN_CAPACITY);
     let shutdown = ingress.state.shutdown_token.clone();
@@ -121,33 +126,87 @@ async fn dispatch(ingress: Arc<SlackIngress>, mut events: mpsc::Receiver<EventCa
         if !seen.insert(&inbound.channel, &inbound.ts) {
             continue;
         }
-        let Ok(waiting) = Arc::clone(&ingress.waiting).try_acquire_owned() else {
-            warn!(
+        if inbound.unaddressed_reply {
+            probe_then_queue(&ingress, inbound);
+        } else {
+            queue_answer(&ingress, inbound);
+        }
+    }
+}
+
+/// Spawn a bounded probe that reads the thread and queues the reply for an
+/// answer only if the bot had posted in that thread before the reply was
+/// sent. Over the probe bound, or once shutdown begins, the reply is
+/// dropped without a reaction.
+fn probe_then_queue(ingress: &Arc<SlackIngress>, inbound: Inbound) {
+    let Ok(probe) = Arc::clone(&ingress.probes).try_acquire_owned() else {
+        debug!(
+            channel = inbound.channel,
+            ts = inbound.ts,
+            "slack thread reply dropped: too many participation probes in flight"
+        );
+        return;
+    };
+    let ingress = Arc::clone(ingress);
+    let tracker = Arc::clone(&ingress.state.active_requests);
+    tracker.track_task(tokio::spawn(async move {
+        let _probe = probe;
+        let earlier = tokio::select! {
+            biased;
+            () = ingress.state.shutdown_token.cancelled() => return,
+            earlier = ingress.earlier_messages(&inbound) => earlier,
+        };
+        match earlier {
+            Ok(earlier) if bot_took_part_before(&earlier, &ingress.identity, &inbound.ts) => {
+                queue_answer(&ingress, inbound);
+            }
+            Ok(_) => {}
+            Err(e) => warn!(
                 channel = inbound.channel,
                 ts = inbound.ts,
-                "slack message dropped: too many waiting for an answer slot"
-            );
-            continue;
-        };
-        let ingress = Arc::clone(&ingress);
-        let tracker = Arc::clone(&ingress.state.active_requests);
-        let active = ActiveRequestGuard::new(Arc::clone(&tracker));
-        let task = async move {
-            let _active = active;
-            let slot = tokio::select! {
-                biased;
-                () = ingress.state.shutdown_token.cancelled() => return,
-                slot = ingress.slots.acquire() => slot,
-            };
-            drop(waiting);
-            if slot.is_ok() {
-                ingress.answer(inbound).await;
-            }
-        };
-        tracker.track_task(tokio::spawn(
-            task.instrument(tracing::info_span!(parent: None, "agent.stream")),
-        ));
+                error = %e,
+                "could not read slack thread for a participation probe"
+            ),
+        }
+    }));
+}
+
+/// Spawn the task that waits for an answer slot and answers. At most
+/// `concurrency * WAIT_FACTOR` messages may wait; past that, or once
+/// shutdown begins, the message is logged and dropped with no reaction.
+/// The task counts as an active request from the moment it is spawned,
+/// waiting included, so the drain covers it; its handle is tracked so a
+/// straggler can be aborted.
+fn queue_answer(ingress: &Arc<SlackIngress>, inbound: Inbound) {
+    if ingress.state.shutdown_token.is_cancelled() {
+        return;
     }
+    let Ok(waiting) = Arc::clone(&ingress.waiting).try_acquire_owned() else {
+        warn!(
+            channel = inbound.channel,
+            ts = inbound.ts,
+            "slack message dropped: too many waiting for an answer slot"
+        );
+        return;
+    };
+    let ingress = Arc::clone(ingress);
+    let tracker = Arc::clone(&ingress.state.active_requests);
+    let active = ActiveRequestGuard::new(Arc::clone(&tracker));
+    let task = async move {
+        let _active = active;
+        let slot = tokio::select! {
+            biased;
+            () = ingress.state.shutdown_token.cancelled() => return,
+            slot = ingress.slots.acquire() => slot,
+        };
+        drop(waiting);
+        if slot.is_ok() {
+            ingress.answer(inbound).await;
+        }
+    };
+    tracker.track_task(tokio::spawn(
+        task.instrument(tracing::info_span!(parent: None, "agent.stream")),
+    ));
 }
 
 impl SlackIngress {
@@ -160,7 +219,10 @@ impl SlackIngress {
                 return;
             }
         };
-        if inbound.unaddressed_reply && !earlier.iter().any(|m| from_bot(m, &self.identity)) {
+        // The probe already checked this for an unaddressed reply; the
+        // fresh read is what the agent sees, so it decides too.
+        if inbound.unaddressed_reply && !bot_took_part_before(&earlier, &self.identity, &inbound.ts)
+        {
             return;
         }
         if let Err(e) = self
@@ -360,6 +422,15 @@ fn from_bot(message: &SlackMessage, bot: &BotIdentity) -> bool {
         || (message.bot_id.is_some() && message.bot_id == bot.bot_id)
 }
 
+/// Whether the bot had posted in this conversation before `ts`. A bot
+/// reply that landed later, while this message waited, does not count:
+/// the person was not talking to the bot when they wrote it.
+fn bot_took_part_before(messages: &[SlackMessage], bot: &BotIdentity, ts: &str) -> bool {
+    messages
+        .iter()
+        .any(|m| m.ts.as_str() < ts && from_bot(m, bot))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -471,19 +542,35 @@ mod tests {
             msg("1", Some("U1"), None, "q"),
             msg("2", Some("U2"), None, "a"),
         ];
-        assert!(!people_only.iter().any(|m| from_bot(m, &bot())));
+        assert!(!bot_took_part_before(&people_only, &bot(), "9"));
         let with_bot_user = [
             msg("1", Some("U1"), None, "q"),
             msg("2", Some("UBOT"), None, "a"),
         ];
-        assert!(with_bot_user.iter().any(|m| from_bot(m, &bot())));
+        assert!(bot_took_part_before(&with_bot_user, &bot(), "9"));
         let with_bot_id = [
             msg("1", Some("U1"), None, "q"),
             msg("2", None, Some("BBOT"), "a"),
         ];
-        assert!(with_bot_id.iter().any(|m| from_bot(m, &bot())));
+        assert!(bot_took_part_before(&with_bot_id, &bot(), "9"));
         let other_bot = [msg("2", None, Some("BOTHER"), "a")];
-        assert!(!other_bot.iter().any(|m| from_bot(m, &bot())));
+        assert!(!bot_took_part_before(&other_bot, &bot(), "9"));
+    }
+
+    #[test]
+    fn a_bot_reply_that_landed_later_does_not_count_as_participation() {
+        let thread = [
+            msg("1", Some("U1"), None, "parent"),
+            msg("3", Some("U2"), None, "reply being probed"),
+            msg(
+                "4",
+                Some("UBOT"),
+                None,
+                "bot answered someone else after it",
+            ),
+        ];
+        assert!(!bot_took_part_before(&thread, &bot(), "3"));
+        assert!(bot_took_part_before(&thread, &bot(), "5"));
     }
 
     #[tokio::test]
