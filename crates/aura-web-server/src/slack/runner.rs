@@ -401,22 +401,42 @@ impl SlackIngress {
     }
 }
 
-/// The config and per-run tools for answering `inbound`. A message that
-/// carried an action token gets the search tool built on it and a system
-/// prompt that asks for citations; any other message gets the agent config
-/// as written and no extra tools, rather than a search tool that fails.
+/// The config and per-run tools for answering `inbound`. Every run's
+/// system prompt gains a line saying where the message came from and who
+/// sent it, since neither the text nor the history carries that. A message
+/// that carried an action token also gets the search tool built on it and
+/// the citation instruction; any other message gets no extra tools, rather
+/// than a search tool that fails.
 fn run_setup(
     config: &aura_config::Config,
     api: &SlackApi,
     inbound: &Inbound,
 ) -> (aura_config::Config, Vec<Box<dyn ToolDyn>>) {
     let mut config = config.clone();
+    config.agent.system_prompt.push_str(&run_context(inbound));
     let Some(token) = &inbound.action_token else {
         return (config, Vec::new());
     };
     config.agent.system_prompt.push_str(search::CITATION_PROMPT);
     let tool = SlackSearchTool::new(api.clone(), token.clone());
     (config, vec![Box::new(tool)])
+}
+
+/// Where `inbound` was sent and by whom, in Slack's own reference syntax
+/// so the agent can repeat the ids in replies and search filters.
+fn run_context(inbound: &Inbound) -> String {
+    let place = if inbound.is_dm {
+        "a direct message to you".to_owned()
+    } else if inbound.thread_ts.is_some() {
+        format!("a thread in the Slack channel <#{}>", inbound.channel)
+    } else {
+        format!("the Slack channel <#{}>", inbound.channel)
+    };
+    format!(
+        "\n\nThis message is {place}, sent by <@{}>. Refer to the channel as <#{}> and to \
+         people as <@USERID> so Slack renders them.",
+        inbound.user, inbound.channel
+    )
 }
 
 /// Drain the run and return the text of its final response.
@@ -776,12 +796,31 @@ mod tests {
         );
         let (plain, tools) = run_setup(&config(), &api, &inbound(None));
         assert!(tools.is_empty());
-        assert_eq!(plain.agent.system_prompt, "Be brief.");
+        assert_eq!(
+            plain.agent.system_prompt,
+            format!("Be brief.{}", run_context(&inbound(None)))
+        );
+        assert!(!plain.agent.system_prompt.contains("slack_search"));
 
         let (with, tools) = run_setup(&config(), &api, &inbound(Some("tok")));
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name(), search::TOOL_NAME);
         assert!(with.agent.system_prompt.starts_with("Be brief."));
         assert!(with.agent.system_prompt.ends_with(search::CITATION_PROMPT));
+        assert!(with.agent.system_prompt.contains("<#C1>"));
+    }
+
+    #[test]
+    fn run_context_names_the_place_and_the_sender() {
+        let mut channel = inbound(None);
+        assert!(run_context(&channel).contains("the Slack channel <#C1>, sent by <@U1>"));
+        channel.thread_ts = Some("0.5".to_owned());
+        assert!(run_context(&channel).contains("a thread in the Slack channel <#C1>"));
+        let mut dm = inbound(None);
+        dm.is_dm = true;
+        dm.channel = "D1".to_owned();
+        let text = run_context(&dm);
+        assert!(text.contains("a direct message to you, sent by <@U1>"));
+        assert!(text.contains("<#D1>"));
     }
 }
