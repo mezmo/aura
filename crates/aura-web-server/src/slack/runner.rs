@@ -129,15 +129,16 @@ async fn dispatch(ingress: Arc<SlackIngress>, mut events: mpsc::Receiver<EventCa
         if inbound.unaddressed_reply {
             probe_then_queue(&ingress, inbound);
         } else {
-            queue_answer(&ingress, inbound);
+            queue_answer(&ingress, inbound, None);
         }
     }
 }
 
 /// Spawn a bounded probe that reads the thread and queues the reply for an
 /// answer only if the bot had posted in that thread before the reply was
-/// sent. Over the probe bound, or once shutdown begins, the reply is
-/// dropped without a reaction.
+/// sent; the thread it read travels with the reply so the answer does not
+/// read it again. Over the probe bound, or once shutdown begins, the reply
+/// is dropped without a reaction.
 fn probe_then_queue(ingress: &Arc<SlackIngress>, inbound: Inbound) {
     let Ok(probe) = Arc::clone(&ingress.probes).try_acquire_owned() else {
         debug!(
@@ -158,7 +159,7 @@ fn probe_then_queue(ingress: &Arc<SlackIngress>, inbound: Inbound) {
         };
         match earlier {
             Ok(earlier) if bot_took_part_before(&earlier, &ingress.identity, &inbound.ts) => {
-                queue_answer(&ingress, inbound);
+                queue_answer(&ingress, inbound, Some(earlier));
             }
             Ok(_) => {}
             Err(e) => warn!(
@@ -171,13 +172,15 @@ fn probe_then_queue(ingress: &Arc<SlackIngress>, inbound: Inbound) {
     }));
 }
 
-/// Spawn the task that waits for an answer slot and answers. At most
+/// Spawn the task that waits for an answer slot and answers. `earlier` is
+/// the conversation as a probe already read it, reused instead of read
+/// again; `None` reads it when the slot is held. At most
 /// `concurrency * WAIT_FACTOR` messages may wait; past that, or once
 /// shutdown begins, the message is logged and dropped with no reaction.
 /// The task counts as an active request from the moment it is spawned,
 /// waiting included, so the drain covers it; its handle is tracked so a
 /// straggler can be aborted.
-fn queue_answer(ingress: &Arc<SlackIngress>, inbound: Inbound) {
+fn queue_answer(ingress: &Arc<SlackIngress>, inbound: Inbound, earlier: Option<Vec<SlackMessage>>) {
     if ingress.state.shutdown_token.is_cancelled() {
         return;
     }
@@ -201,7 +204,7 @@ fn queue_answer(ingress: &Arc<SlackIngress>, inbound: Inbound) {
         };
         drop(waiting);
         if slot.is_ok() {
-            ingress.answer(inbound).await;
+            ingress.answer(inbound, earlier).await;
         }
     };
     tracker.track_task(tokio::spawn(
@@ -210,17 +213,22 @@ fn queue_answer(ingress: &Arc<SlackIngress>, inbound: Inbound) {
 }
 
 impl SlackIngress {
-    async fn answer(&self, inbound: Inbound) {
+    /// Answer one message. A conversation handed in from a probe is as old
+    /// as that probe's read: messages posted while the reply waited for a
+    /// slot are not in it, which is accepted over reading a long thread
+    /// twice.
+    async fn answer(&self, inbound: Inbound, prefetched: Option<Vec<SlackMessage>>) {
         let request_id = format!("slack_{}_{}", inbound.channel, inbound.ts);
-        let earlier = match self.earlier_messages(&inbound).await {
-            Ok(earlier) => earlier,
-            Err(e) => {
-                error!(request_id, error = %e, "could not read slack history");
-                return;
-            }
+        let earlier = match prefetched {
+            Some(earlier) => earlier,
+            None => match self.earlier_messages(&inbound).await {
+                Ok(earlier) => earlier,
+                Err(e) => {
+                    error!(request_id, error = %e, "could not read slack history");
+                    return;
+                }
+            },
         };
-        // The probe already checked this for an unaddressed reply; the
-        // fresh read is what the agent sees, so it decides too.
         if inbound.unaddressed_reply && !bot_took_part_before(&earlier, &self.identity, &inbound.ts)
         {
             return;
