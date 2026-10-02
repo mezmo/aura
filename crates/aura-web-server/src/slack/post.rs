@@ -95,9 +95,11 @@ impl PostError {
                 format!("`thread_ts` does not name a message in `{channel}`")
             }
             SlackApiError::Api { error, .. } if error == "missing_scope" => {
-                "the Slack app lacks the chat:write scope, so posting is unavailable".to_owned()
+                "the Slack app lacks the scope to post here: chat:write, or chat:write.public \
+                 for a public channel the bot has not joined"
+                    .to_owned()
             }
-            SlackApiError::Api { error, .. } if error.starts_with("rate") => {
+            SlackApiError::Api { error, .. } if error == "ratelimited" => {
                 "Slack is rate limiting posts right now; do not retry".to_owned()
             }
             other => format!("slack post failed: {other}"),
@@ -158,7 +160,8 @@ impl RigTool for SlackPostTool {
         if channel.is_empty() {
             return Err(PostError::EmptyChannel);
         }
-        if args.text.trim().is_empty() {
+        let text = args.text.trim();
+        if text.is_empty() {
             return Err(PostError::EmptyText);
         }
         if !self.budget.take() {
@@ -166,7 +169,7 @@ impl RigTool for SlackPostTool {
         }
         let posted = self
             .api
-            .post_message(channel, args.thread_ts.as_deref(), &args.text)
+            .post_message(channel, args.thread_ts.as_deref(), text)
             .await
             .map_err(|e| PostError::from_slack(e, channel))?;
         let permalink = match self.api.get_permalink(&posted.channel, &posted.ts).await {
@@ -347,9 +350,12 @@ model = "gpt-4o"
             .mount(&server)
             .await;
 
-        let out = call(&tool(&server), args("#ops", "deploy done", Some("1.0")))
-            .await
-            .unwrap();
+        let out = call(
+            &tool(&server),
+            args(" #ops ", "\n deploy done \n", Some("1.0")),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             out,
             PostOutput {
@@ -385,6 +391,26 @@ model = "gpt-4o"
         assert_eq!(out.permalink, None);
         let json = serde_json::to_value(&out).unwrap();
         assert!(json.get("permalink").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_missing_scope_names_both_posting_scopes() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat.postMessage"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"ok": false, "error": "missing_scope"})),
+            )
+            .mount(&server)
+            .await;
+
+        let err = call(&tool(&server), args("C1", "hi", None))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("chat:write,"), "{err}");
+        assert!(err.contains("chat:write.public"), "{err}");
     }
 
     #[tokio::test]
