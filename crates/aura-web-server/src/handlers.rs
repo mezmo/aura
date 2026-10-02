@@ -277,8 +277,10 @@ pub async fn prepare_request(
 
     validate_hitl_delivery_mode(&config, req)?;
 
-    // Get additional tools from the factory (e.g., CLI tools in standalone mode)
+    // Tools the server executes for the agent: the deployment's (CLI tools in
+    // standalone mode) and the run's (Slack tools for an opted-in agent).
     let additional_tools = (data.additional_tools)();
+    let run_tools = data.run_tools(&config);
 
     // Convert request-supplied client tool definitions once; both paths use them.
     let client_tools_vec: Option<Vec<aura::builder::ClientTool>> = req
@@ -309,11 +311,12 @@ pub async fn prepare_request(
                 .with_hitl_hmac(data.hitl_webhook_hmac.clone())
                 .with_skill_recorder(skill_recorder.clone());
             let agent = builder
-                .build_streaming_agent_with_headers(
+                .build_streaming_agent_with_tools(
                     Some(req_headers_map),
                     Some(chat_session_id.to_string()),
                     client_tools_vec.clone(),
                     Some(request_id.clone()),
+                    run_tools,
                 )
                 .await
                 .map_err(|e| {
@@ -333,6 +336,8 @@ pub async fn prepare_request(
             let builder = RigBuilder::new(config.clone(), data.pending_approvals.clone())
                 .with_hitl_hmac(data.hitl_webhook_hmac.clone())
                 .with_skill_recorder(skill_recorder.clone());
+            let mut additional_tools = additional_tools;
+            additional_tools.extend(run_tools());
             let agent = build_agent_for_request(
                 builder,
                 req_headers_map,
@@ -1917,6 +1922,7 @@ mod tests {
             active_requests: Arc::new(crate::types::ActiveRequestTracker::new()),
             default_agent: None,
             additional_tools: Arc::new(Vec::new),
+            slack_api: None,
             pending_approvals: aura::hitl::PendingApprovals::new(),
             hitl_webhook_hmac: None,
             session_store: Arc::new(crate::session_store::InMemorySessionStore::new()),
@@ -2024,6 +2030,7 @@ model = "gpt-4o"
             active_requests: Arc::new(crate::types::ActiveRequestTracker::new()),
             default_agent: default_agent.map(str::to_owned),
             additional_tools: Arc::new(Vec::new),
+            slack_api: None,
             debug_provider_errors: false,
             pending_approvals: aura::hitl::PendingApprovals::new(),
             hitl_webhook_hmac: None,
@@ -2497,6 +2504,7 @@ url = "http://127.0.0.1:9"
                 active_requests: Arc::new(ActiveRequestTracker::default()),
                 default_agent: None,
                 additional_tools: Arc::new(Vec::new),
+                slack_api: None,
                 pending_approvals: aura::hitl::PendingApprovals::new(),
                 hitl_webhook_hmac: None,
                 session_store: Arc::new(crate::session_store::InMemorySessionStore::new()),
