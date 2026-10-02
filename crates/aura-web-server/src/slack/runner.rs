@@ -9,7 +9,7 @@ use tokio::sync::{Semaphore, mpsc};
 use tracing::{Instrument, error, info, warn};
 
 use super::api::{BotIdentity, SlackApi, SlackApiError, SlackMessage};
-use super::events::{EventCallback, Inbound, SeenMessages, accept, strip_mentions};
+use super::events::{EventCallback, HUMAN_SUBTYPES, Inbound, SeenMessages, accept, strip_mentions};
 use super::socket_mode;
 use crate::types::{ActiveRequestGuard, AppState};
 
@@ -149,6 +149,15 @@ impl SlackIngress {
         let reply = match self.run_agent(&inbound, &request_id).await {
             Ok(text) if text.trim().is_empty() => EMPTY_REPLY.to_owned(),
             Ok(text) => text,
+            // The server is going down; a reply would race the shutdown and
+            // tell the user something broke when nothing did.
+            Err(RunError::Cancelled) => {
+                warn!(
+                    request_id,
+                    "slack-triggered agent run cancelled by shutdown"
+                );
+                return;
+            }
             Err(e) => {
                 error!(request_id, error = %e, "slack-triggered agent run failed");
                 FAILED_REPLY.to_owned()
@@ -272,20 +281,28 @@ enum RunError {
 /// become assistant turns, everyone else's become user turns with the
 /// bot's handle stripped. Only messages older than the one being answered
 /// (`current_ts`) count, so replies that landed while it waited for a slot
-/// do not precede it; system subtypes and empty messages are left out, and
-/// only the newest `HISTORY_LIMIT` turns are kept. Slack timestamps are
-/// fixed-width `seconds.micros`, so string order is time order.
+/// do not precede it; empty messages and system subtypes (joins, edits,
+/// deletions) are left out, while the bot's own replies pass whatever
+/// subtype Slack stamps on them, `bot_message` included. Only the newest
+/// `HISTORY_LIMIT` turns are kept. Slack timestamps are fixed-width
+/// `seconds.micros`, so string order is time order.
 fn thread_history(replies: &[SlackMessage], bot: &BotIdentity, current_ts: &str) -> Vec<Message> {
     let turns: Vec<Message> = replies
         .iter()
-        .filter(|m| m.ts.as_str() < current_ts && m.subtype.is_none() && !m.text.trim().is_empty())
-        .map(|m| {
+        .filter(|m| m.ts.as_str() < current_ts && !m.text.trim().is_empty())
+        .filter_map(|m| {
             let from_bot = m.user.as_deref() == Some(&bot.user_id)
                 || (m.bot_id.is_some() && m.bot_id == bot.bot_id);
+            let from_person = m
+                .subtype
+                .as_deref()
+                .is_none_or(|subtype| HUMAN_SUBTYPES.contains(&subtype));
             if from_bot {
-                Message::assistant(&m.text)
+                Some(Message::assistant(&m.text))
+            } else if from_person {
+                Some(Message::user(strip_mentions(&m.text, &bot.user_id)))
             } else {
-                Message::user(strip_mentions(&m.text, &bot.user_id))
+                None
             }
         })
         .collect();
@@ -328,10 +345,12 @@ mod tests {
 
     #[test]
     fn thread_maps_roles_and_keeps_only_older_messages() {
+        let mut bot_message = msg("3", None, Some("BBOT"), "bot answer by bot id");
+        bot_message.subtype = Some("bot_message".to_owned());
         let replies = [
             msg("1", Some("U1"), None, "parent question"),
             msg("2", Some("UBOT"), None, "bot answer by user id"),
-            msg("3", None, Some("BBOT"), "bot answer by bot id"),
+            bot_message,
             msg("4", Some("U2"), None, "  "),
             msg(
                 "5",
@@ -365,9 +384,28 @@ mod tests {
             .map(|i| msg(&format!("{i:04}"), Some("U1"), None, &format!("m{i}")))
             .collect();
         replies[0].subtype = Some("channel_join".to_owned());
+        replies[1].subtype = Some("file_share".to_owned());
         let history = thread_history(&replies, &bot(), "9999");
         assert_eq!(history.len(), HISTORY_LIMIT);
         assert!(matches!(history.last(), Some(Message::User { .. })));
+    }
+
+    #[test]
+    fn thread_keeps_bot_replies_whatever_their_subtype_and_drops_system_ones() {
+        let mut bot_reply = msg("2", Some("UBOT"), Some("BBOT"), "earlier bot answer");
+        bot_reply.subtype = Some("bot_message".to_owned());
+        let mut join = msg("3", Some("U2"), None, "has joined the thread");
+        join.subtype = Some("channel_join".to_owned());
+        let mut upload = msg("4", Some("U1"), None, "see attached");
+        upload.subtype = Some("file_share".to_owned());
+        let replies = [
+            msg("1", Some("U1"), None, "question"),
+            bot_reply,
+            join,
+            upload,
+        ];
+        let history = thread_history(&replies, &bot(), "5");
+        assert_eq!(roles(&history), ["user", "assistant", "user"]);
     }
 
     #[test]
