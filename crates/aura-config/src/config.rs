@@ -965,6 +965,10 @@ pub struct AgentConfig {
     /// Glob patterns selecting which client-side tools this agent can call.
     #[serde(default)]
     pub client_tool_filter: Option<Vec<GlobPattern>>,
+    /// Whether this agent may use the Slack tools the server offers, such
+    /// as `slack_post_message` (default: false).
+    #[serde(default)]
+    pub enable_slack_tools: bool,
     /// LLM configuration for this agent.
     ///
     /// Parsed from the `[agent.llm]` TOML table. Workers inherit this config
@@ -1028,6 +1032,7 @@ impl Default for AgentConfig {
             mcp_filter: None,
             enable_client_tools: false,
             client_tool_filter: None,
+            enable_slack_tools: false,
             llm: LlmConfig::default(),
             scratchpad: None,
             hidden: bool::default(),
