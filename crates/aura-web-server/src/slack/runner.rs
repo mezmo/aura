@@ -127,7 +127,7 @@ async fn dispatch(ingress: Arc<SlackIngress>, mut events: mpsc::Receiver<EventCa
             if received.is_empty() {
                 debug!("slack event ignored: not a message kind the ingress handles");
             } else {
-                info!(event = %received, "slack message ignored by the accept rules");
+                debug!(event = %received, "slack message ignored by the accept rules");
             }
             continue;
         };
