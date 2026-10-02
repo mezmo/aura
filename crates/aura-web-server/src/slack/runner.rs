@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use aura::{Message, RigBuilder, StreamItem};
+use aura::{Message, RigBuilder, RunToolFactory, StreamItem, ToolDyn, no_run_tools};
 use futures_util::StreamExt;
 use tokio::sync::{Semaphore, mpsc};
 use tracing::{Instrument, debug, error, info, warn};
@@ -12,6 +12,7 @@ use super::api::{BotIdentity, SlackApi, SlackApiError, SlackMessage};
 use super::events::{
     Event, EventCallback, HUMAN_SUBTYPES, Inbound, SeenMessages, accept, strip_mentions,
 };
+use super::search::{self, SearchBudget, SlackSearchTool};
 use super::socket_mode;
 use crate::types::{ActiveRequestGuard, AppState};
 
@@ -349,13 +350,20 @@ impl SlackIngress {
             Some(thread) => format!("slack:{}:{thread}", inbound.channel),
             None => format!("slack:{}", inbound.channel),
         };
-        let agent = RigBuilder::new(self.config.clone(), self.state.pending_approvals.clone())
+        let (config, tools) = run_setup(&self.config, &self.api, inbound);
+        debug!(
+            request_id,
+            search = inbound.action_token.is_some(),
+            "slack run tools"
+        );
+        let agent = RigBuilder::new(config, self.state.pending_approvals.clone())
             .with_hitl_hmac(self.state.hitl_webhook_hmac.clone())
-            .build_streaming_agent_with_headers(
+            .build_streaming_agent_with_tools(
                 None,
                 Some(session_id),
                 None,
                 Some(request_id.to_owned()),
+                tools,
             )
             .await
             .map_err(|e| RunError::Build(e.to_string()))?;
@@ -395,6 +403,67 @@ impl SlackIngress {
         }
         outcome
     }
+}
+
+/// The config and per-run tool factory for answering `inbound`. Every
+/// run's prompts gain a line saying where the message came from and who
+/// sent it, since neither the text nor the history carries that. A message
+/// that carried an action token also gets the citation instruction and a
+/// factory that builds a search tool on that token for each agent the run
+/// creates (one in single-agent mode, one per worker under orchestration),
+/// all drawing on one search budget for the message; any other message
+/// gets a factory that builds nothing, rather than a search tool that
+/// fails. Both additions go to the agent's system prompt and, under
+/// orchestration, to every worker's preamble, since a worker's preamble
+/// replaces the system prompt rather than extending it.
+fn run_setup(
+    config: &aura_config::Config,
+    api: &SlackApi,
+    inbound: &Inbound,
+) -> (aura_config::Config, RunToolFactory) {
+    let mut config = config.clone();
+    let mut addition = run_context(inbound);
+    if inbound.action_token.is_some() {
+        addition.push_str(search::CITATION_PROMPT);
+    }
+    config.agent.system_prompt.push_str(&addition);
+    if let Some(orchestration) = config.orchestration.as_mut() {
+        for worker in orchestration.workers.values_mut() {
+            worker.preamble.push_str(&addition);
+        }
+        orchestration
+            .worker_system_prompt
+            .get_or_insert_with(String::new)
+            .push_str(&addition);
+    }
+    let Some(token) = &inbound.action_token else {
+        return (config, no_run_tools());
+    };
+    let api = api.clone();
+    let token = token.clone();
+    let budget = SearchBudget::new(search::SEARCHES_PER_MESSAGE);
+    let factory: RunToolFactory = Arc::new(move || {
+        let tool = SlackSearchTool::new(api.clone(), token.clone(), Arc::clone(&budget));
+        vec![Box::new(tool) as Box<dyn ToolDyn>]
+    });
+    (config, factory)
+}
+
+/// Where `inbound` was sent and by whom, in Slack's own reference syntax
+/// so the agent can repeat the ids in replies and search filters.
+fn run_context(inbound: &Inbound) -> String {
+    let place = if inbound.is_dm {
+        "a direct message to you".to_owned()
+    } else if inbound.thread_ts.is_some() {
+        format!("a thread in the Slack channel <#{}>", inbound.channel)
+    } else {
+        format!("the Slack channel <#{}>", inbound.channel)
+    };
+    format!(
+        "\n\nThis message is {place}, sent by <@{}>. Refer to the channel as <#{}> and to \
+         people as <@USERID> so Slack renders them.",
+        inbound.user, inbound.channel
+    )
 }
 
 /// Drain the run and return the text of its final response.
@@ -714,5 +783,108 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, RunError::TimedOut), "{err}");
+    }
+
+    fn inbound(action_token: Option<&str>) -> Inbound {
+        Inbound {
+            channel: "C1".to_owned(),
+            ts: "1.0".to_owned(),
+            thread_ts: None,
+            user: "U1".to_owned(),
+            text: "where did we discuss gizmo".to_owned(),
+            is_dm: false,
+            unaddressed_reply: false,
+            action_token: action_token.map(|t| super::super::api::ActionToken::new(t.to_owned())),
+        }
+    }
+
+    fn config() -> aura_config::Config {
+        aura_config::Config {
+            memory_dir: None,
+            mcp: None,
+            vector_stores: vec![],
+            tools: None,
+            orchestration: None,
+            hitl: None,
+            governance: None,
+            agent: aura_config::AgentConfig {
+                name: "slack-bot".to_owned(),
+                system_prompt: "Be brief.".to_owned(),
+                ..aura_config::AgentConfig::default()
+            },
+        }
+    }
+
+    #[test]
+    fn search_tool_and_citation_prompt_exist_only_with_an_action_token() {
+        let api = SlackApi::new(
+            super::super::api::BotToken::new("xoxb-bot".to_owned()).unwrap(),
+            super::super::api::AppToken::new("xapp-app".to_owned()).unwrap(),
+        );
+        let (plain, tools) = run_setup(&config(), &api, &inbound(None));
+        assert!(tools().is_empty());
+        assert_eq!(
+            plain.agent.system_prompt,
+            format!("Be brief.{}", run_context(&inbound(None)))
+        );
+        assert!(!plain.agent.system_prompt.contains("slack_search"));
+
+        let (with, tools) = run_setup(&config(), &api, &inbound(Some("tok")));
+        let first = tools();
+        let second = tools();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].name(), search::TOOL_NAME);
+        assert_eq!(second[0].name(), search::TOOL_NAME);
+        assert!(with.agent.system_prompt.starts_with("Be brief."));
+        assert!(with.agent.system_prompt.ends_with(search::CITATION_PROMPT));
+        assert!(with.agent.system_prompt.contains("<#C1>"));
+    }
+
+    #[test]
+    fn workers_get_the_run_additions_too() {
+        let api = SlackApi::new(
+            super::super::api::BotToken::new("xoxb-bot".to_owned()).unwrap(),
+            super::super::api::AppToken::new("xapp-app".to_owned()).unwrap(),
+        );
+        let mut orchestrated = config();
+        let mut orchestration: aura_config::OrchestrationConfig =
+            serde_json::from_value(serde_json::json!({"enabled": true})).unwrap();
+        let worker: aura_config::WorkerConfig = serde_json::from_value(serde_json::json!({
+            "description": "searches",
+            "preamble": "You search.",
+            "mcp_filter": []
+        }))
+        .unwrap();
+        orchestration.workers.insert("finder".to_owned(), worker);
+        orchestrated.orchestration = Some(orchestration);
+
+        let (with, _) = run_setup(&orchestrated, &api, &inbound(Some("tok")));
+        let orchestration = with.orchestration.unwrap();
+        let preamble = &orchestration.workers["finder"].preamble;
+        assert!(preamble.starts_with("You search."));
+        assert!(preamble.contains("<#C1>"));
+        assert!(preamble.ends_with(search::CITATION_PROMPT));
+        let unnamed = orchestration.worker_system_prompt.unwrap();
+        assert!(unnamed.contains("<#C1>"));
+        assert!(unnamed.ends_with(search::CITATION_PROMPT));
+
+        let (plain, _) = run_setup(&orchestrated, &api, &inbound(None));
+        let preamble = &plain.orchestration.unwrap().workers["finder"].preamble;
+        assert!(preamble.contains("<#C1>"));
+        assert!(!preamble.contains("slack_search"));
+    }
+
+    #[test]
+    fn run_context_names_the_place_and_the_sender() {
+        let mut channel = inbound(None);
+        assert!(run_context(&channel).contains("the Slack channel <#C1>, sent by <@U1>"));
+        channel.thread_ts = Some("0.5".to_owned());
+        assert!(run_context(&channel).contains("a thread in the Slack channel <#C1>"));
+        let mut dm = inbound(None);
+        dm.is_dm = true;
+        dm.channel = "D1".to_owned();
+        let text = run_context(&dm);
+        assert!(text.contains("a direct message to you, sent by <@U1>"));
+        assert!(text.contains("<#D1>"));
     }
 }

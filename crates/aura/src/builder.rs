@@ -1788,6 +1788,28 @@ pub async fn build_streaming_agent(
     config: &crate::config::AgentRuntimeConfig,
     client_tools: Option<Vec<ClientTool>>,
 ) -> Result<Arc<dyn StreamingAgent>, Box<dyn std::error::Error + Send + Sync>> {
+    build_streaming_agent_with_tools(config, client_tools, no_run_tools()).await
+}
+
+/// Builds the rig tools that exist for one run.
+pub type RunToolFactory = Arc<dyn Fn() -> Vec<Box<dyn rig::tool::ToolDyn>> + Send + Sync>;
+
+/// A factory that yields no tools.
+pub fn no_run_tools() -> RunToolFactory {
+    Arc::new(Vec::new)
+}
+
+/// [`build_streaming_agent`] plus `run_tools`, the rig tools the agent
+/// executes itself that exist for this one run. A boxed tool cannot be
+/// cloned, so they come from a factory: in single-agent mode it is called
+/// once and its tools join the agent's; in orchestration mode it is called
+/// once per worker and every worker gets its own instances, while the
+/// coordinator, whose tool set is routing only, gets none.
+pub async fn build_streaming_agent_with_tools(
+    config: &crate::config::AgentRuntimeConfig,
+    client_tools: Option<Vec<ClientTool>>,
+    run_tools: RunToolFactory,
+) -> Result<Arc<dyn StreamingAgent>, Box<dyn std::error::Error + Send + Sync>> {
     use crate::orchestration::OrchestratorFactory;
 
     if config.orchestration_enabled() {
@@ -1799,7 +1821,7 @@ pub async fn build_streaming_agent(
                  will be ignored. Use a non-orchestrated agent config to enable them."
             );
         }
-        let factory = OrchestratorFactory::new(config.clone());
+        let factory = OrchestratorFactory::new(config.clone()).with_run_tools(run_tools);
         Ok(Arc::new(factory))
     } else {
         // Standard single-agent mode: gate client tools on the agent's TOML opt-in
@@ -1821,7 +1843,7 @@ pub async fn build_streaming_agent(
         } else {
             None
         };
-        let agent = Agent::new(config, vec![], attached).await?;
+        let agent = Agent::new(config, run_tools(), attached).await?;
         Ok(Arc::new(agent))
     }
 }

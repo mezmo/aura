@@ -462,6 +462,8 @@ pub struct Orchestrator {
 
     /// Run-scoped park guard (park mode).
     park_guard: Option<Arc<ParkGuard>>,
+
+    pub(super) run_tools: crate::builder::RunToolFactory,
 }
 
 /// The task and worker a stream's reasoning is attributed to.
@@ -652,7 +654,33 @@ impl Orchestrator {
             usage_state: crate::UsageState::new(),
             outer_budget: None,
             park_guard,
+            run_tools: crate::builder::no_run_tools(),
         })
+    }
+
+    /// The tools a worker executes itself beside its MCP tools: `wait_for`
+    /// when an MCP manager exists, plus fresh instances of the run's own
+    /// tools. Called once per worker built.
+    fn worker_own_tools(&self) -> Vec<Box<dyn rig::tool::ToolDyn>> {
+        let mut tools: Vec<Box<dyn rig::tool::ToolDyn>> = self
+            .mcp_manager
+            .as_ref()
+            .map(|mcp| {
+                vec![
+                    Box::new(super::tools::wait_for::WaitForTool::new(Arc::clone(mcp)))
+                        as Box<dyn rig::tool::ToolDyn>,
+                ]
+            })
+            .unwrap_or_default();
+        tools.extend((self.run_tools)());
+        tools
+    }
+
+    /// The names of the run's own tools, as the planner lists them under
+    /// every worker: the planner sees names only, so it costs one throwaway
+    /// build of the tools.
+    fn run_tool_names(&self) -> Vec<String> {
+        (self.run_tools)().iter().map(|tool| tool.name()).collect()
     }
 
     /// Create a worker agent for task execution.
@@ -2262,7 +2290,7 @@ Each worker has specialized capabilities. Assign tasks to the most appropriate w
             r#"
 
 AVAILABLE WORKERS:
-NOTE: Worker names below are role assignments, not callable tool names. Only the tools listed under each worker are MCP tools that workers can execute.
+NOTE: Worker names below are role assignments, not callable tool names. Only the tools listed under each worker are tools that worker can execute.
 
 {}
 
@@ -2317,7 +2345,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             r#"
 
 AVAILABLE WORKERS:
-NOTE: Worker names below are role assignments, not callable tool names. Only the tools listed under each worker are MCP tools that workers can execute.
+NOTE: Worker names below are role assignments, not callable tool names. Only the tools listed under each worker are tools that worker can execute.
 
 {}
 
@@ -2357,14 +2385,17 @@ Assign tasks to the worker whose tools best match the required operations."#,
     ///
     /// Returns an empty Vec if no MCP manager is present.
     fn get_all_tool_names(&self) -> Vec<String> {
-        let Some(ref mcp_manager) = self.mcp_manager else {
-            return Vec::new();
-        };
-
-        let mut names: Vec<String> = mcp_manager
-            .tool_definitions_iter()
-            .map(|tool| tool.name().to_string())
-            .collect();
+        let mut names: Vec<String> = self
+            .mcp_manager
+            .as_ref()
+            .map(|mcp_manager| {
+                mcp_manager
+                    .tool_definitions_iter()
+                    .map(|tool| tool.name().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.extend(self.run_tool_names());
 
         // Remove duplicates while preserving order
         let mut seen = std::collections::HashSet::new();
@@ -2373,21 +2404,27 @@ Assign tasks to the worker whose tools best match the required operations."#,
         names
     }
 
-    /// Get tool schemas for inspect_tool_params.
-    ///
-    /// Returns a map of tool name -> input_schema JSON value.
-    /// Used by the `inspect_tool_params` reconnaissance tool.
-    ///
-    /// Returns an empty HashMap if no MCP manager is present.
-    fn get_all_tool_schemas(&self) -> std::collections::HashMap<String, serde_json::Value> {
-        let Some(ref mcp_manager) = self.mcp_manager else {
-            return std::collections::HashMap::new();
-        };
-
-        mcp_manager
-            .tool_definitions_iter()
-            .map(|tool| (tool.name().to_string(), tool.input_schema()))
-            .collect()
+    /// Every tool's parameter schema by name, for the coordinator's
+    /// `inspect_tool_params`: the MCP tools' schemas when a manager exists,
+    /// plus the run's own tools' definitions, which are built once and
+    /// asked for their definition since a `ToolDyn` yields it
+    /// asynchronously.
+    async fn get_all_tool_schemas(&self) -> std::collections::HashMap<String, serde_json::Value> {
+        let mut schemas: std::collections::HashMap<String, serde_json::Value> = self
+            .mcp_manager
+            .as_ref()
+            .map(|mcp_manager| {
+                mcp_manager
+                    .tool_definitions_iter()
+                    .map(|tool| (tool.name().to_string(), tool.input_schema()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for tool in (self.run_tools)() {
+            let definition = tool.definition(String::new()).await;
+            schemas.insert(definition.name, definition.parameters);
+        }
+        schemas
     }
 
     /// Resolve which tools each worker can access based on their mcp_filter.
@@ -2413,6 +2450,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             .map(|m| m.all_tools())
             .unwrap_or_default();
         let mut worker_tools = std::collections::HashMap::new();
+        let run_tool_names = self.run_tool_names();
 
         for (worker_name, worker_config) in &self.config.workers {
             // Omitted filter = every MCP tool (backwards compatibility);
@@ -2433,6 +2471,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
             for store_name in &worker_config.vector_stores {
                 matching_tools.push(format!("vector_search_{}", store_name));
             }
+            // The run's own tools reach every worker, filter or not.
+            matching_tools.extend(run_tool_names.iter().cloned());
 
             worker_tools.insert(worker_name.clone(), matching_tools);
         }
@@ -2548,7 +2588,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
         // Capture tool information for reconnaissance tools
         let tool_names = self.get_all_tool_names();
-        let tool_schemas = self.get_all_tool_schemas();
+        let tool_schemas = self.get_all_tool_schemas().await;
 
         // Create reconnaissance tools
         let list_tool = ListToolsTool::new(tool_names);
@@ -2929,17 +2969,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         let shared_mcp: Option<Arc<McpManager>> = self.mcp_manager.clone();
 
         // Box<dyn ToolDyn> is not Clone, so each provider arm constructs its own instance.
-        let wait_for_tools = || -> Vec<Box<dyn rig::tool::ToolDyn>> {
-            shared_mcp
-                .as_ref()
-                .map(|mcp| {
-                    vec![
-                        Box::new(super::tools::wait_for::WaitForTool::new(Arc::clone(mcp)))
-                            as Box<dyn rig::tool::ToolDyn>,
-                    ]
-                })
-                .unwrap_or_default()
-        };
+        let wait_for_tools = || self.worker_own_tools();
 
         // Test-only model injection (park/reify rig): a queued override builds
         // this worker from a scripted model. The override's extra tools go
@@ -7389,6 +7419,76 @@ mod tests {
 
     /// `park_enabled` requires the flag AND the conversational route — the
     /// webhook arm of park mode is out of V1 scope.
+    #[tokio::test]
+    async fn workers_get_fresh_instances_of_the_run_tools() {
+        use rig::tool::Tool as _;
+
+        #[derive(Debug, serde::Deserialize)]
+        struct NoArgs {}
+        struct Marker;
+        impl rig::tool::Tool for Marker {
+            const NAME: &'static str = "run_marker";
+            type Error = std::convert::Infallible;
+            type Args = NoArgs;
+            type Output = String;
+            async fn definition(&self, _p: String) -> rig::completion::ToolDefinition {
+                rig::completion::ToolDefinition {
+                    name: Self::NAME.to_owned(),
+                    description: String::new(),
+                    parameters: serde_json::json!({"type": "object"}),
+                }
+            }
+            async fn call(&self, _a: Self::Args) -> Result<Self::Output, Self::Error> {
+                Ok(String::new())
+            }
+        }
+
+        let mut orchestrator = Orchestrator::new(AgentRuntimeConfig::default())
+            .await
+            .unwrap();
+        assert!(orchestrator.worker_own_tools().is_empty());
+
+        let built = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&built);
+        orchestrator.run_tools = Arc::new(move || {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            vec![Box::new(Marker) as Box<dyn rig::tool::ToolDyn>]
+        });
+        let first = orchestrator.worker_own_tools();
+        let second = orchestrator.worker_own_tools();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].name(), Marker::NAME);
+        assert_eq!(second[0].name(), Marker::NAME);
+        assert_eq!(built.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        // The planner's inventory lists them under a worker that has no MCP
+        // tools at all, and the recon tool's name list carries them too.
+        let worker: aura_config::WorkerConfig = serde_json::from_value(serde_json::json!({
+            "description": "searches",
+            "preamble": "You search.",
+            "mcp_filter": []
+        }))
+        .unwrap();
+        orchestrator
+            .config
+            .workers
+            .insert("finder".to_owned(), worker);
+        let inventory = orchestrator.resolve_worker_tools();
+        assert_eq!(inventory["finder"], vec![Marker::NAME.to_owned()]);
+        assert!(
+            orchestrator
+                .get_all_tool_names()
+                .contains(&Marker::NAME.to_owned())
+        );
+        let schemas = orchestrator.get_all_tool_schemas().await;
+        assert_eq!(schemas[Marker::NAME], serde_json::json!({"type": "object"}));
+        assert!(
+            orchestrator
+                .build_workers_section_with_tools()
+                .contains("Tools: run_marker")
+        );
+    }
+
     #[tokio::test]
     async fn park_enabled_requires_flag_and_conversational_route() {
         fn config(park_enabled: bool, conversational: bool) -> AgentRuntimeConfig {

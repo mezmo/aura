@@ -1,5 +1,6 @@
 //! Socket Mode frames and the Slack events the ingress answers.
 
+use super::api::ActionToken;
 use serde::Deserialize;
 use std::collections::{HashSet, VecDeque};
 
@@ -33,7 +34,7 @@ pub enum Frame {
     /// Anything Slack expects an acknowledgement for.
     Envelope {
         envelope_id: String,
-        event: Option<EventCallback>,
+        event: Option<Box<EventCallback>>,
     },
     Other(String),
 }
@@ -70,7 +71,8 @@ pub fn parse_frame(text: &str) -> Result<Frame, serde_json::Error> {
                 .unwrap_or_else(|e| {
                     tracing::warn!(envelope_id, error = %e, "undecodable slack event payload");
                     None
-                });
+                })
+                .map(Box::new);
             Frame::Envelope { envelope_id, event }
         }
         (_, Some(envelope_id)) => Frame::Envelope {
@@ -112,6 +114,17 @@ pub struct MessageEvent {
     pub bot_id: Option<String>,
     #[serde(default)]
     pub channel_type: Option<String>,
+    #[serde(default)]
+    pub action_token: Option<ActionToken>,
+    #[serde(default)]
+    pub assistant_thread: Option<AssistantThread>,
+}
+
+/// A message event's `assistant_thread` object.
+#[derive(Debug, Deserialize)]
+pub struct AssistantThread {
+    #[serde(default)]
+    pub action_token: Option<ActionToken>,
 }
 
 /// A message the agent answers.
@@ -126,6 +139,7 @@ pub struct Inbound {
     pub is_dm: bool,
     /// A thread reply in a channel that did not mention the bot.
     pub unaddressed_reply: bool,
+    pub action_token: Option<ActionToken>,
 }
 
 impl Inbound {
@@ -181,6 +195,11 @@ pub fn accept(event: Event, self_user_id: &str) -> Option<Inbound> {
     if text.is_empty() && !is_dm {
         return None;
     }
+    // Slack's own handlers read the token at the top of the event; older
+    // payloads nest it under `assistant_thread`.
+    let action_token = message
+        .action_token
+        .or_else(|| message.assistant_thread.and_then(|t| t.action_token));
     Some(Inbound {
         channel: message.channel,
         ts: message.ts,
@@ -189,6 +208,7 @@ pub fn accept(event: Event, self_user_id: &str) -> Option<Inbound> {
         text,
         is_dm,
         unaddressed_reply,
+        action_token,
     })
 }
 
@@ -273,6 +293,8 @@ mod tests {
             subtype: None,
             bot_id: None,
             channel_type: None,
+            action_token: None,
+            assistant_thread: None,
         })
     }
 
@@ -286,6 +308,8 @@ mod tests {
             subtype: subtype.map(str::to_owned),
             bot_id: bot_id.map(str::to_owned),
             channel_type: Some("im".to_owned()),
+            action_token: None,
+            assistant_thread: None,
         })
     }
 
@@ -325,7 +349,7 @@ mod tests {
                 assert_eq!(envelope_id, "env-1");
                 let Some(EventCallback {
                     event: Event::AppMention(m),
-                }) = event
+                }) = event.map(|cb| *cb)
                 else {
                     panic!("not a mention");
                 };
@@ -399,6 +423,8 @@ mod tests {
             subtype: None,
             bot_id: None,
             channel_type: Some(channel_type.to_owned()),
+            action_token: None,
+            assistant_thread: None,
         })
     }
 
@@ -494,5 +520,54 @@ mod tests {
         assert!(seen.insert("C1", "2"));
         assert!(seen.insert("C1", "3"));
         assert!(seen.insert("C1", "1"), "oldest entry was evicted");
+    }
+
+    fn event_json(kind: &str, extra: &str) -> String {
+        format!(
+            r#"{{"type": "event_callback", "event": {{"type": "{kind}", "user": "U1",
+                "text": "<@UBOT> where did we discuss gizmo", "ts": "1.0", "channel": "D1",
+                "channel_type": "im"{extra}}}}}"#
+        )
+    }
+
+    fn accepted(json: &str) -> Inbound {
+        let callback: EventCallback = serde_json::from_str(json).unwrap();
+        accept(callback.event, SELF).unwrap()
+    }
+
+    #[test]
+    fn action_token_rides_along_from_either_shape_on_both_kinds() {
+        for kind in ["app_mention", "message"] {
+            let top = accepted(&event_json(kind, r#", "action_token": "12345.98765.abcd""#));
+            assert_eq!(
+                top.action_token,
+                Some(ActionToken::new("12345.98765.abcd".to_owned())),
+                "{kind}"
+            );
+            let nested = accepted(&event_json(
+                kind,
+                r#", "assistant_thread": {"action_token": "nested.token"}"#,
+            ));
+            assert_eq!(
+                nested.action_token,
+                Some(ActionToken::new("nested.token".to_owned())),
+                "{kind}"
+            );
+            let both = accepted(&event_json(
+                kind,
+                r#", "action_token": "top", "assistant_thread": {"action_token": "nested"}"#,
+            ));
+            assert_eq!(both.action_token, Some(ActionToken::new("top".to_owned())));
+            assert_eq!(accepted(&event_json(kind, "")).action_token, None, "{kind}");
+        }
+    }
+
+    #[test]
+    fn inbound_debug_never_shows_the_action_token() {
+        let inbound = accepted(&event_json(
+            "message",
+            r#", "action_token": "secret-token""#,
+        ));
+        assert!(!format!("{inbound:?}").contains("secret"));
     }
 }

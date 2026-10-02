@@ -13,6 +13,9 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Hard stop on `conversations.replies` pagination for one thread.
 const MAX_REPLY_PAGES: usize = 50;
 
+/// The most hits `assistant.search.context` returns per page.
+pub const MAX_SEARCH_HITS: usize = 20;
+
 #[derive(Debug, thiserror::Error)]
 pub enum TokenError {
     #[error("slack {kind} token must start with `{prefix}`")]
@@ -68,6 +71,23 @@ impl fmt::Debug for AppToken {
     }
 }
 
+/// A Slack per-message action token.
+#[derive(Clone, PartialEq, Eq, Deserialize)]
+#[serde(transparent)]
+pub struct ActionToken(String);
+
+impl ActionToken {
+    pub fn new(raw: String) -> Self {
+        Self(raw)
+    }
+}
+
+impl fmt::Debug for ActionToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ActionToken(***)")
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SlackApiError {
     #[error("{method}: {source}")]
@@ -108,6 +128,47 @@ pub struct SlackMessage {
     pub text: String,
     #[serde(default)]
     pub subtype: Option<String>,
+}
+
+/// One message hit as `assistant.search.context` returns it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SearchHit {
+    pub channel_id: String,
+    #[serde(default)]
+    pub channel_name: Option<String>,
+    #[serde(default)]
+    pub author_name: Option<String>,
+    #[serde(default)]
+    pub author_user_id: Option<String>,
+    #[serde(default)]
+    pub is_author_bot: bool,
+    pub message_ts: String,
+    #[serde(default)]
+    pub thread_ts: Option<String>,
+    #[serde(default)]
+    pub content: String,
+    pub permalink: String,
+}
+
+/// One page of search hits plus the cursor for the next page.
+#[derive(Debug, Clone)]
+pub struct SearchPage {
+    pub messages: Vec<SearchHit>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SearchResponse {
+    #[serde(default)]
+    results: SearchResults,
+    #[serde(default)]
+    response_metadata: Option<ResponseMetadata>,
+}
+
+#[derive(Default, Deserialize)]
+struct SearchResults {
+    #[serde(default)]
+    messages: Vec<SearchHit>,
 }
 
 #[derive(Debug, Clone)]
@@ -276,6 +337,42 @@ impl SlackApi {
             Err(SlackApiError::Api { error, .. }) if error == "already_reacted" => Ok(()),
             Err(e) => Err(e),
         }
+    }
+
+    /// One page of messages matching `query`, searched as the person whose
+    /// message carried `action_token`: Slack applies that person's
+    /// visibility and narrows further to where the message was sent. Only
+    /// public channels are requested, since a bot token cannot hold the
+    /// private, DM, or group-DM search scopes. `limit` is clamped to
+    /// `1..=MAX_SEARCH_HITS`; `cursor` continues an earlier page. Every
+    /// page counts against Slack's per-person search rate limit.
+    pub async fn assistant_search_context(
+        &self,
+        action_token: &ActionToken,
+        query: &str,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<SearchPage, SlackApiError> {
+        let mut params = vec![
+            ("query", query.to_owned()),
+            ("action_token", action_token.0.clone()),
+            ("channel_types", "public_channel".to_owned()),
+            ("content_types", "messages".to_owned()),
+            ("limit", limit.clamp(1, MAX_SEARCH_HITS).to_string()),
+        ];
+        if let Some(cursor) = cursor.filter(|c| !c.is_empty()) {
+            params.push(("cursor", cursor.to_owned()));
+        }
+        let page: SearchResponse = self
+            .call("assistant.search.context", &self.bot_token.0, &params)
+            .await?;
+        Ok(SearchPage {
+            messages: page.results.messages,
+            next_cursor: page
+                .response_metadata
+                .map(|m| m.next_cursor)
+                .filter(|c| !c.is_empty()),
+        })
     }
 
     /// One form-encoded POST. Slack signals failure inside a 200 body as
@@ -515,5 +612,119 @@ mod tests {
             .add_reaction("C1", "1.0", "eyes")
             .await
             .unwrap();
+    }
+
+    #[test]
+    fn action_token_debug_is_redacted() {
+        let token = ActionToken::new("12345.98765.secret".to_owned());
+        assert!(!format!("{token:?}").contains("secret"));
+    }
+
+    #[tokio::test]
+    async fn search_sends_the_asker_token_and_decodes_hits() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/assistant.search.context"))
+            .and(header("authorization", "Bearer xoxb-bot"))
+            .and(body_string_contains("query=project+gizmo"))
+            .and(body_string_contains("action_token=12345.98765.abcd"))
+            .and(body_string_contains("channel_types=public_channel"))
+            .and(body_string_contains("content_types=messages"))
+            .and(body_string_contains("limit=5"))
+            .and(body_string_contains("cursor=c2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "results": {
+                    "messages": [{
+                        "author_name": "Jennifer Hynes",
+                        "author_user_id": "U0123456",
+                        "team_id": "T0123456",
+                        "channel_id": "C0123456",
+                        "channel_name": "proj-gizmo",
+                        "message_ts": "123456.7890",
+                        "content": "Hey team, kicking off the revamp",
+                        "is_author_bot": false,
+                        "permalink": "https://x.slack.com/archives/C0123456/p1234567890",
+                        "blocks": [{"type": "rich_text"}]
+                    }, {
+                        "channel_id": "C0123456",
+                        "message_ts": "123457.0001",
+                        "thread_ts": "123456.7890",
+                        "permalink": "https://x.slack.com/archives/C0123456/p1234570001",
+                        "is_author_bot": true
+                    }]
+                },
+                "response_metadata": {"next_cursor": "c3"}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let token = ActionToken::new("12345.98765.abcd".to_owned());
+        let page = api(&server)
+            .assistant_search_context(&token, "project gizmo", 5, Some("c2"))
+            .await
+            .unwrap();
+        assert_eq!(page.next_cursor.as_deref(), Some("c3"));
+        assert_eq!(page.messages.len(), 2);
+        let first = &page.messages[0];
+        assert_eq!(first.channel_name.as_deref(), Some("proj-gizmo"));
+        assert_eq!(first.author_name.as_deref(), Some("Jennifer Hynes"));
+        assert!(!first.is_author_bot);
+        let second = &page.messages[1];
+        assert!(second.is_author_bot);
+        assert_eq!(second.thread_ts.as_deref(), Some("123456.7890"));
+        assert_eq!(second.content, "");
+    }
+
+    #[tokio::test]
+    async fn search_clamps_limit_and_omits_empty_cursor() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/assistant.search.context"))
+            .and(body_string_contains("limit=20"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "results": {"messages": []},
+                "response_metadata": {"next_cursor": ""}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let token = ActionToken::new("t".to_owned());
+        let page = api(&server)
+            .assistant_search_context(&token, "q", 500, Some(""))
+            .await
+            .unwrap();
+        assert!(page.messages.is_empty());
+        assert_eq!(page.next_cursor, None);
+        let sent = &server.received_requests().await.unwrap()[0];
+        assert!(!String::from_utf8_lossy(&sent.body).contains("cursor="));
+    }
+
+    #[tokio::test]
+    async fn search_surfaces_slack_errors() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/assistant.search.context"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"ok": false, "error": "invalid_action_token"}),
+                ),
+            )
+            .mount(&server)
+            .await;
+
+        let token = ActionToken::new("stale".to_owned());
+        let err = api(&server)
+            .assistant_search_context(&token, "q", 10, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, SlackApiError::Api { method: "assistant.search.context", ref error } if error == "invalid_action_token"),
+            "{err}"
+        );
+        assert!(!err.to_string().contains("stale"));
     }
 }
