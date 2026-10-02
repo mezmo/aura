@@ -485,6 +485,17 @@ pub struct AgentInfo {
     /// Configured MCP servers keyed by name — the config view, no connection state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_servers: Option<BTreeMap<String, McpServerOverview>>,
+    /// Tools the server itself executes for the agent, beside its MCP tools.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<NativeToolOverview>,
+}
+
+/// One tool the server itself executes for an agent.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NativeToolOverview {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 /// Response body for `GET /aura/info`.

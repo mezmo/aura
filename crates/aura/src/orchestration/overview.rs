@@ -27,6 +27,7 @@ pub fn agent_info(config: &Config) -> AgentInfo {
                 })
                 .unwrap_or_default(),
         ),
+        tools: Vec::new(),
     }
 }
 
@@ -525,6 +526,7 @@ api_key = "k"
             description: None,
             model: "gpt-4o".to_string(),
             workers: Vec::new(),
+            tools: Vec::new(),
             mcp_servers: Some(BTreeMap::from([
                 (
                     "with-tools".to_string(),
