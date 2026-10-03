@@ -492,6 +492,23 @@ pipeline {
                   returnStdout: true
                 ).trim()
               }
+
+              // Clearing the version skips every stage below. Exit 10 is the
+              // stale verdict; anything else non-zero means the check could
+              // not run and must not read as a release-worthy branch.
+              if (env.NEXT_RELEASE_VERSION && env.BRANCH_NAME != 'main') {
+                def baseline = sh(
+                  script: './scripts/check-release-baseline.sh',
+                  returnStatus: true
+                )
+                if (baseline == 10) {
+                  env.NEXT_RELEASE_VERSION = ''
+                  unstable("${env.BRANCH_NAME} is behind main's release tag; merge the sync pull request before releasing")
+                } else if (baseline != 0) {
+                  error("check-release-baseline.sh could not evaluate ${env.BRANCH_NAME} (exit ${baseline})")
+                }
+              }
+
               echo env.NEXT_RELEASE_VERSION ? "Release version: ${env.NEXT_RELEASE_VERSION}" : 'No release version determined; skipping build'
             }
           }

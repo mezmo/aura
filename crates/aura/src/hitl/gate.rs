@@ -48,6 +48,8 @@ pub struct HitlApprovalWrapper {
     scope: AgentScope,
     /// Global request id, for SSE event routing.
     request_id: String,
+    /// The run whose observer sees this gate's approvals.
+    run: crate::run_context::BoundRun,
     /// `[agent].name` of the config that built this agent.
     agent_name: String,
     /// Instance ID of the AURA process that built this wrapper.
@@ -76,10 +78,36 @@ impl HitlApprovalWrapper {
             route,
             scope,
             request_id,
+            // A worker's gate is built inside its run; a single agent's is
+            // built before one exists and is bound by `stream`.
+            run: crate::run_context::BoundRun::captured(),
             agent_name,
             instance_id,
             park: None,
             recorded_decisions: None,
+        }
+    }
+
+    /// Names the run this gate's approvals belong to.
+    pub fn bind_run(&self, run: Arc<crate::run_context::RunContext>) {
+        self.run.bind(run);
+    }
+
+    fn run(&self) -> Option<Arc<crate::run_context::RunContext>> {
+        self.run.get()
+    }
+
+    /// Hands an approval to the run's observer, warning when there is no run to
+    /// hand it to — an approval nobody sees is a request that stalls unanswered.
+    async fn emit(&self, event: aura_events::agent::AgentEvent) {
+        match self.run() {
+            Some(run) => {
+                run.emit(event).await;
+            }
+            None => tracing::warn!(
+                request_id = %self.request_id,
+                "no run bound to this gate; its approval reaches no observer"
+            ),
         }
     }
 
@@ -114,13 +142,18 @@ impl HitlApprovalWrapper {
     /// approval tool itself ("request_approval" == RequestApprovalTool::NAME).
     /// Any match gates the call; the returned pattern is only the reported
     /// `origin.matched_pattern`, so pattern order has no effect on gating.
-    fn matched_pattern(&self, tool_name: &str) -> Option<&str> {
+    ///
+    /// Namespace-aware: a pattern containing `:` (e.g. `github:*`) scopes the
+    /// match to `tool_namespace`. `tool_namespace` is `None` for tools with
+    /// no known MCP server (e.g. filesystem or client-side tools), which only
+    /// patterns without `:` can match.
+    fn matched_pattern(&self, tool_name: &str, tool_namespace: Option<&str>) -> Option<&str> {
         if tool_name == "request_approval" {
             return None;
         }
         self.patterns
             .iter()
-            .find(|p| p.matches(tool_name))
+            .find(|p| p.matches(tool_namespace, tool_name))
             .map(|p| p.as_str())
     }
 
@@ -172,6 +205,7 @@ impl HitlApprovalWrapper {
             },
             items: vec![ApprovalItem {
                 tool_name: ctx.tool_name.clone(),
+                tool_namespace: ctx.tool_namespace.clone(),
                 arguments: args.clone(),
                 tool_call_intent: ctx.tool_call_intent.clone(),
             }],
@@ -213,21 +247,13 @@ impl HitlApprovalWrapper {
         // task returns still sweeps this ticket.
         park.guard.record(std::slice::from_ref(&call));
 
-        // The lifecycle pair goes to the live request's broker, not the owner id.
-        crate::approval_event_broker::publish(
-            &self.request_id,
-            crate::approval_event_broker::ApprovalLifecycleEvent::Requested(
-                (&parked.request).into(),
-            ),
-        )
-        .await;
-        crate::approval_event_broker::publish(
-            &self.request_id,
-            crate::approval_event_broker::ApprovalLifecycleEvent::Pending(super::events::pending(
-                &parked.request,
-                &parked.expires_at,
-            )),
-        )
+        // The lifecycle pair goes to the live request, not the owner id.
+        self.emit(super::events::requested_event(&parked.request))
+            .await;
+        self.emit(super::events::pending_event(
+            &parked.request,
+            &parked.expires_at,
+        ))
         .await;
 
         park.cell.push(call);
@@ -250,7 +276,8 @@ impl ToolWrapper for HitlApprovalWrapper {
         args: &Value,
         ctx: &ToolCallContext,
     ) -> Result<PreCallOutcome, ToolError> {
-        let Some(matched) = self.matched_pattern(&ctx.tool_name) else {
+        let Some(matched) = self.matched_pattern(&ctx.tool_name, ctx.tool_namespace.as_deref())
+        else {
             return Ok(PreCallOutcome::Proceed { overrides: None });
         };
         // Recorded-decisions consult: a resumed worker's gated call may
@@ -304,14 +331,27 @@ impl ToolWrapper for HitlApprovalWrapper {
             },
             items: vec![ApprovalItem {
                 tool_name: ctx.tool_name.clone(),
+                tool_namespace: ctx.tool_namespace.clone(),
                 arguments: args.clone(),
                 tool_call_intent: ctx.tool_call_intent.clone(),
             }],
         };
-        let cancel =
-            crate::request_cancellation::RequestCancellation::token_for_id(&self.request_id)
-                .unwrap_or_else(crate::request_cancellation::RequestCancelToken::unbound);
-        approval_result_to_pre_call(self.route.decide_for_gate(request, &cancel).await)
+        let cancel = self
+            .run()
+            .map(|run| {
+                crate::request_cancellation::RequestCancelToken::from(run.cancel_token().clone())
+            })
+            .unwrap_or_else(crate::request_cancellation::RequestCancelToken::unbound);
+        // `DecisionRoute` emits the lifecycle itself; the scope is how those
+        // events find the run, since rig calls this off it.
+        let decision = match self.run() {
+            Some(run) => {
+                crate::run_context::with_run(run, self.route.decide_for_gate(request, &cancel))
+                    .await
+            }
+            None => self.route.decide_for_gate(request, &cancel).await,
+        };
+        approval_result_to_pre_call(decision)
     }
 }
 
@@ -352,7 +392,7 @@ mod tests {
     #[test]
     fn matched_pattern_selects_first_matching_glob_and_excludes_approval_tool() {
         let wrapper = HitlApprovalWrapper::new(
-            Arc::from([GlobPattern::new("kubectl_*").unwrap()]),
+            Arc::from(["kubectl_*".into()]),
             Arc::new(DecisionRoute::Webhook {
                 client: WebhookClient::new(
                     build_webhook_client(),
@@ -365,9 +405,45 @@ mod tests {
             "test-agent".to_string(),
             "test-instance-id".to_string(),
         );
-        assert_eq!(wrapper.matched_pattern("kubectl_apply"), Some("kubectl_*"));
-        assert_eq!(wrapper.matched_pattern("request_approval"), None);
-        assert_eq!(wrapper.matched_pattern("ls"), None);
+        assert_eq!(
+            wrapper.matched_pattern("kubectl_apply", None),
+            Some("kubectl_*")
+        );
+        assert_eq!(wrapper.matched_pattern("request_approval", None), None);
+        assert_eq!(wrapper.matched_pattern("ls", None), None);
+    }
+
+    #[test]
+    fn matched_pattern_is_namespace_aware() {
+        let wrapper = HitlApprovalWrapper::new(
+            Arc::from(["github:*".into()]),
+            Arc::new(DecisionRoute::Webhook {
+                client: WebhookClient::new(
+                    build_webhook_client(),
+                    WebhookUrl::new("http://localhost:9").unwrap(),
+                ),
+                timeout: Duration::from_secs(1),
+            }),
+            AgentScope::Single { session_id: None },
+            "t".into(),
+            "test-agent".to_string(),
+            "test-instance-id".to_string(),
+        );
+        assert_eq!(
+            wrapper.matched_pattern("list_repos", Some("github")),
+            Some("github:*"),
+            "a namespace-scoped pattern must match a bare tool name paired with its namespace",
+        );
+        assert_eq!(
+            wrapper.matched_pattern("list_repos", Some("gitlab")),
+            None,
+            "the namespace half of the pattern must still be enforced",
+        );
+        assert_eq!(
+            wrapper.matched_pattern("list_repos", None),
+            None,
+            "a namespace-scoped pattern must not match a tool with no known namespace",
+        );
     }
 
     /// A matching tool whose approval channel is unreachable must fail closed
@@ -377,7 +453,7 @@ mod tests {
     #[tokio::test]
     async fn matching_tool_fails_closed_when_webhook_unreachable() {
         let wrapper = HitlApprovalWrapper::new(
-            Arc::from([GlobPattern::new("kubectl_*").unwrap()]),
+            Arc::from(["kubectl_*".into()]),
             Arc::new(DecisionRoute::Webhook {
                 client: WebhookClient::new(
                     build_webhook_client(),
@@ -487,7 +563,7 @@ mod tests {
             cell: &Arc<crate::orchestration::BlockedCell>,
         ) -> HitlApprovalWrapper {
             HitlApprovalWrapper::new(
-                Arc::from([GlobPattern::new("kubectl_*").unwrap()]),
+                Arc::from(["kubectl_*".into()]),
                 route.clone(),
                 worker_scope(),
                 request_id.to_string(),
@@ -500,7 +576,6 @@ mod tests {
                 ParkGuard::new(
                     registry.clone(),
                     "0191e8c0-1111-7000-8000-000000000042".to_string(),
-                    request_id.to_string(),
                 ),
             )
         }
@@ -508,7 +583,6 @@ mod tests {
         #[tokio::test]
         async fn register_error_fails_closed_with_no_cell_entry_and_no_event() {
             let request_id = format!("req_park_fail_{}", uuid::Uuid::new_v4().simple());
-            let mut events = crate::approval_event_broker::subscribe(&request_id).await;
             let store: Arc<dyn crate::session_store::ApprovalStore> =
                 Arc::new(crate::session_store::FaultInjectingStore::failing_register());
             let registry = PendingApprovals::with_backend(
@@ -521,7 +595,8 @@ mod tests {
 
             let args = serde_json::json!({ "namespace": "prod" });
             let ctx = ToolCallContext::new("kubectl_apply");
-            let result = gate.pre_call(&args, &ctx).await;
+            let (result, events) =
+                crate::run_context::observing(&request_id, gate.pre_call(&args, &ctx)).await;
 
             let err = result.expect_err("a register fault must fail the call closed");
             assert!(
@@ -537,19 +612,14 @@ mod tests {
                 "no cell entry may exist after a register fault"
             );
             assert!(
-                tokio::time::timeout(Duration::from_millis(50), events.recv())
-                    .await
-                    .is_err(),
-                "no approval event may be published after a register fault"
+                events.is_empty(),
+                "no approval event may reach the run after a register fault"
             );
-
-            crate::approval_event_broker::unsubscribe(&request_id).await;
         }
 
         #[tokio::test]
         async fn happy_path_registers_publishes_appends_and_short_circuits() {
             let request_id = format!("req_park_ok_{}", uuid::Uuid::new_v4().simple());
-            let mut events = crate::approval_event_broker::subscribe(&request_id).await;
             let store: Arc<dyn crate::session_store::ApprovalStore> =
                 Arc::new(crate::session_store::InMemoryApprovalStore::new());
             let registry = PendingApprovals::with_backend(
@@ -563,7 +633,9 @@ mod tests {
 
             let args = serde_json::json!({ "namespace": "prod" });
             let ctx = ToolCallContext::new("kubectl_apply");
-            let outcome = gate.pre_call(&args, &ctx).await.unwrap();
+            let (outcome, events) =
+                crate::run_context::observing(&request_id, gate.pre_call(&args, &ctx)).await;
+            let outcome = outcome.unwrap();
 
             assert_eq!(
                 outcome,
@@ -601,29 +673,24 @@ mod tests {
                 other => panic!("expected Blocked, got {other:?}"),
             }
 
-            // SSE: requested then pending, on the live request id.
-            match tokio::time::timeout(Duration::from_secs(1), events.recv()).await {
-                Ok(Some(crate::approval_event_broker::ApprovalLifecycleEvent::Requested(
-                    requested,
-                ))) => {
+            // The run sees requested then pending, in that order.
+            use aura_events::agent::AgentEventPayload as Payload;
+            match events.first().map(|e| &e.payload) {
+                Some(Payload::ApprovalRequested(requested)) => {
                     assert_eq!(requested.tool_name, "kubectl_apply");
                 }
-                other => panic!("expected Requested event, got {other:?}"),
+                other => panic!("expected Requested first, got {other:?}"),
             }
-            match tokio::time::timeout(Duration::from_secs(1), events.recv()).await {
-                Ok(Some(crate::approval_event_broker::ApprovalLifecycleEvent::Pending(
-                    pending,
-                ))) => {
+            match events.get(1).map(|e| &e.payload) {
+                Some(Payload::ApprovalPending(pending)) => {
                     assert_eq!(pending.tool_name, "kubectl_apply");
                     assert_eq!(pending.arguments, args);
                     let scope = serde_json::to_value(&pending.scope).unwrap();
                     assert_eq!(scope["kind"], "worker");
                     assert_eq!(scope["run_id"], "0191e8c0-1111-7000-8000-000000000042");
                 }
-                other => panic!("expected Pending event, got {other:?}"),
+                other => panic!("expected Pending second, got {other:?}"),
             }
-
-            crate::approval_event_broker::unsubscribe(&request_id).await;
         }
 
         #[tokio::test]
@@ -689,10 +756,9 @@ mod tests {
             let guard = ParkGuard::new(
                 registry.clone(),
                 "0191e8c0-1111-7000-8000-000000000042".to_string(),
-                "req-guard".to_string(),
             );
             let gate = HitlApprovalWrapper::new(
-                Arc::from([GlobPattern::new("kubectl_*").unwrap()]),
+                Arc::from(["kubectl_*".into()]),
                 route,
                 worker_scope(),
                 "req-guard".to_string(),
@@ -760,7 +826,7 @@ mod tests {
             route: Arc<DecisionRoute>,
         ) -> HitlApprovalWrapper {
             HitlApprovalWrapper::new(
-                Arc::from([GlobPattern::new("kubectl_*").unwrap()]),
+                Arc::from(["kubectl_*".into()]),
                 route,
                 AgentScope::Single { session_id: None },
                 "req-recorded".to_string(),
@@ -901,6 +967,73 @@ mod tests {
         }
     }
 
+    /// The gate awaits the run's own token, so stopping the run releases a call
+    /// waiting on a human. Sourcing the token from anywhere else — an unbound
+    /// stand-in, a registry the run never registered with — leaves the call
+    /// parked until its approval times out, with nobody left to answer it.
+    #[tokio::test]
+    async fn stopping_the_run_releases_a_call_waiting_on_approval() {
+        use crate::hitl::PendingApprovals;
+
+        let registry = PendingApprovals::new();
+        let route = Arc::new(DecisionRoute::Conversational {
+            registry,
+            // Long enough that only cancellation can end the wait.
+            timeout: Duration::from_secs(3_600),
+        });
+        let gate = Arc::new(HitlApprovalWrapper::new(
+            Arc::from(["kubectl_*".into()]),
+            route,
+            AgentScope::Single { session_id: None },
+            "req_run_cancel".into(),
+            "test-agent".to_string(),
+            "test-instance-id".to_string(),
+        ));
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (run, mut events) =
+            crate::run_context::RunContext::channel_on("req_run_cancel", cancel.clone());
+        gate.bind_run(run);
+
+        let gated = Arc::clone(&gate);
+        let call = tokio::spawn(async move {
+            let args = serde_json::json!({ "namespace": "prod" });
+            let ctx = ToolCallContext::new("kubectl_apply");
+            gated.pre_call(&args, &ctx).await
+        });
+
+        // The route registers the approval and raises it before parking on the
+        // decision, so the pending event arriving is what says the call is
+        // waiting rather than still on its way there.
+        for expected in ["requested", "pending"] {
+            let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
+                .await
+                .unwrap_or_else(|_| panic!("the gate raises {expected} before parking"))
+                .expect("the run's channel stays open");
+            let raised = matches!(
+                event.payload,
+                aura_events::agent::AgentEventPayload::ApprovalRequested(_)
+                    | aura_events::agent::AgentEventPayload::ApprovalPending(_)
+            );
+            assert!(
+                raised,
+                "expected an approval event, got {:?}",
+                event.payload
+            );
+        }
+        cancel.cancel();
+
+        let err = tokio::time::timeout(Duration::from_secs(5), call)
+            .await
+            .expect("stopping the run must release the call, not leave it parked")
+            .expect("the call task did not panic")
+            .expect_err("a cancelled approval fails the call closed");
+        assert!(
+            err.to_string().contains("approval cancelled"),
+            "the failure must name the cancellation, got: {err}"
+        );
+    }
+
     #[test]
     fn approval_result_mapping_timeout_cancel_and_channel_fault_are_errors() {
         let timed_out = approval_result_to_pre_call(Ok(GateDecision::TimedOut {
@@ -954,10 +1087,10 @@ mod tests {
         use super::super::super::decision::ApprovalDecision;
         use super::super::super::registry::PendingApprovals;
         use super::*;
-        use crate::approval_event_broker::{self, ApprovalLifecycleEvent};
         use crate::logging::ATTR_DECISION_ID;
         use crate::test_span_capture::{CapturedSpans, traced_as_execute_tool};
         use crate::tool_wrapper::WrappedTool;
+        use aura_events::agent::{AgentEvent, AgentEventPayload};
 
         /// What a trace backend actually receives, assembled the way the binary
         /// assembles it: the real OTel filter, the OpenInference exporter, and
@@ -984,9 +1117,8 @@ mod tests {
             );
 
             let request_id = unique_request_id();
-            let mut events = approval_event_broker::subscribe(&request_id).await;
             let registry = PendingApprovals::new();
-            let (tool, ran) = gated_tool(
+            let (tool, ran, mut events) = gated_tool(
                 DecisionRoute::Conversational {
                     registry: registry.clone(),
                     timeout: Duration::from_secs(60),
@@ -1041,8 +1173,6 @@ mod tests {
                     .as_deref(),
                 Some("TOOL"),
             );
-
-            approval_event_broker::unsubscribe(&request_id).await;
         }
 
         /// Inner tool that records whether the gate let it run.
@@ -1079,35 +1209,46 @@ mod tests {
 
         /// A tool behind the `kubectl_*` gate, wrapped the way production wraps
         /// it, plus the flag that reports whether the inner tool ran.
+        /// The gate is bound to a run rather than left to find one, because
+        /// rig calls a gated tool from its server task — which these tests
+        /// reproduce by spawning — and no scope crosses that.
         fn gated_tool(
             route: DecisionRoute,
             request_id: &str,
             tool_name: &str,
-        ) -> (WrappedTool<StubTool>, Arc<AtomicBool>) {
+        ) -> (WrappedTool<StubTool>, Arc<AtomicBool>, Receiver<AgentEvent>) {
             let ran = Arc::new(AtomicBool::new(false));
             let inner = StubTool {
                 name: tool_name.to_string(),
                 ran: ran.clone(),
             };
             let gate = HitlApprovalWrapper::new(
-                Arc::from([GlobPattern::new("kubectl_*").unwrap()]),
+                Arc::from(["kubectl_*".into()]),
                 Arc::new(route),
                 AgentScope::Single { session_id: None },
                 request_id.to_string(),
                 "test-agent".to_string(),
                 "test-instance-id".to_string(),
             );
+            let (run, events) = crate::run_context::RunContext::channel(request_id);
+            gate.bind_run(run);
             (
                 WrappedTool::new(inner, Arc::new(gate) as Arc<dyn ToolWrapper>),
                 ran,
+                events,
             )
         }
 
         /// The decision id the approval payload carried, read off the
         /// `Requested` lifecycle event the route publishes for it.
-        async fn payload_decision_id(events: &mut Receiver<ApprovalLifecycleEvent>) -> DecisionId {
-            match events.recv().await.expect("approval events channel open") {
-                ApprovalLifecycleEvent::Requested(event) => {
+        async fn payload_decision_id(events: &mut Receiver<AgentEvent>) -> DecisionId {
+            match events
+                .recv()
+                .await
+                .expect("the run's events channel open")
+                .payload
+            {
+                AgentEventPayload::ApprovalRequested(event) => {
                     DecisionId::parse(&event.decision_id).expect("valid decision id")
                 }
                 other => panic!("expected Requested, got {other:?}"),
@@ -1123,9 +1264,8 @@ mod tests {
         #[tokio::test]
         async fn approved_gate_stamps_the_payload_decision_id_on_the_execution_span() {
             let request_id = unique_request_id();
-            let mut events = approval_event_broker::subscribe(&request_id).await;
             let registry = PendingApprovals::new();
-            let (tool, ran) = gated_tool(
+            let (tool, ran, mut events) = gated_tool(
                 DecisionRoute::Conversational {
                     registry: registry.clone(),
                     timeout: Duration::from_secs(60),
@@ -1156,8 +1296,6 @@ mod tests {
                 Some(payload_id.to_string().as_str()),
                 "the execution span must carry the approval payload's decision id",
             );
-
-            approval_event_broker::unsubscribe(&request_id).await;
         }
 
         /// An attempt that never reaches a decision is exactly where the
@@ -1166,8 +1304,7 @@ mod tests {
         #[tokio::test(start_paused = true)]
         async fn timed_out_gate_stamps_the_decision_id_on_the_execution_span() {
             let request_id = unique_request_id();
-            let mut events = approval_event_broker::subscribe(&request_id).await;
-            let (tool, ran) = gated_tool(
+            let (tool, ran, mut events) = gated_tool(
                 DecisionRoute::Conversational {
                     registry: PendingApprovals::new(),
                     timeout: Duration::from_secs(30),
@@ -1188,8 +1325,6 @@ mod tests {
             );
             assert!(!ran.load(Ordering::SeqCst));
             assert_eq!(span_id.as_deref(), Some(payload_id.to_string().as_str()));
-
-            approval_event_broker::unsubscribe(&request_id).await;
         }
 
         /// The webhook route stamps the same id from the same place, so the
@@ -1197,8 +1332,7 @@ mod tests {
         #[tokio::test]
         async fn webhook_gate_stamps_the_decision_id_on_the_execution_span() {
             let request_id = unique_request_id();
-            let mut events = approval_event_broker::subscribe(&request_id).await;
-            let (tool, ran) = gated_tool(
+            let (tool, ran, mut events) = gated_tool(
                 DecisionRoute::Webhook {
                     client: WebhookClient::new(
                         build_webhook_client(),
@@ -1222,13 +1356,11 @@ mod tests {
             );
             assert!(!ran.load(Ordering::SeqCst));
             assert_eq!(span_id.as_deref(), Some(payload_id.to_string().as_str()));
-
-            approval_event_broker::unsubscribe(&request_id).await;
         }
 
         #[tokio::test]
         async fn ungated_call_records_no_decision_id() {
-            let (tool, ran) = gated_tool(
+            let (tool, ran, _events) = gated_tool(
                 DecisionRoute::Conversational {
                     registry: PendingApprovals::new(),
                     timeout: Duration::from_secs(60),

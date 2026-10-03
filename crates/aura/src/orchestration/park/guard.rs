@@ -11,18 +11,20 @@ use super::commit::cancel_run_approvals;
 pub(crate) struct ParkGuard {
     registry: PendingApprovals,
     run_id: String,
-    request_id: String,
+    run: Option<Arc<crate::run_context::RunContext>>,
     published: AtomicBool,
     armed: AtomicBool,
 }
 
 impl ParkGuard {
     /// Create the guard for a run; inert until the first [`Self::record`].
-    pub(crate) fn new(registry: PendingApprovals, run_id: String, request_id: String) -> Arc<Self> {
+    pub(crate) fn new(registry: PendingApprovals, run_id: String) -> Arc<Self> {
         Arc::new(Self {
             registry,
             run_id,
-            request_id,
+            // `Drop` runs wherever the run ended, off its scope, so the run is
+            // captured now.
+            run: crate::run_context::current_run(),
             published: AtomicBool::new(false),
             armed: AtomicBool::new(false),
         })
@@ -53,13 +55,13 @@ impl Drop for ParkGuard {
         }
         let registry = self.registry.clone();
         let run_id = self.run_id.clone();
-        let request_id = self.request_id.clone();
+        let run = self.run.clone();
         // Drop cannot await; the sweep spawns its own task on the runtime
         // that dropped the guard. Off-runtime drops (a test teardown) log
         // and skip.
         match tokio::runtime::Handle::try_current() {
             Ok(_) => {
-                cancel_run_approvals(&registry, &run_id, &request_id);
+                cancel_run_approvals(&registry, &run_id, run);
             }
             Err(_) => {
                 tracing::warn!(
@@ -119,6 +121,7 @@ mod tests {
                 },
                 items: vec![ApprovalItem {
                     tool_name: "kubectl_apply".to_string(),
+                    tool_namespace: None,
                     arguments: serde_json::json!({ "namespace": "prod" }),
                     tool_call_intent: None,
                 }],
@@ -142,7 +145,7 @@ mod tests {
         let (registry, store) = registry_with_store();
         let run_id: RunId = "0191e8c0-2222-7000-8000-000000000042".parse().unwrap();
         let request_id = format!("req_guard_{}", uuid::Uuid::new_v4().simple());
-        let mut events = crate::approval_event_broker::subscribe(&request_id).await;
+        let (run, mut events) = crate::run_context::RunContext::channel(request_id.as_str());
 
         let scope = worker_scope(run_id);
         let decision_id = DecisionId::generate();
@@ -155,7 +158,10 @@ mod tests {
             .await
             .unwrap();
 
-        let guard = ParkGuard::new(registry.clone(), run_id.to_string(), request_id.clone());
+        let guard = crate::run_context::with_run(Arc::clone(&run), async {
+            ParkGuard::new(registry.clone(), run_id.to_string())
+        })
+        .await;
         guard.record(std::slice::from_ref(&parked_call(decision_id)));
         drop(guard);
 
@@ -171,18 +177,17 @@ mod tests {
             "no decidable approval outlives the unpublished run"
         );
 
-        match tokio::time::timeout(Duration::from_secs(1), events.recv()).await {
-            Ok(Some(crate::approval_event_broker::ApprovalLifecycleEvent::Completed(
-                completed,
-            ))) => {
+        match tokio::time::timeout(Duration::from_secs(1), events.recv())
+            .await
+            .map(|event| event.map(|event| event.payload))
+        {
+            Ok(Some(aura_events::agent::AgentEventPayload::ApprovalCompleted(completed))) => {
                 assert_eq!(completed.decision_id, decision_id.to_string());
                 let outcome = serde_json::to_value(&completed.outcome).unwrap();
                 assert_eq!(outcome["kind"], "cancelled");
             }
             other => panic!("expected a completed(cancelled) event, got {other:?}"),
         }
-
-        crate::approval_event_broker::unsubscribe(&request_id).await;
     }
 
     #[tokio::test]
@@ -200,7 +205,7 @@ mod tests {
             .await
             .unwrap();
 
-        let guard = ParkGuard::new(registry.clone(), run_id.to_string(), "req_x".to_string());
+        let guard = ParkGuard::new(registry.clone(), run_id.to_string());
         guard.record(std::slice::from_ref(&parked_call(decision_id)));
         guard.mark_published();
         drop(guard);
@@ -228,7 +233,7 @@ mod tests {
             .await
             .unwrap();
 
-        let guard = ParkGuard::new(registry.clone(), run_id.to_string(), "req_y".to_string());
+        let guard = ParkGuard::new(registry.clone(), run_id.to_string());
         drop(guard);
 
         tokio::time::sleep(Duration::from_millis(25)).await;

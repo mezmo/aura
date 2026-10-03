@@ -25,34 +25,34 @@
 //! # Usage
 //!
 //! ```ignore
-//! let (hook, cancel_sender, usage_state) = StreamingRequestHook::new(Duration::from_secs(60), "req_123");
+//! let options = RunOptions::bounded(Some(Duration::from_secs(60)));
+//! let (hook, cancel, usage_state) = StreamingRequestHook::new(options, "req_123");
 //!
 //! // Pass hook to streaming request
 //! agent.stream_prompt(query).with_hook(hook).multi_turn(depth).await;
 //!
 //! // To cancel externally (e.g., on client disconnect):
-//! let _ = cancel_sender.send(true);
+//! cancel.cancel();
 //!
 //! // At stream end, read final usage from usage_state
 //! let (prompt, completion, total) = usage_state.get_final_usage();
 //! ```
 
+use crate::hooks::{AgentHook, ClientTools, Deadline, Hooks, RunCancelReason};
+use aura_events::agent::{AgentEvent, AgentEventPayload};
+use rig::agent::{CancelSignal, StreamingPromptHook};
+use rig::completion::{CompletionModel, GetTokenUsage, Message};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
-
-use rig::agent::{CancelSignal, StreamingPromptHook};
-use rig::completion::{CompletionModel, GetTokenUsage, Message};
-use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
 
 use crate::orchestration::BlockedCell;
+use crate::run_context::current_run;
 use crate::scratchpad::{self, ContextBudget};
-use crate::tool_event_broker::{
-    pop_tool_call_id, publish_tool_requested, publish_tool_usage, push_tool_call_id,
-};
+use aura_events::{TokenUsage, ToolCallId, ToolName};
 
 /// Maximum pending tool IDs before warning. Prevents unbounded growth if
 /// usage events never fire (e.g., provider doesn't return token counts).
@@ -68,15 +68,14 @@ pub(crate) const PARK_CANCEL_REASON: &str = "parked";
 /// Blocked cells of the worker streams in park mode, keyed by the per-stream
 /// id the orchestrator passes as the hook's `request_id`. The hook is built
 /// inside the streaming layer and cannot take the cell as a parameter, so it
-/// travels through this request-keyed global like the tool-event broker.
+/// travels through this request-keyed global.
 static PARK_CELLS: OnceLock<std::sync::RwLock<HashMap<String, Arc<BlockedCell>>>> = OnceLock::new();
 
 fn park_cells() -> &'static std::sync::RwLock<HashMap<String, Arc<BlockedCell>>> {
     PARK_CELLS.get_or_init(|| std::sync::RwLock::new(HashMap::new()))
 }
 
-/// A worker stream's park-cell registration; dropping it removes the cell
-/// and the stream's tool-event subscription.
+/// A worker stream's park-cell registration; dropping it removes the cell.
 pub(crate) struct ParkCellRegistration(String);
 
 impl ParkCellRegistration {
@@ -95,12 +94,25 @@ impl Drop for ParkCellRegistration {
             .write()
             .expect("park cell registry poisoned")
             .remove(&self.0);
-        // The hook keyed its tool-event FIFO under the same id; the broker is
-        // async, so that cleanup runs as its own task when a runtime exists.
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            let key = std::mem::take(&mut self.0);
-            handle.spawn(async move { crate::tool_event_broker::unsubscribe(&key).await });
-        }
+    }
+}
+
+/// The run whose tool-call queue and tool events this stream may use, which is
+/// the run only when the stream *is* the run.
+///
+/// MCP reads the queue under the run id, its only identity, so a queue filled
+/// by some other stream of the same run would hand a tool call the id of a
+/// sibling's. An orchestration worker streams under a key of its own and so
+/// correlates nothing until #732. Its tool events stay off the run for the same
+/// reason, and orchestration reports the worker's calls itself.
+fn queue_owner(stream_id: &str) -> Option<Arc<crate::run_context::RunContext>> {
+    current_run().filter(|run| run.id().as_ref() == stream_id)
+}
+
+/// Sends a tool event raised by this stream to the run [`queue_owner`] gives it.
+async fn emit_from_stream(stream_id: &str, event: AgentEvent) {
+    if let Some(run) = queue_owner(stream_id) {
+        let _ = run.emit(event).await;
     }
 }
 
@@ -140,7 +152,7 @@ pub struct UsageState {
     /// Output tokens of the most recent turn.
     last_output_tokens: Arc<AtomicU64>,
     /// Tool IDs completed since the last usage event (for aura.tool_usage correlation)
-    pending_tool_ids: Arc<Mutex<Vec<String>>>,
+    pending_tool_ids: Arc<Mutex<Vec<ToolCallId>>>,
 }
 
 impl UsageState {
@@ -255,7 +267,7 @@ impl UsageState {
     /// Add a tool ID to the pending list.
     ///
     /// Called from on_tool_result when a tool completes.
-    pub fn add_pending_tool_id(&self, tool_id: String) {
+    pub fn add_pending_tool_id(&self, tool_id: ToolCallId) {
         match self.pending_tool_ids.lock() {
             Ok(mut pending) => {
                 if pending.len() >= MAX_PENDING_TOOL_IDS {
@@ -283,7 +295,7 @@ impl UsageState {
     /// Take all pending tool IDs, leaving the list empty.
     ///
     /// Called when usage becomes available to associate tools with usage snapshot.
-    pub fn take_pending_tool_ids(&self) -> Vec<String> {
+    pub fn take_pending_tool_ids(&self) -> Vec<ToolCallId> {
         match self.pending_tool_ids.lock() {
             Ok(mut pending) => std::mem::take(&mut *pending),
             Err(poisoned) => {
@@ -364,10 +376,8 @@ impl ResponseContent {
 /// MCP cancellation is handled separately via client-level tracking (Arc-based).
 #[derive(Clone)]
 pub struct StreamingRequestHook {
-    start_time: Instant,
-    timeout: Duration,
-    /// External cancellation signal (e.g., from client disconnect)
-    cancelled: watch::Receiver<bool>,
+    /// Everything watching this run.
+    hooks: Hooks,
     /// Request ID for event correlation
     request_id: String,
     /// Shared usage state (returned separately for handler access)
@@ -376,27 +386,15 @@ pub struct StreamingRequestHook {
     /// LLM-reported per-turn input/output tokens into the budget as ground
     /// truth so `remaining()` reflects actual context pressure.
     scratchpad_budget: Option<ContextBudget>,
-    /// Names of client-side (passthrough) tools registered for this request.
-    /// When the LLM calls one, the stream is terminated before the next LLM
-    /// turn so the client can execute the tool locally and submit results back.
-    client_tool_names: HashSet<String>,
-    /// Set when a client-side tool has been called in this request. Read by
-    /// `on_completion_call` to bail out before the next LLM turn.
-    client_tool_called: Arc<AtomicBool>,
 }
 
 impl StreamingRequestHook {
-    /// Create a new streaming request hook with the given timeout duration and request ID.
-    ///
-    /// Returns a tuple of (hook, cancel_sender, usage_state).
-    /// - `hook`: The hook to pass to stream_prompt().with_hook()
-    /// - `cancel_sender`: Send `true` to trigger cancellation
-    /// - `usage_state`: Shared state - handler keeps clone to read final usage at stream end
+    /// Create a new streaming request hook for one request.
     pub fn new(
-        timeout: Duration,
+        options: crate::streaming::RunOptions,
         request_id: impl Into<String>,
-    ) -> (Self, watch::Sender<bool>, UsageState) {
-        Self::with_scratchpad_budget(timeout, request_id, None)
+    ) -> (Self, CancellationToken, UsageState) {
+        Self::with_scratchpad_budget(options, request_id, None, HashSet::new())
     }
 
     /// Like `new`, but additionally wires a scratchpad `ContextBudget` so the
@@ -404,40 +402,36 @@ impl StreamingRequestHook {
     /// after each completion turn (mirrors what orchestration workers do via
     /// `StreamItem::TurnUsage`).
     pub fn with_scratchpad_budget(
-        timeout: Duration,
+        options: crate::streaming::RunOptions,
         request_id: impl Into<String>,
         scratchpad_budget: Option<ContextBudget>,
-    ) -> (Self, watch::Sender<bool>, UsageState) {
-        let (tx, rx) = watch::channel(false);
+        client_tool_names: HashSet<String>,
+    ) -> (Self, CancellationToken, UsageState) {
+        let (timeout, cancel) = options.into_parts();
+        // A caller that supplied one can cancel before the run exists.
+        let cancel = cancel.unwrap_or_default();
         let usage_state = UsageState::new();
         let hook = Self {
-            start_time: Instant::now(),
-            timeout,
-            cancelled: rx,
+            hooks: Hooks::new()
+                .with(Arc::new(Deadline::new(timeout, cancel.clone())))
+                .with(Arc::new(ClientTools::new(client_tool_names))),
             request_id: request_id.into(),
             usage_state: usage_state.clone(),
             scratchpad_budget,
-            client_tool_names: HashSet::new(),
-            client_tool_called: Arc::new(AtomicBool::new(false)),
         };
-        (hook, tx, usage_state)
+        (hook, cancel, usage_state)
     }
 
-    /// Register the names of client-side (passthrough) tools for this request.
-    ///
-    /// When any of these tools are called, the hook ends the stream before the
-    /// next LLM turn so the client can execute the tool and submit results.
-    pub fn with_client_tool_names(mut self, names: HashSet<String>) -> Self {
-        self.client_tool_names = names;
+    /// Registers another observer for this run, alongside the deadline and
+    /// client-tool concerns the hook starts with.
+    #[must_use]
+    pub fn with_hook(mut self, hook: Arc<dyn AgentHook>) -> Self {
+        self.hooks = self.hooks.with(hook);
         self
     }
 
-    /// Check if the request should be cancelled (timeout or external signal).
-    fn should_cancel(&self) -> bool {
-        if *self.cancelled.borrow() {
-            return true;
-        }
-        self.start_time.elapsed() > self.timeout
+    fn should_cancel(&self) -> Option<RunCancelReason> {
+        AgentHook::should_cancel(&self.hooks)
     }
 
     /// Should the SSE event surface (`aura.tool_requested` / `aura.tool_complete`
@@ -464,17 +458,26 @@ impl StreamingRequestHook {
 
     /// Check and cancel if needed, logging the reason.
     fn check_and_cancel(&self, cancel_sig: CancelSignal, context: &str) {
-        if *self.cancelled.borrow() {
-            tracing::info!("Request cancelled externally during {}", context);
-            cancel_sig.cancel();
-        } else if self.start_time.elapsed() > self.timeout {
-            tracing::warn!(
+        let Some(reason) = self.should_cancel() else {
+            return;
+        };
+        // A blown deadline is an operator's problem; the rest are routine.
+        match reason {
+            RunCancelReason::Deadline { after } => tracing::warn!(
                 "Request timeout ({:?}) exceeded during {} - cancelling",
-                self.timeout,
+                after,
                 context
-            );
-            cancel_sig.cancel();
+            ),
+            RunCancelReason::External => {
+                tracing::info!("Request cancelled externally during {}", context)
+            }
+            // Raised by `before_turn`, which logs it and ends the run itself, so
+            // reaching the cancel path means a hook also reports it here.
+            RunCancelReason::ClientTool => {
+                tracing::info!("Run yielding to a client tool during {}", context)
+            }
         }
+        cancel_sig.cancel();
     }
 }
 
@@ -490,11 +493,9 @@ where
         history: &[Message],
         cancel_sig: CancelSignal,
     ) -> impl Future<Output = ()> + Send {
-        let has_client_tools = !self.client_tool_names.is_empty();
-        let client_tool_called = self.client_tool_called.clone();
         async move {
-            // Checked before the client-tool, cancel, and timeout checks: a
-            // waiting parked call must get its snapshot whatever else is true.
+            // Checked before the hooks: a waiting parked call must get its
+            // snapshot whatever else is true.
             if let Some(cell) = park_cell_for(&self.request_id)
                 && cell.snapshot_if_pending(history, prompt)
             {
@@ -506,15 +507,14 @@ where
                 cancel_sig.cancel_with_reason(PARK_CANCEL_REASON);
                 return;
             }
-            // If a passthrough tool was called this turn, do not initiate
-            // another LLM completion. Cancel here so the stream terminates
-            // and the streaming layer can emit `finish_reason: "tool_calls"`
-            // — the client will execute the tool and resume in a follow-up
-            // request.
-            if has_client_tools && client_tool_called.load(Ordering::Acquire) {
-                tracing::info!(
-                    "Client tool was called — cancelling before next LLM completion call"
-                );
+
+            // A hook ending the run says why, so the log names it. Only a
+            // passthrough tool call leaves the marker the streaming layer reads
+            // for `finish_reason: "tool_calls"`; another reason ends the run
+            // without one.
+            if let Some(reason) = self.hooks.before_turn().await {
+                tracing::info!("Run ended before the next LLM completion call ({reason:?})");
+
                 cancel_sig.cancel();
                 return;
             }
@@ -529,10 +529,7 @@ where
         cancel_sig: CancelSignal,
     ) -> impl Future<Output = ()> + Send {
         async move {
-            // Only check periodically for text deltas (they're frequent)
-            if self.should_cancel() {
-                self.check_and_cancel(cancel_sig, "text streaming");
-            }
+            self.check_and_cancel(cancel_sig, "text streaming");
         }
     }
 
@@ -544,9 +541,7 @@ where
         cancel_sig: CancelSignal,
     ) -> impl Future<Output = ()> + Send {
         async move {
-            if self.should_cancel() {
-                self.check_and_cancel(cancel_sig, "tool call delta");
-            }
+            self.check_and_cancel(cancel_sig, "tool call delta");
         }
     }
 
@@ -568,22 +563,13 @@ where
         // makes the matching skip so push/pop stay symmetric. Cancellation
         // is still checked.
         let publish_event = Self::should_publish_tool_event(&tool_name);
-        let is_client_tool = self.client_tool_names.contains(&tool_name);
-        let client_tool_called = self.client_tool_called.clone();
         async move {
             // Stash the call id so the park arm can record it on the cell entry.
             if let Some(cell) = park_cell_for(&request_id) {
                 cell.set_current_call_id(tool_call_id.clone());
             }
 
-            if is_client_tool {
-                tracing::info!(
-                    "Client tool '{}' called for request '{}' — marking for passthrough",
-                    tool_name,
-                    request_id
-                );
-                client_tool_called.store(true, Ordering::Release);
-            }
+            self.hooks.on_tool_call(&tool_name).await;
 
             if publish_event {
                 // Parse args as JSON (fallback to empty object if invalid)
@@ -592,9 +578,19 @@ where
 
                 // Rig 0.28+ passes correct tool_call_id; register for event correlation
                 if let Some(id) = &tool_call_id {
-                    push_tool_call_id(&request_id, id.clone()).await;
-                    publish_tool_requested(&request_id, id.clone(), tool_name.clone(), arguments)
-                        .await;
+                    let id = ToolCallId::new(id);
+                    if let Some(run) = queue_owner(&request_id) {
+                        run.push_tool_call(id.clone());
+                    }
+                    emit_from_stream(
+                        &request_id,
+                        AgentEvent::single_agent(AgentEventPayload::ToolRequested {
+                            tool_call_id: id,
+                            tool_name: ToolName::new(&tool_name),
+                            arguments,
+                        }),
+                    )
+                    .await;
                 } else {
                     tracing::warn!(
                         "Tool '{}' called without tool_call_id for request '{}' - event correlation unavailable",
@@ -611,10 +607,7 @@ where
                 tool_call_id
             );
 
-            if self.should_cancel() {
-                tracing::info!("Cancelling before tool '{}' execution", tool_name);
-                self.check_and_cancel(cancel_sig, &format!("tool call ({})", tool_name));
-            }
+            self.check_and_cancel(cancel_sig, &format!("tool call ({})", tool_name));
         }
     }
 
@@ -647,7 +640,10 @@ where
                 // Only pop if on_tool_call pushed (i.e., tool_call_id was Some).
                 // This maintains push/pop symmetry and prevents popping IDs belonging
                 // to other tool calls when a tool arrives without an ID.
-                if had_tool_call_id && pop_tool_call_id(&request_id).await.is_none() {
+                if had_tool_call_id
+                    && let Some(run) = queue_owner(&request_id)
+                    && run.pop_tool_call().is_none()
+                {
                     tracing::warn!(
                         "Queue desync: pop returned None for tool '{}' on request '{}' \
                          (possible duplicate on_tool_result or Rig version issue)",
@@ -660,7 +656,7 @@ where
                 // This allows us to correlate tools with the usage snapshot when
                 // on_stream_completion_response_finish fires
                 if let Some(id) = tool_call_id {
-                    usage_state.add_pending_tool_id(id);
+                    usage_state.add_pending_tool_id(ToolCallId::new(id));
                 }
 
                 tracing::debug!(
@@ -670,10 +666,7 @@ where
                 );
             }
 
-            if self.should_cancel() {
-                tracing::info!("Cancelling after tool '{}' result", tool_name);
-                self.check_and_cancel(cancel_sig, &format!("tool result ({})", tool_name));
-            }
+            self.check_and_cancel(cancel_sig, &format!("tool result ({})", tool_name));
         }
     }
 
@@ -730,12 +723,16 @@ where
                         tool_ids.len(),
                         tool_ids
                     );
-                    publish_tool_usage(
+                    emit_from_stream(
                         &request_id,
-                        tool_ids,
-                        usage.input_tokens,
-                        usage.output_tokens,
-                        usage.total_tokens,
+                        AgentEvent::single_agent(AgentEventPayload::ToolUsage {
+                            tool_call_ids: tool_ids,
+                            usage: TokenUsage {
+                                prompt_tokens: usage.input_tokens.into(),
+                                completion_tokens: usage.output_tokens.into(),
+                                total_tokens: usage.total_tokens.into(),
+                            },
+                        }),
                     )
                     .await;
                 }
@@ -757,13 +754,109 @@ where
 
 #[cfg(test)]
 mod tests {
+    /// MCP reads the tool-call queue under the run id, its only identity, so a
+    /// queue filled by another stream of the same run hands a tool call a
+    /// sibling's id. Only the stream that *is* the run may fill it.
+    mod queue_ownership {
+        use super::super::{emit_from_stream, queue_owner};
+        use crate::run_context::{RunContext, with_run};
+        use aura_events::agent::{AgentEvent, AgentEventPayload};
+        use aura_events::{ToolCallId, ToolName};
+
+        fn requested(id: &str) -> AgentEvent {
+            AgentEvent::single_agent(AgentEventPayload::ToolRequested {
+                tool_call_id: ToolCallId::new(id),
+                tool_name: ToolName::new("lookup"),
+                arguments: serde_json::json!({}),
+            })
+        }
+
+        /// A park-mode worker streams under its task attempt inside the run's
+        /// scope, and its tool events must not reach the run as the run's own.
+        #[tokio::test]
+        async fn only_the_run_s_own_stream_sends_it_tool_events() {
+            let (run, mut events) = RunContext::channel("req_1");
+            with_run(run, async {
+                emit_from_stream("req_1:task:0:attempt:1", requested("worker")).await;
+                emit_from_stream("req_1", requested("own")).await;
+            })
+            .await;
+
+            let first = events.try_recv().expect("the run's own event arrives");
+            assert!(
+                matches!(
+                    &first.payload,
+                    AgentEventPayload::ToolRequested { tool_call_id, .. }
+                        if tool_call_id.as_str() == "own"
+                ),
+                "the worker's event reached the run: {first:?}"
+            );
+            assert!(events.try_recv().is_err(), "nothing else reaches the run");
+        }
+
+        #[tokio::test]
+        async fn the_run_s_own_stream_owns_the_queue() {
+            let run = RunContext::detached("req_1");
+            let owned = with_run(run, async { queue_owner("req_1").is_some() }).await;
+            assert!(owned);
+        }
+
+        /// An orchestration worker streams under its task attempt.
+        #[tokio::test]
+        async fn a_worker_s_stream_owns_no_queue() {
+            let run = RunContext::detached("req_1");
+            let owned = with_run(run, async {
+                queue_owner("req_1:task:0:attempt:1").is_some()
+            })
+            .await;
+            assert!(
+                !owned,
+                "a stream that is not the run leaves its queue alone"
+            );
+        }
+
+        #[tokio::test]
+        async fn no_run_owns_nothing() {
+            assert!(queue_owner("req_1").is_none());
+        }
+    }
+
     use super::*;
+    use std::time::Duration;
+
+    /// A hook a caller registers has to be asked alongside the ones the hook
+    /// starts with, or the registration is decorative.
+    #[test]
+    fn a_registered_hook_is_asked() {
+        struct AlwaysCancel;
+
+        #[async_trait::async_trait]
+        impl AgentHook for AlwaysCancel {
+            fn should_cancel(&self) -> Option<RunCancelReason> {
+                Some(RunCancelReason::External)
+            }
+        }
+
+        let (hook, _cancel, _usage) = StreamingRequestHook::new(
+            crate::streaming::RunOptions::bounded(Some(Duration::from_secs(300))),
+            "req_registered",
+        );
+        assert!(
+            hook.should_cancel().is_none(),
+            "nothing has asked for cancellation yet"
+        );
+
+        let hook = hook.with_hook(Arc::new(AlwaysCancel));
+        assert!(hook.should_cancel().is_some());
+    }
 
     #[test]
     fn test_streaming_request_hook_creation() {
-        let (hook, _tx, _usage_state) =
-            StreamingRequestHook::new(Duration::from_secs(60), "test_req_1");
-        assert!(!hook.should_cancel());
+        let (hook, _tx, _usage_state) = StreamingRequestHook::new(
+            crate::streaming::RunOptions::bounded(Some(Duration::from_secs(60))),
+            "test_req_1",
+        );
+        assert!(hook.should_cancel().is_none());
         assert_eq!(hook.request_id, "test_req_1");
     }
 
@@ -803,30 +896,35 @@ mod tests {
 
     #[test]
     fn test_external_cancellation() {
-        let (hook, tx, _usage_state) =
-            StreamingRequestHook::new(Duration::from_secs(60), "test_req_2");
-        assert!(!hook.should_cancel());
+        let (hook, cancel, _usage_state) = StreamingRequestHook::new(
+            crate::streaming::RunOptions::bounded(Some(Duration::from_secs(60))),
+            "test_req_2",
+        );
+        assert!(hook.should_cancel().is_none());
 
-        // Signal cancellation
-        tx.send(true).unwrap();
-        assert!(hook.should_cancel());
+        cancel.cancel();
+        assert!(hook.should_cancel().is_some());
     }
 
     #[test]
     fn test_timeout_detection() {
         // Create hook with very short timeout
-        let (hook, _tx, _usage_state) =
-            StreamingRequestHook::new(Duration::from_millis(1), "test_req_3");
+        let (hook, _tx, _usage_state) = StreamingRequestHook::new(
+            crate::streaming::RunOptions::bounded(Some(Duration::from_millis(1))),
+            "test_req_3",
+        );
 
         // Wait for timeout
         std::thread::sleep(Duration::from_millis(5));
-        assert!(hook.should_cancel());
+        assert!(hook.should_cancel().is_some());
     }
 
     #[test]
     fn test_usage_state_creation() {
-        let (_hook, _tx, usage_state) =
-            StreamingRequestHook::new(Duration::from_secs(60), "test_req_4");
+        let (_hook, _tx, usage_state) = StreamingRequestHook::new(
+            crate::streaming::RunOptions::bounded(Some(Duration::from_secs(60))),
+            "test_req_4",
+        );
 
         // Initially all zeros
         let (prompt, completion, total) = usage_state.get_final_usage();
@@ -939,8 +1037,8 @@ mod tests {
     fn test_usage_state_pending_tool_ids() {
         let usage_state = UsageState::new();
 
-        usage_state.add_pending_tool_id("call_abc".to_string());
-        usage_state.add_pending_tool_id("call_def".to_string());
+        usage_state.add_pending_tool_id(ToolCallId::new("call_abc"));
+        usage_state.add_pending_tool_id(ToolCallId::new("call_def"));
 
         let tool_ids = usage_state.take_pending_tool_ids();
         assert_eq!(tool_ids, vec!["call_abc", "call_def"]);
@@ -952,8 +1050,10 @@ mod tests {
 
     #[test]
     fn test_usage_state_shared_between_clones() {
-        let (_hook, _tx, usage_state) =
-            StreamingRequestHook::new(Duration::from_secs(60), "test_req_5");
+        let (_hook, _tx, usage_state) = StreamingRequestHook::new(
+            crate::streaming::RunOptions::bounded(Some(Duration::from_secs(60))),
+            "test_req_5",
+        );
         let usage_state_clone = usage_state.clone();
 
         // Modify through original (tool turn)
@@ -973,11 +1073,11 @@ mod tests {
 
         // Fill to capacity
         for i in 0..MAX_PENDING_TOOL_IDS {
-            usage_state.add_pending_tool_id(format!("call_{}", i));
+            usage_state.add_pending_tool_id(ToolCallId::new(format!("call_{}", i)));
         }
 
         // Add one more - should drop oldest
-        usage_state.add_pending_tool_id("call_overflow".to_string());
+        usage_state.add_pending_tool_id(ToolCallId::new("call_overflow"));
 
         let tool_ids = usage_state.take_pending_tool_ids();
         assert_eq!(tool_ids.len(), MAX_PENDING_TOOL_IDS);
@@ -1013,9 +1113,16 @@ mod tests {
 
     #[test]
     fn test_with_scratchpad_budget_none_matches_new() {
-        let (hook_a, _, _) = StreamingRequestHook::new(Duration::from_secs(60), "req_a");
-        let (hook_b, _, _) =
-            StreamingRequestHook::with_scratchpad_budget(Duration::from_secs(60), "req_b", None);
+        let (hook_a, _, _) = StreamingRequestHook::new(
+            crate::streaming::RunOptions::bounded(Some(Duration::from_secs(60))),
+            "req_a",
+        );
+        let (hook_b, _, _) = StreamingRequestHook::with_scratchpad_budget(
+            crate::streaming::RunOptions::bounded(Some(Duration::from_secs(60))),
+            "req_b",
+            None,
+            HashSet::new(),
+        );
         // Both hooks should report no scratchpad budget.
         assert!(hook_a.scratchpad_budget.is_none());
         assert!(hook_b.scratchpad_budget.is_none());
@@ -1027,9 +1134,10 @@ mod tests {
         let counter = Arc::new(TiktokenCounter::default_counter());
         let budget = ContextBudget::new(128_000, 0.20, 0, counter);
         let (hook, _, _) = StreamingRequestHook::with_scratchpad_budget(
-            Duration::from_secs(60),
+            crate::streaming::RunOptions::bounded(Some(Duration::from_secs(60))),
             "req_with_budget",
             Some(budget.clone()),
+            HashSet::new(),
         );
         let stored = hook
             .scratchpad_budget

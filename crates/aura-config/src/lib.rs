@@ -1,6 +1,7 @@
 pub mod config;
 pub mod env;
 pub mod error;
+pub mod globpattern;
 pub mod lenient_bool;
 pub mod lenient_int;
 pub mod loader;
@@ -19,6 +20,7 @@ mod test_env_lock;
 pub use config::*;
 pub use env::resolve_env_vars;
 pub use error::ConfigError;
+pub use globpattern::*;
 pub use loader::ConfigLoader;
 pub use orchestration::{
     ArtifactsConfig, OrchestrationConfig, TimeoutsConfig, ToolVisibility, WorkerConfig,

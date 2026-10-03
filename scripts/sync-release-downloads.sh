@@ -206,6 +206,8 @@ selftest() {
     got=$(TZ=Pacific/Auckland day_before "2024-03-01"); want="2024-02-29"
     [ "${got}" = "${want}" ] || { echo "selftest: day_before is timezone-sensitive: ${got}, want ${want}" >&2; exit 1; }
 
+    hogql_retry_selftest "${tmp}"
+
     echo "selftest: ok"
 }
 

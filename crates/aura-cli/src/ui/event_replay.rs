@@ -7,6 +7,7 @@ use std::io;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use aura_events::CONVERSATION_AGENT_ID;
 use crossterm::cursor;
 use crossterm::execute;
 use crossterm::style::{Attribute, Stylize};
@@ -393,9 +394,12 @@ pub fn replay_event_log_global() {
                         DisplayEvent::OrchestratorToolCallStarted {
                             tool_name, fields, ..
                         } => {
-                            // Coordinator-owned calls (worker "main") render
-                            // at the top level, not inside a task tree.
-                            if fields.get("worker_id").and_then(|v| v.as_str()) == Some("main") {
+                            // Coordinator-owned calls carry the conversation's
+                            // id as their worker; they render at the top
+                            // level, not inside a task tree.
+                            if fields.get("worker_id").and_then(|v| v.as_str())
+                                == Some(CONVERSATION_AGENT_ID)
+                            {
                                 break;
                             }
                             let dn = snake_to_pascal_case(tool_name);
@@ -598,9 +602,10 @@ pub fn replay_event_log_global() {
             DisplayEvent::OrchestratorToolCallStarted {
                 tool_name, fields, ..
             } => {
-                // Coordinator-owned calls (worker "main") render at the top
-                // level; task-owned calls are rendered by the task walk above.
-                if fields.get("worker_id").and_then(|v| v.as_str()) == Some("main") {
+                // Coordinator-owned calls carry the conversation's id as their
+                // worker and render at the top level; task-owned calls are
+                // rendered by the task walk above.
+                if fields.get("worker_id").and_then(|v| v.as_str()) == Some(CONVERSATION_AGENT_ID) {
                     let dn = snake_to_pascal_case(tool_name);
                     let args = format_orch_args_summary(fields);
                     let call_id = fields.get("tool_call_id").and_then(|v| v.as_str());
@@ -656,7 +661,7 @@ pub fn replay_event_log_global() {
                     } else {
                         agent_id.as_str()
                     });
-                    let header = if agent_id == "main" || agent_id.is_empty() {
+                    let header = if agent_id == CONVERSATION_AGENT_ID || agent_id.is_empty() {
                         "Reasoning".to_string()
                     } else {
                         format!("Reasoning - {agent_id}")

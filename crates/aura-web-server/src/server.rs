@@ -1,5 +1,13 @@
 //! Web-server entry point, shared by every binary that can launch the server.
 
+use crate::a2a::{
+    AuraAgentExecutor, AuraRequestHandler, BusBridgedExecutor, SharedTaskStore, agent_card_router,
+    legacy_jsonrpc_router,
+};
+use crate::handlers;
+use crate::session_store::{SessionStore, build_session_store};
+use crate::streaming::ToolResultMode;
+use crate::types::{ActiveRequestTracker, AppState, ErrorDetail, ErrorResponse};
 use aura::instance_id::instance_id as compute_instance_id;
 use aura_config::load_config;
 use axum::Json;
@@ -14,18 +22,11 @@ use axum::{
 use clap::{CommandFactory, FromArgMatches, Parser};
 use std::ffi::OsString;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tower_http::trace::TraceLayer;
-use tracing::{error, info};
-
-use crate::a2a::{
-    AuraAgentExecutor, AuraRequestHandler, BusBridgedExecutor, SharedTaskStore, agent_card_router,
-    legacy_jsonrpc_router,
-};
-use crate::handlers;
-use crate::session_store::{SessionStore, build_session_store};
-use crate::streaming::ToolResultMode;
-use crate::types::{ActiveRequestTracker, AppState, ErrorDetail, ErrorResponse};
+use tracing::{error, info, warn};
 
 /// Command-line and environment configuration for the web server.
 #[derive(Parser, Debug)]
@@ -109,7 +110,8 @@ pub struct ServerArgs {
     /// SSE streaming request timeout in seconds.
     /// This is the maximum time a streaming request can run before being cancelled.
     /// Set higher for long-running tool operations (e.g., log analysis).
-    /// Set to 0 to disable timeout (not recommended for production).
+    /// Set to 0 to disable the bound (not recommended for production). No other
+    /// flag caps total run length.
     #[arg(long, env = "STREAMING_TIMEOUT_SECS", default_value = "900")]
     pub streaming_timeout_secs: u64,
 
@@ -344,6 +346,25 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
         warn_timeout_relationships(id, config, &args);
     }
 
+    // Tool-name collisions are a config fault the request path can only warn
+    // about per request, so report them once here where an operator is
+    // watching. Pre-filter and non-gating: an agent's `mcp_filter` may well
+    // resolve a collision reported below.
+    for config in &configs {
+        let Some(mcp_config) = &config.mcp else {
+            continue;
+        };
+        let id = config.agent.alias.as_deref().unwrap_or(&config.agent.name);
+        match aura::McpManager::initialize_from_config(mcp_config).await {
+            Ok(manager) => {
+                for line in manager.collision_report() {
+                    warn!("agent '{}': {}", id, line);
+                }
+            }
+            Err(e) => warn!("agent '{}': could not check MCP tool names: {}", id, e),
+        }
+    }
+
     // Validate DEFAULT_AGENT matches a loaded config
     if let Some(ref default_agent) = args.default_agent {
         let exists = configs
@@ -372,7 +393,7 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
     let stream_shutdown_token = CancellationToken::new();
     let active_requests = Arc::new(ActiveRequestTracker::new());
 
-    let shutdown_timeout_secs = args.shutdown_timeout_secs;
+    let shutdown_timeout = Duration::from_secs(args.shutdown_timeout_secs);
 
     // Deployment-scoped, env-only configuration (AURA_SESSION_STORE*).
     let session_store_config = aura_config::SessionStoreConfig::from_env().map_err(|e| {
@@ -453,8 +474,8 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
     });
 
     info!(
-        "Starting server on {}:{} (shutdown_timeout={}s)",
-        args.host, args.port, shutdown_timeout_secs
+        "Starting server on {}:{} (shutdown_timeout={shutdown_timeout:?})",
+        args.host, args.port
     );
 
     let app = Router::new()
@@ -534,24 +555,44 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
             }
 
             // Phase 1: reject new requests (middleware returns 503)
+            let mut clean_shutdown = false;
             shutdown_token.cancel();
-
-            info!(
-                "Allowing {}s for in-flight requests to complete",
-                shutdown_timeout_secs
-            );
-            tokio::select! {
-                _ = tokio::time::sleep(std::time::Duration::from_secs(shutdown_timeout_secs)) => {
-                    info!("Grace period expired, terminating remaining streams");
-                }
-                _ = active_requests.wait_for_drain() => {
-                    info!("All in-flight requests completed, shutting down early");
-                }
+            info!("Allowing {shutdown_timeout:?} for in-flight requests to complete");
+            if timeout(shutdown_timeout, active_requests.wait_for_drain())
+                .await
+                .is_ok()
+            {
+                clean_shutdown = true;
             }
 
             // Phase 2: terminate remaining streams ([DONE] → MCP cleanup)
-            stream_shutdown_token.cancel();
+            if !clean_shutdown {
+                info!("Grace period expired, terminating remaining streams");
+                stream_shutdown_token.cancel();
+                if timeout(Duration::from_secs(5), active_requests.wait_for_drain())
+                    .await
+                    .is_ok()
+                {
+                    clean_shutdown = true;
+                }
+            }
 
+            // Phase 3: hard-stop any request task that ignored the
+            // cooperative signal above, so its `agent.stream` span closes
+            // before the OTel provider shuts down/flushes below (#305).
+            let mut unaborted_tasks = false;
+            if !clean_shutdown {
+                warn!("Stream shutdown grace period expired, aborting stragglers");
+                let abort_timeout = Duration::from_millis(400);
+                if timeout(abort_timeout, active_requests.abort_unfinished())
+                    .await
+                    .is_err()
+                {
+                    unaborted_tasks = true;
+                }
+            }
+
+            info!(clean_shutdown, unaborted_tasks, "shutdown complete");
             let _ = shutdown_tx.send(());
         }
     });

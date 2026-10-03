@@ -213,27 +213,31 @@ pub(crate) async fn publish(
 /// ordered teardown. A decided ticket is never in the cleared set, so the
 /// stream cannot disagree with a decision that won the race. A lost store
 /// reply yields warn-and-empty, the conceded residual.
+/// The sweep is its own task, which no scope reaches, so the run comes from the
+/// caller rather than the ambient one.
 pub(crate) fn cancel_run_approvals(
     registry: &PendingApprovals,
     run_id: &str,
-    request_id: &str,
+    run: Option<std::sync::Arc<crate::run_context::RunContext>>,
 ) -> tokio::task::JoinHandle<()> {
     let registry = registry.clone();
     let run_id = run_id.to_string();
-    let request_id = request_id.to_string();
     tokio::task::spawn(async move {
         for parked in registry.cancel_request(&run_owner_id(&run_id)).await {
-            crate::approval_event_broker::publish(
-                &request_id,
-                crate::approval_event_broker::ApprovalLifecycleEvent::Completed(
-                    crate::hitl::completed_cancelled(
-                        parked.request.decision_id,
-                        &parked.request.scope,
-                        std::time::Duration::ZERO,
-                    ),
+            let cancelled = crate::hitl::completed_cancelled_event(
+                parked.request.decision_id,
+                &parked.request.scope,
+                std::time::Duration::ZERO,
+            );
+            match &run {
+                Some(run) => {
+                    run.emit(cancelled).await;
+                }
+                None => tracing::warn!(
+                    run_id = %run_id,
+                    "no run for the park sweep; its cancellations reach no observer"
                 ),
-            )
-            .await;
+            }
         }
     })
 }
@@ -327,6 +331,7 @@ mod tests {
                 },
                 items: vec![ApprovalItem {
                     tool_name: "kubectl_apply".to_string(),
+                    tool_namespace: None,
                     arguments: serde_json::json!({ "namespace": "prod" }),
                     tool_call_intent: None,
                 }],
@@ -554,7 +559,7 @@ mod tests {
         let run_id = "0191e8c0-ffff-7000-8000-000000000006";
         let owner = run_owner_id(run_id);
         let request_id = format!("req_sweep_{}", uuid::Uuid::new_v4().simple());
-        let mut events = crate::approval_event_broker::subscribe(&request_id).await;
+        let (run, mut events) = crate::run_context::RunContext::channel(request_id.as_str());
 
         let now = chrono::Utc::now();
         let decided = DecisionId::generate();
@@ -580,7 +585,7 @@ mod tests {
             .await
             .unwrap();
 
-        cancel_run_approvals(&registry, run_id, &request_id)
+        cancel_run_approvals(&registry, run_id, Some(std::sync::Arc::clone(&run)))
             .await
             .unwrap();
 
@@ -594,10 +599,11 @@ mod tests {
             "the recorded decision survives the sweep"
         );
 
-        match tokio::time::timeout(Duration::from_secs(1), events.recv()).await {
-            Ok(Some(crate::approval_event_broker::ApprovalLifecycleEvent::Completed(
-                completed,
-            ))) => {
+        match tokio::time::timeout(Duration::from_secs(1), events.recv())
+            .await
+            .map(|event| event.map(|event| event.payload))
+        {
+            Ok(Some(aura_events::agent::AgentEventPayload::ApprovalCompleted(completed))) => {
                 assert_eq!(completed.decision_id, sibling.to_string());
                 assert!(matches!(
                     completed.outcome,
@@ -612,8 +618,6 @@ mod tests {
                 .is_err(),
             "the decided approval publishes no cancelled event"
         );
-
-        crate::approval_event_broker::unsubscribe(&request_id).await;
     }
 
     /// Two tickets under the same owner clear with one cancelled event each.
@@ -623,7 +627,7 @@ mod tests {
         let run_id = "0191e8c0-aaaa-7000-8000-000000000007";
         let owner = run_owner_id(run_id);
         let request_id = format!("req_sweep_{}", uuid::Uuid::new_v4().simple());
-        let mut events = crate::approval_event_broker::subscribe(&request_id).await;
+        let (run, mut events) = crate::run_context::RunContext::channel(request_id.as_str());
 
         let now = chrono::Utc::now();
         let first = DecisionId::generate();
@@ -645,7 +649,7 @@ mod tests {
             .await
             .unwrap();
 
-        cancel_run_approvals(&registry, run_id, &request_id)
+        cancel_run_approvals(&registry, run_id, Some(std::sync::Arc::clone(&run)))
             .await
             .unwrap();
 
@@ -654,10 +658,13 @@ mod tests {
 
         let mut cancelled_ids = Vec::new();
         for _ in 0..2 {
-            match tokio::time::timeout(Duration::from_secs(1), events.recv()).await {
-                Ok(Some(crate::approval_event_broker::ApprovalLifecycleEvent::Completed(
-                    completed,
-                ))) => cancelled_ids.push(completed.decision_id),
+            match tokio::time::timeout(Duration::from_secs(1), events.recv())
+                .await
+                .map(|event| event.map(|event| event.payload))
+            {
+                Ok(Some(aura_events::agent::AgentEventPayload::ApprovalCompleted(completed))) => {
+                    cancelled_ids.push(completed.decision_id)
+                }
                 other => panic!("expected a second completed(cancelled), got {other:?}"),
             }
         }
@@ -669,8 +676,6 @@ mod tests {
                 .is_err(),
             "exactly two cancelled events publish"
         );
-
-        crate::approval_event_broker::unsubscribe(&request_id).await;
     }
 
     /// A cleared ticket refuses a late resolve: the sweep is terminal for it.
@@ -690,9 +695,8 @@ mod tests {
             .await
             .unwrap();
 
-        cancel_run_approvals(&registry, run_id, "req_late_resolve")
-            .await
-            .unwrap();
+        // No run here, since this case asserts the store is swept.
+        cancel_run_approvals(&registry, run_id, None).await.unwrap();
 
         assert_eq!(
             registry
@@ -706,12 +710,10 @@ mod tests {
     /// gating or tool surface changes.
     #[test]
     fn config_fingerprint_stable_and_sensitive() {
-        use aura_config::GlobPattern;
-
         fn config(pattern: &str) -> crate::config::AgentRuntimeConfig {
             crate::config::AgentRuntimeConfig {
                 hitl: Some(crate::hitl::HitlRuntime {
-                    patterns: Arc::from([GlobPattern::new(pattern).unwrap()]),
+                    patterns: Arc::from([pattern.into()]),
                     route: Arc::new(crate::hitl::DecisionRoute::Conversational {
                         registry: PendingApprovals::new(),
                         timeout: Duration::from_secs(120),

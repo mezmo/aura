@@ -81,7 +81,7 @@ aura/
 ### Streaming
 - OpenAI-compatible SSE streaming (`/v1/chat/completions`)
 - Custom `aura.*` events (opt-in via `AURA_CUSTOM_EVENTS=true`):
-  - `aura.session_info`, `aura.mcp_status`, `aura.tool_requested`, `aura.tool_start`, `aura.tool_complete`, `aura.reasoning`, `aura.progress`, `aura.worker_phase`, `aura.tool_usage`, `aura.usage`, `aura.context_usage`, `aura.scratchpad_usage`
+  - `aura.session_info`, `aura.skills_rehydrated`, `aura.mcp_status`, `aura.tool_requested`, `aura.tool_start`, `aura.tool_complete`, `aura.reasoning`, `aura.progress`, `aura.worker_phase`, `aura.tool_usage`, `aura.usage`, `aura.context_usage`, `aura.scratchpad_usage`
   - `aura.usage` reports **cumulative provider-billed** tokens (Σ input + Σ output across every LLM turn), identical in single-agent and orchestration mode. `aura.context_usage` reports **context-window occupancy** — the provider's final-turn input/output (`context_tokens`/`response_tokens`) plus optional `context_window` — per-agent (single-agent emits one; orchestration emits one per worker plus one `main` reading for the conversation, taken from the first LLM turn of the request's first planning call — later inner turns and planning cycles carry the coordinator's scratch conversation and report nothing). Both derive from provider usage, not a local tokenizer. See `crates/aura/src/streaming_request_hook.rs` (`UsageState`) for the billed-vs-occupancy split
 - Request cancellation on timeout or client disconnect
 - Two-phase graceful shutdown: new requests rejected immediately (503), in-flight streams get configurable grace period (`SHUTDOWN_TIMEOUT_SECS`, default 30s)
@@ -151,13 +151,13 @@ export AWS_REGION="your-region"       # For Knowledge Base
 ### Key Modules
 - `provider_agent.rs` - Type-erased streaming across providers
 - `stream_events.rs` - Custom aura SSE events
-- `request_cancellation.rs` - Request lifecycle management
-- `tool_event_broker.rs` - FIFO queue for tool_call_id correlation (see critical assumption below)
+- `request_cancellation.rs` - The signal that stops a run, as awaiting work sees it
+- `run_context.rs` - The run a task is working on: its event channel, and the FIFO queue for tool_call_id correlation (see critical assumption below)
 - `orchestration/` - Multi-agent coordinator, workers, DAG execution, orchestration SSE events
 
 ### Critical Assumption: Rig Sequential Tool Execution
 
-The `tool_event_broker` uses a FIFO queue for correlating `tool_call_id` between hook and MCP execution contexts. **This relies on Rig 0.28 streaming mode executing tools sequentially.**
+`RunContext` holds a FIFO queue for correlating `tool_call_id` between hook and MCP execution contexts. **This relies on Rig 0.28 streaming mode executing tools sequentially.**
 
 **If upgrading Rig**, verify this assumption by reviewing:
 - `rig-core/src/agent/prompt_request/streaming.rs`

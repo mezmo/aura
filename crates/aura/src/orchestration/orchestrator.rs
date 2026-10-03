@@ -32,7 +32,7 @@
 //!
 //! # Streaming Events
 //!
-//! The orchestrator emits `OrchestratorEvent` variants through the stream:
+//! The orchestrator emits `AgentEventPayload` variants through the stream:
 //! - `PlanCreated` - when the coordinator produces a plan
 //! - `TaskStarted` - when a worker begins a task
 //! - `TaskCompleted` - when a worker finishes a task
@@ -41,11 +41,15 @@
 //! - `IterationComplete` - when the post-execute coordinator decision completes
 //! - `Synthesizing` - when task results are being consolidated for the coordinator
 
+use aura_events::CONVERSATION_AGENT_ID;
+use aura_events::agent::{AgentEvent, AgentEventPayload};
+use aura_events::orchestration::RoutingMode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use aura_config::GlobPattern;
 use rig::client::CompletionClient;
-use tokio::sync::{Mutex, watch};
+use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::Agent;
@@ -61,7 +65,6 @@ use super::tools::RoutingToolSet;
 use super::tools::{InspectToolParamsTool, ListToolsTool, ReadArtifactTool};
 
 use super::config::OrchestrationConfig;
-use super::events::OrchestratorEvent;
 use super::park::{
     ParkGuard, ParkedTaskRecord, ParkedTaskRecords, RecordedDecisions, ResumeContext,
     TaskContinuation,
@@ -187,40 +190,28 @@ fn apply_worker_skills_override(
     }
 }
 
-/// Spawns a task that monitors for external cancellation or timeout,
-/// cancelling the provided token when either occurs.
+/// Spawns a task that cancels `cancel_token` once `timeout` passes.
+///
+/// It also stops early on either of two signals. `finished` resolves when the
+/// run's task ends, so the watcher does not sleep out its full duration; a
+/// finished run has not been cancelled, which is why that is a separate token.
+/// An already-cancelled `cancel_token` needs nothing further and only logs.
 ///
 /// Returns a `JoinHandle` for the watcher task. The handle is intentionally
 /// fire-and-forget in production (the task self-terminates via `select!`),
 /// but callers in tests should `.await` it to assert post-conditions.
-///
-/// Cleanup: when the caller drops the sender side of `cancel_rx`, `rx.changed()`
-/// returns `Err`, the `select!` resolves, and the sleep future is dropped
-/// (cancelling the timer via tokio's standard drop semantics).
 #[must_use = "task runs independently; bind with `let _handle =` to document fire-and-forget intent"]
-pub(super) fn spawn_cancellation_watcher(
-    cancel_rx: watch::Receiver<bool>,
+pub(super) fn spawn_timeout_watcher(
     timeout: Duration,
     cancel_token: CancellationToken,
+    finished: CancellationToken,
     request_id: String,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         tokio::select! {
-            was_cancelled = async {
-                let mut rx = cancel_rx;
-                loop {
-                    if rx.changed().await.is_err() {
-                        return false; // Sender dropped — stream finished normally
-                    }
-                    if *rx.borrow_and_update() {
-                        return true; // External cancellation requested
-                    }
-                }
-            } => {
-                if was_cancelled {
-                    tracing::info!("External cancellation triggered for {}", request_id);
-                    cancel_token.cancel();
-                }
+            () = finished.cancelled() => {}
+            () = cancel_token.cancelled() => {
+                tracing::info!("Run cancelled for {}", request_id);
             }
             _ = tokio::time::sleep(timeout) => {
                 tracing::warn!("Timeout reached, cancelling orchestration");
@@ -241,10 +232,21 @@ fn extract_task_id(tool_call_id: &str) -> Option<usize> {
         .and_then(|s| s.parse().ok())
 }
 
-/// Convert a `ToolEvent` to an `OrchestratorEvent`.
-fn tool_event_to_orchestrator_event(
-    event: crate::tool_call_observer::ToolEvent,
-) -> OrchestratorEvent {
+/// Names the worker an event came from, so the payload does not have to carry
+/// attribution the envelope already holds.
+fn by_worker(worker_id: &str, payload: AgentEventPayload) -> AgentEvent {
+    AgentEvent::new(
+        aura_events::AgentContext::worker(worker_id, None, aura_events::COORDINATOR_AGENT_ID),
+        payload,
+    )
+}
+
+fn by_coordinator(payload: AgentEventPayload) -> AgentEvent {
+    AgentEvent::new(aura_events::AgentContext::coordinator(), payload)
+}
+
+/// Converts an observed tool call into the agent event it is published as.
+fn tool_event_to_orchestrator_event(event: crate::tool_call_observer::ToolEvent) -> AgentEvent {
     match event {
         crate::tool_call_observer::ToolEvent::CallStarted {
             tool_call_id,
@@ -252,15 +254,20 @@ fn tool_event_to_orchestrator_event(
             tool_initiator_id,
             arguments,
             ..
-        } => OrchestratorEvent::ToolCallStarted {
-            task_id: extract_task_id(&tool_call_id),
-            tool_call_id,
-            tool_name,
-            worker_id: tool_initiator_id,
-            arguments,
-        },
+        } => by_worker(
+            &tool_initiator_id,
+            AgentEventPayload::ToolStart {
+                task_id: extract_task_id(&tool_call_id),
+                tool_call_id: tool_call_id.into(),
+                tool_name: tool_name.into(),
+                arguments: Some(arguments),
+                progress_token: None,
+            },
+        ),
         crate::tool_call_observer::ToolEvent::CallCompleted {
             tool_call_id,
+            tool_name,
+            tool_initiator_id,
             result,
             duration_ms,
         } => {
@@ -269,23 +276,44 @@ fn tool_event_to_orchestrator_event(
                 crate::tool_call_observer::ToolOutcome::Success(content) => content,
                 crate::tool_call_observer::ToolOutcome::Error { message, .. } => message,
             };
-            OrchestratorEvent::ToolCallCompleted {
-                task_id: extract_task_id(&tool_call_id),
-                tool_call_id,
-                success,
-                duration_ms,
-                result: result_str,
-            }
+            by_worker(
+                &tool_initiator_id,
+                AgentEventPayload::ToolComplete {
+                    task_id: extract_task_id(&tool_call_id),
+                    tool_call_id: tool_call_id.into(),
+                    tool_name: tool_name.into(),
+                    duration_ms,
+                    outcome: outcome_of(success, result_str),
+                },
+            )
         }
     }
 }
 
-/// Forward a `ToolCallStarted` event for a non-MCP tool the worker
+/// The schema distinguishes success from failure by variant; the observer
+/// reports one string either way.
+fn outcome_of(success: bool, message: String) -> aura_events::agent::ToolOutcome {
+    if success {
+        aura_events::agent::ToolOutcome::Success { result: message }
+    } else {
+        aura_events::agent::ToolOutcome::Failure { error: message }
+    }
+}
+
+/// Forward a `ToolStart` event for a non-MCP tool the worker
 /// `ObserverWrapper` does not cover: skills, orchestration operations, and
 /// scratchpad tools when enabled (see [`scratchpad::should_forward_tool_event`]).
 /// Records the start instant so the completion can report a duration. No-op
 /// without an event channel. Used by both `stream_and_forward` (workers) and
 /// `stream_and_collect` (coordinator) so skill use surfaces in both roles.
+/// What a forwarded internal tool call needs from its start to report a
+/// completion.
+struct InternalToolStart {
+    at: std::time::Instant,
+    tool_name: String,
+    worker_id: String,
+}
+
 async fn forward_internal_tool_started(
     event_tx: Option<&tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>>,
     task_id: Option<usize>,
@@ -293,22 +321,30 @@ async fn forward_internal_tool_started(
     tool_call_id: &str,
     tool_name: &str,
     raw_arguments: &str,
-    starts: &mut std::collections::HashMap<String, std::time::Instant>,
+    starts: &mut std::collections::HashMap<String, InternalToolStart>,
 ) {
     let Some(tx) = event_tx else { return };
     let tool_call_id = tool_call_id.to_string();
-    starts.insert(tool_call_id.clone(), std::time::Instant::now());
+    starts.insert(
+        tool_call_id.clone(),
+        InternalToolStart {
+            at: std::time::Instant::now(),
+            tool_name: tool_name.to_string(),
+            worker_id: worker_id.to_string(),
+        },
+    );
     let arguments = serde_json::from_str(raw_arguments).unwrap_or_else(|_| serde_json::json!({}));
     let _ = tx
-        .send(Ok(StreamItem::OrchestratorEvent(
-            OrchestratorEvent::ToolCallStarted {
+        .send(Ok(StreamItem::AgentEvent(Box::new(by_worker(
+            worker_id,
+            AgentEventPayload::ToolStart {
                 task_id,
-                tool_call_id,
-                tool_name: tool_name.to_string(),
-                worker_id: worker_id.to_string(),
-                arguments,
+                tool_call_id: tool_call_id.into(),
+                tool_name: tool_name.into(),
+                arguments: Some(arguments),
+                progress_token: None,
             },
-        )))
+        )))))
         .await;
 }
 
@@ -320,7 +356,7 @@ async fn forward_internal_tool_completed(
     task_id: Option<usize>,
     tool_call_id: &str,
     result: &str,
-    starts: &mut std::collections::HashMap<String, std::time::Instant>,
+    starts: &mut std::collections::HashMap<String, InternalToolStart>,
 ) {
     let Some(start) = starts.remove(tool_call_id) else {
         return;
@@ -331,22 +367,23 @@ async fn forward_internal_tool_completed(
         crate::tool_error_detection::ToolResultStatus::Success
     );
     let _ = tx
-        .send(Ok(StreamItem::OrchestratorEvent(
-            OrchestratorEvent::ToolCallCompleted {
+        .send(Ok(StreamItem::AgentEvent(Box::new(by_worker(
+            &start.worker_id,
+            AgentEventPayload::ToolComplete {
                 task_id,
-                tool_call_id: tool_call_id.to_string(),
-                success,
-                duration_ms: start.elapsed().as_millis() as u64,
-                result: result.to_string(),
+                tool_call_id: tool_call_id.into(),
+                tool_name: start.tool_name.into(),
+                duration_ms: start.at.elapsed().as_millis() as u64,
+                outcome: outcome_of(success, result.to_string()),
             },
-        )))
+        )))))
         .await;
 }
 
 /// Spawn a task that forwards tool call events to the SSE stream.
 ///
 /// Listens on the observer's broadcast channel and converts `ToolEvent`s
-/// to `OrchestratorEvent`s, sending them through the event channel.
+/// to `AgentEventPayload`s, sending them through the event channel.
 pub(super) fn spawn_tool_event_forwarder(
     observer: &ToolCallObserver,
     event_tx: tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>,
@@ -361,7 +398,7 @@ pub(super) fn spawn_tool_event_forwarder(
                     match result {
                         Ok(tool_event) => {
                             let orch_event = tool_event_to_orchestrator_event(tool_event);
-                            let _ = event_tx.send(Ok(StreamItem::OrchestratorEvent(orch_event))).await;
+                            let _ = event_tx.send(Ok(StreamItem::AgentEvent(Box::new(orch_event)))).await;
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                             tracing::warn!("Tool observer lagged by {} events", n);
@@ -398,7 +435,7 @@ pub struct Orchestrator {
     agent_config: AgentRuntimeConfig,
 
     /// Tool call observer for coordinator visibility into worker tool execution.
-    /// Wired to emit OrchestratorEvent for real-time SSE streaming via spawn_tool_event_forwarder.
+    /// Wired to emit AgentEventPayload for real-time SSE streaming via spawn_tool_event_forwarder.
     pub(super) tool_call_observer: ToolCallObserver,
 
     /// Shared MCP manager for tool discovery and cancellation.
@@ -411,8 +448,8 @@ pub struct Orchestrator {
     /// Accumulated token usage across all LLM calls in this orchestration run
     /// (planning, workers, continuation routing).
     ///
-    /// Cloned from a handle owned by `OrchestratorFactory::stream_with_timeout`
-    /// so the streaming handler can read the final totals and emit `aura.usage`.
+    /// Cloned from the handle `OrchestratorFactory::stream` puts on the run, so
+    /// the streaming handler can read the final totals and emit `aura.usage`.
     /// In orchestration mode we aggregate additively via
     /// [`crate::UsageState::accumulate_usage`] so the reported prompt/completion
     /// totals reflect *billed* tokens across every internal LLM turn, not just
@@ -427,11 +464,7 @@ pub struct Orchestrator {
     park_guard: Option<Arc<ParkGuard>>,
 }
 
-/// Stream context for reasoning attribution in `stream_and_forward`.
-///
-/// When `Some`, reasoning items are wrapped as `OrchestratorEvent::WorkerReasoning`
-/// with proper task/worker attribution. When `None`, reasoning is forwarded raw
-/// (coordinator context — attributed as `agent_id: "main"` by handlers).
+/// The task and worker a stream's reasoning is attributed to.
 struct StreamContext<'a> {
     task_id: usize,
     worker_id: &'a str,
@@ -448,11 +481,6 @@ struct StreamCallParams<'a> {
     event_tx: Option<&'a tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>>,
     context_agent: Option<&'a str>,
 }
-
-/// Agent id for the conversation-level context an orchestration run carries,
-/// matching the single-agent id so clients key context pressure the same way
-/// in both modes.
-const COORDINATOR_AGENT_ID: &str = "main";
 
 /// Every exit path of a stream loop must route its turns through
 /// [`TurnTally::record`]: a turn counted locally but not into the shared
@@ -597,11 +625,7 @@ impl Orchestrator {
             .filter(|hitl| hitl.park_enabled)
             .and_then(|hitl| match &*hitl.route {
                 crate::hitl::DecisionRoute::Conversational { registry, .. } => {
-                    Some(ParkGuard::new(
-                        registry.clone(),
-                        run_id_str.clone(),
-                        agent_config.request_id.clone().unwrap_or_default(),
-                    ))
+                    Some(ParkGuard::new(registry.clone(), run_id_str.clone()))
                 }
                 crate::hitl::DecisionRoute::Webhook { .. } => None,
             });
@@ -710,6 +734,11 @@ impl Orchestrator {
         }
 
         apply_worker_skills_override(&mut worker_config, worker_name);
+        // Workers are per-run ephemeral and receive no chat history, so their
+        // skill invocations are never rehydrated into the session — recording
+        // them would leak task-scoped loads across turns. Coordinator-side
+        // invocations keep the recorder from the top-level config.
+        worker_config.skill_recorder = None;
 
         // Per-worker scratchpad override falls back to [agent.scratchpad].
         // Each worker gets a FRESH ContextBudget scoped to its effective LLM —
@@ -734,7 +763,7 @@ impl Orchestrator {
             let accessible_tools = self
                 .mcp_manager
                 .as_ref()
-                .map(|m| m.get_available_tool_names())
+                .map(|m| m.all_tools())
                 .unwrap_or_default();
             let has_matching_tool = scratchpad::has_accessible_scratchpad_tool(
                 &accessible_tools,
@@ -743,7 +772,7 @@ impl Orchestrator {
             );
 
             if !has_matching_tool {
-                if worker_filter.is_some_and(<[String]>::is_empty) {
+                if worker_filter.is_some_and(<[GlobPattern]>::is_empty) {
                     // The deliberate no-tools assignment — nothing to intercept.
                     tracing::info!(
                         "Worker {}: mcp_filter = [] (no MCP tools); scratchpad not needed",
@@ -1043,12 +1072,18 @@ impl Orchestrator {
         let (provider_agent, model_name) = self.build_worker_provider_agent(&worker_config).await?;
 
         let agent = Agent {
+            // A worker's gate and approval tool captured their run when
+            // `create_worker` built them, inside that run, so there is nothing
+            // for `stream` to bind.
+            hitl_gate: None,
+            hitl_approval_tool: None,
             inner: provider_agent,
             model: model_name,
             max_depth: resolved_depth,
             mcp_manager: self.mcp_manager.clone(),
             fallback_tool_parsing: false,
             fallback_tool_names: vec![],
+            fallback_mcp_filter: None,
             context_window: worker_config.llm.context_window(),
             scratchpad_budget: worker_config
                 .scratchpad_tools_config
@@ -1058,6 +1093,7 @@ impl Orchestrator {
             turn_nudge,
             system_prompt: preamble.clone(),
             invocation_parameters: crate::logging::llm_invocation_parameters(&worker_config.llm),
+            skills: worker_config.agent.skills.clone(),
         };
 
         Ok(AgentWithPreamble {
@@ -1132,16 +1168,14 @@ impl Orchestrator {
             return;
         };
         let scope = self.worker_scope(task_id, worker_name).await;
-        let request_id = self.agent_config.request_id.clone().unwrap_or_default();
         for call in pending {
             registry.remove(&call.decision_id).await;
             if let Some(ref scope) = scope {
-                crate::approval_event_broker::publish(
-                    &request_id,
-                    crate::approval_event_broker::ApprovalLifecycleEvent::Completed(
-                        crate::hitl::completed_cancelled(call.decision_id, scope, Duration::ZERO),
-                    ),
-                )
+                crate::run_context::emit(crate::hitl::completed_cancelled_event(
+                    call.decision_id,
+                    scope,
+                    Duration::ZERO,
+                ))
                 .await;
             }
             tracing::warn!(
@@ -1189,7 +1223,7 @@ impl Orchestrator {
         // ToolResult can report a duration. Membership also gates completion:
         // only IDs we started get completed, so MCP tools (covered by
         // ObserverWrapper) are never double-emitted.
-        let mut internal_tool_starts: HashMap<String, std::time::Instant> = HashMap::new();
+        let mut internal_tool_starts: HashMap<String, InternalToolStart> = HashMap::new();
 
         // Two guarded phases per iteration, so the body (its sends and the
         // decision-ready branch's inner `next()`) runs under the deadline
@@ -1232,13 +1266,13 @@ impl Orchestrator {
                         if let Some(tx) = event_tx {
                             if let Some(ref ctx) = stream_context {
                                 let _ = tx
-                                    .send(Ok(StreamItem::OrchestratorEvent(
-                                        OrchestratorEvent::WorkerReasoning {
-                                            task_id: ctx.task_id,
-                                            worker_id: ctx.worker_id.to_string(),
+                                    .send(Ok(StreamItem::AgentEvent(Box::new(by_worker(
+                                        ctx.worker_id,
+                                        AgentEventPayload::Reasoning {
+                                            task_id: Some(ctx.task_id),
                                             content: delta,
                                         },
-                                    )))
+                                    )))))
                                     .await;
                             } else {
                                 let _ = tx
@@ -1269,7 +1303,7 @@ impl Orchestrator {
                     {
                         let (task_id, worker_id) = match stream_context.as_ref() {
                             Some(w) => (Some(w.task_id), w.worker_id),
-                            None => (None, "main"),
+                            None => (None, CONVERSATION_AGENT_ID),
                         };
                         forward_internal_tool_started(
                             event_tx,
@@ -1400,12 +1434,15 @@ impl Orchestrator {
         let timeout_secs = self.config.per_call_timeout_secs();
         let stream_future = async {
             let stream = match park_key {
-                Some(key) => {
-                    agent
-                        .stream_chat_with_timeout(prompt, history, Duration::MAX, key)
-                        .await
-                        .0
-                }
+                Some(key) => agent
+                    .stream_chat_with_timeout(
+                        prompt,
+                        history,
+                        crate::streaming::RunOptions::default(),
+                        key,
+                    )
+                    .await
+                    .into_events(),
                 None => agent.stream_chat(prompt, history).await,
             };
             Self::drive_forward_loop(
@@ -1493,7 +1530,7 @@ impl Orchestrator {
             // The coordinator is not ObserverWrapped, so forward the same non-MCP
             // tool calls a worker does (skills, orchestration operations), attributed
             // to the main agent.
-            let mut internal_tool_starts: HashMap<String, std::time::Instant> = HashMap::new();
+            let mut internal_tool_starts: HashMap<String, InternalToolStart> = HashMap::new();
 
             // Same two-phase guarded shape as `stream_and_forward`; see the
             // rationale there, including why new_disarmed() rather than new().
@@ -1553,7 +1590,7 @@ impl Orchestrator {
                             forward_internal_tool_started(
                                 event_tx,
                                 None,
-                                "main",
+                                CONVERSATION_AGENT_ID,
                                 &tc.id,
                                 &tc.name,
                                 &tc.arguments,
@@ -1913,13 +1950,14 @@ impl Orchestrator {
                         // persistent conversation — the chat history plus the
                         // planning prompt — so its occupancy is the
                         // conversation's, reported under the same agent id
-                        // single-agent mode uses. Continuation cycles carry
-                        // the turn's scratch conversation, discarded when the
-                        // turn ends, and so do routing-correction attempts
-                        // (the skipped reply plus the correction), so neither
-                        // reports.
+                        // single-agent mode uses so clients key context
+                        // pressure the same way in both modes. Continuation
+                        // cycles carry the turn's scratch conversation,
+                        // discarded when the turn ends, and so do
+                        // routing-correction attempts (the skipped reply plus
+                        // the correction), so neither reports.
                         context_agent: (previous.is_none() && attempt == 1)
-                            .then_some(COORDINATOR_AGENT_ID),
+                            .then_some(CONVERSATION_AGENT_ID),
                     },
                     &coordinator_state.routing_decision,
                 )
@@ -2323,28 +2361,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
             return Vec::new();
         };
 
-        let mut names = Vec::new();
-
-        // Collect from streamable HTTP tools (rmcp::model::Tool has Cow<'static, str>)
-        for tools in mcp_manager.streamable_tools.values() {
-            for tool in tools {
-                names.push(tool.name.to_string());
-            }
-        }
-
-        // Collect from SSE tools
-        for tools in mcp_manager.sse_tools.values() {
-            for tool in tools {
-                names.push(tool.name.to_string());
-            }
-        }
-
-        // Collect from STDIO tools
-        for tools in mcp_manager.stdio_tools.values() {
-            for tool in tools {
-                names.push(tool.name.to_string());
-            }
-        }
+        let mut names: Vec<String> = mcp_manager
+            .tool_definitions_iter()
+            .map(|tool| tool.name().to_string())
+            .collect();
 
         // Remove duplicates while preserving order
         let mut seen = std::collections::HashSet::new();
@@ -2364,35 +2384,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
             return std::collections::HashMap::new();
         };
 
-        let mut schemas = std::collections::HashMap::new();
-
-        // Collect from streamable HTTP tools
-        // rmcp::model::Tool.input_schema is Arc<JsonObject> where JsonObject = Map<String, Value>
-        for tools in mcp_manager.streamable_tools.values() {
-            for tool in tools {
-                // Convert Arc<Map<String, Value>> to serde_json::Value
-                let schema_value = serde_json::Value::Object((*tool.input_schema).clone());
-                schemas.insert(tool.name.to_string(), schema_value);
-            }
-        }
-
-        // Collect from SSE tools
-        for tools in mcp_manager.sse_tools.values() {
-            for tool in tools {
-                let schema_value = serde_json::Value::Object((*tool.input_schema).clone());
-                schemas.insert(tool.name.to_string(), schema_value);
-            }
-        }
-
-        // Collect from STDIO tools
-        for tools in mcp_manager.stdio_tools.values() {
-            for tool in tools {
-                let schema_value = serde_json::Value::Object((*tool.input_schema).clone());
-                schemas.insert(tool.name.to_string(), schema_value);
-            }
-        }
-
-        schemas
+        mcp_manager
+            .tool_definitions_iter()
+            .map(|tool| (tool.name().to_string(), tool.input_schema()))
+            .collect()
     }
 
     /// Resolve which tools each worker can access based on their mcp_filter.
@@ -2412,22 +2407,25 @@ Assign tasks to the worker whose tools best match the required operations."#,
     /// - "operations" -> ["mezmo_logs", "mezmo_pipelines"]
     /// - "knowledge" -> ["ListKnowledgeBases", "QueryKnowledgeBases"]
     fn resolve_worker_tools(&self) -> std::collections::HashMap<String, Vec<String>> {
-        let all_tools = self.get_all_tool_names();
+        let all_tools: Vec<crate::mcp::AuraTool> = self
+            .mcp_manager
+            .as_ref()
+            .map(|m| m.all_tools())
+            .unwrap_or_default();
         let mut worker_tools = std::collections::HashMap::new();
 
         for (worker_name, worker_config) in &self.config.workers {
             // Omitted filter = every MCP tool (backwards compatibility);
-            // `mcp_filter = []` = none.
+            // `mcp_filter = []` = none. Matching is namespace-aware — see
+            // `AuraTool::is_match` — so a worker's `mcp_filter` can scope to
+            // one server (`k8s:*`) even though the resulting tool names are
+            // always bare.
             let mut matching_tools: Vec<String> = match &worker_config.mcp_filter {
-                None => all_tools.clone(),
+                None => all_tools.iter().map(|t| t.name().to_string()).collect(),
                 Some(filter) => all_tools
                     .iter()
-                    .filter(|tool_name| {
-                        filter
-                            .iter()
-                            .any(|pattern| crate::config::glob_match(pattern, tool_name))
-                    })
-                    .cloned()
+                    .filter(|tool| filter.iter().any(|pattern| tool.is_match(pattern)))
+                    .map(|t| t.name().to_string())
                     .collect(),
             };
 
@@ -2451,30 +2449,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
         // Collect from MCP tools
         if let Some(ref mcp_manager) = self.mcp_manager {
-            // Collect from streamable HTTP tools (description is Option<Cow<'static, str>>)
-            for tools in mcp_manager.streamable_tools.values() {
-                for tool in tools {
-                    if let Some(ref desc) = tool.description {
-                        descriptions.insert(tool.name.to_string(), desc.to_string());
-                    }
-                }
-            }
-
-            // Collect from SSE tools
-            for tools in mcp_manager.sse_tools.values() {
-                for tool in tools {
-                    if let Some(ref desc) = tool.description {
-                        descriptions.insert(tool.name.to_string(), desc.to_string());
-                    }
-                }
-            }
-
-            // Collect from STDIO tools
-            for tools in mcp_manager.stdio_tools.values() {
-                for tool in tools {
-                    if let Some(ref desc) = tool.description {
-                        descriptions.insert(tool.name.to_string(), desc.to_string());
-                    }
+            for tool in mcp_manager.tool_definitions_iter() {
+                if let Some(desc) = tool.description() {
+                    descriptions.insert(tool.name().to_string(), desc.to_string());
                 }
             }
         }
@@ -2688,7 +2665,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
             } else {
                 None
             },
-            skill_tools: crate::skill_tool::SkillToolset::new(&self.agent_config.agent.skills),
+            skill_tools: crate::skill_tool::SkillToolset::new(
+                &self.agent_config.agent.skills,
+                self.agent_config.skill_recorder.clone(),
+            ),
         };
 
         let provider_agent = self
@@ -2711,12 +2691,15 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
         Ok(AgentWithPreamble {
             agent: Agent {
+                hitl_gate: None,
+                hitl_approval_tool: None,
                 inner: provider_agent,
                 model: model_name,
                 max_depth,
                 mcp_manager: None, // Coordinator doesn't have MCP tools
                 fallback_tool_parsing: false,
                 fallback_tool_names: vec![],
+                fallback_mcp_filter: None,
                 context_window: self.agent_config.llm.context_window(),
                 scratchpad_budget: None,
                 client_tool_names: Default::default(),
@@ -2725,6 +2708,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 invocation_parameters: crate::logging::llm_invocation_parameters(
                     &self.agent_config.llm,
                 ),
+                skills: self.agent_config.agent.skills.clone(),
             },
             preamble,
             escalation_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -3309,14 +3293,14 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     task.start();
                 }
                 let _ = event_tx
-                    .send(Ok(StreamItem::OrchestratorEvent(
-                        OrchestratorEvent::TaskStarted {
+                    .send(Ok(StreamItem::AgentEvent(Box::new(by_worker(
+                        &worker_name.clone().unwrap_or(self.orchestrator_id.clone()),
+                        AgentEventPayload::TaskStarted {
                             task_id: *task_id,
                             description: task_desc.clone(),
                             orchestrator_id: self.orchestrator_id.clone(),
-                            worker_id: worker_name.clone().unwrap_or(self.orchestrator_id.clone()),
                         },
-                    )))
+                    )))))
                     .await;
             }
 
@@ -3365,18 +3349,15 @@ Assign tasks to the worker whose tools best match the required operations."#,
                             t.structured_output = exec_result.structured_output;
                         }
                         let _ = event_tx
-                            .send(Ok(StreamItem::OrchestratorEvent(
-                                OrchestratorEvent::TaskCompleted {
+                            .send(Ok(StreamItem::AgentEvent(Box::new(by_worker(
+                                &worker_name.clone().unwrap_or(self.orchestrator_id.clone()),
+                                AgentEventPayload::TaskCompleted {
                                     task_id,
-                                    success,
                                     duration_ms,
                                     orchestrator_id: self.orchestrator_id.clone(),
-                                    worker_id: worker_name
-                                        .clone()
-                                        .unwrap_or(self.orchestrator_id.clone()),
-                                    result: result_for_event,
+                                    outcome: outcome_of(success, result_for_event),
                                 },
-                            )))
+                            )))))
                             .await;
                         if success {
                             tracing::info!("Task {} completed in {}ms", task_id, duration_ms);
@@ -3398,16 +3379,16 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         let worker_id = worker_name.clone().unwrap_or(self.orchestrator_id.clone());
                         for call in &pending {
                             let _ = event_tx
-                                .send(Ok(StreamItem::OrchestratorEvent(
-                                    OrchestratorEvent::TaskBlocked {
+                                .send(Ok(StreamItem::AgentEvent(Box::new(by_worker(
+                                    &worker_id,
+                                    AgentEventPayload::TaskBlocked {
                                         task_id,
                                         orchestrator_id: self.orchestrator_id.clone(),
-                                        worker_id: worker_id.clone(),
-                                        tool_call_id: call.call_id.clone(),
+                                        tool_call_id: call.call_id.clone().into(),
                                         decision_id: call.decision_id.to_string(),
-                                        tool_name: call.tool_name.clone(),
+                                        tool_name: call.tool_name.clone().into(),
                                     },
-                                )))
+                                )))))
                                 .await;
                         }
                         if let Some(t) = plan.get_task_mut(task_id) {
@@ -3428,18 +3409,15 @@ Assign tasks to the worker whose tools best match the required operations."#,
                             t.fail(err_str.clone(), category);
                         }
                         let _ = event_tx
-                            .send(Ok(StreamItem::OrchestratorEvent(
-                                OrchestratorEvent::TaskCompleted {
+                            .send(Ok(StreamItem::AgentEvent(Box::new(by_worker(
+                                &worker_name.clone().unwrap_or(self.orchestrator_id.clone()),
+                                AgentEventPayload::TaskCompleted {
                                     task_id,
-                                    success: false,
                                     duration_ms,
                                     orchestrator_id: self.orchestrator_id.clone(),
-                                    worker_id: worker_name
-                                        .clone()
-                                        .unwrap_or(self.orchestrator_id.clone()),
-                                    result: err_str.clone(),
+                                    outcome: outcome_of(false, err_str.clone()),
                                 },
-                            )))
+                            )))))
                             .await;
                         let worker_label = worker_name.as_deref().unwrap_or("generic");
                         let (task_preview, _) = safe_truncate(&task_desc, 100);
@@ -4035,18 +4013,19 @@ Assign tasks to the worker whose tools best match the required operations."#,
         let srd = submit_result_decision.clone();
         let park_registration =
             crate::streaming_request_hook::ParkCellRegistration::new(&park.key, park.cell.clone());
-        let (stream, _cancel_tx, _usage_state) = worker
+        let stream = worker
             .inner
             .stream_chat_message_with_timeout(
                 current_prompt,
                 continuation.history.clone(),
                 worker.max_depth,
-                Duration::MAX,
+                crate::streaming::RunOptions::default(),
                 &park.key,
                 worker.scratchpad_budget.clone(),
                 worker.client_tool_names.clone(),
             )
-            .await;
+            .await
+            .into_events();
         let stream_result = Self::drive_forward_loop(
             stream,
             &self.usage_state,
@@ -4347,10 +4326,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
     /// Send an orchestrator event through the stream channel.
     async fn emit_event(
         event_tx: &tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>,
-        event: OrchestratorEvent,
+        event: AgentEventPayload,
     ) {
         let _ = event_tx
-            .send(Ok(StreamItem::OrchestratorEvent(event)))
+            .send(Ok(StreamItem::AgentEvent(Box::new(by_coordinator(event)))))
             .await;
     }
 
@@ -4369,7 +4348,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
     ) -> (Option<IterationContext>, Plan) {
         Self::emit_event(
             event_tx,
-            OrchestratorEvent::ReplanStarted {
+            AgentEventPayload::ReplanStarted {
                 iteration: iteration + 1,
                 trigger: trigger.to_string(),
             },
@@ -4475,7 +4454,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 span.record("orchestration.routing", "direct");
                 Self::emit_event(
                     &event_tx,
-                    OrchestratorEvent::DirectAnswer {
+                    AgentEventPayload::DirectAnswer {
                         response: response.clone(),
                         routing_rationale,
                     },
@@ -4493,7 +4472,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 span.record("orchestration.routing", "clarification");
                 Self::emit_event(
                     &event_tx,
-                    OrchestratorEvent::ClarificationNeeded {
+                    AgentEventPayload::ClarificationNeeded {
                         question: question.clone(),
                         options,
                         routing_rationale,
@@ -4510,10 +4489,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
                 Self::emit_event(
                     &event_tx,
-                    OrchestratorEvent::PlanCreated {
+                    AgentEventPayload::PlanCreated {
                         goal: plan.goal.clone(),
                         tasks: plan.tasks.iter().map(|t| t.description.clone()).collect(),
-                        routing_mode: super::events::RoutingMode::for_plan(plan.tasks.len()),
+                        routing_mode: RoutingMode::for_plan(plan.tasks.len()),
                         routing_rationale: routing_rationale.clone(),
                         planning_response: planning_summary,
                     },
@@ -4857,7 +4836,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             failure_history.clone(),
             tool_traces,
         );
-        Self::emit_event(event_tx, OrchestratorEvent::Synthesizing { iteration }).await;
+        Self::emit_event(event_tx, AgentEventPayload::Synthesizing { iteration }).await;
         let decision_start = Instant::now();
         let routing = self
             .plan_with_routing(
@@ -4892,7 +4871,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     .record("orchestration.post_execute_decision", "respond_directly");
                 Self::emit_event(
                     event_tx,
-                    OrchestratorEvent::DirectAnswer {
+                    AgentEventPayload::DirectAnswer {
                         response: response.clone(),
                         routing_rationale,
                     },
@@ -4900,7 +4879,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 .await;
                 Self::emit_event(
                     event_tx,
-                    OrchestratorEvent::IterationComplete {
+                    AgentEventPayload::IterationComplete {
                         iteration,
                         will_replan: false,
                         reasoning: String::new(),
@@ -4940,7 +4919,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 );
                 Self::emit_event(
                     event_tx,
-                    OrchestratorEvent::ClarificationNeeded {
+                    AgentEventPayload::ClarificationNeeded {
                         question: question.clone(),
                         options,
                         routing_rationale,
@@ -4949,7 +4928,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 .await;
                 Self::emit_event(
                     event_tx,
-                    OrchestratorEvent::IterationComplete {
+                    AgentEventPayload::IterationComplete {
                         iteration,
                         will_replan: false,
                         reasoning: String::new(),
@@ -4999,7 +4978,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     let raw = Self::build_raw_task_results(&plan, detail);
                     Self::emit_event(
                         event_tx,
-                        OrchestratorEvent::IterationComplete {
+                        AgentEventPayload::IterationComplete {
                             iteration,
                             will_replan: false,
                             reasoning: reasoning.to_string(),
@@ -5015,18 +4994,25 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
                 let routing_rationale = resp.routing_rationale().to_string();
                 let planning_summary = resp.planning_summary().unwrap_or_default().to_string();
-                let new_plan = resp.into_plan().expect("StepsPlan always converts to plan");
+                let Some(new_plan) = resp.into_plan() else {
+                    // create_plan validates the shape before recording the
+                    // decision, so this is unreachable in practice; fail the
+                    // request rather than panic the runtime if it is not.
+                    return Err("Planning produced a plan Aura cannot flatten; \
+                                see the orchestrator log for the reason"
+                        .into());
+                };
 
                 Self::emit_event(
                     event_tx,
-                    OrchestratorEvent::PlanCreated {
+                    AgentEventPayload::PlanCreated {
                         goal: new_plan.goal.clone(),
                         tasks: new_plan
                             .tasks
                             .iter()
                             .map(|t| t.description.clone())
                             .collect(),
-                        routing_mode: super::events::RoutingMode::for_plan(new_plan.tasks.len()),
+                        routing_mode: RoutingMode::for_plan(new_plan.tasks.len()),
                         routing_rationale,
                         planning_response: planning_summary,
                     },
@@ -5034,7 +5020,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 .await;
                 Self::emit_event(
                     event_tx,
-                    OrchestratorEvent::IterationComplete {
+                    AgentEventPayload::IterationComplete {
                         iteration,
                         will_replan: true,
                         reasoning: String::new(),
@@ -5102,7 +5088,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 let raw = Self::build_raw_task_results(&plan, &note);
                 Self::emit_event(
                     event_tx,
-                    OrchestratorEvent::IterationComplete {
+                    AgentEventPayload::IterationComplete {
                         iteration,
                         will_replan: false,
                         reasoning: note,
@@ -5267,7 +5253,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 }
                 Self::emit_event(
                     event_tx,
-                    OrchestratorEvent::RunParked {
+                    AgentEventPayload::RunParked {
                         run_id: run_id.clone(),
                         decision_ids: commit
                             .refreshed
@@ -5316,8 +5302,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         let crate::hitl::DecisionRoute::Conversational { registry, .. } = &*hitl.route else {
             return;
         };
-        let request_id = self.agent_config.request_id.clone().unwrap_or_default();
-        super::park::cancel_run_approvals(registry, run_id, &request_id)
+        super::park::cancel_run_approvals(registry, run_id, crate::run_context::current_run())
             .await
             .ok();
     }
@@ -5448,7 +5433,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             goal: plan.goal.clone(),
             status,
             iterations,
-            routing_mode: Some(super::events::RoutingMode::for_plan(plan.tasks.len())),
+            routing_mode: Some(RoutingMode::for_plan(plan.tasks.len())),
             outcome,
             response_summary,
             task_summaries,
@@ -5485,7 +5470,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             goal: query.to_string(),
             status: RunStatus::Success,
             iterations: 0,
-            routing_mode: Some(super::events::RoutingMode::DirectAnswer),
+            routing_mode: Some(RoutingMode::DirectAnswer),
             outcome: Some("Answered directly".to_string()),
             response_summary,
             task_summaries: vec![],
@@ -5650,6 +5635,35 @@ mod tests {
                 .collect(),
             other => panic!("expected assistant message, got {other:?}"),
         }
+    }
+
+    /// A worker's tool call and its completion must name the same agent. The
+    /// envelope's agent id becomes the wire `worker_id`, so a completion
+    /// attributed to the coordinator splits the pair across two agents in the
+    /// client's view.
+    #[test]
+    fn tool_events_attribute_both_halves_to_the_initiating_worker() {
+        use crate::tool_call_observer::ToolEvent;
+
+        let started = tool_event_to_orchestrator_event(ToolEvent::call_started(
+            "task1_search_0",
+            "search",
+            "log-analyst",
+            serde_json::json!({}),
+        ));
+        let completed = tool_event_to_orchestrator_event(ToolEvent::call_completed_success(
+            "task1_search_0",
+            "search",
+            "log-analyst",
+            "result",
+            42,
+        ));
+
+        assert_eq!(started.agent.agent_id, "log-analyst");
+        assert_eq!(
+            completed.agent.agent_id, "log-analyst",
+            "the completion must name the worker, not the coordinator"
+        );
     }
 
     /// Blank assistant turns must be replayed as non-empty text so providers
@@ -5997,7 +6011,7 @@ mod tests {
             WorkerConfig {
                 description: "For logs and pipelines".to_string(),
                 preamble: "Operations specialist.".to_string(),
-                mcp_filter: Some(vec!["mezmo_*".to_string()]),
+                mcp_filter: Some(vec!["mezmo_*".into()]),
                 vector_stores: vec![], // No RAG for operations
                 turn_depth: None,
                 llm: None,
@@ -6105,7 +6119,7 @@ mod tests {
             WorkerConfig {
                 description: "For operational tasks".to_string(),
                 preamble: "Operations specialist.".to_string(),
-                mcp_filter: Some(vec!["mezmo_*".to_string()]),
+                mcp_filter: Some(vec!["mezmo_*".into()]),
                 vector_stores: vec![], // Explicitly no RAG access
                 turn_depth: None,
                 llm: None,
@@ -6506,116 +6520,46 @@ mod tests {
     // Cancellation watcher tests
     // ========================================================================
 
+    /// A finished run is not a cancelled one, so the watcher has to stop on a
+    /// signal that leaves the run's own token untouched.
     #[tokio::test(start_paused = true)]
-    async fn test_watcher_normal_completion_does_not_cancel() {
-        let (cancel_tx, cancel_rx) = watch::channel(false);
+    async fn watcher_stops_when_the_run_ends() {
         let cancel_token = CancellationToken::new();
-        let handle = spawn_cancellation_watcher(
-            cancel_rx,
+        let finished = CancellationToken::new();
+        let handle = spawn_timeout_watcher(
             Duration::from_secs(300),
             cancel_token.clone(),
+            finished.clone(),
             "test-normal".to_string(),
         );
 
-        drop(cancel_tx);
-        tokio::task::yield_now().await;
-        handle.await.unwrap();
-        assert!(!cancel_token.is_cancelled());
-    }
+        finished.cancel();
 
-    #[tokio::test(start_paused = true)]
-    async fn test_watcher_external_cancel_triggers_token() {
-        let (cancel_tx, cancel_rx) = watch::channel(false);
-        let cancel_token = CancellationToken::new();
-        let handle = spawn_cancellation_watcher(
-            cancel_rx,
-            Duration::from_secs(300),
-            cancel_token.clone(),
-            "test-cancel".to_string(),
+        let start = tokio::time::Instant::now();
+        handle.await.unwrap();
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "watcher should exit when the run ends, not wait out its timeout"
         );
-
-        cancel_tx.send(true).unwrap();
-        tokio::task::yield_now().await;
-        handle.await.unwrap();
-        assert!(cancel_token.is_cancelled());
+        assert!(
+            !cancel_token.is_cancelled(),
+            "a run that finished was never cancelled"
+        );
     }
 
     #[tokio::test(start_paused = true)]
-    async fn test_watcher_timeout_triggers_cancellation() {
-        // Keep sender alive so only the timeout path can fire
-        let (_cancel_tx, cancel_rx) = watch::channel(false);
+    async fn watcher_cancels_on_timeout() {
         let cancel_token = CancellationToken::new();
-        let handle = spawn_cancellation_watcher(
-            cancel_rx,
+        let handle = spawn_timeout_watcher(
             Duration::from_secs(60),
             cancel_token.clone(),
+            CancellationToken::new(),
             "test-timeout".to_string(),
         );
 
         tokio::time::advance(Duration::from_secs(61)).await;
-        tokio::task::yield_now().await;
         handle.await.unwrap();
         assert!(cancel_token.is_cancelled());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn test_watcher_drop_before_timeout_prevents_spurious_cancel() {
-        let (cancel_tx, cancel_rx) = watch::channel(false);
-        let cancel_token = CancellationToken::new();
-        let handle = spawn_cancellation_watcher(
-            cancel_rx,
-            Duration::from_secs(60),
-            cancel_token.clone(),
-            "test-no-spurious".to_string(),
-        );
-
-        // Advance to T=30s, then drop sender (simulating stream completing mid-timeout)
-        tokio::time::advance(Duration::from_secs(30)).await;
-        tokio::task::yield_now().await;
-        drop(cancel_tx);
-        tokio::task::yield_now().await;
-
-        let start = tokio::time::Instant::now();
-        handle.await.unwrap();
-        let elapsed = start.elapsed();
-
-        assert!(
-            !cancel_token.is_cancelled(),
-            "token should not be cancelled when sender is dropped before timeout"
-        );
-        // Task should exit promptly on sender drop, not wait for remaining 30s timeout
-        assert!(
-            elapsed < Duration::from_secs(1),
-            "task should exit promptly after sender drop, not wait for timeout; elapsed: {:?}",
-            elapsed
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn test_watcher_false_signal_does_not_cancel() {
-        let (cancel_tx, cancel_rx) = watch::channel(false);
-        let cancel_token = CancellationToken::new();
-        let handle = spawn_cancellation_watcher(
-            cancel_rx,
-            Duration::from_secs(300),
-            cancel_token.clone(),
-            "test-false-signal".to_string(),
-        );
-
-        // Send false — triggers rx.changed() but borrow_and_update() sees false,
-        // so the loop continues waiting
-        cancel_tx.send(false).unwrap();
-        tokio::task::yield_now().await;
-        assert!(
-            !cancel_token.is_cancelled(),
-            "false signal should not cancel"
-        );
-
-        // Clean exit via sender drop
-        drop(cancel_tx);
-        tokio::task::yield_now().await;
-        handle.await.unwrap();
-        assert!(!cancel_token.is_cancelled());
     }
 
     // ========================================================================
@@ -7454,8 +7398,6 @@ mod tests {
     /// webhook arm of park mode is out of V1 scope.
     #[tokio::test]
     async fn park_enabled_requires_flag_and_conversational_route() {
-        use aura_config::GlobPattern;
-
         fn config(park_enabled: bool, conversational: bool) -> AgentRuntimeConfig {
             let mut config = AgentRuntimeConfig::default();
             let route = if conversational {
@@ -7473,7 +7415,7 @@ mod tests {
                 }
             };
             config.hitl = Some(crate::hitl::HitlRuntime {
-                patterns: Arc::from([GlobPattern::new("kubectl_*").unwrap()]),
+                patterns: Arc::from(["kubectl_*".into()]),
                 route: Arc::new(route),
                 park_enabled,
             });
@@ -7507,7 +7449,7 @@ mod tests {
         use crate::session_store::{InMemoryApprovalStore, InMemoryEventBus};
 
         let request_id = format!("req_cancel_{}", uuid::Uuid::new_v4().simple());
-        let mut events = crate::approval_event_broker::subscribe(&request_id).await;
+        let (run, mut events) = crate::run_context::RunContext::channel(request_id.as_str());
 
         let store: Arc<dyn crate::session_store::ApprovalStore> =
             Arc::new(InMemoryApprovalStore::new());
@@ -7515,7 +7457,7 @@ mod tests {
             PendingApprovals::with_backend(store.clone(), Arc::new(InMemoryEventBus::new()));
         let config = AgentRuntimeConfig {
             hitl: Some(crate::hitl::HitlRuntime {
-                patterns: Arc::from([aura_config::GlobPattern::new("kubectl_*").unwrap()]),
+                patterns: Arc::from(["kubectl_*".into()]),
                 route: Arc::new(crate::hitl::DecisionRoute::Conversational {
                     registry: registry.clone(),
                     timeout: Duration::from_secs(60),
@@ -7563,9 +7505,12 @@ mod tests {
             });
         }
 
-        orchestrator
-            .cancel_parked_approvals(3, Some("operations"), &pending)
-            .await;
+        // The orchestrator emits through the ambient run, as its own body does.
+        crate::run_context::with_run(
+            run,
+            orchestrator.cancel_parked_approvals(3, Some("operations"), &pending),
+        )
+        .await;
 
         for call in &pending {
             assert!(
@@ -7575,10 +7520,11 @@ mod tests {
             );
         }
         for expected in &pending {
-            match tokio::time::timeout(Duration::from_secs(1), events.recv()).await {
-                Ok(Some(crate::approval_event_broker::ApprovalLifecycleEvent::Completed(
-                    completed,
-                ))) => {
+            match tokio::time::timeout(Duration::from_secs(1), events.recv())
+                .await
+                .map(|event| event.map(|event| event.payload))
+            {
+                Ok(Some(aura_events::agent::AgentEventPayload::ApprovalCompleted(completed))) => {
                     assert_eq!(completed.decision_id, expected.decision_id.to_string());
                     assert!(matches!(
                         completed.outcome,
@@ -7588,8 +7534,6 @@ mod tests {
                 other => panic!("expected Completed(cancelled) event, got {other:?}"),
             }
         }
-
-        crate::approval_event_broker::unsubscribe(&request_id).await;
     }
 
     // ====================================================================
@@ -7627,7 +7571,7 @@ mod tests {
         let registry = PendingApprovals::with_backend(store, Arc::new(InMemoryEventBus::new()));
         let config = AgentRuntimeConfig {
             hitl: Some(crate::hitl::HitlRuntime {
-                patterns: Arc::from([aura_config::GlobPattern::new("kubectl_*").unwrap()]),
+                patterns: Arc::from(["kubectl_*".into()]),
                 route: Arc::new(crate::hitl::DecisionRoute::Conversational {
                     registry: registry.clone(),
                     timeout: Duration::from_secs(3600),
@@ -7674,6 +7618,7 @@ mod tests {
                         },
                         items: vec![ApprovalItem {
                             tool_name: tool.to_string(),
+                            tool_namespace: None,
                             arguments: serde_json::json!({ "namespace": "prod" }),
                             tool_call_intent: None,
                         }],
@@ -7784,12 +7729,18 @@ mod tests {
         assert!(awaiting.history.is_some() && awaiting.current_prompt.is_some());
 
         match event_rx.recv().await {
-            Some(Ok(StreamItem::OrchestratorEvent(OrchestratorEvent::RunParked {
-                run_id: event_run,
-                decision_ids,
-                iteration,
-                ..
-            }))) => {
+            Some(Ok(StreamItem::AgentEvent(event)))
+                if matches!(event.payload, AgentEventPayload::RunParked { .. }) =>
+            {
+                let AgentEventPayload::RunParked {
+                    run_id: event_run,
+                    decision_ids,
+                    iteration,
+                    ..
+                } = event.payload
+                else {
+                    unreachable!("guarded above")
+                };
                 assert_eq!(event_run, run_id);
                 assert_eq!(decision_ids, expected_ids);
                 assert_eq!(iteration, 1);
@@ -7854,11 +7805,17 @@ mod tests {
             document.expires_at
         );
         match event_rx.recv().await {
-            Some(Ok(StreamItem::OrchestratorEvent(OrchestratorEvent::RunParked {
-                decision_ids,
-                expires_at: stamp,
-                ..
-            }))) => {
+            Some(Ok(StreamItem::AgentEvent(event)))
+                if matches!(event.payload, AgentEventPayload::RunParked { .. }) =>
+            {
+                let AgentEventPayload::RunParked {
+                    decision_ids,
+                    expires_at: stamp,
+                    ..
+                } = event.payload
+                else {
+                    unreachable!("guarded above")
+                };
                 assert!(decision_ids.is_empty());
                 assert_eq!(stamp, document.expires_at);
             }
@@ -7876,8 +7833,10 @@ mod tests {
             .request_id
             .clone()
             .unwrap_or_default();
-        let mut events = crate::approval_event_broker::subscribe(&request_id).await;
-        arm_guard(&orchestrator, &plan).await;
+        let (run, mut events) = crate::run_context::RunContext::channel(request_id.as_str());
+        // Arming inside the scope is what gives the guard the run its drop
+        // sweep reports to.
+        crate::run_context::with_run(Arc::clone(&run), arm_guard(&orchestrator, &plan)).await;
 
         // A read-only session root makes the checkpoint write fail.
         let session_root = dir.path().join("park-sess");
@@ -7885,8 +7844,9 @@ mod tests {
 
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(32);
         let chat_history = vec![rig::completion::Message::user("deploy the service")];
-        let result = orchestrator
-            .park_run(
+        let result = crate::run_context::with_run(
+            Arc::clone(&run),
+            orchestrator.park_run(
                 "deploy the service",
                 &chat_history,
                 &[],
@@ -7897,8 +7857,9 @@ mod tests {
                 &plan,
                 &records,
                 &event_tx,
-            )
-            .await;
+            ),
+        )
+        .await;
 
         set_mode(&session_root, 0o755);
 
@@ -7933,10 +7894,11 @@ mod tests {
 
         // One completed(cancelled) per decision from the immediate sweep…
         for _ in &pending {
-            match tokio::time::timeout(Duration::from_secs(1), events.recv()).await {
-                Ok(Some(crate::approval_event_broker::ApprovalLifecycleEvent::Completed(
-                    completed,
-                ))) => {
+            match tokio::time::timeout(Duration::from_secs(1), events.recv())
+                .await
+                .map(|event| event.map(|event| event.payload))
+            {
+                Ok(Some(aura_events::agent::AgentEventPayload::ApprovalCompleted(completed))) => {
                     assert!(matches!(
                         completed.outcome,
                         aura_events::ApprovalOutcomeWire::Cancelled { .. }
@@ -7954,8 +7916,6 @@ mod tests {
                 .is_err(),
             "the drop sweep does not double-report cancelled approvals"
         );
-
-        crate::approval_event_broker::unsubscribe(&request_id).await;
     }
 
     #[tokio::test]
@@ -7968,7 +7928,7 @@ mod tests {
             .request_id
             .clone()
             .unwrap_or_default();
-        let mut events = crate::approval_event_broker::subscribe(&request_id).await;
+        let (run, mut events) = crate::run_context::RunContext::channel(request_id.as_str());
 
         // The human decides the first call before the commit is attempted.
         let decided = pending[0].decision_id;
@@ -7978,7 +7938,7 @@ mod tests {
             .await
             .unwrap();
 
-        arm_guard(&orchestrator, &plan).await;
+        crate::run_context::with_run(Arc::clone(&run), arm_guard(&orchestrator, &plan)).await;
 
         // A read-only session root makes the checkpoint write fail.
         let session_root = dir.path().join("park-sess");
@@ -7986,8 +7946,9 @@ mod tests {
 
         let (event_tx, _event_rx) = tokio::sync::mpsc::channel(32);
         let chat_history = vec![rig::completion::Message::user("deploy the service")];
-        let result = orchestrator
-            .park_run(
+        let result = crate::run_context::with_run(
+            Arc::clone(&run),
+            orchestrator.park_run(
                 "deploy the service",
                 &chat_history,
                 &[],
@@ -7998,8 +7959,9 @@ mod tests {
                 &plan,
                 &records,
                 &event_tx,
-            )
-            .await;
+            ),
+        )
+        .await;
 
         set_mode(&session_root, 0o755);
 
@@ -8016,10 +7978,11 @@ mod tests {
 
         // Exactly one cancelled event — the sibling's; the decided
         // approval stays silent.
-        match tokio::time::timeout(Duration::from_secs(1), events.recv()).await {
-            Ok(Some(crate::approval_event_broker::ApprovalLifecycleEvent::Completed(
-                completed,
-            ))) => {
+        match tokio::time::timeout(Duration::from_secs(1), events.recv())
+            .await
+            .map(|event| event.map(|event| event.payload))
+        {
+            Ok(Some(aura_events::agent::AgentEventPayload::ApprovalCompleted(completed))) => {
                 assert_eq!(completed.decision_id, sibling.to_string());
                 assert!(matches!(
                     completed.outcome,
@@ -8043,8 +8006,6 @@ mod tests {
             registry.recorded_decision(&decided).await.is_some(),
             "the recorded decision survives the guard's drop"
         );
-
-        crate::approval_event_broker::unsubscribe(&request_id).await;
     }
 
     #[tokio::test]
@@ -8059,13 +8020,14 @@ mod tests {
             .request_id
             .clone()
             .unwrap_or_default();
-        let mut events = crate::approval_event_broker::subscribe(&request_id).await;
-        arm_guard(&orchestrator, &plan).await;
+        let (run, mut events) = crate::run_context::RunContext::channel(request_id.as_str());
+        crate::run_context::with_run(Arc::clone(&run), arm_guard(&orchestrator, &plan)).await;
 
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(32);
         let chat_history = vec![rig::completion::Message::user("deploy the service")];
-        let result = orchestrator
-            .park_run(
+        let result = crate::run_context::with_run(
+            Arc::clone(&run),
+            orchestrator.park_run(
                 "deploy the service",
                 &chat_history,
                 &[],
@@ -8076,8 +8038,9 @@ mod tests {
                 &plan,
                 &records,
                 &event_tx,
-            )
-            .await;
+            ),
+        )
+        .await;
 
         let err = result.expect_err("the store fault must fail the commit");
         assert!(
@@ -8110,10 +8073,11 @@ mod tests {
 
         // One completed(cancelled) per decision from the immediate sweep…
         for _ in &pending {
-            match tokio::time::timeout(Duration::from_secs(1), events.recv()).await {
-                Ok(Some(crate::approval_event_broker::ApprovalLifecycleEvent::Completed(
-                    completed,
-                ))) => {
+            match tokio::time::timeout(Duration::from_secs(1), events.recv())
+                .await
+                .map(|event| event.map(|event| event.payload))
+            {
+                Ok(Some(aura_events::agent::AgentEventPayload::ApprovalCompleted(completed))) => {
                     assert!(matches!(
                         completed.outcome,
                         aura_events::ApprovalOutcomeWire::Cancelled { .. }
@@ -8131,8 +8095,6 @@ mod tests {
                 .is_err(),
             "the drop sweep does not double-report cancelled approvals"
         );
-
-        crate::approval_event_broker::unsubscribe(&request_id).await;
     }
 
     // ====================================================================
@@ -8184,7 +8146,7 @@ mod tests {
         let request_id = format!("req_orphan_{}", uuid::Uuid::new_v4().simple());
         let config = AgentRuntimeConfig {
             hitl: Some(crate::hitl::HitlRuntime {
-                patterns: Arc::from([aura_config::GlobPattern::new("echo_tool").unwrap()]),
+                patterns: Arc::from(["echo_tool".into()]),
                 route: Arc::new(crate::hitl::DecisionRoute::Conversational {
                     registry: registry.clone(),
                     timeout: Duration::from_secs(3600),
@@ -8238,9 +8200,7 @@ mod tests {
     async fn assert_orphaned(
         result: Result<TaskOutcome, StreamError>,
         store: &Arc<crate::session_store::InMemoryApprovalStore>,
-        events: &mut tokio::sync::mpsc::Receiver<
-            crate::approval_event_broker::ApprovalLifecycleEvent,
-        >,
+        events: &mut tokio::sync::mpsc::Receiver<aura_events::agent::AgentEvent>,
         expected_events: usize,
         underlying: &str,
     ) {
@@ -8260,10 +8220,11 @@ mod tests {
 
         let mut decision_ids = Vec::new();
         while decision_ids.len() < expected_events {
-            match tokio::time::timeout(Duration::from_secs(1), events.recv()).await {
-                Ok(Some(crate::approval_event_broker::ApprovalLifecycleEvent::Completed(
-                    completed,
-                ))) => {
+            match tokio::time::timeout(Duration::from_secs(1), events.recv())
+                .await
+                .map(|event| event.map(|event| event.payload))
+            {
+                Ok(Some(aura_events::agent::AgentEventPayload::ApprovalCompleted(completed))) => {
                     assert!(matches!(
                         completed.outcome,
                         aura_events::ApprovalOutcomeWire::Cancelled { .. }
@@ -8271,7 +8232,7 @@ mod tests {
                     decision_ids.push(completed.decision_id);
                 }
                 // The park arm's Requested/Pending pair precedes the sweep's
-                // Completed events on the same broker.
+                // Completed events on the same channel.
                 Ok(Some(_)) => continue,
                 other => panic!("expected completed(cancelled), got {other:?}"),
             }
@@ -8306,7 +8267,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (orchestrator, store, _registry, request_id) =
             override_park_orchestrator(dir.path(), 1).await;
-        let mut events = crate::approval_event_broker::subscribe(&request_id).await;
+        let (run, mut events) = crate::run_context::RunContext::channel(request_id.as_str());
 
         // Depth 1 gives the loop three turns (the rig's +1 safety net), so
         // the gated call must land on the third: the first two turns burn
@@ -8341,17 +8302,19 @@ mod tests {
             worker_name: Some("operations"),
         };
         let (event_tx, _event_rx) = tokio::sync::mpsc::channel(32);
-        let result = orchestrator
-            .execute_task(0, &params, Some(&event_tx), None, None)
-            .await;
+        // The orchestrator's own body runs inside the run; these call it
+        // directly, so the scope is established here instead.
+        let result = crate::run_context::with_run(
+            Arc::clone(&run),
+            orchestrator.execute_task(0, &params, Some(&event_tx), None, None),
+        )
+        .await;
 
         assert_orphaned(result, &store, &mut events, 1, "MaxDepthError").await;
         assert!(
             gated_invocations.lock().unwrap().is_empty(),
             "the parked call must never have reached the inner tool"
         );
-
-        crate::approval_event_broker::unsubscribe(&request_id).await;
     }
 
     /// Provider stream error: the scripted turn issues the gated call and
@@ -8363,7 +8326,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (orchestrator, store, _registry, request_id) =
             override_park_orchestrator(dir.path(), 4).await;
-        let mut events = crate::approval_event_broker::subscribe(&request_id).await;
+        let (run, mut events) = crate::run_context::RunContext::channel(request_id.as_str());
 
         let (_model, gated_invocations) =
             gated_worker_override(vec![ScriptedTurn::tool_calls_then_stream_failure(vec![
@@ -8383,9 +8346,13 @@ mod tests {
             worker_name: Some("operations"),
         };
         let (event_tx, _event_rx) = tokio::sync::mpsc::channel(32);
-        let result = orchestrator
-            .execute_task(0, &params, Some(&event_tx), None, None)
-            .await;
+        // The orchestrator's own body runs inside the run; these call it
+        // directly, so the scope is established here instead.
+        let result = crate::run_context::with_run(
+            Arc::clone(&run),
+            orchestrator.execute_task(0, &params, Some(&event_tx), None, None),
+        )
+        .await;
 
         assert_orphaned(
             result,
@@ -8399,8 +8366,6 @@ mod tests {
             gated_invocations.lock().unwrap().is_empty(),
             "the parked call must never have reached the inner tool"
         );
-
-        crate::approval_event_broker::unsubscribe(&request_id).await;
     }
 
     // ====================================================================
@@ -8472,7 +8437,7 @@ mod tests {
         )]);
         let config = AgentRuntimeConfig {
             hitl: Some(crate::hitl::HitlRuntime {
-                patterns: Arc::from([aura_config::GlobPattern::new("echo_tool").unwrap()]),
+                patterns: Arc::from(["echo_tool".into()]),
                 route: Arc::new(crate::hitl::DecisionRoute::Conversational {
                     registry: registry.clone(),
                     timeout: Duration::from_secs(3600),

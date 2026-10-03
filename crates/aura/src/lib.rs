@@ -5,7 +5,6 @@
 //! in web services or other applications that need to build agents
 //! programmatically.
 
-pub mod approval_event_broker;
 pub mod approver_headers;
 pub mod bedrock_embedding;
 pub mod builder;
@@ -16,6 +15,7 @@ pub mod fallback_tool_parser;
 pub mod fallback_tool_stream;
 pub mod governance;
 pub mod hitl;
+pub mod hooks;
 pub mod inactivity;
 pub mod instance_id;
 pub mod logging;
@@ -28,11 +28,12 @@ pub mod prompts;
 mod provider_agent; // Private - internal implementation detail
 pub mod rag_tools;
 pub mod request_cancellation;
-pub mod request_progress;
 pub mod rig_builder;
+pub mod run_context;
 mod schema_sanitize; // Private - MCP schema sanitization for OpenAI compatibility
 pub mod scratchpad;
 pub mod session_store;
+pub mod skill_rehydration;
 pub mod skill_tool;
 pub mod stream_events;
 pub mod streaming;
@@ -42,7 +43,6 @@ pub(crate) mod string_utils;
 pub(crate) mod test_span_capture;
 pub mod tool_call_observer;
 pub mod tool_error_detection;
-pub mod tool_event_broker;
 pub mod tool_wrapper;
 pub mod tools;
 pub mod turn_nudge;
@@ -65,9 +65,9 @@ pub use orchestration::tools::{
 };
 pub use orchestration::{
     ArtifactsConfig, EventContext, OrchestrationConfig, OrchestrationStreamEvent, Orchestrator,
-    OrchestratorEvent, OrchestratorFactory, Plan, PlanningResponse, RoutingMode, RunId, Task,
-    TaskIdentity, TaskJson, TaskState, TaskStatus, TimeoutsConfig, agent_info,
-    agent_info_with_tools, summarize_tools, worker_overview,
+    OrchestratorFactory, Plan, PlanningResponse, RoutingMode, RunId, Task, TaskIdentity, TaskJson,
+    TaskState, TaskStatus, TimeoutsConfig, agent_info, agent_info_with_tools, summarize_tools,
+    worker_overview,
 };
 pub use passthrough_tool::{PASSTHROUGH_MARKER, PassthroughTool};
 pub use provider_agent::{
@@ -92,17 +92,10 @@ pub type AuraToolCall = provider_agent::ToolCall;
 #[deprecated(since = "1.2.0", note = "use ToolResult instead")]
 pub type AuraToolResult = provider_agent::ToolResult;
 
-pub use approval_event_broker::{
-    ApprovalEventBroker, ApprovalLifecycleEvent, subscribe as approval_event_subscribe,
-    unsubscribe as approval_event_unsubscribe,
-};
+pub use aura_events::{TokenUsage, ToolCallId, ToolName};
 pub use mcp::{InFlightRequests, McpManager, ProgressEnabledHandler};
 pub use rag_tools::{AutoIngest, VectorIngestTool};
-pub use request_cancellation::{RequestCancellation, RequestId};
-pub use request_progress::{
-    ProgressNotification, RequestProgressBroker, global as request_progress_global,
-    subscribe as request_progress_subscribe, unsubscribe as request_progress_unsubscribe,
-};
+pub use request_cancellation::{RequestCancelToken, RequestId};
 pub use rmcp::model::{NumberOrString, ProgressToken};
 pub use skill_tool::{LoadSkillTool, ReadSkillFileTool, SkillToolset, render_skill_catalog};
 pub use stream_events::{
@@ -112,12 +105,6 @@ pub use stream_events::{
 pub use streaming_request_hook::{ResponseContent, StreamingRequestHook, UsageState};
 pub use tool_call_observer::{RetryHint, ToolCallObserver, ToolEvent, ToolOutcome};
 pub use tool_error_detection::{DetectedToolError, ToolResultStatus, detect_tool_error};
-pub use tool_event_broker::{
-    ToolCallId, ToolEventBroker, ToolLifecycleEvent, ToolName, ToolUsageEvent,
-    global as tool_event_global, peek_tool_call_id, pop_tool_call_id, publish_tool_start,
-    publish_tool_usage, push_tool_call_id, subscribe as tool_event_subscribe, tool_usage_subscribe,
-    tool_usage_unsubscribe, unsubscribe as tool_event_unsubscribe,
-};
 pub use tool_wrapper::{
     ComposedWrapper, ToolCallContext, ToolWrapper, TransformArgsResult, TransformOutputResult,
     WrappedTool,

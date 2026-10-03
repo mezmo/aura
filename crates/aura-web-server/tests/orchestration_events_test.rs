@@ -581,8 +581,8 @@ async fn test_division_error_emits_task_failure() {
 ///
 /// Query triggers the progress_task worker which calls task_with_progress on
 /// mock-mcp. This tool emits MCP notifications/progress as it runs. The
-/// OrchestratorFactory must bridge the request_id to the inner orchestrator's
-/// MCP clients so the progress broker routes notifications to the SSE stream.
+/// inner orchestrator's MCP calls must be bound to the run so their progress
+/// notifications reach the SSE stream.
 ///
 /// LENIENCY: LLM may route to direct answer. Progress notification delivery
 /// depends on MCP transport timing. We assert structurally when events appear.

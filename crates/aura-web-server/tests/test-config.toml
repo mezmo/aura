@@ -79,6 +79,13 @@ EXAMPLES:
 """
 turn_depth = 3 # Lower depth for faster tests
 
+# On-demand skills: exercises load_skill capture and cross-turn rehydration.
+# Resolves against the server's CWD, which is the repo root for the local run in
+# crates/aura-web-server/README.md; compose/base.yml mounts the fixture at the
+# same path under /app so both entry points find it.
+[[agent.skills.local]]
+source = "./tests/integration/skills"
+
 # LLM Configuration
 [agent.llm]
 provider = "openai"

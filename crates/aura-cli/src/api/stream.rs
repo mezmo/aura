@@ -1061,6 +1061,7 @@ mod tests {
             "prompt_tokens": 18777,
             "completion_tokens": 500,
             "total_tokens": 19277,
+            "agent_id": "main",
             "session_id": "s1"
         });
         let events = vec![
@@ -1074,6 +1075,24 @@ mod tests {
         assert!(caps.orchestrator_events.is_empty());
         // It IS a named event, so raw_event should have captured it.
         assert_eq!(caps.raw_events.len(), 1);
+    }
+
+    /// A server that predates the agent context on this event still parses.
+    #[tokio::test]
+    async fn aura_tool_usage_without_agent_id() {
+        let data = serde_json::json!({
+            "tool_ids": ["c1"],
+            "prompt_tokens": 18777,
+            "completion_tokens": 500,
+            "total_tokens": 19277,
+            "session_id": "s1"
+        });
+        let events = vec![
+            sse(event_names::TOOL_USAGE, &data.to_string()),
+            sse("", "[DONE]"),
+        ];
+        let (_, caps) = run_stream(events).await;
+        assert_eq!(caps.tool_usages, vec![(18777, 500)]);
     }
 
     #[tokio::test]

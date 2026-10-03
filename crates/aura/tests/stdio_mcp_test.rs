@@ -36,10 +36,12 @@ async fn test_stdio_mcp_connection_and_tool_execution() {
                 env: HashMap::new(),
                 description: Some("Everything MCP server for STDIO testing".to_string()),
                 scratchpad: HashMap::new(),
+                user_agent: None,
             },
         )]
         .into_iter()
         .collect(),
+        ..Default::default()
     };
 
     let manager = McpManager::initialize_from_config(&mcp_config)
@@ -72,13 +74,13 @@ async fn test_stdio_mcp_connection_and_tool_execution() {
         "Expected per-server tracking for 'test_stdio'"
     );
     assert!(
-        tools_per_server["test_stdio"].contains(&"echo".to_string()),
+        tools_per_server["test_stdio"].contains(&"echo".into()),
         "Expected 'echo' in per-server tools"
     );
 
     // Verify tool execution via fallback path
     let result = manager
-        .execute_fallback_tool("echo", r#"{"message": "hello stdio"}"#)
+        .execute_fallback_tool("echo", r#"{"message": "hello stdio"}"#, None)
         .await
         .expect("Failed to execute echo tool");
     assert!(

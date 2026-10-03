@@ -27,6 +27,7 @@ pub struct RequestApprovalTool {
     route: Arc<DecisionRoute>,
     scope: AgentScope,
     request_id: String,
+    run: Arc<crate::run_context::BoundRun>,
     agent_name: String,
     /// Instance ID of the AURA process that built this tool.
     instance_id: String,
@@ -45,9 +46,22 @@ impl RequestApprovalTool {
             route,
             scope,
             request_id,
+            // A worker's tool is built inside its run; a single agent's is built
+            // before one exists and is bound by `stream`.
+            run: Arc::new(crate::run_context::BoundRun::captured()),
             agent_name,
             instance_id,
         }
+    }
+
+    /// Names the run this tool's approvals belong to. Clones share the slot,
+    /// so this also binds the clone rig holds in its toolset.
+    pub fn bind_run(&self, run: Arc<crate::run_context::RunContext>) {
+        self.run.bind(run);
+    }
+
+    fn run(&self) -> Option<Arc<crate::run_context::RunContext>> {
+        self.run.get()
     }
 }
 
@@ -158,17 +172,27 @@ impl Tool for RequestApprovalTool {
             },
             items: vec![ApprovalItem {
                 tool_name: Self::NAME.to_string(),
+                tool_namespace: None,
                 arguments: serde_json::to_value(&args).unwrap_or_default(),
                 tool_call_intent,
             }],
         };
-        let cancel =
-            crate::request_cancellation::RequestCancellation::token_for_id(&self.request_id)
-                .unwrap_or_else(crate::request_cancellation::RequestCancelToken::unbound);
-        approval_outcome_to_tool_result(
-            self.route.decide(request, &cancel).await,
-            &args.action_description,
-        )
+        let run = self.run();
+        let cancel = run
+            .as_ref()
+            .map(|run| {
+                crate::request_cancellation::RequestCancelToken::from(run.cancel_token().clone())
+            })
+            .unwrap_or_else(crate::request_cancellation::RequestCancelToken::unbound);
+        // `DecisionRoute` emits the lifecycle itself; the scope is how those
+        // events find the run, since rig calls this off it.
+        let decided = match run {
+            Some(run) => {
+                crate::run_context::with_run(run, self.route.decide(request, &cancel)).await
+            }
+            None => self.route.decide(request, &cancel).await,
+        };
+        approval_outcome_to_tool_result(decided, &args.action_description)
     }
 }
 
@@ -177,9 +201,9 @@ mod tests {
     use super::super::decision::{ApprovalOutcome, CancelReason};
     use super::*;
 
-    use crate::approval_event_broker::{self, ApprovalLifecycleEvent};
     use crate::hitl::PendingApprovals;
     use crate::session_store::{ApprovalStore, EventBus, InMemoryApprovalStore, InMemoryEventBus};
+    use aura_events::agent::AgentEventPayload;
 
     #[test]
     fn mapping_approved_returns_ok_with_action() {
@@ -318,11 +342,12 @@ mod tests {
             "test-instance-id".to_string(),
         );
 
-        // Subscribe before the call so the Requested event is captured.
-        let mut rx = approval_event_broker::subscribe(&request_id).await;
-
+        // The scope goes inside the spawn, because task-locals do not cross one.
+        let (run, mut rx) = crate::run_context::RunContext::channel(request_id.as_str());
         let call_handle: tokio::task::JoinHandle<Result<String, ToolError>> =
-            tokio::spawn(async move { tool.call(args).await });
+            tokio::spawn(crate::run_context::with_run(run, async move {
+                tool.call(args).await
+            }));
 
         // Learn the decision_id from the Requested event, then read the
         // parked request the production call site registered.
@@ -330,11 +355,11 @@ mod tests {
             .await
             .expect("requested event should arrive")
             .expect("event channel open");
-        let decision_id = match event {
-            ApprovalLifecycleEvent::Requested(req) => {
+        let decision_id = match event.payload {
+            AgentEventPayload::ApprovalRequested(req) => {
                 DecisionId::parse(&req.decision_id).expect("valid decision id")
             }
-            other => panic!("expected Requested event, got {:?}", other),
+            other => panic!("expected Requested event, got {other:?}"),
         };
 
         let parked = store
@@ -351,8 +376,6 @@ mod tests {
 
         let result = call_handle.await.expect("call task did not panic");
         assert!(result.is_ok(), "approved call should succeed: {:?}", result);
-
-        approval_event_broker::unsubscribe(&request_id).await;
 
         parked.request.items.into_iter().next().expect("one item")
     }
@@ -477,7 +500,7 @@ mod tests {
             });
 
             let request_id = format!("req_tool_span_{}", uuid::Uuid::new_v4().simple());
-            let mut events = approval_event_broker::subscribe(&request_id).await;
+            let (run, mut events) = crate::run_context::RunContext::channel(request_id.as_str());
             let tool = RequestApprovalTool::new(
                 route,
                 AgentScope::Single { session_id: None },
@@ -493,13 +516,13 @@ mod tests {
             };
 
             let ((result, payload_id), span_id) = traced_as_execute_tool(async {
-                tokio::join!(tool.call(args), async {
+                tokio::join!(crate::run_context::with_run(run, tool.call(args)), async {
                     let event = events.recv().await.expect("requested event arrives");
-                    let id = match event {
-                        ApprovalLifecycleEvent::Requested(req) => {
+                    let id = match event.payload {
+                        AgentEventPayload::ApprovalRequested(req) => {
                             DecisionId::parse(&req.decision_id).expect("valid decision id")
                         }
-                        other => panic!("expected Requested event, got {:?}", other),
+                        other => panic!("expected Requested event, got {other:?}"),
                     };
                     registry
                         .resolve(&id, ApprovalDecision::Approved)
@@ -520,8 +543,6 @@ mod tests {
                 Some(payload_id.to_string().as_str()),
                 "the execution span must carry the request_approval tool's decision id",
             );
-
-            approval_event_broker::unsubscribe(&request_id).await;
         }
     }
 }

@@ -1,0 +1,56 @@
+# Incident response agent — Checkly.
+# Uses Checkly's hosted MCP server to confirm user-facing impact from
+# synthetic monitoring, inspect failing check results and their assets,
+# re-run checks to verify recovery, and manage checks and check groups.
+#
+# Prerequisites:
+#   export OPENAI_API_KEY="sk-..."
+#   export CHECKLY_API_KEY="sv_..."   # service API key, or a user API key (cu_...)
+#
+# Optional, only when the API key belongs to a user with several accounts:
+#   export CHECKLY_ACCOUNT_ID="..."
+#
+# Usage:
+#   CONFIG_PATH=examples/complete/incident-response-checkly.toml cargo run --bin aura -- webserver
+
+[mcp]
+sanitize_schemas = true
+
+# Checkly — synthetic monitoring, check results, and check management.
+# Endpoint reference: https://api.checklyhq.com/mcp (Streamable HTTP).
+[mcp.servers.checkly]
+transport = "http_streamable"
+url = "https://api.checklyhq.com/mcp"
+description = "Checkly synthetic monitoring: checks, check groups, results, and assets"
+
+[mcp.servers.checkly.headers]
+Authorization = "Bearer {{ env.CHECKLY_API_KEY | default: '' }}"
+X-Checkly-Account = "{{ env.CHECKLY_ACCOUNT_ID | default: '' }}"
+
+[agent]
+name = "Incident Response Agent"
+alias = "incident-response/checkly"
+description = "Incident triage with Checkly synthetic monitoring results"
+model_owner = "mezmo"
+system_prompt = """
+You are an incident response agent with access to Checkly. Follow this
+triage workflow:
+
+1. Establish user-facing impact: use list-check-stats and list-check-results
+   to find which checks are failing, since when, and from which locations.
+2. Get the evidence: use get-check-result and fetch-check-result-asset for
+   error messages, traces, and screenshots of the failing runs.
+3. After a fix or rollback, confirm recovery with trigger-checks on the
+   affected checks and report the new results.
+4. Summarize findings: timeline, affected checks and locations, root cause
+   hypothesis, and next steps.
+
+Only create, update, or delete checks and check groups when explicitly asked
+to. Always include timestamps and link back to the Checkly check result.
+"""
+turn_depth = 10
+
+[agent.llm]
+provider = "openai"
+api_key = "{{ env.OPENAI_API_KEY }}"
+model = "gpt-5.2"

@@ -12,6 +12,7 @@ use crate::streaming::ToolResultMode;
 pub struct ActiveRequestTracker {
     count: AtomicUsize,
     drained: Notify,
+    tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
 impl Default for ActiveRequestTracker {
@@ -25,6 +26,7 @@ impl ActiveRequestTracker {
         Self {
             count: AtomicUsize::new(0),
             drained: Notify::new(),
+            tasks: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -49,6 +51,30 @@ impl ActiveRequestTracker {
                 return;
             }
             notified.await;
+        }
+    }
+
+    /// Register a detached per-request task handle so shutdown can abort it
+    /// if it's still running once the drain grace period expires. Prunes
+    /// already-finished handles first so the list doesn't grow unbounded
+    /// across the process lifetime.
+    pub fn track_task(&self, handle: tokio::task::JoinHandle<()>) {
+        let mut tasks = self.tasks.lock().expect("tasks mutex poisoned");
+        tasks.retain(|h| !h.is_finished());
+        tasks.push(handle);
+    }
+
+    /// Abort and await every tracked task that hasn't finished yet. Used as the final
+    /// step of shutdown so a straggler can't hold its `agent.stream` span
+    /// open past the OTel provider shutdown/flush (#305).
+    ///
+    /// After calling, the list of tracked tasks will be empty since they should
+    /// have all been aborted.
+    pub async fn abort_unfinished(&self) {
+        let tasks = std::mem::take(&mut *self.tasks.lock().expect("tasks mutex poisoned"));
+        tasks.iter().for_each(tokio::task::JoinHandle::abort);
+        for handle in tasks {
+            let _ = handle.await;
         }
     }
 }
@@ -347,6 +373,31 @@ mod tests {
         )
         .await
         .expect("wait_for_drain should resolve immediately when count is 0");
+    }
+
+    #[tokio::test]
+    async fn test_abort_unfinished_aborts_only_running_tasks() {
+        let tracker = ActiveRequestTracker::new();
+
+        let finished = tokio::spawn(async {});
+        finished.await.expect("task should not panic");
+        let running = tokio::spawn(std::future::pending::<()>());
+
+        // Re-wrap the already-finished handle: `track_task` only observes
+        // `is_finished()` at call time, so this exercises both branches.
+        tracker.track_task(tokio::spawn(async {}));
+        tracker.track_task(running);
+
+        let abort_res = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            tracker.abort_unfinished(),
+        )
+        .await;
+
+        assert!(
+            abort_res.is_ok(),
+            "every tracked task should have stopped before deadline"
+        );
     }
 
     #[tokio::test]

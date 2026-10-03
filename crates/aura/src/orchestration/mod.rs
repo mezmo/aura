@@ -37,12 +37,12 @@
 //!     .build_streaming_agent_with_headers(None, None, None)
 //!     .await?;
 //!
-//! let stream = agent.stream(query, history, cancel_token, "req_123").await?;
+//! let run = agent.stream(query, history, RunOptions::default(), "req_123").await;
+//! let stream = run.into_events();
 //! ```
 
 mod config;
 mod duplicate_call_guard;
-mod events;
 mod factory;
 #[cfg(test)]
 mod frame_validation_tests;
@@ -60,11 +60,11 @@ mod test_rig;
 pub mod tools;
 mod types;
 
+pub use aura_events::orchestration::RoutingMode;
 pub use config::{
     ArtifactsConfig, OrchestrationConfig, TimeoutsConfig, ToolVisibility, WorkerConfig,
     build_coordinator_preamble, build_vector_store_context, build_worker_preamble,
 };
-pub use events::{OrchestratorEvent, RoutingMode};
 pub use factory::OrchestratorFactory;
 pub use observer_wrapper::ObserverWrapper;
 pub use orchestrator::Orchestrator;
