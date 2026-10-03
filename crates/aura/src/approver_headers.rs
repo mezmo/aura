@@ -44,12 +44,15 @@ impl ApproverHeaders {
                         .expect("outbound names validated at config parse");
                     headers.insert(name, value.clone());
                 }
-                None => missing.push(outbound.to_owned()),
+                None => missing.push(MissingMapping {
+                    response_name: response_name.to_owned(),
+                    outbound_name: outbound.to_owned(),
+                }),
             }
         }
         if !missing.is_empty() {
             missing.sort_unstable();
-            return Err(CaptureError::MissingHeaders { names: missing });
+            return Err(CaptureError::MissingHeaders { missing });
         }
         Ok(Self { headers })
     }
@@ -93,21 +96,71 @@ impl PartialEq for ApproverHeaders {
 
 impl Eq for ApproverHeaders {}
 
+/// One missing pair in a capture failure: the approved webhook response
+/// lacked the response header a configured mapping expected, so no value
+/// could be captured under the outbound tool header's name.
+///
+/// Both fields are header names and only header names — the audit surface
+/// never carries values. Both are lowercase, normalized at config parse by
+/// `ToolHeaderMappings`; response lookup remains case-insensitive.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct MissingMapping {
+    /// The configured response header that was absent from the approved response.
+    pub response_name: String,
+    /// The outbound MCP tool header the value would have been captured under.
+    pub outbound_name: String,
+}
+
+impl std::fmt::Display for MissingMapping {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "\"{}\" (mapped to tool header \"{}\")",
+            self.response_name, self.outbound_name
+        )
+    }
+}
+
 /// Capture-time failures: the approved webhook response could not yield
 /// the configured approver headers (fail closed).
 ///
-/// The `names` payload is diagnostic-only text for the error message and
+/// The `missing` payload is diagnostic-only text for the error message and
 /// the event-level audit signal: always non-empty by construction (capture
-/// fails only when at least one name is missing), lowercased outbound
-/// header names, never values, and no domain logic branches on it.
+/// fails only when at least one mapping is missing), sorted by response
+/// header name then outbound header name (the derived field order of
+/// `MissingMapping`) so the audit string is deterministic, both sides of
+/// every mapping carried as header names and never values, and no domain
+/// logic branches on it.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CaptureError {
     /// Mapped response headers absent from the approved response. Invalid
     /// values cannot occur here: capture reads a parsed `HeaderMap`, whose
     /// values are already syntactically valid; invalid outbound names are
     /// rejected earlier, at config parse.
-    #[error("approver identity capture failed: response missing mapped headers {names:?}")]
-    MissingHeaders { names: Vec<String> },
+    MissingHeaders { missing: Vec<MissingMapping> },
+}
+
+impl std::fmt::Display for CaptureError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CaptureError::MissingHeaders { missing } => {
+                if let [one] = missing.as_slice() {
+                    write!(
+                        f,
+                        "approver identity capture failed: webhook response missing header {one}"
+                    )
+                } else {
+                    let clauses: Vec<String> =
+                        missing.iter().map(MissingMapping::to_string).collect();
+                    write!(
+                        f,
+                        "approver identity capture failed: webhook response missing headers [{}]",
+                        clauses.join("; ")
+                    )
+                }
+            }
+        }
+    }
 }
 
 /// Application-time failures at the execution seam (double override,
@@ -291,8 +344,8 @@ pub(crate) mod tests {
         );
     }
 
-    /// Every missing name is reported at once, sorted, so one failing
-    /// response always produces the same audit string.
+    /// Every missing mapping is reported at once, sorted by response header
+    /// name, so one failing response always produces the same audit string.
     #[test]
     fn missing_names_are_all_reported_and_sorted() {
         let err = ApproverHeaders::from_captured(
@@ -308,18 +361,93 @@ pub(crate) mod tests {
         assert_eq!(
             err,
             CaptureError::MissingHeaders {
-                names: vec!["authorization".to_owned(), "x-forwarded-user".to_owned()],
+                missing: vec![
+                    MissingMapping {
+                        response_name: "x-approver-id".to_owned(),
+                        outbound_name: "x-forwarded-user".to_owned(),
+                    },
+                    MissingMapping {
+                        response_name: "x-approver-token".to_owned(),
+                        outbound_name: "authorization".to_owned(),
+                    },
+                ],
             }
         );
 
-        // Event-level audit signal: the Display text names every missing header and carries no value.
+        // Event-level audit signal: the Display text names both sides of
+        // every missing mapping and carries no value.
         let message = err.to_string();
         assert_eq!(
             message,
-            "approver identity capture failed: response missing mapped headers \
-             [\"authorization\", \"x-forwarded-user\"]"
+            "approver identity capture failed: webhook response missing headers \
+             [\"x-approver-id\" (mapped to tool header \"x-forwarded-user\"); \
+             \"x-approver-token\" (mapped to tool header \"authorization\")]"
         );
         assert!(!message.contains("acme"), "message was: {message}");
+    }
+
+    /// The same logical set of missing mappings renders identically however
+    /// the config map enumerates them: the audit string is deterministic.
+    #[test]
+    fn display_is_deterministic_regardless_of_construction_order() {
+        let pairs = [
+            ("x-forwarded-user", "x-approver-id"),
+            ("authorization", "x-approver-token"),
+            ("x-tenant", "x-approver-tenant"),
+        ];
+        let mut reversed = pairs;
+        reversed.reverse();
+
+        let forward = ApproverHeaders::from_captured(&mappings(&pairs), &response(&[]))
+            .expect_err("an empty response must fail every mapping");
+        let backward = ApproverHeaders::from_captured(&mappings(&reversed), &response(&[]))
+            .expect_err("an empty response must fail every mapping");
+
+        assert_eq!(forward.to_string(), backward.to_string());
+    }
+
+    /// Mappings that read the same response header tie on response name;
+    /// the outbound name breaks the tie, so the sort total-orders every
+    /// payload and the audit string is deterministic even under ties.
+    #[test]
+    fn equal_response_names_tie_break_on_outbound_name() {
+        let err = ApproverHeaders::from_captured(
+            &mappings(&[
+                ("x-second-tool", "x-shared-response"),
+                ("x-first-tool", "x-shared-response"),
+            ]),
+            &response(&[]),
+        )
+        .expect_err("an empty response must fail every mapping");
+
+        assert_eq!(
+            err.to_string(),
+            "approver identity capture failed: webhook response missing headers \
+             [\"x-shared-response\" (mapped to tool header \"x-first-tool\"); \
+             \"x-shared-response\" (mapped to tool header \"x-second-tool\")]"
+        );
+    }
+
+    /// The failure names the response header as what was missing and the
+    /// tool header as what it maps to — never the value the response did carry.
+    #[test]
+    fn missing_pair_error_names_both_sides_and_never_the_value() {
+        let err = ApproverHeaders::from_captured(
+            &mappings(&[("x-source-header", "x-dest-header")]),
+            &response(&[("x-source-header", "my forwarded value")]),
+        )
+        .expect_err("a response lacking the mapped response header must fail closed");
+
+        let message = err.to_string();
+        assert_eq!(
+            message,
+            "approver identity capture failed: webhook response missing header \
+             \"x-dest-header\" (mapped to tool header \"x-source-header\")"
+        );
+        assert!(
+            !message.contains("my forwarded value"),
+            "message was: {message}"
+        );
     }
 
     #[test]
