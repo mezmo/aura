@@ -73,26 +73,12 @@ impl From<ApprovalDecisionWire> for ApprovalDecision {
     }
 }
 
-/// Wire form of one status-poll answer: the `{ "status": ..., "reason": ... }`
-/// envelope a governance receiver returns on the poll-delivery status GET.
-/// `pending` parses here like any other status (the envelope is
-/// self-describing), unknown fields are tolerated, and an unknown status
-/// value fails the parse — which the poll leg treats as not-yet.
-#[derive(Debug, Clone, Deserialize)]
-pub(crate) struct PollDecisionWire {
-    pub status: PollStatusWire,
-    #[serde(default)]
-    pub reason: Option<String>,
-}
-
-/// The status discriminant of [`PollDecisionWire`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum PollStatusWire {
-    Pending,
-    Approved,
-    Denied,
-}
+/// Wire form of one status-poll answer: the `{ "approved": bool, "reason": ... }`
+/// shape shared with the POST. Pending is status-code-carried (207), never a
+/// body field; unknown fields are rejected. A type alias for
+/// [`ApprovalDecisionWire`] — the pinned GET contract is the authorize shape,
+/// so the poll leg reuses the one wire type and its conversion.
+pub(crate) type PollDecisionWire = ApprovalDecisionWire;
 
 /// The webhook request projected to its wire form: the flat, rename-stable JSON
 /// AURA POSTs to an approval webhook (Route A).

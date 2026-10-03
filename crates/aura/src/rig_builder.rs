@@ -61,6 +61,31 @@ impl RigBuilder {
         self.to_agent_config(None)
     }
 
+    /// The production config projection for one HTTP request: skill
+    /// discovery, `headers_from_request` resolution, and request/session
+    /// stamping in one fallible step.
+    ///
+    /// The resumed run's EXECUTION config builds through this surface —
+    /// never the debug-only [`Self::get_agent_config`], which skips
+    /// discovery and header resolution. The pre-grant evaluation keeps the
+    /// pure projection (the stored checkpoint fingerprint was computed from
+    /// the startup shape, and refusal rows answer without fallible
+    /// discovery). `request_id` is the new HTTP request's id for
+    /// request-scoped events; `session_id` is the request's chat session,
+    /// preserved from the parked run where it matters downstream.
+    pub fn prepare_agent_config(
+        &self,
+        req_headers: Option<&HashMap<String, String>>,
+        request_id: &str,
+        session_id: &str,
+    ) -> Result<AgentRuntimeConfig, BuilderError> {
+        let mut agent_config = self.discovered_agent_config(req_headers)?;
+        resolve_mcp_headers(&mut agent_config, req_headers);
+        agent_config.request_id = Some(request_id.to_string());
+        agent_config.session_id = Some(session_id.to_string());
+        Ok(agent_config)
+    }
+
     /// Project the parsed `Config` into the runtime `AgentRuntimeConfig`.
     ///
     /// The `[agent]` TOML table is split into `AgentSettings` (the runtime
@@ -72,8 +97,28 @@ impl RigBuilder {
     ///
     /// `req_headers` threads the inbound client request's HTTP headers through
     /// to [`HitlRuntime::from_config`] for `[hitl.route]` `headers_from_request`
-    /// resolution. Pass `None` outside an HTTP request context.
+    /// resolution, and — when `[hitl.park].bind_identity` is on — carries the
+    /// configured `identity_header`'s presented value onto the config for the
+    /// park path to hash. Pass `None` outside an HTTP request context; a bound
+    /// config then presents no identity and the park commits an unbound
+    /// checkpoint.
     fn to_agent_config(&self, req_headers: Option<&HashMap<String, String>>) -> AgentRuntimeConfig {
+        let park_bind_identity = self
+            .config
+            .hitl
+            .as_ref()
+            .is_some_and(|hitl| hitl.park.bind_identity);
+        let presented_identity = if park_bind_identity {
+            self.config.identity_header.as_deref().and_then(|name| {
+                req_headers?
+                    .iter()
+                    .find(|(key, _)| key.to_lowercase() == name.to_lowercase())
+                    .map(|(_, value)| value.clone())
+            })
+        } else {
+            None
+        };
+        let identity_header = self.config.identity_header.clone();
         let agent = AgentSettings {
             name: self.config.agent.name.clone(),
             system_prompt: self.config.agent.system_prompt.clone(),
@@ -104,6 +149,9 @@ impl RigBuilder {
                     req_headers,
                 )
             }),
+            park_bind_identity,
+            presented_identity,
+            identity_header,
             instance_id: crate::instance_id::instance_id(&self.config.agent).to_string(),
             ..Default::default()
         }
@@ -176,12 +224,17 @@ impl RigBuilder {
     /// attaches them only to the coordinator / workers whose TOML config sets
     /// `enable_client_tools = true`, filtered by `client_tool_filter`. In single-agent mode,
     /// callers should attach client tools via `build_agent` instead.
+    ///
+    /// `reservation_table` is the deployment's one shared run-reservation
+    /// table, threaded through to an orchestrated build. Callers that hold no
+    /// shared table (CLI, A2A, tests) pass `None`.
     pub async fn build_streaming_agent_with_headers(
         &self,
         req_headers: Option<&HashMap<String, String>>,
         session_id: Option<String>,
         client_tools: Option<Vec<ClientTool>>,
         request_id: Option<String>,
+        reservation_table: Option<Arc<crate::orchestration::ResumeClaimTable>>,
     ) -> Result<Arc<dyn StreamingAgent>, BuilderError> {
         let mut agent_config = self.discovered_agent_config(req_headers)?;
         resolve_mcp_headers(&mut agent_config, req_headers);
@@ -189,7 +242,7 @@ impl RigBuilder {
         agent_config.request_id = request_id;
         agent_config.skill_recorder = self.skill_recorder.clone();
 
-        build_streaming_agent(&agent_config, client_tools)
+        build_streaming_agent(&agent_config, client_tools, reservation_table)
             .await
             .map_err(|e| BuilderError::AgentError(format!("Failed to build streaming agent: {e}")))
     }
@@ -788,5 +841,232 @@ source = '/nonexistent/path/to/worker/skills'
             .discovered_agent_config(None)
             .unwrap_err();
         assert!(err.to_string().contains("not found"));
+    }
+
+    /// The park bind-identity projection: the flag comes from the parsed
+    /// `[hitl.park]` table, and the configured identity header's value is
+    /// extracted from the request headers only while the flag is on —
+    /// case-insensitively, like every other request-header lookup.
+    #[test]
+    fn bind_identity_projects_the_flag_and_extracts_the_presented_header() {
+        let config_str = r#"
+identity_header = "X-Client-Identity"
+
+[agent]
+name = "Binder"
+system_prompt = "You bind."
+
+[agent.llm]
+provider = "openai"
+api_key = "test"
+model = "gpt-5.1"
+
+[hitl]
+require_approval = []
+
+[hitl.route]
+mode = "conversational"
+timeout_secs = 60
+
+[hitl.park]
+enabled = false
+bind_identity = true
+"#;
+        let builder = RigBuilder::new(
+            aura_config::Config::parse_toml(config_str).expect("config should parse"),
+            PendingApprovals::new(),
+        );
+
+        let mut req_headers = HashMap::new();
+        req_headers.insert("x-client-identity".to_string(), "alice-token".to_string());
+
+        let bound = builder.to_agent_config(Some(&req_headers));
+        assert!(bound.park_bind_identity, "the [hitl.park] flag projects");
+        assert_eq!(
+            bound.presented_identity.as_deref(),
+            Some("alice-token"),
+            "the configured header's value is extracted"
+        );
+
+        let headerless = builder.to_agent_config(Some(&HashMap::new()));
+        assert!(headerless.park_bind_identity);
+        assert!(
+            headerless.presented_identity.is_none(),
+            "a request without the header presents nothing"
+        );
+
+        let offline = builder.to_agent_config(None);
+        assert!(offline.park_bind_identity);
+        assert!(
+            offline.presented_identity.is_none(),
+            "no request context presents nothing"
+        );
+
+        // Binding off leaves the presented value unset even when the header
+        // is present: the park commits an unbound checkpoint as before.
+        let unbound_config_str =
+            config_str.replace("bind_identity = true", "bind_identity = false");
+        let unbound = RigBuilder::new(
+            aura_config::Config::parse_toml(&unbound_config_str).expect("config should parse"),
+            PendingApprovals::new(),
+        )
+        .to_agent_config(Some(&req_headers));
+        assert!(!unbound.park_bind_identity);
+        assert!(unbound.presented_identity.is_none());
+    }
+
+    #[test]
+    fn s1_prepare_agent_config_discovers_skills_into_the_projection() {
+        // The production projection runs skill discovery; the debug
+        // `get_agent_config` path never does. Both assertions live in one
+        // test so the distinct-value pair is inseparable evidence.
+        let skills_dir = tempfile::TempDir::new().unwrap();
+        write_skill(skills_dir.path(), "s1-probe-skill", "S1 discovery probe");
+
+        let config_str = format!(
+            r#"
+[agent]
+name = "S1Discovery"
+system_prompt = "You discover."
+
+[agent.llm]
+provider = "openai"
+api_key = "test"
+model = "gpt-5.1"
+
+[[agent.skills.local]]
+source = '{}'
+"#,
+            skills_dir.path().display()
+        );
+        let builder = RigBuilder::new(
+            aura_config::Config::parse_toml(&config_str).expect("config should parse"),
+            PendingApprovals::new(),
+        );
+
+        let projection = builder
+            .prepare_agent_config(None, "req-s1-disc", "sess-s1-disc")
+            .expect("projection should build from a valid skill source");
+        assert_eq!(projection.agent.skills.len(), 1);
+        assert_eq!(projection.agent.skills[0].name, "s1-probe-skill");
+
+        let debug = builder.get_agent_config();
+        assert!(
+            debug.agent.skills.is_empty(),
+            "the debug path skips discovery and must stay empty"
+        );
+    }
+
+    #[test]
+    fn s1_prepare_agent_config_resolves_headers_from_request_once() {
+        // A presented request header resolves into the projection's MCP
+        // server entry; passing None resolves nothing and the static TOML
+        // fallback stands. The two arms hold distinct values so an
+        // unresolved/identity pass cannot fake the resolved one.
+        let config_str = r#"
+[agent]
+name = "S1Headers"
+system_prompt = "You resolve."
+
+[agent.llm]
+provider = "openai"
+api_key = "test"
+model = "gpt-5.1"
+
+[mcp.servers.test_server]
+transport = "http_streamable"
+url = "https://example.com/mcp"
+headers = { "x-s1-auth" = "static-fallback" }
+
+[mcp.servers.test_server.headers_from_request]
+"x-s1-auth" = "x-s1-incoming-auth"
+"#;
+        let builder = RigBuilder::new(
+            aura_config::Config::parse_toml(config_str).expect("config should parse"),
+            PendingApprovals::new(),
+        );
+
+        let mut req_headers = HashMap::new();
+        req_headers.insert(
+            "x-s1-incoming-auth".to_string(),
+            "resolved-dynamic".to_string(),
+        );
+
+        let resolved = builder
+            .prepare_agent_config(Some(&req_headers), "req-s1-hdr", "sess-s1-hdr")
+            .expect("projection should build");
+        assert_eq!(
+            get_server_headers(&resolved).get("x-s1-auth"),
+            Some(&"resolved-dynamic".to_string()),
+            "the presented header resolves into the projection's MCP entry"
+        );
+
+        let unresolved = builder
+            .prepare_agent_config(None, "req-s1-hdr", "sess-s1-hdr")
+            .expect("projection should build");
+        assert_eq!(
+            get_server_headers(&unresolved).get("x-s1-auth"),
+            Some(&"static-fallback".to_string()),
+            "no request context resolves nothing; the static fallback stands"
+        );
+    }
+
+    #[test]
+    fn s1_prepare_agent_config_stamps_the_request_and_session_ids() {
+        let config_str = r#"
+[agent]
+name = "S1Stamps"
+system_prompt = "You stamp."
+
+[agent.llm]
+provider = "openai"
+api_key = "test"
+model = "gpt-5.1"
+"#;
+        let builder = RigBuilder::new(
+            aura_config::Config::parse_toml(config_str).expect("config should parse"),
+            PendingApprovals::new(),
+        );
+
+        let projection = builder
+            .prepare_agent_config(None, "req-s1-42", "sess-s1-42")
+            .expect("projection should build");
+        assert_eq!(projection.request_id.as_deref(), Some("req-s1-42"));
+        assert_eq!(projection.session_id.as_deref(), Some("sess-s1-42"));
+
+        let debug = builder.get_agent_config();
+        assert_eq!(debug.request_id, None, "the debug path carries no stamp");
+        assert_eq!(debug.session_id, None, "the debug path carries no stamp");
+    }
+
+    #[test]
+    fn s1_prepare_agent_config_is_fallible_on_broken_skill_sources() {
+        // An unrepresentable skills source must surface as Err(BuilderError)
+        // from the projection — not a panic, not a silent empty-skills Ok.
+        let config_str = r#"
+[agent]
+name = "S1Fallible"
+system_prompt = "You fail."
+
+[agent.llm]
+provider = "openai"
+api_key = "test"
+model = "gpt-5.1"
+
+[[agent.skills.local]]
+source = '/nonexistent/s1/red/skill/source'
+"#;
+        let builder = RigBuilder::new(
+            aura_config::Config::parse_toml(config_str).expect("config should parse"),
+            PendingApprovals::new(),
+        );
+
+        let err = builder
+            .prepare_agent_config(None, "req-s1-err", "sess-s1-err")
+            .expect_err("a broken skill source must be an Err, not a panic or empty Ok");
+        assert!(
+            err.to_string().contains("not found"),
+            "unexpected error shape: {err}"
+        );
     }
 }

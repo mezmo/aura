@@ -781,6 +781,8 @@ impl McpManager {
     /// Cancel in-flight requests and close all MCP client connections.
     /// After calling this, all MCP clients become unusable until reinitialized.
     pub async fn cancel_and_close_all(&self, http_request_id: &str, reason: &str) -> usize {
+        #[cfg(test)]
+        a1_observation::record_cancel_key(self, http_request_id);
         let mut total_cancelled = 0;
 
         for (server_name, client) in &self.streamable_clients {
@@ -833,6 +835,8 @@ impl McpManager {
         run: std::sync::Arc<crate::run_context::RunContext>,
         agent: aura_events::AgentContext,
     ) {
+        #[cfg(test)]
+        a1_observation::record_armed(self, run.id());
         let mut total_clients = 0;
         for client in self.clients() {
             client
@@ -1089,6 +1093,99 @@ impl McpManager {
 impl Default for McpManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// TEST-ONLY observation seam for the A1 id-channel split (aura#271, card
+/// P45; Mike's 2026-09-25 ruling): records, PER MANAGER, the request ids
+/// the MCP arm ([`McpManager::bind_call`]) and the all-servers
+/// close ([`McpManager::cancel_and_close_all`]) last ran under, so the
+/// resume goldens can pin that a resumed segment ARMS (before its first
+/// tool executes) and CLOSES the manager under the config's FRESH request
+/// id — not the conflated run owner id the resume path's config overwrite
+/// used to stamp.
+///
+/// Records are keyed by the recording manager's own identity, so
+/// concurrently-live managers never overwrite one another's observations
+/// (the readers correlate by request-id VALUE, which is unique to the
+/// driving frame); `reset()` clears the table before a frame drives the
+/// surface it pins. Never compiled into production builds; the reexport
+/// discipline follows the S6 wave's test-only-reexport precedent (see
+/// `hitl/mod.rs` `webhook_client_from_config`).
+#[cfg(test)]
+pub(crate) mod a1_observation {
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, Mutex};
+
+    use super::McpManager;
+
+    /// One manager's observation slots: the last armed id and the last
+    /// close key that manager ran under.
+    #[derive(Default)]
+    struct ManagerRecord {
+        armed: Option<String>,
+        cancel_key: Option<String>,
+    }
+
+    static RECORDS: LazyLock<Mutex<HashMap<usize, ManagerRecord>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    fn key(manager: &McpManager) -> usize {
+        std::ptr::from_ref(manager) as usize
+    }
+
+    /// Clear every manager's records before a frame drives the surface it
+    /// pins.
+    pub(crate) fn reset() {
+        RECORDS.lock().expect("a1 seam: records table").clear();
+    }
+
+    pub(crate) fn record_armed(manager: &McpManager, id: &str) {
+        RECORDS
+            .lock()
+            .expect("a1 seam: records table")
+            .entry(key(manager))
+            .or_default()
+            .armed = Some(id.to_owned());
+    }
+
+    pub(crate) fn record_cancel_key(manager: &McpManager, id: &str) {
+        RECORDS
+            .lock()
+            .expect("a1 seam: records table")
+            .entry(key(manager))
+            .or_default()
+            .cancel_key = Some(id.to_owned());
+    }
+
+    /// The request ids any recorded manager has ARMED under since the last
+    /// reset — the mid-segment probe reads this to prove the arm landed
+    /// before the segment's first tool executed. Sorted and deduped so
+    /// failure messages are deterministic.
+    pub(crate) fn armed_ids() -> Vec<String> {
+        let mut ids: Vec<String> = RECORDS
+            .lock()
+            .expect("a1 seam: records table")
+            .values()
+            .filter_map(|record| record.armed.clone())
+            .collect();
+        ids.sort();
+        ids.dedup();
+        ids
+    }
+
+    /// The request ids any recorded manager has CLOSED under since the
+    /// last reset, sorted and deduped for deterministic failure messages.
+    pub(crate) fn closed_ids() -> Vec<String> {
+        let mut ids: Vec<String> = RECORDS
+            .lock()
+            .expect("a1 seam: records table")
+            .values()
+            .filter_map(|record| record.cancel_key.clone())
+            .collect();
+        ids.sort();
+        ids.dedup();
+        ids
     }
 }
 

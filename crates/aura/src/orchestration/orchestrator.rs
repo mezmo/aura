@@ -44,6 +44,7 @@
 use aura_events::CONVERSATION_AGENT_ID;
 use aura_events::agent::{AgentEvent, AgentEventPayload};
 use aura_events::orchestration::RoutingMode;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -65,15 +66,19 @@ use super::tools::RoutingToolSet;
 use super::tools::{InspectToolParamsTool, ListToolsTool, ReadArtifactTool};
 
 use super::config::OrchestrationConfig;
+use super::park::resume::evaluate::IdentityHash;
+use super::park::resume::{Diagnostic, ResumeGrant, ResumeStreamEnd, SegmentError};
 use super::park::{
-    ParkGuard, ParkedTaskRecord, ParkedTaskRecords, RecordedDecisions, ResumeContext,
-    TaskContinuation,
+    CallId, CallKey, NodePreflightInput, OutcomeWire, ParkCommitInputs, ParkGuard, ParkGuardMode,
+    ParkedRun, ParkedTaskRecord, ParkedTaskRecords, PeekOutcome, RecordedDecisions,
+    ResumingDocumentHandle, RunStateForPark, SegmentPreflight, commit_from_run_state,
+    rebuild_context,
 };
 use super::persistence::ExecutionPersistence;
 use super::types::{
     BlockedCell, CellOutcome, FailedTaskRecord, FailureCategory, FailureSummary, IterationContext,
     IterationOutcome, IterationTimings, ParkSnapshot, PendingCall, Plan, PlanningResponse,
-    TaskState, TaskStatus,
+    StructuredTaskOutput, Task, TaskState, TaskStatus,
 };
 
 // ============================================================================
@@ -107,6 +112,11 @@ struct TaskExecutionParams<'a> {
 struct TaskExecutionResult {
     result: String,
     structured_output: Option<super::types::StructuredTaskOutput>,
+    /// The worker's assistant turns, at the stream's turn boundaries — what
+    /// a resumed coordinator loop's segment turns carry for this task. A
+    /// parked task carries none here: its turns come from the park snapshot
+    /// at full wire fidelity instead.
+    turns: Vec<rig::completion::Message>,
 }
 
 /// The outcome of one worker task.
@@ -128,6 +138,49 @@ struct WorkerPark {
     key: String,
 }
 
+/// One validated awaiting node the resume segment drives: the node's
+/// identity and its pending calls, which the driver's seeding loop checks
+/// non-empty before any worker build. The park record rides in
+/// `ParkedTaskRecords`, keyed by task id; this bundle carries what the
+/// drive loop reads per node.
+struct AwaitingNode {
+    task_id: usize,
+    worker: Option<String>,
+    /// The node's decided pending calls, non-empty by construction —
+    /// an awaiting node without pending calls faults the seeding
+    /// loop, so the substitution prelude can never face a node whose
+    /// checkpointed placeholder it has no call to replace.
+    pending: Vec<PendingCall>,
+}
+
+/// How the resumed coordinator continuation ended: the loop answered (the
+/// segment completes) or a newly gated call re-parked through
+/// run_iteration's park path (the run parks; the publication owner emits
+/// `RunParked`).
+enum ContinuationOutcome {
+    Completed {
+        /// The run's natural finish, the normal factory finalization's
+        /// answer; the borrowed stream drive hands it to the supervisor.
+        final_answer: String,
+    },
+    ReParked,
+}
+
+/// One resumed segment's terminal data: the borrowed stream drive projects
+/// it to [`ResumeStreamEnd`].
+enum SegmentTerminal {
+    Completed { final_answer: String },
+    Parked,
+}
+
+/// How the borrowed stream drive's body future ended: returned (carrying
+/// the body's result, or a caught panic payload), or was dropped because the
+/// grant's scope was cancelled mid-segment.
+enum SegmentDriveExit {
+    Returned(Result<Result<SegmentTerminal, SegmentError>, Box<dyn std::any::Any + Send>>),
+    Cancelled,
+}
+
 /// Named return type for `create_*` coordinator/worker methods.
 ///
 /// Replaces bare `(Agent, String)` tuples where the `String` was the preamble
@@ -142,6 +195,15 @@ struct AgentWithPreamble {
     /// Shared state for the worker's `submit_result` tool. Read after the
     /// worker completes to extract structured output (summary, result, confidence).
     submit_result_decision: super::tools::SubmitResultDecision,
+    /// The tool context factory this build produced. Workers consume it through
+    /// their config; the coordinator's is declared here (its tools are added
+    /// unwrapped today). Carries the run's execution scope when the
+    /// orchestrator is resume-bound, `None` scope on the initial path.
+    ///
+    /// Read by the L3a context-threading goldens (the production worker path
+    /// reads the factory off its config before this return).
+    #[allow(dead_code)]
+    tool_context_factory: Option<crate::config::ToolContextFactory>,
 }
 
 /// Persistent coordinator state for conversation across planning iterations.
@@ -154,6 +216,21 @@ struct CoordinatorState {
     preamble: String,
     conversation: Vec<rig::completion::Message>,
     routing_decision: super::tools::routing_tools::RoutingDecision,
+}
+
+/// What the plan-execute-continue loop is seeded with: a fresh run starts
+/// at iteration zero with no failures; a resumed continuation seeds the
+/// checkpoint's iteration, planning latency, and failure history so the
+/// loop continues the checkpointed run rather than restarting it. The
+/// known-failed task ids ride along for the same reason: the restored
+/// plan's pre-existing failures are already in the seeded history, and
+/// the iteration that executes the restored plan must not record them
+/// again under the resumed iteration.
+struct LoopSeed {
+    iteration: usize,
+    planning_ms: u64,
+    failure_history: Vec<FailedTaskRecord>,
+    known_failed_tasks: HashSet<usize>,
 }
 
 /// Bundled coordinator tools for `build_agent_with_tools`.
@@ -188,6 +265,67 @@ fn apply_worker_skills_override(
             crate::config::WorkerSkills::Override(skills) => skills.clone(),
         };
     }
+}
+
+/// The re-park commit's plan: the checkpoint's tasks reconstructed with
+/// their committed states, so the commit starts from what the run had and
+/// only the segment's own outcomes overwrite nodes. The goal is the
+/// checkpoint's stored `plan.goal`, not the raw query: the planner's goal
+/// is the run's record of intent, and a re-park must carry it forward.
+fn segment_plan(checkpoint: &ParkedRun) -> Plan {
+    let mut plan = Plan::new(checkpoint.plan.goal.clone());
+    plan.steps = checkpoint.plan.steps.clone();
+    for node in &checkpoint.plan.tasks {
+        let mut task = Task::new(
+            node.task_id,
+            node.description.clone(),
+            node.rationale.clone(),
+        );
+        task.dependencies = node.dependencies.clone();
+        task.worker = node.worker.clone();
+        task.state = match node.status {
+            TaskStatus::AwaitingApproval => TaskState::AwaitingApproval {
+                pending: node.pending.clone().unwrap_or_default(),
+            },
+            TaskStatus::Complete => TaskState::Complete {
+                result: node.result.clone().unwrap_or_default(),
+            },
+            TaskStatus::Failed => TaskState::Failed {
+                error: node.error.clone().unwrap_or_default(),
+                category: node.failure_category.unwrap_or_default(),
+            },
+            TaskStatus::Pending | TaskStatus::Running => TaskState::Pending,
+        };
+        plan.add_task(task);
+    }
+    plan
+}
+
+/// Flush one accumulated turn (text plus tool calls) into a run's turn list;
+/// empty accumulators produce nothing.
+fn flush_segment_turn(
+    text: &mut String,
+    calls: &mut Vec<rig::message::ToolCall>,
+    turns: &mut Vec<rig::completion::Message>,
+) {
+    if text.is_empty() && calls.is_empty() {
+        return;
+    }
+    let mut pieces = Vec::<rig::message::AssistantContent>::new();
+    if !text.is_empty() {
+        pieces.push(rig::message::AssistantContent::Text(rig::message::Text {
+            text: std::mem::take(text),
+        }));
+    }
+    pieces.extend(
+        calls
+            .drain(..)
+            .map(rig::message::AssistantContent::ToolCall),
+    );
+    turns.push(rig::completion::Message::Assistant {
+        id: None,
+        content: rig::OneOrMany::many(pieces).expect("turn carries content"),
+    });
 }
 
 /// Spawns a task that cancels `cancel_token` once `timeout` passes.
@@ -383,22 +521,33 @@ async fn forward_internal_tool_completed(
 /// Spawn a task that forwards tool call events to the SSE stream.
 ///
 /// Listens on the observer's broadcast channel and converts `ToolEvent`s
-/// to `AgentEventPayload`s, sending them through the event channel.
+/// to `AgentEventPayload`s, sending them through the event channel. When the
+/// producing run is park-scoped, the forwarder spawns tracked through that
+/// scope (registered before it starts, holding a lease reference through its
+/// actual completion), so the supervisor's drain waits it out; an unscoped
+/// caller passes `None` and keeps today's bare spawn.
 pub(super) fn spawn_tool_event_forwarder(
     observer: &ToolCallObserver,
     event_tx: tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>,
     cancel_token: CancellationToken,
+    execution_scope: Option<Arc<crate::orchestration::RunExecutionScope>>,
 ) {
     let mut tool_rx = observer.subscribe();
 
-    tokio::spawn(async move {
+    let forward = async move {
         loop {
             tokio::select! {
                 result = tool_rx.recv() => {
                     match result {
                         Ok(tool_event) => {
                             let orch_event = tool_event_to_orchestrator_event(tool_event);
-                            let _ = event_tx.send(Ok(StreamItem::AgentEvent(Box::new(orch_event)))).await;
+                            // Race the send against cancellation: a full
+                            // channel with no consumer must not strand the
+                            // forwarder and block the supervisor's drain.
+                            tokio::select! {
+                                _ = event_tx.send(Ok(StreamItem::AgentEvent(Box::new(orch_event)))) => {}
+                                _ = cancel_token.cancelled() => break,
+                            }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                             tracing::warn!("Tool observer lagged by {} events", n);
@@ -413,7 +562,16 @@ pub(super) fn spawn_tool_event_forwarder(
                 }
             }
         }
-    });
+    };
+
+    match execution_scope {
+        Some(scope) => {
+            scope.spawn_tracked(forward);
+        }
+        None => {
+            tokio::spawn(forward);
+        }
+    }
 }
 
 // ============================================================================
@@ -442,8 +600,12 @@ pub struct Orchestrator {
     /// Arc-wrapped so workers can share the same connections.
     pub(super) mcp_manager: Option<Arc<McpManager>>,
 
-    /// Execution persistence for debugging and retry intelligence
-    persistence: Arc<Mutex<ExecutionPersistence>>,
+    /// Execution persistence for debugging and retry intelligence.
+    ///
+    /// `pub(super)` so the factory's initial supervisor can read the
+    /// persistence-bound run id it reserves before worker registration
+    /// (the same read [`Self::assemble`] makes).
+    pub(super) persistence: Arc<Mutex<ExecutionPersistence>>,
 
     /// Accumulated token usage across all LLM calls in this orchestration run
     /// (planning, workers, continuation routing).
@@ -462,6 +624,13 @@ pub struct Orchestrator {
 
     /// Run-scoped park guard (park mode).
     park_guard: Option<Arc<ParkGuard>>,
+
+    /// The run's ONE park execution scope, threaded into every tool context
+    /// this orchestrator builds. `None` for an initial run: every context
+    /// stays unscoped, byte-equivalent to before. `Some` only for a
+    /// resume-bound orchestrator — a clone of the grant's single scope `Arc`,
+    /// never a freshly minted second.
+    execution_scope: Option<Arc<crate::orchestration::RunExecutionScope>>,
 }
 
 /// The task and worker a stream's reasoning is attributed to.
@@ -488,7 +657,6 @@ struct StreamCallParams<'a> {
 #[derive(Default)]
 struct TurnTally {
     total: rig::completion::Usage,
-    first: Option<rig::completion::Usage>,
     last: rig::completion::Usage,
 }
 
@@ -507,7 +675,6 @@ impl TurnTally {
             output_tokens: turn.output_tokens,
             total_tokens: turn.total_tokens,
         };
-        self.first.get_or_insert(self.last);
         usage_state.accumulate_usage(turn.input_tokens, turn.output_tokens);
         if let Some(cache) = cache {
             usage_state.store_cache_usage(
@@ -550,6 +717,8 @@ struct ForwardedRun {
     /// Provider-reported usage of the loop's last turn — context-window
     /// occupancy, as opposed to `response.usage`'s loop total.
     last_turn: rig::completion::Usage,
+    /// The run's assistant turns, one per turn boundary (`TurnUsage`).
+    turns: Vec<rig::completion::Message>,
 }
 
 /// Replay an assistant turn as conversation history.
@@ -593,10 +762,6 @@ impl Orchestrator {
             None
         };
 
-        // Tool call observer for real-time streaming. The _rx receiver is consumed
-        // by spawn_tool_event_forwarder in factory.rs when the stream starts.
-        let (tool_call_observer, _rx) = ToolCallObserver::new(32);
-
         // Initialize execution persistence for debugging and retry intelligence.
         let effective_memory_dir = agent_config.effective_memory_dir();
         let persistence = if let Some(memory_dir) = effective_memory_dir {
@@ -615,17 +780,167 @@ impl Orchestrator {
             Arc::new(Mutex::new(ExecutionPersistence::disabled()))
         };
 
+        Ok(Self::assemble(
+            agent_config,
+            orchestration_config,
+            mcp_manager,
+            persistence,
+            None,
+            ParkGuardMode::Initial,
+        )
+        .await)
+    }
+
+    /// Bind an orchestrator to a checkpointed run for one resume segment.
+    /// Persistence is seeded with the checkpoint's existing
+    /// `(run_id, session_id)` instead of minting a fresh run id, so
+    /// everything the segment stamps — worker approval scopes, a re-park's
+    /// tickets and commit, the guard's sweep — names the run the checkpoint
+    /// belongs to and the next resume's consult matches it.
+    async fn for_resume_segment(
+        grant: &ResumeGrant,
+        config: &AgentRuntimeConfig,
+    ) -> Result<Self, SegmentError> {
+        let fault = |message: String| SegmentError::Continuation(Diagnostic::new(message));
+        let orchestration_config = config.orchestration.clone().unwrap_or_default();
+
+        // Initialize MCP manager (shared across coordinator and all workers via Arc)
+        let mcp_manager = if let Some(ref mcp_config) = config.mcp {
+            Some(Arc::new(
+                McpManager::initialize_from_config(mcp_config)
+                    .await
+                    .map_err(|e| {
+                        fault(format!(
+                            "the resume segment's MCP connections failed to initialize: {e}"
+                        ))
+                    })?,
+            ))
+        } else {
+            None
+        };
+
+        // Arm MCP tracking under the run in scope — the same arm the chat
+        // path applies. The factory's resume supervisor scopes the drive
+        // with the request's observable run (keyed by the config's FRESH
+        // request id), so the segment's MCP calls are tracked AND their
+        // run-scoped emissions reach the consumer (Gate A finding 1,
+        // aura#271 N3: a synthesized channel with a dropped receiver is
+        // not an equivalent arm). An orchestrator built outside any run
+        // leaves MCP untracked and says so.
+        if let Some(ref mcp_manager) = mcp_manager {
+            match crate::run_context::current_run() {
+                Some(run) => {
+                    mcp_manager
+                        .bind_call(run, aura_events::AgentContext::coordinator())
+                        .await;
+                }
+                None => tracing::warn!(
+                    "the resume segment built outside any run; its MCP calls run untracked"
+                ),
+            }
+        }
+
+        let checkpoint = grant.checkpoint();
+        let Some(memory_dir) = config.effective_memory_dir().map(str::to_string) else {
+            return Err(fault(
+                "the resume segment has no memory_dir configured; the checkpoint cannot bind \
+                 to a run"
+                    .to_string(),
+            ));
+        };
+        let persistence = Arc::new(Mutex::new(
+            ExecutionPersistence::resume(
+                memory_dir,
+                checkpoint.session_id.clone(),
+                &checkpoint.run_id,
+                checkpoint.iteration,
+            )
+            .await
+            .map_err(|e| {
+                fault(format!(
+                    "the resume segment could not bind persistence to run {}: {e}",
+                    checkpoint.run_id
+                ))
+            })?,
+        ));
+
+        // The frozen-egress seed: the resume POST carries no request-scoped
+        // headers, so the config's route resolved its egress against nothing
+        // (capture fails closed). The checkpoint froze the ORIGINAL request's
+        // resolved values at park time; seed the route from them, so a new
+        // gated ask during the resumed segment — a re-plan's call, a
+        // re-park's registration — authenticates to the receiver under the
+        // original request's identity. Checkpoints written before the field
+        // existed (empty map) keep the fail-closed behavior.
+        let mut agent_config = config.clone();
+        if !checkpoint.request_egress.is_empty()
+            && let Some(ref hitl) = agent_config.hitl
+        {
+            agent_config.hitl = Some(
+                hitl.with_frozen_egress(&checkpoint.request_egress)
+                    .map_err(|e| {
+                        fault(format!(
+                            "frozen egress restoration failed for run {}: {e}",
+                            checkpoint.run_id
+                        ))
+                    })?,
+            );
+        }
+
+        Ok(Self::assemble(
+            agent_config,
+            orchestration_config,
+            mcp_manager,
+            persistence,
+            Some(grant.execution_scope()),
+            ParkGuardMode::Resumed,
+        )
+        .await)
+    }
+
+    /// Shared constructor tail of [`Self::new`] and
+    /// [`Self::for_resume_segment`]: the observer, the orchestrator id, and
+    /// the park guard — armed under the persistence-bound run id, so a
+    /// resume-bound orchestrator re-parks against the checkpointed run
+    /// with a checkpoint-preserving (non-sweeping) scoped guard.
+    async fn assemble(
+        agent_config: AgentRuntimeConfig,
+        orchestration_config: OrchestrationConfig,
+        mcp_manager: Option<Arc<McpManager>>,
+        persistence: Arc<Mutex<ExecutionPersistence>>,
+        execution_scope: Option<Arc<crate::orchestration::RunExecutionScope>>,
+        park_mode: ParkGuardMode,
+    ) -> Self {
+        // Tool call observer for real-time streaming. The _rx receiver is consumed
+        // by spawn_tool_event_forwarder in factory.rs when the stream starts.
+        let (tool_call_observer, _rx) = ToolCallObserver::new(32);
+
         let orchestrator_id = uuid::Uuid::new_v4().to_string();
 
         let run_id_str = persistence.lock().await.run_id().to_string();
         // One guard per park-mode run; `ParkGuard` documents arming and drop.
+        // A scoped run (the resume segment's grant, or the L3 initial path)
+        // builds the guard with its mode AND its scope TOGETHER, so the
+        // guard's deferred sweep spawns tracked through the run's ONE scope;
+        // an unscoped initial run keeps the interim unscoped constructor.
         let park_guard = agent_config
             .hitl
             .as_ref()
             .filter(|hitl| hitl.park_enabled)
             .and_then(|hitl| {
                 let (registry, _) = hitl.route.park_registry()?;
-                Some(ParkGuard::new(registry.clone(), run_id_str.clone()))
+                let run_id = run_id_str.clone();
+                let request_id = agent_config.request_id.clone().unwrap_or_default();
+                Some(match &execution_scope {
+                    Some(scope) => ParkGuard::new_with_execution_scope(
+                        registry.clone(),
+                        run_id,
+                        request_id,
+                        park_mode,
+                        Arc::clone(scope),
+                    ),
+                    None => ParkGuard::new(registry.clone(), run_id, request_id),
+                })
             });
         let default_turn_depth = agent_config
             .agent
@@ -640,7 +955,7 @@ impl Orchestrator {
             orchestration_config.max_plan_parse_retries,
         );
 
-        Ok(Self {
+        Self {
             orchestrator_id,
             config: orchestration_config,
             agent_config,
@@ -650,7 +965,8 @@ impl Orchestrator {
             usage_state: crate::UsageState::new(),
             outer_budget: None,
             park_guard,
-        })
+            execution_scope,
+        }
     }
 
     /// Create a worker agent for task execution.
@@ -938,13 +1254,25 @@ impl Orchestrator {
                 gate = gate.with_recorded_decisions(Arc::clone(recorded));
             }
             wrappers.insert(0, Arc::new(gate));
-            worker_config.hitl_request_approval_tool = Some(crate::hitl::RequestApprovalTool::new(
-                hitl.route.clone(),
-                scope,
-                request_id,
-                worker_config.agent.name.clone(),
-                worker_config.instance_id.clone(),
-            ));
+            // Poll-mode delivery gives the worker no callable park path: the
+            // 207 bridge registers the call server-side and the poller
+            // resolves it, so the tool is not attached. Only poll is
+            // suppressed — conversational keeps the inline tool and a sync
+            // hold keeps it too. The gate wrappers above still enforce the
+            // approval on gated calls.
+            if !matches!(
+                hitl.route.park_authority(),
+                Some(crate::hitl::ApprovalAuthority::WebhookPoll)
+            ) {
+                worker_config.hitl_request_approval_tool =
+                    Some(crate::hitl::RequestApprovalTool::new(
+                        hitl.route.clone(),
+                        scope,
+                        request_id,
+                        worker_config.agent.name.clone(),
+                        worker_config.instance_id.clone(),
+                    ));
+            }
         }
 
         let wrapper: Arc<dyn ToolWrapper> = Arc::new(ComposedWrapper::new(wrappers));
@@ -993,26 +1321,40 @@ impl Orchestrator {
             );
             let worker_name_copy = String::from(name);
 
-            // Orchestrator provides context factory with task metadata
+            // Orchestrator provides context factory with task metadata, and
+            // threads the run's execution scope when this orchestrator is
+            // resume-bound (`None` scope keeps the context unscoped).
+            let execution_scope = self.execution_scope.clone();
             worker_config.tool_context_factory = Some(Arc::new(move |tool_name: &str| {
-                ToolCallContext::new(tool_name).with_task_context(
+                let ctx = ToolCallContext::new(tool_name).with_task_context(
                     task_id,
                     worker_name_copy.clone(),
                     attempt,
-                )
+                );
+                match &execution_scope {
+                    Some(scope) => ctx.with_execution_scope(Arc::clone(scope)),
+                    None => ctx,
+                }
             }));
         } else {
             worker_config.preamble_override =
                 Some(super::config::build_worker_preamble(&self.config));
             let orchestrator_id_copy = self.orchestrator_id.clone();
 
-            // Orchestrator provides context factory with task metadata
+            // Orchestrator provides context factory with task metadata, and
+            // threads the run's execution scope when this orchestrator is
+            // resume-bound (`None` scope keeps the context unscoped).
+            let execution_scope = self.execution_scope.clone();
             worker_config.tool_context_factory = Some(Arc::new(move |tool_name: &str| {
-                ToolCallContext::new(tool_name).with_task_context(
+                let ctx = ToolCallContext::new(tool_name).with_task_context(
                     task_id,
                     orchestrator_id_copy.clone(),
                     attempt,
-                )
+                );
+                match &execution_scope {
+                    Some(scope) => ctx.with_execution_scope(Arc::clone(scope)),
+                    None => ctx,
+                }
             }));
         }
 
@@ -1097,6 +1439,7 @@ impl Orchestrator {
             preamble,
             escalation_flag,
             submit_result_decision,
+            tool_context_factory: worker_config.tool_context_factory.clone(),
         })
     }
 
@@ -1114,13 +1457,34 @@ impl Orchestrator {
         })
     }
 
-    /// `[hitl.park].enabled` on a park-capable route: conversational, or
-    /// webhook with poll delivery.
-    fn park_enabled(&self) -> bool {
+    /// `[hitl.park].enabled` on a park-capable route: conversational, or a
+    /// webhook route that can park (`can_park` — poll delivery with park
+    /// mode; sync never parks).
+    pub(super) fn park_enabled(&self) -> bool {
         self.agent_config
             .hitl
             .as_ref()
             .is_some_and(|hitl| hitl.park_enabled && hitl.route.park_registry().is_some())
+    }
+
+    /// Arm this constructed orchestrator with its run's ONE execution scope:
+    /// the initial park-enabled producer reserves its persistence-bound run
+    /// id, then calls this before worker registration, so every tool context,
+    /// the tool-event forwarder, and the guard's tails share the scope the
+    /// supervisor drains before the fence releases. `scope` is a clone of the
+    /// caller's single `Arc` — never a freshly minted second token or tracker.
+    pub(super) fn arm_execution_scope(
+        &mut self,
+        scope: Arc<crate::orchestration::RunExecutionScope>,
+    ) {
+        // The initial guard was built unscoped in `assemble` (the run id it
+        // would reserve does not exist yet); arm its deferred sweep with the
+        // same ONE scope the supervisor holds. Set-once: an already-scoped
+        // (resumed) guard ignores it.
+        if let Some(guard) = &self.park_guard {
+            guard.arm_execution_scope(Arc::clone(&scope));
+        }
+        self.execution_scope = Some(scope);
     }
 
     /// The worker approval scope stamped on a task's approvals — the same
@@ -1209,6 +1573,11 @@ impl Orchestrator {
         let emit_scratchpad_events = scratchpad::emit_scratchpad_tool_events_enabled();
         let mut content = String::new();
         let mut tally = TurnTally::default();
+        // The pending segment turn: streamed text plus tool calls, flushed
+        // at the turn boundary (`TurnUsage`).
+        let mut turn_text = String::new();
+        let mut turn_calls = Vec::new();
+        let mut turns = Vec::new();
         // Set only by the Final arm, whose reported loop total supersedes
         // the per-turn sum as the response's authoritative usage.
         let mut final_total: Option<Usage> = None;
@@ -1248,6 +1617,38 @@ impl Orchestrator {
                 // must resume explicitly.
                 Liveness::ToolFinished => deadline.resume(),
                 _ => deadline.touch(),
+            }
+            // Segment-turn accumulation: every assistant item of the
+            // pending turn feeds it, forwarded or not — the boundary rule
+            // is the TurnUsage flush below, not the forwarding policy.
+            match &item {
+                Ok(StreamItem::StreamAssistantItem(StreamedAssistantContent::Text(t))) => {
+                    turn_text.push_str(t);
+                }
+                Ok(StreamItem::StreamAssistantItem(StreamedAssistantContent::ToolCall(tc))) => {
+                    let arguments: serde_json::Value = serde_json::from_str(&tc.arguments)
+                        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                            format!(
+                                "segment turn for {} carries unparseable arguments: {e}",
+                                tc.name
+                            )
+                            .into()
+                        })?;
+                    turn_calls.push(rig::message::ToolCall {
+                        id: tc.id.clone(),
+                        // The provider-agnostic item carries no provider
+                        // call_id; a parked node re-derives its turns from
+                        // the park snapshot at full fidelity instead.
+                        call_id: None,
+                        function: rig::message::ToolFunction {
+                            name: tc.name.clone(),
+                            arguments,
+                        },
+                        signature: None,
+                        additional_params: None,
+                    });
+                }
+                _ => {}
             }
             let body = async {
                 match item {
@@ -1338,6 +1739,7 @@ impl Orchestrator {
                         if let Some(budget) = scratchpad_budget {
                             budget.set_estimated_used(turn.input_tokens, turn.output_tokens);
                         }
+                        flush_segment_turn(&mut turn_text, &mut turn_calls, &mut turns);
                     }
                     Err(e) => return Err(e),
                     Ok(StreamItem::StreamUserItem(StreamedUserContent::ToolResult(ref tr))) => {
@@ -1365,6 +1767,7 @@ impl Orchestrator {
                             {
                                 tally.record(&turn, cache, usage_state);
                             }
+                            flush_segment_turn(&mut turn_text, &mut turn_calls, &mut turns);
                             return Ok(LoopStep::End);
                         }
                     }
@@ -1386,6 +1789,8 @@ impl Orchestrator {
                 deadline.suspend();
             }
         }
+        // A stream that ended without a Final item still produced its turns.
+        flush_segment_turn(&mut turn_text, &mut turn_calls, &mut turns);
 
         Ok(ForwardedRun {
             response: CompletionResponse {
@@ -1393,6 +1798,7 @@ impl Orchestrator {
                 usage: final_total.unwrap_or(tally.total),
             },
             last_turn: tally.last,
+            turns,
         })
     }
 
@@ -1423,7 +1829,7 @@ impl Orchestrator {
             history,
             phase,
             event_tx,
-            ..
+            context_agent: _,
         } = params;
         let timeout_secs = self.config.per_call_timeout_secs();
         let stream_future = async {
@@ -1675,17 +2081,16 @@ impl Orchestrator {
             }
             // Report this call's occupancy under the agent id the caller asked
             // for; callers whose context is scratch pass none. The reading is
-            // the call's first inner turn: later inner turns add the tool
-            // results the coordinator pulled in on the way to its decision
-            // (skill bodies, prior-run listings), which is scratch too.
-            if let (Some(tx), Some(agent_id), Some(first)) = (event_tx, context_agent, tally.first)
-                && first.input_tokens > 0
+            // the call's final inner turn, which is the coordinator's live
+            // conversation at the point the decision was made.
+            if let (Some(tx), Some(agent_id)) = (event_tx, context_agent)
+                && tally.last.input_tokens > 0
             {
                 let _ = tx
                     .send(Ok(StreamItem::ContextUsage {
                         agent_id: agent_id.to_string(),
-                        context_tokens: first.input_tokens,
-                        response_tokens: first.output_tokens,
+                        context_tokens: tally.last.input_tokens,
+                        response_tokens: tally.last.output_tokens,
                         context_window: agent.context_window,
                     }))
                     .await;
@@ -1800,7 +2205,7 @@ impl Orchestrator {
                         history: params.history.clone(),
                         phase: params.phase,
                         event_tx: params.event_tx,
-                        context_agent: params.context_agent,
+                        context_agent: None,
                     },
                     || {
                         let rd = rd.clone();
@@ -2537,8 +2942,21 @@ Assign tasks to the worker whose tools best match the required operations."#,
         routing_tools: RoutingToolSet,
         allow_recon_tools: bool,
     ) -> Result<AgentWithPreamble, Box<dyn std::error::Error + Send + Sync>> {
+        use crate::tool_wrapper::ToolCallContext;
         use crate::vector_dynamic::DynamicVectorSearchTool;
         use crate::vector_store::VectorStoreManager;
+
+        // The coordinator's tool context factory: a resume-bound orchestrator
+        // threads the grant's ONE execution scope into every context the
+        // coordinator's tools build; an initial run stays unscoped. The
+        // coordinator adds its tools unwrapped today, so this is the produced
+        // factory the L3a goldens pin.
+        let coordinator_tool_context_factory: Option<crate::config::ToolContextFactory> =
+            self.execution_scope.clone().map(|scope| {
+                Arc::new(move |tool_name: &str| {
+                    ToolCallContext::new(tool_name).with_execution_scope(Arc::clone(&scope))
+                }) as crate::config::ToolContextFactory
+            });
 
         // Capture tool information for reconnaissance tools
         let tool_names = self.get_all_tool_names();
@@ -2665,6 +3083,56 @@ Assign tasks to the worker whose tools best match the required operations."#,
             ),
         };
 
+        let model_name = self.agent_config.llm.model_name().to_string();
+
+        // Test-only model injection (park/reify rig): a queued override
+        // builds this coordinator from a scripted model, registered through
+        // the same toolset a live coordinator receives — the routing tools
+        // included, so a scripted coordinator routes exactly like a live
+        // one. No override queued: unchanged behavior.
+        #[cfg(test)]
+        if let Some(coordinator_override) =
+            crate::orchestration::test_rig::take_coordinator_override()
+        {
+            let (llm_provider, llm_model) = self.agent_config.llm.model_info();
+            let agent = Self::build_agent_with_tools(
+                coordinator_override.model,
+                &preamble,
+                temperature,
+                self.agent_config.llm.additional_params(),
+                self.agent_config.llm.max_tokens(),
+                llm_provider,
+                llm_model,
+                coordinator_tools,
+            );
+            return Ok(AgentWithPreamble {
+                agent: Agent {
+                    inner: ProviderAgent::Scripted(agent),
+                    model: model_name,
+                    max_depth: PLANNING_COORDINATOR_MAX_DEPTH,
+                    mcp_manager: None,
+                    fallback_tool_parsing: false,
+                    fallback_tool_names: vec![],
+                    fallback_mcp_filter: None,
+                    hitl_gate: None,
+                    hitl_approval_tool: None,
+                    skills: Vec::new(),
+                    context_window: self.agent_config.llm.context_window(),
+                    scratchpad_budget: None,
+                    client_tool_names: Default::default(),
+                    turn_nudge: None,
+                    system_prompt: preamble.clone(),
+                    invocation_parameters: crate::logging::llm_invocation_parameters(
+                        &self.agent_config.llm,
+                    ),
+                },
+                preamble,
+                escalation_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                submit_result_decision: Arc::new(Mutex::new(None)),
+                tool_context_factory: coordinator_tool_context_factory.clone(),
+            });
+        }
+
         let provider_agent = self
             .build_provider_agent_with_tools(
                 &preamble,
@@ -2674,8 +3142,6 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 coordinator_tools,
             )
             .await?;
-
-        let model_name = self.agent_config.llm.model_name().to_string();
 
         // Coordinator depth budget allows recon + read_artifact + routing within one
         // stream_and_collect call. The decision_ready early-exit is the primary guard;
@@ -2707,6 +3173,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             preamble,
             escalation_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             submit_result_decision: Arc::new(Mutex::new(None)),
+            tool_context_factory: coordinator_tool_context_factory,
         })
     }
 
@@ -3233,12 +3700,15 @@ Assign tasks to the worker whose tools best match the required operations."#,
         &self,
         plan: &mut Plan,
         event_tx: &tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>,
-    ) -> Result<(u64, ParkedTaskRecords), StreamError> {
+    ) -> Result<(u64, ParkedTaskRecords, Vec<rig::completion::Message>), StreamError> {
         use futures::StreamExt;
         use futures::stream::FuturesUnordered;
 
         let mut task_compute_ms: u64 = 0;
         let mut park_records: ParkedTaskRecords = ParkedTaskRecords::new();
+        // The iteration's worker turns: buffered per wave, emitted in task-id
+        // order so parallel completion order cannot reorder the segment.
+        let mut worker_turns = Vec::new();
         while !plan.is_finished() {
             // Collect ready tasks with their context and worker assignment
             // Tuple: (task_id, description, context, worker_name)
@@ -3309,9 +3779,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                             task_context: &task_context,
                             worker_name: worker_name.as_deref(),
                         };
-                        let result = self
-                            .execute_task(task_id, &params, Some(event_tx), None, None)
-                            .await;
+                        let result = self.execute_task(task_id, &params, Some(event_tx)).await;
                         let duration_ms = start_time.elapsed().as_millis() as u64;
                         (task_id, result, duration_ms, worker_name, task_desc)
                     },
@@ -3319,6 +3787,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 .collect();
 
             // Collect results as they complete and update plan
+            let mut wave_turns: Vec<(usize, Vec<rig::completion::Message>)> = Vec::new();
             while let Some((task_id, result, duration_ms, worker_name, task_desc)) =
                 futures.next().await
             {
@@ -3334,6 +3803,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                             .await;
                         let result_for_event = final_result.clone();
                         let success = exec_result.structured_output.is_some();
+                        wave_turns.push((task_id, exec_result.turns));
                         if let Some(t) = plan.get_task_mut(task_id) {
                             if success {
                                 t.complete(final_result);
@@ -3388,6 +3858,20 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         if let Some(t) = plan.get_task_mut(task_id) {
                             t.state = TaskState::AwaitingApproval { pending };
                         }
+                        // The parked worker's snapshot turns join the wave's
+                        // task-id merge — at full wire fidelity, like every
+                        // wave turn — so a parked task keeps its wave
+                        // position instead of trailing every completed turn
+                        // of every later wave.
+                        wave_turns.push((
+                            task_id,
+                            snapshot
+                                .history
+                                .iter()
+                                .filter(|m| matches!(m, rig::completion::Message::Assistant { .. }))
+                                .cloned()
+                                .collect(),
+                        ));
                         park_records.insert(task_id, ParkedTaskRecord { attempt, snapshot });
                         tracing::warn!(
                             "Task {} ('{}') blocked awaiting approval after {}ms",
@@ -3427,18 +3911,28 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     }
                 }
             }
+            wave_turns.sort_by_key(|(task_id, _)| *task_id);
+            for (_, task_turns) in wave_turns {
+                worker_turns.extend(task_turns);
+            }
         }
 
-        Ok((task_compute_ms, park_records))
+        Ok((task_compute_ms, park_records, worker_turns))
     }
 
     /// Collect failed tasks from this iteration into failure records.
+    /// Collect this iteration's failures from the plan, skipping the task
+    /// ids that were already Failed when their plan arrived (`known_failed`
+    /// carries the restored plan's pre-existing failures for the resumed
+    /// continuation; a fresh run passes an empty set).
     fn collect_iteration_failures(
         plan: &Plan,
         iteration: usize,
+        known_failed: &HashSet<usize>,
     ) -> Vec<super::types::FailedTaskRecord> {
         plan.tasks
             .iter()
+            .filter(|t| !known_failed.contains(&t.id))
             .filter_map(|t| match &t.state {
                 TaskState::Failed { error, category } => Some(super::types::FailedTaskRecord {
                     description: t.description.clone(),
@@ -3545,10 +4039,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         }
     }
 
-    /// Execute a single task using a worker agent. `continuation` carries a
-    /// parked task's checkpointed conversation (the resume path) and `resume`
-    /// the recorded decisions + resuming document it drives; both are `None`
-    /// on the live path.
+    /// Execute a single task using a worker agent.
     #[tracing::instrument(
         name = "orchestration.worker",
         skip_all,
@@ -3563,27 +4054,12 @@ Assign tasks to the worker whose tools best match the required operations."#,
         task_id: usize,
         params: &TaskExecutionParams<'_>,
         event_tx: Option<&tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>>,
-        continuation: Option<&TaskContinuation>,
-        resume: Option<&ResumeContext>,
     ) -> Result<TaskOutcome, StreamError> {
         let TaskExecutionParams {
             task_description,
             task_context,
             worker_name,
         } = params;
-
-        // The resume path: the checkpointed conversation drives everything,
-        // so the live prompt-building and retry loop below do not apply.
-        if let (Some(continuation), Some(resume)) = (continuation, resume) {
-            return self
-                .resume_task(task_id, *worker_name, continuation, resume, event_tx)
-                .await;
-        }
-        if continuation.is_some() != resume.is_some() {
-            return Err("task resume state is incomplete: continuation and \
-                        resume context must be provided together"
-                .into());
-        }
 
         {
             let span = tracing::Span::current();
@@ -3649,6 +4125,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 preamble: worker_preamble,
                 escalation_flag,
                 submit_result_decision,
+                ..
             } = self
                 .create_worker(
                     task_id,
@@ -3798,17 +4275,20 @@ Assign tasks to the worker whose tools best match the required operations."#,
             }
 
             // Detect context overflow and other errors — don't retry hard errors
-            let result = match stream_result {
-                Ok(r) => Ok(r.response.content),
+            let (result, run_turns) = match stream_result {
+                Ok(r) => (Ok(r.response.content), r.turns),
                 Err(e) if is_context_overflow_error(e.as_ref()) => {
                     let suggestion = context_overflow_suggestion("worker");
-                    Err(format!(
-                        "Worker context limit exceeded for task {}. {}",
-                        task_id, suggestion
+                    (
+                        Err(format!(
+                            "Worker context limit exceeded for task {}. {}",
+                            task_id, suggestion
+                        )
+                        .into()),
+                        Vec::new(),
                     )
-                    .into())
                 }
-                Err(e) => Err(e),
+                Err(e) => (Err(e), Vec::new()),
             };
 
             // Check escalation flag (duplicate call loop)
@@ -3848,6 +4328,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                                     summary: output.summary,
                                     confidence: output.confidence,
                                 }),
+                                turns: run_turns,
                             }));
                         }
                         None if is_final_attempt => {
@@ -3870,6 +4351,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                             return Ok(TaskOutcome::Completed(TaskExecutionResult {
                                 result: raw_response,
                                 structured_output: None,
+                                turns: run_turns,
                             }));
                         }
                         None => {
@@ -3923,185 +4405,894 @@ Assign tasks to the worker whose tools best match the required operations."#,
             Ok(TaskOutcome::Completed(TaskExecutionResult {
                 result: last_raw_response,
                 structured_output: None,
+                turns: Vec::new(),
             }))
         }
     }
 
-    /// The continuation arm (design doc sections 2.7–2.8): finish a parked
-    /// task from its checkpoint. Rebuilds the worker for the recorded
-    /// attempt with the run's recorded decisions at the gate, tombstones and
-    /// invokes each pending call in recorded order through the wrapper
-    /// chain, replaces the checkpointed sentinel tool results with the real
-    /// ones, then hands the conversation back to the normal multi-turn loop
-    /// via `stream_chat`. Consumed decisions are removed from the store
-    /// after the task completes. The task execution record is not re-persisted
-    /// here: the resuming document's executed list is the resume's record.
-    async fn resume_task(
-        &self,
-        task_id: usize,
-        worker_name: Option<&str>,
-        continuation: &TaskContinuation,
-        resume: &ResumeContext,
-        event_tx: Option<&tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>>,
-    ) -> Result<TaskOutcome, StreamError> {
-        let attempt = continuation.attempt;
-        let Some(park) = self.worker_park(task_id, attempt) else {
-            return Err("cannot resume a task without park mode enabled".into());
-        };
+    // ====================================================================
+    // Resume segment: the endpoint's production segment driver (P45)
+    // ====================================================================
 
-        let AgentWithPreamble {
-            agent: worker,
-            preamble: _,
-            escalation_flag: _,
-            submit_result_decision,
-        } = self
-            .create_worker(
-                task_id,
-                attempt,
-                worker_name,
-                Some(&park.cell),
-                Some(&resume.recorded),
-            )
-            .await?;
-
-        let mut current_prompt = continuation.current_prompt.clone();
-        // Strict arm: a continuation invocation that misses the recorded set
-        // is a resume fault, never a fresh park. The drop guard clears the
-        // task's entry on every exit path (error, panic, and the normal drop
-        // after the last pending call, before the loop resumes).
-        let strict = resume.recorded.strict_guard(task_id);
-        for call in &continuation.pending {
-            // The tombstone precedes the invocation: a crash after this
-            // write shows the call as executed, never re-asks the human.
-            resume
-                .document
-                .append_executed_and_publish(&call.call_id)
-                .await
-                .map_err(|e| -> StreamError {
-                    format!(
-                        "resume tombstone write for call {} failed: {e}",
-                        call.call_id
-                    )
-                    .into()
-                })?;
-            let wire = worker
-                .inner
-                .call_tool(&call.tool_name, &call.arguments.to_string())
-                .await
-                .map_err(|e| -> StreamError {
-                    format!("resume invocation of {} failed: {e}", call.tool_name).into()
-                })?;
-            if !super::park::replace_tool_result(&mut current_prompt, &call.call_id, &wire) {
-                return Err(format!(
-                    "continuation prompt has no tool result for call {}",
-                    call.call_id
-                )
-                .into());
-            }
-        }
-        drop(strict);
-
-        // stream_chat(current_prompt, history): the normal multi-turn loop,
-        // to submit_result or depth exhaustion — park-aware, so a
-        // model-issued gated call re-parks through the live arm.
-        let srd = submit_result_decision.clone();
-        let park_registration =
-            crate::streaming_request_hook::ParkCellRegistration::new(&park.key, park.cell.clone());
-        let stream = worker
-            .inner
-            .stream_chat_message_with_timeout(
-                current_prompt,
-                continuation.history.clone(),
-                worker.max_depth,
-                crate::streaming::RunOptions::default(),
-                &park.key,
-                worker.scratchpad_budget.clone(),
-                worker.client_tool_names.clone(),
-            )
+    /// The resume module's borrowed-grant seam
+    /// ([`super::park::resume::run_segment_borrowed`]): build the segment
+    /// orchestrator from the prepared config, hand it the caller's usage
+    /// handle and projected outer budget, then drive the borrowed grant with
+    /// events streaming to the caller's channel.
+    ///
+    /// The supervisor keeps ownership of the grant so the claim lease
+    /// outlives every await; the drive borrows `&ResumeGrant` across its
+    /// whole body.
+    pub(super) async fn run_resume_segment_borrowed(
+        grant: &ResumeGrant,
+        config: &AgentRuntimeConfig,
+        event_tx: tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>,
+        usage_state: crate::UsageState,
+        outer_budget: Option<Duration>,
+    ) -> Result<ResumeStreamEnd, SegmentError> {
+        // The config arrives already prepared by `run_segment_borrowed`:
+        // the fresh `req_<uuid>` rides it untouched (the wire stamp
+        // derives at the POST seam), and the deliberate header no-op
+        // happened there, before the orchestrator build.
+        let mut orchestrator = Self::for_resume_segment(grant, config).await?;
+        // Share the caller's usage handle so the resumed turns accumulate
+        // into the state the streaming handler reads, exactly as the live
+        // supervisor wires it; the projected budget bounds the resumed
+        // coordinator's outer request budget.
+        orchestrator.usage_state = usage_state;
+        orchestrator.outer_budget = outer_budget;
+        orchestrator
+            .drive_resume_segment_stream(grant, event_tx)
             .await
-            .into_events();
-        let stream_result = Self::drive_forward_loop(
-            stream,
-            &self.usage_state,
-            self.config.stream_inactivity_timeout_secs(),
-            worker.scratchpad_budget.as_ref(),
-            "Worker resume",
-            event_tx,
-            worker_name.map(|name| StreamContext {
-                task_id,
-                worker_id: name,
-            }),
-            || {
-                let srd = srd.clone();
-                Box::pin(async move { srd.lock().await.is_some() })
-            },
-        )
-        .await;
-        drop(park_registration);
+    }
 
-        // Same cell contract as the live path: the cell is the source of
-        // truth after any stream end.
-        match park.cell.outcome() {
-            CellOutcome::Blocked { pending } => {
-                let snapshot = park
-                    .cell
-                    .snapshot()
-                    .expect("cell outcome Blocked implies a captured snapshot");
-                return Ok(TaskOutcome::Blocked {
-                    pending,
-                    attempt,
-                    snapshot,
-                });
+    /// Drive the borrowed grant as a stream shape.
+    ///
+    /// Races the segment body against the grant's ONE execution scope: a
+    /// cancellation that arrives mid-segment drops the body future (the
+    /// grant is borrowed, never moved, so dropping is safe) and forwards the
+    /// run's stop through the caller's channel BEFORE returning, because the
+    /// supervisor's post-return sends are cancellation-aware and would lose
+    /// the race once the scope is cancelled. This is where the carried-over
+    /// frame-7 Leg D stop publication lands.
+    ///
+    /// Closes the MCP manager exactly once in every exit arm — normal,
+    /// error, cancellation, and the caught panic — BEFORE the scope drain,
+    /// so a supervised-task panic cannot strand the manager. Then drains the
+    /// grant's scope so no tracked tail outlives the reservation fence.
+    async fn drive_resume_segment_stream(
+        self,
+        grant: &ResumeGrant,
+        event_tx: tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>,
+    ) -> Result<ResumeStreamEnd, SegmentError> {
+        use futures::FutureExt;
+
+        let scope = grant.execution_scope();
+        let outcome = {
+            let drive =
+                std::panic::AssertUnwindSafe(self.drive_resume_segment_core(grant, &event_tx))
+                    .catch_unwind();
+            tokio::pin!(drive);
+            tokio::select! {
+                biased;
+                _ = scope.cancellation().cancelled() => SegmentDriveExit::Cancelled,
+                returned = &mut drive => SegmentDriveExit::Returned(returned),
             }
-            CellOutcome::Orphaned { pending } => {
-                self.cancel_parked_approvals(task_id, worker_name, &pending)
-                    .await;
-                let underlying = match stream_result.as_ref() {
-                    Err(e) => format!(" Underlying error: {e}"),
-                    Ok(_) => String::new(),
+        };
+
+        match outcome {
+            // A supervised-task panic must not strand the manager: close it
+            // and drain the scope first, then propagate the panic.
+            SegmentDriveExit::Returned(Err(panic)) => {
+                self.close_segment_mcp().await;
+                scope.drain().await;
+                std::panic::resume_unwind(panic);
+            }
+            SegmentDriveExit::Returned(Ok(Ok(SegmentTerminal::Completed { final_answer }))) => {
+                self.close_segment_mcp().await;
+                Self::drain_resume_scope_with_stop(&scope, &event_tx).await;
+                Ok(ResumeStreamEnd::Completed { final_answer })
+            }
+            SegmentDriveExit::Returned(Ok(Ok(SegmentTerminal::Parked))) => {
+                self.close_segment_mcp().await;
+                Self::drain_resume_scope_with_stop(&scope, &event_tx).await;
+                Ok(ResumeStreamEnd::Reparked)
+            }
+            // A mid-segment fault must surface before the drain: the
+            // supervisor's error-arm send runs only after this drive returns
+            // (that is, after the drain), and the frame's fault arm reads the
+            // error while the held tail keeps the drain pending. Forward the
+            // fault here, first, then latch the scope so the supervisor's
+            // cancellation-aware error-arm send races a cancelled token and
+            // cannot duplicate the fault we just published.
+            SegmentDriveExit::Returned(Ok(Err(fault))) => {
+                let wire: StreamError = match &fault {
+                    SegmentError::Continuation(diagnostic) => diagnostic.to_string().into(),
                 };
-                return Err(format!(
-                    "Worker resume stream ended before the parked approval snapshot \
-                     was captured for task {task_id}; {} pending approval(s) \
-                     cancelled.{underlying}",
-                    pending.len()
-                )
-                .into());
+                let _ = event_tx.send(Err(wire)).await;
+                scope.cancel();
+                self.close_segment_mcp().await;
+                scope.drain().await;
+                Err(fault)
             }
-            CellOutcome::Normal => {}
+            // The scope's cancellation is the run's stop: forward it on the
+            // stream first, since the supervisor's exit-arm sends race the
+            // now-latched cancellation and cannot publish it.
+            SegmentDriveExit::Cancelled => {
+                Self::forward_segment_stop(&event_tx).await;
+                self.close_segment_mcp().await;
+                scope.drain().await;
+                Err(SegmentError::Continuation(Diagnostic::new(
+                    "the resume segment was cancelled",
+                )))
+            }
         }
+    }
 
-        let raw_response = match stream_result {
-            Ok(run) => run.response.content,
-            Err(e) => {
-                return Err(format!("Worker resume failed for task {task_id}: {e}").into());
+    /// Publish the run's stop on the caller's channel: a terminal-shaped
+    /// item the client consumes, emitted only where the supervisor's own
+    /// cancellation-aware sends would lose the race — a mid-segment
+    /// cancellation, or a cancellation that lands while the drain still
+    /// waits on tracked tails.
+    async fn forward_segment_stop(
+        event_tx: &tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>,
+    ) {
+        let _ = event_tx
+            .send(Ok(StreamItem::Final(
+                crate::provider_agent::FinalResponseInfo {
+                    content: String::new(),
+                    usage: Default::default(),
+                    cache_usage: None,
+                },
+            )))
+            .await;
+    }
+
+    /// Drain the grant's scope, publishing the run's stop if the scope is
+    /// cancelled before the drain ends. A cancellation that lands after the
+    /// segment body finished must not strand the client behind a held
+    /// tracked tail: the supervisor's post-return sends race the latched
+    /// cancellation and lose, so the drive publishes the stop here.
+    async fn drain_resume_scope_with_stop(
+        scope: &crate::orchestration::RunExecutionScope,
+        event_tx: &tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>,
+    ) {
+        let drain = scope.drain();
+        tokio::pin!(drain);
+        tokio::select! {
+            biased;
+            _ = scope.cancellation().cancelled() => {
+                Self::forward_segment_stop(event_tx).await;
+                (&mut drain).await;
             }
+            _ = &mut drain => {}
+        }
+    }
+
+    /// Close the segment's MCP manager exactly once, the same close shape
+    /// the normal supervisor's cancellation arm uses. A segment with no MCP
+    /// configured has nothing to close.
+    async fn close_segment_mcp(&self) {
+        let Some(ref mcp_manager) = self.mcp_manager else {
+            return;
         };
-        let structured = submit_result_decision.lock().await.take();
-        let (result, structured_output) = match structured {
-            Some(output) => (
-                output.result,
-                Some(super::types::StructuredTaskOutput {
-                    summary: output.summary,
-                    confidence: output.confidence,
-                }),
-            ),
-            None => (raw_response, None),
+        let request_id = self.agent_config.request_id.clone().unwrap_or_default();
+        let cancelled = mcp_manager
+            .cancel_and_close_all(&request_id, "Resume segment ended")
+            .await;
+        if cancelled > 0 {
+            tracing::info!(
+                "Cancelled {} MCP request(s) during resume segment shutdown",
+                cancelled
+            );
+        }
+    }
+
+    /// The segment body: the decided approvals' next agent turns through
+    /// the coordinator iteration loop, returning the terminal segment data
+    /// or the mid-segment fault. Borrows the grant so the drain wrapper holds
+    /// the reservation lease across its scope drain. `event_tx` is the
+    /// caller's stream channel: the drive-loop re-park publishes its one
+    /// `RunParked` there, and the coordinator continuation relays its own.
+    async fn drive_resume_segment_core(
+        &self,
+        grant: &ResumeGrant,
+        event_tx: &tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>,
+    ) -> Result<SegmentTerminal, SegmentError> {
+        let fault = |message: String| SegmentError::Continuation(Diagnostic::new(message));
+        let Some(hitl) = self.agent_config.hitl.clone() else {
+            return Err(fault(
+                "the resume segment requires the HITL runtime".to_string(),
+            ));
+        };
+        let Some((registry, _)) = hitl.route.park_registry() else {
+            return Err(fault(
+                "the resume segment requires a park-capable decision route".to_string(),
+            ));
+        };
+        let Some(memory_dir) = self.agent_config.effective_memory_dir().map(str::to_string) else {
+            return Err(fault(
+                "the resume segment has no memory_dir configured; no checkpoint can be written"
+                    .to_string(),
+            ));
         };
 
-        // Step 5: the consumed decisions leave the store with the task.
-        if let Some(hitl) = self.agent_config.hitl.clone()
-            && let Some((registry, _)) = hitl.route.park_registry()
+        let checkpoint = grant.checkpoint().clone();
+        let recorded = grant.recorded_decisions().clone();
+        let documents = grant.documents().clone();
+
+        // The re-park commit starts from the checkpoint's plan; driven nodes
+        // overwrite their own state as the segment runs. Every awaiting
+        // node's park record the commit needs is seeded from the checkpoint,
+        // and a re-parked node's record is overwritten with the fresh
+        // snapshot before the commit runs. A node whose pending calls are
+        // absent or empty faults here, beside the other payload checks and
+        // before any worker build: the park paths never write such a node
+        // (the gate registers every parked call durably before the commit),
+        // and streaming it would carry the stale placeholder past the
+        // substitution with no call to replace it for.
+        let mut plan = segment_plan(&checkpoint);
+        // The restored plan's already-failed tasks, snapshotted before the
+        // drive loop's own outcomes touch the plan: their failures are the
+        // checkpoint's own history (seeded into the continuation loop
+        // below), so only tasks that fail during this segment may be
+        // recorded again.
+        let known_failed: HashSet<usize> = plan
+            .tasks
+            .iter()
+            .filter(|t| matches!(t.state, TaskState::Failed { .. }))
+            .map(|t| t.id)
+            .collect();
+        let mut records = ParkedTaskRecords::new();
+        let mut awaiting = Vec::new();
+        for node in checkpoint
+            .plan
+            .tasks
+            .iter()
+            .filter(|n| matches!(n.status, TaskStatus::AwaitingApproval))
         {
-            for call in &continuation.pending {
-                registry.remove(&call.decision_id).await;
+            let task_id = node.task_id;
+            let attempt = node.attempt.ok_or_else(|| {
+                fault(format!(
+                    "awaiting task {task_id} carries no attempt in the checkpoint"
+                ))
+            })?;
+            let history = node.history.clone().ok_or_else(|| {
+                fault(format!(
+                    "awaiting task {task_id} carries no history in the checkpoint"
+                ))
+            })?;
+            let current_prompt = node.current_prompt.clone().ok_or_else(|| {
+                fault(format!(
+                    "awaiting task {task_id} carries no tool-result prompt in the checkpoint"
+                ))
+            })?;
+            let pending = node.pending.clone().ok_or_else(|| {
+                fault(format!(
+                    "awaiting task {task_id} carries no pending calls in the checkpoint"
+                ))
+            })?;
+            if pending.is_empty() {
+                return Err(fault(format!(
+                    "awaiting task {task_id} carries an empty pending list in the checkpoint"
+                )));
+            }
+            records.insert(
+                task_id,
+                ParkedTaskRecord {
+                    attempt,
+                    snapshot: ParkSnapshot {
+                        history,
+                        current_prompt,
+                    },
+                },
+            );
+            awaiting.push(AwaitingNode {
+                task_id,
+                worker: node.worker.clone(),
+                pending,
+            });
+        }
+        // The substitution prelude's segment-level inputs: the resuming
+        // document every tombstone appends through, and the route's
+        // identity demand — the same source the gate's `recorded_pre_call`
+        // consults. The consumed accumulator holds the decided calls this
+        // segment actually consumed; a re-park removes only that subset.
+        let document_handle =
+            ResumingDocumentHandle::open(documents.resuming(), self.execution_scope.clone())
+                .await
+                .map_err(|e| fault(format!("opening the resuming document failed: {e}")))?;
+        let requires_identity = hitl.route.requires_identity();
+        let mut consumed = Vec::new();
+
+        // The segment-wide preflight: every awaiting node's pending calls
+        // and snapshot prompt validate TOGETHER, or nothing runs — the
+        // all-or-nothing door. A refusal fires here, before ANY tombstone
+        // or invocation across the whole segment, carrying the
+        // node-attributed diagnostic; the per-node halves it yields are
+        // what the drive loop resolves and rebuilds from.
+        let preflight_inputs: Vec<NodePreflightInput<'_>> = awaiting
+            .iter()
+            .map(|node| {
+                let record = records
+                    .get(&node.task_id)
+                    .expect("every awaiting node was seeded with a park record");
+                NodePreflightInput::new(&node.pending, &record.snapshot.current_prompt)
+            })
+            .collect();
+        let validated_nodes = SegmentPreflight::try_new(&preflight_inputs)
+            .map_err(|refusal| fault(refusal.to_string()))?
+            .into_nodes();
+
+        for (node, validated) in awaiting.into_iter().zip(validated_nodes) {
+            let task_id = node.task_id;
+            let worker_name = node.worker.as_deref();
+            let pending = node.pending;
+            let ParkedTaskRecord { attempt, snapshot } = records
+                .get(&task_id)
+                .expect("every awaiting node was seeded with a park record")
+                .clone();
+            let ParkSnapshot { history, .. } = snapshot;
+
+            let Some(park) = self.worker_park(task_id, attempt) else {
+                return Err(fault(
+                    "cannot resume a segment without park mode enabled".to_string(),
+                ));
+            };
+            let AgentWithPreamble {
+                agent: worker,
+                submit_result_decision,
+                ..
+            } = self
+                .create_worker(
+                    task_id,
+                    attempt,
+                    worker_name,
+                    Some(&park.cell),
+                    Some(&recorded),
+                )
+                .await
+                .map_err(|e| {
+                    fault(format!(
+                        "the resume worker for task {task_id} failed to build: {e}"
+                    ))
+                })?;
+
+            // The substitution prelude: pre-flight the COMPLETE pending
+            // sequence against the recorded set, then per decided call,
+            // tombstone, invoke through the gated pipeline, and collect the
+            // keyed outcome pairs — all before the continuation ever
+            // streams. Every pending call of an awaiting node is decided —
+            // the grant's consult refused the resume otherwise. Same-key
+            // duplicate calls (identical tool and arguments, distinct call
+            // ids) share one FIFO queue: the calls in document order pair
+            // with the queue's entries front-to-back, positionally, and
+            // consumption is tracked per call by the key's queue depth
+            // around that call's own invocation. The outcomes key to the
+            // VALIDATED calls' own ids — taken from `ValidatedCall` before
+            // `resolve` consumes the list (the resolve caller obligation)
+            // — and the total `rebuild_context` then rebuilds the node's
+            // continuation context from the resolved bundle and the prompt
+            // witness the segment preflight validated.
+            let (calls, prompt_witness) = validated.into_parts();
+            // One outcome per bundle call, keyed by the validated calls'
+            // own ids (the resolve caller obligation) — the ids are cloned
+            // off `ValidatedCall` before `resolve` consumes the list.
+            let mut outcomes: Vec<(CallId, OutcomeWire)> = Vec::new();
+            {
+                let strict = recorded.strict_guard(task_id);
+                // The per-call key-position pairs, derived from document
+                // order alone: the i-th call under a key is that key's
+                // position i.
+                let keyed: Vec<(CallKey, usize)> = {
+                    let mut next_position: HashMap<CallKey, usize> = HashMap::new();
+                    pending
+                        .iter()
+                        .map(|call| {
+                            let key = CallKey::new(task_id, &call.tool_name, &call.arguments);
+                            let position = next_position.entry(key.clone()).or_insert(0);
+                            let at = *position;
+                            *position += 1;
+                            (key, at)
+                        })
+                        .collect()
+                };
+                // Pre-flight, non-consuming and positional: a miss or an
+                // unsatisfiable identity rule at ANY position is fatal
+                // before any tombstone or invocation, naming the faulting
+                // call.
+                for (call, (key, position)) in pending.iter().zip(&keyed) {
+                    match recorded.peek_at(key, *position, requires_identity) {
+                        PeekOutcome::Ready => {}
+                        PeekOutcome::Missing => {
+                            return Err(fault(format!(
+                                "resume mismatch: decided call {} of task {task_id} \
+                                 is missing from the recorded set",
+                                call.tool_name
+                            )));
+                        }
+                        PeekOutcome::IdentityBlocked => {
+                            return Err(fault(
+                                "resume mismatch: approved call is missing required \
+                                 approver identity"
+                                    .to_string(),
+                            ));
+                        }
+                    }
+                }
+                for ((call, (key, _position)), validated_call) in
+                    pending.iter().zip(&keyed).zip(calls.as_slice())
+                {
+                    // Consumption derives from the key's queue depth
+                    // around this call's own invocation — a drop of
+                    // exactly one is this call's decision being consumed —
+                    // never from the passed pre-flight.
+                    let depth_before = recorded.depth(key);
+                    // The tombstone precedes the invocation: a crash after
+                    // this write shows the call as executed, never re-asks
+                    // the human.
+                    document_handle
+                        .append_executed_and_publish(&call.call_id)
+                        .await
+                        .map_err(|e| {
+                            fault(format!(
+                                "resume tombstone write for call {} failed: {e}",
+                                call.call_id
+                            ))
+                        })?;
+                    // The gated pipeline consumes the decision: approved
+                    // executes once under the recorded identity; denied
+                    // short-circuits with the live denial text and never
+                    // executes.
+                    let wire = match worker
+                        .inner
+                        .call_tool(&call.tool_name, &call.arguments.to_string())
+                        .await
+                    {
+                        Ok(wire) => wire,
+                        // An execution failure is result text for the
+                        // model (sync parity): the live loop's Err branch
+                        // renders the error raw, where the Ok path delivers
+                        // the JSON-quoted form. Bookkeeping faults stay
+                        // fatal above — distinguished by where they arise.
+                        Err(e) => e.to_string(),
+                    };
+                    if recorded.depth(key) + 1 == depth_before {
+                        consumed.push(call.decision_id);
+                    }
+                    outcomes.push((validated_call.call_id().clone(), OutcomeWire::new(wire)));
+                }
+                // The strict guard drops before streaming, so a genuinely
+                // new gated call afterward re-parks through the live arm
+                // rather than faulting as a strict miss.
+                drop(strict);
+            }
+
+            // Resolution pairs by identity, then the total rebuild: the
+            // bundle is valid by construction, so `rebuild_context` cannot
+            // fail — the streamed context carries every bundle call's tool
+            // result preceded by the assistant tool call of the same id
+            // (synthesized where the checkpoint's history missed it), and
+            // no sentinel slot survives.
+            let bundle = calls.resolve(outcomes).map_err(|e| fault(e.to_string()))?;
+            let rebuilt = rebuild_context(&history, prompt_witness, &bundle);
+            let (current_prompt, rebuilt_history) = rebuilt.into_parts();
+
+            let park_registration = crate::streaming_request_hook::ParkCellRegistration::new(
+                &park.key,
+                park.cell.clone(),
+            );
+            let run = worker
+                .inner
+                .stream_chat_message_with_timeout(
+                    current_prompt,
+                    rebuilt_history,
+                    worker.max_depth,
+                    crate::streaming::RunOptions::default(),
+                    &park.key,
+                    worker.scratchpad_budget.clone(),
+                    worker.client_tool_names.clone(),
+                )
+                .await;
+            let srd = submit_result_decision.clone();
+            let stream_drive = Self::collect_segment_content(
+                run.into_events(),
+                &self.usage_state,
+                self.config.stream_inactivity_timeout_secs(),
+                worker.scratchpad_budget.as_ref(),
+                move || {
+                    let srd = srd.clone();
+                    Box::pin(async move { srd.lock().await.is_some() })
+                },
+            );
+            let timeout_secs = self.config.per_call_timeout_secs();
+            let stream_result = if timeout_secs == 0 {
+                stream_drive.await
+            } else {
+                match tokio::time::timeout(Duration::from_secs(timeout_secs), stream_drive).await {
+                    Ok(result) => result,
+                    Err(_elapsed) => {
+                        tracing::warn!(
+                            "Resume segment timed out after {}s (per_call_timeout_secs={})",
+                            timeout_secs,
+                            timeout_secs,
+                        );
+                        Err(format!(
+                            "Resume segment timed out after {}s — the LLM provider did not \
+                             respond in time",
+                            timeout_secs
+                        )
+                        .into())
+                    }
+                }
+            };
+            drop(park_registration);
+
+            // Same cell contract as the live path: the cell is the source of
+            // truth after any stream end, the park cancel's Err included.
+            match park.cell.outcome() {
+                CellOutcome::Blocked { pending } => {
+                    let snapshot = park
+                        .cell
+                        .snapshot()
+                        .expect("cell outcome Blocked implies a captured snapshot");
+                    let task = plan
+                        .get_task_mut(task_id)
+                        .expect("the segment plan carries the checkpoint's task ids");
+                    task.state = TaskState::AwaitingApproval {
+                        pending: pending.clone(),
+                    };
+                    records.insert(task_id, ParkedTaskRecord { attempt, snapshot });
+
+                    // The published history is the checkpoint's own plus this
+                    // drive's newly observed failures — the same derivation
+                    // the completion path's collector applies, over the same
+                    // known-failed set, stamped with the iteration the
+                    // restored plan executes under. The next resume seeds its
+                    // known-failed ids from the published plan, so a failure
+                    // dropped here would never be recorded.
+                    let mut failure_history = checkpoint.failure_history.clone();
+                    failure_history.extend(Self::collect_iteration_failures(
+                        &plan,
+                        checkpoint.iteration + 1,
+                        &known_failed,
+                    ));
+                    let inputs = ParkCommitInputs {
+                        state: RunStateForPark {
+                            run_id: &checkpoint.run_id,
+                            session_id: checkpoint.session_id.as_deref(),
+                            query: &checkpoint.query,
+                            chat_history: &checkpoint.chat_history,
+                            coordinator_conversation: &checkpoint.coordinator_conversation,
+                            routing_decision: checkpoint.routing_decision.as_ref(),
+                            iteration: checkpoint.iteration,
+                            planning_ms: checkpoint.planning_ms,
+                            failure_history: &failure_history,
+                        },
+                        plan: &plan,
+                        records: &records,
+                        registry,
+                        memory_dir: &memory_dir,
+                        config: &self.agent_config,
+                        park_ttl: hitl.park_ttl,
+                        // The checkpoint's binding rides forward: the
+                        // re-parked document compares against the same
+                        // identity the original park bound.
+                        identity_hash: checkpoint.identity_hash.clone(),
+                    };
+                    let commit = commit_from_run_state(&inputs, self.execution_scope.as_ref())
+                        .await
+                        .map_err(|e| fault(format!("the re-park commit failed: {e}")))?;
+                    if let Some(ref guard) = self.park_guard {
+                        guard.mark_published();
+                    }
+                    // This inline drive-loop re-park is the publication
+                    // owner: its ONE `RunParked` rides the caller's channel,
+                    // exactly as `park_run` does for a coordinator-loop
+                    // re-park. The segment returns immediately below, so no
+                    // second publication path runs.
+                    Self::emit_event(
+                        event_tx,
+                        AgentEventPayload::RunParked {
+                            run_id: checkpoint.run_id.clone(),
+                            decision_ids: commit
+                                .refreshed
+                                .decision_ids
+                                .iter()
+                                .map(ToString::to_string)
+                                .collect(),
+                            retention_expires_at: aura_events::RetentionExpiresAt::from_datetime(
+                                commit.retention_expires_at.as_datetime(),
+                            ),
+                            iteration: checkpoint.iteration,
+                        },
+                    )
+                    .await;
+                    // A re-park removes only the actually-consumed subset
+                    // from the store, after the commit published, so
+                    // untouched sibling nodes keep their recorded approvals.
+                    for id in &consumed {
+                        registry.remove(id).await;
+                    }
+                    return Ok(SegmentTerminal::Parked);
+                }
+                CellOutcome::Orphaned { pending } => {
+                    self.cancel_parked_approvals(task_id, worker_name, &pending)
+                        .await;
+                    let underlying = match stream_result.as_ref() {
+                        Err(e) => format!(" Underlying error: {e}"),
+                        Ok(_) => String::new(),
+                    };
+                    return Err(fault(format!(
+                        "the resume stream ended before the parked approval snapshot was \
+                         captured for task {task_id}; {} pending approval(s) cancelled.\
+                         {underlying}",
+                        pending.len()
+                    )));
+                }
+                CellOutcome::Normal => {
+                    let content = stream_result.map_err(|e| {
+                        fault(format!("the resume stream for task {task_id} failed: {e}"))
+                    })?;
+                    let structured = submit_result_decision.lock().await.take();
+                    let task = plan
+                        .get_task_mut(task_id)
+                        .expect("the segment plan carries the checkpoint's task ids");
+                    task.structured_output =
+                        structured.as_ref().map(|output| StructuredTaskOutput {
+                            summary: output.summary.clone(),
+                            confidence: output.confidence,
+                        });
+                    // The live loop's completion rule: a worker that never
+                    // called submit_result soft-fails, so the resumed
+                    // coordinator loop sees the failure and can re-plan
+                    // instead of a fabricated completion.
+                    match structured {
+                        Some(output) => task.complete(output.result),
+                        None => task.fail(content, FailureCategory::SoftFailure),
+                    }
+                }
             }
         }
 
-        Ok(TaskOutcome::Completed(TaskExecutionResult {
-            result,
-            structured_output,
-        }))
+        // Every awaiting node reached Normal: re-enter the coordinator
+        // iteration loop over the checkpoint's restored state. The run is
+        // not finished until the loop answers or a newly gated call parks
+        // again — the segment's terminal arm is the loop's, not the last
+        // worker's.
+        let final_answer = match self
+            .resume_coordinator_continuation(
+                &checkpoint,
+                plan,
+                known_failed,
+                &documents,
+                registry,
+                &consumed,
+                event_tx,
+            )
+            .await?
+        {
+            ContinuationOutcome::Completed { final_answer } => final_answer,
+            ContinuationOutcome::ReParked => {
+                return Ok(SegmentTerminal::Parked);
+            }
+        };
+
+        // Every awaiting node completed and the continuation finished: the
+        // checkpoint is the record only until the segment ends — delete the
+        // resuming document (the manifest is the record), then release the
+        // consumed decisions from the store, whose file backend retains
+        // them until removed.
+        let resuming = documents.resuming().to_path_buf();
+        let removed = tokio::task::spawn_blocking(move || std::fs::remove_file(&resuming))
+            .await
+            .map_err(|e| fault(format!("the checkpoint unlink task did not complete: {e}")))?;
+        match removed {
+            Ok(()) => {}
+            // Already gone: the deletion stays idempotent.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(fault(format!(
+                    "deleting the resuming checkpoint {} failed: {e}",
+                    documents.resuming().display()
+                )));
+            }
+        }
+        for id in grant.consumed_decisions() {
+            registry.remove(id).await;
+        }
+
+        Ok(SegmentTerminal::Completed { final_answer })
+    }
+
+    /// Re-enter the coordinator iteration loop after every awaiting node
+    /// reached [`CellOutcome::Normal`] (the R6 natural-finish ruling): the
+    /// coordinator's conversation, the run's chat history, iteration,
+    /// planning latency, and failure history restore from the checkpoint,
+    /// and the loop continues — driving never-started siblings, re-planning
+    /// past failures, and finishing its turn naturally. A newly gated call
+    /// re-parks through `run_iteration`'s park path; the re-published
+    /// checkpoint under the parked name is the park signal.
+    #[allow(clippy::too_many_arguments)]
+    async fn resume_coordinator_continuation(
+        &self,
+        checkpoint: &ParkedRun,
+        plan: Plan,
+        known_failed_tasks: HashSet<usize>,
+        documents: &super::park::resume::ResumeDocuments,
+        registry: &crate::hitl::PendingApprovals,
+        consumed: &[crate::hitl::DecisionId],
+        caller_tx: &tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>,
+    ) -> Result<ContinuationOutcome, SegmentError> {
+        let fault = |message: String| SegmentError::Continuation(Diagnostic::new(message));
+        // Restore the coordinator exactly as run_orchestration creates it,
+        // with the checkpoint's conversation as the starting state: the
+        // conversation's growth past the restore point is the
+        // coordinator's natural tail.
+        let routing_toolset = RoutingToolSet::new();
+        let routing_decision = routing_toolset.decision.clone();
+        let AgentWithPreamble {
+            agent: coordinator,
+            preamble,
+            ..
+        } = self
+            .create_coordinator(routing_toolset, true)
+            .await
+            .map_err(|e| fault(format!("the resumed coordinator failed to build: {e}")))?;
+        let mut coordinator_state = CoordinatorState {
+            agent: coordinator,
+            preamble,
+            conversation: checkpoint.coordinator_conversation.clone(),
+            routing_decision,
+        };
+
+        // The loop's routine events are not re-streamed to the client (the
+        // caller already has the run's context): an internal channel feeds a
+        // relay that forwards exactly the publication owner's `RunParked` to
+        // the caller's channel, so a re-park reaches the client once and only
+        // once.
+        let (event_tx, mut relay_rx) =
+            tokio::sync::mpsc::channel::<Result<StreamItem, StreamError>>(64);
+        let caller_tx = caller_tx.clone();
+        let publication_relay = tokio::spawn(async move {
+            while let Some(item) = relay_rx.recv().await {
+                if let Ok(StreamItem::AgentEvent(event)) = &item
+                    && matches!(event.payload, AgentEventPayload::RunParked { .. })
+                    && caller_tx.send(item).await.is_err()
+                {
+                    break;
+                }
+            }
+        });
+
+        // The resumed coordinator carries the checkpoint's iteration budget
+        // (Mike's 2026-10-01 ruling, reversing the prior fresh-cycles
+        // design): a run parked at iteration 2 of 3 resumes with one
+        // remaining cycle. The checkpoint's historical failure entries stay
+        // evidence-only; the iteration counter is the budget.
+        let seed = LoopSeed {
+            iteration: checkpoint.iteration,
+            planning_ms: checkpoint.planning_ms,
+            failure_history: checkpoint.failure_history.clone(),
+            known_failed_tasks,
+        };
+
+        let loop_result = self
+            .run_orchestration_loop(
+                &checkpoint.query,
+                plan,
+                checkpoint.chat_history.clone(),
+                &mut coordinator_state,
+                event_tx,
+                Instant::now(),
+                seed,
+            )
+            .await;
+        // The relay exits once the loop's sender drops (above); awaiting it
+        // guarantees the publication owner's `RunParked`, if any, reached the
+        // caller's channel before this continuation returns.
+        let _ = publication_relay.await;
+        let (final_answer, _worker_turns) =
+            loop_result.map_err(|e| fault(format!("the resumed coordinator loop failed: {e}")))?;
+
+        // A mid-loop re-park published a fresh checkpoint under the parked
+        // name (run_iteration's park path; the publish unlinked the resuming
+        // document). Nothing published means the loop answered.
+        let parked = documents.parked().to_path_buf();
+        let re_parked = tokio::task::spawn_blocking(move || parked.exists())
+            .await
+            .map_err(|e| fault(format!("the re-park probe task did not complete: {e}")))?;
+        if !re_parked {
+            return Ok(ContinuationOutcome::Completed { final_answer });
+        }
+        // The consumed subset leaves the store only now, after the commit
+        // published — untouched sibling decisions survive, as on the drive
+        // loop's re-park path.
+        for id in consumed {
+            registry.remove(id).await;
+        }
+        Ok(ContinuationOutcome::ReParked)
+    }
+
+    /// Drive one continuation stream to its end: consume the worker's items
+    /// under the inactivity guarding, per-turn usage tallying, scratchpad
+    /// occupancy, and the submit-result stop the other stream loops apply,
+    /// and return the loop's final text. No turn data is assembled: the live
+    /// drive observes worker output through the stream itself, and the park
+    /// snapshot carries the re-parked history at full fidelity.
+    async fn collect_segment_content(
+        mut stream: std::pin::Pin<
+            Box<dyn futures::Stream<Item = Result<StreamItem, StreamError>> + Send>,
+        >,
+        usage_state: &crate::UsageState,
+        inactivity_secs: u64,
+        scratchpad_budget: Option<&scratchpad::ContextBudget>,
+        decision_ready: impl Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        use crate::provider_agent::StreamedUserContent;
+        use futures::StreamExt;
+
+        let mut content = String::new();
+        let mut tally = TurnTally::default();
+        let mut deadline = crate::inactivity::InactivityDeadline::new_disarmed(
+            Duration::from_secs(inactivity_secs),
+        );
+        loop {
+            let item = tokio::select! {
+                biased;
+                _ = deadline.expired() => {
+                    return Err(deadline.stall_error("Resume segment"));
+                }
+                item = stream.next() => item,
+            };
+            let Some(item) = item else {
+                break;
+            };
+            let liveness = liveness_of(&item);
+            match liveness {
+                Liveness::ToolFinished => deadline.resume(),
+                _ => deadline.touch(),
+            }
+            match item {
+                Ok(StreamItem::TurnUsage(turn, cache)) => {
+                    tally.record(&turn, cache, usage_state);
+                    if let Some(budget) = scratchpad_budget {
+                        budget.set_estimated_used(turn.input_tokens, turn.output_tokens);
+                    }
+                }
+                Ok(StreamItem::Final(info)) => {
+                    let unrecorded = tally.reconcile(&info.usage);
+                    if unrecorded.input_tokens > 0 || unrecorded.output_tokens > 0 {
+                        tracing::warn!(
+                            "Resume segment: {} input / {} output tokens reached the provider \
+                             without a TurnUsage item; billing reconciled, occupancy may \
+                             understate the final turn",
+                            unrecorded.input_tokens,
+                            unrecorded.output_tokens
+                        );
+                        usage_state
+                            .accumulate_usage(unrecorded.input_tokens, unrecorded.output_tokens);
+                    }
+                    content = info.content;
+                    break;
+                }
+                Ok(StreamItem::StreamUserItem(StreamedUserContent::ToolResult(ref tr))) => {
+                    if decision_ready().await {
+                        if let Some(Ok(StreamItem::TurnUsage(turn, cache))) = stream.next().await {
+                            tally.record(&turn, cache, usage_state);
+                            if let Some(budget) = scratchpad_budget {
+                                budget.set_estimated_used(turn.input_tokens, turn.output_tokens);
+                            }
+                        }
+                        break;
+                    }
+                    tracing::debug!("Resume segment: tool result received (id={})", tr.id);
+                }
+                Err(e) => return Err(e),
+                _ => {}
+            }
+        }
+        Ok(content)
     }
 
     /// Persist a single worker execution attempt to the persistence store.
@@ -4439,7 +5630,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             .await?;
         let initial_planning_ms = planning_start.elapsed().as_millis() as u64;
 
-        let result = match response {
+        let result: Result<String, StreamError> = match response {
             PlanningResponse::Direct {
                 response,
                 routing_rationale,
@@ -4493,16 +5684,23 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 )
                 .await;
 
-                self.run_orchestration_loop(
-                    query,
-                    plan,
-                    chat_history,
-                    &mut coordinator_state,
-                    event_tx,
-                    orchestration_start,
-                    initial_planning_ms,
-                )
-                .await
+                let (final_answer, _worker_turns) = self
+                    .run_orchestration_loop(
+                        query,
+                        plan,
+                        chat_history,
+                        &mut coordinator_state,
+                        event_tx,
+                        orchestration_start,
+                        LoopSeed {
+                            iteration: 0,
+                            planning_ms: initial_planning_ms,
+                            failure_history: Vec::new(),
+                            known_failed_tasks: HashSet::new(),
+                        },
+                    )
+                    .await?;
+                Ok(final_answer)
             }
         };
 
@@ -4523,6 +5721,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
     /// `run_iteration`: a replan request is refused, with raw task results
     /// returned, once `max_planning_cycles` or the outer time budget
     /// (`budget_exhausted`) is spent.
+    ///
+    /// Returns the final answer plus every iteration's worker assistant
+    /// turns — the segment turns a resumed continuation reports (a live
+    /// caller discards them; its SSE stream carried them already).
     #[allow(clippy::too_many_arguments)]
     async fn run_orchestration_loop(
         &self,
@@ -4532,17 +5734,24 @@ Assign tasks to the worker whose tools best match the required operations."#,
         coordinator_state: &mut CoordinatorState,
         event_tx: tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>,
         orchestration_start: Instant,
-        initial_planning_ms: u64,
-    ) -> Result<String, StreamError> {
-        let mut iteration = 0;
+        seed: LoopSeed,
+    ) -> Result<(String, Vec<rig::completion::Message>), StreamError> {
+        let mut iteration = seed.iteration;
         let mut previous_context: Option<IterationContext> = None;
         let mut plan = initial_plan;
-        let mut failure_history: Vec<FailedTaskRecord> = Vec::new();
+        let mut failure_history: Vec<FailedTaskRecord> = seed.failure_history;
+        // Only the iteration that executes the restored plan may skip the
+        // known-failed ids. A replan flattens a fresh plan whose task ids
+        // restart at zero — colliding with the restored ids — so the set
+        // retires with the plan it describes rather than muting the
+        // replacement plan's own failures.
+        let mut known_failed = seed.known_failed_tasks;
         // Planning latency for the next iteration. The first iteration uses the
         // initial planning call; replanned iterations inherit the prior
         // iteration's continuation-decision latency (that call produced the
         // plan being executed).
-        let mut planning_ms = initial_planning_ms;
+        let mut planning_ms = seed.planning_ms;
+        let mut worker_turns = Vec::new();
 
         let final_result = loop {
             iteration += 1;
@@ -4557,7 +5766,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     &event_tx,
                     orchestration_start,
                     planning_ms,
+                    &known_failed,
                     &mut failure_history,
+                    &mut worker_turns,
                 )
                 .await?
             {
@@ -4570,11 +5781,12 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     plan = new_plan;
                     previous_context = pc;
                     planning_ms = next_planning_ms;
+                    known_failed.clear();
                 }
             }
         };
 
-        Ok(final_result)
+        Ok((final_result, worker_turns))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4603,7 +5815,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
         event_tx: &tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>,
         orchestration_start: Instant,
         planning_ms: u64,
+        known_failed: &HashSet<usize>,
         failure_history: &mut Vec<FailedTaskRecord>,
+        worker_turns: &mut Vec<rig::completion::Message>,
     ) -> Result<IterationOutcome, StreamError> {
         let elapsed = orchestration_start.elapsed().as_secs_f64();
         // Execution span: plan ready → continuation-prompt entrypoint. Covers
@@ -4638,15 +5852,21 @@ Assign tasks to the worker whose tools best match the required operations."#,
         // ----------------------------------------------------------------
         // EXECUTE: Run workers on tasks (parallel when possible)
         // ----------------------------------------------------------------
-        let (task_compute_ms, park_records) = match self.execute(&mut plan, event_tx).await {
-            Ok(result) => result,
-            Err(e) => {
-                self.write_run_manifest(&plan, iteration, None).await;
-                return Err(e);
-            }
-        };
+        let (task_compute_ms, park_records, iteration_worker_turns) =
+            match self.execute(&mut plan, event_tx).await {
+                Ok(result) => result,
+                Err(e) => {
+                    self.write_run_manifest(&plan, iteration, None).await;
+                    return Err(e);
+                }
+            };
+        worker_turns.extend(iteration_worker_turns);
         let new_failure_start = failure_history.len();
-        failure_history.extend(Self::collect_iteration_failures(&plan, iteration));
+        failure_history.extend(Self::collect_iteration_failures(
+            &plan,
+            iteration,
+            known_failed,
+        ));
         let this_iteration_failures = &failure_history[new_failure_start..];
 
         // Drain in-flight persistence writes before reading back artifacts.
@@ -4684,6 +5904,11 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 "Iteration {} parked at quiescence; skipping post-execute coordinator call",
                 iteration
             );
+            // A parked task's turns entered its wave's task-id merge inside
+            // `execute`, from its captured snapshot at full wire fidelity —
+            // the stream collector's assembly drops a tool call's provider
+            // call_id, and the segment's re-park report keys on the gated
+            // turn exactly as the park recorded it.
             let conversation = coordinator_state.conversation.clone();
             let routing_decision = coordinator_state.routing_decision.lock().await.clone();
             let result = self
@@ -5197,7 +6422,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         let Some(hitl) = self.agent_config.hitl.clone() else {
             return Err("run parked without the HITL runtime configured".into());
         };
-        let Some((registry, timeout)) = hitl.route.park_registry() else {
+        let Some((registry, _)) = hitl.route.park_registry() else {
             return Err("run parked without a park-capable route".into());
         };
         let (run_id, session_id) = {
@@ -5220,6 +6445,19 @@ Assign tasks to the worker whose tools best match the required operations."#,
             .into());
         };
 
+        // The write side of `[hitl.park].bind_identity`: the checkpoint
+        // stores the presented header's hash, which is what the resume
+        // evaluation compares against. Binding on with no presented value
+        // commits no hash, and the resume side refuses such a document —
+        // the same fail-closed reading the resume path gives a missing
+        // header.
+        let identity_hash = self
+            .agent_config
+            .presented_identity
+            .as_deref()
+            .filter(|_| self.agent_config.park_bind_identity)
+            .map(|value| IdentityHash::hash_value(value).into_inner());
+
         let inputs = super::park::ParkCommitInputs {
             state: super::park::RunStateForPark {
                 run_id: &run_id,
@@ -5237,10 +6475,11 @@ Assign tasks to the worker whose tools best match the required operations."#,
             registry,
             memory_dir: &memory_dir,
             config: &self.agent_config,
-            decision_window: timeout,
+            park_ttl: hitl.park_ttl,
+            identity_hash,
         };
 
-        match super::park::commit_from_run_state(&inputs).await {
+        match super::park::commit_from_run_state(&inputs, self.execution_scope.as_ref()).await {
             Ok(commit) => {
                 if let Some(ref guard) = self.park_guard {
                     guard.mark_published();
@@ -5255,7 +6494,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
                             .iter()
                             .map(ToString::to_string)
                             .collect(),
-                        expires_at: commit.expires_at,
+                        retention_expires_at: aura_events::RetentionExpiresAt::from_datetime(
+                            commit.retention_expires_at.as_datetime(),
+                        ),
                         iteration,
                     },
                 )
@@ -5296,9 +6537,16 @@ Assign tasks to the worker whose tools best match the required operations."#,
         let Some((registry, _)) = hitl.route.park_registry() else {
             return;
         };
-        super::park::cancel_run_approvals(registry, run_id, crate::run_context::current_run())
-            .await
-            .ok();
+        let request_id = self.agent_config.request_id.clone().unwrap_or_default();
+        super::park::cancel_run_approvals(
+            registry,
+            run_id,
+            &request_id,
+            crate::run_context::current_run(),
+            None,
+        )
+        .await
+        .ok();
     }
 
     async fn write_run_manifest(
@@ -5741,23 +6989,6 @@ mod tests {
 
         assert_eq!(unrecorded.input_tokens, 0);
         assert_eq!(unrecorded.output_tokens, 0);
-    }
-
-    #[test]
-    fn test_tally_keeps_the_first_turn_as_the_context_reading() {
-        let usage_state = crate::UsageState::new();
-        let mut tally = TurnTally::default();
-        assert_eq!(tally.first, None);
-
-        // Coordinator loads a skill, lists prior runs, then plans: each inner
-        // turn re-sends the growing scratch context.
-        tally.record(&usage(10_741, 58), None, &usage_state);
-        tally.record(&usage(12_763, 127), None, &usage_state);
-        tally.record(&usage(40_112, 1_240), None, &usage_state);
-
-        let first = tally.first.unwrap();
-        assert_eq!((first.input_tokens, first.output_tokens), (10_741, 58));
-        assert_eq!(tally.last.input_tokens, 40_112);
     }
 
     /// A two-worker orchestration run replayed from its Bedrock
@@ -7365,12 +8596,17 @@ mod tests {
         mark_awaiting(&mut plan, 1, vec![parked_call("kubectl_apply")]);
 
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(32);
-        let (compute_ms, park_records) = orchestrator.execute(&mut plan, &event_tx).await.unwrap();
+        let (compute_ms, park_records, worker_turns) =
+            orchestrator.execute(&mut plan, &event_tx).await.unwrap();
 
         assert_eq!(compute_ms, 0, "no worker ran");
         assert!(
             park_records.is_empty(),
             "no park record exists for a pre-marked awaiting plan"
+        );
+        assert!(
+            worker_turns.is_empty(),
+            "no worker streamed, so no worker turns exist"
         );
         assert!(matches!(
             plan.tasks[1].state,
@@ -7403,12 +8639,14 @@ mod tests {
             poll_url: None,
             poll_interval_secs: 10,
             poll_request_timeout_secs: 30,
+            receiver_wait_timeout_secs: 900,
         }
     }
 
     /// `park_enabled` requires the flag AND a park-capable route: the
-    /// conversational route and the webhook route under poll delivery park;
-    /// the webhook route under sync delivery keeps the live decision path.
+    /// conversational route parks inline, and the webhook route parks only
+    /// under poll delivery with the flag on; sync delivery never arms park,
+    /// with or without the flag - the flag alone is not admission.
     #[tokio::test]
     async fn park_enabled_requires_flag_and_park_capable_route() {
         use aura_config::GlobPattern;
@@ -7421,6 +8659,8 @@ mod tests {
                 require_approval: vec![GlobPattern::new("kubectl_*").unwrap()],
                 park: aura_config::ParkConfig {
                     enabled: park_enabled,
+                    bind_identity: false,
+                    park_ttl: aura_config::ParkTtl::default(),
                 },
                 route,
             };
@@ -7456,13 +8696,27 @@ mod tests {
         .unwrap();
         assert!(on.park_enabled(), "flag on + conversational: park on");
 
-        let sync = Orchestrator::new(config(
+        let sync_park = Orchestrator::new(config(
             true,
             webhook_route_config(aura_config::WebhookDelivery::Sync),
         ))
         .await
         .unwrap();
-        assert!(!sync.park_enabled(), "webhook sync route: park off");
+        assert!(
+            !sync_park.park_enabled(),
+            "a webhook sync route never arms park: sync holds one POST"
+        );
+
+        let sync_hold = Orchestrator::new(config(
+            false,
+            webhook_route_config(aura_config::WebhookDelivery::Sync),
+        ))
+        .await
+        .unwrap();
+        assert!(
+            !sync_hold.park_enabled(),
+            "webhook sync route with park disabled: park off"
+        );
 
         let poll = Orchestrator::new(config(
             true,
@@ -7473,6 +8727,67 @@ mod tests {
         assert!(poll.park_enabled(), "webhook poll route: park on");
     }
 
+    /// The tool names a built worker agent ADVERTISES — the observable
+    /// for the poll-mode tool-suppression contract (the worker config's
+    /// `hitl_request_approval_tool` field is consumed by the build; the
+    /// advertised set is what the model sees).
+    async fn advertised_worker_tool_names(agent: &Agent) -> Vec<String> {
+        let defs = match &agent.inner {
+            ProviderAgent::OpenAI(agent) => agent.tool_server_handle.get_tool_defs(None).await,
+            ProviderAgent::Anthropic(agent) => agent.tool_server_handle.get_tool_defs(None).await,
+            ProviderAgent::Bedrock(agent) => agent.tool_server_handle.get_tool_defs(None).await,
+            ProviderAgent::Gemini(agent) => agent.tool_server_handle.get_tool_defs(None).await,
+            ProviderAgent::Ollama(agent) => agent.tool_server_handle.get_tool_defs(None).await,
+            ProviderAgent::OpenRouter(agent) => agent.tool_server_handle.get_tool_defs(None).await,
+            #[cfg(test)]
+            ProviderAgent::Scripted(agent) => agent.tool_server_handle.get_tool_defs(None).await,
+        };
+        defs.expect("tool definitions list")
+            .into_iter()
+            .map(|def| def.name)
+            .collect()
+    }
+
+    /// The worker path under a park-capable webhook poll route attaches
+    /// no `request_approval` tool: poll mode resolves decisions without
+    /// an agent-callable park path — `create_worker` scopes the attach to
+    /// non-poll routes.
+    #[tokio::test]
+    async fn worker_poll_mode_does_not_attach_the_request_approval_tool() {
+        fn config() -> AgentRuntimeConfig {
+            let hitl = aura_config::HitlConfig {
+                require_approval: vec![aura_config::GlobPattern::new("kubectl_*").unwrap()],
+                park: aura_config::ParkConfig {
+                    enabled: true,
+                    bind_identity: false,
+                    park_ttl: aura_config::ParkTtl::default(),
+                },
+                route: webhook_route_config(aura_config::WebhookDelivery::Poll),
+            };
+            AgentRuntimeConfig {
+                hitl: Some(crate::hitl::HitlRuntime::from_config(
+                    &hitl,
+                    &crate::hitl::PendingApprovals::new(),
+                    None,
+                    None,
+                )),
+                ..AgentRuntimeConfig::default()
+            }
+        }
+
+        let orchestrator = Orchestrator::new(config()).await.unwrap();
+        let worker = orchestrator
+            .create_worker(1, 1, None, None, None)
+            .await
+            .expect("the poll-mode worker builds");
+
+        let names = advertised_worker_tool_names(&worker.agent).await;
+        assert!(
+            !names.iter().any(|name| name == "request_approval"),
+            "poll-mode workers must not attach request_approval; advertised: {names:?}",
+        );
+    }
+
     /// Run-level activation: a webhook route with poll delivery
     /// arms the park guard, enables park, and the commit path publishes the
     /// checkpoint. The reconciler flow itself is the poller's.
@@ -7481,7 +8796,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let hitl = aura_config::HitlConfig {
             require_approval: vec![aura_config::GlobPattern::new("kubectl_*").unwrap()],
-            park: aura_config::ParkConfig { enabled: true },
+            park: aura_config::ParkConfig {
+                enabled: true,
+                bind_identity: false,
+                park_ttl: aura_config::ParkTtl::default(),
+            },
             route: webhook_route_config(aura_config::WebhookDelivery::Poll),
         };
         let store = Arc::new(crate::session_store::InMemoryApprovalStore::new());
@@ -7577,13 +8896,17 @@ mod tests {
                     timeout: Duration::from_secs(60),
                 }),
                 park_enabled: true,
+                park_ttl: aura_config::ParkTtl::default(),
+                headers_from_request: std::collections::HashMap::new(),
             }),
             request_id: Some(request_id.clone()),
             ..AgentRuntimeConfig::default()
         };
         let orchestrator = Orchestrator::new(config).await.unwrap();
 
-        // Two durable registrations, as the park arm would make them.
+        // Two durable registrations, as the park arm would make them:
+        // born through the 207 bridge, acknowledged by the registration
+        // itself and never re-POSTed.
         let now = chrono::Utc::now();
         let mut pending = Vec::new();
         for tool in ["kubectl_apply", "kubectl_delete"] {
@@ -7606,6 +8929,7 @@ mod tests {
                     expires_at: now + chrono::Duration::seconds(60),
                     authority: crate::hitl::ApprovalAuthority::WebhookPoll,
                     egress_headers: None,
+                    acknowledgment: crate::hitl::AcknowledgmentState::Acknowledged,
                 })
                 .await
                 .expect("durable register succeeds");
@@ -7693,6 +9017,8 @@ mod tests {
                     timeout: Duration::from_secs(3600),
                 }),
                 park_enabled: true,
+                park_ttl: aura_config::ParkTtl::default(),
+                headers_from_request: std::collections::HashMap::new(),
             }),
             memory_dir: Some(memory_dir.to_string_lossy().into_owned()),
             session_id: Some("park-sess".to_string()),
@@ -7705,8 +9031,8 @@ mod tests {
     }
 
     /// An awaiting plan plus its park record, with every pending call
-    /// durably parked under the run-scoped owner — the state the gate and
-    /// hook leave behind at the quiescence verdict.
+    /// durably parked under the run-scoped owner — born through the 207
+    /// bridge, acknowledged by the registration itself and never re-POSTed.
     async fn awaiting_plan_with_parked_calls(
         registry: &crate::hitl::PendingApprovals,
         run_id: &str,
@@ -7743,6 +9069,7 @@ mod tests {
                     expires_at: now + chrono::Duration::hours(1),
                     authority: crate::hitl::ApprovalAuthority::WebhookPoll,
                     egress_headers: None,
+                    acknowledgment: crate::hitl::AcknowledgmentState::Acknowledged,
                 })
                 .await
                 .unwrap();
@@ -7875,8 +9202,453 @@ mod tests {
         drop(orchestrator);
     }
 
+    /// The identity-binding round trip end to end: a park under
+    /// `[hitl.park].bind_identity` stamps the presented header's hash into
+    /// the checkpoint, the resume evaluation admits the same header, and
+    /// refuses a differing one with the detail-less not-found row.
     #[tokio::test]
-    async fn park_run_with_every_call_decided_stamps_the_decision_window() {
+    async fn bound_park_stamps_the_identity_hash_and_resume_enforces_it() {
+        use crate::orchestration::park::resume::{
+            ResumeClaimTable, ResumeEvaluation, ResumeRefusal, ValidatedResumePath, evaluate_resume,
+        };
+
+        const SESSION: &str = "bind-sess";
+        const IDENTITY: &str = "identity-alice-token";
+
+        let dir = tempfile::tempdir().unwrap();
+        // The file backend: the resume consult rehydrates each recorded
+        // decision from the stored approval, which the file store keeps
+        // readable after resolve and the memory store does not.
+        let approval_dir = dir.path().join("approvals");
+        std::fs::create_dir_all(&approval_dir).unwrap();
+        let registry = crate::hitl::PendingApprovals::with_backend(
+            Arc::new(crate::session_store::FileApprovalStore::open(&approval_dir).unwrap()),
+            Arc::new(crate::session_store::InMemoryEventBus::new()),
+        );
+        let memory_dir = dir.path().to_string_lossy().into_owned();
+        // One bound configuration shapes both sides: the park commits under
+        // it, and the resume evaluation fingerprint-checks against a rebuild
+        // of it.
+        let bound_config = || AgentRuntimeConfig {
+            hitl: Some(crate::hitl::HitlRuntime {
+                patterns: Arc::from([aura_config::GlobPattern::new("kubectl_*").unwrap()]),
+                route: Arc::new(crate::hitl::DecisionRoute::Conversational {
+                    registry: registry.clone(),
+                    timeout: Duration::from_secs(3600),
+                }),
+                park_enabled: true,
+                park_ttl: aura_config::ParkTtl::default(),
+                headers_from_request: std::collections::HashMap::new(),
+            }),
+            memory_dir: Some(memory_dir.clone()),
+            session_id: Some(SESSION.to_string()),
+            request_id: Some(format!("req_bind_{}", uuid::Uuid::new_v4().simple())),
+            park_bind_identity: true,
+            presented_identity: Some(IDENTITY.to_string()),
+            ..AgentRuntimeConfig::default()
+        };
+
+        let orchestrator = Orchestrator::new(bound_config()).await.unwrap();
+        let run_id = orchestrator.persistence.lock().await.run_id().to_string();
+
+        // The awaiting plan with its two durably parked approvals, scoped to
+        // this run's gated task: the resume consult refuses approvals whose
+        // stored scope names another run, another task, or a non-worker
+        // scope shape.
+        let mut plan = Plan::new("Deploy");
+        plan.add_task(Task::new(0, "Facts", "r"));
+        plan.add_task(Task::new(1, "Gated apply", "r").with_dependency(0));
+        plan.get_task_mut(0).unwrap().complete("facts");
+
+        let registered_at = chrono::Utc::now();
+        let mut pending = Vec::new();
+        for tool in ["kubectl_apply", "kubectl_delete"] {
+            let decision_id = TestDecisionId::generate();
+            registry
+                .register_durable(crate::hitl::ParkedApproval {
+                    request: crate::hitl::ApprovalRequest {
+                        version: crate::hitl::PROTOCOL_VERSION,
+                        instance_id: "test-instance".to_string(),
+                        decision_id,
+                        request_id: format!("run:{run_id}"),
+                        scope: crate::hitl::AgentScope::Worker {
+                            run_id: run_id.parse().expect("run id parses"),
+                            task: crate::orchestration::TaskIdentity::new(1, None),
+                            session_id: None,
+                        },
+                        origin: crate::hitl::ApprovalOrigin::ConfigGate {
+                            matched_pattern: "kubectl_*".to_string(),
+                            agent_name: "test-agent".to_string(),
+                        },
+                        items: vec![crate::hitl::ApprovalItem {
+                            tool_name: tool.to_string(),
+                            tool_namespace: None,
+                            arguments: serde_json::json!({ "namespace": "prod" }),
+                            tool_call_intent: None,
+                        }],
+                    },
+                    registered_at,
+                    expires_at: registered_at + chrono::Duration::hours(1),
+                    authority: crate::hitl::ApprovalAuthority::WebhookPoll,
+                    egress_headers: None,
+                    acknowledgment: crate::hitl::AcknowledgmentState::Acknowledged,
+                })
+                .await
+                .unwrap();
+            pending.push(TestPendingCall {
+                decision_id,
+                tool_name: tool.to_string(),
+                arguments: serde_json::json!({ "namespace": "prod" }),
+                call_id: format!("call_{}", pending.len()),
+            });
+        }
+        mark_awaiting(&mut plan, 1, pending.clone());
+
+        let mut records = ParkedTaskRecords::new();
+        records.insert(
+            1,
+            crate::orchestration::park::ParkedTaskRecord {
+                attempt: 1,
+                snapshot: crate::orchestration::ParkSnapshot {
+                    history: vec![rig::completion::Message::user("apply it")],
+                    current_prompt: rig::completion::Message::user("tool results"),
+                },
+            },
+        );
+
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(32);
+
+        let chat_history = vec![rig::completion::Message::user("deploy the service")];
+        orchestrator
+            .park_run(
+                "deploy the service",
+                &chat_history,
+                &[],
+                None,
+                1,
+                2_500,
+                &[],
+                &plan,
+                &records,
+                &event_tx,
+            )
+            .await
+            .expect("the bound park commits");
+
+        let document_path = dir
+            .path()
+            .join(SESSION)
+            .join("parked")
+            .join(format!("{run_id}.json"));
+        let document = crate::orchestration::park::load_parked_run(&document_path)
+            .await
+            .unwrap();
+        assert_eq!(
+            document.identity_hash,
+            Some(IdentityHash::hash_value(IDENTITY).into_inner()),
+            "the park stamps the presented header's hash"
+        );
+
+        let claims = ResumeClaimTable::new();
+        let resume_config = bound_config();
+        let evaluation = |presented: Option<&'static str>| ResumeEvaluation {
+            path: ValidatedResumePath::parse(SESSION, &run_id).expect("path validates"),
+            memory_dir: &memory_dir,
+            config: &resume_config,
+            store: &registry,
+            claims: &claims,
+            bind_identity: true,
+            presented_identity: presented,
+            now: chrono::Utc::now(),
+        };
+
+        let differing = evaluate_resume(evaluation(Some("identity-mallory-token"))).await;
+        assert!(
+            matches!(differing, Err(ResumeRefusal::IdentityMismatch)),
+            "a differing header answers the detail-less not-found row: {differing:?}"
+        );
+
+        for call in &pending {
+            registry
+                .resolve(
+                    &call.decision_id,
+                    crate::hitl::ApprovalAuthority::WebhookPoll,
+                    crate::hitl::ApprovalDecision::Approved.into(),
+                )
+                .await
+                .unwrap();
+        }
+        let granted = evaluate_resume(evaluation(Some(IDENTITY)))
+            .await
+            .expect("the matching header is admitted");
+        assert_eq!(granted.run_id().to_string(), run_id);
+        assert_eq!(granted.session_id().to_string(), SESSION);
+    }
+
+    // ====================================================================
+    // L3a execution-scope context threading
+    // ====================================================================
+
+    /// A resume grant over a file-backed conversational park: an awaiting run
+    /// whose two gated calls are durably parked under the run's worker scope,
+    /// both decided, then admitted through the interim `authorize` path — the
+    /// scope the grant owns is minted there and never re-minted. The
+    /// evaluation config is returned so `for_resume_segment` can rebuild from
+    /// the same shape (the file backend keeps each decided approval readable
+    /// for the consult, which the memory store does not).
+    async fn resume_grant_fixture(
+        root: &std::path::Path,
+        session: &str,
+    ) -> (AgentRuntimeConfig, crate::orchestration::ResumeGrant) {
+        use crate::orchestration::park::resume::{
+            ResumeClaimTable, ResumeEvaluation, ValidatedResumePath, evaluate_resume,
+        };
+
+        let approval_dir = root.join("approvals");
+        std::fs::create_dir_all(&approval_dir).unwrap();
+        let registry = crate::hitl::PendingApprovals::with_backend(
+            Arc::new(crate::session_store::FileApprovalStore::open(&approval_dir).unwrap()),
+            Arc::new(crate::session_store::InMemoryEventBus::new()),
+        );
+        let memory_dir = root.to_string_lossy().into_owned();
+        let config = || AgentRuntimeConfig {
+            hitl: Some(crate::hitl::HitlRuntime {
+                patterns: Arc::from([aura_config::GlobPattern::new("kubectl_*").unwrap()]),
+                route: Arc::new(crate::hitl::DecisionRoute::Conversational {
+                    registry: registry.clone(),
+                    timeout: Duration::from_secs(3600),
+                }),
+                park_enabled: true,
+                park_ttl: aura_config::ParkTtl::default(),
+                headers_from_request: std::collections::HashMap::new(),
+            }),
+            memory_dir: Some(memory_dir.clone()),
+            session_id: Some(session.to_string()),
+            request_id: Some(format!("req_l3a_{}", uuid::Uuid::new_v4().simple())),
+            ..AgentRuntimeConfig::default()
+        };
+
+        let orchestrator = Orchestrator::new(config()).await.unwrap();
+        let run_id = orchestrator.persistence.lock().await.run_id().to_string();
+
+        let mut plan = Plan::new("Deploy");
+        plan.add_task(Task::new(0, "Facts", "r"));
+        plan.add_task(Task::new(1, "Gated apply", "r").with_dependency(0));
+        plan.get_task_mut(0).unwrap().complete("facts");
+
+        let registered_at = chrono::Utc::now();
+        let mut pending = Vec::new();
+        for tool in ["kubectl_apply", "kubectl_delete"] {
+            let decision_id = TestDecisionId::generate();
+            registry
+                .register_durable(ParkedApproval {
+                    request: crate::hitl::ApprovalRequest {
+                        version: crate::hitl::PROTOCOL_VERSION,
+                        instance_id: "test-instance".to_string(),
+                        decision_id,
+                        request_id: format!("run:{run_id}"),
+                        scope: crate::hitl::AgentScope::Worker {
+                            run_id: run_id.parse().expect("run id parses"),
+                            task: crate::orchestration::TaskIdentity::new(1, None),
+                            session_id: None,
+                        },
+                        origin: crate::hitl::ApprovalOrigin::ConfigGate {
+                            matched_pattern: "kubectl_*".to_string(),
+                            agent_name: "test-agent".to_string(),
+                        },
+                        items: vec![ApprovalItem {
+                            tool_namespace: None,
+                            tool_name: tool.to_string(),
+                            arguments: serde_json::json!({ "namespace": "prod" }),
+                            tool_call_intent: None,
+                        }],
+                    },
+                    registered_at,
+                    expires_at: registered_at + chrono::Duration::hours(1),
+                    authority: crate::hitl::ApprovalAuthority::WebhookPoll,
+                    egress_headers: None,
+                    acknowledgment: crate::hitl::AcknowledgmentState::Acknowledged,
+                })
+                .await
+                .unwrap();
+            pending.push(TestPendingCall {
+                decision_id,
+                tool_name: tool.to_string(),
+                arguments: serde_json::json!({ "namespace": "prod" }),
+                call_id: format!("call_{}", pending.len()),
+            });
+        }
+        mark_awaiting(&mut plan, 1, pending.clone());
+
+        let mut records = ParkedTaskRecords::new();
+        records.insert(
+            1,
+            crate::orchestration::park::ParkedTaskRecord {
+                attempt: 1,
+                snapshot: crate::orchestration::ParkSnapshot {
+                    history: vec![rig::completion::Message::user("apply it")],
+                    current_prompt: rig::completion::Message::user("tool results"),
+                },
+            },
+        );
+
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(32);
+        orchestrator
+            .park_run(
+                "deploy the service",
+                &[rig::completion::Message::user("deploy the service")],
+                &[],
+                None,
+                1,
+                2_500,
+                &[],
+                &plan,
+                &records,
+                &event_tx,
+            )
+            .await
+            .expect("the fixture park commits");
+
+        for call in &pending {
+            registry
+                .resolve(
+                    &call.decision_id,
+                    crate::hitl::ApprovalAuthority::WebhookPoll,
+                    crate::hitl::ApprovalDecision::Approved.into(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let claims = ResumeClaimTable::new();
+        let resume_config = config();
+        let evaluation = ResumeEvaluation {
+            path: ValidatedResumePath::parse(session, &run_id).expect("path validates"),
+            memory_dir: &memory_dir,
+            config: &resume_config,
+            store: &registry,
+            claims: &claims,
+            bind_identity: false,
+            presented_identity: None,
+            now: chrono::Utc::now(),
+        };
+        let grant = evaluate_resume(evaluation)
+            .await
+            .expect("the resume is admitted over the decided park");
+        (resume_config, grant)
+    }
+
+    /// L3a golden (RED today): a resume segment's worker tool context carries
+    /// the grant's ONE execution scope — the same `Arc`, never a second.
+    #[tokio::test]
+    async fn resume_segment_worker_context_carries_execution_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, grant) = resume_grant_fixture(dir.path(), "l3a-worker-sess").await;
+
+        let segment = Orchestrator::for_resume_segment(&grant, &config)
+            .await
+            .expect("the resume segment orchestrator builds");
+        let worker = segment
+            .create_worker(1, 1, None, None, None)
+            .await
+            .expect("the resume worker builds");
+        let factory = worker
+            .tool_context_factory
+            .as_ref()
+            .expect("create_worker produces a tool context factory");
+
+        let ctx = factory("kubectl_apply");
+        let scope = ctx.execution_scope.expect(
+            "the resume worker context carries the execution scope (RED today: never injected)",
+        );
+        assert!(
+            Arc::ptr_eq(&scope, &grant.execution_scope()),
+            "the worker context must carry the grant's ONE scope Arc, not a fresh one"
+        );
+    }
+
+    /// L3a golden (RED today): a resume segment's coordinator tool context
+    /// carries the same grant-owned execution scope.
+    #[tokio::test]
+    async fn resume_segment_coordinator_context_carries_execution_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, grant) = resume_grant_fixture(dir.path(), "l3a-coord-sess").await;
+
+        let segment = Orchestrator::for_resume_segment(&grant, &config)
+            .await
+            .expect("the resume segment orchestrator builds");
+        let coordinator = segment
+            .create_coordinator(RoutingToolSet::new(), true)
+            .await
+            .expect("the resume coordinator builds");
+        let factory = coordinator
+            .tool_context_factory
+            .as_ref()
+            .expect("create_coordinator produces a tool context factory");
+
+        let ctx = factory("read_artifact");
+        let scope = ctx.execution_scope.expect(
+            "the resume coordinator context carries the execution scope (RED today: never injected)",
+        );
+        assert!(
+            Arc::ptr_eq(&scope, &grant.execution_scope()),
+            "the coordinator context must carry the grant's ONE scope Arc, not a fresh one"
+        );
+    }
+
+    /// L3b golden (RED today): the resume segment's orchestrator builds the
+    /// checkpoint-preserving guard, scoped to the grant's ONE execution scope.
+    #[tokio::test]
+    async fn resume_segment_guard_is_scoped_and_preserving() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, grant) = resume_grant_fixture(dir.path(), "l3b-guard-sess").await;
+
+        let segment = Orchestrator::for_resume_segment(&grant, &config)
+            .await
+            .expect("the resume segment orchestrator builds");
+        let guard = segment
+            .park_guard
+            .as_ref()
+            .expect("the resume segment arms a park guard");
+        assert_eq!(
+            guard.mode(),
+            ParkGuardMode::Resumed,
+            "a resume segment's guard is checkpoint-preserving"
+        );
+        let scope = guard
+            .execution_scope()
+            .expect("the resume guard carries the grant's execution scope");
+        assert!(
+            Arc::ptr_eq(&scope, &grant.execution_scope()),
+            "the resume guard must carry the grant's ONE scope Arc, not a fresh one"
+        );
+    }
+
+    /// L3a characterization (green today, must stay green): an initial
+    /// `Orchestrator::new`-built orchestrator's worker context stays unscoped.
+    #[tokio::test]
+    async fn initial_orchestrator_contexts_stay_unscoped() {
+        let orchestrator = Orchestrator::new(AgentRuntimeConfig::default())
+            .await
+            .expect("the initial orchestrator builds");
+        let worker = orchestrator
+            .create_worker(1, 1, None, None, None)
+            .await
+            .expect("the initial worker builds");
+        let factory = worker
+            .tool_context_factory
+            .as_ref()
+            .expect("create_worker produces a tool context factory");
+
+        let ctx = factory("kubectl_apply");
+        assert!(
+            ctx.execution_scope.is_none(),
+            "an initial run's worker context must stay unscoped"
+        );
+    }
+
+    #[tokio::test]
+    async fn park_run_with_every_call_decided_stamps_publication_plus_park_ttl() {
         let dir = tempfile::tempdir().unwrap();
         let (orchestrator, _store, registry, run_id) = park_orchestrator(dir.path()).await;
         let (plan, records, pending) = awaiting_plan_with_parked_calls(&registry, &run_id).await;
@@ -7884,6 +9656,7 @@ mod tests {
             registry
                 .resolve(
                     &call.decision_id,
+                    crate::hitl::ApprovalAuthority::WebhookPoll,
                     crate::hitl::ApprovalDecision::Approved.into(),
                 )
                 .await
@@ -7918,12 +9691,13 @@ mod tests {
         .await
         .unwrap();
         assert!(document.awaiting_decision_ids().is_empty());
-        let expires_at = chrono::DateTime::parse_from_rfc3339(&document.expires_at).unwrap();
-        // The fixture route timeout is one hour.
+        let expires_at = document.retention_expires_at.as_datetime();
+        // The fixture park_ttl is one hour: the stamp is the publication
+        // timestamp plus it, and publication is at or after `before`.
         assert!(
             expires_at >= before + chrono::Duration::seconds(3600 - 5),
-            "expires_at carries the decision window: {}",
-            document.expires_at
+            "retention_expires_at carries the publication stamp plus the park_ttl: {}",
+            expires_at.to_rfc3339()
         );
         match event_rx.recv().await {
             Some(Ok(StreamItem::AgentEvent(event)))
@@ -7931,14 +9705,19 @@ mod tests {
             {
                 let AgentEventPayload::RunParked {
                     decision_ids,
-                    expires_at: stamp,
+                    retention_expires_at: stamp,
                     ..
                 } = event.payload
                 else {
                     unreachable!("guarded above")
                 };
                 assert!(decision_ids.is_empty());
-                assert_eq!(stamp, document.expires_at);
+                assert_eq!(
+                    stamp,
+                    aura_events::RetentionExpiresAt::from_datetime(
+                        document.retention_expires_at.as_datetime()
+                    )
+                );
             }
             other => panic!("expected a RunParked event, got {other:?}"),
         }
@@ -8055,7 +9834,11 @@ mod tests {
         let decided = pending[0].decision_id;
         let sibling = pending[1].decision_id;
         registry
-            .resolve(&decided, crate::hitl::ApprovalDecision::Approved.into())
+            .resolve(
+                &decided,
+                crate::hitl::ApprovalAuthority::WebhookPoll,
+                crate::hitl::ApprovalDecision::Approved.into(),
+            )
             .await
             .unwrap();
 
@@ -8229,11 +10012,47 @@ mod tests {
     /// Serializes the override-using tests: the override queue is
     /// process-global, and two parallel installs could cross-consume each
     /// other's scripted workers. Async-aware so the guard may cross awaits.
-    static WORKER_OVERRIDE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    /// Shared with the resume goldens via `test_rig`, so every queue
+    /// consumer serializes against ONE lock.
+    use test_rig::WORKER_OVERRIDE_SERIAL as WORKER_OVERRIDE_LOCK;
+
+    /// A scripted 207 receiver mirroring the resume goldens' `park_receiver`:
+    /// the std listener binds synchronously and converts inside the spawned
+    /// task, so the caller needs no await; every accepted POST is answered
+    /// `207 Multi-Status` with an empty JSON body (the shape that parks the
+    /// gated call through the 207 bridge).
+    fn park_207_receiver() -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::AsyncWriteExt;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("receiver listener binds");
+        let url = format!(
+            "http://{}",
+            listener.local_addr().expect("receiver address")
+        );
+        listener
+            .set_nonblocking(true)
+            .expect("receiver listener goes non-blocking for tokio");
+        let handle = tokio::spawn(async move {
+            let listener =
+                tokio::net::TcpListener::from_std(listener).expect("async receiver listener");
+            for _ in 0..64 {
+                let (mut socket, _) = listener.accept().await.expect("receiver accepts");
+                let _ = crate::hitl::read_full_request(&mut socket).await;
+                let response = "HTTP/1.1 207 Multi-Status\r\ncontent-type: application/json\r\n\
+                                content-length: 0\r\nconnection: close\r\n\r\n";
+                socket.write_all(response.as_bytes()).await.ok();
+                socket.shutdown().await.ok();
+            }
+        });
+        (url, handle)
+    }
 
     /// A park-mode orchestrator whose `operations` worker is built through
     /// the override seam: the gate glob matches the stub tool, and the
     /// worker's turn depth is settable for the depth-exhaustion trigger.
+    /// The HITL runtime is the production [`HitlRuntime::from_config`]
+    /// construction over a poll-delivery webhook route with park enabled —
+    /// the one admitted parking route — so the gated calls park through the
+    /// 207 bridge exactly as production parks them.
     async fn override_park_orchestrator(
         memory_dir: &std::path::Path,
         turn_depth: usize,
@@ -8265,15 +10084,38 @@ mod tests {
             },
         )]);
         let request_id = format!("req_orphan_{}", uuid::Uuid::new_v4().simple());
+        let (url, receiver) = park_207_receiver();
+        // The receiver's JoinHandle is deliberately dropped here: dropping
+        // detaches the task without aborting it, so the scripted receiver
+        // lives for the process lifetime while the fixture's tuple signature
+        // (and every call site) stays unchanged.
+        drop(receiver);
         let config = AgentRuntimeConfig {
-            hitl: Some(crate::hitl::HitlRuntime {
-                patterns: Arc::from(["echo_tool".into()]),
-                route: Arc::new(crate::hitl::DecisionRoute::Conversational {
-                    registry: registry.clone(),
-                    timeout: Duration::from_secs(3600),
-                }),
-                park_enabled: true,
-            }),
+            hitl: Some(crate::hitl::HitlRuntime::from_config(
+                &aura_config::HitlConfig {
+                    require_approval: vec![aura_config::GlobPattern::new("echo_tool").unwrap()],
+                    park: aura_config::ParkConfig {
+                        enabled: true,
+                        bind_identity: false,
+                        park_ttl: aura_config::ParkTtl::default(),
+                    },
+                    route: aura_config::DecisionRouteConfig::Webhook {
+                        url: aura_config::WebhookUrl::new(&url).unwrap(),
+                        timeout_secs: Some(3600),
+                        headers: std::collections::HashMap::new(),
+                        headers_from_request: std::collections::HashMap::new(),
+                        tool_headers_from_response: aura_config::ToolHeaderMappings::default(),
+                        delivery: aura_config::WebhookDelivery::Poll,
+                        poll_url: None,
+                        poll_interval_secs: 10,
+                        poll_request_timeout_secs: 30,
+                        receiver_wait_timeout_secs: 900,
+                    },
+                },
+                &registry,
+                None,
+                None,
+            )),
             memory_dir: Some(memory_dir.to_string_lossy().into_owned()),
             session_id: Some("orphan-sess".to_string()),
             request_id: Some(request_id.clone()),
@@ -8427,7 +10269,7 @@ mod tests {
         // directly, so the scope is established here instead.
         let result = crate::run_context::with_run(
             Arc::clone(&run),
-            orchestrator.execute_task(0, &params, Some(&event_tx), None, None),
+            orchestrator.execute_task(0, &params, Some(&event_tx)),
         )
         .await;
 
@@ -8471,7 +10313,7 @@ mod tests {
         // directly, so the scope is established here instead.
         let result = crate::run_context::with_run(
             Arc::clone(&run),
-            orchestrator.execute_task(0, &params, Some(&event_tx), None, None),
+            orchestrator.execute_task(0, &params, Some(&event_tx)),
         )
         .await;
 
@@ -8490,84 +10332,447 @@ mod tests {
     }
 
     // ====================================================================
+    // Park control boundary (R7 / P45 stage 4b): the hook's park branch
+    // hard-cancels after the capture, so no completion ever runs over a
+    // parked call's sentinel. Mike's two confirmed assumptions (ruled
+    // 2026-09-12) are pinned here: (1) a parked call never executes its
+    // tool; (2) no model call after a park — the approval is recorded
+    // (register + cell push), the batch drains (gated siblings register,
+    // ungated siblings execute), and the TRUE cancel fires before the
+    // next `stream_completion`.
+    // ====================================================================
+
+    /// The park sentinel literal, duplicated from the gate's private
+    /// constant the way the resume goldens embed it: under R7 it is
+    /// capture-side bookkeeping (it rides the snapshot's prompt slot,
+    /// never a model request), which is exactly what the frames below pin.
+    const R7_PARK_SENTINEL: &str =
+        "This tool call is parked pending human approval. It has not run. Do not retry.";
+
+    /// The `(id, text)` pairs of a captured snapshot prompt's tool
+    /// results, in slot order — the capture shape the frames pin. Panics
+    /// on any non-tool-result item or a non-User prompt, both of which
+    /// would refuse the stage 2 preflight witness anyway.
+    fn prompt_tool_result_slots(prompt: &rig::completion::Message) -> Vec<(String, String)> {
+        let rig::completion::Message::User { content } = prompt else {
+            panic!("the captured prompt must be the tool-result user message");
+        };
+        content
+            .iter()
+            .map(|item| match item {
+                rig::message::UserContent::ToolResult(tr) => {
+                    let text = tr
+                        .content
+                        .iter()
+                        .map(|c| match c {
+                            rig::message::ToolResultContent::Text(t) => t.text.clone(),
+                            _ => "[non-text tool result]".to_string(),
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    (tr.id.clone(), text)
+                }
+                other => panic!("unexpected non-tool-result prompt item: {other:?}"),
+            })
+            .collect()
+    }
+
+    /// R7: NO MODEL CALL AFTER A PARK. The script carries a second turn
+    /// that would answer after the gated call's tool result, but the
+    /// hook's park branch (snapshot first, then the TRUE cancel) stops
+    /// the loop before the next `stream_completion`. Under the pre-R7
+    /// inert `cancel_with_reason` this completion ran over the sentinel —
+    /// the live re-drive the Gate M deny leg caught pivoting to a
+    /// variant call.
+    #[tokio::test]
+    async fn no_completion_runs_after_a_park_and_the_sentinel_never_reaches_the_model() {
+        let _serial = WORKER_OVERRIDE_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let (orchestrator, store, _registry, _request_id) =
+            override_park_orchestrator(dir.path(), 4).await;
+
+        let (model, gated_invocations) = gated_worker_override(vec![
+            ScriptedTurn::tool_calls(vec![
+                ScriptedToolCall::new(
+                    "call_0",
+                    test_rig::ECHO_TOOL_NAME,
+                    serde_json::json!({"namespace": "prod"}),
+                )
+                .with_call_id("call_id_0"),
+            ]),
+            // Would answer after the tool result — under the hard park
+            // cancel it is never served; serving it would prove the
+            // completion after the park still runs.
+            ScriptedTurn::text("applied the manifest to prod"),
+        ]);
+
+        let mut plan = Plan::new("Deploy");
+        plan.add_task(Task::new(0, "Gated apply", "r").with_worker("operations"));
+        let params = TaskExecutionParams {
+            task_description: "apply the manifest",
+            task_context: &None,
+            worker_name: Some("operations"),
+        };
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(32);
+        let result = orchestrator.execute_task(0, &params, Some(&event_tx)).await;
+
+        // The park is recorded (register + cell push) and terminal for the
+        // attempt; the gated action never executed (ruled assumption 1).
+        let TaskOutcome::Blocked {
+            pending,
+            attempt,
+            snapshot,
+        } = result.expect("a parked call blocks the task")
+        else {
+            unreachable!("the parked task's outcome is Blocked");
+        };
+        assert_eq!(attempt, 1, "the park is terminal for the attempt");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].call_id, "call_0");
+        assert!(
+            gated_invocations.lock().unwrap().is_empty(),
+            "a parked call never executes its tool"
+        );
+        assert!(
+            store.get(&pending[0].decision_id).await.unwrap().is_some(),
+            "the park recorded its approval durably before the cancel"
+        );
+
+        // THE headline pins: exactly one model request, and the sentinel
+        // appears in no captured request payload — capture-side
+        // bookkeeping, never model-visible truth.
+        let request_log = model.requests();
+        let requests = request_log.lock().expect("request log");
+        assert_eq!(
+            requests.len(),
+            1,
+            "the completion after the parking batch must never run"
+        );
+        for request in requests.iter() {
+            for message in request.chat_history.iter() {
+                let payload =
+                    serde_json::to_string(message).expect("a captured request message serializes");
+                assert!(
+                    !payload.contains(R7_PARK_SENTINEL),
+                    "the sentinel must never reach a model request: {payload}"
+                );
+            }
+        }
+        drop(requests);
+
+        // The sentinel rides the SNAPSHOT's prompt instead — the resume's
+        // replaceable slot, keyed by the parked call's own id.
+        let slots = prompt_tool_result_slots(&snapshot.current_prompt);
+        assert_eq!(slots.len(), 1, "one sentinel slot for the parked call");
+        assert_eq!(slots[0].0, "call_0");
+        assert!(slots[0].1.contains(R7_PARK_SENTINEL));
+    }
+
+    /// R7 + the sibling ruling: TWO gated calls in ONE assistant message
+    /// both register and both park (the batch drains under the cancel),
+    /// the stream ends after one batch, and the captured snapshot's
+    /// prompt carries one sentinel slot PER parked call — the
+    /// same-completion capture shape.
+    #[tokio::test]
+    async fn one_message_two_gated_calls_both_park_and_the_snapshot_carries_a_slot_per_call() {
+        let _serial = WORKER_OVERRIDE_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let (orchestrator, store, _registry, _request_id) =
+            override_park_orchestrator(dir.path(), 4).await;
+
+        // No second turn: the stream must end after the one batch. A
+        // second scripted turn would surface as a second request (and
+        // then script exhaustion) if the cancel were still inert.
+        let (model, gated_invocations) =
+            gated_worker_override(vec![ScriptedTurn::tool_calls(vec![
+                ScriptedToolCall::new(
+                    "call_a",
+                    test_rig::ECHO_TOOL_NAME,
+                    serde_json::json!({"namespace": "prod"}),
+                )
+                .with_call_id("call_id_a"),
+                ScriptedToolCall::new(
+                    "call_b",
+                    test_rig::ECHO_TOOL_NAME,
+                    serde_json::json!({"namespace": "stage"}),
+                )
+                .with_call_id("call_id_b"),
+            ])]);
+
+        let mut plan = Plan::new("Deploy");
+        plan.add_task(Task::new(0, "Gated apply", "r").with_worker("operations"));
+        let params = TaskExecutionParams {
+            task_description: "apply the manifest",
+            task_context: &None,
+            worker_name: Some("operations"),
+        };
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(32);
+        let result = orchestrator.execute_task(0, &params, Some(&event_tx)).await;
+
+        let TaskOutcome::Blocked {
+            pending,
+            attempt,
+            snapshot,
+        } = result.expect("both gated calls park the task")
+        else {
+            unreachable!("the parked task's outcome is Blocked");
+        };
+        assert_eq!(attempt, 1);
+        assert_eq!(pending.len(), 2, "both same-message calls registered");
+        assert_eq!(pending[0].call_id, "call_a");
+        assert_eq!(pending[1].call_id, "call_b");
+        assert_ne!(
+            pending[0].decision_id, pending[1].decision_id,
+            "each parked call owns its own approval"
+        );
+        for call in &pending {
+            assert!(
+                store.get(&call.decision_id).await.unwrap().is_some(),
+                "both approvals are recorded durably in the store"
+            );
+        }
+        assert!(
+            gated_invocations.lock().unwrap().is_empty(),
+            "neither parked call executed its tool"
+        );
+
+        // The stream ended after the one batch: no completion followed.
+        let request_log = model.requests();
+        let requests = request_log.lock().expect("request log");
+        assert_eq!(requests.len(), 1, "the stream ends after one batch");
+        drop(requests);
+
+        // The capture shape: one sentinel slot PER parked call, keyed by
+        // each call's own id.
+        let slots = prompt_tool_result_slots(&snapshot.current_prompt);
+        assert_eq!(slots.len(), 2, "one sentinel slot per parked call");
+        assert_eq!(slots[0].0, "call_a");
+        assert_eq!(slots[1].0, "call_b");
+        assert!(slots[0].1.contains(R7_PARK_SENTINEL));
+        assert!(slots[1].1.contains(R7_PARK_SENTINEL));
+
+        // The assistant turn carrying BOTH calls is in the captured
+        // history — the pairing the stage 2 builder reconstructs from.
+        let captured_call_ids: Vec<String> = snapshot
+            .history
+            .iter()
+            .filter_map(|m| match m {
+                rig::completion::Message::Assistant { content, .. } => Some(content),
+                _ => None,
+            })
+            .flat_map(|content| {
+                content.iter().filter_map(|item| match item {
+                    rig::message::AssistantContent::ToolCall(tc) => Some(tc.id.clone()),
+                    _ => None,
+                })
+            })
+            .collect();
+        assert_eq!(
+            captured_call_ids,
+            vec!["call_a".to_string(), "call_b".to_string()],
+            "the assistant turn with both gated calls is captured in the history"
+        );
+    }
+
+    /// R7 + the sibling ruling, mixed batch: one scripted turn issues a
+    /// GATED call then an UNGATED sibling. The gated one parks; the
+    /// ungated one EXECUTES (the batch drains in script order); the
+    /// captured prompt carries the sentinel slot and the real result, in
+    /// batch order.
+    #[tokio::test]
+    async fn a_mixed_batch_parks_the_gated_call_and_executes_the_ungated_sibling() {
+        let _serial = WORKER_OVERRIDE_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let (orchestrator, _store, _registry, _request_id) =
+            override_park_orchestrator(dir.path(), 4).await;
+
+        // Both invocation logs are observed, so the install is inline
+        // (`gated_worker_override` hides the setup tool's log).
+        let model = test_rig::ScriptedCompletionModel::new(vec![ScriptedTurn::tool_calls(vec![
+            ScriptedToolCall::new(
+                "call_g",
+                test_rig::ECHO_TOOL_NAME,
+                serde_json::json!({"namespace": "prod"}),
+            )
+            .with_call_id("call_id_g"),
+            ScriptedToolCall::new("call_u", "setup_tool", serde_json::json!({"step": 1})),
+        ])]);
+        let gated_invocations: Arc<std::sync::Mutex<Vec<test_rig::ToolInvocation>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let ungated_invocations: Arc<std::sync::Mutex<Vec<test_rig::ToolInvocation>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        test_rig::install_worker_overrides(vec![test_rig::WorkerOverride {
+            model: model.clone(),
+            extra_tools: vec![
+                Box::new(
+                    test_rig::RecordingTool::new(Arc::clone(&ungated_invocations))
+                        .with_name("setup_tool"),
+                ) as Box<dyn rig::tool::ToolDyn>,
+                Box::new(test_rig::RecordingTool::new(Arc::clone(&gated_invocations)))
+                    as Box<dyn rig::tool::ToolDyn>,
+            ],
+        }]);
+
+        let mut plan = Plan::new("Deploy");
+        plan.add_task(Task::new(0, "Gated apply", "r").with_worker("operations"));
+        let params = TaskExecutionParams {
+            task_description: "apply the manifest",
+            task_context: &None,
+            worker_name: Some("operations"),
+        };
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(32);
+        let result = orchestrator.execute_task(0, &params, Some(&event_tx)).await;
+
+        let TaskOutcome::Blocked {
+            pending,
+            attempt,
+            snapshot,
+        } = result.expect("the mixed batch parks the task")
+        else {
+            unreachable!("the parked task's outcome is Blocked");
+        };
+        assert_eq!(attempt, 1);
+        assert_eq!(pending.len(), 1, "only the gated call parked");
+        assert_eq!(pending[0].call_id, "call_g");
+        assert!(
+            gated_invocations.lock().unwrap().is_empty(),
+            "the gated call never executed its tool"
+        );
+        // The ungated sibling EXECUTED — the batch drains past the park.
+        let ungated = ungated_invocations.lock().unwrap();
+        assert_eq!(ungated.len(), 1, "the ungated sibling executed once");
+        assert_eq!(ungated[0].arguments, serde_json::json!({"step": 1}));
+        assert_eq!(ungated[0].result, test_rig::ECHO_TOOL_RESULT);
+        drop(ungated);
+
+        // No completion after the parking batch.
+        let request_log = model.requests();
+        assert_eq!(
+            request_log.lock().expect("request log").len(),
+            1,
+            "the stream ends after one batch"
+        );
+
+        // The capture shape, in batch order: the sentinel slot first
+        // (the gated call), then the sibling's real result.
+        let slots = prompt_tool_result_slots(&snapshot.current_prompt);
+        assert_eq!(
+            slots.len(),
+            2,
+            "the captured prompt carries the sentinel slot and the real result"
+        );
+        assert_eq!(slots[0].0, "call_g");
+        assert!(slots[0].1.contains(R7_PARK_SENTINEL));
+        assert_eq!(slots[1].0, "call_u");
+        assert_eq!(slots[1].1, test_rig::echo_tool_result_wire());
+    }
+
+    /// R7 + the retry ruling: a Blocked cell is terminal for the attempt —
+    /// the cell read precedes the no-`submit_result` retry arm, so the
+    /// attempt loop runs ONCE. Two queued overrides: the second is never
+    /// consumed (no second worker build, no second model request); it is
+    /// drained back here so a passing frame leaves the process-global
+    /// queue clean.
+    #[tokio::test]
+    async fn a_blocked_cell_never_re_drives_the_worker_attempt_loop() {
+        let _serial = WORKER_OVERRIDE_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let (orchestrator, _store, _registry, _request_id) =
+            override_park_orchestrator(dir.path(), 4).await;
+
+        // Attempt 1 parks on its gated call. A retry (the no-submit_result
+        // arm) would build a second worker from the second override and
+        // issue it at least one request.
+        let gated_tool = |invocations: &Arc<std::sync::Mutex<Vec<test_rig::ToolInvocation>>>| {
+            Box::new(test_rig::RecordingTool::new(Arc::clone(invocations)))
+                as Box<dyn rig::tool::ToolDyn>
+        };
+        let model_one =
+            test_rig::ScriptedCompletionModel::new(vec![ScriptedTurn::tool_calls(vec![
+                ScriptedToolCall::new(
+                    "call_0",
+                    test_rig::ECHO_TOOL_NAME,
+                    serde_json::json!({"namespace": "prod"}),
+                )
+                .with_call_id("call_id_0"),
+            ])]);
+        let model_two = test_rig::ScriptedCompletionModel::new(Vec::new());
+        let invocations_one: Arc<std::sync::Mutex<Vec<test_rig::ToolInvocation>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let invocations_two: Arc<std::sync::Mutex<Vec<test_rig::ToolInvocation>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        test_rig::install_worker_overrides(vec![
+            test_rig::WorkerOverride {
+                model: model_one.clone(),
+                extra_tools: vec![gated_tool(&invocations_one)],
+            },
+            test_rig::WorkerOverride {
+                model: model_two.clone(),
+                extra_tools: vec![gated_tool(&invocations_two)],
+            },
+        ]);
+
+        let mut plan = Plan::new("Deploy");
+        plan.add_task(Task::new(0, "Gated apply", "r").with_worker("operations"));
+        let params = TaskExecutionParams {
+            task_description: "apply the manifest",
+            task_context: &None,
+            worker_name: Some("operations"),
+        };
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(32);
+        let result = orchestrator.execute_task(0, &params, Some(&event_tx)).await;
+
+        let TaskOutcome::Blocked { attempt, .. } = result.expect("the parked call blocks the task")
+        else {
+            unreachable!("the parked task's outcome is Blocked");
+        };
+        assert_eq!(
+            attempt, 1,
+            "the park outcome is terminal: the attempt loop runs once"
+        );
+        assert_eq!(
+            model_one.requests().lock().expect("request log").len(),
+            1,
+            "attempt 1 drove exactly one worker stream"
+        );
+        assert!(
+            model_two.requests().lock().expect("request log").is_empty(),
+            "no second worker build ever issued a model request"
+        );
+
+        // The queue still holds the unconsumed second override — exactly
+        // one worker was built — and draining it keeps the process-global
+        // queue clean for the next consumer.
+        assert!(
+            test_rig::take_worker_override().is_some(),
+            "the second override must still be queued (no second build)"
+        );
+        assert!(
+            test_rig::take_worker_override().is_none(),
+            "exactly one override was consumed by the one attempt"
+        );
+    }
+
+    // ====================================================================
     // Reify and continuation proofs (P44 commit 3)
     // ====================================================================
 
-    use crate::hitl::{ApprovalDecision, PendingApprovals};
+    use crate::hitl::{ApprovalAuthority, ApprovalDecision, PendingApprovals};
     use crate::orchestration::CallKey;
     use crate::orchestration::ObserverWrapper;
     use crate::orchestration::duplicate_call_guard::DuplicateCallGuard;
     use crate::orchestration::persistence_wrapper::{PersistenceWrapper, PersistenceWrapperParams};
     use crate::tool_wrapper::ToolCallContext;
 
-    /// The denial feedback the gate produces, quoted for the wire (rig
-    /// JSON-serializes tool outputs). Mirrors `approval_result_to_pre_call`'s
-    /// denial arm in `gate.rs` verbatim.
-    fn denial_feedback_wire(reason: &str) -> String {
-        serde_json::to_string(&format!(
-            "Tool call blocked by human approval denial: {reason}. Do not execute this action."
-        ))
-        .expect("a plain string serializes")
-    }
-
-    /// The tool-result text carried by a chat-history message, decoded —
-    /// assertions compare the actual content, not a serialization level.
-    fn tool_result_text(message: &rig::completion::Message) -> String {
-        let rig::completion::Message::User { content } = message else {
-            return String::new();
-        };
-        content
-            .iter()
-            .filter_map(|item| match item {
-                rig::message::UserContent::ToolResult(tr) => Some(
-                    tr.content
-                        .iter()
-                        .map(|c| match c {
-                            rig::message::ToolResultContent::Text(t) => t.text.clone(),
-                            rig::message::ToolResultContent::Image(_) => String::new(),
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                ),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
-    fn conversational_route(registry: &PendingApprovals) -> Arc<crate::hitl::DecisionRoute> {
-        Arc::new(crate::hitl::DecisionRoute::Conversational {
-            registry: registry.clone(),
-            timeout: Duration::from_secs(3600),
-        })
-    }
-
-    /// A webhook route under poll delivery, built the production way; the
-    /// resume path never reaches its unroutable url.
-    fn poll_webhook_route(registry: &PendingApprovals) -> Arc<crate::hitl::DecisionRoute> {
-        let config = aura_config::HitlConfig {
-            require_approval: vec![],
-            park: aura_config::ParkConfig { enabled: true },
-            route: aura_config::DecisionRouteConfig::Webhook {
-                url: aura_config::WebhookUrl::new("http://127.0.0.1:9").unwrap(),
-                timeout_secs: Some(3600),
-                headers: std::collections::HashMap::new(),
-                headers_from_request: std::collections::HashMap::new(),
-                tool_headers_from_response: aura_config::ToolHeaderMappings::default(),
-                delivery: aura_config::WebhookDelivery::Poll,
-                poll_url: None,
-                poll_interval_secs: 10,
-                poll_request_timeout_secs: 30,
-            },
-        };
-        crate::hitl::HitlRuntime::from_config(&config, registry, None, None).route
-    }
-
     /// A park-mode orchestrator over a file-backed approval store (the park
     /// contract's backend: `get` returns the approval before and after the
-    /// decision), gating `echo_tool` on `route`.
+    /// decision), gating `echo_tool` on the production
+    /// [`HitlRuntime::from_config`] construction over a poll-delivery
+    /// webhook route with park enabled — the one admitted parking route —
+    /// so the gated call parks through the 207 bridge exactly as
+    /// production parks it.
     async fn file_backed_park_orchestrator(
-        route: Arc<crate::hitl::DecisionRoute>,
+        registry: &crate::hitl::PendingApprovals,
         memory_dir: &std::path::Path,
         session_id: &str,
     ) -> (Orchestrator, String) {
@@ -8584,12 +10789,38 @@ mod tests {
                 skills: None,
             },
         )]);
+        let (url, receiver) = park_207_receiver();
+        // The receiver's JoinHandle is deliberately dropped here: dropping
+        // detaches the task without aborting it, so the scripted receiver
+        // lives for the process lifetime while the helper's signature (and
+        // its single call site) stays simple.
+        drop(receiver);
         let config = AgentRuntimeConfig {
-            hitl: Some(crate::hitl::HitlRuntime {
-                patterns: Arc::from([aura_config::GlobPattern::new("echo_tool").unwrap()]),
-                route,
-                park_enabled: true,
-            }),
+            hitl: Some(crate::hitl::HitlRuntime::from_config(
+                &aura_config::HitlConfig {
+                    require_approval: vec![aura_config::GlobPattern::new("echo_tool").unwrap()],
+                    park: aura_config::ParkConfig {
+                        enabled: true,
+                        bind_identity: false,
+                        park_ttl: aura_config::ParkTtl::default(),
+                    },
+                    route: aura_config::DecisionRouteConfig::Webhook {
+                        url: aura_config::WebhookUrl::new(&url).unwrap(),
+                        timeout_secs: Some(3600),
+                        headers: std::collections::HashMap::new(),
+                        headers_from_request: std::collections::HashMap::new(),
+                        tool_headers_from_response: aura_config::ToolHeaderMappings::default(),
+                        delivery: aura_config::WebhookDelivery::Poll,
+                        poll_url: None,
+                        poll_interval_secs: 10,
+                        poll_request_timeout_secs: 30,
+                        receiver_wait_timeout_secs: 900,
+                    },
+                },
+                registry,
+                None,
+                None,
+            )),
             memory_dir: Some(memory_dir.to_string_lossy().into_owned()),
             session_id: Some(session_id.to_string()),
             request_id: Some(format!("req_resume_{}", uuid::Uuid::new_v4().simple())),
@@ -8631,53 +10862,36 @@ mod tests {
         }
     }
 
-    /// Open is `pub(crate)` through the park module; this thin wrapper keeps
-    /// the test honest about the error type while staying inside the crate.
-    async fn open_resuming_document(
-        path: &std::path::Path,
-    ) -> crate::orchestration::park::ResumingDocumentHandle {
-        crate::orchestration::park::ResumingDocumentHandle::open(path)
-            .await
-            .expect("the published document opens")
-    }
+    /// The park-commit round trip over a live park, without any resume
+    /// driver: the scripted worker parks its gated call (the inner tool
+    /// never runs at park time), the commit publishes the checkpoint, and
+    /// the replan state — iteration, planning latency, the coordinator
+    /// conversation, the routed decision — re-derives from the on-disk
+    /// document alone. A decided approval then rehydrates from the store
+    /// under its own id, the consult the resume grant builds on.
+    #[tokio::test]
+    async fn park_commit_round_trips_the_replan_state_over_disk() {
+        let _serial = WORKER_OVERRIDE_LOCK.lock().await;
 
-    /// The shared full-loop harness: park over the file-backed store, drop
-    /// the in-memory state, record `decision` in the store, rehydrate from
-    /// disk, and drive the continuation with `resume_turns`. Returns the
-    /// task outcome plus the handles the proofs assert through.
-    async fn park_then_resume(
-        route_for: fn(&PendingApprovals) -> Arc<crate::hitl::DecisionRoute>,
-        decision: ApprovalDecision,
-        resume_turns: Vec<ScriptedTurn>,
-    ) -> (
-        Result<TaskOutcome, StreamError>,
-        test_rig::ScriptedCompletionModel,
-        Arc<std::sync::Mutex<Vec<test_rig::ToolInvocation>>>,
-        Arc<std::sync::Mutex<Vec<test_rig::ToolInvocation>>>,
-        Arc<crate::orchestration::park::ResumingDocumentHandle>,
-        Arc<dyn crate::session_store::ApprovalStore>,
-        crate::hitl::DecisionId,
-        tempfile::TempDir,
-    ) {
         let dir = tempfile::tempdir().unwrap();
-        let (registry, store) = file_store_registry(&dir.path().join("approvals"));
+        let (registry, _store) = file_store_registry(&dir.path().join("approvals"));
         let (orchestrator, run_id) =
-            file_backed_park_orchestrator(route_for(&registry), dir.path(), "loop-sess").await;
+            file_backed_park_orchestrator(&registry, dir.path(), "loop-sess").await;
         let (event_tx, _event_rx) = tokio::sync::mpsc::channel(64);
 
-        let (park_model, park_invocations) =
+        let (_park_model, park_invocations) =
             gated_worker_override(vec![ScriptedTurn::tool_calls(vec![ScriptedToolCall::new(
                 "call_apply_1",
                 test_rig::ECHO_TOOL_NAME,
                 serde_json::json!({"namespace": "prod"}),
             )])]);
-        let _ = park_model;
 
         let mut plan = Plan::new("Deploy");
         plan.add_task(Task::new(0, "Gated apply", "r").with_worker("operations"));
-        let (_compute_ms, park_records) = orchestrator.execute(&mut plan, &event_tx).await.unwrap();
+        let (_compute_ms, park_records, _worker_turns) =
+            orchestrator.execute(&mut plan, &event_tx).await.unwrap();
         let TaskState::AwaitingApproval { pending } = &plan.tasks[0].state else {
-            unreachable!("the fixture task is awaiting")
+            unreachable!("the fixture task is awaiting");
         };
         let decision_id = pending[0].decision_id;
 
@@ -8701,10 +10915,10 @@ mod tests {
             .expect("the park commit succeeds");
         drop(orchestrator);
 
-        registry
-            .resolve(&decision_id, decision.into())
-            .await
-            .unwrap();
+        assert!(
+            park_invocations.lock().unwrap().is_empty(),
+            "the gated action did not run at park time"
+        );
 
         let document_path = dir
             .path()
@@ -8732,190 +10946,29 @@ mod tests {
             serde_json::to_value(Some(routing_decision)).unwrap(),
             "the routing decision survives the round trip"
         );
-        let (recorded, consumed_ids) =
-            crate::orchestration::park::load_recorded_decisions(&registry, &document)
-                .await
-                .unwrap();
-        assert_eq!(consumed_ids, vec![decision_id]);
 
-        let node = document
-            .plan
-            .tasks
-            .iter()
-            .find(|t| t.status == TaskStatus::AwaitingApproval)
-            .expect("the awaiting node is in the document");
-        let continuation = TaskContinuation {
-            attempt: node.attempt.expect("the recorded attempt"),
-            history: node.history.clone().expect("the captured history"),
-            current_prompt: node.current_prompt.clone().expect("the sentinel prompt"),
-            pending: node.pending.clone().expect("the pending calls"),
-        };
-        let document_handle = Arc::new(open_resuming_document(&document_path).await);
-        let resume_ctx = ResumeContext {
-            recorded,
-            document: Arc::clone(&document_handle),
-        };
-
-        let (orchestrator2, _run_id2) =
-            file_backed_park_orchestrator(route_for(&registry), dir.path(), "loop-sess").await;
-        let (resume_model, resume_invocations) = gated_worker_override(resume_turns);
-        let params = TaskExecutionParams {
-            task_description: "apply the manifest",
-            task_context: &None,
-            worker_name: Some("operations"),
-        };
-        let (event_tx2, _event_rx2) = tokio::sync::mpsc::channel(64);
-        let outcome = orchestrator2
-            .execute_task(
-                0,
-                &params,
-                Some(&event_tx2),
-                Some(&continuation),
-                Some(&resume_ctx),
+        registry
+            .resolve(
+                &decision_id,
+                // The row now parks through the 207 bridge under the route's
+                // poll authority; a mismatched expected authority answers
+                // NotFound with no mutation (the one-channel-one-row rule).
+                ApprovalAuthority::WebhookPoll,
+                ApprovalDecision::Approved.into(),
             )
-            .await;
-
-        (
-            outcome,
-            resume_model,
-            resume_invocations,
-            park_invocations,
-            document_handle,
-            store,
-            decision_id,
-            dir,
+            .await
+            .unwrap();
+        let (_recorded, consumed_ids) = crate::orchestration::park::load_recorded_decisions(
+            &registry,
+            &document,
+            chrono::Utc::now(),
         )
-    }
-
-    /// The same loop on a webhook route under poll delivery: the resume
-    /// consumes the recorded decision and removes the row, as the
-    /// conversational route does.
-    #[tokio::test]
-    async fn full_loop_on_a_poll_route_removes_the_consumed_row() {
-        let _serial = WORKER_OVERRIDE_LOCK.lock().await;
-
-        let (outcome, _model, _resumed, _parked, _document, store, decision_id, _dir) =
-            park_then_resume(
-                poll_webhook_route,
-                ApprovalDecision::Approved,
-                vec![ScriptedTurn::tool_calls(vec![ScriptedToolCall::new(
-                    "call_final",
-                    "submit_result",
-                    serde_json::json!({
-                        "summary": "applied the manifest",
-                        "result": "applied successfully to prod",
-                        "confidence": "high",
-                    }),
-                )])],
-            )
-            .await;
-
-        let outcome = outcome.expect("the resumed task completes");
-        assert!(matches!(outcome, TaskOutcome::Completed(_)));
-        assert!(
-            store.get(&decision_id).await.unwrap().is_none(),
-            "the consumed decision is removed on the poll route"
-        );
-    }
-
-    /// FULL LOOP, zero human input: the scripted worker parks, the document
-    /// publishes, in-memory state drops, the store holds the approval, and
-    /// the rehydrated continuation completes the task — the tool running
-    /// exactly once with the recorded arguments, the executed tombstone
-    /// landing, the consumed decision removed, and no sentinel surviving in
-    /// the resumed conversation.
-    #[tokio::test]
-    async fn full_loop_park_rehydrate_and_resume_completes() {
-        let _serial = WORKER_OVERRIDE_LOCK.lock().await;
-
-        let (
-            outcome,
-            resume_model,
-            resume_invocations,
-            park_invocations,
-            document_handle,
-            store,
-            decision_id,
-            _dir,
-        ) = park_then_resume(
-            conversational_route,
-            ApprovalDecision::Approved,
-            vec![ScriptedTurn::tool_calls(vec![ScriptedToolCall::new(
-                "call_final",
-                "submit_result",
-                serde_json::json!({
-                    "summary": "applied the manifest",
-                    "result": "applied successfully to prod",
-                    "confidence": "high",
-                }),
-            )])],
-        )
-        .await;
-
-        // The replan state survived the round trip and the task completes
-        // with the injected tool result flowing through submit_result.
-        let outcome = outcome.expect("the resumed task completes");
-        let TaskOutcome::Completed(execution) = outcome else {
-            panic!("the resumed task must complete");
-        };
+        .await
+        .unwrap();
         assert_eq!(
-            execution
-                .structured_output
-                .as_ref()
-                .map(|s| s.summary.as_str()),
-            Some("applied the manifest"),
-            "the submit_result structured output flows through"
-        );
-
-        // The tool ran exactly once, with the recorded arguments — on the
-        // resume side only.
-        assert_eq!(
-            resume_invocations.lock().unwrap().len(),
-            1,
-            "exactly one resumed invocation"
-        );
-        assert_eq!(
-            resume_invocations.lock().unwrap()[0].arguments,
-            serde_json::json!({"namespace": "prod"})
-        );
-        assert!(
-            park_invocations.lock().unwrap().is_empty(),
-            "the gated action did not run at park time"
-        );
-
-        // The tombstone published: the resuming document's executed list is
-        // non-empty and terminal.
-        let executed = document_handle.executed().await;
-        assert_eq!(executed, vec!["call_apply_1".to_string()]);
-        let resuming: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(document_handle.publish_path()).unwrap())
-                .unwrap();
-        assert_eq!(resuming["executed"][0], "call_apply_1");
-
-        // The consumed decision left the store.
-        assert!(
-            store.get(&decision_id).await.unwrap().is_none(),
-            "the consumed decision is removed"
-        );
-
-        // No sentinel remains in the resumed conversation: the resume turn's
-        // prompt carries the real tool result in the wire form.
-        let requests = resume_model.requests();
-        let requests = requests.lock().unwrap();
-        assert_eq!(requests.len(), 1, "the resume turn is the only model turn");
-        let last = requests[0]
-            .chat_history
-            .iter()
-            .last()
-            .expect("the prompt is in the history");
-        let tool_text = tool_result_text(last);
-        assert!(
-            tool_text.contains(&test_rig::echo_tool_result_wire()),
-            "the resumed prompt must carry the tool result wire text: {tool_text}"
-        );
-        assert!(
-            !tool_text.contains("parked pending human approval"),
-            "no sentinel may survive the sentinel replacement: {tool_text}"
+            consumed_ids,
+            vec![decision_id],
+            "the decided approval rehydrates from the store under its own id"
         );
     }
 
@@ -8928,14 +10981,16 @@ mod tests {
         let args = serde_json::json!({ "namespace": "prod" });
         recorded.push(
             CallKey::new(1, "kubectl_apply", &args),
-            ApprovalDecision::Approved.into(),
+            crate::hitl::AddressedApproval::Decided(ApprovalDecision::Approved.into()),
         );
         recorded.push(
             CallKey::new(1, "kubectl_apply", &args),
-            ApprovalDecision::Denied {
-                reason: Some("no".to_string()),
-            }
-            .into(),
+            crate::hitl::AddressedApproval::Decided(
+                ApprovalDecision::Denied {
+                    reason: Some("no".to_string()),
+                }
+                .into(),
+            ),
         );
 
         let taken = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -8961,14 +11016,19 @@ mod tests {
             "two decisions consumed exactly once each: {taken:?}"
         );
         assert!(
-            matches!(taken[0].1, crate::hitl::ResolvedDecision::Approved { .. }),
+            matches!(
+                taken[0].1,
+                crate::hitl::AddressedApproval::Decided(
+                    crate::hitl::ResolvedDecision::Approved { .. }
+                )
+            ),
             "recorded order holds across consumers: the approval is consumed first"
         );
         assert!(matches!(
             &taken[1].1,
-            crate::hitl::ResolvedDecision::Denied {
+            crate::hitl::AddressedApproval::Decided(crate::hitl::ResolvedDecision::Denied {
                 reason: Some(reason),
-            } if reason == "no"
+            }) if reason == "no"
         ));
     }
 
@@ -9043,71 +11103,5 @@ mod tests {
             CallKey::new(1, test_rig::ECHO_TOOL_NAME, &second.args),
             "the recorded call digests to the same key after re-entering the chain"
         );
-    }
-
-    /// DENIAL PARITY: a denial recorded in the store produces the live
-    /// path's denial feedback string as the tool result, byte-identical to
-    /// the gate's denial arm, and the inner tool never runs.
-    #[tokio::test]
-    async fn denial_parity_the_recorded_denial_produces_the_live_denial_feedback() {
-        let _serial = WORKER_OVERRIDE_LOCK.lock().await;
-
-        let (
-            outcome,
-            resume_model,
-            resume_invocations,
-            park_invocations,
-            _document_handle,
-            _store,
-            _decision_id,
-            _dir,
-        ) = park_then_resume(
-            conversational_route,
-            ApprovalDecision::Denied {
-                reason: Some("too risky".to_string()),
-            },
-            vec![ScriptedTurn::tool_calls(vec![ScriptedToolCall::new(
-                "call_final",
-                "submit_result",
-                serde_json::json!({
-                    "summary": "blocked, moving on",
-                    "result": "the apply was denied; reporting back",
-                    "confidence": "low",
-                }),
-            )])],
-        )
-        .await;
-
-        let outcome = outcome.expect("the resumed task completes");
-        let TaskOutcome::Completed(execution) = outcome else {
-            panic!("the resumed task must complete even on a denial");
-        };
-        assert_eq!(
-            execution.result, "the apply was denied; reporting back",
-            "the worker continues past the denial"
-        );
-
-        // The denial feedback reached the model's prompt in the wire form,
-        // identical to the live path's denial arm — and no tool invocation
-        // happened on either side.
-        let requests = resume_model.requests();
-        let requests = requests.lock().unwrap();
-        assert_eq!(requests.len(), 1, "the resume turn is the only model turn");
-        let last = requests[0]
-            .chat_history
-            .iter()
-            .last()
-            .expect("the prompt is in the history");
-        let tool_text = tool_result_text(last);
-        assert!(
-            tool_text.contains(&denial_feedback_wire("too risky")),
-            "the denial feedback must appear in the resumed prompt verbatim: {tool_text}"
-        );
-        assert!(
-            !tool_text.contains("parked pending human approval"),
-            "no sentinel may survive the sentinel replacement: {tool_text}"
-        );
-        assert!(resume_invocations.lock().unwrap().is_empty());
-        assert!(park_invocations.lock().unwrap().is_empty());
     }
 }
