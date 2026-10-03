@@ -3,6 +3,7 @@ use crate::globpattern::GlobPattern;
 use crate::lenient_bool;
 use crate::lenient_int;
 use crate::orchestration::OrchestrationConfig;
+use crate::park::ParkTtl;
 use crate::scratchpad::{ScratchpadConfig, ScratchpadToolEntry};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -16,6 +17,10 @@ pub struct Config {
     /// legacy fallback.
     #[serde(default)]
     pub memory_dir: Option<String>,
+    /// Name of the HTTP request header whose value identifies the caller for
+    /// park-resume identity binding.
+    #[serde(default)]
+    pub identity_header: Option<String>,
     pub mcp: Option<McpConfig>,
     /// Vector stores for RAG - optional, defaults to empty
     #[serde(default)]
@@ -407,9 +412,25 @@ impl Config {
             }
         }
 
+        self.validate_identity_binding()?;
+
         // Scratchpad validation
         self.validate_scratchpad()?;
 
+        // Park admission delegates to the one authority, `crate::park`:
+        // webhook-poll plus orchestration is the only parking route;
+        // conversational and webhook-sync never durable-park. Its typed
+        // diagnostics and refusals ARE the poll-only validator — every
+        // loading path (server, CLI/direct) admits through this one
+        // boundary.
+        if let Some(hitl) = &self.hitl {
+            crate::park::validate_park_admission(hitl, self.orchestration_enabled())
+                .map_err(|err| crate::ConfigError::Validation(err.to_string()))?;
+        }
+
+        // The admitted route always carries poll settings: the reconciler
+        // needs a nonzero tick interval, and each poll attempt holds a
+        // request open for a nonzero budget.
         if let Some(hitl) = &self.hitl
             && let DecisionRouteConfig::Webhook {
                 delivery: WebhookDelivery::Poll,
@@ -432,22 +453,23 @@ impl Config {
                         .to_string(),
                 ));
             }
-            return Err(crate::ConfigError::Validation(
-                "`hitl.route.delivery = \"poll\"` is not available: \
-                 poll delivery is disabled; use sync delivery (the default) \
-                 or a conversational route"
-                    .to_string(),
-            ));
         }
 
-        if let Some(hitl) = &self.hitl
-            && hitl.park.enabled
-        {
-            return Err(crate::ConfigError::Validation(
-                "`hitl.park.enabled = true` is not available: \
-                 park mode is disabled; leave `hitl.park.enabled` off (the default)"
-                    .to_string(),
-            ));
+        // The route timeouts feed `chrono::Duration::from_std` at the
+        // gate (a panic path on overflow): bound them here so that
+        // conversion is a justified invariant, not a user-config panic.
+        if let Some(hitl) = &self.hitl {
+            let route_timeout_secs = match &hitl.route {
+                DecisionRouteConfig::Webhook { timeout_secs, .. } => timeout_secs.unwrap_or(300),
+                DecisionRouteConfig::Conversational { timeout_secs, .. } => *timeout_secs,
+            };
+            if route_timeout_secs > WEBHOOK_TIMEOUT_SECS_BOUND {
+                return Err(crate::ConfigError::Validation(format!(
+                    "`hitl.route.timeout_secs` = {route_timeout_secs} exceeds the representable \
+                     bound of {WEBHOOK_TIMEOUT_SECS_BOUND}s (chrono's i64-millisecond ceiling); \
+                     reduce it below that bound"
+                )));
+            }
         }
 
         if let (Some(hitl), Some(orch)) = (
@@ -455,6 +477,12 @@ impl Config {
             self.orchestration.as_ref().filter(|o| o.enabled),
         ) && let Some(msg) =
             hitl_timeout_conflict_warning(hitl, orch.timeouts.per_call_timeout_secs)
+        {
+            tracing::warn!("{msg}");
+        }
+
+        if let Some(hitl) = &self.hitl
+            && let Some(msg) = hitl_timeout_alignment_warning(hitl)
         {
             tracing::warn!("{msg}");
         }
@@ -476,6 +504,18 @@ impl Config {
         }
 
         Ok(())
+    }
+
+    /// Identity binding is only coherent with a header to hash: reject
+    /// `bind_identity = true` without a top-level `identity_header`.
+    fn validate_identity_binding(&self) -> Result<(), crate::ConfigError> {
+        let Some(hitl) = &self.hitl else {
+            return Ok(());
+        };
+        if !hitl.park.bind_identity {
+            return Ok(());
+        }
+        require_identity_header_for_binding(true, self.identity_header.as_deref())
     }
 
     /// Validate that the effective `memory_dir` (if set) is writable.
@@ -578,6 +618,27 @@ fn no_inner_bound_warning(
     }
 }
 
+/// Reject `bind_identity` without an `identity_header` to hash.
+fn require_identity_header_for_binding(
+    bind_identity: bool,
+    identity_header: Option<&str>,
+) -> Result<(), crate::ConfigError> {
+    if !bind_identity {
+        return Ok(());
+    }
+    // An empty header name can never match a presented request header, so it
+    // would silently unbind every checkpoint — refused like a missing name.
+    let Some(_) = identity_header.filter(|name| !name.is_empty()) else {
+        return Err(crate::ConfigError::Validation(
+            "`[hitl.park].bind_identity = true` requires the top-level `identity_header` to be \
+             set: identity binding hashes the presented header's value and has nothing to hash \
+             without it"
+                .to_string(),
+        ));
+    };
+    Ok(())
+}
+
 /// Warn when the inactivity window cannot fire before the per-call budget.
 fn inactivity_vs_per_call_warning(
     per_call_timeout_secs: u64,
@@ -614,6 +675,30 @@ fn hitl_timeout_conflict_warning(hitl: &HitlConfig, per_call_timeout_secs: u64) 
     } else {
         None
     }
+}
+
+/// Warn when aura's route timeout does not exceed the receiver's sync-wait
+/// timeout: aura would deny as TimedOut while governance decides into the
+/// void. Config guidance, not a hard error — aura cannot see the receiver's
+/// actual value, only the operator-configured `receiver_wait_timeout_secs`.
+fn hitl_timeout_alignment_warning(hitl: &HitlConfig) -> Option<String> {
+    let DecisionRouteConfig::Webhook {
+        timeout_secs,
+        receiver_wait_timeout_secs,
+        ..
+    } = &hitl.route
+    else {
+        return None;
+    };
+    let timeout_secs = timeout_secs.unwrap_or(300);
+    if timeout_secs > *receiver_wait_timeout_secs {
+        return None;
+    }
+    Some(format!(
+        "hitl route timeout ({timeout_secs}s) does not exceed receiver_wait_timeout_secs \
+         ({receiver_wait_timeout_secs}s); aura denies the call as TimedOut while governance \
+         decides into the void — set the route timeout above the receiver's wait timeout"
+    ))
 }
 
 fn validate_llm_api_key(llm: &LlmConfig, location: &str) -> Result<(), crate::ConfigError> {
@@ -1282,6 +1367,7 @@ mod tests {
                 poll_url: None,
                 poll_interval_secs: default_poll_interval_secs(),
                 poll_request_timeout_secs: default_poll_request_timeout_secs(),
+                receiver_wait_timeout_secs: default_receiver_wait_timeout_secs(),
             },
         };
         assert!(hitl_timeout_conflict_warning(&hitl, 0).is_none());
@@ -1319,6 +1405,7 @@ mod tests {
                 poll_url: None,
                 poll_interval_secs: default_poll_interval_secs(),
                 poll_request_timeout_secs: default_poll_request_timeout_secs(),
+                receiver_wait_timeout_secs: default_receiver_wait_timeout_secs(),
             },
         };
         assert!(hitl_timeout_conflict_warning(&hitl, 60).is_none());
@@ -1339,6 +1426,7 @@ mod tests {
                 poll_url: None,
                 poll_interval_secs: default_poll_interval_secs(),
                 poll_request_timeout_secs: default_poll_request_timeout_secs(),
+                receiver_wait_timeout_secs: default_receiver_wait_timeout_secs(),
             },
         };
         let msg = hitl_timeout_conflict_warning(&hitl, 60).unwrap();
@@ -1361,6 +1449,7 @@ mod tests {
                 poll_url: None,
                 poll_interval_secs: default_poll_interval_secs(),
                 poll_request_timeout_secs: default_poll_request_timeout_secs(),
+                receiver_wait_timeout_secs: default_receiver_wait_timeout_secs(),
             },
         };
         let msg = hitl_timeout_conflict_warning(&hitl, 60).unwrap();
@@ -1378,6 +1467,46 @@ mod tests {
         };
         let msg = hitl_timeout_conflict_warning(&hitl, 60).unwrap();
         assert!(msg.contains("120s"));
+    }
+
+    #[test]
+    fn test_hitl_timeout_alignment_warns_when_route_timeout_does_not_exceed_receiver() {
+        let webhook = |timeout_secs: u64, receiver_wait_timeout_secs: u64| HitlConfig {
+            require_approval: vec![],
+            park: ParkConfig::default(),
+            route: DecisionRouteConfig::Webhook {
+                url: WebhookUrl::new("http://localhost:9999").unwrap(),
+                timeout_secs: Some(timeout_secs),
+                headers: HashMap::new(),
+                headers_from_request: HashMap::new(),
+                tool_headers_from_response: ToolHeaderMappings::default(),
+                delivery: WebhookDelivery::default(),
+                poll_url: None,
+                poll_interval_secs: default_poll_interval_secs(),
+                poll_request_timeout_secs: default_poll_request_timeout_secs(),
+                receiver_wait_timeout_secs,
+            },
+        };
+
+        // 300 < 900: aura would deny as TimedOut while governance still decides.
+        assert!(hitl_timeout_alignment_warning(&webhook(300, 900)).is_some());
+
+        // Equality is still a misalignment: the route timeout must exceed the
+        // receiver's wait timeout.
+        assert!(hitl_timeout_alignment_warning(&webhook(900, 900)).is_some());
+
+        // 1200 > 900: the route outlives the receiver's wait, no warning.
+        assert!(hitl_timeout_alignment_warning(&webhook(1200, 900)).is_none());
+    }
+
+    #[test]
+    fn test_hitl_timeout_alignment_conversational_variant_is_none() {
+        let hitl = HitlConfig {
+            require_approval: vec![],
+            park: ParkConfig::default(),
+            route: DecisionRouteConfig::Conversational { timeout_secs: 120 },
+        };
+        assert!(hitl_timeout_alignment_warning(&hitl).is_none());
     }
 
     // -------------------------------------------------------------------
@@ -1448,6 +1577,22 @@ mode = "conversational"
              [agent.llm]\nprovider = \"openai\"\napi_key = \"test\"\nmodel = \"gpt-4o\"\n\n\
              [hitl]\nrequire_approval = [\"kubectl_*\"]\n\n\
              {park_table}\
+             [hitl.route]\nmode = \"webhook\"\nurl = \"https://approvals.example.com/decide\"\n\
+             {route_lines}\n"
+        )
+    }
+
+    /// A full config TOML shaped like [`poll_config_toml`], plus
+    /// orchestration enabled and a `[hitl.park]` table that always
+    /// renders: the admission cases under test pin both park knobs
+    /// explicitly.
+    fn orchestrated_config_toml(park_enabled: bool, park_ttl: u64, route_lines: &str) -> String {
+        format!(
+            "[agent]\nname = \"Test\"\nsystem_prompt = \"test\"\n\n\
+             [agent.llm]\nprovider = \"openai\"\napi_key = \"test\"\nmodel = \"gpt-4o\"\n\n\
+             [orchestration]\nenabled = true\n\n\
+             [hitl]\nrequire_approval = [\"kubectl_*\"]\n\n\
+             [hitl.park]\nenabled = {park_enabled}\npark_ttl = {park_ttl}\n\n\
              [hitl.route]\nmode = \"webhook\"\nurl = \"https://approvals.example.com/decide\"\n\
              {route_lines}\n"
         )
@@ -1583,32 +1728,30 @@ mode = "conversational"
             .expect_err("poll delivery without park mode must be rejected");
         let msg = err.to_string();
         assert!(
-            msg.contains("hitl.route.delivery"),
-            "error must name the refused key: {msg}"
+            msg.contains("hitl.park.enabled"),
+            "the typed admission diagnostic must name the missing park arm: {msg}"
         );
     }
 
-    /// Poll delivery is refused even with `headers_from_request`: the
-    /// mapping's persist-at-rest semantics do not make the delivery mode
-    /// itself admissible.
+    /// Poll delivery + `headers_from_request` is valid: the resolved
+    /// values are captured at request-scoped route construction and
+    /// persisted on the parked approval record, so the background
+    /// reconciler does NOT need to reconstruct them after a restart.
     #[test]
-    fn validate_refuses_poll_delivery_with_headers_from_request() {
-        let err = crate::load_config_from_str(&poll_config_toml(
+    fn validate_accepts_poll_delivery_with_headers_from_request() {
+        crate::load_config_from_str(&orchestrated_config_toml(
             true,
+            3600,
             "delivery = \"poll\"\nheaders_from_request = { \"authorization\" = \"authorization\" }",
         ))
-        .expect_err("poll delivery is refused regardless of header mappings");
-        assert!(
-            err.to_string().contains("hitl.route.delivery"),
-            "error must name the refused key: {}",
-            err
-        );
+        .expect("headers_from_request with poll delivery is valid: values persist at rest");
     }
 
     #[test]
     fn validate_rejects_zero_poll_interval() {
-        let err = crate::load_config_from_str(&poll_config_toml(
+        let err = crate::load_config_from_str(&orchestrated_config_toml(
             true,
+            3600,
             "delivery = \"poll\"\npoll_interval_secs = 0",
         ))
         .expect_err("a zero poll interval must be rejected");
@@ -1619,21 +1762,53 @@ mode = "conversational"
         );
     }
 
-    /// `tool_headers_from_response` (approver identity) does not make poll
-    /// delivery admissible either.
+    /// A webhook route timeout above chrono's i64-millisecond ceiling is
+    /// refused at load, so the gate's `chrono::Duration::from_std` conversion
+    /// is a justified invariant rather than a user-config panic.
     #[test]
-    fn validate_refuses_poll_delivery_with_park() {
+    fn validate_rejects_webhook_timeout_over_chrono_ceiling() {
         let err = crate::load_config_from_str(&poll_config_toml(
+            false,
+            "timeout_secs = 9223372036854776",
+        ))
+        .expect_err("a webhook timeout above chrono's ceiling must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("hitl.route.timeout_secs") && msg.contains("9223372036854775"),
+            "error must name the key and the bound: {msg}"
+        );
+    }
+
+    /// The conversational route timeout feeds the same chrono
+    /// conversion; it carries the same bound.
+    #[test]
+    fn validate_rejects_conversational_timeout_over_chrono_ceiling() {
+        let err = crate::load_config_from_str(
+            "[agent]\nname = \"Test\"\nsystem_prompt = \"test\"\n\n\
+             [agent.llm]\nprovider = \"openai\"\napi_key = \"test\"\nmodel = \"gpt-4o\"\n\n\
+             [hitl]\nrequire_approval = [\"kubectl_*\"]\n\n\
+             [hitl.route]\nmode = \"conversational\"\n\
+             timeout_secs = 9223372036854776\n",
+        )
+        .expect_err("a conversational timeout above chrono's ceiling must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("hitl.route.timeout_secs") && msg.contains("9223372036854775"),
+            "error must name the key and the bound: {msg}"
+        );
+    }
+
+    /// `tool_headers_from_response` (approver identity) stays allowed with
+    /// poll delivery.
+    #[test]
+    fn validate_accepts_poll_delivery_with_park() {
+        crate::load_config_from_str(&orchestrated_config_toml(
             true,
+            3600,
             "delivery = \"poll\"\n\
              tool_headers_from_response = { \"X-Forwarded-User\" = \"X-Approver-Id\" }",
         ))
-        .expect_err("poll delivery with park mode is refused");
-        assert!(
-            err.to_string().contains("hitl.route.delivery"),
-            "error must name the refused key: {}",
-            err
-        );
+        .expect("poll delivery with park mode and no request-derived headers is valid");
     }
 
     #[test]
@@ -1678,73 +1853,33 @@ mode = "conversational"
     }
 
     #[test]
-    fn validate_refuses_poll_delivery_even_with_park() {
-        let err = crate::load_config_from_str(&poll_config_toml(true, "delivery = \"poll\""))
-            .expect_err("poll delivery must be refused even with park enabled");
-        assert!(
-            err.to_string().contains("hitl.route.delivery"),
-            "error must name the refused key: {}",
-            err
-        );
-    }
-
-    #[test]
-    fn validate_refuses_park_enabled_conversational() {
-        let err = crate::load_config_from_str(&conversational_config_toml(
-            "[hitl.park]\nenabled = true\n\n",
-        ))
-        .expect_err("park enabled on a conversational route must be refused");
-        assert!(
-            err.to_string().contains("hitl.park.enabled"),
-            "error must name the refused key: {}",
-            err
-        );
-    }
-
-    #[test]
-    fn validate_refuses_park_enabled_sync_webhook() {
-        let err = crate::load_config_from_str(&poll_config_toml(true, ""))
-            .expect_err("park enabled on a sync webhook route must be refused");
-        assert!(
-            err.to_string().contains("hitl.park.enabled"),
-            "error must name the refused key: {}",
-            err
-        );
-    }
-
-    #[test]
-    fn validate_poll_interval_zero_diagnostic_precedes_availability() {
-        let err = crate::load_config_from_str(&poll_config_toml(
-            false,
+    fn validate_poll_interval_zero_is_diagnosed() {
+        let err = crate::load_config_from_str(&orchestrated_config_toml(
+            true,
+            3600,
             "delivery = \"poll\"\npoll_interval_secs = 0",
         ))
-        .expect_err("a zero poll interval must be diagnosed, not the delivery refusal");
-        let msg = err.to_string();
+        .expect_err("a zero poll interval must be diagnosed");
         assert!(
-            msg.contains("hitl.route.poll_interval_secs"),
-            "error must name the interval key: {msg}"
-        );
-        assert!(
-            !msg.contains("hitl.route.delivery"),
-            "the interval diagnostic must precede the availability refusal: {msg}"
+            err.to_string().contains("hitl.route.poll_interval_secs"),
+            "error must name the interval key: {}",
+            err
         );
     }
 
     #[test]
-    fn validate_poll_request_timeout_zero_diagnostic_precedes_availability() {
-        let err = crate::load_config_from_str(&poll_config_toml(
-            false,
+    fn validate_poll_request_timeout_zero_is_diagnosed() {
+        let err = crate::load_config_from_str(&orchestrated_config_toml(
+            true,
+            3600,
             "delivery = \"poll\"\npoll_interval_secs = 5\npoll_request_timeout_secs = 0",
         ))
-        .expect_err("a zero poll request timeout must be diagnosed, not the delivery refusal");
-        let msg = err.to_string();
+        .expect_err("a zero poll request timeout must be diagnosed");
         assert!(
-            msg.contains("hitl.route.poll_request_timeout_secs"),
-            "error must name the request-timeout key: {msg}"
-        );
-        assert!(
-            !msg.contains("hitl.route.delivery"),
-            "the request-timeout diagnostic must precede the availability refusal: {msg}"
+            err.to_string()
+                .contains("hitl.route.poll_request_timeout_secs"),
+            "error must name the request-timeout key: {}",
+            err
         );
     }
 
@@ -1752,6 +1887,125 @@ mode = "conversational"
     fn validate_accepts_sync_delivery_without_park() {
         crate::load_config_from_str(&poll_config_toml(false, ""))
             .expect("sync webhook without park mode must stay valid");
+    }
+
+    // -------------------------------------------------------------------
+    // Park admission into full Config validation
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn config_park_admission_rejects_conversational_with_park() {
+        let err = crate::load_config_from_str(&conversational_config_toml(
+            "[hitl.park]\nenabled = true\n\n",
+        ))
+        .expect_err("park mode on the conversational route must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("conversational route"),
+            "error must name the route: {msg}"
+        );
+    }
+
+    #[test]
+    fn config_park_admission_rejects_sync_delivery_with_park() {
+        let err = crate::load_config_from_str(&orchestrated_config_toml(
+            true,
+            3600,
+            "delivery = \"sync\"",
+        ))
+        .expect_err("park mode on webhook sync delivery must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("webhook sync delivery"),
+            "error must name the delivery mode: {msg}"
+        );
+    }
+
+    #[test]
+    fn config_park_admission_rejects_poll_without_orchestration() {
+        let err = crate::load_config_from_str(&poll_config_toml(true, "delivery = \"poll\""))
+            .expect_err("poll delivery without orchestration must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("requires orchestration"),
+            "error must name the orchestration requirement: {msg}"
+        );
+    }
+
+    /// Like [`orchestrated_config_toml`] with `enabled = false` in the
+    /// orchestration table: poll delivery parks nowhere when the resolved
+    /// mode flag is off, so the table is inlined minimal rather than
+    /// growing the shared helper with a second flag.
+    #[test]
+    fn config_park_admission_rejects_poll_with_orchestration_disabled() {
+        let toml = "[agent]\nname = \"Test\"\nsystem_prompt = \"test\"\n\n\
+                    [agent.llm]\nprovider = \"openai\"\napi_key = \"test\"\nmodel = \"gpt-4o\"\n\n\
+                    [orchestration]\nenabled = false\n\n\
+                    [hitl]\nrequire_approval = [\"kubectl_*\"]\n\n\
+                    [hitl.park]\nenabled = true\npark_ttl = 3600\n\n\
+                    [hitl.route]\nmode = \"webhook\"\nurl = \"https://approvals.example.com/decide\"\n\
+                    delivery = \"poll\"\n";
+        let err = crate::load_config_from_str(toml)
+            .expect_err("poll delivery with orchestration disabled must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("requires orchestration"),
+            "error must name the orchestration requirement: {msg}"
+        );
+    }
+
+    #[test]
+    fn config_park_admission_rejects_ttl_below_route_timeout() {
+        let err = crate::load_config_from_str(&orchestrated_config_toml(
+            true,
+            299,
+            "delivery = \"poll\"\ntimeout_secs = 300",
+        ))
+        .expect_err("a park retention age below the route timeout must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("retention"),
+            "error must name the retention age: {msg}"
+        );
+    }
+
+    #[test]
+    fn config_park_admission_accepts_conversational_without_park() {
+        crate::load_config_from_str(&conversational_config_toml(""))
+            .expect("conversational without park mode is valid");
+    }
+
+    /// The retention boundary itself (ttl == timeout admitted, ttl below
+    /// refused) is proven at the typed authority by `park.rs`'s own unit
+    /// battery; through `Config::validate` the admitted boundary shapes
+    /// now validate end to end.
+    #[test]
+    fn config_park_admission_ttl_boundary_is_admitted() {
+        crate::load_config_from_str(&orchestrated_config_toml(
+            true,
+            300,
+            "delivery = \"poll\"\ntimeout_secs = 300",
+        ))
+        .expect("ttl at the route-timeout boundary is admitted");
+    }
+
+    #[test]
+    fn config_park_admission_ttl_above_timeout_is_admitted() {
+        crate::load_config_from_str(&orchestrated_config_toml(
+            true,
+            3600,
+            "delivery = \"poll\"\ntimeout_secs = 300",
+        ))
+        .expect("ttl above the route timeout is admitted");
+    }
+
+    #[test]
+    fn config_park_admission_accepts_config_without_hitl() {
+        crate::load_config_from_str(
+            "[agent]\nname = \"Test\"\nsystem_prompt = \"test\"\n\n\
+             [agent.llm]\nprovider = \"openai\"\napi_key = \"test\"\nmodel = \"gpt-4o\"\n",
+        )
+        .expect("a config with no [hitl] table is valid");
     }
 
     #[test]
@@ -1968,6 +2222,14 @@ pub struct ParkConfig {
     /// Park mode on or off (default off).
     #[serde(default)]
     pub enabled: bool,
+    /// Bind each run's checkpoint to the caller's identity-header hash.
+    #[serde(default)]
+    pub bind_identity: bool,
+    /// Disk retention age in seconds (`park_ttl`): how long a parked run's
+    /// evidence stays reclaimable. Default one hour; zero is refused at
+    /// parse. Separate from each approval's route timeout.
+    #[serde(default)]
+    pub park_ttl: ParkTtl,
 }
 
 /// `[hitl.route]` table. The `Webhook` variant cannot parse without a valid
@@ -2015,6 +2277,16 @@ pub enum DecisionRouteConfig {
             skip_serializing_if = "is_default_poll_request_timeout_secs"
         )]
         poll_request_timeout_secs: u64,
+        /// The receiver's `response_type=sync` wait timeout in seconds
+        /// (~15 min). Aura's route timeout must exceed it, or aura denies as
+        /// TimedOut while governance decides into the void. Config guidance,
+        /// not a hard error — aura cannot see the receiver's actual value,
+        /// only what the operator configures here.
+        #[serde(
+            default = "default_receiver_wait_timeout_secs",
+            skip_serializing_if = "is_default_receiver_wait_timeout_secs"
+        )]
+        receiver_wait_timeout_secs: u64,
     },
 }
 
@@ -2152,6 +2424,12 @@ fn default_conversational_timeout_secs() -> u64 {
     60
 }
 
+/// The whole-second ceiling on a webhook route timeout: chrono's `Duration`
+/// is i64 milliseconds, so `chrono::Duration::from_std(Duration::from_secs(n))`
+/// succeeds only while `n * 1000 <= i64::MAX`. Values above this bound would
+/// panic at the gate's `from_std` conversion, so they are refused at load.
+const WEBHOOK_TIMEOUT_SECS_BOUND: u64 = (i64::MAX / 1000) as u64;
+
 fn default_poll_interval_secs() -> u64 {
     10
 }
@@ -2166,6 +2444,14 @@ fn default_poll_request_timeout_secs() -> u64 {
 
 fn is_default_poll_request_timeout_secs(value: &u64) -> bool {
     *value == default_poll_request_timeout_secs()
+}
+
+fn default_receiver_wait_timeout_secs() -> u64 {
+    900
+}
+
+fn is_default_receiver_wait_timeout_secs(value: &u64) -> bool {
+    *value == default_receiver_wait_timeout_secs()
 }
 
 /// A validated webhook URL.

@@ -30,6 +30,9 @@ pub(crate) struct CommandContext<'a> {
     pub telemetry: &'a aura_telemetry::TelemetryHandle,
     pub rt: &'a tokio::runtime::Runtime,
     pub backend: &'a Backend,
+    /// Shared approval poster (HTTP mode), so `/resume-run` renders the
+    /// same approval links the park banner does.
+    pub approval_poster: &'a Option<crate::api::approval::ApprovalPoster>,
 }
 
 /// What the REPL loop should do after a command handler returns.
@@ -151,6 +154,14 @@ pub(crate) const COMMANDS: &[Command] = &[
         usage_hint: Some("<filter>"),
         handler: cmd_resume,
         validate: Some(validate_resume),
+        mid_stream: MidStream::Defer,
+    },
+    Command {
+        name: "/resume-run",
+        description: "Re-enter the reattach wait for the session's parked run",
+        usage_hint: Some("[run_id]"),
+        handler: cmd_resume_run,
+        validate: None,
         mid_stream: MidStream::Defer,
     },
     Command {
@@ -295,6 +306,18 @@ fn cmd_resume(ctx: &mut CommandContext, args: &str) -> CommandOutcome {
         Some(new_input) => CommandOutcome::Reinject(new_input),
         None => CommandOutcome::Handled,
     }
+}
+
+fn cmd_resume_run(ctx: &mut CommandContext, args: &str) -> CommandOutcome {
+    commands::handle_resume_run(
+        args,
+        ctx.conversation,
+        ctx.conv_store,
+        ctx.rt,
+        ctx.backend,
+        ctx.approval_poster,
+    );
+    CommandOutcome::Handled
 }
 
 fn cmd_rename(ctx: &mut CommandContext, args: &str) -> CommandOutcome {

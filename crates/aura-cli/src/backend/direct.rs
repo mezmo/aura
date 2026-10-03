@@ -28,7 +28,7 @@ use aura_web_server::types::{
     ChatMessageToolCall, ClientFunctionDefinition, ClientToolDefinition, Role,
 };
 
-use crate::api::stream::{StreamHandler, StreamResult, process_sse_events};
+use crate::api::stream::{StreamHandler, StreamOutcome, process_sse_events};
 use crate::api::types::{Message, ModelEntry, ToolCallInfo, ToolDefinition};
 use crate::ui::prompt::get_selected_model;
 
@@ -334,14 +334,19 @@ impl DirectBackend {
         session_id: &str,
         cancel: Arc<AtomicBool>,
         handler: &mut impl StreamHandler,
-    ) -> Result<StreamResult> {
+    ) -> Result<StreamOutcome> {
         let selected = get_selected_model();
         let mut req = Self::build_chat_request(messages, tools, selected);
 
-        let setup =
-            handlers::prepare_request(&self.app_state, &mut req, session_id, &self.extra_headers)
-                .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let setup = handlers::prepare_request(
+            &self.app_state,
+            &mut req,
+            session_id,
+            &self.extra_headers,
+            None,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
         let config = handlers::build_completion_config(&self.app_state, &setup, None, true, true);
 
@@ -404,10 +409,15 @@ impl DirectBackend {
             tools: None,
         };
 
-        let setup =
-            handlers::prepare_request(&self.app_state, &mut req, session_id, &self.extra_headers)
-                .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let setup = handlers::prepare_request(
+            &self.app_state,
+            &mut req,
+            session_id,
+            &self.extra_headers,
+            None,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
         let config = handlers::build_completion_config(&self.app_state, &setup, None, false, false);
 
@@ -991,8 +1001,8 @@ preamble = "p"
             Ok(_) => panic!("a poll-delivery config must fail the direct backend boot"),
         };
         assert!(
-            format!("{err:#}").contains("hitl.route.delivery"),
-            "the load error must carry the admission diagnostic: {err:#}"
+            format!("{err:#}").contains("webhook poll delivery requires orchestration"),
+            "the load error must carry the typed admission diagnostic: {err:#}"
         );
     }
 

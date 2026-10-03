@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use tokio::runtime::Runtime;
 
 use crate::api::mcp_status::McpNotice;
-use crate::api::stream::{StreamHandler, StreamResult};
+use crate::api::stream::{StreamHandler, StreamOutcome, StreamResult, StreamTermination};
 use crate::api::types::{DisplayEvent, ShellCallDetail, ToolCallInfo, snake_to_pascal_case};
 use crate::backend::Backend;
 use crate::config::AppConfig;
@@ -580,6 +580,9 @@ fn orch_event_prints_scrollback(event_name: &str) -> bool {
             | event_names::TOOL_CALL_COMPLETED
             | event_names::TASK_COMPLETED
             | event_names::ITERATION_COMPLETE
+            // A park must reach its match arm: the banner, the reattach
+            // slot, and the epoch bump all live behind this gate.
+            | event_names::RUN_PARKED
     )
 }
 
@@ -810,6 +813,18 @@ pub fn run_repl(
     // leaving it uninitialized lets the compiler prove complete coverage.
     let exit_reason: aura_telemetry::events::ExitReason;
 
+    // Approval poster: HTTP mode can POST decisions to the server's
+    // /v1/approvals/{id} ingress; standalone mode has no HTTP server to
+    // POST to. Shared by every turn, the reattach driver, and the
+    // /resume-run command's gate rendering.
+    let approval_poster = match backend {
+        Backend::Http(_) => Some(crate::api::approval::ApprovalPoster::new(Arc::new(
+            config.clone(),
+        ))),
+        #[cfg(feature = "standalone-cli")]
+        Backend::Direct(_) => None,
+    };
+
     loop {
         // Frame is already drawn (by setup or previous iteration).
         // Restore normal terminal mode and show cursor for readline.
@@ -899,6 +914,7 @@ pub fn run_repl(
                         telemetry,
                         rt,
                         backend,
+                        approval_poster: &approval_poster,
                     };
                     match registry::dispatch(&input, &mut ctx) {
                         Some(CommandOutcome::Exit) => {
@@ -1046,6 +1062,11 @@ pub fn run_repl(
                 };
                 let mut tool_loop_error: Option<anyhow::Error> = None;
                 let mut final_text = String::new();
+                // Set when a reattach wait was user-released: the turn's
+                // partial persists through the normal path, but no
+                // further model requests serve it — a released wait
+                // abandons silently.
+                let mut reattach_released = false;
                 let mut did_compact = false;
                 let mut auto_compact_count: u32 = 0;
 
@@ -1118,17 +1139,6 @@ pub fn run_repl(
                 // when the LLM is inside an Update group.
                 let in_update_group = Arc::new(AtomicBool::new(false));
 
-                // Approval poster: HTTP mode can POST decisions to the
-                // server's /v1/approvals/{id} ingress; standalone mode
-                // has no HTTP server to POST to.
-                let approval_poster = match backend {
-                    Backend::Http(_) => Some(crate::api::approval::ApprovalPoster::new(Arc::new(
-                        config.clone(),
-                    ))),
-                    #[cfg(feature = "standalone-cli")]
-                    Backend::Direct(_) => None,
-                };
-
                 // In-process approval registry: standalone mode resolves
                 // conversational approvals directly via the shared registry.
                 #[cfg(feature = "standalone-cli")]
@@ -1148,27 +1158,39 @@ pub fn run_repl(
                             .unwrap_or(&fallback_session_uuid),
                         crate::api::session::SessionKind::Chat,
                     );
+                    // One handler factory per iteration: the stream, and
+                    // any reattach a park triggers, render through the
+                    // same machinery under the session this request runs
+                    // under.
+                    let make_handler_session = chat_session_id.clone();
+                    let mut make_handler = || ReplStreamHandler {
+                        pending_args: pending_args.clone(),
+                        turn_events: turn_events.clone(),
+                        live_reasoning: live_reasoning.clone(),
+                        live_worker_reasoning: live_worker_reasoning.clone(),
+                        worker_reasoning_seen: worker_reasoning_seen.clone(),
+                        session_info_seen: session_info_seen.clone(),
+                        stop_flag: stop_flag.clone(),
+                        anim_cleared: anim_cleared.clone(),
+                        cancel: cancel_flag.clone(),
+                        post_tool_wave: post_tool_wave.clone(),
+                        input_buf: input_buf.clone(),
+                        orch_state: orch_state.clone(),
+                        needs_blank: needs_blank.clone(),
+                        in_update_group: in_update_group.clone(),
+                        approval_poster: approval_poster.clone(),
+                        #[cfg(feature = "standalone-cli")]
+                        pending_approvals: pending_approvals.clone(),
+                        turn_context_peak: 0,
+                        chat_session_id: make_handler_session.clone(),
+                    };
+                    // Only THIS stream's RunParked may drive the
+                    // reattach: the epoch snapshot distinguishes a park
+                    // recorded during this request from a stale record,
+                    // which stays available for a manual re-arm.
+                    let epoch_before_stream = crate::repl::reattach::current_park_epoch();
                     let result = rt.block_on(async {
-                        let mut handler = ReplStreamHandler {
-                            pending_args: pending_args.clone(),
-                            turn_events: turn_events.clone(),
-                            live_reasoning: live_reasoning.clone(),
-                            live_worker_reasoning: live_worker_reasoning.clone(),
-                            worker_reasoning_seen: worker_reasoning_seen.clone(),
-                            session_info_seen: session_info_seen.clone(),
-                            stop_flag: stop_flag.clone(),
-                            anim_cleared: anim_cleared.clone(),
-                            cancel: cancel_flag.clone(),
-                            post_tool_wave: post_tool_wave.clone(),
-                            input_buf: input_buf.clone(),
-                            orch_state: orch_state.clone(),
-                            needs_blank: needs_blank.clone(),
-                            in_update_group: in_update_group.clone(),
-                            approval_poster: approval_poster.clone(),
-                            #[cfg(feature = "standalone-cli")]
-                            pending_approvals: pending_approvals.clone(),
-                            turn_context_peak: 0,
-                        };
+                        let mut handler = make_handler();
                         backend
                             .stream_chat(
                                 conversation.messages(),
@@ -1195,280 +1217,376 @@ pub fn run_repl(
                         store.save_turn_model(get_selected_model().as_deref());
                     }
 
+                    // A targeted RunParked ended this stream: drive the
+                    // bounded reattach through the same machinery. The
+                    // wait consumes the turn; its outcome is the turn's
+                    // final text — the resumed answer, or the fixed
+                    // reify-failure message with the received partial
+                    // preserved — and the epilogue persists it through
+                    // the normal response/history path.
+                    let parked_this_stream =
+                        crate::repl::reattach::current_park_epoch() != epoch_before_stream;
+                    let parked_run = parked_this_stream
+                        .then(|| {
+                            crate::repl::reattach::latest_park_slot()
+                                .lock()
+                                .ok()
+                                .and_then(|g| g.clone())
+                        })
+                        .flatten();
+                    if let Some(park) = parked_run {
+                        let (text, user_released) = drive_reattach(
+                            rt,
+                            backend,
+                            park,
+                            &cancel_flag,
+                            &approval_poster,
+                            &mut make_handler,
+                        );
+                        // A released wait consumed the user's escape:
+                        // the turn ends through the normal path with the
+                        // preserved partial, not the cancellation path
+                        // that would discard it — and no further model
+                        // request (the response summarizer included)
+                        // serves the released turn.
+                        if user_released {
+                            cancel_flag.store(false, Ordering::Relaxed);
+                            reattach_released = true;
+                        }
+                        final_text = text;
+                        break 'tool_loop;
+                    }
+
                     // Check for cancellation
                     if cancel_flag.load(Ordering::Relaxed) {
                         break 'tool_loop;
                     }
 
                     match result {
-                        Ok(StreamResult::TextResponse(text)) => {
-                            // Check for auto-compaction trigger (context pressure).
-                            // Occupancy is bounded by the window, so it is
-                            // judged as a fill fraction; without a
-                            // window-relative reading there is no pressure to
-                            // act on.
-                            let under_pressure = fresh_context_fill_ratio()
-                                .is_some_and(|fill| fill >= AUTO_COMPACT_FILL);
-                            if under_pressure
-                                && text.contains(
-                                    "My tools returned more data than I can work with at once",
-                                )
-                            {
-                                auto_compact_count += 1;
-
-                                if auto_compact_count <= 2 {
-                                    // Auto-compact and retry
-                                    let removed = conversation.compact();
-
-                                    // Stop any running animations
-                                    if let Ok(mut guard) = post_tool_wave.lock()
-                                        && let Some((ptw_anim, _)) = guard.take()
-                                    {
-                                        ptw_anim.finish();
-                                    }
-                                    if !anim_cleared.load(Ordering::Relaxed) {
-                                        if let Some(a) = anim.take() {
-                                            a.finish();
+                        Ok(StreamOutcome {
+                            received,
+                            ref termination,
+                        }) => match received {
+                            StreamResult::TextResponse(text) => {
+                                // An ambiguous end (EOF without [DONE], a
+                                // malformed event body, or a transport error)
+                                // still carries whatever text was received:
+                                // it becomes the turn's final text through
+                                // the normal response path, with one warning
+                                // line so the partial is never mistaken for
+                                // a completed answer. The turn ENDS here —
+                                // an explicitly incomplete stream must not
+                                // trigger further model requests (the
+                                // auto-compaction retry included).
+                                if matches!(
+                                    termination,
+                                    StreamTermination::EofWithoutDone
+                                        | StreamTermination::Malformed { .. }
+                                        | StreamTermination::StreamError { .. }
+                                ) {
+                                    let detail = match termination {
+                                        StreamTermination::Malformed { detail } => {
+                                            format!(" ({detail})")
                                         }
-                                        anim_cleared.store(true, Ordering::Relaxed);
-                                    }
+                                        StreamTermination::StreamError { detail } => {
+                                            format!(" ({detail})")
+                                        }
+                                        _ => String::new(),
+                                    };
+                                    let _term = lock_term();
                                     erase_input_frame();
-
                                     println!(
                                         "{} {}",
-                                        "●"
-                                            .with(random_bullet_color())
-                                            .attribute(crossterm::style::Attribute::Bold),
-                                        "Auto-compacting context"
-                                            .attribute(crossterm::style::Attribute::Bold),
+                                        "⏸ Stream ended without completing"
+                                            .themed(AuraStyle::Warning),
+                                        detail.themed(AuraStyle::Muted),
                                     );
-                                    println!(
-                                        "{} Context limit reached — removed {} messages ({} tokens in context)",
-                                        "└─".themed(AuraStyle::Connector),
-                                        removed,
-                                        get_context_tokens(),
-                                    );
-                                    println!();
+                                    crate::ui::prompt::increment_orch_scrollback();
+                                    final_text = text;
+                                    break 'tool_loop;
+                                }
 
-                                    if let Ok(mut events) = turn_events.lock() {
-                                        events.push(DisplayEvent::Compacted {
-                                            messages_removed: removed,
-                                        });
-                                    }
-                                    did_compact = true;
+                                // Check for auto-compaction trigger (context pressure).
+                                // Occupancy is bounded by the window, so it is
+                                // judged as a fill fraction; without a
+                                // window-relative reading there is no pressure to
+                                // act on.
+                                let under_pressure = fresh_context_fill_ratio()
+                                    .is_some_and(|fill| fill >= AUTO_COMPACT_FILL);
+                                if under_pressure
+                                    && text.contains(
+                                        "My tools returned more data than I can work with at once",
+                                    )
+                                {
+                                    auto_compact_count += 1;
 
-                                    // Restart thinking animation and retry with compacted context
-                                    let (new_anim, new_stop) = WaveAnimation::start(
-                                        "Thinking",
-                                        vec![],
-                                        input_buf.clone(),
-                                        Some(cancel_flag.clone()),
-                                    );
-                                    drop(new_stop);
-                                    if let Ok(mut guard) = post_tool_wave.lock() {
-                                        *guard = Some((new_anim, stop_flag.clone()));
-                                    }
-                                    prepare_input_line(&input_buf, Some(&cancel_flag));
+                                    if auto_compact_count <= 2 {
+                                        // Auto-compact and retry
+                                        let removed = conversation.compact();
 
-                                    continue 'tool_loop;
-                                } else {
-                                    // 3rd attempt: history-free fallback
-                                    // Compact client-side one more time
-                                    let removed = conversation.compact();
-
-                                    if let Ok(mut guard) = post_tool_wave.lock()
-                                        && let Some((ptw_anim, _)) = guard.take()
-                                    {
-                                        ptw_anim.finish();
-                                    }
-                                    if !anim_cleared.load(Ordering::Relaxed) {
-                                        if let Some(a) = anim.take() {
-                                            a.finish();
+                                        // Stop any running animations
+                                        if let Ok(mut guard) = post_tool_wave.lock()
+                                            && let Some((ptw_anim, _)) = guard.take()
+                                        {
+                                            ptw_anim.finish();
                                         }
-                                        anim_cleared.store(true, Ordering::Relaxed);
-                                    }
-                                    erase_input_frame();
+                                        if !anim_cleared.load(Ordering::Relaxed) {
+                                            if let Some(a) = anim.take() {
+                                                a.finish();
+                                            }
+                                            anim_cleared.store(true, Ordering::Relaxed);
+                                        }
+                                        erase_input_frame();
 
-                                    println!(
-                                        "{} {}",
-                                        "●"
-                                            .with(random_bullet_color())
-                                            .attribute(crossterm::style::Attribute::Bold),
-                                        "Auto-compacting context (recovery mode)"
-                                            .attribute(crossterm::style::Attribute::Bold),
-                                    );
-                                    println!(
-                                        "{} Removed {} more messages. Sending minimal recovery request.",
-                                        "└─".themed(AuraStyle::Connector),
-                                        removed,
-                                    );
-                                    println!();
+                                        println!(
+                                            "{} {}",
+                                            "●"
+                                                .with(random_bullet_color())
+                                                .attribute(crossterm::style::Attribute::Bold),
+                                            "Auto-compacting context"
+                                                .attribute(crossterm::style::Attribute::Bold),
+                                        );
+                                        println!(
+                                            "{} Context limit reached — removed {} messages ({} tokens in context)",
+                                            "└─".themed(AuraStyle::Connector),
+                                            removed,
+                                            get_context_tokens(),
+                                        );
+                                        println!();
 
-                                    if let Ok(mut events) = turn_events.lock() {
-                                        events.push(DisplayEvent::Compacted {
-                                            messages_removed: removed,
-                                        });
-                                    }
-                                    did_compact = true;
+                                        if let Ok(mut events) = turn_events.lock() {
+                                            events.push(DisplayEvent::Compacted {
+                                                messages_removed: removed,
+                                            });
+                                        }
+                                        did_compact = true;
 
-                                    // Send a minimal history-free message so the LLM can recover
-                                    conversation.add_assistant(&text);
-                                    conversation.add_user(
+                                        // Restart thinking animation and retry with compacted context
+                                        let (new_anim, new_stop) = WaveAnimation::start(
+                                            "Thinking",
+                                            vec![],
+                                            input_buf.clone(),
+                                            Some(cancel_flag.clone()),
+                                        );
+                                        drop(new_stop);
+                                        if let Ok(mut guard) = post_tool_wave.lock() {
+                                            *guard = Some((new_anim, stop_flag.clone()));
+                                        }
+                                        prepare_input_line(&input_buf, Some(&cancel_flag));
+
+                                        continue 'tool_loop;
+                                    } else {
+                                        // 3rd attempt: history-free fallback
+                                        // Compact client-side one more time
+                                        let removed = conversation.compact();
+
+                                        if let Ok(mut guard) = post_tool_wave.lock()
+                                            && let Some((ptw_anim, _)) = guard.take()
+                                        {
+                                            ptw_anim.finish();
+                                        }
+                                        if !anim_cleared.load(Ordering::Relaxed) {
+                                            if let Some(a) = anim.take() {
+                                                a.finish();
+                                            }
+                                            anim_cleared.store(true, Ordering::Relaxed);
+                                        }
+                                        erase_input_frame();
+
+                                        println!(
+                                            "{} {}",
+                                            "●"
+                                                .with(random_bullet_color())
+                                                .attribute(crossterm::style::Attribute::Bold),
+                                            "Auto-compacting context (recovery mode)"
+                                                .attribute(crossterm::style::Attribute::Bold),
+                                        );
+                                        println!(
+                                            "{} Removed {} more messages. Sending minimal recovery request.",
+                                            "└─".themed(AuraStyle::Connector),
+                                            removed,
+                                        );
+                                        println!();
+
+                                        if let Ok(mut events) = turn_events.lock() {
+                                            events.push(DisplayEvent::Compacted {
+                                                messages_removed: removed,
+                                            });
+                                        }
+                                        did_compact = true;
+
+                                        // Send a minimal history-free message so the LLM can recover
+                                        conversation.add_assistant(&text);
+                                        conversation.add_user(
                                         "The conversation context was too large so it has been \
                                          compacted automatically. Please continue where you left off."
                                     );
 
-                                    // Restart animation and retry
-                                    let (new_anim, new_stop) = WaveAnimation::start(
-                                        "Thinking",
-                                        vec![],
-                                        input_buf.clone(),
-                                        Some(cancel_flag.clone()),
-                                    );
-                                    drop(new_stop);
-                                    if let Ok(mut guard) = post_tool_wave.lock() {
-                                        *guard = Some((new_anim, stop_flag.clone()));
+                                        // Restart animation and retry
+                                        let (new_anim, new_stop) = WaveAnimation::start(
+                                            "Thinking",
+                                            vec![],
+                                            input_buf.clone(),
+                                            Some(cancel_flag.clone()),
+                                        );
+                                        drop(new_stop);
+                                        if let Ok(mut guard) = post_tool_wave.lock() {
+                                            *guard = Some((new_anim, stop_flag.clone()));
+                                        }
+                                        prepare_input_line(&input_buf, Some(&cancel_flag));
+
+                                        continue 'tool_loop;
                                     }
-                                    prepare_input_line(&input_buf, Some(&cancel_flag));
-
-                                    continue 'tool_loop;
                                 }
-                            }
 
-                            final_text = text;
-                            break 'tool_loop;
-                        }
-                        Ok(StreamResult::ToolCalls {
-                            text,
-                            tool_calls,
-                            server_results,
-                        }) => {
-                            // Stop any running animations before tool execution
-                            if let Ok(mut guard) = post_tool_wave.lock()
-                                && let Some((ptw_anim, _)) = guard.take()
-                            {
-                                ptw_anim.finish();
+                                final_text = text;
+                                break 'tool_loop;
                             }
-                            if !anim_cleared.load(Ordering::Relaxed) {
-                                if let Some(a) = anim.take() {
-                                    a.finish();
+                            StreamResult::ToolCalls {
+                                text,
+                                tool_calls,
+                                server_results,
+                            } => {
+                                // Tool calls are only actionable when the
+                                // stream completed: an ambiguous end may have
+                                // truncated the delta accumulation, so
+                                // executing the half-received calls is unsafe.
+                                // Preserve any received text through the
+                                // normal history path and end the turn.
+                                if !matches!(termination, StreamTermination::Done) {
+                                    if !text.is_empty() {
+                                        conversation.add_assistant(&text);
+                                    }
+                                    if matches!(
+                                        termination,
+                                        StreamTermination::EofWithoutDone
+                                            | StreamTermination::Malformed { .. }
+                                            | StreamTermination::StreamError { .. }
+                                    ) {
+                                        let _term = lock_term();
+                                        erase_input_frame();
+                                        println!(
+                                            "{}",
+                                            "⏸ Stream ended without completing; no tool \
+                                             calls were executed"
+                                                .themed(AuraStyle::Warning)
+                                        );
+                                        crate::ui::prompt::increment_orch_scrollback();
+                                    }
+                                    break 'tool_loop;
                                 }
-                                anim_cleared.store(true, Ordering::Relaxed);
-                            }
-                            erase_input_frame();
 
-                            // Convert AccumulatedToolCalls to ToolCallInfo for history
-                            let tool_call_infos: Vec<ToolCallInfo> = tool_calls
-                                .iter()
-                                .map(|tc| ToolCallInfo {
-                                    id: tc.id.clone(),
-                                    call_type: "function".to_string(),
-                                    function: crate::api::types::FunctionCallInfo {
-                                        name: tc.name.clone(),
-                                        arguments: tc.arguments.clone(),
-                                    },
-                                })
-                                .collect();
+                                // Stop any running animations before tool execution
+                                if let Ok(mut guard) = post_tool_wave.lock()
+                                    && let Some((ptw_anim, _)) = guard.take()
+                                {
+                                    ptw_anim.finish();
+                                }
+                                if !anim_cleared.load(Ordering::Relaxed) {
+                                    if let Some(a) = anim.take() {
+                                        a.finish();
+                                    }
+                                    anim_cleared.store(true, Ordering::Relaxed);
+                                }
+                                erase_input_frame();
 
-                            // Add assistant message with tool calls to history
-                            let text_content = if text.is_empty() { None } else { Some(text) };
-                            conversation
-                                .add_assistant_with_tool_calls(text_content, tool_call_infos);
+                                // Convert AccumulatedToolCalls to ToolCallInfo for history
+                                let tool_call_infos: Vec<ToolCallInfo> = tool_calls
+                                    .iter()
+                                    .map(|tc| ToolCallInfo {
+                                        id: tc.id.clone(),
+                                        call_type: "function".to_string(),
+                                        function: crate::api::types::FunctionCallInfo {
+                                            name: tc.name.clone(),
+                                            arguments: tc.arguments.clone(),
+                                        },
+                                    })
+                                    .collect();
 
-                            // Execute each tool call, collecting info for grouped display
-                            let mut batch_tools: Vec<(
-                                String,
-                                String,
-                                String,
-                                std::time::Duration,
-                            )> = Vec::new();
-                            for tc in &tool_calls {
-                                // Special handling for CompactContext — needs direct
-                                // access to conversation and event_log
-                                if tc.name == "CompactContext" {
-                                    let removed = conversation.compact();
-                                    let result_msg = format!(
-                                        "Context compacted: removed {} messages. \
+                                // Add assistant message with tool calls to history
+                                let text_content = if text.is_empty() { None } else { Some(text) };
+                                conversation
+                                    .add_assistant_with_tool_calls(text_content, tool_call_infos);
+
+                                // Execute each tool call, collecting info for grouped display
+                                let mut batch_tools: Vec<(
+                                    String,
+                                    String,
+                                    String,
+                                    std::time::Duration,
+                                )> = Vec::new();
+                                for tc in &tool_calls {
+                                    // Special handling for CompactContext — needs direct
+                                    // access to conversation and event_log
+                                    if tc.name == "CompactContext" {
+                                        let removed = conversation.compact();
+                                        let result_msg = format!(
+                                            "Context compacted: removed {} messages. \
                                          Conversation history has been pruned to the most \
                                          recent half. The system prompt is preserved.",
-                                        removed
-                                    );
+                                            removed
+                                        );
 
-                                    println!(
-                                        "{} {}",
-                                        "●"
-                                            .with(random_bullet_color())
-                                            .attribute(crossterm::style::Attribute::Bold),
-                                        "CompactContext()".themed(AuraStyle::Primary),
-                                    );
-                                    println!(
-                                        "{} {}",
-                                        "└─".themed(AuraStyle::Connector),
-                                        result_msg.as_str().themed(AuraStyle::Muted),
-                                    );
+                                        println!(
+                                            "{} {}",
+                                            "●"
+                                                .with(random_bullet_color())
+                                                .attribute(crossterm::style::Attribute::Bold),
+                                            "CompactContext()".themed(AuraStyle::Primary),
+                                        );
+                                        println!(
+                                            "{} {}",
+                                            "└─".themed(AuraStyle::Connector),
+                                            result_msg.as_str().themed(AuraStyle::Muted),
+                                        );
 
-                                    if let Ok(mut events) = turn_events.lock() {
-                                        events.push(DisplayEvent::Compacted {
-                                            messages_removed: removed,
-                                        });
-                                    }
-                                    did_compact = true;
-
-                                    conversation.add_tool_result(&tc.id, &tc.name, &result_msg);
-                                    continue;
-                                }
-
-                                // --- Update tool grouping ---
-                                if tc.name == "Update" {
-                                    // Finalize any previous active Update
-                                    if let Some(prev) = active_update.take() {
-                                        finalize_update(prev, &turn_events);
-                                    }
-
-                                    let args: serde_json::Value =
-                                        serde_json::from_str(&tc.arguments).unwrap_or_default();
-                                    let file_path =
-                                        args["file_path"].as_str().unwrap_or("?").to_string();
-
-                                    // Show what we're about to do before asking permission
-                                    let display =
-                                        tools::format_tool_call_display(&tc.name, &tc.arguments);
-                                    println!(
-                                        "{} {}",
-                                        "●"
-                                            .with(random_bullet_color())
-                                            .attribute(crossterm::style::Attribute::Bold),
-                                        display.themed(AuraStyle::Primary),
-                                    );
-
-                                    // Check permissions for Update
-                                    let perm = permissions.check(&tc.name, &tc.arguments);
-                                    match perm {
-                                        crate::permissions::PermissionResult::Denied(reason) => {
-                                            in_update_group.store(false, Ordering::Relaxed);
-                                            eprintln!(
-                                                "  {}",
-                                                reason.as_str().themed(AuraStyle::Warning)
-                                            );
-                                            let rules = permissions.describe_rules();
-                                            let denied_msg = tools::permission_denied_message(
-                                                &tc.name,
-                                                &reason,
-                                                rules.as_deref(),
-                                            );
-                                            conversation.add_tool_result(
-                                                &tc.id,
-                                                &tc.name,
-                                                &denied_msg,
-                                            );
-                                            continue;
+                                        if let Ok(mut events) = turn_events.lock() {
+                                            events.push(DisplayEvent::Compacted {
+                                                messages_removed: removed,
+                                            });
                                         }
-                                        crate::permissions::PermissionResult::Prompt => {
-                                            if !permissions
-                                                .prompt_tool_permission(&tc.name, &tc.arguments)
-                                            {
+                                        did_compact = true;
+
+                                        conversation.add_tool_result(&tc.id, &tc.name, &result_msg);
+                                        continue;
+                                    }
+
+                                    // --- Update tool grouping ---
+                                    if tc.name == "Update" {
+                                        // Finalize any previous active Update
+                                        if let Some(prev) = active_update.take() {
+                                            finalize_update(prev, &turn_events);
+                                        }
+
+                                        let args: serde_json::Value =
+                                            serde_json::from_str(&tc.arguments).unwrap_or_default();
+                                        let file_path =
+                                            args["file_path"].as_str().unwrap_or("?").to_string();
+
+                                        // Show what we're about to do before asking permission
+                                        let display = tools::format_tool_call_display(
+                                            &tc.name,
+                                            &tc.arguments,
+                                        );
+                                        println!(
+                                            "{} {}",
+                                            "●"
+                                                .with(random_bullet_color())
+                                                .attribute(crossterm::style::Attribute::Bold),
+                                            display.themed(AuraStyle::Primary),
+                                        );
+
+                                        // Check permissions for Update
+                                        let perm = permissions.check(&tc.name, &tc.arguments);
+                                        match perm {
+                                            crate::permissions::PermissionResult::Denied(
+                                                reason,
+                                            ) => {
                                                 in_update_group.store(false, Ordering::Relaxed);
-                                                let reason = "denied by user".to_string();
+                                                eprintln!(
+                                                    "  {}",
+                                                    reason.as_str().themed(AuraStyle::Warning)
+                                                );
                                                 let rules = permissions.describe_rules();
                                                 let denied_msg = tools::permission_denied_message(
                                                     &tc.name,
@@ -1482,76 +1600,65 @@ pub fn run_repl(
                                                 );
                                                 continue;
                                             }
+                                            crate::permissions::PermissionResult::Prompt => {
+                                                if !permissions
+                                                    .prompt_tool_permission(&tc.name, &tc.arguments)
+                                                {
+                                                    in_update_group.store(false, Ordering::Relaxed);
+                                                    let reason = "denied by user".to_string();
+                                                    let rules = permissions.describe_rules();
+                                                    let denied_msg =
+                                                        tools::permission_denied_message(
+                                                            &tc.name,
+                                                            &reason,
+                                                            rules.as_deref(),
+                                                        );
+                                                    conversation.add_tool_result(
+                                                        &tc.id,
+                                                        &tc.name,
+                                                        &denied_msg,
+                                                    );
+                                                    continue;
+                                                }
+                                            }
+                                            crate::permissions::PermissionResult::Allowed => {}
                                         }
-                                        crate::permissions::PermissionResult::Allowed => {}
+
+                                        // Snapshot the file
+                                        let snapshot = std::fs::read_to_string(&file_path).ok();
+
+                                        active_update = Some(UpdateContext {
+                                            file_path,
+                                            snapshot,
+                                            shell_calls: Vec::new(),
+                                            commands_used: Vec::new(),
+                                            start_time: std::time::Instant::now(),
+                                        });
+
+                                        let result_msg = format!(
+                                            "Update context started for {}. Use Shell calls to make changes.",
+                                            active_update.as_ref().unwrap().file_path
+                                        );
+                                        conversation.add_tool_result(&tc.id, &tc.name, &result_msg);
+                                        continue;
                                     }
 
-                                    // Snapshot the file
-                                    let snapshot = std::fs::read_to_string(&file_path).ok();
-
-                                    active_update = Some(UpdateContext {
-                                        file_path,
-                                        snapshot,
-                                        shell_calls: Vec::new(),
-                                        commands_used: Vec::new(),
-                                        start_time: std::time::Instant::now(),
-                                    });
-
-                                    let result_msg = format!(
-                                        "Update context started for {}. Use Shell calls to make changes.",
-                                        active_update.as_ref().unwrap().file_path
-                                    );
-                                    conversation.add_tool_result(&tc.id, &tc.name, &result_msg);
-                                    continue;
-                                }
-
-                                // --- Shell within an active Update group ---
-                                if tc.name == "Shell" && active_update.is_some() {
-                                    // Run the full permission check — Update
-                                    // approval does not implicitly trust
-                                    // arbitrary Shell commands. The user must
-                                    // allow each command (or pattern)
-                                    // explicitly.
-                                    let shell_perm = permissions.check("Shell", &tc.arguments);
-                                    match shell_perm {
-                                        crate::permissions::PermissionResult::Denied(reason) => {
-                                            eprintln!(
-                                                "  {}",
-                                                reason.as_str().themed(AuraStyle::Warning)
-                                            );
-                                            let rules = permissions.describe_rules();
-                                            let denied_msg = tools::permission_denied_message(
-                                                "Shell",
-                                                &reason,
-                                                rules.as_deref(),
-                                            );
-                                            conversation.add_tool_result(
-                                                &tc.id,
-                                                &tc.name,
-                                                &denied_msg,
-                                            );
-                                            continue;
-                                        }
-                                        crate::permissions::PermissionResult::Prompt => {
-                                            // Show the Shell call so the user
-                                            // has context for what they're
-                                            // approving — display is normally
-                                            // suppressed inside Update groups.
-                                            let display = tools::format_tool_call_display(
-                                                &tc.name,
-                                                &tc.arguments,
-                                            );
-                                            println!(
-                                                "{} {}",
-                                                "●"
-                                                    .with(random_bullet_color())
-                                                    .attribute(crossterm::style::Attribute::Bold),
-                                                display.themed(AuraStyle::Primary),
-                                            );
-                                            if !permissions
-                                                .prompt_tool_permission(&tc.name, &tc.arguments)
-                                            {
-                                                let reason = "denied by user".to_string();
+                                    // --- Shell within an active Update group ---
+                                    if tc.name == "Shell" && active_update.is_some() {
+                                        // Run the full permission check — Update
+                                        // approval does not implicitly trust
+                                        // arbitrary Shell commands. The user must
+                                        // allow each command (or pattern)
+                                        // explicitly.
+                                        let shell_perm = permissions.check("Shell", &tc.arguments);
+                                        match shell_perm {
+                                            crate::permissions::PermissionResult::Denied(
+                                                reason,
+                                            ) => {
+                                                eprintln!(
+                                                    "  {}",
+                                                    reason.as_str().themed(AuraStyle::Warning)
+                                                );
                                                 let rules = permissions.describe_rules();
                                                 let denied_msg = tools::permission_denied_message(
                                                     "Shell",
@@ -1565,59 +1672,98 @@ pub fn run_repl(
                                                 );
                                                 continue;
                                             }
+                                            crate::permissions::PermissionResult::Prompt => {
+                                                // Show the Shell call so the user
+                                                // has context for what they're
+                                                // approving — display is normally
+                                                // suppressed inside Update groups.
+                                                let display = tools::format_tool_call_display(
+                                                    &tc.name,
+                                                    &tc.arguments,
+                                                );
+                                                println!(
+                                                    "{} {}",
+                                                    "●".with(random_bullet_color()).attribute(
+                                                        crossterm::style::Attribute::Bold
+                                                    ),
+                                                    display.themed(AuraStyle::Primary),
+                                                );
+                                                if !permissions
+                                                    .prompt_tool_permission(&tc.name, &tc.arguments)
+                                                {
+                                                    let reason = "denied by user".to_string();
+                                                    let rules = permissions.describe_rules();
+                                                    let denied_msg =
+                                                        tools::permission_denied_message(
+                                                            "Shell",
+                                                            &reason,
+                                                            rules.as_deref(),
+                                                        );
+                                                    conversation.add_tool_result(
+                                                        &tc.id,
+                                                        &tc.name,
+                                                        &denied_msg,
+                                                    );
+                                                    continue;
+                                                }
+                                            }
+                                            crate::permissions::PermissionResult::Allowed => {}
                                         }
-                                        crate::permissions::PermissionResult::Allowed => {}
+
+                                        let start = std::time::Instant::now();
+                                        let tool_result =
+                                            tools::execute_tool("Shell", &tc.arguments)
+                                                .unwrap_or_else(|e| format!("Error: {e}"));
+                                        let duration = start.elapsed();
+
+                                        // Record in the update context
+                                        let cmd_name = tools::extract_command_name(&tc.arguments);
+                                        let args_val: serde_json::Value =
+                                            serde_json::from_str(&tc.arguments).unwrap_or_default();
+                                        let full_cmd =
+                                            args_val["command"].as_str().unwrap_or("").to_string();
+
+                                        if let Some(ref mut ctx) = active_update {
+                                            if !cmd_name.is_empty()
+                                                && !ctx.commands_used.contains(&cmd_name)
+                                            {
+                                                ctx.commands_used.push(cmd_name.clone());
+                                            }
+                                            ctx.shell_calls.push(ShellCallDetail {
+                                                command_name: cmd_name,
+                                                full_command: full_cmd,
+                                                result: tool_result.clone(),
+                                                duration,
+                                            });
+                                        }
+
+                                        // Add result to conversation (LLM needs feedback)
+                                        conversation.add_tool_result(
+                                            &tc.id,
+                                            &tc.name,
+                                            &tool_result,
+                                        );
+                                        // Suppress display — grouped under Update
+                                        continue;
                                     }
 
-                                    let start = std::time::Instant::now();
-                                    let tool_result = tools::execute_tool("Shell", &tc.arguments)
-                                        .unwrap_or_else(|e| format!("Error: {e}"));
-                                    let duration = start.elapsed();
+                                    // --- Non-Update, non-grouped tools ---
 
-                                    // Record in the update context
-                                    let cmd_name = tools::extract_command_name(&tc.arguments);
-                                    let args_val: serde_json::Value =
-                                        serde_json::from_str(&tc.arguments).unwrap_or_default();
-                                    let full_cmd =
-                                        args_val["command"].as_str().unwrap_or("").to_string();
-
-                                    if let Some(ref mut ctx) = active_update {
-                                        if !cmd_name.is_empty()
-                                            && !ctx.commands_used.contains(&cmd_name)
-                                        {
-                                            ctx.commands_used.push(cmd_name.clone());
-                                        }
-                                        ctx.shell_calls.push(ShellCallDetail {
-                                            command_name: cmd_name,
-                                            full_command: full_cmd,
-                                            result: tool_result.clone(),
-                                            duration,
-                                        });
+                                    // If there's an active Update and we hit a non-Shell tool,
+                                    // finalize the Update first.
+                                    if let Some(prev) = active_update.take() {
+                                        finalize_update(prev, &turn_events);
+                                        in_update_group.store(false, Ordering::Relaxed);
                                     }
 
-                                    // Add result to conversation (LLM needs feedback)
-                                    conversation.add_tool_result(&tc.id, &tc.name, &tool_result);
-                                    // Suppress display — grouped under Update
-                                    continue;
-                                }
-
-                                // --- Non-Update, non-grouped tools ---
-
-                                // If there's an active Update and we hit a non-Shell tool,
-                                // finalize the Update first.
-                                if let Some(prev) = active_update.take() {
-                                    finalize_update(prev, &turn_events);
-                                    in_update_group.store(false, Ordering::Relaxed);
-                                }
-
-                                // For non-local tools (server-side), use the cached result
-                                // from aura.tool_complete events instead of executing locally.
-                                // Display was already shown from on_tool_complete callback.
-                                if !tools::is_local_tool(&tc.name) {
-                                    let result = match server_results.get(&tc.id).cloned() {
-                                        Some(r) => r,
-                                        None => {
-                                            eprintln!(
+                                    // For non-local tools (server-side), use the cached result
+                                    // from aura.tool_complete events instead of executing locally.
+                                    // Display was already shown from on_tool_complete callback.
+                                    if !tools::is_local_tool(&tc.name) {
+                                        let result = match server_results.get(&tc.id).cloned() {
+                                            Some(r) => r,
+                                            None => {
+                                                eprintln!(
                                                 "{} {}",
                                                 "└─".themed(AuraStyle::Warning),
                                                 format!(
@@ -1626,55 +1772,43 @@ pub fn run_repl(
                                                 )
                                                 .themed(AuraStyle::Warning),
                                             );
-                                            tools::missing_server_result_message(&tc.name)
-                                        }
-                                    };
-                                    conversation.add_tool_result(&tc.id, &tc.name, &result);
-                                    continue;
-                                }
-
-                                // Show the tool call if permission will be prompted,
-                                // so the user has context for what they're approving.
-                                let perm = permissions.check(&tc.name, &tc.arguments);
-                                if matches!(perm, crate::permissions::PermissionResult::Prompt) {
-                                    let display =
-                                        tools::format_tool_call_display(&tc.name, &tc.arguments);
-                                    println!(
-                                        "{} {}",
-                                        "●"
-                                            .with(random_bullet_color())
-                                            .attribute(crossterm::style::Attribute::Bold),
-                                        display.themed(AuraStyle::Primary),
-                                    );
-                                }
-
-                                // Execute the tool (with permission check)
-                                let start = std::time::Instant::now();
-                                let tool_result = match perm {
-                                    crate::permissions::PermissionResult::Allowed => {
-                                        tools::execute_tool(&tc.name, &tc.arguments)
-                                            .unwrap_or_else(|e| format!("Error: {e}"))
+                                                tools::missing_server_result_message(&tc.name)
+                                            }
+                                        };
+                                        conversation.add_tool_result(&tc.id, &tc.name, &result);
+                                        continue;
                                     }
-                                    crate::permissions::PermissionResult::Denied(reason) => {
-                                        eprintln!(
-                                            "  {}",
-                                            reason.as_str().themed(AuraStyle::Warning)
-                                        );
-                                        let rules = permissions.describe_rules();
-                                        tools::permission_denied_message(
+
+                                    // Show the tool call if permission will be prompted,
+                                    // so the user has context for what they're approving.
+                                    let perm = permissions.check(&tc.name, &tc.arguments);
+                                    if matches!(perm, crate::permissions::PermissionResult::Prompt)
+                                    {
+                                        let display = tools::format_tool_call_display(
                                             &tc.name,
-                                            &reason,
-                                            rules.as_deref(),
-                                        )
+                                            &tc.arguments,
+                                        );
+                                        println!(
+                                            "{} {}",
+                                            "●"
+                                                .with(random_bullet_color())
+                                                .attribute(crossterm::style::Attribute::Bold),
+                                            display.themed(AuraStyle::Primary),
+                                        );
                                     }
-                                    crate::permissions::PermissionResult::Prompt => {
-                                        if permissions
-                                            .prompt_tool_permission(&tc.name, &tc.arguments)
-                                        {
+
+                                    // Execute the tool (with permission check)
+                                    let start = std::time::Instant::now();
+                                    let tool_result = match perm {
+                                        crate::permissions::PermissionResult::Allowed => {
                                             tools::execute_tool(&tc.name, &tc.arguments)
                                                 .unwrap_or_else(|e| format!("Error: {e}"))
-                                        } else {
-                                            let reason = "denied by user".to_string();
+                                        }
+                                        crate::permissions::PermissionResult::Denied(reason) => {
+                                            eprintln!(
+                                                "  {}",
+                                                reason.as_str().themed(AuraStyle::Warning)
+                                            );
                                             let rules = permissions.describe_rules();
                                             tools::permission_denied_message(
                                                 &tc.name,
@@ -1682,100 +1816,118 @@ pub fn run_repl(
                                                 rules.as_deref(),
                                             )
                                         }
-                                    }
-                                };
-                                let duration = start.elapsed();
+                                        crate::permissions::PermissionResult::Prompt => {
+                                            if permissions
+                                                .prompt_tool_permission(&tc.name, &tc.arguments)
+                                            {
+                                                tools::execute_tool(&tc.name, &tc.arguments)
+                                                    .unwrap_or_else(|e| format!("Error: {e}"))
+                                            } else {
+                                                let reason = "denied by user".to_string();
+                                                let rules = permissions.describe_rules();
+                                                tools::permission_denied_message(
+                                                    &tc.name,
+                                                    &reason,
+                                                    rules.as_deref(),
+                                                )
+                                            }
+                                        }
+                                    };
+                                    let duration = start.elapsed();
 
-                                // Record DisplayEvent for expand/replay
-                                let parsed_args: BTreeMap<String, serde_json::Value> =
-                                    serde_json::from_str(&tc.arguments).unwrap_or_default();
-                                if let Ok(mut events) = turn_events.lock() {
-                                    events.push(DisplayEvent::ToolCall {
-                                        tool_name: tc.name.clone(),
-                                        arguments: parsed_args,
+                                    // Record DisplayEvent for expand/replay
+                                    let parsed_args: BTreeMap<String, serde_json::Value> =
+                                        serde_json::from_str(&tc.arguments).unwrap_or_default();
+                                    if let Ok(mut events) = turn_events.lock() {
+                                        events.push(DisplayEvent::ToolCall {
+                                            tool_name: tc.name.clone(),
+                                            arguments: parsed_args,
+                                            duration,
+                                            result: Some(tool_result.clone()),
+                                        });
+                                    }
+
+                                    // Collect for grouped summary display
+                                    let display_name =
+                                        tools::extract_tool_display_name(&tc.name, &tc.arguments);
+                                    batch_tools.push((
+                                        tc.name.clone(),
+                                        display_name,
+                                        tc.arguments.clone(),
                                         duration,
-                                        result: Some(tool_result.clone()),
-                                    });
+                                    ));
+
+                                    // Add tool result to conversation history
+                                    conversation.add_tool_result(&tc.id, &tc.name, &tool_result);
                                 }
 
-                                // Collect for grouped summary display
-                                let display_name =
-                                    tools::extract_tool_display_name(&tc.name, &tc.arguments);
-                                batch_tools.push((
-                                    tc.name.clone(),
-                                    display_name,
-                                    tc.arguments.clone(),
-                                    duration,
-                                ));
-
-                                // Add tool result to conversation history
-                                conversation.add_tool_result(&tc.id, &tc.name, &tool_result);
-                            }
-
-                            // Print summaries for batch of local tools
-                            if !batch_tools.is_empty() {
-                                #[allow(clippy::type_complexity)]
-                                let mut groups: Vec<(
-                                    String,
-                                    Vec<String>,
-                                    Option<String>,
-                                    Option<std::time::Duration>,
-                                )> = Vec::new();
-                                for (name, display, args, dur) in &batch_tools {
-                                    if let Some(group) =
-                                        groups.iter_mut().find(|(n, _, _, _)| n == name)
-                                    {
-                                        group.1.push(display.clone());
-                                    } else {
-                                        groups.push((
-                                            name.clone(),
-                                            vec![display.clone()],
-                                            Some(args.clone()),
-                                            Some(*dur),
-                                        ));
+                                // Print summaries for batch of local tools
+                                if !batch_tools.is_empty() {
+                                    #[allow(clippy::type_complexity)]
+                                    let mut groups: Vec<(
+                                        String,
+                                        Vec<String>,
+                                        Option<String>,
+                                        Option<std::time::Duration>,
+                                    )> = Vec::new();
+                                    for (name, display, args, dur) in &batch_tools {
+                                        if let Some(group) =
+                                            groups.iter_mut().find(|(n, _, _, _)| n == name)
+                                        {
+                                            group.1.push(display.clone());
+                                        } else {
+                                            groups.push((
+                                                name.clone(),
+                                                vec![display.clone()],
+                                                Some(args.clone()),
+                                                Some(*dur),
+                                            ));
+                                        }
+                                    }
+                                    for (name, displays, first_args, first_duration) in &groups {
+                                        if displays.len() == 1 {
+                                            let args_str = first_args.as_deref().unwrap_or("{}");
+                                            let args_map: std::collections::BTreeMap<
+                                                String,
+                                                serde_json::Value,
+                                            > = serde_json::from_str(args_str).unwrap_or_default();
+                                            crate::ui::prompt::print_tool_call_summary(
+                                                name,
+                                                &args_map,
+                                                *first_duration,
+                                            );
+                                        } else {
+                                            // Multiple calls: grouped summary
+                                            let header = tools::format_tool_group_header(
+                                                name,
+                                                displays.len(),
+                                            );
+                                            tools::print_tool_group(&header, displays, false);
+                                        }
+                                        println!();
                                     }
                                 }
-                                for (name, displays, first_args, first_duration) in &groups {
-                                    if displays.len() == 1 {
-                                        let args_str = first_args.as_deref().unwrap_or("{}");
-                                        let args_map: std::collections::BTreeMap<
-                                            String,
-                                            serde_json::Value,
-                                        > = serde_json::from_str(args_str).unwrap_or_default();
-                                        crate::ui::prompt::print_tool_call_summary(
-                                            name,
-                                            &args_map,
-                                            *first_duration,
-                                        );
-                                    } else {
-                                        // Multiple calls: grouped summary
-                                        let header =
-                                            tools::format_tool_group_header(name, displays.len());
-                                        tools::print_tool_group(&header, displays, false);
-                                    }
-                                    println!();
+
+                                // Restart thinking animation for next iteration
+                                let (new_anim, new_stop) = WaveAnimation::start(
+                                    "Thinking",
+                                    vec![],
+                                    input_buf.clone(),
+                                    Some(cancel_flag.clone()),
+                                );
+                                // The new animation has its own internal stop flag.
+                                // Callbacks will stop it via ptw_anim.finish(), not stop_flag.
+                                drop(new_stop);
+                                // Store the new animation so it gets cleaned up properly
+                                if let Ok(mut guard) = post_tool_wave.lock() {
+                                    *guard = Some((new_anim, stop_flag.clone()));
                                 }
-                            }
+                                prepare_input_line(&input_buf, Some(&cancel_flag));
 
-                            // Restart thinking animation for next iteration
-                            let (new_anim, new_stop) = WaveAnimation::start(
-                                "Thinking",
-                                vec![],
-                                input_buf.clone(),
-                                Some(cancel_flag.clone()),
-                            );
-                            // The new animation has its own internal stop flag.
-                            // Callbacks will stop it via ptw_anim.finish(), not stop_flag.
-                            drop(new_stop);
-                            // Store the new animation so it gets cleaned up properly
-                            if let Ok(mut guard) = post_tool_wave.lock() {
-                                *guard = Some((new_anim, stop_flag.clone()));
+                                // Continue the tool loop
+                                continue 'tool_loop;
                             }
-                            prepare_input_line(&input_buf, Some(&cancel_flag));
-
-                            // Continue the tool loop
-                            continue 'tool_loop;
-                        }
+                        },
                         Err(e) => {
                             tool_loop_error = Some(e);
                             break 'tool_loop;
@@ -1905,6 +2057,7 @@ pub fn run_repl(
 
                         let (summary, usage, displayed_text) = if is_multi_line
                             && config.enable_final_response_summary
+                            && !reattach_released
                         {
                             let (summarize_anim, _) = WaveAnimation::start(
                                 "Thinking",
@@ -2047,6 +2200,7 @@ pub fn run_repl(
                         telemetry,
                         rt,
                         backend,
+                        approval_poster: &approval_poster,
                     };
                     match (pending.command.handler)(&mut ctx, &pending.args) {
                         CommandOutcome::Exit => {
@@ -2213,7 +2367,7 @@ impl<'a> ReplTelemetryLifecycle<'a> {
 /// "Thinking" animation, tool-call rendering, reasoning blocks, and the
 /// orchestrator task tree. State is shared via `Arc` so each turn's stream
 /// mutates the same terminal-display state the REPL reads between turns.
-struct ReplStreamHandler {
+pub(crate) struct ReplStreamHandler {
     pending_args:
         Arc<Mutex<std::collections::HashMap<String, BTreeMap<String, serde_json::Value>>>>,
     turn_events: Arc<Mutex<Vec<DisplayEvent>>>,
@@ -2243,9 +2397,46 @@ struct ReplStreamHandler {
     pending_approvals: Option<aura::hitl::PendingApprovals>,
     /// Largest context size any `aura.tool_usage` reported this request.
     turn_context_peak: u64,
+    /// The chat session this stream's requests run under — recorded on
+    /// the park so reattachment targets the same session route.
+    chat_session_id: String,
 }
 
 impl ReplStreamHandler {
+    /// A handler over fresh state, for the manual `/resume-run`
+    /// re-entry: the command layer has no live turn to share, so the
+    /// resumed segment renders through its own (identical) machinery.
+    /// The automatic in-turn reattach shares the turn's real state via
+    /// the handler factory instead.
+    pub(crate) fn fresh_for_manual_resume(
+        approval_poster: Option<crate::api::approval::ApprovalPoster>,
+        chat_session_id: String,
+    ) -> Self {
+        Self {
+            pending_args: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            turn_events: Arc::new(Mutex::new(Vec::new())),
+            live_reasoning: Arc::new(Mutex::new(None)),
+            live_worker_reasoning: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            worker_reasoning_seen: Arc::new(AtomicBool::new(false)),
+            session_info_seen: Arc::new(AtomicBool::new(false)),
+            stop_flag: Arc::new(AtomicBool::new(false)),
+            anim_cleared: Arc::new(AtomicBool::new(true)),
+            cancel: Arc::new(AtomicBool::new(false)),
+            post_tool_wave: Arc::new(Mutex::new(None)),
+            input_buf: Arc::new(Mutex::new(String::new())),
+            orch_state: Arc::new(Mutex::new(OrchDisplayState {
+                tasks: std::collections::HashMap::new(),
+            })),
+            needs_blank: Arc::new(AtomicBool::new(false)),
+            in_update_group: Arc::new(AtomicBool::new(false)),
+            approval_poster,
+            #[cfg(feature = "standalone-cli")]
+            pending_approvals: None,
+            turn_context_peak: 0,
+            chat_session_id,
+        }
+    }
+
     /// Renumber handler-owned row records (task headers, live reasoning
     /// bodies) after a tree-gap insertion moved rows at/below `shift.at`
     /// down. The statically-tracked records were already renumbered by
@@ -3282,6 +3473,82 @@ impl StreamHandler for ReplStreamHandler {
                         fields,
                     });
                 }
+                event_names::TASK_BLOCKED => {
+                    // The call is no longer running — it is parked awaiting
+                    // a decision — so its live duration ticker closes with
+                    // a terminal `blocked` marker instead of a duration.
+                    let tool_call_id = get_str(val, "tool_call_id");
+                    crate::ui::prompt::finalize_orch_tool_blocked(&tool_call_id);
+                }
+                event_names::RUN_PARKED => {
+                    let run_id = get_str(val, "run_id");
+                    let retention_expires_at = get_str(val, "retention_expires_at");
+                    let decision_ids: Vec<String> = val
+                        .get("decision_ids")
+                        .and_then(|a| a.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str().map(str::to_string))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+
+                    flush_all_worker_reasoning(&self.live_worker_reasoning);
+
+                    // The shared pre-match machinery already flushed the top
+                    // reasoning block, stopped the animation, erased the
+                    // input frame, and — critically — holds TERM_WRITE for
+                    // the whole match. Re-acquiring it here self-deadlocks.
+                    println!(
+                        "{}  {}",
+                        "⏸ Run parked".themed(AuraStyle::Warning),
+                        format!("(retention expires {retention_expires_at})")
+                            .themed(AuraStyle::Muted),
+                    );
+                    crate::ui::prompt::increment_orch_scrollback();
+
+                    if !run_id.is_empty() {
+                        println!(
+                            "  {} {}",
+                            "run:".themed(AuraStyle::Muted),
+                            run_id.clone().themed(AuraStyle::Primary),
+                        );
+                        crate::ui::prompt::increment_orch_scrollback();
+                    }
+
+                    for id in &decision_ids {
+                        let link = self
+                            .approval_poster
+                            .as_ref()
+                            .map(|p| p.approval_url(id))
+                            .unwrap_or_else(|| id.clone());
+                        println!(
+                            "  {} {}",
+                            "approve:".themed(AuraStyle::Muted),
+                            link.themed(AuraStyle::Primary),
+                        );
+                        crate::ui::prompt::increment_orch_scrollback();
+                    }
+
+                    println!();
+                    crate::ui::prompt::increment_orch_scrollback();
+
+                    // Record the reattach target for the in-turn driver
+                    // (and the manual /resume-run re-arm): one handle per
+                    // run, seeded only from this targeted event.
+                    if !run_id.is_empty()
+                        && let Ok(mut slot) = crate::repl::reattach::latest_park_slot().lock()
+                    {
+                        *slot = Some(crate::repl::reattach::ParkedRun {
+                            run_id,
+                            session_id: self.chat_session_id.clone(),
+                            retention_expires_at,
+                            decision_ids,
+                        });
+                        crate::repl::reattach::park_epoch()
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }
                 event_names::TASK_COMPLETED => {
                     let worker_id = get_str(val, "worker_id");
                     let task_id = get_str(val, "task_id");
@@ -3611,8 +3878,13 @@ impl StreamHandler for ReplStreamHandler {
                     // parented to the stream's trace.
                     let resolve = tracing::Instrument::instrument(
                         async move {
-                            if let Err(aura::hitl::ResolveError::NotFound) =
-                                registry.resolve(&id, decision.into()).await
+                            if let Err(aura::hitl::ResolveError::NotFound) = registry
+                                .resolve(
+                                    &id,
+                                    aura::hitl::ApprovalAuthority::Conversational,
+                                    decision.into(),
+                                )
+                                .await
                             {
                                 eprintln!(
                                     "warning: approval decision was not found \
@@ -3738,15 +4010,271 @@ impl StreamHandler for ReplStreamHandler {
     }
 }
 
+/// How a sliced wait ended.
+enum WaitOut {
+    Slept,
+    Cancelled,
+    CapReached,
+}
+
+/// Sleep `delay` in slices, staying responsive to cancellation and the
+/// retention cap. A `None` cap is an unknown bound, not an absent one:
+/// the wait is refused rather than run unbounded.
+fn wait_out(
+    delay: std::time::Duration,
+    cancel: &AtomicBool,
+    cap: Option<std::time::SystemTime>,
+) -> WaitOut {
+    let deadline = std::time::Instant::now() + delay;
+    while std::time::Instant::now() < deadline {
+        if cancel.load(Ordering::Relaxed) {
+            return WaitOut::Cancelled;
+        }
+        match cap {
+            None => return WaitOut::CapReached,
+            Some(cap) if std::time::SystemTime::now() >= cap => {
+                return WaitOut::CapReached;
+            }
+            Some(_) => {}
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    WaitOut::Slept
+}
+
+/// Render a retryable `parked` row's outstanding calls as a gate — a
+/// state, not an error: the run advanced and waits again.
+fn render_blocking_gate(
+    blocking: &[crate::api::resume::BlockingCall],
+    approval_poster: &Option<crate::api::approval::ApprovalPoster>,
+) {
+    let _term = lock_term();
+    println!(
+        "{}  {}",
+        "⏸ Still parked".themed(AuraStyle::Warning),
+        "waiting on approvals".themed(AuraStyle::Muted),
+    );
+    crate::ui::prompt::increment_orch_scrollback();
+    for call in blocking {
+        let link = approval_poster
+            .as_ref()
+            .map(|p| p.approval_url(&call.decision_id))
+            .unwrap_or_else(|| call.decision_id.clone());
+        println!(
+            "  {} {} {} {} {}",
+            "approve:".themed(AuraStyle::Muted),
+            link.themed(AuraStyle::Primary),
+            "—".themed(AuraStyle::Muted),
+            call.tool.as_str().themed(AuraStyle::Muted),
+            format!("(expires {})", call.expires_at).themed(AuraStyle::Muted),
+        );
+        crate::ui::prompt::increment_orch_scrollback();
+    }
+    println!();
+    crate::ui::prompt::increment_orch_scrollback();
+}
+
+/// Drive the bounded reattach for one parked run: poll the
+/// run-resource POST on the contract schedule (retryable rows at one
+/// second growing to five, five consecutive transient failures at
+/// 1/2/4/8/10 second delays, the advertised retention deadline as the
+/// total cap), render every resumed segment through the same REPL
+/// handler machinery, and stop automatic retries after an accepted
+/// stream ends ambiguously.
+///
+/// Returns the turn's final text (the resumed answer, the received
+/// partial plus the fixed message, or the fixed message alone) and
+/// whether the user cancelled the wait (no failure message is added in
+/// that case — the received partial alone is preserved).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn drive_reattach(
+    rt: &tokio::runtime::Runtime,
+    backend: &Backend,
+    park: crate::repl::reattach::ParkedRun,
+    cancel_flag: &Arc<AtomicBool>,
+    approval_poster: &Option<crate::api::approval::ApprovalPoster>,
+    make_handler: &mut impl FnMut() -> ReplStreamHandler,
+) -> (String, bool) {
+    use crate::api::resume::ResumeOutcome;
+    use crate::repl::reattach::{REIFY_FAILED_MESSAGE, ReattachEnd, ReattachSchedule};
+
+    /// Append one segment's received text to the running partial.
+    /// Concatenation is verbatim — segments of one run's answer are
+    /// parts of the same stream, and only content actually received is
+    /// saved: no separator is invented between them.
+    fn accumulate(partial: &mut String, received: StreamResult) {
+        let text = match received {
+            StreamResult::TextResponse(text) => text,
+            StreamResult::ToolCalls { text, .. } => text,
+        };
+        partial.push_str(&text);
+    }
+
+    let mut cap = crate::repl::reattach::retention_cap_from(&park.retention_expires_at);
+    let mut park = park;
+    let mut schedule = ReattachSchedule::new();
+    let mut partial = String::new();
+
+    let end = loop {
+        if let Some(cap) = cap
+            && std::time::SystemTime::now() >= cap
+        {
+            break ReattachEnd::RetentionCap;
+        }
+        if cancel_flag.load(Ordering::Relaxed) {
+            break ReattachEnd::Cancelled;
+        }
+
+        // The park record is peeks-only here: epoch change (not slot
+        // emptiness) says THIS request parked, and the record stays
+        // available for a later manual re-arm.
+        let epoch_before = crate::repl::reattach::current_park_epoch();
+        let mut handler = make_handler();
+        let outcome = rt.block_on(backend.stream_resume(
+            &park.session_id,
+            &park.run_id,
+            cancel_flag.clone(),
+            &mut handler,
+        ));
+        // A POST may have consumed request time past the deadline:
+        // re-check before any wait or further poll.
+        if let Some(cap) = cap
+            && std::time::SystemTime::now() >= cap
+        {
+            break ReattachEnd::RetentionCap;
+        }
+
+        let retryable_wait = |schedule: &mut ReattachSchedule| schedule.next_retryable_delay();
+        let transient_wait = |schedule: &mut ReattachSchedule| schedule.record_transient();
+
+        match outcome {
+            // Transport errors and 503s share the transient budget.
+            Err(_) | Ok(ResumeOutcome::Unavailable) => match transient_wait(&mut schedule) {
+                Some(delay) => match wait_out(delay, cancel_flag, cap) {
+                    WaitOut::Slept => continue,
+                    WaitOut::Cancelled => break ReattachEnd::Cancelled,
+                    WaitOut::CapReached => break ReattachEnd::RetentionCap,
+                },
+                None => break ReattachEnd::TransientBudget,
+            },
+            Ok(ResumeOutcome::Parked { blocking }) => {
+                render_blocking_gate(&blocking, approval_poster);
+                let delay = retryable_wait(&mut schedule);
+                match wait_out(delay, cancel_flag, cap) {
+                    WaitOut::Slept => continue,
+                    WaitOut::Cancelled => break ReattachEnd::Cancelled,
+                    WaitOut::CapReached => break ReattachEnd::RetentionCap,
+                }
+            }
+            Ok(ResumeOutcome::Running) => {
+                let delay = retryable_wait(&mut schedule);
+                match wait_out(delay, cancel_flag, cap) {
+                    WaitOut::Slept => continue,
+                    WaitOut::Cancelled => break ReattachEnd::Cancelled,
+                    WaitOut::CapReached => break ReattachEnd::RetentionCap,
+                }
+            }
+            Ok(ResumeOutcome::Streamed(outcome)) => {
+                // The POST was accepted: transient failures are no
+                // longer consecutive.
+                schedule.reset_transient();
+                let reparked = crate::repl::reattach::current_park_epoch() != epoch_before;
+                if reparked
+                    && let Some(new_park) = crate::repl::reattach::latest_park_slot()
+                        .lock()
+                        .ok()
+                        .and_then(|g| g.clone())
+                {
+                    // A fresh park: the handler's arm rendered the new
+                    // gate, the segment's received text stays in the
+                    // running partial, and the renewed checkpoint's
+                    // retention deadline re-arms the total cap. The new
+                    // gate still waits on the fresh cadence before the
+                    // next poll — an unknown renewed bound refuses the
+                    // wait instead of polling unbounded.
+                    accumulate(&mut partial, outcome.received);
+                    park = new_park;
+                    cap = crate::repl::reattach::retention_cap_from(&park.retention_expires_at);
+                    schedule = ReattachSchedule::new();
+                    let delay = schedule.next_retryable_delay();
+                    match wait_out(delay, cancel_flag, cap) {
+                        WaitOut::Slept => continue,
+                        WaitOut::Cancelled => break ReattachEnd::Cancelled,
+                        WaitOut::CapReached => break ReattachEnd::RetentionCap,
+                    }
+                }
+                match outcome.termination {
+                    StreamTermination::Done => match outcome.received {
+                        StreamResult::TextResponse(text) => {
+                            let mut text_all = std::mem::take(&mut partial);
+                            text_all.push_str(&text);
+                            break ReattachEnd::Completed(text_all);
+                        }
+                        // An orchestration resume ends in text or a
+                        // re-park; client tool calls here mean the
+                        // segment ended oddly — treat the received text
+                        // as the partial and stop.
+                        StreamResult::ToolCalls { text, .. } => {
+                            accumulate(&mut partial, StreamResult::TextResponse(text));
+                            break ReattachEnd::AmbiguousStream;
+                        }
+                    },
+                    StreamTermination::Cancelled => {
+                        accumulate(&mut partial, outcome.received);
+                        break ReattachEnd::Cancelled;
+                    }
+                    // After acceptance, an ambiguous end stops all
+                    // automatic retries; the received partial is kept.
+                    _ => {
+                        accumulate(&mut partial, outcome.received);
+                        break ReattachEnd::AmbiguousStream;
+                    }
+                }
+            }
+            Ok(
+                ResumeOutcome::Interrupted
+                | ResumeOutcome::ConfigChanged
+                | ResumeOutcome::Mismatch
+                | ResumeOutcome::Expired,
+            ) => break ReattachEnd::Terminal,
+            Ok(ResumeOutcome::NotFound) => break ReattachEnd::NotFound,
+            Ok(ResumeOutcome::ReifyFailed) => break ReattachEnd::ReifyFailed,
+        }
+    };
+
+    match end {
+        ReattachEnd::Completed(text) => (text, false),
+        ReattachEnd::Cancelled => (partial, true),
+        ReattachEnd::AmbiguousStream => {
+            let text = if partial.is_empty() {
+                REIFY_FAILED_MESSAGE.to_string()
+            } else {
+                format!("{partial}\n\n{REIFY_FAILED_MESSAGE}")
+            };
+            (text, false)
+        }
+        _ => (REIFY_FAILED_MESSAGE.to_string(), false),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         COMMAND_ALIASES, COMPACT_NUDGE_FILL, ReplTelemetryLifecycle, approval_requested_line,
-        command_hint, compaction_note, should_nudge_at_fill,
+        command_hint, compaction_note, orch_event_prints_scrollback, should_nudge_at_fill,
     };
     use crate::repl::registry;
     use crate::ui::prompt::ContextWindowUsage;
     use std::num::NonZeroU64;
+
+    #[test]
+    fn run_parked_passes_the_scrollback_gate() {
+        // The on_orchestrator_event dispatch returns early for any
+        // orchestrator event outside this gate, so a RunParked that is not
+        // listed never fills the reattach slot or bumps the park epoch —
+        // the auto-resume after approval/timeout silently never engages.
+        assert!(orch_event_prints_scrollback(crate::event_names::RUN_PARKED));
+    }
 
     #[test]
     fn compaction_note_reports_window_fill() {

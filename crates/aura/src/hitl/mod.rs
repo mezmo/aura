@@ -44,6 +44,7 @@ pub use decision::{
     DecisionId, ResolvedDecision, Timestamp,
 };
 pub(crate) use events::completed_cancelled_event;
+pub use outcome::{AddressedApproval, ApprovalAuthority, ApprovalRead};
 /// Read one full HTTP/1.1 request (head plus content-length body) off a
 /// test socket, returning the raw text. Shared by the scripted receivers in
 /// the route and poller test modules.
@@ -85,10 +86,9 @@ pub(crate) async fn read_full_request(socket: &mut tokio::net::TcpStream) -> Str
 }
 
 pub use gate::HitlApprovalWrapper;
-pub use outcome::ApprovalAuthority;
 pub use poller::{PollReconciler, PollerExit, PollerHandle};
 pub use protocol::{ApprovalDecisionWire, ApprovalItem, ApprovalRequest, PROTOCOL_VERSION};
-pub use registry::{ParkedApproval, PendingApprovals, ResolveError};
+pub use registry::{AcknowledgmentState, ParkedApproval, PendingApprovals, ResolveError};
 // Re-exported so config-fingerprint tests construct the poll client the
 // production way.
 #[cfg(test)]

@@ -33,8 +33,8 @@
 //! // `RigBuilder` returns an `Orchestrator` (wrapped as `StreamingAgent`) when
 //! // `orchestration.enabled = true`, or a standard `Agent` otherwise.
 //! let config = load_config_from_str(toml_str)?;
-//! let agent: std::sync::Arc<dyn StreamingAgent> = RigBuilder::new(config)
-//!     .build_streaming_agent_with_headers(None, None, None)
+//! let agent: std::sync::Arc<dyn StreamingAgent> = RigBuilder::new(config, pending_approvals)
+//!     .build_streaming_agent_with_headers(None, None, None, None, None)
 //!     .await?;
 //!
 //! let run = agent.stream(query, history, RunOptions::default(), "req_123").await;
@@ -83,6 +83,25 @@ pub use tools::wait_for::{StopReason, WaitForError, WaitForOutput, WaitForTool};
 pub use tools::{SubmitResultDecision, SubmitResultOutput, SubmitResultTool};
 
 pub(crate) use park::{CallKey, ParkGuard, RecordedDecisions, run_owner_id};
+// The park retention sweep engine and its lifecycle handle: the web server
+// wires one engine per park-enabled config and drives the startup pass and
+// the cadence loop.
+pub use park::sweep::{ParkSweep, SweepExit, SweepHandle};
+// The park-owned execution lifetime: the shared run-reservation fence and
+// the scope detached park work registers under. `RunExecutionScope` rides
+// the public `ToolCallContext` field, and `ReservationFault` is the error
+// arm of the publicly reachable `ResumeClaimTable::reserve`, so all three
+// names are part of the crate's public surface.
+pub use park::lifetime::{ReservationFault, RunExecutionScope, RunReservationLease};
+// The resume endpoint's surfaces: consumed by aura-web-server's resume
+// handler (P45). Every type named in a re-exported signature is re-exported
+// with it, so the consumer can name what it receives.
+pub use park::resume::{
+    BlockingEntry, ConflictCode, Diagnostic, EmptyBlocking, MalformedId, NonEmptyBlocking,
+    ParkedToolName, ResumeClaimTable, ResumeConflictRow, ResumeDocuments, ResumeEvaluation,
+    ResumeGrant, ResumeRefusal, ResumeRunId, ResumeSessionId, ResumeStreamEnd, SegmentError,
+    ValidatedResumePath, evaluate_resume, run_segment_borrowed,
+};
 // The sentinel leak guard drives the commit and the resuming document
 // from the reconciler side of the crate.
 #[cfg(test)]
@@ -95,6 +114,11 @@ pub(crate) use park::{
 pub use prompt_constants::{context, fields, sections};
 #[cfg(test)]
 pub(crate) use test_rig::ScriptedAgent;
+// Test-only in-crate reach for the reservation table: the L2 lifetime
+// goldens (tool_wrapper.rs) build real scopes over admitted runs. Never
+// crosses the public facade (same pattern as ScriptedAgent above).
+#[cfg(test)]
+pub(crate) use park::lifetime::ReservationTable;
 pub use types::{
     BlockedCell, CellOutcome, ParkSnapshot, PendingCall, Plan, PlanningResponse, RunId, StepInput,
     StructuredTaskOutput, Task, TaskIdentity, TaskJson, TaskState, TaskStatus,

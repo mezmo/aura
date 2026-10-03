@@ -41,7 +41,8 @@ serde_json = { workspace = true }
 
 # Async
 tokio = { workspace = true }
-tokio-util = "0.7"
+# `rt` gates TaskTracker, the park execution scope's join barrier
+tokio-util = { version = "0.7", features = ["rt"] }
 async-trait = "0.1"
 
 # Error handling

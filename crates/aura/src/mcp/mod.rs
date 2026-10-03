@@ -39,6 +39,12 @@ pub use response::{CallOutcome, MAX_TOOL_ERROR_BYTES, bound_error_content, extra
 pub use sse::SseTransport;
 pub use types::{AuraTool, ToolName, ToolNamespace};
 
+// Test-only reexport (the S6 wave's discipline, cf. hitl/mod.rs
+// `webhook_client_from_config`): the A1 resume goldens read the MCP
+// arm/close observation seam (aura#271, card P45).
+#[cfg(test)]
+pub(crate) use manager::a1_observation;
+
 #[allow(deprecated)]
 pub use tools::{
     AnalyzeLogsRelativeTimeTool, AnalyzeLogsTimeRangeTool, ExportLogsRelativeTimeTool,

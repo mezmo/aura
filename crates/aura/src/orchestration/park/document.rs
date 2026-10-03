@@ -10,6 +10,7 @@
 use std::io;
 use std::path::Path;
 
+use http::HeaderMap;
 use rig::completion::Message;
 use serde::{Deserialize, Serialize};
 
@@ -19,6 +20,7 @@ use crate::orchestration::types::{
 };
 
 use super::ParkedTaskRecords;
+use super::retention::RetentionExpiresAt;
 
 /// The checkpoint format version this build writes and accepts.
 pub(crate) const SCHEMA_VERSION: u32 = 1;
@@ -97,8 +99,10 @@ pub(crate) struct ParkedRun {
     pub run_id: String,
     /// RFC 3339 timestamp of the park commit.
     pub parked_at: String,
-    /// RFC 3339 timestamp after which the run's decisions have expired.
-    pub expires_at: String,
+    /// The absolute retention deadline: the instant after which the run's
+    /// parked evidence may be reclaimed, renewed by each successful
+    /// checkpoint publication.
+    pub retention_expires_at: RetentionExpiresAt,
     /// The query that started the run.
     pub query: String,
     /// The external chat history the run was started with.
@@ -116,6 +120,16 @@ pub(crate) struct ParkedRun {
     #[serde(default)]
     pub executed: Vec<String>,
     pub config_fingerprint: String,
+    /// Hex sha256 of the bound identity header's value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_hash: Option<String>,
+    /// The original request's resolved `headers_from_request` egress values,
+    /// frozen at park time. A resumed run's route seeds itself from these,
+    /// so new gated asks (and re-parks) authenticate to the receiver under
+    /// the original request's identity. Empty for conversational routes and
+    /// checkpoints written before the field existed.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub request_egress: std::collections::HashMap<String, String>,
 }
 
 impl ParkedRun {
@@ -148,14 +162,19 @@ pub(crate) struct RunStateForPark<'a> {
 /// Build the checkpoint from the run's current state. `pending_by_task`
 /// narrows each awaiting node to the calls still awaiting a decision, and an
 /// awaiting node without a park record is an error: a checkpoint that cannot
-/// resume must not be written.
+/// resume must not be written. `identity_hash` carries the hex sha256 of the
+/// bound identity header's value; `None` serializes nothing, so the v1 wire
+/// form is unchanged for runs parked without identity binding.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_document(
     state: &RunStateForPark<'_>,
     plan: &Plan,
     records: &ParkedTaskRecords,
     pending_by_task: &std::collections::HashMap<usize, Vec<PendingCall>>,
-    expires_at: String,
+    retention_expires_at: RetentionExpiresAt,
     config_fingerprint: String,
+    identity_hash: Option<String>,
+    request_egress: &HeaderMap,
 ) -> io::Result<ParkedRun> {
     let mut tasks = Vec::with_capacity(plan.tasks.len());
     for t in &plan.tasks {
@@ -202,7 +221,7 @@ pub(crate) fn build_document(
         session_id: state.session_id.map(str::to_string),
         run_id: state.run_id.to_string(),
         parked_at: chrono::Utc::now().to_rfc3339(),
-        expires_at,
+        retention_expires_at,
         query: state.query.to_string(),
         chat_history: state.chat_history.to_vec(),
         coordinator_conversation: state.coordinator_conversation.to_vec(),
@@ -217,13 +236,17 @@ pub(crate) fn build_document(
         },
         executed: Vec::new(),
         config_fingerprint,
+        identity_hash,
+        request_egress: request_egress
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_str().unwrap_or("").to_string()))
+            .collect(),
     })
 }
 
 /// Load a checkpoint document from `path`, rejecting unknown schema
 /// versions. The read runs on the blocking pool. Used by the park commit's
 /// tests and by the resume path's [`super::continuation::ResumingDocumentHandle::open`].
-#[allow(dead_code)] // P45 resume endpoint consumes the rehydrate entry points
 pub(crate) async fn load_parked_run(path: &Path) -> io::Result<ParkedRun> {
     let display = path.display().to_string();
     let path = path.to_path_buf();
@@ -256,6 +279,14 @@ mod tests {
     use crate::orchestration::park::ParkedTaskRecord;
 
     const GOLDEN: &str = include_str!("../../../testdata/park/parked_run_v1.json");
+
+    fn retention(stamp: &str) -> RetentionExpiresAt {
+        RetentionExpiresAt::from_datetime(
+            chrono::DateTime::parse_from_rfc3339(stamp)
+                .expect("fixture stamp parses")
+                .with_timezone(&chrono::Utc),
+        )
+    }
 
     fn pending_call(tool: &str, call_id: &str) -> PendingCall {
         PendingCall {
@@ -319,8 +350,10 @@ mod tests {
             &plan,
             &records,
             &pending_by_task,
-            "2026-09-02T15:00:00+00:00".to_string(),
+            retention("2026-09-02T15:00:00+00:00"),
             "fingerprint".to_string(),
+            None,
+            &HeaderMap::new(),
         )
         .unwrap();
 
@@ -379,8 +412,10 @@ mod tests {
             &plan,
             &records,
             &pending_by_task,
-            "2026-09-02T15:00:00+00:00".to_string(),
+            retention("2026-09-02T15:00:00+00:00"),
             "fingerprint".to_string(),
+            None,
+            &HeaderMap::new(),
         )
         .unwrap();
 
@@ -409,8 +444,10 @@ mod tests {
             &plan,
             &ParkedTaskRecords::new(),
             &std::collections::HashMap::new(),
-            "2026-09-02T15:00:00+00:00".to_string(),
+            retention("2026-09-02T15:00:00+00:00"),
             "fingerprint".to_string(),
+            None,
+            &HeaderMap::new(),
         )
         .unwrap_err();
         assert!(err.to_string().contains("task 0"), "{err}");

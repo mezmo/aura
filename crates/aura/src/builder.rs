@@ -349,15 +349,26 @@ impl Agent {
                 ])),
                 None => gate,
             });
-            let approval_tool = crate::hitl::RequestApprovalTool::new(
-                hitl.route.clone(),
-                scope,
-                request_id,
-                config_owned.agent.name.clone(),
-                config_owned.instance_id.clone(),
-            );
-            hitl_approval_tool = Some(approval_tool.clone());
-            config_owned.hitl_request_approval_tool = Some(approval_tool);
+            // Poll-mode delivery gives the agent no callable park path: the
+            // 207 bridge registers the call server-side and the poller
+            // resolves it, so the tool is not advertised. Only poll is
+            // suppressed — conversational keeps the inline tool and a sync
+            // hold keeps it too. The gate above still enforces the approval
+            // on gated calls.
+            if !matches!(
+                hitl.route.park_authority(),
+                Some(crate::hitl::ApprovalAuthority::WebhookPoll)
+            ) {
+                let approval_tool = crate::hitl::RequestApprovalTool::new(
+                    hitl.route.clone(),
+                    scope,
+                    request_id,
+                    config_owned.agent.name.clone(),
+                    config_owned.instance_id.clone(),
+                );
+                hitl_approval_tool = Some(approval_tool.clone());
+                config_owned.hitl_request_approval_tool = Some(approval_tool);
+            }
         }
 
         // Scratchpad bonus only applies when scratchpad was actually wired up
@@ -1784,9 +1795,16 @@ impl StreamingAgent for Agent {
 /// `orchestration.enabled = true`, any supplied `client_tools` are dropped
 /// with a warning. In single-agent mode, they are attached to the agent only
 /// when `[agent].enable_client_tools = true` (filtered by `client_tool_filter`).
+///
+/// `reservation_table` is the deployment's one shared run-reservation table.
+/// An orchestrated build injects it so a park-enabled producer reserves its
+/// persistence-bound run; `None` on non-park callers and on callers that hold
+/// no shared table. The factory itself gates reservation on `park_enabled()`,
+/// so an injected table on a non-park config is inert.
 pub async fn build_streaming_agent(
     config: &crate::config::AgentRuntimeConfig,
     client_tools: Option<Vec<ClientTool>>,
+    reservation_table: Option<Arc<crate::orchestration::ResumeClaimTable>>,
 ) -> Result<Arc<dyn StreamingAgent>, Box<dyn std::error::Error + Send + Sync>> {
     use crate::orchestration::OrchestratorFactory;
 
@@ -1799,7 +1817,10 @@ pub async fn build_streaming_agent(
                  will be ignored. Use a non-orchestrated agent config to enable them."
             );
         }
-        let factory = OrchestratorFactory::new(config.clone());
+        let factory = match reservation_table {
+            Some(table) => OrchestratorFactory::new(config.clone()).with_reservation_table(table),
+            None => OrchestratorFactory::new(config.clone()),
+        };
         Ok(Arc::new(factory))
     } else {
         // Standard single-agent mode: gate client tools on the agent's TOML opt-in
@@ -2685,6 +2706,104 @@ mod tests {
             result.output.contains("[scratchpad:"),
             "scratchpad must rewrite the LLM-facing output to a pointer, got: {}",
             &result.output[..result.output.len().min(120)]
+        );
+    }
+
+    // ====================================================================
+    // Poll-mode tool suppression: poll configurations do not advertise the
+    // server-side `request_approval` tool (single-agent/inline keeps it).
+    // GREEN since R4-INT-4: the attach in `Agent::new` is scoped to non-poll
+    // routes.
+    // ====================================================================
+
+    /// A HITL-enabled single-agent config over the given decision route
+    /// (poll settings mirror poller.rs `poll_config`).
+    fn hitl_agent_config(route: aura_config::DecisionRouteConfig) -> AgentRuntimeConfig {
+        let hitl = aura_config::HitlConfig {
+            require_approval: vec![],
+            park: aura_config::ParkConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            route,
+        };
+        AgentRuntimeConfig {
+            hitl: Some(crate::hitl::HitlRuntime::from_config(
+                &hitl,
+                &crate::hitl::PendingApprovals::new(),
+                None,
+                None,
+            )),
+            ..AgentRuntimeConfig::default()
+        }
+    }
+
+    fn webhook_poll_route() -> aura_config::DecisionRouteConfig {
+        aura_config::DecisionRouteConfig::Webhook {
+            url: aura_config::WebhookUrl::new("https://approvals.example.com/").unwrap(),
+            timeout_secs: Some(300),
+            headers: std::collections::HashMap::new(),
+            headers_from_request: std::collections::HashMap::new(),
+            tool_headers_from_response: aura_config::ToolHeaderMappings::default(),
+            delivery: aura_config::WebhookDelivery::Poll,
+            poll_url: None,
+            poll_interval_secs: 1,
+            poll_request_timeout_secs: 30,
+            receiver_wait_timeout_secs: 900,
+        }
+    }
+
+    /// The tool names the built agent ADVERTISES — the contract surface
+    /// for poll-mode suppression (the transient config field is consumed
+    /// by the build; the advertised set is what the model sees).
+    async fn advertised_tool_names(agent: &Agent) -> Vec<String> {
+        let defs = match &agent.inner {
+            ProviderAgent::OpenAI(agent) => agent.tool_server_handle.get_tool_defs(None).await,
+            ProviderAgent::Anthropic(agent) => agent.tool_server_handle.get_tool_defs(None).await,
+            ProviderAgent::Bedrock(agent) => agent.tool_server_handle.get_tool_defs(None).await,
+            ProviderAgent::Gemini(agent) => agent.tool_server_handle.get_tool_defs(None).await,
+            ProviderAgent::Ollama(agent) => agent.tool_server_handle.get_tool_defs(None).await,
+            ProviderAgent::OpenRouter(agent) => agent.tool_server_handle.get_tool_defs(None).await,
+            #[cfg(test)]
+            ProviderAgent::Scripted(agent) => agent.tool_server_handle.get_tool_defs(None).await,
+        };
+        defs.expect("tool definitions list")
+            .into_iter()
+            .map(|def| def.name)
+            .collect()
+    }
+
+    /// Poll mode does not advertise the request_approval tool: the poll
+    /// contract resolves decisions without an agent-callable park path.
+    #[tokio::test]
+    async fn poll_mode_does_not_advertise_the_request_approval_tool() {
+        let config = hitl_agent_config(webhook_poll_route());
+        let agent = Agent::new(&config, vec![], None)
+            .await
+            .expect("the poll-mode agent builds");
+
+        let names = advertised_tool_names(&agent).await;
+        assert!(
+            !names.iter().any(|name| name == "request_approval"),
+            "poll mode must not advertise request_approval; advertised: {names:?}",
+        );
+    }
+
+    /// Conversational mode keeps the inline tool: suppression is
+    /// poll-scoped, not a removal.
+    #[tokio::test]
+    async fn conversational_route_keeps_the_inline_request_approval_tool() {
+        let config = hitl_agent_config(aura_config::DecisionRouteConfig::Conversational {
+            timeout_secs: 60,
+        });
+        let agent = Agent::new(&config, vec![], None)
+            .await
+            .expect("the conversational agent builds");
+
+        let names = advertised_tool_names(&agent).await;
+        assert!(
+            names.iter().any(|name| name == "request_approval"),
+            "conversational mode keeps the inline request_approval tool; advertised: {names:?}",
         );
     }
 }
