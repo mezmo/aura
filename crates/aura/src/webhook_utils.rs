@@ -55,10 +55,7 @@ pub fn resolve_headers(
             HeaderName::from_bytes(key.as_bytes()),
             HeaderValue::from_str(value),
         ) {
-            // `HeaderValue::from_str` admits bytes above 0x7F, but the
-            // resolved map is also persisted as text, so a value outside
-            // visible ASCII is skipped like any other invalid header.
-            (Ok(name), Ok(val)) if val.to_str().is_ok() => {
+            (Ok(name), Ok(val)) => {
                 header_map.insert(name, val);
             }
             _ => {
@@ -97,11 +94,13 @@ impl EgressCaptureError {
 
 /// The strict egress check behind the park arm's registration-closed rule:
 /// every `headers_from_request` destination must appear in `resolved` with a
-/// valid header value. `resolve_headers` skips invalid entries with a warning,
-/// so presence in the resolved map is exactly "a usable resolved value" —
-/// from the request itself or from a valid static fallback (whose existing
-/// resolution semantics this check preserves). A map with no `headers_from_request`
-/// destinations always passes.
+/// valid header value that persists as text: `resolve_headers` skips invalid
+/// entries with a warning, and a value outside visible ASCII (admitted by
+/// `HeaderValue::from_str` but not persistable) is treated here as no usable
+/// value — the park arm's registration-closed rule is where the persist
+/// contract is enforced, not the shared resolver, so the sync delivery paths
+/// forward such values verbatim as they always have. A map with no
+/// `headers_from_request` destinations always passes.
 pub fn check_egress_capture(
     resolved: &HeaderMap,
     headers_from_request: &HashMap<String, String>,
@@ -109,7 +108,11 @@ pub fn check_egress_capture(
     let missing: Vec<String> = headers_from_request
         .keys()
         .map(|destination| destination.to_lowercase())
-        .filter(|destination| !resolved.contains_key(destination))
+        .filter(|destination| {
+            resolved
+                .get(destination)
+                .is_none_or(|value| value.to_str().is_err())
+        })
         .collect();
     if missing.is_empty() {
         Ok(())
@@ -134,9 +137,10 @@ pub fn build_hmac_from_secret(secret: Option<&str>) -> Result<Option<WebhookHmac
 }
 
 /// Header pairs as a storage projection: (lowercased name, value) strings.
-/// Every producer of a persisted map keeps values to visible ASCII
-/// (`resolve_headers` skips anything else, `ApproverHeaders::from_captured`
-/// and `pairs_to_header_map` reject it), so `to_str` cannot fail here.
+/// Every producer of a persisted map keeps values to visible ASCII (the park
+/// arm's `check_egress_capture` refuses anything else at registration, and
+/// `ApproverHeaders::from_captured` and `pairs_to_header_map` reject it), so
+/// `to_str` cannot fail here.
 pub(crate) fn header_map_to_pairs(
     headers: &reqwest::header::HeaderMap,
 ) -> std::collections::BTreeMap<String, String> {
@@ -263,20 +267,38 @@ mod tests {
     }
 
     /// A request header value outside visible ASCII is admitted by
-    /// `HeaderValue::from_str` but cannot be persisted as text, so
-    /// resolution skips it like any other invalid header.
+    /// `HeaderValue::from_str` and forwarded verbatim: the resolver serves
+    /// the sync delivery paths too, which never persist the map. The persist
+    /// contract is enforced at the park arm's capture check instead.
     #[test]
-    fn resolve_headers_skips_a_non_ascii_value() {
+    fn resolve_headers_forwards_a_non_ascii_value_verbatim() {
         let resolved = resolve_headers(
             &headers(&[("x-static", "caf\u{e9}"), ("x-ok", "plain")]),
             &HashMap::new(),
             None,
         );
-        assert!(
-            resolved.get("x-static").is_none(),
-            "non-ASCII value skipped"
+        assert_eq!(
+            resolved.get("x-static").unwrap().as_bytes(),
+            "caf\u{e9}".as_bytes(),
+            "non-ASCII value forwarded unchanged"
         );
         assert_eq!(resolved.get("x-ok").unwrap(), "plain");
+    }
+
+    /// A mapped destination whose resolved value cannot persist as text
+    /// counts as no usable value: the capture check refuses it by name.
+    #[test]
+    fn check_egress_capture_refuses_a_non_ascii_mapped_value() {
+        let resolved = resolve_headers(
+            &headers(&[("x-bad", "caf\u{e9}"), ("x-ok", "plain")]),
+            &HashMap::new(),
+            None,
+        );
+        let mut mapped = HashMap::new();
+        mapped.insert("x-bad".to_string(), "x-bad".to_string());
+        let err = check_egress_capture(&resolved, &mapped)
+            .expect_err("a non-persistable value is no usable value");
+        assert_eq!(err.missing_names(), ["x-bad".to_string()]);
     }
 
     /// Restoring a stored pair whose value is outside visible ASCII fails
