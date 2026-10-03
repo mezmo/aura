@@ -57,7 +57,7 @@ pub use config::{AgentRuntimeConfig, SessionId, ToolContextFactory};
 pub use aura_config::{
     AgentConfig, AgentSettings, CatalogHmacConfig, CatalogWebhookConfig, EmbeddingConfig,
     GovernanceConfig, LlmConfig, McpConfig, McpServerConfig, ReasoningEffort, SkillConfig,
-    TodoToolsConfig, ToolsConfig, VectorStoreConfig, VectorStoreType, glob_match, lenient_int,
+    TodoToolsConfig, ToolsConfig, VectorStoreConfig, VectorStoreType, lenient_int,
 };
 pub use error::{BuilderError, BuilderResult};
 pub use orchestration::tools::{

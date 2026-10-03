@@ -5,7 +5,9 @@
 //! the eight exploration tools) lives in the `aura` crate's `scratchpad`
 //! module.
 
+use crate::globpattern::GlobPattern;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// Scratchpad configuration.
 ///
@@ -49,6 +51,92 @@ pub struct ScratchpadToolEntry {
     /// Minimum output size (in tokens) before interception kicks in.
     #[serde(default = "default_scratchpad_min_tokens")]
     pub min_tokens: usize,
+}
+
+/// One per-tool scratchpad override: a tool-name pattern and its thresholds.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScratchpadRule {
+    pub pattern: GlobPattern,
+    pub entry: ScratchpadToolEntry,
+}
+
+/// The per-tool scratchpad overrides for one MCP server, parsed from the
+/// `[mcp.servers.<name>.scratchpad]` table.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ScratchpadRules {
+    rules: Vec<ScratchpadRule>,
+}
+
+impl ScratchpadRules {
+    pub fn is_empty(&self) -> bool {
+        self.rules.is_empty()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &ScratchpadRule> {
+        self.rules.iter()
+    }
+
+    /// Add a rule, replacing any existing rule with the same pattern text.
+    ///
+    /// Mirrors what a TOML table does with a repeated key, so a config written
+    /// back out round-trips to the same shape. The rules are kept sorted by
+    /// pattern source, so walking them visits the same order on every run.
+    pub fn insert(&mut self, pattern: GlobPattern, entry: ScratchpadToolEntry) {
+        match self.rules.iter_mut().find(|rule| rule.pattern == pattern) {
+            Some(existing) => existing.entry = entry,
+            None => {
+                self.rules.push(ScratchpadRule { pattern, entry });
+                self.rules
+                    .sort_by(|a, b| a.pattern.as_str().cmp(b.pattern.as_str()));
+            }
+        }
+    }
+
+    /// The entry whose pattern text is exactly `pattern`.
+    #[must_use]
+    pub fn get(&self, pattern: &str) -> Option<&ScratchpadToolEntry> {
+        self.rules
+            .iter()
+            .find(|rule| rule.pattern.as_str() == pattern)
+            .map(|rule| &rule.entry)
+    }
+}
+
+impl FromIterator<ScratchpadRule> for ScratchpadRules {
+    fn from_iter<I: IntoIterator<Item = ScratchpadRule>>(iter: I) -> Self {
+        let mut rules = Self::default();
+        for ScratchpadRule { pattern, entry } in iter {
+            rules.insert(pattern, entry);
+        }
+        rules
+    }
+}
+
+impl Serialize for ScratchpadRules {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_map(
+            self.rules
+                .iter()
+                .map(|rule| (rule.pattern.as_str(), &rule.entry)),
+        )
+    }
+}
+
+impl<'de> Deserialize<'de> for ScratchpadRules {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // A `BTreeMap` collapses a repeated key the way a TOML table does and
+        // sorts by pattern source before the patterns are compiled, matching
+        // the order `insert` keeps.
+        let raw = BTreeMap::<String, ScratchpadToolEntry>::deserialize(deserializer)?;
+        let rules = raw
+            .into_iter()
+            .map(|(source, entry)| {
+                let pattern = GlobPattern::new(source).map_err(serde::de::Error::custom)?;
+                Ok(ScratchpadRule { pattern, entry })
+            })
+            .collect::<Result<Vec<_>, D::Error>>()?;
+        Ok(Self { rules })
+    }
 }
 
 impl Default for ScratchpadToolEntry {

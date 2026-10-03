@@ -19,7 +19,7 @@ pub mod storage;
 pub mod tools;
 pub mod wrapper;
 
-use aura_config::GlobPattern;
+use aura_config::{GlobPattern, ScratchpadRule};
 pub use context_budget::{
     ContextBudget, ExtractionLimitExceeded, TiktokenCounter, TokenCounter,
     token_counter_for_provider,
@@ -36,7 +36,7 @@ pub use tools::{
 };
 pub use wrapper::ScratchpadWrapper;
 
-use crate::config::{McpConfig, glob_match};
+use crate::config::McpConfig;
 use crate::mcp::{AuraTool, ToolName};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -81,17 +81,24 @@ pub fn scratchpad_tool_map(
 
         for tool_name in tools {
             // Find the most-specific pattern (longest; tie → smallest threshold)
-            // that matches THIS server's tool.
+            // that matches THIS server's tool. The server key is the tool's
+            // namespace, so a `<ns>:<name>` pattern written under one server's
+            // table only matches when its namespace glob accepts that server.
             let best = patterns
                 .iter()
-                .filter(|(pattern, _)| glob_match(pattern, tool_name.as_str()))
-                .min_by(|(pa, ea), (pb, eb)| {
-                    pb.len()
-                        .cmp(&pa.len())
-                        .then(ea.min_tokens.cmp(&eb.min_tokens))
+                .filter(|rule| {
+                    rule.pattern
+                        .matches(Some(server_name.as_str()), tool_name.as_str())
+                })
+                .min_by(|a, b| {
+                    b.pattern
+                        .as_str()
+                        .len()
+                        .cmp(&a.pattern.as_str().len())
+                        .then(a.entry.min_tokens.cmp(&b.entry.min_tokens))
                 });
 
-            if let Some((_, entry)) = best {
+            if let Some(ScratchpadRule { entry, .. }) = best {
                 use std::collections::hash_map::Entry;
                 match resolved.entry(tool_name.to_string()) {
                     Entry::Vacant(slot) => {
@@ -230,7 +237,10 @@ mod tests {
     fn server_with_scratchpad(patterns: &[(&str, usize)]) -> McpServerConfig {
         let scratchpad = patterns
             .iter()
-            .map(|(p, t)| ((*p).to_string(), ScratchpadToolEntry { min_tokens: *t }))
+            .map(|(p, t)| ScratchpadRule {
+                pattern: GlobPattern::from(*p),
+                entry: ScratchpadToolEntry { min_tokens: *t },
+            })
             .collect();
         McpServerConfig::HttpStreamable {
             url: "http://test".to_string(),

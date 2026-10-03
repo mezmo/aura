@@ -150,7 +150,9 @@ never guess cluster state. Report names, kinds, replicas, and conditions.
 """
 # Overrides [agent].turn_depth for this worker.
 turn_depth = 8
-# Glob patterns (`*`, `?`) against MCP tool names. Omit for all tools.
+# Glob patterns against MCP tool names — `*`, `?`, `[abc]`, `{a,b}`, and a
+# `<server>:<tool>` form that scopes the match to one MCP server. Omit for all
+# tools.
 mcp_filter = [
   "namespaces_list",
   "pods_list", "pods_list_in_namespace", "pods_get", "pods_log", "pods_top",
