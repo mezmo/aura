@@ -60,6 +60,10 @@ pub fn is_model_error(err: &anyhow::Error) -> bool {
 pub struct ChatClient {
     http: Client,
     config: AppConfig,
+    /// Bound on the resume POST up to response headers. The 200 body is
+    /// the resumed run's SSE stream and must outlive this bound; a total
+    /// request timeout killed healthy long streams mid-chunk (P63).
+    resume_post_timeout: std::time::Duration,
 }
 
 impl ChatClient {
@@ -67,7 +71,14 @@ impl ChatClient {
         Self {
             http: Client::new(),
             config,
+            resume_post_timeout: std::time::Duration::from_secs(10),
         }
+    }
+
+    #[cfg(test)]
+    fn with_resume_post_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.resume_post_timeout = timeout;
+        self
     }
 
     /// Build a request with common headers.
@@ -119,11 +130,8 @@ impl ChatClient {
         Ok(response)
     }
 
-    /// POST to the resume endpoint and return the raw response without
-    /// status-checking: a 200 carries the resumed run's SSE stream, while
-    /// a refusal status carries the typed body the caller decodes. The
-    /// POST itself is bounded at ten seconds so a stuck server cannot
-    /// hold a reattach poll forever.
+    /// Build the resume POST: url, common headers, and the JSON body
+    /// carrying the model the parked run ran under.
     fn build_resume_request(
         &self,
         session_id: &str,
@@ -138,19 +146,27 @@ impl ChatClient {
         .json(&crate::api::types::ResumeRequest {
             model: model.map(str::to_owned),
         })
-        .timeout(std::time::Duration::from_secs(10))
     }
 
+    /// POST to the resume endpoint and return the raw response without
+    /// status-checking: a 200 carries the resumed run's SSE stream, while
+    /// a refusal status carries the typed body the caller decodes. The
+    /// bound covers the POST up to response headers, so a stuck server
+    /// cannot hold a reattach poll; the stream itself is unbounded — a
+    /// total request timeout killed healthy long streams mid-chunk (P63).
     pub async fn send_resume(
         &self,
         session_id: &str,
         run_id: &str,
         model: Option<&str>,
     ) -> Result<reqwest::Response> {
-        self.build_resume_request(session_id, run_id, model)
-            .send()
-            .await
-            .context("Failed to connect to API for resume")
+        tokio::time::timeout(
+            self.resume_post_timeout,
+            self.build_resume_request(session_id, run_id, model).send(),
+        )
+        .await
+        .context("the resume POST timed out before the server answered")?
+        .context("Failed to connect to API for resume")
     }
 
     /// Ask the LLM for a short one-line summary/title of the given text.
@@ -286,8 +302,12 @@ mod tests {
     use super::*;
 
     fn test_client() -> ChatClient {
+        test_client_at("http://localhost:9340")
+    }
+
+    fn test_client_at(api_url: &str) -> ChatClient {
         ChatClient::new(AppConfig {
-            api_url: "http://localhost:9340".to_string(),
+            api_url: api_url.to_string(),
             api_key: None,
             model: None,
             system_prompt: None,
@@ -335,6 +355,58 @@ mod tests {
             .expect("the request builds");
         let body = request.body().expect("the request has a body").as_bytes();
         assert_eq!(body, Some(b"{}".as_slice()));
+    }
+
+    /// P63 regression: a resume stream whose body outlives the POST bound
+    /// completes. The mock server answers headers at once, then holds the
+    /// chunk past twice the client's post bound — a total-request timeout
+    /// (the bug) kills the read; bounding only the POST lets it through.
+    #[tokio::test]
+    async fn resume_stream_outliving_the_post_bound_completes() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("local addr").port();
+        let server = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().expect("accept");
+            let mut buf = [0u8; 4096];
+            let _ = conn.read(&mut buf);
+            conn.write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n",
+            )
+            .expect("headers");
+            conn.flush().expect("flush headers");
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            conn.write_all(b"data: {\"choices\":[{\"delta\":{\"content\":\"late\"}}]}\n\ndata: [DONE]\n\n")
+                .expect("chunk");
+            conn.flush().expect("flush chunk");
+        });
+
+        let client = test_client_at(&format!("http://127.0.0.1:{port}"))
+            .with_resume_post_timeout(std::time::Duration::from_millis(200));
+        let response = client
+            .send_resume("sess-1", "run-1", None)
+            .await
+            .expect("headers arrive inside the post bound");
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        struct NoopHandler;
+        impl crate::api::stream::StreamHandler for NoopHandler {}
+        let outcome = crate::api::stream::process_stream(response, cancel, &mut NoopHandler)
+            .await
+            .expect("the stream reads");
+        server.join().expect("server thread");
+        assert!(
+            matches!(
+                outcome.termination,
+                crate::api::stream::StreamTermination::Done
+            ),
+            "the stream ran to [DONE]: {:?}",
+            outcome.termination
+        );
+        match outcome.received {
+            crate::api::stream::StreamResult::TextResponse(text) => assert_eq!(text, "late"),
+            other => panic!("expected the late text, got {other:?}"),
+        }
     }
 
     #[test]
