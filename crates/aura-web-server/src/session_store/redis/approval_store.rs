@@ -22,7 +22,9 @@
 //! building its MATCH pattern with the configured key prefix
 //! glob-escaped, so a prefix loaded with metacharacters still addresses
 //! the store's literal keys; the scan skips decision and index keys by
-//! segment and wrong-typed or undecodable records per key. The native TTL
+//! segment and wrong-typed or undecodable records per key, and the
+//! per-key type-guarded GET rides the script cache (EVALSHA with the
+//! client's NOSCRIPT fallback), never a re-upload per key. The native TTL
 //! is the primary expiry, with a post-decode filter as defense in depth.
 
 use std::sync::LazyLock;
@@ -47,7 +49,9 @@ const SCAN_BATCH_SIZE: usize = 200;
 /// integer 0 for a wrong-typed key (the caller warns and skips), nil for a
 /// key that expired or resolved between SCAN and here. A bare GET maps the
 /// server's WRONGTYPE to an extension error that would fail the whole scan.
-static TYPED_GET_SCRIPT: &str = r#"
+static TYPED_GET_SCRIPT: LazyLock<redis::Script> = LazyLock::new(|| {
+    redis::Script::new(
+        r#"
 if redis.call('TYPE', KEYS[1]).ok == 'string' then
     return redis.call('GET', KEYS[1])
 end
@@ -55,7 +59,9 @@ if redis.call('EXISTS', KEYS[1]) == 1 then
     return 0
 end
 return nil
-"#;
+"#,
+    )
+});
 /// Key prefixes under `{p}:approval:` that are not parked records: the
 /// recorded decisions and the `cancel_request` index sets. Matched against
 /// the key remainder after the `{p}:approval:` prefix is stripped.
@@ -322,11 +328,9 @@ impl ApprovalStore for RedisApprovalStore {
             if rest.starts_with(DECISION_KEY_SEGMENT) || rest.starts_with(REQ_KEY_SEGMENT) {
                 continue;
             }
-            let value = redis::cmd("EVAL")
-                .arg(TYPED_GET_SCRIPT)
-                .arg(1)
-                .arg(&key)
-                .query_async::<redis::Value>(&mut conn)
+            let value: redis::Value = TYPED_GET_SCRIPT
+                .key(&key)
+                .invoke_async(&mut conn)
                 .await
                 .map_err(request_err)?;
             let json = match value {
