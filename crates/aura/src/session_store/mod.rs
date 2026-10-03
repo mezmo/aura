@@ -24,11 +24,12 @@ use bytes::Bytes;
 use futures::Stream;
 
 use crate::config::SessionId;
-use crate::hitl::{ApprovalDecision, DecisionId, ParkedApproval, ResolveError};
+use crate::hitl::{DecisionId, ParkedApproval, ResolveError, ResolvedDecision};
 
 #[cfg(test)]
 pub(crate) use fault_store::FaultInjectingStore;
 pub use file::{FileApprovalStore, FileSkillInvocationStore};
+pub(crate) use file::{private_dir, write_private};
 pub use memory::{InMemoryApprovalStore, InMemoryEventBus, InMemorySkillInvocationStore};
 pub use record::{DecisionRecord, InvalidRecord, OriginRecord, ParkedApprovalRecord, ScopeRecord};
 pub use skill_record::{
@@ -57,6 +58,9 @@ pub enum SessionStoreError {
     /// A stored record failed to decode.
     #[error("session store record failed to decode: {reason}")]
     Decode { reason: String },
+    /// The backend does not implement the requested operation.
+    #[error("session store does not support '{operation}'")]
+    Unsupported { operation: &'static str },
 }
 
 /// Durable storage for parked conversational HITL approvals, over the
@@ -65,26 +69,28 @@ pub enum SessionStoreError {
 pub trait ApprovalStore: Send + Sync {
     /// Persist a parked approval, keyed by its `DecisionId`. Backends with
     /// native expiry set the entry's TTL from `expires_at`; the file store
-    /// keeps it until `remove`.
+    /// unlinks an expired entry on its next poll scan.
     async fn register(&self, parked: ParkedApproval) -> Result<(), SessionStoreError>;
 
     /// Look up a parked approval.
     async fn get(&self, id: &DecisionId) -> Result<Option<ParkedApproval>, SessionStoreError>;
 
-    /// Record a terminal decision at most once per id; later attempts read
-    /// as `NotFound`. The file backend moves the ticket into its decision
+    /// Record a terminal decision — and the approver identity captured
+    /// alongside it, as one carrier — at most once per id; later attempts
+    /// read as `NotFound`. The file backend moves the ticket into its decision
     /// record, other backends drop it.
     async fn resolve(
         &self,
         id: &DecisionId,
-        decision: ApprovalDecision,
+        decision: ResolvedDecision,
     ) -> Result<(), ResolveError>;
 
-    /// Look up the decision recorded for an already-resolved approval.
+    /// Look up the decision recorded for an already-resolved approval,
+    /// carrying any captured identity with it.
     async fn decision(
         &self,
         id: &DecisionId,
-    ) -> Result<Option<ApprovalDecision>, SessionStoreError>;
+    ) -> Result<Option<ResolvedDecision>, SessionStoreError>;
 
     /// Remove a parked entry.
     async fn remove(&self, id: &DecisionId) -> Result<(), SessionStoreError>;
@@ -97,6 +103,20 @@ pub trait ApprovalStore: Send + Sync {
         &self,
         request_id: &str,
     ) -> Result<Vec<ParkedApproval>, SessionStoreError>;
+
+    /// Scans the store for approval rows that are still pending: every
+    /// parked approval that is undecided and non-expired
+    /// (`expires_at > now`). No ordering guarantee.
+    ///
+    /// The default returns the store's `Unsupported` error so a backend
+    /// without a scan implementation fails loudly instead of reporting an
+    /// empty pending set, which the reconciler would read as no awaiting
+    /// decisions.
+    async fn list_pending(&self) -> Result<Vec<ParkedApproval>, SessionStoreError> {
+        Err(SessionStoreError::Unsupported {
+            operation: "list_pending",
+        })
+    }
 }
 
 /// Distinct skill-invocation records one session may hold.
@@ -145,4 +165,65 @@ pub trait EventBus: Send + Sync {
     /// call returns. The stream ends when the subscription is dropped or the
     /// backend closes the topic.
     async fn subscribe(&self, topic: &str) -> Result<Subscription, SessionStoreError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct ScanlessStore;
+
+    #[async_trait]
+    impl ApprovalStore for ScanlessStore {
+        async fn register(&self, _parked: ParkedApproval) -> Result<(), SessionStoreError> {
+            Ok(())
+        }
+
+        async fn get(&self, _id: &DecisionId) -> Result<Option<ParkedApproval>, SessionStoreError> {
+            Ok(None)
+        }
+
+        async fn resolve(
+            &self,
+            _id: &DecisionId,
+            _decision: ResolvedDecision,
+        ) -> Result<(), ResolveError> {
+            Ok(())
+        }
+
+        async fn decision(
+            &self,
+            _id: &DecisionId,
+        ) -> Result<Option<ResolvedDecision>, SessionStoreError> {
+            Ok(None)
+        }
+
+        async fn remove(&self, _id: &DecisionId) -> Result<(), SessionStoreError> {
+            Ok(())
+        }
+
+        async fn cancel_request(
+            &self,
+            _request_id: &str,
+        ) -> Result<Vec<ParkedApproval>, SessionStoreError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn list_pending_default_returns_unsupported() {
+        let err = match ScanlessStore.list_pending().await {
+            Err(err) => err,
+            Ok(pending) => panic!(
+                "the default list_pending must fail loudly, never report a set of {}",
+                pending.len()
+            ),
+        };
+        assert_eq!(
+            err,
+            SessionStoreError::Unsupported {
+                operation: "list_pending"
+            }
+        );
+    }
 }

@@ -9,7 +9,7 @@ use bytes::Bytes;
 use tokio::sync::broadcast;
 
 use crate::config::SessionId;
-use crate::hitl::{ApprovalDecision, DecisionId, ParkedApproval, ResolveError, Timestamp};
+use crate::hitl::{DecisionId, ParkedApproval, ResolveError, ResolvedDecision, Timestamp};
 
 use super::{
     ApprovalStore, EventBus, MAX_SKILL_RECORDS_PER_SESSION, SessionStoreError,
@@ -26,9 +26,10 @@ const DECISION_RETENTION_MARGIN_SECS: i64 = 60;
 /// touched one is evicted.
 const MAX_SKILL_SESSIONS: usize = 1024;
 
-/// A recorded decision and its retention deadline.
+/// A recorded resolved decision (decision plus captured identity) and its
+/// retention deadline.
 struct DecidedEntry {
-    decision: ApprovalDecision,
+    decision: ResolvedDecision,
     keep_until: Timestamp,
 }
 
@@ -73,7 +74,7 @@ impl ApprovalStore for InMemoryApprovalStore {
     async fn resolve(
         &self,
         id: &DecisionId,
-        decision: ApprovalDecision,
+        decision: ResolvedDecision,
     ) -> Result<(), ResolveError> {
         // Lock removal provides at-most-once.
         let parked = {
@@ -101,7 +102,7 @@ impl ApprovalStore for InMemoryApprovalStore {
     async fn decision(
         &self,
         id: &DecisionId,
-    ) -> Result<Option<ApprovalDecision>, SessionStoreError> {
+    ) -> Result<Option<ResolvedDecision>, SessionStoreError> {
         Ok(self.lock_decided().get(id).map(|e| e.decision.clone()))
     }
 
@@ -120,6 +121,19 @@ impl ApprovalStore for InMemoryApprovalStore {
             .map(|(_, parked)| parked)
             .collect();
         Ok(cleared)
+    }
+
+    async fn list_pending(&self) -> Result<Vec<ParkedApproval>, SessionStoreError> {
+        // The map self-prunes only decided entries; expired tickets stay
+        // until resolve/remove, so the contract filter repeats here.
+        let now = chrono::Utc::now();
+        let entries = self.lock();
+        let pending = entries
+            .values()
+            .filter(|parked| parked.expires_at > now)
+            .cloned()
+            .collect();
+        Ok(pending)
     }
 }
 
@@ -313,7 +327,8 @@ mod tests {
 
     use super::*;
     use crate::hitl::{
-        AgentScope, ApprovalItem, ApprovalOrigin, ApprovalRequest, PROTOCOL_VERSION,
+        AgentScope, ApprovalAuthority, ApprovalDecision, ApprovalItem, ApprovalOrigin,
+        ApprovalRequest, PROTOCOL_VERSION,
     };
 
     fn parked(request_id: &str) -> ParkedApproval {
@@ -338,49 +353,9 @@ mod tests {
             },
             registered_at: now,
             expires_at: now + chrono::Duration::seconds(60),
+            authority: ApprovalAuthority::WebhookPoll,
+            egress_headers: None,
         }
-    }
-
-    #[tokio::test]
-    async fn approval_store_register_get_resolve() {
-        let store = InMemoryApprovalStore::new();
-        let entry = parked("req-1");
-        let id = entry.request.decision_id;
-
-        store.register(entry).await.unwrap();
-        assert!(store.get(&id).await.unwrap().is_some());
-
-        store
-            .resolve(&id, ApprovalDecision::Approved)
-            .await
-            .unwrap();
-        assert!(store.get(&id).await.unwrap().is_none());
-        assert_eq!(
-            store.resolve(&id, ApprovalDecision::Approved).await,
-            Err(ResolveError::NotFound),
-        );
-    }
-
-    #[tokio::test]
-    async fn approval_store_resolve_records_readable_decision() {
-        let store = InMemoryApprovalStore::new();
-        let entry = parked("req-durable");
-        let id = entry.request.decision_id;
-        store.register(entry).await.unwrap();
-
-        let denied = ApprovalDecision::Denied {
-            reason: Some("not safe".into()),
-        };
-        store.resolve(&id, denied.clone()).await.unwrap();
-
-        assert_eq!(store.decision(&id).await.unwrap(), Some(denied.clone()));
-        // Recorded decision survives rejected second resolve.
-        assert_eq!(
-            store.resolve(&id, ApprovalDecision::Approved).await,
-            Err(ResolveError::NotFound)
-        );
-        assert_eq!(store.decision(&id).await.unwrap(), Some(denied));
-        assert_eq!(store.decision(&DecisionId::generate()).await.unwrap(), None);
     }
 
     /// Retention pruning drops entries past window.
@@ -391,7 +366,7 @@ mod tests {
         store.lock_decided().insert(
             id,
             DecidedEntry {
-                decision: ApprovalDecision::Approved,
+                decision: ResolvedDecision::from(ApprovalDecision::Approved),
                 keep_until: chrono::Utc::now() - chrono::Duration::seconds(1),
             },
         );
@@ -409,7 +384,7 @@ mod tests {
         store.register(entry).await.unwrap();
 
         assert_eq!(
-            store.resolve(&id, ApprovalDecision::Approved).await,
+            store.resolve(&id, ApprovalDecision::Approved.into()).await,
             Err(ResolveError::NotFound)
         );
         assert_eq!(store.decision(&id).await.unwrap(), None);
@@ -428,24 +403,6 @@ mod tests {
         assert!(store.get(&id).await.unwrap().is_some());
         store.remove(&id).await.unwrap();
         assert!(store.get(&id).await.unwrap().is_none());
-    }
-
-    #[tokio::test]
-    async fn approval_store_cancel_request_removes_only_matching() {
-        let store = InMemoryApprovalStore::new();
-        let cancel = parked("req-cancel");
-        let cancel_id = cancel.request.decision_id;
-        let keep = parked("req-keep");
-        let keep_id = keep.request.decision_id;
-        store.register(cancel).await.unwrap();
-        store.register(keep).await.unwrap();
-
-        let cleared = store.cancel_request("req-cancel").await.unwrap();
-
-        assert_eq!(cleared.len(), 1, "only the matching ticket is cleared");
-        assert_eq!(cleared[0].request.decision_id, cancel_id);
-        assert!(store.get(&keep_id).await.unwrap().is_some());
-        assert_eq!(store.lock().len(), 1);
     }
 
     #[tokio::test]

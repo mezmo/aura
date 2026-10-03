@@ -18,11 +18,19 @@
 //! the record TTL and pruned best-effort on resolve/remove. The cancel sweep
 //! prunes per id, never the whole index key; `SWEEP_TAKE_SCRIPT` states what
 //! each id yields.
+//! `list_pending` SCANs the parked-record keys in batches (never KEYS),
+//! building its MATCH pattern with the configured key prefix
+//! glob-escaped, so a prefix loaded with metacharacters still addresses
+//! the store's literal keys; the scan skips decision and index keys by
+//! segment and wrong-typed or undecodable records per key, and the
+//! per-key type-guarded GET rides the script cache (EVALSHA with the
+//! client's NOSCRIPT fallback), never a re-upload per key. The native TTL
+//! is the primary expiry, with a post-decode filter as defense in depth.
 
 use std::sync::LazyLock;
 
 use async_trait::async_trait;
-use aura::hitl::{ApprovalDecision, DecisionId, ParkedApproval, ResolveError};
+use aura::hitl::{DecisionId, ParkedApproval, ResolveError, ResolvedDecision};
 use aura::session_store::{ApprovalStore, DecisionRecord, ParkedApprovalRecord, SessionStoreError};
 use redis::AsyncCommands;
 use redis::aio::ConnectionManager;
@@ -36,6 +44,29 @@ const MIN_TTL_SECS: u64 = 1;
 const REQ_INDEX_TTL_MARGIN_SECS: u64 = 60;
 /// Decision TTL margin over the parked record's remaining TTL.
 const DECISION_TTL_MARGIN_MS: u64 = 60_000;
+const SCAN_BATCH_SIZE: usize = 200;
+/// Type-guarded GET for the `list_pending` scan: a string key's value,
+/// integer 0 for a wrong-typed key (the caller warns and skips), nil for a
+/// key that expired or resolved between SCAN and here. A bare GET maps the
+/// server's WRONGTYPE to an extension error that would fail the whole scan.
+static TYPED_GET_SCRIPT: LazyLock<redis::Script> = LazyLock::new(|| {
+    redis::Script::new(
+        r#"
+if redis.call('TYPE', KEYS[1]).ok == 'string' then
+    return redis.call('GET', KEYS[1])
+end
+if redis.call('EXISTS', KEYS[1]) == 1 then
+    return 0
+end
+return nil
+"#,
+    )
+});
+/// Key prefixes under `{p}:approval:` that are not parked records: the
+/// recorded decisions and the `cancel_request` index sets. Matched against
+/// the key remainder after the `{p}:approval:` prefix is stripped.
+const DECISION_KEY_SEGMENT: &str = "decision:";
+const REQ_KEY_SEGMENT: &str = "req:";
 
 /// Sweep one approval key (KEYS[1]) out of its request index (KEYS[2]):
 /// a string key is GETDEL'd and its id SREM'd; a wrong-typed key returns 0
@@ -153,12 +184,13 @@ impl ApprovalStore for RedisApprovalStore {
     async fn resolve(
         &self,
         id: &DecisionId,
-        decision: ApprovalDecision,
+        decision: ResolvedDecision,
     ) -> Result<(), ResolveError> {
         // The script's atomic take is the at-most-once guarantee: exactly one
         // resolver gets the record; everyone else (and every later attempt)
-        // sees `NotFound`. The same step writes the decision record, so a
-        // consumed parked entry always leaves a recoverable decision.
+        // sees `NotFound`. The same step writes the decision record — the
+        // serialized record carries the decision AND any captured identity,
+        // so one atomic SET keeps the pair together under concurrency.
         let payload = serde_json::to_string(&DecisionRecord::from(&decision))
             .expect("decision record serializes to JSON");
         let mut conn = self.conn.clone();
@@ -180,7 +212,7 @@ impl ApprovalStore for RedisApprovalStore {
     async fn decision(
         &self,
         id: &DecisionId,
-    ) -> Result<Option<ApprovalDecision>, SessionStoreError> {
+    ) -> Result<Option<ResolvedDecision>, SessionStoreError> {
         let mut conn = self.conn.clone();
         let payload: Option<String> = conn
             .get(self.decision_key(&id.to_string()))
@@ -189,9 +221,13 @@ impl ApprovalStore for RedisApprovalStore {
         payload
             .map(|json| {
                 serde_json::from_str::<DecisionRecord>(&json)
-                    .map(ApprovalDecision::from)
                     .map_err(|e| SessionStoreError::Decode {
                         reason: e.to_string(),
+                    })
+                    .and_then(|record| {
+                        ResolvedDecision::try_from(record).map_err(|e| SessionStoreError::Decode {
+                            reason: e.to_string(),
+                        })
                     })
             })
             .transpose()
@@ -254,12 +290,116 @@ impl ApprovalStore for RedisApprovalStore {
         }
         Ok(cleared)
     }
+
+    async fn list_pending(&self) -> Result<Vec<ParkedApproval>, SessionStoreError> {
+        let mut conn = self.conn.clone();
+        let pattern = scan_pattern(&self.key_prefix);
+
+        // SCAN in batches, never KEYS: a scan must not block the server.
+        // A mutating keyspace can hand a key back twice; dedupe before GET.
+        let mut cursor: u64 = 0;
+        let mut keys = std::collections::HashSet::new();
+        loop {
+            let (next, batch): (u64, Vec<String>) = redis::cmd("SCAN")
+                .cursor_arg(cursor)
+                .arg("MATCH")
+                .arg(&pattern)
+                .arg("COUNT")
+                .arg(SCAN_BATCH_SIZE)
+                .query_async(&mut conn)
+                .await
+                .map_err(request_err)?;
+            keys.extend(batch);
+            cursor = next;
+            if cursor == 0 {
+                break;
+            }
+        }
+
+        let now = chrono::Utc::now();
+        let mut pending = Vec::new();
+        for key in keys {
+            // Strip the configured prefix before the subspace test: a prefix
+            // containing ":decision:" or ":req:" must not exclude every key.
+            let Some(rest) = key.strip_prefix(format!("{}:approval:", self.key_prefix).as_str())
+            else {
+                continue;
+            };
+            if rest.starts_with(DECISION_KEY_SEGMENT) || rest.starts_with(REQ_KEY_SEGMENT) {
+                continue;
+            }
+            let value: redis::Value = TYPED_GET_SCRIPT
+                .key(&key)
+                .invoke_async(&mut conn)
+                .await
+                .map_err(request_err)?;
+            let json = match value {
+                // Expired or resolved between SCAN and GET: nothing to list.
+                redis::Value::Nil => continue,
+                redis::Value::Int(0) => {
+                    tracing::warn!(key = %key, "wrong-typed approval key skipped by list_pending");
+                    continue;
+                }
+                redis::Value::BulkString(bytes) => match String::from_utf8(bytes) {
+                    Ok(json) => json,
+                    Err(err) => {
+                        tracing::warn!(
+                            key = %key, error = %err,
+                            "non-UTF8 approval record skipped by list_pending"
+                        );
+                        continue;
+                    }
+                },
+                _ => {
+                    tracing::warn!(key = %key, "unexpected approval key value skipped by list_pending");
+                    continue;
+                }
+            };
+            let parked = match decode(&json) {
+                Ok(parked) => parked,
+                Err(err) => {
+                    tracing::warn!(
+                        key = %key, error = %err,
+                        "undecodable approval record skipped by list_pending"
+                    );
+                    continue;
+                }
+            };
+            // Native TTL is the primary expiry; the contract filter repeats
+            // here so a record inside its MIN_TTL_SECS floor past
+            // `expires_at` is never listed.
+            if parked.expires_at > now {
+                pending.push(parked);
+            }
+        }
+        Ok(pending)
+    }
 }
 
 /// Seconds until the approval expires, floored at [`MIN_TTL_SECS`].
 fn record_ttl_secs(parked: &ParkedApproval) -> u64 {
     let remaining = (parked.expires_at - chrono::Utc::now()).num_seconds();
     u64::try_from(remaining).unwrap_or(0).max(MIN_TTL_SECS)
+}
+
+/// The `list_pending` SCAN MATCH pattern for `key_prefix`: the prefix with
+/// its glob metacharacters backslash-escaped — a deployment is free to
+/// load the prefix with them, and an unescaped pattern would stop matching
+/// the store's own literal keys — then the literal `:approval:` segment
+/// and a trailing `*` over the record ids. The returned keys are stripped
+/// with the unescaped literal prefix, which a MATCH hit guarantees
+/// equals it.
+fn scan_pattern(key_prefix: &str) -> String {
+    const METACHARACTERS: [char; 5] = ['\\', '[', ']', '*', '?'];
+    let mut pattern = String::with_capacity(key_prefix.len() + ":approval:*".len());
+    for ch in key_prefix.chars() {
+        if METACHARACTERS.contains(&ch) {
+            pattern.push('\\');
+        }
+        pattern.push(ch);
+    }
+    pattern.push_str(":approval:*");
+    pattern
 }
 
 fn decode(json: &str) -> Result<ParkedApproval, SessionStoreError> {
@@ -294,5 +434,24 @@ fn swept_record_json(id: &str, value: redis::Value) -> Option<String> {
             );
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::scan_pattern;
+
+    /// A prefix free of metacharacters passes through untouched, and one
+    /// loaded with every metacharacter the MATCH glob gives meaning to
+    /// (`\`, `[`, `]`, `*`, `?`) comes out backslash-escaped, so the
+    /// pattern matches the store's literal keys.
+    #[test]
+    fn scan_pattern_escapes_glob_metacharacters_in_prefix() {
+        assert_eq!(scan_pattern("aura:test"), "aura:test:approval:*");
+        assert_eq!(
+            scan_pattern(r"au\[?*]ra"),
+            r"au\\\[\?\*\]ra:approval:*",
+            "each metacharacter gains one backslash; ordinary characters are untouched"
+        );
     }
 }

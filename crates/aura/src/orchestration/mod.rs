@@ -83,6 +83,13 @@ pub use tools::wait_for::{StopReason, WaitForError, WaitForOutput, WaitForTool};
 pub use tools::{SubmitResultDecision, SubmitResultOutput, SubmitResultTool};
 
 pub(crate) use park::{CallKey, ParkGuard, RecordedDecisions, run_owner_id};
+// The sentinel leak guard drives the commit and the resuming document
+// from the reconciler side of the crate.
+#[cfg(test)]
+pub(crate) use park::{
+    ParkCommitInputs, ParkedTaskRecord, ResumingDocumentHandle, RunStateForPark,
+    commit_from_run_state,
+};
 // The worker-model injection seam: `provider_agent.rs`'s cfg(test) variant
 // wraps the rig's scripted agent type.
 pub use prompt_constants::{context, fields, sections};

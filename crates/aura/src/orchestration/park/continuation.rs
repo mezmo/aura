@@ -166,7 +166,10 @@ impl ResumingDocumentHandle {
                 .unwrap_or_default()
         ));
         tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-            std::fs::write(&tmp, &bytes)?;
+            if let Some(parent) = non_empty_parent(&publish_path) {
+                crate::session_store::private_dir(parent)?;
+            }
+            crate::session_store::write_private(&tmp, &bytes)?;
             std::fs::rename(&tmp, &publish_path)
         })
         .await
@@ -223,6 +226,9 @@ pub(crate) async fn load_recorded_decisions(
                 .await
                 .map_err(|e| RehydrateError::Store(e.to_string()))?;
             let Some(parked) = parked else {
+                if chrono::Utc::now() > expires_at {
+                    return Err(RehydrateError::Expired);
+                }
                 return Err(RehydrateError::Mismatch(format!(
                     "store approval {} is missing",
                     call.decision_id
@@ -273,7 +279,7 @@ pub(crate) async fn load_recorded_decisions(
                     call.tool_name, call.decision_id
                 )));
             }
-            let Some(decision) = store.recorded_decision(&call.decision_id).await else {
+            let Some(resolved) = store.recorded_decision(&call.decision_id).await else {
                 // No decision yet: expired past the window (the 2.6 expired
                 // row outranks parked), still parked otherwise — collected
                 // so the 409 body can carry every outstanding id.
@@ -284,10 +290,11 @@ pub(crate) async fn load_recorded_decisions(
                 continue;
             };
             // The key's task id comes from the awaiting node, the tool name
-            // and arguments from the store's approval record.
+            // and arguments from the store's approval record. The carrier
+            // keeps the recorded identity with the decision it rode in with.
             recorded.push(
                 CallKey::new(node.task_id, &item.tool_name, &item.arguments),
-                decision,
+                resolved,
             );
             decision_ids.push(call.decision_id);
         }
@@ -324,12 +331,29 @@ pub(crate) fn replace_tool_result(current_prompt: &mut Message, call_id: &str, w
     replaced
 }
 
+/// The directory a document lives in, or `None` for a bare file name whose
+/// parent is the empty path.
+fn non_empty_parent(path: &std::path::Path) -> Option<&std::path::Path> {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn non_empty_parent_skips_a_bare_file_name() {
+        use std::path::Path;
+        assert_eq!(super::non_empty_parent(Path::new("run.json")), None);
+        assert_eq!(
+            super::non_empty_parent(Path::new("parked/run.json")),
+            Some(Path::new("parked"))
+        );
+    }
+
     use super::*;
     use crate::hitl::{
         AgentScope, ApprovalDecision, ApprovalItem, ApprovalOrigin, ApprovalRequest,
-        PROTOCOL_VERSION, ParkedApproval,
+        PROTOCOL_VERSION, ParkedApproval, ResolvedDecision,
     };
     use crate::orchestration::park::document::{ParkedPlan, ParkedTaskNode, SCHEMA_VERSION};
     use crate::orchestration::types::TaskStatus;
@@ -406,6 +430,8 @@ mod tests {
             },
             registered_at: chrono::Utc::now(),
             expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+            authority: crate::hitl::ApprovalAuthority::WebhookPoll,
+            egress_headers: None,
         }
     }
 
@@ -435,7 +461,7 @@ mod tests {
             .await
             .unwrap();
         registry
-            .resolve(&decision_id, ApprovalDecision::Approved)
+            .resolve(&decision_id, ApprovalDecision::Approved.into())
             .await
             .unwrap();
 
@@ -460,7 +486,7 @@ mod tests {
         assert_eq!(ids, vec![decision_id]);
         assert_eq!(
             recorded.take(&CallKey::new(3, "kubectl_apply", &args)),
-            Some(ApprovalDecision::Approved),
+            Some(ResolvedDecision::from(ApprovalDecision::Approved)),
             "the recorded decision is consumable at the resume gate"
         );
         assert!(
@@ -511,10 +537,16 @@ mod tests {
 
         // The same undecided call past the document's expiry is the expired
         // row.
-        let mut doc = parked_run(vec![pending_call(undecided, args)]);
+        let mut doc = parked_run(vec![pending_call(undecided, args.clone())]);
         doc.expires_at = (chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
         let err = load_recorded_decisions(&registry, &doc).await.unwrap_err();
         assert!(err.to_string().contains("expired"), "got: {err}");
+
+        // A row the store already swept past the window is expired, not a
+        // mismatch.
+        doc.plan.tasks[0].pending = Some(vec![pending_call(vanished, args)]);
+        let err = load_recorded_decisions(&registry, &doc).await.unwrap_err();
+        assert!(matches!(err, RehydrateError::Expired), "got: {err}");
     }
 
     /// The stored approval's scope must name this run and this checkpoint
@@ -587,7 +619,7 @@ mod tests {
             .unwrap();
         // The decision lands after the document was committed.
         registry
-            .resolve(&decision_id, ApprovalDecision::Approved)
+            .resolve(&decision_id, ApprovalDecision::Approved.into())
             .await
             .unwrap();
 
@@ -596,7 +628,7 @@ mod tests {
         assert_eq!(ids, vec![decision_id]);
         assert_eq!(
             recorded.take(&CallKey::new(3, "kubectl_apply", &args)),
-            Some(ApprovalDecision::Approved)
+            Some(ResolvedDecision::from(ApprovalDecision::Approved))
         );
     }
 
@@ -667,6 +699,12 @@ mod tests {
         )
         .unwrap();
 
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            dir.path(),
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+        )
+        .unwrap();
         let handle = Arc::new(ResumingDocumentHandle::open(&parked_path).await.unwrap());
         let h1 = Arc::clone(&handle);
         let h2 = Arc::clone(&handle);
@@ -699,6 +737,21 @@ mod tests {
             .filter_map(|e| e.ok())
             .any(|e| e.file_name().to_string_lossy().ends_with(".tmp"));
         assert!(!residue, "no temp file residue");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(handle.publish_path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "the resuming document is owner-only");
+            let dir_mode = std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                dir_mode, 0o700,
+                "the parked directory is tightened on append"
+            );
+        }
     }
 
     /// A missing document opens as NotFound — the section 2.6 "not found"

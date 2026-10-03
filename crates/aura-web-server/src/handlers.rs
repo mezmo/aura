@@ -1298,9 +1298,11 @@ pub async fn resolve_approval(
         }
     };
     let decision = aura::hitl::ApprovalDecision::from(body);
+    // The conversational ingress has no identity source: the decision
+    // resolves uncaptured.
     match state
         .pending_approvals
-        .resolve(&decision_id, decision)
+        .resolve(&decision_id, aura::hitl::ResolvedDecision::from(decision))
         .await
     {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
@@ -1552,10 +1554,14 @@ mod tests {
     fn non_streaming_webhook_hitl_is_allowed() {
         let config = make_hitl_config(aura_config::DecisionRouteConfig::Webhook {
             url: aura_config::WebhookUrl::new("http://127.0.0.1:8080/approve").unwrap(),
-            timeout_secs: 300,
+            timeout_secs: Some(300),
             headers: std::collections::HashMap::new(),
             headers_from_request: std::collections::HashMap::new(),
             tool_headers_from_response: aura_config::ToolHeaderMappings::default(),
+            delivery: aura_config::WebhookDelivery::Sync,
+            poll_url: None,
+            poll_interval_secs: 10,
+            poll_request_timeout_secs: 30,
         });
         let req = chat_request_with_stream(None);
 
