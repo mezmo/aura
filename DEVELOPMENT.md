@@ -215,6 +215,12 @@ Prompt routing and execution model:
 - Orchestration Mode (`orchestration.enabled = true`): `Orchestrator` coordinates worker execution.
 - Both `Agent` and `Orchestrator` implement `StreamingAgent`, so they are interchangeable at the API boundary.
 
+Ingress paths into the web server (all end in the same `StreamingAgent::stream` call):
+
+- `/v1/chat/completions`: OpenAI-compatible HTTP and SSE, the primary path.
+- A2A (`--enable-a2a`): JSON-RPC and REST task endpoints, driven by `a2a::AuraAgentExecutor`.
+- Slack (`--enable-slack`): an outbound Socket Mode WebSocket; `slack::runner` answers channel @mentions in a thread and DMs inline, rebuilding history from the Slack thread or DM on each message. See the `crates/aura-web-server/src/slack/` module docs and the Slack Ingress section of `CLAUDE.md`.
+
 Orchestrator components and loop:
 
 - Coordinator agent: plans task DAGs and consolidates worker outputs via continuation.
