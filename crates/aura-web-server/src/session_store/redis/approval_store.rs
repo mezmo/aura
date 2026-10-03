@@ -30,6 +30,12 @@
 use std::sync::LazyLock;
 
 use async_trait::async_trait;
+use aura::hitl::{
+    ApprovalAuthority, ApprovalRead, DecisionId, ParkedApproval, ResolveError, ResolvedDecision,
+};
+use aura::session_store::{
+    AcknowledgeOutcome, ApprovalStore, DecisionRecord, ParkedApprovalRecord, RetainedApproval,
+    SessionStoreError,
 use aura::hitl::{DecisionId, ParkedApproval, ResolveError, ResolvedDecision};
 use aura::session_store::{ApprovalStore, DecisionRecord, ParkedApprovalRecord, SessionStoreError};
 use redis::AsyncCommands;
@@ -86,11 +92,18 @@ return nil
 "#;
 
 /// Atomic script for the at-most-once claim and durable decision write.
+/// The authority check joins the arbitration: ARGV[3] carries the
+/// expected authority's serialized token, and a record whose authority
+/// differs returns nil — indistinguishable from unknown, the row left
+/// parked and nothing written — before any DEL or SET runs.
 static RESOLVE_SCRIPT: LazyLock<redis::Script> = LazyLock::new(|| {
     redis::Script::new(
         r#"
         local record = redis.call('GET', KEYS[1])
         if not record then
+            return nil
+        end
+        if cjson.decode(record)['authority'] ~= ARGV[3] then
             return nil
         end
         local ttl_ms = redis.call('PTTL', KEYS[1])
@@ -172,6 +185,14 @@ impl ApprovalStore for RedisApprovalStore {
         pipe.query_async::<()>(&mut conn).await.map_err(request_err)
     }
 
+    #[expect(unused_variables, reason = "fill layer consumes the id")]
+    async fn mark_acknowledged(
+        &self,
+        id: &DecisionId,
+    ) -> Result<AcknowledgeOutcome, SessionStoreError> {
+        todo!("conditional acknowledgment transition (fill layer)")
+    }
+
     async fn get(&self, id: &DecisionId) -> Result<Option<ParkedApproval>, SessionStoreError> {
         let mut conn = self.conn.clone();
         let payload: Option<String> = conn
@@ -184,21 +205,32 @@ impl ApprovalStore for RedisApprovalStore {
     async fn resolve(
         &self,
         id: &DecisionId,
+        expected_authority: ApprovalAuthority,
         decision: ResolvedDecision,
     ) -> Result<(), ResolveError> {
         // The script's atomic take is the at-most-once guarantee: exactly one
         // resolver gets the record; everyone else (and every later attempt)
-        // sees `NotFound`. The same step writes the decision record — the
-        // serialized record carries the decision AND any captured identity,
-        // so one atomic SET keeps the pair together under concurrency.
+        // sees `NotFound`. The authority check rides the same arbitration:
+        // a record held for another channel reads exactly like an absent
+        // one — the row stays parked and nothing is written — so no caller
+        // can bolt a validate-then-resolve race ahead of it. The same step
+        // writes the decision record — the serialized record carries the
+        // decision AND any captured identity, so one atomic SET keeps the
+        // pair together under concurrency.
         let payload = serde_json::to_string(&DecisionRecord::from(&decision))
             .expect("decision record serializes to JSON");
+        let expected_authority = serde_json::to_value(expected_authority)
+            .expect("the authority serializes")
+            .as_str()
+            .expect("the authority serializes to a string token")
+            .to_string();
         let mut conn = self.conn.clone();
         let taken: Option<String> = RESOLVE_SCRIPT
             .key(self.approval_key(&id.to_string()))
             .key(self.decision_key(&id.to_string()))
             .arg(payload)
             .arg(DECISION_TTL_MARGIN_MS)
+            .arg(expected_authority)
             .invoke_async(&mut conn)
             .await
             .map_err(|e| ResolveError::Store(request_err(e)))?;
@@ -373,6 +405,26 @@ impl ApprovalStore for RedisApprovalStore {
             }
         }
         Ok(pending)
+    }
+
+    #[expect(
+        unused_variables,
+        reason = "todo!() body; filled by P45 wave fill units"
+    )]
+    async fn read_or_expire(
+        &self,
+        id: &DecisionId,
+        expected_authority: ApprovalAuthority,
+    ) -> Result<ApprovalRead, SessionStoreError> {
+        todo!(
+            "P45 wave fill units: redis is an unsupported park backend; read_or_expire returns the typed unsupported-configuration error, never a faked outcome"
+        )
+    }
+
+    async fn retained_rows(&self) -> Result<Vec<RetainedApproval>, SessionStoreError> {
+        todo!(
+            "P45 wave fill units: redis is an unsupported park backend; the retained scan returns the typed unsupported-operation error"
+        )
     }
 }
 
