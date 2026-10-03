@@ -78,8 +78,8 @@ pub use stream_events::EventContext;
 pub use stream_events::OrchestrationStreamEvent;
 pub use stream_events::event_names;
 pub use tools::ListPriorRunsTool;
-pub use tools::ReadArtifactTool;
 pub use tools::wait_for::{StopReason, WaitForError, WaitForOutput, WaitForTool};
+pub use tools::{ReadArtifactTool, inline_cap_tokens};
 pub use tools::{SubmitResultDecision, SubmitResultOutput, SubmitResultTool};
 
 pub(crate) use park::{CallKey, ParkGuard, RecordedDecisions, run_owner_id};
