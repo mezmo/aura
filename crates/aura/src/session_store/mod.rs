@@ -24,7 +24,10 @@ use bytes::Bytes;
 use futures::Stream;
 
 use crate::config::SessionId;
-use crate::hitl::{DecisionId, ParkedApproval, ResolveError, ResolvedDecision};
+use crate::hitl::{
+    AddressedApproval, ApprovalAuthority, ApprovalRead, DecisionId, ParkedApproval, ResolveError,
+    ResolvedDecision,
+};
 
 #[cfg(test)]
 pub(crate) use fault_store::FaultInjectingStore;
@@ -58,9 +61,48 @@ pub enum SessionStoreError {
     /// A stored record failed to decode.
     #[error("session store record failed to decode: {reason}")]
     Decode { reason: String },
-    /// The backend does not implement the requested operation.
-    #[error("session store does not support '{operation}'")]
-    Unsupported { operation: &'static str },
+    /// The backend does not implement this operation at all — e.g. a park
+    /// surface on a backend without park parity. Distinct from
+    /// [`SessionStoreError::BackendUnavailable`]: the store is reachable,
+    /// the operation is simply not supported, and the answer is never a
+    /// panic or a faked success.
+    #[error("session store operation '{operation}' is not supported by this backend: {reason}")]
+    UnsupportedOperation {
+        operation: &'static str,
+        reason: String,
+    },
+    /// The configured store cannot serve this deployment's requirements
+    /// (e.g. park mode on a backend that has no park parity): a bootstrap
+    /// admission rejection, not a runtime failure.
+    #[error("session store configuration is not supported: {reason}")]
+    UnsupportedConfiguration { reason: String },
+}
+
+/// The outcome of a conditional acknowledgment transition on a parked row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcknowledgeOutcome {
+    /// The row was still pending; its acknowledgment state is now
+    /// `Acknowledged`.
+    Acknowledged,
+    /// No still-pending row matched the id: unknown, already resolved, or
+    /// cancelled/removed while the notify was in flight. Nothing was created.
+    Missing,
+}
+
+/// One row of the retained-evidence scan: an approval row the store still
+/// holds, pending or already addressed. Retention — not decidability — is
+/// the question, so decided and timed-out rows stay in the scan and
+/// [`ApprovalStore::list_pending`] cannot stand in for it.
+#[derive(Clone)]
+pub enum RetainedApproval {
+    /// Undecided, inside or past its own window.
+    Pending(ParkedApproval),
+    /// Addressed — decided, or timed out strictly past its deadline — and
+    /// still retained as evidence.
+    Addressed {
+        approval: ParkedApproval,
+        outcome: AddressedApproval,
+    },
 }
 
 /// Durable storage for parked conversational HITL approvals, over the
@@ -72,6 +114,15 @@ pub trait ApprovalStore: Send + Sync {
     /// unlinks an expired entry on its next poll scan.
     async fn register(&self, parked: ParkedApproval) -> Result<(), SessionStoreError>;
 
+    /// Conditionally mark a still-pending row's acknowledgment state as
+    /// acknowledged. Updates only a row that is still pending (undecided and
+    /// not removed); never recreates a row. Returns an explicit outcome for a
+    /// row that is missing (unknown, resolved, or cancelled).
+    async fn mark_acknowledged(
+        &self,
+        id: &DecisionId,
+    ) -> Result<AcknowledgeOutcome, SessionStoreError>;
+
     /// Look up a parked approval.
     async fn get(&self, id: &DecisionId) -> Result<Option<ParkedApproval>, SessionStoreError>;
 
@@ -79,9 +130,17 @@ pub trait ApprovalStore: Send + Sync {
     /// alongside it, as one carrier — at most once per id; later attempts
     /// read as `NotFound`. The file backend moves the ticket into its decision
     /// record, other backends drop it.
+    ///
+    /// `expected_authority` is the channel the caller resolves under.
+    /// Authority, the row's deadline, and the terminal-winner check all run
+    /// inside this one store serialization boundary; a row parked under a
+    /// different authority answers `NotFound` with no mutation — a validly
+    /// signed local request cannot override governance, and one agent's
+    /// poller cannot consume another's rows.
     async fn resolve(
         &self,
         id: &DecisionId,
+        expected_authority: ApprovalAuthority,
         decision: ResolvedDecision,
     ) -> Result<(), ResolveError>;
 
@@ -104,19 +163,64 @@ pub trait ApprovalStore: Send + Sync {
         request_id: &str,
     ) -> Result<Vec<ParkedApproval>, SessionStoreError>;
 
+    /// Strict variant of [`Self::cancel_request`]: store faults and any
+    /// incomplete removal are propagated to the caller instead of being
+    /// logged and ignored. Cleanup paths use this so they do not proceed
+    /// to checkpoint deletion while durable approval evidence may remain.
+    ///
+    /// Strict cancellation is opt-in per backend: the default returns
+    /// [`SessionStoreError::UnsupportedOperation`] so a backend without a
+    /// dedicated strict implementation fails closed rather than silently
+    /// answering Ok while durable evidence may remain.
+    async fn cancel_request_strict(
+        &self,
+        _request_id: &str,
+    ) -> Result<Vec<ParkedApproval>, SessionStoreError> {
+        Err(SessionStoreError::UnsupportedOperation {
+            operation: "cancel_request_strict",
+            reason: "this backend implements no strict cancellation".to_string(),
+        })
+    }
+
     /// Scans the store for approval rows that are still pending: every
     /// parked approval that is undecided and non-expired
     /// (`expires_at > now`). No ordering guarantee.
     ///
-    /// The default returns the store's `Unsupported` error so a backend
-    /// without a scan implementation fails loudly instead of reporting an
-    /// empty pending set, which the reconciler would read as no awaiting
-    /// decisions.
+    /// The default returns the store's `UnsupportedOperation` error so a
+    /// backend without a scan implementation fails loudly instead of
+    /// reporting an empty pending set, which the reconciler would read as no
+    /// awaiting decisions.
     async fn list_pending(&self) -> Result<Vec<ParkedApproval>, SessionStoreError> {
-        Err(SessionStoreError::Unsupported {
+        Err(SessionStoreError::UnsupportedOperation {
             operation: "list_pending",
+            reason: "this backend implements no pending scan".to_string(),
         })
     }
+
+    /// Read one approval row and, under the same serialization boundary
+    /// [`ApprovalStore::resolve`] and [`ApprovalStore::remove`] hold, expire
+    /// it when its own deadline has passed strictly.
+    ///
+    /// A row parked under a different authority than `expected_authority`
+    /// reads as [`ApprovalRead::Missing`] with no mutation — a validly signed
+    /// local request cannot override governance, and one agent's poller
+    /// cannot consume another's rows. A decision recorded exactly at the
+    /// deadline remains valid; an existing terminal winner is returned
+    /// unchanged. Missing, decode, and I/O failures are errors, never
+    /// outcomes.
+    async fn read_or_expire(
+        &self,
+        id: &DecisionId,
+        expected_authority: ApprovalAuthority,
+    ) -> Result<ApprovalRead, SessionStoreError>;
+
+    /// Scan every retained row — pending and already addressed — for the
+    /// retention cleanup actor, which groups them by validated scope and
+    /// run ownership. Unlike [`ApprovalStore::list_pending`], decided and
+    /// expired rows stay in the scan and no row is unlinked as a side
+    /// effect. Backends without park parity answer
+    /// [`SessionStoreError::UnsupportedOperation`].
+    async fn retained_rows(&self) -> Result<Vec<RetainedApproval>, SessionStoreError>;
 }
 
 /// Distinct skill-invocation records one session may hold.
@@ -179,6 +283,13 @@ mod tests {
             Ok(())
         }
 
+        async fn mark_acknowledged(
+            &self,
+            _id: &DecisionId,
+        ) -> Result<AcknowledgeOutcome, SessionStoreError> {
+            unreachable!("the scanless default-probe battery never acknowledges");
+        }
+
         async fn get(&self, _id: &DecisionId) -> Result<Option<ParkedApproval>, SessionStoreError> {
             Ok(None)
         }
@@ -186,9 +297,22 @@ mod tests {
         async fn resolve(
             &self,
             _id: &DecisionId,
+            _expected_authority: ApprovalAuthority,
             _decision: ResolvedDecision,
         ) -> Result<(), ResolveError> {
             Ok(())
+        }
+
+        async fn read_or_expire(
+            &self,
+            _id: &DecisionId,
+            _expected_authority: ApprovalAuthority,
+        ) -> Result<ApprovalRead, SessionStoreError> {
+            unreachable!("the scanless default-probe battery never reads a row");
+        }
+
+        async fn retained_rows(&self) -> Result<Vec<RetainedApproval>, SessionStoreError> {
+            unreachable!("the scanless default-probe battery never scans retention");
         }
 
         async fn decision(
@@ -221,8 +345,27 @@ mod tests {
         };
         assert_eq!(
             err,
-            SessionStoreError::Unsupported {
-                operation: "list_pending"
+            SessionStoreError::UnsupportedOperation {
+                operation: "list_pending",
+                reason: "this backend implements no pending scan".to_string(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_request_strict_default_returns_unsupported() {
+        let err = match ScanlessStore.cancel_request_strict("any-request").await {
+            Err(err) => err,
+            Ok(cleared) => panic!(
+                "the default cancel_request_strict must fail closed, never report a cleared set of {}",
+                cleared.len()
+            ),
+        };
+        assert_eq!(
+            err,
+            SessionStoreError::UnsupportedOperation {
+                operation: "cancel_request_strict",
+                reason: "this backend implements no strict cancellation".to_string(),
             }
         );
     }
