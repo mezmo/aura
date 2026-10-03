@@ -324,6 +324,7 @@ dependencies = [
 name = "aura-events"
 version = "0.2.17"
 dependencies = [
+ "chrono",
  "rmcp",
  "serde",
  "serde_json",
@@ -4839,6 +4840,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]
