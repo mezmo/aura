@@ -263,6 +263,29 @@ pub struct RequestSetup {
     pub rehydrated_skills: Vec<String>,
 }
 
+/// Find the matching config: single-config passthrough > explicit model > DEFAULT_AGENT.
+/// Single-config servers accept any model field value (clients like LibreChat always send one).
+/// Multi-config servers require the model field to match an alias or agent name.
+fn resolve_agent_config(
+    configs: &[aura_config::Config],
+    default_agent: Option<&str>,
+    model: Option<&str>,
+) -> Result<aura_config::Config, PrepareError> {
+    if configs.len() == 1 {
+        Ok(configs[0].clone())
+    } else if let Some(model_name) = model.or(default_agent) {
+        configs
+            .iter()
+            .find(|c| c.agent.alias.as_deref().unwrap_or(&c.agent.name) == model_name)
+            .cloned()
+            .ok_or_else(|| PrepareError::NotFound(model_name.to_string()))
+    } else {
+        Err(PrepareError::BadRequest(
+            "you must provide a model parameter".to_string(),
+        ))
+    }
+}
+
 /// Extract query, chat history, and build agent -- shared across both code paths.
 pub async fn prepare_request(
     data: &AppState,
@@ -286,24 +309,13 @@ pub async fn prepare_request(
     // `build_completion_config`, after the agent was already built.
     let request_id = format!("req_{}", Uuid::new_v4().simple());
 
-    // Find the matching config: single-config passthrough > explicit model > DEFAULT_AGENT
-    // Single-config servers accept any model field value (clients like LibreChat always send one).
-    // Multi-config servers require the model field to match an alias or agent name.
-    // Resolved before the history conversion, which needs to know whether this
-    // agent owns the skill-tool names.
-    let config = if data.configs.len() == 1 {
-        data.configs[0].clone()
-    } else if let Some(model_name) = req.model.as_deref().or(data.default_agent.as_deref()) {
-        data.configs
-            .iter()
-            .find(|c| c.agent.alias.as_deref().unwrap_or(&c.agent.name) == model_name)
-            .cloned()
-            .ok_or_else(|| PrepareError::NotFound(model_name.to_string()))?
-    } else {
-        return Err(PrepareError::BadRequest(
-            "you must provide a model parameter".to_string(),
-        ));
-    };
+    // Resolved before the history conversion, which needs to know whether
+    // this agent owns the skill-tool names.
+    let config = resolve_agent_config(
+        &data.configs,
+        data.default_agent.as_deref(),
+        req.model.as_deref(),
+    )?;
     let serves_skills = !config.agent.skills.local.is_empty();
 
     // Single pass: pull the user query out of `messages` and convert the rest
