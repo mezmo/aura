@@ -55,10 +55,11 @@ impl HttpBackend {
         &self,
         session_id: &str,
         run_id: &str,
+        model: Option<&str>,
         cancel: Arc<AtomicBool>,
         handler: &mut impl StreamHandler,
     ) -> Result<ResumeOutcome> {
-        let response = self.client.send_resume(session_id, run_id).await?;
+        let response = self.client.send_resume(session_id, run_id, model).await?;
         if response.status() == reqwest::StatusCode::OK {
             let outcome: StreamOutcome = process_stream(response, cancel, handler).await?;
             Ok(ResumeOutcome::Streamed(Box::new(outcome)))

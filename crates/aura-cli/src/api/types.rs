@@ -145,6 +145,12 @@ pub struct ChatRequest {
     pub tools: Option<Vec<ToolDefinition>>,
 }
 
+#[derive(Debug, Serialize)]
+pub struct ResumeRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ChatCompletionChunk {
     pub choices: Vec<ChunkChoice>,

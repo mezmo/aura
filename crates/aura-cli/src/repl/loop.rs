@@ -4133,6 +4133,7 @@ pub(crate) fn drive_reattach(
         let outcome = rt.block_on(backend.stream_resume(
             &park.session_id,
             &park.run_id,
+            get_selected_model().as_deref(),
             cancel_flag.clone(),
             &mut handler,
         ));

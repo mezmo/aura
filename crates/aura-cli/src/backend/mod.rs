@@ -101,12 +101,13 @@ impl Backend {
         &self,
         session_id: &str,
         run_id: &str,
+        model: Option<&str>,
         cancel: Arc<AtomicBool>,
         handler: &mut impl StreamHandler,
     ) -> Result<http::ResumeOutcome> {
         match self {
             Self::Http(http) => {
-                http.stream_resume(session_id, run_id, cancel, handler)
+                http.stream_resume(session_id, run_id, model, cancel, handler)
                     .await
             }
             #[cfg(feature = "standalone-cli")]

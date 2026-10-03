@@ -1617,6 +1617,7 @@ pub async fn resume_run(
     axum::extract::Extension(claims): axum::extract::Extension<ResumeClaims>,
     headers: HeaderMap,
     Path((session_raw, run_raw)): Path<(String, String)>,
+    body: Option<Json<crate::types::ResumeRequest>>,
 ) -> Response {
     // Both path segments validate before anything else: a malformed segment
     // answers the bare 404 without a single filesystem read.
@@ -1624,26 +1625,16 @@ pub async fn resume_run(
         return StatusCode::NOT_FOUND.into_response();
     };
 
-    // The run's config from the parsed startup configs: single-config
-    // servers pass through, multi-config servers need DEFAULT_AGENT — the
-    // resume path carries no model field to select with.
-    let config = if state.configs.len() == 1 {
-        Some(&state.configs[0])
-    } else {
-        let default_agent = state.default_agent.as_deref();
-        default_agent.and_then(|agent| {
-            state
-                .configs
-                .iter()
-                .find(|c| c.agent.alias.as_deref().unwrap_or(&c.agent.name) == agent)
-        })
-    };
-    let Some(config) = config else {
-        return error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "no configuration can serve this resume: multi-agent servers must set DEFAULT_AGENT",
-            "internal_error",
-        );
+    // The run's config resolves exactly like the chat path's: the resume
+    // body carries the model field the resume URL cannot. A wrong-agent
+    // resume is caught downstream by the checkpoint fingerprint check.
+    let config = match resolve_agent_config(
+        &state.configs,
+        state.default_agent.as_deref(),
+        body.and_then(|Json(req)| req.model).as_deref(),
+    ) {
+        Ok(config) => config,
+        Err(err) => return err.into_http_response(),
     };
 
     // Binding is a parsed-config flag; the presented header is read only
@@ -3400,6 +3391,7 @@ url = "http://127.0.0.1:9"
                     "../escape".to_string(),
                     "0199c0de-4545-7000-8000-000000000045".to_string(),
                 )),
+                None,
             )
             .await;
 
@@ -3421,6 +3413,7 @@ url = "http://127.0.0.1:9"
                 resume_claims(),
                 HeaderMap::new(),
                 Path(("sess-p45".to_string(), "not-a-uuid".to_string())),
+                None,
             )
             .await;
 
@@ -3444,6 +3437,7 @@ url = "http://127.0.0.1:9"
                     "sess-p45".to_string(),
                     "0199c0de-4545-7000-8000-000000000045".to_string(),
                 )),
+                None,
             )
             .await;
 
@@ -3503,6 +3497,7 @@ bind_identity = true
                     "sess-p45".to_string(),
                     "0199c0de-4545-7000-8000-000000000045".to_string(),
                 )),
+                None,
             )
             .await;
 
@@ -3572,6 +3567,7 @@ bind_identity = true
                 resume_claims(),
                 HeaderMap::new(),
                 Path(("sess-p45".to_string(), S2_RUN.to_string())),
+                None,
             )
             .await;
 
@@ -3638,6 +3634,7 @@ bind_identity = true
                 resume_claims(),
                 HeaderMap::new(),
                 Path(("sess-p45".to_string(), S2_INTERRUPTED_RUN.to_string())),
+                None,
             )
             .await;
 
@@ -3679,6 +3676,122 @@ bind_identity = true
                     .expect("the parked-name probe reads"),
                 "no parked-name document is created for a dead resume"
             );
+        }
+    }
+
+    /// The resume path resolves the run's config through the same
+    /// model-field resolution as the chat path (P64): single-config
+    /// passthrough, explicit `model` in the resume body, then
+    /// DEFAULT_AGENT, else the chat path's 400.
+    mod resume_model_resolution {
+        use super::*;
+
+        fn named_config(name: &str, memory_dir: Option<&std::path::Path>) -> aura_config::Config {
+            aura_config::Config {
+                memory_dir: memory_dir.map(|p| p.to_str().expect("UTF-8 path").to_string()),
+                agent: aura_config::AgentConfig {
+                    name: name.to_string(),
+                    ..aura_config::AgentConfig::default()
+                },
+                ..make_test_config()
+            }
+        }
+
+        fn resume_claims() -> axum::extract::Extension<ResumeClaims> {
+            axum::extract::Extension(ResumeClaims(Arc::new(ResumeClaimTable::new())))
+        }
+
+        const RESUME_PATH: (&str, &str) = ("sess-p45", "0199c0de-4545-7000-8000-000000000045");
+
+        fn model_body(model: &str) -> Option<Json<crate::types::ResumeRequest>> {
+            Some(Json(crate::types::ResumeRequest {
+                model: Some(model.to_string()),
+            }))
+        }
+
+        #[test]
+        fn resolve_agent_config_matches_chat_semantics() {
+            let a = named_config("agent-a", None);
+            let b = named_config("agent-b", None);
+
+            // Single-config passthrough ignores the model entirely.
+            let only = resolve_agent_config(std::slice::from_ref(&a), None, Some("anything"))
+                .expect("single-config passthrough");
+            assert_eq!(only.agent.name, "agent-a");
+
+            // Explicit model selects on a multi-config server.
+            let picked = resolve_agent_config(&[a.clone(), b.clone()], None, Some("agent-b"))
+                .expect("model selects");
+            assert_eq!(picked.agent.name, "agent-b");
+
+            // Unknown model is the chat path's 404.
+            let err = resolve_agent_config(&[a.clone(), b.clone()], None, Some("nope"))
+                .expect_err("unknown model refuses");
+            assert!(matches!(err, PrepareError::NotFound(m) if m == "nope"));
+
+            // No model and no default is the chat path's 400.
+            let err = resolve_agent_config(&[a.clone(), b.clone()], None, None)
+                .expect_err("model required");
+            assert!(
+                matches!(err, PrepareError::BadRequest(m) if m == "you must provide a model parameter")
+            );
+
+            // DEFAULT_AGENT is the last resort.
+            let picked = resolve_agent_config(&[a, b], Some("agent-b"), None)
+                .expect("default agent resolves");
+            assert_eq!(picked.agent.name, "agent-b");
+        }
+
+        /// The model field in the resume body selects the serving config:
+        /// the config with no memory_dir answers the 500, the config with
+        /// a readable memory dir answers the DocumentAbsent 404.
+        #[tokio::test]
+        async fn resume_body_model_selects_the_serving_config() {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let state = make_state(vec![
+                named_config("agent-a", None),
+                named_config("agent-b", Some(dir.path())),
+            ]);
+
+            let response = resume_run(
+                State(Arc::clone(&state)),
+                resume_claims(),
+                HeaderMap::new(),
+                Path((RESUME_PATH.0.to_string(), RESUME_PATH.1.to_string())),
+                model_body("agent-a"),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+            let response = resume_run(
+                State(state),
+                resume_claims(),
+                HeaderMap::new(),
+                Path((RESUME_PATH.0.to_string(), RESUME_PATH.1.to_string())),
+                model_body("agent-b"),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
+
+        /// A multi-config server with no body and no DEFAULT_AGENT answers
+        /// the chat path's 400.
+        #[tokio::test]
+        async fn resume_without_model_on_multi_config_answers_400() {
+            let state = make_state(vec![
+                named_config("agent-a", None),
+                named_config("agent-b", None),
+            ]);
+
+            let response = resume_run(
+                State(state),
+                resume_claims(),
+                HeaderMap::new(),
+                Path((RESUME_PATH.0.to_string(), RESUME_PATH.1.to_string())),
+                None,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         }
     }
 }
