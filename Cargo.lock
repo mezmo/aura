@@ -271,6 +271,7 @@ dependencies = [
  "aura-telemetry",
  "aura-web-server",
  "bytes",
+ "chrono",
  "clap",
  "crossterm",
  "dirs",

@@ -185,14 +185,6 @@ impl ApprovalStore for RedisApprovalStore {
         pipe.query_async::<()>(&mut conn).await.map_err(request_err)
     }
 
-    #[expect(unused_variables, reason = "fill layer consumes the id")]
-    async fn mark_acknowledged(
-        &self,
-        id: &DecisionId,
-    ) -> Result<AcknowledgeOutcome, SessionStoreError> {
-        todo!("conditional acknowledgment transition (fill layer)")
-    }
-
     async fn get(&self, id: &DecisionId) -> Result<Option<ParkedApproval>, SessionStoreError> {
         let mut conn = self.conn.clone();
         let payload: Option<String> = conn
@@ -407,25 +399,6 @@ impl ApprovalStore for RedisApprovalStore {
         Ok(pending)
     }
 
-    #[expect(
-        unused_variables,
-        reason = "todo!() body; filled by P45 wave fill units"
-    )]
-    async fn read_or_expire(
-        &self,
-        id: &DecisionId,
-        expected_authority: ApprovalAuthority,
-    ) -> Result<ApprovalRead, SessionStoreError> {
-        todo!(
-            "P45 wave fill units: redis is an unsupported park backend; read_or_expire returns the typed unsupported-configuration error, never a faked outcome"
-        )
-    }
-
-    async fn retained_rows(&self) -> Result<Vec<RetainedApproval>, SessionStoreError> {
-        todo!(
-            "P45 wave fill units: redis is an unsupported park backend; the retained scan returns the typed unsupported-operation error"
-        )
-    }
 }
 
 /// Seconds until the approval expires, floored at [`MIN_TTL_SECS`].
