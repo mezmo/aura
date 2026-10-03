@@ -8495,6 +8495,41 @@ mod tests {
             .expect("the published document opens")
     }
 
+    /// The snapshot ends the worker's run, so the model never answers the
+    /// parked call's sentinel result.
+    #[tokio::test]
+    async fn parking_ends_the_worker_run_before_another_model_turn() {
+        let _serial = WORKER_OVERRIDE_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _store) = file_store_registry(&dir.path().join("approvals"));
+        let (orchestrator, _run_id) =
+            file_backed_park_orchestrator(&registry, dir.path(), "park-ends-run").await;
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(64);
+
+        let (park_model, _invocations) = gated_worker_override(vec![
+            ScriptedTurn::tool_calls(vec![ScriptedToolCall::new(
+                "call_apply_1",
+                test_rig::ECHO_TOOL_NAME,
+                serde_json::json!({"namespace": "prod"}),
+            )]),
+            ScriptedTurn::text("answered the parked call's sentinel"),
+        ]);
+
+        let mut plan = Plan::new("Deploy");
+        plan.add_task(Task::new(0, "Gated apply", "r").with_worker("operations"));
+        orchestrator.execute(&mut plan, &event_tx).await.unwrap();
+
+        assert!(matches!(
+            plan.tasks[0].state,
+            TaskState::AwaitingApproval { .. }
+        ));
+        assert_eq!(
+            park_model.requests().lock().unwrap().len(),
+            1,
+            "the parking turn is the worker's last model turn"
+        );
+    }
+
     /// The shared full-loop harness: park over the file-backed store, drop
     /// the in-memory state, record `decision` in the store, rehydrate from
     /// disk, and drive the continuation with `resume_turns`. Returns the
