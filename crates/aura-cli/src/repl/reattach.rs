@@ -22,6 +22,10 @@ pub(crate) struct ParkedRun {
     pub session_id: String,
     pub retention_expires_at: String,
     pub decision_ids: Vec<String>,
+    /// The model the parking turn ran under, captured when the park
+    /// armed. The resume POST carries it so the server resolves the
+    /// original run's config; the live selection may have moved on.
+    pub model: Option<String>,
 }
 
 /// How a reattach wait ended.

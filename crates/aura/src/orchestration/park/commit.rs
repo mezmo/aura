@@ -335,6 +335,8 @@ pub(crate) fn config_fingerprint(config: &AgentRuntimeConfig) -> String {
         "agent": {
             "llm": serde_json::to_value(&config.llm).ok(),
             "mcp_filter": &config.agent.mcp_filter,
+            "name": &config.agent.name,
+            "system_prompt": &config.agent.system_prompt,
         },
         "identity_header": &config.identity_header,
         "workers": config

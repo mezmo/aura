@@ -1770,6 +1770,35 @@ async fn fingerprint_drift_refuses_with_the_config_changed_row() {
     );
 }
 
+/// The fingerprint carries agent identity (P64): a checkpoint parked under
+/// one agent refuses under an agent that differs only in name, even when
+/// every other fingerprinted setting matches — the wrong-agent resume a
+/// model-field mix-up would produce.
+#[tokio::test]
+async fn wrong_agent_refuses_with_the_config_changed_row() {
+    let mut world = world();
+    register_undecided(&world).await;
+    publish_document(
+        &world,
+        &parked_document(FUTURE_STAMP, matching_fingerprint(&world), None, vec![]),
+    )
+    .await;
+
+    world.config.agent.name = "a-different-agent".to_string();
+
+    let refusal = evaluate_resume(evaluation(&world, false, None))
+        .await
+        .expect_err("a checkpoint parked under another agent refuses");
+    assert_conflict(
+        refusal,
+        json!({
+            "code": "config_changed",
+            "detail": "configuration changed since the run parked",
+            "blocking": [],
+        }),
+    );
+}
+
 /// A ticket naming another run cannot decide this document's calls: the
 /// mismatch row, whose detail is the consult's diagnostic prose.
 #[tokio::test]

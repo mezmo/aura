@@ -3544,6 +3544,7 @@ impl StreamHandler for ReplStreamHandler {
                             session_id: self.chat_session_id.clone(),
                             retention_expires_at,
                             decision_ids,
+                            model: get_selected_model(),
                         });
                         crate::repl::reattach::park_epoch()
                             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -4133,7 +4134,7 @@ pub(crate) fn drive_reattach(
         let outcome = rt.block_on(backend.stream_resume(
             &park.session_id,
             &park.run_id,
-            get_selected_model().as_deref(),
+            park.model.as_deref(),
             cancel_flag.clone(),
             &mut handler,
         ));

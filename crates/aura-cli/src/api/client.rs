@@ -124,12 +124,12 @@ impl ChatClient {
     /// a refusal status carries the typed body the caller decodes. The
     /// POST itself is bounded at ten seconds so a stuck server cannot
     /// hold a reattach poll forever.
-    pub async fn send_resume(
+    fn build_resume_request(
         &self,
         session_id: &str,
         run_id: &str,
         model: Option<&str>,
-    ) -> Result<reqwest::Response> {
+    ) -> reqwest::RequestBuilder {
         self.build_request(
             reqwest::Method::POST,
             &self.config.resume_url(session_id, run_id),
@@ -139,9 +139,18 @@ impl ChatClient {
             model: model.map(str::to_owned),
         })
         .timeout(std::time::Duration::from_secs(10))
-        .send()
-        .await
-        .context("Failed to connect to API for resume")
+    }
+
+    pub async fn send_resume(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        model: Option<&str>,
+    ) -> Result<reqwest::Response> {
+        self.build_resume_request(session_id, run_id, model)
+            .send()
+            .await
+            .context("Failed to connect to API for resume")
     }
 
     /// Ask the LLM for a short one-line summary/title of the given text.
@@ -275,6 +284,58 @@ impl ChatClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_client() -> ChatClient {
+        ChatClient::new(AppConfig {
+            api_url: "http://localhost:9340".to_string(),
+            api_key: None,
+            model: None,
+            system_prompt: None,
+            query: None,
+            resume: None,
+            extra_headers: vec![],
+            force: false,
+            enable_client_tools: false,
+            enable_final_response_summary: false,
+            style: None,
+            pretty: false,
+            log_file: None,
+            telemetry: None,
+            status_line_segments: None,
+        })
+    }
+
+    /// The resume POST carries the model field on the wire: the server
+    /// resolves the resumed run's agent config from it (P64).
+    #[test]
+    fn resume_request_body_carries_the_model() {
+        let request = test_client()
+            .build_resume_request("sess-1", "run-1", Some("live-smoke"))
+            .build()
+            .expect("the request builds");
+        assert_eq!(
+            request.url().as_str(),
+            "http://localhost:9340/v1/sessions/sess-1/runs/run-1"
+        );
+        let body = request.body().expect("the request has a body").as_bytes();
+        assert_eq!(
+            body,
+            Some(br#"{"model":"live-smoke"}"#.as_slice()),
+            "the whole request body"
+        );
+    }
+
+    /// No model serializes with the field omitted (`skip_serializing_if`),
+    /// which the server's `Option<Json<ResumeRequest>>` reads as no model.
+    #[test]
+    fn resume_request_body_omits_an_absent_model() {
+        let request = test_client()
+            .build_resume_request("sess-1", "run-1", None)
+            .build()
+            .expect("the request builds");
+        let body = request.body().expect("the request has a body").as_bytes();
+        assert_eq!(body, Some(b"{}".as_slice()));
+    }
 
     #[test]
     fn model_not_found_keyword() {
