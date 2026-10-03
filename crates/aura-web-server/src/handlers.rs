@@ -3680,9 +3680,9 @@ bind_identity = true
     }
 
     /// The resume path resolves the run's config through the same
-    /// model-field resolution as the chat path (P64): single-config
-    /// passthrough, explicit `model` in the resume body, then
-    /// DEFAULT_AGENT, else the chat path's 400.
+    /// model-field resolution as the chat path: single-config passthrough,
+    /// explicit `model` in the resume body, then DEFAULT_AGENT, else the
+    /// chat path's 400.
     mod resume_model_resolution {
         use super::*;
 

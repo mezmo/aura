@@ -1770,9 +1770,9 @@ async fn fingerprint_drift_refuses_with_the_config_changed_row() {
     );
 }
 
-/// The fingerprint carries agent identity (P64): a checkpoint parked under
-/// one agent refuses under an agent that differs only in name, even when
-/// every other fingerprinted setting matches — the wrong-agent resume a
+/// The fingerprint carries agent identity: a checkpoint parked under one
+/// agent refuses under an agent that differs only in name, even when every
+/// other fingerprinted setting matches — the wrong-agent resume a
 /// model-field mix-up would produce.
 #[tokio::test]
 async fn wrong_agent_refuses_with_the_config_changed_row() {

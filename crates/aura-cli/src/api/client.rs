@@ -60,9 +60,8 @@ pub fn is_model_error(err: &anyhow::Error) -> bool {
 pub struct ChatClient {
     http: Client,
     config: AppConfig,
-    /// Bound on the resume POST up to response headers. The 200 body is
-    /// the resumed run's SSE stream and must outlive this bound; a total
-    /// request timeout killed healthy long streams mid-chunk (P63).
+    /// Maximum time to receive resume response headers; the SSE body is
+    /// intentionally unbounded past it.
     resume_post_timeout: std::time::Duration,
 }
 
@@ -152,8 +151,7 @@ impl ChatClient {
     /// status-checking: a 200 carries the resumed run's SSE stream, while
     /// a refusal status carries the typed body the caller decodes. The
     /// bound covers the POST up to response headers, so a stuck server
-    /// cannot hold a reattach poll; the stream itself is unbounded — a
-    /// total request timeout killed healthy long streams mid-chunk (P63).
+    /// cannot hold a reattach poll; the stream itself is unbounded.
     pub async fn send_resume(
         &self,
         session_id: &str,
@@ -326,7 +324,7 @@ mod tests {
     }
 
     /// The resume POST carries the model field on the wire: the server
-    /// resolves the resumed run's agent config from it (P64).
+    /// resolves the resumed run's agent config from it.
     #[test]
     fn resume_request_body_carries_the_model() {
         let request = test_client()
@@ -357,10 +355,10 @@ mod tests {
         assert_eq!(body, Some(b"{}".as_slice()));
     }
 
-    /// P63 regression: a resume stream whose body outlives the POST bound
-    /// completes. The mock server answers headers at once, then holds the
-    /// chunk past twice the client's post bound — a total-request timeout
-    /// (the bug) kills the read; bounding only the POST lets it through.
+    /// A resume stream whose body outlives the POST bound completes. The
+    /// mock server answers headers at once, then holds the chunk past
+    /// twice the client's post bound — a total-request timeout (the bug)
+    /// kills the read; bounding only the POST lets it through.
     #[tokio::test]
     async fn resume_stream_outliving_the_post_bound_completes() {
         use std::io::{Read, Write};
@@ -376,14 +374,14 @@ mod tests {
             )
             .expect("headers");
             conn.flush().expect("flush headers");
-            std::thread::sleep(std::time::Duration::from_millis(400));
+            std::thread::sleep(std::time::Duration::from_millis(1000));
             conn.write_all(b"data: {\"choices\":[{\"delta\":{\"content\":\"late\"}}]}\n\ndata: [DONE]\n\n")
                 .expect("chunk");
             conn.flush().expect("flush chunk");
         });
 
         let client = test_client_at(&format!("http://127.0.0.1:{port}"))
-            .with_resume_post_timeout(std::time::Duration::from_millis(200));
+            .with_resume_post_timeout(std::time::Duration::from_millis(500));
         let response = client
             .send_resume("sess-1", "run-1", None)
             .await
