@@ -267,6 +267,91 @@ pub(crate) fn handle_rename(arg: &str, conv_store: &Option<ConversationStore>) {
     redraw_input_frame();
 }
 
+/// Handle the `/resume-run [run_id]` command: re-enter the reattach
+/// machinery for the session's recorded park, with no new user message.
+///
+/// The manual path is the same consume loop the automatic in-turn
+/// reattach drives — one bounded wait on the run-resource POST, the same
+/// rendering, and the same history persistence — never a print-only
+/// echo. With no argument it re-arms the latest recorded park; with a
+/// run id it must match, else nothing is re-armed.
+pub(crate) fn handle_resume_run(
+    args: &str,
+    conversation: &mut ConversationHistory,
+    conv_store: &mut Option<ConversationStore>,
+    rt: &tokio::runtime::Runtime,
+    backend: &Backend,
+    approval_poster: &Option<crate::api::approval::ApprovalPoster>,
+) {
+    use crate::repl::reattach::latest_park_slot;
+
+    // Peek, never take: the record stays for a later re-arm, and a
+    // mismatched id must not destroy it.
+    let requested = args.trim().to_string();
+    let recorded = latest_park_slot().lock().ok().and_then(|g| g.clone());
+    let park = recorded.filter(|p| requested.is_empty() || requested == p.run_id);
+    let Some(park) = park else {
+        println!(
+            "{}",
+            "no parked run recorded in this session to resume"
+                .themed(crate::theme::AuraStyle::Muted)
+        );
+        return;
+    };
+
+    // The park carries the session its turn resolved — reattachment
+    // targets the same route.
+    let chat_session_id = park.session_id.clone();
+
+    // Re-surface the recorded gate: the user re-arming manually wants
+    // the approval links in view again before the wait.
+    {
+        let _term = crate::ui::prompt::lock_term();
+        println!(
+            "{}  {}",
+            "⏸ Resuming parked run".themed(crate::theme::AuraStyle::Warning),
+            park.run_id
+                .as_str()
+                .themed(crate::theme::AuraStyle::Primary),
+        );
+        for id in &park.decision_ids {
+            let link = approval_poster
+                .as_ref()
+                .map(|p| p.approval_url(id))
+                .unwrap_or_else(|| id.clone());
+            println!(
+                "  {} {}",
+                "approve:".themed(crate::theme::AuraStyle::Muted),
+                link.themed(crate::theme::AuraStyle::Primary),
+            );
+        }
+        println!();
+    }
+
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let poster = approval_poster.clone();
+    let (text, _user_released) =
+        crate::repl::r#loop::drive_reattach(rt, backend, park, &cancel, &poster, &mut || {
+            crate::repl::r#loop::ReplStreamHandler::fresh_for_manual_resume(
+                poster.clone(),
+                chat_session_id.clone(),
+            )
+        });
+
+    if !text.is_empty() {
+        conversation.add_assistant(&text);
+        println!();
+        crate::ui::markdown::render_markdown(&text);
+        println!();
+    }
+    if let Some(store) = conv_store.as_ref() {
+        let expanded = crate::ui::prompt::is_expanded_output();
+        crate::ui::prompt::with_event_log(|log| {
+            store.save_all(conversation.messages(), log, expanded);
+        });
+    }
+}
+
 /// Handle the `/resume <id or name>` command.
 /// Returns the new initial_input if any was loaded from the resumed conversation.
 pub(crate) fn handle_resume(

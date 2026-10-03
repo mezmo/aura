@@ -8,7 +8,7 @@ use std::sync::atomic::AtomicBool;
 
 use anyhow::Result;
 
-use crate::api::stream::{StreamHandler, StreamResult};
+use crate::api::stream::{StreamHandler, StreamOutcome};
 use crate::api::types::{Message, ToolDefinition};
 use crate::cli::Args;
 use crate::config::AppConfig;
@@ -58,7 +58,7 @@ impl Backend {
         session_id: &str,
         cancel: Arc<AtomicBool>,
         handler: &mut impl StreamHandler,
-    ) -> Result<StreamResult> {
+    ) -> Result<StreamOutcome> {
         match self {
             Self::Http(http) => {
                 http.stream_chat(messages, tools, session_id, cancel, handler)
@@ -89,6 +89,30 @@ impl Backend {
             Self::Http(http) => http.summarize(text, session_id).await,
             #[cfg(feature = "standalone-cli")]
             Self::Direct(direct) => direct.summarize(text, session_id).await,
+        }
+    }
+
+    /// POST to the resume endpoint and, on a 200, stream the resumed
+    /// run's SSE through `handler`. A refusal decodes to the typed
+    /// [`http::ResumeOutcome`] rows. Park-resume is an HTTP-only flow
+    /// (park mode requires the web server), so the direct backend has
+    /// no arm.
+    pub async fn stream_resume(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        cancel: Arc<AtomicBool>,
+        handler: &mut impl StreamHandler,
+    ) -> Result<http::ResumeOutcome> {
+        match self {
+            Self::Http(http) => {
+                http.stream_resume(session_id, run_id, cancel, handler)
+                    .await
+            }
+            #[cfg(feature = "standalone-cli")]
+            Self::Direct(_) => Err(anyhow::anyhow!(
+                "park-resume is not available in standalone mode"
+            )),
         }
     }
 
