@@ -149,10 +149,12 @@ export AWS_REGION="your-region"       # For Knowledge Base
 - **Rig Fork**: `mezmo/rig` branch `mshearer/LOG-23351-openai-reasoning`
 
 ### Key Modules
+- `builder.rs` - `PreparedAgent` (built once from config: provider client, tools, MCP connections) and `Agent` (one run of it, via `PreparedAgent::begin_run`)
+- `forwarded_headers.rs` - `ForwardedHeaders`, the `headers_from_request` values a prepared agent's MCP connections and HITL route were opened with; `begin_run` refuses a request that forwards different values, so a prepared agent never runs under another request's credentials
 - `provider_agent.rs` - Type-erased streaming across providers
 - `stream_events.rs` - Custom aura SSE events
 - `request_cancellation.rs` - The signal that stops a run, as awaiting work sees it
-- `run_context.rs` - The run a task is working on: its event channel, and the FIFO queue for tool_call_id correlation (see critical assumption below)
+- `run_context.rs` - `RunContext`, the run a task is working on: its event channel, the FIFO queue for tool_call_id correlation (see critical assumption below), and the scratchpad budget, turn-nudge counters and skill-invocation recorder an agent keeps for it; `BoundRun` is the slot through which prepare-time tools and wrappers (turn nudge, scratchpad, skills, HITL) reach it, and `RunLease` is what `begin_run` counts to serve one run at a time
 - `orchestration/` - Multi-agent coordinator, workers, DAG execution, orchestration SSE events
 
 ### Critical Assumption: Rig Sequential Tool Execution

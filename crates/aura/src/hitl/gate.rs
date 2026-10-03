@@ -46,8 +46,6 @@ pub struct HitlApprovalWrapper {
     route: Arc<DecisionRoute>,
     /// Who this wrapper speaks for, stamped onto every request it raises.
     scope: AgentScope,
-    /// Global request id, for SSE event routing.
-    request_id: String,
     /// The run whose observer sees this gate's approvals.
     run: crate::run_context::BoundRun,
     /// `[agent].name` of the config that built this agent.
@@ -69,7 +67,6 @@ impl HitlApprovalWrapper {
         patterns: Arc<[GlobPattern]>,
         route: Arc<DecisionRoute>,
         scope: AgentScope,
-        request_id: String,
         agent_name: String,
         instance_id: String,
     ) -> Self {
@@ -77,9 +74,8 @@ impl HitlApprovalWrapper {
             patterns,
             route,
             scope,
-            request_id,
             // A worker's gate is built inside its run; a single agent's is
-            // built before one exists and is bound by `stream`.
+            // built before one exists and is bound by `begin_run`.
             run: crate::run_context::BoundRun::captured(),
             agent_name,
             instance_id,
@@ -104,10 +100,7 @@ impl HitlApprovalWrapper {
             Some(run) => {
                 run.emit(event).await;
             }
-            None => tracing::warn!(
-                request_id = %self.request_id,
-                "no run bound to this gate; its approval reaches no observer"
-            ),
+            None => tracing::warn!("no run bound to this gate; its approval reaches no observer"),
         }
     }
 
@@ -319,11 +312,12 @@ impl ToolWrapper for HitlApprovalWrapper {
         if let Some(park) = &self.park {
             return self.park_pre_call(park, matched, args, ctx).await;
         }
+        let run = self.run();
         let request = ApprovalRequest {
             version: PROTOCOL_VERSION,
             instance_id: self.instance_id.clone(),
             decision_id: DecisionId::generate(),
-            request_id: self.request_id.clone(),
+            request_id: self.run.id_or_empty(),
             scope: self.scope.clone(),
             origin: ApprovalOrigin::ConfigGate {
                 matched_pattern: matched.to_string(),
@@ -336,15 +330,15 @@ impl ToolWrapper for HitlApprovalWrapper {
                 tool_call_intent: ctx.tool_call_intent.clone(),
             }],
         };
-        let cancel = self
-            .run()
+        let cancel = run
+            .as_ref()
             .map(|run| {
                 crate::request_cancellation::RequestCancelToken::from(run.cancel_token().clone())
             })
             .unwrap_or_else(crate::request_cancellation::RequestCancelToken::unbound);
         // `DecisionRoute` emits the lifecycle itself; the scope is how those
         // events find the run, since rig calls this off it.
-        let decision = match self.run() {
+        let decision = match run {
             Some(run) => {
                 crate::run_context::with_run(run, self.route.decide_for_gate(request, &cancel))
                     .await
@@ -401,7 +395,6 @@ mod tests {
                 timeout: Duration::from_secs(1),
             }),
             AgentScope::Single { session_id: None },
-            "t".into(),
             "test-agent".to_string(),
             "test-instance-id".to_string(),
         );
@@ -425,7 +418,6 @@ mod tests {
                 timeout: Duration::from_secs(1),
             }),
             AgentScope::Single { session_id: None },
-            "t".into(),
             "test-agent".to_string(),
             "test-instance-id".to_string(),
         );
@@ -463,7 +455,6 @@ mod tests {
                 timeout: Duration::from_secs(2),
             }),
             AgentScope::Single { session_id: None },
-            "req-test".into(),
             "test-agent".to_string(),
             "test-instance-id".to_string(),
         );
@@ -559,14 +550,12 @@ mod tests {
         fn parked_gate(
             registry: &PendingApprovals,
             route: &Arc<DecisionRoute>,
-            request_id: &str,
             cell: &Arc<crate::orchestration::BlockedCell>,
         ) -> HitlApprovalWrapper {
             HitlApprovalWrapper::new(
                 Arc::from(["kubectl_*".into()]),
                 route.clone(),
                 worker_scope(),
-                request_id.to_string(),
                 "test-agent".to_string(),
                 "test-instance".to_string(),
             )
@@ -591,7 +580,7 @@ mod tests {
             );
             let route = conv_route_over(registry.clone(), Duration::from_secs(60));
             let cell = Arc::new(crate::orchestration::BlockedCell::default());
-            let gate = parked_gate(&registry, &route, &request_id, &cell);
+            let gate = parked_gate(&registry, &route, &cell);
 
             let args = serde_json::json!({ "namespace": "prod" });
             let ctx = ToolCallContext::new("kubectl_apply");
@@ -629,7 +618,7 @@ mod tests {
             let route = conv_route_over(registry.clone(), Duration::from_secs(120));
             let cell = Arc::new(crate::orchestration::BlockedCell::default());
             cell.set_current_call_id(Some("call_7".to_string()));
-            let gate = parked_gate(&registry, &route, &request_id, &cell);
+            let gate = parked_gate(&registry, &route, &cell);
 
             let args = serde_json::json!({ "namespace": "prod" });
             let ctx = ToolCallContext::new("kubectl_apply");
@@ -697,7 +686,7 @@ mod tests {
         async fn two_gated_calls_append_two_cell_entries() {
             let (registry, route) = conv_route(Duration::from_secs(60));
             let cell = Arc::new(crate::orchestration::BlockedCell::default());
-            let gate = parked_gate(&registry, &route, "req-two-calls", &cell);
+            let gate = parked_gate(&registry, &route, &cell);
 
             let first = gate
                 .pre_call(
@@ -733,7 +722,7 @@ mod tests {
         async fn ungated_tool_proceeds_without_parking() {
             let (registry, route) = conv_route(Duration::from_secs(60));
             let cell = Arc::new(crate::orchestration::BlockedCell::default());
-            let gate = parked_gate(&registry, &route, "req-ungated", &cell);
+            let gate = parked_gate(&registry, &route, &cell);
 
             let outcome = gate
                 .pre_call(&serde_json::json!({}), &ToolCallContext::new("ls"))
@@ -761,7 +750,6 @@ mod tests {
                 Arc::from(["kubectl_*".into()]),
                 route,
                 worker_scope(),
-                "req-guard".to_string(),
                 "test-agent".to_string(),
                 "test-instance".to_string(),
             )
@@ -829,7 +817,6 @@ mod tests {
                 Arc::from(["kubectl_*".into()]),
                 route,
                 AgentScope::Single { session_id: None },
-                "req-recorded".to_string(),
                 "test-agent".to_string(),
                 "test-instance".to_string(),
             )
@@ -985,7 +972,6 @@ mod tests {
             Arc::from(["kubectl_*".into()]),
             route,
             AgentScope::Single { session_id: None },
-            "req_run_cancel".into(),
             "test-agent".to_string(),
             "test-instance-id".to_string(),
         ));
@@ -1226,7 +1212,6 @@ mod tests {
                 Arc::from(["kubectl_*".into()]),
                 Arc::new(route),
                 AgentScope::Single { session_id: None },
-                request_id.to_string(),
                 "test-agent".to_string(),
                 "test-instance-id".to_string(),
             );
