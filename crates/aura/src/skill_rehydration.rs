@@ -415,6 +415,7 @@ mod tests {
         let toolset = SkillToolset::new(&skills, Some(recorder)).unwrap();
         toolset
             .load
+            .expect("load_skill is present outside exclusive mode")
             .call(LoadSkillArgs {
                 name: "alpha".to_string(),
             })

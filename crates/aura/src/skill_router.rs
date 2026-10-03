@@ -1,0 +1,808 @@
+//! Decision-model skill routing.
+//!
+//! Chooses which skills to preload into an agent's context by asking a System
+//! One decision model (TypeSafe Jev, or a local Kev server exposing the same
+//! `POST /v1/systemone` API) one independent yes/no `noul` question per skill.
+//! Skill selection is multi-label, so the request fans out one `noul` per
+//! skill and thresholds each calibrated `P(yes)`; a `choice` question would
+//! be a softmax whose options compete and always names exactly one winner.
+//!
+//! Two stages form a funnel: stage 1 scores the whole catalog and is tuned
+//! for recall, stage 2 rescores only the stage-1 shortlist and is tuned for
+//! precision. The stages make different mistakes, so the funnel only fails
+//! where both agree.
+//!
+//! The router never fails the agent. A stage-1 failure yields
+//! [`SkillRoutingOutcome::Unavailable`] and the caller keeps the on-demand
+//! `load_skill` path; a stage-2 failure degrades to the stage-1 shortlist.
+
+use aura_config::skills::SkillName;
+use aura_config::{SkillConfig, SkillRouterConfig, SkillRouterMode, SkillRouterStage};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::io::Write as _;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+/// Which agent a routing decision was made for.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SkillRoutingSubject {
+    Coordinator,
+    Worker {
+        task_id: usize,
+        worker_name: Option<String>,
+    },
+    /// The single-agent (non-orchestrated) path.
+    Agent,
+}
+
+/// The scored result of one decision-model stage.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StageDecision {
+    pub url: String,
+    pub model: String,
+    pub threshold: f64,
+    /// Calibrated `P(load)` for every skill this stage scored.
+    pub probabilities: BTreeMap<SkillName, f64>,
+    /// Skills whose probability met the threshold, catalog order.
+    pub selected: Vec<SkillName>,
+    /// Wall-clock time of the HTTP round trip.
+    pub latency_ms: u64,
+    /// Latency the model server reported for its own inference.
+    pub server_latency_ms: Option<f64>,
+}
+
+/// One complete routing decision, also the JSONL decision-log record.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillRoutingDecision {
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+    pub request_id: Option<String>,
+    pub subject: SkillRoutingSubject,
+    pub mode: SkillRouterMode,
+    /// The text the skills were scored against.
+    pub prompt: String,
+    pub catalog: Vec<SkillName>,
+    pub stage1: StageDecision,
+    pub stage2: Option<StageDecision>,
+    /// Why stage 2 was configured but did not run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage2_skipped: Option<String>,
+    /// The final selection.
+    pub selected: Vec<SkillName>,
+    pub total_latency_ms: u64,
+}
+
+/// What routing decided to preload for an agent.
+#[derive(Debug, Clone)]
+pub enum SkillPlan {
+    /// Nothing preloaded.
+    OnDemand,
+    /// `section` is a preamble section holding the bodies of `selected`, a
+    /// subset of the catalog.
+    Augment {
+        section: String,
+        selected: Vec<SkillName>,
+    },
+    /// `section` is a preamble section holding the bodies of `selected`, the
+    /// agent's whole skill set.
+    Exclusive {
+        section: Option<String>,
+        selected: Vec<SkillConfig>,
+    },
+}
+
+/// Wording of the preloaded-skills section.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreloadStyle {
+    /// `load_skill` stays available for the rest of the catalog.
+    Augment,
+    /// The section is the complete skill set.
+    Exclusive,
+}
+
+/// What routing produced for one prompt.
+#[derive(Debug, Clone)]
+pub enum SkillRoutingOutcome {
+    Routed(Box<SkillRoutingDecision>),
+    /// No decision was made.
+    Unavailable {
+        reason: String,
+    },
+}
+
+#[derive(Debug, thiserror::Error)]
+enum StageError {
+    #[error("request to {url} failed: {source}")]
+    Http { url: String, source: reqwest::Error },
+    #[error("{url} returned HTTP {status}: {body}")]
+    Status {
+        url: String,
+        status: u16,
+        body: String,
+    },
+    #[error("{url} returned no noul answer for skill '{skill}'")]
+    MissingAnswer { url: String, skill: SkillName },
+    #[error("{url} returned noul {value} for skill '{skill}', outside [0, 1]")]
+    InvalidProbability {
+        url: String,
+        skill: SkillName,
+        value: f64,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// System One wire types (the subset the router uses)
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+struct SystemOneRequest<'a> {
+    model: &'a str,
+    state: SystemOneState<'a>,
+    questions: BTreeMap<&'a str, NoulQuestion>,
+}
+
+#[derive(Serialize)]
+struct SystemOneState<'a> {
+    user_prompt: &'a str,
+}
+
+#[derive(Serialize)]
+struct NoulQuestion {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    instructions: String,
+}
+
+#[derive(Deserialize)]
+struct SystemOneResponse {
+    answers: BTreeMap<String, NoulAnswer>,
+    #[serde(default)]
+    latency_ms: Option<f64>,
+}
+
+#[derive(Deserialize)]
+struct NoulAnswer {
+    #[serde(default)]
+    noul: Option<f64>,
+}
+
+/// The per-skill question sent to the decision model.
+///
+/// The trailing "only if the prompt actually requires" clause measurably
+/// reduces keyword-triggered false loads; keep it when editing.
+pub fn question_for(skill: &SkillConfig) -> String {
+    format!(
+        "Should the '{}' skill be loaded for this prompt? It covers: {} \
+         Load it only if the prompt actually requires that capability, \
+         not merely because related words appear.",
+        skill.name, skill.description
+    )
+}
+
+/// Two-stage decision-model skill router. Cheap to share behind an `Arc`.
+pub struct SkillRouter {
+    config: SkillRouterConfig,
+    client: reqwest::Client,
+    decision_log: Option<Mutex<std::fs::File>>,
+}
+
+impl std::fmt::Debug for SkillRouter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SkillRouter")
+            .field("mode", &self.config.mode)
+            .field("stage1", &self.config.stage1.url)
+            .field("stage2", &self.config.stage2.as_ref().map(|s| &s.url))
+            .field("decision_log", &self.config.decision_log)
+            .finish()
+    }
+}
+
+impl SkillRouter {
+    /// A decision log that cannot be opened is reported and skipped; routing
+    /// itself is unaffected.
+    pub fn new(config: SkillRouterConfig) -> Self {
+        let decision_log = config.decision_log.as_ref().and_then(|path| {
+            let parent_ready = match path.parent() {
+                Some(parent) if !parent.as_os_str().is_empty() => std::fs::create_dir_all(parent),
+                _ => Ok(()),
+            };
+            match parent_ready.and_then(|()| open_decision_log(path)) {
+                Ok(file) => Some(Mutex::new(file)),
+                Err(e) => {
+                    tracing::warn!(
+                        "Skill router: cannot open decision log {}: {e}; decisions will \
+                         only be traced",
+                        path.display()
+                    );
+                    None
+                }
+            }
+        });
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(config.timeout_ms))
+            .build()
+            .unwrap_or_default();
+        tracing::info!(
+            "Skill router enabled (mode={:?}, stage1={} @ {}, stage2={})",
+            config.mode,
+            config.stage1.url,
+            config.stage1.threshold,
+            config
+                .stage2
+                .as_ref()
+                .map(|s| format!("{} @ {}", s.url, s.threshold))
+                .unwrap_or_else(|| "none".to_string()),
+        );
+        Self {
+            config,
+            client,
+            decision_log,
+        }
+    }
+
+    pub fn mode(&self) -> SkillRouterMode {
+        self.config.mode
+    }
+
+    /// Score `skills` against `prompt`, log the decision, and return it.
+    pub async fn route(
+        &self,
+        subject: SkillRoutingSubject,
+        request_id: Option<&str>,
+        prompt: &str,
+        skills: &[SkillConfig],
+    ) -> SkillRoutingOutcome {
+        if skills.is_empty() {
+            return SkillRoutingOutcome::Unavailable {
+                reason: "no skills configured".to_string(),
+            };
+        }
+        let started = Instant::now();
+
+        let stage1 = match self.score_stage(&self.config.stage1, prompt, skills).await {
+            Ok(stage) => stage,
+            Err(e) => {
+                tracing::warn!(
+                    subject = ?subject,
+                    "Skill router: stage 1 unavailable, keeping on-demand skill loading: {e}"
+                );
+                return SkillRoutingOutcome::Unavailable {
+                    reason: e.to_string(),
+                };
+            }
+        };
+
+        let shortlist: Vec<SkillConfig> = skills
+            .iter()
+            .filter(|s| stage1.selected.contains(&s.name))
+            .cloned()
+            .collect();
+
+        let (stage2, stage2_skipped) = match &self.config.stage2 {
+            None => (None, None),
+            Some(_) if shortlist.is_empty() => {
+                (None, Some("stage 1 shortlist is empty".to_string()))
+            }
+            Some(cfg) => match self.score_stage(cfg, prompt, &shortlist).await {
+                Ok(stage) => (Some(stage), None),
+                Err(e) => {
+                    tracing::warn!(
+                        subject = ?subject,
+                        "Skill router: stage 2 unavailable, using the stage 1 shortlist: {e}"
+                    );
+                    (None, Some(e.to_string()))
+                }
+            },
+        };
+
+        // Stage 2 owns the final selection when it ran; otherwise the stage-1
+        // shortlist is the selection.
+        let selected = stage2
+            .as_ref()
+            .map(|s| s.selected.clone())
+            .unwrap_or_else(|| stage1.selected.clone());
+
+        let decision = SkillRoutingDecision {
+            timestamp: chrono::Utc::now(),
+            request_id: request_id.map(String::from),
+            subject,
+            mode: self.config.mode,
+            prompt: prompt.to_string(),
+            catalog: skills.iter().map(|s| s.name.clone()).collect(),
+            stage1,
+            stage2,
+            stage2_skipped,
+            selected,
+            total_latency_ms: started.elapsed().as_millis() as u64,
+        };
+        self.record(&decision);
+        SkillRoutingOutcome::Routed(Box::new(decision))
+    }
+
+    /// Route and turn the decision into what the agent should preload.
+    ///
+    /// Shadow mode and an unavailable router preload nothing, which leaves
+    /// the caller's on-demand surface (catalog plus `load_skill` and
+    /// `read_skill_file`) intact. Inject mode adds the selected bodies on
+    /// top of that surface. Exclusive mode makes the selected bodies the
+    /// whole skill set, even when the selection is empty: the caller drops
+    /// the catalog and `load_skill` and keeps `read_skill_file` scoped to
+    /// the selection for its resource files.
+    pub async fn plan(
+        &self,
+        subject: SkillRoutingSubject,
+        request_id: Option<&str>,
+        prompt: &str,
+        skills: &[SkillConfig],
+    ) -> SkillPlan {
+        let SkillRoutingOutcome::Routed(decision) =
+            self.route(subject, request_id, prompt, skills).await
+        else {
+            return SkillPlan::OnDemand;
+        };
+        match self.config.mode {
+            SkillRouterMode::Shadow => SkillPlan::OnDemand,
+            SkillRouterMode::Inject => {
+                match render_preloaded_skills(&decision.selected, skills, PreloadStyle::Augment)
+                    .await
+                {
+                    Some(section) => SkillPlan::Augment {
+                        selected: section.loaded,
+                        section: section.text,
+                    },
+                    None => SkillPlan::OnDemand,
+                }
+            }
+            SkillRouterMode::Exclusive => {
+                // The surface is only what was actually read: a selected
+                // skill whose body could not be loaded has no catalog entry
+                // or `load_skill` to fall back on, so it is dropped rather
+                // than left as a name `read_skill_file` accepts but the LLM
+                // has no instructions for.
+                let section =
+                    render_preloaded_skills(&decision.selected, skills, PreloadStyle::Exclusive)
+                        .await;
+                let loaded = section.as_ref().map(|s| s.loaded.as_slice()).unwrap_or(&[]);
+                SkillPlan::Exclusive {
+                    selected: skills
+                        .iter()
+                        .filter(|s| loaded.contains(&s.name))
+                        .cloned()
+                        .collect(),
+                    section: section.map(|s| s.text),
+                }
+            }
+        }
+    }
+
+    async fn score_stage(
+        &self,
+        stage: &SkillRouterStage,
+        prompt: &str,
+        skills: &[SkillConfig],
+    ) -> Result<StageDecision, StageError> {
+        let url = format!("{}/v1/systemone", stage.url.trim_end_matches('/'));
+        let questions = skills
+            .iter()
+            .map(|s| {
+                (
+                    s.name.as_str(),
+                    NoulQuestion {
+                        kind: "noul",
+                        instructions: question_for(s),
+                    },
+                )
+            })
+            .collect();
+        let body = SystemOneRequest {
+            model: &stage.model,
+            state: SystemOneState {
+                user_prompt: prompt,
+            },
+            questions,
+        };
+
+        let mut request = self.client.post(&url).json(&body);
+        if let Some(key) = &stage.api_key {
+            request = request.bearer_auth(key);
+        }
+
+        let started = Instant::now();
+        let response = request.send().await.map_err(|source| StageError::Http {
+            url: url.clone(),
+            source,
+        })?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            let (body, _) = crate::string_utils::safe_truncate(&body, 300);
+            return Err(StageError::Status {
+                url,
+                status: status.as_u16(),
+                body: body.to_string(),
+            });
+        }
+        let parsed: SystemOneResponse =
+            response.json().await.map_err(|source| StageError::Http {
+                url: url.clone(),
+                source,
+            })?;
+        let latency_ms = started.elapsed().as_millis() as u64;
+
+        let mut probabilities = BTreeMap::new();
+        let mut selected = Vec::new();
+        for skill in skills {
+            let p = parsed
+                .answers
+                .get(skill.name.as_str())
+                .and_then(|a| a.noul)
+                .ok_or_else(|| StageError::MissingAnswer {
+                    url: url.clone(),
+                    skill: skill.name.clone(),
+                })?;
+            // A calibrated probability outside [0, 1] (or NaN) means the
+            // server is not speaking the protocol; the stage is treated as
+            // unavailable rather than letting garbage narrow the surface.
+            if !(0.0..=1.0).contains(&p) {
+                return Err(StageError::InvalidProbability {
+                    url: url.clone(),
+                    skill: skill.name.clone(),
+                    value: p,
+                });
+            }
+            probabilities.insert(skill.name.clone(), p);
+            if p >= stage.threshold {
+                selected.push(skill.name.clone());
+            }
+        }
+
+        Ok(StageDecision {
+            url: stage.url.clone(),
+            model: stage.model.clone(),
+            threshold: stage.threshold,
+            probabilities,
+            selected,
+            latency_ms,
+            server_latency_ms: parsed.latency_ms,
+        })
+    }
+
+    fn record(&self, decision: &SkillRoutingDecision) {
+        // The prompt is request content: it reaches the tracing event only
+        // under the same gate as every other prompt/completion attribute.
+        // The decision log keeps it regardless, since fitting thresholds
+        // from real traffic is the log's whole purpose.
+        let prompt_preview = crate::logging::should_record_content()
+            .then(|| crate::string_utils::safe_truncate(&decision.prompt, 120).0);
+        tracing::info!(
+            subject = ?decision.subject,
+            mode = ?decision.mode,
+            selected = ?decision.selected,
+            shortlist = ?decision.stage1.selected,
+            stage1_ms = decision.stage1.latency_ms,
+            stage2_ms = decision.stage2.as_ref().map(|s| s.latency_ms),
+            total_ms = decision.total_latency_ms,
+            prompt = prompt_preview,
+            "Skill router decision"
+        );
+        tracing::debug!(
+            stage1 = ?decision.stage1.probabilities,
+            stage2 = ?decision.stage2.as_ref().map(|s| &s.probabilities),
+            "Skill router probabilities"
+        );
+        if let Some(log) = &self.decision_log
+            && let Ok(line) = serde_json::to_string(decision)
+            && let Ok(mut file) = log.lock()
+            && let Err(e) = writeln!(file, "{line}")
+        {
+            tracing::warn!("Skill router: failed to append decision log: {e}");
+        }
+    }
+}
+
+/// Open (creating if needed) the append-only decision log. Every record
+/// carries a full user prompt, so on Unix the file is created owner-only
+/// rather than inheriting the process umask.
+fn open_decision_log(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
+/// A rendered preloaded-skills preamble section.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreloadedSection {
+    pub text: String,
+    /// The skills whose bodies `text` holds, catalog order.
+    pub loaded: Vec<SkillName>,
+}
+
+/// Render the preamble section carrying the full body of each selected
+/// skill, or `None` when nothing was selected or nothing could be read.
+///
+/// A selected skill whose `SKILL.md` cannot be read is left out of both the
+/// text and `loaded`, so callers that scope tools or mark skills as
+/// preloaded see only what the LLM actually holds.
+pub async fn render_preloaded_skills(
+    selected: &[SkillName],
+    skills: &[SkillConfig],
+    style: PreloadStyle,
+) -> Option<PreloadedSection> {
+    let mut section = String::new();
+    let mut loaded = Vec::new();
+    for skill in skills.iter().filter(|s| selected.contains(&s.name)) {
+        let path = skill.path.join("SKILL.md");
+        let content = match tokio::fs::read_to_string(&path).await {
+            Ok(content) => content,
+            Err(e) => {
+                tracing::warn!(
+                    "Skill router: cannot preload skill '{}' from {}: {e}",
+                    skill.name,
+                    path.display()
+                );
+                continue;
+            }
+        };
+        let body = crate::skill_tool::strip_frontmatter(&content).trim();
+        section.push_str(&format!("\n### Skill: {}\n\n{body}\n", skill.name));
+        loaded.push(skill.name.clone());
+        let resources = crate::skill_tool::list_skill_resources(&skill.path).await;
+        if !resources.is_empty() {
+            section.push_str("\nSkill resources (fetch with `read_skill_file`):\n");
+            for resource in resources {
+                section.push_str(&format!("- {resource}\n"));
+            }
+        }
+    }
+    if section.is_empty() {
+        return None;
+    }
+    let intro = match style {
+        PreloadStyle::Augment => {
+            "\n\n## Preloaded skills\n\n\
+             The skills below were selected for this request and are already loaded. \
+             Follow them without calling `load_skill` for them; `load_skill` remains \
+             available for any other catalog entry.\n"
+        }
+        PreloadStyle::Exclusive => {
+            "\n\n## Skills for this request\n\n\
+             Follow the skills below where they apply. They are the complete set for \
+             this request; there is nothing further to load. Fetch a listed resource \
+             file with `read_skill_file` only when a skill directs you to it.\n"
+        }
+    };
+    Some(PreloadedSection {
+        text: format!("{intro}{section}"),
+        loaded,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn skill(name: &str, description: &str, path: PathBuf) -> SkillConfig {
+        SkillConfig {
+            name: SkillName::new(name).unwrap(),
+            description: description.to_string(),
+            path,
+        }
+    }
+
+    fn write_skill(dir: &std::path::Path, name: &str, body: &str) -> PathBuf {
+        let skill_dir = dir.join(name);
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: d\n---\n{body}"),
+        )
+        .unwrap();
+        skill_dir
+    }
+
+    #[test]
+    fn question_keeps_the_precision_clause() {
+        let q = question_for(&skill("alpha", "Alpha things.", PathBuf::new()));
+        assert!(q.starts_with("Should the 'alpha' skill be loaded"));
+        assert!(q.contains("It covers: Alpha things."));
+        assert!(q.contains("not merely because related words appear"));
+    }
+
+    #[tokio::test]
+    async fn preload_renders_only_selected_bodies() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let a = write_skill(dir.path(), "alpha", "# Alpha\n\nDo alpha.");
+        let b = write_skill(dir.path(), "beta", "# Beta\n\nDo beta.");
+        std::fs::create_dir_all(a.join("references")).unwrap();
+        std::fs::write(a.join("references/REF.md"), "ref").unwrap();
+        let skills = vec![skill("alpha", "a", a), skill("beta", "b", b)];
+
+        let section = render_preloaded_skills(
+            &[SkillName::new("alpha").unwrap()],
+            &skills,
+            PreloadStyle::Augment,
+        )
+        .await
+        .unwrap();
+        assert_eq!(section.loaded, vec![SkillName::new("alpha").unwrap()]);
+        let section = section.text;
+        assert!(section.contains("## Preloaded skills"));
+        assert!(section.contains("### Skill: alpha"));
+        assert!(section.contains("Do alpha."));
+        assert!(section.contains("- references/REF.md"));
+        assert!(!section.contains("Do beta."));
+        assert!(
+            !section.contains("name: alpha"),
+            "frontmatter must be stripped"
+        );
+    }
+
+    #[tokio::test]
+    async fn preload_drops_a_selected_skill_whose_body_cannot_be_read() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let a = write_skill(dir.path(), "alpha", "# Alpha\n\nDo alpha.");
+        let skills = vec![
+            skill("alpha", "a", a),
+            skill("ghost", "g", dir.path().join("ghost")),
+        ];
+        let selected = [
+            SkillName::new("alpha").unwrap(),
+            SkillName::new("ghost").unwrap(),
+        ];
+
+        let section = render_preloaded_skills(&selected, &skills, PreloadStyle::Exclusive)
+            .await
+            .unwrap();
+        assert_eq!(section.loaded, vec![SkillName::new("alpha").unwrap()]);
+        assert!(!section.text.contains("ghost"));
+
+        assert!(
+            render_preloaded_skills(&selected[1..], &skills, PreloadStyle::Augment)
+                .await
+                .is_none(),
+            "nothing readable means no section"
+        );
+    }
+
+    #[tokio::test]
+    async fn preload_is_none_when_nothing_selected() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let a = write_skill(dir.path(), "alpha", "body");
+        let skills = vec![skill("alpha", "a", a)];
+        assert!(
+            render_preloaded_skills(&[], &skills, PreloadStyle::Augment)
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn exclusive_style_keeps_resources_but_not_load_skill() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let a = write_skill(dir.path(), "alpha", "# Alpha\n\nDo alpha.");
+        std::fs::create_dir_all(a.join("references")).unwrap();
+        std::fs::write(a.join("references/REF.md"), "ref").unwrap();
+        let skills = vec![skill("alpha", "a", a)];
+
+        let section = render_preloaded_skills(
+            &[SkillName::new("alpha").unwrap()],
+            &skills,
+            PreloadStyle::Exclusive,
+        )
+        .await
+        .unwrap()
+        .text;
+        assert!(section.contains("## Skills for this request"));
+        assert!(section.contains("Do alpha."));
+        assert!(section.contains("- references/REF.md"));
+        assert!(!section.contains("load_skill"));
+        assert!(section.contains("read_skill_file"));
+    }
+
+    #[tokio::test]
+    async fn unreachable_stage1_is_unavailable_not_an_error() {
+        let router = SkillRouter::new(SkillRouterConfig {
+            mode: SkillRouterMode::Inject,
+            timeout_ms: 500,
+            decision_log: None,
+            stage1: SkillRouterStage {
+                url: "http://127.0.0.1:1".to_string(),
+                model: "kev-latest".to_string(),
+                threshold: 0.5,
+                api_key: None,
+            },
+            stage2: None,
+        });
+        let skills = vec![skill("alpha", "a", PathBuf::new())];
+        match router
+            .route(SkillRoutingSubject::Agent, None, "hello", &skills)
+            .await
+        {
+            SkillRoutingOutcome::Unavailable { reason } => {
+                assert!(reason.contains("127.0.0.1:1"), "{reason}")
+            }
+            SkillRoutingOutcome::Routed(_) => panic!("unreachable server must not route"),
+        }
+        assert!(
+            matches!(
+                router
+                    .plan(SkillRoutingSubject::Agent, None, "hello", &skills)
+                    .await,
+                SkillPlan::OnDemand
+            ),
+            "an unreachable router keeps on-demand loading in every mode"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn decision_log_is_created_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::TempDir::new().unwrap();
+        let log = dir.path().join("decisions.jsonl");
+        let router = SkillRouter::new(SkillRouterConfig {
+            mode: SkillRouterMode::Shadow,
+            timeout_ms: 500,
+            decision_log: Some(log.clone()),
+            stage1: SkillRouterStage {
+                url: "http://127.0.0.1:1".to_string(),
+                model: "kev-latest".to_string(),
+                threshold: 0.5,
+                api_key: None,
+            },
+            stage2: None,
+        });
+        assert!(router.decision_log.is_some());
+        let mode = std::fs::metadata(&log).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "decision log must not be group/world readable");
+    }
+
+    #[test]
+    fn decision_log_parent_directory_is_created() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let log = dir.path().join("nested/run/decisions.jsonl");
+        let router = SkillRouter::new(SkillRouterConfig {
+            mode: SkillRouterMode::Shadow,
+            timeout_ms: 500,
+            decision_log: Some(log.clone()),
+            stage1: SkillRouterStage {
+                url: "http://127.0.0.1:1".to_string(),
+                model: "kev-latest".to_string(),
+                threshold: 0.5,
+                api_key: None,
+            },
+            stage2: None,
+        });
+        assert!(router.decision_log.is_some());
+        assert!(log.exists());
+    }
+
+    #[tokio::test]
+    async fn empty_catalog_is_unavailable() {
+        let router = SkillRouter::new(SkillRouterConfig {
+            mode: SkillRouterMode::Shadow,
+            timeout_ms: 500,
+            decision_log: None,
+            stage1: SkillRouterStage {
+                url: "http://127.0.0.1:1".to_string(),
+                model: "kev-latest".to_string(),
+                threshold: 0.5,
+                api_key: None,
+            },
+            stage2: None,
+        });
+        assert!(matches!(
+            router
+                .route(SkillRoutingSubject::Coordinator, None, "hello", &[])
+                .await,
+            SkillRoutingOutcome::Unavailable { .. }
+        ));
+    }
+}

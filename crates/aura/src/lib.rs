@@ -34,6 +34,7 @@ mod schema_sanitize; // Private - MCP schema sanitization for OpenAI compatibili
 pub mod scratchpad;
 pub mod session_store;
 pub mod skill_rehydration;
+pub mod skill_router;
 pub mod skill_tool;
 pub mod stream_events;
 pub mod streaming;
@@ -57,7 +58,8 @@ pub use config::{AgentRuntimeConfig, SessionId, ToolContextFactory};
 pub use aura_config::{
     AgentConfig, AgentSettings, CatalogHmacConfig, CatalogWebhookConfig, EmbeddingConfig,
     GovernanceConfig, LlmConfig, McpConfig, McpServerConfig, ReasoningEffort, SkillConfig,
-    TodoToolsConfig, ToolsConfig, VectorStoreConfig, VectorStoreType, glob_match, lenient_int,
+    SkillRouterConfig, SkillRouterMode, SkillRouterStage, TodoToolsConfig, ToolsConfig,
+    VectorStoreConfig, VectorStoreType, glob_match, lenient_int,
 };
 pub use error::{BuilderError, BuilderResult};
 pub use orchestration::tools::{
@@ -97,6 +99,10 @@ pub use mcp::{InFlightRequests, McpManager, ProgressEnabledHandler};
 pub use rag_tools::{AutoIngest, VectorIngestTool};
 pub use request_cancellation::{RequestCancelToken, RequestId};
 pub use rmcp::model::{NumberOrString, ProgressToken};
+pub use skill_router::{
+    PreloadStyle, SkillPlan, SkillRouter, SkillRoutingDecision, SkillRoutingOutcome,
+    SkillRoutingSubject,
+};
 pub use skill_tool::{LoadSkillTool, ReadSkillFileTool, SkillToolset, render_skill_catalog};
 pub use stream_events::{
     AgentContext, AuraStreamEvent, CorrelationContext, CorrelationContextExt, WorkerPhase,

@@ -1157,16 +1157,34 @@ impl Agent {
             builder_state = builder_state.add_tools_dyn(additional_tools);
         }
 
-        if let Some(toolset) =
-            SkillToolset::new(&config.agent.skills, config.skill_recorder.clone())
-        {
+        // Skill tools follow what the preamble already holds. When every
+        // skill body is preloaded there is nothing left to load, so the
+        // agent gets `read_skill_file` alone for the skills' resource files.
+        // Otherwise it gets the full pair, with `load_skill` answering a
+        // pointer instead of a second copy for the bodies already preloaded.
+        let toolset = if config.skills_preloaded {
+            SkillToolset::read_only(&config.agent.skills, config.skill_recorder.clone())
+        } else {
+            SkillToolset::with_preloaded(
+                &config.agent.skills,
+                &config.preloaded_skills,
+                config.skill_recorder.clone(),
+            )
+        };
+        if let Some(toolset) = toolset {
             tracing::info!(
-                "Adding skill tools (load_skill, read_skill_file) with {} skills",
+                "Adding skill tools ({}read_skill_file) with {} skills",
+                if toolset.load.is_some() {
+                    "load_skill, "
+                } else {
+                    ""
+                },
                 config.agent.skills.len(),
             );
-            builder_state = builder_state
-                .add_tool(toolset.load)
-                .add_tool(toolset.read_file);
+            if let Some(load) = toolset.load {
+                builder_state = builder_state.add_tool(load);
+            }
+            builder_state = builder_state.add_tool(toolset.read_file);
         }
 
         Ok(builder_state)

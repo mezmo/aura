@@ -1,0 +1,110 @@
+# Skill routing — the SRE assistant from skills-agent.toml run in
+# orchestration mode, plus a local decision model that picks which skills
+# to preload for the coordinator and for each worker task.
+#
+# Routing runs in orchestration mode only: the coordinator is routed on the
+# user query and each worker on its task description. A single-agent config
+# with `[agent.skill_router]` still validates but never routes.
+#
+# Skill selection is multi-label, so the router asks a System One decision
+# model (TypeSafe Jev, or a local Kev server exposing the same
+# `POST /v1/systemone` API) one independent yes/no question per skill and
+# thresholds each calibrated probability. Two stages form a funnel: stage 1
+# scores the whole catalog with a small, fast model tuned for recall; stage 2
+# rescores only that shortlist with a bigger model tuned for precision.
+#
+# Modes:
+#   shadow    — route and log every decision; the agent's context is untouched.
+#               Run this first and fit the thresholds against `decision_log`.
+#   inject    — preload the selected skills' full SKILL.md bodies into the
+#               coordinator's and each worker's system prompt; the catalog and
+#               `load_skill` stay available for the rest, and `load_skill`
+#               answers a pointer for a skill that is already preloaded.
+#   exclusive — the selected bodies are the agent's only skills: no catalog
+#               and no `load_skill`, nothing for the LLM to deliberate over.
+#               `read_skill_file` stays, scoped to the selected skills, so
+#               their resource files remain reachable.
+# A router that is down never fails a request: the agent keeps the on-demand
+# `load_skill` path in every mode.
+#
+# The decision log holds every routed prompt in full (that is what threshold
+# fitting needs); it is created owner-only. The prompt reaches the tracing
+# event only when OTEL_RECORD_CONTENT=true, like every other prompt attribute.
+#
+# Prerequisites:
+#   export OPENAI_API_KEY="sk-..."
+#   Kubernetes context configured (kubectl access)
+#   Start the K8s MCP server:
+#     npx -y kubernetes-mcp-server@latest --port 8081 --read-only
+#   Start local Kev decision models (https://github.com/jaredpalmer/kev):
+#     uv run --extra serve python -m kev.serve --run jaredpalmer/kev-0.8b --port 8011
+#     uv run --extra serve python -m kev.serve --run jaredpalmer/kev-4b   --port 8009
+#
+# Usage (run from the repo root):
+#   CONFIG_PATH=examples/complete/skills-router.toml cargo run --bin aura -- webserver
+#
+# Offline threshold fitting against a labelled prompt set. This reads only
+# `[agent.skills]` and `[agent.skill_router]` from the config and never
+# starts an agent, so it works with any config that carries those tables:
+#   cargo run -p aura --example skill_router_eval -- \
+#     examples/complete/skills-router.toml cases.jsonl
+
+[mcp]
+sanitize_schemas = true
+
+[mcp.servers.kubernetes]
+transport = "http_streamable"
+url = "http://localhost:8081/mcp"
+description = "Kubernetes cluster operations: pods, deployments, services, logs, events"
+
+[agent]
+name = "SRE Assistant"
+model_owner = "mezmo"
+system_prompt = """
+You are an SRE assistant coordinating a Kubernetes worker. Follow any
+preloaded skill that matches the request; for other catalog entries call
+`load_skill` first. Cite which skill you followed.
+"""
+turn_depth = 15
+
+[agent.llm]
+provider = "openai"
+api_key = "{{ env.OPENAI_API_KEY }}"
+model = "gpt-5.2"
+
+[[agent.skills.local]]
+source = "examples/complete/skills"
+
+[agent.skill_router]
+mode = "shadow"                 # shadow | inject | exclusive (see above)
+timeout_ms = 5000               # per-stage HTTP timeout; a timeout falls back to load_skill
+decision_log = "skill-router-decisions.jsonl"   # optional JSONL, one line per decision
+
+# Recall stage: every skill in the catalog, generous threshold.
+[agent.skill_router.stage1]
+url = "http://127.0.0.1:8011"
+model = "kev-latest"
+threshold = 0.45
+# api_key = "{{ env.KEV_API_KEY }}"   # sent as a bearer token when the server requires one
+
+# Precision stage: only the stage-1 shortlist. Omit the table for single-stage routing.
+[agent.skill_router.stage2]
+url = "http://127.0.0.1:8009"
+model = "kev-latest"
+threshold = 0.5
+
+# Orchestration is what puts the router on the request path: the coordinator
+# is routed on the user query, the worker on each task it is handed.
+[orchestration]
+enabled = true
+max_planning_cycles = 2
+allow_direct_answers = true
+
+[orchestration.worker.k8s]
+description = "Kubernetes cluster inspection: pods, deployments, services, logs, events"
+turn_depth = 8
+preamble = """
+You are a Kubernetes specialist. Use your tools to inspect the cluster; never
+guess or fabricate cluster state. Follow any preloaded skill that matches
+your task; for other catalog entries call `load_skill` first.
+"""
