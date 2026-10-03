@@ -117,11 +117,18 @@ pub trait ApprovalStore: Send + Sync {
     /// Conditionally mark a still-pending row's acknowledgment state as
     /// acknowledged. Updates only a row that is still pending (undecided and
     /// not removed); never recreates a row. Returns an explicit outcome for a
-    /// row that is missing (unknown, resolved, or cancelled).
+    /// row that is missing (unknown, resolved, or cancelled). Backends
+    /// without park parity answer
+    /// [`SessionStoreError::UnsupportedOperation`].
     async fn mark_acknowledged(
         &self,
-        id: &DecisionId,
-    ) -> Result<AcknowledgeOutcome, SessionStoreError>;
+        _id: &DecisionId,
+    ) -> Result<AcknowledgeOutcome, SessionStoreError> {
+        Err(SessionStoreError::UnsupportedOperation {
+            operation: "mark_acknowledged",
+            reason: "this backend implements no acknowledgment transition".to_string(),
+        })
+    }
 
     /// Look up a parked approval.
     async fn get(&self, id: &DecisionId) -> Result<Option<ParkedApproval>, SessionStoreError>;
@@ -207,12 +214,18 @@ pub trait ApprovalStore: Send + Sync {
     /// cannot consume another's rows. A decision recorded exactly at the
     /// deadline remains valid; an existing terminal winner is returned
     /// unchanged. Missing, decode, and I/O failures are errors, never
-    /// outcomes.
+    /// outcomes. Backends without park parity answer
+    /// [`SessionStoreError::UnsupportedOperation`].
     async fn read_or_expire(
         &self,
-        id: &DecisionId,
-        expected_authority: ApprovalAuthority,
-    ) -> Result<ApprovalRead, SessionStoreError>;
+        _id: &DecisionId,
+        _expected_authority: ApprovalAuthority,
+    ) -> Result<ApprovalRead, SessionStoreError> {
+        Err(SessionStoreError::UnsupportedOperation {
+            operation: "read_or_expire",
+            reason: "this backend implements no expiry-aware read".to_string(),
+        })
+    }
 
     /// Scan every retained row — pending and already addressed — for the
     /// retention cleanup actor, which groups them by validated scope and
@@ -220,7 +233,12 @@ pub trait ApprovalStore: Send + Sync {
     /// expired rows stay in the scan and no row is unlinked as a side
     /// effect. Backends without park parity answer
     /// [`SessionStoreError::UnsupportedOperation`].
-    async fn retained_rows(&self) -> Result<Vec<RetainedApproval>, SessionStoreError>;
+    async fn retained_rows(&self) -> Result<Vec<RetainedApproval>, SessionStoreError> {
+        Err(SessionStoreError::UnsupportedOperation {
+            operation: "retained_rows",
+            reason: "this backend implements no retained-row scan".to_string(),
+        })
+    }
 }
 
 /// Distinct skill-invocation records one session may hold.
