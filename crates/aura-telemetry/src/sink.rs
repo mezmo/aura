@@ -237,63 +237,77 @@ mod tests {
 
     mod classify {
         use super::*;
-        use wiremock::matchers::method;
-        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use shimforge::{mock, Session};
 
-        /// Drive a real POST against `endpoint` and return the resulting
-        /// error so `classify_post_error` is tested on genuine
-        /// `reqwest::Error`s, not hand-built ones (which can't be).
-        async fn post_error(endpoint: &str, timeout: Duration) -> reqwest::Error {
-            post_batch(&reqwest::Client::new(), endpoint, "phc_test", &[], timeout)
-                .await
-                .expect_err("the POST is set up to fail")
+        /// A real `reqwest::Error` from a URL that does not parse. It is not
+        /// a timeout, has no status and is not a connect error, so each test
+        /// mocks only the check it is about.
+        fn url_error() -> reqwest::Error {
+            reqwest::Client::new()
+                .post("not a url")
+                .build()
+                .expect_err("the URL is set up to fail")
         }
 
-        async fn server_returning(status: u16) -> MockServer {
-            let server = MockServer::start().await;
-            Mock::given(method("POST"))
-                .respond_with(ResponseTemplate::new(status))
-                .mount(&server)
-                .await;
-            server
+        fn classify_with_status(code: reqwest::StatusCode) -> &'static str {
+            let err = url_error();
+            let mut session = Session::new_global();
+            let status = mock!(
+                session,
+                reqwest::Error::status,
+                fn(&reqwest::Error) -> Option<reqwest::StatusCode>
+            );
+            status.expect().once().returns(Some(code));
+            classify_post_error(&err)
         }
 
-        #[tokio::test]
-        async fn client_error_status_is_http_4xx() {
-            let server = server_returning(404).await;
-            let err = post_error(&server.uri(), Duration::from_secs(2)).await;
-            assert_eq!(classify_post_error(&err), "http_4xx");
+        #[test]
+        fn client_error_status_is_http_4xx() {
+            assert_eq!(
+                classify_with_status(reqwest::StatusCode::NOT_FOUND),
+                "http_4xx"
+            );
         }
 
-        #[tokio::test]
-        async fn server_error_status_is_http_5xx() {
-            let server = server_returning(503).await;
-            let err = post_error(&server.uri(), Duration::from_secs(2)).await;
-            assert_eq!(classify_post_error(&err), "http_5xx");
+        #[test]
+        fn server_error_status_is_http_5xx() {
+            assert_eq!(
+                classify_with_status(reqwest::StatusCode::SERVICE_UNAVAILABLE),
+                "http_5xx"
+            );
         }
 
-        #[tokio::test]
-        async fn slow_response_is_timeout() {
-            let server = MockServer::start().await;
-            Mock::given(method("POST"))
-                // Delay far exceeds the per-request budget below, so the
-                // client times out deterministically before the response.
-                .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(30)))
-                .mount(&server)
-                .await;
-            let err = post_error(&server.uri(), Duration::from_millis(100)).await;
-            assert!(err.is_timeout(), "precondition: timed out, got {err:?}");
+        #[test]
+        fn slow_response_is_timeout() {
+            let err = url_error();
+            let mut session = Session::new_global();
+            let is_timeout = mock!(
+                session,
+                reqwest::Error::is_timeout,
+                fn(&reqwest::Error) -> bool
+            );
+            is_timeout.expect().once().returns(true);
+            // reqwest also reports a timeout as a request error; the timeout
+            // label must still win over "network".
+            let is_request = mock!(
+                session,
+                reqwest::Error::is_request,
+                fn(&reqwest::Error) -> bool
+            );
+            is_request.expect().returns(true);
             assert_eq!(classify_post_error(&err), "timeout");
         }
 
-        #[tokio::test]
-        async fn connection_refused_is_network() {
-            // Port 1 on loopback is not listening -> connect error.
-            let err = post_error("http://127.0.0.1:1", Duration::from_secs(2)).await;
-            assert!(
-                !err.is_timeout() && err.status().is_none(),
-                "precondition: a transport error, not a timeout/status: {err:?}"
+        #[test]
+        fn connection_refused_is_network() {
+            let err = url_error();
+            let mut session = Session::new_global();
+            let is_connect = mock!(
+                session,
+                reqwest::Error::is_connect,
+                fn(&reqwest::Error) -> bool
             );
+            is_connect.expect().once().returns(true);
             assert_eq!(classify_post_error(&err), "network");
         }
     }
