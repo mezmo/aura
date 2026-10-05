@@ -1,5 +1,6 @@
 //! The Socket Mode connection: open a WebSocket, ack every envelope, hand
-//! event callbacks to the runner, and reconnect when Slack asks.
+//! event callbacks to the runner, and reconnect when Slack asks or the
+//! connection goes quiet.
 
 use std::time::Duration;
 
@@ -15,6 +16,8 @@ use super::events::{DisconnectReason, EventCallback, Frame, parse_frame};
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
+/// Slack pings a healthy connection every 20 seconds or so.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug, thiserror::Error)]
 pub enum SocketModeError {
@@ -22,6 +25,8 @@ pub enum SocketModeError {
     Api(#[from] SlackApiError),
     #[error("websocket: {0}")]
     WebSocket(#[from] tokio_tungstenite::tungstenite::Error),
+    #[error("websocket handshake not finished after {0:?}")]
+    ConnectTimedOut(Duration),
     #[error("event consumer is gone")]
     ConsumerGone,
 }
@@ -32,6 +37,8 @@ pub enum Disconnected {
     Slack(DisconnectReason),
     ClosedByPeer,
     StreamEnded,
+    /// No frame arrived from Slack for this long.
+    Idle(Duration),
     Shutdown,
 }
 
@@ -42,11 +49,20 @@ pub enum Disconnected {
 /// or an app with Socket Mode switched off, cannot hammer
 /// apps.connections.open.
 pub async fn run(api: SlackApi, events: mpsc::Sender<EventCallback>, shutdown: CancellationToken) {
+    run_with_idle_timeout(api, events, shutdown, IDLE_TIMEOUT).await;
+}
+
+async fn run_with_idle_timeout(
+    api: SlackApi,
+    events: mpsc::Sender<EventCallback>,
+    shutdown: CancellationToken,
+    idle_timeout: Duration,
+) {
     let mut backoff = INITIAL_BACKOFF;
     loop {
         let attempt = async {
             let url = api.connections_open().await?;
-            serve_connection(&url, &events, &shutdown).await
+            serve_connection(&url, &events, &shutdown, idle_timeout).await
         };
         let outcome = tokio::select! {
             biased;
@@ -61,6 +77,14 @@ pub async fn run(api: SlackApi, events: mpsc::Sender<EventCallback>, shutdown: C
                 info!(?reason, "slack asked for a fresh socket mode connection");
                 backoff = INITIAL_BACKOFF;
                 continue;
+            }
+            Ok(Disconnected::Idle(silent_for)) => {
+                warn!(
+                    ?silent_for,
+                    retry_in = ?backoff,
+                    "slack socket mode connection went silent without closing; reconnecting"
+                );
+                backoff
             }
             Ok(ended) => {
                 warn!(?ended, retry_in = ?backoff, "slack socket mode connection ended");
@@ -83,12 +107,20 @@ pub async fn run(api: SlackApi, events: mpsc::Sender<EventCallback>, shutdown: C
 /// is cancelled, or the receiver behind `events` is gone. Every envelope is
 /// acked before its event is forwarded, so a consumer that stalls can delay
 /// later acks; the runner only spawns per event, so it never stalls long.
+///
+/// A connection whose path dies without a FIN or RST stays established and
+/// never yields another frame, so the handshake and every read carry
+/// `idle_timeout` as a deadline. Any frame restarts it, Slack's pings
+/// included.
 pub async fn serve_connection(
     url: &str,
     events: &mpsc::Sender<EventCallback>,
     shutdown: &CancellationToken,
+    idle_timeout: Duration,
 ) -> Result<Disconnected, SocketModeError> {
-    let (ws, _) = tokio_tungstenite::connect_async(url).await?;
+    let (ws, _) = tokio::time::timeout(idle_timeout, tokio_tungstenite::connect_async(url))
+        .await
+        .map_err(|_| SocketModeError::ConnectTimedOut(idle_timeout))??;
     let (mut sink, mut stream) = ws.split();
     loop {
         let next = tokio::select! {
@@ -97,7 +129,10 @@ pub async fn serve_connection(
                 let _ = tokio::time::timeout(CLOSE_TIMEOUT, sink.send(Message::Close(None))).await;
                 return Ok(Disconnected::Shutdown);
             }
-            next = stream.next() => next,
+            next = tokio::time::timeout(idle_timeout, stream.next()) => match next {
+                Ok(next) => next,
+                Err(_) => return Ok(Disconnected::Idle(idle_timeout)),
+            },
         };
         let message = match next {
             Some(Ok(message)) => message,
@@ -205,7 +240,7 @@ mod tests {
         .await;
 
         let (tx, mut rx) = mpsc::channel(4);
-        let ended = serve_connection(&url, &tx, &CancellationToken::new())
+        let ended = serve_connection(&url, &tx, &CancellationToken::new(), IDLE_TIMEOUT)
             .await
             .unwrap();
         assert_eq!(
@@ -233,7 +268,7 @@ mod tests {
 
         let (tx, rx) = mpsc::channel(1);
         drop(rx);
-        let err = serve_connection(&url, &tx, &CancellationToken::new())
+        let err = serve_connection(&url, &tx, &CancellationToken::new(), IDLE_TIMEOUT)
             .await
             .unwrap_err();
         assert!(matches!(err, SocketModeError::ConsumerGone), "{err}");
@@ -261,7 +296,9 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
             stopper.cancel();
         });
-        let ended = serve_connection(&url, &tx, &shutdown).await.unwrap();
+        let ended = serve_connection(&url, &tx, &shutdown, IDLE_TIMEOUT)
+            .await
+            .unwrap();
         assert_eq!(ended, Disconnected::Shutdown);
     }
 
@@ -278,10 +315,121 @@ mod tests {
         .await;
 
         let (tx, _rx) = mpsc::channel(1);
-        let ended = serve_connection(&url, &tx, &CancellationToken::new())
+        let ended = serve_connection(&url, &tx, &CancellationToken::new(), IDLE_TIMEOUT)
             .await
             .unwrap();
         assert_eq!(ended, Disconnected::ClosedByPeer);
+    }
+
+    #[tokio::test]
+    async fn a_silent_connection_ends_as_idle() {
+        let url = fake_slack(1, |_, mut ws| async move {
+            send(&mut ws, r#"{"type":"hello"}"#).await;
+            // Hold the socket open and say nothing more: no close frame.
+            let _ = ws.next().await;
+        })
+        .await;
+
+        let (tx, _rx) = mpsc::channel(1);
+        let idle = Duration::from_millis(100);
+        let ended = serve_connection(&url, &tx, &CancellationToken::new(), idle)
+            .await
+            .unwrap();
+        assert_eq!(ended, Disconnected::Idle(idle));
+    }
+
+    #[tokio::test]
+    async fn pings_keep_a_quiet_connection_alive() {
+        let idle = Duration::from_millis(300);
+        let url = fake_slack(1, move |_, mut ws| async move {
+            // Pings alone for three idle periods, each well inside one.
+            for _ in 0..30 {
+                ws.send(Message::Ping("p".into())).await.unwrap();
+                tokio::time::sleep(idle / 10).await;
+            }
+            ws.send(Message::Close(None)).await.unwrap();
+        })
+        .await;
+
+        let (tx, _rx) = mpsc::channel(1);
+        let ended = serve_connection(&url, &tx, &CancellationToken::new(), idle)
+            .await
+            .unwrap();
+        assert_eq!(ended, Disconnected::ClosedByPeer);
+    }
+
+    #[tokio::test]
+    async fn a_handshake_that_never_finishes_times_out() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            // Accept the TCP connection and never answer the upgrade.
+            let (_tcp, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        let (tx, _rx) = mpsc::channel(1);
+        let err = serve_connection(
+            &format!("ws://{addr}"),
+            &tx,
+            &CancellationToken::new(),
+            Duration::from_millis(100),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, SocketModeError::ConnectTimedOut(_)), "{err}");
+    }
+
+    #[tokio::test]
+    async fn run_reconnects_when_the_connection_goes_silent() {
+        let shutdown = CancellationToken::new();
+        let stopper = shutdown.clone();
+        let hellos = Arc::new(AtomicUsize::new(0));
+        let hellos_seen = Arc::clone(&hellos);
+        let url = fake_slack(2, move |ordinal, mut ws| {
+            let stopper = stopper.clone();
+            let hellos = Arc::clone(&hellos_seen);
+            async move {
+                send(&mut ws, r#"{"type":"hello"}"#).await;
+                hellos.fetch_add(1, Ordering::SeqCst);
+                if ordinal == 1 {
+                    // Go silent with the socket held open, off the accept
+                    // loop so the second connection can be served.
+                    tokio::spawn(async move {
+                        let _ = ws.next().await;
+                    });
+                } else {
+                    stopper.cancel();
+                    let _ = ws.next().await;
+                }
+            }
+        })
+        .await;
+
+        let slack = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/apps.connections.open"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"ok": true, "url": url})),
+            )
+            .expect(2)
+            .mount(&slack)
+            .await;
+        let api = SlackApi::new(
+            BotToken::new("xoxb-b".to_owned()).unwrap(),
+            AppToken::new("xapp-a".to_owned()).unwrap(),
+        )
+        .with_base_url(slack.uri());
+
+        let (tx, _rx) = mpsc::channel(1);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            run_with_idle_timeout(api, tx, shutdown, Duration::from_millis(100)),
+        )
+        .await
+        .expect("run must return once shutdown is cancelled");
+        assert_eq!(hellos.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
