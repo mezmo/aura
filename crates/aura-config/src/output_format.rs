@@ -5,11 +5,8 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Per-tool output formatter, configured via `[mcp.servers.<name>.output_format]`.
-///
-/// Keys are tool-name glob patterns, matched like `scratchpad` keys (the
-/// longest matching pattern wins). The `formatter` field selects the variant;
-/// the remaining fields are that formatter's options.
+/// A tool's output formatter and its options: one value of
+/// `[mcp.servers.<name>.output_format]`, keyed by tool-name glob pattern.
 ///
 /// ```toml
 /// [mcp.servers.metrics.output_format]
@@ -35,32 +32,28 @@ impl OutputFormatEntry {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct PrometheusFormatOptions {
-    /// Tool argument holding the requested query step (seconds or a
-    /// Prometheus duration such as `30s`). When set, the output states the
-    /// requested step next to the resolution the backend returned.
+    /// Name of the tool argument holding the requested query step (seconds
+    /// or a Prometheus duration such as `30s`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub step_arg: Option<String>,
-    /// Tool argument holding the range start (RFC 3339 or Unix seconds).
-    /// When set with `end_arg`, missing points are counted over the
-    /// requested window rather than the span of the returned data.
+    /// Name of the tool argument holding the range start (RFC 3339 or Unix
+    /// seconds).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub start_arg: Option<String>,
-    /// Tool argument holding the range end (RFC 3339 or Unix seconds).
+    /// Name of the tool argument holding the range end (RFC 3339 or Unix
+    /// seconds).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub end_arg: Option<String>,
-    /// Labels always printed per series, even when every series has the
-    /// same value.
+    /// Labels to print on every series.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub keep_labels: Vec<String>,
-    /// Glob patterns (`*` and `?`) for labels never printed.
+    /// Glob patterns (`*` and `?`) for labels not to print.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub drop_labels: Vec<String>,
-    /// Maximum number of series printed. Series with the most missing
-    /// points are printed first.
+    /// Maximum number of series printed.
     #[serde(default = "default_max_series")]
     pub max_series: usize,
-    /// Maximum number of run-length entries printed per series. A series
-    /// with more runs is printed as evenly spaced samples.
+    /// Maximum number of run-length entries printed per series.
     #[serde(default = "default_max_runs_per_series")]
     pub max_runs_per_series: usize,
 }

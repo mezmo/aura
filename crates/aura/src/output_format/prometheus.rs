@@ -17,16 +17,13 @@ use chrono::{DateTime, SecondsFormat};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// Largest expected-point grid analysed per response. Wider grids skip the
-/// missing-point analysis rather than allocate for it.
-const MAX_GRID_POINTS: i64 = 100_000;
+/// Prometheus's own limit on points per series in a range query.
+const MAX_GRID_POINTS: i64 = 11_000;
 
 /// Maximum missing-point ranges listed per series.
 const MAX_MISSING_RANGES: usize = 10;
 
-/// Request arguments the formatter compares the response against, read from
-/// the tool call by the arguments named in [`PrometheusFormatOptions`].
-/// All values are milliseconds.
+/// The step, start and end a range query requested, in milliseconds.
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct RequestedRange {
     pub step_ms: Option<i64>,
@@ -35,6 +32,8 @@ pub(crate) struct RequestedRange {
 }
 
 impl RequestedRange {
+    /// Read the tool arguments named by `step_arg`, `start_arg` and `end_arg`.
+    /// Unnamed or unparseable arguments are left as `None`.
     pub(crate) fn from_args(args: &Value, opts: &PrometheusFormatOptions) -> Self {
         let arg = |name: &Option<String>| name.as_deref().and_then(|n| args.get(n));
         Self {
@@ -65,7 +64,7 @@ pub(crate) fn format(
 fn header(result_type: &str, series: usize) -> String {
     format!(
         "Prometheus {result_type} result: {series} series. Formatted by aura; call again with \
-         \"_aura_raw\": true for the unformatted response.\n"
+         \"_aura_raw\": true to skip formatting.\n"
     )
 }
 
@@ -252,13 +251,15 @@ fn fmt_duration(ms: i64) -> String {
     out
 }
 
-/// Labels printed once for the whole result, and the label keys printed per
-/// series (`keep_labels` first, in config order, then the rest sorted).
+/// Labels shared by the whole result, and the label keys shown per series.
 struct LabelView {
     common: BTreeMap<String, String>,
     per_series: Vec<String>,
 }
 
+/// Split labels into those with one value on every series (printed once) and
+/// those printed per series: `keep_labels` first, in config order, then the
+/// varying labels sorted. Labels matching `drop_labels` are left out.
 fn label_view(series: &[Series], opts: &PrometheusFormatOptions) -> LabelView {
     let dropped = |k: &str| opts.drop_labels.iter().any(|p| glob_match(p, k));
     let keys: BTreeSet<&String> = series.iter().flat_map(|s| s.labels.keys()).collect();
@@ -341,7 +342,7 @@ fn format_scalar(result_type: &str, result: &Value) -> Option<String> {
     let sample = parse_sample(result)?;
     Some(format!(
         "Prometheus {result_type} result: {} at {}. Formatted by aura; call again with \
-         \"_aura_raw\": true for the unformatted response.\n",
+         \"_aura_raw\": true to skip formatting.\n",
         sample.value,
         fmt_ts(sample.ts_ms)
     ))
@@ -379,9 +380,50 @@ fn returned_resolution(series: &[Series]) -> Option<i64> {
         .map(|(delta, _)| delta)
 }
 
-/// Expected evaluation timestamps: aligned to the observed samples, spanning
-/// the requested window when known, else the observed span.
-fn expected_grid(series: &[Series], step: i64, requested: &RequestedRange) -> Option<Vec<i64>> {
+/// Evenly spaced expected evaluation timestamps.
+#[derive(Debug, Clone, Copy)]
+struct Grid {
+    first: i64,
+    step: i64,
+    count: i64,
+}
+
+impl Grid {
+    fn last(&self) -> i64 {
+        self.first + (self.count - 1) * self.step
+    }
+
+    fn at(&self, i: i64) -> i64 {
+        self.first + i * self.step
+    }
+
+    fn contains(&self, t: i64) -> bool {
+        t >= self.first && t <= self.last() && (t - self.first) % self.step == 0
+    }
+
+    /// Grid points with no sample in `series`. Samples are sorted, so a
+    /// repeated timestamp is counted once.
+    fn missing_in(&self, series: &Series) -> usize {
+        let mut on_grid = 0usize;
+        let mut previous = None;
+        for sample in &series.samples {
+            if previous != Some(sample.ts_ms) && self.contains(sample.ts_ms) {
+                on_grid += 1;
+            }
+            previous = Some(sample.ts_ms);
+        }
+        self.count as usize - on_grid
+    }
+}
+
+/// The expected grid at `step`: aligned to the observed samples, spanning the
+/// requested window when known, else the observed span. `None` when there
+/// are no samples, or when the grid exceeds [`MAX_GRID_POINTS`].
+///
+/// A gap shared by every series at regular intervals is indistinguishable
+/// here from a coarser resolution: `format_matrix` states both readings when
+/// the requested step is known.
+fn expected_grid(series: &[Series], step: i64, requested: &RequestedRange) -> Option<Grid> {
     let observed = series
         .iter()
         .flat_map(|s| s.samples.iter().map(|x| x.ts_ms));
@@ -393,10 +435,7 @@ fn expected_grid(series: &[Series], step: i64, requested: &RequestedRange) -> Op
     let hi = requested.end_ms.unwrap_or(max_ts).max(max_ts);
     let first = min_ts - ((min_ts - lo) / step) * step;
     let count = (hi - first) / step + 1;
-    if count > MAX_GRID_POINTS {
-        return None;
-    }
-    Some((0..count).map(|i| first + i * step).collect())
+    (count <= MAX_GRID_POINTS).then_some(Grid { first, step, count })
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -422,7 +461,7 @@ struct SeriesSummary<'a> {
     missing_points: usize,
 }
 
-fn summarise<'a>(series: &'a Series, grid: Option<&[i64]>) -> SeriesSummary<'a> {
+fn summarise<'a>(series: &'a Series, grid: Option<Grid>) -> SeriesSummary<'a> {
     let Some(grid) = grid else {
         return SeriesSummary {
             series,
@@ -446,7 +485,7 @@ fn summarise<'a>(series: &'a Series, grid: Option<&[i64]>) -> SeriesSummary<'a> 
     let mut missing: Vec<(i64, i64, usize)> = Vec::new();
     let mut missing_points = 0;
     let mut previous_missing = false;
-    for &t in grid {
+    for t in (0..grid.count).map(|i| grid.at(i)) {
         if present.contains(&t) {
             previous_missing = false;
             continue;
@@ -483,6 +522,8 @@ fn run_length(timeline: &[Point<'_>]) -> Vec<(String, usize)> {
     runs
 }
 
+/// Run-length encode the timeline. With more than `max_runs` runs, print
+/// `max_runs` evenly spaced points instead, so the trend stays visible.
 fn fmt_values(timeline: &[Point<'_>], max_runs: usize) -> String {
     let runs = run_length(timeline);
     if runs.len() <= max_runs {
@@ -531,6 +572,10 @@ fn fmt_missing(runs: &[(i64, i64, usize)]) -> String {
     parts.join(", ")
 }
 
+/// Print the returned resolution (and the requested step, when `step_arg`
+/// is configured), the expected window (over the requested start and end,
+/// when configured), common labels, then up to `max_series` series, those
+/// with the most missing points first.
 fn format_matrix(
     series: &[Series],
     opts: &PrometheusFormatOptions,
@@ -552,12 +597,21 @@ fn format_matrix(
                 let _ = write!(out, " (requested step {})", fmt_duration(step));
             }
             out.push('\n');
-            if requested.step_ms.is_some_and(|step| res > step) {
+            // Coarser than requested: either the backend aggregated, or every
+            // series lacks the same points at regular intervals. The data
+            // cannot tell these apart, so state both with the counts.
+            if let Some(step) = requested.step_ms.filter(|&step| res > step)
+                && let Some(g) = &grid
+            {
+                let at_step = (g.last() - g.first) / step + 1;
+                let most = series.iter().map(|s| s.samples.len()).max().unwrap_or(0);
                 let _ = writeln!(
                     out,
-                    "The backend returned a resolution of {}, coarser than the requested step of {}.",
+                    "The returned resolution {} is coarser than the requested step {}: the backend \
+                     aggregated the data, or every series is missing the same points. The requested \
+                     step gives {at_step} points over this window; the series with the most has {most}.",
                     fmt_duration(res),
-                    fmt_duration(requested.step_ms.unwrap_or_default()),
+                    fmt_duration(step),
                 );
             }
         }
@@ -568,13 +622,16 @@ fn format_matrix(
             let _ = writeln!(
                 out,
                 "window: {} to {}, {} points expected per series",
-                fmt_ts(g[0]),
-                fmt_ts(g[g.len() - 1]),
-                g.len()
+                fmt_ts(g.first),
+                fmt_ts(g.last()),
+                g.count
             );
         }
         None if grid_step.is_some() => {
-            out.push_str("missing points: not analysed (window too large for the resolution)\n");
+            let _ = writeln!(
+                out,
+                "missing points: not analysed (more than {MAX_GRID_POINTS} points expected per series)"
+            );
         }
         None => {}
     }
@@ -582,19 +639,26 @@ fn format_matrix(
     let view = label_view(series, opts);
     write_common_labels(&mut out, &view);
 
-    let mut summaries: Vec<SeriesSummary> = series
+    // Rank every series by a cheap missing-point count, then build full
+    // timelines only for the series that are printed.
+    let mut ranked: Vec<(usize, &Series)> = series
         .iter()
-        .map(|s| summarise(s, grid.as_deref()))
+        .map(|s| (grid.map_or(0, |g| g.missing_in(s)), s))
         .collect();
-    summaries.sort_by_key(|s| std::cmp::Reverse(s.missing_points));
+    ranked.sort_by_key(|(missing, _)| std::cmp::Reverse(*missing));
+    let summaries: Vec<SeriesSummary> = ranked
+        .iter()
+        .take(opts.max_series)
+        .map(|(_, s)| summarise(s, grid))
+        .collect();
 
-    for summary in summaries.iter().take(opts.max_series) {
+    for summary in &summaries {
         let s = summary.series;
         let _ = writeln!(out, "{}", series_labels(s, &view));
 
         let _ = write!(out, "  points {}", s.samples.len());
         if let Some(g) = &grid {
-            let _ = write!(out, "/{}", g.len());
+            let _ = write!(out, "/{}", g.count);
             if summary.missing_points > 0 {
                 let _ = write!(
                     out,
@@ -800,7 +864,82 @@ mod tests {
         let out = format(&content, &opts(), &requested).unwrap();
         assert!(out.contains("resolution: 1h (requested step 5m)"), "{out}");
         assert!(
-            out.contains("coarser than the requested step of 5m"),
+            out.contains(
+                "The returned resolution 1h is coarser than the requested step 5m: the backend \
+                 aggregated the data, or every series is missing the same points. The requested \
+                 step gives 37 points over this window; the series with the most has 4."
+            ),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn matrix_flags_gaps_shared_by_every_series_at_regular_intervals() {
+        // A 1m query where every series has points only at minutes 0, 2, 4, 6.
+        let every_other = |instance: &str| {
+            (
+                json!({"instance": instance}),
+                (0..4).map(|i| (T0 + 120 * i, "1")).collect::<Vec<_>>(),
+            )
+        };
+        let content = matrix(vec![every_other("a"), every_other("b")]);
+        let requested = RequestedRange {
+            step_ms: Some(60_000),
+            ..Default::default()
+        };
+        let out = format(&content, &opts(), &requested).unwrap();
+        assert!(
+            out.contains("or every series is missing the same points"),
+            "{out}"
+        );
+        assert!(
+            out.contains("The requested step gives 7 points over this window; the series with the most has 4."),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn matrix_builds_timelines_only_for_printed_series() {
+        // 2,000 sparse series over a full-size grid: ranked by a count, with
+        // timelines built for the 2 printed.
+        let series: Vec<_> = (0..2_000)
+            .map(|i| {
+                (
+                    json!({"instance": format!("i{i}")}),
+                    vec![(T0, "1"), (T0 + 30, "1")],
+                )
+            })
+            .collect();
+        let requested = RequestedRange {
+            step_ms: Some(30_000),
+            start_ms: Some(T0 * 1000),
+            end_ms: Some((T0 + 30 * (MAX_GRID_POINTS - 1)) * 1000),
+        };
+        let options = PrometheusFormatOptions {
+            max_series: 2,
+            ..opts()
+        };
+        let out = format(&matrix(series), &options, &requested).unwrap();
+        assert!(
+            out.contains(&format!("{MAX_GRID_POINTS} points expected per series")),
+            "{out}"
+        );
+        assert!(out.contains("1998 more series not shown"), "{out}");
+    }
+
+    #[test]
+    fn matrix_skips_missing_analysis_beyond_the_prometheus_point_limit() {
+        let content = matrix(vec![steady("a", 2, &[])]);
+        let requested = RequestedRange {
+            step_ms: Some(30_000),
+            start_ms: Some(T0 * 1000),
+            end_ms: Some((T0 + 30 * MAX_GRID_POINTS) * 1000),
+        };
+        let out = format(&content, &opts(), &requested).unwrap();
+        assert!(
+            out.contains(
+                "missing points: not analysed (more than 11000 points expected per series)"
+            ),
             "{out}"
         );
     }

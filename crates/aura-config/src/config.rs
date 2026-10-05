@@ -731,7 +731,7 @@ pub enum McpServerConfig {
         /// Per-tool scratchpad interception thresholds (glob-matched on tool name).
         #[serde(default)]
         scratchpad: HashMap<String, ScratchpadToolEntry>,
-        /// Per-tool output formatters (glob-matched on tool name).
+        /// Per-tool output formatters, keyed by tool-name glob pattern.
         #[serde(default)]
         output_format: HashMap<String, OutputFormatEntry>,
         /// Client identity for this server alone.
@@ -750,7 +750,7 @@ pub enum McpServerConfig {
         /// Per-tool scratchpad interception thresholds (glob-matched on tool name).
         #[serde(default)]
         scratchpad: HashMap<String, ScratchpadToolEntry>,
-        /// Per-tool output formatters (glob-matched on tool name).
+        /// Per-tool output formatters, keyed by tool-name glob pattern.
         #[serde(default)]
         output_format: HashMap<String, OutputFormatEntry>,
         /// Client identity for this server alone.
@@ -769,7 +769,7 @@ pub enum McpServerConfig {
         /// Per-tool scratchpad interception thresholds (glob-matched on tool name).
         #[serde(default)]
         scratchpad: HashMap<String, ScratchpadToolEntry>,
-        /// Per-tool output formatters (glob-matched on tool name).
+        /// Per-tool output formatters, keyed by tool-name glob pattern.
         #[serde(default)]
         output_format: HashMap<String, OutputFormatEntry>,
         /// Client identity for this server alone.

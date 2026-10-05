@@ -23,24 +23,21 @@ use crate::tool_wrapper::{
 };
 use aura_config::{OutputFormatEntry, glob_match};
 
-/// Tool argument the model sets to receive the unformatted output.
+/// Tool argument that skips formatting for one call.
 pub const RAW_FIELD: &str = "_aura_raw";
 
 /// Key of this wrapper's entry in the `extracted` payload.
 const EXTRACTED_KEY: &str = "_aura_output_format";
 
-/// Applies the configured output formatter to each MCP tool's output.
-///
-/// Compose it so its `transform_output` runs before `ScratchpadWrapper`'s:
-/// formatted output that still reaches a tool's `min_tokens` is then
-/// intercepted as usual.
+/// The configured output formatters, by MCP server.
 pub struct OutputFormatWrapper {
-    /// Server name → `(pattern, entry)`, longest pattern first.
+    /// Server name → `(tool-name pattern, entry)`.
     servers: HashMap<String, Vec<(String, OutputFormatEntry)>>,
 }
 
 impl OutputFormatWrapper {
-    /// Build from the MCP config. `None` when no server configures a
+    /// Build from the MCP config, ordering each server's patterns longest
+    /// first for [`Self::entry`]. `None` when no server configures a
     /// formatter, so callers add nothing to the wrapper chain.
     pub fn from_mcp_config(mcp: Option<&McpConfig>) -> Option<Self> {
         let servers: HashMap<_, _> = mcp?
@@ -107,8 +104,9 @@ impl ToolWrapper for OutputFormatWrapper {
                 json!({
                     "type": "boolean",
                     "description": format!(
-                        "Optional. Set true to receive this tool's unformatted response. \
-                         By default the response is condensed by the {} formatter.",
+                        "Optional. Set true to skip the {} formatter and receive the \
+                         response as the server returned it. Large responses are still \
+                         subject to the same size handling as any other tool output.",
                         entry.name()
                     ),
                 }),
@@ -133,6 +131,10 @@ impl ToolWrapper for OutputFormatWrapper {
         )
     }
 
+    /// Runs before `ScratchpadWrapper::transform_output` in both wrapper
+    /// chains (`Agent::new`, `create_worker`): formatted output that still
+    /// reaches a tool's `min_tokens`, and `_aura_raw` output, are then
+    /// intercepted as usual.
     async fn transform_output(
         &self,
         output: String,

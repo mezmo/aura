@@ -112,7 +112,7 @@ Authorization = "Bearer {{ env.MCP_TOKEN | default: '' }}"
 # Rewrite a tool's output before the model (and scratchpad) sees it.
 # Keys are tool-name glob patterns; the longest match wins. Available on
 # all three transports. Unrecognised output passes through unchanged, and
-# the model can pass `"_aura_raw": true` for the unformatted response.
+# the model can pass `"_aura_raw": true` to skip formatting for a call.
 # See examples/complete/output-format-prometheus.toml.
 #
 # [mcp.servers.example_http.output_format]

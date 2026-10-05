@@ -9,7 +9,8 @@
 #   - the resolution the backend returned is stated, and compared with the
 #     requested step when `step_arg` names the tool's step argument
 # Output the formatter does not recognise passes through unchanged. The model
-# can pass `"_aura_raw": true` on a call to get the unformatted response.
+# can pass `"_aura_raw": true` on a call to skip formatting; a large raw
+# response is still subject to scratchpad interception when configured.
 #
 # Prerequisites:
 #   export OPENAI_API_KEY="sk-..."
