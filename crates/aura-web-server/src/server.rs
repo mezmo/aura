@@ -240,7 +240,9 @@ fn warn_timeout_relationships(agent_id: &str, config: &aura_config::Config, args
     }
     if let Some(hitl) = config.hitl.as_ref() {
         let route_timeout = match &hitl.route {
-            aura_config::DecisionRouteConfig::Webhook { timeout_secs, .. } => *timeout_secs,
+            aura_config::DecisionRouteConfig::Webhook { .. } => {
+                hitl.route.effective_webhook_timeout_secs()
+            }
             aura_config::DecisionRouteConfig::Conversational { timeout_secs, .. } => *timeout_secs,
         };
         if let Some(msg) = hitl_route_vs_server_window_warning(route_timeout, server_inactivity) {
@@ -450,7 +452,7 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
     }
 
     let app_state = Arc::new(AppState {
-        configs: configs_arc,
+        configs: Arc::clone(&configs_arc),
         tool_result_mode: args.tool_result_mode,
         tool_result_max_length: args.tool_result_max_length,
         streaming_buffer_size: args.streaming_buffer_size,
@@ -478,6 +480,55 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
         args.host, args.port
     );
 
+    // Poll delivery: one reconciler per poll-mode agent config, holding its
+    // own webhook client built from the same route config the per-request
+    // routes use, and the ingress registry's store. Each loop stops when the
+    // shutdown token cancels; the handles are kept and joined at teardown,
+    // where a loop that died of a panic mid-run warns instead of detaching
+    // silently.
+    //
+    // Boot guard: two poll-mode configs whose agent settings produce the
+    // same effective instance id would each spawn a reconciler claiming
+    // the same pending rows in one process, breaking the single-writer
+    // posture the poller documents — refuse at boot, the same loud config
+    // error as the plaintext-http-with-secret refusal. In-process only: a
+    // cross-process same-id deployment (active/standby) must fence
+    // reconciler leadership externally.
+    let mut reconcilers = Vec::new();
+    let mut claims = Vec::new();
+    for config in configs_arc.iter() {
+        let Some(hitl) = &config.hitl else {
+            continue;
+        };
+        let instance_id = compute_instance_id(&config.agent).to_string();
+        let Some(reconciler) = aura::hitl::PollReconciler::from_config(
+            hitl,
+            ingress_hmac.as_ref(),
+            instance_id.clone(),
+            session_store.approvals(),
+            &app_state.pending_approvals,
+        ) else {
+            continue;
+        };
+        let label = config.agent.alias.as_deref().unwrap_or(&config.agent.name);
+        claims.push((label.to_string(), instance_id));
+        reconcilers.push(reconciler);
+    }
+    if let Some(((first, second), id)) = reconciler_id_conflicts(&claims) {
+        error!(
+            "poll-delivery conflict: agents '{first}' and '{second}' resolve to the same \
+             effective instance id {id}"
+        );
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "poll-delivery conflict: agents '{first}' and '{second}' resolve to the same \
+                 effective instance id {id}; two reconcilers in one process would claim the \
+                 same pending approvals. give each poll-mode agent a distinct instance_seed \
+                 (or a distinct name)"
+            ),
+        ));
+    }
     let app = Router::new()
         .route("/health", get(handlers::health))
         .route("/aura/info", get(handlers::info))
@@ -597,11 +648,121 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
         }
     });
 
-    axum::serve(listener, app)
+    // Spawned once all fallible setup (bind, signal registration) has
+    // completed; every path out of `run` with spawned loops joins them at teardown.
+    let pollers: Vec<aura::hitl::PollerHandle> = reconcilers
+        .into_iter()
+        .map(|reconciler| reconciler.spawn(&shutdown_token))
+        .collect();
+
+    let serve_result = axum::serve(listener, app)
         .with_graceful_shutdown(async {
             shutdown_rx.await.ok();
         })
-        .await
+        .await;
+
+    for handle in pollers {
+        let _ = handle.stop().await;
+    }
+
+    serve_result
+}
+
+/// The reconciler boot guard's conflict scan: the first duplicate
+/// effective instance id among the configs that would spawn a reconciler,
+/// as `((first agent label, second agent label), shared id)`.
+fn reconciler_id_conflicts(claims: &[(String, String)]) -> Option<((String, String), String)> {
+    let mut seen = std::collections::HashMap::new();
+    for (label, id) in claims {
+        if let Some(first) = seen.insert(id, label) {
+            return Some(((first.clone(), label.clone()), id.clone()));
+        }
+    }
+    None
+}
+
+/// The scan sees only configs `PollReconciler::from_config` arms (the
+/// spawn loop claims no others), so a non-poll config sharing an id never
+/// reaches it; that gating is pinned by the poller's
+/// `from_config_gates_on_poll_delivery`.
+#[cfg(test)]
+mod reconciler_boot_guard_tests {
+    use super::{compute_instance_id, reconciler_id_conflicts};
+
+    fn claim(label: &str, id: &str) -> (String, String) {
+        (label.to_string(), id.to_string())
+    }
+
+    /// An `[agent]` table with the given name and optional alias, built
+    /// the way real configs arrive (the effective-id and label fixtures
+    /// below derive from its fields).
+    fn agent_config(name: &str, alias: Option<&str>) -> aura_config::AgentConfig {
+        let alias_field = alias
+            .map(|a| format!("alias = \"{a}\"\n"))
+            .unwrap_or_default();
+        let toml = format!(
+            "[agent]\nname = \"{name}\"\n{alias_field}system_prompt = \"test\"\n\n\
+             [agent.llm]\nprovider = \"openai\"\napi_key = \"test\"\nmodel = \"gpt-4o\"\n"
+        );
+        aura_config::load_config_from_str(&toml)
+            .expect("the boot-guard fixture config parses")
+            .agent
+    }
+
+    #[test]
+    fn duplicate_id_reports_both_labels_and_the_id() {
+        let ((first, second), id) = reconciler_id_conflicts(&[
+            claim("alpha", "id-1"),
+            claim("beta", "id-2"),
+            claim("gamma", "id-1"),
+        ])
+        .expect("the shared id must conflict");
+        assert_eq!(first, "alpha");
+        assert_eq!(second, "gamma");
+        assert_eq!(id, "id-1");
+    }
+
+    #[test]
+    fn distinct_ids_do_not_conflict() {
+        assert!(
+            reconciler_id_conflicts(&[claim("alpha", "id-1"), claim("beta", "id-2")]).is_none()
+        );
+    }
+
+    /// The alias-vs-name arm of the boot guard: one agent's alias may
+    /// equal another agent's name, making their boot labels identical,
+    /// while the effective instance ids stay distinct — the guard must
+    /// refuse on the shared effective id (the true-positive arm above),
+    /// never on the shared label, or this deployment shape would be
+    /// refused at boot.
+    #[test]
+    fn identical_labels_from_alias_and_name_keep_distinct_effective_ids() {
+        let with_alias = agent_config("primary", Some("shared-label"));
+        let bare = agent_config("shared-label", None);
+
+        let first = compute_instance_id(&with_alias).to_string();
+        let second = compute_instance_id(&bare).to_string();
+        assert_ne!(
+            first, second,
+            "an alias equal to another agent's name must not collide on the effective id"
+        );
+
+        // The boot label, the same expression the spawn loop claims with.
+        let label = |agent: &aura_config::AgentConfig| {
+            agent.alias.as_deref().unwrap_or(&agent.name).to_string()
+        };
+        assert_eq!(
+            label(&with_alias),
+            label(&bare),
+            "the fixture collides on boot labels by construction"
+        );
+
+        let claims = vec![(label(&with_alias), first), (label(&bare), second)];
+        assert!(
+            reconciler_id_conflicts(&claims).is_none(),
+            "the guard refuses on shared effective ids, never on shared labels"
+        );
+    }
 }
 
 #[cfg(test)]

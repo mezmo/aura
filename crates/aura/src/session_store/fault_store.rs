@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use async_trait::async_trait;
 
 use super::{ApprovalStore, InMemoryApprovalStore, SessionStoreError};
-use crate::hitl::{ApprovalDecision, DecisionId, ParkedApproval, ResolveError};
+use crate::hitl::{DecisionId, ParkedApproval, ResolveError, ResolvedDecision};
 
 /// Delegates to an in-memory store; each `fail_*` flag makes that operation
 /// answer `SessionStoreError::Request` (the `*_once` flag fires one time).
@@ -55,7 +55,7 @@ impl ApprovalStore for FaultInjectingStore {
     async fn resolve(
         &self,
         id: &DecisionId,
-        decision: ApprovalDecision,
+        decision: ResolvedDecision,
     ) -> Result<(), ResolveError> {
         self.inner.resolve(id, decision).await
     }
@@ -63,7 +63,7 @@ impl ApprovalStore for FaultInjectingStore {
     async fn decision(
         &self,
         id: &DecisionId,
-    ) -> Result<Option<ApprovalDecision>, SessionStoreError> {
+    ) -> Result<Option<ResolvedDecision>, SessionStoreError> {
         self.inner.decision(id).await
     }
 
@@ -76,5 +76,9 @@ impl ApprovalStore for FaultInjectingStore {
         request_id: &str,
     ) -> Result<Vec<ParkedApproval>, SessionStoreError> {
         self.inner.cancel_request(request_id).await
+    }
+
+    async fn list_pending(&self) -> Result<Vec<ParkedApproval>, SessionStoreError> {
+        self.inner.list_pending().await
     }
 }

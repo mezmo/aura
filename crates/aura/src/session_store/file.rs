@@ -12,21 +12,34 @@
 //! Store contract (park/reify §2.5):
 //!
 //! - `resolve` refuses past the approval's `expires_at`, uniformly with an
-//!   unknown id; expiry is enforced only by `resolve`.
+//!   unknown id.
 //! - `resolve` *moves* the approval into the decision file rather than deleting
-//!   it: `get` returns the approval before and after the decision, `decision`
+//!   it, minus its egress headers (a decided id is never notified again):
+//!   `get` returns the approval before and after the decision, `decision`
 //!   returns the recorded decision, and both are retained until `remove`.
 //! - At-most-once `resolve` is the `File::create_new` claim on the decision
 //!   file: `AlreadyExists` reads as `NotFound`.
 //! - `cancel_request` removes undecided approvals by owner (request) id and
 //!   returns them; decided entries are retained until their consumer removes
 //!   them.
+//! - `list_pending` scans the undecided approvals for the poll reconciler:
+//!   corrupt files are warn-and-skipped per id, expired records are
+//!   unlinked, and an approval file left behind a complete decision file
+//!   is unlinked (one behind an undecodable decision file is kept, as the
+//!   only intact record).
 //!
 //! Decision ids are validated as UUIDs before path building, so none address
 //! outside the root.
 //! Temp-file plus rename prevents partial files after crashes. A `std::sync::Mutex`
 //! serializes operations for the single writing process; no operation awaits
-//! while holding it.
+//! while holding it, and `list_pending` holds it only to snapshot the
+//! directory listing — its per-file reads and decodes run outside it.
+//! Publishes and destructive commits also serialize per path on a separate
+//! lock map, so a compare+remove commit never overlaps a same-instance
+//! registration's rename at one approval path and cannot erase the record
+//! the registration published. The per-path locks are per store instance:
+//! two handles on one root stay independent, and no cross-process claim
+//! is made.
 //!
 //! Store operations run sync on the blocking pool rather than over
 //! `tokio::fs`, which is itself one `spawn_blocking` per call: a whole
@@ -44,6 +57,7 @@
 
 mod skill_store;
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -53,7 +67,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::task::{JoinError, spawn_blocking};
 
-use crate::hitl::{ApprovalDecision, DecisionId, ParkedApproval, ResolveError};
+use crate::hitl::{DecisionId, ParkedApproval, ResolveError, ResolvedDecision};
 
 use super::{ApprovalStore, DecisionRecord, ParkedApprovalRecord, SessionStoreError};
 
@@ -79,10 +93,16 @@ pub struct FileApprovalStore {
     inner: Arc<Inner>,
 }
 
-/// The shared store state: root directory and operation lock.
+/// The shared store state: root directory, operation lock, and the
+/// per-path destructive-commit locks.
 struct Inner {
     root: PathBuf,
     lock: Mutex<()>,
+    /// One lock per approval path, keyed by this store's own constructed
+    /// paths. An entry lives only while a parked approval exists at its
+    /// path, so growth is bounded by the approvals in flight.
+    /// Mechanism: `with_path_lock`, `evict_path_lock`.
+    path_locks: Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>,
 }
 
 impl FileApprovalStore {
@@ -91,11 +111,12 @@ impl FileApprovalStore {
     /// cannot hold files must fail at startup, not on the first approval.
     pub fn open(root: impl AsRef<Path>) -> Result<Self, SessionStoreError> {
         let root = root.as_ref();
-        fs::create_dir_all(root.join(APPROVALS_DIR)).map_err(connect_err)?;
-        fs::create_dir_all(root.join(DECISIONS_DIR)).map_err(connect_err)?;
+        private_dir(&root.join(APPROVALS_DIR)).map_err(connect_err)?;
+        private_dir(&root.join(DECISIONS_DIR)).map_err(connect_err)?;
         let inner = Arc::new(Inner {
             root: root.to_path_buf(),
             lock: Mutex::new(()),
+            path_locks: Mutex::new(HashMap::new()),
         });
         inner.probe_writable_sync().map_err(connect_err)?;
         Ok(Self { inner })
@@ -131,12 +152,31 @@ impl Inner {
         self.lock.lock().expect("file approval store lock poisoned")
     }
 
+    /// Run `f` holding the per-path lock for `path` — the primitive that
+    /// makes a destructive commit indivisible against same-instance
+    /// publishes. The map lock guards only the lookup; it is released
+    /// before `f` runs, so unrelated paths never wait on each other.
+    fn with_path_lock<R>(&self, path: &Path, f: impl FnOnce() -> R) -> R {
+        let lock = {
+            let mut map = self
+                .path_locks
+                .lock()
+                .expect("file approval store path-lock map poisoned");
+            Arc::clone(
+                map.entry(path.to_path_buf())
+                    .or_insert_with(|| Arc::new(Mutex::new(()))),
+            )
+        };
+        let _guard = lock.lock().expect("file approval store path lock poisoned");
+        f()
+    }
+
     /// Create and unlink an empty probe file in each store directory. This
     /// catches permission and mount faults, not a full disk.
     fn probe_writable_sync(&self) -> io::Result<()> {
         for dir in [self.approvals_dir(), self.decisions_dir()] {
             let probe = dir.join(format!(".{}.probe", uuid::Uuid::new_v4()));
-            fs::write(&probe, b"")
+            write_private(&probe, b"")
                 .and_then(|()| fs::remove_file(&probe))
                 .map_err(|err| {
                     io::Error::new(err.kind(), format!("{} not writable: {err}", dir.display()))
@@ -150,7 +190,8 @@ impl Inner {
         let id = canonical_id(&parked.request.decision_id)?;
         let payload = serde_json::to_vec(&ParkedApprovalRecord::from(&parked))
             .expect("approval record serializes to JSON");
-        publish(&self.approval_path(&id), &payload)
+        let path = self.approval_path(&id);
+        self.with_path_lock(&path, || publish(&path, &payload))
     }
 
     fn get_sync(&self, id: &DecisionId) -> Result<Option<ParkedApproval>, SessionStoreError> {
@@ -174,13 +215,13 @@ impl Inner {
     fn resolve_sync(
         &self,
         id: &DecisionId,
-        decision: ApprovalDecision,
+        decision: ResolvedDecision,
     ) -> Result<(), ResolveError> {
         let _guard = self.lock();
         let id = canonical_id(id).map_err(ResolveError::Store)?;
 
         // Reading the approval before claiming avoids claiming unknown ids.
-        let record = match fs::read(self.approval_path(&id)) {
+        let mut record = match fs::read(self.approval_path(&id)) {
             Ok(bytes) => serde_json::from_slice::<ParkedApprovalRecord>(&bytes)
                 .map_err(|e| ResolveError::Store(decode_err(e)))?,
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
@@ -192,6 +233,7 @@ impl Inner {
         if chrono::Utc::now() > record.expires_at {
             return Err(ResolveError::NotFound);
         }
+        record.egress_headers = None;
         let payload = serde_json::to_vec(&ResolvedEntry {
             approval: record,
             decision: DecisionRecord::from(&decision),
@@ -199,7 +241,11 @@ impl Inner {
         .expect("resolved entry serializes to JSON");
 
         let decision_path = self.decision_path(&id);
-        let mut file = match fs::File::create_new(&decision_path) {
+        let mut file = match private_file()
+            .write(true)
+            .create_new(true)
+            .open(&decision_path)
+        {
             Ok(file) => file,
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
                 return Err(ResolveError::NotFound);
@@ -214,9 +260,15 @@ impl Inner {
             return Err(ResolveError::Store(request_err(err)));
         }
         // After sync commit, removing the approval file is best-effort.
-        // Failure leaves a stale approval file; resolve succeeded.
-        match fs::remove_file(self.approval_path(&id)) {
-            Ok(()) => {}
+        // Failure leaves a stale approval file; resolve succeeded. The
+        // store op lock already serializes this unlink against
+        // registration, so no per-path lock is involved — a real destroy
+        // here needs only the entry eviction.
+        let approval_path = self.approval_path(&id);
+        match fs::remove_file(&approval_path) {
+            Ok(()) => self.evict_path_lock(&approval_path),
+            // A NotFound miss is another op's destroy; that destroyer's
+            // own eviction covered the map entry.
             Err(err) if err.kind() == io::ErrorKind::NotFound => {}
             Err(err) => tracing::warn!(
                 decision_id = %id,
@@ -230,13 +282,15 @@ impl Inner {
     fn decision_sync(
         &self,
         id: &DecisionId,
-    ) -> Result<Option<ApprovalDecision>, SessionStoreError> {
+    ) -> Result<Option<ResolvedDecision>, SessionStoreError> {
         let _guard = self.lock();
         let id = canonical_id(id)?;
         match fs::read(self.decision_path(&id)) {
             Ok(bytes) => {
                 let entry: ResolvedEntry = serde_json::from_slice(&bytes).map_err(decode_err)?;
-                Ok(Some(ApprovalDecision::from(entry.decision)))
+                ResolvedDecision::try_from(entry.decision)
+                    .map(Some)
+                    .map_err(decode_err)
             }
             Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(err) => Err(request_err(err)),
@@ -246,12 +300,15 @@ impl Inner {
     fn remove_sync(&self, id: &DecisionId) -> Result<(), SessionStoreError> {
         let _guard = self.lock();
         let id = canonical_id(id)?;
-        // Remove both halves; missing halves are fine (idempotent).
+        // Remove both halves; missing halves are fine (idempotent). The
+        // op lock already serializes these unlinks against registration,
+        // so a remove here needs only the entry eviction — the decision
+        // half never materializes an entry, making its evict a no-op.
         for path in [self.approval_path(&id), self.decision_path(&id)] {
-            if let Err(err) = fs::remove_file(&path)
-                && err.kind() != io::ErrorKind::NotFound
-            {
-                return Err(request_err(err));
+            match fs::remove_file(&path) {
+                Ok(()) => self.evict_path_lock(&path),
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => return Err(request_err(err)),
             }
         }
         Ok(())
@@ -305,26 +362,33 @@ impl Inner {
                 .try_exists()
                 .map_err(request_err)?
             {
-                stale_decided.push(path);
+                stale_decided.push((path, bytes));
                 continue;
             }
-            candidates.push((path, parked));
+            candidates.push((path, parked, bytes));
         }
 
-        // Phase 2 removes; a file that survives drops its record from the
-        // returned set so a later cancel can clear it again.
+        // Phase 2 removes; each removal rechecks the file still holds the
+        // bytes phase 1 decoded, so a registration that rewrote the path
+        // mid-cancel keeps its record for a later cancel. A file that
+        // survives drops its record from the returned set so a later
+        // cancel can clear it again.
         let mut cleared = Vec::new();
-        for (path, parked) in candidates {
-            match fs::remove_file(&path) {
-                Ok(()) => cleared.push(parked),
+        for (path, parked, bytes) in candidates {
+            match self.unlink_if_unchanged(&path, &bytes) {
+                Ok(true) => cleared.push(parked),
+                Ok(false) => tracing::warn!(
+                    path = %path.display(), decision_id = %parked.request.decision_id,
+                    "approval file changed under cancel_request; a later cancel can clear it"
+                ),
                 Err(err) => tracing::warn!(
                     path = %path.display(), decision_id = %parked.request.decision_id, error = %err,
                     "approval file not removed by cancel_request; a later cancel can clear it"
                 ),
             }
         }
-        for path in stale_decided {
-            if let Err(err) = fs::remove_file(&path) {
+        for (path, bytes) in stale_decided {
+            if let Err(err) = self.unlink_if_unchanged(&path, &bytes) {
                 tracing::warn!(
                     path = %path.display(), error = %err,
                     "stale decided approval file not removed by cancel_request"
@@ -332,6 +396,83 @@ impl Inner {
             }
         }
         Ok(cleared)
+    }
+
+    fn list_pending_sync(&self) -> Result<Vec<ParkedApproval>, SessionStoreError> {
+        let paths: Vec<PathBuf> = {
+            let _guard = self.lock();
+            let entries = fs::read_dir(self.approvals_dir()).map_err(request_err)?;
+            let mut paths = Vec::new();
+            for entry in entries {
+                let entry = entry.map_err(request_err)?;
+                let path = entry.path();
+                if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                    // A mid-publish temp file, never a stored approval.
+                    continue;
+                }
+                paths.push(path);
+            }
+            paths
+        };
+
+        let now = chrono::Utc::now();
+
+        let mut pending = Vec::new();
+        for path in paths {
+            let bytes = match fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(request_err(err)),
+            };
+            let parked = match decode_approval(&bytes) {
+                Ok(parked) => parked,
+                Err(err) => {
+                    tracing::warn!(
+                        path = %path.display(), error = %err,
+                        "undecodable approval file skipped by list_pending"
+                    );
+                    continue;
+                }
+            };
+            // resolve writes the decision before its best-effort approval
+            // unlink, so a decision file here marks an already-decided id:
+            // the reconciler must not re-poll it. A decision file that
+            // decodes as a complete entry makes the approval file residue
+            // (which carries the row's credentials), retried for removal on
+            // every scan until it is gone; a decision file that does not
+            // decode (a write interrupted before its sync) leaves the
+            // approval file in place as the only intact record.
+            let decision_path = self.decision_path(&parked.request.decision_id.to_string());
+            match fs::read(&decision_path) {
+                Ok(decision_bytes) => {
+                    if serde_json::from_slice::<ResolvedEntry>(&decision_bytes).is_ok() {
+                        if let Err(err) = self.unlink_if_unchanged(&path, &bytes) {
+                            tracing::warn!(
+                                path = %path.display(), error = %err,
+                                "decided approval file not removed by list_pending"
+                            );
+                        }
+                    } else {
+                        tracing::warn!(
+                            path = %decision_path.display(),
+                            "incomplete decision file; approval file kept for recovery"
+                        );
+                    }
+                    continue;
+                }
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => return Err(request_err(err)),
+            }
+            if parked.expires_at > now {
+                pending.push(parked);
+            } else if let Err(err) = self.unlink_if_unchanged(&path, &bytes) {
+                tracing::warn!(
+                    path = %path.display(), error = %err,
+                    "expired approval file not removed by list_pending"
+                );
+            }
+        }
+        Ok(pending)
     }
 }
 
@@ -355,7 +496,7 @@ impl ApprovalStore for FileApprovalStore {
     async fn resolve(
         &self,
         id: &DecisionId,
-        decision: ApprovalDecision,
+        decision: ResolvedDecision,
     ) -> Result<(), ResolveError> {
         let inner = Arc::clone(&self.inner);
         let id = *id;
@@ -367,7 +508,7 @@ impl ApprovalStore for FileApprovalStore {
     async fn decision(
         &self,
         id: &DecisionId,
-    ) -> Result<Option<ApprovalDecision>, SessionStoreError> {
+    ) -> Result<Option<ResolvedDecision>, SessionStoreError> {
         let inner = Arc::clone(&self.inner);
         let id = *id;
         spawn_blocking(move || inner.decision_sync(&id))
@@ -390,6 +531,13 @@ impl ApprovalStore for FileApprovalStore {
         let inner = Arc::clone(&self.inner);
         let request_id = request_id.to_owned();
         spawn_blocking(move || inner.cancel_request_sync(&request_id))
+            .await
+            .map_err(join_err)?
+    }
+
+    async fn list_pending(&self) -> Result<Vec<ParkedApproval>, SessionStoreError> {
+        let inner = Arc::clone(&self.inner);
+        spawn_blocking(move || inner.list_pending_sync())
             .await
             .map_err(join_err)?
     }
@@ -416,11 +564,177 @@ fn publish(path: &Path, payload: &[u8]) -> Result<(), SessionStoreError> {
         name.to_string_lossy(),
         uuid::Uuid::new_v4()
     ));
-    let written = fs::write(&tmp, payload).and_then(|()| fs::rename(&tmp, path));
+    let written = write_private(&tmp, payload).and_then(|()| fs::rename(&tmp, path));
     if let Err(err) = written {
         let _ = fs::remove_file(&tmp);
         return Err(request_err(err));
     }
+    Ok(())
+}
+
+impl Inner {
+    /// Unlink `path` only if it still holds exactly `expected`; `Ok(true)`
+    /// means the file was unlinked here. The compare is redone under the
+    /// per-path lock, so a same-instance registration landing between
+    /// compare and remove survives. A vanished path was destroyed by
+    /// someone whose own eviction may have been refcount-blocked, so every
+    /// vanished-path observation retries the eviction.
+    fn unlink_if_unchanged(&self, path: &Path, expected: &[u8]) -> io::Result<bool> {
+        match compare_bytes(path, expected)? {
+            ByteCompare::Unchanged => {}
+            ByteCompare::Changed => return Ok(false),
+            ByteCompare::Vanished => {
+                self.evict_path_lock(path);
+                return Ok(false);
+            }
+        }
+        #[cfg(test)]
+        unlink_interleave::fire(path);
+        let (unlinked, destroyed) =
+            self.with_path_lock(path, || match compare_bytes(path, expected)? {
+                ByteCompare::Unchanged => match fs::remove_file(path) {
+                    Ok(()) => Ok((true, true)),
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => Ok((false, true)),
+                    Err(err) => Err(err),
+                },
+                ByteCompare::Changed => Ok((false, false)),
+                ByteCompare::Vanished => Ok((false, true)),
+            })?;
+        if destroyed {
+            self.evict_path_lock(path);
+        }
+        Ok(unlinked)
+    }
+
+    /// Drop a destroyed path's lock entry when only the map itself still
+    /// holds it. The count is read and the entry removed in one map-lock
+    /// critical section — the same lock every waiter clones under — so a
+    /// count of one is stable: no waiter is in flight and the entry can
+    /// go, while more means a waiter holds a clone across its critical
+    /// section and the entry stays for a later destroy to evict. Because
+    /// clones and removal are serialized on the same lock, an entry
+    /// removed at count one leaves its mutex unreachable — every later
+    /// lookup inserts a fresh lock instead of joining a dead one, so two
+    /// locks for one path never coexist.
+    fn evict_path_lock(&self, path: &Path) {
+        let mut map = self
+            .path_locks
+            .lock()
+            .expect("file approval store path-lock map poisoned");
+        if map
+            .get(path)
+            .is_some_and(|lock| Arc::strong_count(lock) == 1)
+        {
+            map.remove(path);
+        }
+    }
+}
+
+/// What an identity compare found at `path` against the bytes a sweep
+/// decoded.
+enum ByteCompare {
+    Unchanged,
+    Changed,
+    Vanished,
+}
+
+/// Compare `path`'s current bytes against `expected`, keeping a
+/// changed-but-alive file distinct from a vanished one — the two demand
+/// opposite lock-entry outcomes (keep vs evict), so NotFound must never
+/// collapse into "changed".
+fn compare_bytes(path: &Path, expected: &[u8]) -> io::Result<ByteCompare> {
+    match fs::read(path) {
+        Ok(current) if current == expected => Ok(ByteCompare::Unchanged),
+        Ok(_) => Ok(ByteCompare::Changed),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(ByteCompare::Vanished),
+        Err(err) => Err(err),
+    }
+}
+
+/// Deterministic interleaving point for the sweep's destructive boundary:
+/// the moment between `unlink_if_unchanged`'s unlocked identity compare
+/// and its per-path-locked commit, where a registration can publish fresh
+/// bytes at the swept path. A test-installed hook fires there, on the
+/// calling thread. The hook may take the per-path lock — it is not yet
+/// held — but must not re-enter the store's operation lock:
+/// `list_pending` reaches the boundary lock-free, `cancel_request` holds
+/// that lock across its unlinks.
+#[cfg(test)]
+mod unlink_interleave {
+    use std::path::Path;
+    use std::sync::Mutex;
+
+    type Hook = Box<dyn Fn(&Path) + Send>;
+
+    static HOOK: Mutex<Option<Hook>> = Mutex::new(None);
+
+    /// Uninstalls the hook on drop, so a failed test cannot leak it into
+    /// the rest of the battery.
+    pub(super) struct HookGuard;
+
+    impl Drop for HookGuard {
+        fn drop(&mut self) {
+            *HOOK.lock().expect("unlink interleave slot poisoned") = None;
+        }
+    }
+
+    /// Fire `hook` at every compare/remove boundary until the returned
+    /// guard drops.
+    pub(super) fn install(hook: Hook) -> HookGuard {
+        *HOOK.lock().expect("unlink interleave slot poisoned") = Some(hook);
+        HookGuard
+    }
+
+    pub(super) fn fire(path: &Path) {
+        // The hook runs outside the slot lock so a boundary reached from
+        // inside a hook nests instead of deadlocking.
+        let hook = HOOK.lock().expect("unlink interleave slot poisoned").take();
+        if let Some(hook) = hook {
+            hook(path);
+            *HOOK.lock().expect("unlink interleave slot poisoned") = Some(hook);
+        }
+    }
+}
+
+/// Open options that create files readable by the owner only.
+fn private_file() -> fs::OpenOptions {
+    let mut options = fs::OpenOptions::new();
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    options
+}
+
+/// Write `payload` to a new or truncated owner-only file. A file that
+/// already exists at `path` is tightened to owner-only after truncation
+/// and before the payload is written, so a permissive leftover never
+/// holds new content.
+pub(crate) fn write_private(path: &Path, payload: &[u8]) -> io::Result<()> {
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut file = private_file()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)?;
+    #[cfg(unix)]
+    file.set_permissions(<fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600))?;
+    file.write_all(payload)
+}
+
+/// Create `path` and any missing parents as owner-only directories. A
+/// `path` that already exists is tightened to owner-only, so a directory
+/// created under a permissive umask by an earlier version stops exposing
+/// the records inside it the next time the store or park path opens.
+pub(crate) fn private_dir(path: &Path) -> io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder.create(path)?;
+    #[cfg(unix)]
+    fs::set_permissions(
+        path,
+        <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+    )?;
     Ok(())
 }
 
@@ -457,5 +771,372 @@ fn decode_err(reason: impl std::fmt::Display) -> SessionStoreError {
 fn join_err(err: JoinError) -> SessionStoreError {
     SessionStoreError::Request {
         reason: format!("file store task failed: {err}"),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod private_mode_tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::{private_dir, write_private};
+
+    fn mode_of(path: &std::path::Path) -> u32 {
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn private_dir_tightens_an_existing_permissive_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("approvals");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(mode_of(&target), 0o755, "fixture is permissive");
+
+        private_dir(&target).unwrap();
+
+        assert_eq!(mode_of(&target), 0o700);
+    }
+
+    #[test]
+    fn write_private_tightens_a_permissive_leftover_before_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join(".leftover.tmp");
+        std::fs::write(&target, b"stale").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(mode_of(&target), 0o644, "fixture is permissive");
+
+        write_private(&target, b"fresh").unwrap();
+
+        assert_eq!(mode_of(&target), 0o600);
+        assert_eq!(std::fs::read(&target).unwrap(), b"fresh");
+    }
+}
+
+/// The concurrent half of the sweep's destructive contract; the
+/// end-to-end recovery half is the aura-web-server battery's
+/// `stale_sweep_cannot_unlink_a_replaced_record`. Every sweep-driven
+/// unlink checks the file against the bytes the sweep decoded
+/// (`unlink_if_unchanged`, the exact code path the scan's expiry
+/// and residue unlinks take), so the interleaving — stale record read,
+/// replace with a fresh record, unlink — is driven directly through
+/// that seam.
+#[cfg(test)]
+mod unlink_recheck_tests {
+    use std::sync::Arc;
+
+    use crate::hitl::{
+        AgentScope, ApprovalAuthority, ApprovalDecision, ApprovalItem, ApprovalOrigin,
+        ApprovalRequest, DecisionId, PROTOCOL_VERSION, ParkedApproval, ResolvedDecision,
+    };
+    use crate::session_store::{ApprovalStore, ParkedApprovalRecord};
+
+    use super::{FileApprovalStore, unlink_interleave};
+
+    /// A representative parked approval for `decision_id`, expiring far
+    /// out — the battery fixture's shape.
+    fn make_parked(decision_id: DecisionId) -> ParkedApproval {
+        let now = chrono::Utc::now();
+        ParkedApproval {
+            request: ApprovalRequest {
+                version: PROTOCOL_VERSION,
+                instance_id: "test-instance".to_string(),
+                decision_id,
+                request_id: "req-replaced".to_string(),
+                scope: AgentScope::Single { session_id: None },
+                origin: ApprovalOrigin::ConfigGate {
+                    matched_pattern: "kubectl_*".to_string(),
+                    agent_name: "test-agent".to_string(),
+                },
+                items: vec![ApprovalItem {
+                    tool_name: "kubectl_delete".to_string(),
+                    tool_namespace: None,
+                    arguments: serde_json::json!({"pod": "web-1"}),
+                    tool_call_intent: Some("restarting to pick up the config change".to_string()),
+                }],
+            },
+            registered_at: now,
+            expires_at: now + chrono::Duration::hours(1),
+            authority: ApprovalAuthority::WebhookPoll,
+            egress_headers: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stale_sweep_snapshot_cannot_unlink_a_replaced_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileApprovalStore::open(dir.path()).unwrap();
+        let id = DecisionId::generate();
+
+        // The snapshot a sweep decoded, and the racing registration that
+        // rewrites the same path with a fresh record.
+        store.register(make_parked(id)).await.unwrap();
+        let path = dir.path().join("approvals").join(format!("{id}.json"));
+        let stale = std::fs::read(&path).unwrap();
+        store.register(make_parked(id)).await.unwrap();
+        let current = std::fs::read(&path).unwrap();
+        assert_ne!(
+            stale, current,
+            "fixture: the racing registration rewrote it"
+        );
+
+        assert!(
+            !store.inner.unlink_if_unchanged(&path, &stale).unwrap(),
+            "a stale snapshot must not unlink the replaced record"
+        );
+        assert!(path.exists(), "the replaced record is retained");
+        assert!(
+            store.inner.unlink_if_unchanged(&path, &current).unwrap(),
+            "the identity the file holds still unlinks"
+        );
+        assert!(!path.exists(), "the matched record is unlinked");
+    }
+
+    /// The boundary the recheck alone cannot close: a registration that
+    /// publishes fresh bytes at the swept path after the identity compare
+    /// but before the remove owns the path, so its record must survive —
+    /// the sweep's unlink decision was made from the stale bytes. The
+    /// interleaving is forced through the test seam at that exact
+    /// boundary, single-threaded, same store instance: no timing luck.
+    #[test]
+    fn a_registration_landing_between_compare_and_remove_survives_the_sweep() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileApprovalStore::open(dir.path()).unwrap();
+        let id = DecisionId::generate();
+
+        // The record the sweep will decide to unlink: expired.
+        let mut expired = make_parked(id);
+        expired.expires_at = chrono::Utc::now() - chrono::Duration::seconds(1);
+        store.inner.register_sync(expired).unwrap();
+        let path = dir.path().join("approvals").join(format!("{id}.json"));
+        let stale = std::fs::read(&path).unwrap();
+
+        // The racing registration: a live record at the same path, published
+        // by the same store instance exactly while the sweep sits between
+        // its compare and its remove.
+        let fresh = make_parked(id);
+        let fresh_payload = serde_json::to_vec(&ParkedApprovalRecord::from(&fresh)).unwrap();
+        assert_ne!(
+            stale, fresh_payload,
+            "fixture: the racing registration publishes different bytes"
+        );
+        let fired = Arc::new(AtomicBool::new(false));
+        let registrar = Arc::clone(&store.inner);
+        let swept_path = path.clone();
+        let to_publish = fresh.clone();
+        let fired_flag = Arc::clone(&fired);
+        let _boundary = unlink_interleave::install(Box::new(move |boundary: &std::path::Path| {
+            // Other tests reach this boundary concurrently; only the
+            // swept path belongs to this interleaving.
+            if boundary != swept_path.as_path() {
+                return;
+            }
+            // The hook contract is repeatable; this pin fires it once.
+            registrar.register_sync(to_publish.clone()).unwrap();
+            fired_flag.store(true, Ordering::SeqCst);
+        }));
+
+        store.inner.list_pending_sync().unwrap();
+
+        assert!(
+            fired.load(Ordering::SeqCst),
+            "fixture: the boundary hook ran"
+        );
+        let on_disk = std::fs::read(&path)
+            .expect("the registration published mid-compare survives the sweep's unlink");
+        assert_eq!(
+            on_disk, fresh_payload,
+            "the surviving record is the fresh registration, not the swept stale one"
+        );
+    }
+
+    /// The destroy that evicts: a registration materializes its path's
+    /// lock entry, and the expiry sweep's commit destroys the record and
+    /// evicts the entry with it, so the map holds nothing beyond the
+    /// approvals actually parked. Single-threaded end to end — the
+    /// refcount is one at eviction because nothing else holds a clone.
+    #[test]
+    fn a_sweep_destroy_evicts_the_destroyed_path_lock_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileApprovalStore::open(dir.path()).unwrap();
+        let id = DecisionId::generate();
+
+        let mut expired = make_parked(id);
+        expired.expires_at = chrono::Utc::now() - chrono::Duration::seconds(1);
+        store.inner.register_sync(expired).unwrap();
+        let path = dir.path().join("approvals").join(format!("{id}.json"));
+        assert!(
+            store
+                .inner
+                .path_locks
+                .lock()
+                .expect("file approval store path-lock map poisoned")
+                .contains_key(&path),
+            "fixture: the registration materialized the path's lock entry"
+        );
+
+        let pending = store.inner.list_pending_sync().unwrap();
+
+        assert!(
+            pending.is_empty(),
+            "fixture: the expired record is not pending"
+        );
+        assert!(
+            !path.exists(),
+            "fixture: the sweep destroyed the expired record"
+        );
+        assert!(
+            store
+                .inner
+                .path_locks
+                .lock()
+                .expect("file approval store path-lock map poisoned")
+                .is_empty(),
+            "the destroyed path's lock entry is evicted"
+        );
+    }
+
+    /// The leak the vanished-path compares close: a destroyer whose
+    /// eviction is refcount-blocked by an in-flight waiter clone leaves
+    /// the path's lock entry behind, and the trailing waiter that next
+    /// observes the path — now vanished — retries the eviction. Forced
+    /// deterministically, single-threaded: the waiter is a clone held
+    /// straight off the map, the destroyer is the sweep through
+    /// `list_pending_sync`, and the trailing waiter is the same commit
+    /// seam re-run against the gone path, where the lock-free first
+    /// compare is what observes the vanish.
+    #[test]
+    fn a_trailing_waiter_on_a_vanished_path_retries_the_blocked_eviction() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileApprovalStore::open(dir.path()).unwrap();
+        let id = DecisionId::generate();
+
+        let mut expired = make_parked(id);
+        expired.expires_at = chrono::Utc::now() - chrono::Duration::seconds(1);
+        store.inner.register_sync(expired).unwrap();
+        let path = dir.path().join("approvals").join(format!("{id}.json"));
+        let snapshot = std::fs::read(&path).unwrap();
+
+        // The in-flight waiter: a clone of the path's lock entry held
+        // across the destroyer's commit, keeping the refcount above one.
+        let held = store
+            .inner
+            .path_locks
+            .lock()
+            .expect("file approval store path-lock map poisoned")
+            .get(&path)
+            .cloned()
+            .expect("fixture: the registration materialized the path's lock entry");
+
+        store.inner.list_pending_sync().unwrap();
+
+        assert!(!path.exists(), "fixture: the sweep destroyed the record");
+        assert!(
+            store
+                .inner
+                .path_locks
+                .lock()
+                .expect("file approval store path-lock map poisoned")
+                .contains_key(&path),
+            "fixture: the held clone refcount-blocked the destroy's eviction"
+        );
+
+        // The trailing waiter: it decoded the record before the destroy
+        // and now commits against a path that no longer exists. The
+        // vanished-path observation carries destroy semantics and evicts
+        // what the blocked destroy left behind.
+        drop(held);
+        let unlinked = store.inner.unlink_if_unchanged(&path, &snapshot).unwrap();
+        assert!(
+            !unlinked,
+            "the trailing waiter unlinked nothing — the file was already gone"
+        );
+        assert!(
+            store
+                .inner
+                .path_locks
+                .lock()
+                .expect("file approval store path-lock map poisoned")
+                .is_empty(),
+            "the trailing waiter's vanished-path observation evicted the blocked entry"
+        );
+    }
+
+    /// The resolve-side half of the same eviction contract: a registered
+    /// approval materializes its path's lock entry, and resolve's
+    /// best-effort approval unlink — reached under the store op lock, with
+    /// no per-path lock involved — destroys the file and evicts the entry
+    /// with it, so the map holds nothing beyond the approvals actually
+    /// parked. Single-threaded end to end — the refcount is one at
+    /// eviction because nothing else holds a clone.
+    #[test]
+    fn a_resolve_destroy_evicts_the_destroyed_path_lock_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileApprovalStore::open(dir.path()).unwrap();
+        let id = DecisionId::generate();
+
+        store.inner.register_sync(make_parked(id)).unwrap();
+        let path = dir.path().join("approvals").join(format!("{id}.json"));
+        assert!(
+            store
+                .inner
+                .path_locks
+                .lock()
+                .expect("file approval store path-lock map poisoned")
+                .contains_key(&path),
+            "fixture: the registration materialized the path's lock entry"
+        );
+
+        store
+            .inner
+            .resolve_sync(&id, ResolvedDecision::from(ApprovalDecision::Approved))
+            .unwrap();
+
+        assert!(
+            !path.exists(),
+            "fixture: resolve destroyed the approval file"
+        );
+        assert!(
+            store
+                .inner
+                .path_locks
+                .lock()
+                .expect("file approval store path-lock map poisoned")
+                .is_empty(),
+            "the resolved path's lock entry is evicted"
+        );
+    }
+}
+
+/// The missing-directory half of the enumeration-errors-surface contract:
+/// an `approvals/` directory that vanishes after open — external cleanup,
+/// a misconfigured mount — must surface the enumeration fault to the poll
+/// reconciler, never an empty pending set it would read as "nothing to
+/// do". The not-a-directory half is pinned in the aura-web-server battery
+/// (`list_pending_reports_enumeration_error`).
+#[cfg(test)]
+mod list_pending_missing_dir_tests {
+    use crate::session_store::SessionStoreError;
+
+    use super::FileApprovalStore;
+
+    #[test]
+    fn list_pending_reports_a_missing_approvals_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileApprovalStore::open(dir.path()).unwrap();
+        std::fs::remove_dir_all(dir.path().join("approvals")).unwrap();
+
+        let err = match store.inner.list_pending_sync() {
+            Ok(pending) => panic!(
+                "an absent approvals directory must not read as a pending set of {}",
+                pending.len()
+            ),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, SessionStoreError::Request { .. }),
+            "expected the enumeration fault to surface, got {err:?}"
+        );
     }
 }

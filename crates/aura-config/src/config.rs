@@ -410,6 +410,46 @@ impl Config {
         // Scratchpad validation
         self.validate_scratchpad()?;
 
+        if let Some(hitl) = &self.hitl
+            && let DecisionRouteConfig::Webhook {
+                delivery: WebhookDelivery::Poll,
+                poll_interval_secs,
+                poll_request_timeout_secs,
+                ..
+            } = &hitl.route
+        {
+            if *poll_interval_secs == 0 {
+                return Err(crate::ConfigError::Validation(
+                    "`hitl.route.poll_interval_secs` must be greater than zero: \
+                     the poll reconciler ticks on this interval"
+                        .to_string(),
+                ));
+            }
+            if *poll_request_timeout_secs == 0 {
+                return Err(crate::ConfigError::Validation(
+                    "`hitl.route.poll_request_timeout_secs` must be greater than zero: \
+                     each poll attempt holds an HTTP request open for this long"
+                        .to_string(),
+                ));
+            }
+            return Err(crate::ConfigError::Validation(
+                "`hitl.route.delivery = \"poll\"` is not available: \
+                 poll delivery is disabled; use sync delivery (the default) \
+                 or a conversational route"
+                    .to_string(),
+            ));
+        }
+
+        if let Some(hitl) = &self.hitl
+            && hitl.park.enabled
+        {
+            return Err(crate::ConfigError::Validation(
+                "`hitl.park.enabled = true` is not available: \
+                 park mode is disabled; leave `hitl.park.enabled` off (the default)"
+                    .to_string(),
+            ));
+        }
+
         if let (Some(hitl), Some(orch)) = (
             &self.hitl,
             self.orchestration.as_ref().filter(|o| o.enabled),
@@ -564,7 +604,7 @@ fn hitl_timeout_conflict_warning(hitl: &HitlConfig, per_call_timeout_secs: u64) 
         return None;
     }
     let route_timeout = match &hitl.route {
-        DecisionRouteConfig::Webhook { timeout_secs, .. } => *timeout_secs,
+        DecisionRouteConfig::Webhook { .. } => hitl.route.effective_webhook_timeout_secs(),
         DecisionRouteConfig::Conversational { timeout_secs, .. } => *timeout_secs,
     };
     if route_timeout >= per_call_timeout_secs {
@@ -1234,10 +1274,14 @@ mod tests {
             park: ParkConfig::default(),
             route: DecisionRouteConfig::Webhook {
                 url: WebhookUrl::new("http://localhost:9999").unwrap(),
-                timeout_secs: 300,
+                timeout_secs: Some(300),
                 headers: HashMap::new(),
                 headers_from_request: HashMap::new(),
                 tool_headers_from_response: ToolHeaderMappings::default(),
+                delivery: WebhookDelivery::default(),
+                poll_url: None,
+                poll_interval_secs: default_poll_interval_secs(),
+                poll_request_timeout_secs: default_poll_request_timeout_secs(),
             },
         };
         assert!(hitl_timeout_conflict_warning(&hitl, 0).is_none());
@@ -1267,10 +1311,14 @@ mod tests {
             park: ParkConfig::default(),
             route: DecisionRouteConfig::Webhook {
                 url: WebhookUrl::new("http://localhost:9999").unwrap(),
-                timeout_secs: 30,
+                timeout_secs: Some(30),
                 headers: HashMap::new(),
                 headers_from_request: HashMap::new(),
                 tool_headers_from_response: ToolHeaderMappings::default(),
+                delivery: WebhookDelivery::default(),
+                poll_url: None,
+                poll_interval_secs: default_poll_interval_secs(),
+                poll_request_timeout_secs: default_poll_request_timeout_secs(),
             },
         };
         assert!(hitl_timeout_conflict_warning(&hitl, 60).is_none());
@@ -1283,10 +1331,14 @@ mod tests {
             park: ParkConfig::default(),
             route: DecisionRouteConfig::Webhook {
                 url: WebhookUrl::new("http://localhost:9999").unwrap(),
-                timeout_secs: 60,
+                timeout_secs: Some(60),
                 headers: HashMap::new(),
                 headers_from_request: HashMap::new(),
                 tool_headers_from_response: ToolHeaderMappings::default(),
+                delivery: WebhookDelivery::default(),
+                poll_url: None,
+                poll_interval_secs: default_poll_interval_secs(),
+                poll_request_timeout_secs: default_poll_request_timeout_secs(),
             },
         };
         let msg = hitl_timeout_conflict_warning(&hitl, 60).unwrap();
@@ -1301,10 +1353,14 @@ mod tests {
             park: ParkConfig::default(),
             route: DecisionRouteConfig::Webhook {
                 url: WebhookUrl::new("http://localhost:9999").unwrap(),
-                timeout_secs: 120,
+                timeout_secs: Some(120),
                 headers: HashMap::new(),
                 headers_from_request: HashMap::new(),
                 tool_headers_from_response: ToolHeaderMappings::default(),
+                delivery: WebhookDelivery::default(),
+                poll_url: None,
+                poll_interval_secs: default_poll_interval_secs(),
+                poll_request_timeout_secs: default_poll_request_timeout_secs(),
             },
         };
         let msg = hitl_timeout_conflict_warning(&hitl, 60).unwrap();
@@ -1368,6 +1424,334 @@ mode = "conversational"
 "#;
         let hitl: HitlConfig = toml::from_str(toml).unwrap();
         assert!(!hitl.park.enabled);
+    }
+
+    /// A `[hitl]` config TOML with a webhook route carrying `route_lines`.
+    fn hitl_toml(route_lines: &str) -> String {
+        format!(
+            "require_approval = [\"kubectl_*\"]\n\n\
+             [route]\nmode = \"webhook\"\nurl = \"https://approvals.example.com/decide\"\n\
+             {route_lines}\n"
+        )
+    }
+
+    /// A full config TOML with a webhook route carrying `route_lines`;
+    /// `park` controls the `[hitl.park]` table.
+    fn poll_config_toml(park: bool, route_lines: &str) -> String {
+        let park_table = if park {
+            "[hitl.park]\nenabled = true\n\n"
+        } else {
+            ""
+        };
+        format!(
+            "[agent]\nname = \"Test\"\nsystem_prompt = \"test\"\n\n\
+             [agent.llm]\nprovider = \"openai\"\napi_key = \"test\"\nmodel = \"gpt-4o\"\n\n\
+             [hitl]\nrequire_approval = [\"kubectl_*\"]\n\n\
+             {park_table}\
+             [hitl.route]\nmode = \"webhook\"\nurl = \"https://approvals.example.com/decide\"\n\
+             {route_lines}\n"
+        )
+    }
+
+    /// A full config TOML with a conversational route and the literal
+    /// `park_table` block (empty for no `[hitl.park]` table).
+    fn conversational_config_toml(park_table: &str) -> String {
+        format!(
+            "[agent]\nname = \"Test\"\nsystem_prompt = \"test\"\n\n\
+             [agent.llm]\nprovider = \"openai\"\napi_key = \"test\"\nmodel = \"gpt-4o\"\n\n\
+             [hitl]\nrequire_approval = [\"kubectl_*\"]\n\n\
+             {park_table}\
+             [hitl.route]\nmode = \"conversational\"\n"
+        )
+    }
+
+    fn poll_fields(route: &DecisionRouteConfig) -> (WebhookDelivery, Option<String>, u64, u64) {
+        let DecisionRouteConfig::Webhook {
+            delivery,
+            poll_url,
+            poll_interval_secs,
+            poll_request_timeout_secs,
+            ..
+        } = route
+        else {
+            panic!("expected Webhook route, got {route:?}");
+        };
+        (
+            *delivery,
+            poll_url.as_ref().map(|u| u.as_str().to_owned()),
+            *poll_interval_secs,
+            *poll_request_timeout_secs,
+        )
+    }
+
+    #[test]
+    fn hitl_webhook_delivery_defaults_to_sync() {
+        let hitl: HitlConfig = toml::from_str(&hitl_toml("")).unwrap();
+        assert_eq!(poll_fields(&hitl.route).0, WebhookDelivery::Sync);
+    }
+
+    #[test]
+    fn hitl_webhook_poll_delivery_parses_with_defaults() {
+        let hitl: HitlConfig = toml::from_str(&hitl_toml("delivery = \"poll\"")).unwrap();
+        assert_eq!(
+            poll_fields(&hitl.route),
+            (WebhookDelivery::Poll, None, 10, 30)
+        );
+    }
+
+    #[test]
+    fn hitl_webhook_poll_fields_round_trip() {
+        let lines = "delivery = \"poll\"\n\
+                     poll_url = \"https://status.example.com/decisions\"\n\
+                     poll_interval_secs = 5\n\
+                     poll_request_timeout_secs = 45";
+        let hitl: HitlConfig = toml::from_str(&hitl_toml(lines)).unwrap();
+        let expected = (
+            WebhookDelivery::Poll,
+            Some("https://status.example.com/decisions".to_owned()),
+            5,
+            45,
+        );
+        assert_eq!(poll_fields(&hitl.route), expected);
+
+        let round_tripped: HitlConfig = toml::from_str(&toml::to_string(&hitl).unwrap()).unwrap();
+        assert_eq!(
+            poll_fields(&round_tripped.route),
+            expected,
+            "explicit poll fields must survive a round trip"
+        );
+    }
+
+    fn webhook_timeout_secs(route: &DecisionRouteConfig) -> Option<u64> {
+        let DecisionRouteConfig::Webhook { timeout_secs, .. } = route else {
+            panic!("expected Webhook route, got {route:?}");
+        };
+        *timeout_secs
+    }
+
+    #[test]
+    fn webhook_timeout_omission_distinguishable_from_explicit_300() {
+        let omitted: HitlConfig = toml::from_str(&hitl_toml("")).unwrap();
+        let explicit: HitlConfig = toml::from_str(&hitl_toml("timeout_secs = 300")).unwrap();
+        assert_eq!(webhook_timeout_secs(&omitted.route), None);
+        assert_eq!(webhook_timeout_secs(&explicit.route), Some(300));
+    }
+
+    #[test]
+    fn webhook_timeout_round_trip_preserves_presence() {
+        let omitted: HitlConfig = toml::from_str(&hitl_toml("")).unwrap();
+        let serialized = toml::to_string(&omitted).unwrap();
+        assert!(
+            !serialized.contains("timeout_secs"),
+            "an omitted timeout must not be emitted: {serialized}"
+        );
+        let round_tripped: HitlConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(webhook_timeout_secs(&round_tripped.route), None);
+
+        let explicit: HitlConfig = toml::from_str(&hitl_toml("timeout_secs = 300")).unwrap();
+        let serialized = toml::to_string(&explicit).unwrap();
+        assert!(
+            serialized.contains("timeout_secs = 300"),
+            "an explicit timeout must survive serialization: {serialized}"
+        );
+        let round_tripped: HitlConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(webhook_timeout_secs(&round_tripped.route), Some(300));
+    }
+
+    #[test]
+    fn webhook_timeout_resolver_defaults_to_300_on_none() {
+        let hitl: HitlConfig = toml::from_str(&hitl_toml("")).unwrap();
+        assert_eq!(hitl.route.effective_webhook_timeout_secs(), 300);
+    }
+
+    #[test]
+    fn webhook_timeout_resolver_returns_explicit_value() {
+        let hitl: HitlConfig = toml::from_str(&hitl_toml("timeout_secs = 45")).unwrap();
+        assert_eq!(hitl.route.effective_webhook_timeout_secs(), 45);
+    }
+
+    #[test]
+    #[should_panic(expected = "effective_webhook_timeout_secs is defined only for webhook routes")]
+    fn webhook_timeout_resolver_panics_on_conversational() {
+        let route = DecisionRouteConfig::Conversational { timeout_secs: 60 };
+        let _ = route.effective_webhook_timeout_secs();
+    }
+
+    #[test]
+    fn validate_rejects_poll_delivery_without_park() {
+        let err = crate::load_config_from_str(&poll_config_toml(false, "delivery = \"poll\""))
+            .expect_err("poll delivery without park mode must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("hitl.route.delivery"),
+            "error must name the refused key: {msg}"
+        );
+    }
+
+    /// Poll delivery is refused even with `headers_from_request`: the
+    /// mapping's persist-at-rest semantics do not make the delivery mode
+    /// itself admissible.
+    #[test]
+    fn validate_refuses_poll_delivery_with_headers_from_request() {
+        let err = crate::load_config_from_str(&poll_config_toml(
+            true,
+            "delivery = \"poll\"\nheaders_from_request = { \"authorization\" = \"authorization\" }",
+        ))
+        .expect_err("poll delivery is refused regardless of header mappings");
+        assert!(
+            err.to_string().contains("hitl.route.delivery"),
+            "error must name the refused key: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn validate_rejects_zero_poll_interval() {
+        let err = crate::load_config_from_str(&poll_config_toml(
+            true,
+            "delivery = \"poll\"\npoll_interval_secs = 0",
+        ))
+        .expect_err("a zero poll interval must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("hitl.route.poll_interval_secs"),
+            "error must name the key: {msg}"
+        );
+    }
+
+    /// `tool_headers_from_response` (approver identity) does not make poll
+    /// delivery admissible either.
+    #[test]
+    fn validate_refuses_poll_delivery_with_park() {
+        let err = crate::load_config_from_str(&poll_config_toml(
+            true,
+            "delivery = \"poll\"\n\
+             tool_headers_from_response = { \"X-Forwarded-User\" = \"X-Approver-Id\" }",
+        ))
+        .expect_err("poll delivery with park mode is refused");
+        assert!(
+            err.to_string().contains("hitl.route.delivery"),
+            "error must name the refused key: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn validate_sync_default_passes() {
+        crate::load_config_from_str(&poll_config_toml(false, ""))
+            .expect("webhook with delivery omitted and park off must stay admissible");
+    }
+
+    #[test]
+    fn validate_sync_explicit_passes() {
+        crate::load_config_from_str(&poll_config_toml(false, "delivery = \"sync\""))
+            .expect("explicit sync delivery with park off must stay admissible");
+    }
+
+    #[test]
+    fn validate_conversational_park_off_passes() {
+        crate::load_config_from_str(&conversational_config_toml(
+            "[hitl.park]\nenabled = false\n\n",
+        ))
+        .expect("conversational route with park explicitly off must stay admissible");
+    }
+
+    #[test]
+    fn validate_sync_with_zero_poll_knobs_still_passes() {
+        crate::load_config_from_str(&poll_config_toml(
+            false,
+            "delivery = \"sync\"\npoll_interval_secs = 0\npoll_request_timeout_secs = 0",
+        ))
+        .expect("the poll knobs are inert under sync delivery and must stay admissible");
+    }
+
+    #[test]
+    fn validate_park_table_present_enabled_omitted_passes() {
+        crate::load_config_from_str(&conversational_config_toml("[hitl.park]\n\n"))
+            .expect("a present [hitl.park] table with enabled omitted is admissible");
+    }
+
+    #[test]
+    fn validate_park_table_absent_passes() {
+        crate::load_config_from_str(&conversational_config_toml(""))
+            .expect("an absent [hitl.park] table is admissible");
+    }
+
+    #[test]
+    fn validate_refuses_poll_delivery_even_with_park() {
+        let err = crate::load_config_from_str(&poll_config_toml(true, "delivery = \"poll\""))
+            .expect_err("poll delivery must be refused even with park enabled");
+        assert!(
+            err.to_string().contains("hitl.route.delivery"),
+            "error must name the refused key: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn validate_refuses_park_enabled_conversational() {
+        let err = crate::load_config_from_str(&conversational_config_toml(
+            "[hitl.park]\nenabled = true\n\n",
+        ))
+        .expect_err("park enabled on a conversational route must be refused");
+        assert!(
+            err.to_string().contains("hitl.park.enabled"),
+            "error must name the refused key: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn validate_refuses_park_enabled_sync_webhook() {
+        let err = crate::load_config_from_str(&poll_config_toml(true, ""))
+            .expect_err("park enabled on a sync webhook route must be refused");
+        assert!(
+            err.to_string().contains("hitl.park.enabled"),
+            "error must name the refused key: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn validate_poll_interval_zero_diagnostic_precedes_availability() {
+        let err = crate::load_config_from_str(&poll_config_toml(
+            false,
+            "delivery = \"poll\"\npoll_interval_secs = 0",
+        ))
+        .expect_err("a zero poll interval must be diagnosed, not the delivery refusal");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("hitl.route.poll_interval_secs"),
+            "error must name the interval key: {msg}"
+        );
+        assert!(
+            !msg.contains("hitl.route.delivery"),
+            "the interval diagnostic must precede the availability refusal: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_poll_request_timeout_zero_diagnostic_precedes_availability() {
+        let err = crate::load_config_from_str(&poll_config_toml(
+            false,
+            "delivery = \"poll\"\npoll_interval_secs = 5\npoll_request_timeout_secs = 0",
+        ))
+        .expect_err("a zero poll request timeout must be diagnosed, not the delivery refusal");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("hitl.route.poll_request_timeout_secs"),
+            "error must name the request-timeout key: {msg}"
+        );
+        assert!(
+            !msg.contains("hitl.route.delivery"),
+            "the request-timeout diagnostic must precede the availability refusal: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_sync_delivery_without_park() {
+        crate::load_config_from_str(&poll_config_toml(false, ""))
+            .expect("sync webhook without park mode must stay valid");
     }
 
     #[test]
@@ -1590,6 +1974,9 @@ pub struct ParkConfig {
 /// URL, so the "url required, never empty" invariant holds structurally.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
+// Parsed once at startup and never moved in a hot path; shrinking the webhook
+// variant with boxes is not worth the serde and call-site churn.
+#[allow(clippy::large_enum_variant)]
 pub enum DecisionRouteConfig {
     /// Attended: the approver is already at the client (default timeout 60s).
     Conversational {
@@ -1600,8 +1987,8 @@ pub enum DecisionRouteConfig {
     /// (default timeout 300s).
     Webhook {
         url: WebhookUrl,
-        #[serde(default = "default_webhook_timeout_secs")]
-        timeout_secs: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_secs: Option<u64>,
         /// Static webhook headers.
         #[serde(default)]
         headers: HashMap<String, String>,
@@ -1611,7 +1998,68 @@ pub enum DecisionRouteConfig {
         /// Outbound MCP header name → webhook approval-response header name.
         #[serde(default, skip_serializing_if = "ToolHeaderMappings::is_empty")]
         tool_headers_from_response: ToolHeaderMappings,
+        #[serde(default, skip_serializing_if = "WebhookDelivery::is_sync")]
+        delivery: WebhookDelivery,
+        /// Status endpoint for the decision poll.
+        #[serde(default)]
+        poll_url: Option<WebhookUrl>,
+        /// Seconds between reconciler polls of the status endpoint.
+        #[serde(
+            default = "default_poll_interval_secs",
+            skip_serializing_if = "is_default_poll_interval_secs"
+        )]
+        poll_interval_secs: u64,
+        /// Per-attempt HTTP timeout for each notify/poll request.
+        #[serde(
+            default = "default_poll_request_timeout_secs",
+            skip_serializing_if = "is_default_poll_request_timeout_secs"
+        )]
+        poll_request_timeout_secs: u64,
     },
+}
+
+impl DecisionRouteConfig {
+    /// Effective webhook decision timeout in seconds for this route.
+    ///
+    /// This is the single default-resolution site for the webhook timeout: a
+    /// webhook route whose `timeout_secs` key was omitted resolves to the
+    /// default of 300 seconds, and an explicit value is returned as written.
+    /// Serialization never applies the default, so an omitted key round-trips
+    /// as omitted.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the route is not the webhook variant. The webhook timeout
+    /// is defined only for webhook routes; callers must have matched that
+    /// variant before calling this method.
+    #[must_use]
+    pub fn effective_webhook_timeout_secs(&self) -> u64 {
+        match self {
+            Self::Webhook { timeout_secs, .. } => timeout_secs.unwrap_or(300),
+            Self::Conversational { .. } => panic!(
+                "effective_webhook_timeout_secs is defined only for webhook routes, got {self:?}"
+            ),
+        }
+    }
+}
+
+/// How the webhook route delivers an approval decision.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WebhookDelivery {
+    /// Synchronous: the POST response carries the decision.
+    #[default]
+    Sync,
+    /// Asynchronous decision delivery.
+    Poll,
+}
+
+impl WebhookDelivery {
+    /// True for the synchronous delivery mode (the serde skip condition).
+    #[must_use]
+    pub fn is_sync(&self) -> bool {
+        matches!(self, Self::Sync)
+    }
 }
 
 /// Transport-owned header names a `tool_headers_from_response` mapping may
@@ -1704,8 +2152,20 @@ fn default_conversational_timeout_secs() -> u64 {
     60
 }
 
-fn default_webhook_timeout_secs() -> u64 {
-    300
+fn default_poll_interval_secs() -> u64 {
+    10
+}
+
+fn is_default_poll_interval_secs(value: &u64) -> bool {
+    *value == default_poll_interval_secs()
+}
+
+fn default_poll_request_timeout_secs() -> u64 {
+    30
+}
+
+fn is_default_poll_request_timeout_secs(value: &u64) -> bool {
+    *value == default_poll_request_timeout_secs()
 }
 
 /// A validated webhook URL.

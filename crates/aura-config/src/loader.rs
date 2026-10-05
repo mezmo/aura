@@ -110,19 +110,9 @@ impl ConfigLoader {
         // Layer 1: Load TOML files (lowest priority among files)
         for toml_file in &self.toml_files {
             tracing::debug!("Loading TOML file: {}", toml_file.display());
-            match load_config_from_str(&std::fs::read_to_string(toml_file)?) {
-                Ok(file_config) => {
-                    config = merge_configs(config, file_config)?;
-                    tracing::debug!("Merged TOML config from: {}", toml_file.display());
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to load TOML config from {}: {}",
-                        toml_file.display(),
-                        e
-                    );
-                }
-            }
+            let file_config = load_config_from_str(&std::fs::read_to_string(toml_file)?)?;
+            config = merge_configs(config, file_config)?;
+            tracing::debug!("Merged TOML config from: {}", toml_file.display());
         }
 
         // Layer 2: Load JSON files
@@ -226,6 +216,30 @@ impl ConfigLoader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_layer_fails_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let invalid = dir.path().join("invalid.toml");
+        std::fs::write(
+            &invalid,
+            "[agent\nname = \"Broken\"\nsystem_prompt = \"p\"\n",
+        )
+        .unwrap();
+        let valid = dir.path().join("valid.toml");
+        std::fs::write(
+            &valid,
+            "[agent]\nname = \"Valid\"\nsystem_prompt = \"p\"\n\n\
+             [agent.llm]\nprovider = \"openai\"\napi_key = \"k\"\nmodel = \"gpt-4o\"\n",
+        )
+        .unwrap();
+
+        ConfigLoader::new()
+            .with_toml_file(&invalid)
+            .with_toml_file(&valid)
+            .build()
+            .expect_err("an invalid layer must fail the build, not warn-and-skip");
+    }
 
     #[test]
     fn test_config_loader_builder() {
