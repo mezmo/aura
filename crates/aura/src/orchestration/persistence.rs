@@ -71,6 +71,26 @@ pub fn sanitize_filename_component(s: &str) -> String {
     }
 }
 
+/// Normalize a coordinator-requested artifact name to
+/// `coordinator-{stem}.{ext}`. The stem is sanitized with
+/// [`sanitize_filename_component`], a leading `coordinator-` in the request is
+/// not doubled, and a missing or non-alphanumeric extension becomes `txt`.
+pub(crate) fn coordinator_artifact_filename(requested: &str) -> String {
+    let (stem, ext) = match requested.rsplit_once('.') {
+        Some((stem, ext))
+            if !stem.is_empty()
+                && !ext.is_empty()
+                && ext.chars().all(|c| c.is_ascii_alphanumeric()) =>
+        {
+            (stem, ext.to_ascii_lowercase())
+        }
+        _ => (requested, "txt".to_string()),
+    };
+    let stem = sanitize_filename_component(stem);
+    let stem = stem.strip_prefix("coordinator-").unwrap_or(&stem);
+    format!("coordinator-{stem}.{ext}")
+}
+
 /// True when `s` is safe to use as a single path component: non-empty, no path
 /// separators, no parent references. Artifact filenames and run IDs come from
 /// untrusted tool/LLM input and are validated with this before being joined
@@ -658,6 +678,42 @@ impl ExecutionPersistence {
             artifact_path.display()
         );
         Ok(filename)
+    }
+
+    /// Write coordinator-authored content to an artifact file.
+    ///
+    /// Returns the artifact filename and whether an existing artifact was
+    /// replaced. The requested name is normalized by
+    /// [`coordinator_artifact_filename`] so the coordinator can never
+    /// overwrite a worker result or tool output artifact; the returned
+    /// filename is the one to hand to `read_artifact`.
+    pub async fn write_coordinator_artifact(
+        &self,
+        requested_name: &str,
+        content: &str,
+    ) -> io::Result<(String, bool)> {
+        if !self.enabled {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Persistence is disabled",
+            ));
+        }
+
+        let filename = coordinator_artifact_filename(requested_name);
+        let artifacts_dir = self.artifacts_path();
+        fs::create_dir_all(&artifacts_dir).await?;
+
+        let artifact_path = artifacts_dir.join(&filename);
+        let replaced = fs::try_exists(&artifact_path).await.unwrap_or(false);
+        fs::write(&artifact_path, content).await?;
+
+        tracing::info!(
+            "Written coordinator artifact ({} chars, replaced={}) to: {}",
+            content.len(),
+            replaced,
+            artifact_path.display()
+        );
+        Ok((filename, replaced))
     }
 
     /// Read an artifact file by filename.
@@ -1305,6 +1361,95 @@ mod tests {
         assert_eq!(artifacts.len(), 2);
         assert!(artifacts.contains(&"task-0-default-iter-1-result.txt".to_string()));
         assert!(artifacts.contains(&"task-1-stats-iter-1-result.txt".to_string()));
+    }
+
+    #[test]
+    fn test_coordinator_artifact_filename() {
+        let cases = [
+            ("draft", "coordinator-draft.txt"),
+            ("runbook-draft.md", "coordinator-runbook-draft.md"),
+            (
+                "Verified Literals.JSON",
+                "coordinator-verified-literals.json",
+            ),
+            ("coordinator-plan.md", "coordinator-plan.md"),
+            ("../../etc/passwd", "coordinator-etc-passwd.txt"),
+            ("notes.", "coordinator-notes.txt"),
+            (".md", "coordinator-md.txt"),
+            ("a.tar/gz", "coordinator-a-tar-gz.txt"),
+            (
+                "task-0-sre-iter-1-result.txt",
+                "coordinator-task-0-sre-iter-1-result.txt",
+            ),
+            ("", "coordinator-unknown.txt"),
+        ];
+        for (requested, expected) in cases {
+            let filename = coordinator_artifact_filename(requested);
+            assert_eq!(filename, expected, "requested={requested:?}");
+            assert!(is_safe_path_component(&filename));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_write_coordinator_artifact_round_trip() {
+        let temp_dir = TempDir::new().unwrap();
+        let persistence = ExecutionPersistence::new(temp_dir.path().join("memory"), None)
+            .await
+            .unwrap();
+
+        let (filename, replaced) = persistence
+            .write_coordinator_artifact("runbook-draft.md", "first draft")
+            .await
+            .unwrap();
+        assert_eq!(filename, "coordinator-runbook-draft.md");
+        assert!(!replaced);
+        assert_eq!(
+            persistence.read_artifact(&filename).await.unwrap(),
+            "first draft"
+        );
+
+        let (filename, replaced) = persistence
+            .write_coordinator_artifact("runbook-draft.md", "second draft")
+            .await
+            .unwrap();
+        assert!(replaced);
+        assert_eq!(
+            persistence.read_artifact(&filename).await.unwrap(),
+            "second draft"
+        );
+        assert_eq!(persistence.list_artifacts().await.unwrap(), vec![filename]);
+    }
+
+    #[tokio::test]
+    async fn test_write_coordinator_artifact_cannot_clobber_worker_result() {
+        let temp_dir = TempDir::new().unwrap();
+        let persistence = ExecutionPersistence::new(temp_dir.path().join("memory"), None)
+            .await
+            .unwrap();
+        let worker_file = persistence
+            .write_result_artifact(0, Some("sre"), 1, "worker result")
+            .await
+            .unwrap();
+
+        persistence
+            .write_coordinator_artifact(&worker_file, "coordinator content")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            persistence.read_artifact(&worker_file).await.unwrap(),
+            "worker result"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_write_coordinator_artifact_disabled() {
+        let persistence = ExecutionPersistence::disabled();
+        let err = persistence
+            .write_coordinator_artifact("draft", "content")
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
     }
 
     #[tokio::test]

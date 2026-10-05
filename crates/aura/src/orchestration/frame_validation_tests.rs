@@ -1082,9 +1082,10 @@ fn test_preamble_recon_and_history_tools_combined() {
     assert!(preamble.contains("list_tools"), "recon tool");
     assert!(preamble.contains("inspect_tool_params"), "recon tool");
     assert!(preamble.contains("read_artifact"), "artifact tool");
+    assert!(preamble.contains("write_artifact"), "artifact tool");
     assert!(preamble.contains("list_prior_runs"), "history tool");
     assert!(
-        preamble.contains("two **artifact/history tools**"),
+        preamble.contains("three **artifact/history tools**"),
         "combined tool count"
     );
 }

@@ -1761,11 +1761,16 @@ pub fn is_scratchpad_tool(tool_name: &str) -> bool {
 }
 
 /// Orchestration operations exposed as non-MCP tools: reading a prior task
-/// result, submitting an answer, listing prior runs. Unlike the scratchpad
+/// result, writing a coordinator artifact, submitting an answer, listing prior
+/// runs. Unlike the scratchpad
 /// exploration tools, these carry task meaning, so their calls surface over SSE
 /// unconditionally.
-static ALWAYS_VISIBLE_INTERNAL_TOOLS: &[&str] =
-    &["read_artifact", "submit_result", "list_prior_runs"];
+static ALWAYS_VISIBLE_INTERNAL_TOOLS: &[&str] = &[
+    "read_artifact",
+    "write_artifact",
+    "submit_result",
+    "list_prior_runs",
+];
 
 /// True for a non-MCP tool whose calls always surface over SSE: the orchestration
 /// operations above plus the skill tools. The worker `ObserverWrapper` covers only
