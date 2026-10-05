@@ -46,7 +46,7 @@ model working through text tools under a turn limit.
   server-specific (argument names, labels to keep) MUST be configuration.
 - It MUST NOT fail a tool call. Output the formatter does not recognise passes through
   unchanged.
-- The model MUST be able to get the unformatted response.
+- The model MUST be able to skip formatting for a call.
 - It SHOULD reuse the existing per-server, glob-on-tool-name configuration model and the
   `ToolWrapper` extension point rather than add a parallel mechanism.
 - It SHOULD admit further formats (other query APIs) without changes to the builder.
@@ -92,8 +92,11 @@ A new `output_format` table on all three `McpServerConfig` variants (`stdio`,
 
 `OutputFormatWrapper` implements `ToolWrapper`:
 
-- `wrap_schema` adds an optional boolean `_aura_raw` to tools that have a formatter, following
-  the `_aura_reasoning` convention.
+- `wrap_schema_for` adds an optional boolean `_aura_raw` to tools that have a formatter,
+  following the `_aura_reasoning` convention. `wrap_schema_for(schema, ctx)` is a new
+  `ToolWrapper` method: `wrap_schema` receives no tool identity, so it cannot change one tool's
+  schema only. `WrappedTool::definition` calls `wrap_schema_for` with the context a call to the
+  tool gets; the default delegates to `wrap_schema`, so existing wrappers are unchanged.
 - `transform_args` removes `_aura_raw`, and reads the request arguments the formatter needs
   (`step_arg`, `start_arg`, `end_arg`) into the extracted data. The arguments sent to the
   server are otherwise unchanged.
@@ -103,7 +106,8 @@ A new `output_format` table on all three `McpServerConfig` variants (`stdio`,
 
 The builder composes it so that its `transform_output` runs before `ScratchpadWrapper`'s,
 for single agents and orchestration workers. Formatted output that still reaches
-`min_tokens` is intercepted by the scratchpad as today.
+`min_tokens`, and output returned unformatted because of `_aura_raw`, is intercepted by the
+scratchpad as today.
 
 ### `prometheus` formatter
 
@@ -119,22 +123,33 @@ argument.
   per series; `drop_labels` (globs) are never printed.
 - **`vector`.** One row per series: varying labels, value, timestamp.
 - **`matrix`.** One row per series: varying labels, number of points, missing timestamps,
-  min, max, last value, and count of `NaN` / `±Inf`. Values are run-length encoded
-  (`1×28 0×1 1×2`), truncated at `max_points_per_series` with the remainder summarised.
+  min, max, last value, and count of `NaN` / `±Inf`. Values are run-length encoded with
+  missing points marked (`1×28 gap×1 1×2`). A series with more than `max_runs_per_series`
+  runs is printed as that many evenly spaced points instead.
 - **Resolution.** The returned resolution is the most common spacing between consecutive
   timestamps across all series. When `step_arg` is configured and the returned resolution
   is coarser than the requested step, the header states both.
 - **Missing points.** The expected grid runs from `start` to `end` (when `start_arg` and
   `end_arg` are configured) or from the earliest to the latest timestamp in the response, at
   the returned resolution. Missing timestamps are listed per series, collapsed into ranges.
-- **Size.** At most `max_series` series are printed, ordered by number of missing points,
-  then by label values. The header states how many were omitted.
+  The grid is capped at 11,000 points, the Prometheus limit per series; beyond it the header
+  states that missing points were not analysed.
+- **Shared gaps.** When every series lacks the same points at regular intervals (a 1-minute
+  query returning points only at minutes 0, 2, 4, 6), the spacing of the data is the same as
+  a coarser returned resolution, and the grid at that resolution shows no missing points. When
+  `step_arg` is configured and the returned resolution is coarser than the requested step,
+  the header states both readings (the backend aggregated, or every series is missing the
+  same points), with the number of points the requested step gives over the window and the
+  most points any series has. Without `step_arg`, the two cases cannot be told apart.
+- **Size.** Every series is ranked by its missing-point count; full timelines are built only
+  for the `max_series` series printed, those with the most missing points first. The header
+  states how many were omitted.
 - `scalar` and `string` results are printed as a single line.
 
 ### Observability
 
-The wrapper records the formatter name and the input and output token counts on the tool
-call's tracing span, so the effect can be measured per tool.
+The wrapper logs a tracing event with the tool, the formatter name, and the input and output
+sizes in bytes, so the effect can be measured per tool.
 
 ## Consequences
 
@@ -146,13 +161,16 @@ call's tracing span, so the effect can be measured per tool.
 - Bad: aura takes on knowledge of a third-party response format and must track changes to it.
 - Bad: label values that are printed only under `common labels`, or dropped by `drop_labels`,
   are not shown per series; the model needs `_aura_raw` to see the original structure.
+- Bad: without `step_arg`, a gap shared by every series at regular intervals is reported as a
+  coarser resolution, not as missing points.
 - Bad: one more configuration surface on `McpServerConfig`.
 
 ## Implementation
 
-One pull request adds the `output_format` configuration types, `OutputFormatWrapper`, its
-builder composition, and the `prometheus` formatter, with unit tests from synthetic
-fixtures: each `resultType`, the envelope and JSON-string encodings, a changed resolution,
-gaps in one series and in all series, `NaN` / `±Inf`, an empty result, and pass-through of
-unrecognised output and of `_aura_raw`. Documentation and an example configuration use a
+One pull request adds `ToolWrapper::wrap_schema_for`, the `output_format` configuration
+types, `OutputFormatWrapper`, its builder composition, and the `prometheus` formatter, with
+unit tests from synthetic fixtures: each `resultType`, the envelope and JSON-string encodings, a changed resolution,
+gaps in one series and in all series, gaps shared by every series at regular intervals,
+`NaN` / `±Inf`, an empty result, a result with more series than `max_series`, and
+pass-through of unrecognised output and of `_aura_raw`. Documentation and an example configuration use a
 plain Prometheus server and the `up` metric.
