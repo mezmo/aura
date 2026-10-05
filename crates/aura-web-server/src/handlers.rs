@@ -286,16 +286,24 @@ pub async fn prepare_request(
         .as_deref()
         .map(|tools| tools.iter().map(aura::builder::ClientTool::from).collect());
 
-    // Skill invocations this turn record under the session so later turns can
-    // rehydrate them. The anchor addresses the client-visible history frame:
-    // the converted history plus this turn's user query message. Recording is
-    // unconditional — even a server-generated session id is echoed back via
-    // `X-Chat-Session-Id`, so the client may adopt it on its next request,
-    // and an id that is never reused just leaves TTL-bounded orphan records.
+    // Skill invocations this turn record under the session and the serving
+    // agent so later turns can rehydrate them. The agent half keeps a client
+    // that switches agents mid-session from having the previous agent's
+    // invocations replayed into the new agent's history, where a skill of the
+    // same name would resolve against the new agent's content. The anchor
+    // addresses the client-visible history frame: the converted history plus
+    // this turn's user query message. Recording is unconditional — even a
+    // server-generated session id is echoed back via `X-Chat-Session-Id`, so
+    // the client may adopt it on its next request, and an id that is never
+    // reused just leaves TTL-bounded orphan records.
+    let skill_log = aura::session_store::SkillLogKey::new(
+        aura::SessionId::new(chat_session_id),
+        config.agent_id(),
+    );
     let skill_recorder = (!config.agent.skills.local.is_empty()).then(|| {
         Arc::new(aura::skill_tool::SkillInvocationRecorder::new(
             data.session_store.skills(),
-            aura::SessionId::new(chat_session_id),
+            skill_log.clone(),
             chat_history.len() as u32 + 1,
         ))
     });
@@ -346,17 +354,12 @@ pub async fn prepare_request(
             (agent as Arc<dyn StreamingAgent>, tools_json)
         };
 
-    // Rehydrate this session's recorded skill invocations into the history
-    // before streaming, replaying content against the skills the agent just
-    // discovered. A store read failure only costs continuity — the request
-    // itself proceeds.
+    // Rehydrate this agent's recorded skill invocations for the session into
+    // the history before streaming, replaying content against the skills the
+    // agent just discovered. A store read failure only costs continuity — the
+    // request itself proceeds.
     let rehydrated_skills = if skill_recorder.is_some() && !chat_history.is_empty() {
-        match data
-            .session_store
-            .skills()
-            .list(&aura::SessionId::new(chat_session_id))
-            .await
-        {
+        match data.session_store.skills().list(&skill_log).await {
             Ok(records) => {
                 aura::skill_rehydration::rehydrate_chat_history(
                     &mut chat_history,
@@ -2901,6 +2904,133 @@ url = "http://127.0.0.1:9"
             request.headers_mut().remove(aura::hitl::TIMESTAMP_HEADER);
             let response = app.oneshot(request).await.unwrap();
             assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
+        }
+    }
+
+    /// `prepare_request` rehydrates a session's skill invocations only into
+    /// the agent that recorded them.
+    mod skill_log_scope {
+        use super::*;
+        use aura::session_store::{
+            SKILL_INVOCATION_RECORD_VERSION, SkillInvocation, SkillInvocationRecord, SkillLogKey,
+        };
+
+        /// An agent serving one skill, `shared`, whose body is `body`.
+        fn skill_agent(dir: &std::path::Path, agent: &str, body: &str) -> aura_config::Config {
+            let source = dir.join(agent);
+            let skill_dir = source.join("shared");
+            std::fs::create_dir_all(&skill_dir).unwrap();
+            std::fs::write(
+                skill_dir.join("SKILL.md"),
+                format!("---\nname: shared\ndescription: shared skill\n---\n{body}"),
+            )
+            .unwrap();
+            aura_config::load_config_from_str(&format!(
+                r#"
+[agent]
+name = "{agent}"
+system_prompt = "p"
+[agent.llm]
+provider = "openai"
+model = "gpt-4o"
+api_key = "k"
+
+[[agent.skills.local]]
+source = '{}'
+"#,
+                source.display()
+            ))
+            .unwrap()
+        }
+
+        fn app_state(configs: Vec<aura_config::Config>) -> AppState {
+            AppState {
+                configs: Arc::new(configs),
+                tool_result_mode: ToolResultMode::default(),
+                tool_result_max_length: 0,
+                streaming_buffer_size: 0,
+                aura_custom_events: false,
+                aura_emit_reasoning: false,
+                debug_provider_errors: false,
+                streaming_timeout_secs: 0,
+                first_chunk_timeout_secs: 0,
+                stream_inactivity_timeout_secs: 0,
+                shutdown_token: CancellationToken::new(),
+                stream_shutdown_token: CancellationToken::new(),
+                active_requests: Arc::new(ActiveRequestTracker::default()),
+                default_agent: None,
+                additional_tools: Arc::new(Vec::new),
+                pending_approvals: aura::hitl::PendingApprovals::new(),
+                hitl_webhook_hmac: None,
+                session_store: Arc::new(crate::session_store::InMemorySessionStore::new()),
+            }
+        }
+
+        /// The second turn of a conversation, routed to `model`.
+        fn follow_up(model: &str) -> ChatCompletionRequest {
+            ChatCompletionRequest {
+                model: Some(model.to_string()),
+                messages: vec![
+                    msg(Role::User, "use the skill"),
+                    msg(Role::Assistant, "done"),
+                    msg(Role::User, "and again"),
+                ],
+                max_tokens: None,
+                stream: Some(true),
+                metadata: None,
+                user: None,
+                tools: None,
+            }
+        }
+
+        #[tokio::test]
+        async fn switching_agents_mid_session_does_not_rehydrate_the_previous_agents_skills() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let state = app_state(vec![
+                skill_agent(dir.path(), "agent-a", "# Agent A instructions"),
+                skill_agent(dir.path(), "agent-b", "# Agent B instructions"),
+            ]);
+            let session = "sess-switch";
+            // Agent A loaded `shared` during the session's first turn.
+            state
+                .session_store
+                .skills()
+                .record(
+                    &SkillLogKey::new(aura::SessionId::new(session), "agent-a"),
+                    SkillInvocationRecord {
+                        version: SKILL_INVOCATION_RECORD_VERSION,
+                        invocation: SkillInvocation::LoadSkill {
+                            name: "shared".to_string(),
+                        },
+                        tool_call_id: "call_shared".to_string(),
+                        anchor: 1,
+                        seq: 0,
+                        invoked_at: Utc::now(),
+                    },
+                )
+                .await
+                .unwrap();
+
+            // The client keeps the session id and switches to agent B, which
+            // configures a skill of the same name it never loaded.
+            let setup =
+                prepare_request(&state, &mut follow_up("agent-b"), session, &HashMap::new())
+                    .await
+                    .unwrap();
+            assert!(
+                setup.rehydrated_skills.is_empty(),
+                "agent B must not replay agent A's invocations, got {:?}",
+                setup.rehydrated_skills
+            );
+            assert_eq!(setup.chat_history.len(), 2);
+
+            // Agent A, back on the same session, still gets its own.
+            let setup =
+                prepare_request(&state, &mut follow_up("agent-a"), session, &HashMap::new())
+                    .await
+                    .unwrap();
+            assert_eq!(setup.rehydrated_skills, ["shared"]);
+            assert_eq!(setup.chat_history.len(), 4);
         }
     }
 }

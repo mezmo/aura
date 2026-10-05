@@ -396,7 +396,9 @@ mod tests {
     /// turn N+1's history as the tool-call pair the model saw originally.
     #[tokio::test]
     async fn recorded_invocation_rehydrates_on_next_turn() {
-        use crate::session_store::{InMemorySkillInvocationStore, SkillInvocationStore};
+        use crate::session_store::{
+            InMemorySkillInvocationStore, SkillInvocationStore, SkillLogKey,
+        };
         use crate::skill_tool::{LoadSkillArgs, SkillInvocationRecorder, SkillToolset};
         use rig::tool::Tool;
         use std::sync::Arc;
@@ -404,14 +406,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let skills = vec![make_skill(dir.path(), "alpha", "# Alpha instructions")];
         let store = Arc::new(InMemorySkillInvocationStore::new());
-        let session = crate::config::SessionId::new("sess-loop");
+        let log = SkillLogKey::new(crate::config::SessionId::new("sess-loop"), "agent");
 
         // Turn N: history [user], anchor = 0 + 1. The LLM calls load_skill.
-        let recorder = Arc::new(SkillInvocationRecorder::new(
-            store.clone(),
-            session.clone(),
-            1,
-        ));
+        let recorder = Arc::new(SkillInvocationRecorder::new(store.clone(), log.clone(), 1));
         let toolset = SkillToolset::new(&skills, Some(recorder)).unwrap();
         toolset
             .load
@@ -422,7 +420,7 @@ mod tests {
             .unwrap();
 
         // The write completes before the tool result returns.
-        let records = store.list(&session).await.unwrap();
+        let records = store.list(&log).await.unwrap();
         assert_eq!(records.len(), 1, "invocation must be recorded");
 
         // Turn N+1: the client resends [user, assistant] text only.

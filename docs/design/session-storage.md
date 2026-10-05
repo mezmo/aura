@@ -419,7 +419,7 @@ default `aura`), so multiple AURA deployments can share a cluster.
 | `{p}:a2a:tasks`                   | set of `task_id`                      | `list` without a `context_id` filter   | same as task             |
 | `{p}:bus:a2a:task:{task_id}`      | pub/sub channel                       | streaming fan-out to subscribers       | —                        |
 | `{p}:bus:a2a:cancel:{task_id}`    | pub/sub channel                       | route `cancel` to the pod running it   | —                        |
-| `{p}:skills:{session_id}`         | hash (dedup key → JSON record)        | session's skill-invocation log         | configurable (e.g. 24h)  |
+| `{p}:skills:{uuid5(agent_id)}:{session_id}` | hash (dedup key → JSON record) | one agent's skill-invocation log in a session | configurable (e.g. 24h) |
 
 Notes:
 
@@ -463,32 +463,44 @@ Notes:
   (`aura::skill_rehydration`), emitting `aura.skills_rehydrated` over SSE.
   The recorder awaits the write before the tool result returns, so a turn
   that follows immediately sees it.
-- **Skill-log bounds.** A session holds at most `MAX_SKILL_RECORDS_PER_SESSION`
+- **Skill logs are per agent.** A skill log is keyed by the chat session id
+  *and* the serving agent's `agent_id` (its alias, or its name), so a client
+  that keeps its session id while switching agents never has the previous
+  agent's invocations replayed into the new agent's history — even when both
+  configure a skill of the same name, which would otherwise resolve against
+  the new agent's content. The agent segment is a v5 UUID of the agent id so
+  the free-form session id stays the trailing segment and no (agent, session)
+  pair can name another's key.
+- **Skill-log bounds.** A log holds at most `MAX_SKILL_RECORDS_PER_LOG`
   (64) distinct invocations; both backends drop a write past the cap with a
   warning rather than failing the tool call. Replay splices at most
   `MAX_REHYDRATED_BYTES` (256 KiB) of rendered content into one turn, admitting
   the newest records that fit. Records on another schema version are skipped
   on read, the same as undecodable ones.
 - **Skill log on the file backend.** `AURA_SESSION_STORE=file` keeps one
-  `{root}/skills/{uuid5(session_id)}.jsonl` per session, one record per line.
-  The filename is the v5 UUID of the client-supplied id, so no id can address
-  outside the directory. Expiry is mtime-based against the same
+  `{root}/skills/{uuid5(uuid5(agent_id), session_id)}.jsonl` per log, one
+  record per line. The filename is the v5 UUID of the client-supplied session
+  id in a namespace derived from the agent id, so no id can address outside
+  the directory. Expiry is mtime-based against the same
   `AURA_SESSION_STORE_SKILLS_TTL_SECS`: a file past it is removed when next
   touched, every successful write rewrites the file and refreshes it, and
   `open` sweeps expired files so an idle host does not accumulate them.
   Undecodable lines are carried forward verbatim by later writes.
-- **Skill-log trust boundary.** Records are keyed by `chat_session_id` alone,
-  which the client supplies (request metadata, `X-Chat-Session-Id`, or the
-  server-generated id echoed back). The server carries no caller identity to
-  scope by, so this is the same boundary conversational approvals
-  (`AgentScope::Single { session_id }`) and A2A `context_id` history already
-  rely on: a caller that knows a session id can list the skill names and
-  resource paths that session loaded, and can seed invocations into it. A
-  seeded record is inert unless the named skill is in the serving agent's
-  config, its content always comes from that agent's local disk, and the
-  bounds above cap what a seeded set can add to a turn. Deployments must treat
-  session ids as unguessable capabilities; identity-scoped storage is a
-  follow-up for when the server carries caller identity.
+- **Skill-log trust boundary.** Records are keyed by `chat_session_id`, which
+  the client supplies (request metadata, `X-Chat-Session-Id`, or the
+  server-generated id echoed back), and by the agent the request routes to.
+  The agent half partitions one conversation's logs; it is not an access
+  control, since the client also picks the agent. The server carries no
+  caller identity to scope by, so this is the same boundary conversational
+  approvals (`AgentScope::Single { session_id }`) and A2A `context_id` history
+  already rely on: a caller that knows a session id can list the skill names
+  and resource paths that session loaded under any agent, and can seed
+  invocations into it. A seeded record is inert unless the named skill is in
+  the serving agent's config, its content always comes from that agent's
+  local disk, and the bounds above cap what a seeded set can add to a turn.
+  Deployments must treat session ids as unguessable capabilities;
+  identity-scoped storage is a follow-up for when the server carries caller
+  identity.
 
 ### In-memory default impl
 

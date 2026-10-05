@@ -5,8 +5,8 @@
 //! decision file, owner-scoped cancel of undecided approvals, and survival of a
 //! process restart. The same battery runs against the memory backend to pin
 //! the uniform contract. The skill-invocation store's own contract points —
-//! restart survival, hashed session filenames, the per-session cap, skew
-//! tolerance, and mtime-based expiry — follow. No Docker: every test gets its
+//! restart survival, hashed log filenames, agent isolation within a session,
+//! the per-log cap, skew tolerance, and mtime-based expiry — follow. No Docker: every test gets its
 //! own tempdir.
 
 mod common;
@@ -18,8 +18,8 @@ use aura::SessionId;
 use aura::hitl::{ApprovalDecision, ResolveError};
 use aura::session_store::{
     ApprovalStore, FileApprovalStore, FileSkillInvocationStore, InMemoryApprovalStore,
-    MAX_SKILL_RECORDS_PER_SESSION, ParkedApprovalRecord, SKILL_INVOCATION_RECORD_VERSION,
-    SessionStoreError, SkillInvocation, SkillInvocationRecord, SkillInvocationStore,
+    MAX_SKILL_RECORDS_PER_LOG, ParkedApprovalRecord, SKILL_INVOCATION_RECORD_VERSION,
+    SessionStoreError, SkillInvocation, SkillInvocationRecord, SkillInvocationStore, SkillLogKey,
 };
 use aura_web_server::session_store::{FileSessionStore, SessionStore};
 
@@ -524,13 +524,17 @@ fn skill_record(name: &str, anchor: u32, seq: u32) -> SkillInvocationRecord {
     }
 }
 
+fn skill_log(session_id: &str) -> SkillLogKey {
+    SkillLogKey::new(SessionId::new(session_id), "agent")
+}
+
 fn skill_store(dir: &tempfile::TempDir, ttl_secs: Option<u64>) -> FileSkillInvocationStore {
     FileSkillInvocationStore::open(dir.path(), ttl_secs.and_then(std::num::NonZeroU64::new))
         .unwrap()
 }
 
-/// Every session log under the store, sorted. Filenames are hashes of the
-/// session id, so tests locate a session's file by listing.
+/// Every log file under the store, sorted. Filenames are hashes of the log
+/// key, so tests locate a log's file by listing.
 fn skill_files(dir: &tempfile::TempDir) -> Vec<std::path::PathBuf> {
     let mut files: Vec<_> = std::fs::read_dir(dir.path().join("skills"))
         .unwrap()
@@ -541,7 +545,7 @@ fn skill_files(dir: &tempfile::TempDir) -> Vec<std::path::PathBuf> {
     files
 }
 
-/// Rewind a session file's mtime by `secs`.
+/// Rewind a log file's mtime by `secs`.
 fn age_file(path: &std::path::Path, secs: u64) {
     std::fs::File::options()
         .write(true)
@@ -561,22 +565,22 @@ fn skill_open_creates_the_skills_directory() {
 #[tokio::test]
 async fn skill_records_survive_a_reopen_in_anchor_order() {
     let dir = tempfile::tempdir().unwrap();
-    let session = SessionId::new("sess-restart");
+    let log = skill_log("sess-restart");
     {
         let store = skill_store(&dir, Some(60));
         store
-            .record(&session, skill_record("beta", 1, 1))
+            .record(&log, skill_record("beta", 1, 1))
             .await
             .unwrap();
         store
-            .record(&session, skill_record("alpha", 1, 0))
+            .record(&log, skill_record("alpha", 1, 0))
             .await
             .unwrap();
     }
 
     let reopened = skill_store(&dir, Some(60));
     let labels: Vec<String> = reopened
-        .list(&session)
+        .list(&log)
         .await
         .unwrap()
         .iter()
@@ -589,17 +593,17 @@ async fn skill_records_survive_a_reopen_in_anchor_order() {
 async fn skill_record_is_idempotent_and_first_write_wins() {
     let dir = tempfile::tempdir().unwrap();
     let store = skill_store(&dir, Some(60));
-    let session = SessionId::new("sess-dup");
+    let log = skill_log("sess-dup");
     store
-        .record(&session, skill_record("alpha", 1, 0))
+        .record(&log, skill_record("alpha", 1, 0))
         .await
         .unwrap();
     store
-        .record(&session, skill_record("alpha", 9, 4))
+        .record(&log, skill_record("alpha", 9, 4))
         .await
         .unwrap();
 
-    let listed = store.list(&session).await.unwrap();
+    let listed = store.list(&log).await.unwrap();
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].anchor, 1);
 }
@@ -608,8 +612,8 @@ async fn skill_record_is_idempotent_and_first_write_wins() {
 async fn skill_sessions_are_isolated_and_a_hostile_id_stays_inside_the_root() {
     let dir = tempfile::tempdir().unwrap();
     let store = skill_store(&dir, Some(60));
-    let hostile = SessionId::new("../../etc/passwd");
-    let other = SessionId::new("sess-other");
+    let hostile = skill_log("../../etc/passwd");
+    let other = skill_log("sess-other");
     store
         .record(&hostile, skill_record("alpha", 1, 0))
         .await
@@ -622,29 +626,52 @@ async fn skill_sessions_are_isolated_and_a_hostile_id_stays_inside_the_root() {
     assert!(files[0].starts_with(dir.path().join("skills")));
 }
 
+/// One session id under two agents is two logs in two files: neither agent
+/// lists the other's records, and the same invocation records independently
+/// in each.
 #[tokio::test]
-async fn skill_store_caps_records_per_session() {
+async fn skill_agents_sharing_a_session_are_isolated() {
     let dir = tempfile::tempdir().unwrap();
     let store = skill_store(&dir, Some(60));
-    let session = SessionId::new("sess-cap");
-    for i in 0..(MAX_SKILL_RECORDS_PER_SESSION + 5) {
+    let session = SessionId::new("sess-switch");
+    let first = SkillLogKey::new(session.clone(), "agent-a");
+    let second = SkillLogKey::new(session, "agent-b");
+
+    store
+        .record(&first, skill_record("shared", 1, 0))
+        .await
+        .unwrap();
+    assert!(store.list(&second).await.unwrap().is_empty());
+
+    store
+        .record(&second, skill_record("shared", 5, 0))
+        .await
+        .unwrap();
+    assert_eq!(store.list(&first).await.unwrap()[0].anchor, 1);
+    assert_eq!(store.list(&second).await.unwrap()[0].anchor, 5);
+    assert_eq!(skill_files(&dir).len(), 2);
+}
+
+#[tokio::test]
+async fn skill_store_caps_records_per_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = skill_store(&dir, Some(60));
+    let log = skill_log("sess-cap");
+    for i in 0..(MAX_SKILL_RECORDS_PER_LOG + 5) {
         store
-            .record(&session, skill_record(&format!("s{i}"), i as u32, 0))
+            .record(&log, skill_record(&format!("s{i}"), i as u32, 0))
             .await
             .unwrap();
     }
     assert_eq!(
-        store.list(&session).await.unwrap().len(),
-        MAX_SKILL_RECORDS_PER_SESSION
+        store.list(&log).await.unwrap().len(),
+        MAX_SKILL_RECORDS_PER_LOG
     );
 
-    // A re-invocation of a key the session already holds is never refused.
-    store
-        .record(&session, skill_record("s0", 99, 0))
-        .await
-        .unwrap();
-    let listed = store.list(&session).await.unwrap();
-    assert_eq!(listed.len(), MAX_SKILL_RECORDS_PER_SESSION);
+    // A re-invocation of a key the log already holds is never refused.
+    store.record(&log, skill_record("s0", 99, 0)).await.unwrap();
+    let listed = store.list(&log).await.unwrap();
+    assert_eq!(listed.len(), MAX_SKILL_RECORDS_PER_LOG);
     assert_eq!(listed[0].anchor, 0, "first write for a key still wins");
 }
 
@@ -655,9 +682,9 @@ async fn skill_store_caps_records_per_session() {
 async fn skill_undecodable_lines_are_skipped_and_preserved() {
     let dir = tempfile::tempdir().unwrap();
     let store = skill_store(&dir, Some(60));
-    let session = SessionId::new("sess-skew");
+    let log = skill_log("sess-skew");
     store
-        .record(&session, skill_record("alpha", 1, 0))
+        .record(&log, skill_record("alpha", 1, 0))
         .await
         .unwrap();
 
@@ -670,12 +697,12 @@ async fn skill_undecodable_lines_are_skipped_and_preserved() {
     text.push('\n');
     std::fs::write(&path, text).unwrap();
 
-    let listed = store.list(&session).await.unwrap();
+    let listed = store.list(&log).await.unwrap();
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].invocation.label(), "alpha");
 
     store
-        .record(&session, skill_record("gamma", 3, 0))
+        .record(&log, skill_record("gamma", 3, 0))
         .await
         .unwrap();
     let text = std::fs::read_to_string(&path).unwrap();
@@ -685,12 +712,12 @@ async fn skill_undecodable_lines_are_skipped_and_preserved() {
 }
 
 #[tokio::test]
-async fn skill_expired_session_is_dropped_on_touch_and_a_write_refreshes_it() {
+async fn skill_expired_log_is_dropped_on_touch_and_a_write_refreshes_it() {
     let dir = tempfile::tempdir().unwrap();
     let store = skill_store(&dir, Some(60));
-    let session = SessionId::new("sess-ttl");
+    let log = skill_log("sess-ttl");
     store
-        .record(&session, skill_record("alpha", 1, 0))
+        .record(&log, skill_record("alpha", 1, 0))
         .await
         .unwrap();
     let path = skill_files(&dir).remove(0);
@@ -699,22 +726,22 @@ async fn skill_expired_session_is_dropped_on_touch_and_a_write_refreshes_it() {
     // records stay alive.
     age_file(&path, 30);
     store
-        .record(&session, skill_record("beta", 2, 0))
+        .record(&log, skill_record("beta", 2, 0))
         .await
         .unwrap();
     age_file(&path, 30);
-    assert_eq!(store.list(&session).await.unwrap().len(), 2);
+    assert_eq!(store.list(&log).await.unwrap().len(), 2);
 
     age_file(&path, 61);
-    assert!(store.list(&session).await.unwrap().is_empty());
+    assert!(store.list(&log).await.unwrap().is_empty());
     assert!(!path.exists(), "the expired file is removed on touch");
 }
 
 #[tokio::test]
-async fn skill_open_sweeps_expired_session_files() {
+async fn skill_open_sweeps_expired_log_files() {
     let dir = tempfile::tempdir().unwrap();
-    let live = SessionId::new("sess-live");
-    let stale = SessionId::new("sess-stale");
+    let live = skill_log("sess-live");
+    let stale = skill_log("sess-stale");
     {
         let store = skill_store(&dir, Some(60));
         store
@@ -739,13 +766,13 @@ async fn skill_open_sweeps_expired_session_files() {
 async fn skill_store_without_ttl_never_expires() {
     let dir = tempfile::tempdir().unwrap();
     let store = skill_store(&dir, None);
-    let session = SessionId::new("sess-forever");
+    let log = skill_log("sess-forever");
     store
-        .record(&session, skill_record("alpha", 1, 0))
+        .record(&log, skill_record("alpha", 1, 0))
         .await
         .unwrap();
     age_file(&skill_files(&dir).remove(0), 10 * 365 * 24 * 3600);
-    assert_eq!(store.list(&session).await.unwrap().len(), 1);
+    assert_eq!(store.list(&log).await.unwrap().len(), 1);
 }
 
 /// The file session store hands out the file-backed skill store, so a skill
@@ -758,15 +785,15 @@ async fn file_session_store_skill_log_survives_a_restart() {
         path: dir.path().to_string_lossy().into_owned(),
         skills_ttl_secs: std::num::NonZeroU64::new(60),
     };
-    let session = SessionId::new("sess-wired");
+    let log = skill_log("sess-wired");
     FileSessionStore::new(&config)
         .unwrap()
         .skills()
-        .record(&session, skill_record("alpha", 1, 0))
+        .record(&log, skill_record("alpha", 1, 0))
         .await
         .unwrap();
 
     let reopened = FileSessionStore::new(&config).unwrap();
-    assert_eq!(reopened.skills().list(&session).await.unwrap().len(), 1);
+    assert_eq!(reopened.skills().list(&log).await.unwrap().len(), 1);
     reopened.ping().await.unwrap();
 }
