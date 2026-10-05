@@ -1,0 +1,72 @@
+# Output formatting — a single agent that queries Prometheus and receives
+# condensed query results instead of raw API JSON.
+#
+# The `prometheus` formatter rewrites Prometheus HTTP API query results
+# (`vector`, `matrix`, `scalar`, `string`) before the model sees them:
+#   - labels with the same value on every series are printed once
+#   - each range series lists its point count, the timestamps with no sample,
+#     min / max / last, and run-length encoded values (`1×28 gap×2 1×14`)
+#   - the resolution the backend returned is stated, and compared with the
+#     requested step when `step_arg` names the tool's step argument
+# Output the formatter does not recognise passes through unchanged. The model
+# can pass `"_aura_raw": true` on a call to get the unformatted response.
+#
+# Prerequisites:
+#   export OPENAI_API_KEY="sk-..."
+#   export PROMETHEUS_URL="http://localhost:9090"
+#   Start the Prometheus MCP server:
+#     docker run -i --rm -e PROMETHEUS_URL -e PROMETHEUS_MCP_SERVER_TRANSPORT=http \
+#       -e PROMETHEUS_MCP_BIND_PORT=8082 -p 8082:8082 ghcr.io/pab1it0/prometheus-mcp-server:latest
+#
+# Usage:
+#   CONFIG_PATH=examples/complete/output-format-prometheus.toml cargo run --bin aura -- webserver
+
+[mcp]
+sanitize_schemas = true
+
+# Prometheus — metrics queries
+# https://github.com/pab1it0/prometheus-mcp-server
+[mcp.servers.prometheus]
+transport = "http_streamable"
+url = "http://localhost:8082/mcp"
+description = "Prometheus metrics queries"
+
+# Per-tool formatters for this server. Keys are glob patterns (`*` and `?`)
+# matched against tool names; the longest matching pattern wins. Tools with
+# no matching entry are not formatted.
+#
+# `prometheus` options (all optional):
+#   step_arg / start_arg / end_arg  tool arguments holding the requested step,
+#                                   range start and range end
+#   keep_labels                     labels always printed per series
+#   drop_labels                     glob patterns for labels never printed
+#   max_series                      series printed (default 50); those with
+#                                   the most missing points come first
+#   max_runs_per_series             run-length entries per series (default 30);
+#                                   longer series are printed as evenly
+#                                   spaced samples
+[mcp.servers.prometheus.output_format]
+"execute_query" = { formatter = "prometheus" }
+"execute_range_query" = { formatter = "prometheus", step_arg = "step", start_arg = "start", end_arg = "end", keep_labels = ["instance"] }
+
+[agent]
+name = "Prometheus Analyst"
+model_owner = "mezmo"
+system_prompt = """
+You are a metrics analyst. Answer questions with Prometheus queries.
+
+Query results are condensed: labels shared by every series are listed once
+under `common labels`, and each range series lists the timestamps with no
+sample. A missing sample is a gap, not a 0. When the stated resolution is
+coarser than the step you requested, narrow the time window before
+concluding that nothing changed.
+
+Report concrete series, timestamps and values. Never invent values you did
+not read from a query result.
+"""
+turn_depth = 12
+
+[agent.llm]
+provider = "openai"
+api_key = "{{ env.OPENAI_API_KEY }}"
+model = "gpt-5.2"

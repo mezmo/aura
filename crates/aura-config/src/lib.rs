@@ -6,6 +6,7 @@ pub mod lenient_bool;
 pub mod lenient_int;
 pub mod loader;
 pub mod orchestration;
+pub mod output_format;
 pub mod scratchpad;
 pub mod session_store;
 pub mod skills;
@@ -25,6 +26,7 @@ pub use loader::ConfigLoader;
 pub use orchestration::{
     ArtifactsConfig, OrchestrationConfig, TimeoutsConfig, ToolVisibility, WorkerConfig,
 };
+pub use output_format::{OutputFormatEntry, PrometheusFormatOptions};
 pub use scratchpad::{ScratchpadConfig, ScratchpadToolEntry};
 pub use session_store::{
     FileSessionStoreConfig, RedisSessionStoreConfig, SessionStoreBackend, SessionStoreConfig,

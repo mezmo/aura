@@ -11,7 +11,13 @@ use crate::config::McpServerConfig;
 use crate::error::ConfigError;
 
 /// Map-valued fields of an MCP server table.
-const MAP_FIELDS: [&str; 4] = ["env", "headers", "headers_from_request", "scratchpad"];
+const MAP_FIELDS: [&str; 5] = [
+    "env",
+    "headers",
+    "headers_from_request",
+    "scratchpad",
+    "output_format",
+];
 
 /// Insert or replace `[mcp.servers.<name>]` in the config file at `path`,
 /// atomically (see [`rewrite_file`]). A missing file is an error, not an
@@ -231,6 +237,7 @@ model = "claude-3-sonnet-20240229"
             args: vec![],
             env: HashMap::new(),
             description: None,
+            output_format: Default::default(),
             scratchpad: HashMap::new(),
             user_agent: None,
         }
@@ -242,6 +249,7 @@ model = "claude-3-sonnet-20240229"
             headers,
             description: Some("Example server".to_owned()),
             headers_from_request: HashMap::new(),
+            output_format: Default::default(),
             scratchpad: HashMap::new(),
             user_agent: None,
         }
@@ -273,6 +281,7 @@ model = "claude-3-sonnet-20240229"
                     headers: HashMap::new(),
                     description: None,
                     headers_from_request: HashMap::new(),
+                    output_format: Default::default(),
                     scratchpad: HashMap::new(),
                     user_agent: None,
                 },
@@ -353,7 +362,7 @@ url = "https://old.example.com/mcp"
     fn omits_empty_optional_collections() {
         let updated = upsert_mcp_server_in_str(BASE_CONFIG, "k8s", &stdio_server()).unwrap();
         let server_section = updated.split("[mcp.servers.k8s]").nth(1).unwrap();
-        for absent in ["args", "env", "scratchpad", "description"] {
+        for absent in ["args", "env", "scratchpad", "output_format", "description"] {
             assert!(
                 !server_section.contains(absent),
                 "`{absent}` should be omitted when empty/None:\n{server_section}"
@@ -431,6 +440,7 @@ url = "https://old.example.com/mcp"
             args: vec![],
             env: HashMap::new(),
             description: None,
+            output_format: Default::default(),
             scratchpad: HashMap::from([(
                 "*".to_owned(),
                 crate::ScratchpadToolEntry { min_tokens: 5120 },
@@ -457,6 +467,7 @@ url = "https://old.example.com/mcp"
                 "Authorization".to_owned(),
                 "authorization".to_owned(),
             )]),
+            output_format: Default::default(),
             scratchpad: HashMap::new(),
             user_agent: None,
         };

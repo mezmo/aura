@@ -315,6 +315,26 @@ impl Agent {
         // fields (tool_wrapper, preamble_override, scratchpad_tools_config,
         // hitl_request_approval_tool).
         let mut config_owned = config.clone();
+
+        // Output formatters run on the raw tool output, before scratchpad
+        // interception: composed here, inside the slot that
+        // setup_single_agent_scratchpad wraps, so transform_output order is
+        // caller-supplied wrapper → formatter → scratchpad. Orchestration
+        // workers compose their own in `create_worker`.
+        if !config_owned.orchestration_enabled()
+            && let Some(formatter) = crate::output_format::OutputFormatWrapper::from_mcp_config(
+                config_owned.mcp.as_ref(),
+            )
+        {
+            let formatter: Arc<dyn crate::tool_wrapper::ToolWrapper> = Arc::new(formatter);
+            config_owned.tool_wrapper = Some(match config_owned.tool_wrapper.take() {
+                Some(existing) => Arc::new(crate::tool_wrapper::ComposedWrapper::new(vec![
+                    formatter, existing,
+                ])),
+                None => formatter,
+            });
+        }
+
         let agent_scratchpad_budget =
             Self::setup_single_agent_scratchpad(&mut config_owned, mcp_manager.as_ref()).await?;
 

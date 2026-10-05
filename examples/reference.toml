@@ -25,6 +25,7 @@
 #   examples/complete/hitl-webhook.toml               - approval gate, webhook route
 #   examples/complete/hitl-conversational.toml        - approval gate, in-chat route
 #   examples/complete/scratchpad-single-agent.toml    - large tool outputs → scratchpad
+#   examples/complete/output-format-prometheus.toml   - condensed Prometheus query results
 #   examples/complete/skills-agent.toml               - on-demand SKILL.md loading
 #   examples/complete/rag-knowledge-base.toml         - Qdrant + Bedrock KB retrieval
 #   examples/complete/local-ollama-stdio.toml         - Ollama + stdio MCP, no API keys
@@ -106,6 +107,16 @@ Authorization = "Bearer {{ env.MCP_TOKEN | default: '' }}"
 # [mcp.servers.auth_aware_server.headers_from_request]
 # # Maps: outgoing header name = incoming request header name
 # Authorization = "x-user-token"
+
+# ── Output formatting ───────────────────────────────────────────────
+# Rewrite a tool's output before the model (and scratchpad) sees it.
+# Keys are tool-name glob patterns; the longest match wins. Available on
+# all three transports. Unrecognised output passes through unchanged, and
+# the model can pass `"_aura_raw": true` for the unformatted response.
+# See examples/complete/output-format-prometheus.toml.
+#
+# [mcp.servers.example_http.output_format]
+# "*query*" = { formatter = "prometheus", step_arg = "step" }
 
 # ── Vector Stores (RAG) ────────────────────────────────────────────
 # Connects to an external Qdrant instance. The agent gets a
