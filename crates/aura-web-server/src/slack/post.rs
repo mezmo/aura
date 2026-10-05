@@ -10,7 +10,7 @@ use super::api::{SlackApi, SlackApiError};
 use super::budget::Budget;
 
 pub const POST_TOOL_NAME: &str = "slack_post_message";
-/// Posts one run may make, across every agent working on it.
+/// Maximum number of posts allowed in a run.
 pub const POSTS_PER_RUN: usize = 5;
 
 /// The per-run tool factory for a request that `config` answers: a post
