@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use futures::stream::{self, BoxStream};
 use tokio_util::sync::CancellationToken;
 
-use crate::config::AgentRuntimeConfig;
+use crate::config::{AgentRuntimeConfig, RunId};
 use crate::provider_agent::{StreamError, StreamItem};
 use crate::streaming::StreamingAgent;
 
@@ -100,7 +100,7 @@ impl OrchestratorFactory {
         let (event_tx, event_rx) =
             tokio::sync::mpsc::channel::<Result<StreamItem, StreamError>>(100);
 
-        let run_id = std::sync::Arc::clone(run.id());
+        let run_id = run.id().to_string();
         let RunTokens { cancel, finished } = tokens;
         let cancel_token_clone = cancel.clone();
         // Marks the run finished on every exit path, which is what lets the
@@ -174,7 +174,7 @@ impl OrchestratorFactory {
                         tracing::info!("Orchestration cancelled");
                         if let Some(ref mcp_manager) = orchestrator.mcp_manager {
                             let cancelled = mcp_manager
-                                .cancel_and_close_all(run_id.as_ref(), "Client disconnected or timeout")
+                                .cancel_and_close_all(&run_id, "Client disconnected or timeout")
                                 .await;
                             if cancelled > 0 {
                                 tracing::info!("Cancelled {} MCP request(s) during orchestration shutdown", cancelled);
@@ -218,6 +218,16 @@ impl StreamingAgent for OrchestratorFactory {
         options: crate::streaming::RunOptions,
         request_id: &str,
     ) -> crate::streaming::AgentRun {
+        // The run is the one this factory was built for, as an `Agent`'s is
+        // the one it began; a factory built for none starts a fresh run.
+        let run_id = self.agent_config.run_id.unwrap_or_else(RunId::mint);
+        if run_id.to_string() != request_id {
+            tracing::debug!(
+                %run_id,
+                request_id,
+                "streaming under the run's id rather than the one passed",
+            );
+        }
         let (timeout, cancel) = options.into_parts();
         let cancel_token = cancel.unwrap_or_default();
 
@@ -229,7 +239,7 @@ impl StreamingAgent for OrchestratorFactory {
                 timeout,
                 cancel_token.clone(),
                 finished.clone(),
-                request_id.to_string(),
+                run_id.to_string(),
             );
             finished
         });
@@ -239,7 +249,7 @@ impl StreamingAgent for OrchestratorFactory {
         // all orchestration LLM turns.
         let usage_state = crate::UsageState::new();
         let (run, run_events) =
-            crate::run_context::RunContext::channel_on(request_id, cancel_token.clone());
+            crate::run_context::RunContext::channel_on(run_id, cancel_token.clone());
         let stream = self.spawn_orchestration_stream(
             query.to_string(),
             chat_history,

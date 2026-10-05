@@ -558,8 +558,8 @@ mod tests {
         let (registry, store) = conv_registry();
         let run_id = "0191e8c0-ffff-7000-8000-000000000006";
         let owner = run_owner_id(run_id);
-        let request_id = format!("req_sweep_{}", uuid::Uuid::new_v4().simple());
-        let (run, mut events) = crate::run_context::RunContext::channel(request_id.as_str());
+        let this_run = aura_events::RunId::mint();
+        let (run, mut events) = crate::run_context::RunContext::channel(this_run);
 
         let now = chrono::Utc::now();
         let decided = DecisionId::generate();
@@ -626,8 +626,8 @@ mod tests {
         let (registry, store) = conv_registry();
         let run_id = "0191e8c0-aaaa-7000-8000-000000000007";
         let owner = run_owner_id(run_id);
-        let request_id = format!("req_sweep_{}", uuid::Uuid::new_v4().simple());
-        let (run, mut events) = crate::run_context::RunContext::channel(request_id.as_str());
+        let this_run = aura_events::RunId::mint();
+        let (run, mut events) = crate::run_context::RunContext::channel(this_run);
 
         let now = chrono::Utc::now();
         let first = DecisionId::generate();

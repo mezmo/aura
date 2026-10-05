@@ -106,7 +106,7 @@ impl Drop for ParkCellRegistration {
 /// correlates nothing until #732. Its tool events stay off the run for the same
 /// reason, and orchestration reports the worker's calls itself.
 fn queue_owner(stream_id: &str) -> Option<Arc<crate::run_context::RunContext>> {
-    current_run().filter(|run| run.id().as_ref() == stream_id)
+    current_run().filter(|run| run.has_id(stream_id))
 }
 
 /// Sends a tool event raised by this stream to the run [`queue_owner`] gives it.
@@ -776,10 +776,11 @@ mod tests {
         /// scope, and its tool events must not reach the run as the run's own.
         #[tokio::test]
         async fn only_the_run_s_own_stream_sends_it_tool_events() {
-            let (run, mut events) = RunContext::channel("req_1");
+            let id = crate::run_context::named_run_id("req_1").to_string();
+            let (run, mut events) = RunContext::channel(id.parse().unwrap());
             with_run(run, async {
-                emit_from_stream("req_1:task:0:attempt:1", requested("worker")).await;
-                emit_from_stream("req_1", requested("own")).await;
+                emit_from_stream(&format!("{id}:task:0:attempt:1"), requested("worker")).await;
+                emit_from_stream(&id, requested("own")).await;
             })
             .await;
 
@@ -797,17 +798,19 @@ mod tests {
 
         #[tokio::test]
         async fn the_run_s_own_stream_owns_the_queue() {
-            let run = RunContext::detached("req_1");
-            let owned = with_run(run, async { queue_owner("req_1").is_some() }).await;
+            let id = crate::run_context::named_run_id("req_1");
+            let run = RunContext::detached(id);
+            let owned = with_run(run, async { queue_owner(&id.to_string()).is_some() }).await;
             assert!(owned);
         }
 
         /// An orchestration worker streams under its task attempt.
         #[tokio::test]
         async fn a_worker_s_stream_owns_no_queue() {
-            let run = RunContext::detached("req_1");
+            let id = crate::run_context::named_run_id("req_1");
+            let run = RunContext::detached(id);
             let owned = with_run(run, async {
-                queue_owner("req_1:task:0:attempt:1").is_some()
+                queue_owner(&format!("{id}:task:0:attempt:1")).is_some()
             })
             .await;
             assert!(
