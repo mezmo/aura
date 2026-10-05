@@ -357,6 +357,7 @@ mod tests {
                     dependencies: vec![],
                     worker: Some("operations".to_string()),
                     rationale: String::new(),
+                    artifacts: Vec::new(),
                     status: TaskStatus::AwaitingApproval,
                     result: None,
                     error: None,

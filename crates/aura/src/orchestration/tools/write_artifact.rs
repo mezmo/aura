@@ -8,14 +8,8 @@ use tokio::sync::Mutex;
 
 use crate::orchestration::persistence::ExecutionPersistence;
 
-/// Writes coordinator-authored content to a run artifact.
-///
-/// The counterpart to [`ReadArtifactTool`](super::ReadArtifactTool): the
-/// coordinator writes a document once, then names the returned filename in a
-/// task description so the worker loads it with `read_artifact`, instead of
-/// routing the document through `create_plan` arguments. Coordinator-only;
-/// artifacts are namespaced `coordinator-*` so worker results can't be
-/// overwritten.
+/// Coordinator tool that saves content as a run artifact; the write-side
+/// counterpart to [`ReadArtifactTool`](super::ReadArtifactTool).
 #[derive(Clone)]
 pub struct WriteArtifactTool {
     persistence: Arc<Mutex<ExecutionPersistence>>,
@@ -29,8 +23,7 @@ impl WriteArtifactTool {
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct WriteArtifactArgs {
-    /// Requested artifact name (e.g. "runbook-draft.md"); normalized to
-    /// `coordinator-{name}`.
+    /// Requested artifact name (e.g. "runbook-draft.md").
     pub filename: String,
     /// The full content to write.
     pub content: String,
@@ -39,12 +32,12 @@ pub struct WriteArtifactArgs {
 #[derive(Debug, Serialize)]
 pub struct WriteArtifactOutput {
     pub written: bool,
-    /// The artifact filename to reference in tasks and pass to `read_artifact`.
+    /// Stored artifact filename.
     pub filename: String,
-    /// True when an existing artifact with this filename was replaced.
+    /// Whether the write overwrote an existing artifact.
     pub replaced: bool,
     pub chars: usize,
-    /// Set when nothing was written.
+    /// Why nothing was written.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
