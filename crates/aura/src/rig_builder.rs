@@ -12,7 +12,7 @@ use crate::builder::{
     Agent, ClientTool, PreparedAgent, RunToolFactory, build_streaming_agent_with_tools,
     no_run_tools,
 };
-use crate::config::{AgentRuntimeConfig, WorkerSkills};
+use crate::config::{AgentRuntimeConfig, RunId, WorkerSkills};
 use crate::error::BuilderError;
 use crate::forwarded_headers::ForwardedHeaders;
 use crate::hitl::PendingApprovals;
@@ -177,8 +177,8 @@ impl RigBuilder {
             .map_err(|e| BuilderError::AgentError(format!("Failed to build agent: {e}")))
     }
 
-    /// Prepare an agent and begin its run for `request_id`, recording skill
-    /// invocations with the builder's skill recorder.
+    /// Prepare an agent and begin its run `run_id` (a fresh one when `None`),
+    /// recording skill invocations with the builder's skill recorder.
     ///
     /// See [`Self::prepare_agent`] for the parameters. Each call prepares a
     /// fresh agent; callers that want to reuse one across requests call
@@ -188,7 +188,7 @@ impl RigBuilder {
         req_headers: Option<&HashMap<String, String>>,
         additional_tools: Vec<Box<dyn rig::tool::ToolDyn>>,
         client_tools: Option<Vec<ClientTool>>,
-        request_id: Option<String>,
+        run_id: Option<RunId>,
         session_id: Option<String>,
     ) -> Result<Agent, BuilderError> {
         let prepared = self
@@ -196,7 +196,7 @@ impl RigBuilder {
             .await?;
         prepared
             .begin_run(
-                request_id.unwrap_or_default(),
+                run_id.unwrap_or_else(RunId::mint),
                 req_headers,
                 self.skill_recorder.clone(),
             )
@@ -218,13 +218,13 @@ impl RigBuilder {
         req_headers: Option<&HashMap<String, String>>,
         session_id: Option<String>,
         client_tools: Option<Vec<ClientTool>>,
-        request_id: Option<String>,
+        run_id: Option<RunId>,
     ) -> Result<Arc<dyn StreamingAgent>, BuilderError> {
         self.build_streaming_agent_with_tools(
             req_headers,
             session_id,
             client_tools,
-            request_id,
+            run_id,
             no_run_tools(),
         )
         .await
@@ -239,13 +239,13 @@ impl RigBuilder {
         req_headers: Option<&HashMap<String, String>>,
         session_id: Option<String>,
         client_tools: Option<Vec<ClientTool>>,
-        request_id: Option<String>,
+        run_id: Option<RunId>,
         run_tools: RunToolFactory,
     ) -> Result<Arc<dyn StreamingAgent>, BuilderError> {
         let mut agent_config = self.discovered_agent_config(req_headers)?;
         resolve_mcp_headers(&mut agent_config, req_headers);
         agent_config.session_id = session_id;
-        agent_config.request_id = request_id;
+        agent_config.run_id = run_id;
         agent_config.skill_recorder = self.skill_recorder.clone();
 
         build_streaming_agent_with_tools(&agent_config, client_tools, run_tools)

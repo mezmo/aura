@@ -306,7 +306,7 @@ mod tests {
         assert!(build.tools_config.run.scratchpad_budget().is_none());
         let run_budget = build.budget.fresh();
         run.bind(crate::run_context::RunContext::detached_with(
-            "req",
+            crate::run_context::named_run_id("req"),
             Some(run_budget.clone()),
             None,
         ));
