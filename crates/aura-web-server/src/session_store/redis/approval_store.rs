@@ -30,13 +30,7 @@
 use std::sync::LazyLock;
 
 use async_trait::async_trait;
-use aura::hitl::{
-    ApprovalAuthority, ApprovalRead, DecisionId, ParkedApproval, ResolveError, ResolvedDecision,
-};
-use aura::session_store::{
-    AcknowledgeOutcome, ApprovalStore, DecisionRecord, ParkedApprovalRecord, RetainedApproval,
-    SessionStoreError,
-use aura::hitl::{DecisionId, ParkedApproval, ResolveError, ResolvedDecision};
+use aura::hitl::{ApprovalAuthority, DecisionId, ParkedApproval, ResolveError, ResolvedDecision};
 use aura::session_store::{ApprovalStore, DecisionRecord, ParkedApprovalRecord, SessionStoreError};
 use redis::AsyncCommands;
 use redis::aio::ConnectionManager;
@@ -398,7 +392,6 @@ impl ApprovalStore for RedisApprovalStore {
         }
         Ok(pending)
     }
-
 }
 
 /// Seconds until the approval expires, floored at [`MIN_TTL_SECS`].
