@@ -6,6 +6,7 @@
 //! The coordinator calls exactly one of these tools during the planning phase.
 //! A shared `RoutingDecision` captures the decision for the orchestrator to read.
 
+use crate::orchestration::persistence::ExecutionPersistence;
 use crate::orchestration::types::{PlanningResponse, StepInput, flatten_steps};
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
@@ -37,12 +38,22 @@ impl RoutingToolSet {
             },
             create_plan: CreatePlanTool {
                 decision: decision.clone(),
+                persistence: None,
             },
             request_clarification: RequestClarificationTool {
                 decision: decision.clone(),
             },
             decision,
         }
+    }
+}
+
+impl RoutingToolSet {
+    /// Let `create_plan` validate task `artifacts` against this run's
+    /// artifacts. Without it, any plan that attaches artifacts is rejected.
+    pub fn with_persistence(mut self, persistence: Arc<Mutex<ExecutionPersistence>>) -> Self {
+        self.create_plan.persistence = Some(persistence);
+        self
     }
 }
 
@@ -147,6 +158,7 @@ impl Tool for RespondDirectlyTool {
 #[derive(Clone)]
 pub struct CreatePlanTool {
     pub(crate) decision: RoutingDecision,
+    pub(crate) persistence: Option<Arc<Mutex<ExecutionPersistence>>>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -197,6 +209,11 @@ impl Tool for CreatePlanTool {
                 "worker": {
                     "type": "string",
                     "description": "Name of the specialized worker to assign this task to. Required when type=task."
+                },
+                "artifacts": {
+                    "type": "array",
+                    "description": "Artifact filenames from this run to hand the worker (e.g. one returned by write_artifact or named in a task result). Each must already exist; the worker loads them with read_artifact. Optional, type=task only.",
+                    "items": { "type": "string" }
                 },
                 "items": {
                     "type": "array",
@@ -265,6 +282,12 @@ impl Tool for CreatePlanTool {
             });
         }
 
+        if let Err(e) = self.validate_artifacts(&args.steps).await {
+            return Ok(CreatePlanOutput {
+                status: format!("Error: {e} Fix the task `artifacts` and call create_plan again."),
+            });
+        }
+
         let step_count = count_leaf_steps(&args.steps);
         *guard = Some(PlanningResponse::StepsPlan {
             goal: args.goal,
@@ -275,6 +298,62 @@ impl Tool for CreatePlanTool {
         Ok(CreatePlanOutput {
             status: format!("Plan created with {} steps.", step_count),
         })
+    }
+}
+
+impl CreatePlanTool {
+    /// Check that every artifact attached to a task exists in the current run,
+    /// so a worker is never sent to read a file that isn't there.
+    async fn validate_artifacts(&self, steps: &[StepInput]) -> Result<(), String> {
+        let mut requested = Vec::new();
+        collect_artifacts(steps, &mut requested);
+        if requested.is_empty() {
+            return Ok(());
+        }
+        let Some(persistence) = &self.persistence else {
+            return Err("Artifacts are unavailable in this run, so tasks cannot attach them.                         Embed the content in the task description instead."
+                .to_string());
+        };
+
+        let persistence = persistence.lock().await;
+        let mut missing = Vec::new();
+        for name in requested {
+            let exists = match persistence.artifact_path(name) {
+                Ok(path) => tokio::fs::try_exists(&path).await.unwrap_or(false),
+                Err(_) => false,
+            };
+            if !exists && !missing.contains(&name) {
+                missing.push(name);
+            }
+        }
+        if missing.is_empty() {
+            return Ok(());
+        }
+
+        let available = persistence.list_artifacts().await.unwrap_or_default();
+        let available = if available.is_empty() {
+            "none".to_string()
+        } else {
+            available.join(", ")
+        };
+        Err(format!(
+            "Artifact(s) not found in this run: {}. Available artifacts: {available}. \
+             Write new content with write_artifact first and use the filename it returns.",
+            missing.join(", ")
+        ))
+    }
+}
+
+/// Collect the artifact filenames attached to every leaf task, in step order.
+fn collect_artifacts<'a>(steps: &'a [StepInput], out: &mut Vec<&'a str>) {
+    for step in steps {
+        match step {
+            StepInput::LeafTask { artifacts, .. } => {
+                out.extend(artifacts.iter().map(String::as_str));
+            }
+            StepInput::ParallelGroup { items } => collect_artifacts(items, out),
+            StepInput::SubChain { steps } => collect_artifacts(steps, out),
+        }
     }
 }
 
@@ -420,6 +499,7 @@ mod tests {
         let leaf = |task: &str| StepInput::LeafTask {
             task: task.to_string(),
             worker: Some("operations".to_string()),
+            artifacts: Vec::new(),
         };
         // chain > chain > parallel: one level deeper than flatten_steps allows.
         let result = toolset
@@ -453,6 +533,118 @@ mod tests {
         );
     }
 
+    fn plan_with_artifacts(artifacts: &[&str]) -> CreatePlanArgs {
+        CreatePlanArgs {
+            goal: "Review the draft".to_string(),
+            steps: vec![
+                StepInput::LeafTask {
+                    task: "Gather context".to_string(),
+                    worker: Some("operations".to_string()),
+                    artifacts: Vec::new(),
+                },
+                StepInput::ParallelGroup {
+                    items: vec![StepInput::LeafTask {
+                        task: "Review the draft".to_string(),
+                        worker: Some("reviewer".to_string()),
+                        artifacts: artifacts.iter().map(|a| a.to_string()).collect(),
+                    }],
+                },
+            ],
+            routing_rationale: "r".to_string(),
+            planning_summary: "s".to_string(),
+        }
+    }
+
+    async fn persistence_with_draft() -> (Arc<Mutex<ExecutionPersistence>>, tempfile::TempDir) {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let persistence = ExecutionPersistence::new(temp_dir.path().join("memory"), None)
+            .await
+            .unwrap();
+        persistence
+            .write_coordinator_artifact("draft.md", "# Draft")
+            .await
+            .unwrap();
+        (Arc::new(Mutex::new(persistence)), temp_dir)
+    }
+
+    #[tokio::test]
+    async fn test_create_plan_accepts_existing_artifacts() {
+        let (persistence, _dir) = persistence_with_draft().await;
+        let toolset = RoutingToolSet::new().with_persistence(persistence);
+
+        let result = toolset
+            .create_plan
+            .call(plan_with_artifacts(&["coordinator-draft.md"]))
+            .await
+            .unwrap();
+
+        assert!(
+            result.status.starts_with("Plan created"),
+            "{}",
+            result.status
+        );
+        let decision = toolset.decision.lock().await;
+        let Some(PlanningResponse::StepsPlan { steps, .. }) = decision.as_ref() else {
+            panic!("expected StepsPlan, got {:?}", decision);
+        };
+        let tasks = flatten_steps(steps).unwrap();
+        assert_eq!(tasks[1].artifacts, vec!["coordinator-draft.md".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_create_plan_rejects_missing_artifacts() {
+        let (persistence, _dir) = persistence_with_draft().await;
+        let toolset = RoutingToolSet::new().with_persistence(persistence);
+
+        let result = toolset
+            .create_plan
+            .call(plan_with_artifacts(&[
+                "coordinator-draft.md",
+                "draft.md",
+                "../../etc/passwd",
+            ]))
+            .await
+            .unwrap();
+
+        assert!(result.status.starts_with("Error:"), "{}", result.status);
+        assert!(
+            result
+                .status
+                .contains("not found in this run: draft.md, ../../etc/passwd."),
+            "{}",
+            result.status
+        );
+        assert!(
+            result
+                .status
+                .contains("Available artifacts: coordinator-draft.md"),
+            "{}",
+            result.status
+        );
+        assert!(
+            toolset.decision.lock().await.is_none(),
+            "a plan with missing artifacts must not be recorded"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_plan_rejects_artifacts_without_persistence() {
+        let toolset = RoutingToolSet::new();
+
+        let result = toolset
+            .create_plan
+            .call(plan_with_artifacts(&["coordinator-draft.md"]))
+            .await
+            .unwrap();
+
+        assert!(
+            result.status.contains("Artifacts are unavailable"),
+            "{}",
+            result.status
+        );
+        assert!(toolset.decision.lock().await.is_none());
+    }
+
     #[tokio::test]
     async fn test_create_plan_stores_decision() {
         let toolset = RoutingToolSet::new();
@@ -463,6 +655,7 @@ mod tests {
                 steps: vec![StepInput::LeafTask {
                     task: "Fetch recent logs".to_string(),
                     worker: Some("operations".to_string()),
+                    artifacts: Vec::new(),
                 }],
                 routing_rationale: "Requires tool execution".to_string(),
                 planning_summary: "Fetch and analyze recent logs".to_string(),

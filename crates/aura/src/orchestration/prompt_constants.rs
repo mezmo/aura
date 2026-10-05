@@ -13,6 +13,7 @@
 /// Section headers for worker prompts.
 pub mod sections {
     pub const PRIOR_WORK: &str = "COMPLETED";
+    pub const INPUT_ARTIFACTS: &str = "INPUT ARTIFACTS";
 }
 
 /// JSON field names for plan parsing.
@@ -46,7 +47,7 @@ pub mod continuation {
 
 /// Conditional guidance fragments injected into continuation prompts.
 pub(crate) mod guidance {
-    pub const RESULT_FORWARDING: &str = "When creating a follow-up plan, do not re-execute completed tasks. Workers cannot see prior iteration results — if a new task needs data from a completed task above, embed the key values in the task description or include the artifact filename so the worker can call `read_artifact`.\n\n";
+    pub const RESULT_FORWARDING: &str = "When creating a follow-up plan, do not re-execute completed tasks. Workers cannot see prior iteration results — if a new task needs data from a completed task above, embed the key values in the task description or attach the artifact filename in the task's `artifacts` list so the worker can call `read_artifact`.\n\n";
 }
 
 /// Correction messages sent to coordinator/worker when they fail to call
