@@ -39,7 +39,7 @@ pub enum WorkerSkills {
     Override(Vec<SkillConfig>),
 }
 
-pub use aura_events::SessionId;
+pub use aura_events::{RunId, SessionId};
 
 /// Runtime build context for constructing agents.
 ///
@@ -111,8 +111,8 @@ pub struct AgentRuntimeConfig {
     /// `None` disables approval gating.
     pub hitl: Option<HitlRuntime>,
 
-    /// Request id (`req_…`) of the request this build serves.
-    pub request_id: Option<String>,
+    /// The run this build serves.
+    pub run_id: Option<RunId>,
 
     /// The request headers this build forwards; see [`ForwardedHeaders`].
     pub forwarded_headers: ForwardedHeaders,
@@ -153,7 +153,7 @@ impl Clone for AgentRuntimeConfig {
             scratchpad_tools_config: self.scratchpad_tools_config.clone(),
             orchestration_submit_result: self.orchestration_submit_result.clone(),
             hitl: self.hitl.clone(),
-            request_id: self.request_id.clone(),
+            run_id: self.run_id,
             forwarded_headers: self.forwarded_headers.clone(),
             instance_id: self.instance_id.clone(),
             hitl_request_approval_tool: self.hitl_request_approval_tool.clone(),
@@ -198,7 +198,7 @@ impl std::fmt::Debug for AgentRuntimeConfig {
                     .map(|_| "<submit_result>"),
             )
             .field("hitl", &self.hitl.as_ref().map(|_| "<hitl>"))
-            .field("request_id", &self.request_id)
+            .field("run_id", &self.run_id)
             .field("forwarded_headers", &self.forwarded_headers)
             .field("instance_id", &self.instance_id)
             .field(

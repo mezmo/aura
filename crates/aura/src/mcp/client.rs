@@ -29,9 +29,9 @@ use crate::approver_headers::ApproverHeaders;
 use crate::mcp::progress::ProgressEnabledHandler;
 use crate::mcp::response::extract_tool_result;
 use crate::mcp::types::ToolNamespace;
-use aura_events::AgentContext;
 use aura_events::ToolName;
 use aura_events::agent::{AgentEvent, AgentEventPayload};
+use aura_events::{AgentContext, RunId};
 
 /// Custom HTTP client that captures the underlying HTTP status when a request
 /// fails.
@@ -574,7 +574,7 @@ impl McpClient {
     /// per request and owning its manager. Sharing a manager across runs — warm
     /// MCP reuse, #578 — makes this answer last-writer-wins, and wants per-run
     /// tool instances or a rig-side change rather than another field here.
-    pub async fn run_id(&self) -> Option<Arc<str>> {
+    pub async fn run_id(&self) -> Option<RunId> {
         match crate::run_context::current_run_id() {
             Some(id) => Some(id),
             None => self
@@ -582,7 +582,7 @@ impl McpClient {
                 .read()
                 .await
                 .as_ref()
-                .map(|call| Arc::clone(call.run.id())),
+                .map(|call| call.run.id()),
         }
     }
 
@@ -597,7 +597,7 @@ impl McpClient {
             .read()
             .await
             .as_ref()
-            .filter(|call| call.run.id().as_ref() == request_id)
+            .filter(|call| call.run.has_id(request_id))
             .cloned()
     }
 
@@ -659,7 +659,12 @@ impl McpClient {
                 tool_name, http_request_id
             );
             return self
-                .call_tool_tracked(tool_name, arguments, &http_request_id, approver_overrides)
+                .call_tool_tracked(
+                    tool_name,
+                    arguments,
+                    &http_request_id.to_string(),
+                    approver_overrides,
+                )
                 .await;
         }
 
@@ -732,7 +737,7 @@ impl McpClient {
         // The transport task cannot read the run's task-local, so tie the token
         // to the run here, while still inside it.
         if let Some(run_id) = self.run_id().await {
-            self.own_progress_token(progress_token.clone(), &run_id)
+            self.own_progress_token(progress_token.clone(), &run_id.to_string())
                 .await;
         }
         // Held from here so a run cancelled mid-await, which drops this future
@@ -817,7 +822,7 @@ impl McpClient {
             .context("Failed to send tool call request")?;
 
         if let Some(run_id) = self.run_id().await {
-            self.own_progress_token(handle.progress_token.clone(), &run_id)
+            self.own_progress_token(handle.progress_token.clone(), &run_id.to_string())
                 .await;
         }
         let _token_guard = ProgressTokenGuard {
@@ -1062,7 +1067,7 @@ impl McpClient {
 
         // Drop this call's token ownership so straggler notifications stop
         // routing, then clear the binding.
-        owners_of(&self.token_owners).retain(|_, call| call.run.id().as_ref() != http_request_id);
+        owners_of(&self.token_owners).retain(|_, call| !call.run.has_id(http_request_id));
         self.clear_current_call().await;
 
         // Forcefully close connection - server is ignoring cancellation anyway
@@ -1087,9 +1092,9 @@ pub(crate) mod tests {
     use super::*;
     use crate::approver_headers::tests::captured_overrides;
 
-    fn owner(request_id: &str) -> CallContext {
+    fn owner(name: &str) -> CallContext {
         CallContext {
-            run: crate::run_context::RunContext::detached(request_id),
+            run: crate::run_context::RunContext::detached(crate::run_context::named_run_id(name)),
             agent: AgentContext::single_agent(),
         }
     }
@@ -1627,30 +1632,32 @@ pub(crate) mod tests {
     async fn a_call_answers_only_for_the_request_that_named_it() {
         let (_server, client) = client_and_server(&requester_headers()).await;
         let worker = AgentContext::worker("log_worker", None, "coordinator");
+        let req_1 = crate::run_context::named_run_id("req-1").to_string();
+        let req_2 = crate::run_context::named_run_id("req-2").to_string();
 
         assert!(
-            client.call_for("req-1").await.is_none(),
+            client.call_for(&req_1).await.is_none(),
             "an unbound client has no call to attribute work to"
         );
 
         client
             .bind_call(
-                crate::run_context::RunContext::detached("req-1"),
+                crate::run_context::RunContext::detached(crate::run_context::named_run_id("req-1")),
                 worker.clone(),
             )
             .await;
         assert_eq!(
-            client.call_for("req-1").await.map(|call| call.agent),
+            client.call_for(&req_1).await.map(|call| call.agent),
             Some(worker)
         );
         assert!(
-            client.call_for("req-2").await.is_none(),
+            client.call_for(&req_2).await.is_none(),
             "another request's id must not pick up this call"
         );
 
         client.clear_current_call().await;
         assert!(
-            client.call_for("req-1").await.is_none(),
+            client.call_for(&req_1).await.is_none(),
             "clearing the call drops it with the request id"
         );
     }
@@ -1667,11 +1674,16 @@ pub(crate) mod tests {
 
         client
             .bind_call(
-                crate::run_context::RunContext::detached("req_bound"),
+                crate::run_context::RunContext::detached(crate::run_context::named_run_id(
+                    "req_bound",
+                )),
                 AgentContext::single_agent(),
             )
             .await;
-        assert_eq!(client.run_id().await.as_deref(), Some("req_bound"));
+        assert_eq!(
+            client.run_id().await,
+            Some(crate::run_context::named_run_id("req_bound"))
+        );
     }
 
     /// A scope still wins, so a call made inside one is attributed to that run
@@ -1681,18 +1693,22 @@ pub(crate) mod tests {
         let (_server, client) = client_and_server(&requester_headers()).await;
         client
             .bind_call(
-                crate::run_context::RunContext::detached("req_bound"),
+                crate::run_context::RunContext::detached(crate::run_context::named_run_id(
+                    "req_bound",
+                )),
                 AgentContext::single_agent(),
             )
             .await;
 
         let seen = crate::run_context::with_run(
-            crate::run_context::RunContext::detached("req_scoped"),
+            crate::run_context::RunContext::detached(crate::run_context::named_run_id(
+                "req_scoped",
+            )),
             async { client.run_id().await },
         )
         .await;
 
-        assert_eq!(seen.as_deref(), Some("req_scoped"));
+        assert_eq!(seen, Some(crate::run_context::named_run_id("req_scoped")));
     }
 
     /// Being inside a run selects the tracked branch, so this is the same entry
@@ -1712,7 +1728,9 @@ pub(crate) mod tests {
             .expect("the untracked call succeeds");
 
         crate::run_context::with_run(
-            crate::run_context::RunContext::detached("http-req-1"),
+            crate::run_context::RunContext::detached(crate::run_context::named_run_id(
+                "http-req-1",
+            )),
             async {
                 client
                     .call_tool(

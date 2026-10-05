@@ -977,8 +977,10 @@ mod tests {
         ));
 
         let cancel = tokio_util::sync::CancellationToken::new();
-        let (run, mut events) =
-            crate::run_context::RunContext::channel_on("req_run_cancel", cancel.clone());
+        let (run, mut events) = crate::run_context::RunContext::channel_on(
+            crate::run_context::named_run_id("req_run_cancel"),
+            cancel.clone(),
+        );
         gate.bind_run(run);
 
         let gated = Arc::clone(&gate);
@@ -1215,7 +1217,8 @@ mod tests {
                 "test-agent".to_string(),
                 "test-instance-id".to_string(),
             );
-            let (run, events) = crate::run_context::RunContext::channel(request_id);
+            let (run, events) =
+                crate::run_context::RunContext::channel(request_id.parse().expect("a run id"));
             gate.bind_run(run);
             (
                 WrappedTool::new(inner, Arc::new(gate) as Arc<dyn ToolWrapper>),
@@ -1241,7 +1244,7 @@ mod tests {
         }
 
         fn unique_request_id() -> String {
-            format!("req_span_{}", uuid::Uuid::new_v4().simple())
+            aura_events::RunId::mint().to_string()
         }
 
         /// The correlation the whole feature exists for: the id the approver

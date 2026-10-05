@@ -269,7 +269,11 @@ impl AgentExecutor for AuraAgentExecutor {
                 metadata: None,
             }));
 
-            let request_id = format!("a2a_{}", task_id);
+            // The run's id, and in string form the request id everything
+            // request-keyed reads: MCP cancellation, approvals, the cancel map.
+            let run_id = aura::RunId::mint();
+            let request_id = run_id.to_string();
+            event!(Level::DEBUG, task_id, %run_id, "a2a task starts its run");
 
             // Registered before the agent build and history fetch, both of which
             // await, so a cancelTask during those has a token to cancel. Its
@@ -295,7 +299,7 @@ impl AgentExecutor for AuraAgentExecutor {
                     Some(&req_headers),
                     session_id,
                     None,
-                    Some(request_id.clone()),
+                    Some(run_id),
                     run_tools,
                 )
                 .await

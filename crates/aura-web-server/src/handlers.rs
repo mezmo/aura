@@ -176,7 +176,7 @@ async fn build_agent_for_request(
     req_headers: &HashMap<String, String>,
     additional_tools: Vec<Box<dyn aura::ToolDyn>>,
     client_tools: Option<&[ClientToolDefinition]>,
-    request_id: String,
+    run_id: aura::RunId,
     session_id: String,
 ) -> Result<Arc<aura::Agent>, PrepareError> {
     let client_tool_defs =
@@ -186,7 +186,7 @@ async fn build_agent_for_request(
             Some(req_headers),
             additional_tools,
             client_tool_defs,
-            Some(request_id),
+            Some(run_id),
             Some(session_id),
         )
         .await
@@ -243,11 +243,12 @@ pub async fn prepare_request(
     // `finish_reason: "tool_calls"` when one fires.
     let has_client_tools = req.tools.is_some();
 
-    // Generate the request id up front so the agent build (single-agent or
-    // orchestration) shares one value with the completion stream. The HITL gate
-    // and approval events stamp this id; previously it was minted later in
-    // `build_completion_config`, after the agent was already built.
-    let request_id = format!("req_{}", Uuid::new_v4().simple());
+    // The run's id, minted before the agent build (single-agent or
+    // orchestration) so the build and the completion stream share one value.
+    // Its string form is the request id every request-keyed registry reads:
+    // the HITL gate's approvals, their sweep, and MCP cancellation.
+    let run_id = aura::RunId::mint();
+    let request_id = run_id.to_string();
 
     // Find the matching config: single-config passthrough > explicit model > DEFAULT_AGENT
     // Single-config servers accept any model field value (clients like LibreChat always send one).
@@ -323,7 +324,7 @@ pub async fn prepare_request(
                     Some(req_headers_map),
                     Some(chat_session_id.to_string()),
                     client_tools_vec.clone(),
-                    Some(request_id.clone()),
+                    Some(run_id),
                     run_tools,
                 )
                 .await
@@ -351,7 +352,7 @@ pub async fn prepare_request(
                 req_headers_map,
                 additional_tools,
                 client_tools,
-                request_id.clone(),
+                run_id,
                 chat_session_id.to_string(),
             )
             .await?;

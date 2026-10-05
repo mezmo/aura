@@ -1449,7 +1449,7 @@ mod tests {
             session_id: None,
         };
 
-        let request_id = format!("req_w2_{}", uuid::Uuid::new_v4().simple());
+        let this_run = aura_events::RunId::mint();
 
         let gate = Arc::new(HitlApprovalWrapper::new(
             Arc::from(["kubectl_*".into()]),
@@ -1460,7 +1460,7 @@ mod tests {
         ));
         // `WrappedTool` runs `pre_call` in its own task, which no scope
         // crosses, so the gate is bound the way `stream` binds it.
-        let (run, mut rx) = crate::run_context::RunContext::channel(request_id.as_str());
+        let (run, mut rx) = crate::run_context::RunContext::channel(this_run);
         gate.bind_run(run);
         let gate: Arc<dyn ToolWrapper> = gate;
         let persistence: Arc<dyn ToolWrapper> = Arc::new(test_wrapper(Arc::new(Mutex::new(

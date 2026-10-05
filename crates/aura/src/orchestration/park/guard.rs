@@ -144,8 +144,8 @@ mod tests {
     async fn unpublished_guard_drop_cancels_run_approvals() {
         let (registry, store) = registry_with_store();
         let run_id: RunId = "0191e8c0-2222-7000-8000-000000000042".parse().unwrap();
-        let request_id = format!("req_guard_{}", uuid::Uuid::new_v4().simple());
-        let (run, mut events) = crate::run_context::RunContext::channel(request_id.as_str());
+        let this_run = aura_events::RunId::mint();
+        let (run, mut events) = crate::run_context::RunContext::channel(this_run);
 
         let scope = worker_scope(run_id);
         let decision_id = DecisionId::generate();

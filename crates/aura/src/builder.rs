@@ -17,6 +17,7 @@ use crate::{
     vector_dynamic::DynamicVectorSearchTool,
     vector_store::VectorStoreManager,
 };
+use aura_events::RunId;
 use aura_events::agent::AgentEvent;
 use futures::StreamExt;
 use rig::client::CompletionClient;
@@ -210,7 +211,7 @@ impl std::fmt::Debug for PreparedAgent {
 impl std::fmt::Debug for Agent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Agent")
-            .field("request_id", &self.request_id())
+            .field("run_id", &self.run_id())
             .field("prepared", &self.prepared)
             .finish()
     }
@@ -967,8 +968,8 @@ impl PreparedAgent {
         &self.forwarded_headers
     }
 
-    /// Begin a run of this agent for the request `request_id`, whose headers
-    /// are `req_headers`.
+    /// Begin the run `run_id` of this agent, for a request whose headers are
+    /// `req_headers`.
     ///
     /// The run is a [`RunContext`] of its own, on a token of its own, with a
     /// fresh scratchpad budget and turn-limit counters starting from what
@@ -982,7 +983,7 @@ impl PreparedAgent {
     /// calls as someone else. Prepare an agent for it instead.
     pub fn begin_run(
         self: &Arc<Self>,
-        request_id: impl Into<String>,
+        run_id: RunId,
         req_headers: Option<&HashMap<String, String>>,
         skill_recorder: Option<Arc<SkillInvocationRecorder>>,
     ) -> Result<Agent, BeginRunError> {
@@ -992,7 +993,7 @@ impl PreparedAgent {
             });
         }
         let (run, events) = RunContext::channel_for_agent(
-            request_id.into(),
+            run_id,
             CancellationToken::new(),
             self.scratchpad_budget.as_ref().map(ContextBudget::fresh),
             self.turn_nudge.as_ref().map(|seed| seed.fresh()),
@@ -1039,7 +1040,7 @@ impl PreparedAgent {
             let mut active = self.active.lock().unwrap_or_else(PoisonError::into_inner);
             if let Some(alive) = active.upgrade() {
                 return Err(RunInProgress {
-                    active: alive.run().id().to_string(),
+                    active: alive.run().id(),
                 });
             }
             let lease = Arc::new(RunLease::new(Arc::clone(&run)));
@@ -1536,7 +1537,7 @@ impl Agent {
     /// Prepare an agent from configuration and begin its single run.
     ///
     /// The run is for the request `config` was resolved for: its id is
-    /// `config.request_id` (empty when unset), its headers are the ones
+    /// `config.run_id` (a fresh one when unset), its headers are the ones
     /// `config.forwarded_headers` recorded, and `config.skill_recorder`
     /// records its skill-tool invocations. See [`PreparedAgent::prepare`] for
     /// `additional_tools` and `client_tools`; callers that want to reuse the
@@ -1551,7 +1552,7 @@ impl Agent {
             Arc::new(PreparedAgent::prepare(config, additional_tools, client_tools).await?);
         let req_headers = config.forwarded_headers.as_request();
         Ok(prepared.begin_run(
-            config.request_id.clone().unwrap_or_default(),
+            config.run_id.unwrap_or_else(RunId::mint),
             Some(&req_headers),
             config.skill_recorder.clone(),
         )?)
@@ -1562,8 +1563,8 @@ impl Agent {
         self.lease.run()
     }
 
-    /// Request id of this run.
-    pub fn request_id(&self) -> &str {
+    /// This run's id.
+    pub fn run_id(&self) -> RunId {
         self.lease.run().id()
     }
 
@@ -1994,7 +1995,7 @@ impl StreamingAgent for Agent {
         // The run began at `begin_run`, so its context is what this streams
         // under; the id is the run's.
         let run = Arc::clone(self.lease.run());
-        if request_id != run.id().as_ref() {
+        if run.id().to_string() != request_id {
             tracing::debug!(
                 run_id = %run.id(),
                 request_id,
@@ -2613,9 +2614,10 @@ mod tests {
         /// one `add_mcp_tool` stamped, carried through `pre_call`.
         #[tokio::test]
         async fn a_namespace_scoped_pattern_gates_a_tool_from_that_server() {
-            let request_id = "req_ns_gating_match";
             let server = RecordingMcpServer::start().await;
-            let (run, mut rx) = crate::run_context::RunContext::channel(request_id);
+            let (run, mut rx) = crate::run_context::RunContext::channel(
+                crate::run_context::named_run_id("req_ns_gating_match"),
+            );
             let agent = compose_gated_agent(&server, "github:*", "github", "list_repos", run).await;
 
             // The parked approval expires unanswered; the call's own outcome is
@@ -2645,9 +2647,10 @@ mod tests {
         /// namespace were ignored and the bare name alone matched.
         #[tokio::test]
         async fn a_namespace_scoped_pattern_ignores_a_tool_from_another_server() {
-            let request_id = "req_ns_gating_miss";
             let server = RecordingMcpServer::start().await;
-            let (run, mut rx) = crate::run_context::RunContext::channel(request_id);
+            let (run, mut rx) = crate::run_context::RunContext::channel(
+                crate::run_context::named_run_id("req_ns_gating_miss"),
+            );
             let agent = compose_gated_agent(&server, "github:*", "k8s", "list_repos", run).await;
 
             agent
@@ -3132,7 +3135,9 @@ mod tests {
                 prepared: &Arc<PreparedAgent>,
                 request_id: &str,
             ) -> (Agent, tokio::task::JoinHandle<()>) {
-                let agent = prepared.begin_run(request_id, None, None).unwrap();
+                let agent = prepared
+                    .begin_run(crate::run_context::named_run_id(request_id), None, None)
+                    .unwrap();
                 let mut events = agent.events.lock().unwrap().take().unwrap();
                 let call = tokio::spawn({
                     let prepared = Arc::clone(prepared);
@@ -3158,7 +3163,7 @@ mod tests {
             };
 
             let (first, call) = park(&prepared, "req_a").await;
-            registry.cancel_request_local("req_a");
+            registry.cancel_request_local(&crate::run_context::named_run_id("req_a").to_string());
             assert!(
                 released(call).await,
                 "ending req_a releases the approval it parked"
@@ -3166,13 +3171,13 @@ mod tests {
             drop(first);
 
             let (_second, call) = park(&prepared, "req_b").await;
-            registry.cancel_request_local("req_a");
+            registry.cancel_request_local(&crate::run_context::named_run_id("req_a").to_string());
             tokio::time::sleep(Duration::from_millis(100)).await;
             assert!(
                 !call.is_finished(),
                 "ending req_a leaves req_b's approval parked"
             );
-            registry.cancel_request_local("req_b");
+            registry.cancel_request_local(&crate::run_context::named_run_id("req_b").to_string());
             assert!(
                 released(call).await,
                 "ending req_b releases the approval it parked"
@@ -3187,22 +3192,22 @@ mod tests {
         async fn a_prepared_agent_serves_one_run_at_a_time() {
             let prepared = prepared();
             let first = prepared
-                .begin_run("req_a", None, None)
+                .begin_run(crate::run_context::named_run_id("req_a"), None, None)
                 .expect("a fresh agent has no run");
 
             let refused = prepared
-                .begin_run("req_b", None, None)
+                .begin_run(crate::run_context::named_run_id("req_b"), None, None)
                 .expect_err("the slot is taken");
             assert!(
-                matches!(refused, BeginRunError::RunInProgress(RunInProgress { ref active }) if active == "req_a"),
+                matches!(refused, BeginRunError::RunInProgress(RunInProgress { ref active }) if *active == crate::run_context::named_run_id("req_a")),
                 "got: {refused:?}",
             );
 
             drop(first);
             let second = prepared
-                .begin_run("req_b", None, None)
+                .begin_run(crate::run_context::named_run_id("req_b"), None, None)
                 .expect("the slot is free again");
-            assert_eq!(second.request_id(), "req_b");
+            assert_eq!(second.run_id(), crate::run_context::named_run_id("req_b"));
         }
 
         /// Each run starts from the prepared seeds, and the slot the tools
@@ -3212,14 +3217,12 @@ mod tests {
             let prepared = prepared();
             let seed = prepared.scratchpad_budget.as_ref().unwrap();
 
-            let first = prepared.begin_run("req_a", None, None).unwrap();
+            let first = prepared
+                .begin_run(crate::run_context::named_run_id("req_a"), None, None)
+                .unwrap();
             assert_eq!(
-                prepared
-                    .run
-                    .get()
-                    .map(|run| run.id().to_string())
-                    .as_deref(),
-                Some("req_a")
+                prepared.run.get().map(|run| run.id()),
+                Some(crate::run_context::named_run_id("req_a"))
             );
             prepared
                 .run
@@ -3241,14 +3244,12 @@ mod tests {
 
             drop(first);
 
-            let second = prepared.begin_run("req_b", None, None).unwrap();
+            let second = prepared
+                .begin_run(crate::run_context::named_run_id("req_b"), None, None)
+                .unwrap();
             assert_eq!(
-                prepared
-                    .run
-                    .get()
-                    .map(|run| run.id().to_string())
-                    .as_deref(),
-                Some("req_b")
+                prepared.run.get().map(|run| run.id()),
+                Some(crate::run_context::named_run_id("req_b"))
             );
             assert_eq!(
                 second.scratchpad_budget().unwrap().scratchpad_usage().0,
@@ -3274,21 +3275,34 @@ mod tests {
             ));
 
             let refused = prepared
-                .begin_run("req_bob", Some(&token("bob")), None)
+                .begin_run(
+                    crate::run_context::named_run_id("req_bob"),
+                    Some(&token("bob")),
+                    None,
+                )
                 .expect_err("bob's token is not alice's");
             assert!(
                 matches!(refused, BeginRunError::ForwardedHeaderDiffers { ref header } if header == "x-user-token"),
                 "got: {refused:?}",
             );
             assert!(
-                prepared.begin_run("req_none", None, None).is_err(),
+                prepared
+                    .begin_run(crate::run_context::named_run_id("req_none"), None, None)
+                    .is_err(),
                 "a request carrying no token is not alice's either",
             );
 
             let served = prepared
-                .begin_run("req_alice", Some(&token("alice")), None)
+                .begin_run(
+                    crate::run_context::named_run_id("req_alice"),
+                    Some(&token("alice")),
+                    None,
+                )
                 .expect("the same credentials are served");
-            assert_eq!(served.request_id(), "req_alice");
+            assert_eq!(
+                served.run_id(),
+                crate::run_context::named_run_id("req_alice")
+            );
         }
 
         /// A stream still driving tools after its `Agent` is dropped keeps
@@ -3296,24 +3310,26 @@ mod tests {
         #[tokio::test]
         async fn a_live_stream_keeps_the_run_bound_after_the_agent_drops() {
             let prepared = prepared();
-            let agent = prepared.begin_run("req_a", None, None).unwrap();
+            let agent = prepared
+                .begin_run(crate::run_context::named_run_id("req_a"), None, None)
+                .unwrap();
             let stream = agent.stream_prompt("hello").await;
             drop(agent);
 
             assert_eq!(
-                prepared
-                    .run
-                    .get()
-                    .map(|run| run.id().to_string())
-                    .as_deref(),
-                Some("req_a"),
+                prepared.run.get().map(|run| run.id()),
+                Some(crate::run_context::named_run_id("req_a")),
                 "the stream holds the run",
             );
-            assert!(prepared.begin_run("req_b", None, None).is_err());
+            assert!(
+                prepared
+                    .begin_run(crate::run_context::named_run_id("req_b"), None, None)
+                    .is_err()
+            );
 
             drop(stream);
             prepared
-                .begin_run("req_b", None, None)
+                .begin_run(crate::run_context::named_run_id("req_b"), None, None)
                 .expect("the slot frees with the stream");
         }
     }

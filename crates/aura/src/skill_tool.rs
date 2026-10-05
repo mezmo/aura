@@ -877,8 +877,14 @@ mod tests {
                 log.clone(),
                 anchor,
             ));
-            RunContext::channel_for_agent(id, CancellationToken::new(), None, None, Some(recorder))
-                .0
+            RunContext::channel_for_agent(
+                crate::run_context::named_run_id(id),
+                CancellationToken::new(),
+                None,
+                None,
+                Some(recorder),
+            )
+            .0
         };
         let load = |name: &str| LoadSkillArgs {
             name: name.to_string(),

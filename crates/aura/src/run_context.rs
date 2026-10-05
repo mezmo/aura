@@ -21,7 +21,7 @@ use futures::Stream;
 use aura_events::agent::AgentEvent;
 use tokio::sync::mpsc;
 
-use aura_events::ToolCallId;
+use aura_events::{RunId, ToolCallId};
 
 use crate::scratchpad::ContextBudget;
 use crate::skill_tool::SkillInvocationRecorder;
@@ -33,7 +33,7 @@ pub const EVENT_CHANNEL_CAPACITY: usize = 1024;
 /// One run — what its own work needs to correlate, where its events go, and
 /// the state an agent's tools keep for it.
 pub struct RunContext {
-    id: Arc<str>,
+    id: RunId,
     tool_calls: Mutex<VecDeque<ToolCallId>>,
     events: mpsc::Sender<AgentEvent>,
     cancel: CancellationToken,
@@ -50,7 +50,7 @@ const MAX_PENDING_TOOL_CALLS: usize = 256;
 
 impl RunContext {
     /// A run and the receiver its observer reads, on a token of its own.
-    pub fn channel(id: impl Into<Arc<str>>) -> (Arc<Self>, mpsc::Receiver<AgentEvent>) {
+    pub fn channel(id: RunId) -> (Arc<Self>, mpsc::Receiver<AgentEvent>) {
         Self::channel_on(id, CancellationToken::new())
     }
 
@@ -58,7 +58,7 @@ impl RunContext {
     /// to stop on — a child of its own caller's, so one run ending leaves the
     /// others alone.
     pub fn channel_on(
-        id: impl Into<Arc<str>>,
+        id: RunId,
         cancel: CancellationToken,
     ) -> (Arc<Self>, mpsc::Receiver<AgentEvent>) {
         Self::channel_for_agent(id, cancel, None, None, None)
@@ -67,7 +67,7 @@ impl RunContext {
     /// A run on `cancel` carrying the state a prepared agent's tools keep for
     /// it, and the receiver its observer reads.
     pub fn channel_for_agent(
-        id: impl Into<Arc<str>>,
+        id: RunId,
         cancel: CancellationToken,
         scratchpad_budget: Option<ContextBudget>,
         turn_nudge: Option<Arc<TurnNudgeState>>,
@@ -75,7 +75,7 @@ impl RunContext {
     ) -> (Arc<Self>, mpsc::Receiver<AgentEvent>) {
         let (events, receiver) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
         let run = Arc::new(Self {
-            id: id.into(),
+            id,
             tool_calls: Mutex::new(VecDeque::new()),
             events,
             cancel,
@@ -97,7 +97,7 @@ impl RunContext {
         skill_recorder: Option<Arc<SkillInvocationRecorder>>,
     ) -> Arc<Self> {
         Arc::new(Self {
-            id: Arc::clone(&parent.id),
+            id: parent.id,
             tool_calls: Mutex::new(VecDeque::new()),
             events: parent.events.clone(),
             cancel: parent.cancel.clone(),
@@ -111,14 +111,14 @@ impl RunContext {
     /// reading what it emits. Production names a run it can reach an observer
     /// through, or names none.
     #[cfg(test)]
-    pub fn detached(id: impl Into<Arc<str>>) -> Arc<Self> {
+    pub fn detached(id: RunId) -> Arc<Self> {
         Self::channel(id).0
     }
 
     /// [`detached`](Self::detached), carrying tool state.
     #[cfg(test)]
     pub(crate) fn detached_with(
-        id: impl Into<Arc<str>>,
+        id: RunId,
         scratchpad_budget: Option<ContextBudget>,
         turn_nudge: Option<Arc<TurnNudgeState>>,
     ) -> Arc<Self> {
@@ -163,8 +163,13 @@ impl RunContext {
         delivered
     }
 
-    pub fn id(&self) -> &Arc<str> {
-        &self.id
+    pub fn id(&self) -> RunId {
+        self.id
+    }
+
+    /// Whether `id` names this run. A string that is not a run id names none.
+    pub fn has_id(&self, id: &str) -> bool {
+        id.parse::<RunId>().is_ok_and(|parsed| parsed == self.id)
     }
 
     /// The token that cancels this run.
@@ -273,13 +278,17 @@ impl BoundRun {
     /// A slot holding an unobserved run that carries only `budget`.
     #[cfg(test)]
     pub(crate) fn pinned_budget(budget: ContextBudget) -> Self {
-        Self::holding(RunContext::detached_with("pinned", Some(budget), None))
+        Self::holding(RunContext::detached_with(RunId::mint(), Some(budget), None))
     }
 
     /// A slot holding an unobserved run that carries only `turn_nudge`.
     #[cfg(test)]
     pub(crate) fn pinned_nudge(turn_nudge: Arc<TurnNudgeState>) -> Self {
-        Self::holding(RunContext::detached_with("pinned", None, Some(turn_nudge)))
+        Self::holding(RunContext::detached_with(
+            RunId::mint(),
+            None,
+            Some(turn_nudge),
+        ))
     }
 }
 
@@ -308,10 +317,10 @@ impl RunLease {
 
 /// A prepared agent was asked to begin a run while it still serves another.
 #[derive(Debug, thiserror::Error)]
-#[error("prepared agent already serves request `{active}`; it runs one request at a time")]
+#[error("prepared agent already serves run `{active}`; it serves one run at a time")]
 pub struct RunInProgress {
     /// Id of the run holding the agent.
-    pub active: String,
+    pub active: RunId,
 }
 
 tokio::task_local! {
@@ -341,8 +350,8 @@ pub fn current_run() -> Option<Arc<RunContext>> {
     RUN.try_with(Arc::clone).ok()
 }
 
-pub fn current_run_id() -> Option<Arc<str>> {
-    RUN.try_with(|run| Arc::clone(run.id())).ok()
+pub fn current_run_id() -> Option<RunId> {
+    RUN.try_with(|run| run.id()).ok()
 }
 
 /// Runs `f` with `run` in scope. Task-locals do not cross `tokio::spawn`, so
@@ -377,8 +386,8 @@ impl<S: Stream + Unpin> Stream for ScopedStream<S> {
 /// Runs `f` with a fresh run in scope and returns what it emitted, for a test
 /// that asserts on a run's events without standing up an observer.
 #[cfg(test)]
-pub(crate) async fn observing<F: Future>(id: &str, f: F) -> (F::Output, Vec<AgentEvent>) {
-    let (run, mut events) = RunContext::channel(id);
+pub(crate) async fn observing<F: Future>(name: &str, f: F) -> (F::Output, Vec<AgentEvent>) {
+    let (run, mut events) = RunContext::channel(named_run_id(name));
     let out = with_run(run, f).await;
 
     let mut seen = Vec::new();
@@ -388,22 +397,33 @@ pub(crate) async fn observing<F: Future>(id: &str, f: F) -> (F::Output, Vec<Agen
     (out, seen)
 }
 
+/// The same run id for the same `name` every time, so a test can name a run
+/// and compare against that name later.
+#[cfg(test)]
+pub(crate) fn named_run_id(name: &str) -> RunId {
+    RunId::try_from(uuid::Uuid::new_v5(
+        &uuid::Uuid::NAMESPACE_OID,
+        name.as_bytes(),
+    ))
+    .expect("a v5 UUID is never nil")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use futures::StreamExt;
 
-    fn run(id: &str) -> Arc<RunContext> {
-        RunContext::detached(id)
+    fn run(name: &str) -> Arc<RunContext> {
+        RunContext::detached(named_run_id(name))
     }
 
     #[tokio::test]
     async fn a_scope_established_inside_a_spawn_holds() {
-        let (run, _rx) = RunContext::channel("spawned");
+        let (run, _rx) = RunContext::channel(named_run_id("spawned"));
         let seen = tokio::spawn(with_run(run, async { current_run_id() }))
             .await
             .unwrap();
-        assert_eq!(seen.as_deref(), Some("spawned"));
+        assert_eq!(seen, Some(named_run_id("spawned")));
     }
 
     /// A run built on the caller's token stops when the caller does. The work
@@ -413,7 +433,7 @@ mod tests {
     #[tokio::test]
     async fn a_run_stops_on_the_token_it_was_built_on() {
         let caller = CancellationToken::new();
-        let (run, _events) = RunContext::channel_on("run_on_token", caller.clone());
+        let (run, _events) = RunContext::channel_on(named_run_id("run_on_token"), caller.clone());
         assert!(!run.cancel_token().is_cancelled());
 
         caller.cancel();
@@ -424,8 +444,8 @@ mod tests {
     /// cancels something else.
     #[tokio::test]
     async fn a_run_given_no_token_has_its_own() {
-        let (a, _ea) = RunContext::channel("run_a");
-        let (b, _eb) = RunContext::channel("run_b");
+        let (a, _ea) = RunContext::channel(named_run_id("run_a"));
+        let (b, _eb) = RunContext::channel(named_run_id("run_b"));
 
         a.cancel_token().cancel();
         assert!(a.cancel_token().is_cancelled());
@@ -444,7 +464,7 @@ mod tests {
     #[tokio::test]
     async fn a_scope_supplies_the_run() {
         let seen = with_run(run("run_1"), async { current_run_id() }).await;
-        assert_eq!(seen.as_deref(), Some("run_1"));
+        assert_eq!(seen, Some(named_run_id("run_1")));
     }
 
     #[tokio::test]
@@ -458,8 +478,8 @@ mod tests {
             current_run_id()
         }));
 
-        assert_eq!(a.await.unwrap().as_deref(), Some("run_a"));
-        assert_eq!(b.await.unwrap().as_deref(), Some("run_b"));
+        assert_eq!(a.await.unwrap(), Some(named_run_id("run_a")));
+        assert_eq!(b.await.unwrap(), Some(named_run_id("run_b")));
     }
 
     #[tokio::test]
@@ -467,10 +487,7 @@ mod tests {
         let inner = futures::stream::iter(0..3).map(|_| current_run_id());
         let seen: Vec<_> = scope_stream(run("run_s"), inner).collect().await;
 
-        assert_eq!(
-            seen.iter().map(|id| id.as_deref()).collect::<Vec<_>>(),
-            vec![Some("run_s"); 3]
-        );
+        assert_eq!(seen, vec![Some(named_run_id("run_s")); 3]);
     }
 
     /// Orchestration drives workers with `FuturesUnordered` inside the run's
@@ -496,10 +513,7 @@ mod tests {
         })
         .await;
 
-        assert_eq!(
-            seen.iter().map(|id| id.as_deref()).collect::<Vec<_>>(),
-            vec![Some("run_w"); 3]
-        );
+        assert_eq!(seen, vec![Some(named_run_id("run_w")); 3]);
     }
 
     /// A spawned task does not inherit its parent's scope, which is why every
@@ -534,12 +548,12 @@ mod tests {
         let nudge = TurnNudgeState::new(true, None, 2).unwrap();
         let slot = BoundRun::default();
         slot.bind(RunContext::detached_with(
-            "req_a",
+            named_run_id("req_a"),
             Some(budget.clone()),
             Some(Arc::clone(&nudge)),
         ));
 
-        assert_eq!(slot.id_or_empty(), "req_a");
+        assert_eq!(slot.id_or_empty(), named_run_id("req_a").to_string());
         slot.scratchpad_budget().unwrap().record_intercepted(7);
         assert_eq!(
             budget.scratchpad_usage().0,
@@ -548,8 +562,8 @@ mod tests {
         );
         assert!(Arc::ptr_eq(&slot.turn_nudge().unwrap(), &nudge));
 
-        slot.bind(RunContext::detached("req_b"));
-        assert_eq!(slot.id_or_empty(), "req_b");
+        slot.bind(RunContext::detached(named_run_id("req_b")));
+        assert_eq!(slot.id_or_empty(), named_run_id("req_b").to_string());
         assert!(slot.scratchpad_budget().is_none());
     }
 
@@ -557,11 +571,11 @@ mod tests {
     /// cancellation see it, with the worker's own tool state.
     #[tokio::test]
     async fn a_child_shares_its_parents_identity_and_keeps_its_own_state() {
-        let (parent, mut events) = RunContext::channel("req_parent");
+        let (parent, mut events) = RunContext::channel(named_run_id("req_parent"));
         let nudge = TurnNudgeState::new(true, None, 2).unwrap();
         let child = RunContext::child(&parent, None, Some(Arc::clone(&nudge)), None);
 
-        assert_eq!(child.id().as_ref(), "req_parent");
+        assert_eq!(child.id(), parent.id());
         assert!(Arc::ptr_eq(child.turn_nudge().unwrap(), &nudge));
         assert!(parent.turn_nudge().is_none(), "the parent keeps none of it");
 

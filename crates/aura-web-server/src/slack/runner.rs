@@ -264,7 +264,16 @@ impl SlackIngress {
     /// hold the bot turn that earned it. A conversation read here is
     /// checked here.
     async fn answer(&self, inbound: Inbound, prefetched: Option<Vec<SlackMessage>>) {
-        let request_id = format!("slack_{}_{}", inbound.channel, inbound.ts);
+        // The run's id, and in string form the request id everything
+        // request-keyed reads. The message it answers is logged beside it.
+        let run_id = aura::RunId::mint();
+        let request_id = run_id.to_string();
+        debug!(
+            request_id,
+            channel = %inbound.channel,
+            ts = %inbound.ts,
+            "slack message starts its run"
+        );
         let earlier = match prefetched {
             Some(earlier) => earlier,
             None => {
@@ -291,7 +300,7 @@ impl SlackIngress {
             warn!(request_id, error = %e, "could not react to slack message");
         }
 
-        let reply = match self.run_agent(&inbound, &earlier, &request_id).await {
+        let reply = match self.run_agent(&inbound, &earlier, run_id).await {
             Ok(text) if text.trim().is_empty() => EMPTY_REPLY.to_owned(),
             Ok(text) => text,
             // The server is going down; a reply would race the shutdown and
@@ -344,8 +353,10 @@ impl SlackIngress {
         &self,
         inbound: &Inbound,
         earlier: &[SlackMessage],
-        request_id: &str,
+        run_id: aura::RunId,
     ) -> Result<String, RunError> {
+        let request_id = run_id.to_string();
+        let request_id = request_id.as_str();
         let history = thread_history(earlier, &self.identity, &inbound.ts);
         let session_id = match inbound.reply_thread() {
             Some(thread) => format!("slack:{}:{thread}", inbound.channel),
@@ -359,13 +370,7 @@ impl SlackIngress {
         );
         let agent = RigBuilder::new(config, self.state.pending_approvals.clone())
             .with_hitl_hmac(self.state.hitl_webhook_hmac.clone())
-            .build_streaming_agent_with_tools(
-                None,
-                Some(session_id),
-                None,
-                Some(request_id.to_owned()),
-                tools,
-            )
+            .build_streaming_agent_with_tools(None, Some(session_id), None, Some(run_id), tools)
             .await
             .map_err(|e| RunError::Build(e.to_string()))?;
 

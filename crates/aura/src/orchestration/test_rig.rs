@@ -742,7 +742,7 @@ pub(crate) async fn park_orchestrator_in(
         }),
         memory_dir: Some(memory_dir.to_string_lossy().into_owned()),
         session_id: Some("park-sess".to_string()),
-        request_id: Some(format!("req_rig_{}", uuid::Uuid::new_v4().simple())),
+        run_id: Some(aura_events::RunId::mint()),
         orchestration: Some(super::OrchestrationConfig {
             enabled: true,
             workers,

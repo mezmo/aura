@@ -334,7 +334,7 @@ mod tests {
         route: &Arc<DecisionRoute>,
         args: RequestApprovalArgs,
     ) -> ApprovalItem {
-        let request_id = format!("req_w2_{}", uuid::Uuid::new_v4().simple());
+        let run_id = aura_events::RunId::mint();
         let tool = RequestApprovalTool::new(
             route.clone(),
             AgentScope::Single { session_id: None },
@@ -343,7 +343,7 @@ mod tests {
         );
 
         // The scope goes inside the spawn, because task-locals do not cross one.
-        let (run, mut rx) = crate::run_context::RunContext::channel(request_id.as_str());
+        let (run, mut rx) = crate::run_context::RunContext::channel(run_id);
         let call_handle: tokio::task::JoinHandle<Result<String, ToolError>> =
             tokio::spawn(crate::run_context::with_run(run, async move {
                 tool.call(args).await
@@ -499,8 +499,8 @@ mod tests {
                 timeout: std::time::Duration::from_secs(60),
             });
 
-            let request_id = format!("req_tool_span_{}", uuid::Uuid::new_v4().simple());
-            let (run, mut events) = crate::run_context::RunContext::channel(request_id.as_str());
+            let run_id = aura_events::RunId::mint();
+            let (run, mut events) = crate::run_context::RunContext::channel(run_id);
             let tool = RequestApprovalTool::new(
                 route,
                 AgentScope::Single { session_id: None },
