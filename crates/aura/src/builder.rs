@@ -1791,7 +1791,7 @@ pub async fn build_streaming_agent(
     build_streaming_agent_with_tools(config, client_tools, no_run_tools()).await
 }
 
-/// Builds the rig tools that exist for one run.
+/// A factory for the rig tools that exist for one run.
 pub type RunToolFactory = Arc<dyn Fn() -> Vec<Box<dyn rig::tool::ToolDyn>> + Send + Sync>;
 
 /// A factory that yields no tools.
