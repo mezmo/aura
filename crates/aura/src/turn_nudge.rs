@@ -451,7 +451,7 @@ mod tests {
 
         let first_nudge = seed.fresh();
         slot.bind(RunContext::detached_with(
-            "req_a",
+            crate::run_context::named_run_id("req_a"),
             None,
             Some(Arc::clone(&first_nudge)),
         ));
@@ -464,7 +464,11 @@ mod tests {
             "the first run is on its penultimate turn",
         );
 
-        slot.bind(RunContext::detached_with("req_b", None, Some(seed.fresh())));
+        slot.bind(RunContext::detached_with(
+            crate::run_context::named_run_id("req_b"),
+            None,
+            Some(seed.fresh()),
+        ));
         assert_eq!(
             tool.call("hello".to_string()).await.unwrap(),
             "hello",
