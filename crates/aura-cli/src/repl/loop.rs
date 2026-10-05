@@ -1235,6 +1235,21 @@ pub fn run_repl(
                         })
                         .flatten();
                     if let Some(park) = parked_run {
+                        // The reattach wait is a waiting state, not a
+                        // thinking state: collapse any wave still live from
+                        // the parked stream so the wait's prints never
+                        // orphan "Thinking" rows into scrollback.
+                        if let Ok(mut guard) = post_tool_wave.lock()
+                            && let Some((ptw_anim, _)) = guard.take()
+                        {
+                            ptw_anim.finish();
+                        }
+                        if !anim_cleared.load(Ordering::Relaxed) {
+                            if let Some(a) = anim.take() {
+                                a.finish();
+                            }
+                            anim_cleared.store(true, Ordering::Relaxed);
+                        }
                         let (text, user_released) = drive_reattach(
                             rt,
                             backend,
@@ -4043,6 +4058,17 @@ fn wait_out(
     WaitOut::Slept
 }
 
+/// The render signature for a blocking gate: one (decision_id, expires_at)
+/// pair per outstanding call, in wire order. The reattach driver re-renders
+/// the gate only when this changes, so the poll cadence never reprints an
+/// unchanged gate.
+fn gate_signature(blocking: &[crate::api::resume::BlockingCall]) -> Vec<(String, String)> {
+    blocking
+        .iter()
+        .map(|c| (c.decision_id.clone(), c.expires_at.clone()))
+        .collect()
+}
+
 /// Render a retryable `parked` row's outstanding calls as a gate — a
 /// state, not an error: the run advanced and waits again.
 fn render_blocking_gate(
@@ -4115,6 +4141,10 @@ pub(crate) fn drive_reattach(
     let mut park = park;
     let mut schedule = ReattachSchedule::new();
     let mut partial = String::new();
+    // The gate renders on change only: the poll cadence (1s growing to 5s)
+    // makes per-tick re-renders pure scrollback noise — explicit once,
+    // quiet until the blocking set moves.
+    let mut last_gate_sig: Option<Vec<(String, String)>> = None;
 
     let end = loop {
         if let Some(cap) = cap
@@ -4160,7 +4190,11 @@ pub(crate) fn drive_reattach(
                 None => break ReattachEnd::TransientBudget,
             },
             Ok(ResumeOutcome::Parked { blocking }) => {
-                render_blocking_gate(&blocking, approval_poster);
+                let sig = gate_signature(&blocking);
+                if last_gate_sig.as_ref() != Some(&sig) {
+                    render_blocking_gate(&blocking, approval_poster);
+                    last_gate_sig = Some(sig);
+                }
                 let delay = retryable_wait(&mut schedule);
                 match wait_out(delay, cancel_flag, cap) {
                     WaitOut::Slept => continue,
@@ -4198,6 +4232,7 @@ pub(crate) fn drive_reattach(
                     park = new_park;
                     cap = crate::repl::reattach::retention_cap_from(&park.retention_expires_at);
                     schedule = ReattachSchedule::new();
+                    last_gate_sig = None;
                     let delay = schedule.next_retryable_delay();
                     match wait_out(delay, cancel_flag, cap) {
                         WaitOut::Slept => continue,
@@ -4276,6 +4311,36 @@ mod tests {
         // listed never fills the reattach slot or bumps the park epoch —
         // the auto-resume after approval/timeout silently never engages.
         assert!(orch_event_prints_scrollback(crate::event_names::RUN_PARKED));
+    }
+
+    #[test]
+    fn gate_signature_changes_only_with_the_blocking_set() {
+        // The reattach driver re-renders the gate only when this signature
+        // changes; per-tick reprints of an unchanged gate are the scrollback
+        // noise this guards against.
+        use crate::api::resume::BlockingCall;
+        let call = |id: &str, expires: &str| BlockingCall {
+            decision_id: id.to_string(),
+            tool: "quick_tool".to_string(),
+            expires_at: expires.to_string(),
+        };
+        let blocking = vec![call("d1", "e1")];
+        assert_eq!(super::gate_signature(&blocking), super::gate_signature(&blocking));
+        assert_ne!(
+            super::gate_signature(&blocking),
+            super::gate_signature(&[call("d1", "e2")]),
+            "a renewed retention deadline re-renders"
+        );
+        assert_ne!(
+            super::gate_signature(&blocking),
+            super::gate_signature(&[call("d2", "e1")]),
+            "a fresh decision re-renders"
+        );
+        assert_ne!(
+            super::gate_signature(&blocking),
+            super::gate_signature(&[call("d1", "e1"), call("d2", "e2")]),
+            "a grown blocking set re-renders"
+        );
     }
 
     #[test]
