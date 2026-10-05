@@ -2128,6 +2128,7 @@ impl Orchestrator {
             steps: vec![super::types::StepInput::LeafTask {
                 task: format!("Execute: {}", truncate_query(query, 100)),
                 worker: None,
+                artifacts: Vec::new(),
             }],
             routing_rationale: "Fallback: all routing attempts failed".to_string(),
             planning_summary: String::new(),
@@ -2170,6 +2171,7 @@ impl Orchestrator {
                     steps: vec![super::types::StepInput::LeafTask {
                         task: format!("Answer the user's query: {}", truncate_query(query, 80)),
                         worker: None,
+                        artifacts: Vec::new(),
                     }],
                     routing_rationale: format!(
                         "Config override (allow_direct_answers=false). Original rationale: {} | Original answer: {}",
@@ -2195,6 +2197,7 @@ impl Orchestrator {
                             truncate_query(query, 80)
                         ),
                         worker: None,
+                        artifacts: Vec::new(),
                     }],
                     routing_rationale: format!(
                         "Config override (allow_clarification=false). Original rationale: {} | Original question: {}",
@@ -3553,35 +3556,40 @@ Assign tasks to the worker whose tools best match the required operations."#,
         let task = plan.tasks.iter().find(|t| t.id == task_id)?;
 
         // Build structured dependency context — compact format to prevent scope creep
+        let mut parts: Vec<String> = task
+            .dependencies
+            .iter()
+            .filter_map(|dep_id| {
+                plan.tasks
+                    .iter()
+                    .find(|t| t.id == *dep_id)
+                    .and_then(|dep_task| match &dep_task.state {
+                        TaskState::Complete { result } => Some(format!(
+                            "{} — Task {} ({}):\n{}",
+                            sections::PRIOR_WORK,
+                            dep_task.id,
+                            dep_task.description,
+                            result
+                        )),
+                        _ => None,
+                    })
+            })
+            .collect();
 
-        if !task.dependencies.is_empty() {
-            let dep_parts: Vec<String> = task
-                .dependencies
-                .iter()
-                .filter_map(|dep_id| {
-                    plan.tasks
-                        .iter()
-                        .find(|t| t.id == *dep_id)
-                        .and_then(|dep_task| match &dep_task.state {
-                            TaskState::Complete { result } => Some(format!(
-                                "{} — Task {} ({}):\n{}",
-                                sections::PRIOR_WORK,
-                                dep_task.id,
-                                dep_task.description,
-                                result
-                            )),
-                            _ => None,
-                        })
-                })
-                .collect();
+        // Artifacts the coordinator attached (validated to exist by create_plan).
+        if !task.artifacts.is_empty() {
+            let list: Vec<String> = task.artifacts.iter().map(|a| format!("- {a}")).collect();
+            parts.push(format!(
+                "{} — load each with `read_artifact` before starting:\n{}",
+                sections::INPUT_ARTIFACTS,
+                list.join("\n")
+            ));
+        }
 
-            if dep_parts.is_empty() {
-                None
-            } else {
-                Some(dep_parts.join(context::DEPENDENCY_SEPARATOR))
-            }
-        } else {
+        if parts.is_empty() {
             None
+        } else {
+            Some(parts.join(context::DEPENDENCY_SEPARATOR))
         }
     }
 
@@ -4448,7 +4456,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         // Recon tools registered unconditionally — the persistent conversation
         // means we can't vary the tool set between calls, and the conversation
         // context guides usage (coordinator won't call list_tools on continuation).
-        let routing_toolset = RoutingToolSet::new();
+        let routing_toolset = RoutingToolSet::new().with_persistence(self.persistence.clone());
         let routing_decision = routing_toolset.decision.clone();
         let AgentWithPreamble {
             agent: coordinator,
@@ -6428,7 +6436,7 @@ mod tests {
                 assert_eq!(goal, "what is the meaning?");
                 assert_eq!(steps.len(), 1);
                 match &steps[0] {
-                    StepInput::LeafTask { task, worker } => {
+                    StepInput::LeafTask { task, worker, .. } => {
                         assert!(task.starts_with("Answer the user's query:"));
                         assert!(task.contains("what is the meaning?"));
                         assert!(worker.is_none());
@@ -6488,6 +6496,7 @@ mod tests {
             steps: vec![StepInput::LeafTask {
                 task: "compute mean of 1,2,3".to_string(),
                 worker: Some("statistics".to_string()),
+                artifacts: Vec::new(),
             }],
             routing_rationale: "needs tool".to_string(),
             planning_summary: "single step".to_string(),
@@ -6531,6 +6540,7 @@ mod tests {
             steps: vec![StepInput::LeafTask {
                 task: "do it".to_string(),
                 worker: None,
+                artifacts: Vec::new(),
             }],
             routing_rationale: "complex".to_string(),
             planning_summary: "A plan to do it".to_string(),
@@ -7387,6 +7397,47 @@ mod tests {
 
         assert!(!has_awaiting_task(&plan));
         assert!(park_verdict_lines(&plan).is_empty());
+    }
+
+    /// Attached artifacts are listed in the worker's context after any
+    /// dependency results, and alone when the task has no dependencies.
+    #[tokio::test]
+    async fn task_context_lists_attached_artifacts() {
+        let orchestrator = Orchestrator::new(crate::config::AgentRuntimeConfig::default())
+            .await
+            .unwrap();
+        let mut plan = Plan::new("Artifacts");
+        let mut first = Task::new(0, "Draft", "r");
+        first.artifacts = vec!["coordinator-brief.md".to_string()];
+        plan.add_task(first);
+        let mut second = Task::new(1, "Review", "r").with_dependency(0);
+        second.artifacts = vec![
+            "coordinator-draft.md".to_string(),
+            "task-0-sre-iter-1-result.txt".to_string(),
+        ];
+        plan.add_task(second);
+        plan.add_task(Task::new(2, "Plain", "r"));
+        plan.get_task_mut(0).unwrap().complete("draft done");
+
+        let first_ctx = orchestrator.build_task_context(&plan, 0).unwrap();
+        assert_eq!(
+            first_ctx,
+            "INPUT ARTIFACTS — load each with `read_artifact` before starting:\n\
+             - coordinator-brief.md"
+        );
+
+        let second_ctx = orchestrator.build_task_context(&plan, 1).unwrap();
+        let completed = second_ctx.find("COMPLETED — Task 0 (Draft):\ndraft done");
+        let artifacts = second_ctx.find(
+            "INPUT ARTIFACTS — load each with `read_artifact` before starting:\n\
+             - coordinator-draft.md\n- task-0-sre-iter-1-result.txt",
+        );
+        assert!(
+            completed.is_some() && artifacts.is_some() && completed < artifacts,
+            "{second_ctx}"
+        );
+
+        assert!(orchestrator.build_task_context(&plan, 2).is_none());
     }
 
     /// The real `execute()` loop parks at quiescence: no worker is dispatched
