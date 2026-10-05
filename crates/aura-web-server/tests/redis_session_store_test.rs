@@ -24,7 +24,8 @@ use aura::SessionId;
 use aura::hitl::{ApprovalDecision, ApprovalOutcome, PendingApprovals, ResolveError};
 use aura::request_cancellation::RequestCancelToken;
 use aura::session_store::{
-    MAX_SKILL_RECORDS_PER_SESSION, ParkedApprovalRecord, SkillInvocation, SkillInvocationRecord,
+    MAX_SKILL_RECORDS_PER_LOG, ParkedApprovalRecord, SkillInvocation, SkillInvocationRecord,
+    SkillLogKey,
 };
 use aura_config::{RedisSessionStoreConfig, SessionStoreBackend};
 use aura_web_server::session_store::{RedisSessionStore, SessionStore};
@@ -1479,6 +1480,16 @@ async fn corrupt_record_is_skipped_from_list() {
 // Skill-invocation store
 // ---------------------------------------------------------------------------
 
+fn skill_log(session_id: &str) -> SkillLogKey {
+    SkillLogKey::new(SessionId::new(session_id), "agent")
+}
+
+/// The Redis key holding `log`, per the store's key schema.
+fn raw_skill_key(key_prefix: &str, log: &SkillLogKey) -> String {
+    let agent = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, log.agent_id.as_bytes());
+    format!("{key_prefix}:skills:{agent}:{}", log.session_id.as_str())
+}
+
 fn skill_record(name: &str, anchor: u32, seq: u32) -> SkillInvocationRecord {
     SkillInvocationRecord {
         version: aura::session_store::SKILL_INVOCATION_RECORD_VERSION,
@@ -1495,7 +1506,7 @@ fn skill_record(name: &str, anchor: u32, seq: u32) -> SkillInvocationRecord {
 #[tokio::test]
 async fn skill_record_list_roundtrip_preserves_record_and_order() {
     let skills = connect(&test_config(60)).await.skills();
-    let session = SessionId::new("sess-1");
+    let log = skill_log("sess-1");
 
     let read_record = SkillInvocationRecord {
         version: aura::session_store::SKILL_INVOCATION_RECORD_VERSION,
@@ -1508,17 +1519,17 @@ async fn skill_record_list_roundtrip_preserves_record_and_order() {
         seq: 0,
         invoked_at: chrono::Utc::now(),
     };
-    skills.record(&session, read_record.clone()).await.unwrap();
+    skills.record(&log, read_record.clone()).await.unwrap();
     skills
-        .record(&session, skill_record("beta", 1, 1))
+        .record(&log, skill_record("beta", 1, 1))
         .await
         .unwrap();
     skills
-        .record(&session, skill_record("alpha", 1, 0))
+        .record(&log, skill_record("alpha", 1, 0))
         .await
         .unwrap();
 
-    let listed = skills.list(&session).await.unwrap();
+    let listed = skills.list(&log).await.unwrap();
     assert_eq!(
         listed
             .iter()
@@ -1537,14 +1548,14 @@ async fn skill_recorded_on_one_instance_is_listed_on_another() {
     let config = test_config(60);
     let instance_a = connect(&config).await.skills();
     let instance_b = connect(&config).await.skills();
-    let session = SessionId::new("sess-cross");
+    let log = skill_log("sess-cross");
 
     instance_a
-        .record(&session, skill_record("alpha", 1, 0))
+        .record(&log, skill_record("alpha", 1, 0))
         .await
         .unwrap();
 
-    let listed = instance_b.list(&session).await.unwrap();
+    let listed = instance_b.list(&log).await.unwrap();
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].invocation.label(), "alpha");
 }
@@ -1554,19 +1565,19 @@ async fn skill_record_is_idempotent_per_invocation_across_instances() {
     let config = test_config(60);
     let instance_a = connect(&config).await.skills();
     let instance_b = connect(&config).await.skills();
-    let session = SessionId::new("sess-dup");
+    let log = skill_log("sess-dup");
 
     instance_a
-        .record(&session, skill_record("alpha", 1, 0))
+        .record(&log, skill_record("alpha", 1, 0))
         .await
         .unwrap();
     // The same invocation re-recorded elsewhere must keep the first position.
     instance_b
-        .record(&session, skill_record("alpha", 9, 4))
+        .record(&log, skill_record("alpha", 9, 4))
         .await
         .unwrap();
 
-    let listed = instance_a.list(&session).await.unwrap();
+    let listed = instance_a.list(&log).await.unwrap();
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].anchor, 1);
 }
@@ -1577,25 +1588,51 @@ async fn skill_sessions_are_isolated_by_prefix_and_session() {
     let config_b = test_config(60);
     let store_a = connect(&config_a).await.skills();
     let store_b = connect(&config_b).await.skills();
-    let session = SessionId::new("sess-iso");
+    let log = skill_log("sess-iso");
 
     store_a
-        .record(&session, skill_record("alpha", 1, 0))
+        .record(&log, skill_record("alpha", 1, 0))
         .await
         .unwrap();
 
     assert!(
-        store_b.list(&session).await.unwrap().is_empty(),
+        store_b.list(&log).await.unwrap().is_empty(),
         "a different deployment prefix must not see the record"
     );
     assert!(
         store_a
-            .list(&SessionId::new("sess-other"))
+            .list(&skill_log("sess-other"))
             .await
             .unwrap()
             .is_empty(),
         "a different session must not see the record"
     );
+}
+
+/// One session id under two agents is two logs: neither agent lists the
+/// other's records, and the same invocation records independently in each.
+#[tokio::test]
+async fn skill_agents_sharing_a_session_are_isolated() {
+    let skills = connect(&test_config(60)).await.skills();
+    let session = SessionId::new("sess-switch");
+    let first = SkillLogKey::new(session.clone(), "agent-a");
+    let second = SkillLogKey::new(session, "agent-b");
+
+    skills
+        .record(&first, skill_record("shared", 1, 0))
+        .await
+        .unwrap();
+    assert!(
+        skills.list(&second).await.unwrap().is_empty(),
+        "another agent in the same session must not see the record"
+    );
+
+    skills
+        .record(&second, skill_record("shared", 5, 0))
+        .await
+        .unwrap();
+    assert_eq!(skills.list(&first).await.unwrap()[0].anchor, 1);
+    assert_eq!(skills.list(&second).await.unwrap()[0].anchor, 5);
 }
 
 #[tokio::test]
@@ -1605,18 +1642,18 @@ async fn skill_records_expire_with_configured_ttl() {
         ..test_config(60)
     };
     let skills = connect(&config).await.skills();
-    let session = SessionId::new("sess-ttl");
+    let log = skill_log("sess-ttl");
 
     skills
-        .record(&session, skill_record("alpha", 1, 0))
+        .record(&log, skill_record("alpha", 1, 0))
         .await
         .unwrap();
-    assert_eq!(skills.list(&session).await.unwrap().len(), 1);
+    assert_eq!(skills.list(&log).await.unwrap().len(), 1);
 
     tokio::time::sleep(Duration::from_millis(1500)).await;
     assert!(
-        skills.list(&session).await.unwrap().is_empty(),
-        "records must expire with the session hash TTL"
+        skills.list(&log).await.unwrap().is_empty(),
+        "records must expire with the log hash TTL"
     );
 }
 
@@ -1624,52 +1661,56 @@ async fn skill_records_expire_with_configured_ttl() {
 async fn corrupt_skill_record_is_skipped_from_list() {
     let config = test_config(60);
     let skills = connect(&config).await.skills();
-    let session = SessionId::new("sess-corrupt");
+    let log = skill_log("sess-corrupt");
     skills
-        .record(&session, skill_record("alpha", 1, 0))
+        .record(&log, skill_record("alpha", 1, 0))
         .await
         .unwrap();
 
     // Plant an entry no instance can deserialize.
     let client = redis::Client::open(redis_url()).unwrap();
     let mut raw = client.get_multiplexed_async_connection().await.unwrap();
+    let key = raw_skill_key(&config.key_prefix, &log);
     redis::pipe()
-        .hset(
-            format!("{}:skills:sess-corrupt", config.key_prefix),
-            "corrupt",
-            "not json",
-        )
+        .hset(&key, "corrupt", "not json")
         .query_async::<()>(&mut raw)
         .await
         .unwrap();
+    // The planted entry shares the store's hash, so the skip below is real.
+    let held: usize = redis::cmd("HLEN")
+        .arg(&key)
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+    assert_eq!(held, 2, "the store's record and the planted entry");
 
-    let listed = skills.list(&session).await.unwrap();
+    let listed = skills.list(&log).await.unwrap();
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].invocation.label(), "alpha");
 }
 
 #[tokio::test]
-async fn skill_store_caps_records_per_session() {
+async fn skill_store_caps_records_per_log() {
     let skills = connect(&test_config(60)).await.skills();
-    let session = SessionId::new("sess-cap");
-    for i in 0..(MAX_SKILL_RECORDS_PER_SESSION + 5) {
+    let log = skill_log("sess-cap");
+    for i in 0..(MAX_SKILL_RECORDS_PER_LOG + 5) {
         skills
-            .record(&session, skill_record(&format!("s{i}"), i as u32, 0))
+            .record(&log, skill_record(&format!("s{i}"), i as u32, 0))
             .await
             .unwrap();
     }
     assert_eq!(
-        skills.list(&session).await.unwrap().len(),
-        MAX_SKILL_RECORDS_PER_SESSION
+        skills.list(&log).await.unwrap().len(),
+        MAX_SKILL_RECORDS_PER_LOG
     );
 
-    // A re-invocation of a key the session already holds is never refused.
+    // A re-invocation of a key the log already holds is never refused.
     skills
-        .record(&session, skill_record("s0", 99, 0))
+        .record(&log, skill_record("s0", 99, 0))
         .await
         .unwrap();
-    let listed = skills.list(&session).await.unwrap();
-    assert_eq!(listed.len(), MAX_SKILL_RECORDS_PER_SESSION);
+    let listed = skills.list(&log).await.unwrap();
+    assert_eq!(listed.len(), MAX_SKILL_RECORDS_PER_LOG);
     assert_eq!(listed[0].anchor, 0, "first write for a key still wins");
 }
 
@@ -1677,9 +1718,9 @@ async fn skill_store_caps_records_per_session() {
 async fn skill_record_on_another_version_is_skipped_from_list() {
     let config = test_config(60);
     let skills = connect(&config).await.skills();
-    let session = SessionId::new("sess-version");
+    let log = skill_log("sess-version");
     skills
-        .record(&session, skill_record("alpha", 1, 0))
+        .record(&log, skill_record("alpha", 1, 0))
         .await
         .unwrap();
 
@@ -1692,7 +1733,7 @@ async fn skill_record_on_another_version_is_skipped_from_list() {
     let mut raw = client.get_multiplexed_async_connection().await.unwrap();
     redis::pipe()
         .hset(
-            format!("{}:skills:sess-version", config.key_prefix),
+            raw_skill_key(&config.key_prefix, &log),
             "load_skill:beta",
             foreign.to_string(),
         )
@@ -1700,7 +1741,7 @@ async fn skill_record_on_another_version_is_skipped_from_list() {
         .await
         .unwrap();
 
-    let listed = skills.list(&session).await.unwrap();
+    let listed = skills.list(&log).await.unwrap();
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].invocation.label(), "alpha");
 }

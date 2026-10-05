@@ -3,26 +3,30 @@
 //!
 //! Key schema (all under the configured `key_prefix`, default `aura`):
 //!
-//! | Key                       | Type                                  | Purpose                    |
-//! | ------------------------- | ------------------------------------- | -------------------------- |
-//! | `{p}:skills:{session_id}` | hash: dedup key → record JSON         | session's invocation log   |
+//! | Key                                         | Type                          | Purpose                      |
+//! | ------------------------------------------- | ----------------------------- | ---------------------------- |
+//! | `{p}:skills:{uuid5(agent_id)}:{session_id}` | hash: dedup key → record JSON | one agent's log in a session |
+//!
+//! The agent segment is the v5 UUID of the agent id (OID namespace): a
+//! fixed-shape segment free of `:`, so no (agent, session) pair can name
+//! another pair's key even though both ids are free-form.
 //!
 //! Writes use `HSETNX`, so the first record for a dedup key wins — the
 //! store-level idempotency the [`SkillInvocationStore`] contract requires —
 //! and a new key is refused once the hash holds
-//! [`MAX_SKILL_RECORDS_PER_SESSION`] entries. Every write refreshes the hash
-//! TTL, so an active session's log lives as long as the session keeps
-//! invoking skills plus the configured TTL, and an abandoned session
-//! self-cleans. Entries that fail to decode, including records on another
-//! schema version, are skipped with a warning rather than failing the
-//! listing, tolerating skew during a rolling deploy.
+//! [`MAX_SKILL_RECORDS_PER_LOG`] entries. Every write refreshes the hash
+//! TTL, so an active log lives as long as the session keeps invoking skills
+//! plus the configured TTL, and an abandoned session self-cleans. Entries
+//! that fail to decode, including records on another schema version, are
+//! skipped with a warning rather than failing the listing, tolerating skew
+//! during a rolling deploy.
 
 use std::num::NonZeroU64;
 
 use async_trait::async_trait;
-use aura::config::SessionId;
 use aura::session_store::{
-    MAX_SKILL_RECORDS_PER_SESSION, SessionStoreError, SkillInvocationRecord, SkillInvocationStore,
+    MAX_SKILL_RECORDS_PER_LOG, SessionStoreError, SkillInvocationRecord, SkillInvocationStore,
+    SkillLogKey,
 };
 use redis::AsyncCommands;
 use redis::aio::ConnectionManager;
@@ -44,8 +48,13 @@ impl RedisSkillInvocationStore {
         }
     }
 
-    fn session_key(&self, session_id: &SessionId) -> String {
-        format!("{}:skills:{}", self.key_prefix, session_id.as_str())
+    fn log_key(&self, log: &SkillLogKey) -> String {
+        let agent = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, log.agent_id.as_bytes());
+        format!(
+            "{}:skills:{agent}:{}",
+            self.key_prefix,
+            log.session_id.as_str()
+        )
     }
 }
 
@@ -53,12 +62,12 @@ impl RedisSkillInvocationStore {
 impl SkillInvocationStore for RedisSkillInvocationStore {
     async fn record(
         &self,
-        session_id: &SessionId,
+        log: &SkillLogKey,
         record: SkillInvocationRecord,
     ) -> Result<(), SessionStoreError> {
         let payload =
             serde_json::to_string(&record).expect("skill invocation record serializes to JSON");
-        let key = self.session_key(session_id);
+        let key = self.log_key(log);
         let dedup_key = record.invocation.dedup_key();
         let mut conn = self.conn.clone();
 
@@ -72,11 +81,12 @@ impl SkillInvocationStore for RedisSkillInvocationStore {
             .query_async(&mut conn)
             .await
             .map_err(request_err)?;
-        if !exists && len >= MAX_SKILL_RECORDS_PER_SESSION {
+        if !exists && len >= MAX_SKILL_RECORDS_PER_LOG {
             tracing::warn!(
-                session_id = session_id.as_str(),
-                cap = MAX_SKILL_RECORDS_PER_SESSION,
-                "skill invocation store at per-session capacity; dropping new record"
+                session_id = log.session_id.as_str(),
+                agent_id = log.agent_id,
+                cap = MAX_SKILL_RECORDS_PER_LOG,
+                "skill invocation store at per-log capacity; dropping new record"
             );
             return Ok(());
         }
@@ -91,13 +101,10 @@ impl SkillInvocationStore for RedisSkillInvocationStore {
 
     async fn list(
         &self,
-        session_id: &SessionId,
+        log: &SkillLogKey,
     ) -> Result<Vec<SkillInvocationRecord>, SessionStoreError> {
         let mut conn = self.conn.clone();
-        let payloads: Vec<String> = conn
-            .hvals(self.session_key(session_id))
-            .await
-            .map_err(request_err)?;
+        let payloads: Vec<String> = conn.hvals(self.log_key(log)).await.map_err(request_err)?;
 
         let mut records: Vec<SkillInvocationRecord> = payloads
             .iter()
@@ -105,7 +112,8 @@ impl SkillInvocationStore for RedisSkillInvocationStore {
                 Ok(record) => Some(record),
                 Err(e) => {
                     tracing::warn!(
-                        session_id = session_id.as_str(),
+                        session_id = log.session_id.as_str(),
+                        agent_id = log.agent_id,
                         "skipping skill invocation record: {e}"
                     );
                     None

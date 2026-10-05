@@ -8,12 +8,11 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use tokio::sync::broadcast;
 
-use crate::config::SessionId;
 use crate::hitl::{ApprovalDecision, DecisionId, ParkedApproval, ResolveError, Timestamp};
 
 use super::{
-    ApprovalStore, EventBus, MAX_SKILL_RECORDS_PER_SESSION, SessionStoreError,
-    SkillInvocationRecord, SkillInvocationStore, Subscription,
+    ApprovalStore, EventBus, MAX_SKILL_RECORDS_PER_LOG, SessionStoreError, SkillInvocationRecord,
+    SkillInvocationStore, SkillLogKey, Subscription,
 };
 
 /// Buffered payloads per topic before slow subscribers start lagging.
@@ -22,9 +21,9 @@ const TOPIC_CAPACITY: usize = 64;
 /// Decision retention margin.
 const DECISION_RETENTION_MARGIN_SECS: i64 = 60;
 
-/// Sessions kept in the skill-invocation store before the least-recently
+/// Skill logs kept in the skill-invocation store before the least-recently
 /// touched one is evicted.
-const MAX_SKILL_SESSIONS: usize = 1024;
+const MAX_SKILL_LOGS: usize = 1024;
 
 /// A recorded decision and its retention deadline.
 struct DecidedEntry {
@@ -123,27 +122,27 @@ impl ApprovalStore for InMemoryApprovalStore {
     }
 }
 
-/// The per-session skill-invocation log as a plain map.
+/// The skill-invocation logs as a plain map.
 ///
 /// Unlike approvals, skill records have no natural removal event, so this
-/// store bounds growth itself: a per-session record cap and a
-/// least-recently-touched session eviction cap.
+/// store bounds growth itself: a per-log record cap and a
+/// least-recently-touched log eviction cap.
 #[derive(Default)]
 pub struct InMemorySkillInvocationStore {
     // `std::sync::Mutex`: every operation is a synchronous map op; nothing
     // awaits while holding the lock.
-    inner: Mutex<SkillSessions>,
+    inner: Mutex<SkillLogs>,
 }
 
 #[derive(Default)]
-struct SkillSessions {
-    sessions: HashMap<String, SkillSessionEntry>,
+struct SkillLogs {
+    logs: HashMap<SkillLogKey, SkillLogEntry>,
     /// Non-decreasing touch counter backing least-recently-touched eviction.
     clock: u64,
 }
 
 #[derive(Default)]
-struct SkillSessionEntry {
+struct SkillLogEntry {
     records: Vec<SkillInvocationRecord>,
     last_touched: u64,
 }
@@ -154,7 +153,7 @@ impl InMemorySkillInvocationStore {
         Self::default()
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, SkillSessions> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, SkillLogs> {
         self.inner
             .lock()
             .expect("skill invocation store lock poisoned")
@@ -165,21 +164,18 @@ impl InMemorySkillInvocationStore {
 impl SkillInvocationStore for InMemorySkillInvocationStore {
     async fn record(
         &self,
-        session_id: &SessionId,
+        log: &SkillLogKey,
         record: SkillInvocationRecord,
     ) -> Result<(), SessionStoreError> {
         let mut inner = self.lock();
         // Saturating rather than wrapping: a wrapped counter would read as
-        // the oldest touch and evict the most recently used session. At
+        // the oldest touch and evict the most recently used log. At
         // saturation every touch ties, so eviction picks arbitrarily instead
         // of backwards.
         inner.clock = inner.clock.saturating_add(1);
         let clock = inner.clock;
 
-        let entry = inner
-            .sessions
-            .entry(session_id.as_str().to_string())
-            .or_default();
+        let entry = inner.logs.entry(log.clone()).or_default();
         entry.last_touched = clock;
 
         let key = record.invocation.dedup_key();
@@ -190,36 +186,37 @@ impl SkillInvocationStore for InMemorySkillInvocationStore {
         {
             return Ok(());
         }
-        if entry.records.len() >= MAX_SKILL_RECORDS_PER_SESSION {
+        if entry.records.len() >= MAX_SKILL_RECORDS_PER_LOG {
             tracing::warn!(
-                session_id = session_id.as_str(),
-                cap = MAX_SKILL_RECORDS_PER_SESSION,
-                "skill invocation store at per-session capacity; dropping new record"
+                session_id = log.session_id.as_str(),
+                agent_id = log.agent_id,
+                cap = MAX_SKILL_RECORDS_PER_LOG,
+                "skill invocation store at per-log capacity; dropping new record"
             );
             return Ok(());
         }
         entry.records.push(record);
 
-        if inner.sessions.len() > MAX_SKILL_SESSIONS
+        if inner.logs.len() > MAX_SKILL_LOGS
             && let Some(evict) = inner
-                .sessions
+                .logs
                 .iter()
                 .min_by_key(|(_, entry)| entry.last_touched)
-                .map(|(id, _)| id.clone())
+                .map(|(key, _)| key.clone())
         {
-            inner.sessions.remove(&evict);
+            inner.logs.remove(&evict);
         }
         Ok(())
     }
 
     async fn list(
         &self,
-        session_id: &SessionId,
+        log: &SkillLogKey,
     ) -> Result<Vec<SkillInvocationRecord>, SessionStoreError> {
         let mut inner = self.lock();
         inner.clock = inner.clock.saturating_add(1);
         let clock = inner.clock;
-        let Some(entry) = inner.sessions.get_mut(session_id.as_str()) else {
+        let Some(entry) = inner.logs.get_mut(log) else {
             return Ok(Vec::new());
         };
         entry.last_touched = clock;
@@ -312,6 +309,7 @@ mod tests {
     use futures::StreamExt;
 
     use super::*;
+    use crate::config::SessionId;
     use crate::hitl::{
         AgentScope, ApprovalItem, ApprovalOrigin, ApprovalRequest, PROTOCOL_VERSION,
     };
@@ -535,26 +533,30 @@ mod tests {
         }
     }
 
+    fn skill_log(session_id: impl Into<String>, agent_id: &str) -> SkillLogKey {
+        SkillLogKey::new(SessionId::new(session_id), agent_id)
+    }
+
     #[tokio::test]
     async fn skill_store_lists_records_ordered_by_anchor_then_seq() {
         let store = InMemorySkillInvocationStore::new();
-        let session = SessionId::new("sess-1");
+        let log = skill_log("sess-1", "agent");
 
         store
-            .record(&session, skill_record("late", 5, 0))
+            .record(&log, skill_record("late", 5, 0))
             .await
             .unwrap();
         store
-            .record(&session, skill_record("second", 1, 1))
+            .record(&log, skill_record("second", 1, 1))
             .await
             .unwrap();
         store
-            .record(&session, skill_record("first", 1, 0))
+            .record(&log, skill_record("first", 1, 0))
             .await
             .unwrap();
 
         let names: Vec<String> = store
-            .list(&session)
+            .list(&log)
             .await
             .unwrap()
             .into_iter()
@@ -566,19 +568,13 @@ mod tests {
     #[tokio::test]
     async fn skill_store_record_is_idempotent_per_invocation() {
         let store = InMemorySkillInvocationStore::new();
-        let session = SessionId::new("sess-1");
+        let log = skill_log("sess-1", "agent");
 
-        store
-            .record(&session, skill_record("dup", 1, 0))
-            .await
-            .unwrap();
+        store.record(&log, skill_record("dup", 1, 0)).await.unwrap();
         // Same invocation re-recorded later must keep the first position.
-        store
-            .record(&session, skill_record("dup", 7, 3))
-            .await
-            .unwrap();
+        store.record(&log, skill_record("dup", 7, 3)).await.unwrap();
 
-        let records = store.list(&session).await.unwrap();
+        let records = store.list(&log).await.unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].anchor, 1);
     }
@@ -587,58 +583,93 @@ mod tests {
     async fn skill_store_sessions_are_independent() {
         let store = InMemorySkillInvocationStore::new();
         store
-            .record(&SessionId::new("sess-a"), skill_record("a", 1, 0))
+            .record(&skill_log("sess-a", "agent"), skill_record("a", 1, 0))
             .await
             .unwrap();
 
         assert!(
             store
-                .list(&SessionId::new("sess-b"))
+                .list(&skill_log("sess-b", "agent"))
                 .await
                 .unwrap()
                 .is_empty()
         );
         assert_eq!(
-            store.list(&SessionId::new("sess-a")).await.unwrap().len(),
+            store
+                .list(&skill_log("sess-a", "agent"))
+                .await
+                .unwrap()
+                .len(),
             1
         );
     }
 
+    /// One session id under two agents is two logs: neither lists the
+    /// other's records, and the same invocation records independently in
+    /// each rather than being deduped across them.
     #[tokio::test]
-    async fn skill_store_caps_records_per_session() {
+    async fn skill_store_agents_sharing_a_session_are_independent() {
         let store = InMemorySkillInvocationStore::new();
-        let session = SessionId::new("sess-cap");
-        for i in 0..(MAX_SKILL_RECORDS_PER_SESSION + 5) {
+        let first = skill_log("sess-1", "agent-a");
+        let second = skill_log("sess-1", "agent-b");
+
+        store
+            .record(&first, skill_record("shared", 1, 0))
+            .await
+            .unwrap();
+        assert!(store.list(&second).await.unwrap().is_empty());
+
+        store
+            .record(&second, skill_record("shared", 5, 0))
+            .await
+            .unwrap();
+        assert_eq!(store.list(&first).await.unwrap()[0].anchor, 1);
+        assert_eq!(store.list(&second).await.unwrap()[0].anchor, 5);
+    }
+
+    #[tokio::test]
+    async fn skill_store_caps_records_per_log() {
+        let store = InMemorySkillInvocationStore::new();
+        let log = skill_log("sess-cap", "agent");
+        for i in 0..(MAX_SKILL_RECORDS_PER_LOG + 5) {
             store
-                .record(&session, skill_record(&format!("s{i}"), i as u32, 0))
+                .record(&log, skill_record(&format!("s{i}"), i as u32, 0))
                 .await
                 .unwrap();
         }
         assert_eq!(
-            store.list(&session).await.unwrap().len(),
-            MAX_SKILL_RECORDS_PER_SESSION
+            store.list(&log).await.unwrap().len(),
+            MAX_SKILL_RECORDS_PER_LOG
         );
+
+        // The cap is per log: another agent in the same session still records.
+        let other = skill_log("sess-cap", "other-agent");
+        store
+            .record(&other, skill_record("s0", 1, 0))
+            .await
+            .unwrap();
+        assert_eq!(store.list(&other).await.unwrap().len(), 1);
     }
 
     /// A saturated touch counter keeps the store working: writes and reads
-    /// still succeed, and eviction still bounds the session map — it just
-    /// stops being ordered by recency.
+    /// still succeed, and eviction still bounds the log map — it just stops
+    /// being ordered by recency.
     #[tokio::test]
     async fn skill_store_survives_a_saturated_clock() {
         let store = InMemorySkillInvocationStore::new();
         store.lock().clock = u64::MAX;
 
-        for i in 0..=MAX_SKILL_SESSIONS {
+        for i in 0..=MAX_SKILL_LOGS {
             store
                 .record(
-                    &SessionId::new(format!("sess-{i}")),
+                    &skill_log(format!("sess-{i}"), "agent"),
                     skill_record("s", 1, 0),
                 )
                 .await
                 .unwrap();
         }
         // Reads bump the counter too, so they must survive saturation as well.
-        store.list(&SessionId::new("sess-0")).await.unwrap();
+        store.list(&skill_log("sess-0", "agent")).await.unwrap();
 
         let inner = store.lock();
         assert_eq!(
@@ -647,39 +678,42 @@ mod tests {
             "the counter stops instead of wrapping"
         );
         assert!(
-            inner.sessions.len() <= MAX_SKILL_SESSIONS,
-            "eviction still bounds the map at {} sessions, got {}",
-            MAX_SKILL_SESSIONS,
-            inner.sessions.len()
+            inner.logs.len() <= MAX_SKILL_LOGS,
+            "eviction still bounds the map at {} logs, got {}",
+            MAX_SKILL_LOGS,
+            inner.logs.len()
         );
     }
 
     #[tokio::test]
-    async fn skill_store_evicts_least_recently_touched_session() {
+    async fn skill_store_evicts_least_recently_touched_log() {
         let store = InMemorySkillInvocationStore::new();
-        for i in 0..MAX_SKILL_SESSIONS {
+        for i in 0..MAX_SKILL_LOGS {
             store
                 .record(
-                    &SessionId::new(format!("sess-{i}")),
+                    &skill_log(format!("sess-{i}"), "agent"),
                     skill_record("s", 1, 0),
                 )
                 .await
                 .unwrap();
         }
-        // Touch the oldest session so it is no longer the eviction candidate.
-        let oldest = SessionId::new("sess-0");
+        // Touch the oldest log so it is no longer the eviction candidate.
+        let oldest = skill_log("sess-0", "agent");
         assert_eq!(store.list(&oldest).await.unwrap().len(), 1);
 
-        // One past the cap evicts the least-recently-touched session (sess-1).
+        // One past the cap evicts the least-recently-touched log (sess-1).
         store
-            .record(&SessionId::new("sess-overflow"), skill_record("s", 1, 0))
+            .record(
+                &skill_log("sess-overflow", "agent"),
+                skill_record("s", 1, 0),
+            )
             .await
             .unwrap();
 
         assert_eq!(store.list(&oldest).await.unwrap().len(), 1);
         assert!(
             store
-                .list(&SessionId::new("sess-1"))
+                .list(&skill_log("sess-1", "agent"))
                 .await
                 .unwrap()
                 .is_empty()

@@ -7,8 +7,9 @@
 //! re-reads them from disk (`crate::skill_rehydration`) and the store stays
 //! small and never serves stale content.
 //!
-//! Records are keyed by the client-supplied chat session id, the same trust
-//! boundary conversational approvals and A2A context history rely on; see
+//! Records are stored under a [`SkillLogKey`](super::SkillLogKey): the
+//! client-supplied chat session id, the same trust boundary conversational
+//! approvals and A2A context history rely on, plus the serving agent; see
 //! `docs/design/session-storage.md` §7 for what a caller holding an id can do.
 
 use serde::{Deserialize, Serialize};
