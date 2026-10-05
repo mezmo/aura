@@ -3,6 +3,7 @@ use crate::globpattern::GlobPattern;
 use crate::lenient_bool;
 use crate::lenient_int;
 use crate::orchestration::OrchestrationConfig;
+use crate::output_format::OutputFormatEntry;
 use crate::scratchpad::{ScratchpadConfig, ScratchpadToolEntry};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -730,6 +731,9 @@ pub enum McpServerConfig {
         /// Per-tool scratchpad interception thresholds (glob-matched on tool name).
         #[serde(default)]
         scratchpad: HashMap<String, ScratchpadToolEntry>,
+        /// Per-tool output formatters, keyed by tool-name glob pattern.
+        #[serde(default)]
+        output_format: HashMap<String, OutputFormatEntry>,
         /// Client identity for this server alone.
         #[serde(default)]
         user_agent: Option<McpUserAgent>,
@@ -746,6 +750,9 @@ pub enum McpServerConfig {
         /// Per-tool scratchpad interception thresholds (glob-matched on tool name).
         #[serde(default)]
         scratchpad: HashMap<String, ScratchpadToolEntry>,
+        /// Per-tool output formatters, keyed by tool-name glob pattern.
+        #[serde(default)]
+        output_format: HashMap<String, OutputFormatEntry>,
         /// Client identity for this server alone.
         #[serde(default)]
         user_agent: Option<McpUserAgent>,
@@ -762,6 +769,9 @@ pub enum McpServerConfig {
         /// Per-tool scratchpad interception thresholds (glob-matched on tool name).
         #[serde(default)]
         scratchpad: HashMap<String, ScratchpadToolEntry>,
+        /// Per-tool output formatters, keyed by tool-name glob pattern.
+        #[serde(default)]
+        output_format: HashMap<String, OutputFormatEntry>,
         /// Client identity for this server alone.
         #[serde(default)]
         user_agent: Option<McpUserAgent>,
@@ -775,6 +785,15 @@ impl McpServerConfig {
             McpServerConfig::Stdio { scratchpad, .. } => scratchpad,
             McpServerConfig::HttpStreamable { scratchpad, .. } => scratchpad,
             McpServerConfig::Sse { scratchpad, .. } => scratchpad,
+        }
+    }
+
+    /// Get the per-tool output formatters for this server.
+    pub fn output_format(&self) -> &HashMap<String, OutputFormatEntry> {
+        match self {
+            McpServerConfig::Stdio { output_format, .. }
+            | McpServerConfig::HttpStreamable { output_format, .. }
+            | McpServerConfig::Sse { output_format, .. } => output_format,
         }
     }
 

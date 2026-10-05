@@ -23,6 +23,7 @@ pub mod mcp;
 #[cfg(feature = "otel")]
 pub mod openinference_exporter;
 pub mod orchestration;
+pub mod output_format;
 pub mod passthrough_tool;
 pub mod prompts;
 mod provider_agent; // Private - internal implementation detail

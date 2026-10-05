@@ -310,6 +310,7 @@ mod tests {
                 headers: static_headers,
                 description: None,
                 headers_from_request,
+                output_format: Default::default(),
                 scratchpad: HashMap::new(),
                 user_agent: None,
             },

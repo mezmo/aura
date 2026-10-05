@@ -873,14 +873,23 @@ impl Orchestrator {
 
         // ComposedWrapper applies transform_output in reverse-list order, so
         // the LAST entry runs FIRST on the raw tool output. Persistence must
-        // see raw output (for debugging/retry), so it goes last. Scratchpad
-        // also needs raw output — persistence's transform_output is a
-        // passthrough that just caches the raw — and rewrites to the pointer.
+        // see raw output (for debugging/retry), so it goes last. The output
+        // formatter (when configured) runs next and condenses recognised
+        // output. Scratchpad then sees that output — persistence's
+        // transform_output is a passthrough that just caches the raw — and
+        // rewrites it to the pointer when it is still over threshold.
         // Duplicate-guard and observer then see the pointer, which is what
         // should surface to the LLM/UI. The turn-limit nudge goes first so
         // it runs after everything else, on the text the LLM sees.
         let mut wrappers: Vec<Arc<dyn ToolWrapper>> = vec![observer_wrapper, duplicate_guard];
         wrappers.extend(scratchpad_tools);
+        // Between scratchpad and persistence: formats the output persistence
+        // has recorded, before scratchpad decides whether to intercept it.
+        if let Some(formatter) = crate::output_format::OutputFormatWrapper::from_mcp_config(
+            self.agent_config.mcp.as_ref(),
+        ) {
+            wrappers.push(Arc::new(formatter));
+        }
         wrappers.push(persistence_wrapper);
         if let Some(ref state) = turn_nudge {
             wrappers.insert(

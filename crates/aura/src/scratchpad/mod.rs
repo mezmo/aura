@@ -237,6 +237,7 @@ mod tests {
             headers: HashMap::new(),
             description: None,
             headers_from_request: HashMap::new(),
+            output_format: Default::default(),
             scratchpad,
             user_agent: None,
         }
