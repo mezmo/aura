@@ -229,6 +229,17 @@ pub trait ToolWrapper: Send + Sync {
         schema
     }
 
+    /// Modify the tool's JSON schema definition, given the tool's identity.
+    ///
+    /// `WrappedTool` calls this rather than [`ToolWrapper::wrap_schema`],
+    /// with a context built the same way as for a call (`tool_name`, and
+    /// `tool_namespace` for MCP tools). Override it when the change depends
+    /// on which tool is being defined. The default delegates to
+    /// [`ToolWrapper::wrap_schema`].
+    fn wrap_schema_for(&self, schema: Value, _ctx: &ToolCallContext) -> Value {
+        self.wrap_schema(schema)
+    }
+
     /// Transform input arguments before tool execution.
     ///
     /// Called before each tool invocation. Use this to:
@@ -439,10 +450,16 @@ where
     ) -> Pin<Box<dyn Future<Output = rig::completion::ToolDefinition> + Send + Sync + '_>> {
         let inner = self.inner.clone();
         let wrapper = self.wrapper.clone();
+        let tool_name = self.inner.name();
+        let ctx = self
+            .context_factory
+            .as_ref()
+            .map(|f| f(&tool_name))
+            .unwrap_or_else(|| ToolCallContext::new(&tool_name));
 
         Box::pin(async move {
             let mut def = inner.definition(prompt).await;
-            def.parameters = wrapper.wrap_schema(def.parameters);
+            def.parameters = wrapper.wrap_schema_for(def.parameters, &ctx);
             def
         })
     }
@@ -715,6 +732,13 @@ impl ToolWrapper for ComposedWrapper {
     fn wrap_schema(&self, mut schema: Value) -> Value {
         for wrapper in &self.wrappers {
             schema = wrapper.wrap_schema(schema);
+        }
+        schema
+    }
+
+    fn wrap_schema_for(&self, mut schema: Value, ctx: &ToolCallContext) -> Value {
+        for wrapper in &self.wrappers {
+            schema = wrapper.wrap_schema_for(schema, ctx);
         }
         schema
     }
@@ -1001,6 +1025,55 @@ mod tests {
 
         assert_eq!(modified["field_a"], true);
         assert_eq!(modified["field_b"], true);
+    }
+
+    #[tokio::test]
+    async fn definition_passes_tool_context_to_wrap_schema_for() {
+        struct RecordIdentity;
+        #[async_trait]
+        impl ToolWrapper for RecordIdentity {
+            fn wrap_schema_for(&self, mut schema: Value, ctx: &ToolCallContext) -> Value {
+                if let Value::Object(ref mut obj) = schema {
+                    obj.insert("tool".to_string(), serde_json::json!(ctx.tool_name));
+                    obj.insert(
+                        "namespace".to_string(),
+                        serde_json::json!(ctx.tool_namespace),
+                    );
+                }
+                schema
+            }
+        }
+
+        // Overrides only `wrap_schema`: the default `wrap_schema_for` must
+        // still apply it.
+        struct AddField;
+        #[async_trait]
+        impl ToolWrapper for AddField {
+            fn wrap_schema(&self, mut schema: Value) -> Value {
+                if let Value::Object(ref mut obj) = schema {
+                    obj.insert("field".to_string(), Value::Bool(true));
+                }
+                schema
+            }
+        }
+
+        let composed = ComposedWrapper::new(vec![
+            Arc::new(RecordIdentity) as Arc<dyn ToolWrapper>,
+            Arc::new(AddField) as Arc<dyn ToolWrapper>,
+        ]);
+        let inner = RecordingInner {
+            ran: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        let wrapped = WrappedTool::new(inner, Arc::new(composed)).with_context_factory(|name| {
+            let mut ctx = ToolCallContext::new(name);
+            ctx.tool_namespace = Some("metrics".to_string());
+            ctx
+        });
+
+        let def = RigTool::definition(&wrapped, String::new()).await;
+        assert_eq!(def.parameters["tool"], RecordingInner::NAME);
+        assert_eq!(def.parameters["namespace"], "metrics");
+        assert_eq!(def.parameters["field"], true);
     }
 
     #[derive(Clone)]
