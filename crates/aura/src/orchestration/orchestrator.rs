@@ -62,7 +62,7 @@ use crate::string_utils::safe_truncate;
 use crate::tool_call_observer::ToolCallObserver;
 
 use super::tools::RoutingToolSet;
-use super::tools::{InspectToolParamsTool, ListToolsTool, ReadArtifactTool};
+use super::tools::{InspectToolParamsTool, ListToolsTool, ReadArtifactTool, WriteArtifactTool};
 
 use super::config::OrchestrationConfig;
 use super::park::{
@@ -158,6 +158,7 @@ struct CoordinatorTools {
     vector_tools: Vec<crate::vector_dynamic::DynamicVectorSearchTool>,
     routing_tools: RoutingToolSet,
     read_artifact: Option<ReadArtifactTool>,
+    write_artifact: Option<WriteArtifactTool>,
     list_prior_runs: Option<super::tools::ListPriorRunsTool>,
     skill_tools: Option<crate::skill_tool::SkillToolset>,
 }
@@ -2552,6 +2553,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
         if let Some(artifact_tool) = tools.read_artifact {
             state = state.add_tool(artifact_tool);
         }
+        if let Some(write_artifact) = tools.write_artifact {
+            state = state.add_tool(write_artifact);
+        }
         if let Some(list_prior_runs) = tools.list_prior_runs {
             state = state.add_tool(list_prior_runs);
         }
@@ -2692,6 +2696,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             vector_tools,
             routing_tools,
             read_artifact: Some(ReadArtifactTool::new(self.persistence.clone())),
+            write_artifact: Some(WriteArtifactTool::new(self.persistence.clone())),
             list_prior_runs: if include_history_tools {
                 Some(super::tools::ListPriorRunsTool::new(
                     self.persistence.clone(),
