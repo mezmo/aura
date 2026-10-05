@@ -705,7 +705,18 @@ impl ExecutionPersistence {
 
         let artifact_path = artifacts_dir.join(&filename);
         let replaced = fs::try_exists(&artifact_path).await.unwrap_or(false);
-        fs::write(&artifact_path, content).await?;
+        // Write beside the target and rename into place, so a failed or
+        // interrupted write never leaves a truncated artifact under a name a
+        // plan may already reference.
+        let tmp_path = artifacts_dir.join(format!(".{filename}.tmp"));
+        let written = match fs::write(&tmp_path, content).await {
+            Ok(()) => fs::rename(&tmp_path, &artifact_path).await,
+            Err(e) => Err(e),
+        };
+        if let Err(e) = written {
+            let _ = fs::remove_file(&tmp_path).await;
+            return Err(e);
+        }
 
         tracing::info!(
             "Written coordinator artifact ({} chars, replaced={}) to: {}",
@@ -1439,6 +1450,29 @@ mod tests {
         assert_eq!(
             persistence.read_artifact(&worker_file).await.unwrap(),
             "worker result"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_write_coordinator_artifact_failed_replace_leaves_no_temp_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let persistence = ExecutionPersistence::new(temp_dir.path().join("memory"), None)
+            .await
+            .unwrap();
+        // A directory at the target name makes the rename fail.
+        let target = persistence.artifacts_path().join("coordinator-draft.txt");
+        fs::create_dir_all(&target).await.unwrap();
+
+        let result = persistence
+            .write_coordinator_artifact("draft", "content")
+            .await;
+
+        assert!(result.is_err());
+        assert!(target.is_dir(), "the existing entry is left untouched");
+        assert_eq!(
+            persistence.list_artifacts().await.unwrap(),
+            vec!["coordinator-draft.txt".to_string()],
+            "no temp file is left behind"
         );
     }
 

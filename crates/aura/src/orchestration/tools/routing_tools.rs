@@ -310,12 +310,19 @@ impl CreatePlanTool {
         if requested.is_empty() {
             return Ok(());
         }
+        let unavailable = || {
+            "Artifacts are unavailable in this run, so tasks cannot attach them. \
+             Embed the content in the task description instead."
+                .to_string()
+        };
         let Some(persistence) = &self.persistence else {
-            return Err("Artifacts are unavailable in this run, so tasks cannot attach them.                         Embed the content in the task description instead."
-                .to_string());
+            return Err(unavailable());
         };
 
         let persistence = persistence.lock().await;
+        if !persistence.is_enabled() {
+            return Err(unavailable());
+        }
         let mut missing = Vec::new();
         for name in requested {
             let exists = match persistence.artifact_path(name) {
@@ -625,6 +632,25 @@ mod tests {
             toolset.decision.lock().await.is_none(),
             "a plan with missing artifacts must not be recorded"
         );
+    }
+
+    #[tokio::test]
+    async fn test_create_plan_rejects_artifacts_with_persistence_disabled() {
+        let toolset = RoutingToolSet::new()
+            .with_persistence(Arc::new(Mutex::new(ExecutionPersistence::disabled())));
+
+        let result = toolset
+            .create_plan
+            .call(plan_with_artifacts(&["coordinator-draft.md"]))
+            .await
+            .unwrap();
+
+        assert!(
+            result.status.contains("Artifacts are unavailable"),
+            "{}",
+            result.status
+        );
+        assert!(toolset.decision.lock().await.is_none());
     }
 
     #[tokio::test]

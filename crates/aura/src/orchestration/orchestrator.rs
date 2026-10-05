@@ -329,7 +329,9 @@ async fn forward_internal_tool_started(
             worker_id: worker_id.to_string(),
         },
     );
-    let arguments = serde_json::from_str(raw_arguments).unwrap_or_else(|_| serde_json::json!({}));
+    let mut arguments =
+        serde_json::from_str(raw_arguments).unwrap_or_else(|_| serde_json::json!({}));
+    redact_internal_tool_arguments(tool_name, &mut arguments);
     let _ = tx
         .send(Ok(StreamItem::AgentEvent(Box::new(by_worker(
             worker_id,
@@ -342,6 +344,23 @@ async fn forward_internal_tool_started(
             },
         )))))
         .await;
+}
+
+/// Replace `write_artifact`'s `content` argument with its size so a large
+/// document is not duplicated onto the event stream; the stored artifact holds
+/// the content.
+fn redact_internal_tool_arguments(tool_name: &str, arguments: &mut serde_json::Value) {
+    if tool_name != <WriteArtifactTool as rig::tool::Tool>::NAME {
+        return;
+    }
+    if let Some(content) = arguments.get_mut("content")
+        && let Some(text) = content.as_str()
+    {
+        *content = serde_json::Value::String(format!(
+            "[{} chars written to artifact]",
+            text.chars().count()
+        ));
+    }
 }
 
 /// Companion to [`forward_internal_tool_started`]. No-op unless a prior start
@@ -3576,7 +3595,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             })
             .collect();
 
-        // Artifacts the coordinator attached (validated to exist by create_plan).
+        // Artifacts the coordinator attached to this task.
         if !task.artifacts.is_empty() {
             let list: Vec<String> = task.artifacts.iter().map(|a| format!("- {a}")).collect();
             parts.push(format!(
@@ -7397,6 +7416,18 @@ mod tests {
 
         assert!(!has_awaiting_task(&plan));
         assert!(park_verdict_lines(&plan).is_empty());
+    }
+
+    #[test]
+    fn redact_internal_tool_arguments_hides_write_artifact_content() {
+        let mut args = serde_json::json!({"filename": "draft.md", "content": "abcdé"});
+        redact_internal_tool_arguments("write_artifact", &mut args);
+        assert_eq!(args["filename"], "draft.md");
+        assert_eq!(args["content"], "[5 chars written to artifact]");
+
+        let mut other = serde_json::json!({"filename": "x", "content": "kept"});
+        redact_internal_tool_arguments("read_artifact", &mut other);
+        assert_eq!(other["content"], "kept");
     }
 
     /// Attached artifacts are listed in the worker's context after any

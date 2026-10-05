@@ -55,6 +55,9 @@ pub(crate) struct ParkedTaskNode {
     pub worker: Option<String>,
     #[serde(default)]
     pub rationale: String,
+    /// Run artifact filenames attached to this task.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<String>,
     pub status: TaskStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<String>,
@@ -165,6 +168,7 @@ pub(crate) fn build_document(
             dependencies: t.dependencies.clone(),
             worker: t.worker.clone(),
             rationale: t.rationale.clone(),
+            artifacts: t.artifacts.clone(),
             status: TaskStatus::from(&t.state),
             result: None,
             error: None,
@@ -290,6 +294,7 @@ mod tests {
         plan.add_task(Task::new(1, "Gated apply", "r").with_dependency(0));
         plan.add_task(Task::new(2, "Verify", "r").with_dependency(1));
         plan.get_task_mut(0).unwrap().complete("facts");
+        plan.get_task_mut(1).unwrap().artifacts = vec!["coordinator-manifest.yaml".to_string()];
 
         let pending = vec![pending_call("kubectl_apply", "call_7")];
         plan.get_task_mut(1).unwrap().state = TaskState::AwaitingApproval {
@@ -341,6 +346,10 @@ mod tests {
             Some(1)
         );
         assert!(awaiting.current_prompt.is_some());
+        assert_eq!(
+            awaiting.artifacts,
+            vec!["coordinator-manifest.yaml".to_string()]
+        );
 
         let completed = &doc.plan.tasks[0];
         assert_eq!(completed.status, TaskStatus::Complete);

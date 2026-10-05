@@ -85,8 +85,7 @@ pub enum StepInput {
         task: String,
         #[serde(default)]
         worker: Option<String>,
-        /// Existing run artifacts the worker should load with `read_artifact`.
-        /// Validated to exist when the plan is created.
+        /// Run artifact filenames attached to this task.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         artifacts: Vec<String>,
     },
@@ -340,8 +339,7 @@ pub struct Task {
     /// Top-level because it's orthogonal to pass/fail — workers can submit
     /// structured output regardless of task outcome.
     pub structured_output: Option<StructuredTaskOutput>,
-    /// Run artifacts the coordinator attached to this task; listed in the
-    /// worker's context for loading with `read_artifact`.
+    /// Run artifact filenames attached to this task.
     pub artifacts: Vec<String>,
 }
 
