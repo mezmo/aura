@@ -375,8 +375,10 @@ mod tests {
             .expect("headers");
             conn.flush().expect("flush headers");
             std::thread::sleep(std::time::Duration::from_millis(1000));
-            conn.write_all(b"data: {\"choices\":[{\"delta\":{\"content\":\"late\"}}]}\n\ndata: [DONE]\n\n")
-                .expect("chunk");
+            conn.write_all(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"late\"}}]}\n\ndata: [DONE]\n\n",
+            )
+            .expect("chunk");
             conn.flush().expect("flush chunk");
         });
 

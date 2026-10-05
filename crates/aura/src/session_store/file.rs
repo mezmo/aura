@@ -1251,12 +1251,12 @@ mod private_mode_tests {
 mod unlink_recheck_tests {
     use std::sync::Arc;
 
+    use super::{FileApprovalStore, TerminalRecord, unlink_interleave};
     use crate::hitl::{
         AgentScope, ApprovalAuthority, ApprovalDecision, ApprovalItem, ApprovalOrigin,
         ApprovalRequest, DecisionId, PROTOCOL_VERSION, ParkedApproval, ResolvedDecision,
     };
     use crate::session_store::{ApprovalStore, ParkedApprovalRecord, SessionStoreError};
-    use super::{FileApprovalStore, TerminalRecord, unlink_interleave};
 
     /// A representative parked approval for `decision_id`, expiring far
     /// out — the battery fixture's shape.

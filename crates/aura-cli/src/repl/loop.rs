@@ -4325,7 +4325,10 @@ mod tests {
             expires_at: expires.to_string(),
         };
         let blocking = vec![call("d1", "e1")];
-        assert_eq!(super::gate_signature(&blocking), super::gate_signature(&blocking));
+        assert_eq!(
+            super::gate_signature(&blocking),
+            super::gate_signature(&blocking)
+        );
         assert_ne!(
             super::gate_signature(&blocking),
             super::gate_signature(&[call("d1", "e2")]),
