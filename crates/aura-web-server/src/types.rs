@@ -131,7 +131,7 @@ pub struct AppState {
     /// Factory for additional tools to register on every agent (e.g., CLI tools in standalone mode).
     /// Called once per request to produce fresh tool instances. Returns empty vec for the web server.
     pub additional_tools: Arc<dyn Fn() -> Vec<Box<dyn aura::ToolDyn>> + Send + Sync>,
-    /// The Slack Web API client, present when the Slack ingress is enabled.
+    /// The Slack Web API client.
     pub slack_api: Option<crate::slack::SlackApi>,
     pub pending_approvals: aura::hitl::PendingApprovals,
     /// Startup-loaded HMAC secret for the HITL webhook route (egress signing).

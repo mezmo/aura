@@ -72,9 +72,24 @@ pub enum PostError {
 
 impl PostError {
     /// Name the cause in the agent's terms; Slack's own codes say nothing
-    /// to a model deciding what to tell the person or try next.
+    /// to a model deciding what to tell the person or try next. Slack has
+    /// no idempotency key on `chat.postMessage`, so the wording says what
+    /// is known about delivery: a connection that never opened posted
+    /// nothing, a request that went out but got no readable answer may
+    /// have landed, and an `ok: true` body that would not decode did land.
     fn from_slack(err: SlackApiError, channel: &str) -> Self {
         let text = match &err {
+            SlackApiError::Transport { source, .. } if source.is_connect() => {
+                format!("could not reach Slack ({source}); nothing was posted")
+            }
+            SlackApiError::Transport { source, .. } => format!(
+                "Slack did not confirm the post ({source}); the message may have landed in \
+                 `{channel}`, so check there before posting it again"
+            ),
+            SlackApiError::Shape { .. } => format!(
+                "Slack accepted the post but its reply could not be read; the message is in \
+                 `{channel}`, do not post it again"
+            ),
             SlackApiError::Api { error, .. } if error == "channel_not_found" => {
                 format!(
                     "no Slack channel `{channel}` is visible to the bot; check the name or use the channel id"
@@ -411,6 +426,66 @@ model = "gpt-4o"
             .to_string();
         assert!(err.contains("chat:write,"), "{err}");
         assert!(err.contains("chat:write.public"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn an_unconfirmed_post_says_it_may_have_landed() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat.postMessage"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_secs(5))
+                    .set_body_json(serde_json::json!({"ok": true, "channel": "C1", "ts": "1.0"})),
+            )
+            .mount(&server)
+            .await;
+        let api = SlackApi::with_timeout(
+            BotToken::new("xoxb-bot".to_owned()).unwrap(),
+            AppToken::new("xapp-app".to_owned()).unwrap(),
+            std::time::Duration::from_millis(100),
+        )
+        .with_base_url(server.uri());
+        let tool = SlackPostTool::new(api, Budget::new(POSTS_PER_RUN));
+
+        let err = call(&tool, args("#ops", "hi", None))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("may have landed in `#ops`"), "{err}");
+        assert!(!err.contains("nothing was posted"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_slack_posted_nothing() {
+        let api = SlackApi::new(
+            BotToken::new("xoxb-bot".to_owned()).unwrap(),
+            AppToken::new("xapp-app".to_owned()).unwrap(),
+        )
+        .with_base_url("http://127.0.0.1:9");
+        let tool = SlackPostTool::new(api, Budget::new(POSTS_PER_RUN));
+
+        let err = call(&tool, args("C1", "hi", None))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("nothing was posted"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn an_accepted_post_with_an_unreadable_reply_is_reported_as_delivered() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat.postMessage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&server)
+            .await;
+
+        let err = call(&tool(&server), args("C1", "hi", None))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("is in `C1`, do not post it again"), "{err}");
     }
 
     #[tokio::test]
