@@ -1,5 +1,114 @@
 ## Changelog
 
+## [0.2.18](https://github.com/mezmo/aura/compare/v0.2.17...v0.2.18) (2026-10-05)
+
+
+### Bug Fixes
+
+* **ci**: keep channel branches from releasing off a stale baseline [2d6080d](https://github.com/mezmo/aura/commit/2d6080dd0355870be3b6c0d3fe77259fdcbccabb) - Justin Gross
+
+* **ci**: refresh the docker jwt per dvp report and harden hogql reads [dbc3bce](https://github.com/mezmo/aura/commit/dbc3bceed6eaa4bbbf03989847afbace32d92663) - Justin Gross
+
+* **cli**: flush telemetry on sigterm in standalone mode [6adf23b](https://github.com/mezmo/aura/commit/6adf23b9325922db15f6bea51fd813175169d155) - Justin Gross [#305](https://github.com/mezmo/aura/issues/305)
+
+* **config**: end a literal run at a character class [2cf0f10](https://github.com/mezmo/aura/commit/2cf0f10177feb371266c88b8b8680a86afc32480) - Justin Gross
+
+* **config**: enforce the mcp_filter literal cap and name it in the error [584ee15](https://github.com/mezmo/aura/commit/584ee15930ae73d5910ba7ec414487d620e597b7) - Justin Gross
+
+* **config**: match tool-name glob patterns with globset [9316530](https://github.com/mezmo/aura/commit/931653081e99b284c7d5be640c99ad60599513ae) - Justin Gross [#705](https://github.com/mezmo/aura/issues/705)
+
+* **config**: measure a class as one character and report the full run [5b3d78f](https://github.com/mezmo/aura/commit/5b3d78fe33d2398a794736487395b418e22d1fbb) - Justin Gross
+
+* **events**: carry the worker id into the tool-completion frame [50b8c57](https://github.com/mezmo/aura/commit/50b8c571a7155e68c46ac95d66e1e89fa3aafdb0) - Justin Gross
+
+* **mcp**: bound connect/initialize/discovery with a timeout [3a2fd56](https://github.com/mezmo/aura/commit/3a2fd564b5f3e8f536238e1e9fb00b65df1f9473) - Justin Gross [#305](https://github.com/mezmo/aura/issues/305)
+
+* **mcp**: warn if multiple servers use same tool name [22c7c05](https://github.com/mezmo/aura/commit/22c7c0542b695266a5cf39c883967958993e03e4) - Justin Gross [#713](https://github.com/mezmo/aura/issues/713)
+
+* **orchestration**: attribute tool completions to the worker [1470d11](https://github.com/mezmo/aura/commit/1470d1184b5258d6024dd475f57c80af6dfe34be) - Justin Gross
+
+* **orchestration**: fail safe on dropped cancel watcher [9b95c00](https://github.com/mezmo/aura/commit/9b95c009707d8c1eaa15d44a71e3a0fd93ff44f7) - Justin Gross [#305](https://github.com/mezmo/aura/issues/305)
+
+* **orchestration**: reject an unflattenable plan instead of panicking [3b0a8f5](https://github.com/mezmo/aura/commit/3b0a8f5b80d60267aa5de753dd4e9908af97d95f) - Justin Gross
+
+* **skills**: scope skill invocation records to the serving agent [e2aad6c](https://github.com/mezmo/aura/commit/e2aad6c8d4453851b3b5eb30f6bc306437672788) - Justin Gross
+
+* **web-server**: abort stragglers before otel shutdown [6c278e8](https://github.com/mezmo/aura/commit/6c278e8ca2a7f3df89de132faa357d0f7ce6749d) - Justin Gross [#305](https://github.com/mezmo/aura/issues/305)
+
+* **web-server**: let a zero streaming timeout disable the bound [08d6c54](https://github.com/mezmo/aura/commit/08d6c54c861d73f0dce163091e08bbda1c421098) - Justin Gross [#715](https://github.com/mezmo/aura/issues/715)
+
+
+
+### Chores
+
+* **globpattern**: stop emiiting Regex debug info [1faf45b](https://github.com/mezmo/aura/commit/1faf45bc3f1eeddcadfc3e591d9a4963344beebc) - Justin Gross
+
+
+
+### Code Refactoring
+
+* **agents**: cancel a run through its own token [a9c4a42](https://github.com/mezmo/aura/commit/a9c4a425d6552bf5af802b92d8e8dc3abc2259a7) - Justin Gross [#626](https://github.com/mezmo/aura/issues/626)
+
+* **events**: approvals reach the run's observer [8777c0e](https://github.com/mezmo/aura/commit/8777c0ebdc336c525517c67f9d21b728858b1420) - Justin Gross [#626](https://github.com/mezmo/aura/issues/626)
+
+* **events**: define orchestration SSE frames once [ca67258](https://github.com/mezmo/aura/commit/ca672587ba7ebd063c24c6fe043315939d606e51) - Justin Gross [#623](https://github.com/mezmo/aura/issues/623)
+
+* **events**: define the conversation agent id once [28f312b](https://github.com/mezmo/aura/commit/28f312b558fa992a358aa1d26fb3fc931ebaa4de) - Justin Gross
+
+* **events**: send a run's events to its observer [a171983](https://github.com/mezmo/aura/commit/a1719838534eebd3c0a1fbe4303647fc4384407c) - Justin Gross [#626](https://github.com/mezmo/aura/issues/626)
+
+
+
+### Features
+
+* **agents**: carry run identity in task-local scope [55fa378](https://github.com/mezmo/aura/commit/55fa378d42e277b7bcbe43938079d5f463a1602a) - Justin Gross [#625](https://github.com/mezmo/aura/issues/625)
+
+* **agents**: give StreamingAgent one entry point returning a run handle [5530e96](https://github.com/mezmo/aura/commit/5530e961439ebeebdce1cb552ade2a2761792e1a) - Justin Gross [#625](https://github.com/mezmo/aura/issues/625)
+
+* **agents**: give the run its own tool-call queue [3856861](https://github.com/mezmo/aura/commit/3856861e4161c766d248ae3a11521e4815c3abf8) - Justin Gross [#626](https://github.com/mezmo/aura/issues/626)
+
+* **agents**: make hooks an extension point [faab087](https://github.com/mezmo/aura/commit/faab087fc09f5baf15e9ac59dfe9879f21603af5) - Justin Gross [#625](https://github.com/mezmo/aura/issues/625)
+
+* **events**: add agent event schema and broker adapter [8ba61fd](https://github.com/mezmo/aura/commit/8ba61fd90eda6e830fd5339361a9b2c8380d8e9f) - Justin Gross [#618](https://github.com/mezmo/aura/issues/618)
+
+* **events**: approvals emit the agent event schema [ab5a15e](https://github.com/mezmo/aura/commit/ab5a15e293ac70cfbc8f10e5e32e728b886520d8) - Justin Gross [#624](https://github.com/mezmo/aura/issues/624)
+
+* **events**: carry response content on the run's event stream [ea0ae61](https://github.com/mezmo/aura/commit/ea0ae6124183ebed1a9d2e4d97af09a9bb637107) - Justin Gross [#626](https://github.com/mezmo/aura/issues/626)
+
+* **events**: name the agent on orchestrated content [0fdec1a](https://github.com/mezmo/aura/commit/0fdec1ae5123fb9600cca04526282a3244e8bc35) - Justin Gross [#626](https://github.com/mezmo/aura/issues/626)
+
+* **events**: orchestration emits the agent event schema [a4414a5](https://github.com/mezmo/aura/commit/a4414a538a4f15d9b48910bdf9f973c9b5e1dff2) - Justin Gross [#623](https://github.com/mezmo/aura/issues/623)
+
+* **events**: single-agent producers emit the agent event schema [cac4f3b](https://github.com/mezmo/aura/commit/cac4f3bb3699a2b6a041ef71ca457a67b21590e5) - Justin Gross [#620](https://github.com/mezmo/aura/issues/620)
+
+* **examples**: add Checkly incident response example config [59c269c](https://github.com/mezmo/aura/commit/59c269cac7df6af8caacd7fbfc8a3974219a1738) - Justin Gross
+
+* **mcp**: add namespace tracking for mcp tools [45036ad](https://github.com/mezmo/aura/commit/45036add434a954291dfa161eb12f5f9c287b856) - Justin Gross [#712](https://github.com/mezmo/aura/issues/712)
+
+* **mcp**: identify aura to mcp servers with a configurable user agent [62f7810](https://github.com/mezmo/aura/commit/62f7810e4add491d202ec984fb38f422750082df) - Justin Gross [#670](https://github.com/mezmo/aura/issues/670)
+
+* **orchestration**: add default 5m telemetry lookback policy [c2733ae](https://github.com/mezmo/aura/commit/c2733aee207d3e599bbdde1ba94d53f49aae1252) - Justin Gross [#697](https://github.com/mezmo/aura/issues/697)
+
+* **skills**: persist and rehydrate skill invocations across turns [770f114](https://github.com/mezmo/aura/commit/770f114e93a501190be17b56021d260f98d47a36) - Justin Gross
+
+
+
+### Miscellaneous
+
+* Merge branch 'nightly' into main [1000f11](https://github.com/mezmo/aura/commit/1000f119d38f4c4656ced0ae883c90f6f7610890) - GitHub
+
+* Merge pull request #688 from mezmo/main [1f4ca61](https://github.com/mezmo/aura/commit/1f4ca618463171da88afa4c2be303d6849ca6c8e) - GitHub [#688](https://github.com/mezmo/aura/issues/688)
+
+
+
+### Tests
+
+* **ci**: cover the dvp jwt refresh and hogql retry, clean up on failure [bd68e28](https://github.com/mezmo/aura/commit/bd68e28af0f0dd3a06fe230deccc07d3e590519f) - Justin Gross
+
+* **events**: state the worker-id parse case as current behavior [c78b6e6](https://github.com/mezmo/aura/commit/c78b6e6b50dd3e39d198ee1cdf713a7f8a2f3a9d) - Justin Gross
+
+* **sre**: add coverage for default window and override query args [3682802](https://github.com/mezmo/aura/commit/368280252d439df2092b5d950060245babccbe6c) - Justin Gross [#697](https://github.com/mezmo/aura/issues/697)
+
 ## [0.2.17](https://github.com/mezmo/aura/compare/v0.2.16...v0.2.17) (2026-09-11)
 
 
