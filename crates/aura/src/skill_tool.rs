@@ -10,9 +10,10 @@
 //! YAML frontmatter. Content is read from disk on demand, keeping the base
 //! system prompt small.
 
-use crate::config::{SessionId, SkillConfig};
+use crate::config::SkillConfig;
 use crate::session_store::{
     SKILL_INVOCATION_RECORD_VERSION, SkillInvocation, SkillInvocationRecord, SkillInvocationStore,
+    SkillLogKey,
 };
 use rig::{completion::ToolDefinition, tool::Tool};
 use serde::{Deserialize, Serialize};
@@ -44,11 +45,11 @@ pub fn is_skill_tool(tool_name: &str) -> bool {
     tool_name == LOAD_SKILL_TOOL_NAME || tool_name == READ_SKILL_FILE_TOOL_NAME
 }
 
-/// Writes a session's skill-tool invocations to its
-/// [`SkillInvocationStore`], the record side of `crate::skill_rehydration`.
+/// Writes one skill log's invocations to its [`SkillInvocationStore`], the
+/// record side of `crate::skill_rehydration`.
 pub struct SkillInvocationRecorder {
     store: Arc<dyn SkillInvocationStore>,
-    session_id: SessionId,
+    log: SkillLogKey,
     /// Position in the client-visible history this recorder's records carry.
     anchor: u32,
     seq: AtomicU32,
@@ -59,10 +60,10 @@ impl SkillInvocationRecorder {
     /// carries `anchor` — that turn's position in the client-visible history
     /// — and the next sequence number within the turn.
     #[must_use]
-    pub fn new(store: Arc<dyn SkillInvocationStore>, session_id: SessionId, anchor: u32) -> Self {
+    pub fn new(store: Arc<dyn SkillInvocationStore>, log: SkillLogKey, anchor: u32) -> Self {
         Self {
             store,
-            session_id,
+            log,
             anchor,
             seq: AtomicU32::new(0),
         }
@@ -82,9 +83,10 @@ impl SkillInvocationRecorder {
             invoked_at: chrono::Utc::now(),
         };
         let label = record.invocation.label();
-        if let Err(e) = self.store.record(&self.session_id, record).await {
+        if let Err(e) = self.store.record(&self.log, record).await {
             tracing::warn!(
-                session_id = self.session_id.as_str(),
+                session_id = self.log.session_id.as_str(),
+                agent_id = self.log.agent_id,
                 invocation = %label,
                 "failed to persist skill invocation: {e}"
             );
@@ -95,7 +97,7 @@ impl SkillInvocationRecorder {
 impl std::fmt::Debug for SkillInvocationRecorder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SkillInvocationRecorder")
-            .field("session_id", &self.session_id)
+            .field("log", &self.log)
             .field("anchor", &self.anchor)
             .finish_non_exhaustive()
     }

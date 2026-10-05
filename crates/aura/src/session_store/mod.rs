@@ -1,5 +1,6 @@
 //! Pluggable cross-instance session-state capabilities: a durable store for parked
-//! HITL approvals, a per-session skill-invocation store, and a pub/sub event bus.
+//! HITL approvals, a per-session, per-agent skill-invocation store, and a pub/sub
+//! event bus.
 //!
 //! The in-memory implementations are the default; file-backed approval and
 //! skill-invocation stores survive a process restart on a single host, and a
@@ -99,31 +100,49 @@ pub trait ApprovalStore: Send + Sync {
     ) -> Result<Vec<ParkedApproval>, SessionStoreError>;
 }
 
-/// Distinct skill-invocation records one session may hold.
-pub const MAX_SKILL_RECORDS_PER_SESSION: usize = 64;
+/// Distinct skill-invocation records one skill log may hold.
+pub const MAX_SKILL_RECORDS_PER_LOG: usize = 64;
 
-/// Per-session storage of skill-tool invocations, over the serializable
-/// [`SkillInvocationRecord`].
+/// One agent's skill-invocation log within a chat session.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SkillLogKey {
+    pub session_id: SessionId,
+    /// The serving agent's public identifier (`aura_config::Config::agent_id`).
+    pub agent_id: String,
+}
+
+impl SkillLogKey {
+    #[must_use]
+    pub fn new(session_id: SessionId, agent_id: impl Into<String>) -> Self {
+        Self {
+            session_id,
+            agent_id: agent_id.into(),
+        }
+    }
+}
+
+/// Storage of skill-tool invocations partitioned by [`SkillLogKey`], over the
+/// serializable [`SkillInvocationRecord`]. Logs are disjoint: no operation on
+/// one log reads or counts another's records.
 #[async_trait]
 pub trait SkillInvocationStore: Send + Sync {
-    /// Persist an invocation under a session. Idempotent per
-    /// (session, [`SkillInvocation::dedup_key`]): the first record for a key
+    /// Persist an invocation under a log. Idempotent per
+    /// (log, [`SkillInvocation::dedup_key`]): the first record for a key
     /// wins and later duplicates are no-ops, so a re-invoked skill keeps its
-    /// original position. A session holds at most
-    /// [`MAX_SKILL_RECORDS_PER_SESSION`] distinct invocations; a write past
-    /// the cap is dropped with a warning, not failed. Backends with native
-    /// expiry should TTL the session's entries so abandoned sessions
-    /// self-clean.
+    /// original position. A log holds at most [`MAX_SKILL_RECORDS_PER_LOG`]
+    /// distinct invocations; a write past the cap is dropped with a warning,
+    /// not failed. Backends with native expiry should TTL the log's entries
+    /// so abandoned sessions self-clean.
     async fn record(
         &self,
-        session_id: &SessionId,
+        log: &SkillLogKey,
         record: SkillInvocationRecord,
     ) -> Result<(), SessionStoreError>;
 
-    /// Every invocation recorded for a session, ordered by (anchor, seq).
+    /// Every invocation recorded under a log, ordered by (anchor, seq).
     async fn list(
         &self,
-        session_id: &SessionId,
+        log: &SkillLogKey,
     ) -> Result<Vec<SkillInvocationRecord>, SessionStoreError>;
 }
 
