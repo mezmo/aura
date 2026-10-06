@@ -24,9 +24,10 @@
 //!   them.
 //! - `list_pending` scans the undecided approvals for the poll reconciler:
 //!   corrupt files are warn-and-skipped per id, expired records are
-//!   unlinked, and an approval file left behind a complete decision file
-//!   is unlinked (one behind an undecodable decision file is kept, as the
-//!   only intact record).
+//!   filtered but kept in place for the read-or-expire consult to
+//!   terminalize (F02), and an approval file left behind a complete
+//!   decision file is unlinked (one behind an undecodable decision file
+//!   is kept, as the only intact record).
 //!
 //! Decision ids are validated as UUIDs before path building, so none address
 //! outside the root.
@@ -67,9 +68,13 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::task::{JoinError, spawn_blocking};
 
-use crate::hitl::{DecisionId, ParkedApproval, ResolveError, ResolvedDecision};
+use crate::hitl::{
+    AcknowledgmentState, AddressedApproval, ApprovalAuthority, ApprovalRead, DecisionId,
+    ParkedApproval, ResolveError, ResolvedDecision,
+};
 
-use super::{ApprovalStore, DecisionRecord, ParkedApprovalRecord, SessionStoreError};
+use super::record::TerminalRecord;
+use super::{AcknowledgeOutcome, ApprovalStore, ParkedApprovalRecord, SessionStoreError};
 
 pub use skill_store::FileSkillInvocationStore;
 
@@ -79,13 +84,16 @@ const APPROVALS_DIR: &str = "approvals";
 const DECISIONS_DIR: &str = "decisions";
 
 /// The on-disk shape of a resolved approval: the approval record carried
-/// over from `approvals/` plus the recorded decision. Field names are a
-/// persisted contract shared by every instance reading the store — rename
-/// only with a migration.
+/// over from `approvals/` plus the terminal record under the `decision`
+/// key. Field names are a persisted contract shared by every instance
+/// reading the store — rename only with a migration. The `decision` value
+/// is the explicitly tagged terminal record (`kind`: `decided` or
+/// `timed_out`); a value carrying both decided fields and a `deadline`
+/// fails decode instead of falling through to a variant.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct ResolvedEntry {
     approval: ParkedApprovalRecord,
-    decision: DecisionRecord,
+    decision: TerminalRecord,
 }
 
 /// A file-backed [`ApprovalStore`] over one root directory.
@@ -93,8 +101,14 @@ pub struct FileApprovalStore {
     inner: Arc<Inner>,
 }
 
-/// The shared store state: root directory, operation lock, and the
-/// per-path destructive-commit locks.
+/// The injectable time source the store samples while holding the
+/// operation lock. `Arc<dyn Fn>` so tests can drive the deadline and
+/// timeout arbitration deterministically.
+type StoreClock = Arc<dyn Fn() -> chrono::DateTime<chrono::Utc> + Send + Sync>;
+
+/// The shared store state: root directory, operation lock, the clock the
+/// resolve/read-or-expire deadline sampling reads, and the per-path
+/// destructive-commit locks.
 struct Inner {
     root: PathBuf,
     lock: Mutex<()>,
@@ -103,13 +117,25 @@ struct Inner {
     /// path, so growth is bounded by the approvals in flight.
     /// Mechanism: `with_path_lock`, `evict_path_lock`.
     path_locks: Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>,
+    clock: StoreClock,
 }
 
 impl FileApprovalStore {
     /// Open (or initialize) the store rooted at `root`, creating both
     /// directories and probing them for writes. Fails fast: a store that
     /// cannot hold files must fail at startup, not on the first approval.
+    /// Samples the wall clock.
     pub fn open(root: impl AsRef<Path>) -> Result<Self, SessionStoreError> {
+        Self::open_with_clock(root, Arc::new(chrono::Utc::now))
+    }
+
+    /// Open (or initialize) the store sampling an injected clock: the
+    /// read-or-expire seam the E2 fill arbitrates deadlines and timeouts
+    /// through, under the same lock as resolve and remove.
+    pub fn open_with_clock(
+        root: impl AsRef<Path>,
+        clock: StoreClock,
+    ) -> Result<Self, SessionStoreError> {
         let root = root.as_ref();
         private_dir(&root.join(APPROVALS_DIR)).map_err(connect_err)?;
         private_dir(&root.join(DECISIONS_DIR)).map_err(connect_err)?;
@@ -117,6 +143,7 @@ impl FileApprovalStore {
             root: root.to_path_buf(),
             lock: Mutex::new(()),
             path_locks: Mutex::new(HashMap::new()),
+            clock,
         });
         inner.probe_writable_sync().map_err(connect_err)?;
         Ok(Self { inner })
@@ -194,6 +221,38 @@ impl Inner {
         self.with_path_lock(&path, || publish(&path, &payload))
     }
 
+    fn mark_acknowledged_sync(
+        &self,
+        id: &DecisionId,
+    ) -> Result<AcknowledgeOutcome, SessionStoreError> {
+        let _guard = self.lock();
+        let id = canonical_id(id)?;
+        let path = self.approval_path(&id);
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            // No approval file: unknown, resolved, removed, or cancelled all
+            // read as `Missing`; a missing row is never recreated.
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                return Ok(AcknowledgeOutcome::Missing);
+            }
+            Err(err) => return Err(request_err(err)),
+        };
+        // resolve writes the decision before its best-effort approval unlink,
+        // so a decision file here marks an already-decided id: the row is no
+        // longer pending, and the stale approval file is left untouched.
+        if self.decision_path(&id).try_exists().map_err(request_err)? {
+            return Ok(AcknowledgeOutcome::Missing);
+        }
+        // Read-modify-write on the persisted record: only `acknowledgment`
+        // changes; every other field round-trips unchanged.
+        let mut record: ParkedApprovalRecord =
+            serde_json::from_slice(&bytes).map_err(decode_err)?;
+        record.acknowledgment = AcknowledgmentState::Acknowledged;
+        let payload = serde_json::to_vec(&record).expect("approval record serializes to JSON");
+        publish(&path, &payload)?;
+        Ok(AcknowledgeOutcome::Acknowledged)
+    }
+
     fn get_sync(&self, id: &DecisionId) -> Result<Option<ParkedApproval>, SessionStoreError> {
         let _guard = self.lock();
         let id = canonical_id(id)?;
@@ -215,6 +274,10 @@ impl Inner {
     fn resolve_sync(
         &self,
         id: &DecisionId,
+        // The authority check runs under this same lock; the signature
+        // carries it so no caller can bolt a validate-then-resolve race
+        // ahead of it.
+        expected_authority: ApprovalAuthority,
         decision: ResolvedDecision,
     ) -> Result<(), ResolveError> {
         let _guard = self.lock();
@@ -230,13 +293,18 @@ impl Inner {
             }
             Err(err) => return Err(ResolveError::Store(request_err(err))),
         };
-        if chrono::Utc::now() > record.expires_at {
+        // Wrong authority is indistinguishable from unknown: the row stays
+        // parked in `list_pending` and nothing is written.
+        if record.authority != expected_authority {
+            return Err(ResolveError::NotFound);
+        }
+        if (self.clock)() > record.expires_at {
             return Err(ResolveError::NotFound);
         }
         record.egress_headers = None;
         let payload = serde_json::to_vec(&ResolvedEntry {
             approval: record,
-            decision: DecisionRecord::from(&decision),
+            decision: TerminalRecord::from(&decision),
         })
         .expect("resolved entry serializes to JSON");
 
@@ -288,9 +356,15 @@ impl Inner {
         match fs::read(self.decision_path(&id)) {
             Ok(bytes) => {
                 let entry: ResolvedEntry = serde_json::from_slice(&bytes).map_err(decode_err)?;
-                ResolvedDecision::try_from(entry.decision)
-                    .map(Some)
-                    .map_err(decode_err)
+                match entry.decision.into_decision_record() {
+                    // A timed-out row records no decision: the timeout
+                    // surfaces through read_or_expire's addressed arm,
+                    // never as an outcome here.
+                    None => Ok(None),
+                    Some(decision) => ResolvedDecision::try_from(decision)
+                        .map(Some)
+                        .map_err(decode_err),
+                }
             }
             Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(err) => Err(request_err(err)),
@@ -398,6 +472,84 @@ impl Inner {
         Ok(cleared)
     }
 
+    /// Strict variant of [`Inner::cancel_request_sync`]: any fault while
+    /// reading, classifying, or unlinking an approval turns into a store
+    /// error so the caller knows the cancellation may be incomplete.
+    fn cancel_request_strict_sync(
+        &self,
+        request_id: &str,
+    ) -> Result<Vec<ParkedApproval>, SessionStoreError> {
+        let _guard = self.lock();
+        let entries = match fs::read_dir(self.approvals_dir()) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) => return Err(request_err(err)),
+        };
+
+        let mut candidates = Vec::new();
+        let mut stale_decided = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(request_err)?;
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            let bytes = match fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(request_err(err)),
+            };
+            let parked = match decode_approval(&bytes) {
+                Ok(parked) => parked,
+                Err(err) => {
+                    return Err(decode_err(format!(
+                        "approval file {} is undecodable and blocks strict cancellation: {err}",
+                        path.display()
+                    )));
+                }
+            };
+            if parked.request.request_id != request_id {
+                continue;
+            }
+            if self
+                .decision_path(&parked.request.decision_id.to_string())
+                .try_exists()
+                .map_err(request_err)?
+            {
+                stale_decided.push((path, bytes));
+                continue;
+            }
+            candidates.push((path, parked, bytes));
+        }
+
+        let mut cleared = Vec::new();
+        for (path, parked, bytes) in candidates {
+            match self.unlink_if_unchanged(&path, &bytes) {
+                Ok(true) => cleared.push(parked),
+                Ok(false) => {
+                    return Err(request_err(format!(
+                        "approval file {} changed under strict cancellation",
+                        path.display()
+                    )));
+                }
+                Err(err) => return Err(request_err(err)),
+            }
+        }
+        for (path, bytes) in stale_decided {
+            match self.unlink_if_unchanged(&path, &bytes) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Err(request_err(format!(
+                        "stale approval file {} changed under strict cancellation",
+                        path.display()
+                    )));
+                }
+                Err(err) => return Err(request_err(err)),
+            }
+        }
+        Ok(cleared)
+    }
+
     fn list_pending_sync(&self) -> Result<Vec<ParkedApproval>, SessionStoreError> {
         let paths: Vec<PathBuf> = {
             let _guard = self.lock();
@@ -414,8 +566,7 @@ impl Inner {
             }
             paths
         };
-
-        let now = chrono::Utc::now();
+        let now = (self.clock)();
 
         let mut pending = Vec::new();
         for path in paths {
@@ -463,16 +614,250 @@ impl Inner {
                 Err(err) if err.kind() == io::ErrorKind::NotFound => {}
                 Err(err) => return Err(request_err(err)),
             }
+            // An expired undecided row is filtered from the scan and
+            // LEFT IN PLACE: the read-or-expire consult is the one
+            // boundary that terminalizes it, writing the durable
+            // `TimedOut` record and stripping the row's credentials in
+            // the same ceremony resolve uses. Once that decision file
+            // exists, the decided-residue arm above cleans the approval
+            // file on every later scan — so no credential outlives the
+            // consult — while evidence cannot be erased ahead of the
+            // resume that must publish the timeout (F02). Eventual
+            // terminal-record cleanup belongs to retention, not here.
             if parked.expires_at > now {
                 pending.push(parked);
-            } else if let Err(err) = self.unlink_if_unchanged(&path, &bytes) {
-                tracing::warn!(
-                    path = %path.display(), error = %err,
-                    "expired approval file not removed by list_pending"
+            } else {
+                tracing::debug!(
+                    decision_id = %parked.request.decision_id,
+                    "expired approval kept for the read-or-expire consult"
                 );
             }
         }
         Ok(pending)
+    }
+
+    /// One read answers Missing / Pending / Addressed under the same lock
+    /// resolve and remove hold. Authority is checked on both the pending
+    /// and the decided path wherever the row is read, so a wrong channel
+    /// reads as missing with no mutation.
+    fn read_or_expire_sync(
+        &self,
+        id: &DecisionId,
+        expected_authority: ApprovalAuthority,
+    ) -> Result<ApprovalRead, SessionStoreError> {
+        let _guard = self.lock();
+        let id = canonical_id(id)?;
+
+        // Terminal-winner precedence: a decidable decision file owns the
+        // outcome wherever one exists — a stale approval residue beside it
+        // never re-enters the pending path — and an undecodable one is a
+        // decode fault, never a fabricated Missing.
+        match fs::read(self.decision_path(&id)) {
+            Ok(bytes) => {
+                let entry: ResolvedEntry = serde_json::from_slice(&bytes).map_err(decode_err)?;
+                if entry.approval.authority != expected_authority {
+                    return Ok(ApprovalRead::Missing);
+                }
+                let ResolvedEntry { approval, decision } = entry;
+                let restored = restore_approval(approval)?;
+                let outcome = AddressedApproval::try_from(decision).map_err(decode_err)?;
+                return Ok(ApprovalRead::Addressed {
+                    approval: restored,
+                    outcome,
+                });
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(request_err(err)),
+        }
+
+        let mut record = match fs::read(self.approval_path(&id)) {
+            Ok(bytes) => {
+                serde_json::from_slice::<ParkedApprovalRecord>(&bytes).map_err(decode_err)?
+            }
+            // No approval file: unknown, resolved, removed, or cancelled all
+            // read as `Missing`; a missing row is never recreated.
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                return Ok(ApprovalRead::Missing);
+            }
+            Err(err) => return Err(request_err(err)),
+        };
+        // Wrong authority is indistinguishable from unknown: the row stays
+        // parked and nothing is written.
+        if record.authority != expected_authority {
+            return Ok(ApprovalRead::Missing);
+        }
+        // The deadline rule is strictly past: a read sampled exactly at the
+        // row's own deadline is still pending. The injected clock is
+        // sampled once, under the same lock resolve and remove hold.
+        if (self.clock)() <= record.expires_at {
+            return restore_approval(record).map(ApprovalRead::Pending);
+        }
+
+        // Expire, in resolve's exact ceremony: the egress-stripped record
+        // moves into a durable tagged `TimedOut` decision file — the
+        // create_new claim commits at-most-once, sync narrows the empty-
+        // file crash window, and the approval unlink past the commit is
+        // best-effort. The complete record restores BEFORE any credential
+        // strip: a corrupt egress header is the stored row's decode fault
+        // returned with no mutation, never erased into a durable timeout.
+        let mut restored = restore_approval(record.clone())?;
+        restored.egress_headers = None;
+        record.egress_headers = None;
+        let deadline = record.expires_at;
+        let payload = serde_json::to_vec(&ResolvedEntry {
+            approval: record,
+            decision: TerminalRecord::TimedOut { deadline },
+        })
+        .expect("resolved entry serializes to JSON");
+        let decision_path = self.decision_path(&id);
+        let mut file = match private_file()
+            .write(true)
+            .create_new(true)
+            .open(&decision_path)
+        {
+            Ok(file) => file,
+            // A terminal winner already exists: the decision file owns the
+            // outcome — fall through to reading it instead of re-expiring.
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                let bytes = fs::read(&decision_path).map_err(request_err)?;
+                let winner: ResolvedEntry = serde_json::from_slice(&bytes).map_err(decode_err)?;
+                if winner.approval.authority != expected_authority {
+                    return Ok(ApprovalRead::Missing);
+                }
+                let ResolvedEntry { approval, decision } = winner;
+                let approval = restore_approval(approval)?;
+                let outcome = AddressedApproval::try_from(decision).map_err(decode_err)?;
+                return Ok(ApprovalRead::Addressed { approval, outcome });
+            }
+            Err(err) => return Err(request_err(err)),
+        };
+        if let Err(err) = file.write_all(&payload).and_then(|()| file.sync_all()) {
+            // Undo claim so retry can take it.
+            let _ = fs::remove_file(&decision_path);
+            return Err(request_err(err));
+        }
+        // After sync commit, removing the approval file is best-effort.
+        match fs::remove_file(self.approval_path(&id)) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => tracing::warn!(
+                decision_id = %id,
+                error = %err,
+                "stale approval file remains after read-or-expire; it is benign"
+            ),
+        }
+        Ok(ApprovalRead::Addressed {
+            approval: restored,
+            outcome: AddressedApproval::TimedOut { deadline },
+        })
+    }
+
+    /// The retained-evidence scan, side-effect-free: nothing is unlinked
+    /// and no clock is sampled — retention, not decidability, is the
+    /// question, so decided and past-window rows stay in the scan.
+    fn retained_rows_sync(&self) -> Result<Vec<super::RetainedApproval>, SessionStoreError> {
+        let _guard = self.lock();
+        let mut rows = Vec::new();
+
+        // Decisions/ first: a decidable decision file owns its id's
+        // classification, so its approval residue never scans as pending.
+        // Undecodable files are warn-and-skipped, never fatal to the scan.
+        let decisions = match fs::read_dir(self.decisions_dir()) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(rows),
+            Err(err) => return Err(request_err(err)),
+        };
+        for entry in decisions {
+            let entry = entry.map_err(request_err)?;
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                // A mid-publish temp file, never a stored decision.
+                continue;
+            }
+            let bytes = match fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(request_err(err)),
+            };
+            let addressed: ResolvedEntry = match serde_json::from_slice(&bytes) {
+                Ok(entry) => entry,
+                Err(err) => {
+                    tracing::warn!(
+                        path = %path.display(), error = %err,
+                        "undecodable decision file skipped by retained_rows"
+                    );
+                    continue;
+                }
+            };
+            let ResolvedEntry { approval, decision } = addressed;
+            let approval = match restore_approval(approval) {
+                Ok(approval) => approval,
+                Err(err) => {
+                    tracing::warn!(
+                        path = %path.display(), error = %err,
+                        "unrestorable approval side of a decision file skipped by retained_rows"
+                    );
+                    continue;
+                }
+            };
+            let outcome = match AddressedApproval::try_from(decision) {
+                Ok(outcome) => outcome,
+                Err(err) => {
+                    tracing::warn!(
+                        path = %path.display(), error = %err,
+                        "undecodable decision record skipped by retained_rows"
+                    );
+                    continue;
+                }
+            };
+            rows.push(super::RetainedApproval::Addressed { approval, outcome });
+        }
+
+        // Approvals/: a row without a decidable decision file is pending,
+        // inside or past its own window alike. Missing directories are
+        // fine (an empty store retains nothing).
+        let approvals = match fs::read_dir(self.approvals_dir()) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(rows),
+            Err(err) => return Err(request_err(err)),
+        };
+        for entry in approvals {
+            let entry = entry.map_err(request_err)?;
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            let bytes = match fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(request_err(err)),
+            };
+            let parked = match decode_approval(&bytes) {
+                Ok(parked) => parked,
+                Err(err) => {
+                    tracing::warn!(
+                        path = %path.display(), error = %err,
+                        "undecodable approval file skipped by retained_rows"
+                    );
+                    continue;
+                }
+            };
+            // Residue beside a decidable decision file was already counted
+            // from that file; a decision file that is missing or undecodable
+            // leaves the approval the pending row — the only intact record.
+            let decision_path = self.decision_path(&parked.request.decision_id.to_string());
+            match fs::read(&decision_path) {
+                Ok(decision_bytes) => {
+                    if serde_json::from_slice::<ResolvedEntry>(&decision_bytes).is_ok() {
+                        continue;
+                    }
+                }
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => return Err(request_err(err)),
+            }
+            rows.push(super::RetainedApproval::Pending(parked));
+        }
+        Ok(rows)
     }
 }
 
@@ -481,6 +866,17 @@ impl ApprovalStore for FileApprovalStore {
     async fn register(&self, parked: ParkedApproval) -> Result<(), SessionStoreError> {
         let inner = Arc::clone(&self.inner);
         spawn_blocking(move || inner.register_sync(parked))
+            .await
+            .map_err(join_err)?
+    }
+
+    async fn mark_acknowledged(
+        &self,
+        id: &DecisionId,
+    ) -> Result<AcknowledgeOutcome, SessionStoreError> {
+        let inner = Arc::clone(&self.inner);
+        let id = *id;
+        spawn_blocking(move || inner.mark_acknowledged_sync(&id))
             .await
             .map_err(join_err)?
     }
@@ -496,11 +892,12 @@ impl ApprovalStore for FileApprovalStore {
     async fn resolve(
         &self,
         id: &DecisionId,
+        expected_authority: ApprovalAuthority,
         decision: ResolvedDecision,
     ) -> Result<(), ResolveError> {
         let inner = Arc::clone(&self.inner);
         let id = *id;
-        spawn_blocking(move || inner.resolve_sync(&id, decision))
+        spawn_blocking(move || inner.resolve_sync(&id, expected_authority, decision))
             .await
             .map_err(|err| ResolveError::Store(join_err(err)))?
     }
@@ -535,9 +932,39 @@ impl ApprovalStore for FileApprovalStore {
             .map_err(join_err)?
     }
 
+    async fn cancel_request_strict(
+        &self,
+        request_id: &str,
+    ) -> Result<Vec<ParkedApproval>, SessionStoreError> {
+        let inner = Arc::clone(&self.inner);
+        let request_id = request_id.to_owned();
+        spawn_blocking(move || inner.cancel_request_strict_sync(&request_id))
+            .await
+            .map_err(join_err)?
+    }
+
     async fn list_pending(&self) -> Result<Vec<ParkedApproval>, SessionStoreError> {
         let inner = Arc::clone(&self.inner);
         spawn_blocking(move || inner.list_pending_sync())
+            .await
+            .map_err(join_err)?
+    }
+
+    async fn read_or_expire(
+        &self,
+        id: &DecisionId,
+        expected_authority: ApprovalAuthority,
+    ) -> Result<ApprovalRead, SessionStoreError> {
+        let inner = Arc::clone(&self.inner);
+        let id = *id;
+        spawn_blocking(move || inner.read_or_expire_sync(&id, expected_authority))
+            .await
+            .map_err(join_err)?
+    }
+
+    async fn retained_rows(&self) -> Result<Vec<super::RetainedApproval>, SessionStoreError> {
+        let inner = Arc::clone(&self.inner);
+        spawn_blocking(move || inner.retained_rows_sync())
             .await
             .map_err(join_err)?
     }
@@ -816,21 +1243,20 @@ mod private_mode_tests {
 /// end-to-end recovery half is the aura-web-server battery's
 /// `stale_sweep_cannot_unlink_a_replaced_record`. Every sweep-driven
 /// unlink checks the file against the bytes the sweep decoded
-/// (`unlink_if_unchanged`, the exact code path the scan's expiry
-/// and residue unlinks take), so the interleaving — stale record read,
-/// replace with a fresh record, unlink — is driven directly through
-/// that seam.
+/// (`unlink_if_unchanged`, the exact code path the scan's residue
+/// unlink takes; the expiry arm keeps evidence for the consult), so
+/// the interleaving — stale record read, replace with a fresh record,
+/// unlink — is driven directly through that seam.
 #[cfg(test)]
 mod unlink_recheck_tests {
     use std::sync::Arc;
 
+    use super::{FileApprovalStore, TerminalRecord, unlink_interleave};
     use crate::hitl::{
         AgentScope, ApprovalAuthority, ApprovalDecision, ApprovalItem, ApprovalOrigin,
         ApprovalRequest, DecisionId, PROTOCOL_VERSION, ParkedApproval, ResolvedDecision,
     };
-    use crate::session_store::{ApprovalStore, ParkedApprovalRecord};
-
-    use super::{FileApprovalStore, unlink_interleave};
+    use crate::session_store::{ApprovalStore, ParkedApprovalRecord, SessionStoreError};
 
     /// A representative parked approval for `decision_id`, expiring far
     /// out — the battery fixture's shape.
@@ -858,7 +1284,28 @@ mod unlink_recheck_tests {
             expires_at: now + chrono::Duration::hours(1),
             authority: ApprovalAuthority::WebhookPoll,
             egress_headers: None,
+            acknowledgment: crate::hitl::AcknowledgmentState::RequiresNotification,
         }
+    }
+
+    /// Publish the durable terminal record for `parked` under `dir` —
+    /// the state the scan's decided-residue arm keys on. Once the
+    /// decision exists, the approval file is residue the sweep unlinks;
+    /// the expiry arm alone keeps evidence for the consult.
+    fn write_terminal_record(dir: &tempfile::TempDir, parked: &ParkedApproval) {
+        let entry = super::ResolvedEntry {
+            approval: ParkedApprovalRecord::from(parked),
+            decision: TerminalRecord::TimedOut {
+                deadline: parked.expires_at,
+            },
+        };
+        let decisions = dir.path().join("decisions");
+        std::fs::create_dir_all(&decisions).unwrap();
+        std::fs::write(
+            decisions.join(format!("{}.json", parked.request.decision_id)),
+            serde_json::to_vec(&entry).unwrap(),
+        )
+        .unwrap();
     }
 
     #[tokio::test]
@@ -905,10 +1352,13 @@ mod unlink_recheck_tests {
         let store = FileApprovalStore::open(dir.path()).unwrap();
         let id = DecisionId::generate();
 
-        // The record the sweep will decide to unlink: expired.
+        // The record the sweep will decide to unlink: expired and
+        // already terminalized, so the scan's decided-residue arm owns
+        // its unlink (the expiry arm keeps evidence for the consult).
         let mut expired = make_parked(id);
         expired.expires_at = chrono::Utc::now() - chrono::Duration::seconds(1);
-        store.inner.register_sync(expired).unwrap();
+        store.inner.register_sync(expired.clone()).unwrap();
+        write_terminal_record(&dir, &expired);
         let path = dir.path().join("approvals").join(format!("{id}.json"));
         let stale = std::fs::read(&path).unwrap();
 
@@ -952,10 +1402,11 @@ mod unlink_recheck_tests {
     }
 
     /// The destroy that evicts: a registration materializes its path's
-    /// lock entry, and the expiry sweep's commit destroys the record and
-    /// evicts the entry with it, so the map holds nothing beyond the
-    /// approvals actually parked. Single-threaded end to end — the
-    /// refcount is one at eviction because nothing else holds a clone.
+    /// lock entry, and the residue sweep's commit destroys the decided
+    /// record and evicts the entry with it, so the map holds nothing
+    /// beyond the approvals actually parked. Single-threaded end to
+    /// end — the refcount is one at eviction because nothing else holds
+    /// a clone.
     #[test]
     fn a_sweep_destroy_evicts_the_destroyed_path_lock_entry() {
         let dir = tempfile::tempdir().unwrap();
@@ -964,7 +1415,8 @@ mod unlink_recheck_tests {
 
         let mut expired = make_parked(id);
         expired.expires_at = chrono::Utc::now() - chrono::Duration::seconds(1);
-        store.inner.register_sync(expired).unwrap();
+        store.inner.register_sync(expired.clone()).unwrap();
+        write_terminal_record(&dir, &expired);
         let path = dir.path().join("approvals").join(format!("{id}.json"));
         assert!(
             store
@@ -1014,7 +1466,8 @@ mod unlink_recheck_tests {
 
         let mut expired = make_parked(id);
         expired.expires_at = chrono::Utc::now() - chrono::Duration::seconds(1);
-        store.inner.register_sync(expired).unwrap();
+        store.inner.register_sync(expired.clone()).unwrap();
+        write_terminal_record(&dir, &expired);
         let path = dir.path().join("approvals").join(format!("{id}.json"));
         let snapshot = std::fs::read(&path).unwrap();
 
@@ -1090,7 +1543,11 @@ mod unlink_recheck_tests {
 
         store
             .inner
-            .resolve_sync(&id, ResolvedDecision::from(ApprovalDecision::Approved))
+            .resolve_sync(
+                &id,
+                ApprovalAuthority::WebhookPoll,
+                ResolvedDecision::from(ApprovalDecision::Approved),
+            )
             .unwrap();
 
         assert!(
@@ -1105,6 +1562,61 @@ mod unlink_recheck_tests {
                 .expect("file approval store path-lock map poisoned")
                 .is_empty(),
             "the resolved path's lock entry is evicted"
+        );
+    }
+
+    /// The stale-decided arm of strict cancellation must treat a record that
+    /// changes between classification and unlink as an incomplete
+    /// cancellation. The race is forced through the same interleaving seam the
+    /// other unlink-recheck tests use: a fresh payload is published at the
+    /// boundary between `unlink_if_unchanged`'s lock-free compare (which saw
+    /// the stale bytes) and its locked remove (which must then see changed
+    /// bytes and refuse).
+    #[tokio::test]
+    async fn strict_cancel_rejects_a_changed_stale_approval_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileApprovalStore::open(dir.path()).unwrap();
+        let id = DecisionId::generate();
+        let parked = make_parked(id);
+        store.register(parked.clone()).await.unwrap();
+        write_terminal_record(&dir, &parked);
+
+        let path = dir.path().join("approvals").join(format!("{id}.json"));
+        let stale = std::fs::read(&path).unwrap();
+
+        // A fresh registration at the same path, ready to be published by the
+        // boundary hook after the stale-decided arm has classified the record.
+        let fresh = make_parked(id);
+        let fresh_payload = serde_json::to_vec(&ParkedApprovalRecord::from(&fresh)).unwrap();
+        assert_ne!(
+            stale, fresh_payload,
+            "fixture: the fresh payload differs from the stale one"
+        );
+
+        let swept_path = path.clone();
+        let _boundary = unlink_interleave::install(Box::new(move |boundary: &std::path::Path| {
+            if boundary != swept_path.as_path() {
+                return;
+            }
+            std::fs::write(boundary, &fresh_payload)
+                .expect("boundary hook publishes the fresh payload");
+        }));
+
+        let result = store.cancel_request_strict("req-replaced").await;
+        let err = match result {
+            Ok(cleared) => panic!(
+                "a changed stale approval must fail strict cancellation, but cleared {}",
+                cleared.len()
+            ),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, SessionStoreError::Request { .. }),
+            "expected a request error naming the changed record, got {err:?}"
+        );
+        assert!(
+            path.exists(),
+            "the changed stale approval file is retained for retry"
         );
     }
 }

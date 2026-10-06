@@ -1,28 +1,47 @@
 //! The park checkpoint (park mode): the document, the commit, the
 //! run-scoped guard, and the resume-side continuation surfaces.
 
+mod cleanup;
 mod commit;
 mod continuation;
 mod document;
 mod guard;
+pub(crate) mod lifetime;
+mod rebuild;
 mod recorded_decisions;
+pub(crate) mod resume;
+mod retention;
+pub mod sweep;
 
 pub(crate) use commit::{
     ParkCommitInputs, cancel_run_approvals, commit_from_run_state, run_owner_id,
 };
-// The rehydrate entry points: consumed by commit 3's tests; the P45 resume
-// endpoint consumes them in production.
+// `ResumingDocumentHandle` drives the resume segment's tombstones in
+// production. `load_recorded_decisions` is consumed through this
+// re-export by the park-tree golden suites alone — the module is private
+// outside `park`, and the resume consult reaches it by module path — so
+// its marker stays.
+pub(crate) use continuation::ResumingDocumentHandle;
 #[allow(unused_imports)]
-pub(crate) use continuation::{
-    RehydrateError, ResumeContext, ResumingDocumentHandle, TaskContinuation,
-    load_recorded_decisions, replace_tool_result,
-};
-#[allow(unused_imports)]
+pub(crate) use continuation::load_recorded_decisions;
 pub(crate) use document::{
-    PARKED_DOCUMENT_SUFFIX, ParkedRun, RESUMING_DOCUMENT_SUFFIX, RunStateForPark, load_parked_run,
+    PARKED_DOCUMENT_SUFFIX, ParkedRun, RESUMING_DOCUMENT_SUFFIX, RunStateForPark,
 };
-pub(crate) use guard::ParkGuard;
-pub(crate) use recorded_decisions::{CallKey, RecordedDecisions};
+// `load_parked_run` is reached through this re-export by the park-tree
+// golden suites alone — the module is private outside `park`, and the
+// production resume path no longer re-loads the re-published checkpoint —
+// so its marker stays.
+#[allow(unused_imports)]
+pub(crate) use document::load_parked_run;
+pub(crate) use guard::{ParkGuard, ParkGuardMode};
+// The provider-valid context builder for the reconstruction direction
+// (P45, R5): the prelude names `CallId`, `NodePreflightInput`,
+// `OutcomeWire`, `SegmentPreflight`, and `rebuild_context` through this
+// re-export; everything else in the module is reached by module path.
+pub(crate) use rebuild::{
+    CallId, NodePreflightInput, OutcomeWire, SegmentPreflight, rebuild_context,
+};
+pub(crate) use recorded_decisions::{CallKey, PeekOutcome, RecordedDecisions};
 
 use std::collections::HashMap;
 

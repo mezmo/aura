@@ -9,10 +9,13 @@ use bytes::Bytes;
 use tokio::sync::broadcast;
 
 use crate::config::SessionId;
-use crate::hitl::{DecisionId, ParkedApproval, ResolveError, ResolvedDecision, Timestamp};
+use crate::hitl::{
+    AcknowledgmentState, AddressedApproval, ApprovalAuthority, ApprovalRead, DecisionId,
+    ParkedApproval, ResolveError, ResolvedDecision, Timestamp,
+};
 
 use super::{
-    ApprovalStore, EventBus, MAX_SKILL_RECORDS_PER_SESSION, SessionStoreError,
+    AcknowledgeOutcome, ApprovalStore, EventBus, MAX_SKILL_RECORDS_PER_SESSION, SessionStoreError,
     SkillInvocationRecord, SkillInvocationStore, Subscription,
 };
 
@@ -27,9 +30,12 @@ const DECISION_RETENTION_MARGIN_SECS: i64 = 60;
 const MAX_SKILL_SESSIONS: usize = 1024;
 
 /// A recorded resolved decision (decision plus captured identity) and its
-/// retention deadline.
+/// retention deadline. The row itself is retained beside the decision so
+/// `read_or_expire`'s addressed arm can return it unchanged (the file
+/// backend persists both halves in its decision record).
 struct DecidedEntry {
     decision: ResolvedDecision,
+    approval: ParkedApproval,
     keep_until: Timestamp,
 }
 
@@ -67,6 +73,20 @@ impl ApprovalStore for InMemoryApprovalStore {
         Ok(())
     }
 
+    async fn mark_acknowledged(
+        &self,
+        id: &DecisionId,
+    ) -> Result<AcknowledgeOutcome, SessionStoreError> {
+        let mut entries = self.lock();
+        match entries.get_mut(id) {
+            Some(parked) => {
+                parked.acknowledgment = AcknowledgmentState::Acknowledged;
+                Ok(AcknowledgeOutcome::Acknowledged)
+            }
+            None => Ok(AcknowledgeOutcome::Missing),
+        }
+    }
+
     async fn get(&self, id: &DecisionId) -> Result<Option<ParkedApproval>, SessionStoreError> {
         Ok(self.lock().get(id).cloned())
     }
@@ -74,28 +94,46 @@ impl ApprovalStore for InMemoryApprovalStore {
     async fn resolve(
         &self,
         id: &DecisionId,
+        // The authority check runs under this same boundary; the signature
+        // carries it so no caller can bolt a validate-then-resolve race
+        // ahead of it.
+        expected_authority: ApprovalAuthority,
         decision: ResolvedDecision,
     ) -> Result<(), ResolveError> {
-        // Lock removal provides at-most-once.
-        let parked = {
-            let mut entries = self.lock();
-            if entries
-                .get(id)
-                .is_some_and(|parked| chrono::Utc::now() > parked.expires_at)
-            {
-                return Err(ResolveError::NotFound);
-            }
-            entries.remove(id)
+        // One serialization boundary: the entries guard spans the removal
+        // AND the decided insert, so a concurrent read_or_expire (which
+        // holds the same lock pair in the same order) observes either the
+        // pending row or the decided winner — never neither. Lock order:
+        // entries -> decided, the only nesting in this module.
+        let mut entries = self.lock();
+        let (row_authority, row_expires_at) = {
+            let row = entries.get(id).ok_or(ResolveError::NotFound)?;
+            (row.authority, row.expires_at)
         };
-        let parked = parked.ok_or(ResolveError::NotFound)?;
+        // Wrong authority is indistinguishable from unknown: the row
+        // stays parked and nothing is recorded. This reads the stored
+        // row's authority, so it covers inline `register` rows and
+        // durable `register_durable` rows alike.
+        if row_authority != expected_authority {
+            return Err(ResolveError::NotFound);
+        }
+        if chrono::Utc::now() > row_expires_at {
+            return Err(ResolveError::NotFound);
+        }
+        // Lock removal provides at-most-once; the row is present under
+        // this guard, so the removal cannot miss.
+        let parked = entries.remove(id).ok_or(ResolveError::NotFound)?;
+        let keep_until =
+            parked.expires_at + chrono::Duration::seconds(DECISION_RETENTION_MARGIN_SECS);
         self.lock_decided().insert(
             *id,
             DecidedEntry {
                 decision,
-                keep_until: parked.expires_at
-                    + chrono::Duration::seconds(DECISION_RETENTION_MARGIN_SECS),
+                approval: parked,
+                keep_until,
             },
         );
+        drop(entries);
         Ok(())
     }
 
@@ -134,6 +172,61 @@ impl ApprovalStore for InMemoryApprovalStore {
             .cloned()
             .collect();
         Ok(pending)
+    }
+
+    async fn read_or_expire(
+        &self,
+        id: &DecisionId,
+        expected_authority: ApprovalAuthority,
+    ) -> Result<ApprovalRead, SessionStoreError> {
+        // One serialization boundary with resolve: the entries guard
+        // spans the pending check AND the decided check (lock order:
+        // entries -> decided, mirroring resolve's nesting), so a resolve
+        // in flight cannot make this read observe neither map and
+        // misreport a row being decided as Missing.
+        let entries = self.lock();
+        // The pending path checks the row's own authority, so a wrong
+        // channel reads as missing with no mutation — one agent's poller
+        // cannot consume another's rows.
+        if let Some(parked) = entries.get(id).cloned() {
+            if parked.authority != expected_authority {
+                return Ok(ApprovalRead::Missing);
+            }
+            if chrono::Utc::now() > parked.expires_at {
+                // The timeout is re-derived from the row on every read:
+                // idempotent, with no cached winner and no mutation — a
+                // `DecidedEntry` cannot hold a timeout and none is needed.
+                let deadline = parked.expires_at;
+                return Ok(ApprovalRead::Addressed {
+                    approval: parked,
+                    outcome: AddressedApproval::TimedOut { deadline },
+                });
+            }
+            return Ok(ApprovalRead::Pending(parked));
+        }
+        // No pending row: a recorded decision inside the window wins over
+        // any timeout, carrying the row retained beside it at resolve time.
+        match self.lock_decided().get(id) {
+            Some(entry) => {
+                if entry.approval.authority != expected_authority {
+                    return Ok(ApprovalRead::Missing);
+                }
+                Ok(ApprovalRead::Addressed {
+                    approval: entry.approval.clone(),
+                    outcome: AddressedApproval::Decided(entry.decision.clone()),
+                })
+            }
+            None => Ok(ApprovalRead::Missing),
+        }
+    }
+
+    async fn retained_rows(&self) -> Result<Vec<super::RetainedApproval>, SessionStoreError> {
+        Err(SessionStoreError::UnsupportedOperation {
+            operation: "retained_rows",
+            reason: "the in-memory backend has no park parity: a process-local \
+                     registry has no durable rows to scan"
+                .to_string(),
+        })
     }
 }
 
@@ -327,9 +420,10 @@ mod tests {
 
     use super::*;
     use crate::hitl::{
-        AgentScope, ApprovalAuthority, ApprovalDecision, ApprovalItem, ApprovalOrigin,
-        ApprovalRequest, PROTOCOL_VERSION,
+        AddressedApproval, AgentScope, ApprovalAuthority, ApprovalDecision, ApprovalItem,
+        ApprovalOrigin, ApprovalRequest, PROTOCOL_VERSION,
     };
+    use crate::session_store::ParkedApprovalRecord;
 
     fn parked(request_id: &str) -> ParkedApproval {
         let now = chrono::Utc::now();
@@ -353,8 +447,9 @@ mod tests {
             },
             registered_at: now,
             expires_at: now + chrono::Duration::seconds(60),
-            authority: ApprovalAuthority::WebhookPoll,
+            authority: ApprovalAuthority::Conversational,
             egress_headers: None,
+            acknowledgment: crate::hitl::AcknowledgmentState::RequiresNotification,
         }
     }
 
@@ -367,6 +462,7 @@ mod tests {
             id,
             DecidedEntry {
                 decision: ResolvedDecision::from(ApprovalDecision::Approved),
+                approval: parked("req-prune"),
                 keep_until: chrono::Utc::now() - chrono::Duration::seconds(1),
             },
         );
@@ -384,7 +480,13 @@ mod tests {
         store.register(entry).await.unwrap();
 
         assert_eq!(
-            store.resolve(&id, ApprovalDecision::Approved.into()).await,
+            store
+                .resolve(
+                    &id,
+                    ApprovalAuthority::Conversational,
+                    ApprovalDecision::Approved.into()
+                )
+                .await,
             Err(ResolveError::NotFound)
         );
         assert_eq!(store.decision(&id).await.unwrap(), None);
@@ -658,5 +760,144 @@ mod tests {
 
         assert_eq!(sub_a.next().await.unwrap(), Bytes::from_static(b"for-a"));
         assert_eq!(sub_b.next().await.unwrap(), Bytes::from_static(b"for-b"));
+    }
+
+    // -- read-or-expire and retained scan (E2 RED) --------------------------
+
+    /// An unknown id reads as missing.
+    #[tokio::test]
+    async fn read_or_expire_missing_row_reads_missing() {
+        let store = InMemoryApprovalStore::new();
+
+        assert!(
+            matches!(
+                store
+                    .read_or_expire(&DecisionId::generate(), ApprovalAuthority::Conversational)
+                    .await
+                    .unwrap(),
+                ApprovalRead::Missing
+            ),
+            "an unknown id must read as Missing"
+        );
+    }
+
+    /// A row parked under a different authority reads as missing with no
+    /// mutation: one agent's poller cannot consume another's rows.
+    #[tokio::test]
+    async fn read_or_expire_wrong_authority_reads_missing_without_mutation() {
+        let store = InMemoryApprovalStore::new();
+        let entry = parked("req-roe-authority");
+        let id = entry.request.decision_id;
+        store.register(entry).await.unwrap();
+
+        assert!(
+            matches!(
+                store
+                    .read_or_expire(&id, ApprovalAuthority::WebhookPoll)
+                    .await
+                    .unwrap(),
+                ApprovalRead::Missing
+            ),
+            "a wrong-authority read must answer Missing"
+        );
+        assert!(
+            store.get(&id).await.unwrap().is_some(),
+            "a wrong-authority read must not consume the row"
+        );
+    }
+
+    /// A row inside its window reads as pending, carrying the row.
+    #[tokio::test]
+    async fn read_or_expire_pending_inside_window_is_pending() {
+        let store = InMemoryApprovalStore::new();
+        let entry = parked("req-roe-pending");
+        let id = entry.request.decision_id;
+        let expected = ParkedApprovalRecord::from(&entry);
+        store.register(entry).await.unwrap();
+
+        match store
+            .read_or_expire(&id, ApprovalAuthority::Conversational)
+            .await
+            .unwrap()
+        {
+            ApprovalRead::Pending(got) => assert_eq!(ParkedApprovalRecord::from(&got), expected),
+            _ => panic!("expected Pending, got another ApprovalRead arm"),
+        }
+    }
+
+    /// A row past its deadline addresses as `TimedOut` carrying the row's own
+    /// `expires_at`, and a second read returns the same addressed answer:
+    /// the derivation is idempotent, with no cached winner type.
+    #[tokio::test]
+    async fn read_or_expire_expired_row_is_addressed_timed_out() {
+        let store = InMemoryApprovalStore::new();
+        let mut entry = parked("req-roe-expired");
+        entry.expires_at = chrono::Utc::now() - chrono::Duration::seconds(1);
+        let id = entry.request.decision_id;
+        let expected = ParkedApprovalRecord::from(&entry);
+        let deadline = entry.expires_at;
+        store.register(entry).await.unwrap();
+
+        for _ in 0..2 {
+            match store
+                .read_or_expire(&id, ApprovalAuthority::Conversational)
+                .await
+                .unwrap()
+            {
+                ApprovalRead::Addressed { approval, outcome } => {
+                    assert_eq!(ParkedApprovalRecord::from(&approval), expected);
+                    assert_eq!(outcome, AddressedApproval::TimedOut { deadline });
+                }
+                _ => panic!("expected Addressed, got another ApprovalRead arm"),
+            }
+        }
+    }
+
+    /// A decision recorded inside the window wins: the read addresses with
+    /// the recorded decision, not a timeout.
+    #[tokio::test]
+    async fn read_or_expire_decided_winner_is_addressed_decided() {
+        let store = InMemoryApprovalStore::new();
+        let entry = parked("req-roe-decided");
+        let id = entry.request.decision_id;
+        let expected = ParkedApprovalRecord::from(&entry);
+        store.register(entry).await.unwrap();
+        store
+            .resolve(
+                &id,
+                ApprovalAuthority::Conversational,
+                ApprovalDecision::Approved.into(),
+            )
+            .await
+            .unwrap();
+
+        match store
+            .read_or_expire(&id, ApprovalAuthority::Conversational)
+            .await
+            .unwrap()
+        {
+            ApprovalRead::Addressed { approval, outcome } => {
+                assert_eq!(ParkedApprovalRecord::from(&approval), expected);
+                assert_eq!(
+                    outcome,
+                    AddressedApproval::Decided(ResolvedDecision::from(ApprovalDecision::Approved))
+                );
+            }
+            _ => panic!("expected Addressed, got another ApprovalRead arm"),
+        }
+    }
+
+    /// The memory backend has no park parity: the retained scan answers the
+    /// typed unsupported-operation error.
+    #[tokio::test]
+    async fn retained_rows_is_unsupported_without_park_parity() {
+        let store = InMemoryApprovalStore::new();
+
+        match store.retained_rows().await {
+            Err(SessionStoreError::UnsupportedOperation { operation, .. }) => {
+                assert_eq!(operation, "retained_rows");
+            }
+            _ => panic!("expected UnsupportedOperation, got another answer"),
+        }
     }
 }

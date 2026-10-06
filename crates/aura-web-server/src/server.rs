@@ -306,6 +306,89 @@ fn hitl_route_vs_server_window_warning(
     None
 }
 
+/// The park bootstrap guard (decree: file-only park admission). Park
+/// mode is admitted only on the file session store, and every
+/// park-enabled agent must name a usable, writable checkpoint root —
+/// both checked at startup BEFORE any poller or listener starts.
+/// Memory and Redis are refused as park backends: memory cannot
+/// outlive the process, and Redis remains supported for ordinary
+/// (non-park) HITL only. The root probe creates
+/// `<memory_dir>/parked/` — the exact subtree park commits land in —
+/// and writes-then-removes a probe file, so an unusable root fails
+/// loud at boot instead of on the first park commit.
+fn bootstrap_park_guard(
+    configs: &[aura_config::Config],
+    backend: aura_config::SessionStoreBackend,
+) -> Result<(), std::io::Error> {
+    let park_enabled: Vec<&aura_config::Config> = configs
+        .iter()
+        .filter(|config| config.hitl.as_ref().is_some_and(|hitl| hitl.park.enabled))
+        .collect();
+    if park_enabled.is_empty() {
+        return Ok(());
+    }
+    // Fail-closed: only the file backend admits park; an unrecognized
+    // backend reads as non-file and is refused the same way.
+    if let Some(denied) = match backend {
+        aura_config::SessionStoreBackend::Memory => Some("memory"),
+        aura_config::SessionStoreBackend::Redis => Some("redis"),
+        aura_config::SessionStoreBackend::File => None,
+        _ => Some("non-file"),
+    } {
+        let agent = park_enabled[0]
+            .agent
+            .alias
+            .as_deref()
+            .unwrap_or(&park_enabled[0].agent.name);
+        let message = format!(
+            "agent '{agent}': [hitl] park mode requires the file session store \
+             (AURA_SESSION_STORE=file), but AURA_SESSION_STORE is '{denied}'; memory \
+             cannot outlive the process, and Redis remains supported for ordinary \
+             HITL only — no resume could ever succeed"
+        );
+        error!("{message}");
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            message,
+        ));
+    }
+    for config in &park_enabled {
+        let agent = config.agent.alias.as_deref().unwrap_or(&config.agent.name);
+        let Some(root) = config.effective_memory_dir() else {
+            let message = format!(
+                "agent '{agent}': [hitl] park mode requires a memory_dir for \
+                 checkpoint evidence; the agent configuration names none"
+            );
+            error!("{message}");
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                message,
+            ));
+        };
+        let parked_root = std::path::Path::new(root).join("parked");
+        if let Err(err) = std::fs::create_dir_all(&parked_root) {
+            let message = format!(
+                "agent '{agent}': [hitl] park mode checkpoint root '{root}' is \
+                 unusable: {err}"
+            );
+            error!("{message}");
+            return Err(std::io::Error::new(err.kind(), message));
+        }
+        let probe = parked_root.join(format!(".park-probe-{}", std::process::id()));
+        if let Err(err) =
+            std::fs::write(&probe, b"probe").and_then(|()| std::fs::remove_file(&probe))
+        {
+            let message = format!(
+                "agent '{agent}': [hitl] park mode checkpoint root '{root}' is \
+                 not writable: {err}"
+            );
+            error!("{message}");
+            return Err(std::io::Error::new(err.kind(), message));
+        }
+    }
+    Ok(())
+}
+
 /// Serve until SIGINT/SIGTERM, then drain in-flight streams and flush spans.
 pub async fn serve(args: ServerArgs) -> std::io::Result<()> {
     let result = run(args).await;
@@ -420,6 +503,8 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
     }
     info!("Session store backend: {}", session_store.backend());
 
+    bootstrap_park_guard(&configs_arc, session_store.backend())?;
+
     // HITL webhook HMAC (AURA_HITL_WEBHOOK_SECRET*): fail startup loud on a
     // misconfiguration instead of silently serving unsigned, unverified
     // traffic. One load serves both legs: egress signing via AppState,
@@ -480,20 +565,25 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
         args.host, args.port
     );
 
-    // Poll delivery: one reconciler per poll-mode agent config, holding its
-    // own webhook client built from the same route config the per-request
+    // Poll delivery: one reconciler per park-capable agent config, holding
+    // its own webhook client built from the same route config the per-request
     // routes use, and the ingress registry's store. Each loop stops when the
     // shutdown token cancels; the handles are kept and joined at teardown,
     // where a loop that died of a panic mid-run warns instead of detaching
     // silently.
     //
-    // Boot guard: two poll-mode configs whose agent settings produce the
+    // Boot guard: two park-capable configs whose agent settings produce the
     // same effective instance id would each spawn a reconciler claiming
     // the same pending rows in one process, breaking the single-writer
     // posture the poller documents — refuse at boot, the same loud config
     // error as the plaintext-http-with-secret refusal. In-process only: a
     // cross-process same-id deployment (active/standby) must fence
     // reconciler leadership externally.
+    //
+    // Cross-comment (see `PollReconciler::from_config`): the "can spawn a
+    // reconciler" predicate is `can_park`. This guard's duplicate-id scan
+    // sees exactly the configs the reconciler arms, so the two must move
+    // together.
     let mut reconcilers = Vec::new();
     let mut claims = Vec::new();
     for config in configs_arc.iter() {
@@ -529,6 +619,74 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
             ),
         ));
     }
+    // The shared run-reservation table: every park-owned execution, the
+    // resume endpoint, and the retention sweep fence on the SAME table. It
+    // is created once before the router so the sweep receives a clone of the
+    // table the handlers use.
+    let resume_claims = Arc::new(aura::orchestration::ResumeClaimTable::new());
+
+    // Park retention sweep: one engine per park-enabled config, sharing the
+    // reservation table above and the session store's approval backend. The
+    // startup pass runs before the listener binds; the cadence loop spawns
+    // after bind and joins at teardown. Each engine carries its config's
+    // effective instance id and reclaims only the rows that instance parked
+    // (the same ownership key the poll reconciler claims by), so sweeps on
+    // one shared store cannot strand each other's runs.
+    let approval_store = session_store.approvals();
+    let mut park_sweeps = Vec::new();
+    let mut sweep_claims = Vec::new();
+    for config in configs_arc.iter() {
+        let Some(hitl) = &config.hitl else {
+            continue;
+        };
+        if !hitl.park.enabled {
+            continue;
+        }
+        let Some(memory_dir) = config.effective_memory_dir() else {
+            // `bootstrap_park_guard` already refused this; skip defensively.
+            continue;
+        };
+        let label = config.agent.alias.as_deref().unwrap_or(&config.agent.name);
+        let instance_id = compute_instance_id(&config.agent).to_string();
+        sweep_claims.push((label.to_string(), instance_id.clone()));
+        park_sweeps.push(aura::orchestration::ParkSweep::new(
+            Arc::clone(&resume_claims),
+            app_state.pending_approvals.clone(),
+            Arc::clone(&approval_store),
+            memory_dir.to_string(),
+            hitl.park.park_ttl,
+            label.to_string(),
+            instance_id,
+        ));
+    }
+    // Boot guard, the sweep-side twin of the reconciler guard above: two
+    // park-enabled configs resolving to the same effective instance id would
+    // each reap the other's approval rows as orphans out of one shared
+    // store. The instance scoping inside each sweep only separates engines
+    // whose ids differ, so identical ids are refused here, loudly, the same
+    // as the poll-delivery conflict.
+    if let Some(((first, second), id)) = reconciler_id_conflicts(&sweep_claims) {
+        error!(
+            "park sweep conflict: agents '{first}' and '{second}' resolve to the same \
+             effective instance id {id}"
+        );
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "park sweep conflict: agents '{first}' and '{second}' resolve to the same \
+                 effective instance id {id}; two retention sweeps in one process would \
+                 reclaim each other's approvals. give each park-enabled agent a distinct \
+                 instance_seed (or a distinct name)"
+            ),
+        ));
+    }
+
+    // Startup pass: every park-enabled config gets one full sweep before the
+    // server accepts any request.
+    for sweep in &park_sweeps {
+        sweep.run_pass().await;
+    }
+
     let app = Router::new()
         .route("/health", get(handlers::health))
         .route("/aura/info", get(handlers::info))
@@ -538,8 +696,15 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
             "/v1/approvals/{decision_id}",
             post(handlers::resolve_approval),
         )
+        .route(
+            "/v1/sessions/{session_id}/runs/{run_id}",
+            post(handlers::resume_run),
+        )
         .layer(axum::extract::Extension(handlers::IngressHmac(
             ingress_hmac,
+        )))
+        .layer(axum::extract::Extension(handlers::ResumeClaims(
+            Arc::clone(&resume_claims),
         )))
         .layer(TraceLayer::new_for_http())
         .layer(middleware::from_fn_with_state(
@@ -655,6 +820,11 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
         .map(|reconciler| reconciler.spawn(&shutdown_token))
         .collect();
 
+    let park_sweep_handles: Vec<aura::orchestration::SweepHandle> = park_sweeps
+        .into_iter()
+        .map(|sweep| sweep.spawn(&shutdown_token))
+        .collect();
+
     let serve_result = axum::serve(listener, app)
         .with_graceful_shutdown(async {
             shutdown_rx.await.ok();
@@ -662,6 +832,9 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
         .await;
 
     for handle in pollers {
+        let _ = handle.stop().await;
+    }
+    for handle in park_sweep_handles {
         let _ = handle.stop().await;
     }
 
@@ -682,12 +855,12 @@ fn reconciler_id_conflicts(claims: &[(String, String)]) -> Option<((String, Stri
 }
 
 /// The scan sees only configs `PollReconciler::from_config` arms (the
-/// spawn loop claims no others), so a non-poll config sharing an id never
-/// reaches it; that gating is pinned by the poller's
-/// `from_config_gates_on_poll_delivery`.
+/// spawn loop claims no others), so a non-park-capable config sharing an id
+/// never reaches it; that gating is pinned by the poller's `can_park` key
+/// (cross-comment at `PollReconciler::from_config`).
 #[cfg(test)]
 mod reconciler_boot_guard_tests {
-    use super::{compute_instance_id, reconciler_id_conflicts};
+    use super::{bootstrap_park_guard, compute_instance_id, reconciler_id_conflicts};
 
     fn claim(label: &str, id: &str) -> (String, String) {
         (label.to_string(), id.to_string())
@@ -707,6 +880,158 @@ mod reconciler_boot_guard_tests {
         aura_config::load_config_from_str(&toml)
             .expect("the boot-guard fixture config parses")
             .agent
+    }
+
+    /// A full config for the park bootstrap guard: a validated base
+    /// (no hitl table — none parses pre-activation) carrying a
+    /// struct-built hitl — park-enabled (the shape the activated world
+    /// will deliver through validation) or an ordinary conversational
+    /// HITL with parking off.
+    fn guard_config(park_enabled: bool, memory_dir: Option<&str>) -> aura_config::Config {
+        let memory_dir_field = memory_dir
+            .map(|dir| format!("memory_dir = \"{dir}\"\n"))
+            .unwrap_or_default();
+        let toml = format!(
+            "{memory_dir_field}[agent]\nname = \"guarded\"\nsystem_prompt = \"test\"\n\n\
+             [agent.llm]\nprovider = \"openai\"\napi_key = \"test\"\nmodel = \"gpt-4o\"\n"
+        );
+        let mut config =
+            aura_config::load_config_from_str(&toml).expect("the park-guard fixture config parses");
+        config.hitl = Some(aura_config::HitlConfig {
+            require_approval: vec![],
+            park: aura_config::ParkConfig {
+                enabled: park_enabled,
+                ..Default::default()
+            },
+            route: aura_config::DecisionRouteConfig::Conversational { timeout_secs: 60 },
+        });
+        config
+    }
+
+    /// Park on the memory backend is refused with the file-only decree
+    /// message; without park, the same backend stays admitted (ordinary
+    /// HITL).
+    #[test]
+    fn bootstrap_guard_refuses_park_on_memory_but_keeps_ordinary_hitl() {
+        let err = bootstrap_park_guard(
+            &[guard_config(true, None)],
+            aura_config::SessionStoreBackend::Memory,
+        )
+        .expect_err("park on memory is refused");
+        let text = err.to_string();
+        assert!(
+            text.contains("park mode requires the file session store") && text.contains("'memory'"),
+            "the refusal names the decree and the backend: {text}"
+        );
+        assert!(
+            bootstrap_park_guard(
+                &[guard_config(false, None)],
+                aura_config::SessionStoreBackend::Memory
+            )
+            .is_ok(),
+            "ordinary HITL on memory stays admitted"
+        );
+    }
+
+    /// Park on Redis is refused — Redis stays supported for ordinary
+    /// HITL only — while ordinary HITL on Redis stays admitted.
+    #[test]
+    fn bootstrap_guard_refuses_park_on_redis_but_keeps_ordinary_hitl() {
+        let err = bootstrap_park_guard(
+            &[guard_config(true, None)],
+            aura_config::SessionStoreBackend::Redis,
+        )
+        .expect_err("park on redis is refused");
+        let text = err.to_string();
+        assert!(
+            text.contains("'redis'") && text.contains("ordinary HITL only"),
+            "the refusal names the backend and the ordinary-HITL boundary: {text}"
+        );
+        assert!(
+            bootstrap_park_guard(
+                &[guard_config(false, None)],
+                aura_config::SessionStoreBackend::Redis
+            )
+            .is_ok(),
+            "ordinary HITL on redis stays admitted"
+        );
+    }
+
+    /// Park on the file backend still needs a named checkpoint root: a
+    /// park-enabled agent with no memory_dir is refused.
+    #[test]
+    fn bootstrap_guard_requires_a_checkpoint_root() {
+        let err = bootstrap_park_guard(
+            &[guard_config(true, None)],
+            aura_config::SessionStoreBackend::File,
+        )
+        .expect_err("park without a checkpoint root is refused");
+        assert!(
+            err.to_string().contains("requires a memory_dir"),
+            "the refusal names the missing root: {err}"
+        );
+    }
+
+    /// A checkpoint root occupied by a file (not a directory) is
+    /// unusable: the probe's directory creation fails loud.
+    #[test]
+    fn bootstrap_guard_refuses_an_unusable_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let occupied = dir.path().join("occupied");
+        std::fs::write(&occupied, b"not a directory").unwrap();
+        let err = bootstrap_park_guard(
+            &[guard_config(true, Some(occupied.to_str().unwrap()))],
+            aura_config::SessionStoreBackend::File,
+        )
+        .expect_err("a file in place of the root is refused");
+        assert!(
+            err.to_string().contains("unusable"),
+            "the refusal names the unusable root: {err}"
+        );
+    }
+
+    /// A read-only checkpoint root is refused: the failure surfaces at
+    /// the probe (directory creation or the write itself, whichever the
+    /// permissions deny first).
+    #[test]
+    fn bootstrap_guard_refuses_a_read_only_root() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let err = bootstrap_park_guard(
+            &[guard_config(true, Some(dir.path().to_str().unwrap()))],
+            aura_config::SessionStoreBackend::File,
+        )
+        .expect_err("a read-only root is refused");
+        let text = err.to_string();
+        assert!(
+            text.contains("unusable") || text.contains("not writable"),
+            "the refusal names the unusable-or-readonly root: {text}"
+        );
+    }
+
+    /// A fresh (absent) checkpoint root is created and probed clean:
+    /// park admission leaves `<memory_dir>/parked/` ready and no probe
+    /// residue behind.
+    #[test]
+    fn bootstrap_guard_creates_and_probes_a_fresh_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("absent-until-probed");
+        bootstrap_park_guard(
+            &[guard_config(true, Some(root.to_str().unwrap()))],
+            aura_config::SessionStoreBackend::File,
+        )
+        .expect("a creatable, writable root admits park");
+        let parked = root.join("parked");
+        assert!(parked.is_dir(), "the parked subtree is ready");
+        let residue: Vec<_> = std::fs::read_dir(&parked)
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        assert!(
+            residue.is_empty(),
+            "the probe leaves nothing behind: {residue:?}"
+        );
     }
 
     #[test]

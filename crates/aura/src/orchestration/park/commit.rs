@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -17,6 +18,8 @@ use super::ParkedTaskRecords;
 use super::document::{
     PARKED_DOCUMENT_SUFFIX, ParkedRun, RESUMING_DOCUMENT_SUFFIX, RunStateForPark, build_document,
 };
+use super::lifetime::RunExecutionScope;
+use super::retention::RetentionExpiresAt;
 
 /// The inputs the orchestrator hands the park commit.
 pub(crate) struct ParkCommitInputs<'a> {
@@ -26,25 +29,32 @@ pub(crate) struct ParkCommitInputs<'a> {
     pub registry: &'a PendingApprovals,
     pub memory_dir: &'a str,
     pub config: &'a AgentRuntimeConfig,
-    /// Decision window stamped on a document with no surviving ticket.
-    pub decision_window: std::time::Duration,
+    /// The validated retention age (`[hitl.park].park_ttl`), projected from
+    /// the runtime HITL config. The stamp computes `retention_expires_at`
+    /// from the publication timestamp plus this age — one timestamp source
+    /// for the persisted deadline and the terminal event.
+    pub park_ttl: aura_config::ParkTtl,
+    /// Hex sha256 of the bound identity header's value, stamped into the
+    /// document the resume side compares against; `None` when identity
+    /// binding is not configured. A re-park passes the checkpoint's stored
+    /// value through so the binding survives the segment.
+    pub identity_hash: Option<String>,
 }
 
 /// The refreshed awaiting set: per-task pending calls still parked —
 /// including calls decided since the gate hit, retained for the resume
-/// consult — and the earliest expiry among the undecided tickets.
+/// consult.
 pub(crate) struct RefreshedAwaiting {
     pub pending_by_task: HashMap<usize, Vec<PendingCall>>,
-    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Every decision id still awaiting a decision, in plan order.
     pub decision_ids: Vec<DecisionId>,
 }
 
-/// A completed park commit: the resolved expiry stamp and the refreshed
+/// A completed park commit: the stamped retention deadline and the refreshed
 /// awaiting set.
 pub(crate) struct ParkCommitOutcome {
-    /// RFC 3339 expiry timestamp.
-    pub expires_at: String,
+    /// The retention deadline the published document carries.
+    pub retention_expires_at: RetentionExpiresAt,
     pub refreshed: RefreshedAwaiting,
 }
 
@@ -54,19 +64,16 @@ pub(crate) fn run_owner_id(run_id: &str) -> String {
     format!("run:{run_id}")
 }
 
-/// Narrow the plan's awaiting tasks to the calls still parked, with the
-/// earliest surviving ticket expiry. A call decided between gate-hit and
-/// commit stays in the checkpoint — the resume consult consumes its
-/// recorded decision — but its settled ticket contributes neither expiry
-/// nor an outstanding id. A store fault fails the refresh, and with it the
-/// commit, rather than dropping a still-decidable approval from the
-/// checkpoint.
+/// Narrow the plan's awaiting tasks to the calls still parked. A call decided
+/// between gate-hit and commit stays in the checkpoint — the resume consult
+/// consumes its recorded decision — but its settled ticket contributes no
+/// outstanding id. A store fault fails the refresh, and with it the commit,
+/// rather than dropping a still-decidable approval from the checkpoint.
 pub(crate) async fn refresh_awaiting(
     plan: &Plan,
     registry: &PendingApprovals,
 ) -> io::Result<RefreshedAwaiting> {
     let mut pending_by_task = HashMap::new();
-    let mut expires_at = None;
     let mut decision_ids = Vec::new();
 
     for task in &plan.tasks {
@@ -75,7 +82,11 @@ pub(crate) async fn refresh_awaiting(
         };
         let mut surviving = Vec::with_capacity(pending.len());
         for call in pending {
-            let Some(parked) = registry
+            // The load is the retain/drop check: a ticket the store no longer
+            // holds drops the call from the checkpoint. The ticket's deadline
+            // feeds nothing (the retention stamp is the publication timestamp
+            // plus `park_ttl`), so the parked value is deliberately unread.
+            let Some(_parked) = registry
                 .try_parked(&call.decision_id)
                 .await
                 .map_err(io::Error::other)?
@@ -100,10 +111,6 @@ pub(crate) async fn refresh_awaiting(
                 surviving.push(call.clone());
                 continue;
             }
-            expires_at = Some(match expires_at {
-                Some(earliest) if parked.expires_at >= earliest => earliest,
-                _ => parked.expires_at,
-            });
             surviving.push(call.clone());
             decision_ids.push(call.decision_id);
         }
@@ -114,17 +121,17 @@ pub(crate) async fn refresh_awaiting(
 
     Ok(RefreshedAwaiting {
         pending_by_task,
-        expires_at,
         decision_ids,
     })
 }
 
 /// The whole commit: refresh the awaiting set against the store, build the
-/// document, publish it. `expires_at` is resolved once here so the document
-/// and the caller's terminal event carry the same stamp; a refresh with no
-/// surviving ticket stamps `now + decision_window`.
+/// document, publish it. The retention deadline is resolved once here — the
+/// publication timestamp plus the validated `park_ttl` — so the document and
+/// the caller's terminal event carry the same stamp.
 pub(crate) async fn commit_from_run_state(
     inputs: &ParkCommitInputs<'_>,
+    scope: Option<&Arc<RunExecutionScope>>,
 ) -> io::Result<ParkCommitOutcome> {
     let ParkCommitInputs {
         state,
@@ -133,31 +140,44 @@ pub(crate) async fn commit_from_run_state(
         registry,
         memory_dir,
         config,
-        decision_window,
+        park_ttl,
+        identity_hash,
     } = inputs;
 
     let refreshed = refresh_awaiting(plan, registry).await?;
-    let expires_at = refreshed
-        .expires_at
-        .unwrap_or_else(|| {
-            chrono::Utc::now()
-                + chrono::Duration::from_std(*decision_window).expect("decision window fits chrono")
-        })
-        .to_rfc3339();
+    let published_at = chrono::Utc::now();
+    let retention_expires_at = RetentionExpiresAt::from_publication(published_at, *park_ttl)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     let document = build_document(
         state,
         plan,
         records,
         &refreshed.pending_by_task,
-        expires_at.clone(),
+        retention_expires_at,
         config_fingerprint(config),
+        identity_hash.clone(),
+        &frozen_request_egress(config),
     )?;
     let parked_dir = parked_document_dir(memory_dir, state.session_id);
-    publish(&document, &parked_dir, state.run_id).await?;
+    publish(&document, &parked_dir, state.run_id, scope).await?;
     Ok(ParkCommitOutcome {
-        expires_at,
+        retention_expires_at,
         refreshed,
     })
+}
+
+/// The original request's resolved `headers_from_request` egress values, as
+/// the park commit freezes them into the checkpoint: the route's resolved
+/// headers verbatim on the webhook arm, empty on the conversational arm (no
+/// egress exists there). A resumed run seeds its route from the frozen map,
+/// so new gated asks authenticate under the original request's identity.
+fn frozen_request_egress(config: &AgentRuntimeConfig) -> http::HeaderMap {
+    config
+        .hitl
+        .as_ref()
+        .and_then(|hitl| hitl.route.park_egress().ok())
+        .map(|headers| headers.into_owned())
+        .unwrap_or_default()
 }
 
 /// Publish a checkpoint by temp write and same-directory rename.
@@ -172,6 +192,7 @@ pub(crate) async fn publish(
     document: &ParkedRun,
     parked_dir: &Path,
     run_id: &str,
+    scope: Option<&Arc<RunExecutionScope>>,
 ) -> io::Result<PathBuf> {
     if !is_safe_path_component(run_id) {
         return Err(io::Error::new(
@@ -187,7 +208,7 @@ pub(crate) async fn publish(
     // performs file I/O.
     let parked_dir = parked_dir.to_path_buf();
     let run_id = run_id.to_string();
-    tokio::task::spawn_blocking(move || {
+    let write = move || -> io::Result<PathBuf> {
         crate::session_store::private_dir(&parked_dir)?;
 
         let tmp = parked_dir.join(format!(".{run_id}.tmp"));
@@ -206,7 +227,11 @@ pub(crate) async fn publish(
             );
         }
         Ok(dest)
-    })
+    };
+    match scope {
+        Some(scope) => scope.spawn_blocking_tracked(write),
+        None => tokio::task::spawn_blocking(write),
+    }
     .await
     .map_err(io::Error::other)?
 }
@@ -218,16 +243,25 @@ pub(crate) async fn publish(
 /// ordered teardown. A decided ticket is never in the cleared set, so the
 /// stream cannot disagree with a decision that won the race. A lost store
 /// reply yields warn-and-empty, the conceded residual.
-/// The sweep is its own task, which no scope reaches, so the run comes from the
-/// caller rather than the ambient one.
+/// The sweep is its own task, which no scope reaches, so the run comes from
+/// the caller rather than the ambient one. When the run carries an execution
+/// scope, the sweep spawns TRACKED through it — registered before it starts
+/// and holding a lease reference through completion, so the supervisor's
+/// drain cannot release the run's fence while the sweep is still publishing.
+/// An unscoped run keeps the bare spawn (byte-equivalent behavior).
 pub(crate) fn cancel_run_approvals(
     registry: &PendingApprovals,
     run_id: &str,
+    request_id: &str,
     run: Option<std::sync::Arc<crate::run_context::RunContext>>,
+    scope: Option<&Arc<RunExecutionScope>>,
 ) -> tokio::task::JoinHandle<()> {
     let registry = registry.clone();
     let run_id = run_id.to_string();
-    tokio::task::spawn(async move {
+    // Signature parity with the span: the emit-port addresses publications
+    // through the run, so the request id itself is unused here.
+    let _ = request_id;
+    let sweep = async move {
         for parked in registry.cancel_request(&run_owner_id(&run_id)).await {
             let cancelled = crate::hitl::completed_cancelled_event(
                 parked.request.decision_id,
@@ -244,7 +278,11 @@ pub(crate) fn cancel_run_approvals(
                 ),
             }
         }
-    })
+    };
+    match scope {
+        Some(scope) => scope.spawn_tracked(sweep),
+        None => tokio::task::spawn(sweep),
+    }
 }
 
 /// The directory checkpoint documents live in:
@@ -259,12 +297,13 @@ pub(crate) fn parked_document_dir(memory_dir: &str, session_id: Option<&str>) ->
 }
 
 /// Fingerprint the configuration a resume must not drift from: the HITL
-/// gating surface (globs, route, park flag), the agent's model and tool
-/// filter, and the per-worker model and tool configuration.
+/// gating surface (globs, route, park flag), the agent's name, system
+/// prompt, model, and tool filter, the per-worker model and tool
+/// configuration, and the bound identity header's NAME.
 ///
-/// The webhook route's projection carries `"delivery"` derived from the
-/// client's poll marker — the same source `park_registry` reads; no second
-/// delivery flag exists. Poll tuning (poll_url, interval, per-attempt
+/// The webhook route's projection carries the two delivery markers —
+/// `decide_live` and `park`, the same sources `park_registry` and the
+/// reconciler spawn read. Poll tuning (poll_url, interval, per-attempt
 /// timeout) is deliberately fingerprint-COMPATIBLE, and no credential value
 /// (headers, secrets) enters the projection; resume-side enforcement is a
 /// one-way bump on change.
@@ -280,7 +319,8 @@ pub(crate) fn config_fingerprint(config: &AgentRuntimeConfig) -> String {
         } => json!({
             "kind": "webhook",
             "timeout_secs": timeout.as_secs(),
-            "delivery": if client.poll_delivery() { "poll" } else { "sync" },
+            "decide_live": client.can_decide_live(),
+            "park": client.can_park(),
         }),
     });
     let source = json!({
@@ -295,7 +335,10 @@ pub(crate) fn config_fingerprint(config: &AgentRuntimeConfig) -> String {
         "agent": {
             "llm": serde_json::to_value(&config.llm).ok(),
             "mcp_filter": &config.agent.mcp_filter,
+            "name": &config.agent.name,
+            "system_prompt": &config.agent.system_prompt,
         },
+        "identity_header": &config.identity_header,
         "workers": config
             .orchestration
             .as_ref()
@@ -312,12 +355,21 @@ mod tests {
 
     use super::*;
     use crate::hitl::{
-        AgentScope, ApprovalItem, ApprovalOrigin, ApprovalRequest, DecisionId, PROTOCOL_VERSION,
-        ParkedApproval, PendingApprovals, ResolveError,
+        AgentScope, ApprovalAuthority, ApprovalItem, ApprovalOrigin, ApprovalRequest, DecisionId,
+        PROTOCOL_VERSION, ParkedApproval, PendingApprovals, ResolveError,
     };
     use crate::orchestration::park::document::{ParkedPlan, SCHEMA_VERSION, load_parked_run};
+    use crate::orchestration::park::retention::RetentionExpiresAt;
     use crate::orchestration::types::Task;
     use crate::session_store::{ApprovalStore, InMemoryApprovalStore, InMemoryEventBus};
+
+    fn fixture_retention() -> RetentionExpiresAt {
+        RetentionExpiresAt::from_datetime(
+            chrono::DateTime::parse_from_rfc3339("2026-09-02T15:00:00+00:00")
+                .expect("fixture stamp parses")
+                .with_timezone(&chrono::Utc),
+        )
+    }
 
     fn conv_registry() -> (PendingApprovals, std::sync::Arc<InMemoryApprovalStore>) {
         let store = std::sync::Arc::new(InMemoryApprovalStore::new());
@@ -353,8 +405,9 @@ mod tests {
             },
             registered_at: chrono::Utc::now(),
             expires_at,
-            authority: crate::hitl::ApprovalAuthority::WebhookPoll,
+            authority: ApprovalAuthority::Conversational,
             egress_headers: None,
+            acknowledgment: crate::hitl::AcknowledgmentState::RequiresNotification,
         }
     }
 
@@ -375,7 +428,7 @@ mod tests {
             session_id: Some("sess".to_string()),
             run_id: run_id.to_string(),
             parked_at: "2026-09-02T14:00:00+00:00".to_string(),
-            expires_at: "2026-09-02T15:00:00+00:00".to_string(),
+            retention_expires_at: fixture_retention(),
             query: "Deploy".to_string(),
             chat_history: vec![],
             coordinator_conversation: vec![],
@@ -390,9 +443,11 @@ mod tests {
             },
             executed: vec![],
             config_fingerprint: "f".to_string(),
+            identity_hash: None,
+            request_egress: HashMap::new(),
         };
 
-        let dest = publish(&document, &parked_dir, run_id).await.unwrap();
+        let dest = publish(&document, &parked_dir, run_id, None).await.unwrap();
         assert_eq!(dest, parked_dir.join(format!("{run_id}.json")));
         assert!(dest.try_exists().unwrap(), "published document exists");
         assert!(
@@ -432,7 +487,7 @@ mod tests {
             session_id: None,
             run_id: run_id.to_string(),
             parked_at: "2026-09-02T14:00:00+00:00".to_string(),
-            expires_at: "2026-09-02T15:00:00+00:00".to_string(),
+            retention_expires_at: fixture_retention(),
             query: "Deploy".to_string(),
             chat_history: vec![],
             coordinator_conversation: vec![],
@@ -447,11 +502,13 @@ mod tests {
             },
             executed: vec![],
             config_fingerprint: "f".to_string(),
+            identity_hash: None,
+            request_egress: HashMap::new(),
         };
 
         let tmp = parked_dir.join(format!(".{run_id}.tmp"));
         tokio::fs::create_dir(&tmp).await.unwrap();
-        let result = publish(&document, &parked_dir, run_id).await;
+        let result = publish(&document, &parked_dir, run_id, None).await;
 
         assert!(result.is_err(), "the temp write must fail");
         assert!(
@@ -464,13 +521,12 @@ mod tests {
         assert!(tmp.is_dir(), "the obstruction is left in place");
     }
 
-    /// Refresh drops approvals the store no longer holds, keeps the
-    /// undecided ones, and reports the earliest surviving expiry. The memory
-    /// backend's resolve moves the row, so a decided call reads as removed
-    /// here; the file-backed retention case is
-    /// [`early_decision_is_retained_and_consumed_at_resume`].
+    /// Refresh drops approvals the store no longer holds and keeps the
+    /// surviving undecided set. The memory backend's resolve moves the row,
+    /// so a decided call reads as removed here; the file-backed retention
+    /// case is [`early_decision_is_retained_and_consumed_at_resume`].
     #[tokio::test]
-    async fn refresh_drops_decided_and_takes_earliest_expiry() {
+    async fn refresh_drops_decided_and_keeps_the_surviving_set() {
         let (registry, _store) = conv_registry();
         let owner = "run:0191e8c0-eeee-7000-8000-000000000003";
         let now = chrono::Utc::now();
@@ -512,7 +568,11 @@ mod tests {
             .await
             .unwrap();
         registry
-            .resolve(&decided, crate::hitl::ApprovalDecision::Approved.into())
+            .resolve(
+                &decided,
+                ApprovalAuthority::Conversational,
+                crate::hitl::ApprovalDecision::Approved.into(),
+            )
             .await
             .unwrap();
         registry.remove(&removed).await;
@@ -552,12 +612,6 @@ mod tests {
         let surviving = &refreshed.pending_by_task[&0];
         assert_eq!(surviving.len(), 2, "decided and removed drop out");
         assert_eq!(refreshed.decision_ids, vec![earliest, latest]);
-        let reported = refreshed.expires_at.expect("earliest expiry reported");
-        let expected = now + chrono::Duration::minutes(30);
-        assert!(
-            (reported - expected).num_seconds().abs() < 1,
-            "expiry is the earliest surviving expiry"
-        );
     }
 
     /// A decision landing between gate-hit and
@@ -602,14 +656,21 @@ mod tests {
                 },
                 registered_at: now,
                 expires_at: now + chrono::Duration::hours(1),
-                authority: crate::hitl::ApprovalAuthority::WebhookPoll,
+                // The authority production park rows register under; the
+                // resume consult reads the retained row under this seam.
+                authority: ApprovalAuthority::WebhookPoll,
                 egress_headers: None,
+                acknowledgment: crate::hitl::AcknowledgmentState::RequiresNotification,
             })
             .await
             .unwrap();
         // The decision wins the race against the park commit.
         registry
-            .resolve(&decided, crate::hitl::ApprovalDecision::Approved.into())
+            .resolve(
+                &decided,
+                ApprovalAuthority::WebhookPoll,
+                crate::hitl::ApprovalDecision::Approved.into(),
+            )
             .await
             .unwrap();
 
@@ -633,10 +694,6 @@ mod tests {
         assert!(
             refreshed.decision_ids.is_empty(),
             "a decided call is no longer outstanding"
-        );
-        assert!(
-            refreshed.expires_at.is_none(),
-            "a settled ticket bounds nothing"
         );
 
         // The resume consult consumes the retained call's recorded decision.
@@ -666,14 +723,19 @@ mod tests {
             &plan,
             &records,
             &refreshed.pending_by_task,
-            (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
+            RetentionExpiresAt::from_datetime(chrono::Utc::now() + chrono::Duration::hours(1)),
             config_fingerprint(&AgentRuntimeConfig::default()),
+            None,
+            &http::HeaderMap::new(),
         )
         .unwrap();
-        let (recorded, ids) =
-            crate::orchestration::park::load_recorded_decisions(&registry, &document)
-                .await
-                .unwrap();
+        let (recorded, ids) = crate::orchestration::park::load_recorded_decisions(
+            &registry,
+            &document,
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
         assert_eq!(ids, vec![decided]);
         assert_eq!(
             recorded.take(&crate::orchestration::CallKey::new(
@@ -681,11 +743,325 @@ mod tests {
                 "kubectl_apply",
                 &args
             )),
-            Some(crate::hitl::ResolvedDecision::from(
-                crate::hitl::ApprovalDecision::Approved
+            Some(crate::hitl::AddressedApproval::Decided(
+                crate::hitl::ResolvedDecision::from(crate::hitl::ApprovalDecision::Approved)
             )),
             "the early decision is consumed at resume",
         );
+    }
+
+    /// E5-R R1: the retention stamp derives from the publication timestamp
+    /// plus the validated `park_ttl` (7200s here), never from the earliest
+    /// surviving ticket — the ticket windows and the stamp part ways exactly
+    /// here. The fixture's park_ttl (7200) differs from the ticket window
+    /// (30min), so the retired interim-bridge value and the E5 value are
+    /// observably different instants.
+    ///
+    /// RED at E5-R: the interim bridge stamped the refresh's earliest
+    /// surviving ticket expiry (`now + 30min`), so both value assertions
+    /// failed at the value — never at compilation or setup. E5 turns it green.
+    #[tokio::test]
+    async fn retention_stamp_derives_from_publication_not_the_earliest_ticket() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory_dir = dir.path().join("memory").to_string_lossy().into_owned();
+        let (registry, _store) = conv_registry();
+
+        let run_id = "0191e8c0-eeee-7000-8000-0000000000a1";
+        let owner = run_owner_id(run_id);
+        let now = chrono::Utc::now();
+        let ticket = DecisionId::generate();
+        let ticket_expiry = now + chrono::Duration::minutes(30);
+        registry
+            .register_durable(parked_approval(ticket, &owner, ticket_expiry))
+            .await
+            .unwrap();
+
+        let mut plan = Plan::new("Deploy");
+        plan.add_task(Task::new(0, "Gated apply", "r"));
+        plan.tasks[0].state = TaskState::AwaitingApproval {
+            pending: vec![PendingCall {
+                decision_id: ticket,
+                tool_name: "kubectl_apply".to_string(),
+                arguments: serde_json::json!({ "namespace": "prod" }),
+                call_id: "c1".to_string(),
+            }],
+        };
+        let mut records = ParkedTaskRecords::new();
+        records.insert(
+            0,
+            crate::orchestration::park::ParkedTaskRecord {
+                attempt: 1,
+                snapshot: crate::orchestration::ParkSnapshot {
+                    history: vec![rig::completion::Message::user("apply it")],
+                    current_prompt: rig::completion::Message::user("tool results"),
+                },
+            },
+        );
+
+        let state = RunStateForPark {
+            run_id,
+            session_id: None,
+            query: "Deploy",
+            chat_history: &[],
+            coordinator_conversation: &[],
+            routing_decision: None,
+            iteration: 1,
+            planning_ms: 0,
+            failure_history: &[],
+        };
+        let inputs = ParkCommitInputs {
+            state,
+            plan: &plan,
+            records: &records,
+            registry: &registry,
+            memory_dir: &memory_dir,
+            config: &AgentRuntimeConfig::default(),
+            park_ttl: aura_config::ParkTtl::try_new(7200).expect("park ttl validates"),
+            identity_hash: None,
+        };
+
+        let before = chrono::Utc::now();
+        let outcome = commit_from_run_state(&inputs, None).await.unwrap();
+        let after = chrono::Utc::now();
+
+        let stamp = outcome.retention_expires_at.as_datetime();
+        let lower = before + chrono::Duration::seconds(7200 - 30);
+        let upper = after + chrono::Duration::seconds(7200 + 30);
+        assert!(
+            stamp >= lower && stamp <= upper,
+            "the retention stamp is the publication timestamp plus the park_ttl \
+             (7200s): got {stamp}, expected within [{lower}, {upper}]"
+        );
+        assert!(
+            (stamp - ticket_expiry).num_seconds().abs() >= 60,
+            "the stamp must not be the earliest-ticket derivation: {stamp} sits \
+             within one minute of the ticket's expiry {ticket_expiry}"
+        );
+    }
+
+    /// E5-R R2: a commit with no surviving undecided ticket — the call
+    /// decided between gate-hit and commit, its decided row retained by the
+    /// file-backed store — stamps retention from the publication timestamp
+    /// plus the validated `park_ttl` (7200s), never from the retired
+    /// `now + decision_window` fallback (30 minutes at E5-R).
+    ///
+    /// RED at E5-R: the bridge's no-surviving-ticket fallback stamped
+    /// `now + decision_window`, so the window assertion failed at the value.
+    /// E5 turns it green.
+    #[tokio::test]
+    async fn retention_stamp_with_no_surviving_ticket_derives_from_park_ttl() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory_dir = dir.path().join("memory").to_string_lossy().into_owned();
+        // The file-backed registry, exactly as
+        // `early_decision_is_retained_and_consumed_at_resume` builds it:
+        // resolve keeps the decided row readable, so the refresh retains the
+        // decided call for the resume consult while its settled ticket
+        // contributes no expiry.
+        let store: Arc<dyn ApprovalStore> = Arc::new(
+            crate::session_store::FileApprovalStore::open(dir.path().join("approvals")).unwrap(),
+        );
+        let registry = PendingApprovals::with_backend(store, Arc::new(InMemoryEventBus::new()));
+
+        let run_id = "0191e8c0-eeee-7000-8000-0000000000a2";
+        let owner = run_owner_id(run_id);
+        let now = chrono::Utc::now();
+        let ticket = DecisionId::generate();
+        registry
+            .register_durable(parked_approval(
+                ticket,
+                &owner,
+                now + chrono::Duration::minutes(30),
+            ))
+            .await
+            .unwrap();
+        registry
+            .resolve(
+                &ticket,
+                ApprovalAuthority::Conversational,
+                crate::hitl::ApprovalDecision::Approved.into(),
+            )
+            .await
+            .unwrap();
+
+        let mut plan = Plan::new("Deploy");
+        plan.add_task(Task::new(0, "Gated apply", "r"));
+        plan.tasks[0].state = TaskState::AwaitingApproval {
+            pending: vec![PendingCall {
+                decision_id: ticket,
+                tool_name: "kubectl_apply".to_string(),
+                arguments: serde_json::json!({ "namespace": "prod" }),
+                call_id: "c1".to_string(),
+            }],
+        };
+        let mut records = ParkedTaskRecords::new();
+        records.insert(
+            0,
+            crate::orchestration::park::ParkedTaskRecord {
+                attempt: 1,
+                snapshot: crate::orchestration::ParkSnapshot {
+                    history: vec![rig::completion::Message::user("apply it")],
+                    current_prompt: rig::completion::Message::user("tool results"),
+                },
+            },
+        );
+
+        let state = RunStateForPark {
+            run_id,
+            session_id: None,
+            query: "Deploy",
+            chat_history: &[],
+            coordinator_conversation: &[],
+            routing_decision: None,
+            iteration: 1,
+            planning_ms: 0,
+            failure_history: &[],
+        };
+        let inputs = ParkCommitInputs {
+            state,
+            plan: &plan,
+            records: &records,
+            registry: &registry,
+            memory_dir: &memory_dir,
+            config: &AgentRuntimeConfig::default(),
+            park_ttl: aura_config::ParkTtl::try_new(7200).expect("park ttl validates"),
+            identity_hash: None,
+        };
+
+        let before = chrono::Utc::now();
+        let outcome = commit_from_run_state(&inputs, None).await.unwrap();
+        let after = chrono::Utc::now();
+
+        assert!(
+            outcome.refreshed.decision_ids.is_empty(),
+            "fixture shape: no undecided ticket survives, so the refresh reports \
+             no outstanding ticket"
+        );
+        let stamp = outcome.retention_expires_at.as_datetime();
+        let lower = before + chrono::Duration::seconds(7200 - 30);
+        let upper = after + chrono::Duration::seconds(7200 + 30);
+        assert!(
+            stamp >= lower && stamp <= upper,
+            "the no-surviving-ticket stamp is the publication timestamp plus the \
+             park_ttl (7200s), never now + decision_window (30 minutes): got \
+             {stamp}, expected within [{lower}, {upper}]"
+        );
+    }
+
+    /// The park commit freezes the original request's resolved
+    /// `headers_from_request` egress into the checkpoint, so a resumed run's
+    /// route can seed its new gated asks under the original request's
+    /// identity. The conversational route (no egress exists there) and a
+    /// config without HITL freeze an empty map.
+    #[tokio::test]
+    async fn park_commit_freezes_the_request_egress_into_the_document() {
+        use std::collections::HashMap;
+
+        fn config_with_resolved_egress(
+            req_headers: Option<&HashMap<String, String>>,
+        ) -> crate::config::AgentRuntimeConfig {
+            let hitl = aura_config::HitlConfig {
+                require_approval: vec![],
+                park: aura_config::ParkConfig::default(),
+                route: aura_config::DecisionRouteConfig::Webhook {
+                    url: aura_config::WebhookUrl::new("https://approvals.example.com/hook")
+                        .unwrap(),
+                    timeout_secs: None,
+                    headers: HashMap::new(),
+                    headers_from_request: HashMap::from([(
+                        "x-tenant-egress".to_string(),
+                        "x-tenant-egress".to_string(),
+                    )]),
+                    tool_headers_from_response: aura_config::ToolHeaderMappings::default(),
+                    delivery: aura_config::WebhookDelivery::Sync,
+                    poll_url: None,
+                    poll_interval_secs: 10,
+                    poll_request_timeout_secs: 30,
+                    receiver_wait_timeout_secs: 900,
+                },
+            };
+            crate::config::AgentRuntimeConfig {
+                hitl: Some(crate::hitl::HitlRuntime::from_config(
+                    &hitl,
+                    &PendingApprovals::new(),
+                    None,
+                    req_headers,
+                )),
+                ..crate::config::AgentRuntimeConfig::default()
+            }
+        }
+
+        let egress_value = "Bearer rig-egress-sentinel".to_string();
+        let config = config_with_resolved_egress(Some(&HashMap::from([(
+            "x-tenant-egress".to_string(),
+            egress_value.clone(),
+        )])));
+
+        let dir = tempfile::tempdir().unwrap();
+        let memory_dir = dir.path().join("memory").to_string_lossy().into_owned();
+        let (registry, _store) = conv_registry();
+        let run_id = "0191e8c0-aaaa-7000-8000-0000000000e1";
+
+        let mut plan = Plan::new("Deploy");
+        plan.add_task(Task::new(0, "Gated apply", "r"));
+        plan.tasks[0].state = TaskState::AwaitingApproval {
+            pending: vec![PendingCall {
+                decision_id: DecisionId::generate(),
+                tool_name: "kubectl_apply".to_string(),
+                arguments: serde_json::json!({ "namespace": "prod" }),
+                call_id: "c1".to_string(),
+            }],
+        };
+        let mut records = ParkedTaskRecords::new();
+        records.insert(
+            0,
+            crate::orchestration::park::ParkedTaskRecord {
+                attempt: 1,
+                snapshot: crate::orchestration::ParkSnapshot {
+                    history: vec![rig::completion::Message::user("apply it")],
+                    current_prompt: rig::completion::Message::user("tool results"),
+                },
+            },
+        );
+
+        let state = RunStateForPark {
+            run_id,
+            session_id: None,
+            query: "Deploy",
+            chat_history: &[],
+            coordinator_conversation: &[],
+            routing_decision: None,
+            iteration: 1,
+            planning_ms: 0,
+            failure_history: &[],
+        };
+        let inputs = ParkCommitInputs {
+            state,
+            plan: &plan,
+            records: &records,
+            registry: &registry,
+            memory_dir: &memory_dir,
+            config: &config,
+            park_ttl: aura_config::ParkTtl::try_new(7200).expect("park ttl validates"),
+            identity_hash: None,
+        };
+        commit_from_run_state(&inputs, None).await.unwrap();
+
+        let document =
+            load_parked_run(&parked_document_dir(&memory_dir, None).join(format!("{run_id}.json")))
+                .await
+                .unwrap();
+        assert_eq!(
+            document.request_egress.get("x-tenant-egress"),
+            Some(&egress_value),
+            "the checkpoint freezes the original request's resolved egress value"
+        );
+
+        // No HITL runtime: nothing to freeze, and the document still loads.
+        let bare_inputs = ParkCommitInputs {
+            config: &crate::config::AgentRuntimeConfig::default(),
+            ..inputs
+        };
+        commit_from_run_state(&bare_inputs, None).await.unwrap();
     }
 
     /// The sweep cancels exactly what the store still holds: the undecided
@@ -720,13 +1096,23 @@ mod tests {
             .await
             .unwrap();
         registry
-            .resolve(&decided, crate::hitl::ApprovalDecision::Approved.into())
+            .resolve(
+                &decided,
+                ApprovalAuthority::Conversational,
+                crate::hitl::ApprovalDecision::Approved.into(),
+            )
             .await
             .unwrap();
 
-        cancel_run_approvals(&registry, run_id, Some(std::sync::Arc::clone(&run)))
-            .await
-            .unwrap();
+        cancel_run_approvals(
+            &registry,
+            run_id,
+            &request_id,
+            Some(std::sync::Arc::clone(&run)),
+            None,
+        )
+        .await
+        .unwrap();
 
         assert!(
             store.get(&sibling).await.unwrap().is_none(),
@@ -789,9 +1175,15 @@ mod tests {
             .await
             .unwrap();
 
-        cancel_run_approvals(&registry, run_id, Some(std::sync::Arc::clone(&run)))
-            .await
-            .unwrap();
+        cancel_run_approvals(
+            &registry,
+            run_id,
+            &request_id,
+            Some(std::sync::Arc::clone(&run)),
+            None,
+        )
+        .await
+        .unwrap();
 
         assert!(store.get(&first).await.unwrap().is_none());
         assert!(store.get(&second).await.unwrap().is_none());
@@ -836,11 +1228,17 @@ mod tests {
             .unwrap();
 
         // No run here, since this case asserts the store is swept.
-        cancel_run_approvals(&registry, run_id, None).await.unwrap();
+        cancel_run_approvals(&registry, run_id, "req_late_resolve", None, None)
+            .await
+            .unwrap();
 
         assert_eq!(
             registry
-                .resolve(&ticket, crate::hitl::ApprovalDecision::Approved.into())
+                .resolve(
+                    &ticket,
+                    ApprovalAuthority::Conversational,
+                    crate::hitl::ApprovalDecision::Approved.into()
+                )
                 .await,
             Err(ResolveError::NotFound),
         );
@@ -859,6 +1257,8 @@ mod tests {
                         timeout: Duration::from_secs(120),
                     }),
                     park_enabled: true,
+                    park_ttl: aura_config::ParkTtl::default(),
+                    headers_from_request: std::collections::HashMap::new(),
                 }),
                 ..crate::config::AgentRuntimeConfig::default()
             }
@@ -904,7 +1304,7 @@ mod tests {
                         }
                         DecisionRouteConfig::Webhook { .. } => {
                             let client =
-                                crate::hitl::webhook_client_from_config(&route, None, None)
+                                crate::hitl::webhook_client_from_config(&route, None, None, false)
                                     .expect("a webhook route config builds a client");
                             crate::hitl::DecisionRoute::Webhook {
                                 client,
@@ -915,6 +1315,14 @@ mod tests {
                         }
                     }),
                     park_enabled: true,
+                    park_ttl: aura_config::ParkTtl::default(),
+                    headers_from_request: match &route {
+                        DecisionRouteConfig::Webhook {
+                            headers_from_request,
+                            ..
+                        } => headers_from_request.clone(),
+                        DecisionRouteConfig::Conversational { .. } => HashMap::new(),
+                    },
                 }),
                 ..crate::config::AgentRuntimeConfig::default()
             }
@@ -937,6 +1345,7 @@ mod tests {
                 poll_url: poll_url.map(|u| WebhookUrl::new(u).unwrap()),
                 poll_interval_secs,
                 poll_request_timeout_secs,
+                receiver_wait_timeout_secs: 900,
             }
         }
 
@@ -1016,6 +1425,7 @@ mod tests {
                     poll_url: None,
                     poll_interval_secs: 10,
                     poll_request_timeout_secs: 30,
+                    receiver_wait_timeout_secs: 900,
                 },
             };
             crate::config::AgentRuntimeConfig {

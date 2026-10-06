@@ -31,6 +31,12 @@ impl RequestCancelToken {
     pub fn unbound() -> Self {
         Self(CancellationToken::new())
     }
+
+    /// The wrapped token, for call sites that drive the generic streaming
+    /// pipeline — it speaks the underlying token type.
+    pub fn as_token(&self) -> &CancellationToken {
+        &self.0
+    }
 }
 
 impl From<CancellationToken> for RequestCancelToken {

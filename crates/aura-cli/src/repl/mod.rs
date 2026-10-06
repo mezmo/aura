@@ -6,5 +6,6 @@ pub mod history;
 pub mod input_reader;
 pub mod r#loop;
 pub mod mcp;
+pub mod reattach;
 pub mod registry;
 pub mod telemetry_notice;

@@ -46,6 +46,7 @@ eventsource-stream = "0.2"
 futures-util = "0.3"
 unicode-segmentation = "1"
 termimad = "0.34"
+chrono = "0.4"
 crossterm = "0.29"
 # `signal-hook` makes rustyline register SIGWINCH via signal_hook's chaining
 # pipe instead of a raw sigaction, so our own SIGWINCH consumer (the resize

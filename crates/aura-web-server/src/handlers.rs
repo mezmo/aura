@@ -4,13 +4,14 @@ use aura::{ResponseContent, StreamingAgent, UsageState};
 use aura_events::{AgentInfo, ServerInfo};
 use axum::Json;
 use axum::body::Body;
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use chrono::Utc;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{Instrument, error};
@@ -21,6 +22,10 @@ use crate::streaming::{
     TurnContext, collect_stream_to_completion, process_sse_stream_full,
 };
 use crate::types::*;
+use aura::orchestration::{
+    OrchestratorFactory, ResumeClaimTable, ResumeEvaluation, ResumeGrant, ResumeRefusal,
+    ValidatedResumePath, evaluate_resume,
+};
 
 /// Guard over a request's pending approvals.
 struct RequestResourceGuard {
@@ -197,12 +202,43 @@ async fn build_agent_for_request(
     Ok(Arc::new(agent))
 }
 
+/// The single-use completion input one request owns: a fresh chat, or the
+/// resume of one granted run. Deliberately not cloneable — a resume grant is
+/// consumed exactly once, and an input that could be duplicated would make
+/// the single-use rule a runtime check instead of a type fact.
+///
+/// The factory in the `Resume` arm stays reusable and never stores the
+/// grant; ownership runs request → input → the spawned completion.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "one input per request, moved once into the spawned completion; \
+              the grant dominates but boxing it would churn the fill-time \
+              consumers for no runtime benefit"
+)]
+pub enum CompletionInput {
+    /// A normal chat completion.
+    Chat {
+        /// The agent built for this request.
+        agent: Arc<dyn StreamingAgent>,
+        /// The user's message.
+        query: String,
+        /// The conversation before the user's message.
+        history: Vec<aura::Message>,
+    },
+    /// Resume a parked run through the normal completion pipeline.
+    Resume {
+        /// The reusable orchestrator factory this deployment builds.
+        factory: Arc<OrchestratorFactory>,
+        /// The owned, single-use resume grant.
+        grant: ResumeGrant,
+    },
+}
+
 /// Shared request setup extracted from the incoming ChatCompletionRequest.
 /// Used by both streaming and non-streaming handlers.
 pub struct RequestSetup {
-    pub query: String,
-    pub chat_history: Vec<aura::Message>,
-    pub streaming_agent: Arc<dyn StreamingAgent>,
+    /// The single-use completion input this request owns.
+    pub completion: CompletionInput,
     pub config: aura_config::Config,
     pub completion_id: String,
     pub model_str: String,
@@ -227,12 +263,36 @@ pub struct RequestSetup {
     pub rehydrated_skills: Vec<String>,
 }
 
+/// Find the matching config: single-config passthrough > explicit model > DEFAULT_AGENT.
+/// Single-config servers accept any model field value (clients like LibreChat always send one).
+/// Multi-config servers require the model field to match an alias or agent name.
+fn resolve_agent_config(
+    configs: &[aura_config::Config],
+    default_agent: Option<&str>,
+    model: Option<&str>,
+) -> Result<aura_config::Config, PrepareError> {
+    if configs.len() == 1 {
+        Ok(configs[0].clone())
+    } else if let Some(model_name) = model.or(default_agent) {
+        configs
+            .iter()
+            .find(|c| c.agent.alias.as_deref().unwrap_or(&c.agent.name) == model_name)
+            .cloned()
+            .ok_or_else(|| PrepareError::NotFound(model_name.to_string()))
+    } else {
+        Err(PrepareError::BadRequest(
+            "you must provide a model parameter".to_string(),
+        ))
+    }
+}
+
 /// Extract query, chat history, and build agent -- shared across both code paths.
 pub async fn prepare_request(
     data: &AppState,
     req: &mut ChatCompletionRequest,
     chat_session_id: &str,
     req_headers_map: &HashMap<String, String>,
+    reservation_table: Option<Arc<ResumeClaimTable>>,
 ) -> Result<RequestSetup, PrepareError> {
     // Client-side tools are gated per-agent by `[agent].enable_client_tools`
     // (single-agent configs only — orchestrated configs drop client tools with a
@@ -249,24 +309,13 @@ pub async fn prepare_request(
     // `build_completion_config`, after the agent was already built.
     let request_id = format!("req_{}", Uuid::new_v4().simple());
 
-    // Find the matching config: single-config passthrough > explicit model > DEFAULT_AGENT
-    // Single-config servers accept any model field value (clients like LibreChat always send one).
-    // Multi-config servers require the model field to match an alias or agent name.
-    // Resolved before the history conversion, which needs to know whether this
-    // agent owns the skill-tool names.
-    let config = if data.configs.len() == 1 {
-        data.configs[0].clone()
-    } else if let Some(model_name) = req.model.as_deref().or(data.default_agent.as_deref()) {
-        data.configs
-            .iter()
-            .find(|c| c.agent.alias.as_deref().unwrap_or(&c.agent.name) == model_name)
-            .cloned()
-            .ok_or_else(|| PrepareError::NotFound(model_name.to_string()))?
-    } else {
-        return Err(PrepareError::BadRequest(
-            "you must provide a model parameter".to_string(),
-        ));
-    };
+    // Resolved before the history conversion, which needs to know whether
+    // this agent owns the skill-tool names.
+    let config = resolve_agent_config(
+        &data.configs,
+        data.default_agent.as_deref(),
+        req.model.as_deref(),
+    )?;
     let serves_skills = !config.agent.skills.local.is_empty();
 
     // Single pass: pull the user query out of `messages` and convert the rest
@@ -314,6 +363,7 @@ pub async fn prepare_request(
                     Some(chat_session_id.to_string()),
                     client_tools_vec.clone(),
                     Some(request_id.clone()),
+                    reservation_table,
                 )
                 .await
                 .map_err(|e| {
@@ -387,9 +437,11 @@ pub async fn prepare_request(
         .and_then(|m| serde_json::to_string(m).ok());
 
     Ok(RequestSetup {
-        query,
-        chat_history,
-        streaming_agent,
+        completion: CompletionInput::Chat {
+            agent: streaming_agent,
+            query,
+            history: chat_history,
+        },
         config,
         completion_id,
         model_str,
@@ -422,10 +474,11 @@ fn validate_hitl_delivery_mode(
 }
 
 /// Handle chat completions endpoint
-#[tracing::instrument(name = "chat_completions", skip(state, req, headers), fields(otel.kind = "server"))]
+#[tracing::instrument(name = "chat_completions", skip(state, req, headers, claims), fields(otel.kind = "server"))]
 pub async fn chat_completions(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    axum::extract::Extension(claims): axum::extract::Extension<ResumeClaims>,
     Json(mut req): Json<ChatCompletionRequest>,
 ) -> Response {
     // Validate we have messages
@@ -459,7 +512,15 @@ pub async fn chat_completions(
         .filter_map(|(k, v)| v.to_str().ok().map(|val| (k.to_string(), val.to_string())))
         .collect();
 
-    let setup = match prepare_request(&state, &mut req, &chat_session_id, &req_headers_map).await {
+    let setup = match prepare_request(
+        &state,
+        &mut req,
+        &chat_session_id,
+        &req_headers_map,
+        Some(Arc::clone(&claims.0)),
+    )
+    .await
+    {
         Ok(s) => s,
         Err(e) => return e.into_http_response(),
     };
@@ -495,6 +556,26 @@ pub fn build_completion_config(
     let request_id = setup.request_id.clone();
     let fallback_tool_parsing = setup.config.is_fallback_tool_parsing_enabled();
 
+    // The resume arm's provider/model, otel inputs, and message count come
+    // from the prepared resume config (setup.config) — the same projection
+    // the resumed run's factory builds from (S2/S3).
+    let ((provider_ref, model_ref), message_count, query_for_otel) = match &setup.completion {
+        CompletionInput::Chat {
+            agent,
+            query,
+            history,
+        } => (agent.get_provider_info(), history.len() + 1, query.clone()),
+        CompletionInput::Resume { factory: _, grant } => {
+            let (provider_ref, model_ref) = setup.config.agent.llm.model_info();
+            (
+                (provider_ref, model_ref),
+                1,
+                format!("resume {}/{}", grant.session_id(), grant.run_id()),
+            )
+        }
+    };
+    let (provider, model) = (provider_ref.to_string(), model_ref.to_string());
+
     let stream_config = StreamConfig::new(
         emit_custom_events,
         emit_reasoning,
@@ -520,10 +601,7 @@ pub fn build_completion_config(
         }
     };
 
-    let (p, m) = setup.streaming_agent.get_provider_info();
-    let (provider, model) = (p.to_string(), m.to_string());
     let response_content = ResponseContent::new();
-    let message_count = setup.chat_history.len() + 1; // +1 for the current query
 
     CompletionConfig {
         request_id,
@@ -536,7 +614,7 @@ pub fn build_completion_config(
         active_requests: data.active_requests.clone(),
         provider,
         model,
-        query_for_otel: setup.query.clone(),
+        query_for_otel,
         message_count,
         response_content,
         pending_approvals: data.pending_approvals.clone(),
@@ -561,11 +639,9 @@ pub async fn execute_completion(
     let invocation_parameters = aura::logging::llm_invocation_parameters(&setup.config.agent.llm);
     let orchestration_enabled = setup.config.orchestration_enabled();
 
-    // Destructure to move chat_history instead of cloning
+    // Destructure to move the owned completion input instead of cloning
     let RequestSetup {
-        query,
-        chat_history,
-        streaming_agent,
+        completion,
         config: _,
         completion_id: _,
         model_str,
@@ -579,21 +655,58 @@ pub async fn execute_completion(
         rehydrated_skills,
     } = setup;
 
-    // Create stream with timeout — single path for both Agent and Orchestrator
-    let mut run = streaming_agent
-        .stream(
-            &query,
-            chat_history,
-            aura::streaming::RunOptions::bounded(config.timeout_duration)
-                .cancelled_by(&config.stream_shutdown_token),
-            &config.request_id,
-        )
-        .await;
-    let cancel_tx = run.cancel_token();
-    let usage_state = run.usage().clone();
+    // Both arms converge on the pieces the shared delivery tail consumes:
+    // the agent surface (status queries and MCP cancel), the event stream,
+    // the run's cancellation token, the usage accumulator, and the
+    // run-scoped event receiver when there is one. The chat arm starts a
+    // run through the prepared agent; the resume arm enters through the
+    // factory's grant-consuming stream, whose run events ride the main
+    // stream, so it carries no side-channel receiver.
+    let (agent, stream, cancel_tx, usage_state, agent_events) = match completion {
+        CompletionInput::Chat {
+            agent,
+            query,
+            history,
+        } => {
+            let mut run = agent
+                .stream(
+                    &query,
+                    history,
+                    aura::streaming::RunOptions::bounded(config.timeout_duration)
+                        .cancelled_by(&config.stream_shutdown_token),
+                    &config.request_id,
+                )
+                .await;
+            let cancel_tx = run.cancel_token();
+            let usage_state = run.usage().clone();
+            let agent_events = run.take_agent_events();
+            (
+                agent,
+                run.into_events(),
+                cancel_tx,
+                usage_state,
+                agent_events,
+            )
+        }
+        CompletionInput::Resume { factory, grant } => {
+            let (stream, cancel_tx, usage_state) = factory
+                .resume_stream_with_timeout(
+                    grant,
+                    config.timeout_duration.unwrap_or(Duration::ZERO),
+                    &config.request_id,
+                )
+                .await;
+            let agent: Arc<dyn StreamingAgent> = factory;
+            (
+                agent,
+                stream,
+                cancel_tx.as_token().clone(),
+                usage_state,
+                None,
+            )
+        }
+    };
 
-    // The run's events are buffered from the moment it starts, so taking the
-    // receiver after `stream` returns loses nothing it already emitted.
     let delivery_channels = match delivery {
         DeliveryMode::Collect { result_tx } => DeliveryChannels::Collect { result_tx },
         DeliveryMode::Sse {
@@ -602,10 +715,9 @@ pub async fn execute_completion(
         } => DeliveryChannels::Sse {
             chunk_tx,
             heartbeat_interval,
-            agent_events: run.take_agent_events(),
+            agent_events,
         },
     };
-    let stream = run.into_events();
 
     let response_content = config.response_content.clone();
     let otel_ctx = StreamOtelContext {
@@ -620,7 +732,7 @@ pub async fn execute_completion(
         tools_json,
         message_count: config.message_count,
         response_content: config.response_content,
-        system_prompt: streaming_agent.system_prompt().map(str::to_string),
+        system_prompt: agent.system_prompt().map(str::to_string),
         orchestration_enabled,
     };
     otel_ctx.record_input();
@@ -648,7 +760,7 @@ pub async fn execute_completion(
         } => {
             let callbacks = StreamingCallbacks {
                 request_id: config.request_id.clone(),
-                agent: streaming_agent.clone(),
+                agent: agent.clone(),
                 agent_events,
                 usage_state: usage_state.clone(),
                 response_content,
@@ -1299,10 +1411,14 @@ pub async fn resolve_approval(
     };
     let decision = aura::hitl::ApprovalDecision::from(body);
     // The conversational ingress has no identity source: the decision
-    // resolves uncaptured.
+    // resolves uncaptured, under the conversational authority.
     match state
         .pending_approvals
-        .resolve(&decision_id, aura::hitl::ResolvedDecision::from(decision))
+        .resolve(
+            &decision_id,
+            aura::hitl::ApprovalAuthority::Conversational,
+            aura::hitl::ResolvedDecision::from(decision),
+        )
         .await
     {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
@@ -1333,6 +1449,7 @@ fn generate_chat_session_id() -> String {
 /// while buffering — maps to the same uniform 401; the real cause is logged
 /// server-side only. Post-verification JSON rejections (415/400/422) surface
 /// as-is: the request is already authenticated at that point.
+#[allow(clippy::result_large_err)]
 async fn verify_approval_ingress(
     hmac: &aura::hitl::WebhookHmac,
     decision_id_str: &str,
@@ -1432,6 +1549,194 @@ fn error_response(
         .into_response()
 }
 
+// -------------------------------------------------------------------------
+// Resume endpoint (P45): `POST /v1/sessions/{session_id}/runs/{run_id}`
+// -------------------------------------------------------------------------
+
+/// The shared per-run resume claim table, carried as a request extension.
+#[derive(Clone)]
+pub struct ResumeClaims(pub Arc<ResumeClaimTable>);
+
+/// Project an evaluation refusal to its HTTP answer: a detail-less 404 for
+/// the two not-found rows, the one 409 shape for conflict rows, and the
+/// typed fault rows. The typed rows render their fixed client codes —
+/// `reify_failed` for corrupt/internal, `reify_unavailable` for known
+/// pre-execution I/O availability failures — and carry no diagnostic
+/// detail in the response; the diagnostic logs server-side.
+fn refusal_response(refusal: ResumeRefusal) -> Response {
+    match refusal {
+        ResumeRefusal::DocumentAbsent | ResumeRefusal::IdentityMismatch => {
+            StatusCode::NOT_FOUND.into_response()
+        }
+        ResumeRefusal::Conflict(row) => (StatusCode::CONFLICT, Json(row)).into_response(),
+        ResumeRefusal::InvalidEvidence(diagnostic) => {
+            tracing::error!("resume refused: invalid evidence: {diagnostic}");
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the paused run could not be restored",
+                "reify_failed",
+            )
+        }
+        ResumeRefusal::Unavailable(diagnostic) => {
+            tracing::warn!("resume refused: approval storage unavailable: {diagnostic}");
+            error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "approval storage is temporarily unavailable; retry the resume",
+                "reify_unavailable",
+            )
+        }
+        ResumeRefusal::Internal(diagnostic) => {
+            tracing::error!("resume refused: internal fault: {diagnostic}");
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the paused run could not be restored",
+                "reify_failed",
+            )
+        }
+        ResumeRefusal::Fault(diagnostic) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            diagnostic.to_string(),
+            "internal_error",
+        ),
+    }
+}
+
+/// Resume a parked run: evaluate the checkpoint against the config and the
+/// store, claim the run, and execute one segment — the decided approvals'
+/// next agent turns — to completion or the next approval-required park.
+///
+/// `POST /v1/sessions/{session_id}/runs/{run_id}`
+#[tracing::instrument(
+    name = "resume_run",
+    skip(state, claims, headers),
+    fields(otel.kind = "server")
+)]
+pub async fn resume_run(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Extension(claims): axum::extract::Extension<ResumeClaims>,
+    headers: HeaderMap,
+    Path((session_raw, run_raw)): Path<(String, String)>,
+    body: Option<Json<crate::types::ResumeRequest>>,
+) -> Response {
+    // Both path segments validate before anything else: a malformed segment
+    // answers the bare 404 without a single filesystem read.
+    let Ok(path) = ValidatedResumePath::parse(&session_raw, &run_raw) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    // The run's config resolves exactly like the chat path's: the resume
+    // body carries the model field the resume URL cannot. A wrong-agent
+    // resume is caught downstream by the checkpoint fingerprint check.
+    let config = match resolve_agent_config(
+        &state.configs,
+        state.default_agent.as_deref(),
+        body.and_then(|Json(req)| req.model).as_deref(),
+    ) {
+        Ok(config) => config,
+        Err(err) => return err.into_http_response(),
+    };
+
+    // Binding is a parsed-config flag; the presented header is read only
+    // when it is on. Binding on without a configured header name (unreachable
+    // past load-time validation) presents nothing and fails closed below.
+    let bind_identity = config
+        .hitl
+        .as_ref()
+        .is_some_and(|hitl| hitl.park.bind_identity);
+    let presented_identity = if bind_identity {
+        config
+            .identity_header
+            .as_deref()
+            .and_then(|name| headers.get(name))
+            .and_then(|value| value.to_str().ok())
+    } else {
+        None
+    };
+
+    // Pure config projection — no skill discovery, no filesystem access. The
+    // fallible production projection's first consumer lands with S2; refusal
+    // rows must answer before any fallible discovery.
+    let builder = RigBuilder::new(config.clone(), state.pending_approvals.clone())
+        .with_hitl_hmac(state.hitl_webhook_hmac.clone());
+    // One mint per request: the evaluation uses it; S2's factory shares it.
+    let request_id = format!("req_{}", Uuid::new_v4().simple());
+    // The validated path session, taken before `path` moves into the
+    // evaluation below. The grant carries this same validated id; the
+    // production projection and the RequestSetup both read it from here.
+    let session_id = path.session.clone();
+    let headers_map: HashMap<String, String> = headers
+        .iter()
+        .filter_map(|(k, v)| v.to_str().ok().map(|val| (k.to_string(), val.to_string())))
+        .collect();
+    let agent_config = builder.get_agent_config();
+    let Some(memory_dir) = agent_config.effective_memory_dir() else {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the resume configuration has no memory_dir; no checkpoint can exist",
+            "internal_error",
+        );
+    };
+
+    let evaluation = ResumeEvaluation {
+        path,
+        memory_dir,
+        config: &agent_config,
+        store: &state.pending_approvals,
+        claims: &claims.0,
+        bind_identity,
+        presented_identity,
+        now: chrono::Utc::now(),
+    };
+    let grant = match evaluate_resume(evaluation).await {
+        Ok(grant) => grant,
+        Err(refusal) => return refusal_response(refusal),
+    };
+
+    // The production projection for the actually-resuming run, built AFTER
+    // the grant: broken skill sources answer the 500 here, never over a
+    // refusal row that already answered above. The evaluation kept the pure
+    // projection; this factory is the production projection's first
+    // consumer, mirroring the chat path's factory wiring.
+    let execution_config =
+        match builder.prepare_agent_config(Some(&headers_map), &request_id, session_id.as_ref()) {
+            Ok(execution_config) => execution_config,
+            Err(err) => {
+                error!("Failed to prepare resume execution config: {err}");
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "the resume configuration could not be prepared for this request",
+                    "internal_error",
+                );
+            }
+        };
+    let factory =
+        OrchestratorFactory::new(execution_config).with_reservation_table(Arc::clone(&claims.0));
+
+    // One request id (the hoisted mint) and one validated session id serve
+    // the whole resumed request. The parsed `config` is the same run the
+    // factory's prepared config describes; `model_info()` is its identity.
+    let (provider, model) = config.agent.llm.model_info();
+    let setup = RequestSetup {
+        completion: CompletionInput::Resume {
+            factory: Arc::new(factory),
+            grant,
+        },
+        config: config.clone(),
+        completion_id: format!("chatcmpl-{}", Uuid::new_v4()),
+        model_str: format!("{provider}/{model}"),
+        created_timestamp: Utc::now().timestamp() as u64,
+        chat_session_id: session_id.to_string(),
+        has_client_tools: false,
+        request_id,
+        user_id: None,
+        metadata_json: None,
+        tools_json: vec![],
+        rehydrated_skills: Vec::new(),
+    };
+
+    handle_streaming_completion(state, setup, None).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1488,6 +1793,7 @@ mod tests {
     fn make_test_config() -> aura_config::Config {
         aura_config::Config {
             memory_dir: None,
+            identity_header: None,
             mcp: None,
             vector_stores: vec![],
             tools: None,
@@ -1562,6 +1868,7 @@ mod tests {
             poll_url: None,
             poll_interval_secs: 10,
             poll_request_timeout_secs: 30,
+            receiver_wait_timeout_secs: 900,
         });
         let req = chat_request_with_stream(None);
 
@@ -2576,6 +2883,126 @@ url = "http://127.0.0.1:9"
             );
         }
 
+        /// Park a durable webhook-owned row (authority `WebhookPoll`, as
+        /// the 207 bridge registers it) directly in the app's approval
+        /// registry.
+        async fn park_webhook_owned(state: &Arc<AppState>) -> aura::hitl::DecisionId {
+            let req = aura::hitl::ApprovalRequest {
+                version: aura::hitl::PROTOCOL_VERSION,
+                instance_id: "test-instance".to_string(),
+                decision_id: aura::hitl::DecisionId::generate(),
+                request_id: "req-webhook".into(),
+                scope: aura::hitl::AgentScope::Single { session_id: None },
+                origin: aura::hitl::ApprovalOrigin::ConfigGate {
+                    matched_pattern: "test_*".into(),
+                    agent_name: "test-agent".to_string(),
+                },
+                items: vec![],
+            };
+            let decision_id = req.decision_id;
+            state
+                .pending_approvals
+                .register_durable(aura::hitl::ParkedApproval {
+                    request: req,
+                    registered_at: chrono::Utc::now(),
+                    expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+                    authority: aura::hitl::ApprovalAuthority::WebhookPoll,
+                    egress_headers: None,
+                    acknowledgment: aura::hitl::AcknowledgmentState::RequiresNotification,
+                })
+                .await
+                .expect("the webhook-owned row parks durably");
+            decision_id
+        }
+
+        /// The conversational ingress refuses a webhook-owned row: 404,
+        /// not 204, with zero mutation — the store checks the row's
+        /// authority inside its resolve boundary.
+        #[tokio::test]
+        async fn resolve_approval_refuses_a_webhook_owned_row() {
+            let state = test_app_state();
+            let decision_id = park_webhook_owned(&state).await;
+            let app = approval_router(state.clone());
+
+            let response = app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri(format!("/v1/approvals/{decision_id}"))
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(r#"{"approved": true}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::NOT_FOUND,
+                "the conversational ingress must not resolve a webhook-owned row",
+            );
+            assert!(
+                state
+                    .pending_approvals
+                    .try_parked(&decision_id)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "the refused ingress must not consume the row",
+            );
+            assert!(
+                state
+                    .pending_approvals
+                    .recorded_decision(&decision_id)
+                    .await
+                    .is_none(),
+                "the refused ingress must not record a decision",
+            );
+        }
+
+        /// The same refusal through the HMAC-ON ingress: a VALIDLY signed
+        /// body passes verification and still gets 404 — a valid signature
+        /// does not override the row's authority.
+        #[tokio::test]
+        async fn resolve_approval_signed_request_still_refuses_a_webhook_owned_row() {
+            let hmac = ingress_test_hmac();
+            let state = test_app_state();
+            let decision_id = park_webhook_owned(&state).await;
+            let app = approval_router_with_hmac(state.clone(), Some(hmac.clone()));
+
+            let response = app
+                .oneshot(signed_request(
+                    &hmac,
+                    &decision_id.to_string(),
+                    r#"{"approved":true}"#,
+                ))
+                .await
+                .unwrap();
+
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::NOT_FOUND,
+                "a valid signature must not override a webhook-owned row's authority",
+            );
+            assert!(
+                state
+                    .pending_approvals
+                    .try_parked(&decision_id)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "the refused ingress must not consume the row",
+            );
+            assert!(
+                state
+                    .pending_approvals
+                    .recorded_decision(&decision_id)
+                    .await
+                    .is_none(),
+                "the refused ingress must not record a decision",
+            );
+        }
+
         #[tokio::test]
         async fn resolve_unknown_id_returns_404() {
             let state = test_app_state();
@@ -2907,6 +3334,511 @@ url = "http://127.0.0.1:9"
             request.headers_mut().remove(aura::hitl::TIMESTAMP_HEADER);
             let response = app.oneshot(request).await.unwrap();
             assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
+        }
+    }
+
+    /// Whole-frame goldens for the resume endpoint's wire surfaces (P45
+    /// layer 2): the handler's bare 404 frames and the 200-body projection.
+    /// The evaluation rows' frames live beside the pipeline in
+    /// `aura::orchestration::park::resume::goldens`; `GOLDENS.md` there maps
+    /// every row to its fixture and records the exclusions.
+    mod resume_goldens {
+        use super::*;
+
+        fn resume_claims() -> axum::extract::Extension<ResumeClaims> {
+            axum::extract::Extension(ResumeClaims(Arc::new(ResumeClaimTable::new())))
+        }
+
+        fn config_with_memory_dir(memory_dir: &str) -> aura_config::Config {
+            aura_config::Config {
+                memory_dir: Some(memory_dir.to_string()),
+                ..make_test_config()
+            }
+        }
+
+        async fn body_bytes(response: Response) -> Bytes {
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("response body reads")
+        }
+
+        async fn bare_404(response: Response) {
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            assert!(
+                body_bytes(response).await.is_empty(),
+                "the 404 frame carries no body"
+            );
+        }
+
+        /// A malformed session segment answers the bare 404 frame. The
+        /// memory root is a regular file, so any filesystem read would
+        /// surface as a fault, never as this 404.
+        #[tokio::test]
+        async fn malformed_session_id_answers_bare_404_without_reading_the_filesystem() {
+            let obstructed = tempfile::tempdir().expect("temp dir");
+            let memory_file = obstructed.path().join("memory-not-a-dir");
+            std::fs::write(&memory_file, "not a directory").expect("obstruct the memory root");
+            let state = make_state(vec![config_with_memory_dir(
+                memory_file.to_str().expect("UTF-8 path"),
+            )]);
+
+            let response = resume_run(
+                State(state),
+                resume_claims(),
+                HeaderMap::new(),
+                Path((
+                    "../escape".to_string(),
+                    "0199c0de-4545-7000-8000-000000000045".to_string(),
+                )),
+                None,
+            )
+            .await;
+
+            bare_404(response).await;
+        }
+
+        /// A malformed run segment answers the same bare 404 frame.
+        #[tokio::test]
+        async fn malformed_run_id_answers_bare_404_without_reading_the_filesystem() {
+            let obstructed = tempfile::tempdir().expect("temp dir");
+            let memory_file = obstructed.path().join("memory-not-a-dir");
+            std::fs::write(&memory_file, "not a directory").expect("obstruct the memory root");
+            let state = make_state(vec![config_with_memory_dir(
+                memory_file.to_str().expect("UTF-8 path"),
+            )]);
+
+            let response = resume_run(
+                State(state),
+                resume_claims(),
+                HeaderMap::new(),
+                Path(("sess-p45".to_string(), "not-a-uuid".to_string())),
+                None,
+            )
+            .await;
+
+            bare_404(response).await;
+        }
+
+        /// A run with no checkpoint under either name answers the bare 404
+        /// frame through the full handler path.
+        #[tokio::test]
+        async fn missing_checkpoint_answers_bare_404() {
+            let empty = tempfile::tempdir().expect("temp memory root");
+            let state = make_state(vec![config_with_memory_dir(
+                empty.path().to_str().expect("UTF-8 path"),
+            )]);
+
+            let response = resume_run(
+                State(state),
+                resume_claims(),
+                HeaderMap::new(),
+                Path((
+                    "sess-p45".to_string(),
+                    "0199c0de-4545-7000-8000-000000000045".to_string(),
+                )),
+                None,
+            )
+            .await;
+
+            bare_404(response).await;
+        }
+
+        /// A checkpoint that reads but does not decode answers the typed
+        /// invalid-evidence row — the fixed `reify_failed` client code with
+        /// its fixed message — never a raw `internal_error` carrying the
+        /// decode diagnostic. The whole response frame is pinned: the
+        /// corrupt document is planted at the documented layout
+        /// (`{memory_dir}/{session}/parked/{run}.json`), matching the
+        /// evaluation row's locate step.
+        #[tokio::test]
+        async fn undecodable_checkpoint_answers_reify_failed_not_internal_error() {
+            let memory = tempfile::tempdir().expect("temp memory root");
+            let parked_dir = memory.path().join("sess-p45").join("parked");
+            std::fs::create_dir_all(&parked_dir).expect("the parked directory creates");
+            std::fs::write(
+                parked_dir.join("0199c0de-4545-7000-8000-000000000045.json"),
+                b"{ not a parked run",
+            )
+            .expect("plant the corrupt checkpoint");
+            let state = make_state(vec![config_with_memory_dir(
+                memory.path().to_str().expect("UTF-8 path"),
+            )]);
+
+            let response = resume_run(
+                State(state),
+                resume_claims(),
+                HeaderMap::new(),
+                Path((
+                    "sess-p45".to_string(),
+                    "0199c0de-4545-7000-8000-000000000045".to_string(),
+                )),
+                None,
+            )
+            .await;
+
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            let frame: serde_json::Value =
+                serde_json::from_slice(&body_bytes(response).await).expect("frame parses");
+            assert_eq!(
+                frame,
+                serde_json::json!({
+                    "error": {
+                        "message": "the paused run could not be restored",
+                        "type": "reify_failed"
+                    }
+                }),
+                "the corrupt-evidence frame carries the fixed client code, not the diagnostic"
+            );
+        }
+
+        /// The pre-grant refusal contract: a refusal row answers from the
+        /// pure projection of the config and the presented headers, before
+        /// the fallible `prepare_agent_config` projection runs. With
+        /// `bind_identity` on, a configured `identity_header`, and no
+        /// presented header, the identity row resolves at evaluation step 1
+        /// with no I/O — so even an unrepresentable skills source (a
+        /// discovery that fails and 500s at the projection) must never
+        /// turn the identity 404 into an internal_error. This frame pins
+        /// the restored order: evaluation first, production projection
+        /// after the grant.
+        #[tokio::test]
+        async fn s1_refusal_rows_answer_before_the_fallible_projection() {
+            let memory = tempfile::tempdir().expect("temp memory root");
+            let config = parse_config(&format!(
+                r#"
+identity_header = "X-Client-Identity"
+memory_dir = "{}"
+
+[agent]
+name = "test-agent"
+system_prompt = "You answer."
+
+[agent.llm]
+provider = "openai"
+api_key = "test"
+model = "gpt-5.1"
+
+[[agent.skills.local]]
+source = "/nonexistent/s1/red/skill/source"
+
+[hitl]
+require_approval = []
+
+[hitl.route]
+mode = "conversational"
+timeout_secs = 60
+
+[hitl.park]
+enabled = false
+bind_identity = true
+"#,
+                memory.path().display()
+            ));
+            let state = make_state(vec![config]);
+
+            let response = resume_run(
+                State(state),
+                resume_claims(),
+                HeaderMap::new(),
+                Path((
+                    "sess-p45".to_string(),
+                    "0199c0de-4545-7000-8000-000000000045".to_string(),
+                )),
+                None,
+            )
+            .await;
+
+            // The post-repair shape: the identity refusal row's bare 404,
+            // not the projection fault's 500.
+            bare_404(response).await;
+        }
+
+        /// A valid UUID run id that no other S2 frame claims.
+        const S2_RUN: &str = "0199c0de-9944-7000-8000-00000000d027";
+
+        /// The bound-config shape the identity frame resolves: the identity
+        /// header is configured and `bind_identity` is on, so the presented
+        /// header decides attribution. The skills source is unrepresentable
+        /// (the S1 red-repair shape): any fallible work that ran before the
+        /// identity check — discovery inside `prepare_agent_config` — would
+        /// fault and 500, so the bare-404 assertion proves the identity row
+        /// answers before ANY fallible work, not just before a healthy
+        /// evaluation.
+        fn s2_bound_memory_root(memory_path: &std::path::Path) -> aura_config::Config {
+            parse_config(&format!(
+                r#"
+identity_header = "X-Client-Identity"
+memory_dir = "{}"
+
+[agent]
+name = "test-agent"
+system_prompt = "You answer."
+
+[agent.llm]
+provider = "openai"
+api_key = "test"
+model = "gpt-5.1"
+
+[[agent.skills.local]]
+source = "/nonexistent/s2/red/skill/source"
+
+[hitl]
+require_approval = []
+
+[hitl.route]
+mode = "conversational"
+timeout_secs = 60
+
+[hitl.park]
+enabled = false
+bind_identity = true
+"#,
+                memory_path.display()
+            ))
+        }
+
+        /// S2 green guard: the identity refusal row's pre-header (404) shape
+        /// fires through the FULL handler path under a bound config with no
+        /// presented header — evaluation step 1
+        /// (`evaluate.rs`: `IdentityBindingState::resolve`), before the
+        /// reservation, the checkpoint read, or anything the streaming
+        /// rewire depends on. The row is a detail-less bare 404, body
+        /// empty.
+        #[tokio::test]
+        async fn s2_identity_mismatch_refusal_row_is_unchanged_by_the_rewire() {
+            let memory = tempfile::tempdir().expect("temp memory root");
+            let state = make_state(vec![s2_bound_memory_root(memory.path())]);
+
+            let response = resume_run(
+                State(state),
+                resume_claims(),
+                HeaderMap::new(),
+                Path(("sess-p45".to_string(), S2_RUN.to_string())),
+                None,
+            )
+            .await;
+
+            bare_404(response).await;
+        }
+
+        /// A second valid UUID run id so each S2 frame plants its own
+        /// checkpoint namespace.
+        const S2_INTERRUPTED_RUN: &str = "0199c0de-9944-7000-8000-00000000e02d";
+
+        /// S2 green guard: a dead resume answers the interrupted
+        /// terminal-409 row through the full handler path, and the document
+        /// stays exactly as found — no rename hides the evidence. The
+        /// fabricated checkpoint is a hand-built JSON value following the
+        /// real `ParkedRun` serde shape: every non-defaulted v1 field
+        /// literal, `executed` non-empty, `identity_hash` omitted, no
+        /// fingerprint match needed — the interruption recheck resolves
+        /// BEFORE `check_fingerprint` in `evaluate_resume`'s ordered entry
+        /// (`evaluate.rs` ~762-820: identity step 1, reservation step 2,
+        /// the one authoritative re-read and the identity + interruption
+        /// rechecks at step 3, `check_fingerprint` strictly after). The
+        /// `pub` `ResumeDocuments` surface (`aura::orchestration`) exposes
+        /// only `for_path` — its path members and `parked()`/`resuming()`
+        /// accessors are `pub(crate)` (`claim.rs` 131-155) — so the file is
+        /// planted at the documented checkpoint layout itself
+        /// (`commit.rs` `parked_document_dir`:
+        /// `{memory_dir}/{session_id}/parked/{run}.resuming.json`).
+        #[tokio::test]
+        async fn s2_interrupted_refusal_row_is_unchanged_by_the_rewire() {
+            let memory = tempfile::tempdir().expect("temp memory root");
+            let parked_dir = memory.path().join("sess-p45").join("parked");
+            std::fs::create_dir_all(&parked_dir).expect("the parked directory creates");
+            let resuming_path = parked_dir.join(format!("{S2_INTERRUPTED_RUN}.resuming.json"));
+            // The fabricated dead-resume document: the real v1 `ParkedRun`
+            // wire shape with every required field, a non-empty `executed`
+            // list, and no stored identity hash (binding is off in this
+            // config, so the identity recheck passes without one).
+            let document = r#"
+                {
+                    "schema_version": 1,
+                    "run_id": "0199c0de-9944-7000-8000-00000000e02d",
+                    "parked_at": "2026-09-18T00:00:00Z",
+                    "retention_expires_at": "2027-09-18T00:00:00Z",
+                    "query": "the interrupted query",
+                    "chat_history": [],
+                    "coordinator_conversation": [],
+                    "iteration": 0,
+                    "planning_ms": 0,
+                    "failure_history": [],
+                    "plan": { "goal": "p45 interrupted document", "tasks": [] },
+                    "executed": ["call_refused_before_any_rename"],
+                    "config_fingerprint": "never consulted: interrupted fires first"
+                }
+            "#;
+            std::fs::write(&resuming_path, document).expect("the resuming document writes");
+            let document_bytes_on_disk =
+                std::fs::read(&resuming_path).expect("the planted document reads back");
+            let state = make_state(vec![config_with_memory_dir(
+                memory.path().to_str().expect("UTF-8 path"),
+            )]);
+
+            let response = resume_run(
+                State(state),
+                resume_claims(),
+                HeaderMap::new(),
+                Path(("sess-p45".to_string(), S2_INTERRUPTED_RUN.to_string())),
+                None,
+            )
+            .await;
+
+            // The refusal_response mapping: `ResumeRefusal::Conflict(row)` is
+            // the one not-ready shape — 409 with the JSON row body.
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            // The row shape is `{code, detail, blocking}`; `code` renders
+            // snake_case and `detail` is the transparent diagnostic string
+            // (`evaluate.rs` `ResumeConflictRow::interrupted`). Format
+            // tolerance: the row decodes before the code/detail pins, so
+            // whitespace never shadows the verdict.
+            let row: serde_json::Value =
+                serde_json::from_slice(&body_bytes(response).await).expect("the 409 row parses");
+            assert_eq!(
+                row.get("code").and_then(serde_json::Value::as_str),
+                Some("interrupted")
+            );
+            assert_eq!(
+                row.get("detail").and_then(serde_json::Value::as_str),
+                Some("a previous resume died mid-segment; the executed list is non-empty")
+            );
+            assert_eq!(
+                row.get("blocking"),
+                Some(&serde_json::json!([])),
+                "the interrupted row carries an explicitly present, empty blocking set"
+            );
+
+            // The document stays exactly as found: same bytes, same name, no
+            // rename to the parked name and no parked document created.
+            assert_eq!(
+                std::fs::read(&resuming_path).expect("the resuming document still reads"),
+                document_bytes_on_disk,
+                "the interrupted refusal leaves the document byte-identical"
+            );
+            assert!(
+                !parked_dir
+                    .join(format!("{S2_INTERRUPTED_RUN}.json"))
+                    .try_exists()
+                    .expect("the parked-name probe reads"),
+                "no parked-name document is created for a dead resume"
+            );
+        }
+    }
+
+    /// The resume path resolves the run's config through the same
+    /// model-field resolution as the chat path: single-config passthrough,
+    /// explicit `model` in the resume body, then DEFAULT_AGENT, else the
+    /// chat path's 400.
+    mod resume_model_resolution {
+        use super::*;
+
+        fn named_config(name: &str, memory_dir: Option<&std::path::Path>) -> aura_config::Config {
+            aura_config::Config {
+                memory_dir: memory_dir.map(|p| p.to_str().expect("UTF-8 path").to_string()),
+                agent: aura_config::AgentConfig {
+                    name: name.to_string(),
+                    ..aura_config::AgentConfig::default()
+                },
+                ..make_test_config()
+            }
+        }
+
+        fn resume_claims() -> axum::extract::Extension<ResumeClaims> {
+            axum::extract::Extension(ResumeClaims(Arc::new(ResumeClaimTable::new())))
+        }
+
+        const RESUME_PATH: (&str, &str) = ("sess-p45", "0199c0de-4545-7000-8000-000000000045");
+
+        fn model_body(model: &str) -> Option<Json<crate::types::ResumeRequest>> {
+            Some(Json(crate::types::ResumeRequest {
+                model: Some(model.to_string()),
+            }))
+        }
+
+        #[test]
+        fn resolve_agent_config_matches_chat_semantics() {
+            let a = named_config("agent-a", None);
+            let b = named_config("agent-b", None);
+
+            // Single-config passthrough ignores the model entirely.
+            let only = resolve_agent_config(std::slice::from_ref(&a), None, Some("anything"))
+                .expect("single-config passthrough");
+            assert_eq!(only.agent.name, "agent-a");
+
+            // Explicit model selects on a multi-config server.
+            let picked = resolve_agent_config(&[a.clone(), b.clone()], None, Some("agent-b"))
+                .expect("model selects");
+            assert_eq!(picked.agent.name, "agent-b");
+
+            // Unknown model is the chat path's 404.
+            let err = resolve_agent_config(&[a.clone(), b.clone()], None, Some("nope"))
+                .expect_err("unknown model refuses");
+            assert!(matches!(err, PrepareError::NotFound(m) if m == "nope"));
+
+            // No model and no default is the chat path's 400.
+            let err = resolve_agent_config(&[a.clone(), b.clone()], None, None)
+                .expect_err("model required");
+            assert!(
+                matches!(err, PrepareError::BadRequest(m) if m == "you must provide a model parameter")
+            );
+
+            // DEFAULT_AGENT is the last resort.
+            let picked = resolve_agent_config(&[a, b], Some("agent-b"), None)
+                .expect("default agent resolves");
+            assert_eq!(picked.agent.name, "agent-b");
+        }
+
+        /// The model field in the resume body selects the serving config:
+        /// the config with no memory_dir answers the 500, the config with
+        /// a readable memory dir answers the DocumentAbsent 404.
+        #[tokio::test]
+        async fn resume_body_model_selects_the_serving_config() {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let state = make_state(vec![
+                named_config("agent-a", None),
+                named_config("agent-b", Some(dir.path())),
+            ]);
+
+            let response = resume_run(
+                State(Arc::clone(&state)),
+                resume_claims(),
+                HeaderMap::new(),
+                Path((RESUME_PATH.0.to_string(), RESUME_PATH.1.to_string())),
+                model_body("agent-a"),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+            let response = resume_run(
+                State(state),
+                resume_claims(),
+                HeaderMap::new(),
+                Path((RESUME_PATH.0.to_string(), RESUME_PATH.1.to_string())),
+                model_body("agent-b"),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
+
+        /// A multi-config server with no body and no DEFAULT_AGENT answers
+        /// the chat path's 400.
+        #[tokio::test]
+        async fn resume_without_model_on_multi_config_answers_400() {
+            let state = make_state(vec![
+                named_config("agent-a", None),
+                named_config("agent-b", None),
+            ]);
+
+            let response = resume_run(
+                State(state),
+                resume_claims(),
+                HeaderMap::new(),
+                Path((RESUME_PATH.0.to_string(), RESUME_PATH.1.to_string())),
+                None,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         }
     }
 }

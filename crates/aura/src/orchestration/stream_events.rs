@@ -149,7 +149,8 @@ mod tests {
                 "0191e8c0-1111-7000-8000-00000000000a".to_string(),
                 "0191e8c0-1111-7000-8000-00000000000b".to_string(),
             ],
-            "2026-09-02T15:03:11+00:00",
+            aura_events::RetentionExpiresAt::parse_rfc3339("2026-09-02T15:03:11+00:00")
+                .expect("fixture stamp parses"),
             2,
             test_ctx(),
         );
@@ -158,7 +159,7 @@ mod tests {
         assert!(sse.starts_with(&format!("event: {}\n", event_names::RUN_PARKED)));
         assert!(sse.contains("\"run_id\":\"0191e8c0-1111-7000-8000-0000000000ff\""));
         assert!(sse.contains("\"decision_ids\":["));
-        assert!(sse.contains("\"expires_at\":\"2026-09-02T15:03:11+00:00\""));
+        assert!(sse.contains("\"retention_expires_at\":\"2026-09-02T15:03:11Z\""));
         assert!(sse.contains("\"iteration\":2"));
     }
 

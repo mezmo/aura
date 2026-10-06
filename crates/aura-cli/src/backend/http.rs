@@ -4,7 +4,8 @@ use std::sync::atomic::AtomicBool;
 use anyhow::Result;
 
 use crate::api::client::ChatClient;
-use crate::api::stream::{StreamHandler, StreamResult, process_stream};
+pub use crate::api::resume::ResumeOutcome;
+use crate::api::stream::{StreamHandler, StreamOutcome, process_stream};
 use crate::api::types::{Message, ToolDefinition};
 use crate::config::AppConfig;
 
@@ -30,7 +31,7 @@ impl HttpBackend {
         session_id: &str,
         cancel: Arc<AtomicBool>,
         handler: &mut impl StreamHandler,
-    ) -> Result<StreamResult> {
+    ) -> Result<StreamOutcome> {
         let response = self
             .client
             .send_streaming(messages, tools, session_id)
@@ -44,6 +45,32 @@ impl HttpBackend {
         session_id: &str,
     ) -> Result<(String, Option<(u64, u64)>)> {
         self.client.summarize(text, session_id).await
+    }
+
+    /// POST to the resume endpoint and, on a 200, stream the resumed
+    /// run's SSE through `handler` with its termination classified. A
+    /// refusal status decodes to the typed [`ResumeOutcome`] rows so the
+    /// caller branches on the variant, never on strings.
+    pub async fn stream_resume(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        model: Option<&str>,
+        cancel: Arc<AtomicBool>,
+        handler: &mut impl StreamHandler,
+    ) -> Result<ResumeOutcome> {
+        let response = self.client.send_resume(session_id, run_id, model).await?;
+        if response.status() == reqwest::StatusCode::OK {
+            let outcome: StreamOutcome = process_stream(response, cancel, handler).await?;
+            Ok(ResumeOutcome::Streamed(Box::new(outcome)))
+        } else {
+            let status = response.status().as_u16();
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "<no body>".to_string());
+            Ok(ResumeOutcome::from_refusal(status, &body))
+        }
     }
 
     pub async fn list_models(&self) -> Result<Vec<String>> {

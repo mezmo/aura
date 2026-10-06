@@ -307,6 +307,7 @@ impl AgentExecutor for AuraAgentExecutor {
                     session_id,
                     None,
                     Some(request_id.clone()),
+                    None,
                 )
                 .await
             {
@@ -818,6 +819,7 @@ mod tests {
     fn make_config(name: &str, alias: Option<&str>) -> aura_config::Config {
         aura_config::Config {
             memory_dir: None,
+            identity_header: None,
             mcp: None,
             vector_stores: vec![],
             tools: None,

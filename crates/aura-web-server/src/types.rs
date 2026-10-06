@@ -352,6 +352,15 @@ pub struct ErrorResponse {
     pub error: ErrorDetail,
 }
 
+/// Resume run request body. The resume path carries no OpenAI request
+/// envelope, so the model field that selects the agent config on
+/// multi-config servers arrives here instead.
+#[derive(Debug, Default, Deserialize)]
+pub struct ResumeRequest {
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct ErrorDetail {
     pub message: String,

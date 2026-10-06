@@ -18,6 +18,8 @@ use crate::ui::prompt::{is_expanded_output, with_event_log};
 use crate::ui::state::{
     MODEL_MATCHES, RESUME_MATCHES, STYLE_MATCHES, get_tab_select_index, set_tab_select_index,
 };
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 /// Mutable per-session state passed to each command handler.
 pub(crate) struct CommandContext<'a> {
@@ -30,6 +32,11 @@ pub(crate) struct CommandContext<'a> {
     pub telemetry: &'a aura_telemetry::TelemetryHandle,
     pub rt: &'a tokio::runtime::Runtime,
     pub backend: &'a Backend,
+    /// Shared approval poster (HTTP mode), so `/resume-run` renders the
+    /// same approval links the park banner does.
+    pub approval_poster: &'a Option<crate::api::approval::ApprovalPoster>,
+    /// Shared approval decision_id → tool_name map, session lifetime.
+    pub approval_names: &'a Arc<Mutex<HashMap<String, String>>>,
 }
 
 /// What the REPL loop should do after a command handler returns.
@@ -151,6 +158,14 @@ pub(crate) const COMMANDS: &[Command] = &[
         usage_hint: Some("<filter>"),
         handler: cmd_resume,
         validate: Some(validate_resume),
+        mid_stream: MidStream::Defer,
+    },
+    Command {
+        name: "/resume-run",
+        description: "Re-enter the reattach wait for the session's parked run",
+        usage_hint: Some("[run_id]"),
+        handler: cmd_resume_run,
+        validate: None,
         mid_stream: MidStream::Defer,
     },
     Command {
@@ -295,6 +310,19 @@ fn cmd_resume(ctx: &mut CommandContext, args: &str) -> CommandOutcome {
         Some(new_input) => CommandOutcome::Reinject(new_input),
         None => CommandOutcome::Handled,
     }
+}
+
+fn cmd_resume_run(ctx: &mut CommandContext, args: &str) -> CommandOutcome {
+    commands::handle_resume_run(
+        args,
+        ctx.conversation,
+        ctx.conv_store,
+        ctx.rt,
+        ctx.backend,
+        ctx.approval_poster,
+        ctx.approval_names.clone(),
+    );
+    CommandOutcome::Handled
 }
 
 fn cmd_rename(ctx: &mut CommandContext, args: &str) -> CommandOutcome {

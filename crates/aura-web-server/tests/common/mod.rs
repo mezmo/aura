@@ -26,6 +26,64 @@ use aura::hitl::{
 };
 use aura::session_store::{ApprovalStore, ParkedApprovalRecord};
 
+/// The shared mock-mcp fixture's URL, the same server every HITL e2e suite
+/// depends on, honoring the same `MCP_MOCK_HOST` override.
+pub fn mcp_url() -> String {
+    let host = std::env::var("MCP_MOCK_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+    format!("http://{host}:9999/mcp")
+}
+
+/// Per-request bound for one chat completion call in the e2e suites.
+pub const CHAT_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// The prompt both e2e suites drive: one `echo_headers` tool call whose raw
+/// JSON output proves which headers the gated call saw.
+pub const ECHO_PROMPT: &str =
+    "Call the echo_headers tool now and reply with only its raw JSON output.";
+
+/// Read one full HTTP/1.1 request (head plus content-length body) off
+/// `socket`, or `None` if the peer hangs up first. Shared by the scripted
+/// governance receivers in the HITL e2e suites.
+pub async fn read_full_request(socket: &mut tokio::net::TcpStream) -> Option<String> {
+    use tokio::io::AsyncReadExt;
+
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        let n = socket.read(&mut chunk).await.ok()?;
+        if n == 0 {
+            return None;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+    }
+    let header_end = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+    let header_section = String::from_utf8_lossy(&buf[..header_end]).to_string();
+    let content_length: usize = header_section
+        .lines()
+        .find(|line| line.to_lowercase().starts_with("content-length:"))
+        .and_then(|line| line.split(':').nth(1))
+        .and_then(|val| val.trim().parse().ok())
+        .unwrap_or(0);
+    let body_already_read = buf.len() - header_end;
+    let remaining = content_length.saturating_sub(body_already_read);
+    if remaining > 0 {
+        let mut body_buf = vec![0u8; remaining];
+        socket.read_exact(&mut body_buf).await.ok()?;
+        buf.extend_from_slice(&body_buf);
+    }
+    Some(String::from_utf8_lossy(&buf).to_string())
+}
+
+/// The assistant's text content from a chat-completion response JSON.
+pub fn assistant_text(response_json: &serde_json::Value) -> &str {
+    response_json["choices"][0]["message"]["content"]
+        .as_str()
+        .expect("response carries assistant message content")
+}
+
 /// A representative parked approval, expiring in `ttl`.
 pub fn make_parked(request_id: &str, ttl: Duration) -> ParkedApproval {
     let now = chrono::Utc::now();
@@ -49,8 +107,9 @@ pub fn make_parked(request_id: &str, ttl: Duration) -> ParkedApproval {
         },
         registered_at: now,
         expires_at: now + chrono::Duration::from_std(ttl).unwrap(),
-        authority: ApprovalAuthority::WebhookPoll,
+        authority: ApprovalAuthority::Conversational,
         egress_headers: None,
+        acknowledgment: aura::hitl::AcknowledgmentState::RequiresNotification,
     }
 }
 
@@ -74,6 +133,100 @@ pub async fn register_get_roundtrip(
 }
 
 /// The first resolve wins; a second resolve of the same id is `NotFound`.
+/// Ownership: resolve is authority-gated on every backend, in both
+/// directions — the ingress (conversational) cannot resolve a poller
+/// row, the poller cannot resolve an interactive row — and a refused
+/// row stays parked with no decision recorded, until its own channel
+/// resolves it.
+pub async fn resolve_rejects_the_other_channels_rows_both_directions(
+    instance_a: &Arc<dyn ApprovalStore>,
+    instance_b: &Arc<dyn ApprovalStore>,
+) {
+    // Direction one: the poller cannot consume an interactive row.
+    let interactive = make_parked("req-d3-interactive", Duration::from_secs(60));
+    let interactive_id = interactive.request.decision_id;
+    instance_a.register(interactive).await.unwrap();
+    match instance_b
+        .resolve(
+            &interactive_id,
+            ApprovalAuthority::WebhookPoll,
+            ApprovalDecision::Approved.into(),
+        )
+        .await
+    {
+        Err(ResolveError::NotFound) => {}
+        other => panic!("the poller's resolve of an interactive row is rejected: {other:?}"),
+    }
+    let still = instance_a
+        .get(&interactive_id)
+        .await
+        .unwrap()
+        .expect("the refused row stays parked");
+    assert_eq!(
+        still.authority,
+        ApprovalAuthority::Conversational,
+        "the row keeps its own channel"
+    );
+    assert!(
+        instance_a
+            .decision(&interactive_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "no decision is recorded by a refused resolve"
+    );
+    instance_b
+        .resolve(
+            &interactive_id,
+            ApprovalAuthority::Conversational,
+            ApprovalDecision::Approved.into(),
+        )
+        .await
+        .expect("the row's own channel resolves it");
+
+    // Direction two: the ingress cannot consume a poller row.
+    let mut polled = make_parked("req-d3-polled", Duration::from_secs(60));
+    polled.authority = ApprovalAuthority::WebhookPoll;
+    let polled_id = polled.request.decision_id;
+    instance_a.register(polled).await.unwrap();
+    match instance_b
+        .resolve(
+            &polled_id,
+            ApprovalAuthority::Conversational,
+            ApprovalDecision::Denied {
+                reason: Some("not now".to_string()),
+            }
+            .into(),
+        )
+        .await
+    {
+        Err(ResolveError::NotFound) => {}
+        other => panic!("the ingress resolve of a poller row is rejected: {other:?}"),
+    }
+    let still = instance_a
+        .get(&polled_id)
+        .await
+        .unwrap()
+        .expect("the refused row stays parked");
+    assert_eq!(
+        still.authority,
+        ApprovalAuthority::WebhookPoll,
+        "the row keeps its own channel"
+    );
+    assert!(
+        instance_a.decision(&polled_id).await.unwrap().is_none(),
+        "no decision is recorded by a refused resolve"
+    );
+    instance_b
+        .resolve(
+            &polled_id,
+            ApprovalAuthority::WebhookPoll,
+            ApprovalDecision::Approved.into(),
+        )
+        .await
+        .expect("the row's own channel resolves it");
+}
+
 pub async fn resolve_is_at_most_once(
     instance_a: &Arc<dyn ApprovalStore>,
     instance_b: &Arc<dyn ApprovalStore>,
@@ -83,12 +236,20 @@ pub async fn resolve_is_at_most_once(
     instance_a.register(parked).await.unwrap();
 
     instance_b
-        .resolve(&id, ApprovalDecision::Approved.into())
+        .resolve(
+            &id,
+            ApprovalAuthority::Conversational,
+            ApprovalDecision::Approved.into(),
+        )
         .await
         .expect("first resolve wins");
     assert_eq!(
         instance_a
-            .resolve(&id, ApprovalDecision::Approved.into())
+            .resolve(
+                &id,
+                ApprovalAuthority::Conversational,
+                ApprovalDecision::Approved.into()
+            )
             .await,
         Err(ResolveError::NotFound)
     );
@@ -104,8 +265,16 @@ pub async fn concurrent_resolves_have_exactly_one_winner(
     instance_a.register(parked).await.unwrap();
 
     let (a, b) = tokio::join!(
-        instance_a.resolve(&id, ApprovalDecision::Approved.into()),
-        instance_b.resolve(&id, ApprovalDecision::Approved.into()),
+        instance_a.resolve(
+            &id,
+            ApprovalAuthority::Conversational,
+            ApprovalDecision::Approved.into()
+        ),
+        instance_b.resolve(
+            &id,
+            ApprovalAuthority::Conversational,
+            ApprovalDecision::Approved.into()
+        ),
     );
     let winners = usize::from(a.is_ok()) + usize::from(b.is_ok());
     assert_eq!(winners, 1, "exactly one resolver must win: {a:?} / {b:?}");
@@ -125,7 +294,11 @@ pub async fn resolve_records_readable_decision(
         reason: Some("not now".to_string()),
     };
     instance_b
-        .resolve(&id, denied.clone().into())
+        .resolve(
+            &id,
+            ApprovalAuthority::Conversational,
+            denied.clone().into(),
+        )
         .await
         .unwrap();
 
@@ -135,7 +308,11 @@ pub async fn resolve_records_readable_decision(
     );
     assert_eq!(
         instance_a
-            .resolve(&id, ApprovalDecision::Approved.into())
+            .resolve(
+                &id,
+                ApprovalAuthority::Conversational,
+                ApprovalDecision::Approved.into()
+            )
             .await,
         Err(ResolveError::NotFound)
     );
@@ -162,7 +339,10 @@ pub async fn resolve_records_identity_with_the_decision(
 
     let identity =
         aura::hitl::ResolvedDecision::approved(Some(unidentity(&[("x-forwarded-user", "alice")])));
-    instance_b.resolve(&id, identity).await.unwrap();
+    instance_b
+        .resolve(&id, ApprovalAuthority::Conversational, identity)
+        .await
+        .unwrap();
 
     match instance_a.decision(&id).await.unwrap().expect("recorded") {
         aura::hitl::ResolvedDecision::Approved {
@@ -211,7 +391,11 @@ pub async fn remove_makes_resolve_not_found(instance: &Arc<dyn ApprovalStore>) {
 
     assert_eq!(
         instance
-            .resolve(&id, ApprovalDecision::Approved.into())
+            .resolve(
+                &id,
+                ApprovalAuthority::Conversational,
+                ApprovalDecision::Approved.into()
+            )
             .await,
         Err(ResolveError::NotFound)
     );
@@ -254,7 +438,11 @@ pub async fn list_pending_returns_only_live_undecided(
     instance_a.register(resolved).await.unwrap();
     instance_a.register(live).await.unwrap();
     instance_b
-        .resolve(&resolved_id, ApprovalDecision::Approved.into())
+        .resolve(
+            &resolved_id,
+            ApprovalAuthority::Conversational,
+            ApprovalDecision::Approved.into(),
+        )
         .await
         .unwrap();
 
@@ -305,11 +493,28 @@ pub struct AuraServer {
     /// Accumulated stderr, drained continuously so the child's pipe never
     /// blocks; read back to explain a health-check timeout.
     stderr_log: Arc<Mutex<String>>,
+    /// Accumulated stdout — the tracing console layer's destination in this
+    /// server — drained for the same reason.
+    stdout_log: Arc<Mutex<String>>,
 }
 
 impl AuraServer {
     pub fn base_url(&self) -> String {
         format!("http://127.0.0.1:{}", self.port)
+    }
+
+    /// The server's accumulated stderr — the diagnosable trail (tracing
+    /// lines, park/resume faults) for assertions that fail mid-flow.
+    pub fn stderr(&self) -> String {
+        self.stderr_log.lock().expect("stderr log mutex").clone()
+    }
+
+    /// The server's accumulated stdout, where the tracing console layer
+    /// writes — combined with stderr for a full diagnostic dump.
+    pub fn logs(&self) -> String {
+        let mut combined = self.stdout_log.lock().expect("stdout log mutex").clone();
+        combined.push_str(&self.stderr());
+        combined
     }
 
     /// Spawn `aura-web-server` against `config_toml` (config file named
@@ -350,6 +555,7 @@ impl AuraServer {
 
     /// One spawn-and-wait attempt. `Err` carries the (still-running) server
     /// so the caller can log its stderr and stop it before retrying.
+    #[allow(clippy::result_large_err)]
     async fn try_start(
         config_toml: &str,
         config_prefix: &str,
@@ -366,11 +572,29 @@ impl AuraServer {
             .env("PORT", port.to_string())
             .env("RUST_LOG", "warn")
             .envs(extra_env.iter().map(|(k, v)| (*k, v.clone())))
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
             .expect("spawn aura-web-server (did `cargo build -p aura-web-server` succeed?)");
+
+        let stdout_log = Arc::new(Mutex::new(String::new()));
+        let stdout = child.stdout.take().expect("stdout was piped");
+        let stdout_sink = Arc::clone(&stdout_log);
+        tokio::spawn(async move {
+            let mut reader = tokio::io::BufReader::new(stdout);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                use tokio::io::AsyncBufReadExt;
+                if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                    break;
+                }
+                let mut log = stdout_sink.lock().expect("stdout log mutex");
+                log.push_str(line.trim_end_matches('\n'));
+                log.push('\n');
+            }
+        });
 
         let stderr_log = Arc::new(Mutex::new(String::new()));
         let stderr = child.stderr.take().expect("stderr was piped");
@@ -395,6 +619,7 @@ impl AuraServer {
             child,
             config_path,
             stderr_log,
+            stdout_log,
         };
         if server.is_healthy_within(HEALTH_TIMEOUT).await {
             Ok(server)

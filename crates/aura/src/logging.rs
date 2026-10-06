@@ -241,8 +241,9 @@ where
         // Build the complete log message into a string buffer
         let mut buf = String::new();
 
-        // Add timestamp
-        let now = chrono::Local::now();
+        // Add timestamp — UTC: the format string carries a literal `Z`
+        // suffix, so a local-time clock would mislabel the zone.
+        let now = chrono::Utc::now();
         write!(&mut buf, "{} ", now.format("%Y-%m-%dT%H:%M:%S%.3fZ"))?;
 
         // Add level

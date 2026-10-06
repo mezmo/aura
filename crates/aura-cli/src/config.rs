@@ -304,6 +304,17 @@ impl AppConfig {
         )
     }
 
+    /// Build the resume endpoint URL for a parked run.
+    ///
+    /// `POST /v1/sessions/{session_id}/runs/{run_id}` — opens the resume
+    /// stream for a parked orchestration run.
+    pub fn resume_url(&self, session_id: &str, run_id: &str) -> String {
+        format!(
+            "{}/v1/sessions/{session_id}/runs/{run_id}",
+            self.api_url.trim_end_matches('/')
+        )
+    }
+
     /// Build the health endpoint URL from the base URL.
     pub fn health_url(&self) -> String {
         format!("{}/health", self.api_url.trim_end_matches('/'))
@@ -1022,6 +1033,31 @@ segments = []
         assert_eq!(
             config.chat_completions_url(),
             "http://localhost:8080/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn resume_url_names_the_session_and_run_segments() {
+        let config = AppConfig {
+            api_url: "http://localhost:8080/".to_string(),
+            api_key: None,
+            model: None,
+            system_prompt: None,
+            query: None,
+            resume: None,
+            extra_headers: vec![],
+            force: false,
+            enable_client_tools: true,
+            enable_final_response_summary: false,
+            style: None,
+            pretty: false,
+            log_file: None,
+            telemetry: None,
+            status_line_segments: None,
+        };
+        assert_eq!(
+            config.resume_url("sess-1", "run-9"),
+            "http://localhost:8080/v1/sessions/sess-1/runs/run-9"
         );
     }
 

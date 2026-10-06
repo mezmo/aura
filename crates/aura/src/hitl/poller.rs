@@ -3,40 +3,59 @@
 //!
 //! Each tick the reconciler lists the undecided, non-expired approvals
 //! from the shared [`ApprovalStore`], keeps its own `instance_id`'s rows,
-//! and per id — one row at a time — reads the status endpoint before
-//! attempting the ack-only notification POST: a receiver that holds the
-//! POST open costs at most one request timeout per tick before the row
-//! and the rows queued behind it move on, and a decided 200 resolves
-//! durably through the same [`PendingApprovals::resolve`] path the
-//! ingress handler uses without re-posting the request. The reconciler
-//! never terminalizes an approval — expiry stays fail-closed at resolve
-//! time — and its notified markers are in-memory only, self-pruning when
-//! an id leaves `list_pending`.
+//! and moves up to [`MAX_CONCURRENT_ROW_POLLS`] different rows
+//! concurrently, with each row's requests strictly ordered inside its
+//! slot — the status read first, then the ack-only notification. A
+//! receiver that holds one row's request open costs at most one request
+//! timeout for that row while the other admitted rows move on, and the
+//! rows queued behind the cap take a slot as it frees. The decision
+//! deadline is rechecked immediately before each request a row issues:
+//! an expired row gets no new request, and its retained evidence is
+//! left for the store's fail-closed expiry — this reconciler never
+//! terminalizes an approval. A decided 200 resolves durably through
+//! the same [`PendingApprovals::resolve`] path the ingress handler
+//! uses, without re-posting the request; the store's atomic resolve
+//! remains the final deadline and ownership check, so a decision that
+//! lands after the deadline is accepted or rejected there, never here.
+//! The notified marker is the durable acknowledgment state on each
+//! row, so a row acknowledged at registration (the 207 bridge) is
+//! never re-POSTed across restarts. Passes never overlap: the tick
+//! loop awaits each pass before the next fires.
 //!
 //! HA posture: single-writer — parked documents are pod-local, so two
 //! instances' reconcilers never see each other's runs. Notify delivery is
-//! at-least-once: a crash between a 2xx ack and the marker being observed
-//! produces one duplicate, idempotent by `decision_id` at the receiver.
-//! Poll-claim is exactly-once within an instance; a shared-store,
+//! at-least-once: a crash between a 2xx ack and the durable acknowledgment
+//! mark produces one duplicate, idempotent by `decision_id` at the
+//! receiver. Poll-claim is exactly-once within an instance; a shared-store,
 //! multi-instance deployment has no cross-instance claim guarantee.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::StreamExt;
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
-use aura_config::{DecisionRouteConfig, HitlConfig, ToolHeaderMappings, WebhookDelivery};
-
-use super::decision::{ApprovalDecision, DecisionId, ResolvedDecision};
-use super::registry::{PendingApprovals, ResolveError};
+use super::decision::{ApprovalDecision, ResolvedDecision};
+use super::outcome::ApprovalAuthority;
+use super::registry::{ParkedApproval, PendingApprovals, ResolveError};
 use super::route::{PollOutcome, WebhookClient, webhook_client_from_config};
 use super::signing::WebhookHmac;
 use crate::approver_headers::ApproverHeaders;
-use crate::session_store::ApprovalStore;
-
+use crate::session_store::{AcknowledgeOutcome, ApprovalStore};
+use aura_config::{DecisionRouteConfig, HitlConfig, ToolHeaderMappings};
+/// The reconciler's wall clock, read immediately before each request a
+/// row issues. A field-shaped seam so the decision-deadline checks test
+/// deterministically; the production constructor installs `Utc::now`.
+/// The file store's `open_with_clock` split is the precedent.
+type PollClock = Arc<dyn Fn() -> chrono::DateTime<chrono::Utc> + Send + Sync>;
+/// How many DIFFERENT rows may move concurrently within one reconcile
+/// pass. The cap bounds egress and task count against a large shared
+/// store — each in-flight row holds at most one request (one request
+/// timeout worst case) — not throughput; parked sets are pod-local
+/// under the single-writer posture.
+const MAX_CONCURRENT_ROW_POLLS: usize = 8;
 /// The poll-delivery reconciler for one process: a private webhook client,
 /// the shared approval store it scans, the ingress registry it resolves
 /// through, and the identity mapping its poll-200 captures against. Built
@@ -49,14 +68,15 @@ pub struct PollReconciler {
     instance_id: String,
     interval: Duration,
     tool_header_mappings: ToolHeaderMappings,
+    clock: PollClock,
 }
 
 impl PollReconciler {
     /// Build the reconciler for a `[hitl]` config, or `None` for every
     /// configuration the reconciler does not drive: the conversational arm,
-    /// and the webhook arm under sync delivery. The client is built by the
-    /// same construction [`super::route::HitlRuntime::from_config`] uses, so
-    /// the reconciler's notify/poll legs carry the exact wire shape of the
+    /// and any webhook arm that cannot park. The client is built by the same
+    /// construction [`super::route::HitlRuntime::from_config`] uses, so the
+    /// reconciler's notify/poll legs carry the exact wire shape of the
     /// per-request routes. Its operator headers are the static set only —
     /// `headers_from_request` values are per-row: each parked approval
     /// carries its own request-scoped resolved values, which the notify
@@ -73,8 +93,15 @@ impl PollReconciler {
         store: Arc<dyn ApprovalStore>,
         registry: &PendingApprovals,
     ) -> Option<Self> {
+        let client = webhook_client_from_config(&config.route, hmac, None, config.park.enabled)?;
+        // Cross-comment (see the server boot guard in aura-web-server): this
+        // is the "can spawn a reconciler" predicate, keyed on `can_park`. The
+        // boot guard's duplicate-id scan sees exactly the configs this arms,
+        // so the two must move together.
+        if !client.can_park() {
+            return None;
+        }
         let DecisionRouteConfig::Webhook {
-            delivery: WebhookDelivery::Poll,
             poll_interval_secs,
             tool_headers_from_response,
             ..
@@ -90,13 +117,23 @@ impl PollReconciler {
             );
         }
         Some(Self {
-            client: webhook_client_from_config(&config.route, hmac, None)?,
+            client,
             store,
             registry: registry.clone(),
             instance_id,
             interval: Duration::from_secs(*poll_interval_secs),
             tool_header_mappings: tool_headers_from_response.clone(),
+            clock: Arc::new(chrono::Utc::now),
         })
+    }
+
+    /// Test seam: override the wall clock the deadline checks read.
+    /// Mirrors the file store's `open_with_clock` split — the production
+    /// constructor always installs `Utc::now`.
+    #[cfg(test)]
+    fn with_clock(mut self, clock: PollClock) -> Self {
+        self.clock = clock;
+        self
     }
 
     /// Spawn the tick loop on the current runtime. The loop stops when
@@ -115,18 +152,21 @@ impl PollReconciler {
     async fn run(self, token: CancellationToken) {
         let mut tick = tokio::time::interval(self.interval);
         tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        let mut notified = HashSet::new();
         loop {
             tokio::select! {
                 () = token.cancelled() => break,
-                _ = tick.tick() => self.tick(&mut notified).await,
+                _ = tick.tick() => self.tick(&token).await,
             }
         }
     }
 
-    /// One reconcile pass. The notified set self-prunes first: an id that
-    /// left `list_pending` (resolved, cancelled, expired) needs no marker.
-    async fn tick(&self, notified: &mut HashSet<DecisionId>) {
+    /// One reconcile pass. Up to [`MAX_CONCURRENT_ROW_POLLS`] different
+    /// rows move concurrently; passes never overlap (the loop awaits
+    /// each pass before the next fires); each row's read-then-notify
+    /// chain stays sequential inside its own slot. The notified-tracking
+    /// reads the persisted acknowledgment state on each row, never a
+    /// process-local set alone.
+    async fn tick(&self, token: &CancellationToken) {
         let pending = match self.store.list_pending().await {
             Ok(pending) => pending,
             Err(err) => {
@@ -134,93 +174,159 @@ impl PollReconciler {
                 return;
             }
         };
-        notified.retain(|id| {
-            pending
-                .iter()
-                .any(|parked| parked.request.decision_id == *id)
-        });
 
-        for parked in pending {
-            if parked.request.instance_id != self.instance_id {
-                continue;
-            }
-            let id = parked.request.decision_id;
-            // The status read runs before the notify attempt, so a
-            // receiver that holds the POST open delays its own row's
-            // acknowledgment, never that row's status read, and a decided
-            // row never re-posts its request.
-            match self.client.poll_decision(id).await {
-                Ok(PollOutcome::NotYet) => {}
-                Ok(PollOutcome::Decided {
-                    decision,
-                    response_headers,
-                }) => {
-                    let resolved = match decision {
-                        // Approver identity rides these headers: capture
-                        // against the route's mapping the same way the sync
-                        // gate does. A capture failure records the decision
-                        // WITHOUT identity — reify blocks the approved
-                        // execution later if identity is required
-                        // (record-then-block, per the approver identity
-                        // ADR).
-                        ApprovalDecision::Approved if !self.tool_header_mappings.is_empty() => {
-                            match ApproverHeaders::from_captured(
-                                &self.tool_header_mappings,
-                                &response_headers,
-                            ) {
-                                Ok(identity) => ResolvedDecision::approved(Some(identity)),
-                                Err(err) => {
-                                    warn!(
-                                        decision_id = %id,
-                                        error = %err,
-                                        "approver identity capture failed; recording the \
-                                         decision without identity",
-                                    );
-                                    ResolvedDecision::approved(None)
-                                }
+        let rows: Vec<ParkedApproval> = pending
+            .into_iter()
+            // Instance and authority filters are admission predicates:
+            // cross-agent polling of a shared store gets no status read
+            // and no notify POST.
+            .filter(|parked| parked.request.instance_id == self.instance_id)
+            .filter(|parked| parked.authority == ApprovalAuthority::WebhookPoll)
+            .collect();
+        futures::stream::iter(rows)
+            .for_each_concurrent(MAX_CONCURRENT_ROW_POLLS, |parked| async move {
+                // Cancellation admission: once the shutdown token fires,
+                // no new row starts a request. Rows already in flight
+                // complete — the never-cut contract — bounding a stop()
+                // join by one request chain per admitted row.
+                if token.is_cancelled() {
+                    return;
+                }
+                self.process_row(parked).await;
+            })
+            .await;
+    }
+
+    /// The row's decision deadline has passed strictly on this
+    /// reconciler's clock. The store keeps its own clock and stays the
+    /// final arbiter at resolve; this check only withholds new requests.
+    fn row_expired(&self, parked: &ParkedApproval) -> bool {
+        (self.clock)() > parked.expires_at
+    }
+
+    /// One row inside a pass: the status read runs before the notify
+    /// attempt, so a receiver that holds the POST open delays its own
+    /// row's acknowledgment, never that row's status read, and a
+    /// decided row never re-posts its request. The deadline is
+    /// rechecked immediately before each request the row issues.
+    async fn process_row(&self, parked: ParkedApproval) {
+        let id = parked.request.decision_id;
+        if self.row_expired(&parked) {
+            debug!(
+                decision_id = %id,
+                "row's decision deadline passed; it gets no new request this pass"
+            );
+            return;
+        }
+        match self
+            .client
+            .poll_decision(id, parked.egress_headers.as_ref())
+            .await
+        {
+            Ok(PollOutcome::NotYet) => {}
+            Ok(PollOutcome::Decided {
+                decision,
+                response_headers,
+            }) => {
+                let resolved = match decision {
+                    // Approver identity rides these headers: capture
+                    // against the route's mapping the same way the sync
+                    // gate does. A capture failure records the decision
+                    // WITHOUT identity — reify blocks the approved
+                    // execution later if identity is required
+                    // (record-then-block, per the approver identity
+                    // ADR).
+                    ApprovalDecision::Approved if !self.tool_header_mappings.is_empty() => {
+                        match ApproverHeaders::from_captured(
+                            &self.tool_header_mappings,
+                            &response_headers,
+                        ) {
+                            Ok(identity) => ResolvedDecision::approved(Some(identity)),
+                            Err(err) => {
+                                warn!(
+                                    decision_id = %id,
+                                    error = %err,
+                                    "approver identity capture failed; recording the \
+                                     decision without identity",
+                                );
+                                ResolvedDecision::approved(None)
                             }
                         }
-                        other => ResolvedDecision::from(other),
-                    };
-                    match self.registry.resolve(&id, resolved).await {
-                        Ok(()) => {}
-                        // The ticket expired or was swept between
-                        // list_pending and resolve; the decision is
-                        // discarded with it, as the ingress 404 would.
-                        Err(ResolveError::NotFound) => debug!(
-                            decision_id = %id,
-                            "polled decision arrived after the approval left the store"
-                        ),
-                        Err(ResolveError::Store(err)) => warn!(
-                            decision_id = %id,
-                            error = %err,
-                            "polled decision could not be recorded; it may be re-polled"
-                        ),
                     }
-                    continue;
-                }
-                Err(err) => warn!(
-                    decision_id = %id,
-                    error = %err,
-                    "approval poll failed; retrying next tick"
-                ),
-            }
-            if !notified.contains(&id) {
+                    other => ResolvedDecision::from(other),
+                };
                 match self
-                    .client
-                    .notify(&parked.request, parked.egress_headers.as_ref())
+                    .registry
+                    .resolve(&id, ApprovalAuthority::WebhookPoll, resolved)
                     .await
                 {
-                    Ok(()) => {
-                        notified.insert(id);
-                    }
-                    Err(err) => {
-                        warn!(
+                    Ok(()) => {}
+                    // The ticket expired or was swept between
+                    // list_pending and resolve; the decision is
+                    // discarded with it, as the ingress 404 would.
+                    Err(ResolveError::NotFound) => debug!(
+                        decision_id = %id,
+                        "polled decision arrived after the approval left the store"
+                    ),
+                    Err(ResolveError::Store(err)) => warn!(
+                        decision_id = %id,
+                        error = %err,
+                        "polled decision could not be recorded; it may be re-polled"
+                    ),
+                }
+                return;
+            }
+            Err(err) => warn!(
+                decision_id = %id,
+                error = %err,
+                "approval poll failed; retrying next tick"
+            ),
+        }
+        // A row acknowledged at registration (the 207 bridge) is never
+        // re-POSTed; the persisted state is the source of truth.
+        if parked.acknowledgment.is_requires_notification() {
+            if self.row_expired(&parked) {
+                debug!(
+                    decision_id = %id,
+                    "row's decision deadline passed during the read; the notify POST is \
+                     withheld"
+                );
+                return;
+            }
+            match self
+                .client
+                .notify(&parked.request, parked.egress_headers.as_ref())
+                .await
+            {
+                Ok(()) => {
+                    match self.store.mark_acknowledged(&id).await {
+                        Ok(AcknowledgeOutcome::Acknowledged) => {}
+                        // The row resolved, was cancelled, or was
+                        // removed while the notify was in flight: it no
+                        // longer needs notification, so there is
+                        // nothing left to mark — the same benign race
+                        // the ingress 404 is.
+                        Ok(AcknowledgeOutcome::Missing) => debug!(
+                            decision_id = %id,
+                            "acknowledged row left the store while the notify \
+                             was in flight"
+                        ),
+                        // The marker stays unset, so the next tick
+                        // re-POSTs — at-least-once, idempotent by
+                        // decision id at the receiver.
+                        Err(err) => warn!(
                             decision_id = %id,
                             error = %err,
-                            "approval notify failed; retrying next tick"
-                        );
+                            "acknowledgment mark failed; the row re-notifies next tick"
+                        ),
                     }
+                }
+                Err(err) => {
+                    warn!(
+                        decision_id = %id,
+                        error = %err,
+                        "approval notify failed; retrying next tick"
+                    );
                 }
             }
         }
@@ -274,10 +380,11 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio::sync::mpsc;
 
-    use super::super::decision::{AgentScope, ApprovalDecision, ApprovalOrigin};
+    use super::super::decision::{AgentScope, ApprovalDecision, ApprovalOrigin, DecisionId};
+    use super::super::outcome::ApprovalAuthority;
     use super::super::protocol::{ApprovalItem, ApprovalRequest, PROTOCOL_VERSION};
     use super::super::read_full_request;
-    use super::super::registry::ParkedApproval;
+    use super::super::registry::{AcknowledgmentState, ParkedApproval};
     use super::*;
     use crate::session_store::{FileApprovalStore, InMemoryApprovalStore, SessionStoreError};
 
@@ -286,7 +393,10 @@ mod tests {
     fn poll_config() -> aura_config::HitlConfig {
         aura_config::HitlConfig {
             require_approval: vec![],
-            park: aura_config::ParkConfig::default(),
+            park: aura_config::ParkConfig {
+                enabled: true,
+                ..Default::default()
+            },
             route: aura_config::DecisionRouteConfig::Webhook {
                 url: aura_config::WebhookUrl::new("http://127.0.0.1:1").unwrap(),
                 timeout_secs: Some(300),
@@ -297,6 +407,7 @@ mod tests {
                 poll_url: None,
                 poll_interval_secs: 1,
                 poll_request_timeout_secs: 30,
+                receiver_wait_timeout_secs: 900,
             },
         }
     }
@@ -322,12 +433,27 @@ mod tests {
     }
 
     fn reconciler_with(store: Arc<dyn ApprovalStore>, url: &str) -> PollReconciler {
+        reconciler_with_timeout(store, url, 30)
+    }
+
+    /// [`reconciler_with`] with an explicit poll request timeout, so the
+    /// shutdown contract test observes a tight per-request bound.
+    fn reconciler_with_timeout(
+        store: Arc<dyn ApprovalStore>,
+        url: &str,
+        poll_request_timeout_secs: u64,
+    ) -> PollReconciler {
         let mut config = poll_config();
-        let aura_config::DecisionRouteConfig::Webhook { url: route_url, .. } = &mut config.route
+        let aura_config::DecisionRouteConfig::Webhook {
+            url: route_url,
+            poll_request_timeout_secs: timeout,
+            ..
+        } = &mut config.route
         else {
             unreachable!("poll_config builds a webhook route");
         };
         *route_url = aura_config::WebhookUrl::new(url).unwrap();
+        *timeout = poll_request_timeout_secs;
         let registry = PendingApprovals::with_backend(
             store.clone(),
             Arc::new(crate::session_store::InMemoryEventBus::new()),
@@ -345,8 +471,9 @@ mod tests {
                 request,
                 registered_at: chrono::Utc::now(),
                 expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
-                authority: crate::hitl::ApprovalAuthority::WebhookPoll,
+                authority: ApprovalAuthority::WebhookPoll,
                 egress_headers: None,
+                acknowledgment: AcknowledgmentState::RequiresNotification,
             })
             .await
             .expect("pending approval registers");
@@ -398,6 +525,531 @@ mod tests {
         store.decision(id).await.unwrap()
     }
 
+    async fn write_response(socket: &mut tokio::net::TcpStream, status: &str, body: &str) {
+        let response = format!(
+            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n\
+             content-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        socket.write_all(response.as_bytes()).await.ok();
+        socket.shutdown().await.ok();
+    }
+
+    /// A test clock the test advances manually: reading the clock
+    /// returns the knob's current instant (starts at `Utc::now`).
+    fn adjustable_clock() -> (
+        PollClock,
+        Arc<std::sync::Mutex<chrono::DateTime<chrono::Utc>>>,
+    ) {
+        let knob = Arc::new(std::sync::Mutex::new(chrono::Utc::now()));
+        let clock: PollClock = {
+            let knob = Arc::clone(&knob);
+            Arc::new(move || *knob.lock().unwrap())
+        };
+        (clock, knob)
+    }
+
+    /// Gate receiver: every connection is its own task, so held and
+    /// fast rows proceed concurrently. A GET whose captured text
+    /// contains a hold marker is held until the gate opens, then served
+    /// `held_response`; every other request is served at once (GET 204,
+    /// POST 200). Captured request texts land on the channel.
+    async fn gate_receiver(
+        hold_markers: Vec<String>,
+        held_response: (&'static str, String),
+    ) -> (
+        String,
+        mpsc::Receiver<String>,
+        tokio::sync::watch::Sender<bool>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (tx, rx) = mpsc::channel(64);
+        let (gate, gate_open) = tokio::sync::watch::channel(false);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let tx = tx.clone();
+                let mut gate_open = gate_open.clone();
+                let markers = hold_markers.clone();
+                let held = held_response.clone();
+                tokio::spawn(async move {
+                    let captured = read_full_request(&mut socket).await;
+                    let is_get = captured.starts_with("GET ");
+                    let is_held = is_get && markers.iter().any(|marker| captured.contains(marker));
+                    if tx.send(captured).await.is_err() {
+                        return;
+                    }
+                    if is_held {
+                        while !*gate_open.borrow_and_update() {
+                            if gate_open.changed().await.is_err() {
+                                return;
+                            }
+                        }
+                        write_response(&mut socket, held.0, &held.1).await;
+                        return;
+                    }
+                    if is_get {
+                        write_response(&mut socket, "204 No Content", "").await;
+                    } else {
+                        write_response(&mut socket, "200 OK", "").await;
+                    }
+                });
+            }
+        });
+        (url, rx, gate)
+    }
+
+    /// Counting receiver: each connection task sleeps `hold_get` before
+    /// answering a GET (204) and answers a POST (200) at once, tracking
+    /// the peak number of simultaneously in-flight connections.
+    async fn counting_receiver(
+        hold_get: Duration,
+    ) -> (
+        String,
+        mpsc::Receiver<String>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (tx, rx) = mpsc::channel(64);
+        let inflight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let task_inflight = Arc::clone(&inflight);
+        let task_peak = Arc::clone(&peak);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let tx = tx.clone();
+                let inflight = Arc::clone(&task_inflight);
+                let peak = Arc::clone(&task_peak);
+                let hold_get = hold_get;
+                tokio::spawn(async move {
+                    let current = inflight.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    peak.fetch_max(current, std::sync::atomic::Ordering::SeqCst);
+                    let captured = read_full_request(&mut socket).await;
+                    let is_get = captured.starts_with("GET ");
+                    if tx.send(captured).await.is_err() {
+                        return;
+                    }
+                    if is_get {
+                        tokio::time::sleep(hold_get).await;
+                        write_response(&mut socket, "204 No Content", "").await;
+                    } else {
+                        write_response(&mut socket, "200 OK", "").await;
+                    }
+                    inflight.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                });
+            }
+        });
+        (url, rx, peak)
+    }
+
+    /// Dual-gate receiver for the shutdown contract: every GET is held
+    /// until `gate_gets` opens (then 204), every POST until
+    /// `gate_posts` opens (then 200). Each connection is its own task,
+    /// so reads and notifies proceed concurrently across rows.
+    async fn dual_gate_receiver() -> (
+        String,
+        mpsc::Receiver<String>,
+        tokio::sync::watch::Sender<bool>,
+        tokio::sync::watch::Sender<bool>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (tx, rx) = mpsc::channel(64);
+        let (gate_gets, gets_open) = tokio::sync::watch::channel(false);
+        let (gate_posts, posts_open) = tokio::sync::watch::channel(false);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let tx = tx.clone();
+                let mut gets_open = gets_open.clone();
+                let mut posts_open = posts_open.clone();
+                tokio::spawn(async move {
+                    let captured = read_full_request(&mut socket).await;
+                    let is_get = captured.starts_with("GET ");
+                    if tx.send(captured).await.is_err() {
+                        return;
+                    }
+                    let open = if is_get {
+                        &mut gets_open
+                    } else {
+                        &mut posts_open
+                    };
+                    while !*open.borrow_and_update() {
+                        if open.changed().await.is_err() {
+                            return;
+                        }
+                    }
+                    if is_get {
+                        write_response(&mut socket, "204 No Content", "").await;
+                    } else {
+                        write_response(&mut socket, "200 OK", "").await;
+                    }
+                });
+            }
+        });
+        (url, rx, gate_gets, gate_posts)
+    }
+
+    /// T1 slow-row progress: a held GET on one row does not stop other
+    /// rows from being read and acknowledged in the same pass. Red
+    /// pre-fill: the serial loop blocks behind the held row (the held
+    /// row registers first, matching the store's insertion order).
+    #[tokio::test]
+    async fn tick_a_held_row_does_not_block_other_rows_in_the_pass() {
+        let store: Arc<dyn ApprovalStore> = Arc::new(InMemoryApprovalStore::new());
+        let held = park_pending(&store, INSTANCE_ID).await;
+        let b = park_pending(&store, INSTANCE_ID).await;
+        let c = park_pending(&store, INSTANCE_ID).await;
+        let (url, mut rx, gate) =
+            gate_receiver(vec![held.to_string()], ("204 No Content", String::new())).await;
+        let reconciler = reconciler_with(store, &url);
+
+        let pass = tokio::spawn(async move { reconciler.tick(&CancellationToken::new()).await });
+        let observed = tokio::time::timeout(Duration::from_secs(5), async {
+            // Full slow-row progress: B and C must complete their notify
+            // POSTs too — GETs alone would pass an implementation that
+            // overlaps reads but delays every notify behind the held row.
+            let mut posted_b = false;
+            let mut posted_c = false;
+            while !(posted_b && posted_c) {
+                let captured = rx.recv().await.expect("capture channel open");
+                if !captured.starts_with("POST ") {
+                    continue;
+                }
+                posted_b |= captured.contains(&b.to_string());
+                posted_c |= captured.contains(&c.to_string());
+            }
+        })
+        .await;
+        assert!(
+            observed.is_ok(),
+            "other rows must read and notify while one row's read is held"
+        );
+        gate.send(true).expect("gate channel open");
+        tokio::time::timeout(Duration::from_secs(5), pass)
+            .await
+            .expect("pass completes once the gate opens")
+            .expect("tick task joins");
+    }
+
+    /// T2 concurrency cap: with more rows than the bound, peak in-flight
+    /// requests never exceed `MAX_CONCURRENT_ROW_POLLS`, and the pass
+    /// genuinely overlaps rows (peak above one — this assert is the red
+    /// signal; the cap alone would hold on serial code too). Red
+    /// pre-fill: the serial loop peaks at exactly one.
+    #[tokio::test]
+    async fn tick_caps_concurrent_rows_and_overlaps_them() {
+        let store: Arc<dyn ApprovalStore> = Arc::new(InMemoryApprovalStore::new());
+        for _ in 0..(MAX_CONCURRENT_ROW_POLLS + 4) {
+            park_pending(&store, INSTANCE_ID).await;
+        }
+        let (url, _rx, peak) = counting_receiver(Duration::from_millis(100)).await;
+        let reconciler = reconciler_with(store, &url);
+
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            reconciler.tick(&CancellationToken::new()),
+        )
+        .await
+        .expect("pass completes");
+
+        let peak = peak.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            peak <= MAX_CONCURRENT_ROW_POLLS,
+            "the concurrency cap holds: {peak}"
+        );
+        assert!(peak > 1, "rows genuinely overlap within a pass: {peak}");
+    }
+
+    /// T3 queued expiry: a row whose decision deadline passes while it
+    /// is queued behind the cap is never read or notified when its turn
+    /// comes, and its stored evidence is untouched — still pending,
+    /// still requiring notification. The store's own clock still sees
+    /// the row live (far real expiry); only the poller's clock moved.
+    /// Red pre-fill: the loop has no deadline check, so the queued row
+    /// is read anyway.
+    #[tokio::test]
+    async fn tick_skips_a_row_that_expires_while_queued() {
+        let (clock, knob) = adjustable_clock();
+        let store: Arc<dyn ApprovalStore> = Arc::new(InMemoryApprovalStore::new());
+        for _ in 0..MAX_CONCURRENT_ROW_POLLS {
+            park_pending(&store, INSTANCE_ID).await;
+        }
+        let queued = DecisionId::generate();
+        store
+            .register(ParkedApproval {
+                request: parked_request(queued, INSTANCE_ID),
+                registered_at: chrono::Utc::now(),
+                expires_at: chrono::Utc::now() + chrono::Duration::seconds(10),
+                authority: ApprovalAuthority::WebhookPoll,
+                egress_headers: None,
+                acknowledgment: AcknowledgmentState::RequiresNotification,
+            })
+            .await
+            .expect("queued row registers");
+        let (url, mut rx, gate) =
+            gate_receiver(vec!["GET".to_string()], ("204 No Content", String::new())).await;
+        let reconciler = reconciler_with(store.clone(), &url).with_clock(clock);
+
+        let pass = tokio::spawn(async move { reconciler.tick(&CancellationToken::new()).await });
+        let mut inflight_gets = 0;
+        while inflight_gets < MAX_CONCURRENT_ROW_POLLS {
+            let captured = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("rows reach the receiver")
+                .expect("capture channel open");
+            if captured.starts_with("GET ") {
+                inflight_gets += 1;
+            }
+        }
+        // Expire the queued row on the poller's clock only, before its
+        // slot frees.
+        *knob.lock().unwrap() = chrono::Utc::now() + chrono::Duration::seconds(11);
+        gate.send(true).expect("gate channel open");
+        tokio::time::timeout(Duration::from_secs(10), pass)
+            .await
+            .expect("pass completes")
+            .expect("tick task joins");
+
+        let still = store.get(&queued).await.unwrap().expect("queued row kept");
+        assert!(
+            still.acknowledgment.is_requires_notification(),
+            "no store write touches the skipped row"
+        );
+        while let Ok(captured) = rx.try_recv() {
+            assert!(
+                !captured.contains(&queued.to_string()),
+                "an expired queued row gets no read and no notify: {captured}"
+            );
+        }
+    }
+
+    /// T4 expiry between GET and POST: the status read returns NotYet
+    /// after the row's decision deadline has passed — the notify POST is
+    /// withheld and the row is left exactly as it was. Red pre-fill:
+    /// the loop posts immediately after an undecided read.
+    #[tokio::test]
+    async fn tick_withholds_the_notify_post_when_the_deadline_passes_during_the_read() {
+        let (clock, knob) = adjustable_clock();
+        let store: Arc<dyn ApprovalStore> = Arc::new(InMemoryApprovalStore::new());
+        let id = park_pending(&store, INSTANCE_ID).await;
+        let (url, mut rx, gate) =
+            gate_receiver(vec![id.to_string()], ("204 No Content", String::new())).await;
+        let reconciler = reconciler_with(store.clone(), &url).with_clock(clock);
+
+        let pass = tokio::spawn(async move { reconciler.tick(&CancellationToken::new()).await });
+        let captured = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the read reaches the receiver")
+            .expect("capture channel open");
+        assert!(
+            captured.starts_with("GET "),
+            "the read precedes the notify: {captured}"
+        );
+        // The deadline passes while the GET is held in flight.
+        *knob.lock().unwrap() = chrono::Utc::now() + chrono::Duration::hours(2);
+        gate.send(true).expect("gate channel open");
+        tokio::time::timeout(Duration::from_secs(5), pass)
+            .await
+            .expect("pass completes")
+            .expect("tick task joins");
+
+        let leaked = rx.try_recv();
+        assert!(
+            leaked.is_err(),
+            "no notify POST after the deadline: {leaked:?}"
+        );
+        let still = store.get(&id).await.unwrap().expect("row kept");
+        assert!(
+            still.acknowledgment.is_requires_notification(),
+            "the withheld POST leaves the row unacknowledged"
+        );
+    }
+
+    /// T5 late response: a decided read that lands after the poller's
+    /// clock passed the deadline still flows to the store's atomic
+    /// arbitration — the store's own deadline and ownership checks
+    /// decide, never the poller. The row resolves through the decided
+    /// path and never posts its request. Contract pin, green on both
+    /// sides of the fill.
+    #[tokio::test]
+    async fn tick_forwards_a_late_decided_read_to_the_store_arbitration() {
+        let (clock, knob) = adjustable_clock();
+        let store: Arc<dyn ApprovalStore> = Arc::new(InMemoryApprovalStore::new());
+        let id = park_pending(&store, INSTANCE_ID).await;
+        let (url, mut rx, gate) = gate_receiver(
+            vec![id.to_string()],
+            ("200 OK", r#"{"approved":true}"#.to_string()),
+        )
+        .await;
+        let reconciler = reconciler_with(store.clone(), &url).with_clock(clock);
+
+        let pass = tokio::spawn(async move { reconciler.tick(&CancellationToken::new()).await });
+        let captured = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the read reaches the receiver")
+            .expect("capture channel open");
+        assert!(captured.starts_with("GET "), "the read is held: {captured}");
+        // The deadline passes on the poller's clock while the read is
+        // in flight; the decided response lands after it.
+        *knob.lock().unwrap() = chrono::Utc::now() + chrono::Duration::hours(2);
+        gate.send(true).expect("gate channel open");
+        tokio::time::timeout(Duration::from_secs(5), pass)
+            .await
+            .expect("pass completes")
+            .expect("tick task joins");
+
+        let decision = store_decision(&store, &id)
+            .await
+            .expect("the store arbitrates the late decision");
+        assert!(
+            matches!(decision, ResolvedDecision::Approved { .. }),
+            "the decision recorded is the polled one"
+        );
+        let leaked = rx.try_recv();
+        assert!(
+            leaked.is_err(),
+            "a decided row never posts its request: {leaked:?}"
+        );
+    }
+
+    /// T6 shutdown: cancelling mid-pass starts no new rows — the rows
+    /// queued behind the cap issue no request — while a stop() join
+    /// waits out the admitted rows' full in-flight chains: the held
+    /// read plus the notify POST after it, each leg bounded by the
+    /// short configured request timeout. Red pre-fill: the serial loop
+    /// keeps processing the remaining rows inside the same pass after
+    /// cancellation.
+    #[tokio::test]
+    async fn cancel_mid_pass_starts_no_new_rows_and_joins_promptly() {
+        let store: Arc<dyn ApprovalStore> = Arc::new(InMemoryApprovalStore::new());
+        let mut ids = Vec::new();
+        for _ in 0..(MAX_CONCURRENT_ROW_POLLS + 4) {
+            ids.push(park_pending(&store, INSTANCE_ID).await);
+        }
+        let (url, mut rx, gate_gets, gate_posts) = dual_gate_receiver().await;
+        let shutdown = CancellationToken::new();
+        let reconciler = reconciler_with_timeout(store, &url, 2);
+        let handle = reconciler.spawn(&shutdown);
+
+        // Let the cap fill with held reads BEFORE stopping: stop()
+        // cancels on call, and the admission checks would bar the rows
+        // the cap has not admitted yet.
+        let mut captures: Vec<String> = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while captures.iter().filter(|c| c.starts_with("GET ")).count()
+                < MAX_CONCURRENT_ROW_POLLS
+            {
+                captures.push(rx.recv().await.expect("capture channel open"));
+            }
+        })
+        .await
+        .expect("the cap fills with held reads");
+        // Now stop: the cancel lands mid-pass with the cap full.
+        let mut stop_task = tokio::spawn(async { handle.stop().await });
+        shutdown.cancel();
+        // Release the reads; the admitted rows move to their notify
+        // POSTs, which stay held.
+        gate_gets.send(true).expect("gets gate open");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while captures.iter().filter(|c| c.starts_with("POST ")).count()
+                < MAX_CONCURRENT_ROW_POLLS
+            {
+                captures.push(rx.recv().await.expect("capture channel open"));
+            }
+        })
+        .await
+        .expect("the admitted rows reach their notify POSTs");
+        // The join waits out the in-flight POST chains: stop has not
+        // returned while they are held, well inside the 2s request
+        // timeout, so the pending state is the held POST, not a slow
+        // leg.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert!(
+            !stop_task.is_finished(),
+            "stop() joins only after the in-flight POST chains complete"
+        );
+        gate_posts.send(true).expect("posts gate open");
+        tokio::time::timeout(Duration::from_secs(5), &mut stop_task)
+            .await
+            .expect("stop must not hang")
+            .expect("stop task joins");
+        while let Ok(captured) = rx.try_recv() {
+            captures.push(captured);
+        }
+
+        let read_ids = ids
+            .iter()
+            .filter(|id| {
+                captures
+                    .iter()
+                    .any(|c| c.starts_with("GET ") && c.contains(&id.to_string()))
+            })
+            .count();
+        let posted = captures.iter().filter(|c| c.starts_with("POST ")).count();
+        assert_eq!(
+            read_ids, MAX_CONCURRENT_ROW_POLLS,
+            "exactly the admitted rows were read; queued rows issue no request after cancel"
+        );
+        assert_eq!(
+            posted, MAX_CONCURRENT_ROW_POLLS,
+            "exactly the admitted rows notified; queued rows issue no request after cancel"
+        );
+    }
+
+    /// T7 pass non-overlap: while a pass is in flight on a row, no
+    /// second pass re-reads that row — the tick interval (1s here)
+    /// fires during the held pass and must not start another one.
+    /// Reliance note: this pin is green by structure on both sides of
+    /// the fill — `run` awaits each pass inside `select!` with
+    /// `MissedTickBehavior::Delay`, so passes cannot overlap by
+    /// construction; the test exists to fail loudly if that loop shape
+    /// is ever changed.
+    #[tokio::test]
+    async fn a_pass_in_flight_blocks_the_next_pass_for_its_row() {
+        let store: Arc<dyn ApprovalStore> = Arc::new(InMemoryApprovalStore::new());
+        let id = park_pending(&store, INSTANCE_ID).await;
+        let (url, mut rx, gate) =
+            gate_receiver(vec!["GET".to_string()], ("204 No Content", String::new())).await;
+        let shutdown = CancellationToken::new();
+        let reconciler = reconciler_with(store, &url);
+        let handle = reconciler.spawn(&shutdown);
+
+        // First pass: the row's read is held. Interval ticks at 1s and
+        // 2s fire during the hold; none may re-read the row.
+        let first = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the first pass reads the row")
+            .expect("capture channel open");
+        assert!(
+            first.starts_with("GET "),
+            "the pass reads status first: {first}"
+        );
+        assert!(
+            first.contains(&id.to_string()),
+            "the held read belongs to the parked row: {first}"
+        );
+        let second_during_hold =
+            tokio::time::timeout(Duration::from_millis(2_500), rx.recv()).await;
+        assert!(
+            second_during_hold.is_err(),
+            "no second read while the pass is in flight"
+        );
+        gate.send(true).expect("gate channel open");
+        tokio::time::timeout(Duration::from_secs(5), handle.stop())
+            .await
+            .expect("stop must not hang");
+    }
+
     /// The tick loop against a scripted receiver: the status read runs
     /// before the notify attempt, a failed notify retries the POST next
     /// tick, an acked id skips the POST (the marker short-circuits it)
@@ -412,13 +1064,12 @@ mod tests {
             ("503 Service Unavailable", String::new()),
             poll_pending(),
             ack_ok(),
-            poll_decided(r#"{"status":"approved"}"#),
+            poll_decided(r#"{"approved":true}"#),
         ])
         .await;
         let reconciler = reconciler_with(store.clone(), &url);
-        let mut notified = HashSet::new();
 
-        reconciler.tick(&mut notified).await;
+        reconciler.tick(&CancellationToken::new()).await;
         let first = rx.recv().await.unwrap();
         assert!(
             first.starts_with("GET "),
@@ -434,7 +1085,7 @@ mod tests {
             "the notify attempt follows the read: {same_tick}"
         );
 
-        reconciler.tick(&mut notified).await;
+        reconciler.tick(&CancellationToken::new()).await;
         assert!(rx.recv().await.unwrap().starts_with("GET "));
         let retried = rx.recv().await.unwrap();
         assert!(
@@ -442,7 +1093,7 @@ mod tests {
             "an unacked id retries the POST: {retried}"
         );
 
-        reconciler.tick(&mut notified).await;
+        reconciler.tick(&CancellationToken::new()).await;
         let marked = rx.recv().await.unwrap();
         assert!(
             marked.starts_with("GET "),
@@ -470,17 +1121,16 @@ mod tests {
         let (url, mut rx) = scripted_receiver(vec![
             poll_pending(),
             ("503 Service Unavailable", String::new()),
-            poll_decided(r#"{"status":"approved"}"#),
+            poll_decided(r#"{"approved":true}"#),
         ])
         .await;
         let reconciler = reconciler_with(store.clone(), &url);
-        let mut notified = HashSet::new();
 
-        reconciler.tick(&mut notified).await;
+        reconciler.tick(&CancellationToken::new()).await;
         assert!(rx.recv().await.unwrap().starts_with("GET "));
         assert!(rx.recv().await.unwrap().starts_with("POST "));
 
-        reconciler.tick(&mut notified).await;
+        reconciler.tick(&CancellationToken::new()).await;
         assert!(rx.recv().await.unwrap().starts_with("GET "));
 
         assert_eq!(
@@ -502,9 +1152,8 @@ mod tests {
         ])
         .await;
         let reconciler = reconciler_with(store.clone(), &url);
-        let mut notified = HashSet::new();
 
-        reconciler.tick(&mut notified).await;
+        reconciler.tick(&CancellationToken::new()).await;
         let out_of_envelope = rx.recv().await.unwrap();
         assert!(out_of_envelope.starts_with("GET "));
         assert!(rx.recv().await.unwrap().starts_with("POST "));
@@ -525,14 +1174,13 @@ mod tests {
         let id = park_pending(&store, INSTANCE_ID).await;
         let (url, mut rx) = scripted_receiver(vec![
             poll_pending(),
-            poll_decided(r#"{"status":"approved"}"#), // the approving ack body
-            poll_decided(r#"{"status":"approved"}"#),
+            poll_decided(r#"{"approved":true}"#), // the approving ack body
+            poll_decided(r#"{"approved":true}"#),
         ])
         .await;
         let reconciler = reconciler_with(store.clone(), &url);
-        let mut notified = HashSet::new();
 
-        reconciler.tick(&mut notified).await;
+        reconciler.tick(&CancellationToken::new()).await;
         let first_read = rx.recv().await.unwrap();
         assert!(
             first_read.starts_with("GET "),
@@ -545,7 +1193,7 @@ mod tests {
             "an approving ack body must never mint a decision"
         );
 
-        reconciler.tick(&mut notified).await;
+        reconciler.tick(&CancellationToken::new()).await;
         assert!(rx.recv().await.unwrap().starts_with("GET "));
         assert_eq!(
             store_decision(&store, &id).await,
@@ -565,13 +1213,12 @@ mod tests {
         let (url, mut rx) = scripted_receiver(vec![
             poll_pending(),
             ack_ok(),
-            poll_decided(r#"{"status":"approved"}"#),
+            poll_decided(r#"{"approved":true}"#),
         ])
         .await;
         let reconciler = reconciler_with(store.clone(), &url);
-        let mut notified = HashSet::new();
 
-        reconciler.tick(&mut notified).await;
+        reconciler.tick(&CancellationToken::new()).await;
         let first = rx.recv().await.unwrap();
         assert!(first.starts_with("GET "));
         assert!(
@@ -585,7 +1232,7 @@ mod tests {
             "the notify belongs to the own-instance row only"
         );
 
-        reconciler.tick(&mut notified).await;
+        reconciler.tick(&CancellationToken::new()).await;
         assert!(rx.recv().await.unwrap().starts_with("GET "));
 
         assert_eq!(
@@ -598,7 +1245,8 @@ mod tests {
         );
     }
 
-    /// `from_config` gates the production spawn on webhook poll delivery.
+    /// `from_config` gates the production spawn on the admitted parking
+    /// route: webhook poll delivery with park mode enabled.
     #[test]
     fn from_config_gates_on_poll_delivery() {
         let store: Arc<dyn ApprovalStore> = Arc::new(InMemoryApprovalStore::new());
@@ -631,19 +1279,18 @@ mod tests {
 
     /// The restart path through the real production wiring (from_config +
     /// spawn over a persistent file-backed store): boot one reads status
-    /// and notifies; stop the runtime; the reboot's fresh markers
-    /// re-notify the still-undecided row (idempotent by decision id), and
-    /// the next tick's decided poll resolves durably.
+    /// and notifies, marking the row acknowledged durably; after a reboot
+    /// the fresh reconciler reads the persisted acknowledgment and never
+    /// re-POSTs the row, resolving it through the pinned GET alone.
     #[tokio::test]
-    async fn restart_renotifies_the_undecided_row_and_resolves_after_reboot() {
+    async fn restart_does_not_repost_the_acknowledged_row_and_resolves_after_reboot() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().to_path_buf();
         let (url, mut rx) = scripted_receiver(vec![
             poll_pending(),
             ack_ok(),
             poll_pending(),
-            ack_ok(),
-            poll_decided(r#"{"status":"approved"}"#),
+            poll_decided(r#"{"approved":true}"#),
         ])
         .await;
 
@@ -663,8 +1310,9 @@ mod tests {
                     request,
                     registered_at: chrono::Utc::now(),
                     expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
-                    authority: crate::hitl::ApprovalAuthority::WebhookPoll,
+                    authority: ApprovalAuthority::WebhookPoll,
                     egress_headers: None,
+                    acknowledgment: AcknowledgmentState::RequiresNotification,
                 })
                 .await
                 .expect("pending approval parks durably");
@@ -677,10 +1325,11 @@ mod tests {
         assert!(notify.starts_with("POST "), "boot one notifies: {notify}");
         let _ = handle_a.stop().await;
 
-        // Boot two: a fresh reconciler over the same store root — notified
-        // markers are gone, so the reboot re-notifies the undecided row and
-        // the next tick's poll picks up the decision. Its registry resolves
-        // over the same store, as the ingress handler's would.
+        // Boot two: a fresh reconciler over the same store root — the
+        // acknowledgment boot one's notify persisted is durable, so the
+        // reboot never re-POSTs the row and resolves it through the pinned
+        // GET alone. Its registry resolves over the same store, as the
+        // ingress handler's would.
         let store_b: Arc<dyn ApprovalStore> = Arc::new(FileApprovalStore::open(&path).unwrap());
         let _handle_b = reconciler_with(store_b.clone(), &url).spawn(&shutdown);
         let reread = tokio::time::timeout(Duration::from_secs(5), rx.recv())
@@ -691,13 +1340,9 @@ mod tests {
             reread.starts_with("GET "),
             "the reboot reads status: {reread}"
         );
-        let renotify = tokio::time::timeout(Duration::from_secs(5), rx.recv())
-            .await
-            .expect("boot two re-notifies")
-            .unwrap();
         assert!(
-            renotify.starts_with("POST "),
-            "the reboot re-notifies: {renotify}"
+            rx.try_recv().is_err(),
+            "the reboot never re-POSTs the acknowledged row"
         );
 
         let recorded = tokio::time::timeout(Duration::from_secs(5), async {
@@ -726,6 +1371,81 @@ mod tests {
         );
 
         shutdown.cancel();
+    }
+
+    /// A row born notified (acknowledgment = `Acknowledged`, as the 207
+    /// bridge registers it) is never re-POSTed: the reconciler reads the
+    /// persisted state and skips the notify, polling only.
+    #[tokio::test]
+    async fn born_notified_row_is_never_reposted() {
+        let store: Arc<dyn ApprovalStore> = Arc::new(InMemoryApprovalStore::new());
+        let request = parked_request(DecisionId::generate(), INSTANCE_ID);
+        store
+            .register(ParkedApproval {
+                request,
+                registered_at: chrono::Utc::now(),
+                expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+                authority: ApprovalAuthority::WebhookPoll,
+                egress_headers: None,
+                acknowledgment: AcknowledgmentState::Acknowledged,
+            })
+            .await
+            .expect("a born-notified row registers");
+
+        let (url, mut rx) = scripted_receiver(vec![poll_pending()]).await;
+        let reconciler = reconciler_with(store.clone(), &url);
+
+        reconciler.tick(&CancellationToken::new()).await;
+        let read = rx.recv().await.unwrap();
+        assert!(
+            read.starts_with("GET "),
+            "the born-notified row polls: {read}"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "no notify POST may follow the read of a born-notified row"
+        );
+    }
+
+    /// A born-notified row stays un-reposted across a simulated restart: a
+    /// fresh reconciler over the same file store reads the persisted
+    /// acknowledgment state and still never POSTs.
+    #[tokio::test]
+    async fn born_notified_row_survives_a_restart_without_a_repost() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        let store_a: Arc<dyn ApprovalStore> = Arc::new(FileApprovalStore::open(&path).unwrap());
+        let request = parked_request(DecisionId::generate(), INSTANCE_ID);
+        store_a
+            .register(ParkedApproval {
+                request,
+                registered_at: chrono::Utc::now(),
+                expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+                authority: ApprovalAuthority::WebhookPoll,
+                egress_headers: None,
+                acknowledgment: AcknowledgmentState::Acknowledged,
+            })
+            .await
+            .expect("a born-notified row registers");
+
+        let (url, mut rx) = scripted_receiver(vec![poll_pending(), poll_pending()]).await;
+
+        let reconciler_a = reconciler_with(store_a.clone(), &url);
+        reconciler_a.tick(&CancellationToken::new()).await;
+        let read = rx.recv().await.unwrap();
+        assert!(read.starts_with("GET "), "boot one polls: {read}");
+        assert!(rx.try_recv().is_err(), "no POST on boot one");
+
+        // A fresh reconciler over the same store root (the restart).
+        let store_b: Arc<dyn ApprovalStore> = Arc::new(FileApprovalStore::open(&path).unwrap());
+        let reconciler_b = reconciler_with(store_b.clone(), &url);
+        reconciler_b.tick(&CancellationToken::new()).await;
+        let read = rx.recv().await.unwrap();
+        assert!(
+            read.starts_with("GET "),
+            "boot two polls, never POSTs: {read}"
+        );
+        assert!(rx.try_recv().is_err(), "no POST on boot two");
     }
 
     /// The handle stops the loop cleanly: no tick is cut mid-request and
@@ -786,15 +1506,34 @@ mod tests {
         async fn register(&self, _parked: ParkedApproval) -> Result<(), SessionStoreError> {
             unreachable!("the panicking-scan battery never registers");
         }
+        async fn mark_acknowledged(
+            &self,
+            _id: &DecisionId,
+        ) -> Result<crate::session_store::AcknowledgeOutcome, SessionStoreError> {
+            unreachable!("the panicking-scan battery never acknowledges");
+        }
         async fn get(&self, _id: &DecisionId) -> Result<Option<ParkedApproval>, SessionStoreError> {
             unreachable!("the panicking-scan battery never reads a row");
         }
         async fn resolve(
             &self,
             _id: &DecisionId,
+            _expected_authority: crate::hitl::ApprovalAuthority,
             _decision: ResolvedDecision,
         ) -> Result<(), ResolveError> {
             unreachable!("the panicking-scan battery never resolves");
+        }
+        async fn read_or_expire(
+            &self,
+            _id: &DecisionId,
+            _expected_authority: crate::hitl::ApprovalAuthority,
+        ) -> Result<crate::hitl::ApprovalRead, SessionStoreError> {
+            unreachable!("the panicking-scan battery never reads a row");
+        }
+        async fn retained_rows(
+            &self,
+        ) -> Result<Vec<crate::session_store::RetainedApproval>, SessionStoreError> {
+            unreachable!("the panicking-scan battery never scans retention");
         }
         async fn decision(
             &self,
@@ -925,7 +1664,10 @@ mod tests {
         ) -> aura_config::HitlConfig {
             aura_config::HitlConfig {
                 require_approval: vec![],
-                park: aura_config::ParkConfig::default(),
+                park: aura_config::ParkConfig {
+                    enabled: true,
+                    ..Default::default()
+                },
                 route: aura_config::DecisionRouteConfig::Webhook {
                     url: aura_config::WebhookUrl::new("http://127.0.0.1:1").unwrap(),
                     timeout_secs: Some(300),
@@ -943,6 +1685,7 @@ mod tests {
                     poll_url: None,
                     poll_interval_secs: 10,
                     poll_request_timeout_secs: 30,
+                    receiver_wait_timeout_secs: 900,
                 },
             }
         }
@@ -993,11 +1736,39 @@ mod tests {
                     request,
                     registered_at: chrono::Utc::now(),
                     expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
-                    authority: crate::hitl::ApprovalAuthority::WebhookPoll,
+                    authority: ApprovalAuthority::WebhookPoll,
                     egress_headers: Some(headers),
+                    acknowledgment: AcknowledgmentState::RequiresNotification,
                 })
                 .await
                 .expect("pending approval registers");
+            id
+        }
+
+        /// Sibling of [`park_row`] for a BORN-ACKNOWLEDGED durable row —
+        /// the truthful post-207 state, `WebhookPoll` authority plus
+        /// `AcknowledgmentState::Acknowledged` — carrying `egress` as its
+        /// resolved authorization value. Existing `park_row` callers are
+        /// untouched.
+        async fn park_acknowledged_row(store: &Arc<dyn ApprovalStore>, egress: &str) -> DecisionId {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "authorization",
+                HeaderValue::from_str(egress).expect("sentinels are valid header values"),
+            );
+            let request = parked_request(DecisionId::generate(), INSTANCE_ID);
+            let id = request.decision_id;
+            store
+                .register(ParkedApproval {
+                    request,
+                    registered_at: chrono::Utc::now(),
+                    expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+                    authority: ApprovalAuthority::WebhookPoll,
+                    egress_headers: Some(headers),
+                    acknowledgment: AcknowledgmentState::Acknowledged,
+                })
+                .await
+                .expect("acknowledged approval registers");
             id
         }
 
@@ -1052,10 +1823,73 @@ mod tests {
                 .to_string()
         }
 
+        /// Content-addressed receiver for the bounded-fan-out era:
+        /// responses key on (row, method) state, never connection
+        /// position, so a pass may interleave its rows freely. The
+        /// `flaky` row's POST fails (503) its first attempt and acks
+        /// (200) on every later one; any other row's POST acks at once;
+        /// GETs read pending (204) until BOTH rows' POSTs have acked,
+        /// then read decided (200, approved).
+        async fn row_state_receiver(flaky: DecisionId) -> (String, mpsc::Receiver<String>) {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let (tx, rx) = mpsc::channel(16);
+            let flaky_acked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let other_acked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let flaky_posted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            tokio::spawn({
+                let flaky = flaky.to_string();
+                async move {
+                    loop {
+                        let Ok((mut socket, _)) = listener.accept().await else {
+                            return;
+                        };
+                        let tx = tx.clone();
+                        let flaky = flaky.clone();
+                        let flaky_acked = Arc::clone(&flaky_acked);
+                        let other_acked = Arc::clone(&other_acked);
+                        let flaky_posted = Arc::clone(&flaky_posted);
+                        tokio::spawn(async move {
+                            let captured = read_full_request(&mut socket).await;
+                            let is_get = captured.starts_with("GET ");
+                            let mentions_flaky = captured.contains(&flaky);
+                            if tx.send(captured).await.is_err() {
+                                return;
+                            }
+                            let (status, body) = if is_get {
+                                if flaky_acked.load(std::sync::atomic::Ordering::SeqCst)
+                                    && other_acked.load(std::sync::atomic::Ordering::SeqCst)
+                                {
+                                    ("200 OK", r#"{"approved":true}"#.to_string())
+                                } else {
+                                    ("204 No Content", String::new())
+                                }
+                            } else if mentions_flaky {
+                                if flaky_posted.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                                    flaky_acked.store(true, std::sync::atomic::Ordering::SeqCst);
+                                    ("200 OK", String::new())
+                                } else {
+                                    ("503 Service Unavailable", String::new())
+                                }
+                            } else {
+                                other_acked.store(true, std::sync::atomic::Ordering::SeqCst);
+                                ("200 OK", String::new())
+                            };
+                            write_response(&mut socket, status, &body).await;
+                        });
+                    }
+                }
+            });
+            (url, rx)
+        }
+
         /// Distinct-credential approvals keep their own headers through
         /// registration, notify retry, and store reopen: each notify POST —
         /// including the retried one — authenticates with ITS row's value,
         /// never the sibling's and never the client's static fallback.
+        /// Scripted content-addressed (see [`row_state_receiver`]): the
+        /// alpha row's notify fails once and retries; assertions key on
+        /// each capture's own row, not its position in the pass.
         #[tokio::test]
         async fn distinct_rows_keep_their_own_headers_through_retry_and_reopen() {
             let dir = tempfile::tempdir().unwrap();
@@ -1094,48 +1928,18 @@ mod tests {
                 "Bearer client-static".to_string(),
             );
             let config = poll_config_with(static_headers, false);
-            let (url, mut rx) = scripted_receiver_with_headers(vec![
-                // Tick 1: row A reads status then POSTs 503 (captured);
-                // row B reads status then acks. Four connections.
-                ("204 No Content", vec![], ""),
-                ("503 Service Unavailable", vec![], ""),
-                ("204 No Content", vec![], ""),
-                ("200 OK", vec![], ""),
-                // Tick 2: row A reads status, then its failed notify
-                // retries (captured); row B's marker skips its POST.
-                // Three connections.
-                ("204 No Content", vec![], ""),
-                ("200 OK", vec![], ""),
-                ("204 No Content", vec![], ""),
-                // Tick 3: both rows resolve on the read alone. Two
-                // connections.
-                ("200 OK", vec![], r#"{"status":"approved"}"#),
-                ("200 OK", vec![], r#"{"status":"approved"}"#),
-            ])
-            .await;
+            let (url, mut rx) = row_state_receiver(alpha).await;
             let reconciler = reconciler_from(&config, Arc::clone(&reader), &url);
-            let mut notified = HashSet::new();
 
-            reconciler.tick(&mut notified).await;
-            let _first = rx.recv().await.unwrap();
-            let second = rx.recv().await.unwrap();
-            let _third = rx.recv().await.unwrap();
-            let fourth = rx.recv().await.unwrap();
-            reconciler.tick(&mut notified).await;
-            let _fifth = rx.recv().await.unwrap();
-            let sixth = rx.recv().await.unwrap();
-            let _seventh = rx.recv().await.unwrap();
-            reconciler.tick(&mut notified).await;
-            let _eighth = rx.recv().await.unwrap();
-            let _ninth = rx.recv().await.unwrap();
-
-            assert!(second.starts_with("POST ") && fourth.starts_with("POST "));
-            assert!(sixth.starts_with("POST "), "the failed notify retries");
-
-            let posts = [second, fourth, sixth];
-            for captured in &posts {
+            let drain = |rx: &mut mpsc::Receiver<String>| {
+                let mut captured = Vec::new();
+                while let Ok(next) = rx.try_recv() {
+                    captured.push(next);
+                }
+                captured
+            };
+            let assert_own_value = |captured: &str| {
                 let id = body_decision_id(captured);
-                let expected_value = expected[&id].as_str();
                 let header_line = captured
                     .lines()
                     .find(|line| line.to_lowercase().starts_with("authorization:"))
@@ -1144,16 +1948,72 @@ mod tests {
                     });
                 assert_eq!(
                     header_line.split_once(':').expect("header line").1.trim(),
-                    expected_value,
+                    expected[&id],
                     "each notify POST authenticates with its own row's value: {captured}"
                 );
                 assert!(
                     !captured.contains("Bearer client-static"),
                     "the client's static value must never leak beside the row's: {captured}"
                 );
+            };
+
+            // Pass one: both rows read status and attempt their notify —
+            // alpha's fails (503), beta's acks.
+            reconciler.tick(&CancellationToken::new()).await;
+            let first_pass = drain(&mut rx);
+            assert_eq!(
+                first_pass.len(),
+                4,
+                "both rows read and notify: {first_pass:?}"
+            );
+            assert_eq!(
+                first_pass.iter().filter(|c| c.starts_with("GET ")).count(),
+                2,
+                "each row reads status first: {first_pass:?}"
+            );
+            let alpha_posts: Vec<&String> = first_pass
+                .iter()
+                .filter(|c| c.starts_with("POST ") && c.contains(&alpha.to_string()))
+                .collect();
+            let beta_posts: Vec<&String> = first_pass
+                .iter()
+                .filter(|c| c.starts_with("POST ") && c.contains(&beta.to_string()))
+                .collect();
+            assert_eq!(alpha_posts.len(), 1, "alpha notifies once: {first_pass:?}");
+            assert_eq!(beta_posts.len(), 1, "beta notifies once: {first_pass:?}");
+            for captured in first_pass.iter().filter(|c| c.starts_with("POST ")) {
+                assert_own_value(captured);
             }
 
-            // Both rows resolved durably, decisions without identity.
+            // Pass two: alpha's failed notify retries with its own value;
+            // beta's marker skips its POST.
+            reconciler.tick(&CancellationToken::new()).await;
+            let second_pass = drain(&mut rx);
+            let alpha_retries: Vec<&String> = second_pass
+                .iter()
+                .filter(|c| c.starts_with("POST ") && c.contains(&alpha.to_string()))
+                .collect();
+            assert_eq!(
+                alpha_retries.len(),
+                1,
+                "the failed notify retries: {second_pass:?}"
+            );
+            assert_own_value(alpha_retries[0]);
+            assert!(
+                !second_pass
+                    .iter()
+                    .any(|c| c.starts_with("POST ") && c.contains(&beta.to_string())),
+                "beta's marker skips its POST: {second_pass:?}"
+            );
+
+            // Pass three: the reads resolve both rows durably.
+            reconciler.tick(&CancellationToken::new()).await;
+            let third_pass = drain(&mut rx);
+            assert!(
+                third_pass.iter().all(|c| c.starts_with("GET ")),
+                "both rows resolve on the read alone: {third_pass:?}"
+            );
+
             assert_eq!(
                 store_decision(&reader, &alpha).await,
                 Some(ResolvedDecision::from(ApprovalDecision::Approved)),
@@ -1174,18 +2034,20 @@ mod tests {
             let (url, mut rx) = scripted_receiver_with_headers(vec![(
                 "200 OK",
                 vec![("x-approver-id", IDENTITY_SENTINEL)],
-                r#"{"status":"approved"}"#,
+                r#"{"approved":true}"#,
             )])
             .await;
             let reconciler = reconciler_from(&config, store.clone(), &url);
-            let mut notified = HashSet::new();
 
-            reconciler.tick(&mut notified).await;
+            reconciler.tick(&CancellationToken::new()).await;
             let poll = rx.recv().await.unwrap();
             assert!(poll.starts_with("GET "), "the status read: {poll}");
+            // The GET carries the row's own egress value (per-row poll
+            // credentials, H2); identity is response-side only and never
+            // rides the request.
             assert!(
-                !poll.contains(EGRESS_ALPHA) && !poll.contains(IDENTITY_SENTINEL),
-                "the status GET carries no row egress or identity values: {poll}"
+                poll.contains(EGRESS_ALPHA) && !poll.contains(IDENTITY_SENTINEL),
+                "the status GET carries the row's egress value and no identity: {poll}"
             );
 
             match store_decision(&store, &id).await.expect("resolved") {
@@ -1217,16 +2079,12 @@ mod tests {
             let store: Arc<dyn ApprovalStore> = Arc::new(InMemoryApprovalStore::new());
             let id = park_row(&store, EGRESS_ALPHA).await;
             let config = poll_config_with(HashMap::new(), true);
-            let (url, mut rx) = scripted_receiver_with_headers(vec![(
-                "200 OK",
-                vec![],
-                r#"{"status":"approved"}"#,
-            )])
-            .await;
+            let (url, mut rx) =
+                scripted_receiver_with_headers(vec![("200 OK", vec![], r#"{"approved":true}"#)])
+                    .await;
             let reconciler = reconciler_from(&config, store.clone(), &url);
-            let mut notified = HashSet::new();
 
-            reconciler.tick(&mut notified).await;
+            reconciler.tick(&CancellationToken::new()).await;
             let _poll = rx.recv().await.unwrap();
 
             assert_eq!(
@@ -1273,8 +2131,9 @@ mod tests {
                     request,
                     registered_at: chrono::Utc::now(),
                     expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
-                    authority: crate::hitl::ApprovalAuthority::WebhookPoll,
+                    authority: ApprovalAuthority::WebhookPoll,
                     egress_headers: Some(egress),
+                    acknowledgment: AcknowledgmentState::RequiresNotification,
                 })
                 .await
                 .unwrap();
@@ -1297,13 +2156,11 @@ mod tests {
                 (
                     "200 OK",
                     vec![("x-approver-id", IDENTITY)],
-                    r#"{"status":"approved"}"#,
+                    r#"{"approved":true}"#,
                 ),
             ])
             .await;
             let reconciler = reconciler_over(&config, store.clone(), &url, &registry);
-            let mut notified = HashSet::new();
-
             let subscriber = tracing_subscriber::fmt()
                 .with_writer(Arc::clone(&log_buf))
                 .with_max_level(tracing::Level::DEBUG)
@@ -1311,10 +2168,10 @@ mod tests {
                 .finish();
             let notify = {
                 let _log_guard = tracing::subscriber::set_default(subscriber);
-                reconciler.tick(&mut notified).await;
+                reconciler.tick(&CancellationToken::new()).await;
                 let _read = rx.recv().await.unwrap();
                 let notify = rx.recv().await.unwrap();
-                reconciler.tick(&mut notified).await;
+                reconciler.tick(&CancellationToken::new()).await;
                 let _decided = rx.recv().await.unwrap();
                 notify
             };
@@ -1421,9 +2278,10 @@ mod tests {
                 registry: &registry,
                 memory_dir: memory_dir.to_str().unwrap(),
                 config: &crate::config::AgentRuntimeConfig::default(),
-                decision_window: Duration::from_secs(300),
+                park_ttl: aura_config::ParkTtl::default(),
+                identity_hash: None,
             };
-            crate::orchestration::commit_from_run_state(&inputs)
+            crate::orchestration::commit_from_run_state(&inputs, None)
                 .await
                 .expect("the park commit publishes");
 
@@ -1434,7 +2292,7 @@ mod tests {
                 "the parked document must never carry approval credentials, got: {parked_text}"
             );
 
-            let handle = crate::orchestration::ResumingDocumentHandle::open(&parked_doc)
+            let handle = crate::orchestration::ResumingDocumentHandle::open(&parked_doc, None)
                 .await
                 .expect("the resuming handle opens");
             handle
@@ -1457,5 +2315,164 @@ mod tests {
                 .any(|e| e.file_name().to_string_lossy().ends_with(".tmp"));
             assert!(!tmp_residue, "the append's temp write is renamed away");
         }
+
+        /// Every born-acknowledged row's poll GET carries THAT row's
+        /// `egress_headers` — the poller passes each row's own values
+        /// into the per-row call, replacing the reconciler client's
+        /// static fallback for that one request. Each capture maps to
+        /// its row through the GET's own `decision_id` query param, so
+        /// the assert holds regardless of within-tick row order.
+        #[tokio::test]
+        async fn polled_get_carries_each_rows_egress_headers() {
+            let dir = tempfile::tempdir().unwrap();
+            let store_root = dir.path().join("approvals");
+
+            // Registration: two born-acknowledged rows with distinct
+            // resolved values on a file store.
+            let writer: Arc<dyn ApprovalStore> =
+                Arc::new(FileApprovalStore::open(&store_root).unwrap());
+            let alpha = park_acknowledged_row(&writer, EGRESS_ALPHA).await;
+            let beta = park_acknowledged_row(&writer, EGRESS_BETA).await;
+            let expected: HashMap<String, String> = HashMap::from([
+                (alpha.to_string(), EGRESS_ALPHA.to_string()),
+                (beta.to_string(), EGRESS_BETA.to_string()),
+            ]);
+
+            // The reconciler's view: a fresh handle over the same root.
+            let reader: Arc<dyn ApprovalStore> =
+                Arc::new(FileApprovalStore::open(&store_root).unwrap());
+
+            // The client's static value differs from both rows' values, so
+            // a per-row override failure is visible.
+            let mut static_headers = HashMap::new();
+            static_headers.insert(
+                "authorization".to_string(),
+                "Bearer client-static".to_string(),
+            );
+            let config = poll_config_with(static_headers, false);
+            let (url, mut rx) = scripted_receiver_with_headers(vec![
+                // Both rows poll pending; identical entries, so the
+                // within-tick row order cannot change the script's shape.
+                ("207 Multi-Status", vec![], ""),
+                ("207 Multi-Status", vec![], ""),
+            ])
+            .await;
+            let reconciler = reconciler_from(&config, Arc::clone(&reader), &url);
+
+            reconciler.tick(&CancellationToken::new()).await;
+            for _ in 0..2 {
+                let captured = rx.recv().await.unwrap();
+                assert!(
+                    captured.starts_with("GET "),
+                    "each born-acknowledged row reads status, never POSTs: {captured}"
+                );
+                let row_id = captured
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .and_then(|target| target.split("decision_id=").nth(1))
+                    .and_then(|rest| rest.split([' ', '&']).next())
+                    .expect("the poll GET carries its row's decision id")
+                    .to_string();
+                let header_line = captured
+                    .lines()
+                    .find(|line| line.to_lowercase().starts_with("authorization:"))
+                    .unwrap_or_else(|| panic!("every poll GET carries a row header: {captured}"));
+                assert_eq!(
+                    header_line.split_once(':').expect("header line").1.trim(),
+                    expected[&row_id],
+                    "each poll GET authenticates with ITS row's value: {captured}"
+                );
+                assert!(
+                    !captured.contains("Bearer client-static"),
+                    "the client's static fallback must never leak beside the row's: {captured}"
+                );
+            }
+        }
+
+        /// Restart leg: the persisted `Acknowledged` marker is the source
+        /// of truth (the 207 registration IS the acknowledgment), so a
+        /// fresh reconciler over the reopened store neither re-POSTs the
+        /// row nor drops its credentials: both GETs carry the row's
+        /// value, zero POSTs occur, and the row resolves durably on the
+        /// decided 200.
+        #[tokio::test]
+        async fn polled_get_keeps_row_headers_across_a_restart_and_never_reposts() {
+            let dir = tempfile::tempdir().unwrap();
+            let store_root = dir.path().join("approvals");
+
+            // The 207 bridge registered the row acknowledged; its
+            // egress values persist with it.
+            let writer: Arc<dyn ApprovalStore> =
+                Arc::new(FileApprovalStore::open(&store_root).unwrap());
+            let id = park_acknowledged_row(&writer, EGRESS_ALPHA).await;
+
+            // The restart: a fresh handle over the same store root — the
+            // same reopen shape as
+            // `distinct_rows_keep_their_own_headers_through_retry_and_reopen`.
+            let store_b: Arc<dyn ApprovalStore> =
+                Arc::new(FileApprovalStore::open(&store_root).unwrap());
+
+            let mut static_headers = HashMap::new();
+            static_headers.insert(
+                "authorization".to_string(),
+                "Bearer client-static".to_string(),
+            );
+            let config = poll_config_with(static_headers, false);
+            let (url, mut rx) = scripted_receiver_with_headers(vec![
+                // Tick 1: the restarted row reads status (pending).
+                ("207 Multi-Status", vec![], ""),
+                // Tick 2: the decided answer resolves the row.
+                ("200 OK", vec![], r#"{"approved":true}"#),
+            ])
+            .await;
+            let reconciler = reconciler_from(&config, Arc::clone(&store_b), &url);
+
+            reconciler.tick(&CancellationToken::new()).await;
+            let first = rx.recv().await.unwrap();
+            reconciler.tick(&CancellationToken::new()).await;
+            let second = rx.recv().await.unwrap();
+
+            assert!(first.starts_with("GET "), "boot two polls: {first}");
+            assert!(second.starts_with("GET "), "tick two polls: {second}");
+            assert!(
+                rx.try_recv().is_err(),
+                "zero POST captures across both ticks: the acknowledged row is never re-POSTed"
+            );
+            for captured in [&first, &second] {
+                let header_line = captured
+                    .lines()
+                    .find(|line| line.to_lowercase().starts_with("authorization:"))
+                    .unwrap_or_else(|| panic!("every poll GET carries the row header: {captured}"));
+                assert_eq!(
+                    header_line.split_once(':').expect("header line").1.trim(),
+                    EGRESS_ALPHA,
+                    "the restarted row's GET keeps its stored egress credential: {captured}"
+                );
+                assert!(
+                    !captured.contains("Bearer client-static"),
+                    "the client's static fallback must be replaced: {captured}"
+                );
+            }
+
+            // The row resolved durably and left the pending scan.
+            assert_eq!(
+                store_decision(&store_b, &id).await,
+                Some(ResolvedDecision::from(ApprovalDecision::Approved)),
+                "the restarted row resolves through the pinned GET",
+            );
+            let still_pending = store_b
+                .list_pending()
+                .await
+                .unwrap()
+                .into_iter()
+                .any(|parked| parked.request.decision_id == id);
+            assert!(
+                !still_pending,
+                "the resolved ticket leaves the pending scan"
+            );
+        }
     }
+
+    // =============================================================    }
 }
