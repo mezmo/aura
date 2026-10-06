@@ -210,4 +210,21 @@ operational investigations.
 [mcp]
 sanitize_schemas = true
 
-[mcp.servers]
+[mcp.servers.mcpK8s]
+transport = "http_streamable"
+url = "http://mcp-kubernetes.sand.k8s.com/mcp"
+headers = { Accept = "application/json, text/event-stream" }
+description = "Kubernetes MCP server for cluster operations"
+
+[mcp.servers.mcpdatadog]
+transport = "http_streamable"
+url = "http://mcp-datadog.sand.k8s.com/mcp"
+headers = { Accept = "application/json, text/event-stream" }
+description = "Datadog MCP server for metrics, monitors, logs and traces"
+
+[mcp.servers.incident_io]
+transport = "http_streamable"
+url = "https://mcp.incident.io/mcp"
+
+[mcp.servers.incident_io.headers]
+Authorization = "Bearer {{ env.INCIDENT_API_KEY }}"
