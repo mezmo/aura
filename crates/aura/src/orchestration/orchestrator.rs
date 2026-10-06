@@ -423,6 +423,12 @@ pub struct Orchestrator {
     /// ID for the orchestrator
     orchestrator_id: String,
 
+    /// The run's id.
+    run_id: super::RunId,
+
+    /// The session the run belongs to.
+    session_id: Option<crate::config::SessionId>,
+
     /// Orchestration configuration
     config: OrchestrationConfig,
 
@@ -614,7 +620,15 @@ impl Orchestrator {
 
         let orchestrator_id = uuid::Uuid::new_v4().to_string();
 
-        let run_id_str = persistence.lock().await.run_id().to_string();
+        // Persistence's session, which a disabled persistence leaves `None`
+        // even when the config names one.
+        let (run_id_str, session_id) = {
+            let p = persistence.lock().await;
+            (
+                p.run_id().to_string(),
+                p.session_id().map(crate::config::SessionId::new),
+            )
+        };
         let run_id = run_id_str.parse::<super::RunId>().map_err(
             |e| -> Box<dyn std::error::Error + Send + Sync> {
                 format!("orchestration run id '{run_id_str}' is not a valid UUID: {e}").into()
@@ -646,6 +660,8 @@ impl Orchestrator {
 
         Ok(Self {
             orchestrator_id,
+            run_id,
+            session_id,
             config: orchestration_config,
             agent_config,
             tool_call_observer,
@@ -932,27 +948,11 @@ impl Orchestrator {
         // front-to-back. The gate only implements `pre_call`, so prepending it
         // leaves the documented `transform_output` ordering above untouched.
         if let Some(hitl) = worker_config.hitl.clone() {
-            let (run_id_str, session_id_owned) = {
-                let p = self.persistence.lock().await;
-                (p.run_id().to_string(), p.session_id().map(String::from))
-            };
-            let run_id = run_id_str.parse::<super::RunId>().map_err(
-                |e| -> Box<dyn std::error::Error + Send + Sync> {
-                    format!("HITL: orchestration run id '{run_id_str}' is not a valid UUID: {e}")
-                        .into()
-                },
-            )?;
-            let scope = crate::hitl::AgentScope::Worker {
-                run_id,
-                task: super::TaskIdentity::new(task_id, worker_name.map(String::from)),
-                session_id: session_id_owned.map(crate::config::SessionId::new),
-            };
-            let request_id = worker_config.request_id.clone();
+            let scope = self.worker_scope(task_id, worker_name);
             let mut gate = crate::hitl::HitlApprovalWrapper::new(
                 hitl.patterns.clone(),
                 hitl.route.clone(),
                 scope.clone(),
-                request_id.clone(),
                 worker_config.agent.name.clone(),
                 worker_config.instance_id.clone(),
             );
@@ -973,7 +973,6 @@ impl Orchestrator {
             worker_config.hitl_request_approval_tool = Some(crate::hitl::RequestApprovalTool::new(
                 hitl.route.clone(),
                 scope,
-                request_id,
                 worker_config.agent.name.clone(),
                 worker_config.instance_id.clone(),
             ));
@@ -1157,26 +1156,14 @@ impl Orchestrator {
         })
     }
 
-    /// The worker approval scope stamped on a task's approvals — the same
-    /// shape `create_worker` builds for the gate and the park guard's
-    /// cancellation events.
-    async fn worker_scope(
-        &self,
-        task_id: usize,
-        worker_name: Option<&str>,
-    ) -> Option<crate::hitl::AgentScope> {
-        let (run_id, session_id) = {
-            let p = self.persistence.lock().await;
-            (p.run_id().to_string(), p.session_id().map(String::from))
-        };
-        run_id
-            .parse::<super::RunId>()
-            .ok()
-            .map(|run_id| crate::hitl::AgentScope::Worker {
-                run_id,
-                task: super::TaskIdentity::new(task_id, worker_name.map(String::from)),
-                session_id: session_id.map(crate::config::SessionId::new),
-            })
+    /// The approval scope of a worker's task, stamped on its gate's approvals
+    /// and on their cancellation events.
+    fn worker_scope(&self, task_id: usize, worker_name: Option<&str>) -> crate::hitl::AgentScope {
+        crate::hitl::AgentScope::Worker {
+            run_id: self.run_id,
+            task: super::TaskIdentity::new(task_id, worker_name.map(String::from)),
+            session_id: self.session_id.clone(),
+        }
     }
 
     /// Orphan cleanup for a parked worker whose stream ended before the hook
@@ -1195,17 +1182,15 @@ impl Orchestrator {
         let crate::hitl::DecisionRoute::Conversational { registry, .. } = &*hitl.route else {
             return;
         };
-        let scope = self.worker_scope(task_id, worker_name).await;
+        let scope = self.worker_scope(task_id, worker_name);
         for call in pending {
             registry.remove(&call.decision_id).await;
-            if let Some(ref scope) = scope {
-                crate::run_context::emit(crate::hitl::completed_cancelled_event(
-                    call.decision_id,
-                    scope,
-                    Duration::ZERO,
-                ))
-                .await;
-            }
+            crate::run_context::emit(crate::hitl::completed_cancelled_event(
+                call.decision_id,
+                &scope,
+                Duration::ZERO,
+            ))
+            .await;
             tracing::warn!(
                 decision_id = %call.decision_id,
                 tool = %call.tool_name,
@@ -5252,7 +5237,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 run_id = %run_id,
                 "park commit impossible: no memory_dir configured; cancelling approvals",
             );
-            self.cancel_run_parked_approvals(&run_id).await;
+            self.cancel_run_parked_approvals().await;
             return Err(format!(
                 "Run {run_id} parked but no memory_dir is configured, so no \
                  checkpoint can be written. The run's pending approvals were cancelled.",
@@ -5317,7 +5302,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     error = %e,
                     "park commit failed; cancelling the run's approvals",
                 );
-                self.cancel_run_parked_approvals(&run_id).await;
+                self.cancel_run_parked_approvals().await;
                 Err(format!(
                     "Park commit failed for run {run_id}: {e}. The run's pending \
                      approvals were cancelled.",
@@ -5329,22 +5314,14 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
     /// Sweep the run's parked approvals by owner id, so no decidable
     /// approval outlives a run that has no checkpoint.
-    async fn cancel_run_parked_approvals(&self, run_id: &str) {
+    async fn cancel_run_parked_approvals(&self) {
         let Some(hitl) = self.agent_config.hitl.clone() else {
             return;
         };
         let crate::hitl::DecisionRoute::Conversational { registry, .. } = &*hitl.route else {
             return;
         };
-        // Persistence mints run ids as UUIDs, so a parse failure is a bug.
-        let Ok(run_id) = run_id.parse::<super::RunId>() else {
-            tracing::error!(
-                run_id,
-                "orchestration run id is not a UUID; its parked approvals were not swept"
-            );
-            return;
-        };
-        super::park::cancel_run_approvals(registry, run_id, crate::run_context::current_run())
+        super::park::cancel_run_approvals(registry, self.run_id, crate::run_context::current_run())
             .await
             .ok();
     }
@@ -7576,7 +7553,6 @@ mod tests {
                 }),
                 park_enabled: true,
             }),
-            request_id: Some(request_id.clone()),
             ..AgentRuntimeConfig::default()
         };
         let orchestrator = Orchestrator::new(config).await.unwrap();
@@ -7694,7 +7670,6 @@ mod tests {
             }),
             memory_dir: Some(memory_dir.to_string_lossy().into_owned()),
             session_id: Some("park-sess".to_string()),
-            request_id: Some(crate::domain::RequestId::generate()),
             ..AgentRuntimeConfig::default()
         };
         let orchestrator = Orchestrator::new(config).await.unwrap();
@@ -7942,11 +7917,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (orchestrator, store, registry, run_id) = park_orchestrator(dir.path()).await;
         let (plan, records, pending) = awaiting_plan_with_parked_calls(&registry, &run_id).await;
-        let request_id = orchestrator
-            .agent_config
-            .request_id
-            .clone()
-            .expect("the config names its request");
+        let request_id = crate::domain::RequestId::generate();
         let (run, mut events) = crate::run_context::RunContext::channel(request_id.clone());
         // Arming inside the scope is what gives the guard the run its drop
         // sweep reports to.
@@ -8037,11 +8008,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (orchestrator, store, registry, run_id) = park_orchestrator(dir.path()).await;
         let (plan, records, pending) = awaiting_plan_with_parked_calls(&registry, &run_id).await;
-        let request_id = orchestrator
-            .agent_config
-            .request_id
-            .clone()
-            .expect("the config names its request");
+        let request_id = crate::domain::RequestId::generate();
         let (run, mut events) = crate::run_context::RunContext::channel(request_id.clone());
 
         // The human decides the first call before the commit is attempted.
@@ -8129,11 +8096,7 @@ mod tests {
         let (orchestrator, registry, run_id) =
             park_orchestrator_over(store.clone(), dir.path()).await;
         let (plan, records, pending) = awaiting_plan_with_parked_calls(&registry, &run_id).await;
-        let request_id = orchestrator
-            .agent_config
-            .request_id
-            .clone()
-            .expect("the config names its request");
+        let request_id = crate::domain::RequestId::generate();
         let (run, mut events) = crate::run_context::RunContext::channel(request_id.clone());
         crate::run_context::with_run(Arc::clone(&run), arm_guard(&orchestrator, &plan)).await;
 
@@ -8269,7 +8232,6 @@ mod tests {
             }),
             memory_dir: Some(memory_dir.to_string_lossy().into_owned()),
             session_id: Some("orphan-sess".to_string()),
-            request_id: Some(request_id.clone()),
             orchestration: Some(OrchestrationConfig {
                 enabled: true,
                 workers,
@@ -8560,7 +8522,6 @@ mod tests {
             }),
             memory_dir: Some(memory_dir.to_string_lossy().into_owned()),
             session_id: Some(session_id.to_string()),
-            request_id: Some(crate::domain::RequestId::generate()),
             orchestration: Some(OrchestrationConfig {
                 enabled: true,
                 workers,

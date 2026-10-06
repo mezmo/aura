@@ -176,7 +176,6 @@ async fn build_agent_for_request(
     req_headers: &HashMap<String, String>,
     additional_tools: Vec<Box<dyn aura::ToolDyn>>,
     client_tools: Option<&[ClientToolDefinition]>,
-    request_id: RequestId,
     session_id: String,
 ) -> Result<Arc<aura::Agent>, PrepareError> {
     let client_tool_defs =
@@ -186,7 +185,6 @@ async fn build_agent_for_request(
             Some(req_headers),
             additional_tools,
             client_tool_defs,
-            Some(request_id),
             Some(session_id),
         )
         .await
@@ -213,7 +211,7 @@ pub struct RequestSetup {
     /// emit `finish_reason: "tool_calls"` instead of `"stop"` when the LLM
     /// invokes a passthrough tool.
     pub has_client_tools: bool,
-    /// Request id (`req_…`) shared by the agent build and the completion stream.
+    /// The request's id.
     pub request_id: RequestId,
     /// OpenAI-compatible `user` field, for the `user.id` span attribute.
     pub user_id: Option<String>,
@@ -243,10 +241,6 @@ pub async fn prepare_request(
     // `finish_reason: "tool_calls"` when one fires.
     let has_client_tools = req.tools.is_some();
 
-    // Generate the request id up front so the agent build (single-agent or
-    // orchestration) shares one value with the completion stream. The HITL gate
-    // and approval events stamp this id; previously it was minted later in
-    // `build_completion_config`, after the agent was already built.
     let request_id = RequestId::generate();
 
     // Find the matching config: single-config passthrough > explicit model > DEFAULT_AGENT
@@ -323,7 +317,6 @@ pub async fn prepare_request(
                     Some(req_headers_map),
                     Some(chat_session_id.to_string()),
                     client_tools_vec.clone(),
-                    Some(request_id.clone()),
                     run_tools,
                 )
                 .await
@@ -351,7 +344,6 @@ pub async fn prepare_request(
                 req_headers_map,
                 additional_tools,
                 client_tools,
-                request_id.clone(),
                 chat_session_id.to_string(),
             )
             .await?;

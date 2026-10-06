@@ -78,6 +78,20 @@ impl ApprovalOwner {
     }
 }
 
+/// The owner of an approval raised live in `run`, and the token its wait stops
+/// on.
+pub(crate) fn live_approval_context(
+    run: Option<&crate::run_context::RunContext>,
+) -> (ApprovalOwner, RequestCancelToken) {
+    match run {
+        Some(run) => (
+            ApprovalOwner::Request(run.id().clone()),
+            RequestCancelToken::from(run.cancel_token().clone()),
+        ),
+        None => (ApprovalOwner::Unowned, RequestCancelToken::unbound()),
+    }
+}
+
 impl fmt::Display for ApprovalOwner {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

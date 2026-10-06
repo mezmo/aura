@@ -742,7 +742,6 @@ pub(crate) async fn park_orchestrator_in(
         }),
         memory_dir: Some(memory_dir.to_string_lossy().into_owned()),
         session_id: Some("park-sess".to_string()),
-        request_id: Some(crate::domain::RequestId::generate()),
         orchestration: Some(super::OrchestrationConfig {
             enabled: true,
             workers,

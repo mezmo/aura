@@ -155,12 +155,10 @@ impl RigBuilder {
         req_headers: Option<&HashMap<String, String>>,
         additional_tools: Vec<Box<dyn rig::tool::ToolDyn>>,
         client_tools: Option<Vec<ClientTool>>,
-        request_id: Option<crate::domain::RequestId>,
         session_id: Option<String>,
     ) -> Result<Agent, BuilderError> {
         let mut agent_config = self.discovered_agent_config(req_headers)?;
         resolve_mcp_headers(&mut agent_config, req_headers);
-        agent_config.request_id = request_id;
         agent_config.session_id = session_id;
         agent_config.skill_recorder = self.skill_recorder.clone();
         Agent::new(&agent_config, additional_tools, client_tools)
@@ -183,16 +181,9 @@ impl RigBuilder {
         req_headers: Option<&HashMap<String, String>>,
         session_id: Option<String>,
         client_tools: Option<Vec<ClientTool>>,
-        request_id: Option<crate::domain::RequestId>,
     ) -> Result<Arc<dyn StreamingAgent>, BuilderError> {
-        self.build_streaming_agent_with_tools(
-            req_headers,
-            session_id,
-            client_tools,
-            request_id,
-            no_run_tools(),
-        )
-        .await
+        self.build_streaming_agent_with_tools(req_headers, session_id, client_tools, no_run_tools())
+            .await
     }
 
     /// [`Self::build_streaming_agent_with_headers`] plus `run_tools`: a
@@ -204,13 +195,11 @@ impl RigBuilder {
         req_headers: Option<&HashMap<String, String>>,
         session_id: Option<String>,
         client_tools: Option<Vec<ClientTool>>,
-        request_id: Option<crate::domain::RequestId>,
         run_tools: RunToolFactory,
     ) -> Result<Arc<dyn StreamingAgent>, BuilderError> {
         let mut agent_config = self.discovered_agent_config(req_headers)?;
         resolve_mcp_headers(&mut agent_config, req_headers);
         agent_config.session_id = session_id;
-        agent_config.request_id = request_id;
         agent_config.skill_recorder = self.skill_recorder.clone();
 
         build_streaming_agent_with_tools(&agent_config, client_tools, run_tools)

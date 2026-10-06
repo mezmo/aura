@@ -359,13 +359,7 @@ impl SlackIngress {
         );
         let agent = RigBuilder::new(config, self.state.pending_approvals.clone())
             .with_hitl_hmac(self.state.hitl_webhook_hmac.clone())
-            .build_streaming_agent_with_tools(
-                None,
-                Some(session_id),
-                None,
-                Some(request_id.clone()),
-                tools,
-            )
+            .build_streaming_agent_with_tools(None, Some(session_id), None, tools)
             .await
             .map_err(|e| RunError::Build(e.to_string()))?;
 

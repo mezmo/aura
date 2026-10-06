@@ -135,11 +135,6 @@ pub struct AgentRuntimeConfig {
     /// `None` disables approval gating.
     pub hitl: Option<HitlRuntime>,
 
-    /// Request id (`req_…`) for this build, used to stamp HITL approval requests
-    /// and route their SSE events. Threaded from the web server so the
-    /// single-agent and orchestration paths share one value.
-    pub request_id: Option<crate::domain::RequestId>,
-
     /// Computed instance UUID for this agent, derived from agent config and
     /// host identity. Threaded into HITL approval requests so webhook
     /// receivers can identify which instance raised each approval.
@@ -180,7 +175,6 @@ impl Clone for AgentRuntimeConfig {
             turn_nudge: self.turn_nudge.clone(),
             orchestration_submit_result: self.orchestration_submit_result.clone(),
             hitl: self.hitl.clone(),
-            request_id: self.request_id.clone(),
             instance_id: self.instance_id.clone(),
             hitl_request_approval_tool: self.hitl_request_approval_tool.clone(),
             skill_recorder: self.skill_recorder.clone(),
@@ -225,7 +219,6 @@ impl std::fmt::Debug for AgentRuntimeConfig {
                     .map(|_| "<submit_result>"),
             )
             .field("hitl", &self.hitl.as_ref().map(|_| "<hitl>"))
-            .field("request_id", &self.request_id)
             .field("instance_id", &self.instance_id)
             .field(
                 "hitl_request_approval_tool",

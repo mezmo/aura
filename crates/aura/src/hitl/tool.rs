@@ -14,11 +14,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::decision::{
-    AgentScope, ApprovalDecision, ApprovalOrigin, ApprovalOutcome, ApprovalOwner, DecisionId,
+    AgentScope, ApprovalDecision, ApprovalOrigin, ApprovalOutcome, DecisionId,
+    live_approval_context,
 };
 use super::protocol::{ApprovalItem, ApprovalRequest, PROTOCOL_VERSION};
 use super::route::{ApprovalError, DecisionRoute};
-use crate::domain::RequestId;
 
 /// The `request_approval` tool. Constructs an
 /// [`ApprovalOrigin::AgentRequested`] and dispatches through the shared
@@ -29,7 +29,6 @@ use crate::domain::RequestId;
 pub struct RequestApprovalTool {
     route: Arc<DecisionRoute>,
     scope: AgentScope,
-    request_id: Option<RequestId>,
     run: Arc<crate::run_context::BoundRun>,
     agent_name: String,
     /// Instance ID of the AURA process that built this tool.
@@ -41,14 +40,12 @@ impl RequestApprovalTool {
     pub fn new(
         route: Arc<DecisionRoute>,
         scope: AgentScope,
-        request_id: Option<RequestId>,
         agent_name: String,
         instance_id: String,
     ) -> Self {
         Self {
             route,
             scope,
-            request_id,
             // A worker's tool is built inside its run; a single agent's is built
             // before one exists and is bound by `stream`.
             run: Arc::new(crate::run_context::BoundRun::captured()),
@@ -163,14 +160,13 @@ impl Tool for RequestApprovalTool {
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         // Blank reasoning collapses to absent, consistent with the config_gate path.
         let tool_call_intent = normalize_tool_call_intent(args.tool_call_intent.as_deref());
+        let run = self.run();
+        let (owner, cancel) = live_approval_context(run.as_deref());
         let request = ApprovalRequest {
             version: PROTOCOL_VERSION,
             instance_id: self.instance_id.clone(),
             decision_id: DecisionId::generate(),
-            owner: self
-                .request_id
-                .clone()
-                .map_or(ApprovalOwner::Unowned, ApprovalOwner::Request),
+            owner,
             scope: self.scope.clone(),
             origin: ApprovalOrigin::AgentRequested {
                 reason: args.risk_rationale.clone(),
@@ -183,13 +179,6 @@ impl Tool for RequestApprovalTool {
                 tool_call_intent,
             }],
         };
-        let run = self.run();
-        let cancel = run
-            .as_ref()
-            .map(|run| {
-                crate::request_cancellation::RequestCancelToken::from(run.cancel_token().clone())
-            })
-            .unwrap_or_else(crate::request_cancellation::RequestCancelToken::unbound);
         // `DecisionRoute` emits the lifecycle itself; the scope is how those
         // events find the run, since rig calls this off it.
         let decided = match run {
@@ -343,7 +332,6 @@ mod tests {
         let tool = RequestApprovalTool::new(
             route.clone(),
             AgentScope::Single { session_id: None },
-            Some(request_id.clone()),
             "test-agent".to_string(),
             "test-instance-id".to_string(),
         );
@@ -510,7 +498,6 @@ mod tests {
             let tool = RequestApprovalTool::new(
                 route,
                 AgentScope::Single { session_id: None },
-                Some(request_id.clone()),
                 "test-agent".to_string(),
                 "test-instance-id".to_string(),
             );

@@ -332,12 +332,10 @@ impl Agent {
                     .clone()
                     .map(crate::config::SessionId::new),
             };
-            let request_id = config_owned.request_id.clone();
             let wrapper = Arc::new(crate::hitl::HitlApprovalWrapper::new(
                 hitl.patterns.clone(),
                 hitl.route.clone(),
                 scope.clone(),
-                request_id.clone(),
                 config_owned.agent.name.clone(),
                 config_owned.instance_id.clone(),
             ));
@@ -352,7 +350,6 @@ impl Agent {
             let approval_tool = crate::hitl::RequestApprovalTool::new(
                 hitl.route.clone(),
                 scope,
-                request_id,
                 config_owned.agent.name.clone(),
                 config_owned.instance_id.clone(),
             );
@@ -1218,7 +1215,8 @@ impl Agent {
 
     /// Process a query with the agent (no chat history).
     ///
-    /// Uses the streaming pipeline internally and collects the result.
+    /// Collects [`Self::stream_prompt`], which documents how its HITL
+    /// approvals are owned.
     #[tracing::instrument(name = "agent.prompt", skip(self), fields(model = %self.model))]
     pub async fn prompt(
         &self,
@@ -1243,7 +1241,8 @@ impl Agent {
 
     /// Process a chat query with conversation history.
     ///
-    /// Uses the streaming pipeline internally and collects the result.
+    /// Collects [`Self::stream_chat`], which documents how its HITL approvals
+    /// are owned.
     #[tracing::instrument(name = "agent.chat", skip(self, chat_history), fields(model = %self.model, history_len = chat_history.len()))]
     pub async fn chat(
         &self,
@@ -1324,6 +1323,9 @@ impl Agent {
     }
 
     /// Stream a query with the agent (no chat history) - returns true streaming response with multi-turn tool support
+    ///
+    /// Starts no run, so HITL approvals raised here have no owner and their
+    /// events reach no observer. [`StreamingAgent::stream`] starts one.
     pub async fn stream_prompt(
         &self,
         query: &str,
@@ -1333,6 +1335,9 @@ impl Agent {
     }
 
     /// Stream a chat query with conversation history - returns true streaming response with multi-turn tool support
+    ///
+    /// Starts no run, so HITL approvals raised here have no owner and their
+    /// events reach no observer. [`StreamingAgent::stream`] starts one.
     pub async fn stream_chat(
         &self,
         query: &str,
@@ -1349,6 +1354,9 @@ impl Agent {
     ///
     /// Unlike `stream_chat()` which uses `self.max_depth`, this allows callers
     /// to specify depth. Used by orchestration phases that need tighter bounds.
+    ///
+    /// Starts no run, so HITL approvals raised here have no owner and their
+    /// events reach no observer. [`StreamingAgent::stream`] starts one.
     #[tracing::instrument(name = "agent.stream_chat", skip(self, chat_history),
         fields(model = %self.model, history_len = chat_history.len(), max_depth))]
     pub async fn stream_chat_with_depth(
@@ -1457,7 +1465,7 @@ impl Agent {
     /// - After each streaming completion (captures usage, emits aura.tool_usage)
     ///
     /// To cancel externally (e.g., on client disconnect), cancel the run's token.
-    pub async fn stream_prompt_with_timeout(
+    pub(crate) async fn stream_prompt_with_timeout(
         &self,
         query: &str,
         options: crate::streaming::RunOptions,
@@ -1492,7 +1500,7 @@ impl Agent {
     ///
     /// # Cancellation
     /// See `stream_prompt_with_timeout` for cancellation details.
-    pub async fn stream_chat_with_timeout(
+    pub(crate) async fn stream_chat_with_timeout(
         &self,
         query: &str,
         chat_history: Vec<rig::completion::Message>,
@@ -2280,7 +2288,6 @@ mod tests {
         /// because rig calls the tool on its server task and no scope reaches
         /// there.
         fn gated_config(
-            request_id: &crate::domain::RequestId,
             pattern: &str,
             run: Arc<crate::run_context::RunContext>,
         ) -> AgentRuntimeConfig {
@@ -2291,7 +2298,6 @@ mod tests {
                     timeout: Duration::from_millis(50),
                 }),
                 AgentScope::Single { session_id: None },
-                Some(request_id.to_owned()),
                 "test-agent".to_owned(),
                 "test-instance-id".to_owned(),
             );
@@ -2304,13 +2310,12 @@ mod tests {
 
         async fn compose_gated_agent(
             server: &RecordingMcpServer,
-            request_id: &crate::domain::RequestId,
             pattern: &str,
             namespace: &str,
             tool: &str,
             run: Arc<crate::run_context::RunContext>,
         ) -> rig::agent::Agent<UnpromptedModel> {
-            let config = gated_config(request_id, pattern, run);
+            let config = gated_config(pattern, run);
             let manager = Some(Arc::new(manager_serving(server, namespace, tool).await));
             let state = BuilderState::Initial(rig::agent::AgentBuilder::new(UnpromptedModel));
             Agent::add_all_tools(state, &config, &manager, Vec::new())
@@ -2327,15 +2332,7 @@ mod tests {
             let request_id = crate::domain::RequestId::generate();
             let server = RecordingMcpServer::start().await;
             let (run, mut rx) = crate::run_context::RunContext::channel(request_id.clone());
-            let agent = compose_gated_agent(
-                &server,
-                &request_id,
-                "github:*",
-                "github",
-                "list_repos",
-                run,
-            )
-            .await;
+            let agent = compose_gated_agent(&server, "github:*", "github", "list_repos", run).await;
 
             // The parked approval expires unanswered; the call's own outcome is
             // not what this test is about.
@@ -2367,9 +2364,7 @@ mod tests {
             let request_id = crate::domain::RequestId::generate();
             let server = RecordingMcpServer::start().await;
             let (run, mut rx) = crate::run_context::RunContext::channel(request_id.clone());
-            let agent =
-                compose_gated_agent(&server, &request_id, "github:*", "k8s", "list_repos", run)
-                    .await;
+            let agent = compose_gated_agent(&server, "github:*", "k8s", "list_repos", run).await;
 
             agent
                 .tool_server_handle

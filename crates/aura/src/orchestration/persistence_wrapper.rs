@@ -1451,7 +1451,6 @@ mod tests {
             Arc::from(["kubectl_*".into()]),
             route,
             scope,
-            Some(request_id.clone()),
             "test-agent".to_string(),
             "test-instance-id".to_string(),
         ));
