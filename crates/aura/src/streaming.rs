@@ -14,12 +14,14 @@
 //!
 //! ```ignore
 //! use aura::streaming::{RunOptions, StreamingAgent};
-//! use aura::{StreamError, StreamItem};
+//! use aura::{RequestId, StreamError, StreamItem};
 //! use futures::StreamExt;
 //!
 //! async fn handle_request(agent: impl StreamingAgent, query: &str) {
 //!     // The default leaves the run unbounded and lets it mint its own token.
-//!     let run = agent.stream(query, vec![], RunOptions::default(), "req_123").await;
+//!     let run = agent
+//!         .stream(query, vec![], RunOptions::default(), &RequestId::generate())
+//!         .await;
 //!     let mut items = run.into_events();
 //!
 //!     // Process stream items (convert to SSE, etc.)
@@ -289,14 +291,18 @@ pub trait StreamingAgent: Send + Sync {
         query: &str,
         chat_history: Vec<Message>,
         options: RunOptions,
-        request_id: &str,
+        request_id: &crate::domain::RequestId,
     ) -> AgentRun;
 
     /// Cancel in-flight MCP requests and close connections.
     ///
     /// Called on client disconnect or timeout to propagate `notifications/cancelled`
     /// to MCP servers. Returns the number of cancelled requests.
-    async fn cancel_and_close_mcp(&self, request_id: &str, reason: &str) -> usize;
+    async fn cancel_and_close_mcp(
+        &self,
+        request_id: &crate::domain::RequestId,
+        reason: &str,
+    ) -> usize;
 
     /// The configured context window size in tokens, `None` when the config
     /// sets no window.
@@ -481,7 +487,7 @@ mod tests {
             agent: aura_events::AgentContext,
             items: Vec<Result<StreamItem, StreamError>>,
         ) -> (Vec<aura_events::AgentContext>, usize, Vec<Payload>) {
-            let (run, mut events) = RunContext::channel("run_tee");
+            let (run, mut events) = RunContext::channel(crate::domain::RequestId::generate());
             let passed = tee_content(run, agent, futures::stream::iter(items))
                 .collect::<Vec<_>>()
                 .await
@@ -564,7 +570,7 @@ mod tests {
         /// the items must still pass.
         #[tokio::test]
         async fn an_unobserved_run_still_streams_its_items() {
-            let (run, events) = RunContext::channel("run_unobserved");
+            let (run, events) = RunContext::channel(crate::domain::RequestId::generate());
             drop(events);
 
             let passed = tee_content(

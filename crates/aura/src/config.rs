@@ -138,7 +138,7 @@ pub struct AgentRuntimeConfig {
     /// Request id (`req_…`) for this build, used to stamp HITL approval requests
     /// and route their SSE events. Threaded from the web server so the
     /// single-agent and orchestration paths share one value.
-    pub request_id: Option<String>,
+    pub request_id: Option<crate::domain::RequestId>,
 
     /// Computed instance UUID for this agent, derived from agent config and
     /// host identity. Threaded into HITL approval requests so webhook

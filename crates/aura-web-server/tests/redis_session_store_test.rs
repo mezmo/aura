@@ -33,7 +33,7 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use tokio::io::AsyncWriteExt;
 
-use common::make_parked;
+use common::{make_parked, owner};
 
 fn redis_url() -> String {
     std::env::var("AURA_TEST_REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string())
@@ -449,7 +449,10 @@ async fn approval_cancel_request_returns_cleared_set() {
         .await
         .unwrap();
 
-    let cleared = approvals.cancel_request("req-cancel-return").await.unwrap();
+    let cleared = approvals
+        .cancel_request(&owner("req-cancel-return"))
+        .await
+        .unwrap();
 
     assert_eq!(cleared.len(), 1, "only the undecided ticket is cleared");
     assert_eq!(
@@ -478,8 +481,9 @@ async fn approval_cancel_request_returns_cleared_set() {
     let mut raw = client.get_multiplexed_async_connection().await.unwrap();
     let still_indexed: bool = redis::cmd("SISMEMBER")
         .arg(format!(
-            "{}:approval:req:req-cancel-return",
-            config.key_prefix
+            "{}:approval:req:{}",
+            config.key_prefix,
+            owner("req-cancel-return")
         ))
         .arg(late_id.to_string())
         .query_async(&mut raw)
@@ -490,7 +494,10 @@ async fn approval_cancel_request_returns_cleared_set() {
         "the first cancel's SREM left the late registration's index entry"
     );
 
-    let cleared_late = approvals.cancel_request("req-cancel-return").await.unwrap();
+    let cleared_late = approvals
+        .cancel_request(&owner("req-cancel-return"))
+        .await
+        .unwrap();
 
     assert_eq!(
         cleared_late.len(),
@@ -551,7 +558,11 @@ async fn remove_tolerates_an_undecodable_record() {
 async fn cancel_request_skips_a_wrong_type_value_and_returns_valid_records() {
     let config = test_config(60);
     let approvals = connect(&config).await.approvals();
-    let req_index_key = format!("{}:approval:req:req-wrong-type", config.key_prefix);
+    let req_index_key = format!(
+        "{}:approval:req:{}",
+        config.key_prefix,
+        owner("req-wrong-type")
+    );
     let client = redis::Client::open(redis_url()).unwrap();
     let mut raw = client.get_multiplexed_async_connection().await.unwrap();
 
@@ -576,7 +587,7 @@ async fn cancel_request_skips_a_wrong_type_value_and_returns_valid_records() {
         .unwrap();
 
     let cleared = approvals
-        .cancel_request("req-wrong-type")
+        .cancel_request(&owner("req-wrong-type"))
         .await
         .expect("a wrong-typed record must not fail the sweep");
 
@@ -627,7 +638,7 @@ async fn cancel_request_skips_a_wrong_type_value_and_returns_valid_records() {
     );
 
     let cleared_again = approvals
-        .cancel_request("req-wrong-type")
+        .cancel_request(&owner("req-wrong-type"))
         .await
         .expect("a retry over a wrong-typed key must not fail the sweep");
     assert!(
@@ -660,7 +671,7 @@ async fn cancel_request_skips_a_wrong_type_value_and_returns_valid_records() {
         .unwrap();
 
     let cleared = approvals
-        .cancel_request("req-wrong-type")
+        .cancel_request(&owner("req-wrong-type"))
         .await
         .expect("a non-UTF-8 record must not fail the sweep");
 
@@ -867,7 +878,11 @@ async fn read_frame<R: tokio::io::AsyncBufRead + Unpin>(
 async fn cancel_request_leaves_a_mid_sweep_registration_indexed() {
     tokio::time::timeout(Duration::from_secs(30), async {
         let config = test_config(60);
-        let req_index_key = format!("{}:approval:req:req-mid-sweep", config.key_prefix);
+        let req_index_key = format!(
+            "{}:approval:req:{}",
+            config.key_prefix,
+            owner("req-mid-sweep")
+        );
         let (proxy, mut events) = SmembersHoldProxy::start(req_index_key.clone()).await;
         let proxied = RedisSessionStoreConfig {
             url: proxy.url(),
@@ -884,7 +899,7 @@ async fn cancel_request_leaves_a_mid_sweep_registration_indexed() {
         proxy.armed.store(true, Ordering::Release);
         let sweep = tokio::spawn({
             let approvals = approvals.clone();
-            async move { approvals.cancel_request("req-mid-sweep").await }
+            async move { approvals.cancel_request(&owner("req-mid-sweep")).await }
         });
         match events.recv().await {
             Some(ProxyEvent::Captured) => {}
@@ -922,7 +937,10 @@ async fn cancel_request_leaves_a_mid_sweep_registration_indexed() {
             .unwrap();
         assert!(indexed, "the mid-sweep registration kept its index entry");
 
-        let cleared_late = approvals.cancel_request("req-mid-sweep").await.unwrap();
+        let cleared_late = approvals
+            .cancel_request(&owner("req-mid-sweep"))
+            .await
+            .unwrap();
         assert_eq!(
             cleared_late.len(),
             1,

@@ -1,6 +1,7 @@
 use a2a::VERSION;
 use aura::RigBuilder;
-use aura::{ResponseContent, StreamingAgent, UsageState};
+use aura::hitl::ApprovalOwner;
+use aura::{RequestId, ResponseContent, StreamingAgent, UsageState};
 use aura_events::{AgentInfo, NativeToolOverview, ServerInfo};
 use axum::Json;
 use axum::body::Body;
@@ -24,12 +25,12 @@ use crate::types::*;
 
 /// Guard over a request's pending approvals.
 struct RequestResourceGuard {
-    request_id: String,
+    request_id: RequestId,
     pending_approvals: aura::hitl::PendingApprovals,
 }
 
 impl RequestResourceGuard {
-    fn new(request_id: String, pending_approvals: aura::hitl::PendingApprovals) -> Self {
+    fn new(request_id: RequestId, pending_approvals: aura::hitl::PendingApprovals) -> Self {
         Self {
             request_id,
             pending_approvals,
@@ -42,18 +43,17 @@ impl Drop for RequestResourceGuard {
     fn drop(&mut self) {
         // Synchronous so parked awaits cancel even when the runtime is
         // shutting down and the spawn below never polls.
-        self.pending_approvals
-            .cancel_request_local(&self.request_id);
+        let owner = ApprovalOwner::Request(self.request_id.clone());
+        self.pending_approvals.cancel_request_local(&owner);
 
         // Use try_current to avoid panic during runtime shutdown
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            let id = self.request_id.clone();
             let pending_approvals = self.pending_approvals.clone();
             // Instrument with the span current at drop so cleanup events
             // stay parented to the request's trace.
             let cleanup = tracing::Instrument::instrument(
                 async move {
-                    pending_approvals.cancel_request(&id).await;
+                    pending_approvals.cancel_request(&owner).await;
                 },
                 tracing::Span::current(),
             );
@@ -111,7 +111,7 @@ impl std::fmt::Display for PrepareError {
 /// Both streaming and non-streaming handlers delegate to the same core logic with different
 /// delivery modes but the same observability instrumentation and stream processing.
 pub struct CompletionConfig {
-    pub request_id: String,
+    pub request_id: RequestId,
     pub timeout_duration: Option<std::time::Duration>,
     pub first_chunk_timeout: Option<std::time::Duration>,
     pub inactivity_timeout: Option<std::time::Duration>,
@@ -176,7 +176,7 @@ async fn build_agent_for_request(
     req_headers: &HashMap<String, String>,
     additional_tools: Vec<Box<dyn aura::ToolDyn>>,
     client_tools: Option<&[ClientToolDefinition]>,
-    request_id: String,
+    request_id: RequestId,
     session_id: String,
 ) -> Result<Arc<aura::Agent>, PrepareError> {
     let client_tool_defs =
@@ -214,7 +214,7 @@ pub struct RequestSetup {
     /// invokes a passthrough tool.
     pub has_client_tools: bool,
     /// Request id (`req_…`) shared by the agent build and the completion stream.
-    pub request_id: String,
+    pub request_id: RequestId,
     /// OpenAI-compatible `user` field, for the `user.id` span attribute.
     pub user_id: Option<String>,
     /// Request `metadata` serialized as a JSON object string, for the
@@ -247,7 +247,7 @@ pub async fn prepare_request(
     // orchestration) shares one value with the completion stream. The HITL gate
     // and approval events stamp this id; previously it was minted later in
     // `build_completion_config`, after the agent was already built.
-    let request_id = format!("req_{}", Uuid::new_v4().simple());
+    let request_id = RequestId::generate();
 
     // Find the matching config: single-config passthrough > explicit model > DEFAULT_AGENT
     // Single-config servers accept any model field value (clients like LibreChat always send one).
@@ -770,7 +770,7 @@ async fn handle_non_streaming_completion(
 
     {
         let span = tracing::Span::current();
-        aura::logging::set_span_attribute(&span, "http.request_id", config.request_id.clone());
+        aura::logging::set_span_attribute(&span, "http.request_id", config.request_id.to_string());
     }
 
     let response_ctx = ResponseContext {
@@ -818,7 +818,7 @@ async fn handle_streaming_completion(
 
     {
         let span = tracing::Span::current();
-        aura::logging::set_span_attribute(&span, "http.request_id", config.request_id.clone());
+        aura::logging::set_span_attribute(&span, "http.request_id", config.request_id.to_string());
     }
 
     let chat_session_id = setup.chat_session_id.clone();
@@ -2621,7 +2621,7 @@ url = "http://127.0.0.1:9"
                 version: aura::hitl::PROTOCOL_VERSION,
                 instance_id: "test-instance".to_string(),
                 decision_id: aura::hitl::DecisionId::generate(),
-                request_id: "req-smoke".into(),
+                owner: aura::hitl::ApprovalOwner::Request(aura::RequestId::generate()),
                 scope: aura::hitl::AgentScope::Single { session_id: None },
                 origin: aura::hitl::ApprovalOrigin::ConfigGate {
                     matched_pattern: "test_*".into(),
@@ -2830,7 +2830,7 @@ url = "http://127.0.0.1:9"
                 version: aura::hitl::PROTOCOL_VERSION,
                 instance_id: "test-instance".to_string(),
                 decision_id: aura::hitl::DecisionId::generate(),
-                request_id: "req-hmac".into(),
+                owner: aura::hitl::ApprovalOwner::Request(aura::RequestId::generate()),
                 scope: aura::hitl::AgentScope::Single { session_id: None },
                 origin: aura::hitl::ApprovalOrigin::ConfigGate {
                     matched_pattern: "test_*".into(),

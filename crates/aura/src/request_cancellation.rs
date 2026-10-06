@@ -5,8 +5,6 @@
 
 use tokio_util::sync::{CancellationToken, WaitForCancellationFuture};
 
-pub type RequestId = String;
-
 /// A run's cancellation signal. Fired by the handler on client disconnect,
 /// timeout, or server shutdown. Observed by MCP notifications, HITL approval
 /// gates, and resource cleanup.

@@ -200,7 +200,7 @@ pub(super) fn spawn_timeout_watcher(
     timeout: Duration,
     cancel_token: CancellationToken,
     finished: CancellationToken,
-    request_id: String,
+    request_id: crate::domain::RequestId,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         tokio::select! {
@@ -615,6 +615,11 @@ impl Orchestrator {
         let orchestrator_id = uuid::Uuid::new_v4().to_string();
 
         let run_id_str = persistence.lock().await.run_id().to_string();
+        let run_id = run_id_str.parse::<super::RunId>().map_err(
+            |e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("orchestration run id '{run_id_str}' is not a valid UUID: {e}").into()
+            },
+        )?;
         // One guard per park-mode run; `ParkGuard` documents arming and drop.
         let park_guard = agent_config
             .hitl
@@ -622,7 +627,7 @@ impl Orchestrator {
             .filter(|hitl| hitl.park_enabled)
             .and_then(|hitl| match &*hitl.route {
                 crate::hitl::DecisionRoute::Conversational { registry, .. } => {
-                    Some(ParkGuard::new(registry.clone(), run_id_str.clone()))
+                    Some(ParkGuard::new(registry.clone(), run_id))
                 }
                 crate::hitl::DecisionRoute::Webhook { .. } => None,
             });
@@ -942,7 +947,7 @@ impl Orchestrator {
                 task: super::TaskIdentity::new(task_id, worker_name.map(String::from)),
                 session_id: session_id_owned.map(crate::config::SessionId::new),
             };
-            let request_id = worker_config.request_id.clone().unwrap_or_default();
+            let request_id = worker_config.request_id.clone();
             let mut gate = crate::hitl::HitlApprovalWrapper::new(
                 hitl.patterns.clone(),
                 hitl.route.clone(),
@@ -5331,6 +5336,14 @@ Assign tasks to the worker whose tools best match the required operations."#,
         let crate::hitl::DecisionRoute::Conversational { registry, .. } = &*hitl.route else {
             return;
         };
+        // Persistence mints run ids as UUIDs, so a parse failure is a bug.
+        let Ok(run_id) = run_id.parse::<super::RunId>() else {
+            tracing::error!(
+                run_id,
+                "orchestration run id is not a UUID; its parked approvals were not swept"
+            );
+            return;
+        };
         super::park::cancel_run_approvals(registry, run_id, crate::run_context::current_run())
             .await
             .ok();
@@ -6559,7 +6572,7 @@ mod tests {
             Duration::from_secs(300),
             cancel_token.clone(),
             finished.clone(),
-            "test-normal".to_string(),
+            crate::domain::RequestId::generate(),
         );
 
         finished.cancel();
@@ -6583,7 +6596,7 @@ mod tests {
             Duration::from_secs(60),
             cancel_token.clone(),
             CancellationToken::new(),
-            "test-timeout".to_string(),
+            crate::domain::RequestId::generate(),
         );
 
         tokio::time::advance(Duration::from_secs(61)).await;
@@ -7547,8 +7560,8 @@ mod tests {
         };
         use crate::session_store::{InMemoryApprovalStore, InMemoryEventBus};
 
-        let request_id = format!("req_cancel_{}", uuid::Uuid::new_v4().simple());
-        let (run, mut events) = crate::run_context::RunContext::channel(request_id.as_str());
+        let request_id = crate::domain::RequestId::generate();
+        let (run, mut events) = crate::run_context::RunContext::channel(request_id.clone());
 
         let store: Arc<dyn crate::session_store::ApprovalStore> =
             Arc::new(InMemoryApprovalStore::new());
@@ -7579,7 +7592,9 @@ mod tests {
                         version: PROTOCOL_VERSION,
                         instance_id: "test-instance".to_string(),
                         decision_id,
-                        request_id: "run:test".to_string(),
+                        owner: crate::hitl::ApprovalOwner::Run(
+                            "0191e8c0-0000-7000-8000-000000000001".parse().unwrap(),
+                        ),
                         scope: AgentScope::Single { session_id: None },
                         origin: ApprovalOrigin::ConfigGate {
                             matched_pattern: "kubectl_*".to_string(),
@@ -7679,7 +7694,7 @@ mod tests {
             }),
             memory_dir: Some(memory_dir.to_string_lossy().into_owned()),
             session_id: Some("park-sess".to_string()),
-            request_id: Some(format!("req_park_{}", uuid::Uuid::new_v4().simple())),
+            request_id: Some(crate::domain::RequestId::generate()),
             ..AgentRuntimeConfig::default()
         };
         let orchestrator = Orchestrator::new(config).await.unwrap();
@@ -7709,7 +7724,7 @@ mod tests {
                         version: crate::hitl::PROTOCOL_VERSION,
                         instance_id: "test-instance".to_string(),
                         decision_id,
-                        request_id: format!("run:{run_id}"),
+                        owner: crate::hitl::ApprovalOwner::Run(run_id.parse().unwrap()),
                         scope: crate::hitl::AgentScope::Single { session_id: None },
                         origin: crate::hitl::ApprovalOrigin::ConfigGate {
                             matched_pattern: "kubectl_*".to_string(),
@@ -7931,8 +7946,8 @@ mod tests {
             .agent_config
             .request_id
             .clone()
-            .unwrap_or_default();
-        let (run, mut events) = crate::run_context::RunContext::channel(request_id.as_str());
+            .expect("the config names its request");
+        let (run, mut events) = crate::run_context::RunContext::channel(request_id.clone());
         // Arming inside the scope is what gives the guard the run its drop
         // sweep reports to.
         crate::run_context::with_run(Arc::clone(&run), arm_guard(&orchestrator, &plan)).await;
@@ -8026,8 +8041,8 @@ mod tests {
             .agent_config
             .request_id
             .clone()
-            .unwrap_or_default();
-        let (run, mut events) = crate::run_context::RunContext::channel(request_id.as_str());
+            .expect("the config names its request");
+        let (run, mut events) = crate::run_context::RunContext::channel(request_id.clone());
 
         // The human decides the first call before the commit is attempted.
         let decided = pending[0].decision_id;
@@ -8118,8 +8133,8 @@ mod tests {
             .agent_config
             .request_id
             .clone()
-            .unwrap_or_default();
-        let (run, mut events) = crate::run_context::RunContext::channel(request_id.as_str());
+            .expect("the config names its request");
+        let (run, mut events) = crate::run_context::RunContext::channel(request_id.clone());
         crate::run_context::with_run(Arc::clone(&run), arm_guard(&orchestrator, &plan)).await;
 
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(32);
@@ -8219,7 +8234,7 @@ mod tests {
         Orchestrator,
         Arc<crate::session_store::InMemoryApprovalStore>,
         crate::hitl::PendingApprovals,
-        String,
+        crate::domain::RequestId,
     ) {
         use crate::hitl::PendingApprovals;
         use crate::session_store::{InMemoryApprovalStore, InMemoryEventBus};
@@ -8242,7 +8257,7 @@ mod tests {
                 skills: None,
             },
         )]);
-        let request_id = format!("req_orphan_{}", uuid::Uuid::new_v4().simple());
+        let request_id = crate::domain::RequestId::generate();
         let config = AgentRuntimeConfig {
             hitl: Some(crate::hitl::HitlRuntime {
                 patterns: Arc::from(["echo_tool".into()]),
@@ -8366,7 +8381,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (orchestrator, store, _registry, request_id) =
             override_park_orchestrator(dir.path(), 1).await;
-        let (run, mut events) = crate::run_context::RunContext::channel(request_id.as_str());
+        let (run, mut events) = crate::run_context::RunContext::channel(request_id.clone());
 
         // Depth 1 gives the loop three turns (the rig's +1 safety net), so
         // the gated call must land on the third: the first two turns burn
@@ -8425,7 +8440,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (orchestrator, store, _registry, request_id) =
             override_park_orchestrator(dir.path(), 4).await;
-        let (run, mut events) = crate::run_context::RunContext::channel(request_id.as_str());
+        let (run, mut events) = crate::run_context::RunContext::channel(request_id.clone());
 
         let (_model, gated_invocations) =
             gated_worker_override(vec![ScriptedTurn::tool_calls_then_stream_failure(vec![
@@ -8545,7 +8560,7 @@ mod tests {
             }),
             memory_dir: Some(memory_dir.to_string_lossy().into_owned()),
             session_id: Some(session_id.to_string()),
-            request_id: Some(format!("req_resume_{}", uuid::Uuid::new_v4().simple())),
+            request_id: Some(crate::domain::RequestId::generate()),
             orchestration: Some(OrchestrationConfig {
                 enabled: true,
                 workers,

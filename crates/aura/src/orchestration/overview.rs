@@ -105,9 +105,7 @@ async fn discover_tools(
         })
         .collect();
 
-    manager
-        .cancel_and_close_all("aura-info", "tool detail collected")
-        .await;
+    manager.close_all().await;
     per_server
 }
 

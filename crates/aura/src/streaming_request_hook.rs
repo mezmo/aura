@@ -106,7 +106,7 @@ impl Drop for ParkCellRegistration {
 /// correlates nothing until #732. Its tool events stay off the run for the same
 /// reason, and orchestration reports the worker's calls itself.
 fn queue_owner(stream_id: &str) -> Option<Arc<crate::run_context::RunContext>> {
-    current_run().filter(|run| run.id().as_ref() == stream_id)
+    current_run().filter(|run| run.id().as_str() == stream_id)
 }
 
 /// Sends a tool event raised by this stream to the run [`queue_owner`] gives it.
@@ -759,9 +759,15 @@ mod tests {
     /// sibling's id. Only the stream that *is* the run may fill it.
     mod queue_ownership {
         use super::super::{emit_from_stream, queue_owner};
+        use crate::domain::RequestId;
         use crate::run_context::{RunContext, with_run};
         use aura_events::agent::{AgentEvent, AgentEventPayload};
         use aura_events::{ToolCallId, ToolName};
+
+        /// The key a park-mode worker's task attempt streams under.
+        fn attempt_key(id: &RequestId) -> String {
+            format!("{id}:task:0:attempt:1")
+        }
 
         fn requested(id: &str) -> AgentEvent {
             AgentEvent::single_agent(AgentEventPayload::ToolRequested {
@@ -775,10 +781,11 @@ mod tests {
         /// scope, and its tool events must not reach the run as the run's own.
         #[tokio::test]
         async fn only_the_run_s_own_stream_sends_it_tool_events() {
-            let (run, mut events) = RunContext::channel("req_1");
+            let id = RequestId::generate();
+            let (run, mut events) = RunContext::channel(id.clone());
             with_run(run, async {
-                emit_from_stream("req_1:task:0:attempt:1", requested("worker")).await;
-                emit_from_stream("req_1", requested("own")).await;
+                emit_from_stream(&attempt_key(&id), requested("worker")).await;
+                emit_from_stream(id.as_str(), requested("own")).await;
             })
             .await;
 
@@ -796,19 +803,18 @@ mod tests {
 
         #[tokio::test]
         async fn the_run_s_own_stream_owns_the_queue() {
-            let run = RunContext::detached("req_1");
-            let owned = with_run(run, async { queue_owner("req_1").is_some() }).await;
+            let id = RequestId::generate();
+            let run = RunContext::detached(id.clone());
+            let owned = with_run(run, async { queue_owner(id.as_str()).is_some() }).await;
             assert!(owned);
         }
 
         /// An orchestration worker streams under its task attempt.
         #[tokio::test]
         async fn a_worker_s_stream_owns_no_queue() {
-            let run = RunContext::detached("req_1");
-            let owned = with_run(run, async {
-                queue_owner("req_1:task:0:attempt:1").is_some()
-            })
-            .await;
+            let id = RequestId::generate();
+            let run = RunContext::detached(id.clone());
+            let owned = with_run(run, async { queue_owner(&attempt_key(&id)).is_some() }).await;
             assert!(
                 !owned,
                 "a stream that is not the run leaves its queue alone"

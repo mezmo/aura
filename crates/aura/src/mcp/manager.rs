@@ -738,38 +738,42 @@ impl McpManager {
         info!("  Total tools available: {}", total_tools);
     }
 
-    /// Cancel all in-flight MCP requests for an HTTP request.
-    pub async fn cancel_all_for_request(&self, http_request_id: &str, reason: &str) -> usize {
+    /// Cancel all in-flight MCP requests for a request.
+    pub async fn cancel_all_for_request(
+        &self,
+        request_id: &crate::domain::RequestId,
+        reason: &str,
+    ) -> usize {
         let mut total_cancelled = 0;
 
         for (server_name, client) in &self.streamable_clients {
-            let cancelled = client.cancel_all_for_request(http_request_id, reason).await;
+            let cancelled = client.cancel_all_for_request(request_id, reason).await;
             if cancelled > 0 {
                 info!(
-                    "Cancelled {} request(s) on MCP server '{}' for HTTP request {}",
-                    cancelled, server_name, http_request_id
+                    "Cancelled {} request(s) on MCP server '{}' for request {}",
+                    cancelled, server_name, request_id
                 );
             }
             total_cancelled += cancelled;
         }
 
         for (server_name, client) in &self.sse_clients {
-            let cancelled = client.cancel_all_for_request(http_request_id, reason).await;
+            let cancelled = client.cancel_all_for_request(request_id, reason).await;
             if cancelled > 0 {
                 info!(
-                    "Cancelled {} request(s) on SSE MCP server '{}' for HTTP request {}",
-                    cancelled, server_name, http_request_id
+                    "Cancelled {} request(s) on SSE MCP server '{}' for request {}",
+                    cancelled, server_name, request_id
                 );
             }
             total_cancelled += cancelled;
         }
 
         for (server_name, client) in &self.stdio_clients {
-            let cancelled = client.cancel_all_for_request(http_request_id, reason).await;
+            let cancelled = client.cancel_all_for_request(request_id, reason).await;
             if cancelled > 0 {
                 info!(
-                    "Cancelled {} request(s) on STDIO MCP server '{}' for HTTP request {}",
-                    cancelled, server_name, http_request_id
+                    "Cancelled {} request(s) on STDIO MCP server '{}' for request {}",
+                    cancelled, server_name, request_id
                 );
             }
             total_cancelled += cancelled;
@@ -780,43 +784,55 @@ impl McpManager {
 
     /// Cancel in-flight requests and close all MCP client connections.
     /// After calling this, all MCP clients become unusable until reinitialized.
-    pub async fn cancel_and_close_all(&self, http_request_id: &str, reason: &str) -> usize {
+    pub async fn cancel_and_close_all(
+        &self,
+        request_id: &crate::domain::RequestId,
+        reason: &str,
+    ) -> usize {
         let mut total_cancelled = 0;
 
         for (server_name, client) in &self.streamable_clients {
-            let cancelled = client.cancel_and_close(http_request_id, reason).await;
+            let cancelled = client.cancel_and_close(request_id, reason).await;
             if cancelled > 0 {
                 info!(
-                    "Cancelled {} request(s) and closed MCP server '{}' for HTTP request {}",
-                    cancelled, server_name, http_request_id
+                    "Cancelled {} request(s) and closed MCP server '{}' for request {}",
+                    cancelled, server_name, request_id
                 );
             }
             total_cancelled += cancelled;
         }
 
         for (server_name, client) in &self.sse_clients {
-            let cancelled = client.cancel_and_close(http_request_id, reason).await;
+            let cancelled = client.cancel_and_close(request_id, reason).await;
             if cancelled > 0 {
                 info!(
-                    "Cancelled {} request(s) and closed SSE MCP server '{}' for HTTP request {}",
-                    cancelled, server_name, http_request_id
+                    "Cancelled {} request(s) and closed SSE MCP server '{}' for request {}",
+                    cancelled, server_name, request_id
                 );
             }
             total_cancelled += cancelled;
         }
 
         for (server_name, client) in &self.stdio_clients {
-            let cancelled = client.cancel_and_close(http_request_id, reason).await;
+            let cancelled = client.cancel_and_close(request_id, reason).await;
             if cancelled > 0 {
                 info!(
-                    "Cancelled {} request(s) and closed STDIO MCP server '{}' for HTTP request {}",
-                    cancelled, server_name, http_request_id
+                    "Cancelled {} request(s) and closed STDIO MCP server '{}' for request {}",
+                    cancelled, server_name, request_id
                 );
             }
             total_cancelled += cancelled;
         }
 
         total_cancelled
+    }
+
+    /// Close every connection, for a manager no request ran through.
+    pub async fn close_all(&self) {
+        for client in self.clients() {
+            client.clear_current_call().await;
+            client.close_connection();
+        }
     }
 
     /// Every connected client, across all three transports.

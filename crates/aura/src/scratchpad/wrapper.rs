@@ -254,11 +254,7 @@ mod tests {
     #[tokio::test]
     async fn test_wrapper_intercepts_via_resolved_tool_name() {
         let tmp = TempDir::new().unwrap();
-        let storage = Arc::new(
-            ScratchpadStorage::with_base_dir(tmp.path(), "req-wrap-glob")
-                .await
-                .unwrap(),
-        );
+        let storage = Arc::new(ScratchpadStorage::in_dir(tmp.path()).await.unwrap());
 
         // The map post-resolution lists the bare tool name → threshold.
         // Glob expansion happens at boot; the wrapper just does HashMap::get.
@@ -299,11 +295,7 @@ mod tests {
     #[tokio::test]
     async fn test_wrapper_pointer_is_deterministic_for_identical_output() {
         let tmp = TempDir::new().unwrap();
-        let storage = Arc::new(
-            ScratchpadStorage::with_base_dir(tmp.path(), "req-wrap-deterministic")
-                .await
-                .unwrap(),
-        );
+        let storage = Arc::new(ScratchpadStorage::in_dir(tmp.path()).await.unwrap());
 
         let tools = HashMap::from([("echo_large".to_string(), 10)]);
         let counter = TiktokenCounter::default_counter();
@@ -331,11 +323,7 @@ mod tests {
     #[tokio::test]
     async fn test_wrapper_intercepts_large_output() {
         let tmp = TempDir::new().unwrap();
-        let storage = Arc::new(
-            ScratchpadStorage::with_base_dir(tmp.path(), "req-wrap-1")
-                .await
-                .unwrap(),
-        );
+        let storage = Arc::new(ScratchpadStorage::in_dir(tmp.path()).await.unwrap());
 
         let tools = HashMap::from([("search_knowledge_base".to_string(), 10)]);
 
@@ -382,11 +370,7 @@ mod tests {
     #[tokio::test]
     async fn test_wrapper_strips_persistence_footer_before_write() {
         let tmp = TempDir::new().unwrap();
-        let storage = Arc::new(
-            ScratchpadStorage::with_base_dir(tmp.path(), "req-wrap-footer")
-                .await
-                .unwrap(),
-        );
+        let storage = Arc::new(ScratchpadStorage::in_dir(tmp.path()).await.unwrap());
 
         let tools = HashMap::from([("execute_range_query".to_string(), 10)]);
         let counter = TiktokenCounter::default_counter();
@@ -436,11 +420,7 @@ mod tests {
     #[tokio::test]
     async fn test_wrapper_passes_through_small_output() {
         let tmp = TempDir::new().unwrap();
-        let storage = Arc::new(
-            ScratchpadStorage::with_base_dir(tmp.path(), "req-wrap-2")
-                .await
-                .unwrap(),
-        );
+        let storage = Arc::new(ScratchpadStorage::in_dir(tmp.path()).await.unwrap());
 
         let tools = HashMap::from([("search_knowledge_base".to_string(), 1000)]);
 
@@ -474,11 +454,7 @@ mod tests {
     #[tokio::test]
     async fn test_wrapper_ignores_non_scratchpad_tools() {
         let tmp = TempDir::new().unwrap();
-        let storage = Arc::new(
-            ScratchpadStorage::with_base_dir(tmp.path(), "req-wrap-3")
-                .await
-                .unwrap(),
-        );
+        let storage = Arc::new(ScratchpadStorage::in_dir(tmp.path()).await.unwrap());
 
         let tools = HashMap::from([("search_knowledge_base".to_string(), 100)]);
 
@@ -502,11 +478,7 @@ mod tests {
     #[tokio::test]
     async fn test_wrapper_passes_through_skill_tool_outputs() {
         let tmp = TempDir::new().unwrap();
-        let storage = Arc::new(
-            ScratchpadStorage::with_base_dir(tmp.path(), "req-wrap-skills")
-                .await
-                .unwrap(),
-        );
+        let storage = Arc::new(ScratchpadStorage::in_dir(tmp.path()).await.unwrap());
 
         let tools = HashMap::from([("search_knowledge_base".to_string(), 10)]);
 
@@ -534,11 +506,7 @@ mod tests {
     #[tokio::test]
     async fn test_wrapper_intercepts_at_exact_threshold() {
         let tmp = TempDir::new().unwrap();
-        let storage = Arc::new(
-            ScratchpadStorage::with_base_dir(tmp.path(), "req-wrap-boundary")
-                .await
-                .unwrap(),
-        );
+        let storage = Arc::new(ScratchpadStorage::in_dir(tmp.path()).await.unwrap());
 
         let counter = TiktokenCounter::default_counter();
 
@@ -584,11 +552,7 @@ mod tests {
     #[tokio::test]
     async fn test_wrapper_records_intercepted_tokens() {
         let tmp = TempDir::new().unwrap();
-        let storage = Arc::new(
-            ScratchpadStorage::with_base_dir(tmp.path(), "req-wrap-counter")
-                .await
-                .unwrap(),
-        );
+        let storage = Arc::new(ScratchpadStorage::in_dir(tmp.path()).await.unwrap());
 
         let tools = HashMap::from([("counted_tool".to_string(), 10)]);
         let counter = TiktokenCounter::default_counter();
@@ -622,11 +586,7 @@ mod tests {
         // Point storage at a non-existent directory that we then remove,
         // so the write will fail with an I/O error.
         let tmp = TempDir::new().unwrap();
-        let storage = Arc::new(
-            ScratchpadStorage::with_base_dir(tmp.path(), "req-wrap-fail")
-                .await
-                .unwrap(),
-        );
+        let storage = Arc::new(ScratchpadStorage::in_dir(tmp.path()).await.unwrap());
 
         // Remove the directory so writes fail
         std::fs::remove_dir_all(storage.dir()).unwrap();
@@ -679,11 +639,7 @@ mod tests {
     #[tokio::test]
     async fn test_wrapper_json_companion_pointer_recommends_get_in() {
         let tmp = TempDir::new().unwrap();
-        let storage = Arc::new(
-            ScratchpadStorage::with_base_dir(tmp.path(), "req-wrap-json-comp")
-                .await
-                .unwrap(),
-        );
+        let storage = Arc::new(ScratchpadStorage::in_dir(tmp.path()).await.unwrap());
 
         let tools = HashMap::from([("nested_call".to_string(), 10)]);
         let counter = TiktokenCounter::default_counter();
@@ -742,11 +698,7 @@ mod tests {
     #[tokio::test]
     async fn test_wrapper_companion_files_in_pointer() {
         let tmp = TempDir::new().unwrap();
-        let storage = Arc::new(
-            ScratchpadStorage::with_base_dir(tmp.path(), "req-wrap-comp")
-                .await
-                .unwrap(),
-        );
+        let storage = Arc::new(ScratchpadStorage::in_dir(tmp.path()).await.unwrap());
 
         let tools = HashMap::from([("analyze_logs".to_string(), 10)]);
 

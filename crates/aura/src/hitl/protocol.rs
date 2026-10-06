@@ -5,7 +5,7 @@ use aura_events::{AgentScopeWire, ApprovalOriginWire};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::decision::{AgentScope, ApprovalDecision, ApprovalOrigin, DecisionId};
+use super::decision::{AgentScope, ApprovalDecision, ApprovalOrigin, ApprovalOwner, DecisionId};
 
 /// Current approval webhook protocol version.
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -22,8 +22,7 @@ pub struct ApprovalRequest {
     pub instance_id: String,
     /// The handle a decision resolves against.
     pub decision_id: DecisionId,
-    /// The id of the request this approval was raised under.
-    pub request_id: String,
+    pub owner: ApprovalOwner,
     /// Who is asking.
     pub scope: AgentScope,
     /// Why this approval exists.
@@ -92,7 +91,7 @@ pub(crate) struct ApprovalRequestWire<'a> {
     pub version: u32,
     pub instance_id: &'a str,
     pub decision_id: DecisionId,
-    pub request_id: &'a str,
+    pub request_id: &'a ApprovalOwner,
     pub scope: AgentScopeWire,
     pub origin: ApprovalOriginWire,
     pub items: &'a [ApprovalItem],

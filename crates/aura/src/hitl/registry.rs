@@ -33,7 +33,7 @@ use crate::session_store::{
     Subscription,
 };
 
-use super::decision::{ApprovalDecision, AwaitingDecision, DecisionId, Timestamp};
+use super::decision::{ApprovalDecision, ApprovalOwner, AwaitingDecision, DecisionId, Timestamp};
 use super::protocol::ApprovalRequest;
 
 /// Bus topic carrying the decision for one parked approval.
@@ -60,7 +60,7 @@ struct PendingApprovalsInner {
 
 /// The process-local half of one parked approval.
 struct WakeEntry {
-    request_id: String,
+    owner: ApprovalOwner,
     wake: oneshot::Sender<ApprovalDecision>,
     wake_task: AbortHandle,
 }
@@ -121,7 +121,7 @@ impl PendingApprovals {
     #[must_use]
     pub async fn register(&self, request: ApprovalRequest, timeout: Duration) -> AwaitingDecision {
         let id = request.decision_id;
-        let request_id = request.request_id.clone();
+        let owner = request.owner.clone();
         let now = chrono::Utc::now();
         let (tx, rx) = oneshot::channel();
         let parked = ParkedApproval {
@@ -156,7 +156,7 @@ impl PendingApprovals {
         self.0.wakes.lock().expect("registry lock poisoned").insert(
             id,
             WakeEntry {
-                request_id,
+                owner,
                 wake: tx,
                 wake_task,
             },
@@ -243,16 +243,16 @@ impl PendingApprovals {
         }
     }
 
-    /// Synchronously drop the wake handles parked under a request id; their
-    /// awaits resolve to `Cancelled`. Leaves store entries in place — use
+    /// Synchronously drop the wake handles parked under `owner`; their awaits
+    /// resolve to `Cancelled`. Leaves store entries in place — use
     /// [`Self::cancel_request`] to also clean the store.
-    pub fn cancel_request_local(&self, request_id: &str) {
+    pub fn cancel_request_local(&self, owner: &ApprovalOwner) {
         self.0
             .wakes
             .lock()
             .expect("registry lock poisoned")
             .retain(|_, entry| {
-                if entry.request_id == request_id {
+                if entry.owner == *owner {
                     entry.abort_wake_task();
                     false
                 } else {
@@ -261,15 +261,15 @@ impl PendingApprovals {
             });
     }
 
-    /// Cancel every approval parked under a request id (stream drop /
-    /// shutdown); their awaits resolve to `Cancelled`. Returns the approvals
-    /// the store cleared, empty on a store fault.
-    pub async fn cancel_request(&self, request_id: &str) -> Vec<ParkedApproval> {
-        self.cancel_request_local(request_id);
-        match self.0.store.cancel_request(request_id).await {
+    /// Cancel every approval parked under `owner` (stream drop / shutdown);
+    /// their awaits resolve to `Cancelled`. Returns the approvals the store
+    /// cleared, empty on a store fault.
+    pub async fn cancel_request(&self, owner: &ApprovalOwner) -> Vec<ParkedApproval> {
+        self.cancel_request_local(owner);
+        match self.0.store.cancel_request(owner).await {
             Ok(cleared) => cleared,
             Err(err) => {
-                warn!(request_id, error = %err, "approval store cancel_request failed");
+                warn!(%owner, error = %err, "approval store cancel_request failed");
                 Vec::new()
             }
         }
@@ -370,13 +370,14 @@ mod tests {
         AgentScope, ApprovalOrigin, ApprovalOutcome, CancelReason, DecisionId,
     };
     use crate::hitl::protocol::{ApprovalItem, ApprovalRequest, PROTOCOL_VERSION};
+    use crate::hitl::test_support::owner;
 
-    fn test_request(request_id: &str) -> ApprovalRequest {
+    fn test_request(label: &str) -> ApprovalRequest {
         ApprovalRequest {
             version: PROTOCOL_VERSION,
             instance_id: "test-instance".to_string(),
             decision_id: DecisionId::generate(),
-            request_id: request_id.to_string(),
+            owner: owner(label),
             scope: AgentScope::Single { session_id: None },
             origin: ApprovalOrigin::ConfigGate {
                 matched_pattern: "test_*".to_string(),
@@ -533,7 +534,7 @@ mod tests {
         let handle = registry.register(req, Duration::from_secs(60)).await;
         let cancel = RequestCancelToken::unbound();
 
-        registry.cancel_request_local("req-local");
+        registry.cancel_request_local(&owner("req-local"));
 
         assert_eq!(
             handle.outcome(&cancel).await,
@@ -544,7 +545,7 @@ mod tests {
             "store entry remains for the async half"
         );
 
-        registry.cancel_request("req-local").await;
+        registry.cancel_request(&owner("req-local")).await;
         assert!(store.get(&id).await.unwrap().is_none());
     }
 
@@ -559,7 +560,7 @@ mod tests {
         let handle_b = registry.register(req_b, Duration::from_secs(60)).await;
         let cancel = RequestCancelToken::unbound();
 
-        registry.cancel_request("req-cancel").await;
+        registry.cancel_request(&owner("req-cancel")).await;
 
         assert_eq!(
             handle_a.outcome(&cancel).await,

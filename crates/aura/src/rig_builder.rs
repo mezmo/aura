@@ -155,7 +155,7 @@ impl RigBuilder {
         req_headers: Option<&HashMap<String, String>>,
         additional_tools: Vec<Box<dyn rig::tool::ToolDyn>>,
         client_tools: Option<Vec<ClientTool>>,
-        request_id: Option<String>,
+        request_id: Option<crate::domain::RequestId>,
         session_id: Option<String>,
     ) -> Result<Agent, BuilderError> {
         let mut agent_config = self.discovered_agent_config(req_headers)?;
@@ -183,7 +183,7 @@ impl RigBuilder {
         req_headers: Option<&HashMap<String, String>>,
         session_id: Option<String>,
         client_tools: Option<Vec<ClientTool>>,
-        request_id: Option<String>,
+        request_id: Option<crate::domain::RequestId>,
     ) -> Result<Arc<dyn StreamingAgent>, BuilderError> {
         self.build_streaming_agent_with_tools(
             req_headers,
@@ -204,7 +204,7 @@ impl RigBuilder {
         req_headers: Option<&HashMap<String, String>>,
         session_id: Option<String>,
         client_tools: Option<Vec<ClientTool>>,
-        request_id: Option<String>,
+        request_id: Option<crate::domain::RequestId>,
         run_tools: RunToolFactory,
     ) -> Result<Arc<dyn StreamingAgent>, BuilderError> {
         let mut agent_config = self.discovered_agent_config(req_headers)?;

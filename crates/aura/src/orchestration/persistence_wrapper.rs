@@ -880,11 +880,7 @@ mod tests {
         use crate::tool_wrapper::ComposedWrapper;
 
         let tmp = tempfile::TempDir::new().unwrap();
-        let storage = Arc::new(
-            ScratchpadStorage::with_base_dir(tmp.path(), "req-compose-1")
-                .await
-                .unwrap(),
-        );
+        let storage = Arc::new(ScratchpadStorage::in_dir(tmp.path()).await.unwrap());
         let counter = TiktokenCounter::default_counter();
         let budget = ContextBudget::new(128_000, 0.20, 0, Arc::new(counter));
 
@@ -1449,19 +1445,19 @@ mod tests {
             session_id: None,
         };
 
-        let request_id = format!("req_w2_{}", uuid::Uuid::new_v4().simple());
+        let request_id = crate::domain::RequestId::generate();
 
         let gate = Arc::new(HitlApprovalWrapper::new(
             Arc::from(["kubectl_*".into()]),
             route,
             scope,
-            request_id.clone(),
+            Some(request_id.clone()),
             "test-agent".to_string(),
             "test-instance-id".to_string(),
         ));
         // `WrappedTool` runs `pre_call` in its own task, which no scope
         // crosses, so the gate is bound the way `stream` binds it.
-        let (run, mut rx) = crate::run_context::RunContext::channel(request_id.as_str());
+        let (run, mut rx) = crate::run_context::RunContext::channel(request_id.clone());
         gate.bind_run(run);
         let gate: Arc<dyn ToolWrapper> = gate;
         let persistence: Arc<dyn ToolWrapper> = Arc::new(test_wrapper(Arc::new(Mutex::new(

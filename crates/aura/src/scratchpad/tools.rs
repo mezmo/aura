@@ -1817,11 +1817,7 @@ mod tests {
 
     async fn setup() -> (TempDir, Arc<ScratchpadStorage>, ContextBudget) {
         let tmp = TempDir::new().unwrap();
-        let storage = Arc::new(
-            ScratchpadStorage::with_base_dir(tmp.path(), "test-req")
-                .await
-                .unwrap(),
-        );
+        let storage = Arc::new(ScratchpadStorage::in_dir(tmp.path()).await.unwrap());
         let counter = TiktokenCounter::default_counter();
         let budget = ContextBudget::new(100_000, 0.20, 0, std::sync::Arc::new(counter));
         (tmp, storage, budget)

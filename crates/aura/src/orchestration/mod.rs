@@ -27,7 +27,7 @@
 //! # Example Usage
 //!
 //! ```ignore
-//! use aura::{RigBuilder, StreamingAgent};
+//! use aura::{RequestId, RigBuilder, StreamingAgent};
 //! use aura_config::load_config_from_str;
 //!
 //! // `RigBuilder` returns an `Orchestrator` (wrapped as `StreamingAgent`) when
@@ -37,7 +37,9 @@
 //!     .build_streaming_agent_with_headers(None, None, None)
 //!     .await?;
 //!
-//! let run = agent.stream(query, history, RunOptions::default(), "req_123").await;
+//! let run = agent
+//!     .stream(query, history, RunOptions::default(), &RequestId::generate())
+//!     .await;
 //! let stream = run.into_events();
 //! ```
 
@@ -82,7 +84,7 @@ pub use tools::ReadArtifactTool;
 pub use tools::wait_for::{StopReason, WaitForError, WaitForOutput, WaitForTool};
 pub use tools::{SubmitResultDecision, SubmitResultOutput, SubmitResultTool};
 
-pub(crate) use park::{CallKey, ParkGuard, RecordedDecisions, run_owner_id};
+pub(crate) use park::{CallKey, ParkGuard, RecordedDecisions};
 // The worker-model injection seam: `provider_agent.rs`'s cfg(test) variant
 // wraps the rig's scripted agent type.
 pub use prompt_constants::{context, fields, sections};

@@ -13,9 +13,12 @@ use rig::tool::{Tool, ToolError};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::decision::{AgentScope, ApprovalDecision, ApprovalOrigin, ApprovalOutcome, DecisionId};
+use super::decision::{
+    AgentScope, ApprovalDecision, ApprovalOrigin, ApprovalOutcome, ApprovalOwner, DecisionId,
+};
 use super::protocol::{ApprovalItem, ApprovalRequest, PROTOCOL_VERSION};
 use super::route::{ApprovalError, DecisionRoute};
+use crate::domain::RequestId;
 
 /// The `request_approval` tool. Constructs an
 /// [`ApprovalOrigin::AgentRequested`] and dispatches through the shared
@@ -26,7 +29,7 @@ use super::route::{ApprovalError, DecisionRoute};
 pub struct RequestApprovalTool {
     route: Arc<DecisionRoute>,
     scope: AgentScope,
-    request_id: String,
+    request_id: Option<RequestId>,
     run: Arc<crate::run_context::BoundRun>,
     agent_name: String,
     /// Instance ID of the AURA process that built this tool.
@@ -38,7 +41,7 @@ impl RequestApprovalTool {
     pub fn new(
         route: Arc<DecisionRoute>,
         scope: AgentScope,
-        request_id: String,
+        request_id: Option<RequestId>,
         agent_name: String,
         instance_id: String,
     ) -> Self {
@@ -164,7 +167,10 @@ impl Tool for RequestApprovalTool {
             version: PROTOCOL_VERSION,
             instance_id: self.instance_id.clone(),
             decision_id: DecisionId::generate(),
-            request_id: self.request_id.clone(),
+            owner: self
+                .request_id
+                .clone()
+                .map_or(ApprovalOwner::Unowned, ApprovalOwner::Request),
             scope: self.scope.clone(),
             origin: ApprovalOrigin::AgentRequested {
                 reason: args.risk_rationale.clone(),
@@ -333,17 +339,17 @@ mod tests {
         route: &Arc<DecisionRoute>,
         args: RequestApprovalArgs,
     ) -> ApprovalItem {
-        let request_id = format!("req_w2_{}", uuid::Uuid::new_v4().simple());
+        let request_id = crate::domain::RequestId::generate();
         let tool = RequestApprovalTool::new(
             route.clone(),
             AgentScope::Single { session_id: None },
-            request_id.clone(),
+            Some(request_id.clone()),
             "test-agent".to_string(),
             "test-instance-id".to_string(),
         );
 
         // The scope goes inside the spawn, because task-locals do not cross one.
-        let (run, mut rx) = crate::run_context::RunContext::channel(request_id.as_str());
+        let (run, mut rx) = crate::run_context::RunContext::channel(request_id.clone());
         let call_handle: tokio::task::JoinHandle<Result<String, ToolError>> =
             tokio::spawn(crate::run_context::with_run(run, async move {
                 tool.call(args).await
@@ -499,12 +505,12 @@ mod tests {
                 timeout: std::time::Duration::from_secs(60),
             });
 
-            let request_id = format!("req_tool_span_{}", uuid::Uuid::new_v4().simple());
-            let (run, mut events) = crate::run_context::RunContext::channel(request_id.as_str());
+            let request_id = crate::domain::RequestId::generate();
+            let (run, mut events) = crate::run_context::RunContext::channel(request_id.clone());
             let tool = RequestApprovalTool::new(
                 route,
                 AgentScope::Single { session_id: None },
-                request_id.clone(),
+                Some(request_id.clone()),
                 "test-agent".to_string(),
                 "test-instance-id".to_string(),
             );
