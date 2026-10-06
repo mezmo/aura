@@ -126,10 +126,16 @@ pub struct ReadArtifactOutput {
     pub found: bool,
     pub filename: String,
     pub content: String,
-    /// Artifact filenames in the current run, listed when a current-run read
-    /// finds nothing.
+    /// Artifact filenames in the current run.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub available: Vec<String>,
+    /// Number of current-run artifact filenames left out of `available`.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub available_omitted: usize,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 /// Error type for ReadArtifactTool.
@@ -189,16 +195,19 @@ impl Tool for ReadArtifactTool {
                 persistence
                     .artifact_path_cross_run(&args.filename, run_id)
                     .ok(),
-                Vec::new(),
+                (Vec::new(), 0),
             )
         } else {
             tracing::info!("read_artifact called for: {}", args.filename);
             let result = persistence.read_artifact(&args.filename).await;
+            // A miss names what does exist, so the caller can correct the
+            // filename instead of guessing again.
             let available = match &result {
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    persistence.list_artifacts().await.unwrap_or_default()
-                }
-                _ => Vec::new(),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => persistence
+                    .list_artifacts_capped()
+                    .await
+                    .unwrap_or_default(),
+                _ => (Vec::new(), 0),
             };
             (
                 result,
@@ -221,13 +230,15 @@ impl Tool for ReadArtifactTool {
                     filename: args.filename,
                     content,
                     available: Vec::new(),
+                    available_omitted: 0,
                 })
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ReadArtifactOutput {
                 found: false,
                 filename: args.filename,
                 content: String::new(),
-                available,
+                available: available.0,
+                available_omitted: available.1,
             }),
             Err(e) => Err(ReadArtifactError::Io(e)),
         }
@@ -287,6 +298,7 @@ mod tests {
         assert!(!result.found);
         assert!(result.content.is_empty());
         assert_eq!(result.available, vec!["task-0-research-iter-1-result.txt"]);
+        assert_eq!(result.available_omitted, 0);
     }
 
     #[tokio::test]

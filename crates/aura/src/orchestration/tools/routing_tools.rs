@@ -337,11 +337,14 @@ impl CreatePlanTool {
             return Ok(());
         }
 
-        let available = persistence.list_artifacts().await.unwrap_or_default();
-        let available = if available.is_empty() {
-            "none".to_string()
-        } else {
-            available.join(", ")
+        let (available, omitted) = persistence
+            .list_artifacts_capped()
+            .await
+            .unwrap_or_default();
+        let available = match (available.is_empty(), omitted) {
+            (true, _) => "none".to_string(),
+            (false, 0) => available.join(", "),
+            (false, n) => format!("{} (and {n} more)", available.join(", ")),
         };
         Err(format!(
             "Artifact(s) not found in this run: {}. Available artifacts: {available}. \

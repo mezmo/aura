@@ -276,6 +276,9 @@ pub struct TaskExecutionRecord {
     pub orchestrator_notes: Option<String>,
 }
 
+/// Most artifact filenames `list_artifacts_capped` returns.
+pub const MAX_LISTED_ARTIFACTS: usize = 40;
+
 /// Manages execution artifact persistence (async).
 ///
 /// Tracks in-flight async writes via `in_flight` / `drain_notify` so callers
@@ -851,6 +854,17 @@ impl ExecutionPersistence {
         }
         filenames.sort();
         Ok(filenames)
+    }
+
+    /// List artifact filenames for naming in a recovery hint, task results and
+    /// coordinator artifacts ahead of tool outputs, keeping the first
+    /// `MAX_LISTED_ARTIFACTS`. Returns the kept names and how many were dropped.
+    pub async fn list_artifacts_capped(&self) -> io::Result<(Vec<String>, usize)> {
+        let mut filenames = self.list_artifacts().await?;
+        filenames.sort_by_key(|name| (name.ends_with("-output.txt"), name.clone()));
+        let omitted = filenames.len().saturating_sub(MAX_LISTED_ARTIFACTS);
+        filenames.truncate(MAX_LISTED_ARTIFACTS);
+        Ok((filenames, omitted))
     }
 
     /// List all artifact filenames with file sizes.
@@ -1431,6 +1445,33 @@ mod tests {
             "second draft"
         );
         assert_eq!(persistence.list_artifacts().await.unwrap(), vec![filename]);
+    }
+
+    #[tokio::test]
+    async fn test_list_artifacts_capped_prefers_results() {
+        let temp_dir = TempDir::new().unwrap();
+        let persistence = ExecutionPersistence::new(temp_dir.path().join("memory"), None)
+            .await
+            .unwrap();
+        persistence
+            .write_result_artifact(1, Some("b"), 1, "result")
+            .await
+            .unwrap();
+        for i in 0..MAX_LISTED_ARTIFACTS {
+            tokio::fs::write(
+                persistence
+                    .artifact_path(&format!("task-0-a-iter-1-tool-{i:02}-output.txt"))
+                    .unwrap(),
+                "out",
+            )
+            .await
+            .unwrap();
+        }
+
+        let (listed, omitted) = persistence.list_artifacts_capped().await.unwrap();
+        assert_eq!(listed.len(), MAX_LISTED_ARTIFACTS);
+        assert_eq!(omitted, 1);
+        assert_eq!(listed[0], "task-1-b-iter-1-result.txt");
     }
 
     #[tokio::test]
