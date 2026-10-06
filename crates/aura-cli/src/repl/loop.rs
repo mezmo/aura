@@ -501,17 +501,83 @@ fn flush_live_reasoning(state: &Arc<Mutex<Option<LiveReasoning>>>) -> bool {
 /// event carries no route, and a conversational `approval_pending` prompt
 /// appends below this line rather than replacing it, so the wording must
 /// not claim a route.
+fn approval_completed_line(
+    completed: &aura_events::ApprovalCompleted,
+    tool_name: Option<&str>,
+) -> String {
+    use aura_events::ApprovalOutcomeWire;
+
+    let (label, detail) = match &completed.outcome {
+        ApprovalOutcomeWire::Approved => ("✓ Approved", String::new()),
+        ApprovalOutcomeWire::Denied { reason } => (
+            "✗ Denied",
+            reason
+                .as_ref()
+                .map(|r| format!(" — {r}"))
+                .unwrap_or_default(),
+        ),
+        ApprovalOutcomeWire::TimedOut { waited_ms } => ("⏱ Timed out", format!(" ({waited_ms}ms)")),
+        ApprovalOutcomeWire::Cancelled { reason } => ("✗ Cancelled", format!(" — {reason:?}")),
+        ApprovalOutcomeWire::Errored { message } => ("✗ Error", format!(" — {message}")),
+    };
+
+    if let Some(tool) = tool_name {
+        format!("⏺ Approval {tool} — {label}{detail}")
+    } else {
+        format!("⏺ Approval {label}{detail}")
+    }
+}
+
 fn approval_requested_line(requested: &aura_events::ApprovalRequested) -> String {
     use aura_events::ApprovalOriginWire;
     let origin = match &requested.origin {
         ApprovalOriginWire::ConfigGate {
             matched_pattern, ..
         } => {
-            format!("config gate · {matched_pattern}")
+            // Naming the tool twice is noise when the matched glob is the
+            // tool itself; collapse to just the gate kind.
+            if matched_pattern == &requested.tool_name {
+                "config gate".to_string()
+            } else {
+                format!("config gate · {matched_pattern}")
+            }
         }
         ApprovalOriginWire::AgentRequested { .. } => "agent requested".to_string(),
     };
     format!("⏸ Approval requested — {} ({origin})", requested.tool_name)
+}
+
+/// Parse an RFC 3339 stamp and describe the remaining time relative to
+/// `now`. Returns `None` for unparseable stamps; the caller decides whether
+/// to fall back to the raw stamp.
+pub(crate) fn human_remaining(
+    expires_at: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<String> {
+    let until = chrono::DateTime::parse_from_rfc3339(expires_at)
+        .ok()?
+        .with_timezone(&chrono::Utc);
+    let remaining = until.signed_duration_since(now);
+    if remaining.num_seconds() <= 0 {
+        return Some("expired".to_string());
+    }
+    let hours = remaining.num_hours();
+    let minutes = remaining.num_minutes() % 60;
+    let seconds = remaining.num_seconds() % 60;
+    if hours > 0 {
+        Some(format!("in {hours}h {minutes}m"))
+    } else if minutes > 0 {
+        Some(format!("in {minutes}m {seconds}s"))
+    } else {
+        Some(format!("in {seconds}s"))
+    }
+}
+
+/// A full-width box-drawing separator for park/resume banners. Width is
+/// fixed at render time so the right edge aligns with the terminal width.
+pub(crate) fn banner_separator() -> String {
+    let width = crate::ui::prompt::term_size().0 as usize;
+    "─".repeat(width)
 }
 
 /// Live worker reasoning blocks, one per concurrently-executing task.
@@ -1139,6 +1205,11 @@ pub fn run_repl(
                 // when the LLM is inside an Update group.
                 let in_update_group = Arc::new(AtomicBool::new(false));
 
+                // Approval decision_id → tool_name, shared across the turn and
+                // any resumed segments so resolution banners can name the tool.
+                let approval_names: Arc<Mutex<std::collections::HashMap<String, String>>> =
+                    Arc::new(Mutex::new(std::collections::HashMap::new()));
+
                 // In-process approval registry: standalone mode resolves
                 // conversational approvals directly via the shared registry.
                 #[cfg(feature = "standalone-cli")]
@@ -1179,6 +1250,7 @@ pub fn run_repl(
                         needs_blank: needs_blank.clone(),
                         in_update_group: in_update_group.clone(),
                         approval_poster: approval_poster.clone(),
+                        approval_names: approval_names.clone(),
                         #[cfg(feature = "standalone-cli")]
                         pending_approvals: pending_approvals.clone(),
                         turn_context_peak: 0,
@@ -2409,6 +2481,9 @@ pub(crate) struct ReplStreamHandler {
     /// HTTP client for POSTing approval decisions. `None` in standalone
     /// mode (no HTTP ingress endpoint to POST to).
     approval_poster: Option<crate::api::approval::ApprovalPoster>,
+    /// Approval decision_id → tool_name, shared across the turn and any
+    /// resumed segments so resolution banners can name the tool.
+    approval_names: Arc<Mutex<std::collections::HashMap<String, String>>>,
     /// In-process approval registry for standalone (direct) mode. When set,
     /// conversational approvals are resolved locally via
     /// `PendingApprovals::resolve()` instead of an HTTP POST.
@@ -2449,6 +2524,7 @@ impl ReplStreamHandler {
             needs_blank: Arc::new(AtomicBool::new(false)),
             in_update_group: Arc::new(AtomicBool::new(false)),
             approval_poster,
+            approval_names: Arc::new(Mutex::new(std::collections::HashMap::new())),
             #[cfg(feature = "standalone-cli")]
             pending_approvals: None,
             turn_context_peak: 0,
@@ -3518,12 +3594,15 @@ impl StreamHandler for ReplStreamHandler {
                     // reasoning block, stopped the animation, erased the
                     // input frame, and — critically — holds TERM_WRITE for
                     // the whole match. Re-acquiring it here self-deadlocks.
+                    let remaining = human_remaining(&retention_expires_at, chrono::Utc::now())
+                        .unwrap_or_else(|| retention_expires_at.clone());
                     println!(
                         "{}  {}",
                         "⏸ Run parked".themed(AuraStyle::Warning),
-                        format!("(retention expires {retention_expires_at})")
-                            .themed(AuraStyle::Muted),
+                        format!("(retention expires {remaining})").themed(AuraStyle::Muted),
                     );
+                    crate::ui::prompt::increment_orch_scrollback();
+                    println!("{}", banner_separator().themed(AuraStyle::Connector));
                     crate::ui::prompt::increment_orch_scrollback();
 
                     if !run_id.is_empty() {
@@ -3727,6 +3806,11 @@ impl StreamHandler for ReplStreamHandler {
         flush_live_reasoning(&self.live_reasoning);
         flush_all_worker_reasoning(&self.live_worker_reasoning);
 
+        // Remember the tool name so the resolution banner can name it.
+        if let Ok(mut names) = self.approval_names.lock() {
+            names.insert(requested.decision_id.clone(), requested.tool_name.clone());
+        }
+
         // Stop animation — same dance as on_approval_pending / on_approval_completed.
         let had_ptw = if let Ok(mut guard) = self.post_tool_wave.lock() {
             guard.take().map(|(a, _)| a.finish()).is_some()
@@ -3768,6 +3852,11 @@ impl StreamHandler for ReplStreamHandler {
     fn on_approval_pending(&mut self, pending: &aura_events::ApprovalPending) {
         flush_live_reasoning(&self.live_reasoning);
         flush_all_worker_reasoning(&self.live_worker_reasoning);
+
+        // Remember the tool name so the resolution banner can name it.
+        if let Ok(mut names) = self.approval_names.lock() {
+            names.insert(pending.decision_id.clone(), pending.tool_name.clone());
+        }
 
         // Stop animation — same dance as on_tool_complete / on_orchestrator_event.
         let had_ptw = if let Ok(mut guard) = self.post_tool_wave.lock() {
@@ -3989,30 +4078,19 @@ impl StreamHandler for ReplStreamHandler {
             let _term = lock_term();
             erase_input_frame();
 
-            use aura_events::ApprovalOutcomeWire;
-
-            let (style, label, detail) = match &completed.outcome {
-                ApprovalOutcomeWire::Approved => (AuraStyle::Success, "✓ Approved", String::new()),
-                ApprovalOutcomeWire::Denied { reason } => (
-                    AuraStyle::Warning,
-                    "✗ Denied",
-                    reason
-                        .as_ref()
-                        .map(|r| format!(" — {r}"))
-                        .unwrap_or_default(),
-                ),
-                ApprovalOutcomeWire::TimedOut { waited_ms } => {
-                    (AuraStyle::Muted, "⏱ Timed out", format!(" ({waited_ms}ms)"))
-                }
-                ApprovalOutcomeWire::Cancelled { reason } => {
-                    (AuraStyle::Error, "✗ Cancelled", format!(" — {reason:?}"))
-                }
-                ApprovalOutcomeWire::Errored { message } => {
-                    (AuraStyle::Error, "✗ Error", format!(" — {message}"))
-                }
+            let tool_name = self
+                .approval_names
+                .lock()
+                .ok()
+                .and_then(|names| names.get(&completed.decision_id).cloned());
+            let line = approval_completed_line(completed, tool_name.as_deref());
+            let style = match &completed.outcome {
+                aura_events::ApprovalOutcomeWire::Approved => AuraStyle::Success,
+                aura_events::ApprovalOutcomeWire::Denied { .. } => AuraStyle::Warning,
+                aura_events::ApprovalOutcomeWire::TimedOut { .. } => AuraStyle::Muted,
+                aura_events::ApprovalOutcomeWire::Cancelled { .. }
+                | aura_events::ApprovalOutcomeWire::Errored { .. } => AuraStyle::Error,
             };
-
-            let line = format!("⏺ Approval {label}{detail}");
             println!("{}", line.themed(style));
             crate::ui::prompt::increment_orch_scrollback();
             println!();
@@ -4092,23 +4170,45 @@ fn render_blocking_gate(
         "waiting on approvals".themed(AuraStyle::Muted),
     );
     crate::ui::prompt::increment_orch_scrollback();
+    println!("{}", banner_separator().themed(AuraStyle::Connector));
+    crate::ui::prompt::increment_orch_scrollback();
     for call in blocking {
         let link = approval_poster
             .as_ref()
             .map(|p| p.approval_url(&call.decision_id))
             .unwrap_or_else(|| call.decision_id.clone());
+        let remaining = human_remaining(&call.expires_at, chrono::Utc::now())
+            .unwrap_or_else(|| call.expires_at.clone());
         println!(
             "  {} {} {} {} {}",
             "approve:".themed(AuraStyle::Muted),
             link.themed(AuraStyle::Primary),
             "—".themed(AuraStyle::Muted),
             call.tool.as_str().themed(AuraStyle::Muted),
-            format!("(expires {})", call.expires_at).themed(AuraStyle::Muted),
+            format!("(expires {remaining})").themed(AuraStyle::Muted),
         );
         crate::ui::prompt::increment_orch_scrollback();
     }
     println!();
     crate::ui::prompt::increment_orch_scrollback();
+}
+
+/// Render a terminal resume refusal as a one-paragraph operator message.
+/// `code` is the wire refusal code and `detail` is the server's prose.
+pub(crate) fn resume_error_message(code: &str, detail: &str) -> String {
+    let action = match code {
+        "config_changed" => {
+            "Update the agent configuration to match the parked checkpoint, or start a new run."
+        }
+        "mismatch" => {
+            "Inspect the recorded approvals for this run; if they cannot be reconciled, start a new run."
+        }
+        "expired" => "The retention window has closed; this parked run cannot be resumed.",
+        "interrupted" => "The checkpoint is in an inconsistent state; start a new run.",
+        "not_found" => "Check the run id or start a new run.",
+        _ => "Check the server configuration and try again, or start a new run.",
+    };
+    format!("Could not resume the parked run: {detail}. {action}")
 }
 
 /// Drive the bounded reattach for one parked run: poll the
@@ -4280,14 +4380,34 @@ pub(crate) fn drive_reattach(
                     }
                 }
             }
-            Ok(
-                ResumeOutcome::Interrupted
-                | ResumeOutcome::ConfigChanged
-                | ResumeOutcome::Mismatch
-                | ResumeOutcome::Expired,
-            ) => break ReattachEnd::Terminal,
+            Ok(ResumeOutcome::Interrupted { detail }) => {
+                break ReattachEnd::Terminal {
+                    code: "interrupted".to_string(),
+                    detail,
+                };
+            }
+            Ok(ResumeOutcome::ConfigChanged { detail }) => {
+                break ReattachEnd::Terminal {
+                    code: "config_changed".to_string(),
+                    detail,
+                };
+            }
+            Ok(ResumeOutcome::Mismatch { detail }) => {
+                break ReattachEnd::Terminal {
+                    code: "mismatch".to_string(),
+                    detail,
+                };
+            }
+            Ok(ResumeOutcome::Expired { detail }) => {
+                break ReattachEnd::Terminal {
+                    code: "expired".to_string(),
+                    detail,
+                };
+            }
             Ok(ResumeOutcome::NotFound) => break ReattachEnd::NotFound,
-            Ok(ResumeOutcome::ReifyFailed) => break ReattachEnd::ReifyFailed,
+            Ok(ResumeOutcome::ReifyFailed { detail }) => {
+                break ReattachEnd::ReifyFailed { detail };
+            }
         }
     };
 
@@ -4302,15 +4422,63 @@ pub(crate) fn drive_reattach(
             };
             (text, false)
         }
-        _ => (REIFY_FAILED_MESSAGE.to_string(), false),
+        ReattachEnd::Terminal { code, detail } => {
+            let _term = lock_term();
+            println!(
+                "{}",
+                resume_error_message(&code, &detail).themed(AuraStyle::Error)
+            );
+            crate::ui::prompt::increment_orch_scrollback();
+            (REIFY_FAILED_MESSAGE.to_string(), false)
+        }
+        ReattachEnd::NotFound => {
+            let _term = lock_term();
+            println!(
+                "{}",
+                resume_error_message("not_found", "the parked run was not found")
+                    .themed(AuraStyle::Error)
+            );
+            crate::ui::prompt::increment_orch_scrollback();
+            (REIFY_FAILED_MESSAGE.to_string(), false)
+        }
+        ReattachEnd::ReifyFailed { detail } => {
+            let _term = lock_term();
+            println!(
+                "{}",
+                resume_error_message("reify_failed", &detail).themed(AuraStyle::Error)
+            );
+            crate::ui::prompt::increment_orch_scrollback();
+            (REIFY_FAILED_MESSAGE.to_string(), false)
+        }
+        ReattachEnd::TransientBudget => {
+            let _term = lock_term();
+            println!(
+                "{}",
+                "Could not resume the parked run: the resume endpoint is unavailable and the retry budget is exhausted. Check the server and try again."
+                        .themed(AuraStyle::Error)
+            );
+            crate::ui::prompt::increment_orch_scrollback();
+            (REIFY_FAILED_MESSAGE.to_string(), false)
+        }
+        ReattachEnd::RetentionCap => {
+            let _term = lock_term();
+            println!(
+                "{}",
+                "Could not resume the parked run: the retention deadline passed while waiting. Start a new run."
+                        .themed(AuraStyle::Error)
+            );
+            crate::ui::prompt::increment_orch_scrollback();
+            (REIFY_FAILED_MESSAGE.to_string(), false)
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        COMMAND_ALIASES, COMPACT_NUDGE_FILL, ReplTelemetryLifecycle, approval_requested_line,
-        command_hint, compaction_note, orch_event_prints_scrollback, should_nudge_at_fill,
+        COMMAND_ALIASES, COMPACT_NUDGE_FILL, ReplTelemetryLifecycle, approval_completed_line,
+        approval_requested_line, banner_separator, command_hint, compaction_note, human_remaining,
+        orch_event_prints_scrollback, resume_error_message, should_nudge_at_fill,
     };
     use crate::repl::registry;
     use crate::ui::prompt::ContextWindowUsage;
@@ -4628,5 +4796,142 @@ mod tests {
                 "line makes a route claim: {line}",
             );
         }
+    }
+
+    #[test]
+    fn approval_requested_line_collapses_config_gate_when_pattern_is_tool_name() {
+        let requested = approval_requested(aura_events::ApprovalOriginWire::ConfigGate {
+            matched_pattern: "mock_tool".to_string(),
+            agent_name: "hitl-fast".to_string(),
+        });
+        assert_eq!(
+            approval_requested_line(&requested),
+            "⏸ Approval requested — mock_tool (config gate)",
+        );
+    }
+
+    fn approval_completed(
+        outcome: aura_events::ApprovalOutcomeWire,
+    ) -> aura_events::ApprovalCompleted {
+        aura_events::ApprovalCompleted {
+            decision_id: "d-1".to_string(),
+            outcome,
+            duration_ms: 100,
+            scope: aura_events::AgentScopeWire::Single { session_id: None },
+        }
+    }
+
+    #[test]
+    fn approval_completed_line_names_tool_when_known() {
+        let completed = approval_completed(aura_events::ApprovalOutcomeWire::Approved);
+        assert_eq!(
+            approval_completed_line(&completed, Some("get_cancellations")),
+            "⏺ Approval get_cancellations — ✓ Approved",
+        );
+    }
+
+    #[test]
+    fn approval_completed_line_falls_back_when_tool_unknown() {
+        let completed = approval_completed(aura_events::ApprovalOutcomeWire::Approved);
+        assert_eq!(
+            approval_completed_line(&completed, None),
+            "⏺ Approval ✓ Approved",
+        );
+    }
+
+    #[test]
+    fn approval_completed_line_includes_denial_reason() {
+        let completed = approval_completed(aura_events::ApprovalOutcomeWire::Denied {
+            reason: Some("unsafe".to_string()),
+        });
+        assert_eq!(
+            approval_completed_line(&completed, Some("get_cancellations")),
+            "⏺ Approval get_cancellations — ✗ Denied — unsafe",
+        );
+    }
+
+    #[test]
+    fn human_remaining_formats_hours_and_minutes() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-06T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(
+            human_remaining("2026-10-06T04:32:15Z", now).unwrap(),
+            "in 4h 32m"
+        );
+    }
+
+    #[test]
+    fn human_remaining_formats_minutes_and_seconds() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-06T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(
+            human_remaining("2026-10-06T00:12:05Z", now).unwrap(),
+            "in 12m 5s"
+        );
+    }
+
+    #[test]
+    fn human_remaining_formats_seconds() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-06T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(
+            human_remaining("2026-10-06T00:00:45Z", now).unwrap(),
+            "in 45s"
+        );
+    }
+
+    #[test]
+    fn human_remaining_reports_expired_for_past_stamps() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-06T01:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(
+            human_remaining("2026-10-06T00:00:00Z", now).unwrap(),
+            "expired"
+        );
+    }
+
+    #[test]
+    fn human_remaining_rejects_garbage_stamps() {
+        let now = chrono::Utc::now();
+        assert!(human_remaining("not a timestamp", now).is_none());
+    }
+
+    #[test]
+    fn banner_separator_matches_terminal_width() {
+        let sep = banner_separator();
+        let width = crate::ui::prompt::term_size().0 as usize;
+        assert_eq!(sep.chars().count(), width);
+        assert!(sep.chars().all(|c| c == '─'));
+    }
+
+    #[test]
+    fn resume_error_message_names_cause_and_action_for_config_changed() {
+        let msg = resume_error_message(
+            "config_changed",
+            "configuration changed since the run parked",
+        );
+        assert!(msg.contains("configuration changed since the run parked"));
+        assert!(msg.contains("Update the agent configuration"));
+    }
+
+    #[test]
+    fn resume_error_message_names_cause_and_action_for_mismatch() {
+        let msg = resume_error_message("mismatch", "resume mismatch: missing approval");
+        assert!(msg.contains("resume mismatch: missing approval"));
+        assert!(msg.contains("Inspect the recorded approvals"));
+    }
+
+    #[test]
+    fn resume_error_message_names_cause_and_action_for_internal_error() {
+        let msg = resume_error_message(
+            "reify_failed",
+            "the resume configuration has no memory_dir; no checkpoint can exist",
+        );
+        assert!(msg.contains("no memory_dir"));
+        assert!(msg.contains("Check the server configuration"));
     }
 }

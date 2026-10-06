@@ -314,6 +314,10 @@ pub(crate) fn handle_resume_run(
                 .as_str()
                 .themed(crate::theme::AuraStyle::Primary),
         );
+        println!(
+            "{}",
+            crate::repl::r#loop::banner_separator().themed(crate::theme::AuraStyle::Connector)
+        );
         for id in &park.decision_ids {
             let link = approval_poster
                 .as_ref()

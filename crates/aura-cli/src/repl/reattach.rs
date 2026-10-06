@@ -35,12 +35,13 @@ pub(crate) enum ReattachEnd {
     /// A resume POST was accepted but its stream ended ambiguously.
     AmbiguousStream,
     /// A terminal 409 row (interrupted, config_changed, mismatch,
-    /// expired).
-    Terminal,
+    /// expired). `code` is the wire code and `detail` is the server prose.
+    Terminal { code: String, detail: String },
     /// The run is absent.
     NotFound,
-    /// A 500 `reify_failed`.
-    ReifyFailed,
+    /// A 500 `reify_failed` or other terminal fault, with the server
+    /// message when one was provided.
+    ReifyFailed { detail: String },
     /// The transient transport/503 budget was exhausted.
     TransientBudget,
     /// The advertised retention deadline passed.
