@@ -18,6 +18,8 @@ use crate::ui::prompt::{is_expanded_output, with_event_log};
 use crate::ui::state::{
     MODEL_MATCHES, RESUME_MATCHES, STYLE_MATCHES, get_tab_select_index, set_tab_select_index,
 };
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 /// Mutable per-session state passed to each command handler.
 pub(crate) struct CommandContext<'a> {
@@ -33,6 +35,8 @@ pub(crate) struct CommandContext<'a> {
     /// Shared approval poster (HTTP mode), so `/resume-run` renders the
     /// same approval links the park banner does.
     pub approval_poster: &'a Option<crate::api::approval::ApprovalPoster>,
+    /// Shared approval decision_id → tool_name map, session lifetime.
+    pub approval_names: &'a Arc<Mutex<HashMap<String, String>>>,
 }
 
 /// What the REPL loop should do after a command handler returns.
@@ -316,6 +320,7 @@ fn cmd_resume_run(ctx: &mut CommandContext, args: &str) -> CommandOutcome {
         ctx.rt,
         ctx.backend,
         ctx.approval_poster,
+        ctx.approval_names.clone(),
     );
     CommandOutcome::Handled
 }

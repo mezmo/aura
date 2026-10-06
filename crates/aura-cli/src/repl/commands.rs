@@ -282,6 +282,7 @@ pub(crate) fn handle_resume_run(
     rt: &tokio::runtime::Runtime,
     backend: &Backend,
     approval_poster: &Option<crate::api::approval::ApprovalPoster>,
+    approval_names: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
 ) {
     use crate::repl::reattach::latest_park_slot;
 
@@ -339,6 +340,7 @@ pub(crate) fn handle_resume_run(
             crate::repl::r#loop::ReplStreamHandler::fresh_for_manual_resume(
                 poster.clone(),
                 chat_session_id.clone(),
+                approval_names.clone(),
             )
         });
 

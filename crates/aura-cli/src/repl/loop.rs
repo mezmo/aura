@@ -548,8 +548,8 @@ fn approval_requested_line(requested: &aura_events::ApprovalRequested) -> String
 }
 
 /// Parse an RFC 3339 stamp and describe the remaining time relative to
-/// `now`. Returns `None` for unparseable stamps; the caller decides whether
-/// to fall back to the raw stamp.
+/// `now`. Returns `None` for unparseable stamps; the caller omits the
+/// expiry clause on a parse failure.
 pub(crate) fn human_remaining(
     expires_at: &str,
     now: chrono::DateTime<chrono::Utc>,
@@ -558,7 +558,7 @@ pub(crate) fn human_remaining(
         .ok()?
         .with_timezone(&chrono::Utc);
     let remaining = until.signed_duration_since(now);
-    if remaining.num_seconds() <= 0 {
+    if remaining <= chrono::Duration::zero() {
         return Some("expired".to_string());
     }
     let hours = remaining.num_hours();
@@ -568,8 +568,10 @@ pub(crate) fn human_remaining(
         Some(format!("in {hours}h {minutes}m"))
     } else if minutes > 0 {
         Some(format!("in {minutes}m {seconds}s"))
-    } else {
+    } else if seconds > 0 {
         Some(format!("in {seconds}s"))
+    } else {
+        Some("in <1s".to_string())
     }
 }
 
@@ -891,6 +893,12 @@ pub fn run_repl(
         Backend::Direct(_) => None,
     };
 
+    // Approval decision_id → tool_name, session lifetime. The live turn,
+    // automatic reattach, and manual /resume-run all populate and read
+    // the same map so resolution banners can name the tool.
+    let approval_names: Arc<Mutex<std::collections::HashMap<String, String>>> =
+        Arc::new(Mutex::new(std::collections::HashMap::new()));
+
     loop {
         // Frame is already drawn (by setup or previous iteration).
         // Restore normal terminal mode and show cursor for readline.
@@ -981,6 +989,7 @@ pub fn run_repl(
                         rt,
                         backend,
                         approval_poster: &approval_poster,
+                        approval_names: &approval_names,
                     };
                     match registry::dispatch(&input, &mut ctx) {
                         Some(CommandOutcome::Exit) => {
@@ -1204,11 +1213,6 @@ pub fn run_repl(
                 // Shared flag so streaming callbacks can suppress Shell display
                 // when the LLM is inside an Update group.
                 let in_update_group = Arc::new(AtomicBool::new(false));
-
-                // Approval decision_id → tool_name, shared across the turn and
-                // any resumed segments so resolution banners can name the tool.
-                let approval_names: Arc<Mutex<std::collections::HashMap<String, String>>> =
-                    Arc::new(Mutex::new(std::collections::HashMap::new()));
 
                 // In-process approval registry: standalone mode resolves
                 // conversational approvals directly via the shared registry.
@@ -2292,6 +2296,7 @@ pub fn run_repl(
                         rt,
                         backend,
                         approval_poster: &approval_poster,
+                        approval_names: &approval_names,
                     };
                     match (pending.command.handler)(&mut ctx, &pending.args) {
                         CommandOutcome::Exit => {
@@ -2505,6 +2510,7 @@ impl ReplStreamHandler {
     pub(crate) fn fresh_for_manual_resume(
         approval_poster: Option<crate::api::approval::ApprovalPoster>,
         chat_session_id: String,
+        approval_names: Arc<Mutex<std::collections::HashMap<String, String>>>,
     ) -> Self {
         Self {
             pending_args: Arc::new(Mutex::new(std::collections::HashMap::new())),
@@ -2524,7 +2530,7 @@ impl ReplStreamHandler {
             needs_blank: Arc::new(AtomicBool::new(false)),
             in_update_group: Arc::new(AtomicBool::new(false)),
             approval_poster,
-            approval_names: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            approval_names,
             #[cfg(feature = "standalone-cli")]
             pending_approvals: None,
             turn_context_peak: 0,
@@ -3594,12 +3600,14 @@ impl StreamHandler for ReplStreamHandler {
                     // reasoning block, stopped the animation, erased the
                     // input frame, and — critically — holds TERM_WRITE for
                     // the whole match. Re-acquiring it here self-deadlocks.
-                    let remaining = human_remaining(&retention_expires_at, chrono::Utc::now())
-                        .unwrap_or_else(|| retention_expires_at.clone());
+                    let remaining_clause =
+                        human_remaining(&retention_expires_at, chrono::Utc::now())
+                            .map(|r| format!(" (retention expires {r})"))
+                            .unwrap_or_default();
                     println!(
                         "{}  {}",
                         "⏸ Run parked".themed(AuraStyle::Warning),
-                        format!("(retention expires {remaining})").themed(AuraStyle::Muted),
+                        remaining_clause.themed(AuraStyle::Muted),
                     );
                     crate::ui::prompt::increment_orch_scrollback();
                     println!("{}", banner_separator().themed(AuraStyle::Connector));
@@ -4177,15 +4185,16 @@ fn render_blocking_gate(
             .as_ref()
             .map(|p| p.approval_url(&call.decision_id))
             .unwrap_or_else(|| call.decision_id.clone());
-        let remaining = human_remaining(&call.expires_at, chrono::Utc::now())
-            .unwrap_or_else(|| call.expires_at.clone());
+        let remaining_clause = human_remaining(&call.expires_at, chrono::Utc::now())
+            .map(|r| format!(" (expires {r})"))
+            .unwrap_or_default();
         println!(
             "  {} {} {} {} {}",
             "approve:".themed(AuraStyle::Muted),
             link.themed(AuraStyle::Primary),
             "—".themed(AuraStyle::Muted),
             call.tool.as_str().themed(AuraStyle::Muted),
-            format!("(expires {remaining})").themed(AuraStyle::Muted),
+            remaining_clause.themed(AuraStyle::Muted),
         );
         crate::ui::prompt::increment_orch_scrollback();
     }
@@ -4206,6 +4215,8 @@ pub(crate) fn resume_error_message(code: &str, detail: &str) -> String {
         "expired" => "The retention window has closed; this parked run cannot be resumed.",
         "interrupted" => "The checkpoint is in an inconsistent state; start a new run.",
         "not_found" => "Check the run id or start a new run.",
+        "transient_budget" => "Check the server and try again, or start a new run.",
+        "retention_cap" => "Start a new run.",
         _ => "Check the server configuration and try again, or start a new run.",
     };
     format!("Could not resume the parked run: {detail}. {action}")
@@ -4454,8 +4465,11 @@ pub(crate) fn drive_reattach(
             let _term = lock_term();
             println!(
                 "{}",
-                "Could not resume the parked run: the resume endpoint is unavailable and the retry budget is exhausted. Check the server and try again."
-                        .themed(AuraStyle::Error)
+                resume_error_message(
+                    "transient_budget",
+                    "the resume endpoint is unavailable and the retry budget is exhausted",
+                )
+                .themed(AuraStyle::Error)
             );
             crate::ui::prompt::increment_orch_scrollback();
             (REIFY_FAILED_MESSAGE.to_string(), false)
@@ -4464,8 +4478,11 @@ pub(crate) fn drive_reattach(
             let _term = lock_term();
             println!(
                 "{}",
-                "Could not resume the parked run: the retention deadline passed while waiting. Start a new run."
-                        .themed(AuraStyle::Error)
+                resume_error_message(
+                    "retention_cap",
+                    "the retention deadline passed while waiting",
+                )
+                .themed(AuraStyle::Error)
             );
             crate::ui::prompt::increment_orch_scrollback();
             (REIFY_FAILED_MESSAGE.to_string(), false)
@@ -4895,9 +4912,14 @@ mod tests {
     }
 
     #[test]
-    fn human_remaining_rejects_garbage_stamps() {
-        let now = chrono::Utc::now();
-        assert!(human_remaining("not a timestamp", now).is_none());
+    fn human_remaining_formats_subsecond_as_less_than_one_second() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-06T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(
+            human_remaining("2026-10-06T00:00:00.500Z", now).unwrap(),
+            "in <1s"
+        );
     }
 
     #[test]
@@ -4933,5 +4955,46 @@ mod tests {
         );
         assert!(msg.contains("no memory_dir"));
         assert!(msg.contains("Check the server configuration"));
+    }
+
+    #[test]
+    fn resume_error_message_names_cause_and_action_for_interrupted() {
+        let msg = resume_error_message("interrupted", "the checkpoint is inconsistent");
+        assert!(msg.contains("the checkpoint is inconsistent"));
+        assert!(msg.contains("start a new run"));
+    }
+
+    #[test]
+    fn resume_error_message_names_cause_and_action_for_expired() {
+        let msg = resume_error_message("expired", "the retention window has closed");
+        assert!(msg.contains("the retention window has closed"));
+        assert!(msg.contains("cannot be resumed"));
+    }
+
+    #[test]
+    fn resume_error_message_names_cause_and_action_for_not_found() {
+        let msg = resume_error_message("not_found", "the parked run was not found");
+        assert!(msg.contains("the parked run was not found"));
+        assert!(msg.contains("Check the run id"));
+    }
+
+    #[test]
+    fn resume_error_message_names_cause_and_action_for_transient_budget() {
+        let msg = resume_error_message(
+            "transient_budget",
+            "the resume endpoint is unavailable and the retry budget is exhausted",
+        );
+        assert!(msg.contains("retry budget is exhausted"));
+        assert!(msg.contains("Check the server"));
+    }
+
+    #[test]
+    fn resume_error_message_names_cause_and_action_for_retention_cap() {
+        let msg = resume_error_message(
+            "retention_cap",
+            "the retention deadline passed while waiting",
+        );
+        assert!(msg.contains("retention deadline passed"));
+        assert!(msg.contains("Start a new run"));
     }
 }

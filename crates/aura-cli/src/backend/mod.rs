@@ -13,6 +13,27 @@ use crate::api::types::{Message, ToolDefinition};
 use crate::cli::Args;
 use crate::config::AppConfig;
 
+/// If a standalone backend fails because the config requests park-resume on
+/// a route that cannot durable-park, rewrite the error into a readable
+/// cause-and-action message. The original diagnostic is preserved in the
+/// cause; the action tells the operator how to proceed.
+#[cfg(feature = "standalone-cli")]
+fn park_config_error_message(err: &anyhow::Error) -> Option<String> {
+    err.root_cause()
+        .downcast_ref::<aura_config::ConfigError>()
+        .and_then(|cfg_err| match cfg_err {
+            aura_config::ConfigError::Validation(msg)
+                if msg.contains("hitl.park.enabled") || msg.contains("park/reify path") =>
+            {
+                Some(format!(
+                    "Could not start the agent: {msg}. \
+                     Use an HTTP backend for park-resume, or set hitl.park.enabled = false."
+                ))
+            }
+            _ => None,
+        })
+}
+
 /// Backend for communicating with an LLM.
 ///
 /// `Http` connects to an aura-web-server via HTTP/SSE (existing behavior).
@@ -39,10 +60,18 @@ impl Backend {
         #[cfg(feature = "standalone-cli")]
         if _is_standalone {
             let config_path = crate::agent_config::resolve(_args.agent_config.as_deref())?;
-            let direct = _rt.block_on(direct::DirectBackend::from_toml(
-                &config_path,
-                config.extra_headers.clone(),
-            ))?;
+            let direct = _rt
+                .block_on(direct::DirectBackend::from_toml(
+                    &config_path,
+                    config.extra_headers.clone(),
+                ))
+                .map_err(|err| {
+                    if let Some(msg) = park_config_error_message(&err) {
+                        anyhow::anyhow!(msg)
+                    } else {
+                        err
+                    }
+                })?;
             return Ok(Self::Direct(direct));
         }
 
@@ -293,5 +322,18 @@ mod tests {
         let agent = select_agent(info, None).expect("old server agent should remain selectable");
 
         assert_eq!(agent.mcp_servers, None);
+    }
+
+    #[cfg(feature = "standalone-cli")]
+    #[test]
+    fn park_config_error_message_formats_cause_and_action() {
+        let cfg_err = aura_config::ConfigError::Validation(
+            "`hitl.park.enabled = true` is not supported on the conversational route: approvals stay inline".to_string(),
+        );
+        let err = anyhow::Error::new(cfg_err);
+        let msg = park_config_error_message(&err).expect("park config message extracted");
+        assert!(msg.contains("Could not start the agent"));
+        assert!(msg.contains("Use an HTTP backend for park-resume"));
+        assert!(msg.contains("set hitl.park.enabled = false"));
     }
 }
