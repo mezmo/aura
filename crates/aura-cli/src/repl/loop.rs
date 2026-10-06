@@ -3554,7 +3554,13 @@ impl StreamHandler for ReplStreamHandler {
 
                     // Record the reattach target for the in-turn driver
                     // (and the manual /resume-run re-arm): one handle per
-                    // run, seeded only from this targeted event.
+                    // run, seeded only from this targeted event. The
+                    // session is the parking turn's own — the resume
+                    // route is per-session — and the model is the
+                    // selection current when the park armed: the resume
+                    // POST carries it so the server resolves the original
+                    // run's config even if the live selection has moved
+                    // on.
                     if !run_id.is_empty()
                         && let Ok(mut slot) = crate::repl::reattach::latest_park_slot().lock()
                     {
@@ -4261,6 +4267,8 @@ pub(crate) fn drive_reattach(
                         }
                     },
                     StreamTermination::Cancelled => {
+                        // Whatever partial text was received is
+                        // preserved; no failure message is added.
                         accumulate(&mut partial, outcome.received);
                         break ReattachEnd::Cancelled;
                     }

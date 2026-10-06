@@ -17,14 +17,11 @@ use std::time::{Duration, SystemTime};
 #[derive(Debug, Clone)]
 pub(crate) struct ParkedRun {
     pub run_id: String,
-    /// The chat session the run belongs to, resolved exactly as the
-    /// parking turn resolved it — the resume route is per-session.
+    /// The chat session the run belongs to.
     pub session_id: String,
     pub retention_expires_at: String,
     pub decision_ids: Vec<String>,
-    /// The model the parking turn ran under, captured when the park
-    /// armed. The resume POST carries it so the server resolves the
-    /// original run's config; the live selection may have moved on.
+    /// The model selection current when the run parked.
     pub model: Option<String>,
 }
 
@@ -33,21 +30,18 @@ pub(crate) struct ParkedRun {
 pub(crate) enum ReattachEnd {
     /// A resumed segment completed with this final text.
     Completed(String),
-    /// The user cancelled the wait; whatever partial text was received
-    /// is preserved, no failure message is added.
+    /// The user cancelled the wait.
     Cancelled,
-    /// A resume POST was accepted but its stream ended ambiguously:
-    /// automatic retries stop after saving the received partial.
+    /// A resume POST was accepted but its stream ended ambiguously.
     AmbiguousStream,
     /// A terminal 409 row (interrupted, config_changed, mismatch,
     /// expired).
     Terminal,
     /// The run is absent.
     NotFound,
-    /// A 500 `reify_failed` (or an unknown/undecodable row, which fails
-    /// closed to terminal).
+    /// A 500 `reify_failed`.
     ReifyFailed,
-    /// Five consecutive transient transport or 503 failures.
+    /// The transient transport/503 budget was exhausted.
     TransientBudget,
     /// The advertised retention deadline passed.
     RetentionCap,
