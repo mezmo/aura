@@ -257,6 +257,14 @@ async fn webhook_round_trip<T>(
 }
 
 impl DecisionRoute {
+    /// The registry approvals park in, which only the conversational route has.
+    pub(crate) fn registry(&self) -> Option<&PendingApprovals> {
+        match self {
+            Self::Conversational { registry, .. } => Some(registry),
+            Self::Webhook { .. } => None,
+        }
+    }
+
     /// Obtain a decision for a config-gated call, carrying any captured
     /// approver header overrides on the approved arm.
     ///

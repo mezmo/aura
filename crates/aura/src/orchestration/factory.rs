@@ -260,7 +260,12 @@ impl StreamingAgent for OrchestratorFactory {
             stream,
         ));
 
-        crate::streaming::AgentRun::new(stream, cancel_token, usage_state).observed_by(run_events)
+        let run = crate::streaming::AgentRun::new(stream, cancel_token, usage_state)
+            .observed_by(run_events);
+        match &self.agent_config.hitl {
+            Some(hitl) => run.sweeping_approvals(&hitl.route, request_id),
+            None => run,
+        }
     }
 
     async fn cancel_and_close_mcp(

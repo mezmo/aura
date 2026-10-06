@@ -44,6 +44,7 @@ pub use decision::{
 pub(crate) use events::completed_cancelled_event;
 pub use gate::HitlApprovalWrapper;
 pub use protocol::{ApprovalDecisionWire, ApprovalItem, ApprovalRequest, PROTOCOL_VERSION};
+pub(crate) use registry::SweepApprovalsOnDrop;
 pub use registry::{ParkedApproval, PendingApprovals, ResolveError};
 pub use route::{
     ApprovalError, DecisionRoute, HitlRuntime, PlaintextWebhookUrlError, WebhookClient,

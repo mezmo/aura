@@ -1757,6 +1757,10 @@ impl StreamingAgent for Agent {
             .await
         };
 
+        let started = match &self.hitl_gate {
+            Some(gate) => started.sweeping_approvals(gate.route(), request_id),
+            None => started,
+        };
         started
             .map_stream(move |stream| {
                 Box::pin(crate::run_context::scope_stream(

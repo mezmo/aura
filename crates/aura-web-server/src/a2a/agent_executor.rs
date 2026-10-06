@@ -46,7 +46,6 @@ pub struct AuraAgentExecutor {
 struct TaskCancelEntry {
     token: CancellationToken,
     agent: Option<Arc<dyn StreamingAgent>>,
-    request_id: RequestId,
 }
 
 /// Whether `cancel()` got to a task before the code asking.
@@ -270,7 +269,6 @@ impl AgentExecutor for AuraAgentExecutor {
             }));
 
             let request_id = RequestId::for_a2a_task(&task_id);
-
             // Registered before the agent build and history fetch, both of which
             // await, so a cancelTask during those has a token to cancel. Its
             // guard comes first, because those paths can return early.
@@ -284,7 +282,6 @@ impl AgentExecutor for AuraAgentExecutor {
                 TaskCancelEntry {
                     token: cancel_token.clone(),
                     agent: None,
-                    request_id: request_id.clone(),
                 },
             );
 
@@ -577,8 +574,10 @@ impl AgentExecutor for AuraAgentExecutor {
                 // orchestration mode (workers manage their own MCP cancellation).
                 // A run cancelled before its agent was built has no MCP calls yet.
                 if let Some(agent) = &entry.agent {
+                    // The task id determines the run's request id, so it is
+                    // rebuilt here rather than stored.
                     agent
-                        .cancel_and_close_mcp(&entry.request_id, "A2A cancelTask")
+                        .cancel_and_close_mcp(&RequestId::for_a2a_task(&task_id), "A2A cancelTask")
                         .await;
                 }
                 entry.token.cancel();
@@ -908,7 +907,6 @@ mod tests {
     #[test]
     fn dropping_the_cancel_guard_releases_the_entry() {
         let task_id = format!("t_{}", uuid::Uuid::new_v4());
-        let request_id = RequestId::for_a2a_task(&task_id);
         let state: Arc<TaskCancelState> = Arc::new(Mutex::new(HashMap::new()));
 
         let guard = TaskCancelGuard {
@@ -920,7 +918,6 @@ mod tests {
             TaskCancelEntry {
                 token: CancellationToken::new(),
                 agent: Some(Arc::new(MockAgent::pending())),
-                request_id: request_id.clone(),
             },
         );
         assert!(lock_cancel_state(&state).contains_key(&task_id));
@@ -942,7 +939,6 @@ mod tests {
                 TaskCancelEntry {
                     token: CancellationToken::new(),
                     agent: None,
-                    request_id: RequestId::for_a2a_task(&task_id),
                 },
             );
             (state, task_id)
@@ -1003,7 +999,6 @@ mod tests {
             TaskCancelEntry {
                 token: CancellationToken::new(),
                 agent: None,
-                request_id: RequestId::for_a2a_task("t"),
             },
         );
         lock_cancel_state(&state).remove("t");
@@ -1019,7 +1014,6 @@ mod tests {
     #[test]
     fn claiming_the_agent_reports_a_cancel_that_already_ran() {
         let task_id = format!("t_{}", uuid::Uuid::new_v4());
-        let request_id = RequestId::for_a2a_task(&task_id);
         let state: Arc<TaskCancelState> = Arc::new(Mutex::new(HashMap::new()));
         let agent: Arc<dyn StreamingAgent> = Arc::new(MockAgent::pending());
 
@@ -1028,7 +1022,6 @@ mod tests {
             TaskCancelEntry {
                 token: CancellationToken::new(),
                 agent: None,
-                request_id,
             },
         );
 
@@ -1050,7 +1043,6 @@ mod tests {
     #[test]
     fn an_early_return_before_the_run_releases_the_entry() {
         let task_id = format!("t_{}", uuid::Uuid::new_v4());
-        let request_id = RequestId::for_a2a_task(&task_id);
         let state: Arc<TaskCancelState> = Arc::new(Mutex::new(HashMap::new()));
 
         {
@@ -1063,7 +1055,6 @@ mod tests {
                 TaskCancelEntry {
                     token: CancellationToken::new(),
                     agent: None,
-                    request_id: request_id.clone(),
                 },
             );
             // The build fails here and the generator returns.
@@ -1318,7 +1309,6 @@ mod loom_tests {
                 TaskCancelEntry {
                     token: CancellationToken::new(),
                     agent: None,
-                    request_id: RequestId::for_a2a_task("t1"),
                 },
             );
 
@@ -1371,7 +1361,6 @@ mod loom_tests {
                 TaskCancelEntry {
                     token: CancellationToken::new(),
                     agent: None,
-                    request_id: RequestId::for_a2a_task("t1"),
                 },
             );
 
@@ -1422,7 +1411,6 @@ mod loom_tests {
                 TaskCancelEntry {
                     token: CancellationToken::new(),
                     agent: None,
-                    request_id: RequestId::for_a2a_task("t1"),
                 },
             );
 

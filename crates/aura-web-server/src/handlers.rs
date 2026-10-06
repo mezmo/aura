@@ -1,6 +1,5 @@
 use a2a::VERSION;
 use aura::RigBuilder;
-use aura::hitl::ApprovalOwner;
 use aura::{RequestId, ResponseContent, StreamingAgent, UsageState};
 use aura_events::{AgentInfo, NativeToolOverview, ServerInfo};
 use axum::Json;
@@ -22,46 +21,6 @@ use crate::streaming::{
     TurnContext, collect_stream_to_completion, process_sse_stream_full,
 };
 use crate::types::*;
-
-/// Guard over a request's pending approvals.
-struct RequestResourceGuard {
-    request_id: RequestId,
-    pending_approvals: aura::hitl::PendingApprovals,
-}
-
-impl RequestResourceGuard {
-    fn new(request_id: RequestId, pending_approvals: aura::hitl::PendingApprovals) -> Self {
-        Self {
-            request_id,
-            pending_approvals,
-        }
-    }
-}
-
-impl Drop for RequestResourceGuard {
-    /// Cancels the request's approvals, on panic as well as on return.
-    fn drop(&mut self) {
-        // Synchronous so parked awaits cancel even when the runtime is
-        // shutting down and the spawn below never polls.
-        let owner = ApprovalOwner::Request(self.request_id.clone());
-        self.pending_approvals.cancel_request_local(&owner);
-
-        // Use try_current to avoid panic during runtime shutdown
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            let pending_approvals = self.pending_approvals.clone();
-            // Instrument with the span current at drop so cleanup events
-            // stay parented to the request's trace.
-            let cleanup = tracing::Instrument::instrument(
-                async move {
-                    pending_approvals.cancel_request(&owner).await;
-                },
-                tracing::Span::current(),
-            );
-            handle.spawn(cleanup);
-        }
-        // If no runtime, cleanup is best-effort (server is shutting down anyway)
-    }
-}
 
 /// Framework-agnostic error returned by `prepare_request` and `build_agent_for_request`.
 /// The axum handler layer converts this to a `Response`; other consumers (e.g. the CLI)
@@ -125,7 +84,6 @@ pub struct CompletionConfig {
     pub query_for_otel: String,
     pub message_count: usize,
     pub response_content: ResponseContent,
-    pub pending_approvals: aura::hitl::PendingApprovals,
 }
 
 /// Determines how stream output reaches the client.
@@ -539,7 +497,6 @@ pub fn build_completion_config(
         query_for_otel: setup.query.clone(),
         message_count,
         response_content,
-        pending_approvals: data.pending_approvals.clone(),
     }
 }
 
@@ -554,9 +511,6 @@ pub async fn execute_completion(
     delivery: DeliveryMode,
 ) {
     let _active_guard = ActiveRequestGuard::new(config.active_requests.clone());
-
-    let _resource_guard =
-        RequestResourceGuard::new(config.request_id.clone(), config.pending_approvals.clone());
 
     let invocation_parameters = aura::logging::llm_invocation_parameters(&setup.config.agent.llm);
     let orchestration_enabled = setup.config.orchestration_enabled();

@@ -93,6 +93,7 @@ pub struct AgentRun {
     cancel: CancellationToken,
     usage: UsageState,
     guard: DropGuard,
+    approvals: Option<crate::hitl::SweepApprovalsOnDrop>,
 }
 
 impl AgentRun {
@@ -110,7 +111,22 @@ impl AgentRun {
             agent_events: None,
             cancel,
             usage,
+            approvals: None,
         }
+    }
+
+    /// Cancels the approvals the run raises under `request_id` once its
+    /// events are dropped. A route with no registry parks nothing to cancel.
+    #[must_use]
+    pub(crate) fn sweeping_approvals(
+        mut self,
+        route: &crate::hitl::DecisionRoute,
+        request_id: &crate::domain::RequestId,
+    ) -> Self {
+        self.approvals = route.registry().map(|registry| {
+            registry.sweep_on_drop(crate::hitl::ApprovalOwner::Request(request_id.clone()))
+        });
+        self
     }
 
     /// Hands the run's events to its observer. A run whose producers emit
@@ -159,7 +175,7 @@ impl AgentRun {
         }
     }
 
-    /// Dropping the returned stream cancels the run.
+    /// Dropping the returned stream cancels the run and its approvals.
     ///
     /// A consumer that goes away without draining — an aborted task, a dropped
     /// stream — would otherwise leave the run spending provider turns nobody
@@ -169,6 +185,7 @@ impl AgentRun {
     pub fn into_events(self) -> BoxStream<'static, Result<StreamItem, StreamError>> {
         Box::pin(CancelOnDrop {
             _guard: self.guard,
+            _approvals: self.approvals,
             inner: self.events,
         })
     }
@@ -241,6 +258,7 @@ fn content_of(item: &StreamItem) -> Option<aura_events::agent::AgentEventPayload
 struct CancelOnDrop<S> {
     inner: S,
     _guard: DropGuard,
+    _approvals: Option<crate::hitl::SweepApprovalsOnDrop>,
 }
 
 impl<S: futures::Stream + Unpin> futures::Stream for CancelOnDrop<S> {
@@ -379,6 +397,74 @@ mod tests {
 
         drop(events);
         assert!(cancel.is_cancelled());
+    }
+
+    /// A run's approvals outlive the handle while its stream is held, and
+    /// dropping the stream cancels them in the registry and the store. Another
+    /// request's approvals stay.
+    #[tokio::test]
+    async fn dropping_a_run_s_stream_cancels_its_approvals() {
+        use crate::domain::RequestId;
+        use crate::hitl::{
+            AgentScope, ApprovalOrigin, ApprovalOutcome, ApprovalOwner, ApprovalRequest,
+            CancelReason, DecisionId, DecisionRoute, PROTOCOL_VERSION, PendingApprovals,
+        };
+        use crate::request_cancellation::RequestCancelToken;
+        use crate::session_store::{ApprovalStore, InMemoryApprovalStore, InMemoryEventBus};
+        use std::time::Duration;
+
+        fn request(request_id: RequestId) -> ApprovalRequest {
+            ApprovalRequest {
+                version: PROTOCOL_VERSION,
+                instance_id: "test-instance".to_string(),
+                decision_id: DecisionId::generate(),
+                owner: ApprovalOwner::Request(request_id),
+                scope: AgentScope::Single { session_id: None },
+                origin: ApprovalOrigin::ConfigGate {
+                    matched_pattern: "kubectl_*".to_string(),
+                    agent_name: "test-agent".to_string(),
+                },
+                items: vec![],
+            }
+        }
+
+        let store = Arc::new(InMemoryApprovalStore::new());
+        let registry = PendingApprovals::with_backend(
+            store.clone() as Arc<dyn ApprovalStore>,
+            Arc::new(InMemoryEventBus::new()),
+        );
+        let route = DecisionRoute::Conversational {
+            registry: registry.clone(),
+            timeout: Duration::from_secs(60),
+        };
+        let request_id = RequestId::generate();
+        let mine = request(request_id.clone());
+        let mine_id = mine.decision_id;
+        let theirs = request(RequestId::generate());
+        let theirs_id = theirs.decision_id;
+        let mine = registry.register(mine, Duration::from_secs(60)).await;
+        let _theirs = registry.register(theirs, Duration::from_secs(60)).await;
+
+        let (run, _cancel) = empty_run();
+        let events = run.sweeping_approvals(&route, &request_id).into_events();
+        assert!(
+            store.get(&mine_id).await.unwrap().is_some(),
+            "a held stream keeps the run's approvals"
+        );
+
+        drop(events);
+        assert_eq!(
+            mine.outcome(&RequestCancelToken::unbound()).await,
+            ApprovalOutcome::Cancelled(CancelReason::SenderDropped)
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while store.get(&mine_id).await.unwrap().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the run's approval leaves the store");
+        assert!(store.get(&theirs_id).await.unwrap().is_some());
     }
 
     /// An orchestration run is a spawned task feeding a channel. Dropping the

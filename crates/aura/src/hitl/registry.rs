@@ -274,6 +274,48 @@ impl PendingApprovals {
             }
         }
     }
+
+    /// A guard that cancels every approval parked under `owner` when it drops.
+    pub(crate) fn sweep_on_drop(&self, owner: ApprovalOwner) -> SweepApprovalsOnDrop {
+        SweepApprovalsOnDrop {
+            registry: self.clone(),
+            owner,
+        }
+    }
+}
+
+/// Guard over the approvals parked under one owner.
+#[must_use = "dropping the guard cancels the approvals at once"]
+pub(crate) struct SweepApprovalsOnDrop {
+    registry: PendingApprovals,
+    owner: ApprovalOwner,
+}
+
+impl Drop for SweepApprovalsOnDrop {
+    /// Cancels the approvals on panic as well as on return.
+    fn drop(&mut self) {
+        // Synchronous so parked awaits cancel even when the runtime is
+        // shutting down and the spawn below never polls.
+        self.registry.cancel_request_local(&self.owner);
+
+        // Use try_current to avoid panic during runtime shutdown
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let registry = self.registry.clone();
+            let owner = self.owner.clone();
+            // Instrument with the span current at drop so cleanup events
+            // stay parented to the request's trace.
+            let cleanup = tracing::Instrument::instrument(
+                async move {
+                    // Repeats the local pass, which also cancels an approval
+                    // registered after the synchronous one above.
+                    registry.cancel_request(&owner).await;
+                },
+                tracing::Span::current(),
+            );
+            handle.spawn(cleanup);
+        }
+        // If no runtime, cleanup is best-effort (server is shutting down anyway)
+    }
 }
 
 impl Default for PendingApprovals {
@@ -547,6 +589,39 @@ mod tests {
 
         registry.cancel_request(&owner("req-local")).await;
         assert!(store.get(&id).await.unwrap().is_none());
+    }
+
+    /// Dropping the guard cancels its owner's approvals in the registry and
+    /// the store, and leaves every other owner's alone.
+    #[tokio::test]
+    async fn a_dropped_sweep_guard_cancels_only_its_owner_s_approvals() {
+        let store: Arc<dyn ApprovalStore> = Arc::new(InMemoryApprovalStore::new());
+        let registry =
+            PendingApprovals::with_backend(store.clone(), Arc::new(InMemoryEventBus::new()));
+        let mine = test_request("req-mine");
+        let mine_id = mine.decision_id;
+        let theirs = test_request("req-theirs");
+        let theirs_id = theirs.decision_id;
+        let mine = registry.register(mine, Duration::from_secs(60)).await;
+        let _theirs = registry.register(theirs, Duration::from_secs(60)).await;
+
+        drop(registry.sweep_on_drop(owner("req-mine")));
+
+        assert_eq!(
+            mine.outcome(&RequestCancelToken::unbound()).await,
+            ApprovalOutcome::Cancelled(CancelReason::SenderDropped)
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while store.get(&mine_id).await.unwrap().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the guard clears its owner's approval from the store");
+        assert!(
+            store.get(&theirs_id).await.unwrap().is_some(),
+            "another owner's approval stays"
+        );
     }
 
     #[tokio::test(start_paused = true)]

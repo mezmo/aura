@@ -84,6 +84,10 @@ impl HitlApprovalWrapper {
         }
     }
 
+    pub(crate) fn route(&self) -> &DecisionRoute {
+        &self.route
+    }
+
     /// Names the run this gate's approvals belong to.
     pub fn bind_run(&self, run: Arc<crate::run_context::RunContext>) {
         self.run.bind(run);
