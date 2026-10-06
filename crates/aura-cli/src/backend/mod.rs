@@ -22,9 +22,7 @@ fn park_config_error_message(err: &anyhow::Error) -> Option<String> {
     err.root_cause()
         .downcast_ref::<aura_config::ConfigError>()
         .and_then(|cfg_err| match cfg_err {
-            aura_config::ConfigError::Validation(msg)
-                if msg.contains("hitl.park.enabled") || msg.contains("park/reify path") =>
-            {
+            aura_config::ConfigError::Validation(msg) if msg.contains("is not supported on") => {
                 Some(format!(
                     "Could not start the agent: {msg}. \
                      Use an HTTP backend for park-resume, or set hitl.park.enabled = false."
@@ -335,5 +333,18 @@ mod tests {
         assert!(msg.contains("Could not start the agent"));
         assert!(msg.contains("Use an HTTP backend for park-resume"));
         assert!(msg.contains("set hitl.park.enabled = false"));
+    }
+
+    #[cfg(feature = "standalone-cli")]
+    #[test]
+    fn park_config_error_message_fails_open_for_poll_without_park() {
+        let cfg_err = aura_config::ConfigError::Validation(
+            "webhook poll delivery requires `hitl.park.enabled = true`".to_string(),
+        );
+        let err = anyhow::Error::new(cfg_err);
+        assert!(
+            park_config_error_message(&err).is_none(),
+            "the opposite diagnostic must not be rewritten"
+        );
     }
 }
