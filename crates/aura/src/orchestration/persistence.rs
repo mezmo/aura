@@ -843,7 +843,9 @@ impl ExecutionPersistence {
         };
         let mut filenames = Vec::new();
         while let Some(entry) = entries.next_entry().await? {
-            if let Some(name) = entry.file_name().to_str() {
+            if let Some(name) = entry.file_name().to_str()
+                && !name.starts_with('.')
+            {
                 filenames.push(name.to_string());
             }
         }
@@ -1428,6 +1430,28 @@ mod tests {
             persistence.read_artifact(&filename).await.unwrap(),
             "second draft"
         );
+        assert_eq!(persistence.list_artifacts().await.unwrap(), vec![filename]);
+    }
+
+    #[tokio::test]
+    async fn test_list_artifacts_skips_temp_files() {
+        let temp_dir = TempDir::new().unwrap();
+        let persistence = ExecutionPersistence::new(temp_dir.path().join("memory"), None)
+            .await
+            .unwrap();
+        let (filename, _) = persistence
+            .write_coordinator_artifact("notes.md", "notes")
+            .await
+            .unwrap();
+        tokio::fs::write(
+            persistence
+                .artifact_path(".coordinator-draft.md.tmp")
+                .unwrap(),
+            "partial",
+        )
+        .await
+        .unwrap();
+
         assert_eq!(persistence.list_artifacts().await.unwrap(), vec![filename]);
     }
 
