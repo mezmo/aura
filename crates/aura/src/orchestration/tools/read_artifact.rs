@@ -126,6 +126,10 @@ pub struct ReadArtifactOutput {
     pub found: bool,
     pub filename: String,
     pub content: String,
+    /// Artifact filenames in the current run, listed when a current-run read
+    /// finds nothing.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub available: Vec<String>,
 }
 
 /// Error type for ReadArtifactTool.
@@ -149,7 +153,8 @@ impl Tool for ReadArtifactTool {
                 the current run. Supply an optional run_id to read artifacts from a prior run \
                 in this session (see session history for available run_id values). A large \
                 artifact is returned as a scratchpad pointer to explore in place (with head, \
-                grep, slice, etc.) rather than inlined."
+                grep, slice, etc.) rather than inlined. A filename that is not found returns \
+                found=false with the run's artifact filenames in `available`."
                 .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -171,7 +176,7 @@ impl Tool for ReadArtifactTool {
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         let persistence = self.persistence.lock().await;
 
-        let (result, abs_path) = if let Some(ref run_id) = args.run_id {
+        let (result, abs_path, available) = if let Some(ref run_id) = args.run_id {
             tracing::info!(
                 "read_artifact cross-run: filename={}, run_id={}",
                 args.filename,
@@ -184,12 +189,21 @@ impl Tool for ReadArtifactTool {
                 persistence
                     .artifact_path_cross_run(&args.filename, run_id)
                     .ok(),
+                Vec::new(),
             )
         } else {
             tracing::info!("read_artifact called for: {}", args.filename);
+            let result = persistence.read_artifact(&args.filename).await;
+            let available = match &result {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    persistence.list_artifacts().await.unwrap_or_default()
+                }
+                _ => Vec::new(),
+            };
             (
-                persistence.read_artifact(&args.filename).await,
+                result,
                 persistence.artifact_path(&args.filename).ok(),
+                available,
             )
         };
         drop(persistence);
@@ -206,12 +220,14 @@ impl Tool for ReadArtifactTool {
                     found: true,
                     filename: args.filename,
                     content,
+                    available: Vec::new(),
                 })
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ReadArtifactOutput {
                 found: false,
                 filename: args.filename,
                 content: String::new(),
+                available,
             }),
             Err(e) => Err(ReadArtifactError::Io(e)),
         }
@@ -270,6 +286,7 @@ mod tests {
 
         assert!(!result.found);
         assert!(result.content.is_empty());
+        assert_eq!(result.available, vec!["task-0-research-iter-1-result.txt"]);
     }
 
     #[tokio::test]
