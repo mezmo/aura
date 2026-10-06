@@ -138,8 +138,6 @@ pub struct Agent {
     /// Used for usage percentage reporting in streaming events.
     pub(crate) context_window: Option<u64>,
     /// Per-agent scratchpad budget for context tracking.
-    /// Set by orchestration workers (from resolved worker LLM + scratchpad config);
-    /// `None` for coordinator agents and non-scratchpad use.
     pub(crate) scratchpad_budget: Option<scratchpad::ContextBudget>,
     /// Names of client-side (passthrough) tools registered for this agent.
     /// When the LLM calls one of these, the streaming layer terminates the
@@ -1116,10 +1114,14 @@ impl Agent {
         // Add read_artifact tool when orchestration persistence is available.
         // When the scratchpad is active, hand it the budget + storage so a
         // large artifact is returned as an in-place pointer (explored with the
-        // scratchpad read tools).
+        // scratchpad read tools); otherwise cap what it returns inline.
         if let Some(ref persistence) = config.orchestration_persistence {
+            let (provider, model) = config.llm.model_info();
             let mut read_artifact =
-                crate::orchestration::ReadArtifactTool::new(persistence.clone());
+                crate::orchestration::ReadArtifactTool::new(persistence.clone()).with_inline_cap(
+                    crate::orchestration::inline_cap_tokens(config.llm.context_window()),
+                    crate::scratchpad::token_counter_for_provider(provider, model),
+                );
             if let Some(ref scratchpad) = config.scratchpad_tools_config {
                 let read_root = scratchpad.storage.read_root().to_path_buf();
                 let run_path = persistence.lock().await.run_path().to_path_buf();
@@ -1521,10 +1523,9 @@ impl Agent {
     /// Seed the scratchpad budget's running estimate with the user query +
     /// chat history at stream-start so early extraction budget checks see
     /// the request shape before turn-1 LLM-reported `input_tokens` arrives.
-    /// No-op when scratchpad isn't wired up. `Debug` formatting on history
-    /// over-counts vs. per-provider serialization — conservative direction
-    /// for budget gating, and `set_estimated_used` corrects from LLM ground
-    /// truth after each turn anyway.
+    /// No-op when scratchpad isn't wired up. History is counted by the
+    /// content each message sends, since the estimate only ever rises and an
+    /// over-count would persist for the rest of the request.
     fn seed_scratchpad_request_input(
         &self,
         query: &str,
@@ -1536,7 +1537,7 @@ impl Agent {
         let query_tokens = budget.count_tokens(query);
         let history_tokens: usize = chat_history
             .iter()
-            .map(|m| budget.count_tokens(&format!("{m:?}")))
+            .map(|m| budget.count_message_tokens(m))
             .sum();
         budget.record_usage(query_tokens + history_tokens);
     }

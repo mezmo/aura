@@ -88,7 +88,7 @@ aura/
 
 ### Scratchpad (Context Window Management)
 - Intercepts large MCP tool outputs and saves them to disk instead of filling the context window; works in both single-agent and orchestration mode. Full usage/config docs: https://docs.mezmo.com/aura/scratchpad
-- Code pointers: token-counter dispatch lives in `token_counter_for_provider` (`scratchpad/context_budget.rs`); per-agent budgets live on `Agent.scratchpad_budget`, created at `create_worker()` time; read tools resolve files under a per-agent **read root** distinct from the write-confined scratchpad dir (`ScratchpadStorage::with_read_root`)
+- Code pointers: token-counter dispatch lives in `token_counter_for_provider` (`scratchpad/context_budget.rs`); per-agent budgets live on `Agent.scratchpad_budget`, created in `create_worker()` for workers and `coordinator_artifact_tools()` for the coordinator (whose `read_artifact` is otherwise capped inline); read tools resolve files under a per-agent **read root** distinct from the write-confined scratchpad dir (`ScratchpadStorage::with_read_root`)
 
 ### Orchestration (Multi-Agent)
 - Coordinator/worker architecture with DAG-based parallel task execution

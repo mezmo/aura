@@ -275,6 +275,50 @@ impl ContextBudget {
         self.token_counter.count_tokens(content)
     }
 
+    /// Count tokens for the content a message sends to the provider: text,
+    /// tool-result text, tool-call names and JSON arguments, and reasoning.
+    /// Images, audio, video, and documents count as zero: no history reaching
+    /// this count carries them. MCP images are flattened to text markers in
+    /// `extract_tool_result`, rig wraps every tool output as a text part, and
+    /// chat history is built from text messages, so the zero branches exist
+    /// only because the match over rig's `Message` must be exhaustive.
+    pub fn count_message_tokens(&self, message: &rig::completion::Message) -> usize {
+        use rig::completion::Message;
+        use rig::completion::message::{AssistantContent, ToolResultContent, UserContent};
+
+        match message {
+            Message::User { content } => content
+                .iter()
+                .map(|c| match c {
+                    UserContent::Text(t) => self.count_tokens(&t.text),
+                    UserContent::ToolResult(r) => r
+                        .content
+                        .iter()
+                        .map(|rc| match rc {
+                            ToolResultContent::Text(t) => self.count_tokens(&t.text),
+                            ToolResultContent::Image(_) => 0,
+                        })
+                        .sum(),
+                    _ => 0,
+                })
+                .sum(),
+            Message::Assistant { content, .. } => content
+                .iter()
+                .map(|c| match c {
+                    AssistantContent::Text(t) => self.count_tokens(&t.text),
+                    AssistantContent::ToolCall(call) => {
+                        self.count_tokens(&call.function.name)
+                            + self.count_tokens(&call.function.arguments.to_string())
+                    }
+                    AssistantContent::Reasoning(r) => {
+                        r.reasoning.iter().map(|s| self.count_tokens(s)).sum()
+                    }
+                    AssistantContent::Image(_) => 0,
+                })
+                .sum(),
+        }
+    }
+
     /// Check if content would fit within the remaining budget.
     ///
     /// Returns `Ok(estimated_tokens)` if it fits, or `Err(BudgetExceeded)` with details.
@@ -359,6 +403,13 @@ impl ContextBudget {
                     None
                 }
             });
+    }
+
+    /// Raise the estimate to cover a request's full input (query plus
+    /// history) on top of the initial overhead, never lowering it.
+    pub fn observe_request_input(&self, input_tokens: usize) {
+        self.estimated_used
+            .fetch_max(self.initial_used + input_tokens, Ordering::Relaxed);
     }
 
     /// Build a `window_hint` string for tool metadata.
@@ -709,5 +760,67 @@ mod tests {
         let before = budget.remaining();
         budget.set_estimated_used(0, 0);
         assert_eq!(budget.remaining(), before);
+    }
+
+    #[test]
+    fn test_count_message_tokens_counts_tool_result_content_not_debug() {
+        let budget = ContextBudget::new(100_000, 0.20, 0, test_counter());
+        let output: String = (0..200)
+            .map(|i| format!("{{\"line\": {i}, \"msg\": \"say \\\"hi\\\"\"}}\n"))
+            .collect();
+        let message = rig::completion::Message::tool_result("call_1", output.clone());
+
+        let counted = budget.count_message_tokens(&message);
+        assert_eq!(counted, budget.count_tokens(&output));
+        assert!(counted < budget.count_tokens(&format!("{message:?}")));
+    }
+
+    #[test]
+    fn test_count_message_tokens_counts_text_tool_calls_and_reasoning() {
+        use rig::OneOrMany;
+        use rig::completion::message::{AssistantContent, Reasoning};
+
+        let budget = ContextBudget::new(100_000, 0.20, 0, test_counter());
+        assert_eq!(
+            budget.count_message_tokens(&rig::completion::Message::user("hello there")),
+            budget.count_tokens("hello there")
+        );
+
+        let args = serde_json::json!({"filename": "task-0-result.txt"});
+        let message = rig::completion::Message::Assistant {
+            id: None,
+            content: OneOrMany::many(vec![
+                AssistantContent::text("checking"),
+                AssistantContent::tool_call("call_1", "read_artifact", args.clone()),
+                AssistantContent::Reasoning(Reasoning::multi(vec!["think".to_string()])),
+            ])
+            .unwrap(),
+        };
+        assert_eq!(
+            budget.count_message_tokens(&message),
+            budget.count_tokens("checking")
+                + budget.count_tokens("read_artifact")
+                + budget.count_tokens(&args.to_string())
+                + budget.count_tokens("think")
+        );
+    }
+
+    #[test]
+    fn test_observe_request_input_counts_on_top_of_initial_overhead() {
+        let budget = ContextBudget::new(100_000, 0.20, 1_000, test_counter());
+        budget.observe_request_input(4_000);
+        assert_eq!(budget.usable_budget() - budget.remaining(), 5_000);
+    }
+
+    #[test]
+    fn test_observe_request_input_does_not_accumulate_across_calls() {
+        // A growing conversation is re-observed in full on each call; the
+        // estimate tracks the largest input, not the sum of inputs.
+        let budget = ContextBudget::new(100_000, 0.20, 1_000, test_counter());
+        budget.observe_request_input(4_000);
+        budget.observe_request_input(6_000);
+        assert_eq!(budget.usable_budget() - budget.remaining(), 7_000);
+        budget.observe_request_input(2_000);
+        assert_eq!(budget.usable_budget() - budget.remaining(), 7_000);
     }
 }
