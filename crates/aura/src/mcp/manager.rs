@@ -738,50 +738,6 @@ impl McpManager {
         info!("  Total tools available: {}", total_tools);
     }
 
-    /// Cancel all in-flight MCP requests for a request.
-    pub async fn cancel_all_for_request(
-        &self,
-        request_id: &crate::domain::RequestId,
-        reason: &str,
-    ) -> usize {
-        let mut total_cancelled = 0;
-
-        for (server_name, client) in &self.streamable_clients {
-            let cancelled = client.cancel_all_for_request(request_id, reason).await;
-            if cancelled > 0 {
-                info!(
-                    "Cancelled {} request(s) on MCP server '{}' for request {}",
-                    cancelled, server_name, request_id
-                );
-            }
-            total_cancelled += cancelled;
-        }
-
-        for (server_name, client) in &self.sse_clients {
-            let cancelled = client.cancel_all_for_request(request_id, reason).await;
-            if cancelled > 0 {
-                info!(
-                    "Cancelled {} request(s) on SSE MCP server '{}' for request {}",
-                    cancelled, server_name, request_id
-                );
-            }
-            total_cancelled += cancelled;
-        }
-
-        for (server_name, client) in &self.stdio_clients {
-            let cancelled = client.cancel_all_for_request(request_id, reason).await;
-            if cancelled > 0 {
-                info!(
-                    "Cancelled {} request(s) on STDIO MCP server '{}' for request {}",
-                    cancelled, server_name, request_id
-                );
-            }
-            total_cancelled += cancelled;
-        }
-
-        total_cancelled
-    }
-
     /// Cancel in-flight requests and close all MCP client connections.
     /// After calling this, all MCP clients become unusable until reinitialized.
     pub async fn cancel_and_close_all(

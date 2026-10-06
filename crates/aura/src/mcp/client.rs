@@ -988,7 +988,7 @@ impl McpClient {
     }
 
     /// Cancel all in-flight MCP requests for a request.
-    pub async fn cancel_all_for_request(&self, request_id: &RequestId, reason: &str) -> usize {
+    async fn cancel_all_for_request(&self, request_id: &RequestId, reason: &str) -> usize {
         let mcp_request_ids = self.in_flight.get_all(request_id).await;
 
         if mcp_request_ids.is_empty() {

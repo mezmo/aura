@@ -1554,30 +1554,6 @@ impl Agent {
         (self.inner.provider_name(), &self.model)
     }
 
-    /// Cancel all in-flight MCP tool requests for a request.
-    ///
-    /// This sends `notifications/cancelled` to all MCP servers that have
-    /// in-flight requests, allowing them to abort long-running operations.
-    /// Call this when a client disconnects or request times out.
-    ///
-    /// # Arguments
-    /// * `request_id` - The request whose MCP calls should be cancelled
-    /// * `reason` - Reason for cancellation (e.g., "client disconnected", "timeout")
-    ///
-    /// # Returns
-    /// Total number of cancellation notifications sent
-    pub async fn cancel_mcp_requests(
-        &self,
-        request_id: &crate::domain::RequestId,
-        reason: &str,
-    ) -> usize {
-        if let Some(mcp_manager) = &self.mcp_manager {
-            mcp_manager.cancel_all_for_request(request_id, reason).await
-        } else {
-            0
-        }
-    }
-
     /// Cancel all in-flight MCP requests and forcefully close connections.
     ///
     /// This sends `notifications/cancelled` to all MCP servers and then
