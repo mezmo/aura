@@ -83,11 +83,6 @@ use super::types::{
 /// Number of characters per chunk when streaming the final orchestration response.
 pub(super) const STREAM_CHUNK_SIZE: usize = 50;
 
-/// Maximum ReAct depth for the planning coordinator.
-/// Defense-in-depth alongside stream_and_collect's early exit.
-/// Allows: 1 list_tools + 1 inspect_tool_params + 1 read_artifact + 1 routing + 2 spare.
-const PLANNING_COORDINATOR_MAX_DEPTH: usize = 6;
-
 /// Maximum attempts for a worker task before giving up.
 /// Attempt 1 = normal execution. Attempt 2 = retry with correction prompt.
 const MAX_WORKER_ATTEMPTS: usize = 2;
@@ -1486,8 +1481,8 @@ impl Orchestrator {
     /// tool chains.
     ///
     /// Key behaviors:
-    /// - Opens the stream depth-capped at `PLANNING_COORDINATOR_MAX_DEPTH`
-    ///   (rig safety net, but early exit is the primary guard)
+    /// - Opens the stream depth-capped at the agent's resolved turn depth
+    ///   (`[agent].turn_depth`; rig safety net, but early exit is the primary guard)
     /// - Forwards `ReasoningDelta`/`Reasoning` items through `event_tx` when provided
     /// - Short-circuits after first `ToolResult` when `decision_ready()` returns true
     /// - Falls back to normal completion for text-only responses
@@ -2683,11 +2678,15 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
         let model_name = self.agent_config.llm.model_name().to_string();
 
-        // Coordinator depth budget allows recon + read_artifact + routing within one
-        // stream_and_collect call. The decision_ready early-exit is the primary guard;
-        // max_depth is defense-in-depth. GPT 5.2 observed using read_artifact during
-        // post-execute continuation routing (13 calls in 5-prompt E2E suite).
-        let max_depth = PLANNING_COORDINATOR_MAX_DEPTH;
+        // The top-level agent block configures the coordinator in orchestration
+        // mode, so the coordinator inherits `[agent].turn_depth`. The
+        // decision_ready early-exit is the primary guard; the depth cap is
+        // defense-in-depth.
+        let max_depth = self
+            .agent_config
+            .agent
+            .turn_depth
+            .unwrap_or(crate::builder::DEFAULT_MAX_DEPTH);
 
         Ok(AgentWithPreamble {
             agent: Agent {
