@@ -108,13 +108,13 @@ impl ProviderAgent {
         chat_history: Vec<rig::completion::Message>,
         max_depth: usize,
         options: crate::streaming::RunOptions,
-        request_id: &str,
+        stream: crate::StreamKey,
         scratchpad_budget: Option<ContextBudget>,
         client_tool_names: HashSet<String>,
     ) -> crate::streaming::AgentRun {
         let (hook, cancel_tx, usage_state) = StreamingRequestHook::with_scratchpad_budget(
             options,
-            request_id,
+            stream,
             scratchpad_budget,
             client_tool_names,
         );
@@ -319,13 +319,13 @@ impl ProviderAgent {
         query: &str,
         max_depth: usize,
         options: crate::streaming::RunOptions,
-        request_id: &str,
+        stream: crate::StreamKey,
         scratchpad_budget: Option<ContextBudget>,
         client_tool_names: HashSet<String>,
     ) -> crate::streaming::AgentRun {
         let (hook, cancel_tx, usage_state) = StreamingRequestHook::with_scratchpad_budget(
             options,
-            request_id,
+            stream,
             scratchpad_budget,
             client_tool_names,
         );
@@ -429,13 +429,13 @@ impl ProviderAgent {
         chat_history: Vec<rig::completion::Message>,
         max_depth: usize,
         options: crate::streaming::RunOptions,
-        request_id: &str,
+        stream: crate::StreamKey,
         scratchpad_budget: Option<ContextBudget>,
         client_tool_names: HashSet<String>,
     ) -> crate::streaming::AgentRun {
         let (hook, cancel_tx, usage_state) = StreamingRequestHook::with_scratchpad_budget(
             options,
-            request_id,
+            stream,
             scratchpad_budget,
             client_tool_names,
         );

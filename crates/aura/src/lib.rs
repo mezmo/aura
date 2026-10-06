@@ -107,7 +107,7 @@ pub use stream_events::{
     AgentContext, AuraStreamEvent, CorrelationContext, CorrelationContextExt, WorkerPhase,
     format_named_sse,
 };
-pub use streaming_request_hook::{ResponseContent, StreamingRequestHook, UsageState};
+pub use streaming_request_hook::{ResponseContent, StreamKey, StreamingRequestHook, UsageState};
 pub use tool_call_observer::{RetryHint, ToolCallObserver, ToolEvent, ToolOutcome};
 pub use tool_error_detection::{DetectedToolError, ToolResultStatus, detect_tool_error};
 pub use tool_wrapper::{

@@ -1446,7 +1446,7 @@ impl Agent {
     /// # Arguments
     /// * `query` - The user query
     /// * `options` - How the run is bounded and cancelled
-    /// * `request_id` - Unique request ID for MCP tool cancellation context
+    /// * `stream` - Which stream this is: the run itself or a task attempt in it
     ///
     /// # Cancellation
     /// The StreamingRequestHook checks for cancellation at key points during streaming:
@@ -1461,7 +1461,7 @@ impl Agent {
         &self,
         query: &str,
         options: crate::streaming::RunOptions,
-        request_id: &str,
+        stream: crate::StreamKey,
     ) -> crate::streaming::AgentRun {
         self.seed_scratchpad_request_input(query, &[]);
         self.inner
@@ -1469,7 +1469,7 @@ impl Agent {
                 query,
                 self.max_depth,
                 options,
-                request_id,
+                stream,
                 self.scratchpad_budget.clone(),
                 self.client_tool_names.clone(),
             )
@@ -1487,7 +1487,7 @@ impl Agent {
     /// * `query` - The user query
     /// * `chat_history` - Previous conversation messages
     /// * `options` - How the run is bounded and cancelled
-    /// * `request_id` - Unique request ID for MCP tool cancellation context
+    /// * `stream` - Which stream this is: the run itself or a task attempt in it
     ///
     ///
     /// # Cancellation
@@ -1497,7 +1497,7 @@ impl Agent {
         query: &str,
         chat_history: Vec<rig::completion::Message>,
         options: crate::streaming::RunOptions,
-        request_id: &str,
+        stream: crate::StreamKey,
     ) -> crate::streaming::AgentRun {
         self.seed_scratchpad_request_input(query, &chat_history);
         self.inner
@@ -1506,7 +1506,7 @@ impl Agent {
                 chat_history,
                 self.max_depth,
                 options,
-                request_id,
+                stream,
                 self.scratchpad_budget.clone(),
                 self.client_tool_names.clone(),
             )
@@ -1733,11 +1733,20 @@ impl StreamingAgent for Agent {
         }
 
         let started = if chat_history.is_empty() {
-            self.stream_prompt_with_timeout(query, options, request_id.as_str())
-                .await
+            self.stream_prompt_with_timeout(
+                query,
+                options,
+                crate::StreamKey::Run(request_id.clone()),
+            )
+            .await
         } else {
-            self.stream_chat_with_timeout(query, chat_history, options, request_id.as_str())
-                .await
+            self.stream_chat_with_timeout(
+                query,
+                chat_history,
+                options,
+                crate::StreamKey::Run(request_id.clone()),
+            )
+            .await
         };
 
         started

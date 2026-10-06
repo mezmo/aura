@@ -1467,7 +1467,7 @@ impl Orchestrator {
                         prompt,
                         history,
                         crate::streaming::RunOptions::default(),
-                        key,
+                        crate::StreamKey::Attempt(key.to_string()),
                     )
                     .await
                     .into_events(),
@@ -4054,7 +4054,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 continuation.history.clone(),
                 worker.max_depth,
                 crate::streaming::RunOptions::default(),
-                &park.key,
+                crate::StreamKey::Attempt(park.key.clone()),
                 worker.scratchpad_budget.clone(),
                 worker.client_tool_names.clone(),
             )
